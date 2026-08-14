@@ -1,5 +1,7 @@
 # Macha
 
+![Macha Logo](gfx/macha_logo.svg)
+
 Macha is a small C++20 distributed filesystem for large media files.
 It mounts as a normal filesystem, stores files as immutable content-addressed extents, and replicates those extents across ordinary machines.
 
