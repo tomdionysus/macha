@@ -1,0 +1,3 @@
+# /etc/macha
+# Keep node policy in YAML; keep the systemd wrapper boring.
+MACHA_ARGS=--config /etc/macha.yaml

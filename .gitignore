@@ -1,0 +1,6 @@
+/build/
+/build-*/
+/.cache/
+.DS_Store
+*.swp
+*.tmp

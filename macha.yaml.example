@@ -1,0 +1,83 @@
+# Macha 0.4.0
+#
+# Copy this file per node. Paths, advertise address and failure_domain are
+# node-local. The cluster key contents and dht policy must match every node.
+#
+# Create state/cache/storage directories before starting the service. Storage
+# paths are deliberately not auto-created: a missing mounted disk must not turn
+# into an accidental directory on the root filesystem.
+
+state_path: /var/lib/macha
+key_file: /etc/macha.key
+mount_path: /srv/media
+
+# ALL, DEBUG, INFO, WARN or ERROR. Default: INFO.
+log_level: INFO
+
+# Authoritative local DHT storage. Add as many independent backends as required.
+storage:
+  - path: /mnt/media-a/dht
+    limit: 10T
+  - path: /mnt/media-b/dht
+    limit: 10T
+
+# Independent best-effort read cache. It does not count as a DHT replica.
+# SSD is a good fit. max_blocks is a block count, not a byte limit.
+cache:
+  path: /var/cache/macha
+  max_blocks: 4096
+  prefer_metadata: true
+
+# Root ownership/mode are used only when a brand-new namespace is formed.
+# They are then persisted in distributed metadata.
+filesystem:
+  allow_other: false
+  root_uid: 0
+  root_gid: 0
+  root_mode: "0755"
+
+network:
+  # listen is the local bind address. advertise is what peers connect to.
+  listen: 0.0.0.0
+  advertise: media-node-2.example.net
+  port: 7437
+
+  # Nodes sharing one physical/site failure domain should share this value.
+  failure_domain: site-a
+
+  heartbeat_ms: 5000
+  dead_after_ms: 30000
+  connect_timeout_ms: 2500
+
+  # DEBUG observability only. These never cancel a healthy RPC; 0 disables.
+  control_stall_notice_ms: 5000
+  data_stall_notice_ms: 120000
+
+# Cluster policy. Pick these before genesis and keep them identical everywhere.
+# 3/3 is a sensible three-node production starting point.
+# For a disposable two-node demo use replicas: 2, metadata_replicas: 1.
+#
+# The compiled extent default is 16M. 4M is the current recommended media
+# setting because it gives finer-grained reads, retries and rebalance.
+dht:
+  replicas: 3
+  metadata_replicas: 3
+  extent_size: 4M
+  read_ahead: 3
+  metadata_cache_ms: 250
+
+# Exactly one founder of a new cluster uses: bootstrap: []
+# Every other node lists one or more reachable current members.
+bootstrap:
+  - media-node-1.example.net:7437
+
+maintenance:
+  # Background work is byte-budgeted and adaptive. Foreground I/O wins.
+  interval_ms: 500
+  foreground_quiet_ms: 2000
+  busy_bandwidth_fraction: 0.0
+  idle_bandwidth_fraction: 0.50
+  cpu_target: 0.35
+  initial_bandwidth: 32M
+  max_bandwidth: 0B       # 0 = no configured cap; observed rate still applies.
+  scrub_fraction: 0.10

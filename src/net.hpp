@@ -1,0 +1,256 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+
+#include "crypto.hpp"
+#include "types.hpp"
+
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <future>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <stop_token>
+#include <thread>
+#include <vector>
+
+namespace macha {
+enum class MessageType : uint16_t {
+    ping = 1,
+    members = 2,
+    have_object = 3,
+    get_object = 4,
+    put_object = 5,
+    get_metadata = 6,
+    cas_metadata = 7,
+    seed_metadata = 8,
+    metadata_notice = 9,
+    get_committed_metadata = 10,
+    checkpoint_metadata = 11,
+    session_retire = 12,
+    ok = 100,
+    error = 101,
+    members_reply = 102,
+    bool_reply = 103,
+    object_reply = 104,
+    metadata_reply = 105,
+    cas_reply = 106
+};
+
+struct RpcMessage {
+    MessageType type{MessageType::error};
+    Bytes payload;
+};
+
+struct RpcFrame {
+    uint64_t request_id{};
+    RpcMessage message;
+};
+
+struct RpcReply {
+    NodeInfo peer;
+    RpcMessage message;
+};
+
+struct RpcStats {
+    uint64_t connections_created{};
+    uint64_t connections_reused{};
+    uint64_t canonical_connections{};
+    uint64_t canonical_health{};
+    uint64_t canonical_control{};
+    uint64_t canonical_data{};
+};
+
+enum class RpcLane : uint8_t { health = 1, control = 2, data = 3 };
+
+RpcLane rpc_lane(MessageType);
+const char* rpc_lane_name(RpcLane) noexcept;
+
+class SecureChannel {
+    int fd_{-1};
+    ClusterKeys keys_;
+    NodeInfo local_;
+    std::array<uint8_t, 32> tx_{}, rx_{};
+    std::array<uint8_t, 32> session_id_{};
+    uint64_t tx_counter_{}, rx_counter_{};
+    bool ready_{};
+    std::mutex close_mutex_;
+    bool shutdown_{};
+    void close_fd();
+
+  public:
+    SecureChannel(int, ClusterKeys, NodeInfo);
+    ~SecureChannel();
+    SecureChannel(const SecureChannel&) = delete;
+    SecureChannel& operator=(const SecureChannel&) = delete;
+    NodeInfo client_handshake(RpcLane);
+    NodeInfo server_handshake(const std::string& remote_host, RpcLane*);
+    void send(uint64_t request_id, const RpcMessage&,
+              const std::function<void(size_t)>& progress = {});
+    RpcFrame receive(const std::function<void(uint64_t, size_t)>& progress = {});
+    void shutdown();
+    const std::array<uint8_t, 32>& session_id() const noexcept { return session_id_; }
+};
+
+class AsyncRpc {
+    std::future<RpcReply> future_;
+    std::function<void()> cancel_;
+    std::function<void()> abort_;
+    std::function<std::chrono::milliseconds()> idle_;
+
+  public:
+    AsyncRpc() = default;
+    AsyncRpc(std::future<RpcReply>, std::function<void()>, std::function<void()>,
+             std::function<std::chrono::milliseconds()> = {});
+    ~AsyncRpc();
+    AsyncRpc(AsyncRpc&&) noexcept;
+    AsyncRpc& operator=(AsyncRpc&&) noexcept;
+    AsyncRpc(const AsyncRpc&) = delete;
+    AsyncRpc& operator=(const AsyncRpc&) = delete;
+
+    bool valid() const;
+    std::future_status wait_for(std::chrono::milliseconds);
+    RpcReply get();
+    void cancel();
+    void abort();
+    std::chrono::milliseconds idle_for() const;
+};
+
+class RpcClient {
+    class PeerConnection;
+    friend class RpcServer;
+    using Lane = RpcLane;
+
+    using InboundReply = std::function<void(const RpcMessage&)>;
+    using InboundHandler = std::function<void(const NodeInfo&, RpcFrame, InboundReply)>;
+
+    struct InboundRoute {
+        NodeInfo peer;
+        RpcLane lane{RpcLane::control};
+        std::array<uint8_t, 32> session_id{};
+        std::function<AsyncRpc(MessageType, std::span<const uint8_t>)> call;
+        std::function<void(const RpcMessage&)> notify;
+        std::function<void()> retire;
+        std::function<void()> close;
+        std::function<bool()> usable;
+    };
+
+    struct PeerHealth {
+        unsigned failures{};
+        Clock::time_point retry_after{};
+    };
+
+    ClusterKeys keys_;
+    std::function<NodeInfo()> local_;
+    std::function<void(const NodeInfo&)> peer_observer_;
+    std::function<void(uint64_t)> metadata_observer_;
+    std::chrono::milliseconds connect_timeout_;
+    std::chrono::milliseconds heartbeat_;
+    std::chrono::milliseconds dead_after_;
+    mutable std::mutex mutex_;
+    std::map<std::string, std::shared_ptr<PeerConnection>> connections_;
+    std::vector<std::shared_ptr<PeerConnection>> retired_connections_;
+    std::map<std::string, InboundRoute> inbound_routes_;
+    std::map<std::string, NodeId> endpoint_peers_;
+    std::map<std::string, PeerHealth> health_;
+    std::map<std::string, Endpoint> endpoints_;
+    std::atomic_uint64_t connections_created_{};
+    std::atomic_uint64_t connections_reused_{};
+    std::jthread health_thread_;
+    std::mutex inbound_mutex_;
+    InboundHandler inbound_handler_;
+
+    static Lane lane_for(MessageType type) { return rpc_lane(type); }
+    static const char* lane_name(Lane lane) { return rpc_lane_name(lane); }
+    static std::string endpoint_key(const Endpoint&);
+    static std::string health_key(const Endpoint&, RpcLane);
+    static std::string peer_key(const NodeId&, RpcLane);
+    std::shared_ptr<PeerConnection> connection(const Endpoint&, RpcLane,
+                                               const NodeId* expected, NodeId* actual);
+    AsyncRpc call_async_known(const Endpoint&, const NodeId*, MessageType,
+                              std::span<const uint8_t>);
+    void observe_result(const std::string&, bool, std::chrono::milliseconds);
+    void health_loop(std::stop_token);
+    void close_endpoint(const Endpoint&, const std::string&);
+    void set_inbound_handler(InboundHandler);
+    void dispatch_inbound(const NodeInfo&, RpcFrame, InboundReply);
+    void register_inbound(InboundRoute);
+    void unregister_inbound(const NodeId&, RpcLane,
+                            const std::array<uint8_t, 32>& session_id);
+    void reconcile_locked(const NodeId&, RpcLane,
+                          std::vector<std::function<void()>>& retire);
+    void reap_retired();
+
+  public:
+    RpcClient(ClusterKeys, std::function<NodeInfo()>, std::function<void(const NodeInfo&)>,
+              std::function<void(uint64_t)>, std::chrono::milliseconds connect_timeout,
+              std::chrono::milliseconds heartbeat = std::chrono::seconds(5),
+              std::chrono::milliseconds dead_after = std::chrono::seconds(30));
+    ~RpcClient();
+    AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
+    AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
+    RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t>,
+                  std::chrono::milliseconds stall_notice);
+    RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t>,
+                  std::chrono::milliseconds stall_notice);
+    RpcStats stats() const;
+    void broadcast(const RpcMessage&);
+    void stop();
+};
+
+class RpcServer {
+  public:
+    using Handler = std::function<RpcMessage(const NodeInfo&, const RpcMessage&)>;
+    using Observer = std::function<void(const NodeInfo&)>;
+
+  private:
+    struct Session;
+    struct RequestJob {
+        std::shared_ptr<Session> session;
+        NodeInfo peer;
+        RpcFrame frame;
+        std::function<void(const RpcMessage&)> reply;
+    };
+
+    std::string host_;
+    uint16_t port_;
+    ClusterKeys keys_;
+    NodeInfo local_;
+    Handler handler_;
+    Observer observer_;
+    std::atomic_int listen_fd_{-1};
+    uint16_t bound_port_{};
+    std::jthread accept_thread_;
+    enum class RequestClass { health, control, data };
+    std::vector<std::jthread> health_workers_;
+    std::vector<std::jthread> control_workers_;
+    std::vector<std::jthread> data_workers_;
+    std::mutex request_mutex_;
+    std::condition_variable request_cv_;
+    std::deque<RequestJob> health_requests_;
+    std::deque<RequestJob> control_requests_;
+    std::deque<RequestJob> data_requests_;
+    std::mutex sessions_mutex_;
+    std::vector<std::shared_ptr<Session>> sessions_;
+    RpcClient* shared_client_{};
+
+    static RequestClass request_class(MessageType);
+    std::deque<RequestJob>& queue(RequestClass);
+    void accept_loop(std::stop_token);
+    void session_loop(Session*);
+    void worker_loop(std::stop_token, RequestClass);
+    void reap_sessions(bool all);
+    void enqueue_shared(const NodeInfo&, RpcFrame, RpcClient::InboundReply);
+
+  public:
+    RpcServer(std::string, uint16_t, ClusterKeys, NodeInfo, Handler, Observer);
+    ~RpcServer();
+    void start();
+    void stop();
+    void attach_client(RpcClient&);
+    void broadcast(const RpcMessage&);
+    uint16_t bound_port() const { return bound_port_; }
+};
+} // namespace macha

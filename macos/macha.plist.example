@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Adjust binary/config paths to match the local install. -->
+    <key>Label</key><string>macha</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/macha</string>
+        <string>--config</string>
+        <string>/usr/local/etc/macha.yaml</string>
+    </array>
+    <key>KeepAlive</key><true/>
+    <key>RunAtLoad</key><true/>
+    <key>StandardOutPath</key><string>/tmp/macha.log</string>
+    <key>StandardErrorPath</key><string>/tmp/macha.log</string>
+</dict>
+</plist>
