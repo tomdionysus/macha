@@ -5,7 +5,9 @@
 - renamed the project to Macha across the executable, build targets, configuration, service files, C++ namespace, FUSE identity and local storage markers;
 - changed cluster cryptographic derivation labels and metadata-placement namespace to `macha/*`;
 - bumped the wire protocol to v4, changed the frame magic to `MCH4`, and changed the authenticated session label to `macha/session/v4`;
-- intentionally removed compatibility with pre-Macha nodes, state directories, backend markers, wire protocol, encrypted storage and service/configuration names; 0.4.0 is a clean compatibility boundary.
+- intentionally removed compatibility with pre-Macha nodes, state directories, backend markers, wire protocol, encrypted storage and service/configuration names; 0.4.0 is a clean compatibility boundary;
+- fixed metadata genesis for symmetric bootstrap and metadata voter counts greater than one;
+- made data and metadata replica counts mutable by coordinated whole-cluster restart, with old-quorum voter-set transitions and automatic object convergence; `extent_size` remains immutable for an existing namespace.
 
 ## 0.3.0 - 2026-08-13
 

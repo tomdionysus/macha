@@ -24,7 +24,7 @@ The core dependencies are C++20, OpenSSL and yaml-cpp. FUSE is optional at build
 
 ## Two-node local demo
 
-This is intentionally disposable. It uses one metadata voter so the first node can form a namespace immediately. For a real cluster with three or more nodes, use `metadata_replicas: 3` from genesis.
+This is intentionally disposable. It uses two metadata voters to exercise the same replicated metadata path as a real cluster. Both nodes are required for namespace writes; for fault-tolerant metadata use an odd voter count such as three.
 
 Build first.
 
@@ -79,10 +79,11 @@ network:
 
 dht:
   replicas: 2
-  metadata_replicas: 1
+  metadata_replicas: 2
   extent_size: 4M
 
-bootstrap: []
+bootstrap:
+  - 127.0.0.1:7438
 ```
 
 `demo/node2.yaml` is the same policy with different local paths and port:
@@ -109,7 +110,7 @@ network:
 
 dht:
   replicas: 2
-  metadata_replicas: 1
+  metadata_replicas: 2
   extent_size: 4M
 
 bootstrap:
@@ -133,8 +134,9 @@ The complete example is `macha.yaml.example`. The important rules are short:
 
 - Every node uses the **same key contents**. The path may differ.
 - `network.advertise` must be reachable from the other nodes. `listen: 0.0.0.0` does not make `127.0.0.1` a useful advertised address.
-- `dht.replicas`, `dht.metadata_replicas` and `dht.extent_size` are cluster policy. Choose them before genesis and keep them identical on every node.
-- Exactly one node in a new cluster has `bootstrap: []`. Every other node bootstraps from one or more reachable members.
+- `dht.replicas` and `dht.metadata_replicas` are cluster policy and must be identical on every node. They may be changed by stopping the whole cluster, changing every node, then restarting it. Do not roll replica-count changes through a running cluster; mixed policies are unsupported.
+- `dht.extent_size` is fixed for an existing namespace.
+- Bootstrap may be one-way or symmetric. A node with configured bootstrap peers will not create a new namespace while none of them is reachable.
 - Storage backend directories must already exist. Missing paths are treated as missing disks, not created automatically.
 - `state_path` is not bulk storage. Put it on reliable local system storage.
 - `failure_domain` describes shared fate. Machines in the same site should normally use the same value.
@@ -147,7 +149,7 @@ Start with:
 macha --config /etc/macha.yaml
 ```
 
-Send `SIGHUP` to reload only local storage-backend and cache configuration. Other settings require restart. Persisted DHT policy must still match the namespace formed at genesis.
+Send `SIGHUP` to reload only local storage-backend and cache configuration. Replica-count changes require a coordinated cluster stop/edit/restart; the old metadata quorum commits the new voter/data policy when the cluster comes back. `extent_size` cannot change for an existing namespace.
 
 A YAML file is required. These CLI options override values from that file for one invocation:
 
@@ -237,7 +239,7 @@ For three voters:
 
 A metadata minority fails rather than inventing a second history. Read-only access may fall back to the last valid local snapshot when quorum is unavailable; mutations do not.
 
-Metadata replication and extent size are persisted in the namespace at genesis. A node with conflicting policy refuses metadata access.
+The current metadata voter set and data replica count are persisted in the namespace. Replica counts may be changed on a coordinated whole-cluster restart; the old voter majority commits the new policy, then ordinary repair converges existing objects to the new data replica count. `extent_size` remains fixed for the lifetime of the namespace.
 
 ## Repair and maintenance
 

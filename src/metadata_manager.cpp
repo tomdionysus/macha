@@ -373,10 +373,6 @@ MetadataManager::CasResult MetadataManager::cas_quorum(const std::vector<NodeInf
 MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& voters) {
     if (voters.empty())
         throw std::runtime_error("metadata voter set is empty");
-    if (voters.size() != node_.config().metadata_replication) {
-        throw std::runtime_error("metadata voter set size does not match configuration");
-    }
-
     const size_t need = quorum(voters.size());
     auto nodes = voter_nodes(voters);
     if (nodes.size() < need)
@@ -436,6 +432,17 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& voters) {
                 auto successor = latest(group.records);
                 node_.seed_metadata(successor);
                 node_.checkpoint_metadata(successor);
+
+                // An old-group majority has committed the voter transition.
+                // Repair the successor onto a new-group quorum before following
+                // it. This also completes a transition interrupted after the
+                // old quorum committed but before every new voter was seeded.
+                auto next_nodes = voter_nodes(group.voters);
+                const size_t next_need = quorum(group.voters.size());
+                if (next_nodes.size() < next_need ||
+                    !seed_quorum(next_nodes, successor, next_need))
+                    throw std::runtime_error("metadata voter transition target quorum unavailable");
+                checkpoint_quorum(next_nodes, successor, next_need);
                 return read_group(group.voters);
             }
         }
@@ -464,9 +471,6 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& voters) {
         auto policy = decode_snapshot(current.payload);
         if (policy.metadata_voters.empty())
             throw std::runtime_error("metadata voter group lost its configuration");
-        if (policy.data_replication != node_.config().replication) {
-            throw std::runtime_error("cluster data replication does not match local configuration");
-        }
         if (policy.extent_size != node_.config().extent_size) {
             throw std::runtime_error("cluster extent size does not match local configuration");
         }
@@ -510,66 +514,155 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& voters) {
     throw std::runtime_error("metadata repair quorum unavailable");
 }
 
-MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& current) {
-    auto snapshot = decode_snapshot(current.payload);
-    const auto old_voters = snapshot.metadata_voters;
-    const size_t need = quorum(old_voters.size());
-    auto active = node_.membership().active();
+MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial) {
+    MetadataRecord current = initial;
 
-    std::set<NodeId> active_ids;
-    for (const auto& peer : active)
-        active_ids.insert(peer.id);
+    for (size_t attempt = 0; attempt < 8; ++attempt) {
+        auto snapshot = decode_snapshot(current.payload);
+        const auto old_voters = snapshot.metadata_voters;
+        if (old_voters.empty())
+            throw std::runtime_error("metadata voter group lost its configuration");
+        if (snapshot.extent_size != node_.config().extent_size)
+            throw std::runtime_error("cluster extent size does not match local configuration");
 
-    std::vector<NodeId> surviving;
-    for (const auto& id : old_voters) {
-        if (active_ids.contains(id))
+        // Replica-policy changes are an offline coordinated operation: every
+        // node must be restarted with the same desired values. Transport v4
+        // does not advertise desired policy, so mixed rolling configurations
+        // cannot be safely reconciled here.
+        const size_t old_need = quorum(old_voters.size());
+        const size_t target = node_.config().metadata_replication;
+        const uint32_t old_data_replication = snapshot.data_replication;
+        auto active = node_.membership().active();
+
+        std::set<NodeId> active_ids;
+        for (const auto& peer : active)
+            active_ids.insert(peer.id);
+
+        std::vector<NodeId> surviving;
+        std::vector<NodeInfo> surviving_nodes;
+        for (const auto& id : old_voters) {
+            if (!active_ids.contains(id))
+                continue;
             surviving.push_back(id);
+            if (auto owner = node_info(id))
+                surviving_nodes.push_back(*owner);
+        }
+        if (surviving.size() < old_need)
+            return current;
+
+        std::vector<NodeId> next;
+        if (target == old_voters.size() && surviving.size() == old_voters.size()) {
+            next = old_voters;
+        } else {
+            if (active.size() < target) {
+                // Ordinary degraded operation is still allowed while the old
+                // voter group has quorum. Reconfiguration waits for enough
+                // nodes to restore the configured group size. A deliberate
+                // size increase, however, cannot take effect until its target
+                // nodes are present.
+                if (target == old_voters.size())
+                    return current;
+                throw std::runtime_error("metadata policy change: need " +
+                                         std::to_string(target) + " active nodes, have " +
+                                         std::to_string(active.size()));
+            }
+
+            if (surviving_nodes.size() > target) {
+                auto ranked = rendezvous_nodes(placement_key_.bytes, surviving_nodes, target);
+                for (const auto& peer : ranked)
+                    next.push_back(peer.id);
+            } else {
+                next = surviving;
+                std::set<NodeId> chosen(next.begin(), next.end());
+                std::vector<NodeInfo> candidates;
+                for (const auto& peer : active) {
+                    if (!chosen.contains(peer.id))
+                        candidates.push_back(peer);
+                }
+                auto ranked = rendezvous_nodes(placement_key_.bytes, candidates,
+                                               target - next.size());
+                for (const auto& peer : ranked)
+                    next.push_back(peer.id);
+            }
+            std::sort(next.begin(), next.end());
+            if (next.size() != target)
+                throw std::runtime_error("metadata policy change target voter set unavailable");
+        }
+
+        const bool voters_changed = !same_voters(next, old_voters);
+        const bool data_changed = snapshot.data_replication != node_.config().replication;
+        if (!voters_changed && !data_changed)
+            return current;
+
+        auto old_nodes = voter_nodes(old_voters);
+        if (old_nodes.size() < old_need)
+            return current;
+
+        std::vector<NodeInfo> next_nodes;
+        size_t next_need = 0;
+        if (voters_changed) {
+            next_nodes = voter_nodes(next);
+            next_need = quorum(next.size());
+            if (next_nodes.size() < next_need)
+                throw std::runtime_error("metadata policy change target quorum unavailable");
+
+            // Put the last committed old-group record on enough future voters
+            // before changing the configuration. Newly-added voters can then
+            // accept/repair the successor immediately after the old quorum CAS.
+            if (!seed_quorum(next_nodes, current, next_need))
+                throw std::runtime_error("metadata policy change target quorum unavailable");
+        }
+
+        snapshot.metadata_voters = next;
+        snapshot.data_replication = static_cast<uint32_t>(node_.config().replication);
+        auto payload = encode_snapshot(snapshot);
+
+        // The old voter majority serialises the configuration change. This is
+        // the authority for both resizing/replacing the metadata group and for
+        // changing the stored data-replication policy.
+        auto result = cas_quorum(old_nodes, current, payload, old_need);
+        if (result.success >= old_need && result.committed) {
+            auto committed = *result.committed;
+            if (voters_changed) {
+                if (!seed_quorum(next_nodes, committed, next_need)) {
+                    // The old quorum has already committed this transition. Do
+                    // not attempt to roll it back; read_group() will finish
+                    // seeding the new quorum when connectivity returns.
+                    node_.checkpoint_metadata(committed);
+                    throw std::runtime_error(
+                        "metadata voter transition committed; target quorum unavailable");
+                }
+                checkpoint_quorum(next_nodes, committed, next_need);
+            } else {
+                checkpoint_quorum(old_nodes, committed, old_need);
+            }
+            node_.checkpoint_metadata(committed);
+            seed_all_best_effort(active, committed);
+            cache_record(committed);
+            if (old_data_replication != node_.config().replication ||
+                old_voters.size() != next.size()) {
+                Log::info("cluster replication policy changed: data " +
+                          std::to_string(old_data_replication) + " metadata " +
+                          std::to_string(old_voters.size()) + " -> data " +
+                          std::to_string(node_.config().replication) + " metadata " +
+                          std::to_string(next.size()));
+            } else {
+                Log::info("metadata voter group replaced unavailable node(s)");
+            }
+            return committed;
+        }
+        if (!result.conflict)
+            throw std::runtime_error("metadata policy change quorum unavailable");
+
+        current = read_record_base();
     }
-    if (surviving.size() == old_voters.size())
-        return current;
-    if (surviving.size() < need || active.size() < old_voters.size())
-        return current;
 
-    std::set<NodeId> chosen(surviving.begin(), surviving.end());
-    std::vector<NodeInfo> candidates;
-    for (const auto& peer : active) {
-        if (!chosen.contains(peer.id))
-            candidates.push_back(peer);
-    }
-    auto ranked =
-        rendezvous_nodes(placement_key_.bytes, candidates, old_voters.size() - surviving.size());
-    for (const auto& peer : ranked)
-        chosen.insert(peer.id);
-    if (chosen.size() != old_voters.size())
-        return current;
-
-    std::vector<NodeId> next(chosen.begin(), chosen.end());
-    snapshot.metadata_voters = next;
-    auto payload = encode_snapshot(snapshot);
-
-    auto retained_nodes = voter_nodes(surviving);
-    auto result = cas_quorum(retained_nodes, current, payload, need);
-    if (result.success < need || !result.committed)
-        return read_record_uncached();
-
-    // The CAS quorum consists only of surviving old voters, and every one is
-    // retained in the new group. Therefore the committed old majority is also
-    // a new majority before best-effort repair reaches replacement voters.
-    auto next_nodes = voter_nodes(next);
-    seed_quorum(next_nodes, *result.committed, quorum(next.size()));
-    checkpoint_quorum(next_nodes, *result.committed, quorum(next.size()));
-    node_.checkpoint_metadata(*result.committed);
-    cache_record(*result.committed);
-    Log::info("metadata voter group replaced " +
-              std::to_string(old_voters.size() - surviving.size()) + " unavailable node(s)");
-    return *result.committed;
+    throw std::runtime_error("metadata policy change conflict");
 }
-
 
 std::optional<MetadataRecord> MetadataManager::recover_from_committed_checkpoints(
     const std::vector<NodeInfo>& active) {
-    const size_t target = node_.config().metadata_replication;
-    if (active.size() < std::max<size_t>(target, 2))
+    if (active.size() < 2)
         return {};
 
     struct Checkpoint {
@@ -668,12 +761,11 @@ std::optional<MetadataRecord> MetadataManager::recover_from_committed_checkpoint
         return {};
 
     auto snapshot = decode_snapshot(base->payload);
-    if (snapshot.metadata_voters.size() != target)
-        throw std::runtime_error(
-            "metadata recovery checkpoint voter count does not match configuration");
-    if (snapshot.data_replication != node_.config().replication)
-        throw std::runtime_error(
-            "metadata recovery checkpoint data replication does not match configuration");
+    const size_t target = snapshot.metadata_voters.size();
+    if (!target)
+        throw std::runtime_error("metadata recovery checkpoint has no voter group");
+    if (active.size() < target)
+        return {};
     if (snapshot.extent_size != node_.config().extent_size)
         throw std::runtime_error(
             "metadata recovery checkpoint extent size does not match configuration");
@@ -789,10 +881,8 @@ MetadataRecord MetadataManager::discover_or_form() {
                 auto reply = item.rpc->get();
                 if (reply.message.type == MessageType::metadata_reply) {
                     auto record = decode_metadata_record(reply.message.payload);
-                    if (record.generation > 1 &&
-                        voters_of(record).size() == node_.config().metadata_replication) {
+                    if (record.generation > 1)
                         discovered.push_back(std::move(record));
-                    }
                 }
             } catch (...) {
             }
@@ -836,8 +926,12 @@ MetadataRecord MetadataManager::discover_or_form() {
         throw std::runtime_error("metadata group forming: need " + std::to_string(target) +
                                  " active nodes, have " + std::to_string(active.size()));
     }
-    if (!node_.config().bootstrap.empty()) {
-        throw std::runtime_error("metadata group forming: waiting for bootstrap-less founder");
+    // A configured joiner must not invent a new namespace while none of its
+    // bootstrap peers are reachable. Once at least one peer is known, genesis
+    // can be formed deterministically by the configured voter set; requiring a
+    // special bootstrap-less founder would make symmetric bootstrap impossible.
+    if (!node_.config().bootstrap.empty() && active.size() == 1) {
+        throw std::runtime_error("metadata group forming: waiting for bootstrap peer");
     }
 
     auto selected = rendezvous_nodes(placement_key_.bytes, active, target);
@@ -883,12 +977,16 @@ MetadataRecord MetadataManager::discover_or_form() {
     throw std::runtime_error("metadata voter group formation quorum unavailable");
 }
 
-MetadataRecord MetadataManager::read_record_uncached() {
+MetadataRecord MetadataManager::read_record_base() {
     auto local = node_.metadata_replica().current();
     auto voters = voters_of(local);
     if (voters.empty())
         return discover_or_form();
     return read_group(voters);
+}
+
+MetadataRecord MetadataManager::read_record_uncached() {
+    return maybe_reconfigure(read_record_base());
 }
 
 MetadataRecord MetadataManager::read_record() {
@@ -957,7 +1055,7 @@ MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot
 }
 
 void MetadataManager::repair_once() {
-    auto record = maybe_reconfigure(read_record_uncached());
+    auto record = read_record_uncached();
     auto voters = voters_of(record);
     auto voter_replicas = voter_nodes(voters);
     seed_quorum(voter_replicas, record, quorum(voters.size()));

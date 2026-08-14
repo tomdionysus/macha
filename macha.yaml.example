@@ -53,11 +53,14 @@ network:
   control_stall_notice_ms: 5000
   data_stall_notice_ms: 120000
 
-# Cluster policy. Pick these before genesis and keep them identical everywhere.
+# Cluster policy. Keep replica counts identical everywhere. They may be changed
+# by stopping the whole cluster, editing every node, then restarting it.
 # 3/3 is a sensible three-node production starting point.
-# For a disposable two-node demo use replicas: 2, metadata_replicas: 1.
+# For a two-node cluster use replicas: 2, metadata_replicas: 2; both nodes are
+# then required for metadata writes.
 #
-# The compiled extent default is 16M. 4M is the current recommended media
+# extent_size is fixed once a namespace exists. The compiled default is 16M.
+# 4M is the current recommended media
 # setting because it gives finer-grained reads, retries and rebalance.
 dht:
   replicas: 3
@@ -66,8 +69,8 @@ dht:
   read_ahead: 3
   metadata_cache_ms: 250
 
-# Exactly one founder of a new cluster uses: bootstrap: []
-# Every other node lists one or more reachable current members.
+# Bootstrap may be one-way or symmetric. A configured joiner waits for a
+# reachable bootstrap peer rather than inventing a new namespace alone.
 bootstrap:
   - media-node-1.example.net:7437
 

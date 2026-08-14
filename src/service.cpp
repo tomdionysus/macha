@@ -43,10 +43,11 @@ void Service::reload_config() {
     auto updated = load_yaml_config(*node_.config().config_file);
     if (updated.state_path != node_.config().state_path || updated.key_file != node_.config().key_file)
         throw std::runtime_error("state_path/key_file cannot be changed by live reload");
+    if (updated.extent_size != node_.config().extent_size)
+        throw std::runtime_error("extent_size cannot be changed for an existing namespace");
     if (updated.replication != node_.config().replication ||
-        updated.metadata_replication != node_.config().metadata_replication ||
-        updated.extent_size != node_.config().extent_size)
-        throw std::runtime_error("DHT replication/extent policy changes require a coordinated restart");
+        updated.metadata_replication != node_.config().metadata_replication)
+        throw std::runtime_error("replica policy changes require a coordinated cluster restart");
     node_.reconfigure_local(updated);
     Log::info("reloaded storage backends and persistent cache configuration");
 }

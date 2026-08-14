@@ -79,6 +79,8 @@ Both files are required for existing state. A `current.meta`-only state from an 
 
 Only the configured voter set participates in consensus. After a committed generation is known, maintenance distributes that checkpoint to every active node as a **recovery witness**. Witnesses are not extra votes.
 
+Replica counts are mutable cluster policy. A coordinated whole-cluster restart may change data replication, metadata voter count, or both. The existing voter majority serialises the policy change; a resized voter group is seeded before normal metadata mutation continues, and object repair subsequently converges the immutable extent set to the new data replica count. Transport v4 does not advertise a node's desired replica policy, so rolling changes with mixed configurations are deliberately unsupported. `extent_size` is intentionally immutable for an existing namespace.
+
 Read-only metadata also has a short in-memory TTL cache with generation invalidation. Mutations bypass it and start from a fresh quorum read.
 
 ## Voter failure and replacement
@@ -91,7 +93,7 @@ If the old voter quorum has been permanently destroyed, replacement recovery use
 - surviving highest-generation committed checkpoints agree;
 - the old voter quorum is no longer available;
 - enough fresh, genesis-state nodes exist to fill the missing voter seats;
-- configured data replication, metadata replication and extent size match the checkpoint.
+- the checkpoint extent size matches local configuration.
 
 The new voter set is installed as the next metadata generation and committed by a quorum of that new set before it becomes a recovery checkpoint.
 

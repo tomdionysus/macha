@@ -30,6 +30,7 @@ class MetadataManager {
     std::optional<MetadataRecord> recover_from_committed_checkpoints(
         const std::vector<NodeInfo>& active);
     MetadataRecord read_group(const std::vector<NodeId>&);
+    MetadataRecord read_record_base();
     MetadataRecord maybe_reconfigure(const MetadataRecord&);
     MetadataRecord read_record_uncached();
     MetadataRecord cache_record(const MetadataRecord&);

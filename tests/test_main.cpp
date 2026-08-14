@@ -1268,10 +1268,196 @@ void test_joiner_cannot_form_genesis() {
     try {
         (void)service.filesystem().getattr("/");
     } catch (const std::exception& error) {
-        rejected = std::string(error.what()).find("bootstrap-less founder") != std::string::npos;
+        rejected = std::string(error.what()).find("waiting for bootstrap peer") != std::string::npos;
     }
     CHECK(rejected);
     service.stop();
+}
+
+
+void test_two_node_mutual_bootstrap_metadata_quorum() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto p1 = free_port();
+    auto p2 = free_port();
+
+    auto c1 = config_for(t.path() / "n1", keyfile, p1, {{"127.0.0.1", p2}});
+    auto c2 = config_for(t.path() / "n2", keyfile, p2, {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 2;
+    c1.metadata_replication = c2.metadata_replication = 2;
+
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }));
+
+    // Both peers may attempt genesis simultaneously after symmetric discovery.
+    // Competing generation-2 proposals must converge on one metadata history.
+    std::exception_ptr first_error;
+    std::exception_ptr second_error;
+    std::thread first([&] {
+        try {
+            s1.filesystem().mkdir("/from-node-1", 0755, getuid(), getgid());
+        } catch (...) {
+            first_error = std::current_exception();
+        }
+    });
+    std::thread second([&] {
+        try {
+            s2.filesystem().mkdir("/from-node-2", 0755, getuid(), getgid());
+        } catch (...) {
+            second_error = std::current_exception();
+        }
+    });
+    first.join();
+    second.join();
+    if (first_error)
+        std::rethrow_exception(first_error);
+    if (second_error)
+        std::rethrow_exception(second_error);
+
+    CHECK(s1.filesystem().getattr("/from-node-2").type == EntryType::directory);
+    CHECK(s2.filesystem().getattr("/from-node-1").type == EntryType::directory);
+
+    s1.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    s1.filesystem().create_file("/media/two-replicas.bin", 0644, getuid(), getgid());
+    auto input = pattern(128 * 1024);
+    auto writer = s1.filesystem().open_write("/media/two-replicas.bin", true);
+    REQUIRE(writer->write(0, input) == input.size());
+    writer->commit();
+
+    REQUIRE(wait_until([&] {
+        try {
+            return s2.filesystem().getattr("/media/two-replicas.bin").size == input.size();
+        } catch (...) {
+            return false;
+        }
+    }));
+
+    MetadataManager m1(s1.node());
+    auto snapshot = m1.snapshot();
+    CHECK(snapshot.metadata_voters.size() == 2);
+    CHECK(snapshot.data_replication == 2);
+
+    auto entry = s1.filesystem().getattr("/media/two-replicas.bin");
+    REQUIRE(entry.extents.size() == 1);
+    CHECK(s1.node().local_store().has(entry.extents.front().id));
+    CHECK(s2.node().local_store().has(entry.extents.front().id));
+
+    s2.stop();
+    s1.stop();
+}
+
+void test_replication_policy_change_on_restart() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto p1 = free_port();
+    auto p2 = free_port();
+
+    auto c1 = config_for(t.path() / "n1", keyfile, p1);
+    auto c2 = config_for(t.path() / "n2", keyfile, p2, {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 1;
+    c1.metadata_replication = c2.metadata_replication = 1;
+
+    ObjectId object;
+    Bytes input = pattern(128 * 1024);
+    {
+        Service s1(c1, keys);
+        Service s2(c2, keys);
+        s1.start();
+        s2.start();
+        REQUIRE(wait_until([&] {
+            return s1.node().membership().active().size() >= 2 &&
+                   s2.node().membership().active().size() >= 2;
+        }));
+
+        s1.filesystem().create_file("/policy.bin", 0644, getuid(), getgid());
+        auto writer = s1.filesystem().open_write("/policy.bin", true);
+        REQUIRE(writer->write(0, input) == input.size());
+        writer->commit();
+        auto entry = s1.filesystem().getattr("/policy.bin");
+        REQUIRE(entry.extents.size() == 1);
+        object = entry.extents.front().id;
+        REQUIRE(wait_until([&] {
+            try {
+                return s2.filesystem().getattr("/policy.bin").size == input.size();
+            } catch (...) {
+                return false;
+            }
+        }));
+        s2.stop();
+        s1.stop();
+    }
+
+    // Replica policy is deliberately changed only while the whole cluster is
+    // stopped. On restart the old metadata quorum commits the new policy and
+    // object repair converges existing content to the new data replica count.
+    c1.replication = c2.replication = 2;
+    c1.metadata_replication = c2.metadata_replication = 2;
+    {
+        Service s1(c1, keys);
+        Service s2(c2, keys);
+        s1.start();
+        s2.start();
+        REQUIRE(wait_until([&] {
+            return s1.node().membership().active().size() >= 2 &&
+                   s2.node().membership().active().size() >= 2;
+        }));
+
+        s1.filesystem().mkdir("/after-grow", 0755, getuid(), getgid());
+        MetadataManager m1(s1.node());
+        auto snapshot = m1.snapshot();
+        CHECK(snapshot.metadata_voters.size() == 2);
+        CHECK(snapshot.data_replication == 2);
+        CHECK(s2.filesystem().getattr("/after-grow").type == EntryType::directory);
+
+        DistributedStore r1(s1.node());
+        DistributedStore r2(s2.node());
+        REQUIRE(wait_until([&] {
+            r1.repair_once(1024 * 1024);
+            r2.repair_once(1024 * 1024);
+            return s1.node().local_store().has(object) && s2.node().local_store().has(object);
+        }));
+
+        s2.stop();
+        s1.stop();
+    }
+
+    c1.replication = c2.replication = 1;
+    c1.metadata_replication = c2.metadata_replication = 1;
+    {
+        Service s1(c1, keys);
+        Service s2(c2, keys);
+        s1.start();
+        s2.start();
+        REQUIRE(wait_until([&] {
+            return s1.node().membership().active().size() >= 2 &&
+                   s2.node().membership().active().size() >= 2;
+        }));
+
+        s2.filesystem().mkdir("/after-shrink", 0755, getuid(), getgid());
+        MetadataManager m2(s2.node());
+        auto snapshot = m2.snapshot();
+        CHECK(snapshot.metadata_voters.size() == 1);
+        CHECK(snapshot.data_replication == 1);
+        CHECK(s1.filesystem().getattr("/after-shrink").type == EntryType::directory);
+
+        auto reader = s2.filesystem().open_read("/policy.bin");
+        Bytes output(input.size());
+        REQUIRE(reader->read(0, output) == output.size());
+        CHECK(output == input);
+
+        s2.stop();
+        s1.stop();
+    }
 }
 
 void test_genesis_root_configuration() {
@@ -1926,6 +2112,8 @@ int main() {
         test_rpc_health_and_control_not_starved_by_data();
         test_early_replication_quorum();
         test_joiner_cannot_form_genesis();
+        test_two_node_mutual_bootstrap_metadata_quorum();
+        test_replication_policy_change_on_restart();
         test_genesis_root_configuration();
         test_open_write_metadata_merge();
         test_active_write_size_visibility();
