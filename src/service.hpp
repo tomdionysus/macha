@@ -5,6 +5,7 @@
 #include "filesystem.hpp"
 #include "hydration.hpp"
 #include "media_catalogue.hpp"
+#include "playback.hpp"
 #include <ctime>
 #include <map>
 #include <memory>
@@ -20,6 +21,7 @@ class Service {
     CatalogueScanner scanner_;
     HydrationManager hydration_;
     CatalogueApi catalogue_api_;
+    PlaybackManager streaming_;
     std::unique_ptr<HttpServer> catalogue_http_;
     std::jthread maintenance_;
     std::map<ObjectId, Clock::time_point> garbage_seen_;

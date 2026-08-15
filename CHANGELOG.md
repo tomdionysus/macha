@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.0 - 2026-08-15
+
+- added negotiated playback sessions with direct play, fragmented-MP4 HLS remux and selective transcoding;
+- added a media-engine abstraction and initial isolated FFmpeg/ffprobe process backend, keeping subprocess details out of the public API and playback policy;
+- added media probe caching, multi-representation selection, validated audio/subtitle track selection, WebVTT subtitle extraction, quality limits and seek-driven pipeline replacement; path-based probes are versioned and active playback pins the resolved file snapshot;
+- added capability-scoped stream URLs so native players can fetch media without receiving the permanent catalogue API Bearer token;
+- split the HTTP server from catalogue routing and replaced the single-request server with a bounded concurrent worker server supporting streaming response bodies, HTTP byte ranges and simultaneous HLS fragment requests;
+- added a loopback-only seekable source endpoint for FFmpeg so transformed reads still pass through the normal Macha filesystem, DHT, playback tracker and hydration machinery;
+- added playback-session, video-transcode and audio-transcode resource limits plus idle expiry and generated-file cleanup;
+- added transformed-stream producer back-pressure so a fast remux cannot hydrate an entire large source merely because playback started;
+- added playback API and media-engine regression coverage, including direct byte ranges, HLS generation, session reconfiguration, subtitle output and transcode-limit enforcement;
+- reduced `README.md` to an overview and moved operational documentation into topic files under `docs/`, including a two-node `quickstart.md` and streaming API guide.
+
 ## 0.6.2 - 2026-08-15
 
 - added a per-node metadata mutation sequence clock (snapshot format 7) so quorum-CAS retries recognise an operation that became canonical, even after other writers committed descendants of it; this fixes the symmetric two-voter `EEXIST` race without making filesystem operations artificially idempotent;

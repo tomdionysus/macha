@@ -13,11 +13,17 @@ Service::Service(Config config, ClusterKeys keys)
       catalogue_(node_, store_, metadata_), fs_(node_, store_, metadata_, &playback_),
       scanner_(node_, fs_, catalogue_, node_.config().catalogue.scanner),
       hydration_(store_, playback_, fs_, catalogue_, node_.config().hydration,
-                 node_.config().read_ahead_extents), catalogue_api_(catalogue_) {
+                 node_.config().read_ahead_extents), catalogue_api_(catalogue_),
+      streaming_(fs_, catalogue_, node_.config().catalogue.api, node_.config().streaming) {
     if (node_.config().catalogue.api.enabled) {
         catalogue_http_ = std::make_unique<HttpServer>(
             node_.config().catalogue.api,
-            [this](const HttpRequest& request) { return catalogue_api_.handle(request); });
+            [this](const HttpRequest& request) {
+                if (request.path.starts_with("/api/v1/playback/"))
+                    return streaming_.handle(request);
+                return catalogue_api_.handle(request);
+            },
+            [this](const HttpRequest& request) { return streaming_.capability_request(request); });
     }
 }
 
@@ -27,6 +33,7 @@ Service::~Service() {
 
 void Service::start() {
     node_.start();
+    streaming_.start();
     if (catalogue_http_)
         catalogue_http_->start();
     scanner_.start();
@@ -43,6 +50,7 @@ void Service::stop() {
     hydration_.stop();
     if (catalogue_http_)
         catalogue_http_->stop();
+    streaming_.stop();
     if (maintenance_.joinable()) {
         Log::debug("shutdown: service maintenance request_stop");
         maintenance_.request_stop();
@@ -68,10 +76,19 @@ void Service::reload_config() {
     if (updated.replication != node_.config().replication ||
         updated.metadata_replication != node_.config().metadata_replication)
         throw std::runtime_error("replica policy changes require a coordinated cluster restart");
+    const auto& current_streaming = node_.config().streaming;
+    const bool streaming_restart_required =
+        updated.streaming.enabled != current_streaming.enabled ||
+        updated.streaming.ffmpeg != current_streaming.ffmpeg ||
+        updated.streaming.ffprobe != current_streaming.ffprobe ||
+        updated.streaming.temp_path != current_streaming.temp_path;
     node_.reconfigure_local(updated);
     scanner_.reconfigure(updated.catalogue.scanner);
     hydration_.reconfigure(updated.hydration, updated.read_ahead_extents);
-    Log::info("reloaded storage backends, persistent cache, catalogue scanner and hydration configuration");
+    if (streaming_restart_required)
+        Log::warn("streaming enable/backend/path changes require restart; live limits were reloaded");
+    streaming_.reconfigure(updated.streaming);
+    Log::info("reloaded storage backends, persistent cache, catalogue scanner, hydration and streaming limits");
 }
 
 void Service::collect_garbage(const std::vector<ObjectId>& garbage) {

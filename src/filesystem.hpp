@@ -129,6 +129,9 @@ class FileSystem {
     void utimens(const std::string&, int64_t);
     void truncate_file(const std::string&, uint64_t);
     std::shared_ptr<ReadHandle> open_read(const std::string&);
+    // Open an already-resolved immutable metadata snapshot. Playback uses this
+    // so a pathname replacement cannot change the bytes underneath a session.
+    std::shared_ptr<ReadHandle> open_read(const FsEntry&, const std::string& logical_path);
     std::optional<std::pair<std::string, FsEntry>> find_media(std::string_view);
     std::shared_ptr<WriteHandle> open_write(const std::string&, bool);
     std::optional<uint64_t> active_write_size(const std::string&);

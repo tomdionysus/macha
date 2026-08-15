@@ -3,6 +3,7 @@
 #include "config.hpp"
 #include "crypto.hpp"
 #include "filesystem.hpp"
+#include "http.hpp"
 #include "local_store.hpp"
 #include "metadata.hpp"
 #include "media_catalogue.hpp"
@@ -67,6 +68,46 @@ class TempDir {
     }
     const std::filesystem::path& path() const {
         return path_;
+    }
+};
+
+class FakeMediaEngineSession final : public MediaEngineSession {
+    bool running_{true};
+  public:
+    bool running() const override { return running_; }
+    std::optional<int> exit_code() const override { return running_ ? std::optional<int>{} : std::optional<int>{0}; }
+    std::string diagnostics() const override { return {}; }
+    void set_paused(bool) override {}
+    void stop() override { running_ = false; }
+};
+
+class FakeMediaEngine final : public MediaEngine {
+  public:
+    MediaEngineStatus status() const override { return {true, true, "fake-ffmpeg"}; }
+    MediaProbeResult probe(const MediaSource&) override {
+        MediaProbeResult result;
+        result.format = "mov,mp4,m4a,3gp,3g2,mj2";
+        result.duration_seconds = 60.0;
+        result.bitrate = 4'000'000;
+        result.streams.push_back(MediaStreamInfo{0, MediaStreamType::video, "h264", "High", "", 1920, 1080, 0, 0, 8, true, false});
+        result.streams.push_back(MediaStreamInfo{1, MediaStreamType::audio, "aac", "LC", "eng", 0, 0, 2, 48000, 0, true, false});
+        result.streams.push_back(MediaStreamInfo{2, MediaStreamType::subtitle, "subrip", "", "eng", 0, 0, 0, 0, 0, false, false});
+        return result;
+    }
+    std::unique_ptr<MediaEngineSession> start_hls(const MediaSource&, const PlaybackPlan&,
+                                                  const std::filesystem::path& output,
+                                                  std::chrono::milliseconds) override {
+        std::filesystem::create_directories(output);
+        std::ofstream(output / "master.m3u8")
+            << "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MAP:URI=\"init.mp4\"\n"
+               "#EXTINF:4.0,\nsegment-000000.m4s\n#EXT-X-ENDLIST\n";
+        std::ofstream(output / "init.mp4", std::ios::binary) << "init";
+        std::ofstream(output / "segment-000000.m4s", std::ios::binary) << "segment";
+        return std::make_unique<FakeMediaEngineSession>();
+    }
+    void extract_webvtt(const MediaSource&, int, const std::filesystem::path& output,
+                        std::chrono::milliseconds) override {
+        std::ofstream(output) << "WEBVTT\n\n00:00.000 --> 00:01.000\nsubtitle\n";
     }
 };
 
@@ -153,6 +194,53 @@ template <class Fn> bool wait_until(Fn&& fn, std::chrono::milliseconds timeout =
         std::this_thread::sleep_for(20ms);
     }
     return fn();
+}
+
+class DelayedHttpBody final : public HttpBodySource {
+    std::atomic_bool& entered_;
+    uint64_t size_;
+  public:
+    DelayedHttpBody(std::atomic_bool& entered, uint64_t size) : entered_(entered), size_(size) {}
+    uint64_t size() const override { return size_; }
+    size_t read(uint64_t offset, std::span<uint8_t> destination) override {
+        if (offset >= size_) return 0;
+        entered_ = true;
+        std::this_thread::sleep_for(75ms);
+        auto n = static_cast<size_t>(std::min<uint64_t>(destination.size(), size_ - offset));
+        std::fill_n(destination.data(), n, static_cast<uint8_t>('s'));
+        return n;
+    }
+};
+
+std::string raw_http_get(uint16_t port, std::string_view path) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) throw std::runtime_error("http test socket failed");
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+        close(fd);
+        throw std::runtime_error("http test connect failed");
+    }
+    auto request = "GET " + std::string(path) + " HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    size_t sent = 0;
+    while (sent < request.size()) {
+        auto n = send(fd, request.data() + sent, request.size() - sent, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { close(fd); throw std::runtime_error("http test send failed"); }
+        sent += static_cast<size_t>(n);
+    }
+    std::string response;
+    std::array<char, 8192> buffer{};
+    while (true) {
+        auto n = recv(fd, buffer.data(), buffer.size(), 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        response.append(buffer.data(), static_cast<size_t>(n));
+    }
+    close(fd);
+    return response;
 }
 
 Bytes pattern(size_t n) {
@@ -612,6 +700,9 @@ void test_config() {
             << "    port: 7441\n"
             << "    token_file: " << (t.path() / "api.token").string() << "\n"
             << "    max_request_bytes: 2M\n"
+            << "    workers: 7\n"
+            << "    max_queued_connections: 33\n"
+            << "    stream_chunk_bytes: 64K\n"
             << "  scanner:\n"
             << "    enabled: true\n"
             << "    interval_ms: 60000\n"
@@ -626,7 +717,19 @@ void test_config() {
             << "      musicbrainz:\n"
             << "        enabled: true\n"
             << "        contact: https://example.test/macha\n"
-            << "        cover_size: '500'\n";
+            << "        cover_size: '500'\n"
+            << "streaming:\n"
+            << "  enabled: true\n"
+            << "  ffmpeg: /usr/local/bin/ffmpeg\n"
+            << "  ffprobe: /usr/local/bin/ffprobe\n"
+            << "  temp_path: " << (t.path() / "streams").string() << "\n"
+            << "  max_sessions: 9\n"
+            << "  max_video_transcodes: 2\n"
+            << "  max_audio_transcodes: 5\n"
+            << "  session_idle_ms: 60000\n"
+            << "  startup_timeout_ms: 7000\n"
+            << "  segment_duration_ms: 3000\n"
+            << "  max_ahead_segments: 11\n";
     }
 
     std::vector<std::string> yaml_args{"macha", "--config", yaml.string()};
@@ -666,6 +769,9 @@ void test_config() {
     REQUIRE(yc.catalogue.api.token_file.has_value());
     CHECK(*yc.catalogue.api.token_file == t.path() / "api.token");
     CHECK(yc.catalogue.api.max_request_bytes == 2ULL * 1024 * 1024);
+    CHECK(yc.catalogue.api.workers == 7);
+    CHECK(yc.catalogue.api.max_queued_connections == 33);
+    CHECK(yc.catalogue.api.stream_chunk_bytes == 64ULL * 1024);
     CHECK(yc.catalogue.scanner.enabled);
     CHECK(yc.catalogue.scanner.interval == 60000ms);
     CHECK(yc.catalogue.scanner.roots.size() == 3);
@@ -677,6 +783,18 @@ void test_config() {
     CHECK(yc.catalogue.scanner.tmdb.image_size == "w500");
     CHECK(yc.catalogue.scanner.musicbrainz.contact == "https://example.test/macha");
     CHECK(yc.catalogue.scanner.musicbrainz.cover_size == "500");
+    CHECK(yc.streaming.enabled);
+    CHECK(yc.streaming.ffmpeg == "/usr/local/bin/ffmpeg");
+    CHECK(yc.streaming.ffprobe == "/usr/local/bin/ffprobe");
+    REQUIRE(yc.streaming.temp_path.has_value());
+    CHECK(*yc.streaming.temp_path == t.path() / "streams");
+    CHECK(yc.streaming.max_sessions == 9);
+    CHECK(yc.streaming.max_video_transcodes == 2);
+    CHECK(yc.streaming.max_audio_transcodes == 5);
+    CHECK(yc.streaming.session_idle == 60000ms);
+    CHECK(yc.streaming.startup_timeout == 7000ms);
+    CHECK(yc.streaming.segment_duration == 3000ms);
+    CHECK(yc.streaming.max_ahead_segments == 11);
 
     // CLI remains useful for node-local/runtime overrides, but configuration
     // now always starts from an explicit YAML file.
@@ -3101,6 +3219,220 @@ void test_three_node_cluster() {
         s1.stop();
     }
 }
+void test_http_server_serves_streams_concurrently() {
+    CatalogueApiConfig config;
+    config.enabled = true;
+    config.listen = "127.0.0.1";
+    config.port = 0;
+    config.workers = 2;
+    config.max_queued_connections = 8;
+    config.stream_chunk_bytes = 16 * 1024;
+    std::atomic_bool entered{};
+    HttpServer server(config, [&](const HttpRequest& request) {
+        if (request.path == "/slow") {
+            HttpResponse response;
+            response.content_type = "application/octet-stream";
+            response.stream = std::make_shared<DelayedHttpBody>(entered, 128 * 1024);
+            return response;
+        }
+        if (request.path == "/fast")
+            return HttpResponse{200, "text/plain", {}, Bytes{'o', 'k'}};
+        return http_error(404, "not_found", "not found");
+    });
+    server.start();
+    REQUIRE(wait_until([&] { return server.bound_port() != 0; }, 1s));
+
+    std::string slow_response;
+    std::jthread slow([&] { slow_response = raw_http_get(server.bound_port(), "/slow"); });
+    REQUIRE(wait_until([&] { return entered.load(); }, 1s));
+    auto started = Clock::now();
+    auto fast = raw_http_get(server.bound_port(), "/fast");
+    auto elapsed = Clock::now() - started;
+    CHECK(fast.find("200 OK") != std::string::npos);
+    CHECK(fast.ends_with("ok"));
+    CHECK(elapsed < 300ms);
+    slow.join();
+    CHECK(slow_response.find("200 OK") != std::string::npos);
+    CHECK(slow_response.size() >= 128 * 1024);
+    server.stop();
+}
+
+void test_playback_sessions_and_streaming_http_bodies() {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto port = free_port();
+    auto c = config_for(t.path() / "node", keyfile, port);
+    c.replication = 1;
+    c.metadata_replication = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/test.mp4", 0644, getuid(), getgid());
+    auto bytes = pattern(512 * 1024 + 37);
+    auto writer = service.filesystem().open_write("/media/test.mp4", true);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto media_id = file_media_id(service.filesystem().getattr("/media/test.mp4"));
+
+    CatalogueApiConfig api;
+    api.stream_chunk_bytes = 64 * 1024;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback";
+    streaming.max_sessions = 4;
+    streaming.max_video_transcodes = 1;
+    streaming.max_audio_transcodes = 1;
+    streaming.startup_timeout = 2s;
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             std::make_unique<FakeMediaEngine>());
+    playback.start();
+
+    Json::Object create_root{{"media_id", media_id}};
+    auto create_text = Json(std::move(create_root)).dump();
+    HttpRequest create;
+    create.method = "POST";
+    create.path = "/api/v1/playback/sessions";
+    create.body.assign(create_text.begin(), create_text.end());
+    auto created = playback.handle(create);
+    REQUIRE(created.status == 201);
+    auto created_json = Json::parse(std::string(created.body.begin(), created.body.end()));
+    CHECK(created_json.find("mode")->asString() == "direct");
+    CHECK(created_json.find("subtitle_url")->isNull());
+    REQUIRE(created_json.find("options") != nullptr);
+    auto options = created_json.find("options");
+    REQUIRE(options->find("audio_streams") != nullptr);
+    REQUIRE(options->find("audio_streams")->isArray());
+    REQUIRE(!options->find("audio_streams")->asArray().empty());
+    CHECK(options->find("audio_streams")->asArray().front().isObject());
+    REQUIRE(options->find("media_ids") != nullptr);
+    CHECK(options->find("media_ids")->asArray().size() == 1);
+    auto session_id = created_json.find("session_id")->asString();
+    auto direct_url = created_json.find("stream_url")->asString();
+
+    HttpRequest direct;
+    direct.method = "GET";
+    direct.path = direct_url;
+    direct.headers["range"] = "bytes=100-1099";
+    auto direct_response = playback.handle(direct);
+    REQUIRE(direct_response.status == 206);
+    REQUIRE(direct_response.stream != nullptr);
+    CHECK(direct_response.content_length() == 1000);
+    Bytes direct_bytes(1000);
+    REQUIRE(direct_response.stream->read(0, direct_bytes) == direct_bytes.size());
+    CHECK(std::equal(direct_bytes.begin(), direct_bytes.end(), bytes.begin() + 100));
+
+    Json::Object bad_track_preferences{{"audio_stream", 99}};
+    Json::Object bad_track_root{{"preferences", Json(std::move(bad_track_preferences))}};
+    auto bad_track_text = Json(std::move(bad_track_root)).dump();
+    HttpRequest bad_track;
+    bad_track.method = "PATCH";
+    bad_track.path = "/api/v1/playback/sessions/" + session_id;
+    bad_track.body.assign(bad_track_text.begin(), bad_track_text.end());
+    CHECK(playback.handle(bad_track).status == 400);
+
+    Json::Object unsupported_caps{{"containers", Json::Array{}},
+                                  {"video_codecs", Json::Array{Json("vp9")}},
+                                  {"audio_codecs", Json::Array{Json("opus")}},
+                                  {"hls_fmp4", true}};
+    Json::Object unsupported_prefs{{"mode", "transcode"}};
+    Json::Object unsupported_root{{"media_id", media_id},
+                                  {"capabilities", Json(std::move(unsupported_caps))},
+                                  {"preferences", Json(std::move(unsupported_prefs))}};
+    auto unsupported_text = Json(std::move(unsupported_root)).dump();
+    HttpRequest unsupported;
+    unsupported.method = "POST";
+    unsupported.path = "/api/v1/playback/sessions";
+    unsupported.body.assign(unsupported_text.begin(), unsupported_text.end());
+    CHECK(playback.handle(unsupported).status == 400);
+
+    Json::Object preferences{{"mode", "transcode"}, {"subtitle_stream", 2}};
+    Json::Object patch_root{{"preferences", Json(std::move(preferences))}, {"seek_ms", 12000}};
+    auto patch_text = Json(std::move(patch_root)).dump();
+    HttpRequest patch;
+    patch.method = "PATCH";
+    patch.path = "/api/v1/playback/sessions/" + session_id;
+    patch.body.assign(patch_text.begin(), patch_text.end());
+    auto patched = playback.handle(patch);
+    REQUIRE(patched.status == 200);
+    auto patched_json = Json::parse(std::string(patched.body.begin(), patched.body.end()));
+    CHECK(patched_json.find("mode")->asString() == "transcode");
+    auto hls_url = patched_json.find("stream_url")->asString();
+    auto subtitle_url = patched_json.find("subtitle_url")->asString();
+
+    HttpRequest playlist;
+    playlist.method = "GET";
+    playlist.path = hls_url;
+    auto playlist_response = playback.handle(playlist);
+    REQUIRE(playlist_response.status == 200);
+    REQUIRE(playlist_response.stream != nullptr);
+    Bytes playlist_bytes(static_cast<size_t>(playlist_response.content_length()));
+    REQUIRE(playlist_response.stream->read(0, playlist_bytes) == playlist_bytes.size());
+    CHECK(std::string(playlist_bytes.begin(), playlist_bytes.end()).find("#EXTM3U") != std::string::npos);
+
+    HttpRequest subtitle;
+    subtitle.method = "GET";
+    subtitle.path = subtitle_url;
+    auto subtitle_response = playback.handle(subtitle);
+    REQUIRE(subtitle_response.status == 200);
+    CHECK(subtitle_response.content_type.starts_with("text/vtt"));
+
+    Json::Object second_preferences{{"mode", "transcode"}};
+    Json::Object second_root{{"media_id", media_id}, {"preferences", Json(std::move(second_preferences))}};
+    auto second_text = Json(std::move(second_root)).dump();
+    HttpRequest second;
+    second.method = "POST";
+    second.path = "/api/v1/playback/sessions";
+    second.body.assign(second_text.begin(), second_text.end());
+    auto limited = playback.handle(second);
+    CHECK(limited.status == 429);
+
+    HttpRequest remove;
+    remove.method = "DELETE";
+    remove.path = "/api/v1/playback/sessions/" + session_id;
+    CHECK(playback.handle(remove).status == 204);
+
+    // A playback lease is a snapshot, not a pathname alias. Replacing the file
+    // after resolve must not switch bytes underneath an already-running direct stream.
+    Json::Object path_root{{"media_id", "path:/media/test.mp4"}};
+    auto path_text = Json(std::move(path_root)).dump();
+    HttpRequest path_create;
+    path_create.method = "POST";
+    path_create.path = "/api/v1/playback/sessions";
+    path_create.body.assign(path_text.begin(), path_text.end());
+    auto path_created = playback.handle(path_create);
+    REQUIRE(path_created.status == 201);
+    auto path_json = Json::parse(std::string(path_created.body.begin(), path_created.body.end()));
+    auto path_session_id = path_json.find("session_id")->asString();
+    auto path_stream_url = path_json.find("stream_url")->asString();
+
+    auto replacement_bytes = bytes;
+    for (auto& byte : replacement_bytes) byte ^= 0x5a;
+    auto replacement_writer = service.filesystem().open_write("/media/test.mp4", true);
+    REQUIRE(replacement_writer->write(0, replacement_bytes) == replacement_bytes.size());
+    replacement_writer->commit();
+
+    HttpRequest pinned;
+    pinned.method = "GET";
+    pinned.path = path_stream_url;
+    pinned.headers["range"] = "bytes=0-255";
+    auto pinned_response = playback.handle(pinned);
+    REQUIRE(pinned_response.status == 206);
+    Bytes pinned_bytes(256);
+    REQUIRE(pinned_response.stream->read(0, pinned_bytes) == pinned_bytes.size());
+    CHECK(std::equal(pinned_bytes.begin(), pinned_bytes.end(), bytes.begin()));
+
+    HttpRequest remove_path;
+    remove_path.method = "DELETE";
+    remove_path.path = "/api/v1/playback/sessions/" + path_session_id;
+    CHECK(playback.handle(remove_path).status == 204);
+    playback.stop();
+    service.stop();
+}
+
 } // namespace
 
 int main() {
@@ -3135,6 +3467,8 @@ int main() {
         test_cache_hydrator_fetches_to_persistent_cache();
         test_media_probe_and_online_catalogue_scanner();
         test_catalogue_sync_search_and_artwork_gc();
+        test_http_server_serves_streams_concurrently();
+        test_playback_sessions_and_streaming_http_bodies();
         test_three_node_cluster();
     } catch (const std::exception& e) {
         std::cerr << "Unhandled test exception: " << e.what() << '\n';

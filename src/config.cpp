@@ -94,6 +94,34 @@ void validate(Config& config) {
         throw std::runtime_error("catalogue.api.port must be nonzero");
     if (config.catalogue.api.max_request_bytes < 1024)
         throw std::runtime_error("catalogue.api.max_request_bytes must be >= 1K");
+    if (!config.catalogue.api.workers || config.catalogue.api.workers > 256)
+        throw std::runtime_error("catalogue.api.workers must be 1..256");
+    if (!config.catalogue.api.max_queued_connections || config.catalogue.api.max_queued_connections > 4096)
+        throw std::runtime_error("catalogue.api.max_queued_connections must be 1..4096");
+    if (config.catalogue.api.stream_chunk_bytes < 16 * 1024 ||
+        config.catalogue.api.stream_chunk_bytes > 4ULL * 1024 * 1024)
+        throw std::runtime_error("catalogue.api.stream_chunk_bytes must be 16K..4M");
+    if (config.streaming.enabled && !config.catalogue.api.enabled)
+        throw std::runtime_error("streaming requires catalogue.api.enabled");
+    if (config.streaming.ffmpeg.empty() || config.streaming.ffprobe.empty())
+        throw std::runtime_error("streaming ffmpeg/ffprobe executable names must not be empty");
+    if (!config.streaming.max_sessions || config.streaming.max_sessions > 1024)
+        throw std::runtime_error("streaming.max_sessions must be 1..1024");
+    if (config.streaming.max_video_transcodes > config.streaming.max_sessions ||
+        config.streaming.max_audio_transcodes > config.streaming.max_sessions)
+        throw std::runtime_error("streaming transcode limits cannot exceed max_sessions");
+    if (config.streaming.session_idle < std::chrono::seconds(30))
+        throw std::runtime_error("streaming.session_idle_ms must be >= 30000");
+    if (config.streaming.startup_timeout < std::chrono::milliseconds(1000) ||
+        config.streaming.startup_timeout > std::chrono::minutes(2))
+        throw std::runtime_error("streaming.startup_timeout_ms must be 1000..120000");
+    if (config.streaming.segment_duration < std::chrono::milliseconds(1000) ||
+        config.streaming.segment_duration > std::chrono::seconds(20))
+        throw std::runtime_error("streaming.segment_duration_ms must be 1000..20000");
+    if (config.streaming.max_ahead_segments < 2 || config.streaming.max_ahead_segments > 120)
+        throw std::runtime_error("streaming.max_ahead_segments must be 2..120");
+    if (!config.streaming.temp_path)
+        config.streaming.temp_path = config.state_path / "tmp" / "playback";
     if (config.catalogue.scanner.interval < std::chrono::seconds(10))
         throw std::runtime_error("catalogue.scanner.interval_ms must be >= 10000");
     if (config.catalogue.scanner.roots.empty())
@@ -237,6 +265,12 @@ void parse_catalogue(const YAML::Node& root, Config& c) {
             c.catalogue.api.token_file = std::filesystem::path(api["token_file"].as<std::string>());
         if (api["max_request_bytes"])
             c.catalogue.api.max_request_bytes = yaml_size(api["max_request_bytes"]);
+        if (api["workers"])
+            c.catalogue.api.workers = api["workers"].as<size_t>();
+        if (api["max_queued_connections"])
+            c.catalogue.api.max_queued_connections = api["max_queued_connections"].as<size_t>();
+        if (api["stream_chunk_bytes"])
+            c.catalogue.api.stream_chunk_bytes = yaml_size(api["stream_chunk_bytes"]);
     }
     if (auto scanner = catalogue["scanner"]) {
         if (scanner["enabled"])
@@ -266,6 +300,34 @@ void parse_catalogue(const YAML::Node& root, Config& c) {
             }
         }
     }
+}
+
+void parse_streaming(const YAML::Node& root, Config& c) {
+    auto streaming = root["streaming"];
+    if (!streaming)
+        return;
+    if (streaming["enabled"])
+        c.streaming.enabled = streaming["enabled"].as<bool>();
+    if (streaming["ffmpeg"])
+        c.streaming.ffmpeg = streaming["ffmpeg"].as<std::string>();
+    if (streaming["ffprobe"])
+        c.streaming.ffprobe = streaming["ffprobe"].as<std::string>();
+    if (streaming["temp_path"])
+        c.streaming.temp_path = std::filesystem::path(streaming["temp_path"].as<std::string>());
+    if (streaming["max_sessions"])
+        c.streaming.max_sessions = streaming["max_sessions"].as<size_t>();
+    if (streaming["max_video_transcodes"])
+        c.streaming.max_video_transcodes = streaming["max_video_transcodes"].as<size_t>();
+    if (streaming["max_audio_transcodes"])
+        c.streaming.max_audio_transcodes = streaming["max_audio_transcodes"].as<size_t>();
+    if (streaming["session_idle_ms"])
+        c.streaming.session_idle = milliseconds(streaming["session_idle_ms"], "streaming.session_idle_ms");
+    if (streaming["startup_timeout_ms"])
+        c.streaming.startup_timeout = milliseconds(streaming["startup_timeout_ms"], "streaming.startup_timeout_ms");
+    if (streaming["segment_duration_ms"])
+        c.streaming.segment_duration = milliseconds(streaming["segment_duration_ms"], "streaming.segment_duration_ms");
+    if (streaming["max_ahead_segments"])
+        c.streaming.max_ahead_segments = streaming["max_ahead_segments"].as<size_t>();
 }
 
 void parse_hydration_engine(const YAML::Node& engines, const char* name,
@@ -430,6 +492,7 @@ Config load_yaml_config(const std::filesystem::path& path) {
     parse_maintenance(root, c);
     parse_filesystem(root, c);
     parse_catalogue(root, c);
+    parse_streaming(root, c);
     parse_hydration(root, c);
 
     if (auto bootstrap = root["bootstrap"]) {

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(macha VERSION 0.6.2 LANGUAGES CXX)
+project(macha VERSION 0.7.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -40,6 +40,9 @@ set(MACHA_CORE_SOURCES
     src/replica_selector.cpp
     src/metadata_manager.cpp
     src/json.cpp
+    src/http.cpp
+    src/media_engine.cpp
+    src/playback.cpp
     src/catalogue.cpp
     src/catalogue_api.cpp
     src/media_catalogue.cpp
@@ -132,6 +135,7 @@ install(TARGETS macha RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES systemd/macha.service DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system OPTIONAL)
 install(FILES README.md ARCHITECTURE.md SECURITY.md CHANGELOG.md CONTRIBUTING.md LICENSE
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
+install(DIRECTORY docs/ DESTINATION ${CMAKE_INSTALL_DOCDIR}/docs)
 install(FILES systemd/macha.conf.example macha.yaml.example
         DESTINATION ${CMAKE_INSTALL_DOCDIR}/examples OPTIONAL)
 if(APPLE)

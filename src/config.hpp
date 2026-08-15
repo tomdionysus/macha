@@ -54,6 +54,9 @@ struct CatalogueApiConfig {
     uint16_t port{7438};
     std::optional<std::filesystem::path> token_file;
     size_t max_request_bytes{8 * 1024 * 1024};
+    size_t workers{16};
+    size_t max_queued_connections{128};
+    size_t stream_chunk_bytes{256 * 1024};
 };
 
 struct CatalogueTmdbConfig {
@@ -83,6 +86,21 @@ struct CatalogueConfig {
     CatalogueScannerConfig scanner;
 };
 
+
+struct StreamingConfig {
+    bool enabled{};
+    std::string ffmpeg{"ffmpeg"};
+    std::string ffprobe{"ffprobe"};
+    std::optional<std::filesystem::path> temp_path;
+    size_t max_sessions{8};
+    size_t max_video_transcodes{1};
+    size_t max_audio_transcodes{4};
+    std::chrono::milliseconds session_idle{std::chrono::minutes(30)};
+    std::chrono::milliseconds startup_timeout{10000};
+    std::chrono::milliseconds segment_duration{4000};
+    size_t max_ahead_segments{8};
+};
+
 struct HydrationEngineConfig {
     bool enabled{true};
     uint32_t priority{};
@@ -106,6 +124,7 @@ struct Config {
     MaintenanceConfig maintenance;
     FilesystemConfig filesystem;
     CatalogueConfig catalogue;
+    StreamingConfig streaming;
     HydrationConfig hydration;
 
     std::filesystem::path key_file;
