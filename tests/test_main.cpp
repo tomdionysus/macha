@@ -347,13 +347,14 @@ void test_storage_pool_and_persistent_cache() {
         on_disk3 += std::filesystem::exists(object_path(disk3, id)) ? 1 : 0;
     CHECK(on_disk3 > 0);
 
-    // A disappeared disk removes only its capacity. The node state is outside
-    // the backend, so the process can keep serving the other disks and the same
-    // disk is recognized automatically when it returns.
+    // A temporary disappearance does not change placement weight. The node can
+    // keep serving/falling back to surviving disks without remapping the whole
+    // pool; the returning disk resumes its old share and rebalance converges.
     auto parked = t.path() / "disk2.offline";
     std::filesystem::rename(disk2, parked);
     pool.refresh();
     CHECK(pool.online_backends() == 2);
+    CHECK(pool.limit() == 192ULL * 1024 * 1024);
     CHECK(load_or_create_node_id(state) == node);
     std::filesystem::rename(parked, disk2);
     pool.refresh();
@@ -364,11 +365,38 @@ void test_storage_pool_and_persistent_cache() {
     pool.reconfigure({{disk1, 64ULL * 1024 * 1024}, {disk2, 64ULL * 1024 * 1024}});
     pool.refresh();
     CHECK(pool.online_backends() == 2);
+    CHECK(pool.limit() == 128ULL * 1024 * 1024);
     pool.reconfigure({{disk1, 64ULL * 1024 * 1024},
                       {disk2, 64ULL * 1024 * 1024},
                       {disk3, 64ULL * 1024 * 1024}});
     pool.refresh();
     CHECK(pool.online_backends() == 3);
+
+    // Local authoritative placement uses the same capacity weighting. A backend
+    // eight times larger should receive overwhelmingly more objects, without
+    // using live free space as part of the score.
+    auto weighted_state = t.path() / "weighted-state";
+    auto small_disk = t.path() / "weighted-small";
+    auto large_disk = t.path() / "weighted-large";
+    std::filesystem::create_directories(small_disk);
+    std::filesystem::create_directories(large_disk);
+    auto weighted_node = load_or_create_node_id(weighted_state);
+    StoragePool weighted(weighted_state, weighted_node,
+                         {{small_disk, 8ULL * 1024 * 1024},
+                          {large_disk, 64ULL * 1024 * 1024}},
+                         keys.storage);
+    size_t small_objects = 0, large_objects = 0;
+    for (size_t i = 0; i < 512; ++i) {
+        auto data = pattern(1024 + i);
+        data[0] ^= static_cast<uint8_t>(i);
+        data[1] ^= static_cast<uint8_t>(i >> 8U);
+        auto id = object_id(data);
+        REQUIRE(weighted.put(id, data));
+        small_objects += std::filesystem::exists(object_path(small_disk, id)) ? 1 : 0;
+        large_objects += std::filesystem::exists(object_path(large_disk, id)) ? 1 : 0;
+    }
+    CHECK(small_objects + large_objects == 512);
+    CHECK(large_objects > small_objects * 5);
 
     auto cache_root = t.path() / "cache";
     MetadataRecord cached_metadata;
@@ -422,6 +450,8 @@ void test_metadata_codec_and_replica() {
     auto b = random_node_id();
     auto c = random_node_id();
     snap.metadata_voters = {a, b, c};
+    snap.mutation_sequences[a] = 7;
+    snap.mutation_sequences[b] = 11;
     FsEntry file;
     file.type = EntryType::file;
     file.size = 123;
@@ -431,6 +461,7 @@ void test_metadata_codec_and_replica() {
     auto encoded = encode_snapshot(snap);
     auto decoded = decode_snapshot(encoded);
     CHECK(decoded.metadata_voters == snap.metadata_voters);
+    CHECK(decoded.mutation_sequences == snap.mutation_sequences);
     CHECK(decoded.entries.at("/movie.mkv").size == 123);
     REQUIRE(decoded.garbage.size() == 1);
     CHECK(decoded.garbage.front().id == garbage_id);
@@ -786,6 +817,101 @@ void test_placement() {
     CHECK(domains.size() == 3);
 }
 
+void test_capacity_placement() {
+    constexpr uint64_t GiB = 1024ULL * 1024 * 1024;
+    constexpr uint64_t TiB = 1024ULL * GiB;
+
+    auto make_node = [](uint8_t tag, uint64_t capacity, std::string domain = {}) {
+        NodeInfo node;
+        node.id.bytes.fill(0);
+        node.id.bytes.back() = tag;
+        node.host = "127.0.0.1";
+        node.port = static_cast<uint16_t>(9300 + tag);
+        node.capacity = capacity;
+        node.failure_domain = std::move(domain);
+        return node;
+    };
+
+    std::vector<NodeInfo> asymmetric{
+        make_node(1, 10 * TiB), make_node(2, 10 * TiB), make_node(3, 8 * GiB)};
+
+    // With three nodes and R=2, all physical capacity can participate: the two
+    // 10 TiB nodes are in almost every shard and the 8 GiB node owns only its
+    // proportional share. This is ~10 TiB logical, not 8 GiB.
+    CHECK(placement_logical_capacity(asymmetric, 2) == 10 * TiB + 4 * GiB);
+
+    // With only 10 TiB + 8 GiB and R=2 every logical byte needs both nodes, so
+    // the small node correctly caps the namespace at 8 GiB.
+    std::vector<NodeInfo> two_nodes{asymmetric[0], asymmetric[2]};
+    CHECK(placement_logical_capacity(two_nodes, 2) == 8 * GiB);
+
+    CHECK(placement_shards == (uint64_t{1} << 32U));
+    auto shard_id = [](uint32_t shard) {
+        std::array<uint8_t, 32> key{};
+        key[0] = static_cast<uint8_t>(shard >> 24U);
+        key[1] = static_cast<uint8_t>(shard >> 16U);
+        key[2] = static_cast<uint8_t>(shard >> 8U);
+        key[3] = static_cast<uint8_t>(shard);
+        return key;
+    };
+    auto preferred_contains = [](const std::vector<NodeInfo>& placed, const NodeId& id,
+                                 size_t replicas) {
+        return std::any_of(placed.begin(), placed.begin() + std::min(replicas, placed.size()),
+                           [&](const auto& node) { return node.id == id; });
+    };
+
+    // Exact 32-bit quota arithmetic: the 8 GiB node receives 3,354,133 of
+    // 4,294,967,296 shards. With these stable node IDs its interval is the tail
+    // of the systematic sample space, so the ownership boundary is exact. This
+    // replaces the old exhaustive 65,536-shard walk.
+    constexpr uint64_t small_quota = 3'354'133;
+    const auto first_small = static_cast<uint32_t>(placement_shards - small_quota);
+    auto just_before = capacity_placement_nodes(shard_id(first_small - 1), asymmetric, 2);
+    auto at_boundary = capacity_placement_nodes(shard_id(first_small), asymmetric, 2);
+    auto at_end = capacity_placement_nodes(shard_id(std::numeric_limits<uint32_t>::max()),
+                                            asymmetric, 2);
+    REQUIRE(just_before.size() == 3);
+    REQUIRE(at_boundary.size() == 3);
+    REQUIRE(at_end.size() == 3);
+    CHECK(!preferred_contains(just_before, asymmetric[2].id, 2));
+    CHECK(preferred_contains(at_boundary, asymmetric[2].id, 2));
+    CHECK(preferred_contains(at_end, asymmetric[2].id, 2));
+    CHECK(at_boundary[0].id != at_boundary[1].id);
+
+    // R=1 is weighted rendezvous over the stable shard space. Adding a backend
+    // or node may steal shards, but must never make two unchanged owners trade
+    // shards with each other. Sample deterministically across the 32-bit space;
+    // iterating all 2^32 virtual shards is neither necessary nor desirable.
+    std::vector<NodeInfo> before{make_node(10, 10 * TiB), make_node(20, 10 * TiB)};
+    auto after = before;
+    after.push_back(make_node(30, 10 * TiB));
+    constexpr size_t placement_samples = 16'384;
+    size_t moved_to_new = 0;
+    for (size_t i = 0; i < placement_samples; ++i) {
+        const auto shard = static_cast<uint32_t>(static_cast<uint64_t>(i) * 2'654'435'761ULL);
+        auto key = shard_id(shard);
+        auto old_owner = capacity_placement_nodes(key, before, 1).front().id;
+        auto new_owner = capacity_placement_nodes(key, after, 1).front().id;
+        if (old_owner != new_owner) {
+            CHECK(new_owner == after.back().id);
+            ++moved_to_new;
+        }
+    }
+    CHECK(moved_to_new > placement_samples / 4);
+    CHECK(moved_to_new < placement_samples * 2 / 5);
+
+    // Failure-domain diversity remains a stronger constraint than raw node
+    // capacity when enough domains exist. One replica must fit in site-b.
+    std::vector<NodeInfo> domains{make_node(1, 10 * TiB, "site-a"),
+                                  make_node(2, 10 * TiB, "site-a"),
+                                  make_node(3, 8 * GiB, "site-b")};
+    CHECK(placement_logical_capacity(domains, 2) == 8 * GiB);
+    std::array<uint8_t, 32> key{};
+    auto diverse = capacity_placement_nodes(key, domains, 2);
+    REQUIRE(diverse.size() == 3);
+    CHECK(diverse[0].failure_domain != diverse[1].failure_domain);
+}
+
 void test_async_rpc_move_ownership() {
     std::atomic_int cancelled{};
 
@@ -816,7 +942,7 @@ void test_async_rpc_move_ownership() {
     CHECK(cancelled.load() == 2);
 }
 
-void test_rpc_v6_frame_priority_and_variable_length() {
+void test_rpc_v7_frame_priority_and_variable_length() {
     CHECK(frame_type_priority(FrameType::control) < frame_type_priority(FrameType::foreground));
     CHECK(frame_type_priority(FrameType::foreground) < frame_type_priority(FrameType::read_ahead));
     CHECK(frame_type_priority(FrameType::read_ahead) <
@@ -889,7 +1015,7 @@ void test_rpc_v6_frame_priority_and_variable_length() {
     server.stop();
 }
 
-void test_rpc_v6_persistence_and_multiplexing() {
+void test_rpc_v7_persistence_and_multiplexing() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -966,7 +1092,7 @@ void test_rpc_v6_persistence_and_multiplexing() {
     server.stop();
 }
 
-void test_rpc_v6_bidirectional_and_deduplication() {
+void test_rpc_v7_bidirectional_and_deduplication() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -1159,7 +1285,7 @@ void test_mutual_bootstrap_prunes_cross_dial() {
     n1.stop();
 }
 
-void test_rpc_v5_handshake_is_rejected() {
+void test_rpc_v6_handshake_is_rejected() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -1197,9 +1323,8 @@ void test_rpc_v5_handshake_is_rejected() {
     std::copy(nonce_bytes.begin(), nonce_bytes.end(), nonce.begin());
 
     Writer hello_writer;
-    hello_writer.u16(5);
-    // Protocol v5 carried a lane byte after the protocol version.
-    hello_writer.u8(2);
+    hello_writer.u16(6);
+    hello_writer.u32(256 * 1024); // v6 negotiated max_frame_size here.
     hello_writer.fixed(keys.cluster_id);
     hello_writer.fixed(old_client.id.bytes);
     hello_writer.fixed(nonce);
@@ -1207,8 +1332,8 @@ void test_rpc_v5_handshake_is_rejected() {
     encode_node_info(hello_writer, old_client);
     auto hello = hello_writer.take();
 
-    Bytes authenticated(reinterpret_cast<const uint8_t*>("client/v5"),
-                        reinterpret_cast<const uint8_t*>("client/v5") + 9);
+    Bytes authenticated(reinterpret_cast<const uint8_t*>("client/v6"),
+                        reinterpret_cast<const uint8_t*>("client/v6") + 9);
     authenticated.insert(authenticated.end(), hello.begin(), hello.end());
     Writer envelope;
     envelope.bytes(hello);
@@ -1489,7 +1614,12 @@ void test_two_node_mutual_bootstrap_metadata_quorum() {
     // Competing generation-2 proposals must converge on one metadata history.
     std::exception_ptr first_error;
     std::exception_ptr second_error;
+    std::atomic<unsigned> ready{};
+    std::atomic<bool> go{};
     std::thread first([&] {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire))
+            std::this_thread::yield();
         try {
             s1.filesystem().mkdir("/from-node-1", 0755, getuid(), getgid());
         } catch (...) {
@@ -1497,12 +1627,18 @@ void test_two_node_mutual_bootstrap_metadata_quorum() {
         }
     });
     std::thread second([&] {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire))
+            std::this_thread::yield();
         try {
             s2.filesystem().mkdir("/from-node-2", 0755, getuid(), getgid());
         } catch (...) {
             second_error = std::current_exception();
         }
     });
+    while (ready.load(std::memory_order_acquire) != 2)
+        std::this_thread::yield();
+    go.store(true, std::memory_order_release);
     first.join();
     second.join();
     if (first_error)
@@ -1853,10 +1989,13 @@ void test_full_replica_fallback() {
     auto c2 = config_for(t.path() / "n2", keyfile, p2, {{"127.0.0.1", p1}});
     auto c3 = config_for(t.path() / "n3", keyfile, p3, {{"127.0.0.1", p1}});
     auto c4 = config_for(t.path() / "n4", keyfile, p4, {{"127.0.0.1", p1}});
-    c1.storage_backends.front().limit = 4096; // Cannot hold the test object.
-    c2.storage_backends.front().limit = 64ULL * 1024 * 1024;
-    c3.storage_backends.front().limit = 64ULL * 1024 * 1024;
-    c4.storage_backends.front().limit = 64ULL * 1024 * 1024;
+    // Equal configured capacities give each node an equal placement share.
+    // Node 1 is then filled locally: current free space must not change its
+    // placement weight, and the missing replica should spill to the fallback.
+    c1.storage_backends.front().limit = 2ULL * 1024 * 1024;
+    c2.storage_backends.front().limit = 2ULL * 1024 * 1024;
+    c3.storage_backends.front().limit = 2ULL * 1024 * 1024;
+    c4.storage_backends.front().limit = 2ULL * 1024 * 1024;
 
     Service s1(c1, keys);
     Service s2(c2, keys);
@@ -1868,13 +2007,17 @@ void test_full_replica_fallback() {
     s4.start();
     REQUIRE(wait_until([&] { return s2.node().membership().active().size() >= 4; }));
 
+    auto filler = pattern(1800 * 1024);
+    filler[0] ^= 0xa5;
+    REQUIRE(s1.node().local_store().put(object_id(filler), filler));
+
     Bytes data;
     std::vector<NodeInfo> ranked;
     for (uint32_t salt = 0; salt < 1000; ++salt) {
         data = pattern(256 * 1024 + salt);
         auto id = object_id(data);
         auto active = s2.node().membership().active();
-        ranked = rendezvous_nodes(id.bytes, active, active.size());
+        ranked = capacity_placement_nodes(id.bytes, active, c2.replication);
         if (ranked.size() == 4 &&
             std::find_if(ranked.begin(), ranked.begin() + 3, [&](const NodeInfo& n) {
                 return n.id == s1.node().node_id();
@@ -1896,9 +2039,9 @@ void test_full_replica_fallback() {
     });
     REQUIRE(fallback != services.end());
 
-    // Foreground put() commits at quorum and does not wait for a known-slow or
-    // full third owner. Placement repair must subsequently spill that missing
-    // replica to the next deterministic HRW node.
+    // Foreground put() commits at quorum and does not wait for the full third
+    // owner. Placement repair subsequently spills that missing replica to the
+    // next deterministic capacity-aware fallback node.
     REQUIRE(wait_until([&] {
         for (auto* service : services) {
             if (!service->node().local_store().has(id))
@@ -2968,12 +3111,13 @@ int main() {
         test_metadata_codec_and_replica();
         test_config();
         test_placement();
+        test_capacity_placement();
         test_async_rpc_move_ownership();
-        test_rpc_v6_frame_priority_and_variable_length();
-        test_rpc_v6_persistence_and_multiplexing();
-        test_rpc_v6_bidirectional_and_deduplication();
+        test_rpc_v7_frame_priority_and_variable_length();
+        test_rpc_v7_persistence_and_multiplexing();
+        test_rpc_v7_bidirectional_and_deduplication();
         test_mutual_bootstrap_prunes_cross_dial();
-        test_rpc_v5_handshake_is_rejected();
+        test_rpc_v6_handshake_is_rejected();
         test_rpc_slow_control_does_not_abort_data();
         test_rpc_health_and_control_not_starved_by_data();
         test_early_replication_quorum();

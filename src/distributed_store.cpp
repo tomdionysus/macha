@@ -44,7 +44,7 @@ std::chrono::milliseconds DistributedStore::foreground_idle_for() const {
 
 std::vector<NodeInfo> DistributedStore::ranked(const ObjectId& id) const {
     auto active = n_.membership().active();
-    return rendezvous_nodes(id.bytes, active, active.size());
+    return capacity_placement_nodes(id.bytes, active, n_.config().replication);
 }
 
 std::vector<NodeInfo> DistributedStore::owners(const ObjectId& id) const {

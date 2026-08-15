@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.2 - 2026-08-15
+
+- added a per-node metadata mutation sequence clock (snapshot format 7) so quorum-CAS retries recognise an operation that became canonical, even after other writers committed descendants of it; this fixes the symmetric two-voter `EEXIST` race without making filesystem operations artificially idempotent;
+
+- replaced equal-node media extent placement with a virtual 32-bit (2^32) stable capacity-weighted placement-shard space;
+- computed exact per-node shard-slot quotas using the distinct-replica capacity constraint, avoiding the severe small-node over-selection of naive weighted sampling for replica counts greater than one;
+- retained `failure_domain` diversity by placing across capacity-weighted failure-domain aggregates before selecting a node within each chosen domain;
+- made deterministic fallback ordering capacity-aware while keeping current free space out of placement weights;
+- applied capacity-weighted rendezvous over the stable shard space to local storage backends, so adding a disk gives it a proportional authoritative share while only moving shards won by the new backend;
+- kept previously adopted configured backends in placement capacity while temporarily offline, preventing transient disk loss from redefining cluster and local ownership; permanent configuration removal drops the capacity;
+- corrected `statfs` logical capacity for heterogeneous nodes using the maximum capacity supportable by `R` distinct replicas rather than `sum(capacity)/R` alone;
+- bumped the wire protocol to v7 (`MCH7`, `macha/session/v7`) because v6 and v7 nodes calculate different data owners; mixed versions are intentionally rejected and no placement migration compatibility is provided.
+
 ## 0.6.1 - 2026-08-15
 
 - added automatic distributed-filesystem catalogue scanning for movies, TV episodes and music, with conservative filename/path recognition and stable media-ID binding;

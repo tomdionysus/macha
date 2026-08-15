@@ -3,11 +3,13 @@
 
 #include "codec.hpp"
 #include "log.hpp"
+#include "placement.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <fstream>
+#include <limits>
 #include <set>
 #include <unistd.h>
 
@@ -230,33 +232,42 @@ void StoragePool::refresh() {
 }
 
 std::vector<std::shared_ptr<StoragePool::Backend>> StoragePool::ranked(const ObjectId& id) const {
-    struct Ranked {
-        Hash256 score;
-        std::shared_ptr<Backend> backend;
-    };
-    std::vector<Ranked> candidates;
+    std::vector<NodeInfo> placement_nodes;
+    std::vector<std::pair<NodeId, std::shared_ptr<Backend>>> lookup;
     for (const auto& backend : snapshot()) {
         NodeId token;
-        bool online = false;
+        uint64_t capacity = 0;
+        bool eligible = false;
         {
             std::lock_guard lock(backend->mutex);
-            online = backend->online && static_cast<bool>(backend->store);
+            // A previously adopted configured disk remains part of the stable
+            // placement map while temporarily offline. put()/get() skip it and
+            // use the ranked fallback; when it returns rebalance restores the
+            // intended proportional placement. A never-seen path has no stable
+            // token yet and therefore contributes neither capacity nor placement.
+            eligible = backend->configured && backend->token_known;
             token = backend->token;
+            capacity = backend->cfg.limit;
         }
-        if (!online)
+        if (!eligible)
             continue;
-        Writer writer;
-        writer.fixed(id.bytes);
-        writer.fixed(token.bytes);
-        candidates.push_back({sha256(writer.data()), backend});
+        NodeInfo node;
+        node.id = token;
+        node.capacity = capacity;
+        placement_nodes.push_back(node);
+        lookup.push_back({token, backend});
     }
-    std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
-        return a.score > b.score;
-    });
+
+    auto order = capacity_placement_nodes(id.bytes, placement_nodes, 1);
     std::vector<std::shared_ptr<Backend>> out;
-    out.reserve(candidates.size());
-    for (auto& candidate : candidates)
-        out.push_back(std::move(candidate.backend));
+    out.reserve(order.size());
+    for (const auto& placed : order) {
+        auto it = std::find_if(lookup.begin(), lookup.end(), [&](const auto& item) {
+            return item.first == placed.id;
+        });
+        if (it != lookup.end())
+            out.push_back(it->second);
+    }
     return out;
 }
 
@@ -467,8 +478,14 @@ uint64_t StoragePool::limit() const {
     uint64_t total = 0;
     for (const auto& backend : snapshot()) {
         std::lock_guard lock(backend->mutex);
-        if (backend->online && backend->store)
+        // Capacity is a topology weight, not a live free-space/online score.
+        // Keep a known configured backend in the advertised capacity while it
+        // is temporarily offline; removing it from configuration drops it.
+        if (backend->configured && backend->token_known) {
+            if (backend->cfg.limit > std::numeric_limits<uint64_t>::max() - total)
+                return std::numeric_limits<uint64_t>::max();
             total += backend->cfg.limit;
+        }
     }
     return total;
 }
