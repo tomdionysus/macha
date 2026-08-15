@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.1 - 2026-08-15
+
+- added automatic distributed-filesystem catalogue scanning for movies, TV episodes and music, with conservative filename/path recognition and stable media-ID binding;
+- added pluggable metadata-provider interfaces, using TMDB for movies/TV and MusicBrainz for artists/albums/tracks;
+- added online artwork acquisition: movie posters/backdrops, show posters/backdrops, season posters, episode stills and Cover Art Archive album covers are downloaded into Macha's immutable object store and replicated with catalogue metadata;
+- made the lowest active node ID the scanner coordinator so normally configured clusters perform one set of external lookups, with deterministic failover when membership changes;
+- made scans idempotent for already-bound media, prune only scanner-owned records when files disappear, and abort deletion reconciliation if a configured root cannot be read;
+- added MusicBrainz request pacing and release/cover caching, TMDB show/season caching, multi-disc music path recognition and conservative provider-match thresholds;
+- fixed catalogue `external_ids` decoding to read key/value fields in defined order; the previous expression depended on function-argument evaluation order and could reverse provider/id pairs after a snapshot reload;
+- added scanner/provider/artwork/reconciliation and catalogue-codec regression coverage; wire protocol remains v6.
+
 ## 0.6.0 - 2026-08-15
 
 - replaced protocol v5 with v6 (`MCH6`, `macha/session/v6`); mixed-version peers are intentionally rejected and no compatibility shim is retained;

@@ -120,6 +120,16 @@ Superseded catalogue roots and artwork that loses its final live reference are a
 
 This first implementation intentionally shares the filesystem metadata generation for the small `catalogue_root` pointer. If catalogue mutation volume later makes that a contention point, the root can move to an independent quorum namespace without changing catalogue object or artwork representation.
 
+### Catalogue scanner
+
+The scanner is filesystem-driven. It first classifies a path as movie, TV episode or music track, then asks a provider capable of that class to resolve metadata. Provider results never decide the local media class. Built-in providers are TMDB for movies/TV and MusicBrainz for music; Cover Art Archive supplies album art. The provider boundary is virtual and deliberately independent of scanner scheduling.
+
+A successful provider match contributes catalogue hierarchy plus remote artwork descriptors. Artwork bytes are fetched before commit, staged as immutable objects and included in the same catalogue durability boundary. No provider URL is required for playback clients after the scan.
+
+The scanner uses stable `macha:<sha256>` file identities. An already-bound identity is skipped on later scans, avoiding repeated provider traffic and artwork downloads. Reconciliation removes vanished bindings only from scanner-owned leaves and prunes scanner-created empty parents; manual catalogue records remain untouched. If any configured root cannot be traversed, the pass fails before reconciliation so temporary namespace/storage loss cannot masquerade as deletion.
+
+The lowest active `NodeId` is the scanner coordinator. Scanner enablement is therefore intended to be consistent across cluster nodes; membership change moves the role without a permanent catalogue master. Catalogue CAS still protects against overlapping scans during membership transitions.
+
 ## Voter failure and replacement
 
 Normal voter replacement requires a majority of the old voter set and therefore preserves quorum intersection.
@@ -168,6 +178,7 @@ Long-lived execution contexts are:
 - membership/gossip and backend refresh;
 - fetched-block persistence;
 - bounded cache-hydration fetch workers;
+- one optional catalogue-scanner worker on the elected node;
 - service maintenance;
 - FUSE/client request threads.
 

@@ -1,4 +1,4 @@
-# Macha 0.6.0
+# Macha 0.6.1
 #
 # Copy this file per node. Paths, advertise address and failure_domain are
 # node-local. The cluster key contents and dht policy must match every node.
@@ -114,8 +114,32 @@ maintenance:
   garbage_grace_ms: 86400000
 
 # The catalogue itself is cluster metadata and is always present on every node.
-# This section only controls the optional local HTTP/JSON interface.
+# The scanner and HTTP/JSON API are optional. Scanner roots should contain only
+# media you want automatically classified. Every configured root must be
+# readable for deletion reconciliation to run.
 catalogue:
+  scanner:
+    enabled: false
+    interval_ms: 21600000
+    roots:
+      - /Movies
+      - /TV
+      - /Music
+    max_artwork_bytes: 16M
+    providers:
+      # TMDB API Read Access Token, stored as the only content of this file.
+      tmdb:
+        enabled: true
+        token_file: /etc/macha-tmdb.token
+        language: en-GB
+        image_size: w500
+
+      # MusicBrainz requires a meaningful application contact; no API key.
+      musicbrainz:
+        enabled: true
+        contact: https://github.com/tomdionysus/macha
+        cover_size: "500"
+
   api:
     enabled: true
     listen: 127.0.0.1

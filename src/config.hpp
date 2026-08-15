@@ -56,8 +56,31 @@ struct CatalogueApiConfig {
     size_t max_request_bytes{8 * 1024 * 1024};
 };
 
+struct CatalogueTmdbConfig {
+    bool enabled{true};
+    std::optional<std::filesystem::path> token_file;
+    std::string language{"en-GB"};
+    std::string image_size{"w500"};
+};
+
+struct CatalogueMusicBrainzConfig {
+    bool enabled{true};
+    std::string contact{"https://github.com/tomdionysus/macha"};
+    std::string cover_size{"500"};
+};
+
+struct CatalogueScannerConfig {
+    bool enabled{};
+    std::chrono::milliseconds interval{std::chrono::hours(6)};
+    std::vector<std::string> roots{"/"};
+    size_t max_artwork_bytes{16 * 1024 * 1024};
+    CatalogueTmdbConfig tmdb;
+    CatalogueMusicBrainzConfig musicbrainz;
+};
+
 struct CatalogueConfig {
     CatalogueApiConfig api;
+    CatalogueScannerConfig scanner;
 };
 
 struct HydrationEngineConfig {
