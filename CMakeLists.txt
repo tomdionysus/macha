@@ -13,6 +13,36 @@ find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(Threads REQUIRED)
 find_package(CURL REQUIRED)
 find_package(yaml-cpp REQUIRED)
+find_package(PkgConfig REQUIRED)
+
+# Homebrew versioned FFmpeg formulae are keg-only, so their .pc files are not
+# necessarily visible to pkg-config. Discover a suitable Homebrew prefix on
+# macOS before asking FindPkgConfig; ordinary system/pkg-config discovery is
+# unchanged on other platforms.
+if(APPLE)
+    find_program(MACHA_BREW_EXECUTABLE brew HINTS /usr/local/bin /opt/homebrew/bin)
+    if(MACHA_BREW_EXECUTABLE)
+        foreach(MACHA_FFMPEG_FORMULA ffmpeg@7 ffmpeg)
+            execute_process(
+                COMMAND ${MACHA_BREW_EXECUTABLE} --prefix ${MACHA_FFMPEG_FORMULA}
+                RESULT_VARIABLE MACHA_BREW_RESULT
+                OUTPUT_VARIABLE MACHA_FFMPEG_PREFIX
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+            if(MACHA_BREW_RESULT EQUAL 0 AND
+               EXISTS "${MACHA_FFMPEG_PREFIX}/lib/pkgconfig/libavformat.pc")
+                list(PREPEND CMAKE_PREFIX_PATH "${MACHA_FFMPEG_PREFIX}")
+                set(PKG_CONFIG_USE_CMAKE_PREFIX_PATH TRUE)
+                message(STATUS "Using Homebrew FFmpeg libraries from ${MACHA_FFMPEG_PREFIX}")
+                break()
+            endif()
+        endforeach()
+    endif()
+endif()
+
+# The in-process media engine uses public APIs present in FFmpeg 6 and later.
+pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET
+    libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7 libswresample>=4)
 
 if(TARGET yaml-cpp::yaml-cpp)
     set(MACHA_YAML_TARGET yaml-cpp::yaml-cpp)
@@ -41,6 +71,8 @@ set(MACHA_CORE_SOURCES
     src/metadata_manager.cpp
     src/json.cpp
     src/http.cpp
+    src/media_segments.cpp
+    src/media_timestamps.cpp
     src/media_engine.cpp
     src/playback.cpp
     src/catalogue.cpp
@@ -53,7 +85,8 @@ set(MACHA_CORE_SOURCES
 
 add_library(macha_core STATIC ${MACHA_CORE_SOURCES})
 target_include_directories(macha_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(macha_core PUBLIC OpenSSL::Crypto Threads::Threads CURL::libcurl ${MACHA_YAML_TARGET})
+target_link_libraries(macha_core PUBLIC
+    OpenSSL::Crypto Threads::Threads CURL::libcurl ${MACHA_YAML_TARGET} PkgConfig::LIBAV)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(macha_core PRIVATE -Wall -Wextra -Wpedantic)
@@ -67,14 +100,11 @@ target_link_libraries(macha PRIVATE macha_core)
 
 set(MACHA_FUSE_FOUND OFF)
 if(MACHA_ENABLE_FUSE)
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(FUSE3 QUIET IMPORTED_TARGET fuse3)
-        if(TARGET PkgConfig::FUSE3)
-            set(MACHA_FUSE_FOUND ON)
-            target_sources(macha PRIVATE src/fuse_adapter.cpp)
-            target_link_libraries(macha PRIVATE PkgConfig::FUSE3)
-        endif()
+    pkg_check_modules(FUSE3 QUIET IMPORTED_TARGET fuse3)
+    if(TARGET PkgConfig::FUSE3)
+        set(MACHA_FUSE_FOUND ON)
+        target_sources(macha PRIVATE src/fuse_adapter.cpp)
+        target_link_libraries(macha PRIVATE PkgConfig::FUSE3)
     endif()
 
     if(APPLE AND NOT MACHA_FUSE_FOUND)

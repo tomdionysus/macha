@@ -7,21 +7,23 @@ This is a disposable two-node local demo. It uses two metadata voters so both no
 Linux:
 
 ```sh
-sudo apt install build-essential cmake pkg-config libssl-dev libyaml-cpp-dev libcurl4-openssl-dev libfuse3-dev ffmpeg
+sudo apt install build-essential cmake pkg-config libssl-dev libyaml-cpp-dev libcurl4-openssl-dev libfuse3-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-macOS, with macFUSE already installed:
+macOS, with macFUSE already installed. Homebrew `ffmpeg@7` supplies the libav headers, libraries and pkg-config metadata; Macha does not execute the command-line program. The formula is keg-only, so Macha's CMake file discovers its Homebrew prefix automatically:
 
 ```sh
-brew install cmake openssl@3 pkg-config yaml-cpp curl ffmpeg
+brew install cmake openssl@3 pkgconf yaml-cpp curl ffmpeg@7
 cmake -S . -B build \
   -DCMAKE_BUILD_TYPE=Release \
   -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
   -DCURL_ROOT="$(brew --prefix curl)"
 cmake --build build -j
 ```
+
+If you deliberately use another keg or non-Homebrew FFmpeg build, expose its `lib/pkgconfig` directory through `PKG_CONFIG_PATH` before configuring.
 
 ## Create the demo cluster
 

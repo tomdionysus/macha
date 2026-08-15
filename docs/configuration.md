@@ -50,7 +50,7 @@ RPC duration itself is unbounded. Stall notices are observability thresholds; th
 
 ## Streaming configuration
 
-Streaming shares the catalogue HTTP listener. `streaming.enabled: true` therefore requires `catalogue.api.enabled: true`. The subprocess backend uses `ffprobe` for source inspection and `ffmpeg` for HLS remux/transcode and subtitle extraction.
+Streaming shares the catalogue HTTP listener. `streaming.enabled: true` therefore requires `catalogue.api.enabled: true`. Macha links `libavformat`, `libavcodec`, `libavutil`, `libswscale` and `libswresample` directly. It does not run the `ffmpeg` or `ffprobe` commands. Legacy `streaming.ffmpeg` and `streaming.ffprobe` keys from the first 0.7.0 build are accepted and ignored.
 
 ```yaml
 catalogue:
@@ -66,20 +66,28 @@ catalogue:
 
 streaming:
   enabled: true
-  ffmpeg: ffmpeg
-  ffprobe: ffprobe
   # temp_path: /var/lib/macha/tmp/playback
   max_sessions: 8
   max_video_transcodes: 1
   max_audio_transcodes: 4
   session_idle_ms: 1800000
-  startup_timeout_ms: 10000
+  startup_timeout_ms: 15000
   segment_duration_ms: 4000
   max_ahead_segments: 8
+  segment_memory_bytes: 64M
+  probe_bytes: 8M
+  probe_analyze_duration_ms: 5000
+  probe_timeout_ms: 20000
 ```
 
-`max_sessions` limits logical playback sessions. Video and audio transcodes have separate lower limits because direct play and remux sessions are much cheaper. `max_ahead_segments` bounds how far a transformed producer is allowed to run ahead of client segment demand; the FFmpeg process is paused and resumed without changing the playback session.
+`max_sessions` limits logical playback sessions. Video and audio transcodes have separate lower limits because direct play and remux sessions are much cheaper. `max_ahead_segments` bounds how far the in-process producer may run ahead of client demand. Producers block on the segment store and wake as the player requests later fragments; no process suspension is involved.
 
-Changes to streaming limits and timing are reloaded by `SIGHUP`. Enabling/disabling streaming, changing the media-engine executables, or changing its temporary path requires a restart.
+Generated init/media fragments are published to memory. `segment_memory_bytes` bounds resident generated-segment memory per session; sufficiently old consumed fragments may spill below `temp_path` and remain directly addressable. `temp_path` is therefore overflow storage, not the signalling mechanism between the media engine and HTTP server.
+
+Source inspection is deliberately bounded because a probe may cause distributed extent reads. `probe_bytes` limits libavformat probing, `probe_analyze_duration_ms` limits media-time analysis, and `probe_timeout_ms` is the wall-clock guard for the complete media-representation inspection pass. All candidate media IDs share that deadline. It is propagated into Macha extent reads and outstanding remote object RPCs, so neither multiple representations nor a peer that stops making progress can multiply the session-creation delay. A timed-out probe fails with a stage-specific 503. Successfully probed immutable media IDs are cached.
+
+`maintenance.no_progress_backoff_ms` controls the quiescent backoff used after repair, local rebalance or scrub makes no progress. The default is 30000 ms. This prevents a settled node from repeatedly walking hot metadata merely because its byte credit has reached one extent.
+
+Changes to streaming session limits and timing are reloaded by `SIGHUP`. Enabling/disabling streaming, changing fragment-memory/probe policy or changing `temp_path` requires a restart.
 
 See [`macha.yaml.example`](../macha.yaml.example) for the complete example.

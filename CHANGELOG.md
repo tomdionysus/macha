@@ -3,14 +3,21 @@
 ## 0.7.0 - 2026-08-15
 
 - added negotiated playback sessions with direct play, fragmented-MP4 HLS remux and selective transcoding;
-- added a media-engine abstraction and initial isolated FFmpeg/ffprobe process backend, keeping subprocess details out of the public API and playback policy;
+- added a media-engine abstraction with an in-process libav implementation; probing, demuxing, decoding, encoding and muxing no longer shell out to `ffprobe`/`ffmpeg`;
+- added custom seekable libav `AVIOContext` input backed directly by pinned Macha `ReadHandle` objects, removing the loopback HTTP source and preserving DHT/playback-hydrator semantics;
+- added direct fragmented-MP4 publication through an in-process bounded `MediaSegmentStore`, removing generated-playlist filesystem polling and signal-based FFmpeg back-pressure;
 - added media probe caching, multi-representation selection, validated audio/subtitle track selection, WebVTT subtitle extraction, quality limits and seek-driven pipeline replacement; path-based probes are versioned and active playback pins the resolved file snapshot;
+- added explicit probe, pipeline-analysis and first-fragment startup deadlines, propagated per-caller probe cancellation through filesystem reads into independent DHT object RPCs, and added stage-specific playback 503 bodies/trace IDs for correlating server failures with client logs;
+- removed two synchronous/startup CPU traps: media-ID lookup is now cached by metadata generation instead of re-hashing the complete namespace for each playback candidate, and probe/subtitle reads no longer register as active playback or trigger hydration;
 - added capability-scoped stream URLs so native players can fetch media without receiving the permanent catalogue API Bearer token;
 - split the HTTP server from catalogue routing and replaced the single-request server with a bounded concurrent worker server supporting streaming response bodies, HTTP byte ranges and simultaneous HLS fragment requests;
-- added a loopback-only seekable source endpoint for FFmpeg so transformed reads still pass through the normal Macha filesystem, DHT, playback tracker and hydration machinery;
-- added playback-session, video-transcode and audio-transcode resource limits plus idle expiry and generated-file cleanup;
-- added transformed-stream producer back-pressure so a fast remux cannot hydrate an entire large source merely because playback started;
-- added playback API and media-engine regression coverage, including direct byte ranges, HLS generation, session reconfiguration, subtitle output and transcode-limit enforcement;
+- added hard concurrent playback-session, video-transcode and audio-transcode admission limits with pending-pipeline reservations, plus idle expiry and generated-fragment cleanup;
+- fixed settled-node maintenance CPU spin: no-progress repair/rebalance/scrub passes now clear accumulated byte credit and back off, catalogue repair is throttled, full filesystem live-object enumeration no longer runs every 500 ms when there is no work, and catalogue-sequence hydration no longer snapshots/repairs the catalogue when there is no active playback;
+- fixed remux timestamp handling after seek: stream-copy PTS/DTS are now repaired after conversion to the muxer's final timebase, missing timestamps are synthesised, equal/backwards DTS values receive a persistent monotonic correction, and repairs are logged per stream instead of allowing the MP4 muxer to abort playback;
+- added optional `seek_ms` to session creation so resumed transformed playback can create its first HLS generation at the requested position instead of requiring an immediate create-then-PATCH pipeline restart;
+- added DEBUG playlist/fragment request logging for correlating server generation/segment progress with client buffering diagnostics;
+- made CMake discover Homebrew's keg-only `ffmpeg@7`/`ffmpeg` pkg-config prefix automatically on macOS;
+- added regression coverage for direct byte ranges, HLS session generation, initial transformed seek, remux timestamp repair, session reconfiguration, subtitle output, transcode limits, concurrent HTTP serving and segment-store back-pressure/spill behaviour;
 - reduced `README.md` to an overview and moved operational documentation into topic files under `docs/`, including a two-node `quickstart.md` and streaming API guide.
 
 ## 0.6.2 - 2026-08-15

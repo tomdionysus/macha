@@ -1,440 +1,1216 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "media_engine.hpp"
 
-#include "json.hpp"
 #include "log.hpp"
+#include "media_timestamps.hpp"
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/audio_fifo.h>
+#include <libavutil/avutil.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/error.h>
+#include <libavutil/opt.h>
+#include <libavutil/version.h>
+#include <libswresample/swresample.h>
+#include <libswscale/swscale.h>
+}
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
 #include <charconv>
-#include <csignal>
+#include <cmath>
+#include <condition_variable>
+#include <cstdio>
 #include <cstring>
-#include <fcntl.h>
+#include <deque>
 #include <fstream>
+#include <iomanip>
+#include <limits>
+#include <map>
 #include <mutex>
-#include <poll.h>
 #include <sstream>
 #include <stdexcept>
-#include <sys/wait.h>
 #include <thread>
-#include <unistd.h>
 
 namespace macha {
 namespace {
 
-struct CaptureResult {
-    int exit_code{-1};
-    std::string out;
-    std::string err;
-};
+std::string av_error(int code) {
+    std::array<char, AV_ERROR_MAX_STRING_SIZE> text{};
+    av_strerror(code, text.data(), text.size());
+    return text.data();
+}
 
-std::vector<char*> argv_ptrs(std::vector<std::string>& args) {
-    std::vector<char*> out;
-    out.reserve(args.size() + 1);
-    for (auto& arg : args) out.push_back(arg.data());
-    out.push_back(nullptr);
+void av_require(int rc, std::string_view operation) {
+    if (rc < 0) throw std::runtime_error(std::string(operation) + ": " + av_error(rc));
+}
+
+uint32_t be32(const uint8_t* p) {
+    return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+}
+
+uint64_t be64(const uint8_t* p) {
+    return (static_cast<uint64_t>(be32(p)) << 32) | be32(p + 4);
+}
+
+constexpr uint32_t codec_tag(char a, char b, char c, char d) {
+    return static_cast<uint8_t>(a) | (static_cast<uint32_t>(static_cast<uint8_t>(b)) << 8) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(c)) << 16) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(d)) << 24);
+}
+
+std::string fourcc(const uint8_t* p) {
+    return std::string(reinterpret_cast<const char*>(p), 4);
+}
+
+std::string format_vtt_time(int64_t milliseconds) {
+    if (milliseconds < 0) milliseconds = 0;
+    auto hours = milliseconds / 3'600'000;
+    milliseconds %= 3'600'000;
+    auto minutes = milliseconds / 60'000;
+    milliseconds %= 60'000;
+    auto seconds = milliseconds / 1000;
+    auto millis = milliseconds % 1000;
+    std::ostringstream out;
+    out << std::setfill('0') << std::setw(2) << hours << ':' << std::setw(2) << minutes << ':'
+        << std::setw(2) << seconds << '.' << std::setw(3) << millis;
+    return out.str();
+}
+
+std::string plain_ass_text(std::string text) {
+    // AVSubtitleRect::ass generally contains an ASS dialogue event. Keep only
+    // the text field and remove the most common inline formatting escapes.
+    size_t commas = 0;
+    size_t pos = 0;
+    for (; pos < text.size(); ++pos) {
+        if (text[pos] == ',' && ++commas == 9) {
+            ++pos;
+            break;
+        }
+    }
+    if (commas == 9) text.erase(0, pos);
+    std::string out;
+    out.reserve(text.size());
+    bool tag = false;
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '{') {
+            tag = true;
+            continue;
+        }
+        if (text[i] == '}' && tag) {
+            tag = false;
+            continue;
+        }
+        if (tag) continue;
+        if (text[i] == '\\' && i + 1 < text.size() && (text[i + 1] == 'N' || text[i + 1] == 'n')) {
+            out.push_back('\n');
+            ++i;
+            continue;
+        }
+        out.push_back(text[i]);
+    }
     return out;
 }
 
-CaptureResult run_capture(std::vector<std::string> args, size_t max_bytes = 16 * 1024 * 1024) {
-    if (args.empty()) throw std::runtime_error("empty process argv");
-    int out_pipe[2]{-1, -1}, err_pipe[2]{-1, -1};
-    if (pipe(out_pipe) || pipe(err_pipe)) throw std::runtime_error("pipe failed");
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(out_pipe[0]); close(out_pipe[1]); close(err_pipe[0]); close(err_pipe[1]);
-        throw std::runtime_error("fork failed");
-    }
-    if (pid == 0) {
-        (void)dup2(out_pipe[1], STDOUT_FILENO);
-        (void)dup2(err_pipe[1], STDERR_FILENO);
-        close(out_pipe[0]); close(out_pipe[1]); close(err_pipe[0]); close(err_pipe[1]);
-        auto ptrs = argv_ptrs(args);
-        execvp(ptrs[0], ptrs.data());
-        _exit(127);
-    }
-    close(out_pipe[1]); close(err_pipe[1]);
-    (void)fcntl(out_pipe[0], F_SETFL, fcntl(out_pipe[0], F_GETFL) | O_NONBLOCK);
-    (void)fcntl(err_pipe[0], F_SETFL, fcntl(err_pipe[0], F_GETFL) | O_NONBLOCK);
+struct InputIoState {
+    std::shared_ptr<MediaInput> input;
+    uint64_t offset{};
+    std::atomic_bool* cancelled{};
+    Clock::time_point deadline{};
+};
 
-    CaptureResult result;
-    bool out_open = true, err_open = true;
-    std::array<char, 8192> buffer{};
-    while (out_open || err_open) {
-        pollfd fds[2]{{out_pipe[0], static_cast<short>(POLLIN | POLLHUP), 0},
-                      {err_pipe[0], static_cast<short>(POLLIN | POLLHUP), 0}};
-        (void)poll(fds, 2, 100);
-        auto drain = [&](int fd, std::string& target, bool& open, short events) {
-            if (!open || !(events & (POLLIN | POLLHUP | POLLERR))) return;
-            while (true) {
-                auto n = read(fd, buffer.data(), buffer.size());
-                if (n > 0) {
-                    if (target.size() + static_cast<size_t>(n) > max_bytes) {
-                        kill(pid, SIGKILL);
-                        throw std::runtime_error("process output exceeded limit");
-                    }
-                    target.append(buffer.data(), static_cast<size_t>(n));
-                    continue;
-                }
-                if (n == 0) { close(fd); open = false; }
-                if (n < 0 && errno != EAGAIN && errno != EINTR) { close(fd); open = false; }
-                break;
-            }
-        };
-        drain(out_pipe[0], result.out, out_open, fds[0].revents);
-        drain(err_pipe[0], result.err, err_open, fds[1].revents);
-    }
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-    if (WIFEXITED(status)) result.exit_code = WEXITSTATUS(status);
-    else if (WIFSIGNALED(status)) result.exit_code = 128 + WTERMSIG(status);
-    return result;
+bool input_aborted(const InputIoState& state) {
+    return (state.cancelled && state.cancelled->load()) ||
+           (state.deadline != Clock::time_point{} && Clock::now() >= state.deadline);
 }
 
-std::optional<std::string> json_string(const Json* value) {
-    if (!value || !value->isString()) return {};
-    return value->asString();
-}
-
-int json_int(const Json* value, int fallback = 0) {
-    if (!value) return fallback;
-    try { return static_cast<int>(value->asInt64()); } catch (...) {}
-    try { return static_cast<int>(value->asUInt64()); } catch (...) {}
-    if (value->isString()) {
-        int parsed{};
-        auto text = value->asString();
-        auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), parsed);
-        if (ec == std::errc{} && end == text.data() + text.size()) return parsed;
-    }
-    return fallback;
-}
-
-uint64_t json_u64(const Json* value, uint64_t fallback = 0) {
-    if (!value) return fallback;
-    try { return value->asUInt64(); } catch (...) {}
+int input_read(void* opaque, uint8_t* buffer, int buffer_size) {
+    auto& state = *static_cast<InputIoState*>(opaque);
+    if (input_aborted(state)) return AVERROR_EXIT;
     try {
-        auto n = value->asInt64();
-        return n >= 0 ? static_cast<uint64_t>(n) : fallback;
-    } catch (...) {}
-    if (value->isString()) {
-        uint64_t parsed{};
-        auto text = value->asString();
-        auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), parsed);
-        if (ec == std::errc{} && end == text.data() + text.size()) return parsed;
+        if (state.offset >= state.input->size()) return AVERROR_EOF;
+        auto wanted = static_cast<size_t>(std::min<uint64_t>(
+            static_cast<uint64_t>(buffer_size), state.input->size() - state.offset));
+        auto n = state.input->read(state.offset, {buffer, wanted}, state.deadline, state.cancelled);
+        if (!n) return AVERROR_EOF;
+        state.offset += n;
+        return static_cast<int>(n);
+    } catch (...) {
+        if (state.cancelled && state.cancelled->load()) return AVERROR_EXIT;
+        if (state.deadline != Clock::time_point{} && Clock::now() >= state.deadline)
+            return AVERROR(ETIMEDOUT);
+        return AVERROR(EIO);
     }
-    return fallback;
 }
 
-double json_double(const Json* value, double fallback = 0.0) {
-    if (!value) return fallback;
-    try { return value->asNumber(); } catch (...) {}
-    if (value->isString()) {
-        char* end = nullptr;
-        auto text = value->asString();
-        auto parsed = std::strtod(text.c_str(), &end);
-        if (end == text.c_str() + text.size()) return parsed;
+int64_t input_seek(void* opaque, int64_t offset, int whence) {
+    auto& state = *static_cast<InputIoState*>(opaque);
+    if (whence == AVSEEK_SIZE) return static_cast<int64_t>(state.input->size());
+    whence &= ~AVSEEK_FORCE;
+    int64_t base = 0;
+    switch (whence) {
+    case SEEK_SET: base = 0; break;
+    case SEEK_CUR: base = static_cast<int64_t>(state.offset); break;
+    case SEEK_END: base = static_cast<int64_t>(state.input->size()); break;
+    default: return AVERROR(EINVAL);
     }
-    return fallback;
+    if ((offset < 0 && base < -offset) ||
+        (offset > 0 && base > std::numeric_limits<int64_t>::max() - offset))
+        return AVERROR(EINVAL);
+    auto target = base + offset;
+    if (target < 0 || static_cast<uint64_t>(target) > state.input->size()) return AVERROR(EINVAL);
+    state.offset = static_cast<uint64_t>(target);
+    return target;
 }
 
-MediaStreamType stream_type(std::string_view value) {
-    if (value == "video") return MediaStreamType::video;
-    if (value == "audio") return MediaStreamType::audio;
-    if (value == "subtitle") return MediaStreamType::subtitle;
-    return MediaStreamType::other;
+int input_interrupt(void* opaque) {
+    auto* state = static_cast<InputIoState*>(opaque);
+    return state && input_aborted(*state) ? 1 : 0;
 }
 
-class ProcessSession final : public MediaEngineSession {
-    mutable std::mutex process_mutex_;
-    mutable pid_t pid_{-1};
-    int stderr_fd_{-1};
-    std::jthread stderr_thread_;
-    mutable std::mutex diagnostics_mutex_;
-    std::string diagnostics_;
-    mutable bool running_{true};
-    mutable bool paused_{};
-    mutable int exit_code_{-1};
+class InputContext {
+    InputIoState state_;
+    AVIOContext* io_{};
+    AVFormatContext* format_{};
 
-    void record_status_locked(int status) const {
-        running_ = false;
-        paused_ = false;
-        pid_ = -1;
-        if (WIFEXITED(status)) exit_code_ = WEXITSTATUS(status);
-        else if (WIFSIGNALED(status)) exit_code_ = 128 + WTERMSIG(status);
-    }
-
-    bool poll_locked() const {
-        if (!running_ || pid_ <= 0) return false;
-        int status = 0;
-        auto result = waitpid(pid_, &status, WNOHANG);
-        if (result == pid_) {
-            record_status_locked(status);
-            return false;
-        }
-        if (result < 0 && errno == ECHILD) {
-            running_ = false;
-            paused_ = false;
-            pid_ = -1;
-            return false;
-        }
-        return true;
-    }
-
-    void read_stderr(std::stop_token stop) {
-        std::array<char, 4096> buffer{};
-        while (!stop.stop_requested()) {
-            auto n = read(stderr_fd_, buffer.data(), buffer.size());
-            if (n > 0) {
-                std::lock_guard lock(diagnostics_mutex_);
-                diagnostics_.append(buffer.data(), static_cast<size_t>(n));
-                constexpr size_t keep = 64 * 1024;
-                if (diagnostics_.size() > keep) diagnostics_.erase(0, diagnostics_.size() - keep);
-                continue;
-            }
-            if (n < 0 && errno == EINTR) continue;
-            break;
-        }
-        if (stderr_fd_ >= 0) {
-            close(stderr_fd_);
-            stderr_fd_ = -1;
+    void cleanup() noexcept {
+        if (format_) avformat_close_input(&format_);
+        if (io_) {
+            av_freep(&io_->buffer);
+            avio_context_free(&io_);
         }
     }
 
   public:
-    ProcessSession(pid_t pid, int stderr_fd) : pid_(pid), stderr_fd_(stderr_fd) {
-        stderr_thread_ = std::jthread([this](std::stop_token stop) { read_stderr(stop); });
+    InputContext(const MediaSource& source, MediaReadPurpose purpose, std::atomic_bool* cancelled,
+                 uint64_t probe_bytes = 0, std::chrono::milliseconds analyze = {},
+                 std::chrono::milliseconds wall_timeout = {}) {
+        try {
+            if (!source.open) throw std::runtime_error("media source has no reader factory");
+            state_.input = source.open(purpose);
+            if (!state_.input) throw std::runtime_error("media source reader could not be opened");
+            state_.cancelled = cancelled;
+            if (wall_timeout.count() > 0) state_.deadline = Clock::now() + wall_timeout;
+
+            constexpr int io_buffer_size = 256 * 1024;
+            auto* io_buffer = static_cast<uint8_t*>(av_malloc(io_buffer_size));
+            if (!io_buffer) throw std::bad_alloc();
+            io_ = avio_alloc_context(io_buffer, io_buffer_size, 0, &state_, input_read, nullptr, input_seek);
+            if (!io_) {
+                av_free(io_buffer);
+                throw std::bad_alloc();
+            }
+            io_->seekable = AVIO_SEEKABLE_NORMAL;
+
+            format_ = avformat_alloc_context();
+            if (!format_) throw std::bad_alloc();
+            format_->pb = io_;
+            format_->flags |= AVFMT_FLAG_CUSTOM_IO | AVFMT_FLAG_GENPTS;
+            format_->interrupt_callback.callback = input_interrupt;
+            format_->interrupt_callback.opaque = &state_;
+            if (probe_bytes)
+                format_->probesize = static_cast<int64_t>(std::min<uint64_t>(probe_bytes, source.size));
+            if (analyze.count() > 0)
+                format_->max_analyze_duration = static_cast<int64_t>(analyze.count()) * 1000;
+
+            auto* candidate = format_;
+            int rc = avformat_open_input(&candidate, nullptr, nullptr, nullptr);
+            format_ = candidate;
+            if (rc < 0) {
+                if (timed_out()) throw std::runtime_error("media probe timed out while opening input");
+                throw std::runtime_error("open media: " + av_error(rc));
+            }
+        } catch (...) {
+            cleanup();
+            throw;
+        }
     }
 
-    ~ProcessSession() override { stop(); }
+    ~InputContext() { cleanup(); }
 
-    bool running() const override {
-        std::lock_guard lock(process_mutex_);
-        return poll_locked();
+    InputContext(const InputContext&) = delete;
+    InputContext& operator=(const InputContext&) = delete;
+
+    AVFormatContext* get() const { return format_; }
+    bool timed_out() const {
+        return state_.deadline != Clock::time_point{} && Clock::now() >= state_.deadline;
+    }
+    void clear_deadline() { state_.deadline = Clock::time_point{}; }
+};
+
+std::string stream_language(const AVStream* stream) {
+    if (auto* tag = av_dict_get(stream->metadata, "language", nullptr, 0)) return tag->value ? tag->value : "";
+    return {};
+}
+
+MediaStreamType stream_type(AVMediaType type) {
+    switch (type) {
+    case AVMEDIA_TYPE_VIDEO: return MediaStreamType::video;
+    case AVMEDIA_TYPE_AUDIO: return MediaStreamType::audio;
+    case AVMEDIA_TYPE_SUBTITLE: return MediaStreamType::subtitle;
+    default: return MediaStreamType::other;
+    }
+}
+
+int choose_height(const AVCodecParameters* input, const PlaybackPlan& plan) {
+    if (!plan.target_height || input->height <= *plan.target_height) return input->height;
+    return std::max(2, *plan.target_height & ~1);
+}
+
+int choose_width(const AVCodecParameters* input, int target_height) {
+    if (!input->width || !input->height || target_height == input->height) return input->width;
+    auto scaled = static_cast<int>(std::llround(static_cast<double>(input->width) * target_height / input->height));
+    return std::max(2, scaled & ~1);
+}
+
+} // namespace
+
+namespace {
+
+class FragmentWriter {
+    std::shared_ptr<MediaSegmentStore> store_;
+    Bytes pending_;
+    Bytes init_;
+    Bytes prefix_;
+    Bytes fragment_;
+    std::deque<double> durations_;
+    double fallback_duration_{};
+    bool init_published_{};
+
+    void append(Bytes& target, const uint8_t* data, size_t size) {
+        target.insert(target.end(), data, data + size);
     }
 
+    void handle_box(std::string_view type, const uint8_t* data, size_t size) {
+        if (!init_published_ && (type == "ftyp" || type == "moov" || type == "free")) {
+            append(init_, data, size);
+            return;
+        }
+        if (type == "moof") {
+            if (!init_published_) {
+                if (init_.empty()) throw std::runtime_error("fragmented MP4 muxer produced media before init segment");
+                if (!store_->publish_init(std::move(init_))) throw std::runtime_error("stream cancelled");
+                init_published_ = true;
+            }
+            fragment_ = std::move(prefix_);
+            prefix_.clear();
+            append(fragment_, data, size);
+            return;
+        }
+        if (!fragment_.empty()) {
+            append(fragment_, data, size);
+            if (type == "mdat") {
+                auto duration = durations_.empty() ? fallback_duration_ : durations_.front();
+                if (!durations_.empty()) durations_.pop_front();
+                if (!store_->publish_segment(std::move(fragment_), duration))
+                    throw std::runtime_error("stream cancelled");
+                fragment_.clear();
+            }
+            return;
+        }
+        if (!init_published_) {
+            append(init_, data, size);
+        } else {
+            append(prefix_, data, size);
+        }
+    }
+
+    void parse() {
+        size_t offset = 0;
+        while (pending_.size() - offset >= 8) {
+            const auto* p = pending_.data() + offset;
+            uint64_t size = be32(p);
+            size_t header = 8;
+            if (size == 1) {
+                if (pending_.size() - offset < 16) break;
+                size = be64(p + 8);
+                header = 16;
+            } else if (size == 0) {
+                break;
+            }
+            if (size < header || size > 2ULL * 1024 * 1024 * 1024)
+                throw std::runtime_error("invalid fragmented MP4 box size");
+            if (pending_.size() - offset < size) break;
+            auto type = fourcc(p + 4);
+            handle_box(type, p, static_cast<size_t>(size));
+            offset += static_cast<size_t>(size);
+        }
+        if (offset) pending_.erase(pending_.begin(), pending_.begin() + static_cast<std::ptrdiff_t>(offset));
+    }
+
+  public:
+    FragmentWriter(std::shared_ptr<MediaSegmentStore> store, std::chrono::milliseconds target)
+        : store_(std::move(store)), fallback_duration_(std::max(0.001, target.count() / 1000.0)) {}
+
+    int write(const uint8_t* data, int size) {
+        pending_.insert(pending_.end(), data, data + size);
+        parse();
+        return size;
+    }
+
+    void queue_duration(double seconds) {
+        if (std::isfinite(seconds) && seconds > 0.001) durations_.push_back(seconds);
+    }
+
+    void finish(double final_duration) {
+        if (final_duration > 0.001) durations_.push_back(final_duration);
+        parse();
+        if (!pending_.empty()) {
+            if (!fragment_.empty()) {
+                append(fragment_, pending_.data(), pending_.size());
+                pending_.clear();
+            } else if (!init_published_) {
+                append(init_, pending_.data(), pending_.size());
+                pending_.clear();
+            }
+        }
+        if (!init_published_ && !init_.empty()) {
+            if (!store_->publish_init(std::move(init_))) throw std::runtime_error("stream cancelled");
+            init_published_ = true;
+        }
+        if (!fragment_.empty()) {
+            auto duration = durations_.empty() ? fallback_duration_ : durations_.front();
+            if (!durations_.empty()) durations_.pop_front();
+            if (!store_->publish_segment(std::move(fragment_), duration))
+                throw std::runtime_error("stream cancelled");
+            fragment_.clear();
+        }
+    }
+};
+
+int output_write(void* opaque, const uint8_t* buffer, int size) {
+    try {
+        return static_cast<FragmentWriter*>(opaque)->write(buffer, size);
+    } catch (...) {
+        return AVERROR(EIO);
+    }
+}
+
+class OutputIo {
+    AVIOContext* io_{};
+  public:
+    explicit OutputIo(FragmentWriter& writer) {
+        constexpr int buffer_size = 256 * 1024;
+        auto* buffer = static_cast<uint8_t*>(av_malloc(buffer_size));
+        if (!buffer) throw std::bad_alloc();
+        io_ = avio_alloc_context(buffer, buffer_size, 1, &writer, nullptr, output_write, nullptr);
+        if (!io_) {
+            av_free(buffer);
+            throw std::bad_alloc();
+        }
+        io_->seekable = 0;
+    }
+    ~OutputIo() {
+        if (io_) {
+            av_freep(&io_->buffer);
+            avio_context_free(&io_);
+        }
+    }
+    AVIOContext* get() const { return io_; }
+};
+
+struct StreamPipeline {
+    int input_index{-1};
+    int output_index{-1};
+    MediaStreamType type{MediaStreamType::other};
+    MediaTransform transform{MediaTransform::copy};
+    AVStream* input_stream{};
+    AVStream* output_stream{};
+    AVCodecContext* decoder{};
+    AVCodecContext* encoder{};
+    SwsContext* sws{};
+    SwrContext* swr{};
+    AVAudioFifo* fifo{};
+    int audio_input_rate{};
+    int64_t audio_next_pts{};
+    bool audio_pts_initialized{};
+
+    // Stream-copy timestamp repair is performed after rescaling into the
+    // muxer's actual output timebase. That is important: rescaling can itself
+    // collapse two distinct source DTS values into one MP4 tick.
+    MediaTimestampRepairState copy_timestamps;
+    bool copy_repair_reported{};
+
+    ~StreamPipeline() {
+        if (fifo) av_audio_fifo_free(fifo);
+        if (swr) swr_free(&swr);
+        if (sws) sws_freeContext(sws);
+        if (encoder) avcodec_free_context(&encoder);
+        if (decoder) avcodec_free_context(&decoder);
+    }
+};
+
+void open_decoder(StreamPipeline& pipe) {
+    const auto* codec = avcodec_find_decoder(pipe.input_stream->codecpar->codec_id);
+    if (!codec) throw std::runtime_error("decoder unavailable for " + std::string(avcodec_get_name(pipe.input_stream->codecpar->codec_id)));
+    pipe.decoder = avcodec_alloc_context3(codec);
+    if (!pipe.decoder) throw std::bad_alloc();
+    av_require(avcodec_parameters_to_context(pipe.decoder, pipe.input_stream->codecpar), "copy decoder parameters");
+    pipe.decoder->pkt_timebase = pipe.input_stream->time_base;
+    av_require(avcodec_open2(pipe.decoder, codec, nullptr), "open decoder");
+}
+
+const AVCodec* h264_encoder() {
+    if (auto* codec = avcodec_find_encoder_by_name("libx264")) return codec;
+    return avcodec_find_encoder(AV_CODEC_ID_H264);
+}
+
+void setup_video_transcode(StreamPipeline& pipe, AVFormatContext* input, AVFormatContext* output,
+                           const PlaybackPlan& plan, std::chrono::milliseconds segment_duration) {
+    open_decoder(pipe);
+    const auto* codec = h264_encoder();
+    if (!codec) throw std::runtime_error("H.264 encoder is unavailable in libavcodec");
+    pipe.encoder = avcodec_alloc_context3(codec);
+    if (!pipe.encoder) throw std::bad_alloc();
+    auto* enc = pipe.encoder;
+    const auto* par = pipe.input_stream->codecpar;
+    enc->height = choose_height(par, plan);
+    enc->width = choose_width(par, enc->height);
+    enc->pix_fmt = AV_PIX_FMT_YUV420P;
+    auto frame_rate = av_guess_frame_rate(input, pipe.input_stream, nullptr);
+    if (frame_rate.num <= 0 || frame_rate.den <= 0) frame_rate = AVRational{25, 1};
+    enc->framerate = frame_rate;
+    enc->time_base = av_inv_q(frame_rate);
+    if (enc->time_base.num <= 0 || enc->time_base.den <= 0) enc->time_base = pipe.input_stream->time_base;
+    enc->gop_size = std::max(1, static_cast<int>(std::llround(av_q2d(frame_rate) * segment_duration.count() / 1000.0)));
+    enc->max_b_frames = 0;
+    if (plan.target_video_bitrate) {
+        enc->bit_rate = static_cast<int64_t>(*plan.target_video_bitrate);
+        enc->rc_max_rate = enc->bit_rate;
+        enc->rc_buffer_size = std::min<int64_t>(std::numeric_limits<int>::max(), enc->bit_rate * 2);
+    }
+    if (output->oformat->flags & AVFMT_GLOBALHEADER) enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    if (enc->priv_data) {
+        (void)av_opt_set(enc->priv_data, "preset", "veryfast", 0);
+        if (!plan.target_video_bitrate) (void)av_opt_set(enc->priv_data, "crf", "20", 0);
+    }
+    av_require(avcodec_open2(enc, codec, nullptr), "open H.264 encoder");
+    pipe.output_stream->time_base = enc->time_base;
+    av_require(avcodec_parameters_from_context(pipe.output_stream->codecpar, enc), "export video encoder parameters");
+    pipe.output_stream->codecpar->codec_tag = 0;
+    // The decoded pixel format is not guaranteed to be known until the first
+    // frame. Create/cache the scaler from actual AVFrame properties later.
+}
+
+void setup_audio_transcode(StreamPipeline& pipe, AVFormatContext* output) {
+    open_decoder(pipe);
+    const auto* codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
+    if (!codec) throw std::runtime_error("AAC encoder is unavailable in libavcodec");
+    pipe.encoder = avcodec_alloc_context3(codec);
+    if (!pipe.encoder) throw std::bad_alloc();
+    auto* enc = pipe.encoder;
+    enc->sample_rate = pipe.decoder->sample_rate > 0 ? pipe.decoder->sample_rate : 48000;
+    enc->sample_fmt = AV_SAMPLE_FMT_FLTP;
+    av_channel_layout_default(&enc->ch_layout, 2);
+    enc->time_base = AVRational{1, enc->sample_rate};
+    enc->bit_rate = 192000;
+    if (output->oformat->flags & AVFMT_GLOBALHEADER) enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    av_require(avcodec_open2(enc, codec, nullptr), "open AAC encoder");
+    pipe.output_stream->time_base = enc->time_base;
+    av_require(avcodec_parameters_from_context(pipe.output_stream->codecpar, enc), "export audio encoder parameters");
+    pipe.output_stream->codecpar->codec_tag = 0;
+    // Input sample format/layout may only become authoritative on the first
+    // decoded frame. The resampler is therefore created lazily in
+    // process_audio_frame() from that frame.
+    pipe.fifo = av_audio_fifo_alloc(enc->sample_fmt, enc->ch_layout.nb_channels,
+                                    std::max(1024, enc->frame_size * 2));
+    if (!pipe.fifo) throw std::bad_alloc();
+}
+
+void prepare_copy_packet(StreamPipeline& pipe, AVPacket* packet, int64_t origin) {
+    if (packet->pts != AV_NOPTS_VALUE) packet->pts -= origin;
+    if (packet->dts != AV_NOPTS_VALUE) packet->dts -= origin;
+
+    // The muxer may choose a different stream timebase while writing the
+    // header. Repair only after this rescale so strict DTS monotonicity is
+    // guaranteed in the values av_interleaved_write_frame actually sees.
+    av_packet_rescale_ts(packet, pipe.input_stream->time_base,
+                         pipe.output_stream->time_base);
+
+    static_assert(AV_NOPTS_VALUE == kNoMediaTimestamp);
+    MediaPacketTimestamps timestamps{packet->pts, packet->dts, packet->duration};
+    normalize_media_timestamps(pipe.copy_timestamps, timestamps);
+    packet->pts = timestamps.pts;
+    packet->dts = timestamps.dts;
+    packet->duration = timestamps.duration;
+    packet->stream_index = pipe.output_stream->index;
+    packet->pos = -1;
+}
+
+void write_mux_packet(AVFormatContext* output, AVPacket* packet) {
+    av_require(av_interleaved_write_frame(output, packet), "mux packet");
+    avio_flush(output->pb);
+}
+
+
+void encode_video_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame* decoded,
+                        AVPacket* encoded, FragmentWriter& writer,
+                        std::optional<double>& fragment_start, double& last_end) {
+    AVFrame* frame = av_frame_alloc();
+    if (!frame) throw std::bad_alloc();
+    frame->format = pipe.encoder->pix_fmt;
+    frame->width = pipe.encoder->width;
+    frame->height = pipe.encoder->height;
+    int rc = av_frame_get_buffer(frame, 32);
+    if (rc >= 0) rc = av_frame_make_writable(frame);
+    if (rc >= 0) {
+        pipe.sws = sws_getCachedContext(
+            pipe.sws, decoded->width, decoded->height, static_cast<AVPixelFormat>(decoded->format),
+            pipe.encoder->width, pipe.encoder->height, pipe.encoder->pix_fmt, SWS_BILINEAR,
+            nullptr, nullptr, nullptr);
+        if (!pipe.sws) {
+            av_frame_free(&frame);
+            throw std::runtime_error("cannot create video scaler for decoded frame");
+        }
+        sws_scale(pipe.sws, decoded->data, decoded->linesize, 0, decoded->height,
+                  frame->data, frame->linesize);
+        auto source_pts = decoded->best_effort_timestamp != AV_NOPTS_VALUE ? decoded->best_effort_timestamp : decoded->pts;
+        frame->pts = source_pts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE
+                     : av_rescale_q(source_pts, pipe.input_stream->time_base, pipe.encoder->time_base);
+        rc = avcodec_send_frame(pipe.encoder, frame);
+    }
+    av_frame_free(&frame);
+    av_require(rc, "send video frame to encoder");
+    while (true) {
+        rc = avcodec_receive_packet(pipe.encoder, encoded);
+        if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
+        av_require(rc, "receive encoded video packet");
+        auto seconds = encoded->pts == AV_NOPTS_VALUE ? 0.0 : encoded->pts * av_q2d(pipe.encoder->time_base);
+        auto duration = encoded->duration > 0 ? encoded->duration * av_q2d(pipe.encoder->time_base) : 0.0;
+        if ((encoded->flags & AV_PKT_FLAG_KEY) != 0) {
+            if (fragment_start && seconds > *fragment_start) writer.queue_duration(seconds - *fragment_start);
+            fragment_start = seconds;
+        }
+        last_end = std::max(last_end, seconds + duration);
+        av_packet_rescale_ts(encoded, pipe.encoder->time_base, pipe.output_stream->time_base);
+        encoded->stream_index = pipe.output_stream->index;
+        encoded->pos = -1;
+        av_require(av_interleaved_write_frame(output, encoded), "mux encoded video packet");
+        avio_flush(output->pb);
+        av_packet_unref(encoded);
+    }
+}
+
+void encode_audio_available(StreamPipeline& pipe, AVFormatContext* output, AVPacket* encoded,
+                            bool flush_partial) {
+    const auto frame_size = pipe.encoder->frame_size > 0 ? pipe.encoder->frame_size : 1024;
+    while (av_audio_fifo_size(pipe.fifo) >= frame_size || (flush_partial && av_audio_fifo_size(pipe.fifo) > 0)) {
+        auto available = av_audio_fifo_size(pipe.fifo);
+        AVFrame* frame = av_frame_alloc();
+        if (!frame) throw std::bad_alloc();
+        frame->nb_samples = frame_size;
+        frame->format = pipe.encoder->sample_fmt;
+        frame->sample_rate = pipe.encoder->sample_rate;
+        int rc = av_channel_layout_copy(&frame->ch_layout, &pipe.encoder->ch_layout);
+        if (rc >= 0) rc = av_frame_get_buffer(frame, 0);
+        if (rc >= 0) rc = av_frame_make_writable(frame);
+        if (rc >= 0) {
+            auto take = std::min(available, frame_size);
+            rc = av_audio_fifo_read(pipe.fifo, reinterpret_cast<void**>(frame->extended_data), take);
+            if (rc >= 0 && take < frame_size) {
+                av_samples_set_silence(frame->extended_data, take, frame_size - take,
+                                       pipe.encoder->ch_layout.nb_channels, pipe.encoder->sample_fmt);
+                rc = frame_size;
+            }
+        }
+        frame->pts = pipe.audio_next_pts;
+        pipe.audio_next_pts += frame_size;
+        if (rc >= 0) rc = avcodec_send_frame(pipe.encoder, frame);
+        av_frame_free(&frame);
+        av_require(rc, "send audio frame to encoder");
+        while (true) {
+            rc = avcodec_receive_packet(pipe.encoder, encoded);
+            if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
+            av_require(rc, "receive encoded audio packet");
+            av_packet_rescale_ts(encoded, pipe.encoder->time_base, pipe.output_stream->time_base);
+            encoded->stream_index = pipe.output_stream->index;
+            encoded->pos = -1;
+            av_require(av_interleaved_write_frame(output, encoded), "mux encoded audio packet");
+            avio_flush(output->pb);
+            av_packet_unref(encoded);
+        }
+    }
+}
+
+void ensure_audio_resampler(StreamPipeline& pipe, const AVFrame* decoded) {
+    if (pipe.swr) return;
+    auto input_rate = decoded->sample_rate > 0 ? decoded->sample_rate : pipe.decoder->sample_rate;
+    if (input_rate <= 0) throw std::runtime_error("decoded audio has no sample rate");
+    auto input_format = static_cast<AVSampleFormat>(decoded->format);
+    if (input_format == AV_SAMPLE_FMT_NONE)
+        throw std::runtime_error("decoded audio has no sample format");
+
+    AVChannelLayout input_layout{};
+    int rc = 0;
+    if (decoded->ch_layout.nb_channels > 0)
+        rc = av_channel_layout_copy(&input_layout, &decoded->ch_layout);
+    else if (pipe.decoder->ch_layout.nb_channels > 0)
+        rc = av_channel_layout_copy(&input_layout, &pipe.decoder->ch_layout);
+    else
+        av_channel_layout_default(&input_layout, 2);
+    av_require(rc, "copy decoded audio channel layout");
+
+    rc = swr_alloc_set_opts2(&pipe.swr, &pipe.encoder->ch_layout, pipe.encoder->sample_fmt,
+                             pipe.encoder->sample_rate, &input_layout, input_format,
+                             input_rate, 0, nullptr);
+    av_channel_layout_uninit(&input_layout);
+    av_require(rc, "configure audio resampler");
+    av_require(swr_init(pipe.swr), "open audio resampler");
+    pipe.audio_input_rate = input_rate;
+}
+
+void process_audio_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame* decoded, AVPacket* encoded) {
+    ensure_audio_resampler(pipe, decoded);
+    auto input_rate = decoded->sample_rate > 0 ? decoded->sample_rate : pipe.decoder->sample_rate;
+    if (!pipe.audio_pts_initialized) {
+        auto source_pts = decoded->best_effort_timestamp != AV_NOPTS_VALUE
+                              ? decoded->best_effort_timestamp
+                              : decoded->pts;
+        if (source_pts != AV_NOPTS_VALUE)
+            pipe.audio_next_pts = av_rescale_q(source_pts, pipe.input_stream->time_base,
+                                               pipe.encoder->time_base);
+        pipe.audio_pts_initialized = true;
+    }
+    auto max_samples = static_cast<int>(av_rescale_rnd(
+        swr_get_delay(pipe.swr, input_rate) + decoded->nb_samples,
+        pipe.encoder->sample_rate, input_rate, AV_ROUND_UP));
+    AVFrame* converted = av_frame_alloc();
+    if (!converted) throw std::bad_alloc();
+    converted->nb_samples = std::max(1, max_samples);
+    converted->format = pipe.encoder->sample_fmt;
+    converted->sample_rate = pipe.encoder->sample_rate;
+    int rc = av_channel_layout_copy(&converted->ch_layout, &pipe.encoder->ch_layout);
+    if (rc >= 0) rc = av_frame_get_buffer(converted, 0);
+    if (rc >= 0) {
+        auto** input_data = const_cast<const uint8_t**>(decoded->extended_data);
+        rc = swr_convert(pipe.swr, converted->extended_data, converted->nb_samples,
+                         input_data, decoded->nb_samples);
+    }
+    if (rc >= 0) converted->nb_samples = rc;
+    if (rc >= 0 && converted->nb_samples) {
+        av_require(av_audio_fifo_realloc(pipe.fifo, av_audio_fifo_size(pipe.fifo) + converted->nb_samples),
+                   "grow audio FIFO");
+        rc = av_audio_fifo_write(pipe.fifo, reinterpret_cast<void**>(converted->extended_data), converted->nb_samples);
+        if (rc != converted->nb_samples) rc = AVERROR(EIO);
+        else rc = 0;
+    }
+    av_frame_free(&converted);
+    av_require(rc, "resample audio frame");
+    encode_audio_available(pipe, output, encoded, false);
+}
+
+void flush_audio_resampler(StreamPipeline& pipe) {
+    if (!pipe.swr || !pipe.fifo || pipe.audio_input_rate <= 0) return;
+    while (true) {
+        auto delay = swr_get_delay(pipe.swr, pipe.audio_input_rate);
+        if (delay <= 0) break;
+        auto max_samples = static_cast<int>(av_rescale_rnd(
+            delay, pipe.encoder->sample_rate, pipe.audio_input_rate, AV_ROUND_UP));
+        if (max_samples <= 0) break;
+        AVFrame* converted = av_frame_alloc();
+        if (!converted) throw std::bad_alloc();
+        converted->nb_samples = max_samples;
+        converted->format = pipe.encoder->sample_fmt;
+        converted->sample_rate = pipe.encoder->sample_rate;
+        int rc = av_channel_layout_copy(&converted->ch_layout, &pipe.encoder->ch_layout);
+        if (rc >= 0) rc = av_frame_get_buffer(converted, 0);
+        if (rc >= 0) rc = swr_convert(pipe.swr, converted->extended_data, converted->nb_samples, nullptr, 0);
+        if (rc > 0) {
+            converted->nb_samples = rc;
+            av_require(av_audio_fifo_realloc(pipe.fifo, av_audio_fifo_size(pipe.fifo) + rc),
+                       "grow audio FIFO while draining resampler");
+            auto written = av_audio_fifo_write(pipe.fifo, reinterpret_cast<void**>(converted->extended_data), rc);
+            if (written != rc) rc = AVERROR(EIO);
+            else rc = 0;
+        }
+        av_frame_free(&converted);
+        av_require(rc, "drain audio resampler");
+        if (delay == swr_get_delay(pipe.swr, pipe.audio_input_rate)) break;
+    }
+}
+
+void flush_decoder(StreamPipeline& pipe, AVFormatContext* output, AVPacket* encoded,
+                   FragmentWriter& writer, std::optional<double>& fragment_start, double& last_end) {
+    if (!pipe.decoder) return;
+    int rc = avcodec_send_packet(pipe.decoder, nullptr);
+    if (rc < 0 && rc != AVERROR_EOF) av_require(rc, "flush decoder");
+    AVFrame* decoded = av_frame_alloc();
+    if (!decoded) throw std::bad_alloc();
+    while (true) {
+        rc = avcodec_receive_frame(pipe.decoder, decoded);
+        if (rc == AVERROR_EOF || rc == AVERROR(EAGAIN)) break;
+        av_require(rc, "receive flushed frame");
+        if (pipe.type == MediaStreamType::video)
+            encode_video_frame(pipe, output, decoded, encoded, writer, fragment_start, last_end);
+        else
+            process_audio_frame(pipe, output, decoded, encoded);
+        av_frame_unref(decoded);
+    }
+    av_frame_free(&decoded);
+}
+
+void flush_encoder(StreamPipeline& pipe, AVFormatContext* output, AVPacket* packet) {
+    if (!pipe.encoder) return;
+    if (pipe.type == MediaStreamType::audio) {
+        flush_audio_resampler(pipe);
+        encode_audio_available(pipe, output, packet, true);
+    }
+    int rc = avcodec_send_frame(pipe.encoder, nullptr);
+    if (rc < 0 && rc != AVERROR_EOF) av_require(rc, "flush encoder");
+    while (true) {
+        rc = avcodec_receive_packet(pipe.encoder, packet);
+        if (rc == AVERROR_EOF || rc == AVERROR(EAGAIN)) break;
+        av_require(rc, "receive flushed packet");
+        av_packet_rescale_ts(packet, pipe.encoder->time_base, pipe.output_stream->time_base);
+        packet->stream_index = pipe.output_stream->index;
+        packet->pos = -1;
+        av_require(av_interleaved_write_frame(output, packet), "mux flushed packet");
+        avio_flush(output->pb);
+        av_packet_unref(packet);
+    }
+}
+
+void run_pipeline(const MediaSource& source, const PlaybackPlan& plan,
+                  std::chrono::milliseconds segment_duration,
+                  std::shared_ptr<MediaSegmentStore> store, std::atomic_bool& cancelled,
+                  uint64_t probe_bytes, std::chrono::milliseconds analyze_duration,
+                  std::chrono::milliseconds startup_timeout) {
+    // Opening the playback pipeline repeats a small amount of container
+    // inspection because this AVFormatContext owns the decoder/muxer state.
+    // Bound that startup work independently: session creation promises a
+    // finite startup timeout, so stopping a failed generation must not join a
+    // worker that is still blocked in stream discovery.
+    InputContext input(source, MediaReadPurpose::playback, &cancelled,
+                       probe_bytes, analyze_duration, startup_timeout);
+    auto* in = input.get();
+    auto stream_info_rc = avformat_find_stream_info(in, nullptr);
+    if (stream_info_rc < 0 && input.timed_out())
+        throw std::runtime_error("playback pipeline timed out while reading stream information");
+    av_require(stream_info_rc, "read stream information");
+    if (cancelled.load()) throw std::runtime_error("stream cancelled");
+    // The deadline above is a startup guard only. Once the streams are known,
+    // media reads may legitimately continue for hours and use the normal
+    // playback cancellation path instead.
+    input.clear_deadline();
+
+    // avformat timestamps are absolute on the input timeline. Keep the public
+    // playback generation relative to zero, including after a seek. Seeking is
+    // deliberately keyframe-backward; AVFMT_AVOID_NEG_TS_MAKE_ZERO below then
+    // shifts a leading keyframe before the requested point to zero while
+    // preserving A/V offsets.
+    const int64_t input_start_us = in->start_time == AV_NOPTS_VALUE ? 0 : in->start_time;
+    const int64_t seek_target_us = input_start_us +
+        av_rescale_q(plan.seek.count(), AVRational{1, 1000}, AV_TIME_BASE_Q);
+    if (plan.seek.count() > 0) {
+        av_require(avformat_seek_file(in, -1, std::numeric_limits<int64_t>::min(), seek_target_us,
+                                     std::numeric_limits<int64_t>::max(), AVSEEK_FLAG_BACKWARD),
+                   "seek media");
+    }
+
+    AVFormatContext* out = nullptr;
+    av_require(avformat_alloc_output_context2(&out, nullptr, "mp4", nullptr), "create fragmented MP4 muxer");
+    if (!out) throw std::runtime_error("MP4 muxer is unavailable");
+    auto out_cleanup = [&] { if (out) avformat_free_context(out); };
+
+    std::vector<std::unique_ptr<StreamPipeline>> pipelines;
+    auto add_stream = [&](int index, MediaStreamType type, MediaTransform transform) {
+        if (index < 0) return;
+        if (index >= static_cast<int>(in->nb_streams)) throw std::runtime_error("selected stream index is out of range");
+        auto* input_stream = in->streams[index];
+        if ((type == MediaStreamType::video && input_stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) ||
+            (type == MediaStreamType::audio && input_stream->codecpar->codec_type != AVMEDIA_TYPE_AUDIO))
+            throw std::runtime_error("selected stream has the wrong media type");
+        auto pipe = std::make_unique<StreamPipeline>();
+        pipe->input_index = index;
+        pipe->type = type;
+        pipe->transform = transform;
+        pipe->input_stream = input_stream;
+        pipe->output_stream = avformat_new_stream(out, nullptr);
+        if (!pipe->output_stream) throw std::bad_alloc();
+        pipe->output_index = pipe->output_stream->index;
+        if (transform == MediaTransform::copy) {
+            av_require(avcodec_parameters_copy(pipe->output_stream->codecpar, input_stream->codecpar), "copy stream parameters");
+            pipe->output_stream->codecpar->codec_tag = 0;
+            if (type == MediaStreamType::video && input_stream->codecpar->codec_id == AV_CODEC_ID_HEVC)
+                pipe->output_stream->codecpar->codec_tag = codec_tag('h', 'v', 'c', '1');
+            pipe->output_stream->time_base = input_stream->time_base;
+        } else if (type == MediaStreamType::video) {
+            setup_video_transcode(*pipe, in, out, plan, segment_duration);
+        } else {
+            setup_audio_transcode(*pipe, out);
+        }
+        pipelines.push_back(std::move(pipe));
+    };
+
+    try {
+        if (plan.video != MediaTransform::omit) add_stream(plan.video_stream, MediaStreamType::video, plan.video);
+        if (plan.audio != MediaTransform::omit) add_stream(plan.audio_stream, MediaStreamType::audio, plan.audio);
+        if (pipelines.empty()) throw std::runtime_error("playback plan contains no output streams");
+
+        FragmentWriter writer(store, segment_duration);
+        OutputIo output_io(writer);
+        out->pb = output_io.get();
+        out->flags |= AVFMT_FLAG_CUSTOM_IO;
+        out->avoid_negative_ts = AVFMT_AVOID_NEG_TS_MAKE_ZERO;
+
+        AVDictionary* options = nullptr;
+        av_dict_set(&options, "movflags", "frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset", 0);
+        const bool has_video = std::any_of(pipelines.begin(), pipelines.end(), [](const auto& p) {
+            return p->type == MediaStreamType::video;
+        });
+        if (!has_video) {
+            av_dict_set(&options, "frag_duration",
+                        std::to_string(static_cast<int64_t>(segment_duration.count()) * 1000).c_str(), 0);
+        }
+        int rc = avformat_write_header(out, &options);
+        av_dict_free(&options);
+        av_require(rc, "write fragmented MP4 header");
+        avio_flush(out->pb);
+
+        std::map<int, StreamPipeline*> by_input;
+        for (auto& pipe : pipelines) by_input[pipe->input_index] = pipe.get();
+
+        AVPacket* packet = av_packet_alloc();
+        AVPacket* encoded = av_packet_alloc();
+        AVFrame* decoded = av_frame_alloc();
+        if (!packet || !encoded || !decoded) throw std::bad_alloc();
+        std::optional<double> fragment_start;
+        double last_video_end = 0.0;
+
+        try {
+            while (!cancelled.load() && (rc = av_read_frame(in, packet)) >= 0) {
+                auto it = by_input.find(packet->stream_index);
+                if (it == by_input.end()) {
+                    av_packet_unref(packet);
+                    continue;
+                }
+                auto& pipe = *it->second;
+                const auto origin = av_rescale_q(seek_target_us, AV_TIME_BASE_Q,
+                                                 pipe.input_stream->time_base);
+                if (pipe.transform == MediaTransform::copy) {
+                    const auto repairs_before = pipe.copy_timestamps.repair_count();
+                    prepare_copy_packet(pipe, packet, origin);
+                    if (!pipe.copy_repair_reported && pipe.copy_timestamps.repair_count() != repairs_before) {
+                        pipe.copy_repair_reported = true;
+                        Log::warn("libav remux repairing packet timestamps media=" + source.media_id +
+                                  " stream=" + std::to_string(pipe.input_index));
+                    }
+                    if (pipe.type == MediaStreamType::video) {
+                        auto seconds = packet->pts == AV_NOPTS_VALUE ? 0.0 : packet->pts * av_q2d(pipe.output_stream->time_base);
+                        auto duration = packet->duration > 0 ? packet->duration * av_q2d(pipe.output_stream->time_base) : 0.0;
+                        if ((packet->flags & AV_PKT_FLAG_KEY) != 0) {
+                            if (fragment_start && seconds > *fragment_start) writer.queue_duration(seconds - *fragment_start);
+                            fragment_start = seconds;
+                        }
+                        last_video_end = std::max(last_video_end, seconds + duration);
+                    }
+                    write_mux_packet(out, packet);
+                } else {
+                    if (packet->pts != AV_NOPTS_VALUE) packet->pts -= origin;
+                    if (packet->dts != AV_NOPTS_VALUE) packet->dts -= origin;
+                    av_require(avcodec_send_packet(pipe.decoder, packet), "send packet to decoder");
+                    while (true) {
+                        rc = avcodec_receive_frame(pipe.decoder, decoded);
+                        if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
+                        av_require(rc, "receive decoded frame");
+                        if (pipe.type == MediaStreamType::video)
+                            encode_video_frame(pipe, out, decoded, encoded, writer, fragment_start, last_video_end);
+                        else
+                            process_audio_frame(pipe, out, decoded, encoded);
+                        av_frame_unref(decoded);
+                    }
+                }
+                av_packet_unref(packet);
+            }
+            if (rc < 0 && rc != AVERROR_EOF && !cancelled.load())
+                av_require(rc, "read media packet");
+
+            if (!cancelled.load()) {
+                for (const auto& pipe : pipelines) {
+                    if (pipe->transform != MediaTransform::copy || !pipe->copy_timestamps.repair_count()) continue;
+                    const auto& ts = pipe->copy_timestamps;
+                    Log::info("libav remux timestamp repairs media=" + source.media_id +
+                              " stream=" + std::to_string(pipe->input_index) +
+                              " missing_pts=" + std::to_string(ts.missing_pts) +
+                              " missing_dts=" + std::to_string(ts.missing_dts) +
+                              " nonmonotonic_dts=" + std::to_string(ts.nonmonotonic_dts) +
+                              " pts_before_dts=" + std::to_string(ts.pts_before_dts));
+                }
+                for (auto& pipe : pipelines)
+                    if (pipe->transform == MediaTransform::transcode)
+                        flush_decoder(*pipe, out, encoded, writer, fragment_start, last_video_end);
+                for (auto& pipe : pipelines)
+                    if (pipe->transform == MediaTransform::transcode)
+                        flush_encoder(*pipe, out, encoded);
+                double final_duration = 0.0;
+                if (fragment_start && last_video_end > *fragment_start) final_duration = last_video_end - *fragment_start;
+                av_require(av_write_trailer(out), "write fragmented MP4 trailer");
+                avio_flush(out->pb);
+                writer.finish(final_duration);
+            }
+        } catch (...) {
+            av_frame_free(&decoded);
+            av_packet_free(&encoded);
+            av_packet_free(&packet);
+            throw;
+        }
+        av_frame_free(&decoded);
+        av_packet_free(&encoded);
+        av_packet_free(&packet);
+    } catch (...) {
+        out_cleanup();
+        throw;
+    }
+    out_cleanup();
+}
+
+class LibavSession final : public MediaEngineSession {
+    MediaSource source_;
+    PlaybackPlan plan_;
+    std::chrono::milliseconds segment_duration_;
+    uint64_t probe_bytes_{};
+    std::chrono::milliseconds analyze_duration_{};
+    std::chrono::milliseconds startup_timeout_{};
+    std::shared_ptr<MediaSegmentStore> store_;
+    std::jthread worker_;
+    std::atomic_bool cancelled_{};
+    std::atomic_bool running_{true};
+    std::atomic_int exit_code_{-1};
+    mutable std::mutex diagnostics_mutex_;
+    std::string diagnostics_;
+
+    void run(std::stop_token stop) {
+        try {
+            if (stop.stop_requested()) cancelled_.store(true);
+            run_pipeline(source_, plan_, segment_duration_, store_, cancelled_,
+                         probe_bytes_, analyze_duration_, startup_timeout_);
+            if (cancelled_.load()) {
+                exit_code_.store(0);
+            } else {
+                store_->finish();
+                exit_code_.store(0);
+            }
+        } catch (const std::exception& e) {
+            if (!cancelled_.load()) {
+                {
+                    std::lock_guard lock(diagnostics_mutex_);
+                    diagnostics_ = e.what();
+                }
+                store_->fail(e.what());
+                Log::warn("libav playback pipeline failed for " + source_.media_id + ": " + e.what());
+                exit_code_.store(1);
+            } else {
+                exit_code_.store(0);
+            }
+        }
+        running_.store(false);
+    }
+
+  public:
+    LibavSession(MediaSource source, PlaybackPlan plan, std::chrono::milliseconds segment_duration,
+                 size_t max_ahead_segments, uint64_t memory_limit,
+                 std::filesystem::path spill_directory, uint64_t probe_bytes,
+                 std::chrono::milliseconds analyze_duration,
+                 std::chrono::milliseconds startup_timeout)
+        : source_(std::move(source)), plan_(std::move(plan)), segment_duration_(segment_duration),
+          probe_bytes_(probe_bytes), analyze_duration_(analyze_duration),
+          startup_timeout_(startup_timeout),
+          store_(std::make_shared<MediaSegmentStore>(max_ahead_segments, memory_limit,
+                                                     std::move(spill_directory), segment_duration)) {
+        worker_ = std::jthread([this](std::stop_token stop) { run(stop); });
+    }
+
+    ~LibavSession() override { stop(); }
+    bool running() const override { return running_.load(); }
     std::optional<int> exit_code() const override {
-        std::lock_guard lock(process_mutex_);
-        (void)poll_locked();
-        if (exit_code_ < 0) return {};
-        return exit_code_;
+        auto code = exit_code_.load();
+        return code < 0 ? std::optional<int>{} : std::optional<int>{code};
     }
-
     std::string diagnostics() const override {
         std::lock_guard lock(diagnostics_mutex_);
         return diagnostics_;
     }
-
-    void set_paused(bool paused) override {
-        std::lock_guard lock(process_mutex_);
-        if (!poll_locked()) return;
-        if (paused_ == paused || pid_ <= 0) return;
-        if (::kill(pid_, paused ? SIGSTOP : SIGCONT) == 0) {
-            paused_ = paused;
-        } else if (errno != ESRCH) {
-            Log::debug("ffmpeg pause/resume signal failed: " + std::string(std::strerror(errno)));
-        }
-    }
-
+    std::shared_ptr<MediaSegmentStore> segments() const override { return store_; }
+    void note_segment_requested(uint64_t index) override { store_->note_requested(index); }
     void stop() override {
-        {
-            std::lock_guard lock(process_mutex_);
-            if (poll_locked() && pid_ > 0) {
-                if (paused_) {
-                    (void)::kill(pid_, SIGCONT);
-                    paused_ = false;
-                }
-                (void)::kill(pid_, SIGTERM);
-                for (int i = 0; i < 20; ++i) {
-                    int status = 0;
-                    auto result = waitpid(pid_, &status, WNOHANG);
-                    if (result == pid_) {
-                        record_status_locked(status);
-                        break;
-                    }
-                    if (result < 0 && errno == ECHILD) {
-                        running_ = false;
-                        pid_ = -1;
-                        break;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(25));
-                }
-                if (pid_ > 0) {
-                    (void)::kill(pid_, SIGKILL);
-                    int status = 0;
-                    while (waitpid(pid_, &status, 0) < 0 && errno == EINTR) {}
-                    running_ = false;
-                    paused_ = false;
-                    exit_code_ = 137;
-                    pid_ = -1;
-                }
-            }
+        cancelled_.store(true);
+        store_->cancel();
+        if (worker_.joinable()) {
+            worker_.request_stop();
+            worker_.join();
         }
-        if (stderr_thread_.joinable()) {
-            stderr_thread_.request_stop();
-            stderr_thread_.join();
-        }
+        running_.store(false);
     }
 };
-std::unique_ptr<MediaEngineSession> spawn_ffmpeg(std::vector<std::string> args) {
-    int err_pipe[2]{-1, -1};
-    if (pipe(err_pipe)) throw std::runtime_error("ffmpeg stderr pipe failed");
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(err_pipe[0]); close(err_pipe[1]);
-        throw std::runtime_error("ffmpeg fork failed");
-    }
-    if (pid == 0) {
-        int devnull = open("/dev/null", O_RDWR);
-        if (devnull >= 0) {
-            (void)dup2(devnull, STDIN_FILENO);
-            (void)dup2(devnull, STDOUT_FILENO);
-            close(devnull);
-        }
-        (void)dup2(err_pipe[1], STDERR_FILENO);
-        close(err_pipe[0]); close(err_pipe[1]);
-        auto ptrs = argv_ptrs(args);
-        execvp(ptrs[0], ptrs.data());
-        _exit(127);
-    }
-    close(err_pipe[1]);
-    return std::make_unique<ProcessSession>(pid, err_pipe[0]);
-}
 
-class FfmpegProcessEngine final : public MediaEngine {
+class LibavMediaEngine final : public MediaEngine {
     StreamingConfig config_;
     MediaEngineStatus status_;
 
   public:
-    explicit FfmpegProcessEngine(StreamingConfig config) : config_(std::move(config)) {
-        auto ffmpeg = run_capture({config_.ffmpeg, "-version"}, 256 * 1024);
-        status_.ffmpeg_available = ffmpeg.exit_code == 0;
-        if (status_.ffmpeg_available) {
-            auto newline = ffmpeg.out.find('\n');
-            status_.ffmpeg_version = ffmpeg.out.substr(0, newline);
-        }
-        auto ffprobe = run_capture({config_.ffprobe, "-version"}, 256 * 1024);
-        status_.ffprobe_available = ffprobe.exit_code == 0;
+    explicit LibavMediaEngine(StreamingConfig config) : config_(std::move(config)) {
+        status_.available = true;
+        status_.backend = "libav";
+        status_.version = av_version_info();
+        status_.h264_encoder = h264_encoder() != nullptr;
+        status_.aac_encoder = avcodec_find_encoder(AV_CODEC_ID_AAC) != nullptr;
     }
 
     MediaEngineStatus status() const override { return status_; }
 
-    MediaProbeResult probe(const MediaSource& source) override {
-        if (!status_.ffprobe_available) throw std::runtime_error("ffprobe is unavailable");
-        auto result = run_capture({config_.ffprobe, "-v", "error", "-print_format", "json",
-                                   "-show_format", "-show_streams", source.url});
-        if (result.exit_code != 0)
-            throw std::runtime_error("ffprobe failed: " + result.err);
-        auto root = Json::parse(result.out);
-        MediaProbeResult out;
-        if (auto format = root.find("format"); format && format->isObject()) {
-            out.format = json_string(format->find("format_name")).value_or("");
-            out.duration_seconds = json_double(format->find("duration"));
-            out.bitrate = json_u64(format->find("bit_rate"));
+    MediaProbeResult probe(const MediaSource& source, std::chrono::milliseconds timeout) override {
+        auto started = Clock::now();
+        if (timeout.count() <= 0) timeout = config_.probe_timeout;
+        Log::debug("playback probe begin media=" + source.media_id + " size=" + std::to_string(source.size));
+        InputContext input(source, MediaReadPurpose::probe, nullptr, config_.probe_bytes,
+                           config_.probe_analyze_duration, timeout);
+        auto* format = input.get();
+        auto probe_rc = avformat_find_stream_info(format, nullptr);
+        if (probe_rc < 0 && input.timed_out())
+            throw std::runtime_error("media probe timed out after " +
+                                     std::to_string(timeout.count()) + " ms");
+        av_require(probe_rc, "read stream information");
+
+        MediaProbeResult result;
+        if (format->iformat && format->iformat->name) result.format = format->iformat->name;
+        if (format->duration != AV_NOPTS_VALUE && format->duration > 0)
+            result.duration_seconds = static_cast<double>(format->duration) / AV_TIME_BASE;
+        if (format->bit_rate > 0) result.bitrate = static_cast<uint64_t>(format->bit_rate);
+        for (unsigned i = 0; i < format->nb_streams; ++i) {
+            auto* stream = format->streams[i];
+            auto* par = stream->codecpar;
+            MediaStreamInfo info;
+            info.index = static_cast<int>(i);
+            info.type = stream_type(par->codec_type);
+            info.codec = avcodec_get_name(par->codec_id);
+            if (const char* profile = avcodec_profile_name(par->codec_id, par->profile)) info.profile = profile;
+            info.language = stream_language(stream);
+            info.width = par->width;
+            info.height = par->height;
+            info.channels = par->ch_layout.nb_channels;
+            info.sample_rate = par->sample_rate;
+            info.bit_depth = par->bits_per_raw_sample;
+            info.default_stream = (stream->disposition & AV_DISPOSITION_DEFAULT) != 0;
+            info.forced = (stream->disposition & AV_DISPOSITION_FORCED) != 0;
+            result.streams.push_back(std::move(info));
         }
-        if (auto streams = root.find("streams"); streams && streams->isArray()) {
-            for (const auto& value : streams->asArray()) {
-                if (!value.isObject()) continue;
-                MediaStreamInfo stream;
-                stream.index = json_int(value.find("index"), -1);
-                stream.type = stream_type(json_string(value.find("codec_type")).value_or(""));
-                stream.codec = json_string(value.find("codec_name")).value_or("");
-                stream.profile = json_string(value.find("profile")).value_or("");
-                stream.width = json_int(value.find("width"));
-                stream.height = json_int(value.find("height"));
-                stream.channels = json_int(value.find("channels"));
-                stream.sample_rate = json_int(value.find("sample_rate"));
-                stream.bit_depth = json_int(value.find("bits_per_raw_sample"));
-                if (auto tags = value.find("tags"); tags && tags->isObject())
-                    stream.language = json_string(tags->find("language")).value_or("");
-                if (auto disposition = value.find("disposition"); disposition && disposition->isObject()) {
-                    stream.default_stream = json_int(disposition->find("default")) != 0;
-                    stream.forced = json_int(disposition->find("forced")) != 0;
-                }
-                out.streams.push_back(std::move(stream));
-            }
-        }
-        return out;
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
+        Log::debug("playback probe end media=" + source.media_id + " elapsed_ms=" + std::to_string(elapsed) +
+                   " streams=" + std::to_string(result.streams.size()));
+        return result;
     }
 
     std::unique_ptr<MediaEngineSession> start_hls(
-        const MediaSource& source, const PlaybackPlan& plan,
-        const std::filesystem::path& output_directory,
-        std::chrono::milliseconds segment_duration) override {
-        if (!status_.ffmpeg_available) throw std::runtime_error("ffmpeg is unavailable");
-        std::filesystem::create_directories(output_directory);
-        const auto playlist = output_directory / "master.m3u8";
-        const auto segment_pattern = output_directory / "segment-%06d.m4s";
-        std::vector<std::string> args{config_.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "warning", "-y"};
-        if (plan.seek.count() > 0) {
-            args.push_back("-ss");
-            args.push_back(std::to_string(static_cast<double>(plan.seek.count()) / 1000.0));
-        }
-        args.insert(args.end(), {"-i", source.url});
-        if (plan.video_stream >= 0) args.insert(args.end(), {"-map", "0:" + std::to_string(plan.video_stream)});
-        if (plan.audio_stream >= 0) args.insert(args.end(), {"-map", "0:" + std::to_string(plan.audio_stream)});
-        else args.push_back("-an");
-        args.push_back("-sn");
-
-        if (plan.video == MediaTransform::copy) {
-            args.insert(args.end(), {"-c:v", "copy"});
-            if (plan.video_codec == "hevc") args.insert(args.end(), {"-tag:v", "hvc1"});
-        } else if (plan.video == MediaTransform::transcode) {
-            args.insert(args.end(), {"-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p"});
-            if (plan.target_height) args.insert(args.end(), {"-vf", "scale=-2:" + std::to_string(*plan.target_height)});
-            if (plan.target_video_bitrate) {
-                args.insert(args.end(), {"-b:v", std::to_string(*plan.target_video_bitrate),
-                                         "-maxrate", std::to_string(*plan.target_video_bitrate),
-                                         "-bufsize", std::to_string(*plan.target_video_bitrate * 2)});
-            } else {
-                args.insert(args.end(), {"-crf", "20"});
-            }
-        } else {
-            args.push_back("-vn");
-        }
-
-        if (plan.audio_stream >= 0) {
-            if (plan.audio == MediaTransform::copy)
-                args.insert(args.end(), {"-c:a", "copy"});
-            else
-                args.insert(args.end(), {"-c:a", "aac", "-b:a", "192k", "-ac", "2"});
-        }
-
-        const auto segment_seconds = std::max(1.0, static_cast<double>(segment_duration.count()) / 1000.0);
-        if (plan.video == MediaTransform::transcode) {
-            args.insert(args.end(), {"-force_key_frames", "expr:gte(t,n_forced*" + std::to_string(segment_seconds) + ")"});
-        }
-        args.insert(args.end(), {"-f", "hls", "-hls_time", std::to_string(segment_seconds),
-                                 "-hls_list_size", "0", "-hls_segment_type", "fmp4",
-                                 "-hls_fmp4_init_filename", "init.mp4",
-                                 "-hls_segment_filename", segment_pattern.string(),
-                                 "-hls_flags", "independent_segments+temp_file", playlist.string()});
-        Log::debug("media engine starting ffmpeg for " + source.media_id + " mode=" + playback_mode_name(plan.mode));
-        return spawn_ffmpeg(std::move(args));
+        const MediaSource& source, const PlaybackPlan& plan, std::chrono::milliseconds segment_duration,
+        size_t max_ahead_segments, uint64_t segment_memory_bytes,
+        const std::filesystem::path& spill_directory) override {
+        if (!status_.available) throw std::runtime_error("libav media engine is unavailable");
+        if (plan.video == MediaTransform::transcode && !status_.h264_encoder)
+            throw std::runtime_error("H.264 encoder is unavailable");
+        if (plan.audio == MediaTransform::transcode && !status_.aac_encoder)
+            throw std::runtime_error("AAC encoder is unavailable");
+        Log::debug("media engine starting libav pipeline media=" + source.media_id +
+                   " mode=" + playback_mode_name(plan.mode));
+        return std::make_unique<LibavSession>(source, plan, segment_duration, max_ahead_segments,
+                                              segment_memory_bytes, spill_directory,
+                                              config_.probe_bytes, config_.probe_analyze_duration,
+                                              config_.startup_timeout);
     }
 
-    void extract_webvtt(const MediaSource& source, int subtitle_stream,
-                        const std::filesystem::path& output_file,
-                        std::chrono::milliseconds seek) override {
-        if (!status_.ffmpeg_available) throw std::runtime_error("ffmpeg is unavailable");
-        std::vector<std::string> args{config_.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "warning", "-y"};
-        if (seek.count() > 0) {
-            args.push_back("-ss");
-            args.push_back(std::to_string(static_cast<double>(seek.count()) / 1000.0));
+    std::string extract_webvtt(const MediaSource& source, int subtitle_stream,
+                               std::chrono::milliseconds seek) override {
+        std::atomic_bool cancelled{};
+        InputContext input(source, MediaReadPurpose::subtitle, &cancelled, config_.probe_bytes,
+                           config_.probe_analyze_duration, config_.probe_timeout);
+        auto* format = input.get();
+        auto probe_rc = avformat_find_stream_info(format, nullptr);
+        if (probe_rc < 0 && input.timed_out())
+            throw std::runtime_error("subtitle probe timed out after " +
+                                     std::to_string(config_.probe_timeout.count()) + " ms");
+        av_require(probe_rc, "read subtitle stream information");
+        input.clear_deadline();
+        if (subtitle_stream < 0 || subtitle_stream >= static_cast<int>(format->nb_streams) ||
+            format->streams[subtitle_stream]->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE)
+            throw std::invalid_argument("selected subtitle stream does not exist");
+
+        auto* stream = format->streams[subtitle_stream];
+        const auto* codec = avcodec_find_decoder(stream->codecpar->codec_id);
+        if (!codec) throw std::runtime_error("subtitle decoder is unavailable");
+        AVCodecContext* decoder = avcodec_alloc_context3(codec);
+        if (!decoder) throw std::bad_alloc();
+        try {
+            av_require(avcodec_parameters_to_context(decoder, stream->codecpar), "copy subtitle decoder parameters");
+            // Legacy subtitle decoding reports AVSubtitle::pts in AV_TIME_BASE.
+            // libavcodec needs the packet time base to perform that rescale.
+            decoder->pkt_timebase = stream->time_base;
+            av_require(avcodec_open2(decoder, codec, nullptr), "open subtitle decoder");
+            if (seek.count() > 0) {
+                auto target = av_rescale_q(seek.count(), AVRational{1, 1000}, AV_TIME_BASE_Q);
+                av_require(avformat_seek_file(format, -1, std::numeric_limits<int64_t>::min(), target,
+                                             std::numeric_limits<int64_t>::max(), AVSEEK_FLAG_BACKWARD),
+                           "seek subtitle stream");
+            }
+            std::ostringstream out;
+            out << "WEBVTT\n\n";
+            AVPacket* packet = av_packet_alloc();
+            if (!packet) throw std::bad_alloc();
+            uint64_t cue = 0;
+            int rc = 0;
+            while ((rc = av_read_frame(format, packet)) >= 0) {
+                if (packet->stream_index != subtitle_stream) {
+                    av_packet_unref(packet);
+                    continue;
+                }
+                AVSubtitle subtitle{};
+                int got = 0;
+                rc = avcodec_decode_subtitle2(decoder, &subtitle, &got, packet);
+                av_packet_unref(packet);
+                av_require(rc, "decode subtitle");
+                if (!got) continue;
+                auto base_ms = subtitle.pts == AV_NOPTS_VALUE
+                                   ? 0
+                                   : av_rescale_q(subtitle.pts, AV_TIME_BASE_Q, AVRational{1, 1000});
+                base_ms -= seek.count();
+                auto begin = base_ms + subtitle.start_display_time;
+                auto end = base_ms + subtitle.end_display_time;
+                if (end <= begin) end = begin + 2000;
+                std::string text;
+                for (unsigned i = 0; i < subtitle.num_rects; ++i) {
+                    auto* rect = subtitle.rects[i];
+                    std::string part;
+                    if (rect->text) part = rect->text;
+                    else if (rect->ass) part = plain_ass_text(rect->ass);
+                    if (!part.empty()) {
+                        if (!text.empty()) text.push_back('\n');
+                        text += part;
+                    }
+                }
+                if (!text.empty() && end > 0) {
+                    out << ++cue << '\n' << format_vtt_time(begin) << " --> " << format_vtt_time(end)
+                        << '\n' << text << "\n\n";
+                }
+                avsubtitle_free(&subtitle);
+            }
+            av_packet_free(&packet);
+            if (rc < 0 && rc != AVERROR_EOF) av_require(rc, "read subtitle packets");
+            avcodec_free_context(&decoder);
+            return out.str();
+        } catch (...) {
+            avcodec_free_context(&decoder);
+            throw;
         }
-        args.insert(args.end(), {"-i", source.url, "-map", "0:" + std::to_string(subtitle_stream),
-                                 "-c:s", "webvtt", output_file.string()});
-        auto result = run_capture(std::move(args), 4 * 1024 * 1024);
-        if (result.exit_code != 0)
-            throw std::runtime_error("subtitle conversion failed: " + result.err);
     }
 };
 
 } // namespace
 
-std::unique_ptr<MediaEngine> make_ffmpeg_process_engine(const StreamingConfig& config) {
-    return std::make_unique<FfmpegProcessEngine>(config);
+std::unique_ptr<MediaEngine> make_libav_media_engine(const StreamingConfig& config) {
+    return std::make_unique<LibavMediaEngine>(config);
 }
 
 std::string playback_mode_name(PlaybackMode mode) {

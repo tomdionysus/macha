@@ -42,9 +42,11 @@ class DistributedStore {
     std::vector<NodeInfo> owners(const ObjectId&) const;
     bool put_on(const NodeInfo&, const ObjectId&, std::span<const uint8_t>, bool foreground);
     std::optional<Bytes> get_from(const NodeInfo&, const ObjectId&, FrameType,
-                                  const std::shared_ptr<SharedFetch>&);
+                                  const std::shared_ptr<SharedFetch>&,
+                                  Clock::time_point deadline, std::atomic_bool* cancelled);
     std::optional<Bytes> get_remote(const ObjectId&, size_t stripe, FrameType, bool foreground,
-                                    bool opportunistic_persist);
+                                    bool opportunistic_persist, Clock::time_point deadline = {},
+                                    std::atomic_bool* cancelled = nullptr);
     void note_foreground(uint64_t);
     void note_network(uint64_t, Clock::duration);
 
@@ -52,7 +54,8 @@ class DistributedStore {
     explicit DistributedStore(NodeRuntime& n) : n_(n) {}
     ObjectId put(std::span<const uint8_t>);
     bool put(const ObjectId&, std::span<const uint8_t>);
-    std::optional<Bytes> get(const ObjectId&, size_t stripe = 0, bool foreground = true);
+    std::optional<Bytes> get(const ObjectId&, size_t stripe = 0, bool foreground = true,
+                             Clock::time_point deadline = {}, std::atomic_bool* cancelled = nullptr);
     bool has_on(const NodeInfo&, const ObjectId&);
     bool should_own(const ObjectId&) const;
     size_t replicate_all(const ObjectId&, std::span<const uint8_t>, bool foreground = false);

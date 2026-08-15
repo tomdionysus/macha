@@ -17,6 +17,11 @@ int64_t steady_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch())
         .count();
 }
+
+bool read_aborted(Clock::time_point deadline, const std::atomic_bool* cancelled) {
+    return (cancelled && cancelled->load(std::memory_order_relaxed)) ||
+           (deadline != Clock::time_point{} && Clock::now() >= deadline);
+}
 } // namespace
 
 void DistributedStore::note_foreground(uint64_t bytes) {
@@ -193,7 +198,9 @@ bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,
 
 std::optional<Bytes> DistributedStore::get_from(const NodeInfo& target, const ObjectId& id,
                                                 FrameType frame_type,
-                                                const std::shared_ptr<SharedFetch>& shared) {
+                                                const std::shared_ptr<SharedFetch>& shared,
+                                                Clock::time_point deadline,
+                                                std::atomic_bool* cancelled) {
     try {
         if (target.id == n_.node_id())
             return n_.local_store().get(id);
@@ -211,6 +218,24 @@ std::optional<Bytes> DistributedStore::get_from(const NodeInfo& target, const Ob
             }
             if (frame_type_priority(effective) < frame_type_priority(frame_type))
                 rpc.promote(effective);
+        }
+        while (rpc.wait_for(std::chrono::milliseconds(25)) != std::future_status::ready) {
+            if (read_aborted(deadline, cancelled)) {
+                // A shared fetch may have acquired other waiters after this
+                // caller became its leader.  Cancellation can abort the wire
+                // RPC only while nobody else depends on it; otherwise finish
+                // the shared transfer and let the cancelled caller discard it.
+                const bool may_cancel = !shared ||
+                    shared->waiters.load(std::memory_order_relaxed) == 0;
+                if (!may_cancel)
+                    continue;
+                rpc.cancel();
+                if (shared) {
+                    std::lock_guard lock(shared->mutex);
+                    shared->promote_network = {};
+                }
+                return {};
+            }
         }
         auto reply = rpc.get();
         if (shared) {
@@ -239,7 +264,58 @@ std::optional<Bytes> DistributedStore::get_from(const NodeInfo& target, const Ob
 
 std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t stripe,
                                                   FrameType frame_type, bool foreground,
-                                                  bool opportunistic_persist) {
+                                                  bool opportunistic_persist,
+                                                  Clock::time_point deadline,
+                                                  std::atomic_bool* cancelled) {
+    // A hard wall-clock deadline belongs to one caller, not to an ObjectId-wide
+    // shared fetch. Probe reads therefore use a private transfer so expiry can
+    // abort the underlying RPC. Cancellation-only playback reads retain normal
+    // shared-fetch deduplication/promotion; a stopped caller may abandon its wait
+    // but does not cancel an ObjectId transfer other readers may still need.
+    if (deadline != Clock::time_point{}) {
+        auto try_private = [&](std::vector<NodeInfo> candidates) -> std::optional<Bytes> {
+            std::erase_if(candidates, [&](const NodeInfo& node) { return node.id == n_.node_id(); });
+            size_t attempt = 0;
+            const auto work = foreground ? ReplicaWorkClass::foreground
+                                         : ReplicaWorkClass::speculative;
+            while (!candidates.empty() && !read_aborted(deadline, cancelled)) {
+                auto ordered = replica_selector_.order(candidates, stripe + attempt, work);
+                if (ordered.empty()) break;
+                const auto target = ordered.front();
+                auto found = std::find_if(candidates.begin(), candidates.end(), [&](const NodeInfo& node) {
+                    return node.id == target.id;
+                });
+                if (found != candidates.end()) candidates.erase(found);
+
+                auto started = Clock::now();
+                replica_selector_.started(target, work);
+                auto data = get_from(target, id, frame_type, nullptr, deadline, cancelled);
+                replica_selector_.finished(target, work, data ? data->size() : 0,
+                                           Clock::now() - started, data.has_value());
+                if (data) return data;
+                ++attempt;
+            }
+            return {};
+        };
+
+        auto preferred = owners(id);
+        std::set<NodeId> preferred_ids;
+        for (const auto& node : preferred) preferred_ids.insert(node.id);
+        auto data = try_private(std::move(preferred));
+        if (!data && !read_aborted(deadline, cancelled)) {
+            auto fallback = ranked(id);
+            std::erase_if(fallback, [&](const NodeInfo& node) {
+                return preferred_ids.contains(node.id);
+            });
+            data = try_private(std::move(fallback));
+        }
+        if (data) {
+            if (foreground) note_foreground(data->size());
+            if (opportunistic_persist) n_.enqueue_fetched(id, *data, should_own(id));
+        }
+        return data;
+    }
+
     std::shared_ptr<SharedFetch> shared;
     bool leader = false;
     {
@@ -282,7 +358,11 @@ std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t str
             lock.lock();
         }
 
-        shared->cv.wait(lock, [&] { return shared->done; });
+        while (!shared->done && !read_aborted(deadline, cancelled))
+            shared->cv.wait_for(lock, std::chrono::milliseconds(25));
+        shared->waiters.fetch_sub(1, std::memory_order_relaxed);
+        if (!shared->done)
+            return {};
         if (shared->result) {
             if (foreground && !shared->foreground_accounted) {
                 note_foreground(shared->result->size());
@@ -337,7 +417,7 @@ std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t str
     auto try_candidates = [&](std::vector<NodeInfo> candidates) -> std::optional<Bytes> {
         std::erase_if(candidates, [&](const NodeInfo& node) { return node.id == n_.node_id(); });
         size_t attempt = 0;
-        while (!candidates.empty()) {
+        while (!candidates.empty() && !read_aborted(deadline, cancelled)) {
             ReplicaWorkClass work;
             {
                 std::lock_guard lock(shared->mutex);
@@ -370,7 +450,11 @@ std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t str
                 std::lock_guard lock(shared->mutex);
                 transfer_type = shared->frame_type;
             }
-            auto data = get_from(target, id, transfer_type, shared);
+            // A shared transfer belongs to the ObjectId, not to whichever
+            // caller happened to become its leader.  A cancelled leader may
+            // abort the wire RPC while it has no other waiters; once another
+            // reader has joined, the shared transfer is allowed to complete.
+            auto data = get_from(target, id, transfer_type, shared, {}, cancelled);
             {
                 std::lock_guard lock(shared->mutex);
                 replica_selector_.finished(target, shared->active_class,
@@ -408,7 +492,9 @@ std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t str
     return finish({});
 }
 
-std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, bool foreground) {
+std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, bool foreground,
+                                           Clock::time_point deadline,
+                                           std::atomic_bool* cancelled) {
     auto started = Clock::now();
     if (auto data = n_.local_store().get(id)) {
         if (foreground)
@@ -434,9 +520,11 @@ std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, bo
         return cached;
     }
 
+    if (read_aborted(deadline, cancelled))
+        return {};
     auto data = get_remote(id, stripe,
                            foreground ? FrameType::foreground : FrameType::speculative,
-                           foreground, foreground);
+                           foreground, foreground, deadline, cancelled);
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
     Log::debug("DIAG object-get id=" + to_string(id) +
                " source=remote result=" + std::to_string(data ? 1 : 0) +

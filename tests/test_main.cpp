@@ -7,6 +7,7 @@
 #include "local_store.hpp"
 #include "metadata.hpp"
 #include "media_catalogue.hpp"
+#include "media_timestamps.hpp"
 #include "net.hpp"
 #include "placement.hpp"
 #include "service.hpp"
@@ -20,11 +21,13 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <netinet/in.h>
 #include <openssl/crypto.h>
 #include <random>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <sys/socket.h>
 #include <thread>
@@ -73,18 +76,24 @@ class TempDir {
 
 class FakeMediaEngineSession final : public MediaEngineSession {
     bool running_{true};
+    std::shared_ptr<MediaSegmentStore> segments_;
   public:
+    explicit FakeMediaEngineSession(std::shared_ptr<MediaSegmentStore> segments)
+        : segments_(std::move(segments)) {}
     bool running() const override { return running_; }
     std::optional<int> exit_code() const override { return running_ ? std::optional<int>{} : std::optional<int>{0}; }
     std::string diagnostics() const override { return {}; }
-    void set_paused(bool) override {}
-    void stop() override { running_ = false; }
+    std::shared_ptr<MediaSegmentStore> segments() const override { return segments_; }
+    void note_segment_requested(uint64_t index) override { segments_->note_requested(index); }
+    void stop() override { running_ = false; segments_->cancel(); }
 };
 
 class FakeMediaEngine final : public MediaEngine {
+    mutable std::mutex mutex_;
+    std::vector<PlaybackPlan> started_plans_;
   public:
-    MediaEngineStatus status() const override { return {true, true, "fake-ffmpeg"}; }
-    MediaProbeResult probe(const MediaSource&) override {
+    MediaEngineStatus status() const override { return {true, "fake", "fake-media-engine", true, true}; }
+    MediaProbeResult probe(const MediaSource&, std::chrono::milliseconds = {}) override {
         MediaProbeResult result;
         result.format = "mov,mp4,m4a,3gp,3g2,mj2";
         result.duration_seconds = 60.0;
@@ -94,20 +103,90 @@ class FakeMediaEngine final : public MediaEngine {
         result.streams.push_back(MediaStreamInfo{2, MediaStreamType::subtitle, "subrip", "", "eng", 0, 0, 0, 0, 0, false, false});
         return result;
     }
-    std::unique_ptr<MediaEngineSession> start_hls(const MediaSource&, const PlaybackPlan&,
-                                                  const std::filesystem::path& output,
-                                                  std::chrono::milliseconds) override {
-        std::filesystem::create_directories(output);
-        std::ofstream(output / "master.m3u8")
-            << "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MAP:URI=\"init.mp4\"\n"
-               "#EXTINF:4.0,\nsegment-000000.m4s\n#EXT-X-ENDLIST\n";
-        std::ofstream(output / "init.mp4", std::ios::binary) << "init";
-        std::ofstream(output / "segment-000000.m4s", std::ios::binary) << "segment";
-        return std::make_unique<FakeMediaEngineSession>();
+    std::unique_ptr<MediaEngineSession> start_hls(const MediaSource&, const PlaybackPlan& plan,
+                                                  std::chrono::milliseconds segment_duration,
+                                                  size_t max_ahead_segments,
+                                                  uint64_t memory_limit,
+                                                  const std::filesystem::path& spill_directory) override {
+        {
+            std::lock_guard lock(mutex_);
+            started_plans_.push_back(plan);
+        }
+        auto store = std::make_shared<MediaSegmentStore>(max_ahead_segments, memory_limit,
+                                                         spill_directory, segment_duration);
+        Bytes init{'i', 'n', 'i', 't'};
+        Bytes segment{'s', 'e', 'g', 'm', 'e', 'n', 't'};
+        REQUIRE(store->publish_init(std::move(init)));
+        REQUIRE(store->publish_segment(std::move(segment), 4.0));
+        store->finish();
+        return std::make_unique<FakeMediaEngineSession>(std::move(store));
     }
-    void extract_webvtt(const MediaSource&, int, const std::filesystem::path& output,
-                        std::chrono::milliseconds) override {
-        std::ofstream(output) << "WEBVTT\n\n00:00.000 --> 00:01.000\nsubtitle\n";
+    std::string extract_webvtt(const MediaSource&, int,
+                               std::chrono::milliseconds) override {
+        return "WEBVTT\n\n00:00.000 --> 00:01.000\nsubtitle\n";
+    }
+    std::vector<PlaybackPlan> started_plans() const {
+        std::lock_guard lock(mutex_);
+        return started_plans_;
+    }
+};
+
+class FailingProbeMediaEngine final : public MediaEngine {
+  public:
+    MediaEngineStatus status() const override { return {true, "fake", "failing-probe", true, true}; }
+    MediaProbeResult probe(const MediaSource&, std::chrono::milliseconds) override {
+        throw std::runtime_error("synthetic probe failure");
+    }
+    std::unique_ptr<MediaEngineSession> start_hls(const MediaSource&, const PlaybackPlan&,
+                                                  std::chrono::milliseconds, size_t, uint64_t,
+                                                  const std::filesystem::path&) override {
+        throw std::runtime_error("start_hls must not be called after a failed probe");
+    }
+    std::string extract_webvtt(const MediaSource&, int, std::chrono::milliseconds) override {
+        throw std::runtime_error("extract_webvtt must not be called after a failed probe");
+    }
+};
+
+
+class BlockingMediaEngine final : public MediaEngine {
+    mutable std::mutex mutex_;
+    std::shared_ptr<MediaSegmentStore> pending_;
+    std::atomic_uint starts_{};
+  public:
+    MediaEngineStatus status() const override { return {true, "fake", "blocking", true, true}; }
+    MediaProbeResult probe(const MediaSource&, std::chrono::milliseconds = {}) override {
+        MediaProbeResult result;
+        result.format = "matroska,webm";
+        result.duration_seconds = 60.0;
+        result.bitrate = 4'000'000;
+        result.streams.push_back(MediaStreamInfo{0, MediaStreamType::video, "h264", "High", "", 1920, 1080, 0, 0, 8, true, false});
+        result.streams.push_back(MediaStreamInfo{1, MediaStreamType::audio, "aac", "LC", "eng", 0, 0, 2, 48000, 0, true, false});
+        return result;
+    }
+    std::unique_ptr<MediaEngineSession> start_hls(const MediaSource&, const PlaybackPlan&,
+                                                  std::chrono::milliseconds segment_duration,
+                                                  size_t max_ahead_segments, uint64_t memory_limit,
+                                                  const std::filesystem::path& spill_directory) override {
+        auto store = std::make_shared<MediaSegmentStore>(max_ahead_segments, memory_limit,
+                                                         spill_directory, segment_duration);
+        {
+            std::lock_guard lock(mutex_);
+            pending_ = store;
+        }
+        ++starts_;
+        return std::make_unique<FakeMediaEngineSession>(std::move(store));
+    }
+    std::string extract_webvtt(const MediaSource&, int, std::chrono::milliseconds) override { return {}; }
+    unsigned starts() const { return starts_.load(); }
+    void release() {
+        std::shared_ptr<MediaSegmentStore> store;
+        {
+            std::lock_guard lock(mutex_);
+            store = pending_;
+        }
+        REQUIRE(store != nullptr);
+        REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
+        REQUIRE(store->publish_segment(Bytes{'s', 'e', 'g'}, 4.0));
     }
 };
 
@@ -720,8 +799,8 @@ void test_config() {
             << "        cover_size: '500'\n"
             << "streaming:\n"
             << "  enabled: true\n"
-            << "  ffmpeg: /usr/local/bin/ffmpeg\n"
-            << "  ffprobe: /usr/local/bin/ffprobe\n"
+            << "  ffmpeg: /legacy/ignored/ffmpeg\n"
+            << "  ffprobe: /legacy/ignored/ffprobe\n"
             << "  temp_path: " << (t.path() / "streams").string() << "\n"
             << "  max_sessions: 9\n"
             << "  max_video_transcodes: 2\n"
@@ -729,7 +808,11 @@ void test_config() {
             << "  session_idle_ms: 60000\n"
             << "  startup_timeout_ms: 7000\n"
             << "  segment_duration_ms: 3000\n"
-            << "  max_ahead_segments: 11\n";
+            << "  max_ahead_segments: 11\n"
+            << "  segment_memory_bytes: 96M\n"
+            << "  probe_bytes: 12M\n"
+            << "  probe_analyze_duration_ms: 4000\n"
+            << "  probe_timeout_ms: 9000\n";
     }
 
     std::vector<std::string> yaml_args{"macha", "--config", yaml.string()};
@@ -784,8 +867,6 @@ void test_config() {
     CHECK(yc.catalogue.scanner.musicbrainz.contact == "https://example.test/macha");
     CHECK(yc.catalogue.scanner.musicbrainz.cover_size == "500");
     CHECK(yc.streaming.enabled);
-    CHECK(yc.streaming.ffmpeg == "/usr/local/bin/ffmpeg");
-    CHECK(yc.streaming.ffprobe == "/usr/local/bin/ffprobe");
     REQUIRE(yc.streaming.temp_path.has_value());
     CHECK(*yc.streaming.temp_path == t.path() / "streams");
     CHECK(yc.streaming.max_sessions == 9);
@@ -795,6 +876,10 @@ void test_config() {
     CHECK(yc.streaming.startup_timeout == 7000ms);
     CHECK(yc.streaming.segment_duration == 3000ms);
     CHECK(yc.streaming.max_ahead_segments == 11);
+    CHECK(yc.streaming.segment_memory_bytes == 96ULL * 1024 * 1024);
+    CHECK(yc.streaming.probe_bytes == 12ULL * 1024 * 1024);
+    CHECK(yc.streaming.probe_analyze_duration == 4000ms);
+    CHECK(yc.streaming.probe_timeout == 9000ms);
 
     // CLI remains useful for node-local/runtime overrides, but configuration
     // now always starts from an explicit YAML file.
@@ -3219,6 +3304,52 @@ void test_three_node_cluster() {
         s1.stop();
     }
 }
+
+void test_media_segment_store_backpressure_and_spill() {
+    TempDir t;
+    auto store = std::make_shared<MediaSegmentStore>(2, 2 * 1024, t.path() / "spill", 4000ms);
+    REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
+    REQUIRE(store->publish_segment(Bytes(1024, 0x10), 4.0));
+    REQUIRE(store->publish_segment(Bytes(1024, 0x11), 4.0));
+    REQUIRE(store->publish_segment(Bytes(1024, 0x12), 4.0));
+
+    std::atomic_bool fourth_published{};
+    std::jthread producer([&] {
+        fourth_published.store(store->publish_segment(Bytes(1024, 0x13), 4.0));
+    });
+    std::this_thread::sleep_for(50ms);
+    CHECK(!fourth_published.load());
+    store->note_requested(1);
+    producer.join();
+    CHECK(fourth_published.load());
+
+    store->note_requested(3);
+    store->finish();
+    REQUIRE(store->wait_ready(10ms));
+    auto state = store->snapshot();
+    CHECK(state.init_ready);
+    CHECK(state.finished);
+    CHECK(state.segment_count == 4);
+    CHECK(state.highest_requested == 3);
+
+    auto playlist = store->playlist();
+    CHECK(playlist.find("#EXT-X-MAP:URI=\"init.mp4\"") != std::string::npos);
+    CHECK(playlist.find("segment-000003.m4s") != std::string::npos);
+    CHECK(playlist.find("#EXT-X-ENDLIST") != std::string::npos);
+
+    auto init = store->object("init.mp4");
+    REQUIRE(init.has_value());
+    CHECK(std::string(init->begin(), init->end()) == "init");
+    for (int i = 0; i < 4; ++i) {
+        std::ostringstream name;
+        name << "segment-" << std::setfill('0') << std::setw(6) << i << ".m4s";
+        auto segment = store->object(name.str());
+        REQUIRE(segment.has_value());
+        CHECK(segment->size() == 1024);
+        CHECK((*segment)[0] == static_cast<uint8_t>(0x10 + i));
+    }
+}
+
 void test_http_server_serves_streams_concurrently() {
     CatalogueApiConfig config;
     config.enabled = true;
@@ -3257,6 +3388,170 @@ void test_http_server_serves_streams_concurrently() {
     server.stop();
 }
 
+void test_media_timestamp_repair() {
+    MediaTimestampRepairState state;
+
+    MediaPacketTimestamps first{-69952, -69952, 40};
+    normalize_media_timestamps(state, first);
+    CHECK(first.pts == -69952);
+    CHECK(first.dts == -69952);
+    CHECK(state.repair_count() == 0);
+
+    // This is the exact failure shape seen from the MP4 muxer: two packets
+    // arrive with equal DTS after a seek/rescale. The second one must advance
+    // and the same correction must remain applied to later source timestamps.
+    MediaPacketTimestamps equal{-69912, -69952, 40};
+    normalize_media_timestamps(state, equal);
+    CHECK(equal.dts == -69951);
+    CHECK(equal.pts == -69911);
+    CHECK(state.nonmonotonic_dts == 1);
+    CHECK(state.timeline_shift == 1);
+
+    MediaPacketTimestamps following{-69872, -69912, 40};
+    normalize_media_timestamps(state, following);
+    CHECK(following.dts == -69911);
+    CHECK(following.pts == -69871);
+    CHECK(state.nonmonotonic_dts == 1);
+
+    MediaTimestampRepairState missing;
+    MediaPacketTimestamps none{kNoMediaTimestamp, kNoMediaTimestamp, 0};
+    normalize_media_timestamps(missing, none);
+    CHECK(none.dts == 0);
+    CHECK(none.pts == 0);
+    CHECK(none.duration == 1);
+    CHECK(missing.missing_dts == 1);
+    CHECK(missing.missing_pts == 1);
+
+    MediaPacketTimestamps missing_dts{100, kNoMediaTimestamp, 40};
+    normalize_media_timestamps(missing, missing_dts);
+    CHECK(missing_dts.dts == 1);
+    CHECK(missing_dts.pts == 100);
+    CHECK(missing.missing_dts == 2);
+
+    MediaTimestampRepairState bad_pts;
+    MediaPacketTimestamps pts_before{4, 5, 1};
+    normalize_media_timestamps(bad_pts, pts_before);
+    CHECK(pts_before.pts == 5);
+    CHECK(pts_before.dts == 5);
+    CHECK(bad_pts.pts_before_dts == 1);
+}
+
+void test_playback_probe_failure_is_stage_specific() {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_replication = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/test.mp4", 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write("/media/test.mp4", true);
+    auto bytes = pattern(64 * 1024);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto media_id = file_media_id(service.filesystem().getattr("/media/test.mp4"));
+
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback";
+    streaming.probe_timeout = 2s;
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             std::make_unique<FailingProbeMediaEngine>());
+    playback.start();
+
+    Json::Object root{{"media_id", media_id}};
+    auto text = Json(std::move(root)).dump();
+    HttpRequest request;
+    request.method = "POST";
+    request.path = "/api/v1/playback/sessions";
+    request.body.assign(text.begin(), text.end());
+    auto response = playback.handle(request);
+    REQUIRE(response.status == 503);
+    auto body = Json::parse(std::string(response.body.begin(), response.body.end()));
+    CHECK(body.find("error")->asString() == "playback_probe_failed");
+    CHECK(body.find("stage")->asString() == "probe");
+    REQUIRE(body.find("trace") != nullptr);
+    CHECK(!body.find("trace")->asString().empty());
+    REQUIRE(response.headers.contains("X-Macha-Playback-Trace"));
+    REQUIRE(response.headers.contains("X-Macha-Playback-Stage"));
+    CHECK(response.headers.at("X-Macha-Playback-Stage") == "probe");
+
+    playback.stop();
+    service.stop();
+}
+
+void test_concurrent_transcode_admission_is_reserved() {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_replication = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/test.mkv", 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write("/media/test.mkv", true);
+    auto bytes = pattern(64 * 1024);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto media_id = file_media_id(service.filesystem().getattr("/media/test.mkv"));
+
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback";
+    streaming.max_sessions = 4;
+    streaming.max_video_transcodes = 1;
+    streaming.max_audio_transcodes = 1;
+    streaming.startup_timeout = 2s;
+    auto engine = std::make_unique<BlockingMediaEngine>();
+    auto* blocking = engine.get();
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             std::move(engine));
+    playback.start();
+
+    auto request_for = [&](const std::string& id) {
+        Json::Object preferences{{"mode", "transcode"}};
+        Json::Object root{{"media_id", id}, {"preferences", Json(std::move(preferences))}};
+        auto text = Json(std::move(root)).dump();
+        HttpRequest request;
+        request.method = "POST";
+        request.path = "/api/v1/playback/sessions";
+        request.body.assign(text.begin(), text.end());
+        return request;
+    };
+
+    HttpResponse first_response;
+    std::jthread first([&] { first_response = playback.handle(request_for(media_id)); });
+    REQUIRE(wait_until([&] { return blocking->starts() == 1; }, 1s));
+
+    auto second_response = playback.handle(request_for(media_id));
+    CHECK(second_response.status == 429);
+    CHECK(blocking->starts() == 1);
+
+    blocking->release();
+    first.join();
+    REQUIRE(first_response.status == 201);
+    auto first_json = Json::parse(std::string(first_response.body.begin(), first_response.body.end()));
+    HttpRequest remove;
+    remove.method = "DELETE";
+    remove.path = "/api/v1/playback/sessions/" + first_json.find("session_id")->asString();
+    CHECK(playback.handle(remove).status == 204);
+
+    playback.stop();
+    service.stop();
+}
+
 void test_playback_sessions_and_streaming_http_bodies() {
     TempDir t;
     auto keyfile = t.path() / "key";
@@ -3287,9 +3582,37 @@ void test_playback_sessions_and_streaming_http_bodies() {
     streaming.max_video_transcodes = 1;
     streaming.max_audio_transcodes = 1;
     streaming.startup_timeout = 2s;
+    auto fake_engine = std::make_unique<FakeMediaEngine>();
+    auto* fake_engine_ptr = fake_engine.get();
     PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
-                             std::make_unique<FakeMediaEngine>());
+                             std::move(fake_engine));
     playback.start();
+
+    // A transformed stream can begin at its resume point in the initial POST.
+    // This avoids creating a generation at zero only to destroy it immediately
+    // with a PATCH before the player has loaded anything.
+    Json::Object initial_seek_preferences{{"mode", "remux"}};
+    Json::Object initial_seek_root{{"media_id", media_id},
+                                   {"seek_ms", 23000},
+                                   {"preferences", Json(std::move(initial_seek_preferences))}};
+    auto initial_seek_text = Json(std::move(initial_seek_root)).dump();
+    HttpRequest initial_seek;
+    initial_seek.method = "POST";
+    initial_seek.path = "/api/v1/playback/sessions";
+    initial_seek.body.assign(initial_seek_text.begin(), initial_seek_text.end());
+    auto initial_seek_response = playback.handle(initial_seek);
+    REQUIRE(initial_seek_response.status == 201);
+    auto initial_seek_json = Json::parse(std::string(initial_seek_response.body.begin(),
+                                                     initial_seek_response.body.end()));
+    CHECK(initial_seek_json.find("mode")->asString() == "remux");
+    CHECK(initial_seek_json.find("seek_ms")->asInt64() == 23000);
+    auto plans = fake_engine_ptr->started_plans();
+    REQUIRE(plans.size() == 1);
+    CHECK(plans.back().seek == 23s);
+    HttpRequest remove_initial_seek;
+    remove_initial_seek.method = "DELETE";
+    remove_initial_seek.path = "/api/v1/playback/sessions/" + initial_seek_json.find("session_id")->asString();
+    CHECK(playback.handle(remove_initial_seek).status == 204);
 
     Json::Object create_root{{"media_id", media_id}};
     auto create_text = Json(std::move(create_root)).dump();
@@ -3467,7 +3790,11 @@ int main() {
         test_cache_hydrator_fetches_to_persistent_cache();
         test_media_probe_and_online_catalogue_scanner();
         test_catalogue_sync_search_and_artwork_gc();
+        test_media_segment_store_backpressure_and_spill();
+        test_media_timestamp_repair();
         test_http_server_serves_streams_concurrently();
+        test_playback_probe_failure_is_stage_specific();
+        test_concurrent_transcode_admission_is_reserved();
         test_playback_sessions_and_streaming_http_bodies();
         test_three_node_cluster();
     } catch (const std::exception& e) {

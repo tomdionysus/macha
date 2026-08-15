@@ -28,8 +28,9 @@ Service
    +---- CatalogueManager / catalogue JSON API
    +---- PlaybackManager / concurrent HTTP streaming
    |       +---- direct logical-file range responses
-   |       +---- MediaEngine -> FFmpeg process backend
-   |       +---- fMP4 HLS session files / capability URLs
+   |       +---- MediaEngine -> in-process libav backend
+   |       +---- custom AVIO -> pinned Macha ReadHandle
+   |       +---- bounded fMP4 SegmentStore / capability URLs
    +---- repair / local rebalance / scrub / GC scheduler
 ```
 
@@ -177,13 +178,15 @@ Every connection uses an HMAC-authenticated ephemeral X25519 handshake, HKDF-SHA
 
 ## Streaming and media engines
 
-Playback policy is owned by `PlaybackManager`, not FFmpeg. A client supplies capabilities and preferences; the resolver chooses a source representation and a `PlaybackPlan` containing direct/remux/transcode mode plus per-stream copy/transcode decisions. `MediaEngine` consumes that plan. Its interface contains media concepts only, so the initial external-process backend can later be replaced by an in-process libav engine without changing session or HTTP semantics.
+Playback policy is owned by `PlaybackManager`, not libav. A client supplies capabilities and preferences; the resolver chooses a source representation and a `PlaybackPlan` containing direct/remux/transcode mode plus per-stream copy/transcode decisions. `MediaEngine` consumes that plan and exposes media concepts only. The current implementation is `LibavMediaEngine`; callers do not depend on libav types.
 
-Direct play exposes the logical Macha file as a streaming HTTP body with byte-range support. Transformed playback gives FFmpeg a loopback-only range-capable source URL backed by the same `FileSystem::open_read` path. The generated output is one fragmented-MP4 HLS rendition (`init.mp4` plus `.m4s` segments). Session capability URLs are distinct from the permanent API Bearer token.
+Direct play exposes the pinned logical Macha file as a streaming HTTP body with byte-range support. Transformed playback opens the same pinned file through a custom seekable libav `AVIOContext`, so probe/remux/transcode reads go directly through `FileSystem::open_read` and the DHT. No FUSE mount, loopback HTTP source or media subprocess is involved.
 
-The public HTTP server has a bounded accepted-connection queue and worker pool. Response bodies are abstract sources rather than necessarily resident byte strings, so long media responses do not serialize catalogue/API work and several HLS fragment requests can be served concurrently. FFmpeg input uses a separate loopback-only HTTP server so a transformed pipeline cannot consume the public worker pool while waiting on itself.
+Transformed output is fragmented MP4. A custom output `AVIOContext` publishes the init fragment and completed `moof`/`mdat` media fragments into a bounded `MediaSegmentStore`; Macha generates the HLS playlist itself. Fragments are kept in memory up to the configured budget and older fragments may spill to `streaming.temp_path`. Session capability URLs are distinct from the permanent API Bearer token.
 
-A transformed producer is paused when generated segment distance exceeds the configured look-ahead from actual client demand and resumed as requested fragment indexes advance. Seeking or a quality/track/media change creates a new internal generation under the same logical playback session. Old generation URLs become invalid; open response file descriptors remain safe until their current response completes.
+The public HTTP server has a bounded accepted-connection queue and worker pool. Response bodies are abstract sources rather than necessarily resident byte strings, so long direct-media responses do not serialize catalogue/API work and several HLS fragment requests can be served concurrently.
+
+A transformed producer blocks on a condition variable when generated segment distance exceeds the configured look-ahead from actual client demand and resumes as requested fragment indexes advance. Seeking or a quality/track/media change creates a new internal generation under the same logical playback session. Old generation URLs become invalid after replacement.
 
 ## Concurrency
 
