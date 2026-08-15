@@ -79,14 +79,16 @@ void Service::reload_config() {
     const auto& current_streaming = node_.config().streaming;
     const bool streaming_restart_required =
         updated.streaming.enabled != current_streaming.enabled ||
-        updated.streaming.ffmpeg != current_streaming.ffmpeg ||
-        updated.streaming.ffprobe != current_streaming.ffprobe ||
-        updated.streaming.temp_path != current_streaming.temp_path;
+        updated.streaming.temp_path != current_streaming.temp_path ||
+        updated.streaming.segment_memory_bytes != current_streaming.segment_memory_bytes ||
+        updated.streaming.probe_bytes != current_streaming.probe_bytes ||
+        updated.streaming.probe_analyze_duration != current_streaming.probe_analyze_duration ||
+        updated.streaming.probe_timeout != current_streaming.probe_timeout;
     node_.reconfigure_local(updated);
     scanner_.reconfigure(updated.catalogue.scanner);
     hydration_.reconfigure(updated.hydration, updated.read_ahead_extents);
     if (streaming_restart_required)
-        Log::warn("streaming enable/backend/path changes require restart; live limits were reloaded");
+        Log::warn("streaming enable/buffer/probe/path changes require restart; live limits were reloaded");
     streaming_.reconfigure(updated.streaming);
     Log::info("reloaded storage backends, persistent cache, catalogue scanner, hydration and streaming limits");
 }
@@ -121,6 +123,11 @@ void Service::loop(std::stop_token stop) {
     auto last_wall = Clock::now();
     auto last_cpu = std::clock();
     auto last_metadata = Clock::time_point{};
+    auto last_catalogue = Clock::time_point{};
+    auto last_garbage_inventory = Clock::time_point{};
+    auto network_quiescent_until = Clock::time_point{};
+    auto local_quiescent_until = Clock::time_point{};
+    auto scrub_quiescent_until = Clock::time_point{};
     double network_credit = 0.0;
     double local_credit = 0.0;
     double scrub_credit = 0.0;
@@ -168,46 +175,85 @@ void Service::loop(std::stop_token stop) {
                 last_metadata = now;
             }
 
-            // Catalogue state is cluster metadata. A joiner pulls the complete
-            // immutable snapshot and all referenced artwork before reporting the
-            // catalogue ready; this runs ahead of ordinary data repair.
-            try {
-                catalogue_.repair_once();
-            } catch (const std::exception& e) {
-                Log::debug("catalogue sync: " + std::string(e.what()));
+            // Catalogue state is cluster metadata. Checking it on every 500 ms
+            // scheduler tick was pure settled-state churn; five seconds still
+            // converges quickly without continuously re-reading metadata.
+            if (last_catalogue == Clock::time_point{} || now - last_catalogue >= std::chrono::seconds(5)) {
+                try {
+                    catalogue_.repair_once();
+                } catch (const std::exception& e) {
+                    Log::debug("catalogue sync: " + std::string(e.what()));
+                }
+                last_catalogue = now;
             }
-
-            auto objects = fs_.maintenance_objects();
-            std::set<ObjectId> live(objects.live.begin(), objects.live.end());
-            std::set<ObjectId> universal;
-            auto catalogue_objects = catalogue_.maintenance_objects();
-            live.insert(catalogue_objects.live.begin(), catalogue_objects.live.end());
-            universal.insert(catalogue_objects.universal.begin(),
-                             catalogue_objects.universal.end());
-            std::erase_if(objects.garbage,
-                          [&](const ObjectId& id) { return live.contains(id); });
 
             const bool allow_network_repair =
                 !busy || policy.busy_bandwidth_fraction > 0.0;
-            if (allow_network_repair && network_credit >= node_.config().extent_size) {
-                auto used = store_.repair_once(static_cast<uint64_t>(network_credit), &live,
-                                               &universal);
-                network_credit = std::max(0.0, network_credit - static_cast<double>(used));
+            const bool network_due = allow_network_repair && now >= network_quiescent_until &&
+                                     network_credit >= node_.config().extent_size;
+            const bool garbage_due = last_garbage_inventory == Clock::time_point{} ||
+                                     now - last_garbage_inventory >= std::chrono::seconds(5);
+
+            // Enumerating every live extent is O(namespace size), and doing it on
+            // every scheduler tick made a settled node burn CPU while performing
+            // no I/O. Build the inventory only when repair can actually spend a
+            // budget or when garbage accounting is due.
+            if (network_due || garbage_due) {
+                auto objects = fs_.maintenance_objects();
+                std::set<ObjectId> live(objects.live.begin(), objects.live.end());
+                std::set<ObjectId> universal;
+                auto catalogue_objects = catalogue_.maintenance_objects();
+                live.insert(catalogue_objects.live.begin(), catalogue_objects.live.end());
+                universal.insert(catalogue_objects.universal.begin(),
+                                 catalogue_objects.universal.end());
+                std::erase_if(objects.garbage,
+                              [&](const ObjectId& id) { return live.contains(id); });
+
+                if (network_due) {
+                    auto used = store_.repair_once(static_cast<uint64_t>(network_credit), &live,
+                                                   &universal);
+                    if (used) {
+                        network_credit = std::max(0.0, network_credit - static_cast<double>(used));
+                    } else {
+                        network_credit = 0.0;
+                        network_quiescent_until = Clock::now() + policy.no_progress_backoff;
+                        Log::debug("maintenance: repair quiescent; backing off no-progress scan");
+                    }
+                }
+                if (garbage_due) {
+                    collect_garbage(objects.garbage);
+                    last_garbage_inventory = now;
+                }
             }
 
             // Local disk rebalance has an independent byte credit: adding or
-            // returning a disk never consumes the network repair allowance.
-            if (!busy && local_credit >= node_.config().extent_size) {
+            // returning a disk never consumes the network repair allowance. A
+            // no-op pass explicitly clears the credit and backs off; otherwise a
+            // settled pool with one extent of credit spins forever.
+            if (!busy && now >= local_quiescent_until &&
+                local_credit >= node_.config().extent_size) {
                 auto used = node_.local_store().rebalance_once(static_cast<uint64_t>(local_credit));
-                local_credit = std::max(0.0, local_credit - static_cast<double>(used));
+                if (used) {
+                    local_credit = std::max(0.0, local_credit - static_cast<double>(used));
+                } else {
+                    local_credit = 0.0;
+                    local_quiescent_until = Clock::now() + policy.no_progress_backoff;
+                    Log::debug("maintenance: local rebalance quiescent; backing off no-progress scan");
+                }
             }
 
-            if (!busy && scrub_credit >= node_.config().extent_size) {
+            if (!busy && now >= scrub_quiescent_until &&
+                scrub_credit >= node_.config().extent_size) {
                 auto used = store_.scrub_once(static_cast<uint64_t>(scrub_credit));
-                scrub_credit = std::max(0.0, scrub_credit - static_cast<double>(used));
+                if (used) {
+                    scrub_credit = std::max(0.0, scrub_credit - static_cast<double>(used));
+                } else {
+                    scrub_credit = 0.0;
+                    scrub_quiescent_until = Clock::now() + policy.no_progress_backoff;
+                    Log::debug("maintenance: scrub quiescent; backing off no-progress scan");
+                }
             }
 
-            collect_garbage(objects.garbage);
         } catch (const std::exception& e) {
             Log::debug("maintenance: " + std::string(e.what()));
         }

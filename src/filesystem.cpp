@@ -121,7 +121,8 @@ ReadHandle::~ReadHandle() {
         playback_->close(playback_session_);
 }
 
-const Bytes& ReadHandle::extent(size_t i) {
+const Bytes& ReadHandle::extent(size_t i, Clock::time_point deadline,
+                                std::atomic_bool* cancelled) {
     if (cached_index_ == i) {
         Log::debug("DIAG read-extent cache-hit ptr=" +
                    std::to_string(reinterpret_cast<uintptr_t>(this)) +
@@ -131,9 +132,16 @@ const Bytes& ReadHandle::extent(size_t i) {
 
     auto& x = e_.extents.at(i);
     auto started = Clock::now();
-    auto data = s_.get(x.id, i);
-    if (!data || data->size() != x.length)
-        fail(EIO, "extent unavailable/corrupt");
+    auto data = s_.get(x.id, i, true, deadline, cancelled);
+    if (!data) {
+        if (cancelled && cancelled->load())
+            fail(ECANCELED, "extent read cancelled");
+        if (deadline != Clock::time_point{} && Clock::now() >= deadline)
+            fail(ETIMEDOUT, "extent read timed out");
+        fail(EIO, "extent unavailable");
+    }
+    if (data->size() != x.length)
+        fail(EIO, "extent corrupt");
 
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
     Log::debug("DIAG read-extent load ptr=" +
@@ -149,7 +157,8 @@ const Bytes& ReadHandle::extent(size_t i) {
     return cached_extent_;
 }
 
-size_t ReadHandle::read(uint64_t off, std::span<uint8_t> out) {
+size_t ReadHandle::read(uint64_t off, std::span<uint8_t> out, Clock::time_point deadline,
+                        std::atomic_bool* cancelled) {
     std::lock_guard g(m_);
     if (off >= e_.size || out.empty())
         return 0;
@@ -167,7 +176,7 @@ size_t ReadHandle::read(uint64_t off, std::span<uint8_t> out) {
             if (it->hole)
                 std::fill_n(out.begin() + done, n, 0);
             else {
-                const auto& d = extent(idx);
+                const auto& d = extent(idx, deadline, cancelled);
                 std::copy_n(d.begin() + (a - it->offset), n, out.begin() + done);
             }
             done += n;
@@ -885,12 +894,32 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
         }
         return {};
     }
-    auto snapshot = snap();
-    for (const auto& [path, entry] : snapshot.entries) {
-        if (entry.type == EntryType::file && file_media_id(entry) == id)
-            return std::pair{path, entry};
+    // read_record() is normally served from MetadataManager's short read cache,
+    // and gives us the generation as well as the snapshot.  Rebuild the media
+    // index only when that generation changes.  This turns repeated catalogue
+    // media-id resolution during playback negotiation into an indexed lookup
+    // rather than another complete namespace walk for every candidate.
+    const auto record = m_.read_record();
+    std::lock_guard lock(media_index_mutex_);
+    if (!media_index_valid_ || media_index_generation_ != record.generation) {
+        auto snapshot = decode_snapshot(record.payload);
+        std::map<std::string, std::pair<std::string, FsEntry>> next;
+        for (const auto& [path, entry] : snapshot.entries) {
+            if (entry.type != EntryType::file)
+                continue;
+            next.emplace(file_media_id(entry), std::pair{path, entry});
+        }
+        media_index_ = std::move(next);
+        media_index_generation_ = record.generation;
+        media_index_valid_ = true;
+        Log::debug("filesystem media index rebuilt generation=" +
+                   std::to_string(record.generation) + " files=" +
+                   std::to_string(media_index_.size()));
     }
-    return {};
+    auto found = media_index_.find(std::string(id));
+    if (found == media_index_.end())
+        return {};
+    return found->second;
 }
 
 std::shared_ptr<ReadHandle> FileSystem::open_read(const std::string& p) {
@@ -900,10 +929,12 @@ std::shared_ptr<ReadHandle> FileSystem::open_read(const std::string& p) {
     return open_read(e, p);
 }
 
-std::shared_ptr<ReadHandle> FileSystem::open_read(const FsEntry& entry, const std::string& logical_path) {
+std::shared_ptr<ReadHandle> FileSystem::open_read(const FsEntry& entry, const std::string& logical_path,
+                                                  bool track_playback) {
     if (entry.type != EntryType::file)
         fail(EISDIR, "directory");
-    return std::make_shared<ReadHandle>(s_, entry, playback_, normalize_path(logical_path));
+    return std::make_shared<ReadHandle>(s_, entry, track_playback ? playback_ : nullptr,
+                                        normalize_path(logical_path));
 }
 std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool trunc) {
     // Serialize path lookup/registration with rename so an opening writer cannot

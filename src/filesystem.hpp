@@ -2,6 +2,7 @@
 #pragma once
 #include "distributed_store.hpp"
 #include "metadata_manager.hpp"
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -45,13 +46,14 @@ class ReadHandle {
     uint64_t last_{};
     size_t cached_index_{static_cast<size_t>(-1)};
     Bytes cached_extent_;
-    const Bytes& extent(size_t);
+    const Bytes& extent(size_t, Clock::time_point, std::atomic_bool*);
 
   public:
     ReadHandle(DistributedStore&, FsEntry, PlaybackTracker* = nullptr,
                std::string path = {});
     ~ReadHandle();
-    size_t read(uint64_t, std::span<uint8_t>);
+    size_t read(uint64_t, std::span<uint8_t>, Clock::time_point deadline = {},
+                std::atomic_bool* cancelled = nullptr);
 };
 class WriteHandle {
     friend class FileSystem;
@@ -110,6 +112,13 @@ class FileSystem {
     PlaybackTracker* playback_{};
     std::mutex open_writes_mutex_;
     std::vector<std::weak_ptr<WriteHandle>> open_writes_;
+    // Immutable media ids are used heavily by catalogue/playback resolution.
+    // Cache their namespace lookup by metadata generation so playback startup
+    // does not linearly re-hash every file for every candidate representation.
+    std::mutex media_index_mutex_;
+    uint64_t media_index_generation_{};
+    bool media_index_valid_{};
+    std::map<std::string, std::pair<std::string, FsEntry>> media_index_;
     MetadataSnapshot snap();
     void commit_write(WriteHandle&, const FsEntry&, uint64_t,
                       const std::vector<ExtentRef>&, FsEntry*);
@@ -131,7 +140,8 @@ class FileSystem {
     std::shared_ptr<ReadHandle> open_read(const std::string&);
     // Open an already-resolved immutable metadata snapshot. Playback uses this
     // so a pathname replacement cannot change the bytes underneath a session.
-    std::shared_ptr<ReadHandle> open_read(const FsEntry&, const std::string& logical_path);
+    std::shared_ptr<ReadHandle> open_read(const FsEntry&, const std::string& logical_path,
+                                               bool track_playback = true);
     std::optional<std::pair<std::string, FsEntry>> find_media(std::string_view);
     std::shared_ptr<WriteHandle> open_write(const std::string&, bool);
     std::optional<uint64_t> active_write_size(const std::string&);

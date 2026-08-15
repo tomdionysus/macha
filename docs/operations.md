@@ -15,6 +15,8 @@ Repair works both ways:
 
 Background work is budgeted in bytes, not a fixed number of extents. The scheduler uses observed transfer rate, foreground activity and CPU load. Network repair, local disk rebalance and scrub have separate credits. With the default `busy_bandwidth_fraction: 0.0`, foreground I/O pauses background WAN repair.
 
+A settled pass that moves no bytes is treated as **quiescent**, not as permission to rescan immediately. Its credit is cleared and that maintenance class backs off for `no_progress_backoff_ms` (30 seconds by default). The full filesystem live-object inventory is built only when network repair has spendable budget or the garbage inventory is due. This specifically avoids background CPU spin where rebalance/repair repeatedly proves that there is nothing to do while generating little or no disk/network traffic. Catalogue and metadata repair checks are rate-limited to five seconds. Garbage/live-object inventory uses the larger of five seconds and `no_progress_backoff_ms`, so with the default configuration the expensive full inventory runs at most once every 30 seconds while settled.
+
 ## Cache and hydration
 
 The persistent cache is deliberately not part of DHT ownership.
@@ -34,7 +36,7 @@ The cache hydrator consumes ordered hints from independent engines. The built-in
 
 Hints that refer to the same ordered run are merged and their priorities reinforce each other. Scheduling uses weighted virtual time across runs, so the current file normally advances fastest without starving a predicted next item. A speculative run is sequential: the hydrator will not fetch a later extent while an earlier missing extent in that run is unavailable. Hydration keeps up to `max_inflight` extent requests active and rebuilds the hint set continuously. Read-ahead/current-file transfers use the read-ahead transport class; catalogue prediction uses speculative transport. Either yields immediately to foreground frames at the transport scheduler.
 
-Hydration requires the persistent cache to be enabled. If the cache is disabled, foreground reads continue normally but speculative hints do not trigger network fetches.
+Hydration requires the persistent cache to be enabled. If the cache is disabled, foreground reads continue normally but speculative hints do not trigger network fetches. The catalogue-sequence hint provider also returns before taking a catalogue snapshot when no playback is active, so an idle hydrator does not continuously repair/copy catalogue state.
 
 `dht.read_ahead` remains the size of the immediate read-ahead hint window. Engine enablement and priority are configured separately under `hydration`:
 

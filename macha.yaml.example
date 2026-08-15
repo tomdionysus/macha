@@ -109,6 +109,10 @@ maintenance:
   max_bandwidth: 0B       # 0 = no configured cap; observed rate still applies.
   scrub_fraction: 0.10
 
+  # A settled repair/rebalance/scrub pass backs off instead of rescanning the
+  # complete object set on every scheduler tick.
+  no_progress_backoff_ms: 30000
+
   # Committed garbage, including superseded catalogue snapshots/artwork, is
   # retained for this grace period before each node removes its local copy.
   garbage_grace_ms: 86400000
@@ -152,18 +156,24 @@ catalogue:
     max_queued_connections: 128
     stream_chunk_bytes: 256K
 
-# Playback API and media transformation. The current engine shells directly to
-# ffprobe/ffmpeg without invoking a command shell. Direct play still uses the
-# logical Macha file; transformed output is fragmented-MP4 HLS.
+# Playback API and media transformation. Macha links libavformat/libavcodec
+# directly and reads the pinned logical Macha file through a custom AVIOContext.
+# No ffmpeg/ffprobe subprocess or loopback media source is involved.
 streaming:
   enabled: true
-  ffmpeg: ffmpeg
-  ffprobe: ffprobe
-  # temp_path: /var/lib/macha/tmp/playback
+  # temp_path: /var/lib/macha/tmp/playback  # spill only; active fragments are in memory
   max_sessions: 8
   max_video_transcodes: 1
   max_audio_transcodes: 4
   session_idle_ms: 1800000
-  startup_timeout_ms: 10000
+  startup_timeout_ms: 15000
   segment_duration_ms: 4000
   max_ahead_segments: 8
+  segment_memory_bytes: 64M
+
+  # Bound source inspection on distributed/slow media. probe_bytes and
+  # probe_analyze_duration_ms limit libavformat analysis; probe_timeout_ms is a
+  # wall-clock guard for the complete probe.
+  probe_bytes: 8M
+  probe_analyze_duration_ms: 5000
+  probe_timeout_ms: 20000

@@ -93,6 +93,18 @@ class ResourceLimitError final : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+class PlaybackStageError final : public std::runtime_error {
+    std::string trace_;
+    std::string stage_;
+
+  public:
+    PlaybackStageError(std::string trace, std::string stage, std::string message)
+        : std::runtime_error(std::move(message)), trace_(std::move(trace)),
+          stage_(std::move(stage)) {}
+    const std::string& trace() const noexcept { return trace_; }
+    const std::string& stage() const noexcept { return stage_; }
+};
+
 std::optional<ByteRange> parse_range(const HttpRequest& request, uint64_t size) {
     auto it = request.headers.find("range");
     if (it == request.headers.end()) return ByteRange{0, size, false};
@@ -137,27 +149,35 @@ class LogicalBody final : public HttpBodySource {
     }
 };
 
-class LocalFileBody final : public HttpBodySource {
-    int fd_{-1};
+
+class LogicalMediaInput final : public MediaInput {
+    std::shared_ptr<ReadHandle> handle_;
+    uint64_t size_{};
+  public:
+    LogicalMediaInput(std::shared_ptr<ReadHandle> handle, uint64_t size)
+        : handle_(std::move(handle)), size_(size) {}
+    uint64_t size() const override { return size_; }
+    size_t read(uint64_t offset, std::span<uint8_t> destination,
+                Clock::time_point deadline, std::atomic_bool* cancelled) override {
+        if (offset >= size_) return 0;
+        auto wanted = static_cast<size_t>(std::min<uint64_t>(destination.size(), size_ - offset));
+        return handle_->read(offset, destination.first(wanted), deadline, cancelled);
+    }
+};
+
+class MemoryBody final : public HttpBodySource {
+    std::shared_ptr<const Bytes> bytes_;
     uint64_t base_{};
     uint64_t size_{};
   public:
-    LocalFileBody(const std::filesystem::path& path, uint64_t base, uint64_t size)
-        : base_(base), size_(size) {
-        fd_ = ::open(path.c_str(), O_RDONLY);
-        if (fd_ < 0) throw std::runtime_error("cannot open stream file");
-    }
-    ~LocalFileBody() override { if (fd_ >= 0) ::close(fd_); }
+    MemoryBody(std::shared_ptr<const Bytes> bytes, uint64_t base, uint64_t size)
+        : bytes_(std::move(bytes)), base_(base), size_(size) {}
     uint64_t size() const override { return size_; }
     size_t read(uint64_t offset, std::span<uint8_t> destination) override {
         if (offset >= size_) return 0;
         auto wanted = static_cast<size_t>(std::min<uint64_t>(destination.size(), size_ - offset));
-        while (true) {
-            auto n = pread(fd_, destination.data(), wanted, static_cast<off_t>(base_ + offset));
-            if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) return 0;
-            return static_cast<size_t>(n);
-        }
+        std::copy_n(bytes_->data() + base_ + offset, wanted, destination.data());
+        return wanted;
     }
 };
 
@@ -388,11 +408,9 @@ Json stream_json(const MediaStreamInfo& stream) {
 
 struct PlaybackManager::Impl {
     struct SourceLease {
-        std::string token;
         std::string media_id;
         std::string path;
         FsEntry entry;
-        Clock::time_point touched{Clock::now()};
     };
 
     struct Session {
@@ -402,40 +420,42 @@ struct PlaybackManager::Impl {
         ClientCapabilities capabilities;
         PlaybackPreferences preferences;
         MediaSource source;
+        FsEntry source_entry;
         MediaProbeResult probe;
         PlaybackPlan plan;
-        std::string source_token;
         uint64_t generation{};
         std::filesystem::path generation_dir;
-        std::unique_ptr<MediaEngineSession> engine_session;
+        mutable std::mutex pipeline_mutex;
+        std::shared_ptr<MediaEngineSession> engine_session;
         std::string stream_url;
         std::string subtitle_url;
-        uint64_t highest_segment_requested{};
-        bool producer_paused{};
+        std::mutex subtitle_mutex;
+        std::optional<std::string> subtitle_data;
         Clock::time_point touched{Clock::now()};
     };
 
     FileSystem& fs;
     CatalogueManager& catalogue;
-    CatalogueApiConfig api_config;
     StreamingConfig config;
     std::unique_ptr<MediaEngine> engine;
-    std::unique_ptr<HttpServer> source_http;
     std::jthread cleanup_thread;
     mutable std::mutex mutex;
-    std::map<std::string, SourceLease, std::less<>> sources;
     std::map<std::string, std::shared_ptr<Session>, std::less<>> sessions;
     std::map<std::string, MediaProbeResult, std::less<>> probe_cache;
+    // Session/pipeline admission happens before a newly-created pipeline is
+    // visible in `sessions`.  Reserve those slots explicitly so concurrent
+    // POST/PATCH requests cannot all pass the same resource-limit check.
+    size_t pending_sessions{};
+    size_t reserved_video_transcodes{};
+    size_t reserved_audio_transcodes{};
     bool started{};
 
     Impl(FileSystem& filesystem, CatalogueManager& cat, CatalogueApiConfig api,
          StreamingConfig streaming, std::unique_ptr<MediaEngine> media_engine)
-        : fs(filesystem), catalogue(cat), api_config(std::move(api)), config(std::move(streaming)),
+        : fs(filesystem), catalogue(cat), config(std::move(streaming)),
           engine(media_engine ? std::move(media_engine) :
-                (config.enabled ? make_ffmpeg_process_engine(config) : nullptr)) {}
-
-    std::string source_url(std::string_view token) const {
-        return "http://127.0.0.1:" + std::to_string(source_http->bound_port()) + "/source/" + std::string(token);
+                (config.enabled ? make_libav_media_engine(config) : nullptr)) {
+        (void)api;
     }
 
     std::string public_stream_prefix(const Session& session) const {
@@ -445,21 +465,21 @@ struct PlaybackManager::Impl {
     SourceLease create_source(std::string_view media_id) {
         auto found = fs.find_media(media_id);
         if (!found) throw std::out_of_range("media object not found in filesystem");
-        SourceLease lease;
-        lease.token = hex_token();
-        lease.media_id = std::string(media_id);
-        lease.path = found->first;
-        lease.entry = found->second;
-        {
-            std::lock_guard lock(mutex);
-            sources[lease.token] = lease;
-        }
-        return lease;
+        return {std::string(media_id), found->first, found->second};
     }
 
-    void remove_source(std::string_view token) {
-        std::lock_guard lock(mutex);
-        sources.erase(std::string(token));
+    MediaSource media_source(const SourceLease& lease) {
+        auto entry = lease.entry;
+        auto path = lease.path;
+        auto size = lease.entry.size;
+        return MediaSource{
+            lease.media_id, lease.path, size,
+            [this, entry = std::move(entry), path = std::move(path), size](MediaReadPurpose purpose) mutable
+                -> std::shared_ptr<MediaInput> {
+                const bool track_playback = purpose == MediaReadPurpose::playback;
+                return std::make_shared<LogicalMediaInput>(
+                    fs.open_read(entry, path, track_playback), size);
+            }};
     }
 
     std::string probe_key(const SourceLease& lease) const {
@@ -470,14 +490,36 @@ struct PlaybackManager::Impl {
         return lease.media_id;
     }
 
-    MediaProbeResult probe_source(const SourceLease& lease) {
+    MediaProbeResult probe_source(const SourceLease& lease, std::string_view trace,
+                                  Clock::time_point resolve_deadline) {
         auto key = probe_key(lease);
         {
             std::lock_guard lock(mutex);
-            if (auto it = probe_cache.find(key); it != probe_cache.end()) return it->second;
+            if (auto it = probe_cache.find(key); it != probe_cache.end()) {
+                Log::debug("playback[" + std::string(trace) + "] probe cache-hit media=" + lease.media_id);
+                return it->second;
+            }
         }
-        MediaSource source{lease.media_id, lease.path, source_url(lease.token), lease.entry.size};
-        auto probed = engine->probe(source);
+        auto started_at = Clock::now();
+        if (started_at >= resolve_deadline)
+            throw std::runtime_error("media inspection deadline exhausted before probing candidate");
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(resolve_deadline - started_at);
+        remaining = std::max(std::chrono::milliseconds(1), remaining);
+        Log::debug("playback[" + std::string(trace) + "] probe start media=" + lease.media_id +
+                   " path=" + lease.path + " bytes=" + std::to_string(lease.entry.size) +
+                   " deadline_ms=" + std::to_string(remaining.count()));
+        MediaProbeResult probed;
+        try {
+            probed = engine->probe(media_source(lease), remaining);
+        } catch (const PlaybackStageError&) {
+            throw;
+        } catch (const std::exception& e) {
+            throw PlaybackStageError(std::string(trace), "probe", e.what());
+        }
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started_at).count();
+        Log::info("playback[" + std::string(trace) + "] probe complete media=" + lease.media_id +
+                  " elapsed_ms=" + std::to_string(elapsed) + " format=" + probed.format +
+                  " streams=" + std::to_string(probed.streams.size()));
         {
             std::lock_guard lock(mutex);
             probe_cache[std::move(key)] = probed;
@@ -489,8 +531,10 @@ struct PlaybackManager::Impl {
         size_t count = 0;
         for (const auto& [id, session] : sessions) {
             if (id == excluding) continue;
-            if (session->plan.video == MediaTransform::transcode &&
-                session->engine_session && session->engine_session->running()) ++count;
+            if (session->plan.video == MediaTransform::transcode) {
+                std::lock_guard pipeline_lock(session->pipeline_mutex);
+                if (session->engine_session && session->engine_session->running()) ++count;
+            }
         }
         return count;
     }
@@ -499,82 +543,135 @@ struct PlaybackManager::Impl {
         size_t count = 0;
         for (const auto& [id, session] : sessions) {
             if (id == excluding) continue;
-            if (session->plan.audio == MediaTransform::transcode &&
-                session->engine_session && session->engine_session->running()) ++count;
+            if (session->plan.audio == MediaTransform::transcode) {
+                std::lock_guard pipeline_lock(session->pipeline_mutex);
+                if (session->engine_session && session->engine_session->running()) ++count;
+            }
         }
         return count;
     }
 
-    void check_resources(const PlaybackPlan& plan, std::string_view excluding = {}) {
+    void reserve_session_slot() {
         std::lock_guard lock(mutex);
-        if (plan.video == MediaTransform::transcode &&
-            video_transcodes_locked(excluding) >= config.max_video_transcodes)
-            throw ResourceLimitError("video transcode limit reached");
-        if (plan.audio == MediaTransform::transcode &&
-            audio_transcodes_locked(excluding) >= config.max_audio_transcodes)
-            throw ResourceLimitError("audio transcode limit reached");
+        if (sessions.size() + pending_sessions >= config.max_sessions)
+            throw ResourceLimitError("playback session limit reached");
+        ++pending_sessions;
     }
 
-    void wait_for_playlist(Session& session) {
-        auto playlist = session.generation_dir / "master.m3u8";
-        auto deadline = Clock::now() + config.startup_timeout;
-        while (Clock::now() < deadline) {
-            std::error_code ec;
-            if (std::filesystem::is_regular_file(playlist, ec) && std::filesystem::file_size(playlist, ec) > 0) return;
-            if (session.engine_session && !session.engine_session->running()) {
-                auto diagnostic = session.engine_session->diagnostics();
-                throw std::runtime_error("ffmpeg exited before producing HLS: " + diagnostic);
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-        throw std::runtime_error("timed out waiting for first HLS playlist");
+    void release_session_slot() {
+        std::lock_guard lock(mutex);
+        if (pending_sessions) --pending_sessions;
+    }
+
+    void reserve_resources(const PlaybackPlan& plan, std::string_view excluding = {}) {
+        std::lock_guard lock(mutex);
+        const bool video = plan.video == MediaTransform::transcode;
+        const bool audio = plan.audio == MediaTransform::transcode;
+        if (video && video_transcodes_locked(excluding) + reserved_video_transcodes >=
+                         config.max_video_transcodes)
+            throw ResourceLimitError("video transcode limit reached");
+        if (audio && audio_transcodes_locked(excluding) + reserved_audio_transcodes >=
+                         config.max_audio_transcodes)
+            throw ResourceLimitError("audio transcode limit reached");
+        if (video) ++reserved_video_transcodes;
+        if (audio) ++reserved_audio_transcodes;
+    }
+
+    void release_resources_locked(const PlaybackPlan& plan) {
+        if (plan.video == MediaTransform::transcode && reserved_video_transcodes)
+            --reserved_video_transcodes;
+        if (plan.audio == MediaTransform::transcode && reserved_audio_transcodes)
+            --reserved_audio_transcodes;
+    }
+
+    void release_resources(const PlaybackPlan& plan) {
+        std::lock_guard lock(mutex);
+        release_resources_locked(plan);
+    }
+
+    std::shared_ptr<MediaEngineSession> active_engine(const Session& session) const {
+        std::lock_guard lock(session.pipeline_mutex);
+        return session.engine_session;
     }
 
     void stop_pipeline(Session& session) {
-        if (session.engine_session) {
-            session.engine_session->stop();
-            session.engine_session.reset();
+        std::shared_ptr<MediaEngineSession> active;
+        {
+            std::lock_guard lock(session.pipeline_mutex);
+            active.swap(session.engine_session);
         }
+        if (active) active->stop();
     }
 
-    void start_pipeline(Session& session) {
+    void wait_for_initial_fragment(Session& session, std::string_view trace) {
+        auto active = active_engine(session);
+        if (!active) throw std::runtime_error("media pipeline did not start");
+        auto store = active->segments();
+        auto started_at = Clock::now();
+        if (store->wait_ready(config.startup_timeout)) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started_at).count();
+            auto state = store->snapshot();
+            Log::info("playback[" + std::string(trace) + "] first fragment ready elapsed_ms=" +
+                      std::to_string(elapsed) + " segments=" + std::to_string(state.segment_count));
+            return;
+        }
+        auto state = store->snapshot();
+        if (!state.error.empty()) throw std::runtime_error("libav pipeline failed before first fragment: " + state.error);
+        auto diagnostic = active->diagnostics();
+        if (!active->running())
+            throw std::runtime_error("libav pipeline ended before first fragment" +
+                                     (diagnostic.empty() ? std::string{} : ": " + diagnostic));
+        throw std::runtime_error("timed out waiting for first fragmented-MP4 segment");
+    }
+
+    void start_pipeline(Session& session, std::string_view trace) {
         stop_pipeline(session);
         ++session.generation;
         session.generation_dir = *config.temp_path / session.id / std::to_string(session.generation);
-        std::filesystem::create_directories(session.generation_dir);
+        std::error_code ec;
+        std::filesystem::remove_all(session.generation_dir, ec);
+        session.subtitle_data.reset();
         session.subtitle_url.clear();
-        session.highest_segment_requested = 0;
-        session.producer_paused = false;
         auto prefix = public_stream_prefix(session);
         if (session.plan.mode == PlaybackMode::direct) {
             session.stream_url = prefix + "/direct";
+            Log::info("playback[" + std::string(trace) + "] pipeline direct media=" + session.source.media_id);
         } else {
-            check_resources(session.plan, session.id);
-            session.engine_session = engine->start_hls(session.source, session.plan, session.generation_dir,
-                                                       config.segment_duration);
+            auto started_at = Clock::now();
+            Log::info("playback[" + std::string(trace) + "] pipeline start media=" + session.source.media_id +
+                      " mode=" + playback_mode_name(session.plan.mode));
+            auto launched = engine->start_hls(session.source, session.plan, config.segment_duration,
+                                              config.max_ahead_segments, config.segment_memory_bytes,
+                                              session.generation_dir);
+            {
+                std::lock_guard lock(session.pipeline_mutex);
+                session.engine_session = std::shared_ptr<MediaEngineSession>(std::move(launched));
+            }
             try {
-                wait_for_playlist(session);
-            } catch (...) {
+                wait_for_initial_fragment(session, trace);
+            } catch (const PlaybackStageError&) {
                 stop_pipeline(session);
+                std::error_code cleanup_ec;
+                std::filesystem::remove_all(session.generation_dir, cleanup_ec);
                 throw;
+            } catch (const std::exception& e) {
+                stop_pipeline(session);
+                std::error_code cleanup_ec;
+                std::filesystem::remove_all(session.generation_dir, cleanup_ec);
+                throw PlaybackStageError(std::string(trace), "pipeline_start", e.what());
             }
             session.stream_url = prefix + "/" + std::to_string(session.generation) + "/master.m3u8";
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started_at).count();
+            Log::info("playback[" + std::string(trace) + "] pipeline startup complete elapsed_ms=" +
+                      std::to_string(elapsed));
         }
-        if (session.plan.subtitle_stream >= 0) {
-            auto subtitle_path = session.generation_dir / "subtitle.vtt";
-            try {
-                auto subtitle_seek = session.plan.mode == PlaybackMode::direct
-                                         ? std::chrono::milliseconds{} : session.plan.seek;
-                engine->extract_webvtt(session.source, session.plan.subtitle_stream, subtitle_path, subtitle_seek);
-                session.subtitle_url = prefix + "/" + std::to_string(session.generation) + "/subtitle.vtt";
-            } catch (const std::exception& e) {
-                Log::debug("subtitle extraction skipped: " + std::string(e.what()));
-            }
-        }
+        if (session.plan.subtitle_stream >= 0)
+            session.subtitle_url = prefix + "/" + std::to_string(session.generation) + "/subtitle.vtt";
     }
 
     std::shared_ptr<Session> resolve_session(std::string item_id, std::vector<std::string> media_ids,
                                              ClientCapabilities capabilities, PlaybackPreferences preferences,
+                                             std::string_view trace,
                                              std::string existing_id = {}, std::string existing_token = {}) {
         if (media_ids.empty()) throw std::runtime_error("no media representations are available");
         struct Candidate {
@@ -584,28 +681,29 @@ struct PlaybackManager::Impl {
             int rank{};
         };
         std::optional<Candidate> best;
-        std::vector<std::string> temporary_tokens;
         std::exception_ptr last_exception;
+        const auto resolve_deadline = Clock::now() + config.probe_timeout;
         for (const auto& media_id : media_ids) {
             try {
                 auto lease = create_source(media_id);
-                temporary_tokens.push_back(lease.token);
-                auto probe = probe_source(lease);
+                auto probe = probe_source(lease, trace, resolve_deadline);
                 auto plan = negotiate(probe, lease.path, capabilities, preferences);
                 int rank = plan.mode == PlaybackMode::direct ? 0 : (plan.mode == PlaybackMode::remux ? 1 : 2);
+                Log::debug("playback[" + std::string(trace) + "] candidate media=" + media_id +
+                           " mode=" + playback_mode_name(plan.mode) + " rank=" + std::to_string(rank));
                 if (!best || rank < best->rank) best = Candidate{std::move(lease), std::move(probe), plan, rank};
                 if (rank == 0) break;
-            } catch (...) {
+            } catch (const std::exception& e) {
+                Log::debug("playback[" + std::string(trace) + "] candidate rejected media=" + media_id +
+                           " error=" + e.what());
                 last_exception = std::current_exception();
+                if (Clock::now() >= resolve_deadline) break;
             }
         }
         if (!best) {
-            for (const auto& token : temporary_tokens) remove_source(token);
             if (last_exception) std::rethrow_exception(last_exception);
             throw std::runtime_error("no playable media representation");
         }
-        for (const auto& token : temporary_tokens)
-            if (token != best->lease.token) remove_source(token);
 
         auto session = std::make_shared<Session>();
         session->id = existing_id.empty() ? hex_token(16) : std::move(existing_id);
@@ -613,8 +711,8 @@ struct PlaybackManager::Impl {
         session->item_id = std::move(item_id);
         session->capabilities = std::move(capabilities);
         session->preferences = std::move(preferences);
-        session->source_token = best->lease.token;
-        session->source = MediaSource{best->lease.media_id, best->lease.path, source_url(best->lease.token), best->lease.entry.size};
+        session->source_entry = best->lease.entry;
+        session->source = media_source(best->lease);
         session->probe = std::move(best->probe);
         session->plan = best->plan;
         session->touched = Clock::now();
@@ -673,68 +771,29 @@ struct PlaybackManager::Impl {
                          {"streams", Json(std::move(streams))},
                          {"source_format", session.probe.format},
                          {"duration_ms", static_cast<uint64_t>(std::max(0.0, session.probe.duration_seconds) * 1000.0)},
-                         {"source_bitrate", session.probe.bitrate}};
+                         {"source_bitrate", session.probe.bitrate},
+                         {"seek_ms", static_cast<uint64_t>(std::max<int64_t>(0, session.plan.seek.count()))}};
         if (!session.item_id.empty()) out["item_id"] = session.item_id;
         return Json(std::move(out));
     }
 
-    HttpResponse source_response(const HttpRequest& request) {
-        constexpr std::string_view prefix = "/source/";
-        auto token = request.path.substr(prefix.size());
-        SourceLease lease;
-        {
-            std::lock_guard lock(mutex);
-            auto it = sources.find(token);
-            if (it == sources.end()) return http_error(404, "not_found", "source lease not found");
-            it->second.touched = Clock::now();
-            lease = it->second;
-        }
-        if (request.method != "GET" && request.method != "HEAD") return http_error(405, "method", "GET or HEAD required");
-        return ranged_response(request, lease.entry.size, "application/octet-stream",
-                               [this, path = lease.path, entry = lease.entry](uint64_t offset, uint64_t length) {
-                                   return std::make_shared<LogicalBody>(fs.open_read(entry, path), offset, length);
-                               });
-    }
-
-    void note_segment_request(Session& session, std::string_view name) {
+    static std::optional<uint64_t> segment_index(std::string_view name) {
         constexpr std::string_view prefix = "segment-";
         constexpr std::string_view suffix = ".m4s";
-        if (!name.starts_with(prefix) || !name.ends_with(suffix)) return;
+        if (!name.starts_with(prefix) || !name.ends_with(suffix)) return {};
         auto number = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
         uint64_t index = 0;
         auto [end, ec] = std::from_chars(number.data(), number.data() + number.size(), index);
-        if (ec != std::errc{} || end != number.data() + number.size()) return;
-        session.highest_segment_requested = std::max(session.highest_segment_requested, index);
+        if (ec != std::errc{} || end != number.data() + number.size()) return {};
+        return index;
     }
 
-    void manage_backpressure(Session& session) {
-        if (!session.engine_session || session.plan.mode == PlaybackMode::direct || !session.engine_session->running()) return;
-        uint64_t highest_generated = 0;
-        bool found = false;
-        std::error_code ec;
-        for (const auto& entry : std::filesystem::directory_iterator(session.generation_dir, ec)) {
-            if (ec) break;
-            auto name = entry.path().filename().string();
-            constexpr std::string_view prefix = "segment-";
-            constexpr std::string_view suffix = ".m4s";
-            if (!std::string_view(name).starts_with(prefix) || !std::string_view(name).ends_with(suffix)) continue;
-            auto number = std::string_view(name).substr(prefix.size(), name.size() - prefix.size() - suffix.size());
-            uint64_t index = 0;
-            auto [end, parse_ec] = std::from_chars(number.data(), number.data() + number.size(), index);
-            if (parse_ec == std::errc{} && end == number.data() + number.size()) {
-                highest_generated = std::max(highest_generated, index);
-                found = true;
-            }
-        }
-        if (!found) return;
-        const auto ahead = config.max_ahead_segments;
-        if (!session.producer_paused && highest_generated > session.highest_segment_requested + ahead) {
-            session.engine_session->set_paused(true);
-            session.producer_paused = true;
-        } else if (session.producer_paused && highest_generated <= session.highest_segment_requested + std::max<size_t>(1, ahead / 2)) {
-            session.engine_session->set_paused(false);
-            session.producer_paused = false;
-        }
+    HttpResponse bytes_response(const HttpRequest& request, Bytes bytes, std::string mime) {
+        auto shared = std::make_shared<const Bytes>(std::move(bytes));
+        return ranged_response(request, shared->size(), std::move(mime),
+                               [shared](uint64_t offset, uint64_t length) {
+                                   return std::make_shared<MemoryBody>(shared, offset, length);
+                               });
     }
 
     HttpResponse public_stream_response(const HttpRequest& request) {
@@ -749,7 +808,6 @@ struct PlaybackManager::Impl {
         auto token = std::string(rest.substr(0, slash2));
         rest.remove_prefix(slash2 + 1);
         std::shared_ptr<Session> session;
-        SourceLease source_lease;
         {
             std::lock_guard lock(mutex);
             auto it = sessions.find(id);
@@ -757,20 +815,16 @@ struct PlaybackManager::Impl {
                 return http_error(404, "not_found", "stream not found");
             session = it->second;
             session->touched = Clock::now();
-            auto source = sources.find(session->source_token);
-            if (source == sources.end()) return http_error(404, "not_found", "media source lease expired");
-            source->second.touched = Clock::now();
-            source_lease = source->second;
         }
         if (request.method != "GET" && request.method != "HEAD") return http_error(405, "method", "GET or HEAD required");
         if (rest == "direct") {
-            return ranged_response(request, source_lease.entry.size, direct_mime(source_lease.path),
-                                   [this, path = source_lease.path, entry = source_lease.entry](uint64_t offset, uint64_t length) {
+            return ranged_response(request, session->source_entry.size, direct_mime(session->source.logical_path),
+                                   [this, path = session->source.logical_path, entry = session->source_entry](uint64_t offset, uint64_t length) {
                                        return std::make_shared<LogicalBody>(fs.open_read(entry, path), offset, length);
                                    });
         }
         auto slash3 = rest.find('/');
-        if (slash3 == std::string_view::npos) return http_error(404, "not_found", "stream file not found");
+        if (slash3 == std::string_view::npos) return http_error(404, "not_found", "stream object not found");
         uint64_t generation = 0;
         auto generation_text = rest.substr(0, slash3);
         auto [end, ec] = std::from_chars(generation_text.data(), generation_text.data() + generation_text.size(), generation);
@@ -778,20 +832,65 @@ struct PlaybackManager::Impl {
             return http_error(404, "not_found", "stream generation not found");
         auto name = std::string(rest.substr(slash3 + 1));
         if (name.empty() || name.find('/') != std::string::npos || name == "." || name == ".." || name.find("..") != std::string::npos)
-            return http_error(400, "bad_path", "invalid stream filename");
-        {
-            std::lock_guard lock(mutex);
-            note_segment_request(*session, name);
+            return http_error(400, "bad_path", "invalid stream object");
+        if (name == "subtitle.vtt") {
+            if (session->plan.subtitle_stream < 0) return http_error(404, "not_found", "subtitle track not selected");
+            std::lock_guard subtitle_lock(session->subtitle_mutex);
+            if (!session->subtitle_data) {
+                try {
+                    auto subtitle_seek = session->plan.mode == PlaybackMode::direct
+                                           ? std::chrono::milliseconds{} : session->plan.seek;
+                    session->subtitle_data = engine->extract_webvtt(session->source,
+                                                                    session->plan.subtitle_stream,
+                                                                    subtitle_seek);
+                } catch (const std::exception& e) {
+                    Log::warn("subtitle extraction failed session=" + session->id + " error=" + e.what());
+                    return http_error(503, "subtitle_unavailable", e.what());
+                }
+            }
+            Bytes bytes(session->subtitle_data->begin(), session->subtitle_data->end());
+            return bytes_response(request, std::move(bytes), "text/vtt; charset=utf-8");
         }
-        auto path = session->generation_dir / name;
-        std::error_code error;
-        if (!std::filesystem::is_regular_file(path, error)) return http_error(404, "not_ready", "stream file not ready");
-        auto size = std::filesystem::file_size(path, error);
-        if (error) return http_error(404, "not_found", "stream file not found");
-        return ranged_response(request, size, file_mime(name),
-                               [path](uint64_t offset, uint64_t length) {
-                                   return std::make_shared<LocalFileBody>(path, offset, length);
-                               });
+        auto active = active_engine(*session);
+        if (!active) return http_error(404, "not_found", "transformed stream is not active");
+        auto store = active->segments();
+        if (name == "master.m3u8") {
+            auto playlist = store->playlist();
+            auto state = store->snapshot();
+            Log::debug("playback stream playlist session=" + session->id +
+                       " generation=" + std::to_string(session->generation) +
+                       " segments=" + std::to_string(state.segment_count) +
+                       " highest_requested=" + std::to_string(state.highest_requested) +
+                       " finished=" + std::string(state.finished ? "true" : "false"));
+            if (playlist.empty()) {
+                if (!state.error.empty()) return http_error(503, "stream_failed", state.error);
+                return http_error(404, "not_ready", "playlist not ready");
+            }
+            Bytes bytes(playlist.begin(), playlist.end());
+            auto response = bytes_response(request, std::move(bytes), "application/vnd.apple.mpegurl");
+            response.headers["Cache-Control"] = "no-store";
+            return response;
+        }
+        auto object = store->object(name);
+        if (!object) {
+            auto state = store->snapshot();
+            if (!state.error.empty()) return http_error(503, "stream_failed", state.error);
+            return http_error(404, state.finished ? "not_found" : "not_ready",
+                              state.finished ? "stream object not found" : "stream object not ready");
+        }
+        // Demand only advances after a fragment actually exists. A guessed or
+        // malicious far-future segment URL must not defeat producer back-pressure
+        // and cause the whole movie to be hydrated.
+        if (auto index = segment_index(name)) {
+            active->note_segment_requested(*index);
+            auto state = store->snapshot();
+            Log::debug("playback stream segment session=" + session->id +
+                       " generation=" + std::to_string(session->generation) +
+                       " index=" + std::to_string(*index) +
+                       " bytes=" + std::to_string(object->size()) +
+                       " segments_ready=" + std::to_string(state.segment_count));
+        }
+        return bytes_response(request, std::move(*object), file_mime(name));
     }
 
     std::vector<std::string> item_media(std::string_view item_id) const {
@@ -802,6 +901,9 @@ struct PlaybackManager::Impl {
 
     HttpResponse create(const HttpRequest& request) {
         if (!config.enabled) return http_error(503, "streaming_disabled", "streaming is disabled");
+        auto trace = hex_token(4);
+        auto request_started = Clock::now();
+        Log::info("playback[" + trace + "] session create start");
         Json root = Json::parse(std::string_view(reinterpret_cast<const char*>(request.body.data()), request.body.size()));
         if (!root.isObject()) return http_error(400, "bad_request", "JSON object required");
         std::string item_id, media_id;
@@ -810,20 +912,45 @@ struct PlaybackManager::Impl {
         if (item_id.empty() && media_id.empty()) return http_error(400, "bad_request", "item_id or media_id is required");
         auto caps = parse_capabilities(root.find("capabilities"));
         auto prefs = parse_preferences(root.find("preferences"));
+        std::optional<int64_t> seek_ms;
+        if (auto seek = root.find("seek_ms")) {
+            try {
+                auto value = seek->asInt64();
+                if (value >= 0) seek_ms = value;
+            } catch (...) {}
+            if (!seek_ms) return http_error(400, "bad_seek", "seek_ms must be non-negative");
+        }
         auto media = media_id.empty() ? item_media(item_id) : std::vector<std::string>{media_id};
-        {
-            std::lock_guard lock(mutex);
-            if (sessions.size() >= config.max_sessions) return http_error(429, "session_limit", "playback session limit reached");
+        reserve_session_slot();
+        bool resources_reserved = false;
+        std::shared_ptr<Session> session;
+        try {
+            session = resolve_session(item_id, std::move(media), std::move(caps), std::move(prefs), trace);
+            if (seek_ms) session->plan.seek = std::chrono::milliseconds(*seek_ms);
+            reserve_resources(session->plan);
+            resources_reserved = true;
+            start_pipeline(*session, trace);
+            {
+                std::lock_guard lock(mutex);
+                sessions[session->id] = session;
+                if (pending_sessions) --pending_sessions;
+                release_resources_locked(session->plan);
+                resources_reserved = false;
+            }
+        } catch (...) {
+            if (session) stop_pipeline(*session);
+            if (resources_reserved && session) release_resources(session->plan);
+            release_session_slot();
+            throw;
         }
-        auto session = resolve_session(item_id, std::move(media), std::move(caps), std::move(prefs));
-        check_resources(session->plan);
-        start_pipeline(*session);
-        {
-            std::lock_guard lock(mutex);
-            sessions[session->id] = session;
-        }
-        auto response = http_json(201, session_json(*session).dump());
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - request_started).count();
+        Log::info("playback[" + trace + "] session create complete id=" + session->id +
+                  " mode=" + playback_mode_name(session->plan.mode) + " elapsed_ms=" + std::to_string(elapsed));
+        auto payload = session_json(*session);
+        payload["trace_id"] = trace;
+        auto response = http_json(201, payload.dump());
         response.headers["Location"] = "/api/v1/playback/sessions/" + session->id;
+        response.headers["X-Macha-Playback-Trace"] = trace;
         return response;
     }
 
@@ -837,9 +964,12 @@ struct PlaybackManager::Impl {
             session->touched = Clock::now();
         }
         auto result = session_json(*session);
-        if (session->engine_session) {
-            result["engine_running"] = session->engine_session->running();
-            if (auto code = session->engine_session->exit_code()) result["engine_exit_code"] = *code;
+        if (auto active = active_engine(*session)) {
+            result["engine_running"] = active->running();
+            if (auto code = active->exit_code()) result["engine_exit_code"] = *code;
+            auto state = active->segments()->snapshot();
+            result["segments_ready"] = state.segment_count;
+            if (!state.error.empty()) result["engine_error"] = state.error;
         }
         return http_json(200, result.dump());
     }
@@ -852,12 +982,16 @@ struct PlaybackManager::Impl {
             if (it == sessions.end()) return http_error(404, "not_found", "playback session not found");
             old = it->second;
         }
+        auto trace = hex_token(4);
         Json root = Json::parse(std::string_view(reinterpret_cast<const char*>(request.body.data()), request.body.size()));
         if (!root.isObject()) return http_error(400, "bad_request", "JSON object required");
         auto prefs = parse_preferences(root.find("preferences"), old->preferences);
-        std::optional<uint64_t> seek_ms;
+        std::optional<int64_t> seek_ms;
         if (auto seek = root.find("seek_ms")) {
-            seek_ms = optional_u64(seek);
+            try {
+                auto value = seek->asInt64();
+                if (value >= 0) seek_ms = value;
+            } catch (...) {}
             if (!seek_ms) return http_error(400, "bad_seek", "seek_ms must be non-negative");
         }
         std::string media_override;
@@ -866,17 +1000,32 @@ struct PlaybackManager::Impl {
                                                                    : item_media(old->item_id))
                                             : std::vector<std::string>{media_override};
         auto replacement = resolve_session(old->item_id, std::move(media), old->capabilities, prefs,
-                                           old->id, old->token);
+                                           trace, old->id, old->token);
         replacement->generation = old->generation;
         if (seek_ms) replacement->plan.seek = std::chrono::milliseconds(*seek_ms);
-        check_resources(replacement->plan, old->id);
-        start_pipeline(*replacement);
-        {
-            std::lock_guard lock(mutex);
-            sessions[std::string(id)] = replacement;
-            sources.erase(old->source_token);
+        bool resources_reserved = false;
+        try {
+            reserve_resources(replacement->plan, old->id);
+            resources_reserved = true;
+            start_pipeline(*replacement, trace);
+            // Keep the replacement reservation until the old physical pipeline
+            // is stopped.  Otherwise a third concurrent request could consume
+            // the apparent free slot during this handover window.
+            stop_pipeline(*old);
+            {
+                std::lock_guard lock(mutex);
+                auto it = sessions.find(std::string(id));
+                if (it == sessions.end() || it->second != old)
+                    throw std::runtime_error("playback session changed during update");
+                it->second = replacement;
+                release_resources_locked(replacement->plan);
+                resources_reserved = false;
+            }
+        } catch (...) {
+            stop_pipeline(*replacement);
+            if (resources_reserved) release_resources(replacement->plan);
+            throw;
         }
-        stop_pipeline(*old);
         std::error_code ec;
         if (!old->generation_dir.empty() && old->generation_dir != replacement->generation_dir)
             std::filesystem::remove_all(old->generation_dir, ec);
@@ -891,7 +1040,6 @@ struct PlaybackManager::Impl {
             if (it == sessions.end()) return http_error(404, "not_found", "playback session not found");
             session = it->second;
             sessions.erase(it);
-            sources.erase(session->source_token);
         }
         stop_pipeline(*session);
         std::error_code ec;
@@ -916,9 +1064,16 @@ struct PlaybackManager::Impl {
                          {"max_video_transcodes", static_cast<uint64_t>(config.max_video_transcodes)},
                          {"audio_transcodes", static_cast<uint64_t>(audio_transcodes)},
                          {"max_audio_transcodes", static_cast<uint64_t>(config.max_audio_transcodes)},
-                         {"ffmpeg_available", state.ffmpeg_available},
-                         {"ffprobe_available", state.ffprobe_available},
-                         {"ffmpeg_version", state.ffmpeg_version}};
+                         {"media_engine_available", state.available},
+                         {"media_engine", state.backend},
+                         {"media_engine_version", state.version},
+                         {"h264_encoder", state.h264_encoder},
+                         {"aac_encoder", state.aac_encoder},
+                         // Kept for one release so older diagnostics UIs do not
+                         // mistake the field's disappearance for a parse failure.
+                         {"ffmpeg_available", false},
+                         {"ffprobe_available", false},
+                         {"ffmpeg_version", ""}};
         return http_json(200, Json(std::move(out)).dump());
     }
 
@@ -947,15 +1102,10 @@ struct PlaybackManager::Impl {
                 for (auto it = sessions.begin(); it != sessions.end();) {
                     if (now - it->second->touched >= config.session_idle) {
                         expired.push_back(it->second);
-                        sources.erase(it->second->source_token);
                         it = sessions.erase(it);
                     } else {
                         ++it;
                     }
-                }
-                for (auto it = sources.begin(); it != sources.end();) {
-                    if (now - it->second.touched >= config.session_idle) it = sources.erase(it);
-                    else ++it;
                 }
             }
             for (auto& session : expired) {
@@ -963,16 +1113,8 @@ struct PlaybackManager::Impl {
                 std::error_code ec;
                 std::filesystem::remove_all(*config.temp_path / session->id, ec);
             }
-            std::vector<std::shared_ptr<Session>> active;
-            {
-                std::lock_guard lock(mutex);
-                for (const auto& [_, session] : sessions) active.push_back(session);
-            }
-            for (auto& session : active) {
-                std::lock_guard lock(mutex);
-                manage_backpressure(*session);
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            for (int i = 0; i < 10 && !stop.stop_requested(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
 };
@@ -986,31 +1128,14 @@ PlaybackManager::~PlaybackManager() { stop(); }
 void PlaybackManager::start() {
     if (impl_->started || !impl_->config.enabled) return;
     std::filesystem::create_directories(*impl_->config.temp_path);
-    CatalogueApiConfig internal;
-    internal.enabled = true;
-    internal.listen = "127.0.0.1";
-    internal.port = 0;
-    internal.workers = 4;
-    internal.max_queued_connections = 64;
-    internal.stream_chunk_bytes = impl_->api_config.stream_chunk_bytes;
-    impl_->source_http = std::make_unique<HttpServer>(internal, [this](const HttpRequest& request) {
-        if (request.path.starts_with("/source/")) return impl_->source_response(request);
-        return http_error(404, "not_found", "source endpoint not found");
-    });
-    impl_->source_http->start();
-    auto deadline = Clock::now() + std::chrono::seconds(2);
-    while (!impl_->source_http->bound_port() && Clock::now() < deadline)
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    if (!impl_->source_http->bound_port()) {
-        impl_->source_http->stop();
-        impl_->source_http.reset();
-        throw std::runtime_error("playback source HTTP server failed to start");
-    }
+    if (!impl_->engine) throw std::runtime_error("streaming media engine is unavailable");
+    auto status = impl_->engine->status();
+    if (!status.available) throw std::runtime_error("streaming media engine is unavailable");
     impl_->cleanup_thread = std::jthread([this](std::stop_token stop) { impl_->cleanup(stop); });
     impl_->started = true;
-    auto status = impl_->engine->status();
-    Log::info("streaming enabled ffmpeg=" + std::string(status.ffmpeg_available ? "yes" : "no") +
-              " ffprobe=" + std::string(status.ffprobe_available ? "yes" : "no"));
+    Log::info("streaming enabled engine=" + status.backend + " version=" + status.version +
+              " h264_encoder=" + std::string(status.h264_encoder ? "yes" : "no") +
+              " aac_encoder=" + std::string(status.aac_encoder ? "yes" : "no"));
 }
 
 void PlaybackManager::stop() {
@@ -1024,20 +1149,15 @@ void PlaybackManager::stop() {
         std::lock_guard lock(impl_->mutex);
         for (auto& [_, session] : impl_->sessions) sessions.push_back(session);
         impl_->sessions.clear();
-        impl_->sources.clear();
     }
     for (auto& session : sessions) impl_->stop_pipeline(*session);
-    if (impl_->source_http) {
-        impl_->source_http->stop();
-        impl_->source_http.reset();
-    }
     impl_->started = false;
 }
 
 void PlaybackManager::reconfigure(StreamingConfig config) {
     std::lock_guard lock(impl_->mutex);
-    // Engine executable/backend changes deliberately require restart. Live reload
-    // covers policy limits and idle/segment timing for subsequent sessions.
+    // Backend, probe, buffering and temp-path changes require a service restart.
+    // Policy limits and playback timing apply to subsequent sessions immediately.
     impl_->config.max_sessions = config.max_sessions;
     impl_->config.max_video_transcodes = config.max_video_transcodes;
     impl_->config.max_audio_transcodes = config.max_audio_transcodes;
@@ -1048,6 +1168,7 @@ void PlaybackManager::reconfigure(StreamingConfig config) {
 }
 
 HttpResponse PlaybackManager::handle(const HttpRequest& request) {
+    auto began = Clock::now();
     try {
         return impl_->handle_api(request);
     } catch (const JsonError& e) {
@@ -1058,7 +1179,23 @@ HttpResponse PlaybackManager::handle(const HttpRequest& request) {
         return http_error(404, "not_found", e.what());
     } catch (const ResourceLimitError& e) {
         return http_error(429, "resource_limit", e.what());
+    } catch (const PlaybackStageError& e) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - began).count();
+        Log::warn("playback[" + e.trace() + "] request failed stage=" + e.stage() +
+                  " method=" + request.method + " path=" + request.path +
+                  " elapsed_ms=" + std::to_string(elapsed) + " error=" + e.what());
+        Json::Object body{{"error", "playback_" + e.stage() + "_failed"},
+                          {"message", std::string(e.what())},
+                          {"trace", e.trace()},
+                          {"stage", e.stage()}};
+        auto response = http_json(503, Json(std::move(body)).dump());
+        response.headers["X-Macha-Playback-Trace"] = e.trace();
+        response.headers["X-Macha-Playback-Stage"] = e.stage();
+        return response;
     } catch (const std::exception& e) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - began).count();
+        Log::warn("playback request failed method=" + request.method + " path=" + request.path +
+                  " elapsed_ms=" + std::to_string(elapsed) + " error=" + e.what());
         return http_error(503, "playback_unavailable", e.what());
     }
 }

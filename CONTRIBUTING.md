@@ -24,7 +24,7 @@ Changes to cluster, metadata, storage, crypto, transport or filesystem semantics
 
 ## Dependencies
 
-The core dependency set is C++20, OpenSSL, yaml-cpp and libcurl. FUSE3/macFUSE is the mount dependency. Boost is not required.
+The core dependency set is C++20, OpenSSL, yaml-cpp, libcurl and the FFmpeg/libavformat, libavcodec, libavutil, libswscale and libswresample development libraries. FUSE3/macFUSE is the mount dependency. The FFmpeg command-line tools are not invoked by Macha. Boost is not required.
 
 ## Security
 

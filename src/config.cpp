@@ -101,10 +101,11 @@ void validate(Config& config) {
     if (config.catalogue.api.stream_chunk_bytes < 16 * 1024 ||
         config.catalogue.api.stream_chunk_bytes > 4ULL * 1024 * 1024)
         throw std::runtime_error("catalogue.api.stream_chunk_bytes must be 16K..4M");
+    if (config.maintenance.no_progress_backoff < std::chrono::milliseconds(500) ||
+        config.maintenance.no_progress_backoff > std::chrono::hours(1))
+        throw std::runtime_error("maintenance.no_progress_backoff_ms must be 500..3600000");
     if (config.streaming.enabled && !config.catalogue.api.enabled)
         throw std::runtime_error("streaming requires catalogue.api.enabled");
-    if (config.streaming.ffmpeg.empty() || config.streaming.ffprobe.empty())
-        throw std::runtime_error("streaming ffmpeg/ffprobe executable names must not be empty");
     if (!config.streaming.max_sessions || config.streaming.max_sessions > 1024)
         throw std::runtime_error("streaming.max_sessions must be 1..1024");
     if (config.streaming.max_video_transcodes > config.streaming.max_sessions ||
@@ -120,6 +121,17 @@ void validate(Config& config) {
         throw std::runtime_error("streaming.segment_duration_ms must be 1000..20000");
     if (config.streaming.max_ahead_segments < 2 || config.streaming.max_ahead_segments > 120)
         throw std::runtime_error("streaming.max_ahead_segments must be 2..120");
+    if (config.streaming.segment_memory_bytes < 4ULL * 1024 * 1024 ||
+        config.streaming.segment_memory_bytes > 4ULL * 1024 * 1024 * 1024)
+        throw std::runtime_error("streaming.segment_memory_bytes must be 4M..4G");
+    if (config.streaming.probe_bytes < 256ULL * 1024 || config.streaming.probe_bytes > 64ULL * 1024 * 1024)
+        throw std::runtime_error("streaming.probe_bytes must be 256K..64M");
+    if (config.streaming.probe_analyze_duration < std::chrono::milliseconds(250) ||
+        config.streaming.probe_analyze_duration > std::chrono::seconds(30))
+        throw std::runtime_error("streaming.probe_analyze_duration_ms must be 250..30000");
+    if (config.streaming.probe_timeout < std::chrono::seconds(2) ||
+        config.streaming.probe_timeout > std::chrono::minutes(2))
+        throw std::runtime_error("streaming.probe_timeout_ms must be 2000..120000");
     if (!config.streaming.temp_path)
         config.streaming.temp_path = config.state_path / "tmp" / "playback";
     if (config.catalogue.scanner.interval < std::chrono::seconds(10))
@@ -234,6 +246,9 @@ void parse_maintenance(const YAML::Node& root, Config& c) {
         c.maintenance.max_bandwidth = yaml_size(m["max_bandwidth"]);
     if (m["scrub_fraction"])
         c.maintenance.scrub_fraction = parse_fraction(m["scrub_fraction"], "scrub_fraction");
+    if (m["no_progress_backoff_ms"])
+        c.maintenance.no_progress_backoff =
+            milliseconds(m["no_progress_backoff_ms"], "maintenance.no_progress_backoff_ms");
 }
 
 void parse_filesystem(const YAML::Node& root, Config& c) {
@@ -308,10 +323,9 @@ void parse_streaming(const YAML::Node& root, Config& c) {
         return;
     if (streaming["enabled"])
         c.streaming.enabled = streaming["enabled"].as<bool>();
-    if (streaming["ffmpeg"])
-        c.streaming.ffmpeg = streaming["ffmpeg"].as<std::string>();
-    if (streaming["ffprobe"])
-        c.streaming.ffprobe = streaming["ffprobe"].as<std::string>();
+    // 0.7.0 originally exposed ffmpeg/ffprobe executable paths. The libav
+    // backend no longer uses them, but silently tolerate those keys so an
+    // existing 0.7.0 configuration keeps starting after this replacement.
     if (streaming["temp_path"])
         c.streaming.temp_path = std::filesystem::path(streaming["temp_path"].as<std::string>());
     if (streaming["max_sessions"])
@@ -328,6 +342,16 @@ void parse_streaming(const YAML::Node& root, Config& c) {
         c.streaming.segment_duration = milliseconds(streaming["segment_duration_ms"], "streaming.segment_duration_ms");
     if (streaming["max_ahead_segments"])
         c.streaming.max_ahead_segments = streaming["max_ahead_segments"].as<size_t>();
+    if (streaming["segment_memory_bytes"])
+        c.streaming.segment_memory_bytes = yaml_size(streaming["segment_memory_bytes"]);
+    if (streaming["probe_bytes"])
+        c.streaming.probe_bytes = yaml_size(streaming["probe_bytes"]);
+    if (streaming["probe_analyze_duration_ms"])
+        c.streaming.probe_analyze_duration =
+            milliseconds(streaming["probe_analyze_duration_ms"], "streaming.probe_analyze_duration_ms");
+    if (streaming["probe_timeout_ms"])
+        c.streaming.probe_timeout =
+            milliseconds(streaming["probe_timeout_ms"], "streaming.probe_timeout_ms");
 }
 
 void parse_hydration_engine(const YAML::Node& engines, const char* name,

@@ -370,6 +370,15 @@ std::vector<HydrationHint> CatalogueSequenceHintProvider::hints() {
     if (!enabled_.load() || !priority_.load() || !lookahead_.load())
         return {};
 
+    // Do not touch or copy the catalogue when there is no active playback.
+    // The hydrator wakes frequently by design; previously this provider called
+    // CatalogueManager::snapshot() every interval even on an idle node, which
+    // repairs metadata and copies the complete catalogue merely to discover
+    // there is no current media to predict from.
+    auto active = playback_.active(std::chrono::milliseconds(timeout_ms_.load()));
+    if (active.empty())
+        return {};
+
     CatalogueSnapshot snapshot;
     try {
         snapshot = catalogue_.snapshot();
@@ -378,8 +387,7 @@ std::vector<HydrationHint> CatalogueSequenceHintProvider::hints() {
     }
 
     std::vector<HydrationHint> out;
-    for (const auto& observation :
-         playback_.active(std::chrono::milliseconds(timeout_ms_.load()))) {
+    for (const auto& observation : active) {
         const auto* current = find_current_catalogue_item(snapshot, observation);
         if (!current)
             continue;

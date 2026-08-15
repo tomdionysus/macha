@@ -31,6 +31,9 @@ struct MaintenanceConfig {
     uint64_t initial_bandwidth{32ULL * 1024 * 1024};
     uint64_t max_bandwidth{}; // 0 = no configured cap; observed bandwidth is still used.
     double scrub_fraction{0.10};
+    // A complete no-op maintenance pass must not immediately rescan the same
+    // settled object set simply because byte credit remains available.
+    std::chrono::milliseconds no_progress_backoff{30000};
 };
 
 struct FilesystemConfig {
@@ -89,16 +92,20 @@ struct CatalogueConfig {
 
 struct StreamingConfig {
     bool enabled{};
-    std::string ffmpeg{"ffmpeg"};
-    std::string ffprobe{"ffprobe"};
+    // libav is linked into Macha. temp_path is only an overflow store for old
+    // generated fragments; active publication is in memory.
     std::optional<std::filesystem::path> temp_path;
     size_t max_sessions{8};
     size_t max_video_transcodes{1};
     size_t max_audio_transcodes{4};
     std::chrono::milliseconds session_idle{std::chrono::minutes(30)};
-    std::chrono::milliseconds startup_timeout{10000};
+    std::chrono::milliseconds startup_timeout{15000};
     std::chrono::milliseconds segment_duration{4000};
     size_t max_ahead_segments{8};
+    uint64_t segment_memory_bytes{64ULL * 1024 * 1024};
+    uint64_t probe_bytes{8ULL * 1024 * 1024};
+    std::chrono::milliseconds probe_analyze_duration{5000};
+    std::chrono::milliseconds probe_timeout{20000};
 };
 
 struct HydrationEngineConfig {
