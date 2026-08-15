@@ -11,6 +11,7 @@ namespace macha {
 namespace {
 constexpr std::array<uint8_t, 8> SM5{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'},
     SM6{'D', 'H', 'T', 'M', 'E', 'T', 'A', '6'},
+    SM7{'D', 'H', 'T', 'M', 'E', 'T', 'A', '7'},
     DM{'D', 'H', 'T', 'M', 'D', 'B', '0', '1'};
 void entry(Writer& w, const FsEntry& e) {
     w.u8((uint8_t)e.type);
@@ -84,12 +85,17 @@ void writefile(const std::filesystem::path& p, std::span<const uint8_t> d) {
 } // namespace
 Bytes encode_snapshot(const MetadataSnapshot& s) {
     Writer w;
-    w.raw(SM6);
+    w.raw(SM7);
     w.u32(s.metadata_voters.size());
     for (auto& v : s.metadata_voters)
         w.fixed(v.bytes);
     w.u32(s.data_replication);
     w.u64(s.extent_size);
+    w.u32(s.mutation_sequences.size());
+    for (const auto& [node, sequence] : s.mutation_sequences) {
+        w.fixed(node.bytes);
+        w.u64(sequence);
+    }
     w.u32(s.entries.size());
     for (auto& [p, e] : s.entries) {
         w.string(p);
@@ -108,7 +114,8 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
     auto m = r.raw(8);
     const bool v5 = std::equal(m.begin(), m.end(), SM5.begin());
     const bool v6 = std::equal(m.begin(), m.end(), SM6.begin());
-    if (!v5 && !v6)
+    const bool v7 = std::equal(m.begin(), m.end(), SM7.begin());
+    if (!v5 && !v6 && !v7)
         throw DecodeError("bad snapshot");
     auto nv = r.u32();
     if (nv > 1024)
@@ -120,6 +127,17 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
     }
     s.data_replication = r.u32();
     s.extent_size = r.u64();
+    if (v7) {
+        auto mutations = r.u32();
+        if (mutations > 65536)
+            throw DecodeError("too many metadata mutation origins");
+        for (uint32_t i = 0; i < mutations; ++i) {
+            NodeId node{r.fixed<16>()};
+            auto sequence = r.u64();
+            if (!sequence || !s.mutation_sequences.emplace(node, sequence).second)
+                throw DecodeError("bad metadata mutation sequence");
+        }
+    }
     auto n = r.u32();
     if (n > 5000000)
         throw DecodeError("too many filesystem entries");
@@ -128,7 +146,7 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
         if (!s.entries.emplace(p, entry(r)).second)
             throw DecodeError("duplicate path");
     }
-    if (v6 && r.u8()) {
+    if ((v6 || v7) && r.u8()) {
         ObjectId root;
         root.bytes = r.fixed<32>();
         s.catalogue_root = root;

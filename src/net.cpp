@@ -18,8 +18,8 @@
 
 namespace macha {
 namespace {
-constexpr uint16_t protocol_version = 6;
-constexpr uint32_t frame_magic = 0x4d434836; // "MCH6"
+constexpr uint16_t protocol_version = 7;
+constexpr uint32_t frame_magic = 0x4d434837; // "MCH7"
 constexpr size_t protocol_min_frame_size = 4 * 1024;
 constexpr size_t protocol_max_frame_size = 4 * 1024 * 1024;
 constexpr size_t max_message_size = 128 * 1024 * 1024;
@@ -115,7 +115,7 @@ Bytes label(const char* prefix, std::span<const uint8_t> data) {
 Bytes session_info(std::span<const uint8_t> transcript, const NodeId& client,
                    const NodeId& server, const char* direction) {
     Writer writer;
-    writer.string("macha/session/v6");
+    writer.string("macha/session/v7");
     writer.string(direction);
     writer.fixed(sha256(transcript).bytes);
     writer.fixed(client.bytes);
@@ -429,7 +429,7 @@ NodeInfo SecureChannel::client_handshake() {
 
     Writer envelope;
     envelope.bytes(hello);
-    envelope.fixed(hmac_sha256(keys_.auth, label("client/v6", hello)));
+    envelope.fixed(hmac_sha256(keys_.auth, label("client/v7", hello)));
     send_blob(fd_, envelope.data());
 
     auto response = recv_blob(fd_, 16384);
@@ -438,7 +438,7 @@ NodeInfo SecureChannel::client_handshake() {
     auto remote_mac = response_reader.fixed<32>();
     response_reader.finish();
 
-    auto authenticated = label("server/v6", hello);
+    auto authenticated = label("server/v7", hello);
     authenticated.insert(authenticated.end(), ack.begin(), ack.end());
     if (!constant_time_equal(remote_mac, hmac_sha256(keys_.auth, authenticated)))
         throw std::runtime_error("peer auth failed");
@@ -490,7 +490,7 @@ NodeInfo SecureChannel::server_handshake(const std::string& remote_host) {
     auto remote_mac = envelope_reader.fixed<32>();
     envelope_reader.finish();
 
-    if (!constant_time_equal(remote_mac, hmac_sha256(keys_.auth, label("client/v6", hello))))
+    if (!constant_time_equal(remote_mac, hmac_sha256(keys_.auth, label("client/v7", hello))))
         throw std::runtime_error("client auth failed");
 
     Reader reader(hello);
@@ -529,7 +529,7 @@ NodeInfo SecureChannel::server_handshake(const std::string& remote_host) {
     encode_node_info(ack_writer, local_);
     auto ack = ack_writer.take();
 
-    auto authenticated = label("server/v6", hello);
+    auto authenticated = label("server/v7", hello);
     authenticated.insert(authenticated.end(), ack.begin(), ack.end());
     Writer response;
     response.bytes(ack);

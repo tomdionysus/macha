@@ -22,7 +22,7 @@ The key is never sent over the network. Every node must nevertheless have the sa
 - AES-256-GCM authoritative extents, cache objects and metadata at rest.
 - Random 96-bit GCM nonces from OpenSSL `RAND_bytes`.
 
-Transport v6 authenticates peer identity, the negotiated frame ceiling and the ephemeral X25519 exchange. Each peer pair uses one canonical bidirectional connection. Variable-length frames are independently AES-256-GCM protected, and frame type is the sole transport-priority authority. The exchange has forward secrecy against later disclosure of the shared cluster key, assuming the endpoint and ephemeral session secrets were not compromised while the session was live.
+Transport v7 authenticates peer identity, the negotiated frame ceiling and the ephemeral X25519 exchange. Each peer pair uses one canonical bidirectional connection. Variable-length frames are independently AES-256-GCM protected, and frame type is the sole transport-priority authority. The exchange has forward secrecy against later disclosure of the shared cluster key, assuming the endpoint and ephemeral session secrets were not compromised while the session was live.
 
 ## Network exposure
 
@@ -32,13 +32,13 @@ For Internet deployment use routable addressing, explicit forwarding, or a priva
 
 The catalogue HTTP API is separate from the authenticated cluster protocol. It binds to loopback by default. If exposed beyond the local host, configure `catalogue.api.token_file` and restrict it with the host/network firewall.
 
-Protocol v6 is intentionally incompatible with v5 and earlier. Mixed versions fail the handshake rather than downgrade.
+Protocol v7 is intentionally incompatible with v6 and earlier. Mixed versions fail the handshake rather than downgrade.
 
 ## Key loss and compromise
 
 Losing the cluster key makes encrypted cluster data unrecoverable. Back it up separately.
 
-Compromise lets an attacker join the trusted cluster from that point onward. 0.6.1 has no online key rotation or per-node revocation.
+Compromise lets an attacker join the trusted cluster from that point onward. 0.6.2 has no online key rotation or per-node revocation.
 
 Forward secrecy protects old transport captures; it does not protect stored encrypted data from someone who later obtains both that data and the cluster key-derived storage key.
 

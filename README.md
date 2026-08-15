@@ -9,7 +9,7 @@ It mounts as a normal filesystem, stores files as immutable content-addressed ex
 
 There is no permanent master. Nodes share one cluster key, discover membership through bootstrap peers, and converge placement and replicas in the background.
 
-0.6.1 is usable, but deliberately narrow. It is built for large mostly-immutable video and music files, not as a complete general-purpose POSIX filesystem.
+0.6.2 is usable, but deliberately narrow. It is built for large mostly-immutable video and music files, not as a complete general-purpose POSIX filesystem.
 
 ## What it does
 
@@ -218,13 +218,13 @@ Remote extent retrieval is replica-aware. Independent foreground reads choose am
 
 ## Nodes and disks
 
-A DHT node may have several local storage backends. The cluster sees one node with aggregate capacity; a second rendezvous-hash layer chooses which online disk holds each local authoritative object.
+A DHT node may have several local storage backends. The cluster sees one node whose placement weight is the aggregate configured capacity of its adopted backends. A second capacity-weighted shard layer chooses the local authoritative disk.
 
 Each adopted backend has a `.macha.backend` marker and a matching identity under `state_path/backend-identities`.
 
-If a disk disappears, the backend goes offline. The node remains available. Repair can reconstruct missing local replicas onto surviving disks. If the disk returns with the expected marker, it rejoins and local placement converges again.
+If an adopted disk disappears temporarily, it goes offline but keeps its placement weight. Reads and writes fall through to surviving disks without making a transient unmount redefine the whole placement map. If the disk returns with the expected marker, local rebalance converges objects back to their intended proportional placement.
 
-Adding or removing a backend in YAML and sending `SIGHUP` changes the local pool without changing node identity.
+Adding or removing a backend in YAML and sending `SIGHUP` changes capacity without changing node identity. A newly adopted backend gains a proportional share of local placement; removing it from configuration removes that share. Current free space is never used as a placement weight.
 
 ## Node replacement and recovery
 
@@ -260,7 +260,7 @@ The optional scanner walks configured roots in the distributed filesystem and po
 
 Only the lowest active node ID runs a scan, so a normally configured cluster does not make the same provider requests from every node. Enable the scanner consistently on all nodes if you want automatic failover of that role. Already-bound files are identified by their stable `macha:<sha256>` media identity and are not looked up or downloaded again on every pass. Scanner-owned entries are removed when their final media binding disappears; manually-created catalogue records are not garbage-collected by the scanner.
 
-Filename/path recognition is intentionally simple and conservative. Typical forms are `Show/Season 02/Show.S02E05.Title.mkv`, `Movie.Title.2024.mkv`, and `Artist/Album/01 - Track.flac`; `CD 2`/`Disc 2` music directories are also recognised. Unrecognised files are ignored. Embedded audio/video tags are not parsed in 0.6.1. A failure to read any configured scan root aborts that pass rather than treating the missing root as an empty library.
+Filename/path recognition is intentionally simple and conservative. Typical forms are `Show/Season 02/Show.S02E05.Title.mkv`, `Movie.Title.2024.mkv`, and `Artist/Album/01 - Track.flac`; `CD 2`/`Disc 2` music directories are also recognised. Unrecognised files are ignored. Embedded audio/video tags are not parsed in 0.6.2. A failure to read any configured scan root aborts that pass rather than treating the missing root as an empty library.
 
 TMDB needs an API Read Access Token. Put the token alone in a file readable by Macha. MusicBrainz does not need an API key, but requires a meaningful contact string and is rate-limited by the provider; Macha spaces its MusicBrainz API requests accordingly. Configure only curated media roots:
 
@@ -319,7 +319,11 @@ Replacing or deleting the last reference to artwork records its object ID in com
 
 ## Repair and maintenance
 
-Object placement uses rendezvous hashing over object ID and stable node ID, with `failure_domain` used to prefer distinct failure domains before ordinary ranking.
+Media-object placement uses a virtual 32-bit shard space derived from the content-addressed object ID. No 2^32-entry map is materialised. Each node receives an exact shard-slot quota from its advertised usable capacity, subject to the configured replica count. The first replica choices therefore follow capacity rather than node count: a 10 TiB node receives roughly 1,280 times the ownership of an 8 GiB node when topology permits it. `failure_domain` remains a stronger placement constraint: replicas prefer distinct domains before additional nodes in the same domain.
+
+Capacity is based on adopted configured backend limits, not live free space. Ordinary writes therefore do not move placement boundaries. Adding/removing storage changes the capacity topology and background repair/rebalance converges the affected shard ownership. Within a node, the single local authoritative copy uses capacity-weighted rendezvous over the stable shards, so adding a backend moves only shards won by that backend. Deterministic capacity-aware fallbacks are used when a preferred node or disk cannot currently store an object.
+
+For `R` replicas, reported logical capacity is the largest `L` satisfying `sum(min(C_i, L)) >= R*L`, where `C_i` is node capacity (or failure-domain aggregate capacity when enough distinct domains exist). This correctly reports about 10.004 TiB for 10 TiB + 10 TiB + 8 GiB at `R=2`, but only 8 GiB for 10 TiB + 8 GiB at `R=2`.
 
 Repair works both ways:
 
@@ -332,11 +336,11 @@ Background work is budgeted in bytes, not a fixed number of extents. The schedul
 
 Each peer pair has one persistent authenticated bidirectional TCP connection. It multiplexes all health, control and object traffic with 64-bit request IDs. Connections are canonical by authenticated node identity, not endpoint text; simultaneous cross-dial deterministically keeps one physical connection and drains the duplicate before closing it.
 
-Protocol v6 transfers logical RPCs as variable-length AES-256-GCM frames. `network.max_frame_size` is an upper bound, negotiated to the lower peer limit during the authenticated handshake; the default is 256 KiB and the allowed range is 4 KiB..4 MiB. Frames are not padded to that size. Storage extent size is independent of transport frame size.
+Protocol v7 transfers logical RPCs as variable-length AES-256-GCM frames. `network.max_frame_size` is an upper bound, negotiated to the lower peer limit during the authenticated handshake; the default is 256 KiB and the allowed range is 4 KiB..4 MiB. Frames are not padded to that size. Storage extent size is independent of transport frame size.
 
 Frame type is the sole source of transport priority: `control` > `foreground` > `read_ahead` > `speculative`. There is no separate numeric priority on the wire. The sender re-runs scheduling after every frame, so health/control and foreground data can pre-empt lower-priority transfers at frame boundaries. Speculative traffic is entitled only to otherwise spare transport capacity. A transfer may be promoted without changing request ID; subsequent frames use the more urgent frame type.
 
-The v6 handshake uses ephemeral X25519 authenticated with HMAC from the shared cluster key and negotiates the frame ceiling. Directional keys are derived with HKDF-SHA256. Server dispatch likewise separates control execution from data work and always chooses foreground before read-ahead before speculative queued data.
+The v7 handshake uses ephemeral X25519 authenticated with HMAC from the shared cluster key and negotiates the frame ceiling. Directional keys are derived with HKDF-SHA256. Server dispatch likewise separates control execution from data work and always chooses foreground before read-ahead before speculative queued data.
 
 Nodes must be mutually reachable at their advertised addresses. There is no STUN, TURN, UPnP or NAT hole punching.
 
@@ -381,7 +385,7 @@ Catalogue media bindings may use the stable `macha:<sha256>` media identity deri
 
 The implemented filesystem operations cover ordinary media-library use: files and directories, create/open/read/write/truncate/unlink, mkdir/rmdir, rename, chmod/chown, timestamps, stat/statfs, directory enumeration, flush and fsync.
 
-0.6.1 does **not** implement symlinks, hard links, extended attributes, distributed advisory locks, full sparse-file semantics, or stable POSIX inode identity across every rename case. Access time is not tracked. Concurrent appenders use file-version CAS rather than a globally serialized append stream.
+0.6.2 does **not** implement symlinks, hard links, extended attributes, distributed advisory locks, full sparse-file semantics, or stable POSIX inode identity across every rename case. Access time is not tracked. Concurrent appenders use file-version CAS rather than a globally serialized append stream.
 
 A failed upload may leave unreachable immutable extents. Online garbage collection only removes objects known to have been dropped from committed metadata after a conservative grace period.
 
@@ -426,7 +430,7 @@ The systemd unit supports `systemctl reload macha`, which sends `SIGHUP`.
 
 ## Security
 
-Anyone with the cluster key is a trusted cluster member. Keep it secret and back it up separately. There is no online key rotation or per-node revocation in 0.6.1. See `SECURITY.md`.
+Anyone with the cluster key is a trusted cluster member. Keep it secret and back it up separately. There is no online key rotation or per-node revocation in 0.6.2. See `SECURITY.md`.
 
 ## License
 

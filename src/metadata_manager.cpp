@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <set>
 #include <thread>
 
@@ -526,7 +527,7 @@ MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial)
             throw std::runtime_error("cluster extent size does not match local configuration");
 
         // Replica-policy changes are an offline coordinated operation: every
-        // node must be restarted with the same desired values. Transport v6
+        // node must be restarted with the same desired values. Transport v7
         // does not advertise desired policy, so mixed rolling configurations
         // cannot be safely reconciled here.
         const size_t old_need = quorum(old_voters.size());
@@ -1017,12 +1018,41 @@ MetadataSnapshot MetadataManager::snapshot() {
 MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot&)>& mutate,
                                        size_t retries) {
     std::lock_guard lock(mutation_mutex_);
+    const auto origin = node_.node_id();
+    std::optional<uint64_t> sequence;
 
     for (size_t attempt = 0; attempt < retries; ++attempt) {
         // Mutations never trust the read cache. They start from a fresh quorum
         // read so a missed invalidation cannot become a conflicting write base.
         auto current = read_record_uncached();
         auto snapshot = decode_snapshot(current.payload);
+
+        // A quorum CAS can partially install a proposal before a competing
+        // writer wins. Another writer may then adopt our proposal as its base
+        // and commit one or more descendants before this call retries. Exact
+        // record-hash matching is therefore insufficient. Each node serialises
+        // its own mutations and advances a per-node sequence in the snapshot;
+        // seeing our sequence (or later) proves this operation is already in the
+        // canonical history, however many descendants now follow it.
+        auto seen = snapshot.mutation_sequences.find(origin);
+        if (sequence && seen != snapshot.mutation_sequences.end() && seen->second >= *sequence) {
+            auto current_voters = voters_of(current);
+            auto current_nodes = voter_nodes(current_voters);
+            const auto current_need = quorum(current_voters.size());
+            seed_quorum(current_nodes, current, current_need);
+            checkpoint_quorum(current_nodes, current, current_need);
+            node_.checkpoint_metadata(current);
+            return cache_record(current);
+        }
+
+        if (!sequence) {
+            const uint64_t previous =
+                seen == snapshot.mutation_sequences.end() ? 0 : seen->second;
+            if (previous == std::numeric_limits<uint64_t>::max())
+                throw std::runtime_error("metadata mutation sequence exhausted");
+            sequence = previous + 1;
+        }
+
         auto voters = snapshot.metadata_voters;
         auto data_replication = snapshot.data_replication;
         auto extent_size = snapshot.extent_size;
@@ -1031,6 +1061,7 @@ MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot
             throw std::runtime_error("filesystem mutation attempted to change metadata voters");
         if (snapshot.data_replication != data_replication || snapshot.extent_size != extent_size)
             throw std::runtime_error("filesystem mutation attempted to change cluster policy");
+        snapshot.mutation_sequences[origin] = *sequence;
 
         auto payload = encode_snapshot(snapshot);
         if (payload == current.payload)

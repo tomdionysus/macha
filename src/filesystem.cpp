@@ -4,12 +4,14 @@
 #include "codec.hpp"
 #include "hydration.hpp"
 #include "log.hpp"
+#include "placement.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <fcntl.h>
+#include <limits>
 #include <set>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -1025,13 +1027,18 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
 }
 std::pair<uint64_t, uint64_t> FileSystem::logical_capacity() const {
     auto ns = n_.membership().active();
-    uint64_t t = 0, u = 0;
-    for (auto& a : ns) {
-        t += a.capacity;
-        u += a.used;
-    }
-    size_t r = std::max<size_t>(1, std::min(n_.config().replication, ns.size()));
-    return {t / r, u / r};
+    if (ns.empty())
+        return {0, 0};
+    const size_t r = std::max<size_t>(1, std::min(n_.config().replication, ns.size()));
+    const uint64_t total = placement_logical_capacity(ns, r);
+
+    __uint128_t physical_used = 0;
+    for (const auto& node : ns)
+        physical_used += node.used;
+    uint64_t used = static_cast<uint64_t>(std::min<__uint128_t>(
+        physical_used / r, std::numeric_limits<uint64_t>::max()));
+    used = std::min(used, total);
+    return {total, used};
 }
 std::vector<ObjectId> FileSystem::live_objects() {
     return maintenance_objects().live;

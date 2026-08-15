@@ -31,13 +31,13 @@ Service
 
 ## StoragePool: one node, many disks
 
-A node has one stable `NodeId` regardless of local disk count. Adding a disk changes local placement, not inter-node DHT placement.
+A node has one stable `NodeId` regardless of local disk count. Adding a disk changes the node's advertised capacity and therefore its proportional inter-node ownership without changing identity.
 
-`StoragePool` ranks online `LocalStore` backends by rendezvous hashing over `(ObjectId, backend-token)` and keeps one authoritative node-local copy on the highest-ranked usable backend. Rebalance copies before deleting.
+`StoragePool` maps object IDs onto a virtual 32-bit stable shard space and uses capacity-weighted rendezvous hashing over those shards for its single authoritative node-local copy. No shard table is materialised. Adding a backend only steals the shards it wins; existing backends do not exchange unrelated shards. Unavailable/full preferred disks fall through to deterministic alternatives. Rebalance copies before deleting.
 
 Every adopted backend has a `.macha.backend` marker. `state_path/backend-identities` records the marker expected at each configured path. A disappeared marker means offline/unmounted storage; it is not silently recreated. A different marker at the same path is rejected. This avoids writing DHT data into a bare mountpoint after a disk failed to mount.
 
-Membership advertises aggregate used/capacity across online backends. Loss of one backend removes capacity, not node identity. Missing local objects can be restored from other replicas.
+Membership advertises current used bytes and stable placement capacity. Placement capacity is the aggregate configured limit of adopted backends, including a temporarily offline known disk. This prevents an unmount/remount from causing a cluster-wide ownership oscillation. Removing a backend from configuration removes its capacity; a never-adopted missing path contributes nothing. Missing local objects can be restored from other replicas.
 
 ## State is not storage
 
@@ -106,7 +106,7 @@ Both files are required for existing state. A `current.meta`-only state from an 
 
 Only the configured voter set participates in consensus. After a committed generation is known, maintenance distributes that checkpoint to every active node as a **recovery witness**. Witnesses are not extra votes.
 
-Replica counts are mutable cluster policy. A coordinated whole-cluster restart may change data replication, metadata voter count, or both. The existing voter majority serialises the policy change; a resized voter group is seeded before normal metadata mutation continues, and object repair subsequently converges the immutable extent set to the new data replica count. Transport v6 does not advertise a node's desired replica policy, so rolling changes with mixed configurations are deliberately unsupported. `extent_size` is intentionally immutable for an existing namespace.
+Replica counts are mutable cluster policy. A coordinated whole-cluster restart may change data replication, metadata voter count, or both. The existing voter majority serialises the policy change; a resized voter group is seeded before normal metadata mutation continues, and object repair subsequently converges the immutable extent set to the new data replica count. Transport v7 does not advertise a node's desired replica policy, so rolling changes with mixed configurations are deliberately unsupported. `extent_size` is intentionally immutable for an existing namespace.
 
 Read-only metadata also has a short in-memory TTL cache with generation invalidation. Mutations bypass it and start from a fresh quorum read.
 
@@ -154,11 +154,11 @@ Namespace mutation always requires quorum.
 
 If quorum is unavailable, a node may use its last valid post-genesis snapshot for read-only namespace access. It can read files only where the required extents exist in authoritative storage or cache. It cannot invent missing blocks or mutate the namespace.
 
-## Transport v6
+## Transport v7
 
 Each peer uses one persistent, authenticated, bidirectional TCP connection. It is multiplexed with 64-bit request IDs, a bounded outbound queue and pending-request maps. The TCP dialler owns odd request IDs and the acceptor owns even request IDs, so either end can originate work without request/reply ambiguity. Requests may complete out of order. Cancelling one request does not tear down unrelated work.
 
-The authenticated v6 handshake negotiates `max_frame_size`; the lower configured ceiling wins. Logical messages are split into variable-length frames no larger than that ceiling. Storage extents remain storage objects and are not transport framing units. Each frame is independently AES-256-GCM protected.
+The authenticated v7 handshake negotiates `max_frame_size`; the lower configured ceiling wins. Logical messages are split into variable-length frames no larger than that ceiling. Storage extents remain storage objects and are not transport framing units. Each frame is independently AES-256-GCM protected.
 
 Frame type defines priority completely: control, foreground, read-ahead, then speculative. No independent wire priority exists. The outbound scheduler selects the most urgent runnable transfer for every frame and returns to scheduling immediately afterwards. This makes lower-priority object transfers pre-emptible at frame boundaries rather than committing an entire extent to TCP before foreground demand can run. A promotion control frame can raise an existing transfer; subsequent frames cannot be demoted. Cancellation stops queued remainder frames without disturbing other request IDs.
 
@@ -186,11 +186,13 @@ Foreground filesystem requests do not perform local rebalance or scrub synchrono
 
 ## Inter-node placement
 
-Objects use rendezvous hashing by `(ObjectId, NodeId)`. Placement first prefers distinct configured failure domains, then fills remaining replica positions in ordinary HRW order.
+Data objects use a fixed virtual 32-bit placement-shard space. The first 32 bits of the uniformly distributed object ID select one of 2^32 shards; no per-shard table is materialised. For a replica count `R`, capacity water-filling computes each node's inclusion probability subject to the rule that a node can hold at most one replica of an object; those probabilities are quantised into exact shard-slot quotas. This avoids the small-node over-selection produced by naive weighted sampling without replacement.
 
-Failure domains are operator-supplied topology, not discovered security boundaries.
+When there are at least `R` configured failure domains, the same calculation is performed over aggregate domain capacities first, guaranteeing distinct-domain replicas. A selected domain then chooses a node within it by capacity. If there are fewer domains than replicas, one node from each domain is preferred before remaining slots are filled from unused nodes. Failure domains are operator-supplied topology, not discovered security boundaries.
 
-Local disk placement is a second independent rendezvous layer below the node.
+Current free bytes never participate in the weight. Configured adopted capacity changes only when storage topology changes. Full or temporarily unavailable preferred owners use deterministic capacity-aware fallback nodes until repair can restore the preferred shard ownership.
+
+Local disk placement uses capacity-weighted rendezvous over the same stable shard space, using stable backend tokens and configured backend limits. Because the local replica count is one, adding a backend has the usual rendezvous monotonicity: only shards won by the new backend move. A known temporarily offline disk remains in that placement map; a backend removed from configuration does not.
 
 ## Data writes
 
