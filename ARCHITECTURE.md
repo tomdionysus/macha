@@ -25,7 +25,11 @@ NodeRuntime
    +---- membership/storage refresh worker
 
 Service
-   +---- CatalogueManager / optional catalogue JSON API
+   +---- CatalogueManager / catalogue JSON API
+   +---- PlaybackManager / concurrent HTTP streaming
+   |       +---- direct logical-file range responses
+   |       +---- MediaEngine -> FFmpeg process backend
+   |       +---- fMP4 HLS session files / capability URLs
    +---- repair / local rebalance / scrub / GC scheduler
 ```
 
@@ -169,6 +173,17 @@ RPCs have no wall-clock completion deadline. Control/data stall intervals are DE
 Server execution has dedicated control workers plus data workers. Data workers choose foreground before read-ahead before speculative queued work. This preserves the same absolute ordering after a request has reached the peer; speculative work may make progress only when more urgent runnable work is absent.
 
 Every connection uses an HMAC-authenticated ephemeral X25519 handshake, HKDF-SHA256 directional keys and AES-256-GCM variable-length frames.
+
+
+## Streaming and media engines
+
+Playback policy is owned by `PlaybackManager`, not FFmpeg. A client supplies capabilities and preferences; the resolver chooses a source representation and a `PlaybackPlan` containing direct/remux/transcode mode plus per-stream copy/transcode decisions. `MediaEngine` consumes that plan. Its interface contains media concepts only, so the initial external-process backend can later be replaced by an in-process libav engine without changing session or HTTP semantics.
+
+Direct play exposes the logical Macha file as a streaming HTTP body with byte-range support. Transformed playback gives FFmpeg a loopback-only range-capable source URL backed by the same `FileSystem::open_read` path. The generated output is one fragmented-MP4 HLS rendition (`init.mp4` plus `.m4s` segments). Session capability URLs are distinct from the permanent API Bearer token.
+
+The public HTTP server has a bounded accepted-connection queue and worker pool. Response bodies are abstract sources rather than necessarily resident byte strings, so long media responses do not serialize catalogue/API work and several HLS fragment requests can be served concurrently. FFmpeg input uses a separate loopback-only HTTP server so a transformed pipeline cannot consume the public worker pool while waiting on itself.
+
+A transformed producer is paused when generated segment distance exceeds the configured look-ahead from actual client demand and resumed as requested fragment indexes advance. Seeking or a quality/track/media change creates a new internal generation under the same logical playback session. Old generation URLs become invalid; open response file descriptors remain safe until their current response completes.
 
 ## Concurrency
 

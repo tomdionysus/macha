@@ -30,7 +30,9 @@ The protocol is authenticated; still restrict it with the host/network firewall.
 
 For Internet deployment use routable addressing, explicit forwarding, or a private routed overlay such as WireGuard.
 
-The catalogue HTTP API is separate from the authenticated cluster protocol. It binds to loopback by default. If exposed beyond the local host, configure `catalogue.api.token_file` and restrict it with the host/network firewall.
+The catalogue/playback HTTP API is separate from the authenticated cluster protocol. It binds to loopback by default. If exposed beyond the local host, configure `catalogue.api.token_file` and restrict it with the host/network firewall.
+
+Playback control requests use the ordinary API Bearer token. A successful session returns a separate high-entropy capability in each stream URL because native media players cannot reliably attach the permanent API header to every playlist, fragment and range request. Treat the returned stream URL as a temporary bearer secret: anyone who has it can read that session's media until the session is deleted or expires. Capability URLs are scoped to one playback session and generated HLS generation; they do not authenticate cluster RPC or catalogue mutation.
 
 Protocol v7 is intentionally incompatible with v6 and earlier. Mixed versions fail the handshake rather than downgrade.
 
@@ -38,7 +40,7 @@ Protocol v7 is intentionally incompatible with v6 and earlier. Mixed versions fa
 
 Losing the cluster key makes encrypted cluster data unrecoverable. Back it up separately.
 
-Compromise lets an attacker join the trusted cluster from that point onward. 0.6.2 has no online key rotation or per-node revocation.
+Compromise lets an attacker join the trusted cluster from that point onward. 0.7.0 has no online key rotation or per-node revocation.
 
 Forward secrecy protects old transport captures; it does not protect stored encrypted data from someone who later obtains both that data and the cluster key-derived storage key.
 

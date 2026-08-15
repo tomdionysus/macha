@@ -897,7 +897,13 @@ std::shared_ptr<ReadHandle> FileSystem::open_read(const std::string& p) {
     auto e = getattr(p);
     if (e.type != EntryType::file)
         fail(EISDIR, "directory");
-    return std::make_shared<ReadHandle>(s_, e, playback_, normalize_path(p));
+    return open_read(e, p);
+}
+
+std::shared_ptr<ReadHandle> FileSystem::open_read(const FsEntry& entry, const std::string& logical_path) {
+    if (entry.type != EntryType::file)
+        fail(EISDIR, "directory");
+    return std::make_shared<ReadHandle>(s_, entry, playback_, normalize_path(logical_path));
 }
 std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool trunc) {
     // Serialize path lookup/registration with rename so an opening writer cannot

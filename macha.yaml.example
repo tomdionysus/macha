@@ -1,4 +1,4 @@
-# Macha 0.6.2
+# Macha 0.7.0
 #
 # Copy this file per node. Paths, advertise address and failure_domain are
 # node-local. The cluster key contents and dht policy must match every node.
@@ -146,3 +146,24 @@ catalogue:
     port: 7438
     # token_file: /etc/macha-api.token
     max_request_bytes: 8M
+
+    # HTTP workers serve catalogue requests, direct media and HLS fragments.
+    workers: 16
+    max_queued_connections: 128
+    stream_chunk_bytes: 256K
+
+# Playback API and media transformation. The current engine shells directly to
+# ffprobe/ffmpeg without invoking a command shell. Direct play still uses the
+# logical Macha file; transformed output is fragmented-MP4 HLS.
+streaming:
+  enabled: true
+  ffmpeg: ffmpeg
+  ffprobe: ffprobe
+  # temp_path: /var/lib/macha/tmp/playback
+  max_sessions: 8
+  max_video_transcodes: 1
+  max_audio_transcodes: 4
+  session_idle_ms: 1800000
+  startup_timeout_ms: 10000
+  segment_duration_ms: 4000
+  max_ahead_segments: 8
