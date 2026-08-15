@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.6.0 - 2026-08-15
+
+- replaced protocol v5 with v6 (`MCH6`, `macha/session/v6`); mixed-version peers are intentionally rejected and no compatibility shim is retained;
+- collapsed health, control and data lanes into one canonical authenticated bidirectional TCP connection per peer;
+- added variable-length independently authenticated transport frames with negotiated `network.max_frame_size` (default 256 KiB, allowed 4 KiB..4 MiB), independent of storage extent size;
+- made frame type the sole wire priority authority: control > foreground > read-ahead > speculative, with no independent numeric priority field;
+- made outbound scheduling pre-emptive at frame boundaries by selecting the highest-priority runnable transfer after every frame;
+- moved heartbeat/liveness and protocol control onto the same highest-priority stream used by real peer traffic;
+- added transfer promotion and cancellation control messages so a speculative/read-ahead object already in flight can become foreground without changing request identity;
+- tagged filesystem retrieval as foreground, current-file/read-ahead hydration as read-ahead, and catalogue prediction as speculative; coalesced object retrieval propagates promotions to the live transport;
+- kept canonical cross-dial deduplication and graceful duplicate draining under the unified connection model;
+- added v6 regression coverage for single-connection reuse, frame-type ordering, variable-length framing, foreground pre-emption and frame-size configuration.
+
+## 0.5.2 - 2026-08-15
+
+- added a shared replica selector below filesystem reads and cache hydration;
+- spread independent extent fetches across suitable replicas using current in-flight load, recent transfer latency and failure history instead of pinning reads to the first owner;
+- kept foreground reads latency-oriented while speculative hydration yields aggressively to peers carrying foreground work;
+- coalesced concurrent requests for the same object so foreground playback can promote an in-flight speculative fetch instead of downloading the extent twice;
+- added bounded concurrent hydration with `hydration.max_inflight` (default 4), preserving ordered file prefixes and weighted-fair interleaving while allowing several replicas to contribute bandwidth at once;
+- added selector and concurrent-hydration regression tests, including striping, latency preference, foreground/speculative accounting, failure penalties and the configured in-flight bound;
+- kept wire protocol v5 unchanged; 0.5.2 is an internal scheduling/retrieval change and remains wire-compatible with 0.5.1.
+
+## 0.5.1 - 2026-08-14
+
+- added a priority-based cache hydrator with pluggable hint-provider interfaces and weighted-fair interleaving of ordered file runs;
+- reimplemented sequential read-ahead as hydration hints instead of per-read-handle asynchronous futures;
+- added whole-current-file prediction at lower priority than the immediate read-ahead window;
+- added catalogue prediction for the next TV episode, including season transitions, and the next movie in a collection;
+- added stable content-manifest media IDs so catalogue prediction survives file renames, with path bindings retained as a fallback;
+- made speculative hydration populate only the persistent non-DHT cache and never authoritative replica placement;
+- added configurable hydration engine enablement, priorities, cadence, activity timeout and catalogue lookahead;
+- added scheduler, prediction and two-node cache-fetch tests, including ordered-prefix and non-starvation behaviour.
+
+## 0.5.0 - 2026-08-14
+
+- added a quorum-rooted distributed media catalogue for movies, shows, seasons, episodes, artists, albums and tracks;
+- made the complete current catalogue and all referenced artwork universal metadata objects held on every active node, with joiner synchronisation ahead of ordinary media repair;
+- added local catalogue browse/search and optimistic revision-based mutation;
+- added an optional HTTP/JSON API for catalogue status, list/search, item mutation and artwork upload/retrieval;
+- made superseded catalogue snapshots and orphaned artwork use persistent metadata garbage tombstones so every node, including later rejoiners, converges deletion after the configured grace period;
+- added `maintenance.garbage_grace_ms` and `catalogue.api` YAML configuration;
+- kept 0.4.0 metadata snapshots readable, defaulting their absent catalogue root to an empty catalogue;
+- bumped the wire protocol to v5 (`MCH5`, `macha/session/v5`) and reject v4-and-earlier peers.
+
 ## 0.4.0 - 2026-08-14
 
 - renamed the project to Macha across the executable, build targets, configuration, service files, C++ namespace, FUSE identity and local storage markers;

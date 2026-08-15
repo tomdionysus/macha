@@ -29,6 +29,7 @@ struct MetadataSnapshot {
     std::vector<NodeId> metadata_voters;
     uint32_t data_replication{};
     uint64_t extent_size{};
+    std::optional<ObjectId> catalogue_root;
     std::map<std::string, FsEntry> entries;
     std::vector<GarbageRef> garbage;
 };

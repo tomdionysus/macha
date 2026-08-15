@@ -10,7 +10,15 @@
 namespace macha {
 Service::Service(Config config, ClusterKeys keys)
     : node_(std::move(config), keys), store_(node_), metadata_(node_),
-      fs_(node_, store_, metadata_) {}
+      catalogue_(node_, store_, metadata_), fs_(node_, store_, metadata_, &playback_),
+      hydration_(store_, playback_, fs_, catalogue_, node_.config().hydration,
+                 node_.config().read_ahead_extents), catalogue_api_(catalogue_) {
+    if (node_.config().catalogue.api.enabled) {
+        catalogue_http_ = std::make_unique<HttpServer>(
+            node_.config().catalogue.api,
+            [this](const HttpRequest& request) { return catalogue_api_.handle(request); });
+    }
+}
 
 Service::~Service() {
     stop();
@@ -18,11 +26,20 @@ Service::~Service() {
 
 void Service::start() {
     node_.start();
+    if (catalogue_http_)
+        catalogue_http_->start();
+    hydration_.start();
+    // The maintenance loop attempts catalogue synchronisation before ordinary
+    // data repair on its first iteration. Catalogue API reads also synchronise
+    // on demand; /status remains available while a joiner is converging.
     maintenance_ = std::jthread([this](std::stop_token stop) { loop(stop); });
 }
 
 void Service::stop() {
     Log::debug("shutdown: Service::stop begin");
+    hydration_.stop();
+    if (catalogue_http_)
+        catalogue_http_->stop();
     if (maintenance_.joinable()) {
         Log::debug("shutdown: service maintenance request_stop");
         maintenance_.request_stop();
@@ -49,11 +66,12 @@ void Service::reload_config() {
         updated.metadata_replication != node_.config().metadata_replication)
         throw std::runtime_error("replica policy changes require a coordinated cluster restart");
     node_.reconfigure_local(updated);
-    Log::info("reloaded storage backends and persistent cache configuration");
+    hydration_.reconfigure(updated.hydration, updated.read_ahead_extents);
+    Log::info("reloaded storage backends, persistent cache and hydration configuration");
 }
 
 void Service::collect_garbage(const std::vector<ObjectId>& garbage) {
-    constexpr auto grace = std::chrono::hours(24);
+    const auto grace = node_.config().maintenance.garbage_grace;
     const auto now = Clock::now();
     std::set<ObjectId> candidates(garbage.begin(), garbage.end());
 
@@ -68,9 +86,10 @@ void Service::collect_garbage(const std::vector<ObjectId>& garbage) {
 
     for (const auto& [id, first_seen] : garbage_seen_) {
         if (now - first_seen >= grace) {
+            // The tombstone is cluster metadata, so every node independently
+            // removes its copy. A disconnected node sees the same tombstone
+            // after rejoining and converges without a remote-delete race.
             node_.local_store().remove(id);
-            // Cache entries are not authoritative, but deleting a known-garbage
-            // object avoids keeping unlinked media indefinitely on the SSD.
             node_.block_cache().remove(id);
         }
     }
@@ -128,13 +147,30 @@ void Service::loop(std::stop_token stop) {
                 last_metadata = now;
             }
 
+            // Catalogue state is cluster metadata. A joiner pulls the complete
+            // immutable snapshot and all referenced artwork before reporting the
+            // catalogue ready; this runs ahead of ordinary data repair.
+            try {
+                catalogue_.repair_once();
+            } catch (const std::exception& e) {
+                Log::debug("catalogue sync: " + std::string(e.what()));
+            }
+
             auto objects = fs_.maintenance_objects();
             std::set<ObjectId> live(objects.live.begin(), objects.live.end());
+            std::set<ObjectId> universal;
+            auto catalogue_objects = catalogue_.maintenance_objects();
+            live.insert(catalogue_objects.live.begin(), catalogue_objects.live.end());
+            universal.insert(catalogue_objects.universal.begin(),
+                             catalogue_objects.universal.end());
+            std::erase_if(objects.garbage,
+                          [&](const ObjectId& id) { return live.contains(id); });
 
             const bool allow_network_repair =
                 !busy || policy.busy_bandwidth_fraction > 0.0;
             if (allow_network_repair && network_credit >= node_.config().extent_size) {
-                auto used = store_.repair_once(static_cast<uint64_t>(network_credit), &live);
+                auto used = store_.repair_once(static_cast<uint64_t>(network_credit), &live,
+                                               &universal);
                 network_credit = std::max(0.0, network_credit - static_cast<double>(used));
             }
 

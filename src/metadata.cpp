@@ -9,7 +9,8 @@
 #include <unistd.h>
 namespace macha {
 namespace {
-constexpr std::array<uint8_t, 8> SM{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'},
+constexpr std::array<uint8_t, 8> SM5{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'},
+    SM6{'D', 'H', 'T', 'M', 'E', 'T', 'A', '6'},
     DM{'D', 'H', 'T', 'M', 'D', 'B', '0', '1'};
 void entry(Writer& w, const FsEntry& e) {
     w.u8((uint8_t)e.type);
@@ -83,7 +84,7 @@ void writefile(const std::filesystem::path& p, std::span<const uint8_t> d) {
 } // namespace
 Bytes encode_snapshot(const MetadataSnapshot& s) {
     Writer w;
-    w.raw(SM);
+    w.raw(SM6);
     w.u32(s.metadata_voters.size());
     for (auto& v : s.metadata_voters)
         w.fixed(v.bytes);
@@ -94,6 +95,9 @@ Bytes encode_snapshot(const MetadataSnapshot& s) {
         w.string(p);
         entry(w, e);
     }
+    w.u8(s.catalogue_root.has_value());
+    if (s.catalogue_root)
+        w.fixed(s.catalogue_root->bytes);
     w.u32(s.garbage.size());
     for (const auto& garbage : s.garbage)
         w.fixed(garbage.id.bytes);
@@ -102,7 +106,9 @@ Bytes encode_snapshot(const MetadataSnapshot& s) {
 MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
     Reader r(d);
     auto m = r.raw(8);
-    if (!std::equal(m.begin(), m.end(), SM.begin()))
+    const bool v5 = std::equal(m.begin(), m.end(), SM5.begin());
+    const bool v6 = std::equal(m.begin(), m.end(), SM6.begin());
+    if (!v5 && !v6)
         throw DecodeError("bad snapshot");
     auto nv = r.u32();
     if (nv > 1024)
@@ -121,6 +127,11 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
         auto p = normalize_path(r.string());
         if (!s.entries.emplace(p, entry(r)).second)
             throw DecodeError("duplicate path");
+    }
+    if (v6 && r.u8()) {
+        ObjectId root;
+        root.bytes = r.fixed<32>();
+        s.catalogue_root = root;
     }
     auto garbage_count = r.u32();
     if (garbage_count > 10000000)

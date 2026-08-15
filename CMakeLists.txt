@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(macha VERSION 0.4.0 LANGUAGES CXX)
+project(macha VERSION 0.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -36,7 +36,12 @@ set(MACHA_CORE_SOURCES
     src/net.cpp
     src/cluster.cpp
     src/distributed_store.cpp
+    src/replica_selector.cpp
     src/metadata_manager.cpp
+    src/json.cpp
+    src/catalogue.cpp
+    src/catalogue_api.cpp
+    src/hydration.cpp
     src/filesystem.cpp
     src/service.cpp
 )

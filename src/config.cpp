@@ -82,12 +82,31 @@ void validate(Config& config) {
         throw std::runtime_error("read-ahead must be <= 64");
     if (config.connect_timeout.count() < 100 || config.metadata_cache.count() < 0)
         throw std::runtime_error("invalid network/cache timeout");
+    if (config.max_frame_size < 4 * 1024 || config.max_frame_size > 4ULL * 1024 * 1024)
+        throw std::runtime_error("network.max_frame_size must be 4K..4M");
     if (config.heartbeat.count() <= 0 || config.dead_after.count() <= 0)
         throw std::runtime_error("network heartbeat and dead_after must be > 0");
     if (config.metadata_cache > std::chrono::seconds(5))
         throw std::runtime_error("metadata cache must be <= 5000ms");
     if (config.extent_size < 1024 * 1024 || config.extent_size > 64ULL * 1024 * 1024)
         throw std::runtime_error("extent size must be 1M..64M");
+    if (config.catalogue.api.enabled && !config.catalogue.api.port)
+        throw std::runtime_error("catalogue.api.port must be nonzero");
+    if (config.catalogue.api.max_request_bytes < 1024)
+        throw std::runtime_error("catalogue.api.max_request_bytes must be >= 1K");
+    if (config.hydration.interval < std::chrono::milliseconds(10))
+        throw std::runtime_error("hydration.interval_ms must be >= 10ms");
+    if (config.hydration.active_timeout < std::chrono::milliseconds(1000))
+        throw std::runtime_error("hydration.active_timeout_ms must be >= 1000ms");
+    if (!config.hydration.max_inflight || config.hydration.max_inflight > 64)
+        throw std::runtime_error("hydration.max_inflight must be 1..64");
+    if (config.hydration.catalogue_lookahead > 16)
+        throw std::runtime_error("hydration.catalogue_lookahead must be <= 16");
+    for (const auto* engine : {&config.hydration.read_ahead, &config.hydration.current_file,
+                               &config.hydration.catalogue}) {
+        if (engine->enabled && (!engine->priority || engine->priority > 1000000))
+            throw std::runtime_error("hydration engine priority must be 1..1000000");
+    }
     if (config.maintenance.interval < std::chrono::milliseconds(50))
         throw std::runtime_error("maintenance interval must be >= 50ms");
     if (config.maintenance.cpu_target <= 0.0 || config.maintenance.cpu_target > 1.0)
@@ -118,6 +137,8 @@ void parse_network(const YAML::Node& root, Config& c) {
         c.dead_after = milliseconds(n["dead_after_ms"], "dead_after_ms");
     if (n["connect_timeout_ms"])
         c.connect_timeout = milliseconds(n["connect_timeout_ms"], "connect_timeout_ms");
+    if (n["max_frame_size"])
+        c.max_frame_size = yaml_size(n["max_frame_size"]);
     if (n["control_stall_notice_ms"])
         c.control_stall_notice =
             milliseconds(n["control_stall_notice_ms"], "control_stall_notice_ms");
@@ -151,6 +172,9 @@ void parse_maintenance(const YAML::Node& root, Config& c) {
     if (m["foreground_quiet_ms"])
         c.maintenance.foreground_quiet =
             milliseconds(m["foreground_quiet_ms"], "maintenance.foreground_quiet_ms");
+    if (m["garbage_grace_ms"])
+        c.maintenance.garbage_grace =
+            milliseconds(m["garbage_grace_ms"], "maintenance.garbage_grace_ms");
     if (m["busy_bandwidth_fraction"])
         c.maintenance.busy_bandwidth_fraction =
             parse_fraction(m["busy_bandwidth_fraction"], "busy_bandwidth_fraction");
@@ -179,6 +203,58 @@ void parse_filesystem(const YAML::Node& root, Config& c) {
         c.filesystem.root_gid = f["root_gid"].as<uint32_t>();
     if (f["root_mode"])
         c.filesystem.root_mode = parse_mode(f["root_mode"], "filesystem.root_mode");
+}
+
+void parse_catalogue(const YAML::Node& root, Config& c) {
+    auto catalogue = root["catalogue"];
+    if (!catalogue)
+        return;
+    auto api = catalogue["api"];
+    if (!api)
+        return;
+    if (api["enabled"])
+        c.catalogue.api.enabled = api["enabled"].as<bool>();
+    if (api["listen"])
+        c.catalogue.api.listen = api["listen"].as<std::string>();
+    if (api["port"])
+        c.catalogue.api.port = api["port"].as<uint16_t>();
+    if (api["token_file"])
+        c.catalogue.api.token_file = std::filesystem::path(api["token_file"].as<std::string>());
+    if (api["max_request_bytes"])
+        c.catalogue.api.max_request_bytes = yaml_size(api["max_request_bytes"]);
+}
+
+void parse_hydration_engine(const YAML::Node& engines, const char* name,
+                            HydrationEngineConfig& engine) {
+    auto node = engines[name];
+    if (!node)
+        return;
+    if (node["enabled"])
+        engine.enabled = node["enabled"].as<bool>();
+    if (node["priority"])
+        engine.priority = node["priority"].as<uint32_t>();
+}
+
+void parse_hydration(const YAML::Node& root, Config& c) {
+    auto hydration = root["hydration"];
+    if (!hydration)
+        return;
+    if (hydration["enabled"])
+        c.hydration.enabled = hydration["enabled"].as<bool>();
+    if (hydration["interval_ms"])
+        c.hydration.interval = milliseconds(hydration["interval_ms"], "hydration.interval_ms");
+    if (hydration["active_timeout_ms"])
+        c.hydration.active_timeout =
+            milliseconds(hydration["active_timeout_ms"], "hydration.active_timeout_ms");
+    if (hydration["max_inflight"])
+        c.hydration.max_inflight = hydration["max_inflight"].as<size_t>();
+    if (hydration["catalogue_lookahead"])
+        c.hydration.catalogue_lookahead = hydration["catalogue_lookahead"].as<size_t>();
+    if (auto engines = hydration["engines"]) {
+        parse_hydration_engine(engines, "read_ahead", c.hydration.read_ahead);
+        parse_hydration_engine(engines, "current_file", c.hydration.current_file);
+        parse_hydration_engine(engines, "catalogue", c.hydration.catalogue);
+    }
 }
 } // namespace
 
@@ -309,6 +385,8 @@ Config load_yaml_config(const std::filesystem::path& path) {
     parse_dht(root, c);
     parse_maintenance(root, c);
     parse_filesystem(root, c);
+    parse_catalogue(root, c);
+    parse_hydration(root, c);
 
     if (auto bootstrap = root["bootstrap"]) {
         if (!bootstrap.IsSequence())
@@ -323,7 +401,8 @@ void print_usage(const char* executable) {
     std::cout
         << "Usage: " << executable << " --config FILE [overrides]\n"
         << "--bootstrap HOST[:PORT] (repeatable)  --listen ADDR  --advertise HOST  --port PORT\n"
-        << "--failure-domain NAME  --connect-timeout MS  --control-stall-notice MS  --data-stall-notice MS\n"
+        << "--failure-domain NAME  --connect-timeout MS  --max-frame-size SIZE\n"
+        << "--control-stall-notice MS  --data-stall-notice MS\n"
         << "--metadata-cache MS  --replicas N  --metadata-replicas N  --extent-size SIZE\n"
         << "--read-ahead N  --mount PATH  --state-path PATH  --cache-path PATH --cache-blocks N\n"
         << "--log-level LEVEL  (ALL|DEBUG|INFO|WARN|ERROR; default INFO)  --help\n";
@@ -394,6 +473,8 @@ Config parse_config(int argc, char** argv) {
         } else if (option == "--connect-timeout") {
             config.connect_timeout = std::chrono::milliseconds(
                 parse_unsigned(need(i, "--connect-timeout"), "connect timeout"));
+        } else if (option == "--max-frame-size") {
+            config.max_frame_size = parse_size(need(i, "--max-frame-size"));
         } else if (option == "--control-stall-notice") {
             config.control_stall_notice = std::chrono::milliseconds(parse_unsigned(
                 need(i, option.c_str()), "control stall notice"));

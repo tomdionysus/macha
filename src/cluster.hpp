@@ -82,8 +82,12 @@ class NodeRuntime {
     }
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
     RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
+    RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType);
+    RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType);
     AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
     AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
+    AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType);
+    AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType);
     bool seed_metadata(const MetadataRecord&);
     bool checkpoint_metadata(const MetadataRecord&);
     bool cas_metadata(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);

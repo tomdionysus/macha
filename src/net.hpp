@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stop_token>
 #include <thread>
 #include <vector>
@@ -30,6 +31,10 @@ enum class MessageType : uint16_t {
     get_committed_metadata = 10,
     checkpoint_metadata = 11,
     session_retire = 12,
+    delete_object = 13,
+    promote_read_ahead = 14,
+    promote_foreground = 15,
+    cancel_transfer = 16,
     ok = 100,
     error = 101,
     members_reply = 102,
@@ -39,6 +44,19 @@ enum class MessageType : uint16_t {
     cas_reply = 106
 };
 
+// Transport priority is a property of the frame type itself. There is no
+// independent priority field on the wire which can contradict it.
+enum class FrameType : uint8_t {
+    control = 1,
+    foreground = 2,
+    read_ahead = 3,
+    speculative = 4,
+};
+
+const char* frame_type_name(FrameType) noexcept;
+unsigned frame_type_priority(FrameType) noexcept;
+FrameType default_frame_type(MessageType) noexcept;
+
 struct RpcMessage {
     MessageType type{MessageType::error};
     Bytes payload;
@@ -46,6 +64,7 @@ struct RpcMessage {
 
 struct RpcFrame {
     uint64_t request_id{};
+    FrameType frame_type{FrameType::control};
     RpcMessage message;
 };
 
@@ -58,15 +77,16 @@ struct RpcStats {
     uint64_t connections_created{};
     uint64_t connections_reused{};
     uint64_t canonical_connections{};
-    uint64_t canonical_health{};
-    uint64_t canonical_control{};
-    uint64_t canonical_data{};
 };
 
-enum class RpcLane : uint8_t { health = 1, control = 2, data = 3 };
-
-RpcLane rpc_lane(MessageType);
-const char* rpc_lane_name(RpcLane) noexcept;
+struct WireFragment {
+    uint64_t request_id{};
+    FrameType frame_type{FrameType::control};
+    MessageType message_type{MessageType::error};
+    bool first{};
+    bool last{};
+    Bytes payload;
+};
 
 class SecureChannel {
     int fd_{-1};
@@ -75,22 +95,27 @@ class SecureChannel {
     std::array<uint8_t, 32> tx_{}, rx_{};
     std::array<uint8_t, 32> session_id_{};
     uint64_t tx_counter_{}, rx_counter_{};
+    size_t configured_max_frame_size_{};
+    size_t negotiated_max_frame_size_{};
     bool ready_{};
     std::mutex close_mutex_;
     bool shutdown_{};
     void close_fd();
 
   public:
-    SecureChannel(int, ClusterKeys, NodeInfo);
+    SecureChannel(int, ClusterKeys, NodeInfo, size_t max_frame_size);
     ~SecureChannel();
     SecureChannel(const SecureChannel&) = delete;
     SecureChannel& operator=(const SecureChannel&) = delete;
-    NodeInfo client_handshake(RpcLane);
-    NodeInfo server_handshake(const std::string& remote_host, RpcLane*);
-    void send(uint64_t request_id, const RpcMessage&,
-              const std::function<void(size_t)>& progress = {});
-    RpcFrame receive(const std::function<void(uint64_t, size_t)>& progress = {});
+    NodeInfo client_handshake();
+    NodeInfo server_handshake(const std::string& remote_host);
+    void send_fragment(uint64_t request_id, FrameType, MessageType, bool first, bool last,
+                       std::span<const uint8_t>,
+                       const std::function<void(size_t)>& progress = {});
+    WireFragment receive_fragment(
+        const std::function<void(uint64_t, size_t)>& progress = {});
     void shutdown();
+    size_t max_frame_size() const noexcept { return negotiated_max_frame_size_; }
     const std::array<uint8_t, 32>& session_id() const noexcept { return session_id_; }
 };
 
@@ -98,11 +123,13 @@ class AsyncRpc {
     std::future<RpcReply> future_;
     std::function<void()> cancel_;
     std::function<void()> abort_;
+    std::function<void(FrameType)> promote_;
     std::function<std::chrono::milliseconds()> idle_;
 
   public:
     AsyncRpc() = default;
     AsyncRpc(std::future<RpcReply>, std::function<void()>, std::function<void()>,
+             std::function<void(FrameType)> = {},
              std::function<std::chrono::milliseconds()> = {});
     ~AsyncRpc();
     AsyncRpc(AsyncRpc&&) noexcept;
@@ -115,22 +142,24 @@ class AsyncRpc {
     RpcReply get();
     void cancel();
     void abort();
+    void promote(FrameType);
+    std::function<void(FrameType)> promotion_callback() const { return promote_; }
     std::chrono::milliseconds idle_for() const;
 };
 
 class RpcClient {
     class PeerConnection;
     friend class RpcServer;
-    using Lane = RpcLane;
 
     using InboundReply = std::function<void(const RpcMessage&)>;
     using InboundHandler = std::function<void(const NodeInfo&, RpcFrame, InboundReply)>;
+    using InboundPromoter = std::function<void(const NodeInfo&, uint64_t, FrameType)>;
+    using InboundCanceller = std::function<void(const NodeInfo&, uint64_t)>;
 
     struct InboundRoute {
         NodeInfo peer;
-        RpcLane lane{RpcLane::control};
         std::array<uint8_t, 32> session_id{};
-        std::function<AsyncRpc(MessageType, std::span<const uint8_t>)> call;
+        std::function<AsyncRpc(MessageType, std::span<const uint8_t>, FrameType)> call;
         std::function<void(const RpcMessage&)> notify;
         std::function<void()> retire;
         std::function<void()> close;
@@ -149,6 +178,7 @@ class RpcClient {
     std::chrono::milliseconds connect_timeout_;
     std::chrono::milliseconds heartbeat_;
     std::chrono::milliseconds dead_after_;
+    size_t max_frame_size_{};
     mutable std::mutex mutex_;
     std::map<std::string, std::shared_ptr<PeerConnection>> connections_;
     std::vector<std::shared_ptr<PeerConnection>> retired_connections_;
@@ -161,39 +191,46 @@ class RpcClient {
     std::jthread health_thread_;
     std::mutex inbound_mutex_;
     InboundHandler inbound_handler_;
+    InboundPromoter inbound_promoter_;
+    InboundCanceller inbound_canceller_;
 
-    static Lane lane_for(MessageType type) { return rpc_lane(type); }
-    static const char* lane_name(Lane lane) { return rpc_lane_name(lane); }
     static std::string endpoint_key(const Endpoint&);
-    static std::string health_key(const Endpoint&, RpcLane);
-    static std::string peer_key(const NodeId&, RpcLane);
-    std::shared_ptr<PeerConnection> connection(const Endpoint&, RpcLane,
-                                               const NodeId* expected, NodeId* actual);
+    static std::string peer_key(const NodeId&);
+    std::shared_ptr<PeerConnection> connection(const Endpoint&, const NodeId* expected,
+                                               NodeId* actual);
     AsyncRpc call_async_known(const Endpoint&, const NodeId*, MessageType,
-                              std::span<const uint8_t>);
+                              std::span<const uint8_t>, FrameType);
     void observe_result(const std::string&, bool, std::chrono::milliseconds);
     void health_loop(std::stop_token);
     void close_endpoint(const Endpoint&, const std::string&);
     void set_inbound_handler(InboundHandler);
+    void set_inbound_transfer_control(InboundPromoter, InboundCanceller);
     void dispatch_inbound(const NodeInfo&, RpcFrame, InboundReply);
+    void dispatch_inbound_promotion(const NodeInfo&, uint64_t, FrameType);
+    void dispatch_inbound_cancel(const NodeInfo&, uint64_t);
     void register_inbound(InboundRoute);
-    void unregister_inbound(const NodeId&, RpcLane,
-                            const std::array<uint8_t, 32>& session_id);
-    void reconcile_locked(const NodeId&, RpcLane,
-                          std::vector<std::function<void()>>& retire);
+    void unregister_inbound(const NodeId&, const std::array<uint8_t, 32>& session_id);
+    void reconcile_locked(const NodeId&, std::vector<std::function<void()>>& retire);
     void reap_retired();
 
   public:
     RpcClient(ClusterKeys, std::function<NodeInfo()>, std::function<void(const NodeInfo&)>,
               std::function<void(uint64_t)>, std::chrono::milliseconds connect_timeout,
               std::chrono::milliseconds heartbeat = std::chrono::seconds(5),
-              std::chrono::milliseconds dead_after = std::chrono::seconds(30));
+              std::chrono::milliseconds dead_after = std::chrono::seconds(30),
+              size_t max_frame_size = 256 * 1024);
     ~RpcClient();
     AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
     AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
+    AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType);
+    AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType);
     RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t>,
                   std::chrono::milliseconds stall_notice);
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t>,
+                  std::chrono::milliseconds stall_notice);
+    RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType,
+                  std::chrono::milliseconds stall_notice);
+    RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType,
                   std::chrono::milliseconds stall_notice);
     RpcStats stats() const;
     void broadcast(const RpcMessage&);
@@ -220,32 +257,40 @@ class RpcServer {
     NodeInfo local_;
     Handler handler_;
     Observer observer_;
+    size_t max_frame_size_{};
     std::atomic_int listen_fd_{-1};
     uint16_t bound_port_{};
     std::jthread accept_thread_;
-    enum class RequestClass { health, control, data };
-    std::vector<std::jthread> health_workers_;
+    enum class RequestClass { control, foreground, read_ahead, speculative };
     std::vector<std::jthread> control_workers_;
     std::vector<std::jthread> data_workers_;
     std::mutex request_mutex_;
     std::condition_variable request_cv_;
-    std::deque<RequestJob> health_requests_;
     std::deque<RequestJob> control_requests_;
-    std::deque<RequestJob> data_requests_;
+    std::deque<RequestJob> foreground_requests_;
+    std::deque<RequestJob> read_ahead_requests_;
+    std::deque<RequestJob> speculative_requests_;
     std::mutex sessions_mutex_;
     std::vector<std::shared_ptr<Session>> sessions_;
     RpcClient* shared_client_{};
 
-    static RequestClass request_class(MessageType);
+    static RequestClass request_class(FrameType);
     std::deque<RequestJob>& queue(RequestClass);
+    bool data_ready() const;
+    RequestClass next_data_class() const;
     void accept_loop(std::stop_token);
     void session_loop(Session*);
-    void worker_loop(std::stop_token, RequestClass);
+    void control_worker_loop(std::stop_token);
+    void data_worker_loop(std::stop_token);
+    void execute(RequestJob);
     void reap_sessions(bool all);
     void enqueue_shared(const NodeInfo&, RpcFrame, RpcClient::InboundReply);
+    void promote_queued(const NodeInfo&, uint64_t, FrameType);
+    void cancel_queued(const NodeInfo&, uint64_t);
 
   public:
-    RpcServer(std::string, uint16_t, ClusterKeys, NodeInfo, Handler, Observer);
+    RpcServer(std::string, uint16_t, ClusterKeys, NodeInfo, Handler, Observer,
+              size_t max_frame_size = 256 * 1024);
     ~RpcServer();
     void start();
     void stop();

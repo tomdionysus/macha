@@ -9,7 +9,7 @@ It mounts as a normal filesystem, stores files as immutable content-addressed ex
 
 There is no permanent master. Nodes share one cluster key, discover membership through bootstrap peers, and converge placement and replicas in the background.
 
-0.4.0 is usable, but deliberately narrow. It is built for large mostly-immutable video and music files, not as a complete general-purpose POSIX filesystem.
+0.6.0 is usable, but deliberately narrow. It is built for large mostly-immutable video and music files, not as a complete general-purpose POSIX filesystem.
 
 ## What it does
 
@@ -17,8 +17,12 @@ There is no permanent master. Nodes share one cluster key, discover membership t
 - Multiple storage disks per node.
 - Automatic replication, repair and rebalance as nodes or disks appear and disappear.
 - Persistent non-DHT read cache, suitable for SSD.
+- Priority-based speculative cache hydration driven by pluggable hint engines.
+- Replica-aware extent retrieval that can use several healthy replicas in parallel across independent reads.
 - Playback-assisted replication: a remotely fetched block can become the local replica without another download.
 - Durable namespace checkpoints on every active node, so a destroyed node can be replaced and repopulated from surviving replicas.
+- A cluster-wide media catalogue whose titles, hierarchy, search data and artwork are kept complete on every node.
+- Optional HTTP/JSON catalogue access and mutation API.
 - Authenticated encrypted transport and encrypted storage.
 - No cloud service, account system or permanent coordinator.
 
@@ -151,7 +155,7 @@ Start with:
 macha --config /etc/macha.yaml
 ```
 
-Send `SIGHUP` to reload only local storage-backend and cache configuration. Replica-count changes require a coordinated cluster stop/edit/restart; the old metadata quorum commits the new voter/data policy when the cluster comes back. `extent_size` cannot change for an existing namespace.
+Send `SIGHUP` to reload local storage-backend, cache and hydration configuration. Replica-count changes require a coordinated cluster stop/edit/restart; the old metadata quorum commits the new voter/data policy when the cluster comes back. `extent_size` cannot change for an existing namespace.
 
 A YAML file is required. These CLI options override values from that file for one invocation:
 
@@ -170,6 +174,7 @@ A YAML file is required. These CLI options override values from that file for on
 --extent-size SIZE               1M..64M; compiled default 16M
 --read-ahead N
 --connect-timeout MS             TCP connection attempt only
+--max-frame-size SIZE             4K..4M; default 256K
 --control-stall-notice MS        DEBUG notice only; 0 disables
 --data-stall-notice MS           DEBUG notice only; 0 disables
 --metadata-cache MS
@@ -177,7 +182,7 @@ A YAML file is required. These CLI options override values from that file for on
 --log-level LEVEL
 ```
 
-RPC duration itself is unbounded. Stall notices are observability thresholds; they do not cancel requests. Peer death is decided independently by the health lane and `dead_after_ms`.
+RPC duration itself is unbounded. Stall notices are observability thresholds; they do not cancel requests. Health/control traffic uses the same peer connection at absolute highest priority. A peer is marked dead only after that unified transport cannot establish liveness within `dead_after_ms`.
 
 ## How files are stored
 
@@ -205,7 +210,9 @@ Reads try, in order:
 2. persistent local cache;
 3. another DHT node.
 
-Sequential readers retain the current decrypted extent and prefetch future extents. A remote foreground fetch is persisted asynchronously; if this node should own that extent, the same bytes are promoted into authoritative storage.
+Sequential readers retain the current decrypted extent. Speculative reads are scheduled through the cache hydrator rather than by per-handle futures. Read-ahead, the remaining extents of the current file, and catalogue-predicted next media all submit ordered hints with independent priorities.
+
+Remote extent retrieval is replica-aware. Independent foreground reads choose among the configured replica set using current load, recent transfer latency and failures. Speculative hydration uses the same measurements but prefers idle replicas and yields to foreground work. Concurrent requests for the same object are coalesced; if playback needs an extent already being hydrated, that transfer is promoted rather than duplicated. A successful remote foreground fetch is still persisted asynchronously, and if this node should own the extent the same bytes can become the authoritative replica.
 
 ## Nodes and disks
 
@@ -243,6 +250,41 @@ A metadata minority fails rather than inventing a second history. Read-only acce
 
 The current metadata voter set and data replica count are persisted in the namespace. Replica counts may be changed on a coordinated whole-cluster restart; the old voter majority commits the new policy, then ordinary repair converges existing objects to the new data replica count. `extent_size` remains fixed for the lifetime of the namespace.
 
+## Catalogue and JSON API
+
+The catalogue is cluster metadata. Every node converges the complete catalogue snapshot and every referenced artwork object, independently of `dht.replicas`. Catalogue synchronisation runs ahead of ordinary media repair, and catalogue reads synchronise on demand. A node reports `ready: true` only when it has the current catalogue and all referenced artwork locally.
+
+The catalogue slice first landed in 0.5.0 and provides distributed storage, browse/search, mutation and artwork lifecycle. Automatic filesystem scanning and external metadata providers are intentionally not wired into the server yet.
+
+Enable the API locally:
+
+```yaml
+catalogue:
+  api:
+    enabled: true
+    listen: 127.0.0.1
+    port: 7438
+    # token_file: /etc/macha-api.token
+    max_request_bytes: 8M
+```
+
+Useful endpoints are:
+
+```text
+GET    /api/v1/catalogue/status
+GET    /api/v1/catalogue/items?type=show&parent=...
+GET    /api/v1/catalogue/search?q=expanse
+GET    /api/v1/catalogue/items/{id}
+PUT    /api/v1/catalogue/items/{id}
+DELETE /api/v1/catalogue/items/{id}
+POST   /api/v1/catalogue/items/{id}/artwork?role=poster&mime=image/jpeg
+GET    /api/v1/catalogue/artwork/{sha256}
+```
+
+Item mutations support `If-Match: "rev-N"` and return an `ETag`. If `token_file` is configured, clients must send that file's contents as a Bearer token. Keep a remotely exposed API authenticated and firewall-restricted.
+
+Replacing or deleting the last reference to artwork records its object ID in committed metadata garbage. After `maintenance.garbage_grace_ms` (24 hours by default), every node removes its local copy; a disconnected node performs the same deletion after it rejoins. A still-live reference always wins.
+
 ## Repair and maintenance
 
 Object placement uses rendezvous hashing over object ID and stable node ID, with `failure_domain` used to prefer distinct failure domains before ordinary ranking.
@@ -256,21 +298,17 @@ Background work is budgeted in bytes, not a fixed number of extents. The schedul
 
 ## Transport
 
-Each peer pair has up to three persistent authenticated connections:
+Each peer pair has one persistent authenticated bidirectional TCP connection. It multiplexes all health, control and object traffic with 64-bit request IDs. Connections are canonical by authenticated node identity, not endpoint text; simultaneous cross-dial deterministically keeps one physical connection and drains the duplicate before closing it.
 
-- `health` for liveness;
-- `control` for membership and metadata;
-- `data` for bulk objects.
+Protocol v6 transfers logical RPCs as variable-length AES-256-GCM frames. `network.max_frame_size` is an upper bound, negotiated to the lower peer limit during the authenticated handshake; the default is 256 KiB and the allowed range is 4 KiB..4 MiB. Frames are not padded to that size. Storage extent size is independent of transport frame size.
 
-Each lane is bidirectional and multiplexes requests with 64-bit request IDs. Connections are canonical by authenticated node identity, not endpoint text. If both nodes dial the same lane, both sides deterministically keep the same physical connection and drain the duplicate before closing it.
+Frame type is the sole source of transport priority: `control` > `foreground` > `read_ahead` > `speculative`. There is no separate numeric priority on the wire. The sender re-runs scheduling after every frame, so health/control and foreground data can pre-empt lower-priority transfers at frame boundaries. Speculative traffic is entitled only to otherwise spare transport capacity. A transfer may be promoted without changing request ID; subsequent frames use the more urgent frame type.
 
-Server work is also split into health, control and data queues so bulk transfers cannot starve liveness or namespace traffic.
-
-The v4 handshake uses ephemeral X25519 authenticated with HMAC from the shared cluster key. The transport lane is part of the authenticated handshake, so duplicate arbitration is complete before the first RPC. Directional keys are derived with HKDF-SHA256 and frames use AES-256-GCM.
+The v6 handshake uses ephemeral X25519 authenticated with HMAC from the shared cluster key and negotiates the frame ceiling. Directional keys are derived with HKDF-SHA256. Server dispatch likewise separates control execution from data work and always chooses foreground before read-ahead before speculative queued data.
 
 Nodes must be mutually reachable at their advertised addresses. There is no STUN, TURN, UPnP or NAT hole punching.
 
-## Cache
+## Cache and hydration
 
 The persistent cache is deliberately not part of DHT ownership.
 
@@ -281,11 +319,37 @@ The persistent cache is deliberately not part of DHT ownership.
 - Cached blocks can later be promoted if placement makes this node an owner.
 - With `prefer_metadata: true`, the latest valid namespace snapshot is also kept outside the media-block limit.
 
+The cache hydrator consumes ordered hints from independent engines. The built-in engines are:
+
+- `read_ahead`: the immediate sequential window after the current read position;
+- `current_file`: the rest of the file currently being read;
+- `catalogue`: the next TV episode, crossing a season boundary when required, or the next movie in the same collection.
+
+Hints that refer to the same ordered run are merged and their priorities reinforce each other. Scheduling uses weighted virtual time across runs, so the current file normally advances fastest without starving a predicted next item. A speculative run is sequential: the hydrator will not fetch a later extent while an earlier missing extent in that run is unavailable. Hydration keeps up to `max_inflight` extent requests active and rebuilds the hint set continuously. Read-ahead/current-file transfers use the read-ahead transport class; catalogue prediction uses speculative transport. Either yields immediately to foreground frames at the transport scheduler.
+
+Hydration requires the persistent cache to be enabled. If the cache is disabled, foreground reads continue normally but speculative hints do not trigger network fetches.
+
+`dht.read_ahead` remains the size of the immediate read-ahead hint window. Engine enablement and priority are configured separately under `hydration`:
+
+```yaml
+hydration:
+  enabled: true
+  interval_ms: 100
+  active_timeout_ms: 30000
+  catalogue_lookahead: 1
+  engines:
+    read_ahead:   { enabled: true, priority: 1000 }
+    current_file: { enabled: true, priority: 700 }
+    catalogue:    { enabled: true, priority: 300 }
+```
+
+Catalogue media bindings may use the stable `macha:<sha256>` media identity derived from file size plus the ordered extent manifest. That identity survives a namespace rename. Raw paths and `path:/...` remain accepted as a practical fallback for manually-created catalogue records.
+
 ## Filesystem limits
 
 The implemented filesystem operations cover ordinary media-library use: files and directories, create/open/read/write/truncate/unlink, mkdir/rmdir, rename, chmod/chown, timestamps, stat/statfs, directory enumeration, flush and fsync.
 
-0.4.0 does **not** implement symlinks, hard links, extended attributes, distributed advisory locks, full sparse-file semantics, or stable POSIX inode identity across every rename case. Access time is not tracked. Concurrent appenders use file-version CAS rather than a globally serialized append stream.
+0.6.0 does **not** implement symlinks, hard links, extended attributes, distributed advisory locks, full sparse-file semantics, or stable POSIX inode identity across every rename case. Access time is not tracked. Concurrent appenders use file-version CAS rather than a globally serialized append stream.
 
 A failed upload may leave unreachable immutable extents. Online garbage collection only removes objects known to have been dropped from committed metadata after a conservative grace period.
 
@@ -318,7 +382,7 @@ Object writes use unique temporary names, `fsync`, and atomic rename. The state 
 ctest --test-dir build --output-on-failure
 ```
 
-The integration suite covers transport/crypto, bidirectional RPC and connection deduplication, metadata quorum and replacement recovery, multi-node placement, disk loss/return, cache persistence, automatic new-owner pull, playback-assisted promotion, corruption repair and restart.
+The integration suite covers transport/crypto, bidirectional RPC and connection deduplication, metadata quorum and replacement recovery, catalogue join synchronisation/search/artwork GC, multi-node placement, disk loss/return, cache persistence, automatic new-owner pull, playback-assisted promotion, corruption repair and restart.
 
 ## Service files
 
@@ -330,7 +394,7 @@ The systemd unit supports `systemctl reload macha`, which sends `SIGHUP`.
 
 ## Security
 
-Anyone with the cluster key is a trusted cluster member. Keep it secret and back it up separately. There is no online key rotation or per-node revocation in 0.4.0. See `SECURITY.md`.
+Anyone with the cluster key is a trusted cluster member. Keep it secret and back it up separately. There is no online key rotation or per-node revocation in 0.6.0. See `SECURITY.md`.
 
 ## License
 

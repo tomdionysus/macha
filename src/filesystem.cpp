@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "filesystem.hpp"
 #include "crypto.hpp"
+#include "codec.hpp"
+#include "hydration.hpp"
 #include "log.hpp"
 #include <algorithm>
 #include <atomic>
@@ -91,13 +93,15 @@ void queue_garbage(MetadataSnapshot& snapshot, const FsEntry& entry) {
     }
 }
 } // namespace
-ReadHandle::ReadHandle(DistributedStore& s, FsEntry e, size_t a)
-    : s_(s), e_(std::move(e)), ahead_(a) {
+ReadHandle::ReadHandle(DistributedStore& s, FsEntry e, PlaybackTracker* playback,
+                       std::string path)
+    : s_(s), e_(std::move(e)), playback_(playback) {
+    if (playback_)
+        playback_session_ = playback_->open(std::move(path), e_);
     Log::debug("DIAG read-handle open ptr=" +
                std::to_string(reinterpret_cast<uintptr_t>(this)) +
                " size=" + std::to_string(e_.size) +
-               " extents=" + std::to_string(e_.extents.size()) +
-               " ahead=" + std::to_string(ahead_));
+               " extents=" + std::to_string(e_.extents.size()));
     for (size_t i = 0; i < e_.extents.size(); ++i) {
         const auto& x = e_.extents[i];
         Log::debug("DIAG read-manifest ptr=" +
@@ -109,12 +113,12 @@ ReadHandle::ReadHandle(DistributedStore& s, FsEntry e, size_t a)
                    (x.hole ? std::string{} : " id=" + to_string(x.id)));
     }
 }
-void ReadHandle::schedule(size_t i) {
-    if (i >= e_.extents.size() || i == cached_index_ || e_.extents[i].hole || pref_.contains(i))
-        return;
-    auto id = e_.extents[i].id;
-    pref_[i] = std::async(std::launch::async, [this, id, i] { return s_.get(id, i); });
+
+ReadHandle::~ReadHandle() {
+    if (playback_ && playback_session_)
+        playback_->close(playback_session_);
 }
+
 const Bytes& ReadHandle::extent(size_t i) {
     if (cached_index_ == i) {
         Log::debug("DIAG read-extent cache-hit ptr=" +
@@ -125,16 +129,7 @@ const Bytes& ReadHandle::extent(size_t i) {
 
     auto& x = e_.extents.at(i);
     auto started = Clock::now();
-    bool used_prefetch = false;
-    std::optional<Bytes> data;
-    auto prefetched = pref_.find(i);
-    if (prefetched != pref_.end()) {
-        used_prefetch = true;
-        data = prefetched->second.get();
-        pref_.erase(prefetched);
-    } else {
-        data = s_.get(x.id, i);
-    }
+    auto data = s_.get(x.id, i);
     if (!data || data->size() != x.length)
         fail(EIO, "extent unavailable/corrupt");
 
@@ -145,13 +140,13 @@ const Bytes& ReadHandle::extent(size_t i) {
                " offset=" + std::to_string(x.offset) +
                " length=" + std::to_string(x.length) +
                " id=" + to_string(x.id) +
-               " source=" + (used_prefetch ? std::string("prefetch") : std::string("direct")) +
-               " ms=" + std::to_string(elapsed.count()));
+               " source=direct ms=" + std::to_string(elapsed.count()));
 
     cached_extent_ = std::move(*data);
     cached_index_ = i;
     return cached_extent_;
 }
+
 size_t ReadHandle::read(uint64_t off, std::span<uint8_t> out) {
     std::lock_guard g(m_);
     if (off >= e_.size || out.empty())
@@ -161,6 +156,7 @@ size_t ReadHandle::read(uint64_t off, std::span<uint8_t> out) {
     auto it =
         std::lower_bound(e_.extents.begin(), e_.extents.end(), off,
                          [](const ExtentRef& x, uint64_t v) { return x.offset + x.length <= v; });
+    size_t last_extent = static_cast<size_t>(-1);
     while (it != e_.extents.end() && it->offset < end) {
         size_t idx = std::distance(e_.extents.begin(), it);
         uint64_t a = std::max(off, it->offset), b = std::min(end, it->offset + it->length);
@@ -173,6 +169,7 @@ size_t ReadHandle::read(uint64_t off, std::span<uint8_t> out) {
                 std::copy_n(d.begin() + (a - it->offset), n, out.begin() + done);
             }
             done += n;
+            last_extent = idx;
         }
         ++it;
     }
@@ -180,21 +177,11 @@ size_t ReadHandle::read(uint64_t off, std::span<uint8_t> out) {
     last_ = off + done;
     if (done)
         s_.foreground_activity(done);
-    if (seq && ahead_) {
-        auto nx = std::lower_bound(
-            e_.extents.begin(), e_.extents.end(), last_,
-            [](const ExtentRef& x, uint64_t v) { return x.offset + x.length <= v; });
-        if (nx != e_.extents.end() && nx->offset < last_ && last_ < nx->offset + nx->length) {
-            ++nx;
-        }
-        size_t i = std::distance(e_.extents.begin(), nx);
-        for (size_t k = 0; k < ahead_ && i + k < e_.extents.size(); ++k)
-            schedule(i + k);
-        while (pref_.size() > ahead_ + 1)
-            pref_.erase(pref_.begin());
-    }
+    if (seq && done && playback_ && playback_session_ && last_extent != static_cast<size_t>(-1))
+        playback_->progress(playback_session_, last_extent);
     return done;
 }
+
 WriteHandle::WriteHandle(FileSystem& f, std::string p, FsEntry b, bool trunc)
     : fs_(f), path_(std::move(p)), base_(std::move(b)), expected_(base_.version),
       sequential_(trunc), logical_(trunc ? 0 : base_.size), staged_(trunc ? 0 : base_.size),
@@ -629,8 +616,8 @@ void WriteHandle::cleanup() {
         std::filesystem::remove(temp_path_, e);
     }
 }
-FileSystem::FileSystem(NodeRuntime& n, DistributedStore& s, MetadataManager& m)
-    : n_(n), s_(s), m_(m) {}
+FileSystem::FileSystem(NodeRuntime& n, DistributedStore& s, MetadataManager& m, PlaybackTracker* playback)
+    : n_(n), s_(s), m_(m), playback_(playback) {}
 MetadataSnapshot FileSystem::snap() {
     return m_.snapshot();
 }
@@ -858,11 +845,57 @@ void FileSystem::truncate_file(const std::string& p, uint64_t z) {
     }
     commit_file(q, e, z, xs, nullptr);
 }
+std::string file_media_id(const FsEntry& entry) {
+    if (entry.type != EntryType::file)
+        return {};
+    Writer writer;
+    constexpr std::array<uint8_t, 8> magic{'M', 'F', 'I', 'L', 'E', '0', '0', '1'};
+    writer.raw(magic);
+    writer.u64(entry.size);
+    writer.u32(entry.extents.size());
+    for (const auto& extent : entry.extents) {
+        writer.u64(extent.offset);
+        writer.u64(extent.length);
+        writer.u8(extent.hole);
+        if (!extent.hole)
+            writer.fixed(extent.id.bytes);
+    }
+    return "macha:" + to_string(object_id(writer.data()));
+}
+
+std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::string_view id) {
+    if (id.starts_with("path:")) {
+        auto path = std::string(id.substr(5));
+        try {
+            auto entry = getattr(path);
+            if (entry.type == EntryType::file)
+                return std::pair{normalize_path(path), entry};
+        } catch (...) {
+        }
+        return {};
+    }
+    if (!id.empty() && id.front() == '/') {
+        try {
+            auto entry = getattr(std::string(id));
+            if (entry.type == EntryType::file)
+                return std::pair{normalize_path(std::string(id)), entry};
+        } catch (...) {
+        }
+        return {};
+    }
+    auto snapshot = snap();
+    for (const auto& [path, entry] : snapshot.entries) {
+        if (entry.type == EntryType::file && file_media_id(entry) == id)
+            return std::pair{path, entry};
+    }
+    return {};
+}
+
 std::shared_ptr<ReadHandle> FileSystem::open_read(const std::string& p) {
     auto e = getattr(p);
     if (e.type != EntryType::file)
         fail(EISDIR, "directory");
-    return std::make_shared<ReadHandle>(s_, e, n_.config().read_ahead_extents);
+    return std::make_shared<ReadHandle>(s_, e, playback_, normalize_path(p));
 }
 std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool trunc) {
     // Serialize path lookup/registration with rename so an opening writer cannot

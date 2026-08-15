@@ -181,7 +181,9 @@ bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,
     writer.fixed(id.bytes);
     writer.bytes(data);
     auto started = Clock::now();
-    bool ok = n_.call(target, MessageType::put_object, writer.data()).message.type == MessageType::ok;
+    const auto frame_type = foreground ? FrameType::foreground : FrameType::speculative;
+    bool ok = n_.call(target, MessageType::put_object, writer.data(), frame_type).message.type ==
+              MessageType::ok;
     if (ok)
         note_network(data.size(), Clock::now() - started);
     if (foreground)
@@ -190,19 +192,31 @@ bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,
 }
 
 std::optional<Bytes> DistributedStore::get_from(const NodeInfo& target, const ObjectId& id,
-                                                bool foreground) {
+                                                FrameType frame_type,
+                                                const std::shared_ptr<SharedFetch>& shared) {
     try {
-        if (target.id == n_.node_id()) {
-            auto data = n_.local_store().get(id);
-            if (data && foreground)
-                note_foreground(data->size());
-            return data;
-        }
+        if (target.id == n_.node_id())
+            return n_.local_store().get(id);
 
         Writer writer;
         writer.fixed(id.bytes);
         auto started = Clock::now();
-        auto reply = n_.call(target, MessageType::get_object, writer.data());
+        auto rpc = n_.call_async(target, MessageType::get_object, writer.data(), frame_type);
+        if (shared) {
+            FrameType effective;
+            {
+                std::lock_guard lock(shared->mutex);
+                shared->promote_network = rpc.promotion_callback();
+                effective = shared->frame_type;
+            }
+            if (frame_type_priority(effective) < frame_type_priority(frame_type))
+                rpc.promote(effective);
+        }
+        auto reply = rpc.get();
+        if (shared) {
+            std::lock_guard lock(shared->mutex);
+            shared->promote_network = {};
+        }
         if (reply.message.type != MessageType::object_reply)
             return {};
         Reader reader(reply.message.payload);
@@ -212,47 +226,186 @@ std::optional<Bytes> DistributedStore::get_from(const NodeInfo& target, const Ob
         if (returned != id || object_id(data) != id)
             throw std::runtime_error("remote integrity failure");
         note_network(data.size(), Clock::now() - started);
-        if (foreground)
-            note_foreground(data.size());
         return data;
     } catch (const std::exception& e) {
+        if (shared) {
+            std::lock_guard lock(shared->mutex);
+            shared->promote_network = {};
+        }
         Log::debug("object read: " + std::string(e.what()));
         return {};
     }
 }
 
 std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t stripe,
-                                                  bool foreground,
+                                                  FrameType frame_type, bool foreground,
                                                   bool opportunistic_persist) {
-    auto preferred = owners(id);
-    if (!preferred.empty())
-        std::rotate(preferred.begin(), preferred.begin() + stripe % preferred.size(),
-                    preferred.end());
-
-    std::set<NodeId> seen;
-    for (const auto& target : preferred) {
-        seen.insert(target.id);
-        if (target.id == n_.node_id())
-            continue;
-        if (auto data = get_from(target, id, foreground)) {
-            if (opportunistic_persist)
-                n_.enqueue_fetched(id, *data, should_own(id));
-            return data;
+    std::shared_ptr<SharedFetch> shared;
+    bool leader = false;
+    {
+        std::lock_guard lock(fetch_mutex_);
+        if (auto it = fetches_.find(id); it != fetches_.end()) {
+            shared = it->second.lock();
+            if (shared)
+                shared->waiters.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (!shared) {
+            shared = std::make_shared<SharedFetch>();
+            shared->foreground = foreground;
+            shared->frame_type = frame_type;
+            shared->opportunistic_persist = opportunistic_persist;
+            fetches_[id] = shared;
+            leader = true;
         }
     }
 
-    // Objects may deliberately live on fallback nodes when a preferred owner is
-    // full, and may temporarily remain on old owners during membership changes.
-    for (const auto& target : ranked(id)) {
-        if (target.id == n_.node_id() || seen.contains(target.id))
-            continue;
-        if (auto data = get_from(target, id, foreground)) {
-            if (opportunistic_persist)
-                n_.enqueue_fetched(id, *data, should_own(id));
-            return data;
+    if (!leader) {
+        std::function<void(FrameType)> promote_network;
+        std::unique_lock lock(shared->mutex);
+        if (frame_type_priority(frame_type) < frame_type_priority(shared->frame_type)) {
+            shared->frame_type = frame_type;
+            promote_network = shared->promote_network;
         }
+        if (foreground && !shared->foreground) {
+            shared->foreground = true;
+            if (shared->active_peer &&
+                shared->active_class == ReplicaWorkClass::speculative) {
+                replica_selector_.promoted(*shared->active_peer);
+                shared->active_class = ReplicaWorkClass::foreground;
+            }
+        }
+        if (opportunistic_persist)
+            shared->opportunistic_persist = true;
+        if (promote_network) {
+            lock.unlock();
+            promote_network(frame_type);
+            lock.lock();
+        }
+
+        shared->cv.wait(lock, [&] { return shared->done; });
+        if (shared->result) {
+            if (foreground && !shared->foreground_accounted) {
+                note_foreground(shared->result->size());
+                shared->foreground_accounted = true;
+            }
+            if (opportunistic_persist && !shared->persist_queued) {
+                n_.enqueue_fetched(id, *shared->result, should_own(id));
+                shared->persist_queued = true;
+            }
+        }
+        return shared->result;
     }
-    return {};
+
+    auto finish = [&](std::optional<Bytes> result) {
+        bool account_foreground = false;
+        bool queue_persist = false;
+        {
+            // Keep the fetch-table lock until the shared result is published.
+            // A caller that found this transfer before completion is therefore
+            // guaranteed to become a waiter; a caller arriving afterwards can
+            // start a new fetch only after this network transfer is complete.
+            std::lock_guard fetch_lock(fetch_mutex_);
+            std::lock_guard shared_lock(shared->mutex);
+            const bool has_waiters = shared->waiters.load(std::memory_order_relaxed) != 0;
+            if (has_waiters)
+                shared->result = result;
+            if (result) {
+                if (shared->foreground && !shared->foreground_accounted) {
+                    shared->foreground_accounted = true;
+                    account_foreground = true;
+                }
+                if (shared->opportunistic_persist && !shared->persist_queued) {
+                    shared->persist_queued = true;
+                    queue_persist = true;
+                }
+            }
+            shared->done = true;
+
+            auto it = fetches_.find(id);
+            if (it != fetches_.end() && it->second.lock() == shared)
+                fetches_.erase(it);
+        }
+
+        if (result && account_foreground)
+            note_foreground(result->size());
+        if (result && queue_persist)
+            n_.enqueue_fetched(id, *result, should_own(id));
+        shared->cv.notify_all();
+        return result;
+    };
+
+    auto try_candidates = [&](std::vector<NodeInfo> candidates) -> std::optional<Bytes> {
+        std::erase_if(candidates, [&](const NodeInfo& node) { return node.id == n_.node_id(); });
+        size_t attempt = 0;
+        while (!candidates.empty()) {
+            ReplicaWorkClass work;
+            {
+                std::lock_guard lock(shared->mutex);
+                work = shared->foreground ? ReplicaWorkClass::foreground
+                                          : ReplicaWorkClass::speculative;
+            }
+
+            auto ordered = replica_selector_.order(candidates, stripe + attempt, work);
+            if (ordered.empty())
+                break;
+            const auto target = ordered.front();
+            auto found = std::find_if(candidates.begin(), candidates.end(), [&](const NodeInfo& n) {
+                return n.id == target.id;
+            });
+            if (found != candidates.end())
+                candidates.erase(found);
+
+            Clock::time_point started;
+            {
+                std::lock_guard lock(shared->mutex);
+                shared->active_peer = target;
+                shared->active_class = shared->foreground ? ReplicaWorkClass::foreground
+                                                          : ReplicaWorkClass::speculative;
+                replica_selector_.started(target, shared->active_class);
+                started = Clock::now();
+            }
+
+            FrameType transfer_type;
+            {
+                std::lock_guard lock(shared->mutex);
+                transfer_type = shared->frame_type;
+            }
+            auto data = get_from(target, id, transfer_type, shared);
+            {
+                std::lock_guard lock(shared->mutex);
+                replica_selector_.finished(target, shared->active_class,
+                                           data ? data->size() : 0, Clock::now() - started,
+                                           data.has_value());
+                shared->active_peer.reset();
+            }
+            if (data)
+                return data;
+            ++attempt;
+        }
+        return {};
+    };
+
+    try {
+        auto preferred = owners(id);
+        std::set<NodeId> preferred_ids;
+        for (const auto& node : preferred)
+            preferred_ids.insert(node.id);
+        if (auto data = try_candidates(std::move(preferred)))
+            return finish(std::move(data));
+
+        // Objects may deliberately live on fallback nodes when a preferred owner is
+        // full, and may temporarily remain on old owners during membership changes.
+        auto fallback = ranked(id);
+        std::erase_if(fallback,
+                      [&](const NodeInfo& node) { return preferred_ids.contains(node.id); });
+        if (auto data = try_candidates(std::move(fallback)))
+            return finish(std::move(data));
+    } catch (const std::exception& error) {
+        Log::debug("remote object scheduling " + to_string(id) + ": " + error.what());
+    } catch (...) {
+        Log::debug("remote object scheduling " + to_string(id) + ": unknown error");
+    }
+    return finish({});
 }
 
 std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, bool foreground) {
@@ -281,7 +434,9 @@ std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, bo
         return cached;
     }
 
-    auto data = get_remote(id, stripe, foreground, foreground);
+    auto data = get_remote(id, stripe,
+                           foreground ? FrameType::foreground : FrameType::speculative,
+                           foreground, foreground);
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
     Log::debug("DIAG object-get id=" + to_string(id) +
                " source=remote result=" + std::to_string(data ? 1 : 0) +
@@ -302,6 +457,67 @@ bool DistributedStore::has_on(const NodeInfo& target, const ObjectId& id) {
     bool present = reader.u8() != 0;
     reader.finish();
     return present;
+}
+
+size_t DistributedStore::replicate_all(const ObjectId& id, std::span<const uint8_t> data,
+                                       bool foreground) {
+    size_t success = 0;
+    for (const auto& target : n_.membership().active()) {
+        try {
+            if (put_on(target, id, data, foreground))
+                ++success;
+        } catch (const std::exception& e) {
+            Log::debug("universal object write " + target.host + ": " + e.what());
+        }
+    }
+    return success;
+}
+
+bool DistributedStore::locally_available(const ObjectId& id) const {
+    return n_.local_store().has(id) || n_.block_cache().has(id);
+}
+
+bool DistributedStore::hydration_available() const {
+    return n_.block_cache().enabled();
+}
+
+bool DistributedStore::hydrate(const ObjectId& id, size_t stripe, FrameType frame_type) {
+    if (n_.local_store().has(id) || n_.block_cache().has(id))
+        return true;
+    if (!n_.block_cache().enabled())
+        return false;
+    auto data = get_remote(id, stripe, frame_type, false, false);
+    return data && n_.block_cache().put(id, *data);
+}
+
+bool DistributedStore::ensure_local(const ObjectId& id, bool foreground) {
+    if (n_.local_store().has(id))
+        return true;
+    if (auto cached = n_.block_cache().get(id)) {
+        if (n_.local_store().put(id, *cached))
+            return true;
+    }
+    auto data = get_remote(id, 0,
+                           foreground ? FrameType::foreground : FrameType::speculative,
+                           foreground, false);
+    return data && n_.local_store().put(id, *data);
+}
+
+void DistributedStore::erase_all(const ObjectId& id) {
+    Writer writer;
+    writer.fixed(id.bytes);
+    for (const auto& target : n_.membership().active()) {
+        try {
+            if (target.id == n_.node_id()) {
+                (void)n_.local_store().remove(id);
+                (void)n_.block_cache().remove(id);
+            } else {
+                (void)n_.call(target, MessageType::delete_object, writer.data());
+            }
+        } catch (const std::exception& e) {
+            Log::debug("object delete " + target.host + ": " + e.what());
+        }
+    }
 }
 
 uint64_t DistributedStore::scrub_once(uint64_t byte_budget) {
@@ -332,7 +548,8 @@ uint64_t DistributedStore::scrub_once(uint64_t byte_budget) {
     return checked;
 }
 
-uint64_t DistributedStore::repair_once(uint64_t byte_budget, const std::set<ObjectId>* live) {
+uint64_t DistributedStore::repair_once(uint64_t byte_budget, const std::set<ObjectId>* live,
+                                       const std::set<ObjectId>* universal) {
     uint64_t transferred = 0;
 
     // First, existing local replicas push toward the current deterministic owner
@@ -353,12 +570,14 @@ uint64_t DistributedStore::repair_once(uint64_t byte_budget, const std::set<Obje
                 continue;
             }
 
-            auto nodes = ranked(id);
+            const bool everywhere = universal && universal->contains(id);
+            auto nodes = everywhere ? n_.membership().active() : ranked(id);
             if (nodes.empty()) {
                 ++processed;
                 continue;
             }
-            const size_t target = std::min(n_.config().replication, nodes.size());
+            const size_t target = everywhere ? nodes.size()
+                                             : std::min(n_.config().replication, nodes.size());
             std::set<NodeId> keepers;
             std::optional<Bytes> source;
 
@@ -389,7 +608,7 @@ uint64_t DistributedStore::repair_once(uint64_t byte_budget, const std::set<Obje
                     keepers.insert(peer.id);
             }
 
-            if (keepers.size() >= target && !keepers.contains(n_.node_id()))
+            if (!everywhere && keepers.size() >= target && !keepers.contains(n_.node_id()))
                 n_.local_store().remove(id);
             ++processed;
         }
@@ -411,7 +630,8 @@ uint64_t DistributedStore::repair_once(uint64_t byte_budget, const std::set<Obje
         for (const auto& id : live_ids) {
             if (byte_budget && transferred >= byte_budget)
                 break;
-            if (!should_own(id) || n_.local_store().has(id)) {
+            const bool everywhere = universal && universal->contains(id);
+            if ((!everywhere && !should_own(id)) || n_.local_store().has(id)) {
                 ++processed;
                 continue;
             }
@@ -426,7 +646,7 @@ uint64_t DistributedStore::repair_once(uint64_t byte_budget, const std::set<Obje
                 continue;
             }
 
-            auto data = get_remote(id, 0, false, false);
+            auto data = get_remote(id, 0, FrameType::speculative, false, false);
             if (data) {
                 if (n_.local_store().put(id, *data))
                     transferred += data->size();

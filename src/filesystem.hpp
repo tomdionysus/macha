@@ -3,8 +3,6 @@
 #include "distributed_store.hpp"
 #include "metadata_manager.hpp"
 #include <filesystem>
-#include <future>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -21,6 +19,7 @@ class FsError : public std::runtime_error {
     }
 };
 class FileSystem;
+class PlaybackTracker;
 
 struct MaintenanceObjects {
     std::vector<ObjectId> live;
@@ -40,21 +39,23 @@ struct WriteHandleDiagnostics {
 class ReadHandle {
     DistributedStore& s_;
     FsEntry e_;
-    size_t ahead_;
+    PlaybackTracker* playback_{};
+    uint64_t playback_session_{};
     std::mutex m_;
     uint64_t last_{};
-    std::map<size_t, std::future<std::optional<Bytes>>> pref_;
     size_t cached_index_{static_cast<size_t>(-1)};
     Bytes cached_extent_;
-    void schedule(size_t);
     const Bytes& extent(size_t);
 
   public:
-    ReadHandle(DistributedStore&, FsEntry, size_t);
+    ReadHandle(DistributedStore&, FsEntry, PlaybackTracker* = nullptr,
+               std::string path = {});
+    ~ReadHandle();
     size_t read(uint64_t, std::span<uint8_t>);
 };
 class WriteHandle {
     friend class FileSystem;
+class PlaybackTracker;
 
     FileSystem& fs_;
     std::string path_;
@@ -106,6 +107,7 @@ class FileSystem {
     NodeRuntime& n_;
     DistributedStore& s_;
     MetadataManager& m_;
+    PlaybackTracker* playback_{};
     std::mutex open_writes_mutex_;
     std::vector<std::weak_ptr<WriteHandle>> open_writes_;
     MetadataSnapshot snap();
@@ -114,7 +116,7 @@ class FileSystem {
     static void require_parent(const MetadataSnapshot&, const std::string&);
 
   public:
-    FileSystem(NodeRuntime&, DistributedStore&, MetadataManager&);
+    FileSystem(NodeRuntime&, DistributedStore&, MetadataManager&, PlaybackTracker* = nullptr);
     FsEntry getattr(const std::string&);
     std::vector<std::pair<std::string, FsEntry>> readdir(const std::string&);
     void mkdir(const std::string&, uint32_t, uint32_t, uint32_t);
@@ -127,6 +129,7 @@ class FileSystem {
     void utimens(const std::string&, int64_t);
     void truncate_file(const std::string&, uint64_t);
     std::shared_ptr<ReadHandle> open_read(const std::string&);
+    std::optional<std::pair<std::string, FsEntry>> find_media(std::string_view);
     std::shared_ptr<WriteHandle> open_write(const std::string&, bool);
     std::optional<uint64_t> active_write_size(const std::string&);
     std::vector<WriteHandleDiagnostics> active_write_diagnostics(const std::string&);
@@ -145,4 +148,9 @@ class FileSystem {
         return n_.config().extent_size;
     }
 };
+
+// Stable across namespace renames: identity is derived only from the logical
+// file size and ordered content-addressed extent manifest.
+std::string file_media_id(const FsEntry&);
+
 } // namespace macha

@@ -24,6 +24,7 @@ struct CacheConfig {
 struct MaintenanceConfig {
     std::chrono::milliseconds interval{500};
     std::chrono::milliseconds foreground_quiet{2000};
+    std::chrono::milliseconds garbage_grace{std::chrono::hours(24)};
     double busy_bandwidth_fraction{0.0};
     double idle_bandwidth_fraction{0.50};
     double cpu_target{0.35};
@@ -47,12 +48,42 @@ struct FilesystemConfig {
     uint32_t root_mode{0755};
 };
 
+struct CatalogueApiConfig {
+    bool enabled{};
+    std::string listen{"127.0.0.1"};
+    uint16_t port{7438};
+    std::optional<std::filesystem::path> token_file;
+    size_t max_request_bytes{8 * 1024 * 1024};
+};
+
+struct CatalogueConfig {
+    CatalogueApiConfig api;
+};
+
+struct HydrationEngineConfig {
+    bool enabled{true};
+    uint32_t priority{};
+};
+
+struct HydrationConfig {
+    bool enabled{true};
+    std::chrono::milliseconds interval{100};
+    std::chrono::milliseconds active_timeout{30000};
+    size_t max_inflight{4};
+    HydrationEngineConfig read_ahead{true, 1000};
+    HydrationEngineConfig current_file{true, 700};
+    HydrationEngineConfig catalogue{true, 300};
+    size_t catalogue_lookahead{1};
+};
+
 struct Config {
     std::filesystem::path state_path;
     std::vector<StorageBackendConfig> storage_backends;
     CacheConfig cache;
     MaintenanceConfig maintenance;
     FilesystemConfig filesystem;
+    CatalogueConfig catalogue;
+    HydrationConfig hydration;
 
     std::filesystem::path key_file;
     std::optional<std::filesystem::path> mount_path;
@@ -69,6 +100,7 @@ struct Config {
     std::chrono::milliseconds heartbeat{5000};
     std::chrono::milliseconds dead_after{30000};
     std::chrono::milliseconds connect_timeout{2500};
+    size_t max_frame_size{256 * 1024};
     // These are observability thresholds only. They never terminate a healthy
     // RPC; 0 disables the corresponding stalled-request DEBUG message.
     std::chrono::milliseconds control_stall_notice{5000};

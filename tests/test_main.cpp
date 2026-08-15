@@ -10,6 +10,7 @@
 #include "service.hpp"
 #include "storage_pool.hpp"
 #include "persistent_cache.hpp"
+#include "replica_selector.hpp"
 #include <arpa/inet.h>
 #include <array>
 #include <atomic>
@@ -105,6 +106,7 @@ Config config_for(const std::filesystem::path& path, const std::filesystem::path
     c.metadata_replication = 3;
     c.extent_size = 1024 * 1024;
     c.read_ahead_extents = 2;
+    c.hydration.enabled = false;
     c.heartbeat = 100ms;
     c.dead_after = 500ms;
     c.connect_timeout = 500ms;
@@ -404,6 +406,31 @@ void test_metadata_codec_and_replica() {
     REQUIRE(decoded.garbage.size() == 1);
     CHECK(decoded.garbage.front().id == garbage_id);
 
+    // 0.4.0 metadata snapshots had no catalogue-root field. 0.5.0 must read
+    // them directly so an existing namespace upgrades to an empty catalogue
+    // rather than requiring destructive state migration.
+    Writer old;
+    const std::array<uint8_t, 8> old_magic{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'};
+    old.raw(old_magic);
+    old.u32(0); // metadata voters
+    old.u32(1); // data replication
+    old.u64(4ULL * 1024 * 1024);
+    old.u32(1); // root entry
+    old.string("/");
+    old.u8(static_cast<uint8_t>(EntryType::directory));
+    old.u32(0755);
+    old.u32(0);
+    old.u32(0);
+    old.u64(0);
+    old.i64(0);
+    old.i64(0);
+    old.u64(0);
+    old.u32(0); // extents
+    old.u32(0); // garbage
+    auto upgraded = decode_snapshot(old.data());
+    CHECK(!upgraded.catalogue_root.has_value());
+    CHECK(upgraded.entries.contains("/"));
+
     auto replica_path = t.path() / "node";
     MetadataReplica replica(replica_path, keys.storage);
     auto current = replica.current();
@@ -491,6 +518,7 @@ void test_config() {
             << "  advertise: media.example\n"
             << "  port: 7440\n"
             << "  failure_domain: site-x\n"
+            << "  max_frame_size: 192K\n"
             << "  control_stall_notice_ms: 4100\n"
             << "  data_stall_notice_ms: 88000\n"
             << "dht:\n"
@@ -503,9 +531,27 @@ void test_config() {
             << "  - seed2.example:7440\n"
             << "maintenance:\n"
             << "  interval_ms: 250\n"
+            << "  garbage_grace_ms: 1234\n"
             << "  busy_bandwidth_fraction: 0.03\n"
             << "  idle_bandwidth_fraction: 0.60\n"
-            << "  cpu_target: 0.40\n";
+            << "  cpu_target: 0.40\n"
+            << "hydration:\n"
+            << "  enabled: true\n"
+            << "  interval_ms: 75\n"
+            << "  active_timeout_ms: 12000\n"
+            << "  max_inflight: 6\n"
+            << "  catalogue_lookahead: 2\n"
+            << "  engines:\n"
+            << "    read_ahead: { enabled: true, priority: 1200 }\n"
+            << "    current_file: { enabled: true, priority: 650 }\n"
+            << "    catalogue: { enabled: true, priority: 250 }\n"
+            << "catalogue:\n"
+            << "  api:\n"
+            << "    enabled: true\n"
+            << "    listen: 127.0.0.1\n"
+            << "    port: 7441\n"
+            << "    token_file: " << (t.path() / "api.token").string() << "\n"
+            << "    max_request_bytes: 2M\n";
     }
 
     std::vector<std::string> yaml_args{"macha", "--config", yaml.string()};
@@ -525,10 +571,26 @@ void test_config() {
     CHECK(yc.filesystem.root_mode == 0750);
     CHECK(yc.bootstrap.size() == 2);
     CHECK(yc.port == 7440);
+    CHECK(yc.max_frame_size == 192ULL * 1024);
     CHECK(yc.control_stall_notice == 4100ms);
     CHECK(yc.data_stall_notice == 88000ms);
     CHECK(yc.maintenance.interval == 250ms);
+    CHECK(yc.maintenance.garbage_grace == 1234ms);
     CHECK(yc.maintenance.busy_bandwidth_fraction == 0.03);
+    CHECK(yc.hydration.enabled);
+    CHECK(yc.hydration.interval == 75ms);
+    CHECK(yc.hydration.active_timeout == 12000ms);
+    CHECK(yc.hydration.max_inflight == 6);
+    CHECK(yc.hydration.catalogue_lookahead == 2);
+    CHECK(yc.hydration.read_ahead.priority == 1200);
+    CHECK(yc.hydration.current_file.priority == 650);
+    CHECK(yc.hydration.catalogue.priority == 250);
+    CHECK(yc.catalogue.api.enabled);
+    CHECK(yc.catalogue.api.listen == "127.0.0.1");
+    CHECK(yc.catalogue.api.port == 7441);
+    REQUIRE(yc.catalogue.api.token_file.has_value());
+    CHECK(*yc.catalogue.api.token_file == t.path() / "api.token");
+    CHECK(yc.catalogue.api.max_request_bytes == 2ULL * 1024 * 1024);
 
     // CLI remains useful for node-local/runtime overrides, but configuration
     // now always starts from an explicit YAML file.
@@ -536,6 +598,7 @@ void test_config() {
                                             "--port", "8123", "--replicas", "5",
                                             "--read-ahead", "4", "--failure-domain", "site-a",
                                             "--connect-timeout", "1700",
+                                            "--max-frame-size", "320K",
                                             "--control-stall-notice", "4200",
                                             "--data-stall-notice", "90000",
                                             "--metadata-cache", "125",
@@ -549,6 +612,7 @@ void test_config() {
     CHECK(overridden.read_ahead_extents == 4);
     CHECK(overridden.failure_domain == "site-a");
     CHECK(overridden.connect_timeout == 1700ms);
+    CHECK(overridden.max_frame_size == 320ULL * 1024);
     CHECK(overridden.control_stall_notice == 4200ms);
     CHECK(overridden.data_stall_notice == 90000ms);
     CHECK(overridden.metadata_cache == 125ms);
@@ -697,7 +761,80 @@ void test_async_rpc_move_ownership() {
     CHECK(cancelled.load() == 2);
 }
 
-void test_rpc_v4_persistence_and_multiplexing() {
+void test_rpc_v6_frame_priority_and_variable_length() {
+    CHECK(frame_type_priority(FrameType::control) < frame_type_priority(FrameType::foreground));
+    CHECK(frame_type_priority(FrameType::foreground) < frame_type_priority(FrameType::read_ahead));
+    CHECK(frame_type_priority(FrameType::read_ahead) <
+          frame_type_priority(FrameType::speculative));
+    CHECK(default_frame_type(MessageType::ping) == FrameType::control);
+    CHECK(default_frame_type(MessageType::get_object) == FrameType::foreground);
+
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto port = free_port();
+
+    NodeInfo server_info;
+    server_info.id = random_node_id();
+    server_info.host = "127.0.0.1";
+    server_info.port = port;
+    server_info.failure_domain = "server-site";
+
+    std::mutex order_mutex;
+    std::vector<uint8_t> order;
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, const RpcMessage& request) {
+            if (request.type == MessageType::put_object && !request.payload.empty()) {
+                std::lock_guard lock(order_mutex);
+                order.push_back(request.payload.front());
+            }
+            return RpcMessage{MessageType::ok, request.payload};
+        },
+        [](const NodeInfo&) {}, 4096);
+    server.start();
+
+    NodeInfo client_info;
+    client_info.id = random_node_id();
+    client_info.host = "127.0.0.1";
+    client_info.port = free_port();
+    client_info.failure_domain = "client-site";
+    RpcClient client(keys, [client_info] { return client_info; }, [](const NodeInfo&) {},
+                     [](uint64_t) {}, 500ms, 5s, 30s, 4096);
+    Endpoint endpoint{"127.0.0.1", port};
+
+    // A non-multiple of max_frame_size proves that the final frame is naturally
+    // short rather than padded to a fixed transport block size.
+    auto odd = pattern(12'345);
+    auto odd_reply = client.call(endpoint, MessageType::ping, odd, 1s);
+    CHECK(odd_reply.message.payload == odd);
+
+    // Start a large speculative transfer, then introduce foreground work. The
+    // writer reconsiders priority after every <=4 KiB variable-length frame, so
+    // foreground reaches the server before the speculative message completes.
+    Bytes speculative(32 * 1024 * 1024, 0x53);
+    auto background = client.call_async(endpoint, MessageType::put_object, speculative,
+                                        FrameType::speculative);
+    std::this_thread::sleep_for(2ms);
+    auto foreground = client.call_async(endpoint, MessageType::put_object, Bytes{0x46},
+                                        FrameType::foreground);
+    REQUIRE(foreground.wait_for(2s) == std::future_status::ready);
+    CHECK(foreground.get().message.type == MessageType::ok);
+    {
+        std::lock_guard lock(order_mutex);
+        REQUIRE(!order.empty());
+        CHECK(order.front() == 0x46);
+    }
+    REQUIRE(background.wait_for(10s) == std::future_status::ready);
+    CHECK(background.get().message.type == MessageType::ok);
+    CHECK(client.stats().canonical_connections == 1);
+
+    client.stop();
+    server.stop();
+}
+
+void test_rpc_v6_persistence_and_multiplexing() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -764,7 +901,7 @@ void test_rpc_v4_persistence_and_multiplexing() {
     CHECK(very_slow.message.payload == very_slow_payload);
     CHECK(Clock::now() - started >= 250ms);
 
-    // The same persistent lane remains usable after a slow request; there is no
+    // The same persistent connection remains usable after a slow request; there is no
     // timeout-induced backoff/reconnect cycle.
     auto recovered = client.call(endpoint, MessageType::ping, fast_payload, 50ms);
     CHECK(recovered.message.type == MessageType::ok);
@@ -774,7 +911,7 @@ void test_rpc_v4_persistence_and_multiplexing() {
     server.stop();
 }
 
-void test_rpc_v4_bidirectional_and_deduplication() {
+void test_rpc_v6_bidirectional_and_deduplication() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -812,8 +949,8 @@ void test_rpc_v4_bidirectional_and_deduplication() {
         return RpcMessage{MessageType::ok, request.payload};
     };
 
-    // Once A has called B, B can originate a control RPC back over the accepted
-    // socket. It must not create a second B->A TCP connection.
+    // Once A has called B, B can originate an RPC back over the accepted socket.
+    // It must not create a second B->A TCP connection.
     {
         TestNode a(keys, node_info(), echo);
         TestNode b(keys, node_info(), echo);
@@ -821,8 +958,8 @@ void test_rpc_v4_bidirectional_and_deduplication() {
         CHECK(b.client.stats().connections_created == 0);
         CHECK(b.client.call(a.info, MessageType::members, Bytes{2}, 1s).message.payload == Bytes{2});
         CHECK(b.client.stats().connections_created == 0);
-        CHECK(a.client.stats().canonical_control == 1);
-        CHECK(b.client.stats().canonical_control == 1);
+        CHECK(a.client.stats().canonical_connections == 1);
+        CHECK(b.client.stats().canonical_connections == 1);
     }
 
     // Simultaneous cross-dial starts with two physical sessions. Both nodes
@@ -865,8 +1002,8 @@ void test_rpc_v4_bidirectional_and_deduplication() {
             std::rethrow_exception(b_error);
 
         REQUIRE(wait_until([&] {
-            return a.client.stats().canonical_control == 1 &&
-                   b.client.stats().canonical_control == 1;
+            return a.client.stats().canonical_connections == 1 &&
+                   b.client.stats().canonical_connections == 1;
         }));
         auto a_created = a.client.stats().connections_created;
         auto b_created = b.client.stats().connections_created;
@@ -885,7 +1022,7 @@ void test_rpc_v4_bidirectional_and_deduplication() {
         Endpoint alias{"localhost", b.info.port};
         CHECK(a.client.call(numeric, MessageType::members, Bytes{7}, 1s).message.payload == Bytes{7});
         CHECK(a.client.call(alias, MessageType::members, Bytes{8}, 1s).message.payload == Bytes{8});
-        REQUIRE(wait_until([&] { return a.client.stats().canonical_control == 1; }));
+        REQUIRE(wait_until([&] { return a.client.stats().canonical_connections == 1; }));
         auto created = a.client.stats().connections_created;
         CHECK(a.client.call(alias, MessageType::members, Bytes{9}, 1s).message.payload == Bytes{9});
         CHECK(a.client.stats().connections_created == created);
@@ -917,8 +1054,8 @@ void test_rpc_v4_bidirectional_and_deduplication() {
         REQUIRE(slow.wait_for(1s) == std::future_status::ready);
         CHECK(slow.get().message.payload == Bytes{42});
         REQUIRE(wait_until([&] {
-            return lower.client.stats().canonical_control == 1 &&
-                   higher.client.stats().canonical_control == 1;
+            return lower.client.stats().canonical_connections == 1 &&
+                   higher.client.stats().canonical_connections == 1;
         }));
         auto created = higher.client.stats().connections_created;
         CHECK(higher.client.call(lower.info, MessageType::members, Bytes{44}, 1s).message.payload ==
@@ -949,8 +1086,7 @@ void test_mutual_bootstrap_prunes_cross_dial() {
         const auto a = n1.rpc_stats();
         const auto b = n2.rpc_stats();
         return n1.membership().active().size() >= 2 && n2.membership().active().size() >= 2 &&
-               a.canonical_control == 1 && b.canonical_control == 1 &&
-               a.canonical_health == 1 && b.canonical_health == 1;
+               a.canonical_connections == 1 && b.canonical_connections == 1;
     }));
 
     const auto a_before = n1.rpc_stats();
@@ -959,12 +1095,8 @@ void test_mutual_bootstrap_prunes_cross_dial() {
     const auto a_after = n1.rpc_stats();
     const auto b_after = n2.rpc_stats();
 
-    CHECK(a_after.canonical_control == 1);
-    CHECK(b_after.canonical_control == 1);
-    CHECK(a_after.canonical_health == 1);
-    CHECK(b_after.canonical_health == 1);
-    CHECK(a_after.canonical_data == 0);
-    CHECK(b_after.canonical_data == 0);
+    CHECK(a_after.canonical_connections == 1);
+    CHECK(b_after.canonical_connections == 1);
     CHECK(a_after.connections_created == a_before.connections_created);
     CHECK(b_after.connections_created == b_before.connections_created);
 
@@ -972,7 +1104,7 @@ void test_mutual_bootstrap_prunes_cross_dial() {
     n1.stop();
 }
 
-void test_rpc_v3_handshake_is_rejected() {
+void test_rpc_v5_handshake_is_rejected() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -1010,8 +1142,9 @@ void test_rpc_v3_handshake_is_rejected() {
     std::copy(nonce_bytes.begin(), nonce_bytes.end(), nonce.begin());
 
     Writer hello_writer;
-    hello_writer.u16(3);
-    hello_writer.u8(static_cast<uint8_t>(RpcLane::control));
+    hello_writer.u16(5);
+    // Protocol v5 carried a lane byte after the protocol version.
+    hello_writer.u8(2);
     hello_writer.fixed(keys.cluster_id);
     hello_writer.fixed(old_client.id.bytes);
     hello_writer.fixed(nonce);
@@ -1019,8 +1152,8 @@ void test_rpc_v3_handshake_is_rejected() {
     encode_node_info(hello_writer, old_client);
     auto hello = hello_writer.take();
 
-    Bytes authenticated(reinterpret_cast<const uint8_t*>("client/v3"),
-                        reinterpret_cast<const uint8_t*>("client/v3") + 9);
+    Bytes authenticated(reinterpret_cast<const uint8_t*>("client/v5"),
+                        reinterpret_cast<const uint8_t*>("client/v5") + 9);
     authenticated.insert(authenticated.end(), hello.begin(), hello.end());
     Writer envelope;
     envelope.bytes(hello);
@@ -1084,11 +1217,10 @@ void test_rpc_slow_control_does_not_abort_data() {
                      [](uint64_t) {}, 500ms, 50ms, 200ms);
     Endpoint endpoint{"127.0.0.1", port};
 
-    // Data and control have independent persistent lanes. More importantly,
-    // the 50-ms value below is not a deadline: both 600-ms RPCs are healthy and
-    // must complete without either lane being destroyed. They also outlive the
-    // 200-ms peer-death window several times over while independent health pings
-    // prove that the peer itself remains alive.
+    // The 50-ms value below is not a deadline: both 600-ms RPCs are healthy and
+    // must complete without the unified peer connection being destroyed. They also
+    // outlive the 200-ms peer-death window while priority control pings on that same
+    // connection prove that the peer itself remains alive.
     Bytes object_payload(256 * 1024, 0x5a);
     auto data = client.call_async(endpoint, MessageType::put_object, object_payload);
     std::this_thread::sleep_for(20ms);
@@ -1100,7 +1232,7 @@ void test_rpc_slow_control_does_not_abort_data() {
 
     REQUIRE(data.wait_for(2s) == std::future_status::ready);
     CHECK(data.get().message.type == MessageType::ok);
-    CHECK(client.stats().connections_created >= 2);
+    CHECK(client.stats().connections_created == 1);
 
     client.stop();
     server.stop();
@@ -1145,11 +1277,12 @@ void test_rpc_health_and_control_not_starved_by_data() {
                      [](uint64_t) {}, 500ms, 100ms, 2s);
     Endpoint endpoint{"127.0.0.1", port};
 
-    // Occupy every data worker. Health and control requests must still be
-    // serviced promptly by their dedicated queues/workers.
+    // Occupy every data worker. Control frames (including health) share the same
+    // connection but must still be serviced promptly by the control workers.
     std::vector<AsyncRpc> bulk;
     for (int i = 0; i < 8; ++i)
-        bulk.push_back(client.call_async(endpoint, MessageType::put_object, Bytes{0x5a}));
+        bulk.push_back(client.call_async(endpoint, MessageType::put_object, Bytes{0x5a},
+                                         FrameType::speculative));
     std::this_thread::sleep_for(50ms);
 
     auto started = Clock::now();
@@ -1857,6 +1990,476 @@ void test_replacement_node_recovers_namespace_and_replication() {
     s2->stop();
 }
 
+void test_hydration_scheduler_and_prediction() {
+    auto make_id = [](uint8_t value) {
+        Bytes bytes(32, value);
+        return object_id(bytes);
+    };
+
+    // Read-ahead and current-file hints reinforce the same ordered run, but
+    // weighted virtual time must still service a lower-priority next-file run.
+    auto a = make_id(1), b = make_id(2), c = make_id(3), d = make_id(4), e = make_id(5),
+         f = make_id(6), n0 = make_id(7), n1 = make_id(8), n2 = make_id(9);
+    std::vector<HydrationHint> hints{
+        {"current", {a, b}, 1000, "read_ahead"},
+        {"current", {a, b, c, d, e, f}, 700, "current_file"},
+        {"next", {n0, n1, n2}, 300, "next_episode"},
+    };
+    HydrationScheduler scheduler;
+    std::set<ObjectId> present;
+    std::vector<HydrationRequest> requests;
+    for (size_t i = 0; i < 7; ++i) {
+        auto request = scheduler.next(hints, [&](const ObjectId& id) { return present.contains(id); });
+        REQUIRE(request.has_value());
+        requests.push_back(*request);
+        present.insert(request->object);
+    }
+    CHECK(requests[0].object == a);
+    CHECK(requests[0].priority == 1700);
+    CHECK(requests[1].object == b);
+    CHECK(requests[2].object == c);
+    CHECK(requests[3].object == n0); // interleaved before the current file completes.
+    auto n0_at = std::find_if(requests.begin(), requests.end(), [&](const auto& r) { return r.object == n0; });
+    auto n1_at = std::find_if(requests.begin(), requests.end(), [&](const auto& r) { return r.object == n1; });
+    REQUIRE(n0_at != requests.end());
+    REQUIRE(n1_at != requests.end());
+    CHECK(n0_at < n1_at); // an ordered speculative run can never start in its middle.
+
+    // A blocked prefix blocks the rest of that run rather than skipping ahead.
+    scheduler.reset();
+    present.clear();
+    auto blocked = [&](const ObjectId& id) { return id == n0; };
+    auto blocked_request = scheduler.next({{"next", {n0, n1, n2}, 300, "next_episode"}},
+                                          [&](const ObjectId& id) { return present.contains(id); },
+                                          blocked);
+    CHECK(!blocked_request.has_value());
+
+    PlaybackTracker tracker;
+    FsEntry synthetic;
+    synthetic.type = EntryType::file;
+    synthetic.size = 6;
+    for (size_t i = 0; i < 6; ++i)
+        synthetic.extents.push_back({i, 1, make_id(static_cast<uint8_t>(20 + i)), false});
+    auto session = tracker.open("/synthetic.mkv", synthetic);
+    tracker.progress(session, 1);
+    HydrationConfig hc;
+    ReadAheadHintProvider ahead(tracker, hc, 2);
+    CurrentFileHintProvider tail(tracker, hc);
+    auto ahead_hints = ahead.hints();
+    auto tail_hints = tail.hints();
+    REQUIRE(ahead_hints.size() == 1);
+    REQUIRE(tail_hints.size() == 1);
+    CHECK(ahead_hints[0].objects.size() == 2);
+    CHECK(ahead_hints[0].objects[0] == synthetic.extents[2].id);
+    CHECK(ahead_hints[0].objects[1] == synthetic.extents[3].id);
+    CHECK(tail_hints[0].objects.size() == 4);
+    CHECK(tail_hints[0].objects.front() == synthetic.extents[2].id);
+    CHECK(tail_hints[0].objects.back() == synthetic.extents[5].id);
+    tracker.close(session);
+
+    auto renamed = synthetic;
+    renamed.mode = 0600;
+    renamed.uid = 1234;
+    renamed.gid = 5678;
+    renamed.mtime_ns = 999;
+    CHECK(file_media_id(synthetic) == file_media_id(renamed));
+
+    // Catalogue prediction is resolved against actual Macha file manifests. It
+    // advances within a season, crosses into the next season, and advances a
+    // movie collection; every predicted run begins at extent zero.
+    TempDir temp;
+    auto keyfile = temp.path() / "key";
+    write_key(keyfile);
+    auto config = config_for(temp.path() / "store", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.hydration.enabled = false;
+    auto keys = load_cluster_keys(keyfile);
+    Service service(config, keys);
+    service.start();
+    service.filesystem().mkdir("/TV", 0755, getuid(), getgid());
+    service.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
+
+    auto make_file = [&](const std::string& path, uint8_t value) {
+        service.filesystem().create_file(path, 0644, getuid(), getgid());
+        auto data = Bytes(2 * 1024 * 1024 + 12345, value);
+        auto writer = service.filesystem().open_write(path, true);
+        REQUIRE(writer->write(0, data) == data.size());
+        writer->commit();
+        auto entry = service.filesystem().getattr(path);
+        REQUIRE(entry.extents.size() >= 3);
+        return entry;
+    };
+
+    auto ep1_file = make_file("/TV/s01e01.mkv", 31);
+    auto ep2_file = make_file("/TV/s01e02.mkv", 32);
+    auto ep3_file = make_file("/TV/s02e01.mkv", 33);
+    auto movie1_file = make_file("/Movies/one.mkv", 41);
+    auto movie2_file = make_file("/Movies/two.mkv", 42);
+
+    CatalogueItem show;
+    show.id = "show:test";
+    show.kind = CatalogueKind::show;
+    show.title = "Test Show";
+    show = service.catalogue().upsert(show);
+
+    CatalogueItem season1;
+    season1.id = "season:test:1";
+    season1.kind = CatalogueKind::season;
+    season1.title = "Season 1";
+    season1.parent_id = show.id;
+    season1.season_number = 1;
+    season1 = service.catalogue().upsert(season1);
+
+    CatalogueItem season2;
+    season2.id = "season:test:2";
+    season2.kind = CatalogueKind::season;
+    season2.title = "Season 2";
+    season2.parent_id = show.id;
+    season2.season_number = 2;
+    season2 = service.catalogue().upsert(season2);
+
+    CatalogueItem ep1;
+    ep1.id = "episode:test:1:1";
+    ep1.kind = CatalogueKind::episode;
+    ep1.title = "One";
+    ep1.parent_id = season1.id;
+    ep1.season_number = 1;
+    ep1.episode_number = 1;
+    ep1.media_ids = {file_media_id(ep1_file)};
+    ep1 = service.catalogue().upsert(ep1);
+
+    CatalogueItem ep2;
+    ep2.id = "episode:test:1:2";
+    ep2.kind = CatalogueKind::episode;
+    ep2.title = "Two";
+    ep2.parent_id = season1.id;
+    ep2.season_number = 1;
+    ep2.episode_number = 2;
+    ep2.media_ids = {file_media_id(ep2_file)};
+    ep2 = service.catalogue().upsert(ep2);
+
+    CatalogueItem ep3;
+    ep3.id = "episode:test:2:1";
+    ep3.kind = CatalogueKind::episode;
+    ep3.title = "Three";
+    ep3.parent_id = season2.id;
+    ep3.season_number = 2;
+    ep3.episode_number = 1;
+    ep3.media_ids = {file_media_id(ep3_file)};
+    ep3 = service.catalogue().upsert(ep3);
+
+    CatalogueItem movie1;
+    movie1.id = "movie:test:1";
+    movie1.kind = CatalogueKind::movie;
+    movie1.title = "First Film";
+    movie1.year = 2001;
+    movie1.external_ids["collection"] = "test-films";
+    movie1.media_ids = {"/Movies/one.mkv"};
+    movie1 = service.catalogue().upsert(movie1);
+
+    CatalogueItem movie2;
+    movie2.id = "movie:test:2";
+    movie2.kind = CatalogueKind::movie;
+    movie2.title = "Second Film";
+    movie2.year = 2003;
+    movie2.external_ids["collection"] = "test-films";
+    movie2.media_ids = {"path:/Movies/two.mkv"};
+    movie2 = service.catalogue().upsert(movie2);
+
+    HydrationConfig prediction_config;
+    prediction_config.catalogue_lookahead = 1;
+    PlaybackTracker prediction_tracker;
+    CatalogueSequenceHintProvider predictor(prediction_tracker, service.filesystem(),
+                                            service.catalogue(), prediction_config);
+
+    auto check_prediction = [&](const std::string& path, const FsEntry& current,
+                                const FsEntry& expected, const char* reason) {
+        auto active = prediction_tracker.open(path, current);
+        prediction_tracker.progress(active, 0);
+        auto predicted = predictor.hints();
+        REQUIRE(predicted.size() == 1);
+        CHECK(predicted[0].reason == reason);
+        REQUIRE(!predicted[0].objects.empty());
+        CHECK(predicted[0].objects.front() == expected.extents.front().id);
+        CHECK(predicted[0].objects.size() == expected.extents.size());
+        prediction_tracker.close(active);
+    };
+    check_prediction("/TV/s01e01.mkv", ep1_file, ep2_file, "next_episode");
+    check_prediction("/TV/s01e02.mkv", ep2_file, ep3_file, "next_episode");
+    check_prediction("/Movies/one.mkv", movie1_file, movie2_file, "next_movie");
+
+    service.stop();
+}
+
+void test_replica_selector() {
+    auto node = [](uint8_t value) {
+        NodeInfo n;
+        n.id.bytes[0] = value;
+        n.host = "replica-" + std::to_string(value);
+        n.port = static_cast<uint16_t>(7000 + value);
+        return n;
+    };
+
+    ReplicaSelector selector;
+    std::vector<NodeInfo> nodes{node(1), node(2), node(3)};
+
+    // With no measurements, the extent stripe spreads equivalent speculative
+    // work over the complete replica set instead of pinning it to peer zero.
+    CHECK(selector.order(nodes, 0, ReplicaWorkClass::speculative).front().id == nodes[0].id);
+    CHECK(selector.order(nodes, 1, ReplicaWorkClass::speculative).front().id == nodes[1].id);
+    CHECK(selector.order(nodes, 2, ReplicaWorkClass::speculative).front().id == nodes[2].id);
+
+    // Outstanding speculative work makes an otherwise equal peer less useful
+    // for the next independent extent.
+    selector.started(nodes[0], ReplicaWorkClass::speculative);
+    CHECK(selector.order(nodes, 0, ReplicaWorkClass::speculative).front().id != nodes[0].id);
+    selector.finished(nodes[0], ReplicaWorkClass::speculative, 1024, 100ms, true);
+
+    // Foreground reads optimise latency rather than symmetry.
+    selector.started(nodes[0], ReplicaWorkClass::foreground);
+    selector.finished(nodes[0], ReplicaWorkClass::foreground, 1024, 20ms, true);
+    selector.started(nodes[1], ReplicaWorkClass::foreground);
+    selector.finished(nodes[1], ReplicaWorkClass::foreground, 1024, 200ms, true);
+    CHECK(selector.order(nodes, 0, ReplicaWorkClass::foreground).front().id == nodes[0].id);
+
+    // Speculative work yields to a peer carrying foreground traffic when an
+    // idle replica is available.
+    selector.started(nodes[0], ReplicaWorkClass::foreground);
+    CHECK(selector.order(nodes, 0, ReplicaWorkClass::speculative).front().id != nodes[0].id);
+    selector.finished(nodes[0], ReplicaWorkClass::foreground, 1024, 20ms, true);
+
+    // Promotion moves one active transfer between accounting classes rather
+    // than duplicating it.
+    selector.started(nodes[2], ReplicaWorkClass::speculative);
+    selector.promoted(nodes[2]);
+    auto promoted = selector.stats(nodes[2].id);
+    CHECK(promoted.speculative_in_flight == 0);
+    CHECK(promoted.foreground_in_flight == 1);
+    selector.finished(nodes[2], ReplicaWorkClass::foreground, 1024, 50ms, true);
+    CHECK(selector.stats(nodes[2].id).foreground_in_flight == 0);
+
+    // A failed source is penalised immediately; a later successful transfer
+    // clears the consecutive-failure penalty without erasing history.
+    selector.started(nodes[1], ReplicaWorkClass::foreground);
+    selector.finished(nodes[1], ReplicaWorkClass::foreground, 0, 10ms, false);
+    CHECK(selector.stats(nodes[1].id).failures == 1);
+    CHECK(selector.order(nodes, 0, ReplicaWorkClass::foreground).front().id != nodes[1].id);
+    selector.started(nodes[1], ReplicaWorkClass::foreground);
+    selector.finished(nodes[1], ReplicaWorkClass::foreground, 1024, 25ms, true);
+    CHECK(selector.stats(nodes[1].id).failures == 1);
+}
+
+void test_cache_hydrator_fetches_to_persistent_cache() {
+    TempDir temp;
+    auto keyfile = temp.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    auto c1 = config_for(temp.path() / "n1", keyfile, p1);
+    auto c2 = config_for(temp.path() / "n2", keyfile, p2, {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 1;
+    c1.metadata_replication = c2.metadata_replication = 1;
+    c2.cache.path = temp.path() / "cache2";
+    c2.cache.max_blocks = 32;
+
+    NodeRuntime n1(c1, keys);
+    NodeRuntime n2(c2, keys);
+    n1.start();
+    n2.start();
+    REQUIRE(wait_until([&] {
+        return n1.membership().active().size() >= 2 && n2.membership().active().size() >= 2;
+    }));
+
+    DistributedStore source(n1);
+    DistributedStore target(n2);
+    auto make_remote = [&](uint8_t value) {
+        Bytes data(128 * 1024, value);
+        auto id = object_id(data);
+        REQUIRE(source.replicate_all(id, data, false) >= 2);
+        n2.local_store().remove(id);
+        n2.block_cache().remove(id);
+        REQUIRE(!target.locally_available(id));
+        return id;
+    };
+
+    const auto a = make_remote(61);
+    const auto b = make_remote(62);
+    const auto c = make_remote(63);
+    const auto n0 = make_remote(64);
+    const auto nnext = make_remote(65);
+
+    class StaticHints final : public HydrationHintProvider {
+        std::vector<HydrationHint> hints_;
+      public:
+        explicit StaticHints(std::vector<HydrationHint> hints) : hints_(std::move(hints)) {}
+        std::string_view name() const override { return "test"; }
+        std::vector<HydrationHint> hints() override { return hints_; }
+    } provider({{"current", {a, b}, 1000, "read_ahead"},
+                {"current", {a, b, c}, 700, "current_file"},
+                {"next", {n0, nnext}, 300, "next_episode"}});
+
+    HydrationConfig config;
+    CacheHydrator hydrator(target, config);
+    hydrator.add_provider(provider);
+    REQUIRE(hydrator.run_once());
+    CHECK(hydrator.status().last_object == a);
+    CHECK(n2.block_cache().has(a));
+    CHECK(!n2.local_store().has(a));
+    REQUIRE(hydrator.run_once());
+    CHECK(hydrator.status().last_object == b);
+    REQUIRE(hydrator.run_once());
+    CHECK(hydrator.status().last_object == c);
+    REQUIRE(hydrator.run_once());
+    CHECK(hydrator.status().last_object == n0);
+    CHECK(n2.block_cache().has(n0));
+    CHECK(!n2.local_store().has(n0));
+    CHECK(!n2.block_cache().has(nnext));
+
+    // The production worker keeps a bounded speculative window in flight so
+    // several replicas can contribute bandwidth. Dispatch is still ordered and
+    // the configured limit is never exceeded.
+    const auto parallel0 = make_remote(66);
+    const auto parallel1 = make_remote(67);
+    const auto parallel2 = make_remote(68);
+    StaticHints concurrent_provider(
+        {{"parallel", {parallel0, parallel1, parallel2}, 500, "current_file"}});
+    HydrationConfig concurrent_config;
+    concurrent_config.interval = 10ms;
+    concurrent_config.max_inflight = 2;
+    CacheHydrator concurrent(target, concurrent_config);
+    concurrent.add_provider(concurrent_provider);
+    concurrent.start();
+    REQUIRE(wait_until([&] { return concurrent.status().fetched >= 3; }, 5s));
+    concurrent.stop();
+    auto concurrent_status = concurrent.status();
+    CHECK(concurrent_status.peak_in_flight == 2);
+    CHECK(concurrent_status.in_flight == 0);
+    CHECK(n2.block_cache().has(parallel0));
+    CHECK(n2.block_cache().has(parallel1));
+    CHECK(n2.block_cache().has(parallel2));
+
+    n2.stop();
+    n1.stop();
+}
+
+void test_catalogue_sync_search_and_artwork_gc() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    uint16_t p1 = free_port();
+    uint16_t p2 = free_port();
+    uint16_t p3 = free_port();
+
+    auto c1 = config_for(t.path() / "cat1", keyfile, p1);
+    auto c2 = config_for(t.path() / "cat2", keyfile, p2, {{"127.0.0.1", p1}});
+    auto c3 = config_for(t.path() / "cat3", keyfile, p3, {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = c3.replication = 1;
+    c1.metadata_replication = c2.metadata_replication = c3.metadata_replication = 1;
+    c1.maintenance.garbage_grace = 0ms;
+    c2.maintenance.garbage_grace = 0ms;
+    c3.maintenance.garbage_grace = 0ms;
+
+    Service s1(c1, keys);
+    s1.start();
+    REQUIRE(wait_until([&] {
+        try {
+            s1.catalogue().repair_once();
+            return s1.catalogue().status().ready;
+        } catch (...) {
+            return false;
+        }
+    }));
+
+    CatalogueItem show;
+    show.id = "show:test";
+    show.kind = CatalogueKind::show;
+    show.title = "Test Programme";
+    show.synopsis = "A deliberately small distributed catalogue test.";
+    show.external_ids["tmdb"] = "1234";
+    show = s1.catalogue().upsert(show);
+
+    CatalogueItem episode;
+    episode.id = "episode:test:1:1";
+    episode.kind = CatalogueKind::episode;
+    episode.title = "The Pilot";
+    episode.parent_id = show.id;
+    episode.season_number = 1;
+    episode.episode_number = 1;
+    episode = s1.catalogue().upsert(episode);
+
+    auto first_art_bytes = pattern(64 * 1024 + 17);
+    auto first_art = s1.catalogue().put_artwork(show.id, "poster", "image/jpeg",
+                                                first_art_bytes, show.revision);
+    show = *s1.catalogue().get(show.id);
+    CHECK(s1.catalogue().search("pilot").front().id == episode.id);
+
+    // A node joining after the catalogue already exists must become locally
+    // browse/search capable, including artwork, without provider access.
+    Service s2(c2, keys);
+    s2.start();
+    REQUIRE(wait_until([&] {
+        auto status = s2.catalogue().status();
+        return status.ready && status.items == 2 && status.artwork_objects == 1 &&
+               status.local_artwork_objects == 1;
+    }, 10s));
+    REQUIRE(s2.catalogue().get(episode.id).has_value());
+    CHECK(s2.catalogue().search("test programme").front().id == show.id);
+    CHECK(s2.node().local_store().has(first_art.id));
+
+    Service s3(c3, keys);
+    s3.start();
+    REQUIRE(wait_until([&] {
+        auto status = s3.catalogue().status();
+        return status.ready && status.items == 2 && status.local_artwork_objects == 1;
+    }, 10s));
+    CHECK(s3.catalogue().list(CatalogueKind::episode).size() == 1);
+    CHECK(s3.node().local_store().has(first_art.id));
+
+    // Replacing the poster makes the old object a persistent metadata garbage
+    // candidate. With a zero grace period in this test, cluster GC must delete
+    // it from every connected node while preserving the replacement.
+    auto second_art_bytes = pattern(96 * 1024 + 3);
+    second_art_bytes[0] ^= 0xa5;
+    auto second_art = s2.catalogue().put_artwork(show.id, "poster", "image/jpeg",
+                                                 second_art_bytes, show.revision);
+    REQUIRE(wait_until([&] {
+        return s1.catalogue().status().ready && s2.catalogue().status().ready &&
+               s3.catalogue().status().ready && s1.node().local_store().has(second_art.id) &&
+               s2.node().local_store().has(second_art.id) &&
+               s3.node().local_store().has(second_art.id);
+    }, 10s));
+    REQUIRE(wait_until([&] {
+        return !s1.node().local_store().has(first_art.id) &&
+               !s2.node().local_store().has(first_art.id) &&
+               !s3.node().local_store().has(first_art.id);
+    }, 10s));
+
+    CatalogueApi api(s3.catalogue());
+    auto status_response = api.handle({.method = "GET",
+                                       .path = "/api/v1/catalogue/status",
+                                       .query = {},
+                                       .headers = {},
+                                       .body = {}});
+    CHECK(status_response.status == 200);
+    std::string status_body(status_response.body.begin(), status_response.body.end());
+    CHECK(status_body.find("\"ready\":true") != std::string::npos);
+    auto search_response = api.handle({.method = "GET",
+                                       .path = "/api/v1/catalogue/search",
+                                       .query = {{"q", "pilot"}},
+                                       .headers = {},
+                                       .body = {}});
+    CHECK(search_response.status == 200);
+    std::string search_body(search_response.body.begin(), search_response.body.end());
+    CHECK(search_body.find("episode:test:1:1") != std::string::npos);
+
+    s3.stop();
+    s2.stop();
+    s1.stop();
+}
+
 void test_three_node_cluster() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
@@ -2104,10 +2707,11 @@ int main() {
         test_config();
         test_placement();
         test_async_rpc_move_ownership();
-        test_rpc_v4_persistence_and_multiplexing();
-        test_rpc_v4_bidirectional_and_deduplication();
+        test_rpc_v6_frame_priority_and_variable_length();
+        test_rpc_v6_persistence_and_multiplexing();
+        test_rpc_v6_bidirectional_and_deduplication();
         test_mutual_bootstrap_prunes_cross_dial();
-        test_rpc_v3_handshake_is_rejected();
+        test_rpc_v5_handshake_is_rejected();
         test_rpc_slow_control_does_not_abort_data();
         test_rpc_health_and_control_not_starved_by_data();
         test_early_replication_quorum();
@@ -2120,6 +2724,10 @@ int main() {
         test_open_write_survives_rename();
         test_full_replica_fallback();
         test_replacement_node_recovers_namespace_and_replication();
+        test_hydration_scheduler_and_prediction();
+        test_replica_selector();
+        test_cache_hydrator_fetches_to_persistent_cache();
+        test_catalogue_sync_search_and_artwork_gc();
         test_three_node_cluster();
     } catch (const std::exception& e) {
         std::cerr << "Unhandled test exception: " << e.what() << '\n';

@@ -63,7 +63,7 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
                                                  current, generation)) {
               }
           },
-          cfg_.connect_timeout, cfg_.heartbeat, cfg_.dead_after),
+          cfg_.connect_timeout, cfg_.heartbeat, cfg_.dead_after, cfg_.max_frame_size),
       server_(
           cfg_.listen_host, cfg_.port, keys_, members_.self(),
           [this](const NodeInfo& peer, const RpcMessage& request) { return handle(peer, request); },
@@ -74,7 +74,8 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
                      !remote_metadata_generation_.compare_exchange_weak(
                          current, peer.metadata_generation)) {
               }
-          }) {
+          },
+          cfg_.max_frame_size) {
     server_.attach_client(client_);
 
     // The metadata cache is deliberately independent of node state. If node
@@ -152,6 +153,16 @@ RpcReply NodeRuntime::call(const Endpoint& endpoint, MessageType type,
     return client_.call(endpoint, type, payload, stall_notice_for(type));
 }
 
+RpcReply NodeRuntime::call(const NodeInfo& node, MessageType type,
+                           std::span<const uint8_t> payload, FrameType frame_type) {
+    return client_.call(node, type, payload, frame_type, stall_notice_for(type));
+}
+
+RpcReply NodeRuntime::call(const Endpoint& endpoint, MessageType type,
+                           std::span<const uint8_t> payload, FrameType frame_type) {
+    return client_.call(endpoint, type, payload, frame_type, stall_notice_for(type));
+}
+
 AsyncRpc NodeRuntime::call_async(const NodeInfo& node, MessageType type,
                                  std::span<const uint8_t> payload) {
     return client_.call_async(node, type, payload);
@@ -160,6 +171,16 @@ AsyncRpc NodeRuntime::call_async(const NodeInfo& node, MessageType type,
 AsyncRpc NodeRuntime::call_async(const Endpoint& endpoint, MessageType type,
                                  std::span<const uint8_t> payload) {
     return client_.call_async(endpoint, type, payload);
+}
+
+AsyncRpc NodeRuntime::call_async(const NodeInfo& node, MessageType type,
+                                 std::span<const uint8_t> payload, FrameType frame_type) {
+    return client_.call_async(node, type, payload, frame_type);
+}
+
+AsyncRpc NodeRuntime::call_async(const Endpoint& endpoint, MessageType type,
+                                 std::span<const uint8_t> payload, FrameType frame_type) {
+    return client_.call_async(endpoint, type, payload, frame_type);
 }
 
 void NodeRuntime::announce_metadata_generation(uint64_t generation) {
@@ -238,6 +259,15 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, const RpcMessage& request) {
             reader.finish();
             if (!local_.put(id, data))
                 return error_reply("storage limit reached");
+            members_.storage(local_.used(), local_.limit());
+            return {MessageType::ok, {}};
+        }
+        case MessageType::delete_object: {
+            Reader reader(request.payload);
+            ObjectId id{reader.fixed<32>()};
+            reader.finish();
+            (void)local_.remove(id);
+            (void)cache_.remove(id);
             members_.storage(local_.used(), local_.limit());
             return {MessageType::ok, {}};
         }
@@ -390,6 +420,8 @@ void NodeRuntime::reconfigure_local(const Config& config) {
     // sync with a successful live reload without changing cluster policy.
     cfg_.storage_backends = updated.storage_backends;
     cfg_.cache = updated.cache;
+    cfg_.hydration = updated.hydration;
+    cfg_.read_ahead_extents = updated.read_ahead_extents;
     members_.storage(local_.used(), local_.limit());
 }
 } // namespace macha
