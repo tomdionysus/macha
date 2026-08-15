@@ -9,7 +9,7 @@ It mounts as a normal filesystem, stores files as immutable content-addressed ex
 
 There is no permanent master. Nodes share one cluster key, discover membership through bootstrap peers, and converge placement and replicas in the background.
 
-0.6.0 is usable, but deliberately narrow. It is built for large mostly-immutable video and music files, not as a complete general-purpose POSIX filesystem.
+0.6.1 is usable, but deliberately narrow. It is built for large mostly-immutable video and music files, not as a complete general-purpose POSIX filesystem.
 
 ## What it does
 
@@ -22,11 +22,12 @@ There is no permanent master. Nodes share one cluster key, discover membership t
 - Playback-assisted replication: a remotely fetched block can become the local replica without another download.
 - Durable namespace checkpoints on every active node, so a destroyed node can be replaced and repopulated from surviving replicas.
 - A cluster-wide media catalogue whose titles, hierarchy, search data and artwork are kept complete on every node.
+- Optional filesystem catalogue scanner using TMDB for TV/movies and MusicBrainz/Cover Art Archive for music.
 - Optional HTTP/JSON catalogue access and mutation API.
 - Authenticated encrypted transport and encrypted storage.
 - No cloud service, account system or permanent coordinator.
 
-The core dependencies are C++20, OpenSSL and yaml-cpp. FUSE is optional at build time but required to mount the filesystem.
+The core dependencies are C++20, OpenSSL, yaml-cpp and libcurl. FUSE is optional at build time but required to mount the filesystem.
 
 ## Two-node local demo
 
@@ -37,7 +38,7 @@ Build first.
 Linux:
 
 ```sh
-sudo apt install build-essential cmake pkg-config libssl-dev libyaml-cpp-dev libfuse3-dev
+sudo apt install build-essential cmake pkg-config libssl-dev libyaml-cpp-dev libcurl4-openssl-dev libfuse3-dev
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
@@ -45,10 +46,11 @@ cmake --build build -j
 macOS, with macFUSE already installed:
 
 ```sh
-brew install cmake openssl@3 pkg-config yaml-cpp
+brew install cmake openssl@3 pkg-config yaml-cpp curl
 cmake -S . -B build \
   -DCMAKE_BUILD_TYPE=Release \
-  -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+  -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
+  -DCURL_ROOT="$(brew --prefix curl)"
 cmake --build build -j
 ```
 
@@ -254,7 +256,37 @@ The current metadata voter set and data replica count are persisted in the names
 
 The catalogue is cluster metadata. Every node converges the complete catalogue snapshot and every referenced artwork object, independently of `dht.replicas`. Catalogue synchronisation runs ahead of ordinary media repair, and catalogue reads synchronise on demand. A node reports `ready: true` only when it has the current catalogue and all referenced artwork locally.
 
-The catalogue slice first landed in 0.5.0 and provides distributed storage, browse/search, mutation and artwork lifecycle. Automatic filesystem scanning and external metadata providers are intentionally not wired into the server yet.
+The optional scanner walks configured roots in the distributed filesystem and populates this catalogue automatically. TV and movie metadata comes from TMDB. Music metadata comes from MusicBrainz, with album covers from Cover Art Archive. Provider integration is behind a small interface rather than built into the scanner.
+
+Only the lowest active node ID runs a scan, so a normally configured cluster does not make the same provider requests from every node. Enable the scanner consistently on all nodes if you want automatic failover of that role. Already-bound files are identified by their stable `macha:<sha256>` media identity and are not looked up or downloaded again on every pass. Scanner-owned entries are removed when their final media binding disappears; manually-created catalogue records are not garbage-collected by the scanner.
+
+Filename/path recognition is intentionally simple and conservative. Typical forms are `Show/Season 02/Show.S02E05.Title.mkv`, `Movie.Title.2024.mkv`, and `Artist/Album/01 - Track.flac`; `CD 2`/`Disc 2` music directories are also recognised. Unrecognised files are ignored. Embedded audio/video tags are not parsed in 0.6.1. A failure to read any configured scan root aborts that pass rather than treating the missing root as an empty library.
+
+TMDB needs an API Read Access Token. Put the token alone in a file readable by Macha. MusicBrainz does not need an API key, but requires a meaningful contact string and is rate-limited by the provider; Macha spaces its MusicBrainz API requests accordingly. Configure only curated media roots:
+
+```yaml
+catalogue:
+  scanner:
+    enabled: true
+    interval_ms: 21600000
+    roots:
+      - /Movies
+      - /TV
+      - /Music
+    max_artwork_bytes: 16M
+    providers:
+      tmdb:
+        enabled: true
+        token_file: /etc/macha-tmdb.token
+        language: en-GB
+        image_size: w500
+      musicbrainz:
+        enabled: true
+        contact: https://github.com/tomdionysus/macha
+        cover_size: "500"
+```
+
+Movies download poster and backdrop artwork. TV downloads show poster/backdrop, season poster and episode stills. Music downloads the front album cover. Images are stored as immutable Macha objects and committed with the catalogue, so every active node receives the actual image bytes rather than depending on provider URLs at display time.
 
 Enable the API locally:
 
@@ -349,7 +381,7 @@ Catalogue media bindings may use the stable `macha:<sha256>` media identity deri
 
 The implemented filesystem operations cover ordinary media-library use: files and directories, create/open/read/write/truncate/unlink, mkdir/rmdir, rename, chmod/chown, timestamps, stat/statfs, directory enumeration, flush and fsync.
 
-0.6.0 does **not** implement symlinks, hard links, extended attributes, distributed advisory locks, full sparse-file semantics, or stable POSIX inode identity across every rename case. Access time is not tracked. Concurrent appenders use file-version CAS rather than a globally serialized append stream.
+0.6.1 does **not** implement symlinks, hard links, extended attributes, distributed advisory locks, full sparse-file semantics, or stable POSIX inode identity across every rename case. Access time is not tracked. Concurrent appenders use file-version CAS rather than a globally serialized append stream.
 
 A failed upload may leave unreachable immutable extents. Online garbage collection only removes objects known to have been dropped from committed metadata after a conservative grace period.
 
@@ -382,7 +414,7 @@ Object writes use unique temporary names, `fsync`, and atomic rename. The state 
 ctest --test-dir build --output-on-failure
 ```
 
-The integration suite covers transport/crypto, bidirectional RPC and connection deduplication, metadata quorum and replacement recovery, catalogue join synchronisation/search/artwork GC, multi-node placement, disk loss/return, cache persistence, automatic new-owner pull, playback-assisted promotion, corruption repair and restart.
+The integration suite covers transport/crypto, bidirectional RPC and connection deduplication, metadata quorum and replacement recovery, catalogue join synchronisation/search/artwork GC, filename probing/provider resolution/scanner reconciliation, multi-node placement, disk loss/return, cache persistence, automatic new-owner pull, playback-assisted promotion, corruption repair and restart.
 
 ## Service files
 
@@ -394,7 +426,7 @@ The systemd unit supports `systemctl reload macha`, which sends `SIGHUP`.
 
 ## Security
 
-Anyone with the cluster key is a trusted cluster member. Keep it secret and back it up separately. There is no online key rotation or per-node revocation in 0.6.0. See `SECURITY.md`.
+Anyone with the cluster key is a trusted cluster member. Keep it secret and back it up separately. There is no online key rotation or per-node revocation in 0.6.1. See `SECURITY.md`.
 
 ## License
 

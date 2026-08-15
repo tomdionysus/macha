@@ -11,6 +11,7 @@ namespace macha {
 Service::Service(Config config, ClusterKeys keys)
     : node_(std::move(config), keys), store_(node_), metadata_(node_),
       catalogue_(node_, store_, metadata_), fs_(node_, store_, metadata_, &playback_),
+      scanner_(node_, fs_, catalogue_, node_.config().catalogue.scanner),
       hydration_(store_, playback_, fs_, catalogue_, node_.config().hydration,
                  node_.config().read_ahead_extents), catalogue_api_(catalogue_) {
     if (node_.config().catalogue.api.enabled) {
@@ -28,6 +29,7 @@ void Service::start() {
     node_.start();
     if (catalogue_http_)
         catalogue_http_->start();
+    scanner_.start();
     hydration_.start();
     // The maintenance loop attempts catalogue synchronisation before ordinary
     // data repair on its first iteration. Catalogue API reads also synchronise
@@ -37,6 +39,7 @@ void Service::start() {
 
 void Service::stop() {
     Log::debug("shutdown: Service::stop begin");
+    scanner_.stop();
     hydration_.stop();
     if (catalogue_http_)
         catalogue_http_->stop();
@@ -66,8 +69,9 @@ void Service::reload_config() {
         updated.metadata_replication != node_.config().metadata_replication)
         throw std::runtime_error("replica policy changes require a coordinated cluster restart");
     node_.reconfigure_local(updated);
+    scanner_.reconfigure(updated.catalogue.scanner);
     hydration_.reconfigure(updated.hydration, updated.read_ahead_extents);
-    Log::info("reloaded storage backends, persistent cache and hydration configuration");
+    Log::info("reloaded storage backends, persistent cache, catalogue scanner and hydration configuration");
 }
 
 void Service::collect_garbage(const std::vector<ObjectId>& garbage) {

@@ -24,7 +24,7 @@ Changes to cluster, metadata, storage, crypto, transport or filesystem semantics
 
 ## Dependencies
 
-The core dependency set is C++20, OpenSSL and yaml-cpp. FUSE3/macFUSE is the mount dependency. Boost is not required.
+The core dependency set is C++20, OpenSSL, yaml-cpp and libcurl. FUSE3/macFUSE is the mount dependency. Boost is not required.
 
 ## Security
 

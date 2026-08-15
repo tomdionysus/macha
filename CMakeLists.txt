@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(macha VERSION 0.6.0 LANGUAGES CXX)
+project(macha VERSION 0.6.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,6 +11,7 @@ option(MACHA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(Threads REQUIRED)
+find_package(CURL REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
 if(TARGET yaml-cpp::yaml-cpp)
@@ -41,6 +42,7 @@ set(MACHA_CORE_SOURCES
     src/json.cpp
     src/catalogue.cpp
     src/catalogue_api.cpp
+    src/media_catalogue.cpp
     src/hydration.cpp
     src/filesystem.cpp
     src/service.cpp
@@ -48,7 +50,7 @@ set(MACHA_CORE_SOURCES
 
 add_library(macha_core STATIC ${MACHA_CORE_SOURCES})
 target_include_directories(macha_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(macha_core PUBLIC OpenSSL::Crypto Threads::Threads ${MACHA_YAML_TARGET})
+target_link_libraries(macha_core PUBLIC OpenSSL::Crypto Threads::Threads CURL::libcurl ${MACHA_YAML_TARGET})
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(macha_core PRIVATE -Wall -Wextra -Wpedantic)

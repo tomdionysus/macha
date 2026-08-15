@@ -174,8 +174,11 @@ CatalogueSnapshot decode_catalogue(std::span<const uint8_t> data) {
         auto external_count = r.u32();
         if (external_count > 100000)
             throw DecodeError("too many external ids");
-        for (uint32_t j = 0; j < external_count; ++j)
-            item.external_ids.emplace(r.string(1024 * 1024), r.string(1024 * 1024));
+        for (uint32_t j = 0; j < external_count; ++j) {
+            auto provider = r.string(1024 * 1024);
+            auto external_id = r.string(1024 * 1024);
+            item.external_ids.emplace(std::move(provider), std::move(external_id));
+        }
         item.media_ids = string_vector(r);
         auto artwork_count = r.u32();
         if (artwork_count > 100000)
@@ -495,6 +498,134 @@ bool CatalogueManager::erase(std::string_view id, std::optional<uint64_t> expect
     return true;
 }
 
+CatalogueArtwork CatalogueManager::stage_artwork(std::string role, std::string mime_type,
+                                                   std::span<const uint8_t> bytes) {
+    if (bytes.empty())
+        throw std::runtime_error("artwork body is empty");
+    CatalogueArtwork art{std::move(role), object_id(bytes), std::move(mime_type)};
+    if (!node_.local_store().put(art.id, bytes))
+        throw std::runtime_error("cannot stage artwork locally");
+    return art;
+}
+
+void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& discovered,
+                                         const std::set<std::string>& active_media_ids) {
+    std::lock_guard mutation_lock(mutation_mutex_);
+    auto current = current_snapshot();
+    std::optional<ObjectId> expected_root;
+    {
+        std::lock_guard lock(mutex_);
+        expected_root = cached_root_;
+    }
+    auto old_art = artwork_ids(current);
+    bool changed = false;
+
+    auto same_content = [](const CatalogueItem& a, const CatalogueItem& b) {
+        return a.id == b.id && a.kind == b.kind && a.title == b.title &&
+               a.sort_title == b.sort_title && a.synopsis == b.synopsis &&
+               a.parent_id == b.parent_id && a.year == b.year &&
+               a.season_number == b.season_number && a.episode_number == b.episode_number &&
+               a.disc_number == b.disc_number && a.track_number == b.track_number &&
+               a.aliases == b.aliases && a.external_ids == b.external_ids &&
+               a.media_ids == b.media_ids && a.artwork == b.artwork;
+    };
+
+    for (auto item : discovered) {
+        item.external_ids["macha_scanner"] = "1";
+        auto it = current.items.find(item.id);
+        if (it != current.items.end()) {
+            // Retain downloaded artwork when a provider result does not carry a
+            // replacement for that role. Scanner refreshes are metadata-safe and
+            // do not churn immutable artwork objects on every pass.
+            for (const auto& art : it->second.artwork) {
+                const bool replaced = std::any_of(item.artwork.begin(), item.artwork.end(),
+                                                  [&](const auto& candidate) {
+                                                      return candidate.role == art.role;
+                                                  });
+                if (!replaced) item.artwork.push_back(art);
+            }
+            // A provider match may represent another local file for an item
+            // already known to the catalogue. Preserve existing bindings here;
+            // the active-media reconciliation below removes vanished ones.
+            item.media_ids.insert(item.media_ids.end(), it->second.media_ids.begin(),
+                                  it->second.media_ids.end());
+            std::sort(item.media_ids.begin(), item.media_ids.end());
+            item.media_ids.erase(std::unique(item.media_ids.begin(), item.media_ids.end()),
+                                 item.media_ids.end());
+            item.revision = it->second.revision;
+            item.updated_ns = it->second.updated_ns;
+            if (same_content(item, it->second))
+                continue;
+            item.revision = it->second.revision + 1;
+        } else {
+            item.revision = 1;
+        }
+        item.updated_ns = wall_time_ns();
+        current.items[item.id] = std::move(item);
+        changed = true;
+    }
+
+    // Only scanner-owned leaf bindings are reconciled against the namespace.
+    // Manually-created catalogue entries are never removed by the scanner.
+    for (auto& [_, item] : current.items) {
+        auto marker = item.external_ids.find("macha_scanner");
+        if (marker == item.external_ids.end() || marker->second != "1")
+            continue;
+        if (item.kind != CatalogueKind::movie && item.kind != CatalogueKind::episode &&
+            item.kind != CatalogueKind::track)
+            continue;
+        auto before = item.media_ids.size();
+        std::erase_if(item.media_ids, [&](const std::string& media) {
+            return !active_media_ids.contains(media);
+        });
+        if (item.media_ids.size() != before) {
+            ++item.revision;
+            item.updated_ns = wall_time_ns();
+            changed = true;
+        }
+    }
+
+    for (auto it = current.items.begin(); it != current.items.end();) {
+        const auto marker = it->second.external_ids.find("macha_scanner");
+        const bool scanner = marker != it->second.external_ids.end() && marker->second == "1";
+        const bool leaf = it->second.kind == CatalogueKind::movie ||
+                          it->second.kind == CatalogueKind::episode ||
+                          it->second.kind == CatalogueKind::track;
+        if (scanner && leaf && it->second.media_ids.empty()) {
+            it = current.items.erase(it);
+            changed = true;
+        } else ++it;
+    }
+
+    // Remove now-empty scanner-created hierarchy nodes from the bottom up.
+    bool removed = true;
+    while (removed) {
+        removed = false;
+        for (auto it = current.items.begin(); it != current.items.end();) {
+            const auto marker = it->second.external_ids.find("macha_scanner");
+            const bool scanner = marker != it->second.external_ids.end() && marker->second == "1";
+            const bool parent_kind = it->second.kind == CatalogueKind::show ||
+                                     it->second.kind == CatalogueKind::season ||
+                                     it->second.kind == CatalogueKind::artist ||
+                                     it->second.kind == CatalogueKind::album;
+            if (!scanner || !parent_kind) { ++it; continue; }
+            const auto id = it->second.id;
+            const bool has_child = std::any_of(current.items.begin(), current.items.end(),
+                                               [&](const auto& pair) {
+                                                   return pair.second.parent_id &&
+                                                          *pair.second.parent_id == id;
+                                               });
+            if (!has_child) {
+                it = current.items.erase(it);
+                changed = removed = true;
+            } else ++it;
+        }
+    }
+
+    if (changed)
+        commit(expected_root, current, old_art);
+}
+
 CatalogueArtwork CatalogueManager::put_artwork(std::string_view item_id, std::string role,
                                                 std::string mime_type,
                                                 std::span<const uint8_t> bytes,
@@ -507,9 +638,7 @@ CatalogueArtwork CatalogueManager::put_artwork(std::string_view item_id, std::st
     if (expected_revision && item->revision != *expected_revision)
         throw CatalogueConflict("catalogue item revision changed");
 
-    CatalogueArtwork art{std::move(role), object_id(bytes), std::move(mime_type)};
-    if (!node_.local_store().put(art.id, bytes))
-        throw std::runtime_error("cannot stage artwork locally");
+    CatalogueArtwork art = stage_artwork(std::move(role), std::move(mime_type), bytes);
 
     auto previous_art = item->artwork;
     std::erase_if(item->artwork, [&](const CatalogueArtwork& existing) {

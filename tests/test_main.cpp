@@ -5,6 +5,7 @@
 #include "filesystem.hpp"
 #include "local_store.hpp"
 #include "metadata.hpp"
+#include "media_catalogue.hpp"
 #include "net.hpp"
 #include "placement.hpp"
 #include "service.hpp"
@@ -66,6 +67,34 @@ class TempDir {
     }
     const std::filesystem::path& path() const {
         return path_;
+    }
+};
+
+class FakeHttpClient final : public HttpClient {
+    struct Route {
+        std::string contains;
+        RemoteHttpResponse response;
+    };
+    std::vector<Route> routes_;
+
+  public:
+    void add(std::string contains, long status, std::string content_type, std::string body) {
+        RemoteHttpResponse response;
+        response.status = status;
+        response.content_type = std::move(content_type);
+        response.body.assign(body.begin(), body.end());
+        routes_.push_back({std::move(contains), std::move(response)});
+    }
+    void add_bytes(std::string contains, long status, std::string content_type, Bytes body) {
+        routes_.push_back({std::move(contains),
+                           RemoteHttpResponse{status, std::move(content_type), std::move(body)}});
+    }
+    RemoteHttpResponse get(std::string_view url, const std::vector<std::string>&, size_t) override {
+        for (const auto& route : routes_) {
+            if (url.find(route.contains) != std::string_view::npos)
+                return route.response;
+        }
+        return RemoteHttpResponse{404, "text/plain", {}};
     }
 };
 
@@ -551,7 +580,22 @@ void test_config() {
             << "    listen: 127.0.0.1\n"
             << "    port: 7441\n"
             << "    token_file: " << (t.path() / "api.token").string() << "\n"
-            << "    max_request_bytes: 2M\n";
+            << "    max_request_bytes: 2M\n"
+            << "  scanner:\n"
+            << "    enabled: true\n"
+            << "    interval_ms: 60000\n"
+            << "    roots: [/TV, /Movies, /Music]\n"
+            << "    max_artwork_bytes: 6M\n"
+            << "    providers:\n"
+            << "      tmdb:\n"
+            << "        enabled: true\n"
+            << "        token_file: " << (t.path() / "tmdb.token").string() << "\n"
+            << "        language: en-GB\n"
+            << "        image_size: w500\n"
+            << "      musicbrainz:\n"
+            << "        enabled: true\n"
+            << "        contact: https://example.test/macha\n"
+            << "        cover_size: '500'\n";
     }
 
     std::vector<std::string> yaml_args{"macha", "--config", yaml.string()};
@@ -591,6 +635,17 @@ void test_config() {
     REQUIRE(yc.catalogue.api.token_file.has_value());
     CHECK(*yc.catalogue.api.token_file == t.path() / "api.token");
     CHECK(yc.catalogue.api.max_request_bytes == 2ULL * 1024 * 1024);
+    CHECK(yc.catalogue.scanner.enabled);
+    CHECK(yc.catalogue.scanner.interval == 60000ms);
+    CHECK(yc.catalogue.scanner.roots.size() == 3);
+    CHECK(yc.catalogue.scanner.roots[0] == "/TV");
+    CHECK(yc.catalogue.scanner.max_artwork_bytes == 6ULL * 1024 * 1024);
+    REQUIRE(yc.catalogue.scanner.tmdb.token_file.has_value());
+    CHECK(*yc.catalogue.scanner.tmdb.token_file == t.path() / "tmdb.token");
+    CHECK(yc.catalogue.scanner.tmdb.language == "en-GB");
+    CHECK(yc.catalogue.scanner.tmdb.image_size == "w500");
+    CHECK(yc.catalogue.scanner.musicbrainz.contact == "https://example.test/macha");
+    CHECK(yc.catalogue.scanner.musicbrainz.cover_size == "500");
 
     // CLI remains useful for node-local/runtime overrides, but configuration
     // now always starts from an explicit YAML file.
@@ -2344,6 +2399,213 @@ void test_cache_hydrator_fetches_to_persistent_cache() {
     n1.stop();
 }
 
+
+void test_media_probe_and_online_catalogue_scanner() {
+    // External IDs are part of the durable catalogue format. Read fields in
+    // deterministic order: function-argument evaluation order must not be
+    // allowed to swap provider/id pairs during decoding.
+    CatalogueSnapshot codec_snapshot;
+    CatalogueItem codec_item;
+    codec_item.id = "codec:test";
+    codec_item.kind = CatalogueKind::movie;
+    codec_item.title = "Codec Test";
+    codec_item.external_ids["tmdb"] = "42";
+    codec_item.external_ids["macha_scanner"] = "1";
+    codec_snapshot.items.emplace(codec_item.id, codec_item);
+    auto codec_roundtrip = decode_catalogue(encode_catalogue(codec_snapshot));
+    REQUIRE(codec_roundtrip.items.contains(codec_item.id));
+    CHECK(codec_roundtrip.items.at(codec_item.id).external_ids == codec_item.external_ids);
+
+    FsEntry fake;
+    fake.type = EntryType::file;
+    fake.size = 123456;
+
+    auto episode = probe_media_path(
+        "/TV/The Expanse/Season 02/The.Expanse.S02E05.Home.mkv", fake);
+    REQUIRE(episode.has_value());
+    CHECK(episode->kind == MediaProbeKind::episode);
+    CHECK(episode->series == "The Expanse");
+    CHECK(episode->season == 2);
+    CHECK(episode->episode == 5);
+    CHECK(episode->title == "Home");
+
+    auto movie = probe_media_path(
+        "/Movies/Blade.Runner.2049.2017.1080p.BluRay.mkv", fake);
+    REQUIRE(movie.has_value());
+    CHECK(movie->kind == MediaProbeKind::movie);
+    CHECK(movie->title == "Blade Runner 2049");
+    CHECK(movie->year == 2017);
+
+    auto track = probe_media_path(
+        "/Music/Pink Floyd/The Dark Side of the Moon/01 - Speak to Me.flac", fake);
+    REQUIRE(track.has_value());
+    CHECK(track->kind == MediaProbeKind::track);
+    CHECK(track->artist == "Pink Floyd");
+    CHECK(track->album == "The Dark Side of the Moon");
+    CHECK(track->track == 1);
+    CHECK(track->title == "Speak to Me");
+
+    auto disc_track = probe_media_path(
+        "/Music/Pink Floyd/The Wall/CD 2/03 - Hey You.flac", fake);
+    REQUIRE(disc_track.has_value());
+    CHECK(disc_track->artist == "Pink Floyd");
+    CHECK(disc_track->album == "The Wall");
+    CHECK(disc_track->disc == 2);
+    CHECK(disc_track->track == 3);
+    CHECK(disc_track->title == "Hey You");
+
+    // Provider unit: one season lookup yields the show/season/episode hierarchy
+    // and all useful visual roles without requiring separate image metadata calls.
+    TempDir provider_temp;
+    auto token = provider_temp.path() / "tmdb.token";
+    {
+        std::ofstream out(token);
+        out << "test-token\n";
+    }
+    FakeHttpClient tmdb_http;
+    tmdb_http.add("/search/tv", 200, "application/json",
+                  R"({"results":[{"id":1402,"name":"The Walking Dead","overview":"Show overview","first_air_date":"2010-10-31","poster_path":"/show.jpg","backdrop_path":"/show-bg.jpg"}]})");
+    tmdb_http.add("/tv/1402/season/1", 200, "application/json",
+                  R"({"id":3643,"name":"Season 1","overview":"Season overview","poster_path":"/season.jpg","episodes":[{"id":63056,"episode_number":1,"name":"Days Gone Bye","overview":"Episode overview","still_path":"/episode.jpg"}]})");
+    CatalogueTmdbConfig tmdb_config;
+    tmdb_config.token_file = token;
+    TmdbProvider tmdb(tmdb_http, tmdb_config);
+    MediaProbe tv_probe;
+    tv_probe.kind = MediaProbeKind::episode;
+    tv_probe.series = "The Walking Dead";
+    tv_probe.season = 1;
+    tv_probe.episode = 1;
+    tv_probe.media_id = "macha:test-episode";
+    auto tv_match = tmdb.lookup(tv_probe);
+    REQUIRE(tv_match.has_value());
+    CHECK(tv_match->items.size() == 3);
+    CHECK(tv_match->items[0].kind == CatalogueKind::show);
+    CHECK(tv_match->items[1].kind == CatalogueKind::season);
+    CHECK(tv_match->items[2].kind == CatalogueKind::episode);
+    CHECK(tv_match->items[2].media_ids == std::vector<std::string>{"macha:test-episode"});
+    CHECK(tv_match->artwork.size() == 4);
+
+    // MusicBrainz resolves one release, then maps the local track onto its
+    // recording; Cover Art Archive provides the front cover URL.
+    FakeHttpClient mb_http;
+    mb_http.add("/ws/2/release?", 200, "application/json",
+                R"({"releases":[{"id":"rel-1","title":"The Dark Side of the Moon","score":100,"artist-credit":[{"name":"Pink Floyd","artist":{"id":"artist-1","name":"Pink Floyd"}}]}]})");
+    mb_http.add("/ws/2/release/rel-1", 200, "application/json",
+                R"({"id":"rel-1","title":"The Dark Side of the Moon","date":"1973-03-01","artist-credit":[{"name":"Pink Floyd","artist":{"id":"artist-1","name":"Pink Floyd"}}],"release-group":{"id":"rg-1"},"media":[{"position":1,"tracks":[{"position":1,"title":"Speak to Me","recording":{"id":"rec-1","title":"Speak to Me"}}]}]})");
+    mb_http.add("coverartarchive.org/release/rel-1", 200, "application/json",
+                R"({"images":[{"front":true,"image":"https://images.example/original.jpg","thumbnails":{"500":"https://images.example/500.jpg"}}]})");
+    CatalogueMusicBrainzConfig mb_config;
+    mb_config.contact = "https://example.test/macha";
+    MusicBrainzProvider mb(mb_http, mb_config);
+    MediaProbe music_probe;
+    music_probe.kind = MediaProbeKind::track;
+    music_probe.artist = "Pink Floyd";
+    music_probe.album = "The Dark Side of the Moon";
+    music_probe.title = "Speak to Me";
+    music_probe.track = 1;
+    music_probe.media_id = "macha:test-track";
+    auto mb_match = mb.lookup(music_probe);
+    REQUIRE(mb_match.has_value());
+    CHECK(mb_match->items.size() == 3);
+    CHECK(mb_match->items[0].kind == CatalogueKind::artist);
+    CHECK(mb_match->items[1].kind == CatalogueKind::album);
+    CHECK(mb_match->items[2].kind == CatalogueKind::track);
+    CHECK(mb_match->items[2].external_ids.at("musicbrainz") == "rec-1");
+    REQUIRE(!mb_match->artwork.empty());
+    CHECK(mb_match->artwork.front().role == "cover");
+    CHECK(mb_match->artwork.front().url == "https://images.example/500.jpg");
+
+    // End-to-end scanner: resolve a real distributed filesystem entry, fetch
+    // poster/backdrop bytes, commit them with the catalogue, then prove a second
+    // scan is idempotent and deletion removes only the scanner-owned item.
+    TempDir t;
+    auto key = t.path() / "cluster.key";
+    write_key(key);
+    auto config = config_for(t.path() / "disk", key, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    auto keys = load_cluster_keys(key);
+    Service service(config, keys);
+    service.start();
+    service.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
+    service.filesystem().create_file("/Movies/Blade.Runner.2049.2017.1080p.mkv", 0644,
+                                     getuid(), getgid());
+    auto bytes = pattern(32768);
+    auto writer = service.filesystem().open_write(
+        "/Movies/Blade.Runner.2049.2017.1080p.mkv", true);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto entry = service.filesystem().getattr(
+        "/Movies/Blade.Runner.2049.2017.1080p.mkv");
+    auto media_id = file_media_id(entry);
+
+    auto scanner_token = t.path() / "scanner-tmdb.token";
+    {
+        std::ofstream out(scanner_token);
+        out << "scanner-token\n";
+    }
+    auto fake_http = std::make_unique<FakeHttpClient>();
+    fake_http->add("/search/movie", 200, "application/json",
+                   R"({"results":[{"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04"}]})");
+    fake_http->add("/movie/335984", 200, "application/json",
+                   R"({"id":335984,"title":"Blade Runner 2049","overview":"A blade runner uncovers a long-buried secret.","release_date":"2017-10-04","poster_path":"/poster.jpg","backdrop_path":"/backdrop.jpg","belongs_to_collection":{"id":422837,"name":"Blade Runner Collection"}})");
+    fake_http->add_bytes("/t/p/w500/poster.jpg", 200, "image/jpeg", Bytes{1,2,3,4,5});
+    fake_http->add_bytes("/t/p/w500/backdrop.jpg", 200, "image/jpeg", Bytes{6,7,8,9});
+
+    CatalogueScannerConfig scanner_config;
+    scanner_config.enabled = true;
+    scanner_config.roots = {"/Movies"};
+    scanner_config.tmdb.token_file = scanner_token;
+    scanner_config.musicbrainz.enabled = false;
+    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(),
+                             scanner_config, std::move(fake_http));
+    CHECK(scanner.scan_once() == 1);
+    auto catalogued = service.catalogue().get("tmdb:movie:335984");
+    REQUIRE(catalogued.has_value());
+    CHECK(catalogued->title == "Blade Runner 2049");
+    CHECK(catalogued->external_ids.at("tmdb_collection") == "422837");
+    CHECK(catalogued->external_ids.at("macha_scanner") == "1");
+    CHECK(catalogued->media_ids == std::vector<std::string>{media_id});
+    CHECK(catalogued->artwork.size() == 2);
+    for (const auto& art : catalogued->artwork)
+        CHECK(service.node().local_store().has(art.id));
+    auto revision = catalogued->revision;
+    CHECK(scanner.scan_once() == 0);
+    REQUIRE(service.catalogue().get("tmdb:movie:335984").has_value());
+    CHECK(service.catalogue().get("tmdb:movie:335984")->revision == revision);
+
+    // A second file resolving to the same title adds another binding without
+    // losing the already-bound media identity. Deletion reconciles them one at
+    // a time and removes the scanner-owned item only after the final copy goes.
+    const std::string alternate = "/Movies/Blade.Runner.2049.2017.Remux.mkv";
+    service.filesystem().create_file(alternate, 0644, getuid(), getgid());
+    auto alternate_bytes = pattern(32769);
+    auto alternate_writer = service.filesystem().open_write(alternate, true);
+    REQUIRE(alternate_writer->write(0, alternate_bytes) == alternate_bytes.size());
+    alternate_writer->commit();
+    auto alternate_id = file_media_id(service.filesystem().getattr(alternate));
+    CHECK(alternate_id != media_id);
+    CHECK(scanner.scan_once() == 1);
+    auto twice = service.catalogue().get("tmdb:movie:335984");
+    REQUIRE(twice.has_value());
+    CHECK(std::find(twice->media_ids.begin(), twice->media_ids.end(), media_id) != twice->media_ids.end());
+    CHECK(std::find(twice->media_ids.begin(), twice->media_ids.end(), alternate_id) != twice->media_ids.end());
+
+    service.filesystem().unlink("/Movies/Blade.Runner.2049.2017.1080p.mkv");
+    std::this_thread::sleep_for(config.metadata_cache + 50ms);
+    CHECK(scanner.scan_once() == 0);
+    auto remaining = service.catalogue().get("tmdb:movie:335984");
+    REQUIRE(remaining.has_value());
+    CHECK(remaining->media_ids == std::vector<std::string>{alternate_id});
+
+    service.filesystem().unlink(alternate);
+    std::this_thread::sleep_for(config.metadata_cache + 50ms);
+    CHECK(service.filesystem().readdir("/Movies").empty());
+    CHECK(scanner.scan_once() == 0);
+    CHECK(!service.catalogue().get("tmdb:movie:335984").has_value());
+    service.stop();
+}
+
 void test_catalogue_sync_search_and_artwork_gc() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
@@ -2727,6 +2989,7 @@ int main() {
         test_hydration_scheduler_and_prediction();
         test_replica_selector();
         test_cache_hydrator_fetches_to_persistent_cache();
+        test_media_probe_and_online_catalogue_scanner();
         test_catalogue_sync_search_and_artwork_gc();
         test_three_node_cluster();
     } catch (const std::exception& e) {

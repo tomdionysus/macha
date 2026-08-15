@@ -94,6 +94,23 @@ void validate(Config& config) {
         throw std::runtime_error("catalogue.api.port must be nonzero");
     if (config.catalogue.api.max_request_bytes < 1024)
         throw std::runtime_error("catalogue.api.max_request_bytes must be >= 1K");
+    if (config.catalogue.scanner.interval < std::chrono::seconds(10))
+        throw std::runtime_error("catalogue.scanner.interval_ms must be >= 10000");
+    if (config.catalogue.scanner.roots.empty())
+        throw std::runtime_error("catalogue.scanner.roots must not be empty");
+    for (const auto& root : config.catalogue.scanner.roots) {
+        if (root.empty() || root.front() != '/')
+            throw std::runtime_error("catalogue.scanner.roots must contain absolute paths");
+    }
+    if (config.catalogue.scanner.max_artwork_bytes < 64 * 1024 ||
+        config.catalogue.scanner.max_artwork_bytes > 128ULL * 1024 * 1024)
+        throw std::runtime_error("catalogue.scanner.max_artwork_bytes must be 64K..128M");
+    if (config.catalogue.scanner.musicbrainz.enabled &&
+        config.catalogue.scanner.musicbrainz.contact.empty())
+        throw std::runtime_error("catalogue.scanner.providers.musicbrainz.contact is required");
+    if (config.catalogue.scanner.enabled && config.catalogue.scanner.tmdb.enabled &&
+        !config.catalogue.scanner.tmdb.token_file)
+        throw std::runtime_error("catalogue.scanner.providers.tmdb.token_file is required when TMDB scanning is enabled");
     if (config.hydration.interval < std::chrono::milliseconds(10))
         throw std::runtime_error("hydration.interval_ms must be >= 10ms");
     if (config.hydration.active_timeout < std::chrono::milliseconds(1000))
@@ -209,19 +226,46 @@ void parse_catalogue(const YAML::Node& root, Config& c) {
     auto catalogue = root["catalogue"];
     if (!catalogue)
         return;
-    auto api = catalogue["api"];
-    if (!api)
-        return;
-    if (api["enabled"])
-        c.catalogue.api.enabled = api["enabled"].as<bool>();
-    if (api["listen"])
-        c.catalogue.api.listen = api["listen"].as<std::string>();
-    if (api["port"])
-        c.catalogue.api.port = api["port"].as<uint16_t>();
-    if (api["token_file"])
-        c.catalogue.api.token_file = std::filesystem::path(api["token_file"].as<std::string>());
-    if (api["max_request_bytes"])
-        c.catalogue.api.max_request_bytes = yaml_size(api["max_request_bytes"]);
+    if (auto api = catalogue["api"]) {
+        if (api["enabled"])
+            c.catalogue.api.enabled = api["enabled"].as<bool>();
+        if (api["listen"])
+            c.catalogue.api.listen = api["listen"].as<std::string>();
+        if (api["port"])
+            c.catalogue.api.port = api["port"].as<uint16_t>();
+        if (api["token_file"])
+            c.catalogue.api.token_file = std::filesystem::path(api["token_file"].as<std::string>());
+        if (api["max_request_bytes"])
+            c.catalogue.api.max_request_bytes = yaml_size(api["max_request_bytes"]);
+    }
+    if (auto scanner = catalogue["scanner"]) {
+        if (scanner["enabled"])
+            c.catalogue.scanner.enabled = scanner["enabled"].as<bool>();
+        if (scanner["interval_ms"])
+            c.catalogue.scanner.interval = milliseconds(scanner["interval_ms"], "catalogue.scanner.interval_ms");
+        if (scanner["max_artwork_bytes"])
+            c.catalogue.scanner.max_artwork_bytes = yaml_size(scanner["max_artwork_bytes"]);
+        if (auto roots = scanner["roots"]) {
+            if (!roots.IsSequence())
+                throw std::runtime_error("catalogue.scanner.roots must be a sequence");
+            c.catalogue.scanner.roots.clear();
+            for (const auto& root : roots)
+                c.catalogue.scanner.roots.push_back(root.as<std::string>());
+        }
+        if (auto providers = scanner["providers"]) {
+            if (auto tmdb = providers["tmdb"]) {
+                if (tmdb["enabled"]) c.catalogue.scanner.tmdb.enabled = tmdb["enabled"].as<bool>();
+                if (tmdb["token_file"]) c.catalogue.scanner.tmdb.token_file = std::filesystem::path(tmdb["token_file"].as<std::string>());
+                if (tmdb["language"]) c.catalogue.scanner.tmdb.language = tmdb["language"].as<std::string>();
+                if (tmdb["image_size"]) c.catalogue.scanner.tmdb.image_size = tmdb["image_size"].as<std::string>();
+            }
+            if (auto mb = providers["musicbrainz"]) {
+                if (mb["enabled"]) c.catalogue.scanner.musicbrainz.enabled = mb["enabled"].as<bool>();
+                if (mb["contact"]) c.catalogue.scanner.musicbrainz.contact = mb["contact"].as<std::string>();
+                if (mb["cover_size"]) c.catalogue.scanner.musicbrainz.cover_size = mb["cover_size"].as<std::string>();
+            }
+        }
+    }
 }
 
 void parse_hydration_engine(const YAML::Node& engines, const char* name,

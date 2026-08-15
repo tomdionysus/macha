@@ -118,6 +118,10 @@ class CatalogueManager {
     CatalogueArtwork put_artwork(std::string_view item_id, std::string role,
                                  std::string mime_type, std::span<const uint8_t> bytes,
                                  std::optional<uint64_t> expected_revision = {});
+    CatalogueArtwork stage_artwork(std::string role, std::string mime_type,
+                                   std::span<const uint8_t> bytes);
+    void reconcile_scanner(const std::vector<CatalogueItem>& discovered,
+                           const std::set<std::string>& active_media_ids);
     std::optional<Bytes> artwork(const ObjectId&);
     CatalogueMaintenance maintenance_objects();
 };
