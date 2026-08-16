@@ -18,9 +18,9 @@ namespace {
 void log_slow_stage(std::string_view stage, Clock::time_point started,
                     const std::string& detail = {}) {
     const auto ms = elapsed_ms(started);
-    if (ms < 50 || !Log::enabled(LogLevel::debug))
+    if (ms < 50 || !Log::enabled(LogLevel::all))
         return;
-    Log::debug("DIAG maintenance-stage stage=" + std::string(stage) +
+    Log::trace("DIAG maintenance-stage stage=" + std::string(stage) +
                " elapsed_ms=" + std::to_string(ms) +
                (detail.empty() ? std::string{} : " " + detail));
 }
@@ -259,8 +259,8 @@ void Service::loop(std::stop_token stop) {
                     maintenance_universal_ = std::move(universal);
                     rebuilt_inventory = true;
                 }
-                if (rebuilt_inventory && Log::enabled(LogLevel::debug)) {
-                    Log::debug("DIAG maintenance-inventory generation=" +
+                if (rebuilt_inventory && Log::enabled(LogLevel::all)) {
+                    Log::trace("DIAG maintenance-inventory generation=" +
                                std::to_string(objects->metadata_generation) +
                                " entries=" + std::to_string(objects->entries) +
                                " extents=" + std::to_string(objects->extents) +
@@ -303,11 +303,11 @@ void Service::loop(std::stop_token stop) {
                             0.0, network_credit - static_cast<double>(repair.bytes_transferred));
                     }
                     if (repair.yielded) {
-                        Log::debug("maintenance: repair yielded to foreground I/O");
+                        Log::trace("maintenance: repair yielded to foreground I/O");
                     } else if (!repair.bytes_transferred && repair.complete) {
                         network_credit = 0.0;
                         network_quiescent_until = Clock::now() + policy.no_progress_backoff;
-                        Log::debug("maintenance: repair quiescent; backing off no-progress scan");
+                        Log::trace("maintenance: repair quiescent; backing off no-progress scan");
                     }
                 }
                 if (garbage_due) {
@@ -337,11 +337,11 @@ void Service::loop(std::stop_token stop) {
                     local_credit = std::max(
                         0.0, local_credit - static_cast<double>(rebalance.bytes));
                 if (rebalance.yielded) {
-                    Log::debug("maintenance: local rebalance yielded to foreground I/O");
+                    Log::trace("maintenance: local rebalance yielded to foreground I/O");
                 } else if (rebalance.complete && !rebalance.bytes) {
                     local_credit = 0.0;
                     local_quiescent_until = Clock::now() + policy.no_progress_backoff;
-                    Log::debug("maintenance: local rebalance quiescent; backing off no-progress scan");
+                    Log::trace("maintenance: local rebalance quiescent; backing off no-progress scan");
                 }
             }
 
@@ -361,14 +361,14 @@ void Service::loop(std::stop_token stop) {
                 if (scrub.bytes)
                     scrub_credit = std::max(0.0, scrub_credit - static_cast<double>(scrub.bytes));
                 if (scrub.yielded) {
-                    Log::debug("maintenance: scrub yielded to foreground I/O");
+                    Log::trace("maintenance: scrub yielded to foreground I/O");
                 } else if (scrub.complete) {
                     // A scrub is a complete integrity pass, not an endless loop.
                     // After reaching the end, pause before beginning at object zero
                     // again even though useful bytes were checked during the pass.
                     scrub_credit = 0.0;
                     scrub_quiescent_until = Clock::now() + policy.no_progress_backoff;
-                    Log::debug("maintenance: scrub pass complete; backing off");
+                    Log::trace("maintenance: scrub pass complete; backing off");
                 }
             }
 

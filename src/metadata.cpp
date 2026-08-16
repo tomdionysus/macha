@@ -82,6 +82,23 @@ void writefile(const std::filesystem::path& p, std::span<const uint8_t> d) {
         close(dirfd);
     }
 }
+bool linkfile(const std::filesystem::path& source, const std::filesystem::path& target) {
+    const auto temporary = target.string() + ".tmp." + std::to_string(getpid());
+    (void)unlink(temporary.c_str());
+    if (link(source.c_str(), temporary.c_str()))
+        return false;
+    if (rename(temporary.c_str(), target.c_str())) {
+        const auto error = errno;
+        (void)unlink(temporary.c_str());
+        throw std::runtime_error(strerror(error));
+    }
+    int dirfd = open(target.parent_path().c_str(), O_RDONLY | O_DIRECTORY);
+    if (dirfd >= 0) {
+        (void)fsync(dirfd);
+        close(dirfd);
+    }
+    return true;
+}
 } // namespace
 Bytes encode_snapshot(const MetadataSnapshot& s) {
     Writer w;
@@ -293,6 +310,25 @@ bool MetadataReplica::remember_committed(const MetadataRecord& r) {
         return true;
     persist(committed_p_, r);
     committed_ = r;
+    return true;
+}
+bool MetadataReplica::remember_current_committed(uint64_t generation, const Hash256& hash) {
+    std::lock_guard l(m_);
+    if (cur_.generation != generation || cur_.hash != hash)
+        return false;
+    if (cur_.generation < committed_.generation)
+        return false;
+    if (cur_.generation == committed_.generation && cur_.hash != committed_.hash)
+        return false;
+    if (cur_.hash == committed_.hash)
+        return true;
+    // current.meta is already an atomically persisted immutable inode for this
+    // generation. Prefer an atomic hard-link checkpoint so committing it does
+    // not re-encrypt and rewrite the complete namespace. Filesystems without
+    // hard-link support fall back to the ordinary durable record write.
+    if (!linkfile(p_, committed_p_))
+        persist(committed_p_, cur_);
+    committed_ = cur_;
     return true;
 }
 void MetadataReplica::persist(const std::filesystem::path& path, const MetadataRecord& r) {

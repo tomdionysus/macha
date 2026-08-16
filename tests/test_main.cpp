@@ -784,8 +784,9 @@ void test_metadata_codec_and_replica() {
     // A successful vote is not yet a committed cluster checkpoint. Recovery
     // witnesses advance only after MetadataManager has observed quorum.
     CHECK(replica.committed().hash == current.hash);
-    REQUIRE(replica.remember_committed(next));
+    REQUIRE(replica.remember_current_committed(next.generation, next.hash));
     CHECK(replica.committed().hash == next.hash);
+    CHECK(!replica.remember_current_committed(next.generation, current.hash));
 
     MetadataReplica reopened(replica_path, keys.storage);
     CHECK(reopened.current().hash == next.hash);
@@ -1277,13 +1278,14 @@ void test_async_rpc_move_ownership() {
     CHECK(cancelled.load() == 2);
 }
 
-void test_rpc_v8_frame_priority_and_variable_length() {
+void test_rpc_v9_frame_priority_and_variable_length() {
     CHECK(frame_type_priority(FrameType::control) < frame_type_priority(FrameType::foreground));
     CHECK(frame_type_priority(FrameType::foreground) < frame_type_priority(FrameType::read_ahead));
     CHECK(frame_type_priority(FrameType::read_ahead) <
           frame_type_priority(FrameType::speculative));
     CHECK(default_frame_type(MessageType::ping) == FrameType::control);
     CHECK(default_frame_type(MessageType::get_object) == FrameType::foreground);
+    CHECK(std::string(message_type_name(MessageType::commit_metadata)) == "commit_metadata");
 
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
@@ -1325,6 +1327,11 @@ void test_rpc_v8_frame_priority_and_variable_length() {
     auto odd = pattern(12'345);
     auto odd_reply = client.call(endpoint, MessageType::ping, odd, 1s);
     CHECK(odd_reply.message.payload == odd);
+
+    auto metadata_reply = client.call(endpoint, MessageType::get_metadata, Bytes{0x4d},
+                                      FrameType::read_ahead, 2s);
+    CHECK(metadata_reply.message.type == MessageType::ok);
+    CHECK(metadata_reply.message.payload == Bytes{0x4d});
 
     // Start a large speculative transfer, then introduce foreground work. The
     // writer reconsiders priority after every <=4 KiB variable-length frame, so
@@ -1432,7 +1439,7 @@ void test_repair_step_is_bounded_and_yields() {
     s1.stop();
 }
 
-void test_rpc_v8_persistence_and_multiplexing() {
+void test_rpc_v9_persistence_and_multiplexing() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -1509,7 +1516,7 @@ void test_rpc_v8_persistence_and_multiplexing() {
     server.stop();
 }
 
-void test_rpc_v8_bidirectional_and_deduplication() {
+void test_rpc_v9_bidirectional_and_deduplication() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -3318,7 +3325,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
-    CHECK(status_body.find("\"server_version\":\"0.8.4\"") != std::string::npos);
+    CHECK(status_body.find("\"server_version\":\"0.8.5\"") != std::string::npos);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -3972,7 +3979,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == "0.8.4");
+    CHECK(playback_status_json.find("server_version")->asString() == "0.8.5");
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately
@@ -4177,10 +4184,10 @@ int main() {
         test_placement();
         test_capacity_placement();
         test_async_rpc_move_ownership();
-        test_rpc_v8_frame_priority_and_variable_length();
+        test_rpc_v9_frame_priority_and_variable_length();
         test_repair_step_is_bounded_and_yields();
-        test_rpc_v8_persistence_and_multiplexing();
-        test_rpc_v8_bidirectional_and_deduplication();
+        test_rpc_v9_persistence_and_multiplexing();
+        test_rpc_v9_bidirectional_and_deduplication();
         test_mutual_bootstrap_prunes_cross_dial();
         test_rpc_v7_handshake_is_rejected();
         test_rpc_slow_control_does_not_abort_data();

@@ -35,6 +35,7 @@ enum class MessageType : uint16_t {
     promote_read_ahead = 14,
     promote_foreground = 15,
     cancel_transfer = 16,
+    commit_metadata = 17,
     ok = 100,
     error = 101,
     members_reply = 102,

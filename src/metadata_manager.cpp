@@ -152,7 +152,8 @@ std::optional<MetadataSnapshotView> MetadataManager::cached_snapshot_view() {
 }
 
 bool MetadataManager::seed_quorum(const std::vector<NodeInfo>& nodes,
-                                  const MetadataRecord& record, size_t required) {
+                                  const MetadataRecord& record, size_t required,
+                                  FrameType frame_type) {
     if (!required)
         return true;
 
@@ -172,7 +173,7 @@ bool MetadataManager::seed_quorum(const std::vector<NodeInfo>& nodes,
         try {
             PendingBool item;
             item.owner = owner;
-            item.rpc.emplace(node_.call_async(owner, MessageType::seed_metadata, encoded));
+            item.rpc.emplace(node_.call_async(owner, MessageType::seed_metadata, encoded, frame_type));
             pending.push_back(std::move(item));
         } catch (...) {
             ++completed;
@@ -213,7 +214,8 @@ bool MetadataManager::seed_quorum(const std::vector<NodeInfo>& nodes,
 
 
 bool MetadataManager::checkpoint_quorum(const std::vector<NodeInfo>& nodes,
-                                        const MetadataRecord& record, size_t required) {
+                                        const MetadataRecord& record, size_t required,
+                                        FrameType frame_type) {
     if (!required)
         return true;
 
@@ -234,7 +236,73 @@ bool MetadataManager::checkpoint_quorum(const std::vector<NodeInfo>& nodes,
             PendingBool item;
             item.owner = owner;
             item.rpc.emplace(
-                node_.call_async(owner, MessageType::checkpoint_metadata, encoded));
+                node_.call_async(owner, MessageType::checkpoint_metadata, encoded, frame_type));
+            pending.push_back(std::move(item));
+        } catch (...) {
+            ++completed;
+        }
+    }
+
+    if (success >= required)
+        return true;
+    if (success + (nodes.size() - completed) < required)
+        return false;
+
+    while (completed < nodes.size()) {
+        bool progressed = false;
+        for (auto& item : pending) {
+            if (item.done || !item.rpc)
+                continue;
+            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+                continue;
+            item.done = true;
+            ++completed;
+            progressed = true;
+            try {
+                if (bool_reply(item.rpc->get()))
+                    ++success;
+            } catch (...) {
+            }
+            if (success >= required)
+                return true;
+            if (success + (nodes.size() - completed) < required)
+                return false;
+        }
+        if (!progressed)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    return success >= required;
+}
+
+bool MetadataManager::commit_quorum(const std::vector<NodeInfo>& nodes,
+                                    const MetadataRecord& record, size_t required,
+                                    FrameType frame_type) {
+    if (!required)
+        return true;
+
+    Writer writer;
+    writer.u64(record.generation);
+    writer.fixed(record.hash.bytes);
+    const auto encoded = writer.take();
+
+    size_t success = 0;
+    size_t completed = 0;
+    std::vector<PendingBool> pending;
+    pending.reserve(nodes.size());
+
+    for (const auto& owner : nodes) {
+        if (owner.id == node_.node_id()) {
+            ++completed;
+            if (node_.commit_metadata(record.generation, record.hash))
+                ++success;
+            continue;
+        }
+        try {
+            PendingBool item;
+            item.owner = owner;
+            item.rpc.emplace(
+                node_.call_async(owner, MessageType::commit_metadata, encoded, frame_type));
             pending.push_back(std::move(item));
         } catch (...) {
             ++completed;
@@ -274,7 +342,8 @@ bool MetadataManager::checkpoint_quorum(const std::vector<NodeInfo>& nodes,
 }
 
 void MetadataManager::seed_all_best_effort(const std::vector<NodeInfo>& nodes,
-                                           const MetadataRecord& record) {
+                                           const MetadataRecord& record,
+                                           FrameType frame_type) {
     std::vector<PendingBool> pending;
     pending.reserve(nodes.size());
     const auto encoded = encode_metadata_record(record);
@@ -288,7 +357,7 @@ void MetadataManager::seed_all_best_effort(const std::vector<NodeInfo>& nodes,
             PendingBool item;
             item.owner = owner;
             item.rpc.emplace(
-                node_.call_async(owner, MessageType::checkpoint_metadata, encoded));
+                node_.call_async(owner, MessageType::checkpoint_metadata, encoded, frame_type));
             pending.push_back(std::move(item));
         } catch (const std::exception& error) {
             Log::debug("metadata checkpoint " + owner.host + ": " + error.what());
@@ -323,7 +392,8 @@ void MetadataManager::seed_all_best_effort(const std::vector<NodeInfo>& nodes,
 MetadataManager::CasResult MetadataManager::cas_quorum(const std::vector<NodeInfo>& nodes,
                                                        const MetadataRecord& expected,
                                                        std::span<const uint8_t> payload,
-                                                       size_t required) {
+                                                       size_t required,
+                                                       FrameType frame_type) {
     CasResult result;
     if (!required)
         return result;
@@ -360,7 +430,7 @@ MetadataManager::CasResult MetadataManager::cas_quorum(const std::vector<NodeInf
         try {
             PendingCas item;
             item.owner = owner;
-            item.rpc.emplace(node_.call_async(owner, MessageType::cas_metadata, encoded));
+            item.rpc.emplace(node_.call_async(owner, MessageType::cas_metadata, encoded, frame_type));
             pending.push_back(std::move(item));
         } catch (...) {
             ++completed;
@@ -399,7 +469,7 @@ MetadataManager::CasResult MetadataManager::cas_quorum(const std::vector<NodeInf
     return result;
 }
 
-MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& voters) {
+MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& voters, FrameType frame_type) {
     if (voters.empty())
         throw std::runtime_error("metadata voter set is empty");
     const size_t need = quorum(voters.size());
@@ -432,7 +502,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& voters) {
         try {
             PendingRead item;
             item.owner = owner;
-            item.rpc.emplace(node_.call_async(owner, MessageType::get_metadata));
+            item.rpc.emplace(node_.call_async(owner, MessageType::get_metadata, {}, frame_type));
             pending.push_back(std::move(item));
         } catch (...) {
             ++completed;
@@ -469,10 +539,10 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& voters) {
                 auto next_nodes = voter_nodes(group.voters);
                 const size_t next_need = quorum(group.voters.size());
                 if (next_nodes.size() < next_need ||
-                    !seed_quorum(next_nodes, successor, next_need))
+                    !seed_quorum(next_nodes, successor, next_need, frame_type))
                     throw std::runtime_error("metadata voter transition target quorum unavailable");
-                checkpoint_quorum(next_nodes, successor, next_need);
-                return read_group(group.voters);
+                checkpoint_quorum(next_nodes, successor, next_need, frame_type);
+                return read_group(group.voters, frame_type);
             }
         }
 
@@ -493,7 +563,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& voters) {
             auto current_voters = voters_of(current);
             if (!same_voters(current_voters, voters))
                 return {};
-            if (!seed_quorum(nodes, current, need))
+            if (!seed_quorum(nodes, current, need, frame_type))
                 return {};
         }
 
@@ -555,7 +625,7 @@ MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial)
             throw std::runtime_error("cluster extent size does not match local configuration");
 
         // Replica-policy changes are an offline coordinated operation: every
-        // node must be restarted with the same desired values. Transport v8
+        // node must be restarted with the same desired values. Transport v9
         // does not advertise desired policy, so mixed rolling configurations
         // cannot be safely reconciled here.
         const size_t old_need = quorum(old_voters.size());
@@ -1026,8 +1096,8 @@ MetadataRecord MetadataManager::read_record() {
     } catch (const std::exception& error) {
         // Reads may continue from the last durably persisted snapshot when the
         // node is completely isolated. Mutations deliberately do not use this
-        // fallback: mutate() calls read_record_uncached() and still requires a
-        // metadata quorum, preserving split-brain safety.
+        // fallback: mutate() still requires quorum CAS, preserving split-brain
+        // safety even when its optimistic base came from the durable local replica.
         auto local = node_.metadata_replica().current();
         auto voters = voters_of(local);
         if (local.generation > 1 && !voters.empty()) {
@@ -1055,32 +1125,57 @@ MetadataSnapshot MetadataManager::snapshot() {
 
 MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot&)>& mutate,
                                        size_t retries) {
-    DiagnosticLock lock(mutation_mutex_, "metadata.mutation");
+    std::unique_lock lock(mutation_mutex_);
     const auto origin = node_.node_id();
     std::optional<uint64_t> sequence;
+    bool force_quorum_read = false;
 
     for (size_t attempt = 0; attempt < retries; ++attempt) {
-        // Mutations never trust the read cache. They start from a fresh quorum
-        // read so a missed invalidation cannot become a conflicting write base.
-        auto current = read_record_uncached();
-        auto snapshot = decode_snapshot(current.payload);
+        const auto total_started = Clock::now();
+        auto base_started = total_started;
 
-        // A quorum CAS can partially install a proposal before a competing
-        // writer wins. Another writer may then adopt our proposal as its base
-        // and commit one or more descendants before this call retries. Exact
-        // record-hash matching is therefore insufficient. Each node serialises
-        // its own mutations and advances a per-node sequence in the snapshot;
-        // seeing our sequence (or later) proves this operation is already in the
-        // canonical history, however many descendants now follow it.
+        // Local mutations are serialised and quorum CAS is the conflict
+        // detector, so the common path can start from our durable current
+        // replica rather than downloading the entire namespace from a quorum
+        // before every create/chmod/commit. A metadata notice or CAS conflict
+        // forces a quorum refresh before retrying.
+        MetadataRecord current;
+        auto local = node_.metadata_replica().current();
+        auto local_voters = voters_of(local);
+        if (force_quorum_read || local_voters.empty() || local.generation <= 1 ||
+            node_.remote_metadata_generation() > local.generation) {
+            if (local_voters.empty() || local.generation <= 1)
+                current = read_record_uncached();
+            else
+                current = maybe_reconfigure(read_group(local_voters, FrameType::read_ahead));
+        } else {
+            current = maybe_reconfigure(local);
+        }
+        const auto base_ms = elapsed_ms(base_started);
+
+        const auto decode_started = Clock::now();
+        auto snapshot = decode_snapshot(current.payload);
+        const auto decode_ms = elapsed_ms(decode_started);
+
         auto seen = snapshot.mutation_sequences.find(origin);
         if (sequence && seen != snapshot.mutation_sequences.end() && seen->second >= *sequence) {
             auto current_voters = voters_of(current);
             auto current_nodes = voter_nodes(current_voters);
             const auto current_need = quorum(current_voters.size());
-            seed_quorum(current_nodes, current, current_need);
-            checkpoint_quorum(current_nodes, current, current_need);
-            node_.checkpoint_metadata(current);
-            return cache_record(current);
+            const auto commit_started = Clock::now();
+            (void)commit_quorum(current_nodes, current, current_need, FrameType::read_ahead);
+            (void)node_.checkpoint_metadata(current);
+            const auto commit_ms = elapsed_ms(commit_started);
+            cache_record(current);
+            const auto total_ms = elapsed_ms(total_started);
+            if (total_ms >= 100 && Log::enabled(LogLevel::debug)) {
+                Log::debug("metadata mutate recovered total_ms=" + std::to_string(total_ms) +
+                           " base_ms=" + std::to_string(base_ms) +
+                           " decode_ms=" + std::to_string(decode_ms) +
+                           " commit_ms=" + std::to_string(commit_ms) +
+                           " generation=" + std::to_string(current.generation));
+            }
+            return current;
         }
 
         if (!sequence) {
@@ -1101,41 +1196,65 @@ MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot
             throw std::runtime_error("filesystem mutation attempted to change cluster policy");
         snapshot.mutation_sequences[origin] = *sequence;
 
+        const auto encode_started = Clock::now();
         auto payload = encode_snapshot(snapshot);
+        const auto encode_ms = elapsed_ms(encode_started);
         if (payload == current.payload)
             return cache_record(current);
 
         auto nodes = voter_nodes(voters);
-        auto result = cas_quorum(nodes, current, payload, quorum(voters.size()));
-        if (result.success >= quorum(voters.size()) && result.committed) {
-            // A write is durable at quorum now. Remaining replicas are seeded
-            // best-effort; foreground mutation latency does not wait for all of
-            // them, and read repair/maintenance will converge stragglers.
-            seed_quorum(nodes, *result.committed, quorum(voters.size()));
-            checkpoint_quorum(nodes, *result.committed, quorum(voters.size()));
-            node_.checkpoint_metadata(*result.committed);
-            return cache_record(*result.committed);
+        const auto need = quorum(voters.size());
+        const auto cas_started = Clock::now();
+        auto result = cas_quorum(nodes, current, payload, need, FrameType::read_ahead);
+        const auto cas_ms = elapsed_ms(cas_started);
+        if (result.success >= need && result.committed) {
+            // The CAS itself has durably installed the successor current.meta on
+            // a quorum. Do not retransmit that multi-megabyte snapshot for seed
+            // and checkpoint rounds. Mark those already-installed records as
+            // committed with a compact generation+hash RPC; repair converges
+            // non-quorum replicas later.
+            const auto commit_started = Clock::now();
+            (void)commit_quorum(nodes, *result.committed, need, FrameType::read_ahead);
+            (void)node_.checkpoint_metadata(*result.committed);
+            const auto commit_ms = elapsed_ms(commit_started);
+            cache_record(*result.committed);
+            const auto total_ms = elapsed_ms(total_started);
+            if (total_ms >= 100 && Log::enabled(LogLevel::debug)) {
+                Log::debug("metadata mutate total_ms=" + std::to_string(total_ms) +
+                           " base_ms=" + std::to_string(base_ms) +
+                           " decode_ms=" + std::to_string(decode_ms) +
+                           " encode_ms=" + std::to_string(encode_ms) +
+                           " cas_ms=" + std::to_string(cas_ms) +
+                           " commit_ms=" + std::to_string(commit_ms) +
+                           " payload_bytes=" + std::to_string(payload.size()) +
+                           " attempt=" + std::to_string(attempt + 1));
+            }
+            return *result.committed;
         }
         if (!result.conflict)
             throw std::runtime_error("metadata write quorum unavailable");
+
+        force_quorum_read = true;
     }
 
     throw std::runtime_error("metadata mutation conflict");
 }
 
 void MetadataManager::repair_once() {
-    auto record = read_record_uncached();
-    auto voters = voters_of(record);
+    auto local = node_.metadata_replica().current();
+    auto voters = voters_of(local);
+    auto record = voters.empty()
+        ? read_record_uncached()
+        : maybe_reconfigure(read_group(voters, FrameType::speculative));
+    voters = voters_of(record);
     auto voter_replicas = voter_nodes(voters);
-    seed_quorum(voter_replicas, record, quorum(voters.size()));
-    checkpoint_quorum(voter_replicas, record, quorum(voters.size()));
+    seed_quorum(voter_replicas, record, quorum(voters.size()), FrameType::speculative);
+    checkpoint_quorum(voter_replicas, record, quorum(voters.size()), FrameType::speculative);
 
-    // Namespace checkpoints are tiny compared with media extents and are
-    // intentionally durable on every active node, not only metadata voters.
-    // They are recovery witnesses, not extra consensus votes. A replacement
-    // node can therefore reconstruct the namespace before the object repair
-    // loop walks the recovered live set and repopulates its assigned blocks.
-    seed_all_best_effort(node_.membership().active(), record);
+    // Namespace checkpoints are recovery witnesses on every active node. Their
+    // full snapshots are background bulk traffic and therefore use the DATA
+    // lane at speculative priority rather than blocking membership/health.
+    seed_all_best_effort(node_.membership().active(), record, FrameType::speculative);
     cache_record(record);
 }
 } // namespace macha

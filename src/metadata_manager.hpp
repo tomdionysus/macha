@@ -39,7 +39,8 @@ class MetadataManager {
     MetadataRecord discover_or_form();
     std::optional<MetadataRecord> recover_from_committed_checkpoints(
         const std::vector<NodeInfo>& active);
-    MetadataRecord read_group(const std::vector<NodeId>&);
+    MetadataRecord read_group(const std::vector<NodeId>&,
+                              FrameType frame_type = FrameType::control);
     MetadataRecord read_record_base();
     MetadataRecord maybe_reconfigure(const MetadataRecord&);
     MetadataRecord read_record_uncached();
@@ -47,11 +48,17 @@ class MetadataManager {
     std::optional<MetadataRecord> cached_record();
     std::optional<MetadataSnapshotView> cached_snapshot_view();
 
-    bool seed_quorum(const std::vector<NodeInfo>&, const MetadataRecord&, size_t required);
-    bool checkpoint_quorum(const std::vector<NodeInfo>&, const MetadataRecord&, size_t required);
-    void seed_all_best_effort(const std::vector<NodeInfo>&, const MetadataRecord&);
+    bool seed_quorum(const std::vector<NodeInfo>&, const MetadataRecord&, size_t required,
+                     FrameType frame_type = FrameType::control);
+    bool checkpoint_quorum(const std::vector<NodeInfo>&, const MetadataRecord&, size_t required,
+                           FrameType frame_type = FrameType::control);
+    bool commit_quorum(const std::vector<NodeInfo>&, const MetadataRecord&, size_t required,
+                       FrameType frame_type);
+    void seed_all_best_effort(const std::vector<NodeInfo>&, const MetadataRecord&,
+                              FrameType frame_type = FrameType::control);
     CasResult cas_quorum(const std::vector<NodeInfo>&, const MetadataRecord&,
-                         std::span<const uint8_t>, size_t required);
+                         std::span<const uint8_t>, size_t required,
+                         FrameType frame_type = FrameType::control);
 
   public:
     explicit MetadataManager(NodeRuntime&);

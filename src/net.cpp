@@ -19,8 +19,8 @@
 
 namespace macha {
 namespace {
-constexpr uint16_t protocol_version = 8;
-constexpr uint32_t frame_magic = 0x4d434838; // "MCH8"
+constexpr uint16_t protocol_version = 9;
+constexpr uint32_t frame_magic = 0x4d434839; // "MCH9"
 constexpr size_t protocol_min_frame_size = 4 * 1024;
 constexpr size_t protocol_max_frame_size = 4 * 1024 * 1024;
 constexpr size_t max_message_size = 128 * 1024 * 1024;
@@ -116,7 +116,7 @@ Bytes label(const char* prefix, std::span<const uint8_t> data) {
 Bytes session_info(std::span<const uint8_t> transcript, const NodeId& client,
                    const NodeId& server, const char* direction) {
     Writer writer;
-    writer.string("macha/session/v8");
+    writer.string("macha/session/v9");
     writer.string(direction);
     writer.fixed(sha256(transcript).bytes);
     writer.fixed(client.bytes);
@@ -255,11 +255,30 @@ bool is_bulk_message(MessageType type) {
            type == MessageType::object_reply;
 }
 
+bool is_priority_data_message(MessageType type) {
+    switch (type) {
+    case MessageType::have_object:
+    case MessageType::get_metadata:
+    case MessageType::cas_metadata:
+    case MessageType::seed_metadata:
+    case MessageType::checkpoint_metadata:
+    case MessageType::commit_metadata:
+    case MessageType::bool_reply:
+    case MessageType::metadata_reply:
+    case MessageType::cas_reply:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool class_allowed(MessageType type, FrameType frame_type) {
     if (is_bulk_message(type))
         return frame_type != FrameType::control;
+    if (is_priority_data_message(type))
+        return true;
     if (type == MessageType::ok || type == MessageType::error)
-        return true; // Replies to a bulk request inherit that request's frame type.
+        return true; // Replies inherit the request's frame type.
     return frame_type == FrameType::control;
 }
 
@@ -401,6 +420,7 @@ const char* message_type_name(MessageType type) noexcept {
     case MessageType::promote_read_ahead: return "promote_read_ahead";
     case MessageType::promote_foreground: return "promote_foreground";
     case MessageType::cancel_transfer: return "cancel_transfer";
+    case MessageType::commit_metadata: return "commit_metadata";
     case MessageType::ok: return "ok";
     case MessageType::error: return "error";
     case MessageType::members_reply: return "members_reply";
@@ -471,7 +491,7 @@ NodeInfo SecureChannel::client_handshake(TransportLane lane) {
 
     Writer envelope;
     envelope.bytes(hello);
-    envelope.fixed(hmac_sha256(keys_.auth, label("client/v8", hello)));
+    envelope.fixed(hmac_sha256(keys_.auth, label("client/v9", hello)));
     send_blob(fd_, envelope.data());
 
     auto response = recv_blob(fd_, 16384);
@@ -480,7 +500,7 @@ NodeInfo SecureChannel::client_handshake(TransportLane lane) {
     auto remote_mac = response_reader.fixed<32>();
     response_reader.finish();
 
-    auto authenticated = label("server/v8", hello);
+    auto authenticated = label("server/v9", hello);
     authenticated.insert(authenticated.end(), ack.begin(), ack.end());
     if (!constant_time_equal(remote_mac, hmac_sha256(keys_.auth, authenticated)))
         throw std::runtime_error("peer auth failed");
@@ -535,7 +555,7 @@ NodeInfo SecureChannel::server_handshake(const std::string& remote_host) {
     auto remote_mac = envelope_reader.fixed<32>();
     envelope_reader.finish();
 
-    if (!constant_time_equal(remote_mac, hmac_sha256(keys_.auth, label("client/v8", hello))))
+    if (!constant_time_equal(remote_mac, hmac_sha256(keys_.auth, label("client/v9", hello))))
         throw std::runtime_error("client auth failed");
 
     Reader reader(hello);
@@ -578,7 +598,7 @@ NodeInfo SecureChannel::server_handshake(const std::string& remote_host) {
     encode_node_info(ack_writer, local_);
     auto ack = ack_writer.take();
 
-    auto authenticated = label("server/v8", hello);
+    auto authenticated = label("server/v9", hello);
     authenticated.insert(authenticated.end(), ack.begin(), ack.end());
     Writer response;
     response.bytes(ack);
@@ -1393,11 +1413,15 @@ std::string RpcClient::dial_key(const Endpoint& endpoint, TransportLane lane) {
 }
 
 TransportLane RpcClient::lane_for(MessageType type, FrameType frame_type) noexcept {
-    // Object transfers and speculative object-existence probes are isolated on
-    // the data TCP stream. Background repair must never queue have_object scans
-    // ahead of membership/metadata control traffic.
+    // Bulk object traffic and explicitly prioritised interactive/background
+    // metadata work use the DATA lane. CONTROL remains reserved for health,
+    // membership and small coordination messages, so multi-megabyte namespace
+    // snapshots cannot head-of-line block liveness traffic.
     if (type == MessageType::get_object || type == MessageType::put_object ||
-        (type == MessageType::have_object && frame_type != FrameType::control))
+        ((type == MessageType::have_object || type == MessageType::get_metadata ||
+          type == MessageType::cas_metadata || type == MessageType::seed_metadata ||
+          type == MessageType::checkpoint_metadata || type == MessageType::commit_metadata) &&
+         frame_type != FrameType::control))
         return TransportLane::data;
     return TransportLane::control;
 }
@@ -2926,8 +2950,8 @@ void RpcServer::execute(RequestJob job) {
     }
 
     const auto handler_ms = elapsed_ms(execute_started);
-    if ((queue_ms >= 25 || handler_ms >= 50) && Log::enabled(LogLevel::debug)) {
-        Log::debug("DIAG rpc-server peer=" + to_string(job.peer.id).substr(0, 12) +
+    if ((queue_ms >= 25 || handler_ms >= 50) && Log::enabled(LogLevel::all)) {
+        Log::trace("DIAG rpc-server peer=" + to_string(job.peer.id).substr(0, 12) +
                    " frame=" + frame_type_name(job.frame.frame_type) +
                    " message=" + message_type_name(job.frame.message.type) +
                    " queue_wait_ms=" + std::to_string(queue_ms) +

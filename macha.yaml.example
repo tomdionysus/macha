@@ -1,4 +1,4 @@
-# Macha 0.8.4
+# Macha 0.8.5
 #
 # Copy this file per node. Paths, advertise address and failure_domain are
 # node-local. The cluster key contents and dht policy must match every node.
@@ -12,7 +12,7 @@ key_file: /etc/macha.key
 mount_path: /srv/media
 
 # ALL, DEBUG, INFO, WARN or ERROR. Default: INFO.
-# ALL includes expensive per-object/FUSE/payload/extent/write trace output; DEBUG is aggregated.
+# ALL includes expensive per-object/FUSE/payload/extent/write trace output; DEBUG is low-volume operational diagnosis.
 log_level: INFO
 
 # Authoritative local DHT storage. Add as many independent backends as required.
