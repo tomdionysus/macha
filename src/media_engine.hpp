@@ -77,6 +77,11 @@ struct PlaybackPlan {
     std::chrono::milliseconds seek{};
 };
 
+struct HlsVodPlan {
+    PlaybackPlan playback;
+    std::vector<double> segment_durations;
+};
+
 struct MediaEngineStatus {
     bool available{};
     std::string backend;
@@ -100,7 +105,8 @@ class MediaSegmentStore {
 
     MediaSegmentStore(size_t max_ahead_segments, uint64_t memory_limit,
                       std::filesystem::path spill_directory,
-                      std::chrono::milliseconds target_duration);
+                      std::chrono::milliseconds target_duration,
+                      std::vector<double> vod_segment_durations = {});
     ~MediaSegmentStore();
 
     MediaSegmentStore(const MediaSegmentStore&) = delete;
@@ -109,6 +115,7 @@ class MediaSegmentStore {
     bool wait_ready(std::chrono::milliseconds timeout);
     std::string playlist() const;
     std::optional<Bytes> object(std::string_view name) const;
+    std::optional<Bytes> wait_object(std::string_view name, std::chrono::milliseconds timeout) const;
     void note_requested(uint64_t index);
     Snapshot snapshot() const;
     void cancel();
@@ -144,8 +151,12 @@ class MediaEngine {
     virtual MediaEngineStatus status() const = 0;
     virtual MediaProbeResult probe(const MediaSource&,
                                    std::chrono::milliseconds timeout = {}) = 0;
+    virtual HlsVodPlan prepare_hls_vod(
+        const MediaSource&, const PlaybackPlan&, double source_duration_seconds,
+        std::chrono::milliseconds segment_duration, bool allow_video_transcode_fallback,
+        std::chrono::milliseconds timeout = {}) = 0;
     virtual std::unique_ptr<MediaEngineSession> start_hls(
-        const MediaSource&, const PlaybackPlan&, std::chrono::milliseconds segment_duration,
+        const MediaSource&, const HlsVodPlan&, std::chrono::milliseconds segment_duration,
         size_t max_ahead_segments, uint64_t segment_memory_bytes,
         const std::filesystem::path& spill_directory) = 0;
     virtual std::string extract_webvtt(const MediaSource&, int subtitle_stream,

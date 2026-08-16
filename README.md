@@ -8,7 +8,7 @@ Macha is a C++20 distributed filesystem and media server for large, mostly immut
 
 There is no permanent master, cloud service or account system. Nodes share one cluster key, discover membership through bootstrap peers, and converge placement and replicas in the background.
 
-0.7.3 is usable but experimental. It is deliberately a media filesystem/server rather than a complete general-purpose POSIX filesystem. Streaming was introduced in 0.7.0 and links the FFmpeg libraries directly when enabled; no media subprocesses are launched.
+0.8.1 is usable but experimental. It is deliberately a media filesystem/server rather than a complete general-purpose POSIX filesystem. Streaming was introduced in 0.7.0 and links the FFmpeg libraries directly when enabled; no media subprocesses are launched.
 
 ## Documentation
 
@@ -21,6 +21,7 @@ There is no permanent master, cloud service or account system. Nodes share one c
 - [Maintenance, cache, tests and service files](docs/operations.md)
 - [Architecture](ARCHITECTURE.md)
 - [Security](SECURITY.md)
+- [Roadmap](ROADMAP.md)
 - [Changelog](CHANGELOG.md)
 
 The complete configuration example is [`macha.yaml.example`](macha.yaml.example).

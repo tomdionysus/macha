@@ -1,6 +1,6 @@
 # Streaming
 
-0.7.0 adds negotiated media streaming to the existing HTTP API. The public API deals in media capabilities, playback plans and sessions. Media probing, remuxing and transcoding run in-process through the FFmpeg libraries behind `MediaEngine`; no `ffmpeg` or `ffprobe` subprocess is launched.
+0.7.0 introduced negotiated media streaming to the existing HTTP API. 0.8.0 changes finite movie/episode transformed playback to immutable HLS VOD manifests; the earlier growing EVENT form is retained as a future live/event design in `ROADMAP.md`. The public API deals in media capabilities, playback plans and sessions. Media probing, remuxing and transcoding run in-process through the FFmpeg libraries behind `MediaEngine`; no `ffmpeg` or `ffprobe` subprocess is launched.
 
 ## Modes
 
@@ -14,7 +14,7 @@ The current transformed output is one HLS rendition using an `init.mp4` plus `.m
 
 ## Media engine boundary
 
-`PlaybackManager` owns policy and `MediaEngine` owns media operations. The interface contains media concepts (`probe`, `PlaybackPlan`, `MediaEngineSession`, fragments and subtitle extraction), not FFmpeg options. The 0.7.0 implementation is `LibavMediaEngine`, but another implementation can replace it without changing the HTTP/session API.
+`PlaybackManager` owns policy and `MediaEngine` owns media operations. The interface contains media concepts (`probe`, `PlaybackPlan`, `MediaEngineSession`, fragments and subtitle extraction), not FFmpeg options. The current implementation is `LibavMediaEngine`, but another implementation can replace it without changing the HTTP/session API.
 
 Each media source is an immutable seekable `MediaInput`. The libav input `AVIOContext` maps read/seek callbacks directly onto the pinned Macha `ReadHandle`. There is no loopback HTTP hop and no FUSE dependency. Replacing or renaming a pathname after playback starts does not silently change the extents underneath that session.
 
@@ -22,9 +22,13 @@ Probe and subtitle readers are deliberately *not* registered with `PlaybackTrack
 
 Transformed output uses the MP4 muxer with fragmented-MP4 flags and a custom output `AVIOContext`. Top-level MP4 init and media fragments are published directly into `MediaSegmentStore`. The HTTP server reads playlists/fragments from that store. No temp directory is polled for readiness.
 
-Stream-copy timestamps are normalised only after rescaling into the MP4 stream's final muxer timebase. Missing PTS/DTS are synthesised conservatively and equal/backwards DTS values are advanced with a persistent per-stream timeline correction. This is necessary around backward keyframe seeks and also after timebase conversion, where two distinct source timestamps can quantise to the same MP4 tick. Any repair is logged with per-stream counters.
+Finite media is presented as HLS VOD. Before the transformed pipeline starts, the media engine prepares the complete segment-duration plan. The playlist is therefore complete and immutable from its first response, contains `#EXT-X-PLAYLIST-TYPE:VOD` and `#EXT-X-ENDLIST`, and never exposes a moving event/live edge. Fragment bytes remain lazy: a request for a valid future segment raises the producer demand watermark and waits for sequential generation to reach that fragment.
 
-The segment store is a bounded producer/consumer queue. Once the producer is `max_ahead_segments` beyond actual client demand it blocks on a condition variable and resumes when later fragment indexes are requested. This prevents a fast remux from pulling an entire movie through the DHT. Resident generated fragments are bounded by `segment_memory_bytes`; old consumed fragments can spill below `temp_path`.
+For stream-copy video, the VOD planner uses the demuxer's keyframe index and chooses random-access boundaries near `segment_duration_ms`. Matroska/WebM Cues are explicitly materialised through the demuxer's seek path before that index is inspected, because probing alone may expose only a partial early-file index. The resulting plan is rejected if any advertised fragment would be grossly larger than the configured target, preventing a partial index from turning the unindexed remainder of a movie into one fragment. A transformed seek is aligned to the first indexed keyframe at or after the requested position so the first advertised segment is independently decodable. If automatic remux has no usable keyframe index, it may fall back to H.264 video transcode only when the client advertised H.264 and the encoder is available; an explicitly forced `remux` still fails rather than silently changing mode. Transcoded video uses the encoder GOP cadence as its VOD boundary plan.
+
+Stream-copy timestamps are normalised only after rescaling into the MP4 stream's final muxer timebase. Missing PTS/DTS are synthesised conservatively and equal/backwards DTS values are advanced with a persistent per-stream timeline correction. Legitimate PTS-before-DTS composition offsets are preserved rather than clamped; fragmented MP4 is emitted with signed composition-time offsets enabled. Repairs that actually modify timestamps are logged with per-stream counters.
+
+The segment store remains a bounded producer/consumer queue. Once the producer is `max_ahead_segments` beyond actual client demand it blocks on a condition variable and resumes when later fragment indexes are requested. This prevents a fast remux from pulling an entire movie through the DHT while keeping VOD playlist semantics independent of producer progress. Resident generated fragments are bounded by `segment_memory_bytes`; old consumed fragments can spill below `temp_path`.
 
 Video scaling and audio resampling are initialised from actual decoded-frame properties rather than assuming the decoder knows the final pixel/sample format at open time. This matters for containers/codecs whose format details are discovered only during decoding.
 

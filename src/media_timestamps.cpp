@@ -61,10 +61,8 @@ void normalize_media_timestamps(MediaTimestampRepairState& state,
         ++state.missing_pts;
         packet.pts = packet.dts;
     }
-    if (packet.pts < packet.dts) {
+    if (packet.pts < packet.dts)
         ++state.pts_before_dts;
-        packet.pts = packet.dts;
-    }
 
     if (packet.duration <= 0) packet.duration = duration;
     state.last_duration = duration;
