@@ -80,6 +80,14 @@ struct PlaybackPlan {
 struct HlsVodPlan {
     PlaybackPlan playback;
     std::vector<double> segment_durations;
+
+    // Reusable seek-planning state. A transformed session retains this after
+    // startup so a seek-only PATCH can create a new generation without
+    // reopening/probing the source or rebuilding its Matroska Cues/index.
+    double source_duration_seconds{};
+    double seek_segment_seconds{};
+    std::vector<double> video_random_access_points;
+    bool reusable_seek{};
 };
 
 struct MediaEngineStatus {
@@ -164,6 +172,13 @@ class MediaEngine {
 };
 
 std::unique_ptr<MediaEngine> make_libav_media_engine(const StreamingConfig&);
+
+// Derive a new transformed VOD generation from an already prepared plan.
+// Returns no plan when the original preparation did not retain sufficient
+// random-access information for a seek-only fast path.
+std::optional<HlsVodPlan> reseek_hls_vod(const HlsVodPlan&,
+                                         std::chrono::milliseconds requested_seek);
+
 std::string playback_mode_name(PlaybackMode);
 std::string media_stream_type_name(MediaStreamType);
 

@@ -93,9 +93,12 @@ class FakeMediaEngineSession final : public MediaEngineSession {
 class FakeMediaEngine final : public MediaEngine {
     mutable std::mutex mutex_;
     std::vector<PlaybackPlan> started_plans_;
+    std::atomic_uint probes_{};
+    std::atomic_uint vod_prepares_{};
   public:
     MediaEngineStatus status() const override { return {true, "fake", "fake-media-engine", true, true}; }
     MediaProbeResult probe(const MediaSource&, std::chrono::milliseconds = {}) override {
+        ++probes_;
         MediaProbeResult result;
         result.format = "mov,mp4,m4a,3gp,3g2,mj2";
         result.duration_seconds = 60.0;
@@ -108,9 +111,13 @@ class FakeMediaEngine final : public MediaEngine {
     HlsVodPlan prepare_hls_vod(const MediaSource&, const PlaybackPlan& plan, double duration_seconds,
                                std::chrono::milliseconds segment_duration, bool,
                                std::chrono::milliseconds = {}) override {
+        ++vod_prepares_;
         HlsVodPlan vod;
         vod.playback = plan;
         const double segment = segment_duration.count() / 1000.0;
+        vod.source_duration_seconds = duration_seconds;
+        vod.seek_segment_seconds = segment;
+        vod.reusable_seek = true;
         double left = duration_seconds - plan.seek.count() / 1000.0;
         while (left > segment + 0.001) { vod.segment_durations.push_back(segment); left -= segment; }
         vod.segment_durations.push_back(std::max(0.001, left));
@@ -143,6 +150,8 @@ class FakeMediaEngine final : public MediaEngine {
         std::lock_guard lock(mutex_);
         return started_plans_;
     }
+    unsigned probes() const { return probes_.load(); }
+    unsigned vod_prepares() const { return vod_prepares_.load(); }
 };
 
 class FailingProbeMediaEngine final : public MediaEngine {
@@ -187,6 +196,9 @@ class BlockingMediaEngine final : public MediaEngine {
         HlsVodPlan vod;
         vod.playback = plan;
         const double segment = segment_duration.count() / 1000.0;
+        vod.source_duration_seconds = duration_seconds;
+        vod.seek_segment_seconds = segment;
+        vod.reusable_seek = true;
         double left = duration_seconds - plan.seek.count() / 1000.0;
         while (left > segment + 0.001) { vod.segment_durations.push_back(segment); left -= segment; }
         vod.segment_durations.push_back(std::max(0.001, left));
@@ -3625,6 +3637,39 @@ void test_media_vod_index_planning_rejects_partial_indexes() {
     CHECK(std::abs(seeked->actual_seek_seconds - 62.0) < 0.0005);
 }
 
+void test_reseek_hls_vod_reuses_prepared_random_access_state() {
+    HlsVodPlan remux;
+    remux.playback.mode = PlaybackMode::remux;
+    remux.playback.video = MediaTransform::copy;
+    remux.source_duration_seconds = 120.0;
+    remux.seek_segment_seconds = 4.0;
+    remux.reusable_seek = true;
+    for (double seconds = 0.0; seconds < 120.0; seconds += 2.0)
+        remux.video_random_access_points.push_back(seconds);
+
+    auto remux_seek = reseek_hls_vod(remux, 61s);
+    REQUIRE(remux_seek.has_value());
+    CHECK(remux_seek->playback.seek == 62s);
+    REQUIRE(!remux_seek->segment_durations.empty());
+    CHECK(remux_seek->segment_durations.front() <= 4.001);
+
+    HlsVodPlan transcode;
+    transcode.playback.mode = PlaybackMode::transcode;
+    transcode.playback.video = MediaTransform::transcode;
+    transcode.source_duration_seconds = 120.0;
+    transcode.seek_segment_seconds = 4.0;
+    transcode.reusable_seek = true;
+
+    auto transcode_seek = reseek_hls_vod(transcode, 61s);
+    REQUIRE(transcode_seek.has_value());
+    CHECK(transcode_seek->playback.seek == 61s);
+    REQUIRE(!transcode_seek->segment_durations.empty());
+    CHECK(std::abs(transcode_seek->segment_durations.front() - 4.0) < 0.0005);
+
+    HlsVodPlan unavailable;
+    CHECK(!reseek_hls_vod(unavailable, 10s).has_value());
+}
+
 void test_media_timestamp_repair() {
     MediaTimestampRepairState state;
 
@@ -3847,6 +3892,29 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto plans = fake_engine_ptr->started_plans();
     REQUIRE(plans.size() == 1);
     CHECK(plans.back().seek == 23s);
+
+    // A transformed seek-only PATCH must reuse the already prepared VOD plan.
+    // Re-probing/re-planning here is the 0.8.1 behaviour that made cached
+    // seeks take several seconds on Matroska media.
+    const auto probes_before_seek = fake_engine_ptr->probes();
+    const auto prepares_before_seek = fake_engine_ptr->vod_prepares();
+    Json::Object fast_seek_root{{"seek_ms", 35000}};
+    auto fast_seek_text = Json(std::move(fast_seek_root)).dump();
+    HttpRequest fast_seek;
+    fast_seek.method = "PATCH";
+    fast_seek.path = "/api/v1/playback/sessions/" + initial_seek_json.find("session_id")->asString();
+    fast_seek.body.assign(fast_seek_text.begin(), fast_seek_text.end());
+    auto fast_seek_response = playback.handle(fast_seek);
+    REQUIRE(fast_seek_response.status == 200);
+    auto fast_seek_json = Json::parse(std::string(fast_seek_response.body.begin(),
+                                                  fast_seek_response.body.end()));
+    CHECK(fast_seek_json.find("seek_ms")->asInt64() == 35000);
+    CHECK(fake_engine_ptr->probes() == probes_before_seek);
+    CHECK(fake_engine_ptr->vod_prepares() == prepares_before_seek);
+    plans = fake_engine_ptr->started_plans();
+    REQUIRE(plans.size() == 2);
+    CHECK(plans.back().seek == 35s);
+
     HttpRequest remove_initial_seek;
     remove_initial_seek.method = "DELETE";
     remove_initial_seek.path = "/api/v1/playback/sessions/" + initial_seek_json.find("session_id")->asString();
@@ -4031,6 +4099,7 @@ int main() {
         test_catalogue_sync_search_and_artwork_gc();
         test_media_segment_store_backpressure_and_spill();
         test_media_vod_index_planning_rejects_partial_indexes();
+        test_reseek_hls_vod_reuses_prepared_random_access_state();
         test_media_timestamp_repair();
         test_http_server_serves_streams_concurrently();
         test_playback_probe_failure_is_stage_specific();
