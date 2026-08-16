@@ -20,7 +20,7 @@
 namespace macha {
 namespace {
 constexpr uint16_t protocol_version = 9;
-constexpr uint32_t frame_magic = 0x4d434839; // "MCH9"
+constexpr uint32_t frame_magic = 0x4d433130; // "MC10"
 constexpr size_t protocol_min_frame_size = 4 * 1024;
 constexpr size_t protocol_max_frame_size = 4 * 1024 * 1024;
 constexpr size_t max_message_size = 128 * 1024 * 1024;
@@ -116,7 +116,7 @@ Bytes label(const char* prefix, std::span<const uint8_t> data) {
 Bytes session_info(std::span<const uint8_t> transcript, const NodeId& client,
                    const NodeId& server, const char* direction) {
     Writer writer;
-    writer.string("macha/session/v9");
+    writer.string("macha/session/v10");
     writer.string(direction);
     writer.fixed(sha256(transcript).bytes);
     writer.fixed(client.bytes);
@@ -491,7 +491,7 @@ NodeInfo SecureChannel::client_handshake(TransportLane lane) {
 
     Writer envelope;
     envelope.bytes(hello);
-    envelope.fixed(hmac_sha256(keys_.auth, label("client/v9", hello)));
+    envelope.fixed(hmac_sha256(keys_.auth, label("client/v10", hello)));
     send_blob(fd_, envelope.data());
 
     auto response = recv_blob(fd_, 16384);
@@ -500,7 +500,7 @@ NodeInfo SecureChannel::client_handshake(TransportLane lane) {
     auto remote_mac = response_reader.fixed<32>();
     response_reader.finish();
 
-    auto authenticated = label("server/v9", hello);
+    auto authenticated = label("server/v10", hello);
     authenticated.insert(authenticated.end(), ack.begin(), ack.end());
     if (!constant_time_equal(remote_mac, hmac_sha256(keys_.auth, authenticated)))
         throw std::runtime_error("peer auth failed");
@@ -555,7 +555,7 @@ NodeInfo SecureChannel::server_handshake(const std::string& remote_host) {
     auto remote_mac = envelope_reader.fixed<32>();
     envelope_reader.finish();
 
-    if (!constant_time_equal(remote_mac, hmac_sha256(keys_.auth, label("client/v9", hello))))
+    if (!constant_time_equal(remote_mac, hmac_sha256(keys_.auth, label("client/v10", hello))))
         throw std::runtime_error("client auth failed");
 
     Reader reader(hello);
@@ -598,7 +598,7 @@ NodeInfo SecureChannel::server_handshake(const std::string& remote_host) {
     encode_node_info(ack_writer, local_);
     auto ack = ack_writer.take();
 
-    auto authenticated = label("server/v9", hello);
+    auto authenticated = label("server/v10", hello);
     authenticated.insert(authenticated.end(), ack.begin(), ack.end());
     Writer response;
     response.bytes(ack);
@@ -1413,16 +1413,15 @@ std::string RpcClient::dial_key(const Endpoint& endpoint, TransportLane lane) {
 }
 
 TransportLane RpcClient::lane_for(MessageType type, FrameType frame_type) noexcept {
-    // Bulk object traffic and explicitly prioritised interactive/background
-    // metadata work use the DATA lane. CONTROL remains reserved for health,
-    // membership and small coordination messages, so multi-megabyte namespace
-    // snapshots cannot head-of-line block liveness traffic.
-    if (type == MessageType::get_object || type == MessageType::put_object ||
-        ((type == MessageType::have_object || type == MessageType::get_metadata ||
-          type == MessageType::cas_metadata || type == MessageType::seed_metadata ||
-          type == MessageType::checkpoint_metadata || type == MessageType::commit_metadata) &&
-         frame_type != FrameType::control))
+    // Object payloads are the viewer-critical transport and keep the DATA lane
+    // to themselves. Metadata may still carry read-ahead/speculative frame
+    // priorities, so it is dispatched by the data worker pool and fragmented
+    // behind control messages, but it deliberately travels on the separate
+    // CONTROL TCP session. This prevents multi-megabyte namespace CAS/repair
+    // traffic from sharing a socket with foreground media reads.
+    if (type == MessageType::get_object || type == MessageType::put_object)
         return TransportLane::data;
+    (void)frame_type;
     return TransportLane::control;
 }
 

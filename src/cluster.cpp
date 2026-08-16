@@ -359,7 +359,18 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             bool ok = cas_metadata(generation, hash, payload, &out);
             Writer writer;
             writer.u8(ok);
-            writer.bytes(encode_metadata_record(out));
+            if (ok) {
+                // The proposer already owns the exact payload accepted by this
+                // voter. Returning it again doubles the wire cost of every
+                // successful namespace mutation. A success acknowledgement only
+                // needs enough identity to prove which successor was installed;
+                // conflicts still return the complete current record below.
+                writer.u64(out.generation);
+                writer.fixed(out.previous.bytes);
+                writer.fixed(out.hash.bytes);
+            } else {
+                writer.bytes(encode_metadata_record(out));
+            }
             return {MessageType::cas_reply, writer.take()};
         }
         case MessageType::metadata_notice:

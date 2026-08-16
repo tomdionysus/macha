@@ -28,15 +28,15 @@ The current metadata voter set and data replica count are persisted in the names
 
 ## Transport
 
-A peer pair uses up to two persistent authenticated bidirectional TCP lanes. `CONTROL` carries heartbeat/health, membership and other small protocol operations. `DATA` carries object payloads plus prioritised metadata snapshots. DATA is lazy: ordinary cluster formation establishes CONTROL, and the second lane appears when a node needs object traffic or user/background metadata work.
+A peer pair uses up to two persistent authenticated bidirectional TCP lanes. `CONTROL` carries heartbeat/health, membership and other small protocol operations. `DATA` carries object payloads only. Prioritised metadata remains on CONTROL, and DATA is lazy: ordinary cluster formation establishes CONTROL while the second lane appears only when a node needs object traffic.
 
 Each lane is canonical independently by authenticated `(NodeId, lane)`, not endpoint text. Simultaneous cross-dial deterministically leaves at most one connection for each lane and drains duplicates before closing them.
 
-Protocol v9 transfers logical RPCs as variable-length AES-256-GCM frames. The authenticated handshake includes the lane and negotiates `network.max_frame_size` to the lower peer limit. The default is 256 KiB and the allowed range is 4 KiB..4 MiB. Frames are not padded to that size and storage extent size is independent of transport frame size. v8-and-earlier peers are intentionally incompatible.
+Protocol v10 transfers logical RPCs as variable-length AES-256-GCM frames. The authenticated handshake includes the lane and negotiates `network.max_frame_size` to the lower peer limit. The default is 256 KiB and the allowed range is 4 KiB..4 MiB. Frames are not padded to that size and storage extent size is independent of transport frame size. v9-and-earlier peers are intentionally incompatible.
 
-On DATA, frame priority is `foreground` > `read_ahead` > `speculative`; scheduling is reconsidered after every frame. Transfer-local promotion and cancellation notifications remain on DATA because request IDs are scoped to that lane. Health and membership never share a TCP byte stream with object payloads, so bulk retransmission/head-of-line blocking cannot directly delay liveness traffic.
+For data-class requests, frame priority is `foreground` > `read_ahead` > `speculative`; scheduling is reconsidered after every frame. Transfer-local promotion and cancellation notifications remain on DATA because object-transfer request IDs are scoped to that lane. Health and membership never share a TCP byte stream with object payloads, so bulk retransmission/head-of-line blocking cannot directly delay liveness traffic.
 
-The v9 handshake uses ephemeral X25519 authenticated with HMAC from the shared cluster key. Directional keys are derived with HKDF-SHA256. Server dispatch separately services control and data work, with foreground chosen before read-ahead before speculative queued data. User-originated metadata mutations use read-ahead priority on the DATA lane, while background metadata repair uses speculative priority; health and membership remain on CONTROL.
+The v10 handshake uses ephemeral X25519 authenticated with HMAC from the shared cluster key. Directional keys are derived with HKDF-SHA256. Server dispatch separately services control and data work, with foreground chosen before read-ahead before speculative queued data. User-originated metadata mutations use read-ahead frame priority and background metadata repair uses speculative frame priority, but both remain on the CONTROL transport so foreground object traffic keeps the DATA connection to itself. Health and membership use control-priority frames on CONTROL and therefore pre-empt fragmented metadata there.
 
 
 Nodes must be mutually reachable at their advertised addresses. There is no STUN, TURN, UPnP or NAT hole punching.

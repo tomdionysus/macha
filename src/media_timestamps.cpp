@@ -69,4 +69,13 @@ void normalize_media_timestamps(MediaTimestampRepairState& state,
     state.last_dts = packet.dts;
 }
 
+int64_t normalize_encoder_pts(int64_t& last_pts, int64_t pts) {
+    if (pts == kNoMediaTimestamp)
+        return pts;
+    if (last_pts != kNoMediaTimestamp && pts <= last_pts)
+        pts = last_pts == std::numeric_limits<int64_t>::max() ? last_pts : last_pts + 1;
+    last_pts = pts;
+    return pts;
+}
+
 } // namespace macha

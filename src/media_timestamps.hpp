@@ -42,4 +42,11 @@ struct MediaTimestampRepairState {
 void normalize_media_timestamps(MediaTimestampRepairState& state,
                                 MediaPacketTimestamps& packet);
 
+// Encoders require presentation timestamps to be strictly increasing in
+// display order. Demuxer best-effort timestamps can still collapse or move
+// backwards after rescaling to the encoder timebase, especially around seek
+// boundaries in imperfect files. Preserve AV_NOPTS_VALUE and otherwise nudge
+// only anomalous values forward by the minimum amount required.
+int64_t normalize_encoder_pts(int64_t& last_pts, int64_t pts);
+
 } // namespace macha

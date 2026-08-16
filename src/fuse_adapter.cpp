@@ -62,7 +62,12 @@ struct FuseLatency {
             if (!enabled)
                 return;
             const auto ms = elapsed_ms(started);
-            if (ms >= 50)
+            // Normal large-file writes on FUSE commonly take tens of
+            // milliseconds and logging every one obscures the actual stalls.
+            // Keep namespace latency sensitive, but only report data writes
+            // once they are clearly outside the normal streaming-write band.
+            const auto threshold_ms = std::strcmp(op, "write") == 0 ? 250 : 100;
+            if (ms >= threshold_ms)
                 Log::debug(std::string("DIAG slow-fuse op=") + op + " path=" +
                            (path ? path : "<null>") + " elapsed_ms=" + std::to_string(ms));
         } catch (...) {

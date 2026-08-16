@@ -120,6 +120,7 @@ std::string plain_ass_text(std::string text) {
 
 struct InputIoState {
     std::shared_ptr<MediaInput> input;
+    std::string media_id;
     uint64_t offset{};
     std::atomic_bool* cancelled{};
     Clock::time_point deadline{};
@@ -133,18 +134,32 @@ bool input_aborted(const InputIoState& state) {
 int input_read(void* opaque, uint8_t* buffer, int buffer_size) {
     auto& state = *static_cast<InputIoState*>(opaque);
     if (input_aborted(state)) return AVERROR_EXIT;
+    size_t wanted = 0;
     try {
         if (state.offset >= state.input->size()) return AVERROR_EOF;
-        auto wanted = static_cast<size_t>(std::min<uint64_t>(
+        wanted = static_cast<size_t>(std::min<uint64_t>(
             static_cast<uint64_t>(buffer_size), state.input->size() - state.offset));
         auto n = state.input->read(state.offset, {buffer, wanted}, state.deadline, state.cancelled);
         if (!n) return AVERROR_EOF;
         state.offset += n;
         return static_cast<int>(n);
+    } catch (const std::exception& error) {
+        if (state.cancelled && state.cancelled->load()) return AVERROR_EXIT;
+        if (state.deadline != Clock::time_point{} && Clock::now() >= state.deadline)
+            return AVERROR(ETIMEDOUT);
+        Log::warn("media input read failed media=" + state.media_id +
+                  " offset=" + std::to_string(state.offset) +
+                  " wanted=" + std::to_string(wanted) +
+                  " error=" + error.what());
+        return AVERROR(EIO);
     } catch (...) {
         if (state.cancelled && state.cancelled->load()) return AVERROR_EXIT;
         if (state.deadline != Clock::time_point{} && Clock::now() >= state.deadline)
             return AVERROR(ETIMEDOUT);
+        Log::warn("media input read failed media=" + state.media_id +
+                  " offset=" + std::to_string(state.offset) +
+                  " wanted=" + std::to_string(wanted) +
+                  " error=unknown");
         return AVERROR(EIO);
     }
 }
@@ -195,6 +210,7 @@ class InputContext {
             if (!source.open) throw std::runtime_error("media source has no reader factory");
             state_.input = source.open(purpose);
             if (!state_.input) throw std::runtime_error("media source reader could not be opened");
+            state_.media_id = source.media_id;
             state_.cancelled = cancelled;
             if (wall_timeout.count() > 0) state_.deadline = Clock::now() + wall_timeout;
 
@@ -583,6 +599,7 @@ struct StreamPipeline {
     // rescaling can. Keep the transformed stream equally strict.
     MediaTimestampRepairState encoded_timestamps;
     bool encoded_repair_reported{};
+    int64_t last_video_encoder_pts{AV_NOPTS_VALUE};
 
     ~StreamPipeline() {
         if (fifo) av_audio_fifo_free(fifo);
@@ -726,6 +743,15 @@ void encode_video_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame* 
                   frame->data, frame->linesize);
         frame->pts = source_pts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE
                      : av_rescale_q(source_pts, pipe.input_stream->time_base, pipe.encoder->time_base);
+        // best_effort_timestamp is normally monotonic, but malformed files and
+        // timestamp quantisation around seeks can still produce duplicate or
+        // backwards input PTS after rescaling to the encoder timebase. libx264
+        // rejects that assumption loudly and may buffer progress behind it.
+        // Repair before avcodec_send_frame(), rather than only repairing the
+        // encoded packet afterwards, so the encoder itself receives a strict
+        // display-order timeline.
+        static_assert(AV_NOPTS_VALUE == kNoMediaTimestamp);
+        frame->pts = normalize_encoder_pts(pipe.last_video_encoder_pts, frame->pts);
         if (frame->pts != AV_NOPTS_VALUE &&
             cuts.force_transcode_keyframe(frame->pts * av_q2d(pipe.encoder->time_base)))
             frame->pict_type = AV_PICTURE_TYPE_I;
