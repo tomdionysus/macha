@@ -3,7 +3,10 @@
 #include "crypto.hpp"
 #include <atomic>
 #include <filesystem>
+#include <condition_variable>
 #include <mutex>
+#include <stop_token>
+#include <thread>
 namespace macha {
 class StorageLock {
     int fd_{-1};
@@ -21,11 +24,16 @@ class LocalStore {
     std::array<uint8_t, 32> key_;
     std::atomic<uint64_t> used_{};
     mutable std::mutex m_;
+    mutable std::condition_variable scan_cv_;
+    std::jthread scan_thread_;
+    std::atomic_bool scan_complete_{};
     std::filesystem::path path(const ObjectId&) const;
-    void scan();
+    void wait_for_accounting(std::unique_lock<std::mutex>&) const;
+    void scan(std::stop_token);
 
   public:
     LocalStore(std::filesystem::path, uint64_t, std::array<uint8_t, 32>);
+    ~LocalStore();
     bool put(const ObjectId&, std::span<const uint8_t>);
     std::optional<Bytes> get(const ObjectId&) const;
     bool has(const ObjectId&) const;
@@ -41,6 +49,9 @@ class LocalStore {
     }
     uint64_t limit() const {
         return limit_;
+    }
+    bool scan_complete() const {
+        return scan_complete_.load();
     }
 };
 NodeId load_or_create_node_id(const std::filesystem::path&);

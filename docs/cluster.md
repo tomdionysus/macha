@@ -28,12 +28,15 @@ The current metadata voter set and data replica count are persisted in the names
 
 ## Transport
 
-Each peer pair has one persistent authenticated bidirectional TCP connection. It multiplexes all health, control and object traffic with 64-bit request IDs. Connections are canonical by authenticated node identity, not endpoint text; simultaneous cross-dial deterministically keeps one physical connection and drains the duplicate before closing it.
+A peer pair uses up to two persistent authenticated bidirectional TCP lanes. `CONTROL` carries heartbeat/health, membership, metadata and other small protocol operations. `DATA` carries object payload traffic. DATA is lazy: ordinary cluster formation establishes CONTROL, and the second lane appears only when a node actually needs an object transfer.
 
-Protocol v7 transfers logical RPCs as variable-length AES-256-GCM frames. `network.max_frame_size` is an upper bound, negotiated to the lower peer limit during the authenticated handshake; the default is 256 KiB and the allowed range is 4 KiB..4 MiB. Frames are not padded to that size. Storage extent size is independent of transport frame size.
+Each lane is canonical independently by authenticated `(NodeId, lane)`, not endpoint text. Simultaneous cross-dial deterministically leaves at most one connection for each lane and drains duplicates before closing them.
 
-Frame type is the sole source of transport priority: `control` > `foreground` > `read_ahead` > `speculative`. There is no separate numeric priority on the wire. The sender re-runs scheduling after every frame, so health/control and foreground data can pre-empt lower-priority transfers at frame boundaries. Speculative traffic is entitled only to otherwise spare transport capacity. A transfer may be promoted without changing request ID; subsequent frames use the more urgent frame type.
+Protocol v8 transfers logical RPCs as variable-length AES-256-GCM frames. The authenticated handshake includes the lane and negotiates `network.max_frame_size` to the lower peer limit. The default is 256 KiB and the allowed range is 4 KiB..4 MiB. Frames are not padded to that size and storage extent size is independent of transport frame size. v7 peers are intentionally incompatible.
 
-The v7 handshake uses ephemeral X25519 authenticated with HMAC from the shared cluster key and negotiates the frame ceiling. Directional keys are derived with HKDF-SHA256. Server dispatch likewise separates control execution from data work and always chooses foreground before read-ahead before speculative queued data.
+On DATA, frame priority is `foreground` > `read_ahead` > `speculative`; scheduling is reconsidered after every frame. Transfer-local promotion and cancellation notifications remain on DATA because request IDs are scoped to that lane. Health and membership never share a TCP byte stream with object payloads, so bulk retransmission/head-of-line blocking cannot directly delay liveness traffic.
+
+The v8 handshake uses ephemeral X25519 authenticated with HMAC from the shared cluster key. Directional keys are derived with HKDF-SHA256. Server dispatch separately services control and data work, with foreground chosen before read-ahead before speculative queued data.
+
 
 Nodes must be mutually reachable at their advertised addresses. There is no STUN, TURN, UPnP or NAT hole punching.
