@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.3 - 2026-08-16
+
+- Remove the obsolete `DistributedStore::scrub_offset_` member left behind by the 0.7.2 persistent scrub cursor rewrite. This fixes Clang builds using `-Werror,-Wunused-private-field`.
+
+## 0.7.2 - 2026-08-16
+
+- changed `StoragePool` locking so backend mutexes protect only in-memory backend state; filesystem operations (`has/get/put/remove/list`, marker checks and `LocalStore` destruction) run after copying the relevant `shared_ptr`, preventing slow disk enumeration or accounting-thread joins from blocking unrelated foreground/control work;
+- removed per-RPC storage-usage refresh from `NodeRuntime::handle()`, so `ping`, membership and metadata RPCs cannot depend on local disk state; usage/capacity is refreshed by the node loop and after successful storage mutations;
+- replaced scrub and local-rebalance full-store list rebuilding with persistent physical-object cursors. Each maintenance slice examines at most a bounded number of objects, retains its position across scheduler ticks and yields promptly when foreground I/O appears;
+- made scrub verify physical backend copies through the cursor and pause after a complete integrity pass instead of immediately beginning another full pass;
+- made rebalance distinguish an incomplete bounded slice from a genuinely quiescent full pass, so a large settled store no longer repeatedly enumerates from object zero or enters no-progress backoff before it has actually examined the namespace;
+- retained the two-lane v8 peer transport introduced in 0.7.1; this release changes local storage/maintenance behaviour only and does not change the wire protocol.
+
 ## 0.7.1 - 2026-08-16
 
 - split peer transport into two canonical authenticated bidirectional TCP lanes: CONTROL for health/membership/metadata and DATA for object transfer traffic. Each lane is independently deduplicated by NodeId, isolating control-plane latency from TCP head-of-line blocking and congestion on bulk transfers.

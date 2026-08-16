@@ -15,7 +15,9 @@ Repair works both ways:
 
 Background work is budgeted in bytes, not a fixed number of extents. The scheduler uses observed transfer rate, foreground activity and CPU load. Network repair, local disk rebalance and scrub have separate credits. With the default `busy_bandwidth_fraction: 0.0`, foreground I/O pauses background WAN repair.
 
-A settled pass that moves no bytes is treated as **quiescent**, not as permission to rescan immediately. Its credit is cleared and that maintenance class backs off for `no_progress_backoff_ms` (30 seconds by default). The full filesystem live-object inventory is built only when network repair has spendable budget or the garbage inventory is due. This specifically avoids background CPU spin where rebalance/repair repeatedly proves that there is nothing to do while generating little or no disk/network traffic. Catalogue and metadata repair checks are rate-limited to five seconds. Garbage/live-object inventory uses the larger of five seconds and `no_progress_backoff_ms`, so with the default configuration the expensive full inventory runs at most once every 30 seconds while settled.
+A settled complete pass that moves no bytes is treated as **quiescent**, not as permission to rescan immediately. Its credit is cleared and that maintenance class backs off for `no_progress_backoff_ms` (30 seconds by default). Local rebalance and scrub do not build whole-store vectors: each keeps a persistent physical-object cursor and examines at most a bounded number of objects per scheduler slice. An incomplete slice is not mistaken for quiescence. Scrub also pauses after reaching the end of a complete integrity pass before it starts again.
+
+The full filesystem live-object inventory is built only when network repair has spendable budget or the garbage inventory is due. Catalogue and metadata repair checks are rate-limited to five seconds. Garbage/live-object inventory uses the larger of five seconds and `no_progress_backoff_ms`, so with the default configuration the expensive full inventory runs at most once every 30 seconds while settled.
 
 ## Cache and hydration
 

@@ -221,7 +221,8 @@ bool NodeRuntime::cas_metadata(uint64_t generation, const Hash256& hash,
 
 RpcMessage NodeRuntime::handle(const NodeInfo&, const RpcMessage& request) {
     try {
-        members_.storage(local_.used(), local_.limit());
+        // Health/control must never depend on storage I/O. Capacity is refreshed
+        // by the node maintenance loop and after successful mutations below.
         switch (request.type) {
         case MessageType::ping:
             return {MessageType::ok, {}};

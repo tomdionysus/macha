@@ -245,16 +245,24 @@ void Service::loop(std::stop_token stop) {
                 }
             }
 
-            // Local disk rebalance has an independent byte credit: adding or
-            // returning a disk never consumes the network repair allowance. A
-            // no-op pass explicitly clears the credit and backs off; otherwise a
-            // settled pool with one extent of credit spins forever.
+            // Local maintenance advances persistent filesystem cursors. A scheduler
+            // slice examines at most 64 objects and yields immediately to foreground
+            // work; it never rebuilds a complete object list merely to discover that
+            // placement is already correct.
             if (!busy && now >= local_quiescent_until &&
                 local_credit >= node_.config().extent_size) {
-                auto used = node_.local_store().rebalance_once(static_cast<uint64_t>(local_credit));
-                if (used) {
-                    local_credit = std::max(0.0, local_credit - static_cast<double>(used));
-                } else {
+                auto rebalance = node_.local_store().rebalance_step(
+                    static_cast<uint64_t>(local_credit), 64,
+                    [this] {
+                        return store_.foreground_idle_for() <
+                               node_.config().maintenance.foreground_quiet;
+                    });
+                if (rebalance.bytes)
+                    local_credit = std::max(
+                        0.0, local_credit - static_cast<double>(rebalance.bytes));
+                if (rebalance.yielded) {
+                    Log::debug("maintenance: local rebalance yielded to foreground I/O");
+                } else if (rebalance.complete && !rebalance.bytes) {
                     local_credit = 0.0;
                     local_quiescent_until = Clock::now() + policy.no_progress_backoff;
                     Log::debug("maintenance: local rebalance quiescent; backing off no-progress scan");
@@ -263,13 +271,23 @@ void Service::loop(std::stop_token stop) {
 
             if (!busy && now >= scrub_quiescent_until &&
                 scrub_credit >= node_.config().extent_size) {
-                auto used = store_.scrub_once(static_cast<uint64_t>(scrub_credit));
-                if (used) {
-                    scrub_credit = std::max(0.0, scrub_credit - static_cast<double>(used));
-                } else {
+                auto scrub = node_.local_store().scrub_step(
+                    static_cast<uint64_t>(scrub_credit), 64,
+                    [this] {
+                        return store_.foreground_idle_for() <
+                               node_.config().maintenance.foreground_quiet;
+                    });
+                if (scrub.bytes)
+                    scrub_credit = std::max(0.0, scrub_credit - static_cast<double>(scrub.bytes));
+                if (scrub.yielded) {
+                    Log::debug("maintenance: scrub yielded to foreground I/O");
+                } else if (scrub.complete) {
+                    // A scrub is a complete integrity pass, not an endless loop.
+                    // After reaching the end, pause before beginning at object zero
+                    // again even though useful bytes were checked during the pass.
                     scrub_credit = 0.0;
                     scrub_quiescent_until = Clock::now() + policy.no_progress_backoff;
-                    Log::debug("maintenance: scrub quiescent; backing off no-progress scan");
+                    Log::debug("maintenance: scrub pass complete; backing off");
                 }
             }
 

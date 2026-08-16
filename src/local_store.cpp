@@ -182,24 +182,59 @@ bool LocalStore::remove(const ObjectId& i) {
     return true;
 }
 std::vector<ObjectId> LocalStore::list() const {
-    std::vector<ObjectId> o;
-    std::error_code e;
-    for (auto& x : std::filesystem::recursive_directory_iterator(objects_, e)) {
-        if (e)
-            break;
-        if (!x.is_regular_file())
-            continue;
-        auto n = x.path().filename().string();
-        if (n.size() != 68 || n.substr(64) != ".obj")
-            continue;
-        auto b = unhex(n.substr(0, 64));
-        if (!b || b->size() != 32)
-            continue;
-        ObjectId i;
-        std::copy(b->begin(), b->end(), i.bytes.begin());
-        o.push_back(i);
+    std::vector<ObjectId> out;
+    Cursor cursor;
+    bool exhausted = false;
+    while (!exhausted) {
+        if (auto id = next_object(cursor, exhausted))
+            out.push_back(*id);
     }
-    return o;
+    return out;
+}
+
+std::optional<ObjectId> LocalStore::next_object(Cursor& cursor, bool& exhausted) const {
+    exhausted = false;
+    std::error_code error;
+    if (!cursor.initialized) {
+        cursor.iterator = std::filesystem::recursive_directory_iterator(
+            objects_, std::filesystem::directory_options::skip_permission_denied, error);
+        cursor.initialized = true;
+        if (error) {
+            cursor = {};
+            exhausted = true;
+            return {};
+        }
+    }
+
+    const std::filesystem::recursive_directory_iterator end;
+    while (cursor.iterator != end) {
+        const auto entry = *cursor.iterator;
+        cursor.iterator.increment(error);
+        if (error) {
+            // A disk disappearing or a directory being removed while maintenance
+            // is walking it ends this pass. refresh() will independently update
+            // backend state; the next pass starts from the root again.
+            cursor = {};
+            exhausted = true;
+            return {};
+        }
+        std::error_code type_error;
+        if (!entry.is_regular_file(type_error) || type_error)
+            continue;
+        auto name = entry.path().filename().string();
+        if (name.size() != 68 || name.compare(64, 4, ".obj") != 0)
+            continue;
+        auto bytes = unhex(name.substr(0, 64));
+        if (!bytes || bytes->size() != 32)
+            continue;
+        ObjectId id;
+        std::copy(bytes->begin(), bytes->end(), id.bytes.begin());
+        return id;
+    }
+
+    cursor = {};
+    exhausted = true;
+    return {};
 }
 std::filesystem::path LocalStore::object_path(const ObjectId& i) const {
     return path(i);
@@ -226,7 +261,15 @@ bool LocalStore::older_than(const ObjectId& i, std::chrono::seconds age) const {
     return std::filesystem::file_time_type::clock::now() - t > age;
 }
 void LocalStore::wait_for_accounting(std::unique_lock<std::mutex>& lock) const {
-    scan_cv_.wait(lock, [this] { return scan_complete_.load(); });
+    // Only mutations need exact quota accounting. Reads, health and maintenance
+    // enumeration never wait for the startup reconciliation. Avoid a condition
+    // variable tied to object lifetime: the scan owns no caller lock and this
+    // path is used only during the short first-start reconciliation window.
+    while (!scan_complete_.load(std::memory_order_acquire)) {
+        lock.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        lock.lock();
+    }
 }
 
 void LocalStore::scan(std::stop_token stop) {
@@ -258,14 +301,10 @@ void LocalStore::scan(std::stop_token stop) {
     }
     {
         std::lock_guard guard(m_);
-        // Even during shutdown, release any mutation waiter. The object is being
-        // destroyed so the partial value is irrelevant; this avoids a stranded
-        // waiter if destruction races an initial scan.
         if (!stop.stop_requested())
-            used_ = n;
-        scan_complete_.store(true);
+            used_.store(n, std::memory_order_relaxed);
+        scan_complete_.store(true, std::memory_order_release);
     }
-    scan_cv_.notify_all();
     if (!stop.stop_requested())
         Log::debug("storage accounting scan complete path=" + root_.string() +
                    " used=" + std::to_string(n));
