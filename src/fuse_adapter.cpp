@@ -24,6 +24,7 @@
 #pragma clang diagnostic ignored "-Wdollar-in-identifier-extension"
 #endif
 #include <fuse.h>
+#include <fuse_lowlevel.h>
 #if defined(__APPLE__) && defined(__clang__)
 #pragma clang diagnostic pop
 #endif
@@ -31,6 +32,7 @@
 #include <memory>
 #include <sstream>
 #include <sys/stat.h>
+#include <thread>
 #include <sys/statvfs.h>
 #include <unistd.h>
 
@@ -577,17 +579,13 @@ fuse_operations operations() {
 
 int run_fuse(FileSystem& filesystem, const std::filesystem::path& mount_path, bool allow_other) {
     auto mount = mount_path.string();
-    std::vector<std::string> args{"macha"};
-    args.emplace_back("-f");
-    args.emplace_back("-o");
-    args.emplace_back(allow_other ? "default_permissions,allow_other,fsname=macha"
-                                  : "default_permissions,fsname=macha");
-    args.push_back(mount);
+    const std::string options = allow_other ? "default_permissions,allow_other,fsname=macha"
+                                            : "default_permissions,fsname=macha";
 
     char cwd[4096]{};
     std::string cwd_text = getcwd(cwd, sizeof(cwd)) ? cwd : "<getcwd failed>";
     if (Log::enabled(LogLevel::all))
-        Log::trace(std::string("FUSE TRACE mount begin path=") + mount + " options=" + args[3] +
+        Log::trace(std::string("FUSE TRACE mount begin path=") + mount + " options=" + options +
               " process_uid=" + std::to_string(getuid()) +
               " process_gid=" + std::to_string(getgid()) +
               " process_euid=" + std::to_string(geteuid()) +
@@ -604,16 +602,69 @@ int run_fuse(FileSystem& filesystem, const std::filesystem::path& mount_path, bo
                   std::to_string(errno) + " message=" + std::strerror(errno));
     }
 
-    std::vector<char*> argv;
-    argv.reserve(args.size());
-    for (auto& s : args)
-        argv.push_back(s.data());
+    // fuse_main() hides the session handle until it returns, which prevents a
+    // filesystem callback blocked in remote I/O from observing daemon shutdown.
+    // Use the equivalent high-level lifecycle directly so a watcher can observe
+    // fuse_session_exit() (set by libfuse's signal handlers) and cooperatively
+    // cancel outstanding mounted-filesystem writes.
+    std::vector<std::string> fuse_arg_storage{"macha", "-o", options};
+    std::vector<char*> fuse_argv;
+    fuse_argv.reserve(fuse_arg_storage.size());
+    for (auto& arg : fuse_arg_storage)
+        fuse_argv.push_back(arg.data());
+    struct fuse_args args = FUSE_ARGS_INIT(static_cast<int>(fuse_argv.size()), fuse_argv.data());
     auto ops = operations();
+    struct fuse* instance = fuse_new(&args, &ops, sizeof(ops), &filesystem);
+    if (!instance) {
+        fuse_opt_free_args(&args);
+        return 3;
+    }
+    if (fuse_mount(instance, mount.c_str()) != 0) {
+        fuse_destroy(instance);
+        fuse_opt_free_args(&args);
+        return 4;
+    }
+
+    auto* session = fuse_get_session(instance);
+    if (fuse_set_signal_handlers(session) != 0) {
+        fuse_unmount(instance);
+        fuse_destroy(instance);
+        fuse_opt_free_args(&args);
+        return 6;
+    }
+
+    filesystem.reset_write_cancellation();
+    std::jthread shutdown_watcher([&](std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            if (fuse_session_exited(session)) {
+                Log::debug("shutdown: FUSE session exit observed; cancelling filesystem writes");
+                filesystem.request_write_cancellation();
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    });
+
     Log::debug("shutdown: entering FUSE main loop");
-    int rc = fuse_main(static_cast<int>(argv.size()), argv.data(), &ops, &filesystem);
+    // FUSE_USE_VERSION=31 gives the stable fuse_loop_mt(fuse, clone_fd)
+    // interface on libfuse3/macFUSE while retaining the concurrent callbacks
+    // previously selected by fuse_main() (we deliberately did not pass -s).
+    int loop_rc = fuse_loop_mt(instance, 0);
+    filesystem.request_write_cancellation();
+    shutdown_watcher.request_stop();
+    if (shutdown_watcher.joinable())
+        shutdown_watcher.join();
+
+    fuse_remove_signal_handlers(session);
+    fuse_unmount(instance);
+    fuse_destroy(instance);
+    fuse_opt_free_args(&args);
+
+    const int rc = loop_rc == 0 ? 0 : 8;
     if (Log::enabled(LogLevel::all))
         Log::trace(std::string("FUSE TRACE mount end rc=") + std::to_string(rc));
     Log::debug("shutdown: FUSE main loop returned rc=" + std::to_string(rc));
     return rc;
 }
+
 } // namespace macha

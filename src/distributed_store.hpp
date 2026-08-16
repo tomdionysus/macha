@@ -70,8 +70,8 @@ class DistributedStore {
 
   public:
     explicit DistributedStore(NodeRuntime& n) : n_(n) {}
-    ObjectId put(std::span<const uint8_t>);
-    bool put(const ObjectId&, std::span<const uint8_t>);
+    ObjectId put(std::span<const uint8_t>, std::atomic_bool* cancelled = nullptr);
+    bool put(const ObjectId&, std::span<const uint8_t>, std::atomic_bool* cancelled = nullptr);
     std::optional<Bytes> get(const ObjectId&, size_t stripe = 0, bool foreground = true,
                              Clock::time_point deadline = {}, std::atomic_bool* cancelled = nullptr);
     std::optional<Bytes> get(const ObjectId&, size_t stripe, FrameType,
