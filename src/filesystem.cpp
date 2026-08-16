@@ -22,12 +22,6 @@ std::atomic_uint64_t next_write_handle_diagnostic_id{1};
 [[noreturn]] void fail(int c, const std::string& s) {
     throw FsError(c, s);
 }
-bool child(const std::string& c, const std::string& p) {
-    if (p == "/")
-        return c.size() > 1 && c.find('/', 1) == std::string::npos;
-    return c.size() > p.size() + 1 && c.compare(0, p.size(), p) == 0 && c[p.size()] == '/' &&
-           c.find('/', p.size() + 1) == std::string::npos;
-}
 bool under(const std::string& p, const std::string& r) {
     return p == r || (p.size() > r.size() && p.compare(0, r.size(), r) == 0 && p[r.size()] == '/');
 }
@@ -96,8 +90,8 @@ void queue_garbage(MetadataSnapshot& snapshot, const FsEntry& entry) {
 }
 } // namespace
 ReadHandle::ReadHandle(DistributedStore& s, FsEntry e, PlaybackTracker* playback,
-                       std::string path)
-    : s_(s), e_(std::move(e)), playback_(playback) {
+                       std::string path, FrameType frame_type)
+    : s_(s), e_(std::move(e)), playback_(playback), frame_type_(frame_type) {
     if (playback_)
         playback_session_ = playback_->open(std::move(path), e_);
     if (Log::enabled(LogLevel::all))
@@ -135,7 +129,7 @@ const Bytes& ReadHandle::extent(size_t i, Clock::time_point deadline,
 
     auto& x = e_.extents.at(i);
     auto started = Clock::now();
-    auto data = s_.get(x.id, i, true, deadline, cancelled);
+    auto data = s_.get(x.id, i, frame_type_, deadline, cancelled);
     if (!data) {
         if (cancelled && cancelled->load())
             fail(ECANCELED, "extent read cancelled");
@@ -190,8 +184,12 @@ size_t ReadHandle::read(uint64_t off, std::span<uint8_t> out, Clock::time_point 
     }
     bool seq = off == last_;
     last_ = off + done;
-    if (done)
-        s_.foreground_activity(done);
+    if (done) {
+        if (frame_type_ == FrameType::foreground)
+            s_.foreground_activity(done);
+        else if (frame_type_ == FrameType::read_ahead)
+            s_.interactive_activity(done);
+    }
     if (seq && done && playback_ && playback_session_ && last_extent != static_cast<size_t>(-1))
         playback_->progress(playback_session_, last_extent);
     return done;
@@ -663,6 +661,32 @@ MetadataSnapshot FileSystem::snap() {
     return m_.snapshot();
 }
 
+std::shared_ptr<const FileSystem::NamespaceIndex> FileSystem::namespace_index() {
+    auto view = m_.snapshot_view();
+    {
+        std::lock_guard lock(namespace_index_mutex_);
+        if (namespace_index_ && namespace_index_->generation == view.generation &&
+            namespace_index_->hash == view.hash)
+            return namespace_index_;
+    }
+
+    auto built = std::make_shared<NamespaceIndex>();
+    built->generation = view.generation;
+    built->hash = view.hash;
+    built->snapshot = std::move(view.snapshot);
+    for (const auto& [path, entry] : built->snapshot->entries) {
+        if (path == "/")
+            continue;
+        built->children[parent_path(path)].push_back({base_name(path), path});
+    }
+
+    std::lock_guard lock(namespace_index_mutex_);
+    if (!namespace_index_ || namespace_index_->generation < built->generation ||
+        (namespace_index_->generation == built->generation && namespace_index_->hash != built->hash))
+        namespace_index_ = built;
+    return namespace_index_;
+}
+
 void FileSystem::require_parent(const MetadataSnapshot& s, const std::string& p) {
     auto i = s.entries.find(parent_path(p));
     if (i == s.entries.end())
@@ -671,25 +695,31 @@ void FileSystem::require_parent(const MetadataSnapshot& s, const std::string& p)
         fail(ENOTDIR, "parent not directory");
 }
 FsEntry FileSystem::getattr(const std::string& p) {
-    auto s = snap();
-    auto i = s.entries.find(normalize_path(p));
-    if (i == s.entries.end())
+    auto index = namespace_index();
+    auto i = index->snapshot->entries.find(normalize_path(p));
+    if (i == index->snapshot->entries.end())
         fail(ENOENT, "not found");
     return i->second;
 }
 std::vector<std::pair<std::string, FsEntry>> FileSystem::readdir(const std::string& p) {
     auto q = normalize_path(p);
-    auto s = snap();
-    auto i = s.entries.find(q);
-    if (i == s.entries.end())
+    auto index = namespace_index();
+    auto entry = index->snapshot->entries.find(q);
+    if (entry == index->snapshot->entries.end())
         fail(ENOENT, "not found");
-    if (i->second.type != EntryType::directory)
+    if (entry->second.type != EntryType::directory)
         fail(ENOTDIR, "not directory");
-    std::vector<std::pair<std::string, FsEntry>> o;
-    for (auto& [x, e] : s.entries)
-        if (child(x, q))
-            o.push_back({base_name(x), e});
-    return o;
+    auto children = index->children.find(q);
+    if (children == index->children.end())
+        return {};
+    std::vector<std::pair<std::string, FsEntry>> result;
+    result.reserve(children->second.size());
+    for (const auto& [name, child_path] : children->second) {
+        auto child = index->snapshot->entries.find(child_path);
+        if (child != index->snapshot->entries.end())
+            result.emplace_back(name, child->second);
+    }
+    return result;
 }
 void FileSystem::mkdir(const std::string& p, uint32_t mode, uint32_t uid, uint32_t gid) {
     auto q = normalize_path(p);
@@ -930,42 +960,48 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
     // index only when that generation changes.  This turns repeated catalogue
     // media-id resolution during playback negotiation into an indexed lookup
     // rather than another complete namespace walk for every candidate.
-    const auto record = m_.read_record();
-    std::lock_guard lock(media_index_mutex_);
-    if (!media_index_valid_ || media_index_generation_ != record.generation) {
-        auto snapshot = decode_snapshot(record.payload);
-        std::map<std::string, std::pair<std::string, FsEntry>> next;
-        for (const auto& [path, entry] : snapshot.entries) {
-            if (entry.type != EntryType::file)
-                continue;
-            next.emplace(file_media_id(entry), std::pair{path, entry});
+    const auto view = m_.snapshot_view();
+    std::string media_path;
+    {
+        std::lock_guard lock(media_index_mutex_);
+        if (!media_index_valid_ || media_index_generation_ != view.generation) {
+            std::map<std::string, std::string> next;
+            for (const auto& [path, entry] : view.snapshot->entries) {
+                if (entry.type != EntryType::file)
+                    continue;
+                next.emplace(file_media_id(entry), path);
+            }
+            media_index_ = std::move(next);
+            media_index_generation_ = view.generation;
+            media_index_valid_ = true;
+            Log::debug("filesystem media index rebuilt generation=" +
+                       std::to_string(view.generation) + " files=" +
+                       std::to_string(media_index_.size()));
         }
-        media_index_ = std::move(next);
-        media_index_generation_ = record.generation;
-        media_index_valid_ = true;
-        Log::debug("filesystem media index rebuilt generation=" +
-                   std::to_string(record.generation) + " files=" +
-                   std::to_string(media_index_.size()));
+        auto found = media_index_.find(std::string(id));
+        if (found == media_index_.end())
+            return {};
+        media_path = found->second;
     }
-    auto found = media_index_.find(std::string(id));
-    if (found == media_index_.end())
+    auto entry = view.snapshot->entries.find(media_path);
+    if (entry == view.snapshot->entries.end() || entry->second.type != EntryType::file)
         return {};
-    return found->second;
+    return std::pair{media_path, entry->second};
 }
 
 std::shared_ptr<ReadHandle> FileSystem::open_read(const std::string& p) {
     auto e = getattr(p);
     if (e.type != EntryType::file)
         fail(EISDIR, "directory");
-    return open_read(e, p);
+    return open_read(e, p, false, FrameType::read_ahead);
 }
 
 std::shared_ptr<ReadHandle> FileSystem::open_read(const FsEntry& entry, const std::string& logical_path,
-                                                  bool track_playback) {
+                                                  bool track_playback, FrameType frame_type) {
     if (entry.type != EntryType::file)
         fail(EISDIR, "directory");
     return std::make_shared<ReadHandle>(s_, entry, track_playback ? playback_ : nullptr,
-                                        normalize_path(logical_path));
+                                        normalize_path(logical_path), frame_type);
 }
 std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool trunc) {
     // Serialize path lookup/registration with rename so an opening writer cannot
@@ -1121,8 +1157,8 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
             return maintenance_index_;
     }
 
-    auto record = m_.read_record();
-    auto snapshot = decode_snapshot(record.payload);
+    auto view = m_.snapshot_view();
+    const auto& snapshot = *view.snapshot;
     std::vector<ObjectId> live;
     size_t extents = 0;
     for (const auto& [_, entry] : snapshot.entries) {
@@ -1147,13 +1183,13 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
     auto built = std::make_shared<MaintenanceObjects>();
     built->live = std::move(live);
     built->garbage = std::move(garbage);
-    built->metadata_generation = record.generation;
+    built->metadata_generation = view.generation;
     built->entries = snapshot.entries.size();
     built->extents = extents;
 
     std::lock_guard lock(maintenance_index_mutex_);
-    if (!maintenance_index_ || record.generation >= maintenance_index_generation_) {
-        maintenance_index_generation_ = record.generation;
+    if (!maintenance_index_ || view.generation >= maintenance_index_generation_) {
+        maintenance_index_generation_ = view.generation;
         maintenance_index_ = built;
     }
     return maintenance_index_;

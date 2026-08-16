@@ -237,6 +237,10 @@ MetadataRecord MetadataReplica::committed() const {
     std::lock_guard g(m_);
     return committed_;
 }
+uint64_t MetadataReplica::generation() const {
+    std::lock_guard g(m_);
+    return cur_.generation;
+}
 bool MetadataReplica::cas(uint64_t g, const Hash256& h, std::span<const uint8_t> d,
                           MetadataRecord* out) {
     std::lock_guard l(m_);

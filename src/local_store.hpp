@@ -30,15 +30,22 @@ class LocalStore {
     };
 
   private:
-    std::filesystem::path root_, objects_;
+    std::filesystem::path root_, objects_, accounting_path_;
     uint64_t limit_;
     std::array<uint8_t, 32> key_;
     std::atomic<uint64_t> used_{};
     mutable std::mutex m_;
     std::jthread scan_thread_;
     std::atomic_bool scan_complete_{};
+    std::atomic_bool accounting_trusted_{};
+    int accounting_fd_{-1};
+    uint64_t accounting_sequence_{};
+    unsigned accounting_slot_{};
     std::filesystem::path path(const ObjectId&) const;
     void wait_for_accounting(std::unique_lock<std::mutex>&) const;
+    bool restore_accounting();
+    void persist_accounting(uint64_t used, uint8_t operation, const ObjectId&, uint64_t size,
+                            bool durable);
     void scan(std::stop_token);
 
   public:

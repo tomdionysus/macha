@@ -110,6 +110,23 @@ MetadataRecord MetadataManager::cache_record(const MetadataRecord& record) {
         std::lock_guard lock(cache_mutex_);
         cache_ = record;
         cache_until_ = Clock::now() + node_.config().metadata_cache;
+        if (decoded_cache_ && decoded_generation_ == record.generation && decoded_hash_ == record.hash)
+            return record;
+    }
+
+    // Decode only when the canonical record actually changes. Metadata reads can
+    // refresh their short quorum cache frequently; rebuilding tens of thousands
+    // of FsEntry/extent objects on every getattr was the dominant namespace cost.
+    auto decoded = std::make_shared<MetadataSnapshot>(decode_snapshot(record.payload));
+    {
+        std::lock_guard lock(cache_mutex_);
+        cache_ = record;
+        cache_until_ = Clock::now() + node_.config().metadata_cache;
+        if (!decoded_cache_ || decoded_generation_ != record.generation || decoded_hash_ != record.hash) {
+            decoded_cache_ = std::move(decoded);
+            decoded_generation_ = record.generation;
+            decoded_hash_ = record.hash;
+        }
     }
     return record;
 }
@@ -118,10 +135,20 @@ std::optional<MetadataRecord> MetadataManager::cached_record() {
     std::lock_guard lock(cache_mutex_);
     if (!cache_ || Clock::now() >= cache_until_)
         return {};
-    if (node_.metadata_replica().current().generation > cache_->generation ||
+    if (node_.metadata_replica().generation() > cache_->generation ||
         node_.remote_metadata_generation() > cache_->generation)
         return {};
     return cache_;
+}
+
+std::optional<MetadataSnapshotView> MetadataManager::cached_snapshot_view() {
+    std::lock_guard lock(cache_mutex_);
+    if (!decoded_cache_)
+        return {};
+    if (node_.metadata_replica().generation() > decoded_generation_ ||
+        node_.remote_metadata_generation() > decoded_generation_)
+        return {};
+    return MetadataSnapshotView{decoded_generation_, decoded_hash_, decoded_cache_};
 }
 
 bool MetadataManager::seed_quorum(const std::vector<NodeInfo>& nodes,
@@ -1012,8 +1039,18 @@ MetadataRecord MetadataManager::read_record() {
     }
 }
 
+MetadataSnapshotView MetadataManager::snapshot_view() {
+    if (auto cached = cached_snapshot_view())
+        return *cached;
+    (void)read_record();
+    if (auto cached = cached_snapshot_view())
+        return *cached;
+    throw std::runtime_error("metadata snapshot cache unavailable after successful read");
+}
+
 MetadataSnapshot MetadataManager::snapshot() {
-    return decode_snapshot(read_record().payload);
+    auto view = snapshot_view();
+    return *view.snapshot;
 }
 
 MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot&)>& mutate,

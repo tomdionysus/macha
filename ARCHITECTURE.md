@@ -167,7 +167,7 @@ Both lanes are canonical independently by authenticated `(NodeId, lane)`, not ho
 
 The authenticated v8 handshake includes the requested lane and negotiates `max_frame_size`; the lower configured ceiling wins. Logical messages are split into variable-length frames no larger than that ceiling. Storage extents remain storage objects and are not transport framing units. Each frame is independently AES-256-GCM protected. v7 peers are rejected because they do not authenticate a lane in the handshake.
 
-Within DATA, frame type defines priority completely: foreground, read-ahead, then speculative. The outbound scheduler selects the most urgent runnable transfer for every frame and returns to scheduling immediately afterwards. A promotion notification can raise an existing transfer and cancellation stops queued remainder frames without disturbing other request IDs. These transfer-local notifications remain on DATA because their request IDs are scoped to that connection. CONTROL frames are all control class; health therefore competes only with bounded control-plane work, never object payloads.
+Within DATA, frame type defines priority completely: foreground, read-ahead, then speculative. `foreground` is reserved for media playback/probe/seek and other viewer-blocking reads. Mounted-filesystem reads/writes and useful read-ahead use `read_ahead`; repair and low-value prediction use `speculative`. The outbound scheduler selects the most urgent runnable transfer for every frame and returns to scheduling immediately afterwards. A promotion notification can raise an existing transfer and cancellation stops queued remainder frames without disturbing other request IDs. Speculative `have_object` placement probes also travel on DATA rather than CONTROL, so a repair walk cannot delay membership or health. These transfer-local notifications remain on DATA because their request IDs are scoped to that connection. CONTROL frames are all control class; health therefore competes only with bounded control-plane work, never object payloads.
 
 RPCs have no wall-clock completion deadline. Control/data stall intervals are DEBUG observability thresholds only. Health probes use only the CONTROL lane; sustained inability to establish control-lane liveness within `dead_after` marks the peer dead.
 
@@ -237,9 +237,13 @@ Separate credits exist for:
 - local backend rebalance;
 - integrity scrub.
 
-Foreground I/O marks the store busy. During `foreground_quiet_ms`, local rebalance and scrub pause. With the default busy network fraction of zero, inter-node repair pauses as well. Credits are burst-capped.
+Viewer and mounted-filesystem activity both mark the store busy for background work, including activity arriving over DATA from another node. Viewer traffic is still the highest DATA priority; mount/read-ahead traffic is the medium class. During `foreground_quiet_ms`, local rebalance and scrub pause. With the default busy network fraction of zero, inter-node repair pauses as well. Credits are burst-capped. Replica repair is additionally capped by objects examined and remote operations so a zero-byte settled scan still consumes a finite CPU budget.
 
 Local backend state is deliberately separated from disk execution. A backend mutex protects only configuration/online state and the current `shared_ptr<LocalStore>`; the pointer is copied and the mutex released before any filesystem operation. Health/control handling therefore never waits behind a backend directory walk or `LocalStore` shutdown. Scrub, local rebalance and distributed push repair use independent persistent physical-object cursors, bounded per scheduler slice, rather than repeatedly materialising the full local object set. Distributed pull repair advances the immutable ordered live-object index directly and does not copy the complete live set for each slice.
+
+## Namespace read path
+
+The committed metadata record is decoded once per observed metadata generation into an immutable shared snapshot. FUSE `getattr` performs a direct lookup in that snapshot; `readdir` uses a generation-matched directory-child path index rather than scanning every namespace entry. Media-id resolution similarly caches only paths, not duplicate `FsEntry` extent manifests. A new committed generation invalidates these views atomically. This keeps ordinary stat/list cost proportional to the requested entry/directory rather than to the complete media namespace.
 
 ## Garbage collection
 

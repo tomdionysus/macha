@@ -578,6 +578,11 @@ struct StreamPipeline {
     // collapse two distinct source DTS values into one MP4 tick.
     MediaTimestampRepairState copy_timestamps;
     bool copy_repair_reported{};
+    // Encoders normally produce valid timestamps, but rescaling into the MP4
+    // stream timebase can collapse adjacent DTS values just as stream-copy
+    // rescaling can. Keep the transformed stream equally strict.
+    MediaTimestampRepairState encoded_timestamps;
+    bool encoded_repair_reported{};
 
     ~StreamPipeline() {
         if (fifo) av_audio_fifo_free(fifo);
@@ -738,9 +743,44 @@ void encode_video_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame* 
             avio_flush(output->pb);
         }
         av_packet_rescale_ts(encoded, pipe.encoder->time_base, pipe.output_stream->time_base);
+        static_assert(AV_NOPTS_VALUE == kNoMediaTimestamp);
+        const auto repairs_before = pipe.encoded_timestamps.repair_count();
+        MediaPacketTimestamps timestamps{encoded->pts, encoded->dts, encoded->duration};
+        normalize_media_timestamps(pipe.encoded_timestamps, timestamps);
+        encoded->pts = timestamps.pts;
+        encoded->dts = timestamps.dts;
+        encoded->duration = timestamps.duration;
+        if (!pipe.encoded_repair_reported &&
+            pipe.encoded_timestamps.repair_count() != repairs_before) {
+            pipe.encoded_repair_reported = true;
+            Log::warn("libav transcode repairing encoded video timestamps stream=" +
+                      std::to_string(pipe.input_index));
+        }
         encoded->stream_index = pipe.output_stream->index;
         encoded->pos = -1;
-        av_require(av_interleaved_write_frame(output, encoded), "mux encoded video packet");
+        const auto pts = encoded->pts;
+        const auto dts = encoded->dts;
+        const auto duration = encoded->duration;
+        const auto flags = encoded->flags;
+        const int mux_rc = av_interleaved_write_frame(output, encoded);
+        if (mux_rc < 0) {
+            Log::warn("libav mux rejected encoded video packet stream=" +
+                      std::to_string(pipe.input_index) +
+                      " pts=" + std::to_string(pts) +
+                      " dts=" + std::to_string(dts) +
+                      " duration=" + std::to_string(duration) +
+                      " key=" + std::string((flags & AV_PKT_FLAG_KEY) ? "true" : "false") +
+                      " encoder_tb=" + std::to_string(pipe.encoder->time_base.num) + "/" +
+                      std::to_string(pipe.encoder->time_base.den) +
+                      " output_tb=" + std::to_string(pipe.output_stream->time_base.num) + "/" +
+                      std::to_string(pipe.output_stream->time_base.den) +
+                      " size=" + std::to_string(pipe.encoder->width) + "x" +
+                      std::to_string(pipe.encoder->height) +
+                      " sar=" + std::to_string(pipe.encoder->sample_aspect_ratio.num) + "/" +
+                      std::to_string(pipe.encoder->sample_aspect_ratio.den) +
+                      " error=" + av_error(mux_rc));
+            av_require(mux_rc, "mux encoded video packet");
+        }
         avio_flush(output->pb);
         av_packet_unref(encoded);
     }
@@ -918,6 +958,13 @@ void flush_encoder(StreamPipeline& pipe, AVFormatContext* output, AVPacket* pack
         if (rc == AVERROR_EOF || rc == AVERROR(EAGAIN)) break;
         av_require(rc, "receive flushed packet");
         av_packet_rescale_ts(packet, pipe.encoder->time_base, pipe.output_stream->time_base);
+        if (pipe.type == MediaStreamType::video) {
+            MediaPacketTimestamps timestamps{packet->pts, packet->dts, packet->duration};
+            normalize_media_timestamps(pipe.encoded_timestamps, timestamps);
+            packet->pts = timestamps.pts;
+            packet->dts = timestamps.dts;
+            packet->duration = timestamps.duration;
+        }
         packet->stream_index = pipe.output_stream->index;
         packet->pos = -1;
         av_require(av_interleaved_write_frame(output, packet), "mux flushed packet");

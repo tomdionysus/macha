@@ -40,7 +40,9 @@ If an adopted disk disappears temporarily, it goes offline but keeps its placeme
 
 Adding or removing a backend in YAML and sending `SIGHUP` changes capacity without changing node identity. A newly adopted backend gains a proportional share of local placement; removing it from configuration removes that share. Current free space is never used as a placement weight.
 
-Backend activation no longer waits for a complete object-tree accounting scan. `LocalStore` comes online immediately and reconciles `used` bytes on a background thread. Reads are available during that scan; mutating operations wait for the initial accounting pass so capacity enforcement cannot race an unknown pre-existing store size. On a freshly upgraded large backend, membership may briefly advertise an incomplete `used` value, but placement weight remains the configured capacity and is unaffected.
+Each authoritative backend keeps a small two-slot checksummed `.macha.accounting` journal. A normal restart restores the exact encrypted bytes-used count from that journal without walking `objects/`. Before each local put/remove, Macha durably records the one pending content-addressed mutation; after the object rename/removal it advances the clean checkpoint. A crash can therefore be reconciled by checking at most that one object path.
+
+The first 0.8.4 startup of an older backend, or a missing/corrupt accounting journal, falls back to the former background object-tree reconciliation once and writes a trusted checkpoint when the scan completes. Reads remain available while this migration/recovery scan runs and mutations wait for exact capacity accounting. If that reconciliation is interrupted, its partial byte count is discarded rather than made authoritative. Placement weight remains configured capacity and never depends on the transient scan result.
 
 Backend state locks never cover filesystem I/O. `StoragePool` snapshots the backend state and takes a `shared_ptr<LocalStore>`, releases the backend mutex, then performs the disk operation. A backend can therefore be refreshed, removed or marked offline without a long `get`, directory walk or accounting-thread shutdown blocking health/control RPCs. An in-flight operation may finish against the old `LocalStore`; the shared pointer keeps it alive safely until that operation returns.
 
@@ -50,7 +52,7 @@ Scrub, local rebalance and distributed push repair use persistent filesystem cur
 
 The implemented filesystem operations cover ordinary media-library use: files and directories, create/open/read/write/truncate/unlink, mkdir/rmdir, rename, chmod/chown, timestamps, stat/statfs, directory enumeration, flush and fsync.
 
-0.8.3 does **not** implement symlinks, hard links, extended attributes, distributed advisory locks, full sparse-file semantics, or stable POSIX inode identity across every rename case. Access time is not tracked. Concurrent appenders use file-version CAS rather than a globally serialized append stream.
+0.8.4 does **not** implement symlinks, hard links, extended attributes, distributed advisory locks, full sparse-file semantics, or stable POSIX inode identity across every rename case. Access time is not tracked. Concurrent appenders use file-version CAS rather than a globally serialized append stream.
 
 A failed upload may leave unreachable immutable extents. Online garbage collection only removes objects known to have been dropped from committed metadata after a conservative grace period.
 
@@ -68,6 +70,7 @@ A failed upload may leave unreachable immutable extents. Online garbage collecti
 
 <storage backend>/
     .macha.backend
+    .macha.accounting
     objects/ab/cd/<sha256>.obj
 
 <cache path>/

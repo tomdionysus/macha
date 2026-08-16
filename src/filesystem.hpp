@@ -49,6 +49,7 @@ class ReadHandle {
     FsEntry e_;
     PlaybackTracker* playback_{};
     uint64_t playback_session_{};
+    FrameType frame_type_{FrameType::read_ahead};
     std::mutex m_;
     uint64_t last_{};
     size_t cached_index_{static_cast<size_t>(-1)};
@@ -57,7 +58,7 @@ class ReadHandle {
 
   public:
     ReadHandle(DistributedStore&, FsEntry, PlaybackTracker* = nullptr,
-               std::string path = {});
+               std::string path = {}, FrameType frame_type = FrameType::read_ahead);
     ~ReadHandle();
     size_t read(uint64_t, std::span<uint8_t>, Clock::time_point deadline = {},
                 std::atomic_bool* cancelled = nullptr);
@@ -122,10 +123,24 @@ class FileSystem {
     // Immutable media ids are used heavily by catalogue/playback resolution.
     // Cache their namespace lookup by metadata generation so playback startup
     // does not linearly re-hash every file for every candidate representation.
+    struct NamespaceIndex {
+        uint64_t generation{};
+        Hash256 hash{};
+        std::shared_ptr<const MetadataSnapshot> snapshot;
+        // Store names/paths only. The immutable snapshot already owns FsEntry
+        // manifests; duplicating every extent into the directory index would make
+        // cache memory proportional to the namespace twice over.
+        std::map<std::string, std::vector<std::pair<std::string, std::string>>, std::less<>> children;
+    };
+    std::mutex namespace_index_mutex_;
+    std::shared_ptr<const NamespaceIndex> namespace_index_;
+    std::shared_ptr<const NamespaceIndex> namespace_index();
+
     std::mutex media_index_mutex_;
     uint64_t media_index_generation_{};
     bool media_index_valid_{};
-    std::map<std::string, std::pair<std::string, FsEntry>> media_index_;
+    // Media ids map to paths only; FsEntry remains owned by the shared snapshot.
+    std::map<std::string, std::string> media_index_;
     std::mutex maintenance_index_mutex_;
     uint64_t maintenance_index_generation_{};
     std::shared_ptr<const MaintenanceObjects> maintenance_index_;
@@ -151,7 +166,8 @@ class FileSystem {
     // Open an already-resolved immutable metadata snapshot. Playback uses this
     // so a pathname replacement cannot change the bytes underneath a session.
     std::shared_ptr<ReadHandle> open_read(const FsEntry&, const std::string& logical_path,
-                                               bool track_playback = true);
+                                          bool track_playback = true,
+                                          FrameType frame_type = FrameType::foreground);
     std::optional<std::pair<std::string, FsEntry>> find_media(std::string_view);
     std::shared_ptr<WriteHandle> open_write(const std::string&, bool);
     std::optional<uint64_t> active_write_size(const std::string&);
@@ -165,6 +181,7 @@ class FileSystem {
     DistributedStore& store() {
         return s_;
     }
+    void note_interactive_activity(uint64_t bytes = 0) { s_.interactive_activity(bytes); }
     NodeRuntime& node() {
         return n_;
     }

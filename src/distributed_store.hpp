@@ -49,8 +49,6 @@ class DistributedStore {
     uint64_t repair_live_generation_{};
     bool repair_push_complete_{};
     bool repair_pull_complete_{};
-    std::atomic_uint64_t foreground_bytes_{};
-    std::atomic_int64_t last_foreground_ms_{};
     std::atomic<double> network_bps_{};
     mutable std::mutex fetch_mutex_;
     std::map<ObjectId, std::weak_ptr<SharedFetch>> fetches_;
@@ -76,6 +74,8 @@ class DistributedStore {
     bool put(const ObjectId&, std::span<const uint8_t>);
     std::optional<Bytes> get(const ObjectId&, size_t stripe = 0, bool foreground = true,
                              Clock::time_point deadline = {}, std::atomic_bool* cancelled = nullptr);
+    std::optional<Bytes> get(const ObjectId&, size_t stripe, FrameType,
+                             Clock::time_point deadline = {}, std::atomic_bool* cancelled = nullptr);
     bool has_on(const NodeInfo&, const ObjectId&);
     bool should_own(const ObjectId&) const;
     size_t replicate_all(const ObjectId&, std::span<const uint8_t>, bool foreground = false);
@@ -86,6 +86,7 @@ class DistributedStore {
                  FrameType frame_type = FrameType::speculative);
     void erase_all(const ObjectId&);
     void foreground_activity(uint64_t bytes) { note_foreground(bytes); }
+    void interactive_activity(uint64_t bytes) { n_.note_activity(FrameType::read_ahead, bytes); }
 
     // Converges remote placement and proactively pulls live objects for which
     // this node has become an owner. Bounded repair_step() calls retain push/pull
@@ -100,10 +101,12 @@ class DistributedStore {
                              uint64_t live_generation = 0);
     uint64_t scrub_once(uint64_t byte_budget = 0);
 
-    uint64_t take_foreground_bytes() {
-        return foreground_bytes_.exchange(0);
-    }
+    uint64_t take_foreground_bytes() { return n_.take_activity_bytes(FrameType::foreground); }
+    uint64_t take_interactive_bytes() { return n_.take_activity_bytes(FrameType::read_ahead); }
     std::chrono::milliseconds foreground_idle_for() const;
+    std::chrono::milliseconds interactive_idle_for() const {
+        return n_.activity_idle_for(FrameType::read_ahead);
+    }
     double estimated_network_bps() const {
         return network_bps_.load();
     }

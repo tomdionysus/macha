@@ -255,7 +255,7 @@ class RpcClient {
 
 class RpcServer {
   public:
-    using Handler = std::function<RpcMessage(const NodeInfo&, const RpcMessage&)>;
+    using Handler = std::function<RpcMessage(const NodeInfo&, FrameType, const RpcMessage&)>;
     using Observer = std::function<void(const NodeInfo&)>;
 
   private:

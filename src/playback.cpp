@@ -5,6 +5,7 @@
 #include "crypto.hpp"
 #include "json.hpp"
 #include "log.hpp"
+#include "macha_version.hpp"
 
 #include <algorithm>
 #include <array>
@@ -480,7 +481,7 @@ struct PlaybackManager::Impl {
                 -> std::shared_ptr<MediaInput> {
                 const bool track_playback = purpose == MediaReadPurpose::playback;
                 return std::make_shared<LogicalMediaInput>(
-                    fs.open_read(entry, path, track_playback), size);
+                    fs.open_read(entry, path, track_playback, FrameType::foreground), size);
             }};
     }
 
@@ -870,7 +871,7 @@ struct PlaybackManager::Impl {
         if (rest == "direct") {
             return ranged_response(request, session->source_entry.size, direct_mime(session->source.logical_path),
                                    [this, path = session->source.logical_path, entry = session->source_entry](uint64_t offset, uint64_t length) {
-                                       return std::make_shared<LogicalBody>(fs.open_read(entry, path), offset, length);
+                                       return std::make_shared<LogicalBody>(fs.open_read(entry, path, false, FrameType::foreground), offset, length);
                                    });
         }
         auto slash3 = rest.find('/');
@@ -1128,7 +1129,8 @@ struct PlaybackManager::Impl {
             video_transcodes = video_transcodes_locked();
             audio_transcodes = audio_transcodes_locked();
         }
-        Json::Object out{{"enabled", config.enabled},
+        Json::Object out{{"server_version", std::string(kServerVersion)},
+                         {"enabled", config.enabled},
                          {"sessions", static_cast<uint64_t>(session_count)},
                          {"max_sessions", static_cast<uint64_t>(config.max_sessions)},
                          {"video_transcodes", static_cast<uint64_t>(video_transcodes)},

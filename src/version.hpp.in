@@ -1,0 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+#include <string_view>
+namespace macha {
+inline constexpr std::string_view kServerVersion{"@PROJECT_VERSION@"};
+}

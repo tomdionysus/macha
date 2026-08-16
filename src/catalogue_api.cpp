@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "catalogue_api.hpp"
+#include "macha_version.hpp"
 
 #include "log.hpp"
 #include "json.hpp"
@@ -224,7 +225,7 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
     try {
         if (request.method == "GET" && request.path == "/api/v1/catalogue/status") {
             auto status = catalogue_.status();
-            std::string out = "{\"enabled\":true,\"ready\":" + std::string(status.ready ? "true" : "false");
+            std::string out = "{\"server_version\":" + json_escape(kServerVersion) + ",\"enabled\":true,\"ready\":" + std::string(status.ready ? "true" : "false");
             out += ",\"metadata_generation\":" + std::to_string(status.metadata_generation);
             out += ",\"root\":" + (status.root ? json_escape(to_string(*status.root)) : "null");
             out += ",\"items\":" + std::to_string(status.items);
