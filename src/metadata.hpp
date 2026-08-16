@@ -67,6 +67,7 @@ class MetadataReplica {
     bool cas(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
     bool seed(const MetadataRecord&);
     bool remember_committed(const MetadataRecord&);
+    bool remember_current_committed(uint64_t, const Hash256&);
 };
 std::string normalize_path(const std::string&);
 std::string parent_path(const std::string&);

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.5 - 2026-08-16
+
+- made foreground metadata mutation optimistic: a locally serialised namespace write starts from the node's durable current metadata record and lets quorum CAS detect staleness, instead of downloading and decoding the complete namespace from a quorum before every create/chmod/write commit. Metadata notices and CAS conflicts still force a quorum refresh before retry;
+- removed the redundant full-record seed round after a successful quorum metadata CAS. The CAS has already persisted the successor on a quorum; non-quorum voters converge through normal repair;
+- added compact `commit_metadata` quorum acknowledgements carrying only generation+hash. This replaces retransmitting the complete metadata record merely to mark already-installed CAS successors as committed recovery witnesses. Where supported, the durable `committed.meta` checkpoint is now an atomic hard link to the already-fsynced `current.meta` inode, with a full-write fallback;
+- route user-originated metadata mutation traffic on the DATA lane at `read_ahead` priority, below playback/seek `foreground` traffic but above speculative maintenance. Background metadata repair now uses DATA/speculative, leaving CONTROL for health, membership and small coordination traffic;
+- reduced DEBUG noise: broad thread CPU, lock, maintenance-stage, RPC handler/queue and storage timing telemetry is now ALL-only. DEBUG retains slow FUSE operations plus one compact slow metadata-mutation timing record with base/decode/encode/CAS/commit stages and payload size;
+- bumped wire protocol to v9 (`MCH9`, `macha/session/v9`) because prioritised metadata frames and the compact metadata-commit message are not compatible with v8 peers.
+
 ## 0.8.4 - 2026-08-16
 
 - made the priority hierarchy explicit across the cluster: current playback/probe/seek object traffic is `foreground`, mounted-filesystem I/O and useful read-ahead are `read_ahead`, and repair/scrub/rebalance remain `speculative`. Incoming foreground/read-ahead object RPCs now mark activity on the serving node as well, so a remote Pi yields background maintenance while serving a viewer or mount; playback remains above mount traffic in both outbound and server-side DATA scheduling;

@@ -77,11 +77,11 @@ void ThreadCpuReporter::tick(uint64_t iterations) {
                                       static_cast<double>(wall_ns))
                                    : 0.0;
 
-    if (Log::enabled(LogLevel::debug) && (report_idle_ || pct >= 1.0 || iterations_ > 0)) {
+    if (Log::enabled(LogLevel::all) && (report_idle_ || pct >= 1.0 || iterations_ > 0)) {
         const auto wall_ms = wall_ns / 1'000'000;
         const auto cpu_ms = cpu_ns / 1'000'000;
         const auto tenths = static_cast<long long>(std::llround(pct * 10.0));
-        Log::debug("DIAG thread name=" + name_ + " wall_ms=" + std::to_string(wall_ms) +
+        Log::trace("DIAG thread name=" + name_ + " wall_ms=" + std::to_string(wall_ms) +
                    " cpu_ms=" + std::to_string(cpu_ms) + " cpu_pct=" +
                    std::to_string(tenths / 10) + "." + std::to_string(std::abs(tenths % 10)) +
                    " iterations=" + std::to_string(iterations_));
@@ -95,7 +95,7 @@ void ThreadCpuReporter::tick(uint64_t iterations) {
 DiagnosticLock::DiagnosticLock(std::mutex& mutex, std::string_view name,
                                std::chrono::milliseconds threshold)
     : lock_(mutex, std::defer_lock), name_(name), threshold_(threshold),
-      enabled_(Log::enabled(LogLevel::debug)) {
+      enabled_(Log::enabled(LogLevel::all)) {
     if (!enabled_) {
         lock_.lock();
         return;
@@ -119,10 +119,10 @@ DiagnosticLock::~DiagnosticLock() noexcept {
         if (wait_ms_ < threshold_.count() && held_ms < threshold_.count())
             return;
         if (wait_ms_ >= threshold_.count())
-            Log::debug("DIAG lock-wait lock=" + std::string(name_) +
+            Log::trace("DIAG lock-wait lock=" + std::string(name_) +
                        " wait_ms=" + std::to_string(wait_ms_));
         if (held_ms >= threshold_.count())
-            Log::debug("DIAG lock-held lock=" + std::string(name_) +
+            Log::trace("DIAG lock-held lock=" + std::string(name_) +
                        " held_ms=" + std::to_string(held_ms) +
                        " wait_ms=" + std::to_string(wait_ms_));
     } catch (...) {

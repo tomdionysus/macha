@@ -348,7 +348,7 @@ void StoragePool::observe_get(size_t bytes, uint64_t elapsed) const {
            !diag_get_max_ms_.compare_exchange_weak(maximum, elapsed, std::memory_order_relaxed)) {
     }
 
-    if (!Log::enabled(LogLevel::debug))
+    if (!Log::enabled(LogLevel::all))
         return;
     const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                             Clock::now().time_since_epoch())
@@ -374,7 +374,7 @@ void StoragePool::observe_get(size_t bytes, uint64_t elapsed) const {
     const auto max_ms = diag_get_max_ms_.exchange(0, std::memory_order_relaxed);
     if (!gets)
         return;
-    Log::debug("DIAG storage-get window_ms=" + std::to_string(window_ms) +
+    Log::trace("DIAG storage-get window_ms=" + std::to_string(window_ms) +
                " gets=" + std::to_string(gets) +
                " bytes=" + std::to_string(total_bytes) +
                " avg_ms=" + std::to_string(total_ms / gets) +

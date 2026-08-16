@@ -32,7 +32,7 @@ class ThreadCpuReporter {
 };
 
 // Use only around important shared locks. It reports waits/holds above the
-// threshold at DEBUG and otherwise behaves like an ordinary unique_lock.
+// threshold at ALL and otherwise behaves like an ordinary unique_lock.
 class DiagnosticLock {
     std::unique_lock<std::mutex> lock_;
     std::string_view name_;

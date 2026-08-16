@@ -87,8 +87,8 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
 
     // The metadata cache is deliberately independent of node state. If node
     // state was restored from an older backup but the SSD cache survived, a
-    // newer valid snapshot can improve read-only/offline startup. Normal quorum
-    // reads still arbitrate before any mutation.
+    // newer valid snapshot can improve read-only/offline startup. Mutations use
+    // quorum CAS as the authority; a stale local base is rejected and refreshed.
     if (auto cached = cache_.metadata()) {
         if (cached->generation > meta_.committed().generation) {
             (void)meta_.seed(*cached);
@@ -247,6 +247,19 @@ bool NodeRuntime::checkpoint_metadata(const MetadataRecord& record) {
     return checkpointed;
 }
 
+bool NodeRuntime::commit_metadata(uint64_t generation, const Hash256& hash) {
+    auto before = meta_.committed();
+    const bool checkpointed = meta_.remember_current_committed(generation, hash);
+    if (!checkpointed)
+        return false;
+    auto committed = meta_.committed();
+    members_.metadata_generation(committed.generation);
+    cache_.remember_metadata(committed);
+    if (committed.hash != before.hash)
+        announce_metadata_generation(committed.generation);
+    return true;
+}
+
 bool NodeRuntime::cas_metadata(uint64_t generation, const Hash256& hash,
                                std::span<const uint8_t> payload, MetadataRecord* out) {
     // A successful per-voter CAS is only a proposal until MetadataManager has
@@ -327,6 +340,15 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             writer.u8(checkpoint_metadata(metadata));
             return {MessageType::bool_reply, writer.take()};
         }
+        case MessageType::commit_metadata: {
+            Reader reader(request.payload);
+            const auto generation = reader.u64();
+            Hash256 hash{reader.fixed<32>()};
+            reader.finish();
+            Writer writer;
+            writer.u8(commit_metadata(generation, hash));
+            return {MessageType::bool_reply, writer.take()};
+        }
         case MessageType::cas_metadata: {
             Reader reader(request.payload);
             auto generation = reader.u64();
@@ -388,8 +410,8 @@ void NodeRuntime::loop(std::stop_token stop) {
         const auto refresh_started = Clock::now();
         local_.refresh();
         const auto refresh_ms = elapsed_ms(refresh_started);
-        if (refresh_ms >= 100 && Log::enabled(LogLevel::debug))
-            Log::debug("DIAG node-stage stage=storage-refresh elapsed_ms=" +
+        if (refresh_ms >= 100 && Log::enabled(LogLevel::all))
+            Log::trace("DIAG node-stage stage=storage-refresh elapsed_ms=" +
                        std::to_string(refresh_ms));
         members_.storage(local_.used(), local_.limit());
         members_.metadata_generation(meta_.current().generation);
