@@ -44,13 +44,13 @@ Backend activation no longer waits for a complete object-tree accounting scan. `
 
 Backend state locks never cover filesystem I/O. `StoragePool` snapshots the backend state and takes a `shared_ptr<LocalStore>`, releases the backend mutex, then performs the disk operation. A backend can therefore be refreshed, removed or marked offline without a long `get`, directory walk or accounting-thread shutdown blocking health/control RPCs. An in-flight operation may finish against the old `LocalStore`; the shared pointer keeps it alive safely until that operation returns.
 
-Scrub and local rebalance use persistent filesystem cursors. They advance a bounded number of physical objects per scheduler slice instead of rebuilding a complete object list for every small maintenance budget. Rebalance declares quiescence only after a complete pass finds no work. Scrub pauses for `maintenance.no_progress_backoff_ms` after completing an integrity pass before starting at the beginning again.
+Scrub, local rebalance and distributed push repair use persistent filesystem cursors. They advance a bounded number of physical objects per scheduler slice instead of rebuilding a complete object list for every small maintenance budget. Distributed pull repair advances the cached ordered live-object index directly rather than copying it into a complete vector for each slice. Rebalance/repair declare quiescence only after a complete pass finds no work. Scrub pauses for `maintenance.no_progress_backoff_ms` after completing an integrity pass before starting at the beginning again.
 
 ## Filesystem limits
 
 The implemented filesystem operations cover ordinary media-library use: files and directories, create/open/read/write/truncate/unlink, mkdir/rmdir, rename, chmod/chown, timestamps, stat/statfs, directory enumeration, flush and fsync.
 
-0.8.2 does **not** implement symlinks, hard links, extended attributes, distributed advisory locks, full sparse-file semantics, or stable POSIX inode identity across every rename case. Access time is not tracked. Concurrent appenders use file-version CAS rather than a globally serialized append stream.
+0.8.3 does **not** implement symlinks, hard links, extended attributes, distributed advisory locks, full sparse-file semantics, or stable POSIX inode identity across every rename case. Access time is not tracked. Concurrent appenders use file-version CAS rather than a globally serialized append stream.
 
 A failed upload may leave unreachable immutable extents. Online garbage collection only removes objects known to have been dropped from committed metadata after a conservative grace period.
 

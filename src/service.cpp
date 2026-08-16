@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "service.hpp"
 #include "log.hpp"
+#include "diagnostics.hpp"
 #include <algorithm>
 #include <cmath>
 #include <ctime>
@@ -8,6 +9,23 @@
 #include <thread>
 
 namespace macha {
+
+std::chrono::milliseconds maintenance_background_interval(const MaintenanceConfig& policy) {
+    return std::max(std::chrono::milliseconds(5000), policy.no_progress_backoff);
+}
+
+namespace {
+void log_slow_stage(std::string_view stage, Clock::time_point started,
+                    const std::string& detail = {}) {
+    const auto ms = elapsed_ms(started);
+    if (ms < 50 || !Log::enabled(LogLevel::debug))
+        return;
+    Log::debug("DIAG maintenance-stage stage=" + std::string(stage) +
+               " elapsed_ms=" + std::to_string(ms) +
+               (detail.empty() ? std::string{} : " " + detail));
+}
+} // namespace
+
 Service::Service(Config config, ClusterKeys keys)
     : node_(std::move(config), keys), store_(node_), metadata_(node_),
       catalogue_(node_, store_, metadata_), fs_(node_, store_, metadata_, &playback_),
@@ -96,10 +114,10 @@ void Service::reload_config() {
 void Service::collect_garbage(const std::vector<ObjectId>& garbage) {
     const auto grace = node_.config().maintenance.garbage_grace;
     const auto now = Clock::now();
-    std::set<ObjectId> candidates(garbage.begin(), garbage.end());
+    const auto& candidates = garbage;
 
     for (auto it = garbage_seen_.begin(); it != garbage_seen_.end();) {
-        if (!candidates.contains(it->first))
+        if (!std::binary_search(candidates.begin(), candidates.end(), it->first))
             it = garbage_seen_.erase(it);
         else
             ++it;
@@ -120,6 +138,8 @@ void Service::collect_garbage(const std::vector<ObjectId>& garbage) {
 
 void Service::loop(std::stop_token stop) {
     const auto& policy = node_.config().maintenance;
+    const auto background_interval = maintenance_background_interval(policy);
+    ThreadCpuReporter cpu_reporter("macha-maint", std::chrono::seconds(5), true);
     auto last_wall = Clock::now();
     auto last_cpu = std::clock();
     auto last_metadata = Clock::time_point{};
@@ -170,20 +190,26 @@ void Service::loop(std::stop_token stop) {
         try {
             // Metadata maintenance is small but quorum-oriented. Keep it regular
             // while avoiding a control-plane RPC burst on every scheduler tick.
-            if (last_metadata == Clock::time_point{} || now - last_metadata >= std::chrono::seconds(5)) {
+            if (!busy &&
+                (last_metadata == Clock::time_point{} || now - last_metadata >= background_interval)) {
+                const auto stage = Clock::now();
                 metadata_.repair_once();
+                log_slow_stage("metadata-repair", stage);
                 last_metadata = now;
             }
 
-            // Catalogue state is cluster metadata. Checking it on every 500 ms
-            // scheduler tick was pure settled-state churn; five seconds still
-            // converges quickly without continuously re-reading metadata.
-            if (last_catalogue == Clock::time_point{} || now - last_catalogue >= std::chrono::seconds(5)) {
+            // Metadata notices and foreground reads provide prompt convergence.
+            // Settled background verification uses the no-progress backoff rather
+            // than creating a control-plane quorum burst every five seconds.
+            if (!busy &&
+                (last_catalogue == Clock::time_point{} || now - last_catalogue >= background_interval)) {
+                const auto stage = Clock::now();
                 try {
                     catalogue_.repair_once();
                 } catch (const std::exception& e) {
                     Log::debug("catalogue sync: " + std::string(e.what()));
                 }
+                log_slow_stage("catalogue-repair", stage);
                 last_catalogue = now;
             }
 
@@ -191,23 +217,49 @@ void Service::loop(std::stop_token stop) {
                 !busy || policy.busy_bandwidth_fraction > 0.0;
             const bool network_due = allow_network_repair && now >= network_quiescent_until &&
                                      network_credit >= node_.config().extent_size;
-            const bool garbage_due = last_garbage_inventory == Clock::time_point{} ||
-                                     now - last_garbage_inventory >= std::chrono::seconds(5);
+            const bool garbage_due =
+                !busy && (last_garbage_inventory == Clock::time_point{} ||
+                          now - last_garbage_inventory >= background_interval);
 
             // Enumerating every live extent is O(namespace size), and doing it on
             // every scheduler tick made a settled node burn CPU while performing
             // no I/O. Build the inventory only when repair can actually spend a
             // budget or when garbage accounting is due.
             if (network_due || garbage_due) {
-                auto objects = fs_.maintenance_objects();
-                std::set<ObjectId> live(objects.live.begin(), objects.live.end());
-                std::set<ObjectId> universal;
-                auto catalogue_objects = catalogue_.maintenance_objects();
-                live.insert(catalogue_objects.live.begin(), catalogue_objects.live.end());
-                universal.insert(catalogue_objects.universal.begin(),
-                                 catalogue_objects.universal.end());
-                std::erase_if(objects.garbage,
-                              [&](const ObjectId& id) { return live.contains(id); });
+                const auto inventory_stage = Clock::now();
+                auto objects = fs_.maintenance_objects_cached();
+                bool rebuilt_inventory = false;
+                if (!maintenance_live_ ||
+                    maintenance_inventory_generation_ != objects->metadata_generation) {
+                    auto live = std::make_shared<std::vector<ObjectId>>(objects->live);
+                    auto universal = std::make_shared<std::vector<ObjectId>>();
+                    auto catalogue_objects = catalogue_.maintenance_objects();
+                    live->insert(live->end(), catalogue_objects.live.begin(), catalogue_objects.live.end());
+                    universal->insert(universal->end(), catalogue_objects.universal.begin(),
+                                      catalogue_objects.universal.end());
+                    std::sort(live->begin(), live->end());
+                    live->erase(std::unique(live->begin(), live->end()), live->end());
+                    std::sort(universal->begin(), universal->end());
+                    universal->erase(std::unique(universal->begin(), universal->end()),
+                                     universal->end());
+                    maintenance_garbage_ = objects->garbage;
+                    std::erase_if(maintenance_garbage_, [&](const ObjectId& id) {
+                        return std::binary_search(live->begin(), live->end(), id);
+                    });
+                    maintenance_inventory_generation_ = objects->metadata_generation;
+                    maintenance_live_ = std::move(live);
+                    maintenance_universal_ = std::move(universal);
+                    rebuilt_inventory = true;
+                }
+                if (rebuilt_inventory && Log::enabled(LogLevel::debug)) {
+                    Log::debug("DIAG maintenance-inventory generation=" +
+                               std::to_string(objects->metadata_generation) +
+                               " entries=" + std::to_string(objects->entries) +
+                               " extents=" + std::to_string(objects->extents) +
+                               " live=" + std::to_string(maintenance_live_->size()) +
+                               " garbage=" + std::to_string(maintenance_garbage_.size()) +
+                               " elapsed_ms=" + std::to_string(elapsed_ms(inventory_stage)));
+                }
 
                 if (network_due) {
                     const auto byte_budget = static_cast<uint64_t>(network_credit);
@@ -218,15 +270,25 @@ void Service::loop(std::stop_token stop) {
                     // network credit. Bound each repair slice independently.
                     const size_t operation_budget = static_cast<size_t>(std::clamp<uint64_t>(
                         (byte_budget / extent) * 2, 8, 64));
+                    const auto repair_stage = Clock::now();
                     auto repair = store_.repair_step(
-                        byte_budget, operation_budget, &live, &universal,
+                        byte_budget, operation_budget, maintenance_live_.get(),
+                        maintenance_universal_.get(),
                         [this] {
                             // End the current maintenance slice as soon as any
                             // foreground I/O appears. The next scheduler pass
                             // will re-evaluate busy_bandwidth_fraction normally.
                             return store_.foreground_idle_for() <
                                    node_.config().maintenance.foreground_quiet;
-                        });
+                        },
+                        maintenance_inventory_generation_);
+                    log_slow_stage("network-repair", repair_stage,
+                                   "bytes=" + std::to_string(repair.bytes_transferred) +
+                                   " push_examined=" + std::to_string(repair.push_examined) +
+                                   " pull_examined=" + std::to_string(repair.pull_examined) +
+                                   " remote_ops=" + std::to_string(repair.remote_operations) +
+                                   " complete=" + std::to_string(repair.complete ? 1 : 0) +
+                                   " yielded=" + std::to_string(repair.yielded ? 1 : 0));
                     if (repair.bytes_transferred) {
                         network_credit = std::max(
                             0.0, network_credit - static_cast<double>(repair.bytes_transferred));
@@ -240,7 +302,7 @@ void Service::loop(std::stop_token stop) {
                     }
                 }
                 if (garbage_due) {
-                    collect_garbage(objects.garbage);
+                    collect_garbage(maintenance_garbage_);
                     last_garbage_inventory = now;
                 }
             }
@@ -251,12 +313,16 @@ void Service::loop(std::stop_token stop) {
             // placement is already correct.
             if (!busy && now >= local_quiescent_until &&
                 local_credit >= node_.config().extent_size) {
+                const auto rebalance_stage = Clock::now();
                 auto rebalance = node_.local_store().rebalance_step(
                     static_cast<uint64_t>(local_credit), 64,
                     [this] {
                         return store_.foreground_idle_for() <
                                node_.config().maintenance.foreground_quiet;
                     });
+                log_slow_stage("local-rebalance", rebalance_stage,
+                               "bytes=" + std::to_string(rebalance.bytes) +
+                               " objects=" + std::to_string(rebalance.objects));
                 if (rebalance.bytes)
                     local_credit = std::max(
                         0.0, local_credit - static_cast<double>(rebalance.bytes));
@@ -271,12 +337,16 @@ void Service::loop(std::stop_token stop) {
 
             if (!busy && now >= scrub_quiescent_until &&
                 scrub_credit >= node_.config().extent_size) {
+                const auto scrub_stage = Clock::now();
                 auto scrub = node_.local_store().scrub_step(
                     static_cast<uint64_t>(scrub_credit), 64,
                     [this] {
                         return store_.foreground_idle_for() <
                                node_.config().maintenance.foreground_quiet;
                     });
+                log_slow_stage("scrub", scrub_stage,
+                               "bytes=" + std::to_string(scrub.bytes) +
+                               " objects=" + std::to_string(scrub.objects));
                 if (scrub.bytes)
                     scrub_credit = std::max(0.0, scrub_credit - static_cast<double>(scrub.bytes));
                 if (scrub.yielded) {
@@ -295,6 +365,7 @@ void Service::loop(std::stop_token stop) {
             Log::debug("maintenance: " + std::string(e.what()));
         }
 
+        cpu_reporter.tick();
         auto until = Clock::now() + policy.interval;
         while (!stop.stop_requested() && Clock::now() < until)
             std::this_thread::sleep_for(std::chrono::milliseconds(25));

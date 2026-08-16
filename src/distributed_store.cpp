@@ -5,6 +5,7 @@
 #include "placement.hpp"
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <set>
 
 namespace macha {
@@ -73,7 +74,8 @@ ObjectId DistributedStore::put(std::span<const uint8_t> data) {
     if (!put(id, data))
         throw std::runtime_error("object replication quorum unavailable");
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
-    Log::debug("DIAG object-put id=" + to_string(id) +
+    if (Log::enabled(LogLevel::all))
+        Log::trace("DIAG object-put id=" + to_string(id) +
                " bytes=" + std::to_string(data.size()) +
                " ms=" + std::to_string(elapsed.count()));
     return id;
@@ -505,7 +507,8 @@ std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, bo
             note_foreground(data->size());
         auto elapsed =
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
-        Log::debug("DIAG object-get id=" + to_string(id) +
+        if (Log::enabled(LogLevel::all))
+            Log::trace("DIAG object-get id=" + to_string(id) +
                    " source=owned bytes=" + std::to_string(data->size()) +
                    " ms=" + std::to_string(elapsed.count()));
         return data;
@@ -518,7 +521,8 @@ std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, bo
             n_.enqueue_fetched(id, *cached, true);
         auto elapsed =
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
-        Log::debug("DIAG object-get id=" + to_string(id) +
+        if (Log::enabled(LogLevel::all))
+            Log::trace("DIAG object-get id=" + to_string(id) +
                    " source=cache bytes=" + std::to_string(cached->size()) +
                    " ms=" + std::to_string(elapsed.count()));
         return cached;
@@ -530,7 +534,8 @@ std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, bo
                            foreground ? FrameType::foreground : FrameType::speculative,
                            foreground, foreground, deadline, cancelled);
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
-    Log::debug("DIAG object-get id=" + to_string(id) +
+    if (Log::enabled(LogLevel::all))
+        Log::trace("DIAG object-get id=" + to_string(id) +
                " source=remote result=" + std::to_string(data ? 1 : 0) +
                " bytes=" + std::to_string(data ? data->size() : 0) +
                " ms=" + std::to_string(elapsed.count()));
@@ -623,19 +628,49 @@ uint64_t DistributedStore::scrub_once(uint64_t byte_budget) {
     return checked;
 }
 
-uint64_t DistributedStore::repair_once(uint64_t byte_budget, const std::set<ObjectId>* live,
-                                       const std::set<ObjectId>* universal) {
+uint64_t DistributedStore::repair_once(uint64_t byte_budget, const std::vector<ObjectId>* live,
+                                       const std::vector<ObjectId>* universal) {
     return repair_step(byte_budget, 0, live, universal).bytes_transferred;
 }
 
 DistributedStore::RepairResult
 DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
-                              const std::set<ObjectId>* live,
-                              const std::set<ObjectId>* universal,
-                              const std::function<bool()>& should_yield) {
+                              const std::vector<ObjectId>* live,
+                              const std::vector<ObjectId>* universal,
+                              const std::function<bool()>& should_yield,
+                              uint64_t live_generation) {
     RepairResult result;
+    result.complete = false;
     auto& transferred = result.bytes_transferred;
     size_t operations = 0;
+
+    // Repair is deliberately cursor-based. The old implementation rebuilt a
+    // complete vector of every locally stored object and copied the complete
+    // live-object set on every scheduler slice, then usually examined only a
+    // handful of objects before the RPC operation budget was exhausted. On a
+    // media-sized store that made idle repair itself an O(store) hot loop.
+    const bool generation_changed =
+        live_generation ? repair_live_generation_ != live_generation
+                        : repair_live_identity_ != live;
+    if (generation_changed) {
+        repair_push_cursor_ = {};
+        repair_push_pending_.reset();
+        repair_pull_after_.reset();
+        repair_push_complete_ = false;
+        repair_pull_complete_ = false;
+    }
+    repair_live_identity_ = live;
+    repair_live_generation_ = live_generation;
+    if (!live || live->empty())
+        repair_pull_complete_ = true;
+
+    auto reset_completed_pass = [&] {
+        repair_push_cursor_ = {};
+        repair_push_pending_.reset();
+        repair_pull_after_.reset();
+        repair_push_complete_ = false;
+        repair_pull_complete_ = !live || live->empty();
+    };
 
     auto yielded = [&] {
         if (should_yield && should_yield()) {
@@ -651,6 +686,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             return false;
         }
         ++operations;
+        result.remote_operations = operations;
         return true;
     };
 
@@ -712,45 +748,71 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
         }
     };
 
-    // First, existing local replicas push toward the current deterministic owner
-    // set. Deletion happens only after the target number of good replicas has
-    // been confirmed, preserving availability during membership churn.
-    auto ids = n_.local_store().list();
-    if (live)
-        std::erase_if(ids, [&](const ObjectId& id) { return !live->contains(id); });
-    if (!ids.empty()) {
-        repair_offset_ %= ids.size();
-        std::rotate(ids.begin(), ids.begin() + repair_offset_, ids.end());
-        size_t processed = 0;
-        for (const auto& id : ids) {
+    // Limit cheap local/live-set examinations independently of remote RPCs. A
+    // settled object may require no network operation at all; without a scan
+    // budget a single maintenance tick could still walk millions of objects.
+    const size_t scan_budget = operation_budget
+                                   ? std::clamp<size_t>(operation_budget * 8, 64, 512)
+                                   : std::numeric_limits<size_t>::max();
+
+    // Push existing local replicas toward the current deterministic owner set.
+    if (!repair_push_complete_) {
+        size_t scanned = 0;
+        while (scanned < scan_budget && !repair_push_complete_) {
             if (yielded())
                 break;
-            if (byte_budget && transferred >= byte_budget) {
-                result.complete = false;
+            if (byte_budget && transferred >= byte_budget)
                 break;
+            if (operation_budget && operations >= operation_budget)
+                break;
+
+            ObjectId id;
+            if (repair_push_pending_) {
+                id = *repair_push_pending_;
+            } else {
+                bool pass_complete = false;
+                auto next = n_.local_store().next_object(repair_push_cursor_, pass_complete);
+                if (!next) {
+                    if (pass_complete)
+                        repair_push_complete_ = true;
+                    break;
+                }
+                id = *next;
+                repair_push_pending_ = id;
             }
-            if (!n_.local_store().has(id)) {
-                ++processed;
+
+            // Physical cursors can see stale/non-live local objects. Garbage is
+            // handled separately; replica repair simply skips them.
+            if (live && !std::binary_search(live->begin(), live->end(), id)) {
+                repair_push_pending_.reset();
+                ++scanned;
+                ++result.push_examined;
                 continue;
             }
 
-            const bool everywhere = universal && universal->contains(id);
+            const bool everywhere = universal &&
+                                    std::binary_search(universal->begin(), universal->end(), id);
             auto nodes = everywhere ? n_.membership().active() : ranked(id);
             if (nodes.empty()) {
-                ++processed;
+                repair_push_pending_.reset();
+                ++scanned;
+                ++result.push_examined;
                 continue;
             }
             const size_t target = everywhere ? nodes.size()
                                              : std::min(n_.config().replication, nodes.size());
             std::set<NodeId> keepers;
             std::optional<Bytes> source;
+            bool retry = false;
 
             for (const auto& peer : nodes) {
                 if (keepers.size() >= target)
                     break;
                 auto present_result = maintenance_has_on(peer, id);
-                if (!present_result)
+                if (!present_result) {
+                    retry = true;
                     break;
+                }
                 bool present = *present_result;
                 if (!present) {
                     if (!source) {
@@ -759,12 +821,14 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                             break;
                     }
                     if (byte_budget && transferred && transferred + source->size() > byte_budget) {
-                        result.complete = false;
+                        retry = true;
                         break;
                     }
                     auto put_result = maintenance_put_on(peer, id, *source);
-                    if (!put_result)
+                    if (!put_result) {
+                        retry = true;
                         break;
+                    }
                     present = *put_result;
                     if (present && peer.id != n_.node_id())
                         transferred += source->size();
@@ -773,38 +837,41 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                     keepers.insert(peer.id);
             }
 
-            if (!result.complete)
+            if (retry)
                 break;
 
             if (!everywhere && keepers.size() >= target && !keepers.contains(n_.node_id()))
                 n_.local_store().remove(id);
-            ++processed;
+
+            repair_push_pending_.reset();
+            ++scanned;
+            ++result.push_examined;
         }
-        repair_offset_ = (repair_offset_ + processed) % ids.size();
-    } else {
-        repair_offset_ = 0;
     }
 
-    // A newly joined node has no local objects to scan, so push-only repair can
-    // never populate it. Walk the committed live set and proactively pull any
-    // object for which this node is now a preferred owner. This makes joining a
-    // node converge automatically without requiring an old owner to notice it
-    // first.
-    if (live && !live->empty() && (!byte_budget || transferred < byte_budget)) {
-        std::vector<ObjectId> live_ids(live->begin(), live->end());
-        pull_offset_ %= live_ids.size();
-        std::rotate(live_ids.begin(), live_ids.begin() + pull_offset_, live_ids.end());
-        size_t processed = 0;
-        for (const auto& id : live_ids) {
+    // Pull objects this node should own. Iterate the immutable ordered live set
+    // directly using upper_bound() rather than copying N object IDs into a new
+    // vector on every bounded repair slice.
+    if (!repair_pull_complete_ && live && !live->empty() &&
+        (!byte_budget || transferred < byte_budget)) {
+        size_t scanned = 0;
+        auto it = repair_pull_after_
+                      ? std::upper_bound(live->begin(), live->end(), *repair_pull_after_)
+                      : live->begin();
+        while (it != live->end() && scanned < scan_budget) {
             if (yielded())
                 break;
-            if (byte_budget && transferred >= byte_budget) {
-                result.complete = false;
+            if (byte_budget && transferred >= byte_budget)
                 break;
-            }
-            const bool everywhere = universal && universal->contains(id);
+
+            const ObjectId id = *it;
+            const bool everywhere = universal &&
+                                    std::binary_search(universal->begin(), universal->end(), id);
             if ((!everywhere && !should_own(id)) || n_.local_store().has(id)) {
-                ++processed;
+                repair_pull_after_ = id;
+                ++it;
+                ++scanned;
+                ++result.pull_examined;
                 continue;
             }
 
@@ -814,7 +881,10 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             // a second download.
             if (auto cached = n_.block_cache().get(id)) {
                 (void)n_.local_store().put(id, *cached);
-                ++processed;
+                repair_pull_after_ = id;
+                ++it;
+                ++scanned;
+                ++result.pull_examined;
                 continue;
             }
 
@@ -824,17 +894,25 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                                    should_yield);
             if (yielded())
                 break;
-            if (data) {
-                if (n_.local_store().put(id, *data))
-                    transferred += data->size();
-            }
-            ++processed;
+            if (data && n_.local_store().put(id, *data))
+                transferred += data->size();
+
+            repair_pull_after_ = id;
+            ++it;
+            ++scanned;
+            ++result.pull_examined;
         }
-        pull_offset_ = (pull_offset_ + processed) % live_ids.size();
-    } else if (!live || live->empty()) {
-        pull_offset_ = 0;
+        if (it == live->end()) {
+            repair_pull_complete_ = true;
+            repair_pull_after_.reset();
+        }
     }
 
+    result.remote_operations = operations;
+    if (repair_push_complete_ && repair_pull_complete_) {
+        result.complete = true;
+        reset_completed_pass();
+    }
     return result;
 }
 } // namespace macha

@@ -8,13 +8,18 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
+#include <vector>
 
 namespace macha {
 class DistributedStore {
   public:
     struct RepairResult {
         uint64_t bytes_transferred{};
+        size_t push_examined{};
+        size_t pull_examined{};
+        size_t remote_operations{};
         bool complete{true};
         bool yielded{};
     };
@@ -37,8 +42,13 @@ class DistributedStore {
     };
 
     NodeRuntime& n_;
-    size_t repair_offset_{};
-    size_t pull_offset_{};
+    StoragePool::Cursor repair_push_cursor_;
+    std::optional<ObjectId> repair_push_pending_;
+    std::optional<ObjectId> repair_pull_after_;
+    const std::vector<ObjectId>* repair_live_identity_{};
+    uint64_t repair_live_generation_{};
+    bool repair_push_complete_{};
+    bool repair_pull_complete_{};
     std::atomic_uint64_t foreground_bytes_{};
     std::atomic_int64_t last_foreground_ms_{};
     std::atomic<double> network_bps_{};
@@ -78,14 +88,16 @@ class DistributedStore {
     void foreground_activity(uint64_t bytes) { note_foreground(bytes); }
 
     // Converges remote placement and proactively pulls live objects for which
-    // this node has become an owner. The limit is bytes, not block count; zero
-    // means unlimited. Returns bytes transferred across the network.
-    uint64_t repair_once(uint64_t byte_budget = 0, const std::set<ObjectId>* live = nullptr,
-                         const std::set<ObjectId>* universal = nullptr);
+    // this node has become an owner. Bounded repair_step() calls retain push/pull
+    // cursors across scheduler slices; they never rebuild complete object vectors.
+    // The byte limit is network transfer, not block count; zero means unlimited.
+    uint64_t repair_once(uint64_t byte_budget = 0, const std::vector<ObjectId>* live = nullptr,
+                         const std::vector<ObjectId>* universal = nullptr);
     RepairResult repair_step(uint64_t byte_budget, size_t operation_budget,
-                             const std::set<ObjectId>* live = nullptr,
-                             const std::set<ObjectId>* universal = nullptr,
-                             const std::function<bool()>& should_yield = {});
+                             const std::vector<ObjectId>* live = nullptr,
+                             const std::vector<ObjectId>* universal = nullptr,
+                             const std::function<bool()>& should_yield = {},
+                             uint64_t live_generation = 0);
     uint64_t scrub_once(uint64_t byte_budget = 0);
 
     uint64_t take_foreground_bytes() {

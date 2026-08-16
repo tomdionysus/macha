@@ -61,6 +61,7 @@ enum class FrameType : uint8_t {
 };
 
 const char* frame_type_name(FrameType) noexcept;
+const char* message_type_name(MessageType) noexcept;
 unsigned frame_type_priority(FrameType) noexcept;
 FrameType default_frame_type(MessageType) noexcept;
 
@@ -264,6 +265,7 @@ class RpcServer {
         NodeInfo peer;
         RpcFrame frame;
         std::function<void(const RpcMessage&)> reply;
+        Clock::time_point queued_at{Clock::now()};
     };
 
     std::string host_;

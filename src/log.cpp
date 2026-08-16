@@ -70,6 +70,10 @@ void ConsoleLogger::log(LogLevel level, const std::string& message) {
 
 std::mutex Log::mutex_;
 std::shared_ptr<Logger> Log::logger_ = std::make_shared<ConsoleLogger>(LogLevel::info);
+std::atomic<unsigned int> Log::enabled_mask_{
+    (1U << static_cast<unsigned int>(LogLevel::info)) |
+    (1U << static_cast<unsigned int>(LogLevel::warn)) |
+    (1U << static_cast<unsigned int>(LogLevel::error))};
 
 std::shared_ptr<Logger> Log::logger() {
     std::lock_guard lock(mutex_);
@@ -79,12 +83,24 @@ std::shared_ptr<Logger> Log::logger() {
 void Log::set_logger(std::shared_ptr<Logger> logger) {
     if (!logger)
         throw std::invalid_argument("logger must not be null");
-    std::lock_guard lock(mutex_);
-    logger_ = std::move(logger);
+
+    unsigned int mask = 0;
+    for (auto level : {LogLevel::all, LogLevel::debug, LogLevel::info, LogLevel::warn,
+                       LogLevel::error}) {
+        if (logger->enabled(level))
+            mask |= 1U << static_cast<unsigned int>(level);
+    }
+
+    {
+        std::lock_guard lock(mutex_);
+        logger_ = std::move(logger);
+    }
+    enabled_mask_.store(mask, std::memory_order_release);
 }
 
 bool Log::enabled(LogLevel level) {
-    return logger()->enabled(level);
+    const auto bit = 1U << static_cast<unsigned int>(level);
+    return (enabled_mask_.load(std::memory_order_acquire) & bit) != 0;
 }
 
 } // namespace macha

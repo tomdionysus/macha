@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -26,6 +27,10 @@ class Logger {
     virtual bool enabled(LogLevel) const noexcept = 0;
     virtual void log(LogLevel, const std::string&) = 0;
 
+    void trace(const std::string& message) {
+        if (enabled(LogLevel::all))
+            log(LogLevel::all, message);
+    }
     void debug(const std::string& message) {
         if (enabled(LogLevel::debug))
             log(LogLevel::debug, message);
@@ -61,31 +66,37 @@ class ConsoleLogger final : public Logger {
 class Log {
     static std::mutex mutex_;
     static std::shared_ptr<Logger> logger_;
+    static std::atomic<unsigned int> enabled_mask_;
     static std::shared_ptr<Logger> logger();
 
   public:
     static void set_logger(std::shared_ptr<Logger>);
     static bool enabled(LogLevel);
 
+    static void trace(const std::string& value) {
+        if (!enabled(LogLevel::all))
+            return;
+        logger()->log(LogLevel::all, value);
+    }
     static void debug(const std::string& value) {
-        auto out = logger();
-        if (out->enabled(LogLevel::debug))
-            out->log(LogLevel::debug, value);
+        if (!enabled(LogLevel::debug))
+            return;
+        logger()->log(LogLevel::debug, value);
     }
     static void info(const std::string& value) {
-        auto out = logger();
-        if (out->enabled(LogLevel::info))
-            out->log(LogLevel::info, value);
+        if (!enabled(LogLevel::info))
+            return;
+        logger()->log(LogLevel::info, value);
     }
     static void warn(const std::string& value) {
-        auto out = logger();
-        if (out->enabled(LogLevel::warn))
-            out->log(LogLevel::warn, value);
+        if (!enabled(LogLevel::warn))
+            return;
+        logger()->log(LogLevel::warn, value);
     }
     static void error(const std::string& value) {
-        auto out = logger();
-        if (out->enabled(LogLevel::error))
-            out->log(LogLevel::error, value);
+        if (!enabled(LogLevel::error))
+            return;
+        logger()->log(LogLevel::error, value);
     }
 };
 

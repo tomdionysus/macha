@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "hydration.hpp"
+#include "diagnostics.hpp"
 
 #include "catalogue.hpp"
 #include "distributed_store.hpp"
@@ -535,6 +536,7 @@ void CacheHydrator::wake() {
 }
 
 void CacheHydrator::loop(std::stop_token stop) {
+    ThreadCpuReporter cpu_reporter("macha-hydrator", std::chrono::seconds(5), true);
     struct Pending {
         HydrationRequest request;
         std::future<bool> future;
@@ -621,6 +623,7 @@ void CacheHydrator::loop(std::stop_token stop) {
             }
         }
 
+        cpu_reporter.tick();
         std::unique_lock lock(mutex_);
         const auto interval = config_.interval;
         cv_.wait_for(lock, stop, interval, [] { return false; });

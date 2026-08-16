@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.3 - 2026-08-16
+
+- fixed a settled-node maintenance regression which rebuilt the complete filesystem live/garbage inventory every five seconds. Metadata repair, catalogue verification and garbage inventory now use the configured `maintenance.no_progress_backoff_ms` once settled, with a five-second minimum, and defer while foreground I/O is active;
+- cache the immutable filesystem live/garbage object index by known metadata generation as a compact sorted vector and reuse it across maintenance passes. The service also retains the combined filesystem/catalogue live set for that generation, avoiding repeated O(namespace) reconstruction and copying when nothing has changed;
+- replaced distributed replica repair's per-slice `local_store().list()` and full live-set vector copy with persistent bounded cursors. Push repair advances the physical local-store cursor directly; pull repair advances the immutable ordered live set with `upper_bound()`. A maintenance slice therefore examines at most a bounded number of objects instead of recursively enumerating/copying the complete store before performing 8–64 RPC operations;
+- added low-volume DEBUG performance diagnostics: named long-lived threads with per-thread CPU reports, maintenance stage/repair-cursor timings and counts, live-inventory size/build time, RPC request type plus queue/handler latency, RPC stall age/type, selected metadata/catalogue/RPC/storage lock waits/holds, slow FUSE operations, and aggregated local-storage GET latency;
+- moved per-object backend/object GET/PUT records, full FUSE request/result traces, read-payload hashing and detailed extent/write diagnostics from DEBUG to ALL. Log-level checks are now lock-free, so disabled hot-path diagnostics do not acquire the process-wide logger mutex. DEBUG can therefore be used for timing diagnosis without serialising every extent/FUSE operation through the console logger; ALL remains intentionally expensive trace output;
+- added regression coverage for maintenance backoff selection, message-type diagnostics, generation-cached filesystem maintenance inventory, and bounded distributed replica repair. The repair regression explicitly verifies that bounded repair performs no full `StoragePool::list()` scan. Wire protocol remains v8.
+
 ## 0.8.2 - 2026-08-16
 
 - make transformed seek-only session PATCHes reuse the session's already prepared VOD/random-access plan instead of resolving the media representation, probing the source and rebuilding the keyframe/Cues plan on every seek;

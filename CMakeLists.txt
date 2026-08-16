@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(macha VERSION 0.8.2 LANGUAGES CXX)
+project(macha VERSION 0.8.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -58,6 +58,7 @@ set(MACHA_CORE_SOURCES
     src/crypto.cpp
     src/config.cpp
     src/log.cpp
+    src/diagnostics.cpp
     src/placement.cpp
     src/membership.cpp
     src/local_store.cpp

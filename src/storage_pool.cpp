@@ -2,6 +2,7 @@
 #include "storage_pool.hpp"
 
 #include "codec.hpp"
+#include "diagnostics.hpp"
 #include "log.hpp"
 #include "placement.hpp"
 
@@ -83,7 +84,7 @@ StoragePool::StoragePool(std::filesystem::path state_path, NodeId node_id,
 }
 
 std::vector<std::shared_ptr<StoragePool::Backend>> StoragePool::snapshot() const {
-    std::lock_guard lock(mutex_);
+    DiagnosticLock lock(mutex_, "storage.pool");
     return backends_;
 }
 
@@ -220,7 +221,7 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
 void StoragePool::reconfigure(const std::vector<StorageBackendConfig>& configs) {
     std::vector<std::shared_ptr<LocalStore>> retired;
     {
-        std::lock_guard lock(mutex_);
+        DiagnosticLock lock(mutex_, "storage.pool");
         std::set<std::filesystem::path> wanted;
         for (const auto& cfg : configs) {
             auto normalized = cfg.path.lexically_normal();
@@ -330,6 +331,48 @@ bool StoragePool::put(const ObjectId& id, std::span<const uint8_t> data) {
     return false;
 }
 
+void StoragePool::observe_get(size_t bytes, uint64_t elapsed) const {
+    diag_gets_.fetch_add(1, std::memory_order_relaxed);
+    diag_get_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    diag_get_ms_.fetch_add(elapsed, std::memory_order_relaxed);
+    auto maximum = diag_get_max_ms_.load(std::memory_order_relaxed);
+    while (maximum < elapsed &&
+           !diag_get_max_ms_.compare_exchange_weak(maximum, elapsed, std::memory_order_relaxed)) {
+    }
+
+    if (!Log::enabled(LogLevel::debug))
+        return;
+    const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            Clock::now().time_since_epoch())
+                            .count();
+    auto previous = diag_get_report_ns_.load(std::memory_order_relaxed);
+    constexpr int64_t report_ns = 5'000'000'000LL;
+    if (!previous) {
+        int64_t unset = 0;
+        (void)diag_get_report_ns_.compare_exchange_strong(unset, now_ns,
+                                                          std::memory_order_relaxed);
+        return;
+    }
+    if (now_ns - previous < report_ns)
+        return;
+    if (!diag_get_report_ns_.compare_exchange_strong(previous, now_ns,
+                                                     std::memory_order_relaxed))
+        return;
+
+    const auto window_ms = static_cast<uint64_t>((now_ns - previous) / 1'000'000LL);
+    const auto gets = diag_gets_.exchange(0, std::memory_order_relaxed);
+    const auto total_bytes = diag_get_bytes_.exchange(0, std::memory_order_relaxed);
+    const auto total_ms = diag_get_ms_.exchange(0, std::memory_order_relaxed);
+    const auto max_ms = diag_get_max_ms_.exchange(0, std::memory_order_relaxed);
+    if (!gets)
+        return;
+    Log::debug("DIAG storage-get window_ms=" + std::to_string(window_ms) +
+               " gets=" + std::to_string(gets) +
+               " bytes=" + std::to_string(total_bytes) +
+               " avg_ms=" + std::to_string(total_ms / gets) +
+               " max_ms=" + std::to_string(max_ms));
+}
+
 std::optional<Bytes> StoragePool::get(const ObjectId& id) const {
     for (const auto& backend : ranked(id)) {
         std::shared_ptr<LocalStore> store;
@@ -348,10 +391,12 @@ std::optional<Bytes> StoragePool::get(const ObjectId& id) const {
             auto data = store->get(id);
             auto elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
-            Log::debug("DIAG backend-get path=" + path.string() + " id=" + to_string(id) +
+            if (Log::enabled(LogLevel::all))
+                Log::trace("DIAG backend-get path=" + path.string() + " id=" + to_string(id) +
                        " result=" + std::to_string(data ? 1 : 0) +
                        " bytes=" + std::to_string(data ? data->size() : 0) +
                        " ms=" + std::to_string(elapsed.count()));
+            observe_get(data ? data->size() : 0, static_cast<uint64_t>(elapsed.count()));
             return data;
         } catch (const std::exception& error) {
             // Corrupt content is an object failure, not a backend failure.
@@ -405,6 +450,7 @@ bool StoragePool::remove(const ObjectId& id) {
 }
 
 std::vector<ObjectId> StoragePool::list() const {
+    full_list_scans_.fetch_add(1, std::memory_order_relaxed);
     std::set<ObjectId> unique;
     for (const auto& backend : snapshot()) {
         std::shared_ptr<LocalStore> store;

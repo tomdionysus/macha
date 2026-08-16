@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "metadata_manager.hpp"
+#include "diagnostics.hpp"
 
 #include "codec.hpp"
 #include "log.hpp"
@@ -1017,7 +1018,7 @@ MetadataSnapshot MetadataManager::snapshot() {
 
 MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot&)>& mutate,
                                        size_t retries) {
-    std::lock_guard lock(mutation_mutex_);
+    DiagnosticLock lock(mutation_mutex_, "metadata.mutation");
     const auto origin = node_.node_id();
     std::optional<uint64_t> sequence;
 

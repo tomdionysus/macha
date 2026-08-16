@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster.hpp"
+#include "diagnostics.hpp"
 
 #include "codec.hpp"
 #include "log.hpp"
@@ -345,8 +346,14 @@ void NodeRuntime::exchange(const NodeInfo& node) {
 }
 
 void NodeRuntime::loop(std::stop_token stop) {
+    ThreadCpuReporter cpu_reporter("macha-node", std::chrono::seconds(5), true);
     while (!stop.stop_requested()) {
+        const auto refresh_started = Clock::now();
         local_.refresh();
+        const auto refresh_ms = elapsed_ms(refresh_started);
+        if (refresh_ms >= 100 && Log::enabled(LogLevel::debug))
+            Log::debug("DIAG node-stage stage=storage-refresh elapsed_ms=" +
+                       std::to_string(refresh_ms));
         members_.storage(local_.used(), local_.limit());
         members_.metadata_generation(meta_.current().generation);
         std::set<std::pair<std::string, uint16_t>> exchanged;
@@ -383,6 +390,7 @@ void NodeRuntime::loop(std::stop_token stop) {
                 Log::debug("peer " + node.host + ": " + error.what());
             }
         }
+        cpu_reporter.tick();
         auto until = Clock::now() + cfg_.heartbeat;
         while (!stop.stop_requested() && Clock::now() < until)
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -412,6 +420,7 @@ void NodeRuntime::enqueue_fetched(const ObjectId& id, std::span<const uint8_t> d
 }
 
 void NodeRuntime::local_writer_loop(std::stop_token stop) {
+    ThreadCpuReporter cpu_reporter("macha-local-wr");
     while (true) {
         LocalCopyJob job;
         {
@@ -437,6 +446,7 @@ void NodeRuntime::local_writer_loop(std::stop_token stop) {
             (void)local_.put(job.id, job.data);
             members_.storage(local_.used(), local_.limit());
         }
+        cpu_reporter.tick();
     }
 }
 
