@@ -36,6 +36,8 @@
 
 namespace macha {
 namespace {
+FileSystem& fs();
+
 struct Handle {
     std::string path;
     std::shared_ptr<ReadHandle> read;
@@ -49,7 +51,11 @@ struct FuseLatency {
     Clock::time_point started{};
 
     FuseLatency(const char* operation, const char* pathname)
-        : op(operation), path(pathname), started(enabled ? Clock::now() : Clock::time_point{}) {}
+        : op(operation), path(pathname), started(enabled ? Clock::now() : Clock::time_point{}) {
+        // Metadata-only mount activity (rsync readdir/getattr in particular)
+        // must preempt maintenance even though it transfers no extent bytes.
+        fs().note_interactive_activity();
+    }
 
     ~FuseLatency() noexcept {
         try {

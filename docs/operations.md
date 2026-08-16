@@ -13,7 +13,9 @@ Repair works both ways:
 - existing owners push toward the current owner set;
 - new or replacement nodes pull live objects they should own.
 
-Background work is budgeted in bytes, not a fixed number of extents. The scheduler uses observed transfer rate, foreground activity and CPU load. Network repair, local disk rebalance and scrub have separate credits. With the default `busy_bandwidth_fraction: 0.0`, foreground I/O pauses background WAN repair.
+Background work is budgeted by bytes, remote operations and objects examined. The scheduler uses observed transfer rate, interactive activity and CPU load. Network repair, local disk rebalance and scrub have separate credits. A distributed repair slice examines at most 64 objects total across push and pull and issues at most 16 remote operations, even when every probe transfers zero bytes.
+
+Macha has three explicit I/O priorities: viewer playback/probe/seek is `foreground`; mounted-filesystem traffic and useful read-ahead are `read_ahead`; maintenance/hydration speculation is `speculative`. DATA scheduling preserves that order on both ends of the connection. Either foreground class pauses background maintenance with the default `busy_bandwidth_fraction: 0.0`, but mount traffic never outranks the viewer. FUSE namespace operations such as `getattr` and `readdir` count as read-ahead/interactive activity even when they move no extent payload. Serving a remote foreground/read-ahead object request marks the same activity on that node, so maintenance yields where the disk/CPU work actually occurs.
 
 A settled complete pass that moves no bytes is treated as **quiescent**, not as permission to rescan immediately. Its credit is cleared and that maintenance class backs off for `no_progress_backoff_ms` (30 seconds by default). Local rebalance, scrub and distributed push repair do not build whole-store vectors: each keeps a persistent physical-object cursor and examines at most a bounded number of objects per scheduler slice. Distributed pull repair advances the immutable ordered live-object index directly rather than copying it into a new vector on every slice. An incomplete slice is not mistaken for quiescence. Scrub also pauses after reaching the end of a complete integrity pass before it starts again.
 
@@ -21,11 +23,11 @@ The filesystem live/garbage object index is immutable, stored as a compact sorte
 
 ## Performance diagnostics
 
-`DEBUG` is intended for low-volume diagnosis. 0.8.3 reports slow maintenance stages, thread CPU consumption, RPC queue/handler latency, selected contended metadata/catalogue/RPC/storage locks, slow FUSE operations and aggregated local-storage GET latency. Long-lived worker threads are named (`macha-maint`, `macha-rpc-health`, `macha-rpc-ctl`, `macha-rpc-data`, `macha-hydrator`, and related names) so `top -H`, `perf` or macOS `sample` output can be correlated with Macha logs.
+`DEBUG` is intended for low-volume diagnosis. 0.8.4 retains the 0.8.3 diagnostics and reports slow maintenance stages, thread CPU consumption, RPC queue/handler latency, selected contended metadata/catalogue/RPC/storage locks, slow FUSE operations and aggregated local-storage GET latency. Long-lived worker threads are named (`macha-maint`, `macha-rpc-health`, `macha-rpc-ctl`, `macha-rpc-data`, `macha-hydrator`, and related names) so `top -H`, `perf` or macOS `sample` output can be correlated with Macha logs.
 
 `ALL` enables the old hot-path trace stream, including individual backend/object transfers, complete FUSE request/result records, read-payload hashes and detailed extent/write diagnostics. Disabled trace-level checks are lock-free. `ALL` is intentionally expensive and should not be used for throughput measurements.
 
-Useful 0.8.3 DEBUG records include:
+Useful DEBUG records include:
 
 ```text
 DIAG thread name=macha-maint wall_ms=5000 cpu_ms=... cpu_pct=... iterations=...

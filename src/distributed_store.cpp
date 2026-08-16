@@ -14,11 +14,6 @@ size_t quorum(size_t n) {
     return n / 2 + 1;
 }
 
-int64_t steady_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch())
-        .count();
-}
-
 bool read_aborted(Clock::time_point deadline, const std::atomic_bool* cancelled,
                   const std::function<bool()>& abort = {}) {
     return (cancelled && cancelled->load(std::memory_order_relaxed)) ||
@@ -28,8 +23,7 @@ bool read_aborted(Clock::time_point deadline, const std::atomic_bool* cancelled,
 } // namespace
 
 void DistributedStore::note_foreground(uint64_t bytes) {
-    foreground_bytes_.fetch_add(bytes, std::memory_order_relaxed);
-    last_foreground_ms_.store(steady_ms(), std::memory_order_relaxed);
+    n_.note_activity(FrameType::foreground, bytes);
 }
 
 void DistributedStore::note_network(uint64_t bytes, Clock::duration duration) {
@@ -43,11 +37,7 @@ void DistributedStore::note_network(uint64_t bytes, Clock::duration duration) {
 }
 
 std::chrono::milliseconds DistributedStore::foreground_idle_for() const {
-    auto last = last_foreground_ms_.load(std::memory_order_relaxed);
-    if (!last)
-        return std::chrono::hours(24);
-    auto now = steady_ms();
-    return std::chrono::milliseconds(std::max<int64_t>(0, now - last));
+    return n_.activity_idle_for(FrameType::foreground);
 }
 
 std::vector<NodeInfo> DistributedStore::ranked(const ObjectId& id) const {
@@ -84,7 +74,7 @@ ObjectId DistributedStore::put(std::span<const uint8_t> data) {
 bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data) {
     if (object_id(data) != id)
         throw std::runtime_error("object hash mismatch");
-    note_foreground(data.size());
+    n_.note_activity(FrameType::read_ahead, data.size());
 
     auto nodes = ranked(id);
     if (nodes.empty())
@@ -120,7 +110,7 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data) {
             PendingPut item;
             item.owner = owner;
             item.started = Clock::now();
-            item.rpc.emplace(n_.call_async(owner, MessageType::put_object, payload));
+            item.rpc.emplace(n_.call_async(owner, MessageType::put_object, payload, FrameType::read_ahead));
             pending.push_back(std::move(item));
         } catch (...) {
             ++completed;
@@ -501,10 +491,19 @@ std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t str
 std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, bool foreground,
                                            Clock::time_point deadline,
                                            std::atomic_bool* cancelled) {
+    return get(id, stripe, foreground ? FrameType::foreground : FrameType::speculative,
+               deadline, cancelled);
+}
+
+std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, FrameType frame_type,
+                                           Clock::time_point deadline,
+                                           std::atomic_bool* cancelled) {
+    const bool foreground = frame_type == FrameType::foreground;
+    const bool interactive = frame_type == FrameType::foreground || frame_type == FrameType::read_ahead;
     auto started = Clock::now();
     if (auto data = n_.local_store().get(id)) {
-        if (foreground)
-            note_foreground(data->size());
+        if (interactive)
+            n_.note_activity(frame_type, data->size());
         auto elapsed =
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
         if (Log::enabled(LogLevel::all))
@@ -515,8 +514,8 @@ std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, bo
     }
 
     if (auto cached = n_.block_cache().get(id)) {
-        if (foreground)
-            note_foreground(cached->size());
+        if (interactive)
+            n_.note_activity(frame_type, cached->size());
         if (should_own(id))
             n_.enqueue_fetched(id, *cached, true);
         auto elapsed =
@@ -530,9 +529,10 @@ std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, bo
 
     if (read_aborted(deadline, cancelled))
         return {};
-    auto data = get_remote(id, stripe,
-                           foreground ? FrameType::foreground : FrameType::speculative,
-                           foreground, foreground, deadline, cancelled);
+    auto data = get_remote(id, stripe, frame_type,
+                           foreground, interactive, deadline, cancelled);
+    if (data && frame_type == FrameType::read_ahead)
+        n_.note_activity(frame_type, data->size());
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
     if (Log::enabled(LogLevel::all))
         Log::trace("DIAG object-get id=" + to_string(id) +
@@ -700,7 +700,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
         Writer writer;
         writer.fixed(id.bytes);
         try {
-            auto rpc = n_.call_async(target, MessageType::have_object, writer.data());
+            auto rpc = n_.call_async(target, MessageType::have_object, writer.data(), FrameType::speculative);
             while (rpc.wait_for(std::chrono::milliseconds(25)) != std::future_status::ready) {
                 if (yielded()) {
                     rpc.cancel();
@@ -752,13 +752,13 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     // settled object may require no network operation at all; without a scan
     // budget a single maintenance tick could still walk millions of objects.
     const size_t scan_budget = operation_budget
-                                   ? std::clamp<size_t>(operation_budget * 8, 64, 512)
+                                   ? std::clamp<size_t>(operation_budget * 4, 16, 64)
                                    : std::numeric_limits<size_t>::max();
+    size_t scanned_total = 0;
 
     // Push existing local replicas toward the current deterministic owner set.
     if (!repair_push_complete_) {
-        size_t scanned = 0;
-        while (scanned < scan_budget && !repair_push_complete_) {
+        while (scanned_total < scan_budget && !repair_push_complete_) {
             if (yielded())
                 break;
             if (byte_budget && transferred >= byte_budget)
@@ -785,7 +785,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             // handled separately; replica repair simply skips them.
             if (live && !std::binary_search(live->begin(), live->end(), id)) {
                 repair_push_pending_.reset();
-                ++scanned;
+                ++scanned_total;
                 ++result.push_examined;
                 continue;
             }
@@ -795,7 +795,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             auto nodes = everywhere ? n_.membership().active() : ranked(id);
             if (nodes.empty()) {
                 repair_push_pending_.reset();
-                ++scanned;
+                ++scanned_total;
                 ++result.push_examined;
                 continue;
             }
@@ -844,7 +844,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 n_.local_store().remove(id);
 
             repair_push_pending_.reset();
-            ++scanned;
+            ++scanned_total;
             ++result.push_examined;
         }
     }
@@ -854,11 +854,10 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     // vector on every bounded repair slice.
     if (!repair_pull_complete_ && live && !live->empty() &&
         (!byte_budget || transferred < byte_budget)) {
-        size_t scanned = 0;
         auto it = repair_pull_after_
                       ? std::upper_bound(live->begin(), live->end(), *repair_pull_after_)
                       : live->begin();
-        while (it != live->end() && scanned < scan_budget) {
+        while (it != live->end() && scanned_total < scan_budget) {
             if (yielded())
                 break;
             if (byte_budget && transferred >= byte_budget)
@@ -870,7 +869,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             if ((!everywhere && !should_own(id)) || n_.local_store().has(id)) {
                 repair_pull_after_ = id;
                 ++it;
-                ++scanned;
+                ++scanned_total;
                 ++result.pull_examined;
                 continue;
             }
@@ -883,7 +882,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 (void)n_.local_store().put(id, *cached);
                 repair_pull_after_ = id;
                 ++it;
-                ++scanned;
+                ++scanned_total;
                 ++result.pull_examined;
                 continue;
             }
@@ -899,7 +898,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
 
             repair_pull_after_ = id;
             ++it;
-            ++scanned;
+            ++scanned_total;
             ++result.pull_examined;
         }
         if (it == live->end()) {

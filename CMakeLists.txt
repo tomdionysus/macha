@@ -1,9 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
-project(macha VERSION 0.8.3 LANGUAGES CXX)
+project(macha VERSION 0.8.4 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+configure_file(src/version.hpp.in ${CMAKE_CURRENT_BINARY_DIR}/generated/macha_version.hpp @ONLY)
 
 option(MACHA_ENABLE_FUSE "Build the FUSE mount adapter when available" ON)
 option(MACHA_BUILD_TESTS "Build tests" ON)
@@ -86,7 +88,9 @@ set(MACHA_CORE_SOURCES
 )
 
 add_library(macha_core STATIC ${MACHA_CORE_SOURCES})
-target_include_directories(macha_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(macha_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(macha_core PUBLIC
     OpenSSL::Crypto Threads::Threads CURL::libcurl ${MACHA_YAML_TARGET} PkgConfig::LIBAV)
 

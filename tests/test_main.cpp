@@ -476,26 +476,65 @@ void test_local_store() {
     auto keyfile = t.path() / "key";
     write_key(keyfile);
     auto keys = load_cluster_keys(keyfile);
-    LocalStore store(t.path() / "store", 64 * 1024 * 1024, keys.storage);
+    const auto root = t.path() / "store";
     auto plain = pattern(1024 * 1024 + 37);
     auto id = object_id(plain);
-    REQUIRE(store.put(id, plain));
-    CHECK(store.has(id));
-    REQUIRE(store.get(id).has_value());
-    CHECK(*store.get(id) == plain);
+    uint64_t accounted_used = 0;
 
-    bool found_plain = false;
-    for (auto& file :
-         std::filesystem::recursive_directory_iterator(t.path() / "store" / "objects")) {
-        if (!file.is_regular_file())
-            continue;
-        std::ifstream in(file.path(), std::ios::binary);
-        Bytes disk(std::istreambuf_iterator<char>(in), {});
-        auto needle = std::span<const uint8_t>(plain).subspan(100, 128);
-        found_plain =
-            std::search(disk.begin(), disk.end(), needle.begin(), needle.end()) != disk.end();
+    {
+        LocalStore store(root, 64 * 1024 * 1024, keys.storage);
+        REQUIRE(store.put(id, plain));
+        CHECK(store.has(id));
+        REQUIRE(store.get(id).has_value());
+        CHECK(*store.get(id) == plain);
+        REQUIRE(wait_until([&] { return store.scan_complete(); }));
+        accounted_used = store.used();
+        CHECK(accounted_used > plain.size());
+
+        bool found_plain = false;
+        for (auto& file : std::filesystem::recursive_directory_iterator(root / "objects")) {
+            if (!file.is_regular_file())
+                continue;
+            std::ifstream in(file.path(), std::ios::binary);
+            Bytes disk(std::istreambuf_iterator<char>(in), {});
+            auto needle = std::span<const uint8_t>(plain).subspan(100, 128);
+            found_plain =
+                std::search(disk.begin(), disk.end(), needle.begin(), needle.end()) != disk.end();
+        }
+        CHECK(!found_plain);
     }
-    CHECK(!found_plain);
+
+    // A clean restart restores exact accounting from the small journal without
+    // starting an O(number-of-objects) tree scan.
+    CHECK(std::filesystem::exists(root / ".macha.accounting"));
+    CHECK(std::filesystem::file_size(root / ".macha.accounting") >= 256);
+    {
+        LocalStore reopened(root, 64 * 1024 * 1024, keys.storage);
+        CHECK(reopened.scan_complete());
+        CHECK(reopened.used() == accounted_used);
+        REQUIRE(reopened.get(id).has_value());
+        CHECK(*reopened.get(id) == plain);
+    }
+
+    // Corrupt/missing state is a migration/recovery case: fall back to one full
+    // reconciliation, then recreate a trusted checkpoint for later O(1) boots.
+    {
+        std::ofstream out(root / ".macha.accounting", std::ios::binary | std::ios::trunc);
+        Bytes junk(256, 0x5a);
+        out.write(reinterpret_cast<const char*>(junk.data()),
+                  static_cast<std::streamsize>(junk.size()));
+    }
+    {
+        LocalStore recovered(root, 64 * 1024 * 1024, keys.storage);
+        REQUIRE(wait_until([&] { return recovered.scan_complete(); }));
+        CHECK(recovered.used() == accounted_used);
+        REQUIRE(recovered.get(id).has_value());
+    }
+    {
+        LocalStore recovered_restart(root, 64 * 1024 * 1024, keys.storage);
+        CHECK(recovered_restart.scan_complete());
+        CHECK(recovered_restart.used() == accounted_used);
+    }
 
     {
         StorageLock first(t.path() / "locked");
@@ -507,10 +546,6 @@ void test_local_store() {
         }
         CHECK(rejected);
     }
-
-    LocalStore reopened(t.path() / "store", 64 * 1024 * 1024, keys.storage);
-    REQUIRE(reopened.get(id).has_value());
-    CHECK(*reopened.get(id) == plain);
 }
 
 void test_storage_pool_and_persistent_cache() {
@@ -1266,7 +1301,7 @@ void test_rpc_v8_frame_priority_and_variable_length() {
     std::vector<uint8_t> order;
     RpcServer server(
         "127.0.0.1", port, keys, server_info,
-        [&](const NodeInfo&, const RpcMessage& request) {
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
             if (request.type == MessageType::put_object && !request.payload.empty()) {
                 std::lock_guard lock(order_mutex);
                 order.push_back(request.payload.front());
@@ -1389,6 +1424,9 @@ void test_repair_step_is_bounded_and_yields() {
     CHECK(yielded.pull_examined <= 64);
     CHECK(bounded.pull_examined <= 64);
     CHECK(completed.pull_examined <= 64);
+    CHECK(yielded.push_examined + yielded.pull_examined <= 64);
+    CHECK(bounded.push_examined + bounded.pull_examined <= 64);
+    CHECK(completed.push_examined + completed.pull_examined <= 64);
 
     s2.stop();
     s1.stop();
@@ -1409,7 +1447,7 @@ void test_rpc_v8_persistence_and_multiplexing() {
 
     RpcServer server(
         "127.0.0.1", port, keys, server_info,
-        [](const NodeInfo&, const RpcMessage& request) {
+        [](const NodeInfo&, FrameType, const RpcMessage& request) {
             if (!request.payload.empty() && request.payload.front() == 1)
                 std::this_thread::sleep_for(300ms);
             return RpcMessage{MessageType::ok, request.payload};
@@ -1505,7 +1543,7 @@ void test_rpc_v8_bidirectional_and_deduplication() {
         node.failure_domain = "rpc-test";
         return node;
     };
-    auto echo = [](const NodeInfo&, const RpcMessage& request) {
+    auto echo = [](const NodeInfo&, FrameType, const RpcMessage& request) {
         return RpcMessage{MessageType::ok, request.payload};
     };
 
@@ -1637,7 +1675,7 @@ void test_rpc_v8_bidirectional_and_deduplication() {
         auto lower_info = first.id < second.id ? first : second;
         auto higher_info = first.id < second.id ? second : first;
         std::atomic_bool entered{};
-        auto lower_handler = [&](const NodeInfo&, const RpcMessage& request) {
+        auto lower_handler = [&](const NodeInfo&, FrameType, const RpcMessage& request) {
             if (!request.payload.empty() && request.payload.front() == 42) {
                 entered = true;
                 std::this_thread::sleep_for(300ms);
@@ -1717,7 +1755,7 @@ void test_rpc_v7_handshake_is_rejected() {
     server_info.port = port;
     server_info.failure_domain = "server";
     RpcServer server("127.0.0.1", port, keys, server_info,
-                     [](const NodeInfo&, const RpcMessage&) {
+                     [](const NodeInfo&, FrameType, const RpcMessage&) {
                          return RpcMessage{MessageType::ok, {}};
                      },
                      [](const NodeInfo&) {});
@@ -1792,7 +1830,7 @@ void test_rpc_slow_control_does_not_abort_data() {
 
     RpcServer server(
         "127.0.0.1", port, keys, server_info,
-        [](const NodeInfo&, const RpcMessage& request) {
+        [](const NodeInfo&, FrameType, const RpcMessage& request) {
             if (request.type == MessageType::put_object) {
                 std::this_thread::sleep_for(600ms);
                 return RpcMessage{MessageType::ok, {}};
@@ -1852,7 +1890,7 @@ void test_rpc_health_and_control_not_starved_by_data() {
 
     RpcServer server(
         "127.0.0.1", port, keys, server_info,
-        [](const NodeInfo&, const RpcMessage& request) {
+        [](const NodeInfo&, FrameType, const RpcMessage& request) {
             if (request.type == MessageType::put_object) {
                 std::this_thread::sleep_for(400ms);
                 return RpcMessage{MessageType::ok, {}};
@@ -1947,7 +1985,7 @@ void test_early_replication_quorum() {
     slow_info.seen_unix_ms = unix_ms();
 
     auto peer_handler = [](const NodeInfo& self, std::chrono::milliseconds put_delay) {
-        return [self, put_delay](const NodeInfo&, const RpcMessage& request) {
+        return [self, put_delay](const NodeInfo&, FrameType, const RpcMessage& request) {
             if (request.type == MessageType::put_object) {
                 if (put_delay.count())
                     std::this_thread::sleep_for(put_delay);
@@ -3280,6 +3318,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
+    CHECK(status_body.find("\"server_version\":\"0.8.4\"") != std::string::npos);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -3924,6 +3963,16 @@ void test_playback_sessions_and_streaming_http_bodies() {
     PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
                              std::move(fake_engine));
     playback.start();
+
+    HttpRequest playback_status_request;
+    playback_status_request.method = "GET";
+    playback_status_request.path = "/api/v1/playback/status";
+    auto playback_status_response = playback.handle(playback_status_request);
+    REQUIRE(playback_status_response.status == 200);
+    auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
+                                                        playback_status_response.body.end()));
+    REQUIRE(playback_status_json.find("server_version") != nullptr);
+    CHECK(playback_status_json.find("server_version")->asString() == "0.8.4");
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately

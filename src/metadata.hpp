@@ -63,6 +63,7 @@ class MetadataReplica {
     MetadataReplica(std::filesystem::path, std::array<uint8_t, 32>);
     MetadataRecord current() const;
     MetadataRecord committed() const;
+    uint64_t generation() const;
     bool cas(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
     bool seed(const MetadataRecord&);
     bool remember_committed(const MetadataRecord&);

@@ -139,6 +139,9 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
     if (!configured)
         return false;
 
+    const auto activate_started = Clock::now();
+    if (!was_online)
+        Log::debug("storage backend probe begin path=" + cfg.path.string());
     try {
         std::error_code ec;
         if (!std::filesystem::is_directory(cfg.path, ec) || ec) {
@@ -209,8 +212,13 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
         }
         if (!installed)
             return false;
-        if (!was_online)
-            Log::info("storage backend online " + cfg.path.string());
+        if (!was_online) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                Clock::now() - activate_started);
+            Log::info("storage backend online " + cfg.path.string() +
+                      " elapsed_ms=" + std::to_string(elapsed.count()) +
+                      " accounting=" + std::string(store->scan_complete() ? "ready" : "reconciling"));
+        }
         return true;
     } catch (const std::exception& error) {
         deactivate(backend, existing, error.what(), generation);

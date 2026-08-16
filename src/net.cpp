@@ -1392,12 +1392,12 @@ std::string RpcClient::dial_key(const Endpoint& endpoint, TransportLane lane) {
     return endpoint_key(endpoint) + ':' + transport_lane_name(lane);
 }
 
-TransportLane RpcClient::lane_for(MessageType type, FrameType) noexcept {
-    // Object transfers, including foreground/read-ahead/speculative variants,
-    // are isolated on the data TCP stream. Transfer-local promotion/cancel
-    // notifications remain on that same stream because request IDs are scoped
-    // to the connection. All other RPCs use the control stream.
-    if (type == MessageType::get_object || type == MessageType::put_object)
+TransportLane RpcClient::lane_for(MessageType type, FrameType frame_type) noexcept {
+    // Object transfers and speculative object-existence probes are isolated on
+    // the data TCP stream. Background repair must never queue have_object scans
+    // ahead of membership/metadata control traffic.
+    if (type == MessageType::get_object || type == MessageType::put_object ||
+        (type == MessageType::have_object && frame_type != FrameType::control))
         return TransportLane::data;
     return TransportLane::control;
 }
@@ -2903,7 +2903,7 @@ void RpcServer::execute(RequestJob job) {
     const auto execute_started = Clock::now();
     const auto queue_ms = elapsed_ms(job.queued_at);
     try {
-        auto reply = handler_(job.peer, job.frame.message);
+        auto reply = handler_(job.peer, job.frame.frame_type, job.frame.message);
         if (job.reply) {
             job.reply(reply);
         } else if (job.session) {

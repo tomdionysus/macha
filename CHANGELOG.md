@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.4 - 2026-08-16
+
+- made the priority hierarchy explicit across the cluster: current playback/probe/seek object traffic is `foreground`, mounted-filesystem I/O and useful read-ahead are `read_ahead`, and repair/scrub/rebalance remain `speculative`. Incoming foreground/read-ahead object RPCs now mark activity on the serving node as well, so a remote Pi yields background maintenance while serving a viewer or mount; playback remains above mount traffic in both outbound and server-side DATA scheduling;
+- moved speculative maintenance `have_object` probes off the CONTROL lane onto the DATA lane. Membership, health and metadata control RPCs can no longer queue behind replica-placement existence scans;
+- bounded distributed repair by CPU/scan work as well as bytes/RPCs. One repair slice now examines at most 64 objects total across push and pull, with at most 16 remote operations, so a settled namespace cannot burn a core merely because it transfers zero bytes;
+- made every user FUSE operation count as medium-priority interactive activity. Namespace-only workloads such as rsync's incremental file-list walk now suppress background repair/rebalance/scrub without being promoted above media playback;
+- added a generation-cached decoded metadata snapshot and immutable namespace indexes. `getattr` is now a lookup in the shared decoded snapshot, `readdir` uses a per-directory child-path index, and media-id resolution caches paths rather than duplicating complete extent manifests. Metadata generation changes invalidate these views; unchanged metadata is not repeatedly decoded/copied for every stat;
+- replaced mandatory restart-time LocalStore object-tree accounting with a two-slot checksummed crash-recoverable accounting journal. Normal restart restores exact used bytes in O(1); first 0.8.4 startup from an older store, missing/corrupt state, or explicit recovery performs the existing full reconciliation once and writes the new checkpoint. A durable pending mutation record lets restart resolve at most one content-addressed object after a crash; interrupted migration scans are never checkpointed as authoritative;
+- return `server_version` from both `/api/v1/catalogue/status` and `/api/v1/playback/status`, sourced from the CMake project version;
+- normalize H.264 encoder packet timestamps after rescaling into the MP4 stream timebase, matching the strict monotonic-DTS handling already used by remux. Mux rejection now logs packet timestamps, timebases, dimensions and sample aspect ratio so media-specific failures such as the observed Crow transcode can be diagnosed mechanically;
+- added regression coverage for LocalStore accounting restore and corruption fallback, server-version status, and the combined repair scan ceiling. Wire protocol remains v8.
+
 ## 0.8.3 - 2026-08-16
 
 - fixed a settled-node maintenance regression which rebuilt the complete filesystem live/garbage inventory every five seconds. Metadata repair, catalogue verification and garbage inventory now use the configured `maintenance.no_progress_backoff_ms` once settled, with a five-second minimum, and defer while foreground I/O is active;

@@ -163,8 +163,16 @@ void Service::loop(std::stop_token stop) {
         last_wall = now;
         last_cpu = cpu_now;
 
-        auto foreground = store_.take_foreground_bytes();
-        bool busy = foreground > 0 || store_.foreground_idle_for() < policy.foreground_quiet;
+        auto playback_bytes = store_.take_foreground_bytes();
+        auto interactive_bytes = store_.take_interactive_bytes();
+        const bool playback_busy = playback_bytes > 0 ||
+            store_.foreground_idle_for() < policy.foreground_quiet;
+        const bool interactive_busy = interactive_bytes > 0 ||
+            store_.interactive_idle_for() < policy.foreground_quiet;
+        // Priority law: playback/seek > mounted filesystem/useful prefetch >
+        // repair/rebalance/scrub. Both foreground classes suppress background
+        // work, while the transport queues themselves keep playback above mount I/O.
+        bool busy = playback_busy || interactive_busy;
         double fraction = busy ? policy.busy_bandwidth_fraction : policy.idle_bandwidth_fraction;
 
         double bandwidth = store_.estimated_network_bps();
@@ -269,7 +277,7 @@ void Service::loop(std::stop_token stop) {
                     // thousands of synchronous control RPCs while consuming no
                     // network credit. Bound each repair slice independently.
                     const size_t operation_budget = static_cast<size_t>(std::clamp<uint64_t>(
-                        (byte_budget / extent) * 2, 8, 64));
+                        (byte_budget / extent), 4, 16));
                     const auto repair_stage = Clock::now();
                     auto repair = store_.repair_step(
                         byte_budget, operation_budget, maintenance_live_.get(),
@@ -278,8 +286,9 @@ void Service::loop(std::stop_token stop) {
                             // End the current maintenance slice as soon as any
                             // foreground I/O appears. The next scheduler pass
                             // will re-evaluate busy_bandwidth_fraction normally.
-                            return store_.foreground_idle_for() <
-                                   node_.config().maintenance.foreground_quiet;
+                            const auto quiet = node_.config().maintenance.foreground_quiet;
+                            return store_.foreground_idle_for() < quiet ||
+                                   store_.interactive_idle_for() < quiet;
                         },
                         maintenance_inventory_generation_);
                     log_slow_stage("network-repair", repair_stage,
@@ -317,8 +326,9 @@ void Service::loop(std::stop_token stop) {
                 auto rebalance = node_.local_store().rebalance_step(
                     static_cast<uint64_t>(local_credit), 64,
                     [this] {
-                        return store_.foreground_idle_for() <
-                               node_.config().maintenance.foreground_quiet;
+                        const auto quiet = node_.config().maintenance.foreground_quiet;
+                        return store_.foreground_idle_for() < quiet ||
+                               store_.interactive_idle_for() < quiet;
                     });
                 log_slow_stage("local-rebalance", rebalance_stage,
                                "bytes=" + std::to_string(rebalance.bytes) +
@@ -341,8 +351,9 @@ void Service::loop(std::stop_token stop) {
                 auto scrub = node_.local_store().scrub_step(
                     static_cast<uint64_t>(scrub_credit), 64,
                     [this] {
-                        return store_.foreground_idle_for() <
-                               node_.config().maintenance.foreground_quiet;
+                        const auto quiet = node_.config().maintenance.foreground_quiet;
+                        return store_.foreground_idle_for() < quiet ||
+                               store_.interactive_idle_for() < quiet;
                     });
                 log_slow_stage("scrub", scrub_stage,
                                "bytes=" + std::to_string(scrub.bytes) +

@@ -5,10 +5,17 @@
 #include "placement.hpp"
 
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 
 namespace macha {
+struct MetadataSnapshotView {
+    uint64_t generation{};
+    Hash256 hash{};
+    std::shared_ptr<const MetadataSnapshot> snapshot;
+};
+
 class MetadataManager {
     NodeRuntime& node_;
     Hash256 placement_key_;
@@ -16,6 +23,9 @@ class MetadataManager {
     std::mutex cache_mutex_;
     std::optional<MetadataRecord> cache_;
     Clock::time_point cache_until_{};
+    std::shared_ptr<const MetadataSnapshot> decoded_cache_;
+    uint64_t decoded_generation_{};
+    Hash256 decoded_hash_{};
 
     struct CasResult {
         size_t success{};
@@ -35,6 +45,7 @@ class MetadataManager {
     MetadataRecord read_record_uncached();
     MetadataRecord cache_record(const MetadataRecord&);
     std::optional<MetadataRecord> cached_record();
+    std::optional<MetadataSnapshotView> cached_snapshot_view();
 
     bool seed_quorum(const std::vector<NodeInfo>&, const MetadataRecord&, size_t required);
     bool checkpoint_quorum(const std::vector<NodeInfo>&, const MetadataRecord&, size_t required);
@@ -46,6 +57,7 @@ class MetadataManager {
     explicit MetadataManager(NodeRuntime&);
     MetadataRecord read_record();
     MetadataSnapshot snapshot();
+    MetadataSnapshotView snapshot_view();
     MetadataRecord mutate(const std::function<void(MetadataSnapshot&)>&, size_t retries = 8);
     void repair_once();
 };

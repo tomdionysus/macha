@@ -42,6 +42,11 @@ RpcMessage error_reply(const std::string& text) {
     writer.string(text);
     return {MessageType::error, writer.take()};
 }
+
+int64_t activity_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch())
+        .count();
+}
 } // namespace
 
 NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
@@ -68,7 +73,7 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
           cfg_.connect_timeout, cfg_.heartbeat, cfg_.dead_after, cfg_.max_frame_size),
       server_(
           cfg_.listen_host, cfg_.port, keys_, members_.self(),
-          [this](const NodeInfo& peer, const RpcMessage& request) { return handle(peer, request); },
+          [this](const NodeInfo& peer, FrameType frame_type, const RpcMessage& request) { return handle(peer, frame_type, request); },
           [this](const NodeInfo& peer) {
               members_.observe(peer, true);
               auto current = remote_metadata_generation_.load();
@@ -185,6 +190,36 @@ AsyncRpc NodeRuntime::call_async(const Endpoint& endpoint, MessageType type,
     return client_.call_async(endpoint, type, payload, frame_type);
 }
 
+void NodeRuntime::note_activity(FrameType type, uint64_t bytes) {
+    const auto now = activity_now_ms();
+    if (type == FrameType::foreground) {
+        playback_activity_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+        last_playback_activity_ms_.store(now, std::memory_order_relaxed);
+    } else if (type == FrameType::read_ahead) {
+        interactive_activity_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+        last_interactive_activity_ms_.store(now, std::memory_order_relaxed);
+    }
+}
+
+uint64_t NodeRuntime::take_activity_bytes(FrameType type) {
+    if (type == FrameType::foreground)
+        return playback_activity_bytes_.exchange(0, std::memory_order_relaxed);
+    if (type == FrameType::read_ahead)
+        return interactive_activity_bytes_.exchange(0, std::memory_order_relaxed);
+    return 0;
+}
+
+std::chrono::milliseconds NodeRuntime::activity_idle_for(FrameType type) const {
+    int64_t last = 0;
+    if (type == FrameType::foreground)
+        last = last_playback_activity_ms_.load(std::memory_order_relaxed);
+    else if (type == FrameType::read_ahead)
+        last = last_interactive_activity_ms_.load(std::memory_order_relaxed);
+    if (!last)
+        return std::chrono::hours(24);
+    return std::chrono::milliseconds(std::max<int64_t>(0, activity_now_ms() - last));
+}
+
 void NodeRuntime::announce_metadata_generation(uint64_t generation) {
     members_.metadata_generation(generation);
     Writer writer;
@@ -220,7 +255,7 @@ bool NodeRuntime::cas_metadata(uint64_t generation, const Hash256& hash,
     return meta_.cas(generation, hash, payload, out);
 }
 
-RpcMessage NodeRuntime::handle(const NodeInfo&, const RpcMessage& request) {
+RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcMessage& request) {
     try {
         // Health/control must never depend on storage I/O. Capacity is refreshed
         // by the node maintenance loop and after successful mutations below.
@@ -250,6 +285,7 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, const RpcMessage& request) {
             auto data = local_.get(id);
             if (!data)
                 return error_reply("object not found");
+            note_activity(frame_type, data->size());
             Writer writer;
             writer.fixed(id.bytes);
             writer.bytes(*data);
@@ -260,6 +296,7 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, const RpcMessage& request) {
             ObjectId id{reader.fixed<32>()};
             auto data = reader.bytes(128 * 1024 * 1024);
             reader.finish();
+            note_activity(frame_type, data.size());
             if (!local_.put(id, data))
                 return error_reply("storage limit reached");
             members_.storage(local_.used(), local_.limit());

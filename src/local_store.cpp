@@ -6,6 +6,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -13,6 +14,98 @@
 namespace macha {
 namespace {
 constexpr std::array<uint8_t, 8> M{'D', 'H', 'T', 'O', 'B', 'J', '0', '1'};
+constexpr std::array<uint8_t, 8> A{'M', 'A', 'C', 'H', 'A', 'A', 'C', '1'};
+constexpr size_t accounting_slot_size = 128;
+constexpr size_t accounting_body_size = accounting_slot_size - 32;
+constexpr uint8_t accounting_none = 0;
+constexpr uint8_t accounting_put = 1;
+constexpr uint8_t accounting_remove = 2;
+
+struct AccountingRecord {
+    uint64_t sequence{};
+    uint64_t used{};
+    uint8_t operation{};
+    ObjectId id{};
+    uint64_t size{};
+};
+
+void pwa_exact(int fd, std::span<const uint8_t> data, uint64_t offset) {
+    size_t done = 0;
+    while (done < data.size()) {
+        auto n = ::pwrite(fd, data.data() + done, data.size() - done,
+                          static_cast<off_t>(offset + done));
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            throw std::runtime_error("cannot write accounting state: " + std::string(strerror(errno)));
+        }
+        done += static_cast<size_t>(n);
+    }
+}
+
+std::optional<Bytes> pra_exact(int fd, size_t size, uint64_t offset) {
+    Bytes out(size);
+    size_t done = 0;
+    while (done < out.size()) {
+        auto n = ::pread(fd, out.data() + done, out.size() - done,
+                         static_cast<off_t>(offset + done));
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return {};
+        }
+        if (n == 0)
+            return {};
+        done += static_cast<size_t>(n);
+    }
+    return out;
+}
+
+Bytes encode_accounting(const AccountingRecord& record) {
+    Writer body;
+    body.raw(A);
+    body.u64(record.sequence);
+    body.u64(record.used);
+    body.u8(record.operation);
+    body.u64(record.size);
+    body.fixed(record.id.bytes);
+    while (body.data().size() < accounting_body_size)
+        body.u8(0);
+    if (body.data().size() != accounting_body_size)
+        throw std::runtime_error("internal accounting record size error");
+    auto hash = sha256(body.data());
+    Writer out;
+    out.raw(body.data());
+    out.fixed(hash.bytes);
+    return out.take();
+}
+
+std::optional<AccountingRecord> decode_accounting(std::span<const uint8_t> bytes) {
+    if (bytes.size() != accounting_slot_size)
+        return {};
+    auto body = bytes.first(accounting_body_size);
+    auto expected = sha256(body);
+    if (!std::equal(expected.bytes.begin(), expected.bytes.end(),
+                    bytes.begin() + accounting_body_size))
+        return {};
+    try {
+        Reader reader(body);
+        auto magic = reader.raw(A.size());
+        if (!std::equal(magic.begin(), magic.end(), A.begin()))
+            return {};
+        AccountingRecord record;
+        record.sequence = reader.u64();
+        record.used = reader.u64();
+        record.operation = reader.u8();
+        record.size = reader.u64();
+        record.id.bytes = reader.fixed<32>();
+        if (record.operation > accounting_remove)
+            return {};
+        return record;
+    } catch (...) {
+        return {};
+    }
+}
 void wa(int f, std::span<const uint8_t> b) {
     size_t p = 0;
     while (p < b.size()) {
@@ -89,9 +182,20 @@ StorageLock::~StorageLock() {
 }
 
 LocalStore::LocalStore(std::filesystem::path r, uint64_t l, std::array<uint8_t, 32> k)
-    : root_(std::move(r)), objects_(root_ / "objects"), limit_(l), key_(k) {
+    : root_(std::move(r)), objects_(root_ / "objects"),
+      accounting_path_(root_ / ".macha.accounting"), limit_(l), key_(k) {
     std::filesystem::create_directories(objects_);
-    scan_thread_ = std::jthread([this](std::stop_token stop) { scan(stop); });
+    accounting_fd_ = ::open(accounting_path_.c_str(), O_RDWR | O_CREAT, 0600);
+    if (accounting_fd_ < 0)
+        throw std::runtime_error("cannot open accounting state: " + std::string(strerror(errno)));
+    if (restore_accounting()) {
+        accounting_trusted_.store(true, std::memory_order_release);
+        scan_complete_.store(true, std::memory_order_release);
+        Log::debug("storage accounting restored path=" + root_.string() +
+                   " used=" + std::to_string(used_.load(std::memory_order_relaxed)));
+    } else {
+        scan_thread_ = std::jthread([this](std::stop_token stop) { scan(stop); });
+    }
 }
 
 LocalStore::~LocalStore() {
@@ -99,10 +203,79 @@ LocalStore::~LocalStore() {
         scan_thread_.request_stop();
         scan_thread_.join();
     }
+    if (accounting_fd_ >= 0) {
+        if (accounting_trusted_.load(std::memory_order_acquire)) {
+            try {
+                ObjectId none{};
+                persist_accounting(used_.load(std::memory_order_relaxed), accounting_none, none, 0, true);
+            } catch (...) {
+            }
+        }
+        close(accounting_fd_);
+        accounting_fd_ = -1;
+    }
 }
 std::filesystem::path LocalStore::path(const ObjectId& i) const {
     auto s = to_string(i);
     return objects_ / s.substr(0, 2) / s.substr(2, 2) / (s + ".obj");
+}
+
+void LocalStore::persist_accounting(uint64_t used, uint8_t operation, const ObjectId& id,
+                                    uint64_t size, bool durable) {
+    AccountingRecord record;
+    record.sequence = ++accounting_sequence_;
+    record.used = used;
+    record.operation = operation;
+    record.id = id;
+    record.size = size;
+    accounting_slot_ ^= 1U;
+    auto encoded = encode_accounting(record);
+    pwa_exact(accounting_fd_, encoded, accounting_slot_ * accounting_slot_size);
+    if (durable && fsync(accounting_fd_) != 0)
+        throw std::runtime_error("cannot sync accounting state: " + std::string(strerror(errno)));
+}
+
+bool LocalStore::restore_accounting() {
+    std::optional<AccountingRecord> best;
+    unsigned best_slot = 0;
+    for (unsigned slot = 0; slot < 2; ++slot) {
+        auto bytes = pra_exact(accounting_fd_, accounting_slot_size,
+                               slot * accounting_slot_size);
+        if (!bytes)
+            continue;
+        auto decoded = decode_accounting(*bytes);
+        if (!decoded)
+            continue;
+        if (!best || decoded->sequence > best->sequence) {
+            best = *decoded;
+            best_slot = slot;
+        }
+    }
+    if (!best)
+        return false;
+
+    accounting_sequence_ = best->sequence;
+    accounting_slot_ = best_slot;
+    uint64_t restored = best->used;
+    if (best->operation == accounting_put) {
+        if (std::filesystem::exists(path(best->id))) {
+            if (std::numeric_limits<uint64_t>::max() - restored < best->size)
+                return false;
+            restored += best->size;
+        }
+    } else if (best->operation == accounting_remove) {
+        if (!std::filesystem::exists(path(best->id))) {
+            if (best->size > restored)
+                return false;
+            restored -= best->size;
+        }
+    }
+    used_.store(restored, std::memory_order_relaxed);
+    if (best->operation != accounting_none) {
+        ObjectId none{};
+        persist_accounting(restored, accounting_none, none, 0, true);
+    }
+    return true;
 }
 bool LocalStore::put(const ObjectId& i, std::span<const uint8_t> d) {
     if (object_id(d) != i)
@@ -121,8 +294,13 @@ bool LocalStore::put(const ObjectId& i, std::span<const uint8_t> d) {
     h.fixed(s.nonce);
     h.fixed(s.tag);
     uint64_t need = h.data().size() + s.ciphertext.size();
-    if (used_ + need > limit_)
+    if (used_.load(std::memory_order_relaxed) + need > limit_)
         return false;
+    const auto before = used_.load(std::memory_order_relaxed);
+    // Make the single pending mutation durable before changing the object tree.
+    // If the process dies after rename, startup resolves this record by checking
+    // only this content-addressed path rather than scanning the complete store.
+    persist_accounting(before, accounting_put, i, need, true);
     std::filesystem::create_directories(p.parent_path());
     auto t = p.string() + ".tmp." + std::to_string(getpid()) + "." + std::to_string(unix_ms());
     int f = ::open(t.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
@@ -139,13 +317,22 @@ bool LocalStore::put(const ObjectId& i, std::span<const uint8_t> d) {
         if (rename(t.c_str(), p.c_str()))
             throw std::runtime_error(strerror(errno));
         syncdir(p.parent_path());
-        used_ += need;
+        used_.store(before + need, std::memory_order_relaxed);
+        ObjectId none{};
+        // The next mutation's durable intent also flushes this clean checkpoint;
+        // destructor performs a final durable sync. The older slot retains the
+        // durable pending record until then, so crash recovery remains O(1).
+        persist_accounting(before + need, accounting_none, none, 0, false);
         return true;
     } catch (...) {
         if (f >= 0)
             close(f);
         std::error_code e;
         std::filesystem::remove(t, e);
+        if (!std::filesystem::exists(p)) {
+            ObjectId none{};
+            try { persist_accounting(before, accounting_none, none, 0, true); } catch (...) {}
+        }
         throw;
     }
 }
@@ -176,9 +363,21 @@ bool LocalStore::remove(const ObjectId& i) {
     auto p = path(i);
     std::error_code e;
     auto n = std::filesystem::file_size(p, e);
-    if (e || !std::filesystem::remove(p, e))
+    if (e)
         return false;
-    used_ -= n;
+    const auto before = used_.load(std::memory_order_relaxed);
+    if (n > before)
+        throw std::runtime_error("local accounting underflow");
+    persist_accounting(before, accounting_remove, i, n, true);
+    if (!std::filesystem::remove(p, e)) {
+        ObjectId none{};
+        persist_accounting(before, accounting_none, none, 0, true);
+        return false;
+    }
+    syncdir(p.parent_path());
+    used_.store(before - n, std::memory_order_relaxed);
+    ObjectId none{};
+    persist_accounting(before - n, accounting_none, none, 0, false);
     return true;
 }
 std::vector<ObjectId> LocalStore::list() const {
@@ -299,15 +498,18 @@ void LocalStore::scan(std::stop_token stop) {
         if (!size_error)
             n += size;
     }
+    if (stop.stop_requested())
+        return;
     {
         std::lock_guard guard(m_);
-        if (!stop.stop_requested())
-            used_.store(n, std::memory_order_relaxed);
+        used_.store(n, std::memory_order_relaxed);
+        ObjectId none{};
+        persist_accounting(n, accounting_none, none, 0, true);
+        accounting_trusted_.store(true, std::memory_order_release);
         scan_complete_.store(true, std::memory_order_release);
     }
-    if (!stop.stop_requested())
-        Log::debug("storage accounting scan complete path=" + root_.string() +
-                   " used=" + std::to_string(n));
+    Log::debug("storage accounting scan complete path=" + root_.string() +
+               " used=" + std::to_string(n));
 }
 NodeId load_or_create_node_id(const std::filesystem::path& r) {
     std::filesystem::create_directories(r);

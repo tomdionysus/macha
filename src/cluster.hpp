@@ -40,8 +40,12 @@ class NodeRuntime {
     std::deque<LocalCopyJob> local_copies_;
     size_t local_copy_bytes_{};
     std::atomic_bool started_{};
+    std::atomic_uint64_t playback_activity_bytes_{};
+    std::atomic_uint64_t interactive_activity_bytes_{};
+    std::atomic_int64_t last_playback_activity_ms_{};
+    std::atomic_int64_t last_interactive_activity_ms_{};
 
-    RpcMessage handle(const NodeInfo&, const RpcMessage&);
+    RpcMessage handle(const NodeInfo&, FrameType, const RpcMessage&);
     void loop(std::stop_token);
     void local_writer_loop(std::stop_token);
     void exchange(const Endpoint&);
@@ -95,11 +99,14 @@ class NodeRuntime {
     void announce_metadata_generation(uint64_t);
     void enqueue_fetched(const ObjectId&, std::span<const uint8_t>, bool promote);
     void reconfigure_local(const Config&);
+    void note_activity(FrameType, uint64_t bytes = 0);
+    uint64_t take_activity_bytes(FrameType);
+    std::chrono::milliseconds activity_idle_for(FrameType) const;
     uint64_t remote_metadata_generation() const {
         return remote_metadata_generation_.load();
     }
     uint64_t known_metadata_generation() const {
-        const auto local = meta_.current().generation;
+        const auto local = meta_.generation();
         const auto remote = remote_metadata_generation_.load();
         return local > remote ? local : remote;
     }
