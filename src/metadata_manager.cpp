@@ -65,7 +65,14 @@ std::pair<bool, MetadataRecord> cas_reply(const RpcReply& reply) {
         return {};
     Reader reader(reply.message.payload);
     bool ok = reader.u8() != 0;
-    auto record = decode_metadata_record(reader.bytes());
+    MetadataRecord record;
+    if (ok) {
+        record.generation = reader.u64();
+        record.previous.bytes = reader.fixed<32>();
+        record.hash.bytes = reader.fixed<32>();
+    } else {
+        record = decode_metadata_record(reader.bytes());
+    }
     reader.finish();
     return {ok, record};
 }
@@ -404,15 +411,24 @@ MetadataManager::CasResult MetadataManager::cas_quorum(const std::vector<NodeInf
     writer.bytes(payload);
     const auto encoded = writer.take();
 
+    MetadataRecord proposed;
+    proposed.generation = expected.generation + 1;
+    proposed.previous = expected.hash;
+    proposed.payload.assign(payload.begin(), payload.end());
+    proposed.hash = metadata_hash(proposed.generation, proposed.previous, proposed.payload);
+
     size_t completed = 0;
     std::vector<PendingCas> pending;
     pending.reserve(nodes.size());
 
     auto observe = [&](bool ok, const MetadataRecord& record) {
         if (ok) {
+            if (record.generation != proposed.generation ||
+                record.previous != proposed.previous || record.hash != proposed.hash)
+                throw std::runtime_error("metadata CAS voter acknowledged unexpected successor");
             ++result.success;
-            if (!result.committed || newer_than(record, *result.committed))
-                result.committed = record;
+            if (!result.committed)
+                result.committed = proposed;
         } else if (record.generation > expected.generation ||
                    (record.generation == expected.generation && record.hash != expected.hash)) {
             result.conflict = true;
@@ -625,7 +641,7 @@ MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial)
             throw std::runtime_error("cluster extent size does not match local configuration");
 
         // Replica-policy changes are an offline coordinated operation: every
-        // node must be restarted with the same desired values. Transport v9
+        // node must be restarted with the same desired values. Transport v10
         // does not advertise desired policy, so mixed rolling configurations
         // cannot be safely reconciled here.
         const size_t old_need = quorum(old_voters.size());

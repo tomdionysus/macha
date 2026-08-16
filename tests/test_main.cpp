@@ -1278,7 +1278,7 @@ void test_async_rpc_move_ownership() {
     CHECK(cancelled.load() == 2);
 }
 
-void test_rpc_v9_frame_priority_and_variable_length() {
+void test_rpc_v10_frame_priority_and_variable_length() {
     CHECK(frame_type_priority(FrameType::control) < frame_type_priority(FrameType::foreground));
     CHECK(frame_type_priority(FrameType::foreground) < frame_type_priority(FrameType::read_ahead));
     CHECK(frame_type_priority(FrameType::read_ahead) <
@@ -1439,7 +1439,7 @@ void test_repair_step_is_bounded_and_yields() {
     s1.stop();
 }
 
-void test_rpc_v9_persistence_and_multiplexing() {
+void test_rpc_v10_persistence_and_multiplexing() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -1516,7 +1516,7 @@ void test_rpc_v9_persistence_and_multiplexing() {
     server.stop();
 }
 
-void test_rpc_v9_bidirectional_and_deduplication() {
+void test_rpc_v10_bidirectional_and_deduplication() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -3817,6 +3817,14 @@ void test_media_timestamp_repair() {
     CHECK(pts_before.dts == 5);
     CHECK(bad_pts.pts_before_dts == 1);
     CHECK(bad_pts.repair_count() == 0);
+
+    int64_t encoder_pts = kNoMediaTimestamp;
+    CHECK(normalize_encoder_pts(encoder_pts, kNoMediaTimestamp) == kNoMediaTimestamp);
+    CHECK(encoder_pts == kNoMediaTimestamp);
+    CHECK(normalize_encoder_pts(encoder_pts, 100) == 100);
+    CHECK(normalize_encoder_pts(encoder_pts, 100) == 101);
+    CHECK(normalize_encoder_pts(encoder_pts, 99) == 102);
+    CHECK(normalize_encoder_pts(encoder_pts, 140) == 140);
 }
 
 void test_playback_probe_failure_is_stage_specific() {
@@ -4184,10 +4192,10 @@ int main() {
         test_placement();
         test_capacity_placement();
         test_async_rpc_move_ownership();
-        test_rpc_v9_frame_priority_and_variable_length();
+        test_rpc_v10_frame_priority_and_variable_length();
         test_repair_step_is_bounded_and_yields();
-        test_rpc_v9_persistence_and_multiplexing();
-        test_rpc_v9_bidirectional_and_deduplication();
+        test_rpc_v10_persistence_and_multiplexing();
+        test_rpc_v10_bidirectional_and_deduplication();
         test_mutual_bootstrap_prunes_cross_dial();
         test_rpc_v7_handshake_is_rejected();
         test_rpc_slow_control_does_not_abort_data();
