@@ -80,7 +80,7 @@ streaming:
   probe_timeout_ms: 20000
 ```
 
-`max_sessions` limits logical playback sessions. Video and audio transcodes have separate lower limits because direct play and remux sessions are much cheaper. `max_ahead_segments` bounds how far the in-process producer may run ahead of client demand. Producers block on the segment store and wake as the player requests later fragments; no process suspension is involved.
+`max_sessions` limits logical playback sessions. Video and audio transcodes have separate lower limits because direct play and remux sessions are much cheaper. `max_ahead_segments` bounds how far the in-process producer may run ahead of client demand. For transformed finite media the VOD playlist itself is complete from first publication; only fragment materialisation is bounded. Producers block on the segment store and wake as the player requests later fragments; no process suspension is involved.
 
 Generated init/media fragments are published to memory. `segment_memory_bytes` bounds resident generated-segment memory per session; sufficiently old consumed fragments may spill below `temp_path` and remain directly addressable. `temp_path` is therefore overflow storage, not the signalling mechanism between the media engine and HTTP server.
 

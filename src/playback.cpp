@@ -423,6 +423,7 @@ struct PlaybackManager::Impl {
         FsEntry source_entry;
         MediaProbeResult probe;
         PlaybackPlan plan;
+        std::optional<HlsVodPlan> vod_plan;
         uint64_t generation{};
         std::filesystem::path generation_dir;
         mutable std::mutex pipeline_mutex;
@@ -624,6 +625,25 @@ struct PlaybackManager::Impl {
         throw std::runtime_error("timed out waiting for first fragmented-MP4 segment");
     }
 
+    void prepare_transformed_vod(Session& session, std::string_view trace) {
+        session.vod_plan.reset();
+        if (session.plan.mode == PlaybackMode::direct) return;
+        auto started = Clock::now();
+        auto prepared = engine->prepare_hls_vod(session.source, session.plan,
+                                                session.probe.duration_seconds, config.segment_duration,
+                                                session.preferences.mode != "remux" &&
+                                                    session.capabilities.video_codecs.contains("h264"),
+                                                config.probe_timeout);
+        session.plan = prepared.playback;
+        Log::debug("playback[" + std::string(trace) + "] VOD plan ready mode=" +
+                   playback_mode_name(session.plan.mode) +
+                   " seek_ms=" + std::to_string(session.plan.seek.count()) +
+                   " segments=" + std::to_string(prepared.segment_durations.size()) +
+                   " elapsed_ms=" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                       Clock::now() - started).count()));
+        session.vod_plan = std::move(prepared);
+    }
+
     void start_pipeline(Session& session, std::string_view trace) {
         stop_pipeline(session);
         ++session.generation;
@@ -640,7 +660,8 @@ struct PlaybackManager::Impl {
             auto started_at = Clock::now();
             Log::info("playback[" + std::string(trace) + "] pipeline start media=" + session.source.media_id +
                       " mode=" + playback_mode_name(session.plan.mode));
-            auto launched = engine->start_hls(session.source, session.plan, config.segment_duration,
+            if (!session.vod_plan) throw std::runtime_error("transformed session has no VOD plan");
+            auto launched = engine->start_hls(session.source, *session.vod_plan, config.segment_duration,
                                               config.max_ahead_segments, config.segment_memory_bytes,
                                               session.generation_dir);
             {
@@ -871,24 +892,30 @@ struct PlaybackManager::Impl {
             response.headers["Cache-Control"] = "no-store";
             return response;
         }
-        auto object = store->object(name);
+        std::optional<Bytes> object;
+        if (auto index = segment_index(name)) {
+            // A VOD playlist is complete and immutable from first publication,
+            // so clients are allowed to ask for a valid future fragment. Demand
+            // wakes the sequential producer and this HTTP request waits for that
+            // fragment instead of returning a transient 404.
+            active->note_segment_requested(*index);
+            object = store->wait_object(name, {});
+            auto state = store->snapshot();
+            if (object) {
+                Log::debug("playback stream segment session=" + session->id +
+                           " generation=" + std::to_string(session->generation) +
+                           " index=" + std::to_string(*index) +
+                           " bytes=" + std::to_string(object->size()) +
+                           " segments_ready=" + std::to_string(state.segment_count));
+            }
+        } else {
+            object = store->object(name);
+        }
         if (!object) {
             auto state = store->snapshot();
             if (!state.error.empty()) return http_error(503, "stream_failed", state.error);
             return http_error(404, state.finished ? "not_found" : "not_ready",
                               state.finished ? "stream object not found" : "stream object not ready");
-        }
-        // Demand only advances after a fragment actually exists. A guessed or
-        // malicious far-future segment URL must not defeat producer back-pressure
-        // and cause the whole movie to be hydrated.
-        if (auto index = segment_index(name)) {
-            active->note_segment_requested(*index);
-            auto state = store->snapshot();
-            Log::debug("playback stream segment session=" + session->id +
-                       " generation=" + std::to_string(session->generation) +
-                       " index=" + std::to_string(*index) +
-                       " bytes=" + std::to_string(object->size()) +
-                       " segments_ready=" + std::to_string(state.segment_count));
         }
         return bytes_response(request, std::move(*object), file_mime(name));
     }
@@ -927,6 +954,7 @@ struct PlaybackManager::Impl {
         try {
             session = resolve_session(item_id, std::move(media), std::move(caps), std::move(prefs), trace);
             if (seek_ms) session->plan.seek = std::chrono::milliseconds(*seek_ms);
+            prepare_transformed_vod(*session, trace);
             reserve_resources(session->plan);
             resources_reserved = true;
             start_pipeline(*session, trace);
@@ -1003,6 +1031,7 @@ struct PlaybackManager::Impl {
                                            trace, old->id, old->token);
         replacement->generation = old->generation;
         if (seek_ms) replacement->plan.seek = std::chrono::milliseconds(*seek_ms);
+        prepare_transformed_vod(*replacement, trace);
         bool resources_reserved = false;
         try {
             reserve_resources(replacement->plan, old->id);

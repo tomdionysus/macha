@@ -3,6 +3,7 @@
 
 #include "log.hpp"
 #include "media_timestamps.hpp"
+#include "media_vod.hpp"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -268,6 +269,92 @@ int choose_width(const AVCodecParameters* input, int target_height) {
     return std::max(2, scaled & ~1);
 }
 
+std::vector<double> fixed_vod_durations(double duration_seconds, double seek_seconds,
+                                        double segment_seconds) {
+    const double remaining = std::max(0.0, duration_seconds - seek_seconds);
+    if (!(remaining > 0.001) || !(segment_seconds > 0.001))
+        throw std::runtime_error("media duration is unavailable for VOD planning");
+    std::vector<double> durations;
+    double left = remaining;
+    while (left > segment_seconds + 0.001) {
+        durations.push_back(segment_seconds);
+        left -= segment_seconds;
+    }
+    durations.push_back(std::max(0.001, left));
+    return durations;
+}
+
+void materialise_deferred_seek_index(AVFormatContext* format, int video_stream,
+                                     double requested_seek_seconds) {
+    if (!format || !format->iformat || !format->iformat->name || video_stream < 0 ||
+        video_stream >= static_cast<int>(format->nb_streams))
+        return;
+    if (!media_vod::requires_seek_index_materialisation(format->iformat->name)) return;
+
+    auto* stream = format->streams[video_stream];
+    const int before = avformat_index_get_entries_count(stream);
+    const int64_t input_start_us = format->start_time == AV_NOPTS_VALUE ? 0 : format->start_time;
+    const int64_t requested_us = input_start_us +
+        av_rescale_q(static_cast<int64_t>(std::llround(requested_seek_seconds * 1000.0)),
+                     AVRational{1, 1000}, AV_TIME_BASE_Q);
+    const int64_t requested_ts = av_rescale_q(requested_us, AV_TIME_BASE_Q, stream->time_base);
+
+    // FFmpeg's Matroska demuxer deliberately defers Cues parsing until a seek
+    // is requested. avformat_find_stream_info() may therefore leave only the
+    // handful of keyframes encountered during probing in AVStream's index.
+    // Triggering a seek here materialises Cues into the index before the VOD
+    // planner decides whether stream-copy segmentation is safe. This context
+    // is planning-only, so changing its demux position has no playback side
+    // effects.
+    const int rc = avformat_seek_file(format, video_stream, std::numeric_limits<int64_t>::min(),
+                                      requested_ts, std::numeric_limits<int64_t>::max(),
+                                      AVSEEK_FLAG_BACKWARD);
+    if (rc < 0) {
+        Log::debug("media VOD planner could not materialise deferred seek index format=" +
+                   std::string(format->iformat->name) + " error=" + av_error(rc));
+        return;
+    }
+
+    const int after = avformat_index_get_entries_count(stream);
+    Log::debug("media VOD planner materialised deferred seek index format=" +
+               std::string(format->iformat->name) + " entries_before=" +
+               std::to_string(before) + " entries_after=" + std::to_string(after));
+}
+
+std::vector<double> indexed_vod_durations(AVFormatContext* format, int video_stream,
+                                          double duration_seconds, double requested_seek_seconds,
+                                          double segment_seconds, double& actual_seek_seconds) {
+    if (video_stream < 0 || video_stream >= static_cast<int>(format->nb_streams)) return {};
+    auto* stream = format->streams[video_stream];
+    const int entries = avformat_index_get_entries_count(stream);
+    if (entries <= 0) return {};
+
+    const int64_t input_start_us = format->start_time == AV_NOPTS_VALUE ? 0 : format->start_time;
+    const int64_t requested_us = input_start_us +
+        av_rescale_q(static_cast<int64_t>(std::llround(requested_seek_seconds * 1000.0)),
+                     AVRational{1, 1000}, AV_TIME_BASE_Q);
+    const int64_t requested_ts = av_rescale_q(requested_us, AV_TIME_BASE_Q, stream->time_base);
+
+    std::vector<double> keyframes;
+    keyframes.reserve(static_cast<size_t>(entries));
+    for (int i = 0; i < entries; ++i) {
+        const auto* entry = avformat_index_get_entry(stream, i);
+        if (!entry || !(entry->flags & AVINDEX_KEYFRAME) || entry->timestamp == AV_NOPTS_VALUE) continue;
+        if (entry->timestamp < requested_ts) continue;
+        const int64_t absolute_us = av_rescale_q(entry->timestamp, stream->time_base, AV_TIME_BASE_Q);
+        const double seconds =
+            std::max(0.0, static_cast<double>(absolute_us - input_start_us) / AV_TIME_BASE);
+        if (!keyframes.empty() && seconds <= keyframes.back() + 0.0005) continue;
+        keyframes.push_back(seconds);
+    }
+
+    auto plan = media_vod::indexed_plan(keyframes, duration_seconds, requested_seek_seconds,
+                                        segment_seconds);
+    if (!plan) return {};
+    actual_seek_seconds = plan->actual_seek_seconds;
+    return std::move(plan->segment_durations);
+}
+
 } // namespace
 
 namespace {
@@ -344,8 +431,10 @@ class FragmentWriter {
     }
 
   public:
-    FragmentWriter(std::shared_ptr<MediaSegmentStore> store, std::chrono::milliseconds target)
-        : store_(std::move(store)), fallback_duration_(std::max(0.001, target.count() / 1000.0)) {}
+    FragmentWriter(std::shared_ptr<MediaSegmentStore> store, std::chrono::milliseconds target,
+                   const std::vector<double>& planned_durations)
+        : store_(std::move(store)), durations_(planned_durations.begin(), planned_durations.end()),
+          fallback_duration_(std::max(0.001, target.count() / 1000.0)) {}
 
     int write(const uint8_t* data, int size) {
         pending_.insert(pending_.end(), data, data + size);
@@ -353,12 +442,7 @@ class FragmentWriter {
         return size;
     }
 
-    void queue_duration(double seconds) {
-        if (std::isfinite(seconds) && seconds > 0.001) durations_.push_back(seconds);
-    }
-
-    void finish(double final_duration) {
-        if (final_duration > 0.001) durations_.push_back(final_duration);
+    void finish() {
         parse();
         if (!pending_.empty()) {
             if (!fragment_.empty()) {
@@ -380,6 +464,38 @@ class FragmentWriter {
                 throw std::runtime_error("stream cancelled");
             fragment_.clear();
         }
+    }
+};
+
+class FragmentCuts {
+    std::vector<double> durations_;
+    size_t next_force_{};
+    size_t next_cut_{};
+    double force_time_{};
+    double cut_time_{};
+
+    static void advance(const std::vector<double>& durations, size_t& next, double& time) {
+        ++next;
+        if (next + 1 < durations.size()) time += durations[next];
+    }
+
+  public:
+    explicit FragmentCuts(std::vector<double> durations) : durations_(std::move(durations)) {
+        if (durations_.size() > 1) force_time_ = cut_time_ = durations_.front();
+    }
+
+    bool force_transcode_keyframe(double seconds) {
+        if (durations_.size() < 2 || next_force_ + 1 >= durations_.size()) return false;
+        if (seconds + 0.002 < force_time_) return false;
+        advance(durations_, next_force_, force_time_);
+        return true;
+    }
+
+    bool before_keyframe(double seconds) {
+        if (durations_.size() < 2 || next_cut_ + 1 >= durations_.size()) return false;
+        if (seconds + 0.002 < cut_time_) return false;
+        advance(durations_, next_cut_, cut_time_);
+        return true;
     }
 };
 
@@ -549,8 +665,11 @@ void write_mux_packet(AVFormatContext* output, AVPacket* packet) {
 
 
 void encode_video_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame* decoded,
-                        AVPacket* encoded, FragmentWriter& writer,
-                        std::optional<double>& fragment_start, double& last_end) {
+                        AVPacket* encoded, FragmentCuts& cuts) {
+    auto source_pts = decoded->best_effort_timestamp != AV_NOPTS_VALUE
+                          ? decoded->best_effort_timestamp
+                          : decoded->pts;
+    if (source_pts != AV_NOPTS_VALUE && source_pts < 0) return;
     AVFrame* frame = av_frame_alloc();
     if (!frame) throw std::bad_alloc();
     frame->format = pipe.encoder->pix_fmt;
@@ -569,9 +688,11 @@ void encode_video_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame* 
         }
         sws_scale(pipe.sws, decoded->data, decoded->linesize, 0, decoded->height,
                   frame->data, frame->linesize);
-        auto source_pts = decoded->best_effort_timestamp != AV_NOPTS_VALUE ? decoded->best_effort_timestamp : decoded->pts;
         frame->pts = source_pts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE
                      : av_rescale_q(source_pts, pipe.input_stream->time_base, pipe.encoder->time_base);
+        if (frame->pts != AV_NOPTS_VALUE &&
+            cuts.force_transcode_keyframe(frame->pts * av_q2d(pipe.encoder->time_base)))
+            frame->pict_type = AV_PICTURE_TYPE_I;
         rc = avcodec_send_frame(pipe.encoder, frame);
     }
     av_frame_free(&frame);
@@ -581,12 +702,10 @@ void encode_video_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame* 
         if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
         av_require(rc, "receive encoded video packet");
         auto seconds = encoded->pts == AV_NOPTS_VALUE ? 0.0 : encoded->pts * av_q2d(pipe.encoder->time_base);
-        auto duration = encoded->duration > 0 ? encoded->duration * av_q2d(pipe.encoder->time_base) : 0.0;
-        if ((encoded->flags & AV_PKT_FLAG_KEY) != 0) {
-            if (fragment_start && seconds > *fragment_start) writer.queue_duration(seconds - *fragment_start);
-            fragment_start = seconds;
+        if ((encoded->flags & AV_PKT_FLAG_KEY) != 0 && cuts.before_keyframe(seconds)) {
+            av_require(av_write_frame(output, nullptr), "flush VOD fragment");
+            avio_flush(output->pb);
         }
-        last_end = std::max(last_end, seconds + duration);
         av_packet_rescale_ts(encoded, pipe.encoder->time_base, pipe.output_stream->time_base);
         encoded->stream_index = pipe.output_stream->index;
         encoded->pos = -1;
@@ -665,12 +784,13 @@ void ensure_audio_resampler(StreamPipeline& pipe, const AVFrame* decoded) {
 }
 
 void process_audio_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame* decoded, AVPacket* encoded) {
+    auto source_pts = decoded->best_effort_timestamp != AV_NOPTS_VALUE
+                          ? decoded->best_effort_timestamp
+                          : decoded->pts;
+    if (source_pts != AV_NOPTS_VALUE && source_pts < 0) return;
     ensure_audio_resampler(pipe, decoded);
     auto input_rate = decoded->sample_rate > 0 ? decoded->sample_rate : pipe.decoder->sample_rate;
     if (!pipe.audio_pts_initialized) {
-        auto source_pts = decoded->best_effort_timestamp != AV_NOPTS_VALUE
-                              ? decoded->best_effort_timestamp
-                              : decoded->pts;
         if (source_pts != AV_NOPTS_VALUE)
             pipe.audio_next_pts = av_rescale_q(source_pts, pipe.input_stream->time_base,
                                                pipe.encoder->time_base);
@@ -735,7 +855,7 @@ void flush_audio_resampler(StreamPipeline& pipe) {
 }
 
 void flush_decoder(StreamPipeline& pipe, AVFormatContext* output, AVPacket* encoded,
-                   FragmentWriter& writer, std::optional<double>& fragment_start, double& last_end) {
+                   FragmentCuts& cuts) {
     if (!pipe.decoder) return;
     int rc = avcodec_send_packet(pipe.decoder, nullptr);
     if (rc < 0 && rc != AVERROR_EOF) av_require(rc, "flush decoder");
@@ -746,7 +866,7 @@ void flush_decoder(StreamPipeline& pipe, AVFormatContext* output, AVPacket* enco
         if (rc == AVERROR_EOF || rc == AVERROR(EAGAIN)) break;
         av_require(rc, "receive flushed frame");
         if (pipe.type == MediaStreamType::video)
-            encode_video_frame(pipe, output, decoded, encoded, writer, fragment_start, last_end);
+            encode_video_frame(pipe, output, decoded, encoded, cuts);
         else
             process_audio_frame(pipe, output, decoded, encoded);
         av_frame_unref(decoded);
@@ -775,11 +895,15 @@ void flush_encoder(StreamPipeline& pipe, AVFormatContext* output, AVPacket* pack
     }
 }
 
-void run_pipeline(const MediaSource& source, const PlaybackPlan& plan,
+void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                   std::chrono::milliseconds segment_duration,
                   std::shared_ptr<MediaSegmentStore> store, std::atomic_bool& cancelled,
                   uint64_t probe_bytes, std::chrono::milliseconds analyze_duration,
                   std::chrono::milliseconds startup_timeout) {
+    const auto& plan = vod_plan.playback;
+    if (vod_plan.segment_durations.empty())
+        throw std::runtime_error("VOD plan contains no media segments");
+
     // Opening the playback pipeline repeats a small amount of container
     // inspection because this AVFormatContext owns the decoder/muxer state.
     // Bound that startup work independently: session creation promises a
@@ -799,10 +923,10 @@ void run_pipeline(const MediaSource& source, const PlaybackPlan& plan,
     input.clear_deadline();
 
     // avformat timestamps are absolute on the input timeline. Keep the public
-    // playback generation relative to zero, including after a seek. Seeking is
-    // deliberately keyframe-backward; AVFMT_AVOID_NEG_TS_MAKE_ZERO below then
-    // shifts a leading keyframe before the requested point to zero while
-    // preserving A/V offsets.
+    // playback generation relative to zero, including after a seek. Remux VOD
+    // seeks have already been aligned to an indexed video keyframe; transcode
+    // may seek backward for decoder pre-roll, but decoded frames before zero
+    // are discarded and never enter the output timeline.
     const int64_t input_start_us = in->start_time == AV_NOPTS_VALUE ? 0 : in->start_time;
     const int64_t seek_target_us = input_start_us +
         av_rescale_q(plan.seek.count(), AVRational{1, 1000}, AV_TIME_BASE_Q);
@@ -852,14 +976,16 @@ void run_pipeline(const MediaSource& source, const PlaybackPlan& plan,
         if (plan.audio != MediaTransform::omit) add_stream(plan.audio_stream, MediaStreamType::audio, plan.audio);
         if (pipelines.empty()) throw std::runtime_error("playback plan contains no output streams");
 
-        FragmentWriter writer(store, segment_duration);
+        FragmentWriter writer(store, segment_duration, vod_plan.segment_durations);
+        FragmentCuts cuts(vod_plan.segment_durations);
         OutputIo output_io(writer);
         out->pb = output_io.get();
         out->flags |= AVFMT_FLAG_CUSTOM_IO;
         out->avoid_negative_ts = AVFMT_AVOID_NEG_TS_MAKE_ZERO;
 
         AVDictionary* options = nullptr;
-        av_dict_set(&options, "movflags", "frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset", 0);
+        av_dict_set(&options, "movflags",
+                    "frag_custom+empty_moov+default_base_moof+omit_tfhd_offset+negative_cts_offsets", 0);
         const bool has_video = std::any_of(pipelines.begin(), pipelines.end(), [](const auto& p) {
             return p->type == MediaStreamType::video;
         });
@@ -879,8 +1005,6 @@ void run_pipeline(const MediaSource& source, const PlaybackPlan& plan,
         AVPacket* encoded = av_packet_alloc();
         AVFrame* decoded = av_frame_alloc();
         if (!packet || !encoded || !decoded) throw std::bad_alloc();
-        std::optional<double> fragment_start;
-        double last_video_end = 0.0;
 
         try {
             while (!cancelled.load() && (rc = av_read_frame(in, packet)) >= 0) {
@@ -893,6 +1017,11 @@ void run_pipeline(const MediaSource& source, const PlaybackPlan& plan,
                 const auto origin = av_rescale_q(seek_target_us, AV_TIME_BASE_Q,
                                                  pipe.input_stream->time_base);
                 if (pipe.transform == MediaTransform::copy) {
+                    const auto presentation = packet->pts != AV_NOPTS_VALUE ? packet->pts : packet->dts;
+                    if (presentation != AV_NOPTS_VALUE && presentation < origin) {
+                        av_packet_unref(packet);
+                        continue;
+                    }
                     const auto repairs_before = pipe.copy_timestamps.repair_count();
                     prepare_copy_packet(pipe, packet, origin);
                     if (!pipe.copy_repair_reported && pipe.copy_timestamps.repair_count() != repairs_before) {
@@ -901,13 +1030,12 @@ void run_pipeline(const MediaSource& source, const PlaybackPlan& plan,
                                   " stream=" + std::to_string(pipe.input_index));
                     }
                     if (pipe.type == MediaStreamType::video) {
-                        auto seconds = packet->pts == AV_NOPTS_VALUE ? 0.0 : packet->pts * av_q2d(pipe.output_stream->time_base);
-                        auto duration = packet->duration > 0 ? packet->duration * av_q2d(pipe.output_stream->time_base) : 0.0;
-                        if ((packet->flags & AV_PKT_FLAG_KEY) != 0) {
-                            if (fragment_start && seconds > *fragment_start) writer.queue_duration(seconds - *fragment_start);
-                            fragment_start = seconds;
+                        auto seconds = packet->pts == AV_NOPTS_VALUE ? 0.0 :
+                                           packet->pts * av_q2d(pipe.output_stream->time_base);
+                        if ((packet->flags & AV_PKT_FLAG_KEY) != 0 && cuts.before_keyframe(seconds)) {
+                            av_require(av_write_frame(out, nullptr), "flush VOD fragment");
+                            avio_flush(out->pb);
                         }
-                        last_video_end = std::max(last_video_end, seconds + duration);
                     }
                     write_mux_packet(out, packet);
                 } else {
@@ -919,7 +1047,7 @@ void run_pipeline(const MediaSource& source, const PlaybackPlan& plan,
                         if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
                         av_require(rc, "receive decoded frame");
                         if (pipe.type == MediaStreamType::video)
-                            encode_video_frame(pipe, out, decoded, encoded, writer, fragment_start, last_video_end);
+                            encode_video_frame(pipe, out, decoded, encoded, cuts);
                         else
                             process_audio_frame(pipe, out, decoded, encoded);
                         av_frame_unref(decoded);
@@ -943,15 +1071,13 @@ void run_pipeline(const MediaSource& source, const PlaybackPlan& plan,
                 }
                 for (auto& pipe : pipelines)
                     if (pipe->transform == MediaTransform::transcode)
-                        flush_decoder(*pipe, out, encoded, writer, fragment_start, last_video_end);
+                        flush_decoder(*pipe, out, encoded, cuts);
                 for (auto& pipe : pipelines)
                     if (pipe->transform == MediaTransform::transcode)
                         flush_encoder(*pipe, out, encoded);
-                double final_duration = 0.0;
-                if (fragment_start && last_video_end > *fragment_start) final_duration = last_video_end - *fragment_start;
                 av_require(av_write_trailer(out), "write fragmented MP4 trailer");
                 avio_flush(out->pb);
-                writer.finish(final_duration);
+                writer.finish();
             }
         } catch (...) {
             av_frame_free(&decoded);
@@ -971,7 +1097,7 @@ void run_pipeline(const MediaSource& source, const PlaybackPlan& plan,
 
 class LibavSession final : public MediaEngineSession {
     MediaSource source_;
-    PlaybackPlan plan_;
+    HlsVodPlan vod_plan_;
     std::chrono::milliseconds segment_duration_;
     uint64_t probe_bytes_{};
     std::chrono::milliseconds analyze_duration_{};
@@ -987,13 +1113,20 @@ class LibavSession final : public MediaEngineSession {
     void run(std::stop_token stop) {
         try {
             if (stop.stop_requested()) cancelled_.store(true);
-            run_pipeline(source_, plan_, segment_duration_, store_, cancelled_,
+            run_pipeline(source_, vod_plan_, segment_duration_, store_, cancelled_,
                          probe_bytes_, analyze_duration_, startup_timeout_);
             if (cancelled_.load()) {
                 exit_code_.store(0);
             } else {
                 store_->finish();
-                exit_code_.store(0);
+                auto state = store_->snapshot();
+                if (!state.error.empty()) {
+                    std::lock_guard lock(diagnostics_mutex_);
+                    diagnostics_ = state.error;
+                    exit_code_.store(1);
+                } else {
+                    exit_code_.store(0);
+                }
             }
         } catch (const std::exception& e) {
             if (!cancelled_.load()) {
@@ -1012,16 +1145,17 @@ class LibavSession final : public MediaEngineSession {
     }
 
   public:
-    LibavSession(MediaSource source, PlaybackPlan plan, std::chrono::milliseconds segment_duration,
+    LibavSession(MediaSource source, HlsVodPlan vod_plan, std::chrono::milliseconds segment_duration,
                  size_t max_ahead_segments, uint64_t memory_limit,
                  std::filesystem::path spill_directory, uint64_t probe_bytes,
                  std::chrono::milliseconds analyze_duration,
                  std::chrono::milliseconds startup_timeout)
-        : source_(std::move(source)), plan_(std::move(plan)), segment_duration_(segment_duration),
+        : source_(std::move(source)), vod_plan_(std::move(vod_plan)), segment_duration_(segment_duration),
           probe_bytes_(probe_bytes), analyze_duration_(analyze_duration),
           startup_timeout_(startup_timeout),
           store_(std::make_shared<MediaSegmentStore>(max_ahead_segments, memory_limit,
-                                                     std::move(spill_directory), segment_duration)) {
+                                                     std::move(spill_directory), segment_duration,
+                                                     vod_plan_.segment_durations)) {
         worker_ = std::jthread([this](std::stop_token stop) { run(stop); });
     }
 
@@ -1105,18 +1239,102 @@ class LibavMediaEngine final : public MediaEngine {
         return result;
     }
 
+    HlsVodPlan prepare_hls_vod(const MediaSource& source, const PlaybackPlan& requested,
+                               double source_duration_seconds,
+                               std::chrono::milliseconds segment_duration,
+                               bool allow_video_transcode_fallback,
+                               std::chrono::milliseconds timeout) override {
+        if (timeout.count() <= 0) timeout = config_.probe_timeout;
+        if (!(source_duration_seconds > 0.001))
+            throw std::runtime_error("source duration is unavailable for VOD planning");
+
+        HlsVodPlan result;
+        result.playback = requested;
+        const double target = std::max(0.001, segment_duration.count() / 1000.0);
+        double requested_seek = std::clamp(requested.seek.count() / 1000.0, 0.0,
+                                           std::max(0.0, source_duration_seconds - 0.001));
+
+        InputContext input(source, MediaReadPurpose::probe, nullptr, config_.probe_bytes,
+                           config_.probe_analyze_duration, timeout);
+        auto* format = input.get();
+        auto rc = avformat_find_stream_info(format, nullptr);
+        if (rc < 0 && input.timed_out())
+            throw std::runtime_error("VOD planning timed out while reading stream information");
+        av_require(rc, "read stream information for VOD planning");
+
+        if (result.playback.video != MediaTransform::omit &&
+            result.playback.video_stream >= 0 &&
+            result.playback.video_stream < static_cast<int>(format->nb_streams)) {
+            auto* stream = format->streams[result.playback.video_stream];
+            if (result.playback.video == MediaTransform::copy) {
+                materialise_deferred_seek_index(format, result.playback.video_stream, requested_seek);
+                if (input.timed_out())
+                    throw std::runtime_error("VOD planning timed out while loading video seek index");
+                double actual_seek = requested_seek;
+                result.segment_durations = indexed_vod_durations(
+                    format, result.playback.video_stream, source_duration_seconds, requested_seek,
+                    target, actual_seek);
+                if (!result.segment_durations.empty()) {
+                    result.playback.seek = std::chrono::milliseconds(
+                        static_cast<int64_t>(std::llround(actual_seek * 1000.0)));
+                } else {
+                    Log::debug("media VOD planner rejected unusable remux keyframe index media=" +
+                               source.media_id + " entries=" +
+                               std::to_string(avformat_index_get_entries_count(stream)));
+                    if (!allow_video_transcode_fallback || !status_.h264_encoder)
+                        throw std::runtime_error(
+                            "remux VOD requires a usable video keyframe index; H.264 fallback is not permitted or unavailable");
+                    result.playback.video = MediaTransform::transcode;
+                    result.playback.video_codec = "h264";
+                    result.playback.mode = PlaybackMode::transcode;
+                    Log::info("media VOD planner falling back from remux to video transcode media=" +
+                              source.media_id + " reason=unusable-keyframe-index");
+                }
+            }
+
+            if (result.playback.video == MediaTransform::transcode) {
+                auto frame_rate = av_guess_frame_rate(format, stream, nullptr);
+                double segment = target;
+                if (frame_rate.num > 0 && frame_rate.den > 0) {
+                    const double fps = av_q2d(frame_rate);
+                    const int gop = std::max(1, static_cast<int>(std::llround(fps * target)));
+                    segment = gop / fps;
+                }
+                result.segment_durations =
+                    fixed_vod_durations(source_duration_seconds, requested_seek, segment);
+                result.playback.seek = std::chrono::milliseconds(
+                    static_cast<int64_t>(std::llround(requested_seek * 1000.0)));
+            }
+        } else {
+            result.segment_durations =
+                fixed_vod_durations(source_duration_seconds, requested_seek, target);
+            result.playback.seek = std::chrono::milliseconds(
+                static_cast<int64_t>(std::llround(requested_seek * 1000.0)));
+        }
+
+        if (result.segment_durations.empty())
+            throw std::runtime_error("VOD planning produced no media segments");
+        Log::debug("media VOD plan media=" + source.media_id +
+                   " mode=" + playback_mode_name(result.playback.mode) +
+                   " seek_ms=" + std::to_string(result.playback.seek.count()) +
+                   " segments=" + std::to_string(result.segment_durations.size()));
+        return result;
+    }
+
     std::unique_ptr<MediaEngineSession> start_hls(
-        const MediaSource& source, const PlaybackPlan& plan, std::chrono::milliseconds segment_duration,
+        const MediaSource& source, const HlsVodPlan& vod_plan, std::chrono::milliseconds segment_duration,
         size_t max_ahead_segments, uint64_t segment_memory_bytes,
         const std::filesystem::path& spill_directory) override {
         if (!status_.available) throw std::runtime_error("libav media engine is unavailable");
+        const auto& plan = vod_plan.playback;
         if (plan.video == MediaTransform::transcode && !status_.h264_encoder)
             throw std::runtime_error("H.264 encoder is unavailable");
         if (plan.audio == MediaTransform::transcode && !status_.aac_encoder)
             throw std::runtime_error("AAC encoder is unavailable");
-        Log::debug("media engine starting libav pipeline media=" + source.media_id +
-                   " mode=" + playback_mode_name(plan.mode));
-        return std::make_unique<LibavSession>(source, plan, segment_duration, max_ahead_segments,
+        Log::debug("media engine starting libav VOD pipeline media=" + source.media_id +
+                   " mode=" + playback_mode_name(plan.mode) +
+                   " segments=" + std::to_string(vod_plan.segment_durations.size()));
+        return std::make_unique<LibavSession>(source, vod_plan, segment_duration, max_ahead_segments,
                                               segment_memory_bytes, spill_directory,
                                               config_.probe_bytes, config_.probe_analyze_duration,
                                               config_.startup_timeout);

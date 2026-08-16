@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(macha VERSION 0.7.3 LANGUAGES CXX)
+project(macha VERSION 0.8.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -73,6 +73,7 @@ set(MACHA_CORE_SOURCES
     src/http.cpp
     src/media_segments.cpp
     src/media_timestamps.cpp
+    src/media_vod.cpp
     src/media_engine.cpp
     src/playback.cpp
     src/catalogue.cpp

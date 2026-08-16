@@ -8,6 +8,7 @@
 #include "metadata.hpp"
 #include "media_catalogue.hpp"
 #include "media_timestamps.hpp"
+#include "media_vod.hpp"
 #include "net.hpp"
 #include "placement.hpp"
 #include "service.hpp"
@@ -18,6 +19,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -103,17 +105,29 @@ class FakeMediaEngine final : public MediaEngine {
         result.streams.push_back(MediaStreamInfo{2, MediaStreamType::subtitle, "subrip", "", "eng", 0, 0, 0, 0, 0, false, false});
         return result;
     }
-    std::unique_ptr<MediaEngineSession> start_hls(const MediaSource&, const PlaybackPlan& plan,
+    HlsVodPlan prepare_hls_vod(const MediaSource&, const PlaybackPlan& plan, double duration_seconds,
+                               std::chrono::milliseconds segment_duration, bool,
+                               std::chrono::milliseconds = {}) override {
+        HlsVodPlan vod;
+        vod.playback = plan;
+        const double segment = segment_duration.count() / 1000.0;
+        double left = duration_seconds - plan.seek.count() / 1000.0;
+        while (left > segment + 0.001) { vod.segment_durations.push_back(segment); left -= segment; }
+        vod.segment_durations.push_back(std::max(0.001, left));
+        return vod;
+    }
+    std::unique_ptr<MediaEngineSession> start_hls(const MediaSource&, const HlsVodPlan& vod_plan,
                                                   std::chrono::milliseconds segment_duration,
                                                   size_t max_ahead_segments,
                                                   uint64_t memory_limit,
                                                   const std::filesystem::path& spill_directory) override {
         {
             std::lock_guard lock(mutex_);
-            started_plans_.push_back(plan);
+            started_plans_.push_back(vod_plan.playback);
         }
         auto store = std::make_shared<MediaSegmentStore>(max_ahead_segments, memory_limit,
-                                                         spill_directory, segment_duration);
+                                                         spill_directory, segment_duration,
+                                                         vod_plan.segment_durations);
         Bytes init{'i', 'n', 'i', 't'};
         Bytes segment{'s', 'e', 'g', 'm', 'e', 'n', 't'};
         REQUIRE(store->publish_init(std::move(init)));
@@ -137,7 +151,11 @@ class FailingProbeMediaEngine final : public MediaEngine {
     MediaProbeResult probe(const MediaSource&, std::chrono::milliseconds) override {
         throw std::runtime_error("synthetic probe failure");
     }
-    std::unique_ptr<MediaEngineSession> start_hls(const MediaSource&, const PlaybackPlan&,
+    HlsVodPlan prepare_hls_vod(const MediaSource&, const PlaybackPlan&, double,
+                               std::chrono::milliseconds, bool, std::chrono::milliseconds = {}) override {
+        throw std::runtime_error("prepare_hls_vod must not be called after a failed probe");
+    }
+    std::unique_ptr<MediaEngineSession> start_hls(const MediaSource&, const HlsVodPlan&,
                                                   std::chrono::milliseconds, size_t, uint64_t,
                                                   const std::filesystem::path&) override {
         throw std::runtime_error("start_hls must not be called after a failed probe");
@@ -163,12 +181,24 @@ class BlockingMediaEngine final : public MediaEngine {
         result.streams.push_back(MediaStreamInfo{1, MediaStreamType::audio, "aac", "LC", "eng", 0, 0, 2, 48000, 0, true, false});
         return result;
     }
-    std::unique_ptr<MediaEngineSession> start_hls(const MediaSource&, const PlaybackPlan&,
+    HlsVodPlan prepare_hls_vod(const MediaSource&, const PlaybackPlan& plan, double duration_seconds,
+                               std::chrono::milliseconds segment_duration, bool,
+                               std::chrono::milliseconds = {}) override {
+        HlsVodPlan vod;
+        vod.playback = plan;
+        const double segment = segment_duration.count() / 1000.0;
+        double left = duration_seconds - plan.seek.count() / 1000.0;
+        while (left > segment + 0.001) { vod.segment_durations.push_back(segment); left -= segment; }
+        vod.segment_durations.push_back(std::max(0.001, left));
+        return vod;
+    }
+    std::unique_ptr<MediaEngineSession> start_hls(const MediaSource&, const HlsVodPlan& vod_plan,
                                                   std::chrono::milliseconds segment_duration,
                                                   size_t max_ahead_segments, uint64_t memory_limit,
                                                   const std::filesystem::path& spill_directory) override {
         auto store = std::make_shared<MediaSegmentStore>(max_ahead_segments, memory_limit,
-                                                         spill_directory, segment_duration);
+                                                         spill_directory, segment_duration,
+                                                         vod_plan.segment_durations);
         {
             std::lock_guard lock(mutex_);
             pending_ = store;
@@ -3451,8 +3481,14 @@ void test_three_node_cluster() {
 
 void test_media_segment_store_backpressure_and_spill() {
     TempDir t;
-    auto store = std::make_shared<MediaSegmentStore>(2, 2 * 1024, t.path() / "spill", 4000ms);
+    auto store = std::make_shared<MediaSegmentStore>(2, 2 * 1024, t.path() / "spill", 4000ms,
+                                                     std::vector<double>{4.0, 4.0, 4.0, 4.0});
     REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
+    const auto initial_playlist = store->playlist();
+    CHECK(initial_playlist.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
+    CHECK(initial_playlist.find("segment-000003.m4s") != std::string::npos);
+    CHECK(initial_playlist.find("#EXT-X-ENDLIST") != std::string::npos);
+
     REQUIRE(store->publish_segment(Bytes(1024, 0x10), 4.0));
     REQUIRE(store->publish_segment(Bytes(1024, 0x11), 4.0));
     REQUIRE(store->publish_segment(Bytes(1024, 0x12), 4.0));
@@ -3463,11 +3499,19 @@ void test_media_segment_store_backpressure_and_spill() {
     });
     std::this_thread::sleep_for(50ms);
     CHECK(!fourth_published.load());
-    store->note_requested(1);
+
+    std::optional<Bytes> waited_segment;
+    std::jthread consumer([&] {
+        store->note_requested(3);
+        waited_segment = store->wait_object("segment-000003.m4s", 1s);
+    });
+    consumer.join();
     producer.join();
     CHECK(fourth_published.load());
+    REQUIRE(waited_segment.has_value());
+    CHECK(waited_segment->size() == 1024);
+    CHECK((*waited_segment)[0] == 0x13);
 
-    store->note_requested(3);
     store->finish();
     REQUIRE(store->wait_ready(10ms));
     auto state = store->snapshot();
@@ -3477,7 +3521,10 @@ void test_media_segment_store_backpressure_and_spill() {
     CHECK(state.highest_requested == 3);
 
     auto playlist = store->playlist();
+    CHECK(playlist == initial_playlist);
     CHECK(playlist.find("#EXT-X-MAP:URI=\"init.mp4\"") != std::string::npos);
+    CHECK(playlist.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
+    CHECK(playlist.find("#EXT-X-PLAYLIST-TYPE:EVENT") == std::string::npos);
     CHECK(playlist.find("segment-000003.m4s") != std::string::npos);
     CHECK(playlist.find("#EXT-X-ENDLIST") != std::string::npos);
 
@@ -3532,6 +3579,52 @@ void test_http_server_serves_streams_concurrently() {
     server.stop();
 }
 
+void test_media_vod_index_planning_rejects_partial_indexes() {
+    CHECK(media_vod::requires_seek_index_materialisation("matroska,webm"));
+    CHECK(media_vod::requires_seek_index_materialisation("webm"));
+    CHECK(!media_vod::requires_seek_index_materialisation("mov,mp4,m4a,3gp,3g2,mj2"));
+
+    std::vector<double> complete;
+    for (double seconds = 0.0; seconds < 120.0; seconds += 2.0) complete.push_back(seconds);
+    auto full = media_vod::indexed_plan(complete, 120.0, 0.0, 4.0);
+    REQUIRE(full.has_value());
+    CHECK(std::abs(full->actual_seek_seconds) < 0.0005);
+    CHECK(full->segment_durations.size() == 30);
+    for (const auto duration : full->segment_durations) CHECK(duration <= 4.001);
+
+    // Regression for 0.8.0: avformat_find_stream_info() can leave a Matroska
+    // AVStream index containing only keyframes encountered during probing. The
+    // old planner accepted that as complete and advertised the entire
+    // unindexed tail as one fragment, e.g. segments=1 for a full movie.
+    const std::vector<double> partial{0.0, 2.0};
+    CHECK(!media_vod::indexed_plan(partial, 120.0, 0.0, 4.0).has_value());
+
+    // A partially populated index must also be rejected when it contains
+    // enough early entries to produce several apparently sensible fragments.
+    const std::vector<double> partial_with_several_starts{0.0, 4.0, 8.0, 12.0, 16.0};
+    CHECK(!media_vod::indexed_plan(partial_with_several_starts, 120.0, 0.0, 4.0).has_value());
+
+    // Sparse but complete GOPs can still be remuxed when they remain within
+    // the deliberately generous 3x target-duration bound.
+    std::vector<double> sparse_complete;
+    for (double seconds = 0.0; seconds < 60.0; seconds += 10.0)
+        sparse_complete.push_back(seconds);
+    CHECK(media_vod::indexed_plan(sparse_complete, 60.0, 0.0, 4.0).has_value());
+
+    // One fragment is legitimate for genuinely short media; the regression
+    // is accepting one fragment for a long presentation with an incomplete
+    // index, not the segment count itself.
+    const std::vector<double> short_index{0.0};
+    auto short_plan = media_vod::indexed_plan(short_index, 6.0, 0.0, 4.0);
+    REQUIRE(short_plan.has_value());
+    CHECK(short_plan->segment_durations.size() == 1);
+    CHECK(std::abs(short_plan->segment_durations.front() - 6.0) < 0.0005);
+
+    auto seeked = media_vod::indexed_plan(complete, 120.0, 61.0, 4.0);
+    REQUIRE(seeked.has_value());
+    CHECK(std::abs(seeked->actual_seek_seconds - 62.0) < 0.0005);
+}
+
 void test_media_timestamp_repair() {
     MediaTimestampRepairState state;
 
@@ -3575,9 +3668,10 @@ void test_media_timestamp_repair() {
     MediaTimestampRepairState bad_pts;
     MediaPacketTimestamps pts_before{4, 5, 1};
     normalize_media_timestamps(bad_pts, pts_before);
-    CHECK(pts_before.pts == 5);
+    CHECK(pts_before.pts == 4);
     CHECK(pts_before.dts == 5);
     CHECK(bad_pts.pts_before_dts == 1);
+    CHECK(bad_pts.repair_count() == 0);
 }
 
 void test_playback_probe_failure_is_stage_specific() {
@@ -3936,6 +4030,7 @@ int main() {
         test_media_probe_and_online_catalogue_scanner();
         test_catalogue_sync_search_and_artwork_gc();
         test_media_segment_store_backpressure_and_spill();
+        test_media_vod_index_planning_rejects_partial_indexes();
         test_media_timestamp_repair();
         test_http_server_serves_streams_concurrently();
         test_playback_probe_failure_is_stage_specific();

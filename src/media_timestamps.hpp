@@ -27,7 +27,7 @@ struct MediaTimestampRepairState {
     uint64_t pts_before_dts{};
 
     uint64_t repair_count() const {
-        return missing_pts + missing_dts + nonmonotonic_dts + pts_before_dts;
+        return missing_pts + missing_dts + nonmonotonic_dts;
     }
 };
 
@@ -36,7 +36,9 @@ struct MediaTimestampRepairState {
 // Some demuxers can produce missing/equal timestamps around a backward seek,
 // and timestamp rescaling itself can collapse adjacent source ticks. A repair
 // is carried forward as a timeline shift so later packets keep their spacing
-// instead of being repeatedly squeezed forward one tick at a time.
+// instead of being repeatedly squeezed forward one tick at a time. PTS before
+// DTS is observed but preserved: signed composition offsets are valid in MP4
+// when the muxer uses version-1 CTTS entries.
 void normalize_media_timestamps(MediaTimestampRepairState& state,
                                 MediaPacketTimestamps& packet);
 

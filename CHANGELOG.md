@@ -1,8 +1,28 @@
 # Changelog
 
+## 0.8.1 - 2026-08-16
+
+- fixed transformed playback startup for Matroska/WebM sources whose FFmpeg stream index was only partially populated during probing. VOD planning now triggers the demuxer seek path so deferred Matroska Cues are materialised before keyframe planning;
+- reject remux VOD plans whose indexed random-access points do not cover the requested presentation densely enough for bounded fragments. This prevents a sparse partial index from being accepted as one whole-file fragment, which previously caused `POST /api/v1/playback/sessions` to wait until the startup timeout while the muxer read continuously without publishing segment 0;
+- preserve remux for valid complete indexes, including moderately sparse GOP layouts, while automatic playback still falls back to H.264 transcode when the final index remains unusable and fallback is permitted;
+- added regression tests for the 0.8.0 long-media `segments=1` failure, partially populated indexes that initially produce several plausible fragments, complete/sparse indexes, short one-fragment media, seek alignment, and Matroska/WebM deferred-index detection. Wire protocol remains v8.
+
+## 0.8.0 - 2026-08-16
+
+- changed transformed movie/episode playback from a growing HLS EVENT presentation to a complete immutable HLS VOD manifest. The full segment URI/duration plan is published from the first playlist response with `#EXT-X-PLAYLIST-TYPE:VOD` and `#EXT-X-ENDLIST`, while fragment bytes remain generated lazily;
+- added VOD planning to the media-engine boundary. Remux planning uses indexed video keyframes to choose approximately `segment_duration_ms` random-access boundaries; transcode planning uses the encoder GOP cadence;
+- made transformed remux seeks begin at the first indexed video keyframe at or after the requested position, so the first advertised VOD fragment is independently decodable rather than containing backward-seek pre-roll;
+- replaced MP4 `frag_keyframe` output with caller-controlled fragment cuts, preventing every source keyframe from becoming an HLS segment and making generated fragment count/durations match the immutable VOD plan;
+- made valid requests for not-yet-generated VOD fragments advance producer demand and wait for sequential generation instead of receiving a transient 404/503 solely because the producer has not reached that fragment yet;
+- preserved legitimate stream-copy PTS-before-DTS composition offsets and enabled signed MP4 composition-time offsets instead of clamping PTS to DTS; timestamp repair logging now reports only timestamps actually modified;
+- allow automatic remux to fall back to H.264 video transcode when no usable keyframe index exists only when the client advertised H.264 and the encoder is available; explicit `mode=remux` still fails rather than silently changing mode;
+- fixed duplicate transformed-playback resource reservation during session creation;
+- added `ROADMAP.md` documenting the former EVENT/request-driven implementation as a future explicit live/event mode, including the native-HLS edge chasing, request/producer feedback loop, forward jumps and edge stalls observed during 0.7.x testing;
+- added VOD playlist/back-pressure/timestamp regression coverage. Wire protocol remains v8.
+
 ## 0.7.3 - 2026-08-16
 
-- Remove the obsolete `DistributedStore::scrub_offset_` member left behind by the 0.7.2 persistent scrub cursor rewrite. This fixes Clang builds using `-Werror,-Wunused-private-field`.
+- removed the obsolete `DistributedStore::scrub_offset_` field left behind by the 0.7.2 persistent-cursor scrub implementation; this fixes Clang `-Werror,-Wunused-private-field` builds.
 
 ## 0.7.2 - 2026-08-16
 
