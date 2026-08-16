@@ -45,6 +45,7 @@ class NodeRuntime {
     void loop(std::stop_token);
     void local_writer_loop(std::stop_token);
     void exchange(const Endpoint&);
+    void exchange(const NodeInfo&);
     void merge(std::span<const uint8_t>);
     std::chrono::milliseconds stall_notice_for(MessageType) const;
 

@@ -1480,6 +1480,37 @@ void test_rpc_v7_bidirectional_and_deduplication() {
         CHECK(a.client.stats().connections_created == created);
     }
 
+    // A failed dial puts the endpoint into retry backoff, but that backoff must
+    // not mask a canonical route which arrives inbound immediately afterwards.
+    // This is the normal recovery shape when a peer reconnects while the other
+    // side is still remembering the failed outbound attempt.
+    {
+        TestNode a(keys, node_info(), echo);
+        TestNode b(keys, node_info(), echo);
+        Endpoint b_endpoint{"127.0.0.1", b.info.port};
+
+        b.server.stop();
+        bool failed = false;
+        try {
+            (void)a.client.call(b_endpoint, MessageType::members, Bytes{10}, 1s);
+        } catch (...) {
+            failed = true;
+        }
+        REQUIRE(failed);
+
+        b.server.attach_client(b.client);
+        b.server.start();
+        CHECK(b.client.call(a.info, MessageType::members, Bytes{11}, 1s).message.payload ==
+              Bytes{11});
+        REQUIRE(wait_until([&] { return a.client.stats().canonical_connections == 1; }));
+
+        // Still inside the failed dial's minimum 250-ms retry-backoff window.
+        // Endpoint lookup must reuse the authenticated inbound route before
+        // consulting dial backoff.
+        CHECK(a.client.call(b_endpoint, MessageType::members, Bytes{12}, 1s).message.payload ==
+              Bytes{12});
+    }
+
     // Retirement is a drain, not a reset. Force the higher NodeId to have a
     // slow request outstanding on the connection which cross-dial arbitration
     // will discard, then create the canonical lower->higher connection.

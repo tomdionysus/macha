@@ -1469,10 +1469,10 @@ RpcClient::connection(const Endpoint& endpoint, const NodeId* expected, NodeId* 
         else if (auto p = endpoint_peers_.find(endpoint_key(endpoint)); p != endpoint_peers_.end())
             known = p->second;
 
-        auto health = health_.find(retry_key);
-        if (health != health_.end() && Clock::now() < health->second.retry_after)
-            throw std::runtime_error("peer in retry backoff");
-
+        // Retry backoff applies to creating a new TCP connection, not to an
+        // already-established canonical route. A failed dial may leave an
+        // endpoint in backoff just as the peer reconnects inbound; rejecting
+        // that healthy route here creates an unnecessary outage/reconnect loop.
         if (known) {
             if (actual)
                 *actual = *known;
@@ -1488,6 +1488,10 @@ RpcClient::connection(const Endpoint& endpoint, const NodeId* expected, NodeId* 
                 return {};
             }
         }
+
+        auto health = health_.find(retry_key);
+        if (health != health_.end() && Clock::now() < health->second.retry_after)
+            throw std::runtime_error("peer in retry backoff");
     }
 
     try {
@@ -1799,16 +1803,31 @@ void RpcClient::health_loop(std::stop_token stop) {
                     continue;
 
                 if (now >= probe.deadline) {
-                    if (probe.rpc)
+                    const auto reason =
+                        probe.last_error.empty()
+                            ? std::string("health could not be established before dead_after")
+                            : std::string("health unavailable until dead_after: ") +
+                                  probe.last_error;
+
+                    // AsyncRpc::abort() closes the exact PeerConnection/Session
+                    // which owns this failed probe. Do not then close_endpoint():
+                    // the peer may have reconnected on a replacement canonical
+                    // route while this probe was outstanding, and closing by
+                    // NodeId would tear down that new healthy route as collateral.
+                    if (probe.rpc) {
+                        Log::debug("peer " + endpoint_key(probe.endpoint) +
+                                   " liveness failure: " + reason);
                         probe.rpc->abort();
+                        probe.rpc.reset();
+                    } else {
+                        // No concrete route was ever acquired, so there is no
+                        // route-specific abort target. Clear any stale route/map
+                        // state associated with the endpoint.
+                        close_endpoint(probe.endpoint, reason);
+                    }
                     probe.done = true;
                     --remaining;
                     progressed = true;
-                    close_endpoint(
-                        probe.endpoint,
-                        probe.last_error.empty()
-                            ? "health could not be established before dead_after"
-                            : "health unavailable until dead_after: " + probe.last_error);
                     continue;
                 }
 
