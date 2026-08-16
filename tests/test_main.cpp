@@ -2343,6 +2343,71 @@ void test_open_write_metadata_merge() {
     service.stop();
 }
 
+void test_fresh_and_resumed_write_exactness() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "write-exactness", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.extent_size = 1024 * 1024;
+
+    Service service(config, keys);
+    service.start();
+
+    const auto read_exact = [&](const std::string& path, size_t size) {
+        auto reader = service.filesystem().open_read(path);
+        Bytes output(size);
+        size_t offset = 0;
+        while (offset < output.size()) {
+            const auto n = reader->read(
+                offset, {output.data() + offset, std::min<size_t>(131071, output.size() - offset)});
+            REQUIRE(n > 0);
+            offset += n;
+        }
+        return output;
+    };
+
+    // Fresh rsync-style sequential write: varied FUSE-sized chunks cross many
+    // extent boundaries and the final extent is deliberately partial.
+    auto fresh = pattern(5 * config.extent_size + 123457);
+    service.filesystem().create_file("/fresh.bin", 0644, getuid(), getgid());
+    auto fresh_writer = service.filesystem().open_write("/fresh.bin", true);
+    size_t offset = 0;
+    while (offset < fresh.size()) {
+        const auto n = std::min<size_t>(65537, fresh.size() - offset);
+        REQUIRE(fresh_writer->write(offset, {fresh.data() + offset, n}) == n);
+        offset += n;
+    }
+    fresh_writer->commit();
+    CHECK(read_exact("/fresh.bin", fresh.size()) == fresh);
+
+    // --append/--append-verify style resume: an existing committed prefix is
+    // reopened without truncation and writing resumes exactly at EOF.  This is
+    // the case that can otherwise retain a bad prefix or corrupt rematerialised
+    // data without being noticed until rsync's final verification pass.
+    auto resumed = pattern(6 * config.extent_size + 654321);
+    const size_t prefix = 2 * config.extent_size + 77777;
+    service.filesystem().create_file("/resumed.bin", 0644, getuid(), getgid());
+    auto prefix_writer = service.filesystem().open_write("/resumed.bin", true);
+    REQUIRE(prefix_writer->write(0, {resumed.data(), prefix}) == prefix);
+    prefix_writer->commit();
+    prefix_writer.reset();
+
+    auto resumed_writer = service.filesystem().open_write("/resumed.bin", false);
+    offset = prefix;
+    while (offset < resumed.size()) {
+        const auto n = std::min<size_t>(98317, resumed.size() - offset);
+        REQUIRE(resumed_writer->write(offset, {resumed.data() + offset, n}) == n);
+        offset += n;
+    }
+    resumed_writer->commit();
+    CHECK(read_exact("/resumed.bin", resumed.size()) == resumed);
+
+    service.stop();
+}
+
 void test_active_write_size_visibility() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
@@ -3430,7 +3495,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
-    CHECK(status_body.find("\"server_version\":\"0.8.5\"") != std::string::npos);
+    CHECK(status_body.find("\"server_version\":\"0.8.6\"") != std::string::npos);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -4092,7 +4157,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == "0.8.5");
+    CHECK(playback_status_json.find("server_version")->asString() == "0.8.6");
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately
@@ -4311,6 +4376,7 @@ int main() {
         test_replication_policy_change_on_restart();
         test_genesis_root_configuration();
         test_open_write_metadata_merge();
+        test_fresh_and_resumed_write_exactness();
         test_active_write_size_visibility();
         test_open_write_survives_rename();
         test_full_replica_fallback();

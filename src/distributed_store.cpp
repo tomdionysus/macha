@@ -75,11 +75,13 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data) {
     if (object_id(data) != id)
         throw std::runtime_error("object hash mismatch");
     n_.note_activity(FrameType::read_ahead, data.size());
+    const auto operation_started = Clock::now();
 
     auto nodes = ranked(id);
     if (nodes.empty())
         return false;
     const size_t target = std::min(n_.config().replication, nodes.size());
+    const size_t need = quorum(target);
 
     Writer writer;
     writer.fixed(id.bytes);
@@ -98,12 +100,34 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data) {
     size_t success = 0;
     size_t completed = 0;
     size_t next_fallback = target;
+    std::chrono::milliseconds local_store_time{};
+    std::chrono::milliseconds remote_max_time{};
+
+    auto finish = [&](bool ok) {
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - operation_started);
+        if (elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
+            Log::debug("object write quorum id=" + to_string(id) +
+                       " bytes=" + std::to_string(data.size()) +
+                       " replicas=" + std::to_string(target) +
+                       " required=" + std::to_string(need) +
+                       " success=" + std::to_string(success) +
+                       " local_ms=" + std::to_string(local_store_time.count()) +
+                       " remote_max_ms=" + std::to_string(remote_max_time.count()) +
+                       " total_ms=" + std::to_string(elapsed.count()) +
+                       " result=" + std::to_string(ok ? 1 : 0));
+        }
+        return ok;
+    };
 
     auto launch = [&](const NodeInfo& owner) {
         if (owner.id == n_.node_id()) {
             ++completed;
+            const auto started = Clock::now();
             if (n_.local_store().put(id, data))
                 ++success;
+            local_store_time +=
+                std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
             return;
         }
         try {
@@ -120,9 +144,8 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data) {
     for (size_t i = 0; i < target; ++i)
         launch(nodes[i]);
 
-    const size_t need = quorum(target);
     if (success >= need)
-        return true;
+        return finish(true);
 
     while (true) {
         bool progressed = false;
@@ -141,6 +164,9 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data) {
                 ok = item.rpc->get().message.type == MessageType::ok;
             } catch (...) {
             }
+            const auto remote_elapsed =
+                std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - item.started);
+            remote_max_time = std::max(remote_max_time, remote_elapsed);
             if (ok) {
                 ++success;
                 note_network(data.size(), Clock::now() - item.started);
@@ -149,7 +175,7 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data) {
             }
 
             if (success >= need)
-                return true;
+                return finish(true);
         }
 
         while (failures && next_fallback < nodes.size() && success < need) {
@@ -169,7 +195,7 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    return success >= need;
+    return finish(success >= need);
 }
 
 bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,

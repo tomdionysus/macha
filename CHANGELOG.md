@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.6 - 2026-08-16
+
+- decoupled catalogue/UI reads from unrelated filesystem metadata generations. Once a catalogue snapshot has been successfully synchronised, ordinary item/list/search API reads use that immutable snapshot immediately; background catalogue maintenance performs convergence. Existing content-addressed media IDs remain pinned to the immutable namespace snapshot that resolved them and only a media-ID cache miss consults newer namespace metadata. Catalogue maintenance still explicitly converges before producing GC liveness so stale API state cannot retain obsolete artwork indefinitely;
+- removed the persistent block cache's foreground read/write lock convoy. Cache reads now snapshot a `shared_ptr` to the immutable object store and perform decrypt/read without holding cache mutation state, while cache insertion/eviction is separately serialised. Runtime eviction uses an in-memory LRU reconciled once when the cache opens instead of recursively enumerating the complete on-disk cache on every inserted extent; cache hits no longer rewrite file mtimes merely to persist LRU order;
+- fixed a metadata snapshot race where a successful quorum/local read could be followed immediately by a newer generation notice, causing `snapshot_view()` to reject the coherent snapshot it had just installed and surface `metadata snapshot cache unavailable after successful read` as FUSE `EIO`. The current operation now completes against that immutable generation and the next operation refreshes normally;
+- added targeted foreground playback source diagnostics. DEBUG logs only slow (>=250 ms) object reads with `owned`/`cache`/`remote` source and slow libav source reads with media id, purpose, offset and requested/returned bytes. These diagnostics established that the remaining seek tail is dominated by cold remote extents and, before this release, cache lock contention;
+- added targeted write-stage diagnostics without changing write semantics: slow extent puts, rebuild staging/object time, write-handle mutex wait, commit data-vs-metadata time, and slow distributed object-quorum local/remote timing. This distinguishes FUSE flush waiting behind an active write from object durability/replication and metadata publication;
+- added byte-for-byte regression coverage for both a fresh multi-extent sequential file and an existing-prefix/resumed append, matching the two important rsync write modes after a reported `--append-verify` verification failure;
+- wire protocol remains v10. No playback/RPC priority, timeout, transcoding, replication or metadata transaction semantics changed in this release.
+
 ## 0.8.5 - 2026-08-16
 
 - made foreground metadata mutation optimistic: a locally serialised namespace write starts from the node's durable current metadata record and lets quorum CAS detect staleness, instead of downloading and decoding the complete namespace from a quorum before every create/chmod/write commit. Metadata notices and CAS conflicts still force a quorum refresh before retry;

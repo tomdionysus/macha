@@ -3,6 +3,7 @@
 #include "distributed_store.hpp"
 #include "metadata_manager.hpp"
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -89,7 +90,7 @@ class PlaybackTracker;
     };
     std::map<std::pair<uint64_t, size_t>, std::pair<uint64_t, Hash256>> diagnostic_exact_writes_;
     std::vector<DiagnosticWriteRange> diagnostic_writes_;
-    void flush();
+    std::chrono::milliseconds flush();
     void materialize();
     void rebuild();
     void cleanup();
