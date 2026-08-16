@@ -1145,7 +1145,7 @@ void test_async_rpc_move_ownership() {
     CHECK(cancelled.load() == 2);
 }
 
-void test_rpc_v7_frame_priority_and_variable_length() {
+void test_rpc_v8_frame_priority_and_variable_length() {
     CHECK(frame_type_priority(FrameType::control) < frame_type_priority(FrameType::foreground));
     CHECK(frame_type_priority(FrameType::foreground) < frame_type_priority(FrameType::read_ahead));
     CHECK(frame_type_priority(FrameType::read_ahead) <
@@ -1212,7 +1212,7 @@ void test_rpc_v7_frame_priority_and_variable_length() {
     }
     REQUIRE(background.wait_for(10s) == std::future_status::ready);
     CHECK(background.get().message.type == MessageType::ok);
-    CHECK(client.stats().canonical_connections == 1);
+    CHECK(client.stats().canonical_connections == 2);
 
     // Cancellation can race with the writer while one frame is outside the
     // outbound deque. The cancelled transfer must not be requeued after that
@@ -1225,7 +1225,7 @@ void test_rpc_v7_frame_priority_and_variable_length() {
     cancelled.cancel();
     auto after_cancel = client.call(endpoint, MessageType::ping, Bytes{0x50}, 2s);
     CHECK(after_cancel.message.type == MessageType::ok);
-    CHECK(client.stats().connections_created == 1);
+    CHECK(client.stats().connections_created == 2);
 
     client.stop();
     server.stop();
@@ -1286,7 +1286,7 @@ void test_repair_step_is_bounded_and_yields() {
     s1.stop();
 }
 
-void test_rpc_v7_persistence_and_multiplexing() {
+void test_rpc_v8_persistence_and_multiplexing() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -1363,7 +1363,7 @@ void test_rpc_v7_persistence_and_multiplexing() {
     server.stop();
 }
 
-void test_rpc_v7_bidirectional_and_deduplication() {
+void test_rpc_v8_bidirectional_and_deduplication() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -1410,8 +1410,17 @@ void test_rpc_v7_bidirectional_and_deduplication() {
         CHECK(b.client.stats().connections_created == 0);
         CHECK(b.client.call(a.info, MessageType::members, Bytes{2}, 1s).message.payload == Bytes{2});
         CHECK(b.client.stats().connections_created == 0);
-        CHECK(a.client.stats().canonical_connections == 1);
-        CHECK(b.client.stats().canonical_connections == 1);
+
+        // DATA is a second independently canonical bidirectional lane. A opens
+        // it lazily; B must reuse the accepted data session rather than dial a
+        // third physical connection back to A.
+        CHECK(a.client.call(b.info, MessageType::put_object, Bytes{3},
+                            FrameType::foreground, 1s).message.payload == Bytes{3});
+        CHECK(b.client.call(a.info, MessageType::get_object, Bytes{4},
+                            FrameType::foreground, 1s).message.payload == Bytes{4});
+        CHECK(b.client.stats().connections_created == 0);
+        CHECK(a.client.stats().canonical_connections == 2);
+        CHECK(b.client.stats().canonical_connections == 2);
     }
 
     // Simultaneous cross-dial starts with two physical sessions. Both nodes
@@ -1587,7 +1596,7 @@ void test_mutual_bootstrap_prunes_cross_dial() {
     n1.stop();
 }
 
-void test_rpc_v6_handshake_is_rejected() {
+void test_rpc_v7_handshake_is_rejected() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -1625,8 +1634,8 @@ void test_rpc_v6_handshake_is_rejected() {
     std::copy(nonce_bytes.begin(), nonce_bytes.end(), nonce.begin());
 
     Writer hello_writer;
-    hello_writer.u16(6);
-    hello_writer.u32(256 * 1024); // v6 negotiated max_frame_size here.
+    hello_writer.u16(7);
+    hello_writer.u32(256 * 1024); // v7 had no transport-lane byte.
     hello_writer.fixed(keys.cluster_id);
     hello_writer.fixed(old_client.id.bytes);
     hello_writer.fixed(nonce);
@@ -1634,8 +1643,8 @@ void test_rpc_v6_handshake_is_rejected() {
     encode_node_info(hello_writer, old_client);
     auto hello = hello_writer.take();
 
-    Bytes authenticated(reinterpret_cast<const uint8_t*>("client/v6"),
-                        reinterpret_cast<const uint8_t*>("client/v6") + 9);
+    Bytes authenticated(reinterpret_cast<const uint8_t*>("client/v7"),
+                        reinterpret_cast<const uint8_t*>("client/v7") + 9);
     authenticated.insert(authenticated.end(), hello.begin(), hello.end());
     Writer envelope;
     envelope.bytes(hello);
@@ -1700,8 +1709,8 @@ void test_rpc_slow_control_does_not_abort_data() {
     Endpoint endpoint{"127.0.0.1", port};
 
     // The 50-ms value below is not a deadline: both 600-ms RPCs are healthy and
-    // must complete without the unified peer connection being destroyed. They also
-    // outlive the 200-ms peer-death window while priority control pings on that same
+    // must complete without the peer transport being destroyed. They also
+    // outlive the 200-ms peer-death window while priority control pings on the independent control
     // connection prove that the peer itself remains alive.
     Bytes object_payload(256 * 1024, 0x5a);
     auto data = client.call_async(endpoint, MessageType::put_object, object_payload);
@@ -1714,7 +1723,7 @@ void test_rpc_slow_control_does_not_abort_data() {
 
     REQUIRE(data.wait_for(2s) == std::future_status::ready);
     CHECK(data.get().message.type == MessageType::ok);
-    CHECK(client.stats().connections_created == 1);
+    CHECK(client.stats().connections_created == 2);
 
     client.stop();
     server.stop();
@@ -1759,8 +1768,8 @@ void test_rpc_health_and_control_not_starved_by_data() {
                      [](uint64_t) {}, 500ms, 100ms, 2s);
     Endpoint endpoint{"127.0.0.1", port};
 
-    // Occupy every data worker. Control frames (including health) share the same
-    // connection but must still be serviced promptly by the control workers.
+    // Occupy every data worker. Health and membership use a separate control TCP
+    // stream and must remain prompt regardless of data-lane work.
     std::vector<AsyncRpc> bulk;
     for (int i = 0; i < 8; ++i)
         bulk.push_back(client.call_async(endpoint, MessageType::put_object, Bytes{0x5a},
@@ -1776,6 +1785,8 @@ void test_rpc_health_and_control_not_starved_by_data() {
     auto control = client.call(endpoint, MessageType::members, {}, 20ms);
     CHECK(control.message.type == MessageType::ok);
     CHECK(Clock::now() - started < 150ms);
+
+    CHECK(client.stats().canonical_connections == 2);
 
     for (auto& rpc : bulk) {
         REQUIRE(rpc.wait_for(1s) == std::future_status::ready);
@@ -3867,12 +3878,12 @@ int main() {
         test_placement();
         test_capacity_placement();
         test_async_rpc_move_ownership();
-        test_rpc_v7_frame_priority_and_variable_length();
+        test_rpc_v8_frame_priority_and_variable_length();
         test_repair_step_is_bounded_and_yields();
-        test_rpc_v7_persistence_and_multiplexing();
-        test_rpc_v7_bidirectional_and_deduplication();
+        test_rpc_v8_persistence_and_multiplexing();
+        test_rpc_v8_bidirectional_and_deduplication();
         test_mutual_bootstrap_prunes_cross_dial();
-        test_rpc_v6_handshake_is_rejected();
+        test_rpc_v7_handshake_is_rejected();
         test_rpc_slow_control_does_not_abort_data();
         test_rpc_health_and_control_not_starved_by_data();
         test_early_replication_quorum();

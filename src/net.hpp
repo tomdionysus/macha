@@ -46,6 +46,13 @@ enum class MessageType : uint16_t {
 
 // Transport priority is a property of the frame type itself. There is no
 // independent priority field on the wire which can contradict it.
+enum class TransportLane : uint8_t {
+    control = 1,
+    data = 2,
+};
+
+const char* transport_lane_name(TransportLane) noexcept;
+
 enum class FrameType : uint8_t {
     control = 1,
     foreground = 2,
@@ -97,6 +104,7 @@ class SecureChannel {
     uint64_t tx_counter_{}, rx_counter_{};
     size_t configured_max_frame_size_{};
     size_t negotiated_max_frame_size_{};
+    TransportLane lane_{TransportLane::control};
     bool ready_{};
     std::mutex close_mutex_;
     bool shutdown_{};
@@ -107,7 +115,7 @@ class SecureChannel {
     ~SecureChannel();
     SecureChannel(const SecureChannel&) = delete;
     SecureChannel& operator=(const SecureChannel&) = delete;
-    NodeInfo client_handshake();
+    NodeInfo client_handshake(TransportLane);
     NodeInfo server_handshake(const std::string& remote_host);
     void send_fragment(uint64_t request_id, FrameType, MessageType, bool first, bool last,
                        std::span<const uint8_t>,
@@ -117,6 +125,7 @@ class SecureChannel {
     void shutdown();
     size_t max_frame_size() const noexcept { return negotiated_max_frame_size_; }
     const std::array<uint8_t, 32>& session_id() const noexcept { return session_id_; }
+    TransportLane lane() const noexcept { return lane_; }
 };
 
 class AsyncRpc {
@@ -158,6 +167,7 @@ class RpcClient {
 
     struct InboundRoute {
         NodeInfo peer;
+        TransportLane lane{TransportLane::control};
         std::array<uint8_t, 32> session_id{};
         std::function<AsyncRpc(MessageType, std::span<const uint8_t>, FrameType)> call;
         std::function<void(const RpcMessage&)> notify;
@@ -196,8 +206,11 @@ class RpcClient {
 
     static std::string endpoint_key(const Endpoint&);
     static std::string peer_key(const NodeId&);
+    static std::string route_key(const NodeId&, TransportLane);
+    static std::string dial_key(const Endpoint&, TransportLane);
+    static TransportLane lane_for(MessageType, FrameType) noexcept;
     std::shared_ptr<PeerConnection> connection(const Endpoint&, const NodeId* expected,
-                                               NodeId* actual);
+                                               NodeId* actual, TransportLane);
     AsyncRpc call_async_known(const Endpoint&, const NodeId*, MessageType,
                               std::span<const uint8_t>, FrameType);
     void observe_result(const std::string&, bool, std::chrono::milliseconds);
@@ -209,8 +222,10 @@ class RpcClient {
     void dispatch_inbound_promotion(const NodeInfo&, uint64_t, FrameType);
     void dispatch_inbound_cancel(const NodeInfo&, uint64_t);
     void register_inbound(InboundRoute);
-    void unregister_inbound(const NodeId&, const std::array<uint8_t, 32>& session_id);
-    void reconcile_locked(const NodeId&, std::vector<std::function<void()>>& retire);
+    void unregister_inbound(const NodeId&, TransportLane,
+                            const std::array<uint8_t, 32>& session_id);
+    void reconcile_locked(const NodeId&, TransportLane,
+                          std::vector<std::function<void()>>& retire);
     void reap_retired();
 
   public:

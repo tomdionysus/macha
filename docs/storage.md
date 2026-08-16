@@ -40,11 +40,13 @@ If an adopted disk disappears temporarily, it goes offline but keeps its placeme
 
 Adding or removing a backend in YAML and sending `SIGHUP` changes capacity without changing node identity. A newly adopted backend gains a proportional share of local placement; removing it from configuration removes that share. Current free space is never used as a placement weight.
 
+Backend activation no longer waits for a complete object-tree accounting scan. `LocalStore` comes online immediately and reconciles `used` bytes on a background thread. Reads are available during that scan; mutating operations wait for the initial accounting pass so capacity enforcement cannot race an unknown pre-existing store size. On a freshly upgraded large backend, membership may briefly advertise an incomplete `used` value, but placement weight remains the configured capacity and is unaffected.
+
 ## Filesystem limits
 
 The implemented filesystem operations cover ordinary media-library use: files and directories, create/open/read/write/truncate/unlink, mkdir/rmdir, rename, chmod/chown, timestamps, stat/statfs, directory enumeration, flush and fsync.
 
-0.7.0 does **not** implement symlinks, hard links, extended attributes, distributed advisory locks, full sparse-file semantics, or stable POSIX inode identity across every rename case. Access time is not tracked. Concurrent appenders use file-version CAS rather than a globally serialized append stream.
+0.7.1 does **not** implement symlinks, hard links, extended attributes, distributed advisory locks, full sparse-file semantics, or stable POSIX inode identity across every rename case. Access time is not tracked. Concurrent appenders use file-version CAS rather than a globally serialized append stream.
 
 A failed upload may leave unreachable immutable extents. Online garbage collection only removes objects known to have been dropped from committed metadata after a conservative grace period.
 

@@ -527,7 +527,7 @@ MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial)
             throw std::runtime_error("cluster extent size does not match local configuration");
 
         // Replica-policy changes are an offline coordinated operation: every
-        // node must be restarted with the same desired values. Transport v7
+        // node must be restarted with the same desired values. Transport v8
         // does not advertise desired policy, so mixed rolling configurations
         // cannot be safely reconciled here.
         const size_t old_need = quorum(old_voters.size());

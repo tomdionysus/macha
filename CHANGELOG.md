@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.1 - 2026-08-16
+
+- split peer transport into two canonical authenticated bidirectional TCP lanes: CONTROL for health/membership/metadata and DATA for object transfer traffic. Each lane is independently deduplicated by NodeId, isolating control-plane latency from TCP head-of-line blocking and congestion on bulk transfers.
+- bumped the wire protocol to v8 (`MCH8`, `macha/session/v8`). v7 peers are intentionally rejected because the authenticated handshake now identifies the transport lane.
+- made DATA connections lazy: cluster formation needs only CONTROL; a DATA lane is established on the first object transfer and then reused bidirectionally.
+- kept transfer promotion/cancellation on the DATA lane because transfer request IDs are scoped to that connection.
+- made LocalStore capacity accounting asynchronous so large object stores no longer block process startup before the backend can come online. The initial scan serialises writes/removes until accounting is reconciled while reads remain immediately available.
+- retained the 0.7.0 maintenance pre-emption, bounded repair probes, in-flight transfer cancellation/promotion and route-recovery fixes developed during streaming stress testing.
+
 ## 0.7.0 - 2026-08-15
 
 - added negotiated playback sessions with direct play, fragmented-MP4 HLS remux and selective transcoding;

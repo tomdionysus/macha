@@ -16,7 +16,7 @@ FuseAdapter / FileSystem
                      +---- PersistentBlockCache - non-DHT cache
                      |
                      +---- RpcClient/RpcServer
-                             one framed priority connection per peer
+                             CONTROL + DATA connections per active peer
 
 NodeRuntime
    +---- state_path: node.id, metadata, backend identities, temp writes
@@ -111,7 +111,7 @@ Both files are required for existing state. A `current.meta`-only state from an 
 
 Only the configured voter set participates in consensus. After a committed generation is known, maintenance distributes that checkpoint to every active node as a **recovery witness**. Witnesses are not extra votes.
 
-Replica counts are mutable cluster policy. A coordinated whole-cluster restart may change data replication, metadata voter count, or both. The existing voter majority serialises the policy change; a resized voter group is seeded before normal metadata mutation continues, and object repair subsequently converges the immutable extent set to the new data replica count. Transport v7 does not advertise a node's desired replica policy, so rolling changes with mixed configurations are deliberately unsupported. `extent_size` is intentionally immutable for an existing namespace.
+Replica counts are mutable cluster policy. A coordinated whole-cluster restart may change data replication, metadata voter count, or both. The existing voter majority serialises the policy change; a resized voter group is seeded before normal metadata mutation continues, and object repair subsequently converges the immutable extent set to the new data replica count. Transport v8 does not advertise a node's desired replica policy, so rolling changes with mixed configurations are deliberately unsupported. `extent_size` is intentionally immutable for an existing namespace.
 
 Read-only metadata also has a short in-memory TTL cache with generation invalidation. Mutations bypass it and start from a fresh quorum read.
 
@@ -159,21 +159,21 @@ Namespace mutation always requires quorum.
 
 If quorum is unavailable, a node may use its last valid post-genesis snapshot for read-only namespace access. It can read files only where the required extents exist in authoritative storage or cache. It cannot invent missing blocks or mutate the namespace.
 
-## Transport v7
+## Transport v8
 
-Each peer uses one persistent, authenticated, bidirectional TCP connection. It is multiplexed with 64-bit request IDs, a bounded outbound queue and pending-request maps. The TCP dialler owns odd request IDs and the acceptor owns even request IDs, so either end can originate work without request/reply ambiguity. Requests may complete out of order. Cancelling one request does not tear down unrelated work.
+Each active peer pair can have two persistent authenticated bidirectional TCP lanes. `CONTROL` carries health, membership, metadata and other bounded control-plane RPCs. `DATA` carries object get/put traffic, including foreground, read-ahead, speculative hydration and repair. The DATA lane is lazy and is opened only when object traffic is first required. Separating the TCP sequence spaces prevents retransmission or kernel buffering of bulk object bytes from head-of-line blocking liveness and membership traffic.
 
-The authenticated v7 handshake negotiates `max_frame_size`; the lower configured ceiling wins. Logical messages are split into variable-length frames no larger than that ceiling. Storage extents remain storage objects and are not transport framing units. Each frame is independently AES-256-GCM protected.
+Both lanes are canonical independently by authenticated `(NodeId, lane)`, not hostname or socket direction. Simultaneous cross-dial arbitration therefore leaves at most one CONTROL and one DATA connection per peer. The TCP dialler owns odd request IDs and the acceptor owns even request IDs on each lane, so either end can originate work without request/reply ambiguity. Requests may complete out of order and cancellation of one request does not tear down unrelated work.
 
-Frame type defines priority completely: control, foreground, read-ahead, then speculative. No independent wire priority exists. The outbound scheduler selects the most urgent runnable transfer for every frame and returns to scheduling immediately afterwards. This makes lower-priority object transfers pre-emptible at frame boundaries rather than committing an entire extent to TCP before foreground demand can run. A promotion control frame can raise an existing transfer; subsequent frames cannot be demoted. Cancellation stops queued remainder frames without disturbing other request IDs.
+The authenticated v8 handshake includes the requested lane and negotiates `max_frame_size`; the lower configured ceiling wins. Logical messages are split into variable-length frames no larger than that ceiling. Storage extents remain storage objects and are not transport framing units. Each frame is independently AES-256-GCM protected. v7 peers are rejected because they do not authenticate a lane in the handshake.
 
-A connection is canonical by authenticated `NodeId`, not hostname or socket direction. Simultaneous cross-dial keeps the connection dialled by the lower `NodeId`. Same-direction duplicates use the authenticated client nonce as tie-break. A losing connection exchanges retirement notices, stops admitting new RPCs atomically with retirement, and closes only after admitted work in both directions has drained.
+Within DATA, frame type defines priority completely: foreground, read-ahead, then speculative. The outbound scheduler selects the most urgent runnable transfer for every frame and returns to scheduling immediately afterwards. A promotion notification can raise an existing transfer and cancellation stops queued remainder frames without disturbing other request IDs. These transfer-local notifications remain on DATA because their request IDs are scoped to that connection. CONTROL frames are all control class; health therefore competes only with bounded control-plane work, never object payloads.
 
-RPCs have no wall-clock completion deadline. Control/data stall intervals are DEBUG observability thresholds only. Health probes are ordinary highest-priority control RPCs on the same transport that carries real work; sustained inability to establish liveness within `dead_after` marks the peer dead.
+RPCs have no wall-clock completion deadline. Control/data stall intervals are DEBUG observability thresholds only. Health probes use only the CONTROL lane; sustained inability to establish control-lane liveness within `dead_after` marks the peer dead.
 
-Server execution has dedicated control workers plus data workers. Data workers choose foreground before read-ahead before speculative queued work. This preserves the same absolute ordering after a request has reached the peer; speculative work may make progress only when more urgent runnable work is absent.
+Server execution retains dedicated control workers plus data workers. Data workers choose foreground before read-ahead before speculative queued work. This preserves the same ordering after a request has reached the peer.
 
-Every connection uses an HMAC-authenticated ephemeral X25519 handshake, HKDF-SHA256 directional keys and AES-256-GCM variable-length frames.
+Every lane uses an HMAC-authenticated ephemeral X25519 handshake, HKDF-SHA256 directional keys and AES-256-GCM variable-length frames.
 
 
 ## Streaming and media engines

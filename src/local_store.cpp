@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "local_store.hpp"
 #include "codec.hpp"
+#include "log.hpp"
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -90,7 +91,14 @@ StorageLock::~StorageLock() {
 LocalStore::LocalStore(std::filesystem::path r, uint64_t l, std::array<uint8_t, 32> k)
     : root_(std::move(r)), objects_(root_ / "objects"), limit_(l), key_(k) {
     std::filesystem::create_directories(objects_);
-    scan();
+    scan_thread_ = std::jthread([this](std::stop_token stop) { scan(stop); });
+}
+
+LocalStore::~LocalStore() {
+    if (scan_thread_.joinable()) {
+        scan_thread_.request_stop();
+        scan_thread_.join();
+    }
 }
 std::filesystem::path LocalStore::path(const ObjectId& i) const {
     auto s = to_string(i);
@@ -102,7 +110,8 @@ bool LocalStore::put(const ObjectId& i, std::span<const uint8_t> d) {
     auto p = path(i);
     if (std::filesystem::exists(p))
         return true;
-    std::lock_guard g(m_);
+    std::unique_lock g(m_);
+    wait_for_accounting(g);
     if (std::filesystem::exists(p))
         return true;
     auto s = aes_gcm_seal(key_, d, i.bytes);
@@ -162,7 +171,8 @@ bool LocalStore::has(const ObjectId& i) const {
     return std::filesystem::exists(path(i));
 }
 bool LocalStore::remove(const ObjectId& i) {
-    std::lock_guard g(m_);
+    std::unique_lock g(m_);
+    wait_for_accounting(g);
     auto p = path(i);
     std::error_code e;
     auto n = std::filesystem::file_size(p, e);
@@ -215,12 +225,24 @@ bool LocalStore::older_than(const ObjectId& i, std::chrono::seconds age) const {
         return false;
     return std::filesystem::file_time_type::clock::now() - t > age;
 }
-void LocalStore::scan() {
+void LocalStore::wait_for_accounting(std::unique_lock<std::mutex>& lock) const {
+    scan_cv_.wait(lock, [this] { return scan_complete_.load(); });
+}
+
+void LocalStore::scan(std::stop_token stop) {
+    // Capacity accounting is intentionally reconciled in the background. The
+    // old constructor walked the entire object tree before the backend could be
+    // declared online, which made startup proportional to store size. Mutating
+    // operations wait for this one initial reconciliation; reads remain
+    // available immediately.
+    Log::debug("storage accounting scan begin path=" + root_.string());
     uint64_t n = 0;
     std::error_code e;
-    for (auto& x : std::filesystem::recursive_directory_iterator(objects_, e)) {
-        if (e)
+    for (auto it = std::filesystem::recursive_directory_iterator(objects_, e);
+         !e && it != std::filesystem::recursive_directory_iterator(); it.increment(e)) {
+        if (stop.stop_requested())
             break;
+        const auto& x = *it;
         if (!x.is_regular_file())
             continue;
         auto name = x.path().filename().string();
@@ -229,9 +251,24 @@ void LocalStore::scan() {
             std::filesystem::remove(x.path(), r);
             continue;
         }
-        n += x.file_size(e);
+        std::error_code size_error;
+        auto size = x.file_size(size_error);
+        if (!size_error)
+            n += size;
     }
-    used_ = n;
+    {
+        std::lock_guard guard(m_);
+        // Even during shutdown, release any mutation waiter. The object is being
+        // destroyed so the partial value is irrelevant; this avoids a stranded
+        // waiter if destruction races an initial scan.
+        if (!stop.stop_requested())
+            used_ = n;
+        scan_complete_.store(true);
+    }
+    scan_cv_.notify_all();
+    if (!stop.stop_requested())
+        Log::debug("storage accounting scan complete path=" + root_.string() +
+                   " used=" + std::to_string(n));
 }
 NodeId load_or_create_node_id(const std::filesystem::path& r) {
     std::filesystem::create_directories(r);

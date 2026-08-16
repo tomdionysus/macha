@@ -18,8 +18,8 @@
 
 namespace macha {
 namespace {
-constexpr uint16_t protocol_version = 7;
-constexpr uint32_t frame_magic = 0x4d434837; // "MCH7"
+constexpr uint16_t protocol_version = 8;
+constexpr uint32_t frame_magic = 0x4d434838; // "MCH8"
 constexpr size_t protocol_min_frame_size = 4 * 1024;
 constexpr size_t protocol_max_frame_size = 4 * 1024 * 1024;
 constexpr size_t max_message_size = 128 * 1024 * 1024;
@@ -115,7 +115,7 @@ Bytes label(const char* prefix, std::span<const uint8_t> data) {
 Bytes session_info(std::span<const uint8_t> transcript, const NodeId& client,
                    const NodeId& server, const char* direction) {
     Writer writer;
-    writer.string("macha/session/v7");
+    writer.string("macha/session/v8");
     writer.string(direction);
     writer.fixed(sha256(transcript).bytes);
     writer.fixed(client.bytes);
@@ -358,6 +358,16 @@ struct MessageAssembler {
 
 } // namespace
 
+const char* transport_lane_name(TransportLane lane) noexcept {
+    switch (lane) {
+    case TransportLane::control:
+        return "control";
+    case TransportLane::data:
+        return "data";
+    }
+    return "unknown";
+}
+
 const char* frame_type_name(FrameType type) noexcept {
     switch (type) {
     case FrameType::control:
@@ -410,7 +420,8 @@ void SecureChannel::shutdown() {
     }
 }
 
-NodeInfo SecureChannel::client_handshake() {
+NodeInfo SecureChannel::client_handshake(TransportLane lane) {
+    lane_ = lane;
     auto nonce_bytes = random_bytes(32);
     std::array<uint8_t, 32> client_nonce{};
     std::copy(nonce_bytes.begin(), nonce_bytes.end(), client_nonce.begin());
@@ -420,6 +431,7 @@ NodeInfo SecureChannel::client_handshake() {
     Writer hello_writer;
     hello_writer.u16(protocol_version);
     hello_writer.u32(static_cast<uint32_t>(configured_max_frame_size_));
+    hello_writer.u8(static_cast<uint8_t>(lane_));
     hello_writer.fixed(keys_.cluster_id);
     hello_writer.fixed(local_.id.bytes);
     hello_writer.fixed(client_nonce);
@@ -429,7 +441,7 @@ NodeInfo SecureChannel::client_handshake() {
 
     Writer envelope;
     envelope.bytes(hello);
-    envelope.fixed(hmac_sha256(keys_.auth, label("client/v7", hello)));
+    envelope.fixed(hmac_sha256(keys_.auth, label("client/v8", hello)));
     send_blob(fd_, envelope.data());
 
     auto response = recv_blob(fd_, 16384);
@@ -438,7 +450,7 @@ NodeInfo SecureChannel::client_handshake() {
     auto remote_mac = response_reader.fixed<32>();
     response_reader.finish();
 
-    auto authenticated = label("server/v7", hello);
+    auto authenticated = label("server/v8", hello);
     authenticated.insert(authenticated.end(), ack.begin(), ack.end());
     if (!constant_time_equal(remote_mac, hmac_sha256(keys_.auth, authenticated)))
         throw std::runtime_error("peer auth failed");
@@ -448,6 +460,9 @@ NodeInfo SecureChannel::client_handshake() {
         throw std::runtime_error("wrong cluster/protocol");
     auto negotiated = static_cast<size_t>(reader.u32());
     validate_frame_limit(negotiated);
+    auto acknowledged_lane = static_cast<TransportLane>(reader.u8());
+    if (acknowledged_lane != lane_)
+        throw std::runtime_error("peer acknowledged the wrong transport lane");
     if (negotiated > configured_max_frame_size_)
         throw std::runtime_error("peer negotiated an invalid frame size");
     if (reader.fixed<16>() != keys_.cluster_id)
@@ -490,7 +505,7 @@ NodeInfo SecureChannel::server_handshake(const std::string& remote_host) {
     auto remote_mac = envelope_reader.fixed<32>();
     envelope_reader.finish();
 
-    if (!constant_time_equal(remote_mac, hmac_sha256(keys_.auth, label("client/v7", hello))))
+    if (!constant_time_equal(remote_mac, hmac_sha256(keys_.auth, label("client/v8", hello))))
         throw std::runtime_error("client auth failed");
 
     Reader reader(hello);
@@ -498,6 +513,9 @@ NodeInfo SecureChannel::server_handshake(const std::string& remote_host) {
         throw std::runtime_error("wrong cluster/protocol");
     auto peer_max = static_cast<size_t>(reader.u32());
     validate_frame_limit(peer_max);
+    lane_ = static_cast<TransportLane>(reader.u8());
+    if (lane_ != TransportLane::control && lane_ != TransportLane::data)
+        throw std::runtime_error("invalid transport lane");
     if (reader.fixed<16>() != keys_.cluster_id)
         throw std::runtime_error("wrong cluster/protocol");
     NodeId client_id{reader.fixed<16>()};
@@ -522,6 +540,7 @@ NodeInfo SecureChannel::server_handshake(const std::string& remote_host) {
     Writer ack_writer;
     ack_writer.u16(protocol_version);
     ack_writer.u32(static_cast<uint32_t>(negotiated_max_frame_size_));
+    ack_writer.u8(static_cast<uint8_t>(lane_));
     ack_writer.fixed(keys_.cluster_id);
     ack_writer.fixed(local_.id.bytes);
     ack_writer.fixed(server_nonce);
@@ -529,7 +548,7 @@ NodeInfo SecureChannel::server_handshake(const std::string& remote_host) {
     encode_node_info(ack_writer, local_);
     auto ack = ack_writer.take();
 
-    auto authenticated = label("server/v7", hello);
+    auto authenticated = label("server/v8", hello);
     authenticated.insert(authenticated.end(), ack.begin(), ack.end());
     Writer response;
     response.bytes(ack);
@@ -1160,6 +1179,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
 
   public:
     PeerConnection(int fd, ClusterKeys keys, NodeInfo local, size_t max_frame_size,
+                   TransportLane lane,
                    std::function<void(const NodeInfo&)> peer_observer,
                    std::function<void(uint64_t)> metadata_observer,
                    InboundHandler inbound_handler, InboundPromoter inbound_promoter,
@@ -1172,7 +1192,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
           inbound_promoter_(std::move(inbound_promoter)),
           inbound_canceller_(std::move(inbound_canceller)),
           result_observer_(std::move(result_observer)) {
-        peer_ = channel_.client_handshake();
+        peer_ = channel_.client_handshake(lane);
         peer_observer_(peer_);
         reader_ = std::jthread([this](std::stop_token stop) { reader_loop(stop); });
         writer_ = std::jthread([this](std::stop_token stop) { writer_loop(stop); });
@@ -1189,6 +1209,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     bool usable() const { return !broken_.load() && !retiring_.load(); }
     bool finished() const { return broken_.load(); }
     const NodeInfo& peer() const { return peer_; }
+    TransportLane lane() const noexcept { return channel_.lane(); }
     const std::array<uint8_t, 32>& session_id() const noexcept { return channel_.session_id(); }
 
     AsyncRpc call(MessageType type, std::span<const uint8_t> payload, FrameType frame_type) {
@@ -1331,6 +1352,24 @@ std::string RpcClient::peer_key(const NodeId& peer) {
     return to_string(peer);
 }
 
+std::string RpcClient::route_key(const NodeId& peer, TransportLane lane) {
+    return peer_key(peer) + ':' + transport_lane_name(lane);
+}
+
+std::string RpcClient::dial_key(const Endpoint& endpoint, TransportLane lane) {
+    return endpoint_key(endpoint) + ':' + transport_lane_name(lane);
+}
+
+TransportLane RpcClient::lane_for(MessageType type, FrameType) noexcept {
+    // Object transfers, including foreground/read-ahead/speculative variants,
+    // are isolated on the data TCP stream. Transfer-local promotion/cancel
+    // notifications remain on that same stream because request IDs are scoped
+    // to the connection. All other RPCs use the control stream.
+    if (type == MessageType::get_object || type == MessageType::put_object)
+        return TransportLane::data;
+    return TransportLane::control;
+}
+
 void RpcClient::set_inbound_handler(InboundHandler handler) {
     std::lock_guard lock(inbound_mutex_);
     inbound_handler_ = std::move(handler);
@@ -1394,9 +1433,9 @@ void RpcClient::reap_retired() {
     reap.clear();
 }
 
-void RpcClient::reconcile_locked(const NodeId& peer,
+void RpcClient::reconcile_locked(const NodeId& peer, TransportLane lane,
                                  std::vector<std::function<void()>>& retire) {
-    const auto k = peer_key(peer);
+    const auto k = route_key(peer, lane);
     auto outbound = connections_.find(k);
     auto inbound = inbound_routes_.find(k);
     const bool have_outbound = outbound != connections_.end() && outbound->second &&
@@ -1422,7 +1461,8 @@ void RpcClient::reconcile_locked(const NodeId& peer,
 void RpcClient::register_inbound(InboundRoute route) {
     reap_retired();
     const auto peer = route.peer.id;
-    const auto k = peer_key(peer);
+    const auto lane = route.lane;
+    const auto k = route_key(peer, lane);
     std::vector<std::function<void()>> retire;
     {
         std::lock_guard lock(mutex_);
@@ -1443,24 +1483,25 @@ void RpcClient::register_inbound(InboundRoute route) {
         } else if (route.retire) {
             retire.push_back(route.retire);
         }
-        reconcile_locked(peer, retire);
+        reconcile_locked(peer, lane, retire);
     }
     for (auto& fn : retire)
         fn();
 }
 
-void RpcClient::unregister_inbound(const NodeId& peer,
+void RpcClient::unregister_inbound(const NodeId& peer, TransportLane lane,
                                    const std::array<uint8_t, 32>& session_id) {
     std::lock_guard lock(mutex_);
-    auto found = inbound_routes_.find(peer_key(peer));
+    auto found = inbound_routes_.find(route_key(peer, lane));
     if (found != inbound_routes_.end() && found->second.session_id == session_id)
         inbound_routes_.erase(found);
 }
 
 std::shared_ptr<RpcClient::PeerConnection>
-RpcClient::connection(const Endpoint& endpoint, const NodeId* expected, NodeId* actual) {
+RpcClient::connection(const Endpoint& endpoint, const NodeId* expected, NodeId* actual,
+                      TransportLane lane) {
     reap_retired();
-    const auto retry_key = endpoint_key(endpoint);
+    const auto retry_key = dial_key(endpoint, lane);
     std::optional<NodeId> known;
     {
         std::lock_guard lock(mutex_);
@@ -1476,12 +1517,12 @@ RpcClient::connection(const Endpoint& endpoint, const NodeId* expected, NodeId* 
         if (known) {
             if (actual)
                 *actual = *known;
-            auto found = connections_.find(peer_key(*known));
+            auto found = connections_.find(route_key(*known, lane));
             if (found != connections_.end() && found->second && found->second->usable()) {
                 ++connections_reused_;
                 return found->second;
             }
-            auto inbound = inbound_routes_.find(peer_key(*known));
+            auto inbound = inbound_routes_.find(route_key(*known, lane));
             if (inbound != inbound_routes_.end() && inbound->second.usable &&
                 inbound->second.usable()) {
                 ++connections_reused_;
@@ -1497,7 +1538,7 @@ RpcClient::connection(const Endpoint& endpoint, const NodeId* expected, NodeId* 
     try {
         int fd = connect_socket(endpoint, connect_timeout_);
         auto fresh = std::make_shared<PeerConnection>(
-            fd, keys_, local_(), max_frame_size_, peer_observer_, metadata_observer_,
+            fd, keys_, local_(), max_frame_size_, lane, peer_observer_, metadata_observer_,
             [this](const NodeInfo& peer, RpcFrame frame, InboundReply reply) {
                 dispatch_inbound(peer, std::move(frame), std::move(reply));
             },
@@ -1532,7 +1573,7 @@ RpcClient::connection(const Endpoint& endpoint, const NodeId* expected, NodeId* 
                 endpoint_peers_[endpoint_key(advertised)] = fresh->peer().id;
             }
 
-            const auto k = peer_key(fresh->peer().id);
+            const auto k = route_key(fresh->peer().id, lane);
             auto found = connections_.find(k);
             if (found == connections_.end() || !found->second || !found->second->usable()) {
                 if (found != connections_.end() && found->second) {
@@ -1557,7 +1598,7 @@ RpcClient::connection(const Endpoint& endpoint, const NodeId* expected, NodeId* 
                 ++connections_reused_;
             }
 
-            reconcile_locked(fresh->peer().id, retire);
+            reconcile_locked(fresh->peer().id, lane, retire);
             auto canonical = connections_.find(k);
             if (canonical != connections_.end() && canonical->second && canonical->second->usable())
                 winner = canonical->second;
@@ -1569,6 +1610,7 @@ RpcClient::connection(const Endpoint& endpoint, const NodeId* expected, NodeId* 
         if (installed && winner == fresh) {
             Log::info("node connection outbound peer=" +
                       to_string(fresh->peer().id).substr(0, 12) +
+                      " lane=" + std::string(transport_lane_name(lane)) +
                       " endpoint=" + endpoint_key(endpoint));
         }
         return winner;
@@ -1582,13 +1624,14 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
                                      MessageType type, std::span<const uint8_t> payload,
                                      FrameType frame_type) {
     validate_frame_semantics(type, frame_type);
+    const auto lane = lane_for(type, frame_type);
 
     auto try_existing = [&](const NodeId& peer) -> std::optional<AsyncRpc> {
         std::shared_ptr<PeerConnection> outbound;
         std::function<AsyncRpc(MessageType, std::span<const uint8_t>, FrameType)> inbound;
         {
             std::lock_guard lock(mutex_);
-            const auto k = peer_key(peer);
+            const auto k = route_key(peer, lane);
             auto out = connections_.find(k);
             if (out != connections_.end() && out->second && out->second->usable())
                 outbound = out->second;
@@ -1620,7 +1663,7 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
             return std::move(*existing);
 
     NodeId actual{};
-    auto outbound = connection(endpoint, expected, &actual);
+    auto outbound = connection(endpoint, expected, &actual, lane);
     if (outbound && outbound->usable()) {
         try {
             return outbound->call(type, payload, frame_type);
@@ -1716,18 +1759,20 @@ void RpcClient::close_endpoint(const Endpoint& endpoint, const std::string& reas
         if (!peer)
             return;
 
-        const auto k = peer_key(*peer);
-        auto out = connections_.find(k);
-        if (out != connections_.end()) {
-            if (out->second)
-                outbound.push_back(std::move(out->second));
-            connections_.erase(out);
-        }
-        auto in = inbound_routes_.find(k);
-        if (in != inbound_routes_.end()) {
-            if (in->second.close)
-                inbound.push_back(in->second.close);
-            inbound_routes_.erase(in);
+        for (auto lane : {TransportLane::control, TransportLane::data}) {
+            const auto k = route_key(*peer, lane);
+            auto out = connections_.find(k);
+            if (out != connections_.end()) {
+                if (out->second)
+                    outbound.push_back(std::move(out->second));
+                connections_.erase(out);
+            }
+            auto in = inbound_routes_.find(k);
+            if (in != inbound_routes_.end()) {
+                if (in->second.close)
+                    inbound.push_back(in->second.close);
+                inbound_routes_.erase(in);
+            }
         }
 
         for (auto it = retired_connections_.begin(); it != retired_connections_.end();) {
@@ -1774,7 +1819,7 @@ void RpcClient::health_loop(std::stop_token stop) {
                 if (known == endpoint_peers_.end())
                     continue;
                 const auto& peer = known->second;
-                const auto k = peer_key(peer);
+                const auto k = route_key(peer, TransportLane::control);
                 bool active = false;
                 auto out = connections_.find(k);
                 if (out != connections_.end() && out->second && out->second->usable())
@@ -1896,10 +1941,12 @@ void RpcClient::broadcast(const RpcMessage& message) {
     {
         std::lock_guard lock(mutex_);
         for (const auto& [_, connection] : connections_)
-            if (connection && connection->usable())
+            if (connection && connection->usable() &&
+                connection->lane() == TransportLane::control)
                 outbound.push_back(connection);
         for (const auto& [_, route] : inbound_routes_)
-            if (route.usable && route.usable() && route.notify)
+            if (route.lane == TransportLane::control && route.usable && route.usable() &&
+                route.notify)
                 inbound.push_back(route.notify);
     }
     for (auto& connection : outbound) {
@@ -2678,6 +2725,7 @@ void RpcServer::session_loop(Session* session) {
                 std::weak_ptr<Session> weak = shared;
                 RpcClient::InboundRoute route;
                 route.peer = session->peer;
+                route.lane = session->channel->lane();
                 route.session_id = session->channel->session_id();
                 route.call = [weak](MessageType type, std::span<const uint8_t> payload,
                                     FrameType frame_type) {
@@ -2707,6 +2755,7 @@ void RpcServer::session_loop(Session* session) {
         }
 
         Log::info("node connection inbound peer=" + to_string(session->peer.id).substr(0, 12) +
+                  " lane=" + std::string(transport_lane_name(session->channel->lane())) +
                   " remote=" + session->remote_host + " advertised=" + session->peer.host + ':' +
                   std::to_string(session->peer.port));
         while (true) {
@@ -2793,7 +2842,8 @@ void RpcServer::session_loop(Session* session) {
     }
 
     if (shared_client_ && session->peer.id != NodeId{})
-        shared_client_->unregister_inbound(session->peer.id, session->channel->session_id());
+        shared_client_->unregister_inbound(session->peer.id, session->channel->lane(),
+                                           session->channel->session_id());
     session->ready = false;
     session->done = true;
     if (session->channel)
