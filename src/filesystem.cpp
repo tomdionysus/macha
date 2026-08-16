@@ -955,38 +955,64 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
         }
         return {};
     }
-    // read_record() is normally served from MetadataManager's short read cache,
-    // and gives us the generation as well as the snapshot.  Rebuild the media
-    // index only when that generation changes.  This turns repeated catalogue
-    // media-id resolution during playback negotiation into an indexed lookup
-    // rather than another complete namespace walk for every candidate.
-    const auto view = m_.snapshot_view();
-    std::string media_path;
+    // Media ids are content-addressed from the immutable file manifest. Once an
+    // id has been resolved, unrelated namespace generations cannot make that
+    // manifest point at different bytes. Serve cache hits from the snapshot that
+    // built the index; only a miss consults current metadata. This keeps rsync's
+    // mkdir/create/chmod generation churn out of playback negotiation.
     {
         std::lock_guard lock(media_index_mutex_);
-        if (!media_index_valid_ || media_index_generation_ != view.generation) {
-            std::map<std::string, std::string> next;
-            for (const auto& [path, entry] : view.snapshot->entries) {
-                if (entry.type != EntryType::file)
-                    continue;
-                next.emplace(file_media_id(entry), path);
+        if (media_index_valid_ && media_index_snapshot_) {
+            auto found = media_index_.find(std::string(id));
+            if (found != media_index_.end()) {
+                auto entry = media_index_snapshot_->entries.find(found->second);
+                if (entry != media_index_snapshot_->entries.end() &&
+                    entry->second.type == EntryType::file &&
+                    file_media_id(entry->second) == id)
+                    return std::pair{found->second, entry->second};
             }
-            media_index_ = std::move(next);
-            media_index_generation_ = view.generation;
-            media_index_valid_ = true;
-            Log::debug("filesystem media index rebuilt generation=" +
-                       std::to_string(view.generation) + " files=" +
-                       std::to_string(media_index_.size()));
         }
-        auto found = media_index_.find(std::string(id));
-        if (found == media_index_.end())
-            return {};
-        media_path = found->second;
     }
-    auto entry = view.snapshot->entries.find(media_path);
-    if (entry == view.snapshot->entries.end() || entry->second.type != EntryType::file)
+
+    const auto view = m_.snapshot_view();
+    std::lock_guard lock(media_index_mutex_);
+
+    // Another lookup may have populated this id while snapshot_view() was in
+    // progress. Prefer it if so.
+    if (media_index_valid_ && media_index_snapshot_) {
+        auto found = media_index_.find(std::string(id));
+        if (found != media_index_.end()) {
+            auto entry = media_index_snapshot_->entries.find(found->second);
+            if (entry != media_index_snapshot_->entries.end() &&
+                entry->second.type == EntryType::file &&
+                file_media_id(entry->second) == id)
+                return std::pair{found->second, entry->second};
+        }
+        if (media_index_generation_ == view.generation)
+            return {};
+    }
+
+    std::map<std::string, std::string> next;
+    for (const auto& [path, entry] : view.snapshot->entries) {
+        if (entry.type != EntryType::file)
+            continue;
+        next.emplace(file_media_id(entry), path);
+    }
+    media_index_ = std::move(next);
+    media_index_generation_ = view.generation;
+    media_index_snapshot_ = view.snapshot;
+    media_index_valid_ = true;
+    Log::debug("filesystem media index rebuilt generation=" +
+               std::to_string(view.generation) + " files=" +
+               std::to_string(media_index_.size()));
+
+    auto found = media_index_.find(std::string(id));
+    if (found == media_index_.end())
         return {};
-    return std::pair{media_path, entry->second};
+    auto entry = media_index_snapshot_->entries.find(found->second);
+    if (entry == media_index_snapshot_->entries.end() || entry->second.type != EntryType::file)
+        return {};
+    return std::pair{found->second, entry->second};
 }
 
 std::shared_ptr<ReadHandle> FileSystem::open_read(const std::string& p) {

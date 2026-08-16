@@ -3215,6 +3215,111 @@ void test_media_probe_and_online_catalogue_scanner() {
     service.stop();
 }
 
+
+void test_catalogue_cache_ignores_unrelated_metadata_generation() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "node", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+
+    NodeRuntime node(config, keys);
+    DistributedStore store(node);
+    MetadataManager metadata(node);
+    CatalogueManager catalogue(node, store, metadata);
+    node.start();
+
+    CatalogueItem item;
+    item.id = "test:movie:1";
+    item.kind = CatalogueKind::movie;
+    item.title = "Cached Movie";
+    auto committed = catalogue.upsert(item);
+    CHECK(committed.title == "Cached Movie");
+
+    auto status = catalogue.status();
+    REQUIRE(status.root.has_value());
+    REQUIRE(node.local_store().remove(*status.root));
+
+    // Advance ordinary filesystem metadata without changing catalogue_root.
+    // The cached immutable catalogue must remain usable even though the backing
+    // root object has deliberately been made unavailable for a reload.
+    metadata.mutate([](MetadataSnapshot& snapshot) {
+        auto root = snapshot.entries.find("/");
+        REQUIRE(root != snapshot.entries.end());
+        ++root->second.version;
+        ++root->second.mtime_ns;
+    });
+
+    auto cached = catalogue.get("test:movie:1");
+    REQUIRE(cached.has_value());
+    CHECK(cached->title == "Cached Movie");
+
+    // Background convergence should also recognise that an unchanged
+    // content-addressed root does not need to be reloaded.
+    catalogue.repair_once();
+    auto after_repair = catalogue.get("test:movie:1");
+    REQUIRE(after_repair.has_value());
+    CHECK(after_repair->title == "Cached Movie");
+
+    node.stop();
+}
+
+void test_media_index_cache_survives_namespace_churn() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "node", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+
+    NodeRuntime node(config, keys);
+    DistributedStore store(node);
+    MetadataManager metadata(node);
+    FileSystem filesystem(node, store, metadata);
+    node.start();
+
+    filesystem.mkdir("/media", 0755, getuid(), getgid());
+    filesystem.create_file("/media/a.mkv", 0644, getuid(), getgid());
+    auto a_bytes = pattern(32 * 1024 + 17);
+    auto a_writer = filesystem.open_write("/media/a.mkv", true);
+    REQUIRE(a_writer->write(0, a_bytes) == a_bytes.size());
+    a_writer->commit();
+    auto a_entry = filesystem.getattr("/media/a.mkv");
+    auto a_id = file_media_id(a_entry);
+
+    auto first = filesystem.find_media(a_id);
+    REQUIRE(first.has_value());
+    CHECK(first->first == "/media/a.mkv");
+
+    // Unrelated namespace churn must not invalidate an already resolved,
+    // content-addressed media id.
+    filesystem.mkdir("/noise", 0755, getuid(), getgid());
+    auto cached = filesystem.find_media(a_id);
+    REQUIRE(cached.has_value());
+    CHECK(cached->first == "/media/a.mkv");
+    CHECK(file_media_id(cached->second) == a_id);
+
+    // A genuinely new id is a cache miss and must rebuild against current
+    // metadata, after which both the new and old ids remain resolvable.
+    filesystem.create_file("/media/b.mkv", 0644, getuid(), getgid());
+    auto b_bytes = pattern(48 * 1024 + 29);
+    auto b_writer = filesystem.open_write("/media/b.mkv", true);
+    REQUIRE(b_writer->write(0, b_bytes) == b_bytes.size());
+    b_writer->commit();
+    auto b_id = file_media_id(filesystem.getattr("/media/b.mkv"));
+    CHECK(b_id != a_id);
+
+    auto second = filesystem.find_media(b_id);
+    REQUIRE(second.has_value());
+    CHECK(second->first == "/media/b.mkv");
+    REQUIRE(filesystem.find_media(a_id).has_value());
+
+    node.stop();
+}
+
 void test_catalogue_sync_search_and_artwork_gc() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
@@ -4214,6 +4319,8 @@ int main() {
         test_replica_selector();
         test_cache_hydrator_fetches_to_persistent_cache();
         test_media_probe_and_online_catalogue_scanner();
+        test_catalogue_cache_ignores_unrelated_metadata_generation();
+        test_media_index_cache_survives_namespace_churn();
         test_catalogue_sync_search_and_artwork_gc();
         test_media_segment_store_backpressure_and_spill();
         test_media_vod_index_planning_rejects_partial_indexes();

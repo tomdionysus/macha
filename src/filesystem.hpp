@@ -139,7 +139,11 @@ class FileSystem {
     std::mutex media_index_mutex_;
     uint64_t media_index_generation_{};
     bool media_index_valid_{};
-    // Media ids map to paths only; FsEntry remains owned by the shared snapshot.
+    // Keep the immutable snapshot that owns entries referenced by media_index_.
+    // Existing content-addressed media ids remain valid across unrelated
+    // namespace generations; only a cache miss needs to inspect newer metadata.
+    std::shared_ptr<const MetadataSnapshot> media_index_snapshot_;
+    // Media ids map to paths only; FsEntry remains owned by media_index_snapshot_.
     std::map<std::string, std::string> media_index_;
     std::mutex maintenance_index_mutex_;
     uint64_t maintenance_index_generation_{};

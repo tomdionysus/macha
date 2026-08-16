@@ -501,11 +501,24 @@ std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, Fr
     const bool foreground = frame_type == FrameType::foreground;
     const bool interactive = frame_type == FrameType::foreground || frame_type == FrameType::read_ahead;
     auto started = Clock::now();
+    auto log_playback_read = [&](std::string_view source, size_t bytes, bool ok) {
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
+        if (foreground && elapsed >= std::chrono::milliseconds(250) &&
+            Log::enabled(LogLevel::debug)) {
+            Log::debug("playback object read source=" + std::string(source) +
+                       " stripe=" + std::to_string(stripe) +
+                       " id=" + to_string(id) +
+                       " result=" + std::to_string(ok ? 1 : 0) +
+                       " bytes=" + std::to_string(bytes) +
+                       " elapsed_ms=" + std::to_string(elapsed.count()));
+        }
+        return elapsed;
+    };
     if (auto data = n_.local_store().get(id)) {
         if (interactive)
             n_.note_activity(frame_type, data->size());
-        auto elapsed =
-            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
+        auto elapsed = log_playback_read("owned", data->size(), true);
         if (Log::enabled(LogLevel::all))
             Log::trace("DIAG object-get id=" + to_string(id) +
                    " source=owned bytes=" + std::to_string(data->size()) +
@@ -518,8 +531,7 @@ std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, Fr
             n_.note_activity(frame_type, cached->size());
         if (should_own(id))
             n_.enqueue_fetched(id, *cached, true);
-        auto elapsed =
-            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
+        auto elapsed = log_playback_read("cache", cached->size(), true);
         if (Log::enabled(LogLevel::all))
             Log::trace("DIAG object-get id=" + to_string(id) +
                    " source=cache bytes=" + std::to_string(cached->size()) +
@@ -533,7 +545,7 @@ std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, Fr
                            foreground, interactive, deadline, cancelled);
     if (data && frame_type == FrameType::read_ahead)
         n_.note_activity(frame_type, data->size());
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
+    auto elapsed = log_playback_read("remote", data ? data->size() : 0, data.has_value());
     if (Log::enabled(LogLevel::all))
         Log::trace("DIAG object-get id=" + to_string(id) +
                " source=remote result=" + std::to_string(data ? 1 : 0) +

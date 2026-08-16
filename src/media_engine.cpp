@@ -121,6 +121,7 @@ std::string plain_ass_text(std::string text) {
 struct InputIoState {
     std::shared_ptr<MediaInput> input;
     std::string media_id;
+    MediaReadPurpose purpose{MediaReadPurpose::playback};
     uint64_t offset{};
     std::atomic_bool* cancelled{};
     Clock::time_point deadline{};
@@ -139,7 +140,21 @@ int input_read(void* opaque, uint8_t* buffer, int buffer_size) {
         if (state.offset >= state.input->size()) return AVERROR_EOF;
         wanted = static_cast<size_t>(std::min<uint64_t>(
             static_cast<uint64_t>(buffer_size), state.input->size() - state.offset));
+        const auto read_offset = state.offset;
+        const auto started = Clock::now();
         auto n = state.input->read(state.offset, {buffer, wanted}, state.deadline, state.cancelled);
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
+        if (elapsed >= std::chrono::milliseconds(250) && Log::enabled(LogLevel::debug)) {
+            const char* purpose = state.purpose == MediaReadPurpose::probe ? "probe" :
+                                  state.purpose == MediaReadPurpose::subtitle ? "subtitle" : "playback";
+            Log::debug("playback source read media=" + state.media_id +
+                       " purpose=" + purpose +
+                       " offset=" + std::to_string(read_offset) +
+                       " wanted=" + std::to_string(wanted) +
+                       " got=" + std::to_string(n) +
+                       " elapsed_ms=" + std::to_string(elapsed.count()));
+        }
         if (!n) return AVERROR_EOF;
         state.offset += n;
         return static_cast<int>(n);
@@ -211,6 +226,7 @@ class InputContext {
             state_.input = source.open(purpose);
             if (!state_.input) throw std::runtime_error("media source reader could not be opened");
             state_.media_id = source.media_id;
+            state_.purpose = purpose;
             state_.cancelled = cancelled;
             if (wall_timeout.count() > 0) state_.deadline = Clock::now() + wall_timeout;
 
