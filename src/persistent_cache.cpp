@@ -56,74 +56,165 @@ void atomic_write(const std::filesystem::path& path, std::span<const uint8_t> by
 
 PersistentBlockCache::PersistentBlockCache(CacheConfig config, std::array<uint8_t, 32> key)
     : config_(std::move(config)), key_(key) {
-    std::lock_guard lock(mutex_);
+    std::lock_guard lock(state_mutex_);
     open_locked();
 }
 
 void PersistentBlockCache::open_locked() {
     store_.reset();
+    lru_.clear();
+    lru_index_.clear();
     if (config_.path.empty() || !config_.max_blocks)
         return;
     try {
-        store_ = std::make_unique<LocalStore>(config_.path, std::numeric_limits<uint64_t>::max(), key_);
-        trim_locked();
+        store_ = std::make_shared<LocalStore>(config_.path,
+                                              std::numeric_limits<uint64_t>::max(), key_);
+        rebuild_lru_locked();
     } catch (const std::exception& error) {
         store_.reset();
+        lru_.clear();
+        lru_index_.clear();
         Log::warn("persistent cache disabled: " + std::string(error.what()));
     }
 }
 
 void PersistentBlockCache::reconfigure(CacheConfig config) {
-    std::lock_guard lock(mutex_);
-    bool reopen = config.path != config_.path;
-    config_ = std::move(config);
-    if (config_.path.empty() || !config_.max_blocks) {
-        store_.reset();
-        return;
+    std::lock_guard writer(writer_mutex_);
+
+    std::shared_ptr<LocalStore> store;
+    size_t limit = 0;
+    {
+        std::lock_guard lock(state_mutex_);
+        bool reopen = config.path != config_.path;
+        config_ = std::move(config);
+        if (config_.path.empty() || !config_.max_blocks) {
+            store_.reset();
+            lru_.clear();
+            lru_index_.clear();
+            return;
+        }
+        if (reopen || !store_)
+            open_locked();
+        store = store_;
+        limit = config_.max_blocks;
     }
-    if (reopen || !store_)
-        open_locked();
-    else
-        trim_locked();
+
+    trim_to_limit(store, limit);
 }
 
 bool PersistentBlockCache::enabled() const {
-    std::lock_guard lock(mutex_);
+    std::lock_guard lock(state_mutex_);
     return static_cast<bool>(store_) && config_.max_blocks;
 }
 
-void PersistentBlockCache::trim_locked(const ObjectId* incoming) {
-    if (!store_ || !config_.max_blocks)
+void PersistentBlockCache::rebuild_lru_locked() {
+    lru_.clear();
+    lru_index_.clear();
+    if (!store_)
         return;
-    auto ids = store_->list();
-    size_t target = config_.max_blocks;
-    if (incoming && !store_->has(*incoming) && target)
-        --target;
-    while (ids.size() > target) {
-        auto victim = std::min_element(ids.begin(), ids.end(), [&](const auto& a, const auto& b) {
-            return store_->last_write(a) < store_->last_write(b);
-        });
-        if (victim == ids.end())
-            break;
-        (void)store_->remove(*victim);
-        ids.erase(victim);
+
+    // Reconcile the on-disk cache exactly once when it is opened.  Runtime
+    // eviction is maintained incrementally from here; it must never recurse
+    // over the complete cache tree on every inserted extent.
+    for (const auto& id : store_->list()) {
+        lru_.push_back(id);
+        lru_index_[id] = std::prev(lru_.end());
+    }
+}
+
+void PersistentBlockCache::mark_used(const std::shared_ptr<LocalStore>& store,
+                                     const ObjectId& id) {
+    std::lock_guard lock(state_mutex_);
+    if (!store_ || store_ != store)
+        return;
+    auto found = lru_index_.find(id);
+    if (found == lru_index_.end())
+        return; // It may have been evicted after this reader opened the object.
+    lru_.splice(lru_.end(), lru_, found->second);
+    found->second = std::prev(lru_.end());
+}
+
+void PersistentBlockCache::trim_to_limit(const std::shared_ptr<LocalStore>& store,
+                                         size_t limit) {
+    if (!store)
+        return;
+
+    while (true) {
+        std::optional<ObjectId> victim;
+        {
+            std::lock_guard lock(state_mutex_);
+            if (!store_ || store_ != store || lru_.size() <= limit)
+                return;
+            victim = lru_.front();
+            lru_index_.erase(*victim);
+            lru_.pop_front();
+        }
+
+        // LocalStore serialises physical mutations internally.  This may fsync,
+        // so deliberately do it without state_mutex_: foreground cache readers
+        // only need a shared_ptr snapshot and continue independently.
+        (void)store->remove(*victim);
     }
 }
 
 bool PersistentBlockCache::put(const ObjectId& id, std::span<const uint8_t> data) {
-    std::lock_guard lock(mutex_);
-    if (!store_ || !config_.max_blocks)
+    // Cache mutation is serialised independently of reads.  This also makes the
+    // in-memory block count a reservation mechanism: two writers cannot both
+    // observe one remaining slot and exceed max_blocks.
+    std::lock_guard writer(writer_mutex_);
+
+    std::shared_ptr<LocalStore> store;
+    size_t limit = 0;
+    {
+        std::lock_guard lock(state_mutex_);
+        store = store_;
+        limit = config_.max_blocks;
+    }
+    if (!store || !limit)
         return false;
+
     try {
-        if (store_->has(id)) {
-            store_->touch(id);
+        if (store->has(id)) {
+            mark_used(store, id);
             return true;
         }
-        trim_locked(&id);
-        bool ok = store_->put(id, data);
-        if (ok)
-            store_->touch(id);
-        return ok;
+
+        // Make one slot before doing the expensive encrypted/fsynced put.  No
+        // recursive directory walk is performed here; lru_ is authoritative
+        // for this cache process after the one-time open reconciliation.
+        while (true) {
+            std::optional<ObjectId> victim;
+            {
+                std::lock_guard lock(state_mutex_);
+                if (!store_ || store_ != store || !config_.max_blocks)
+                    return false;
+                limit = config_.max_blocks;
+                if (lru_.size() < limit)
+                    break;
+                victim = lru_.front();
+                lru_index_.erase(*victim);
+                lru_.pop_front();
+            }
+            (void)store->remove(*victim);
+        }
+
+        const bool ok = store->put(id, data);
+        if (!ok)
+            return false;
+        {
+            std::lock_guard lock(state_mutex_);
+            if (store_ != store)
+                return true; // Reconfigured concurrently after the physical put.
+            auto existing = lru_index_.find(id);
+            if (existing != lru_index_.end()) {
+                lru_.splice(lru_.end(), lru_, existing->second);
+                existing->second = std::prev(lru_.end());
+            } else {
+                lru_.push_back(id);
+                lru_index_[id] = std::prev(lru_.end());
+            }
+        }
+        return true;
     } catch (const std::exception& error) {
         Log::debug("persistent cache write: " + std::string(error.what()));
         return false;
@@ -131,43 +222,97 @@ bool PersistentBlockCache::put(const ObjectId& id, std::span<const uint8_t> data
 }
 
 std::optional<Bytes> PersistentBlockCache::get(const ObjectId& id) {
-    std::lock_guard lock(mutex_);
-    if (!store_)
+    std::shared_ptr<LocalStore> store;
+    {
+        std::lock_guard lock(state_mutex_);
+        store = store_;
+    }
+    if (!store)
         return {};
+
     try {
-        auto data = store_->get(id);
+        auto data = store->get(id);
         if (data)
-            store_->touch(id);
+            mark_used(store, id);
         return data;
     } catch (const std::exception& error) {
         Log::debug("persistent cache read: " + std::string(error.what()));
-        (void)store_->remove(id);
+        // A corrupt cache entry is disposable, but only remove it from the
+        // same cache instance that produced the failed read.  A live
+        // reconfiguration may already have installed a different cache root.
+        std::lock_guard writer(writer_mutex_);
+        bool current = false;
+        {
+            std::lock_guard lock(state_mutex_);
+            current = store_ == store;
+        }
+        if (current) {
+            (void)store->remove(id);
+            std::lock_guard lock(state_mutex_);
+            if (store_ == store) {
+                auto found = lru_index_.find(id);
+                if (found != lru_index_.end()) {
+                    lru_.erase(found->second);
+                    lru_index_.erase(found);
+                }
+            }
+        }
         return {};
     }
 }
 
 bool PersistentBlockCache::has(const ObjectId& id) const {
-    std::lock_guard lock(mutex_);
-    return store_ && store_->has(id);
+    std::shared_ptr<LocalStore> store;
+    {
+        std::lock_guard lock(state_mutex_);
+        store = store_;
+    }
+    return store && store->has(id);
 }
 
 bool PersistentBlockCache::remove(const ObjectId& id) {
-    std::lock_guard lock(mutex_);
-    return store_ && store_->remove(id);
+    std::lock_guard writer(writer_mutex_);
+    std::shared_ptr<LocalStore> store;
+    {
+        std::lock_guard lock(state_mutex_);
+        store = store_;
+    }
+    if (!store)
+        return false;
+
+    const bool removed = store->remove(id);
+    {
+        std::lock_guard lock(state_mutex_);
+        if (store_ == store) {
+            auto found = lru_index_.find(id);
+            if (found != lru_index_.end()) {
+                lru_.erase(found->second);
+                lru_index_.erase(found);
+            }
+        }
+    }
+    return removed;
 }
 
 size_t PersistentBlockCache::blocks() const {
-    std::lock_guard lock(mutex_);
-    return store_ ? store_->list().size() : 0;
+    std::lock_guard lock(state_mutex_);
+    return lru_.size();
 }
 
-std::filesystem::path PersistentBlockCache::metadata_path_locked() const {
-    return config_.path / "metadata" / "current.meta";
+std::filesystem::path PersistentBlockCache::metadata_path(const CacheConfig& config) {
+    return config.path / "metadata" / "current.meta";
 }
 
 void PersistentBlockCache::remember_metadata(const MetadataRecord& record) {
-    std::lock_guard lock(mutex_);
-    if (!store_ || !config_.prefer_metadata)
+    std::lock_guard metadata_lock(metadata_mutex_);
+    CacheConfig config;
+    std::shared_ptr<LocalStore> store;
+    {
+        std::lock_guard lock(state_mutex_);
+        config = config_;
+        store = store_;
+    }
+    if (!store || !config.prefer_metadata)
         return;
     try {
         auto plain = encode_metadata_record(record);
@@ -177,18 +322,25 @@ void PersistentBlockCache::remember_metadata(const MetadataRecord& record) {
         writer.fixed(sealed.nonce);
         writer.fixed(sealed.tag);
         writer.bytes(sealed.ciphertext);
-        atomic_write(metadata_path_locked(), writer.data());
+        atomic_write(metadata_path(config), writer.data());
     } catch (const std::exception& error) {
         Log::debug("persistent metadata cache write: " + std::string(error.what()));
     }
 }
 
 std::optional<MetadataRecord> PersistentBlockCache::metadata() const {
-    std::lock_guard lock(mutex_);
-    if (!store_ || !config_.prefer_metadata)
+    std::lock_guard metadata_lock(metadata_mutex_);
+    CacheConfig config;
+    std::shared_ptr<LocalStore> store;
+    {
+        std::lock_guard lock(state_mutex_);
+        config = config_;
+        store = store_;
+    }
+    if (!store || !config.prefer_metadata)
         return {};
     try {
-        auto path = metadata_path_locked();
+        auto path = metadata_path(config);
         if (!std::filesystem::exists(path))
             return {};
         std::ifstream in(path, std::ios::binary);

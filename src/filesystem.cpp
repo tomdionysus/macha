@@ -261,9 +261,9 @@ void WriteHandle::diagnostic_stage_checkpoint(const char* label) {
         diagnostic_stage_extent(label, static_cast<size_t>(index), offset, length);
     }
 }
-void WriteHandle::flush() {
+std::chrono::milliseconds WriteHandle::flush() {
     if (buffer_.empty())
-        return;
+        return {};
     const auto offset = staged_;
     const auto length = buffer_.size();
     const bool diagnostics = Log::enabled(LogLevel::all);
@@ -273,6 +273,14 @@ void WriteHandle::flush() {
     auto started = Clock::now();
     auto id = fs_.store().put(buffer_);
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
+    if (elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
+        Log::debug("write stage id=" + std::to_string(diagnostic_id_) +
+                   " path=" + path_ +
+                   " stage=extent-put offset=" + std::to_string(offset) +
+                   " bytes=" + std::to_string(length) +
+                   " object=" + to_string(id) +
+                   " elapsed_ms=" + std::to_string(elapsed.count()));
+    }
     if (diagnostics) {
         if (Log::enabled(LogLevel::all))
             Log::trace("WRITE extent-put id=" + std::to_string(diagnostic_id_) +
@@ -286,6 +294,7 @@ void WriteHandle::flush() {
     extents_.push_back({staged_, buffer_.size(), id, false});
     staged_ += buffer_.size();
     buffer_.clear();
+    return elapsed;
 }
 void WriteHandle::materialize() {
     if (temp_ >= 0)
@@ -339,7 +348,10 @@ void WriteHandle::materialize() {
                " completed_extents=" + std::to_string(diagnostic_completed_extents_));
 }
 size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
-    std::lock_guard g(m_);
+    const auto operation_started = Clock::now();
+    std::unique_lock g(m_);
+    const auto lock_wait =
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - operation_started);
     if (d.empty())
         return 0;
 
@@ -410,6 +422,7 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
         diagnostic_writes_.push_back({sequence, off, d.size(), input_hash});
     }
 
+    std::chrono::milliseconds extent_put_time{};
     if (sequential_ && off == logical_) {
         size_t p = 0;
         while (p < d.size()) {
@@ -418,7 +431,7 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
             p += n;
             logical_ += n;
             if (buffer_.size() == fs_.extent_size())
-                flush();
+                extent_put_time += flush();
         }
         if (diagnostics) {
             if (Log::enabled(LogLevel::all))
@@ -495,6 +508,17 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
     }
     dirty_ = true;
     fs_.store().foreground_activity(d.size());
+    const auto total =
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - operation_started);
+    if (total >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
+        Log::debug("write stage id=" + std::to_string(diagnostic_id_) +
+                   " path=" + path_ +
+                   " stage=write bytes=" + std::to_string(d.size()) +
+                   " offset=" + std::to_string(off) +
+                   " lock_wait_ms=" + std::to_string(lock_wait.count()) +
+                   " extent_put_ms=" + std::to_string(extent_put_time.count()) +
+                   " total_ms=" + std::to_string(total.count()));
+    }
     return d.size();
 }
 void WriteHandle::truncate(uint64_t z) {
@@ -543,6 +567,8 @@ void WriteHandle::truncate(uint64_t z) {
 }
 void WriteHandle::rebuild() {
     auto rebuild_started = Clock::now();
+    std::chrono::milliseconds staging_read_time{};
+    std::chrono::milliseconds object_put_time{};
     if (Log::enabled(LogLevel::all))
         Log::trace("WRITE rebuild-begin id=" + std::to_string(diagnostic_id_) +
                " logical=" + std::to_string(logical_) +
@@ -555,8 +581,11 @@ void WriteHandle::rebuild() {
     size_t index = 0;
     while (o < logical_) {
         size_t n = std::min<uint64_t>(b.size(), logical_ - o);
+        const auto read_started = Clock::now();
         if (pra(temp_, {b.data(), n}, o) != n)
             fail(EIO, "short staging read");
+        staging_read_time +=
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - read_started);
         const bool diagnostics = Log::enabled(LogLevel::all);
         Hash256 plaintext_hash{};
         bool zero = false;
@@ -571,6 +600,16 @@ void WriteHandle::rebuild() {
         auto id = fs_.store().put({b.data(), n});
         auto elapsed =
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
+        object_put_time += elapsed;
+        if (elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
+            Log::debug("write stage id=" + std::to_string(diagnostic_id_) +
+                       " path=" + path_ +
+                       " stage=rebuild-extent-put index=" + std::to_string(index) +
+                       " offset=" + std::to_string(o) +
+                       " bytes=" + std::to_string(n) +
+                       " object=" + to_string(id) +
+                       " elapsed_ms=" + std::to_string(elapsed.count()));
+        }
         if (diagnostics) {
             if (Log::enabled(LogLevel::all))
                 Log::trace("WRITE rebuild-extent id=" + std::to_string(diagnostic_id_) +
@@ -591,14 +630,31 @@ void WriteHandle::rebuild() {
     staged_ = logical_;
     auto rebuild_elapsed =
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - rebuild_started);
+    if (rebuild_elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
+        Log::debug("write stage id=" + std::to_string(diagnostic_id_) +
+                   " path=" + path_ +
+                   " stage=rebuild extents=" + std::to_string(extents_.size()) +
+                   " staging_read_ms=" + std::to_string(staging_read_time.count()) +
+                   " object_put_ms=" + std::to_string(object_put_time.count()) +
+                   " total_ms=" + std::to_string(rebuild_elapsed.count()));
+    }
     if (Log::enabled(LogLevel::all))
         Log::trace("WRITE rebuild-end id=" + std::to_string(diagnostic_id_) +
                " extents=" + std::to_string(extents_.size()) +
                " ms=" + std::to_string(rebuild_elapsed.count()));
 }
 void WriteHandle::commit() {
-    std::lock_guard g(m_);
+    const auto operation_started = Clock::now();
+    std::unique_lock g(m_);
+    const auto lock_wait =
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - operation_started);
     if (!dirty_) {
+        if (lock_wait >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
+            Log::debug("write stage id=" + std::to_string(diagnostic_id_) +
+                       " path=" + path_ +
+                       " stage=commit-clean lock_wait_ms=" +
+                       std::to_string(lock_wait.count()));
+        }
         if (Log::enabled(LogLevel::all))
             Log::trace("WRITE commit-clean id=" + std::to_string(diagnostic_id_));
         return;
@@ -612,10 +668,13 @@ void WriteHandle::commit() {
                " extents=" + std::to_string(extents_.size()) +
                " temp=" + std::to_string(temp_ >= 0 ? 1 : 0) +
                " base_version=" + std::to_string(base_.version));
+    const auto data_started = Clock::now();
     if (temp_ >= 0)
         rebuild();
     else
-        flush();
+        (void)flush();
+    const auto data_time =
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - data_started);
     for (size_t i = 0; i < extents_.size(); ++i) {
         const auto& x = extents_[i];
         if (Log::enabled(LogLevel::all))
@@ -626,12 +685,27 @@ void WriteHandle::commit() {
                    " id=" + to_string(x.id));
     }
     FsEntry committed;
+    const auto metadata_started = Clock::now();
     fs_.commit_write(*this, base_, logical_, extents_, &committed);
+    const auto metadata_time =
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - metadata_started);
     base_ = std::move(committed);
     expected_ = base_.version;
     dirty_ = false;
     auto commit_elapsed =
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - commit_started);
+    const auto total =
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - operation_started);
+    if (total >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
+        Log::debug("write stage id=" + std::to_string(diagnostic_id_) +
+                   " path=" + path_ +
+                   " stage=commit logical_bytes=" + std::to_string(logical_) +
+                   " extents=" + std::to_string(extents_.size()) +
+                   " lock_wait_ms=" + std::to_string(lock_wait.count()) +
+                   " data_ms=" + std::to_string(data_time.count()) +
+                   " metadata_ms=" + std::to_string(metadata_time.count()) +
+                   " total_ms=" + std::to_string(total.count()));
+    }
     if (Log::enabled(LogLevel::all))
         Log::trace("WRITE commit-end id=" + std::to_string(diagnostic_id_) +
                " committed_size=" + std::to_string(base_.size) +

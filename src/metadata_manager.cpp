@@ -115,6 +115,11 @@ MetadataRecord MetadataManager::latest(const std::vector<MetadataRecord>& record
 MetadataRecord MetadataManager::cache_record(const MetadataRecord& record) {
     {
         std::lock_guard lock(cache_mutex_);
+        // Concurrent quorum/local reads can complete out of order.  Never let
+        // an older completion move the process cache backwards after a newer
+        // immutable record has already been observed.
+        if (cache_ && newer_than(*cache_, record))
+            return *cache_;
         cache_ = record;
         cache_until_ = Clock::now() + node_.config().metadata_cache;
         if (decoded_cache_ && decoded_generation_ == record.generation && decoded_hash_ == record.hash)
@@ -127,6 +132,8 @@ MetadataRecord MetadataManager::cache_record(const MetadataRecord& record) {
     auto decoded = std::make_shared<MetadataSnapshot>(decode_snapshot(record.payload));
     {
         std::lock_guard lock(cache_mutex_);
+        if (cache_ && newer_than(*cache_, record))
+            return *cache_;
         cache_ = record;
         cache_until_ = Clock::now() + node_.config().metadata_cache;
         if (!decoded_cache_ || decoded_generation_ != record.generation || decoded_hash_ != record.hash) {
@@ -1128,10 +1135,33 @@ MetadataRecord MetadataManager::read_record() {
 MetadataSnapshotView MetadataManager::snapshot_view() {
     if (auto cached = cached_snapshot_view())
         return *cached;
-    (void)read_record();
+    auto record = read_record();
     if (auto cached = cached_snapshot_view())
         return *cached;
-    throw std::runtime_error("metadata snapshot cache unavailable after successful read");
+
+    // A successful read installed a fully decoded, immutable snapshot.  A
+    // concurrent metadata notice can advance remote_metadata_generation()
+    // between that read and the second cached_snapshot_view() above, making the
+    // freshly installed generation look stale immediately.  That is not an I/O
+    // error: this filesystem operation may safely finish against the coherent
+    // generation it just obtained.  Return the installed snapshot even when a
+    // newer generation is already known; the next operation will refresh via
+    // the normal fast-path staleness check.
+    {
+        std::lock_guard lock(cache_mutex_);
+        if (decoded_cache_ &&
+            (decoded_generation_ > record.generation ||
+             (decoded_generation_ == record.generation && decoded_hash_ >= record.hash))) {
+            return MetadataSnapshotView{decoded_generation_, decoded_hash_, decoded_cache_};
+        }
+    }
+
+    // If another reader displaced the decoded cache in an unusual interleave,
+    // the record returned by read_record() is still self-contained and valid.
+    // Decode that exact generation rather than turning cache churn into FUSE
+    // EIO.  This path is exceptional; normal operations reuse decoded_cache_.
+    auto decoded = std::make_shared<MetadataSnapshot>(decode_snapshot(record.payload));
+    return MetadataSnapshotView{record.generation, record.hash, std::move(decoded)};
 }
 
 MetadataSnapshot MetadataManager::snapshot() {
