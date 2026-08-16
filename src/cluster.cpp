@@ -333,27 +333,51 @@ void NodeRuntime::exchange(const Endpoint& endpoint) {
     merge(reply.message.payload);
 }
 
+void NodeRuntime::exchange(const NodeInfo& node) {
+    // Once membership has authenticated a NodeId, preserve that identity when
+    // selecting the route. This lets RpcClient reuse an inbound canonical route
+    // immediately instead of treating an advertised endpoint as a fresh dial.
+    auto reply = call(node, MessageType::members);
+    if (reply.message.type != MessageType::members_reply)
+        throw std::runtime_error("membership rejected");
+    merge(reply.message.payload);
+}
+
 void NodeRuntime::loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
         local_.refresh();
         members_.storage(local_.used(), local_.limit());
         members_.metadata_generation(meta_.current().generation);
         std::set<std::pair<std::string, uint16_t>> exchanged;
+        const auto known_nodes = members_.all();
         for (const auto& endpoint : cfg_.bootstrap) {
             exchanged.emplace(endpoint.host, endpoint.port);
             try {
-                exchange(endpoint);
+                // Bootstrap is only identity-less before first authentication.
+                // Once the advertised endpoint belongs to a known NodeId, use
+                // the identity-aware route so a reconnect/backoff state cannot
+                // force us back into endpoint-dial behaviour.
+                auto known = std::find_if(known_nodes.begin(), known_nodes.end(),
+                                          [&](const NodeInfo& node) {
+                                              return node.id != id_ &&
+                                                     node.host == endpoint.host &&
+                                                     node.port == endpoint.port;
+                                          });
+                if (known != known_nodes.end())
+                    exchange(*known);
+                else
+                    exchange(endpoint);
             } catch (const std::exception& error) {
                 Log::debug("bootstrap: " + std::string(error.what()));
             }
         }
-        for (const auto& node : members_.all()) {
+        for (const auto& node : known_nodes) {
             if (node.id == id_)
                 continue;
             if (!exchanged.emplace(node.host, node.port).second)
                 continue;
             try {
-                exchange({node.host, node.port});
+                exchange(node);
             } catch (const std::exception& error) {
                 Log::debug("peer " + node.host + ": " + error.what());
             }
