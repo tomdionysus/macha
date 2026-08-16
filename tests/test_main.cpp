@@ -748,6 +748,25 @@ void test_metadata_codec_and_replica() {
     REQUIRE(decoded.garbage.size() == 1);
     CHECK(decoded.garbage.front().id == garbage_id);
 
+    auto delta_target = decoded;
+    delta_target.mutation_sequences[a] = 8;
+    delta_target.entries.at("/movie.mkv").size = 456;
+    FsEntry extra;
+    extra.type = EntryType::file;
+    extra.size = 999;
+    delta_target.entries["/extra.mkv"] = extra;
+    auto catalogue_id = object_id(pattern(1024));
+    delta_target.catalogue_root = catalogue_id;
+    auto garbage_id_2 = object_id(pattern(2048));
+    delta_target.garbage.push_back({garbage_id_2});
+    auto compact = metadata_delta(decoded, delta_target);
+    REQUIRE(compact.has_value());
+    auto encoded_delta = encode_metadata_delta(*compact);
+    auto decoded_delta = decode_metadata_delta(encoded_delta);
+    auto reconstructed = apply_metadata_delta(decoded, decoded_delta);
+    CHECK(encode_snapshot(reconstructed) == encode_snapshot(delta_target));
+    CHECK(encoded_delta.size() < encode_snapshot(delta_target).size());
+
     // 0.4.0 metadata snapshots had no catalogue-root field. 0.5.0 must read
     // them directly so an existing namespace upgrades to an empty catalogue
     // rather than requiring destructive state migration.
@@ -791,23 +810,98 @@ void test_metadata_codec_and_replica() {
     MetadataReplica reopened(replica_path, keys.storage);
     CHECK(reopened.current().hash == next.hash);
     CHECK(reopened.committed().hash == next.hash);
+    CHECK(std::filesystem::exists(replica_path / "metadata" / "checkpoint.meta"));
+    CHECK(std::filesystem::exists(replica_path / "metadata" / "journal.log"));
 
-    // current.meta without committed.meta is pre-v3/incomplete state. Do not
-    // silently promote it into a recovery checkpoint.
-    auto legacy_path = t.path() / "legacy-node";
+    // Ordinary 0.9 mutation is a compact delta proposal. It survives restart
+    // through the encrypted journal and does not require a full snapshot file
+    // rewrite for either prepare or commit.
+    auto before_delta = decode_snapshot(reopened.current().payload);
+    auto after_delta = before_delta;
+    after_delta.entries.at("/movie.mkv").size = 456;
+    after_delta.mutation_sequences[a] = 8;
+    auto delta = metadata_delta(before_delta, after_delta);
+    REQUIRE(delta.has_value());
+    auto delta_bytes = encode_metadata_delta(*delta);
+    const auto journal_before_delta =
+        std::filesystem::file_size(replica_path / "metadata" / "journal.log");
+    MetadataRecord delta_next;
+    REQUIRE(reopened.cas_delta(reopened.current().generation, reopened.current().hash,
+                               delta_bytes, &delta_next));
+    CHECK(reopened.committed().hash == next.hash);
+    REQUIRE(reopened.remember_current_committed(delta_next.generation, delta_next.hash));
+    auto journal_size = std::filesystem::file_size(replica_path / "metadata" / "journal.log");
+    const auto journal_growth = journal_size - journal_before_delta;
+    // The journal contains two authenticated frames (prepare + commit), so for
+    // deliberately tiny snapshots the fixed nonce/tag/framing overhead can be
+    // larger than the snapshot itself. What matters is that growth tracks the
+    // compact delta plus bounded framing, rather than embedding the full
+    // successor snapshot in the ordinary mutation path.
+    CHECK(delta_bytes.size() < delta_next.payload.size());
+    CHECK(journal_growth >= delta_bytes.size());
+    CHECK(journal_growth < delta_bytes.size() + 512);
+
+    MetadataReplica reopened_again(replica_path, keys.storage);
+    CHECK(reopened_again.current().hash == delta_next.hash);
+    CHECK(reopened_again.committed().hash == delta_next.hash);
+    CHECK(decode_snapshot(reopened_again.current().payload).entries.at("/movie.mkv").size == 456);
+
+    // Accepted-but-uncommitted state remains current after restart but does not
+    // become a recovery witness. An interrupted trailing journal append is
+    // discarded without losing the last complete proposal.
+    auto uncommitted_path = t.path() / "uncommitted-node";
+    MetadataRecord uncommitted_next;
+    Hash256 uncommitted_base_hash;
     {
-        MetadataReplica legacy(legacy_path, keys.storage);
-        (void)legacy;
+        MetadataReplica uncommitted(uncommitted_path, keys.storage);
+        auto base = uncommitted.current();
+        uncommitted_base_hash = base.hash;
+        auto before = decode_snapshot(base.payload);
+        auto after = before;
+        after.entries["/pending"] = extra;
+        auto d = metadata_delta(before, after);
+        REQUIRE(d.has_value());
+        auto dbytes = encode_metadata_delta(*d);
+        REQUIRE(uncommitted.cas_delta(base.generation, base.hash, dbytes, &uncommitted_next));
+        CHECK(uncommitted.committed().hash == uncommitted_base_hash);
     }
-    std::filesystem::remove(legacy_path / "metadata" / "committed.meta");
-    bool legacy_rejected = false;
-    try {
-        MetadataReplica legacy(legacy_path, keys.storage);
-        (void)legacy;
-    } catch (const std::exception&) {
-        legacy_rejected = true;
+    {
+        std::ofstream tail(uncommitted_path / "metadata" / "journal.log",
+                           std::ios::binary | std::ios::app);
+        tail.write("bad", 3);
     }
-    CHECK(legacy_rejected);
+    {
+        MetadataReplica recovered(uncommitted_path, keys.storage);
+        CHECK(recovered.current().hash == uncommitted_next.hash);
+        CHECK(recovered.committed().hash == uncommitted_base_hash);
+    }
+
+    // Periodic compaction bounds replay. 64 committed mutations produce 128
+    // prepare+commit journal records; the threshold checkpoints and truncates
+    // them rather than allowing an unbounded replay log.
+    auto compact_path = t.path() / "compact-node";
+    {
+        MetadataReplica compacted(compact_path, keys.storage);
+        for (size_t i = 0; i < 65; ++i) {
+            auto base = compacted.current();
+            auto before = decode_snapshot(base.payload);
+            auto after = before;
+            after.entries["/"].mtime_ns = static_cast<int64_t>(i + 1);
+            auto d = metadata_delta(before, after);
+            REQUIRE(d.has_value());
+            auto dbytes = encode_metadata_delta(*d);
+            MetadataRecord proposal;
+            REQUIRE(compacted.cas_delta(base.generation, base.hash, dbytes, &proposal));
+            REQUIRE(compacted.remember_current_committed(proposal.generation, proposal.hash));
+        }
+        CHECK(std::filesystem::file_size(compact_path / "metadata" / "journal.log") > 4096);
+        compacted.compact();
+    }
+    CHECK(std::filesystem::file_size(compact_path / "metadata" / "journal.log") < 4096);
+    MetadataReplica compacted_again(compact_path, keys.storage);
+    CHECK(compacted_again.current().generation == 66);
+    CHECK(compacted_again.current().hash == compacted_again.committed().hash);
+
 }
 
 void test_config() {
@@ -1278,7 +1372,7 @@ void test_async_rpc_move_ownership() {
     CHECK(cancelled.load() == 2);
 }
 
-void test_rpc_v10_frame_priority_and_variable_length() {
+void test_rpc_v11_frame_priority_and_variable_length() {
     CHECK(frame_type_priority(FrameType::control) < frame_type_priority(FrameType::foreground));
     CHECK(frame_type_priority(FrameType::foreground) < frame_type_priority(FrameType::read_ahead));
     CHECK(frame_type_priority(FrameType::read_ahead) <
@@ -1286,6 +1380,8 @@ void test_rpc_v10_frame_priority_and_variable_length() {
     CHECK(default_frame_type(MessageType::ping) == FrameType::control);
     CHECK(default_frame_type(MessageType::get_object) == FrameType::foreground);
     CHECK(std::string(message_type_name(MessageType::commit_metadata)) == "commit_metadata");
+    CHECK(std::string(message_type_name(MessageType::cas_metadata_delta)) ==
+          "cas_metadata_delta");
 
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
@@ -1439,7 +1535,7 @@ void test_repair_step_is_bounded_and_yields() {
     s1.stop();
 }
 
-void test_rpc_v10_persistence_and_multiplexing() {
+void test_rpc_v11_persistence_and_multiplexing() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -1516,7 +1612,7 @@ void test_rpc_v10_persistence_and_multiplexing() {
     server.stop();
 }
 
-void test_rpc_v10_bidirectional_and_deduplication() {
+void test_rpc_v11_bidirectional_and_deduplication() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -3580,7 +3676,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
-    CHECK(status_body.find("\"server_version\":\"0.8.7\"") != std::string::npos);
+    CHECK(status_body.find("\"server_version\":\"0.9.0\"") != std::string::npos);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -4242,7 +4338,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == "0.8.7");
+    CHECK(playback_status_json.find("server_version")->asString() == "0.9.0");
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately
@@ -4447,10 +4543,10 @@ int main() {
         test_placement();
         test_capacity_placement();
         test_async_rpc_move_ownership();
-        test_rpc_v10_frame_priority_and_variable_length();
+        test_rpc_v11_frame_priority_and_variable_length();
         test_repair_step_is_bounded_and_yields();
-        test_rpc_v10_persistence_and_multiplexing();
-        test_rpc_v10_bidirectional_and_deduplication();
+        test_rpc_v11_persistence_and_multiplexing();
+        test_rpc_v11_bidirectional_and_deduplication();
         test_mutual_bootstrap_prunes_cross_dial();
         test_rpc_v7_handshake_is_rejected();
         test_rpc_slow_control_does_not_abort_data();

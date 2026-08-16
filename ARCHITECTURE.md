@@ -100,20 +100,30 @@ Catalogue matching uses the stable `macha:<sha256>` media identity derived from 
 
 ## Metadata state
 
-Metadata is a whole versioned encrypted CAS snapshot. This is intentionally simple: media data is large and immutable; namespace mutation is comparatively rare.
+The canonical namespace is still a versioned `MetadataSnapshot`, but ordinary mutation is no longer replicated or persisted as a complete snapshot. 0.9.0 uses a deterministic **delta CAS + local encrypted journal**.
 
-Each node holds two durable metadata records under `state_path`:
+Each node stores metadata under `state_path/metadata/` as:
 
-- `metadata/current.meta`: local voter/working state, which may contain a CAS generation not yet known committed;
-- `metadata/committed.meta`: the latest generation known to have reached quorum.
+- `checkpoint.meta`: a complete encrypted **committed** `MetadataRecord`;
+- `journal.log`: encrypted append-only records after that checkpoint. A CAS vote appends `prepare(delta)` (or, for rare repair/policy paths, a full prepare/seed); quorum commitment appends `commit(generation, hash)`.
 
-Both files are required for existing state. A `current.meta`-only state from an older build is rejected rather than upgraded implicitly.
+The in-memory current record may therefore be newer than the committed record. On restart the checkpoint is loaded and the journal is replayed deterministically. A prepared vote remains current but cannot become a recovery witness until its matching commit marker is present. A torn final journal frame is discarded; authenticated corruption of a complete frame is an error.
 
-Only the configured voter set participates in consensus. After a committed generation is known, maintenance distributes that checkpoint to every active node as a **recovery witness**. Witnesses are not extra votes.
+Ordinary filesystem and catalogue mutation begins from the node's durable current record, applies the requested change locally, and computes a canonical `MetadataDelta`. The delta can contain mutation-sequence updates, entry upserts/deletes, a catalogue-root set/clear and appended garbage tombstones. Cluster policy (`metadata_voters`, data replication and extent size) is not mutable through this path. If a change cannot be represented compactly, or the encoded delta would be larger than the resulting snapshot, the existing full-snapshot CAS primitive is used instead.
 
-Replica counts are mutable cluster policy. A coordinated whole-cluster restart may change data replication, metadata voter count, or both. The existing voter majority serialises the policy change; a resized voter group is seeded before normal metadata mutation continues, and object repair subsequently converges the immutable extent set to the new data replica count. Transport v10 does not advertise a node's desired replica policy, so rolling changes with mixed configurations are deliberately unsupported. `extent_size` is intentionally immutable for an existing namespace.
+A voter accepts a delta only when its current generation/hash matches the proposal base. It applies the delta itself, re-encodes the canonical snapshot and computes the expected successor hash before durably appending the prepare record. Successful replies carry only generation/previous/hash. Once the proposer observes voter quorum, `commit_metadata` carries only generation+hash and each voter appends the commit marker. Mutation-sequence clocks make retry recovery idempotent after a quorum succeeds but the proposer loses the acknowledgement.
 
-Read-only metadata also has a short in-memory TTL cache with generation invalidation. Locally serialised mutations normally start from the durable current replica and use quorum CAS as the conflict and durability boundary. A newer remote generation notice or CAS conflict forces a quorum refresh before retry.
+Journal compaction is deliberately not part of the mutation critical path. When the journal reaches 128 records or 8 MiB, the existing idle/speculative metadata-maintenance pass writes the current committed record to `checkpoint.meta` and then truncates the journal. The checkpoint is published first; replay ignores exact generations already represented by it, so a crash between checkpoint publication and journal truncation is safe.
+
+0.8.x state is migrated on first 0.9.0 open. `committed.meta` becomes the checkpoint. If `current.meta` contains a newer accepted vote, that full record is journaled **before** the new checkpoint becomes authoritative so migration cannot forget an uncommitted vote. The old files are then renamed to `.v10`. Rollback to pre-0.9 metadata handling after migration is unsupported.
+
+Only the configured voter set participates in consensus. After a committed generation is known, maintenance distributes a complete checkpoint to every active node as a **recovery witness**. Witnesses are not extra votes. Full records remain the repair/recovery primitive because they allow a stale or replacement node to converge without requiring it to possess every intermediate delta.
+
+The node-local persistent block cache still keeps an independent encrypted full metadata snapshot for disaster/offline recovery, but 0.9.0 no longer rewrites that file synchronously on every commit. Full checkpoint/repair activity refreshes it in the background, and an unchanged hash is not rewritten.
+
+Replica counts are mutable cluster policy. A coordinated whole-cluster restart may change data replication, metadata voter count, or both. The existing voter majority serialises the policy change through the full-snapshot CAS path; a resized voter group is seeded before normal metadata mutation continues, and object repair subsequently converges the immutable extent set to the new data replica count. Transport v11 does not advertise a node's desired replica policy, so rolling changes with mixed configurations are deliberately unsupported. `extent_size` is intentionally immutable for an existing namespace.
+
+Read-only metadata retains the short in-memory TTL cache with generation invalidation. A newer remote generation notice or CAS conflict forces a quorum refresh before retry.
 
 ## Catalogue metadata
 
@@ -159,13 +169,13 @@ Namespace mutation always requires quorum.
 
 If quorum is unavailable, a node may use its last valid post-genesis snapshot for read-only namespace access. It can read files only where the required extents exist in authoritative storage or cache. It cannot invent missing blocks or mutate the namespace.
 
-## Transport v10
+## Transport v11
 
 Each active peer pair can have two persistent authenticated bidirectional TCP lanes. `CONTROL` carries health, membership and other small control-plane RPCs. `DATA` carries object traffic only. Metadata remains on the CONTROL transport even when classified as read-ahead or speculative work. The DATA lane is lazy and is opened when object traffic is first required. Separating the TCP sequence spaces prevents retransmission or kernel buffering of bulk payloads from head-of-line blocking liveness and membership traffic.
 
 Both lanes are canonical independently by authenticated `(NodeId, lane)`, not hostname or socket direction. Simultaneous cross-dial arbitration therefore leaves at most one CONTROL and one DATA connection per peer. The TCP dialler owns odd request IDs and the acceptor owns even request IDs on each lane, so either end can originate work without request/reply ambiguity. Requests may complete out of order and cancellation of one request does not tear down unrelated work.
 
-The authenticated v10 handshake includes the requested lane and negotiates `max_frame_size`; the lower configured ceiling wins. Logical messages are split into variable-length frames no larger than that ceiling. Storage extents remain storage objects and are not transport framing units. Each frame is independently AES-256-GCM protected. v9-and-earlier peers are rejected at the protocol boundary. v10 retains the authenticated two-lane handshake and permits prioritised metadata frames without placing metadata payloads on the DATA transport; DATA is reserved for object traffic.
+The authenticated v11 handshake includes the requested lane and negotiates `max_frame_size`; the lower configured ceiling wins. Logical messages are split into variable-length frames no larger than that ceiling. Storage extents remain storage objects and are not transport framing units. Each frame is independently AES-256-GCM protected. v10-and-earlier peers are rejected at the protocol boundary. v11 retains the authenticated two-lane handshake and permits prioritised metadata frames without placing metadata payloads on the DATA transport; DATA is reserved for object traffic.
 
 For queued data-class work, frame type defines priority completely: foreground, read-ahead, then speculative. `foreground` is reserved for media playback/probe/seek and other viewer-blocking reads. Mounted-filesystem reads/writes and useful read-ahead use `read_ahead`; repair and low-value prediction use `speculative`. The outbound scheduler selects the most urgent runnable transfer for every frame and returns to scheduling immediately afterwards. A promotion notification can raise an existing transfer and cancellation stops queued remainder frames without disturbing other request IDs. Object-transfer promotion and cancellation notifications remain on DATA because their request IDs are scoped to that connection. Metadata and placement probes may carry read-ahead/speculative frame classes on CONTROL; the frame scheduler therefore lets control-priority health and membership messages pre-empt them between fragments. DATA remains free of metadata payloads, preserving the viewer-critical object path.
 
@@ -253,4 +263,4 @@ Uncommitted upload orphans are not guessed safe. They require a future explicit 
 
 ## Scaling boundary
 
-Metadata is still a whole replicated snapshot. That is the current scaling boundary. The immutable extent layer, storage pool and cache do not depend on that representation, so metadata can be replaced later without redesigning media storage.
+0.9.0 removes namespace-size network and durable-write amplification from ordinary metadata mutation, but the canonical in-memory state is still a complete `MetadataSnapshot`. A proposer and voter re-encode that snapshot to derive the successor hash, and changing one very large file still carries that file's complete extent manifest in its delta. Background stale-node repair also uses complete snapshots. Those are now the metadata scaling boundaries; none require redesigning the immutable extent layer, storage pool or media cache.

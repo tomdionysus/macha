@@ -492,6 +492,96 @@ MetadataManager::CasResult MetadataManager::cas_quorum(const std::vector<NodeInf
     return result;
 }
 
+MetadataManager::CasResult MetadataManager::cas_delta_quorum(
+    const std::vector<NodeInfo>& nodes, const MetadataRecord& expected,
+    std::span<const uint8_t> delta, std::span<const uint8_t> proposed_payload,
+    size_t required, FrameType frame_type) {
+    CasResult result;
+    if (!required)
+        return result;
+
+    Writer writer;
+    writer.u64(expected.generation);
+    writer.fixed(expected.hash.bytes);
+    writer.bytes(delta);
+    const auto encoded = writer.take();
+
+    MetadataRecord proposed;
+    proposed.generation = expected.generation + 1;
+    proposed.previous = expected.hash;
+    proposed.payload.assign(proposed_payload.begin(), proposed_payload.end());
+    proposed.hash = metadata_hash(proposed.generation, proposed.previous, proposed.payload);
+
+    size_t completed = 0;
+    std::vector<PendingCas> pending;
+    pending.reserve(nodes.size());
+
+    auto observe = [&](bool ok, const MetadataRecord& record) {
+        if (ok) {
+            if (record.generation != proposed.generation ||
+                record.previous != proposed.previous || record.hash != proposed.hash)
+                throw std::runtime_error(
+                    "metadata delta CAS voter acknowledged unexpected successor");
+            ++result.success;
+            if (!result.committed)
+                result.committed = proposed;
+        } else if (record.generation > expected.generation ||
+                   (record.generation == expected.generation && record.hash != expected.hash)) {
+            result.conflict = true;
+        }
+    };
+
+    for (const auto& owner : nodes) {
+        if (owner.id == node_.node_id()) {
+            ++completed;
+            MetadataRecord record;
+            bool ok = node_.cas_metadata_delta(expected.generation, expected.hash, delta, &record);
+            observe(ok, record);
+            continue;
+        }
+        try {
+            PendingCas item;
+            item.owner = owner;
+            item.rpc.emplace(
+                node_.call_async(owner, MessageType::cas_metadata_delta, encoded, frame_type));
+            pending.push_back(std::move(item));
+        } catch (...) {
+            ++completed;
+        }
+    }
+
+    if (result.success >= required)
+        return result;
+    if (result.success + (nodes.size() - completed) < required)
+        return result;
+
+    while (completed < nodes.size()) {
+        bool progressed = false;
+        for (auto& item : pending) {
+            if (item.done || !item.rpc)
+                continue;
+            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+                continue;
+            item.done = true;
+            ++completed;
+            progressed = true;
+            try {
+                auto [ok, record] = cas_reply(item.rpc->get());
+                observe(ok, record);
+            } catch (...) {
+            }
+            if (result.success >= required)
+                return result;
+            if (result.success + (nodes.size() - completed) < required)
+                return result;
+        }
+        if (!progressed)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    return result;
+}
+
 MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& voters, FrameType frame_type) {
     if (voters.empty())
         throw std::runtime_error("metadata voter set is empty");
@@ -648,7 +738,7 @@ MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial)
             throw std::runtime_error("cluster extent size does not match local configuration");
 
         // Replica-policy changes are an offline coordinated operation: every
-        // node must be restarted with the same desired values. Transport v10
+        // node must be restarted with the same desired values. Transport v11
         // does not advertise desired policy, so mixed rolling configurations
         // cannot be safely reconciled here.
         const size_t old_need = quorum(old_voters.size());
@@ -1232,6 +1322,7 @@ MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot
             sequence = previous + 1;
         }
 
+        auto before = snapshot;
         auto voters = snapshot.metadata_voters;
         auto data_replication = snapshot.data_replication;
         auto extent_size = snapshot.extent_size;
@@ -1251,17 +1342,39 @@ MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot
         auto nodes = voter_nodes(voters);
         const auto need = quorum(voters.size());
         const auto cas_started = Clock::now();
-        auto result = cas_quorum(nodes, current, payload, need, FrameType::read_ahead);
+        Bytes delta_payload;
+        bool used_delta = false;
+        CasResult result;
+        if (auto delta = metadata_delta(before, snapshot)) {
+            delta_payload = encode_metadata_delta(*delta);
+            if (delta_payload.size() < payload.size()) {
+                result = cas_delta_quorum(nodes, current, delta_payload, payload, need,
+                                          FrameType::read_ahead);
+                used_delta = true;
+            } else {
+                delta_payload.clear();
+                result = cas_quorum(nodes, current, payload, need, FrameType::read_ahead);
+            }
+        } else {
+            // Rare policy/shape changes retain the full-snapshot CAS primitive.
+            // Ordinary filesystem and catalogue mutations are representable as
+            // MetadataDelta and therefore never take this branch.
+            result = cas_quorum(nodes, current, payload, need, FrameType::read_ahead);
+        }
         const auto cas_ms = elapsed_ms(cas_started);
         if (result.success >= need && result.committed) {
-            // The CAS itself has durably installed the successor current.meta on
-            // a quorum. Do not retransmit that multi-megabyte snapshot for seed
-            // and checkpoint rounds. Mark those already-installed records as
-            // committed with a compact generation+hash RPC; repair converges
-            // non-quorum replicas later.
+            // The delta/full CAS has durably appended the successor proposal on
+            // a quorum. Mark those already-installed records committed with a
+            // compact generation+hash RPC; checkpoint compaction is local and
+            // periodic, while non-quorum replicas converge through repair.
             const auto commit_started = Clock::now();
             (void)commit_quorum(nodes, *result.committed, need, FrameType::read_ahead);
-            (void)node_.checkpoint_metadata(*result.committed);
+            if (used_delta) {
+                if (!node_.checkpoint_metadata_delta(current, delta_payload, *result.committed))
+                    (void)node_.checkpoint_metadata(*result.committed);
+            } else {
+                (void)node_.checkpoint_metadata(*result.committed);
+            }
             const auto commit_ms = elapsed_ms(commit_started);
             cache_record(*result.committed);
             const auto total_ms = elapsed_ms(total_started);
@@ -1272,7 +1385,9 @@ MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot
                            " encode_ms=" + std::to_string(encode_ms) +
                            " cas_ms=" + std::to_string(cas_ms) +
                            " commit_ms=" + std::to_string(commit_ms) +
-                           " payload_bytes=" + std::to_string(payload.size()) +
+                           " mode=" + std::string(used_delta ? "delta" : "snapshot") +
+                           " delta_bytes=" + std::to_string(delta_payload.size()) +
+                           " snapshot_bytes=" + std::to_string(payload.size()) +
                            " attempt=" + std::to_string(attempt + 1));
             }
             return *result.committed;
@@ -1297,10 +1412,12 @@ void MetadataManager::repair_once() {
     seed_quorum(voter_replicas, record, quorum(voters.size()), FrameType::speculative);
     checkpoint_quorum(voter_replicas, record, quorum(voters.size()), FrameType::speculative);
 
-    // Namespace checkpoints are recovery witnesses on every active node. Their
-    // full snapshots are background bulk traffic and therefore use the DATA
-    // lane at speculative priority rather than blocking membership/health.
+    // Namespace checkpoints are recovery witnesses on every active node. Full
+    // repair snapshots stay on CONTROL at speculative frame priority; health
+    // and membership can pre-empt their fragmented frames, while DATA remains
+    // reserved for object traffic.
     seed_all_best_effort(node_.membership().active(), record, FrameType::speculative);
+    node_.metadata_replica().compact();
     cache_record(record);
 }
 } // namespace macha

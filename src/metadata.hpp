@@ -19,6 +19,7 @@ struct FsEntry {
     int64_t ctime_ns{}, mtime_ns{};
     uint64_t version{1};
     std::vector<ExtentRef> extents;
+    auto operator<=>(const FsEntry&) const = default;
 };
 struct GarbageRef {
     ObjectId id{};
@@ -42,9 +43,28 @@ struct MetadataRecord {
     Hash256 previous{}, hash{};
     Bytes payload;
 };
+
+enum class CatalogueDelta : uint8_t { unchanged = 0, clear = 1, set = 2 };
+
+// Compact deterministic mutation from one canonical metadata snapshot to the
+// next. Ordinary namespace/catalogue mutation uses this on the wire and in the
+// local encrypted journal; full MetadataRecord payloads remain the repair and
+// reconfiguration primitive.
+struct MetadataDelta {
+    std::map<NodeId, uint64_t> mutation_sequences;
+    std::map<std::string, FsEntry> upsert_entries;
+    std::vector<std::string> erase_entries;
+    std::vector<GarbageRef> append_garbage;
+    CatalogueDelta catalogue{CatalogueDelta::unchanged};
+    std::optional<ObjectId> catalogue_root;
+};
 Bytes encode_snapshot(const MetadataSnapshot&);
 MetadataSnapshot decode_snapshot(std::span<const uint8_t>);
 Bytes encode_metadata_record(const MetadataRecord&);
+Bytes encode_metadata_delta(const MetadataDelta&);
+MetadataDelta decode_metadata_delta(std::span<const uint8_t>);
+std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot&, const MetadataSnapshot&);
+MetadataSnapshot apply_metadata_delta(const MetadataSnapshot&, const MetadataDelta&);
 MetadataRecord decode_metadata_record(std::span<const uint8_t>);
 Hash256 metadata_hash(uint64_t, const Hash256&, std::span<const uint8_t>);
 MetadataRecord genesis_metadata();
@@ -52,12 +72,20 @@ bool valid_metadata_record(const MetadataRecord&);
 class MetadataReplica {
     std::filesystem::path p_;
     std::filesystem::path committed_p_;
+    std::filesystem::path checkpoint_p_;
+    std::filesystem::path journal_p_;
     std::array<uint8_t, 32> key_;
     mutable std::mutex m_;
     MetadataRecord cur_;
     MetadataRecord committed_;
+    size_t journal_records_{};
+    uint64_t journal_bytes_{};
     void persist(const std::filesystem::path&, const MetadataRecord&);
     std::optional<MetadataRecord> load(const std::filesystem::path&) const;
+    void append_journal(uint8_t, const MetadataRecord&, std::span<const uint8_t> = {});
+    void load_journal();
+    void compact_if_needed();
+    void reset_checkpoint(const MetadataRecord&);
 
   public:
     MetadataReplica(std::filesystem::path, std::array<uint8_t, 32>);
@@ -65,9 +93,13 @@ class MetadataReplica {
     MetadataRecord committed() const;
     uint64_t generation() const;
     bool cas(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
+    bool cas_delta(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
+    bool install_committed_delta(uint64_t, const Hash256&, std::span<const uint8_t>,
+                                 const MetadataRecord&);
     bool seed(const MetadataRecord&);
     bool remember_committed(const MetadataRecord&);
     bool remember_current_committed(uint64_t, const Hash256&);
+    void compact();
 };
 std::string normalize_path(const std::string&);
 std::string parent_path(const std::string&);
