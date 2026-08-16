@@ -501,6 +501,40 @@ void test_storage_pool_and_persistent_cache() {
         CHECK(*got == data);
     }
 
+    // Maintenance traversal is resumable. A one-object slice must not rebuild
+    // or consume the whole object namespace, and a complete pass eventually
+    // visits every physical object without blocking foreground pool operations.
+    {
+        StoragePool::Cursor cursor;
+        std::set<ObjectId> seen;
+        bool complete = false;
+        size_t calls = 0;
+        while (!complete && calls++ < 256) {
+            auto id = pool.next_object(cursor, complete);
+            if (id)
+                seen.insert(*id);
+        }
+        CHECK(complete);
+        CHECK(seen.size() == objects.size());
+    }
+    {
+        size_t slices = 0;
+        bool complete = false;
+        while (!complete && slices++ < 256) {
+            auto step = pool.scrub_step(0, 1);
+            CHECK(step.objects <= 1);
+            complete = step.complete;
+        }
+        CHECK(complete);
+        CHECK(slices > 1);
+    }
+    {
+        auto yielded = pool.rebalance_step(0, 1, [] { return true; });
+        CHECK(yielded.yielded);
+        CHECK(yielded.objects == 0);
+        CHECK(yielded.bytes == 0);
+    }
+
     // Add a third disk live and migrate local placement without changing the
     // node identity or DHT replica accounting.
     pool.reconfigure({{disk1, 64ULL * 1024 * 1024},

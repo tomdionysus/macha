@@ -4,26 +4,58 @@
 #include "config.hpp"
 #include "local_store.hpp"
 
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 
 namespace macha {
 
 class StoragePool {
     struct Backend;
+
+  public:
+    // Persistent local-object traversal. Maintenance owns one cursor per class
+    // and advances it a bounded number of objects on each scheduler slice.
+    struct Cursor {
+        size_t backend_index{};
+        size_t completed_backends{};
+        size_t backend_count{};
+        std::shared_ptr<LocalStore> store;
+        LocalStore::Cursor local;
+    };
+
+    struct MaintenanceResult {
+        uint64_t bytes{};
+        size_t objects{};
+        bool complete{};
+        bool yielded{};
+    };
+
+  private:
+    struct CursorItem {
+        std::shared_ptr<Backend> backend;
+        std::shared_ptr<LocalStore> store;
+        std::filesystem::path path;
+        ObjectId id;
+    };
+
     std::filesystem::path state_path_;
     NodeId node_id_;
     std::array<uint8_t, 32> key_{};
     mutable std::mutex mutex_;
     std::vector<std::shared_ptr<Backend>> backends_;
-    size_t rebalance_offset_{};
+    Cursor rebalance_cursor_;
+    Cursor scrub_cursor_;
 
     std::vector<std::shared_ptr<Backend>> snapshot() const;
     std::filesystem::path identity_path(const std::filesystem::path&) const;
     bool activate(const std::shared_ptr<Backend>&);
-    void deactivate(const std::shared_ptr<Backend>&, const std::string&) const;
+    void deactivate(const std::shared_ptr<Backend>&, const std::shared_ptr<LocalStore>&,
+                    const std::string&, uint64_t expected_generation = 0) const;
     std::vector<std::shared_ptr<Backend>> ranked(const ObjectId&) const;
+    std::optional<CursorItem> next_physical(Cursor&, bool& pass_complete) const;
 
   public:
     StoragePool(std::filesystem::path state_path, NodeId, std::vector<StorageBackendConfig>,
@@ -36,10 +68,17 @@ class StoragePool {
     bool has(const ObjectId&) const;
     bool remove(const ObjectId&);
     std::vector<ObjectId> list() const;
+    std::optional<ObjectId> next_object(Cursor&, bool& pass_complete) const;
     bool older_than(const ObjectId&, std::chrono::seconds) const;
 
-    // Moves authoritative local objects toward their deterministic backend as
-    // disks are added, removed or returned. budget_bytes == 0 means unlimited.
+    MaintenanceResult rebalance_step(uint64_t budget_bytes, size_t operation_budget,
+                                     const std::function<bool()>& should_yield = {});
+    MaintenanceResult scrub_step(uint64_t budget_bytes, size_t operation_budget,
+                                 const std::function<bool()>& should_yield = {});
+
+    // Compatibility helper for callers/tests that explicitly request a complete
+    // pass. Service maintenance uses rebalance_step() so a settled large store
+    // is never enumerated in one scheduler tick.
     uint64_t rebalance_once(uint64_t budget_bytes = 0);
 
     uint64_t used() const;

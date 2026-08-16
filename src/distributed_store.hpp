@@ -38,7 +38,6 @@ class DistributedStore {
 
     NodeRuntime& n_;
     size_t repair_offset_{};
-    size_t scrub_offset_{};
     size_t pull_offset_{};
     std::atomic_uint64_t foreground_bytes_{};
     std::atomic_int64_t last_foreground_ms_{};

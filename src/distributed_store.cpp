@@ -613,30 +613,13 @@ void DistributedStore::erase_all(const ObjectId& id) {
 }
 
 uint64_t DistributedStore::scrub_once(uint64_t byte_budget) {
-    auto ids = n_.local_store().list();
-    if (ids.empty()) {
-        scrub_offset_ = 0;
-        return 0;
-    }
-    scrub_offset_ %= ids.size();
-    std::rotate(ids.begin(), ids.begin() + scrub_offset_, ids.end());
-
     uint64_t checked = 0;
-    size_t processed = 0;
-    for (const auto& id : ids) {
-        try {
-            auto data = n_.local_store().get(id);
-            if (data)
-                checked += data->size();
-        } catch (const std::exception& e) {
-            Log::warn("removing corrupt local object " + to_string(id) + ": " + e.what());
-            n_.local_store().remove(id);
-        }
-        ++processed;
-        if (byte_budget && checked >= byte_budget)
+    while (!byte_budget || checked < byte_budget) {
+        auto step = n_.local_store().scrub_step(byte_budget ? byte_budget - checked : 0, 256);
+        checked += step.bytes;
+        if (step.complete || step.yielded)
             break;
     }
-    scrub_offset_ = (scrub_offset_ + processed) % ids.size();
     return checked;
 }
 

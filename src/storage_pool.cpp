@@ -61,12 +61,15 @@ bool parse_marker(const std::string& text, NodeId& node, NodeId& token) {
 } // namespace
 
 struct StoragePool::Backend {
+    // This mutex protects only the small in-memory state below. No filesystem
+    // operation is performed while it is held.
     mutable std::mutex mutex;
     StorageBackendConfig cfg;
     NodeId token{};
     bool token_known{};
     bool online{};
     bool configured{true};
+    uint64_t generation{1};
     std::shared_ptr<LocalStore> store;
     std::string last_error;
 };
@@ -91,42 +94,72 @@ std::filesystem::path StoragePool::identity_path(const std::filesystem::path& pa
 }
 
 void StoragePool::deactivate(const std::shared_ptr<Backend>& backend,
-                             const std::string& reason) const {
-    std::lock_guard lock(backend->mutex);
-    if (backend->online || backend->last_error != reason)
-        Log::warn("storage backend offline " + backend->cfg.path.string() + ": " + reason);
-    backend->online = false;
-    backend->store.reset();
-    backend->last_error = reason;
+                             const std::shared_ptr<LocalStore>& expected,
+                             const std::string& reason, uint64_t expected_generation) const {
+    std::shared_ptr<LocalStore> retired;
+    std::filesystem::path path;
+    bool log = false;
+    {
+        std::lock_guard lock(backend->mutex);
+        if ((expected_generation && backend->generation != expected_generation) ||
+            (expected && backend->store != expected))
+            return;
+        path = backend->cfg.path;
+        log = backend->online || backend->last_error != reason;
+        backend->online = false;
+        retired = std::move(backend->store);
+        backend->last_error = reason;
+    }
+    // LocalStore destruction may join its accounting thread. Never do that
+    // while holding backend state.
+    retired.reset();
+    if (log)
+        Log::warn("storage backend offline " + path.string() + ": " + reason);
 }
 
 bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
-    std::lock_guard lock(backend->mutex);
+    StorageBackendConfig cfg;
+    NodeId known_token{};
+    bool token_known = false;
+    bool configured = false;
+    bool was_online = false;
+    uint64_t generation = 0;
+    std::shared_ptr<LocalStore> existing;
+    {
+        std::lock_guard lock(backend->mutex);
+        cfg = backend->cfg;
+        known_token = backend->token;
+        token_known = backend->token_known;
+        configured = backend->configured;
+        was_online = backend->online;
+        generation = backend->generation;
+        existing = backend->store;
+    }
+    if (!configured)
+        return false;
+
     try {
         std::error_code ec;
-        if (!std::filesystem::is_directory(backend->cfg.path, ec) || ec) {
+        if (!std::filesystem::is_directory(cfg.path, ec) || ec) {
             const std::string reason = ec ? ec.message() : "configured path is not a directory";
-            if (backend->online || backend->last_error != reason)
-                Log::warn("storage backend offline " + backend->cfg.path.string() + ": " + reason);
-            backend->online = false;
-            backend->store.reset();
-            backend->last_error = reason;
+            deactivate(backend, existing, reason, generation);
             return false;
         }
 
-        auto state_id = identity_path(backend->cfg.path);
-        auto marker = backend->cfg.path / marker_name;
+        auto state_id = identity_path(cfg.path);
+        auto marker = cfg.path / marker_name;
         bool have_state = std::filesystem::exists(state_id, ec) && !ec;
         ec.clear();
         bool have_marker = std::filesystem::exists(marker, ec) && !ec;
 
+        NodeId token = known_token;
         NodeId expected_node{}, expected_token{};
         if (have_state) {
             if (!parse_marker(read_text(state_id), expected_node, expected_token) ||
                 expected_node != node_id_)
                 throw std::runtime_error("invalid backend identity in node state");
-            backend->token = expected_token;
-            backend->token_known = true;
+            token = expected_token;
+            token_known = true;
         }
 
         if (have_marker) {
@@ -135,88 +168,97 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
                 throw std::runtime_error("invalid backend marker");
             if (marker_node != node_id_)
                 throw std::runtime_error("backend belongs to another node identity");
-            if (backend->token_known && marker_token != backend->token)
+            if (token_known && marker_token != token)
                 throw std::runtime_error("backend identity mismatch (wrong disk mounted)");
-            backend->token = marker_token;
-            backend->token_known = true;
+            token = marker_token;
+            token_known = true;
             if (!have_state)
                 atomic_text(state_id, marker_text(node_id_, marker_token));
         } else if (have_state) {
-            // A known disk disappeared. Never create a new marker on the bare
-            // mountpoint: doing so could silently write onto the root filesystem.
-            backend->online = false;
-            backend->store.reset();
-            backend->last_error = "known backend marker is absent";
+            deactivate(backend, existing, "known backend marker is absent", generation);
             return false;
         } else {
-            // First sighting of a newly configured backend. The path must already
-            // exist (normally because the disk is mounted) before it is adopted.
-            backend->token = random_node_id();
-            backend->token_known = true;
-            atomic_text(marker, marker_text(node_id_, backend->token));
-            atomic_text(state_id, marker_text(node_id_, backend->token));
+            token = random_node_id();
+            token_known = true;
+            atomic_text(marker, marker_text(node_id_, token));
+            atomic_text(state_id, marker_text(node_id_, token));
         }
 
-        // Re-read the marker on every refresh. This detects an unmount/remount or
-        // a different disk appearing at the same path.
         NodeId marker_node{}, marker_token{};
         if (!parse_marker(read_text(marker), marker_node, marker_token) ||
-            marker_node != node_id_ || marker_token != backend->token)
+            marker_node != node_id_ || marker_token != token)
             throw std::runtime_error("backend marker changed");
 
-        if (!backend->store)
-            backend->store = std::make_shared<LocalStore>(backend->cfg.path, backend->cfg.limit, key_);
-        bool was_online = backend->online;
-        backend->online = true;
-        backend->last_error.clear();
+        auto store = existing;
+        if (!store)
+            store = std::make_shared<LocalStore>(cfg.path, cfg.limit, key_);
+
+        bool installed = false;
+        {
+            std::lock_guard lock(backend->mutex);
+            if (backend->generation == generation && backend->configured &&
+                backend->cfg.path == cfg.path && backend->cfg.limit == cfg.limit) {
+                backend->token = token;
+                backend->token_known = token_known;
+                backend->store = store;
+                backend->online = true;
+                backend->last_error.clear();
+                installed = true;
+            }
+        }
+        if (!installed)
+            return false;
         if (!was_online)
-            Log::info("storage backend online " + backend->cfg.path.string());
+            Log::info("storage backend online " + cfg.path.string());
         return true;
     } catch (const std::exception& error) {
-        backend->online = false;
-        backend->store.reset();
-        if (backend->last_error != error.what())
-            Log::warn("storage backend unavailable " + backend->cfg.path.string() + ": " + error.what());
-        backend->last_error = error.what();
+        deactivate(backend, existing, error.what(), generation);
         return false;
     }
 }
 
 void StoragePool::reconfigure(const std::vector<StorageBackendConfig>& configs) {
-    std::lock_guard lock(mutex_);
-    std::set<std::filesystem::path> wanted;
-    for (const auto& cfg : configs) {
-        auto normalized = cfg.path.lexically_normal();
-        if (!wanted.insert(normalized).second)
-            throw std::runtime_error("duplicate storage backend: " + normalized.string());
-        auto existing = std::find_if(backends_.begin(), backends_.end(), [&](const auto& backend) {
+    std::vector<std::shared_ptr<LocalStore>> retired;
+    {
+        std::lock_guard lock(mutex_);
+        std::set<std::filesystem::path> wanted;
+        for (const auto& cfg : configs) {
+            auto normalized = cfg.path.lexically_normal();
+            if (!wanted.insert(normalized).second)
+                throw std::runtime_error("duplicate storage backend: " + normalized.string());
+            auto existing = std::find_if(backends_.begin(), backends_.end(), [&](const auto& backend) {
+                std::lock_guard backend_lock(backend->mutex);
+                return backend->cfg.path.lexically_normal() == normalized;
+            });
+            if (existing == backends_.end()) {
+                auto backend = std::make_shared<Backend>();
+                backend->cfg = cfg;
+                backend->configured = true;
+                backends_.push_back(std::move(backend));
+            } else {
+                std::lock_guard backend_lock((*existing)->mutex);
+                (*existing)->configured = true;
+                if ((*existing)->cfg.limit != cfg.limit) {
+                    (*existing)->cfg.limit = cfg.limit;
+                    ++(*existing)->generation;
+                    (*existing)->online = false;
+                    retired.push_back(std::move((*existing)->store));
+                }
+            }
+        }
+        for (auto& backend : backends_) {
             std::lock_guard backend_lock(backend->mutex);
-            return backend->cfg.path.lexically_normal() == normalized;
-        });
-        if (existing == backends_.end()) {
-            auto backend = std::make_shared<Backend>();
-            backend->cfg = cfg;
-            backend->configured = true;
-            backends_.push_back(std::move(backend));
-        } else {
-            std::lock_guard backend_lock((*existing)->mutex);
-            (*existing)->configured = true;
-            if ((*existing)->cfg.limit != cfg.limit) {
-                (*existing)->cfg.limit = cfg.limit;
-                (*existing)->store.reset();
-                (*existing)->online = false;
+            if (!wanted.contains(backend->cfg.path.lexically_normal())) {
+                backend->configured = false;
+                backend->online = false;
+                ++backend->generation;
+                retired.push_back(std::move(backend->store));
+                backend->last_error = "removed from configuration";
             }
         }
     }
-    for (auto& backend : backends_) {
-        std::lock_guard backend_lock(backend->mutex);
-        if (!wanted.contains(backend->cfg.path.lexically_normal())) {
-            backend->configured = false;
-            backend->online = false;
-            backend->store.reset();
-            backend->last_error = "removed from configuration";
-        }
-    }
+    // Destroy retired stores after all backend/pool locks have been released.
+    retired.clear();
 }
 
 void StoragePool::refresh() {
@@ -240,11 +282,6 @@ std::vector<std::shared_ptr<StoragePool::Backend>> StoragePool::ranked(const Obj
         bool eligible = false;
         {
             std::lock_guard lock(backend->mutex);
-            // A previously adopted configured disk remains part of the stable
-            // placement map while temporarily offline. put()/get() skip it and
-            // use the ranked fallback; when it returns rebalance restores the
-            // intended proportional placement. A never-seen path has no stable
-            // token yet and therefore contributes neither capacity nor placement.
             eligible = backend->configured && backend->token_known;
             token = backend->token;
             capacity = backend->cfg.limit;
@@ -273,20 +310,21 @@ std::vector<std::shared_ptr<StoragePool::Backend>> StoragePool::ranked(const Obj
 
 bool StoragePool::put(const ObjectId& id, std::span<const uint8_t> data) {
     for (const auto& backend : ranked(id)) {
-        try {
+        std::shared_ptr<LocalStore> store;
+        std::filesystem::path path;
+        {
             std::lock_guard lock(backend->mutex);
             if (!backend->online || !backend->store)
                 continue;
-            if (backend->store->has(id) || backend->store->put(id, data))
+            store = backend->store;
+            path = backend->cfg.path;
+        }
+        try {
+            if (store->has(id) || store->put(id, data))
                 return true;
         } catch (const std::exception& error) {
-            // Drop the lock before deactivation takes it again.
-            std::string reason = error.what();
-            Log::debug("storage write failed " + backend->cfg.path.string() + ": " + reason);
-            std::lock_guard lock(backend->mutex);
-            backend->online = false;
-            backend->store.reset();
-            backend->last_error = reason;
+            Log::debug("storage write failed " + path.string() + ": " + error.what());
+            deactivate(backend, store, error.what());
         }
     }
     return false;
@@ -294,30 +332,33 @@ bool StoragePool::put(const ObjectId& id, std::span<const uint8_t> data) {
 
 std::optional<Bytes> StoragePool::get(const ObjectId& id) const {
     for (const auto& backend : ranked(id)) {
-        try {
+        std::shared_ptr<LocalStore> store;
+        std::filesystem::path path;
+        {
             std::lock_guard lock(backend->mutex);
-            if (!backend->online || !backend->store || !backend->store->has(id))
+            if (!backend->online || !backend->store)
+                continue;
+            store = backend->store;
+            path = backend->cfg.path;
+        }
+        try {
+            if (!store->has(id))
                 continue;
             auto started = Clock::now();
-            auto data = backend->store->get(id);
+            auto data = store->get(id);
             auto elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
-            Log::debug("DIAG backend-get path=" + backend->cfg.path.string() +
-                       " id=" + to_string(id) +
+            Log::debug("DIAG backend-get path=" + path.string() + " id=" + to_string(id) +
                        " result=" + std::to_string(data ? 1 : 0) +
                        " bytes=" + std::to_string(data ? data->size() : 0) +
                        " ms=" + std::to_string(elapsed.count()));
             return data;
         } catch (const std::exception& error) {
-            // Object authentication/corruption is an object failure, not a disk
-            // failure. Discard the bad local copy and let DHT fallback/repair
-            // recover it without taking every other object on this backend down.
+            // Corrupt content is an object failure, not a backend failure.
             Log::warn("discarding unreadable local object " + to_string(id) + " on " +
-                      backend->cfg.path.string() + ": " + error.what());
+                      path.string() + ": " + error.what());
             try {
-                std::lock_guard lock(backend->mutex);
-                if (backend->store)
-                    (void)backend->store->remove(id);
+                (void)store->remove(id);
             } catch (...) {
             }
         }
@@ -327,9 +368,16 @@ std::optional<Bytes> StoragePool::get(const ObjectId& id) const {
 
 bool StoragePool::has(const ObjectId& id) const {
     for (const auto& backend : ranked(id)) {
-        try {
+        std::shared_ptr<LocalStore> store;
+        {
             std::lock_guard lock(backend->mutex);
-            if (backend->online && backend->store && backend->store->has(id))
+            if (backend->online)
+                store = backend->store;
+        }
+        if (!store)
+            continue;
+        try {
+            if (store->has(id))
                 return true;
         } catch (...) {
         }
@@ -340,10 +388,16 @@ bool StoragePool::has(const ObjectId& id) const {
 bool StoragePool::remove(const ObjectId& id) {
     bool removed = false;
     for (const auto& backend : snapshot()) {
-        try {
+        std::shared_ptr<LocalStore> store;
+        {
             std::lock_guard lock(backend->mutex);
-            if (backend->online && backend->store)
-                removed = backend->store->remove(id) || removed;
+            if (backend->online)
+                store = backend->store;
+        }
+        if (!store)
+            continue;
+        try {
+            removed = store->remove(id) || removed;
         } catch (...) {
         }
     }
@@ -353,11 +407,16 @@ bool StoragePool::remove(const ObjectId& id) {
 std::vector<ObjectId> StoragePool::list() const {
     std::set<ObjectId> unique;
     for (const auto& backend : snapshot()) {
-        try {
+        std::shared_ptr<LocalStore> store;
+        {
             std::lock_guard lock(backend->mutex);
-            if (!backend->online || !backend->store)
-                continue;
-            auto ids = backend->store->list();
+            if (backend->online)
+                store = backend->store;
+        }
+        if (!store)
+            continue;
+        try {
+            auto ids = store->list();
             unique.insert(ids.begin(), ids.end());
         } catch (...) {
         }
@@ -365,12 +424,76 @@ std::vector<ObjectId> StoragePool::list() const {
     return {unique.begin(), unique.end()};
 }
 
+std::optional<StoragePool::CursorItem> StoragePool::next_physical(Cursor& cursor,
+                                                                 bool& pass_complete) const {
+    pass_complete = false;
+    struct View {
+        std::shared_ptr<Backend> backend;
+        std::shared_ptr<LocalStore> store;
+        std::filesystem::path path;
+    };
+    std::vector<View> views;
+    for (const auto& backend : snapshot()) {
+        std::lock_guard lock(backend->mutex);
+        if (backend->online && backend->store)
+            views.push_back({backend, backend->store, backend->cfg.path});
+    }
+    if (views.empty()) {
+        cursor = {};
+        pass_complete = true;
+        return {};
+    }
+
+    // A backend set/store replacement invalidates only the maintenance cursor;
+    // foreground operations are completely independent of this state.
+    if (cursor.backend_count != views.size() || cursor.backend_index >= views.size() ||
+        (cursor.store && cursor.store != views[cursor.backend_index].store)) {
+        cursor = {};
+        cursor.backend_count = views.size();
+    }
+    if (!cursor.store)
+        cursor.store = views[cursor.backend_index].store;
+
+    while (cursor.completed_backends < views.size()) {
+        auto& view = views[cursor.backend_index];
+        if (cursor.store != view.store) {
+            cursor.store = view.store;
+            cursor.local = {};
+        }
+        bool exhausted = false;
+        if (auto id = view.store->next_object(cursor.local, exhausted))
+            return CursorItem{view.backend, view.store, view.path, *id};
+        if (!exhausted)
+            return {};
+
+        ++cursor.completed_backends;
+        cursor.backend_index = (cursor.backend_index + 1) % views.size();
+        cursor.store = views[cursor.backend_index].store;
+        cursor.local = {};
+    }
+
+    cursor = {};
+    pass_complete = true;
+    return {};
+}
+
+std::optional<ObjectId> StoragePool::next_object(Cursor& cursor, bool& pass_complete) const {
+    auto item = next_physical(cursor, pass_complete);
+    return item ? std::optional<ObjectId>{item->id} : std::nullopt;
+}
+
 bool StoragePool::older_than(const ObjectId& id, std::chrono::seconds age) const {
     for (const auto& backend : snapshot()) {
-        try {
+        std::shared_ptr<LocalStore> store;
+        {
             std::lock_guard lock(backend->mutex);
-            if (backend->online && backend->store && backend->store->has(id) &&
-                backend->store->older_than(id, age))
+            if (backend->online)
+                store = backend->store;
+        }
+        if (!store)
+            continue;
+        try {
+            if (store->has(id) && store->older_than(id, age))
                 return true;
         } catch (...) {
         }
@@ -378,98 +501,162 @@ bool StoragePool::older_than(const ObjectId& id, std::chrono::seconds age) const
     return false;
 }
 
-uint64_t StoragePool::rebalance_once(uint64_t budget_bytes) {
-    auto ids = list();
-    if (ids.empty()) {
-        rebalance_offset_ = 0;
-        return 0;
-    }
-    rebalance_offset_ %= ids.size();
-    std::rotate(ids.begin(), ids.begin() + rebalance_offset_, ids.end());
+StoragePool::MaintenanceResult
+StoragePool::rebalance_step(uint64_t budget_bytes, size_t operation_budget,
+                            const std::function<bool()>& should_yield) {
+    MaintenanceResult result;
+    while (!operation_budget || result.objects < operation_budget) {
+        if (should_yield && should_yield()) {
+            result.yielded = true;
+            return result;
+        }
+        bool pass_complete = false;
+        auto item = next_physical(rebalance_cursor_, pass_complete);
+        if (!item) {
+            result.complete = pass_complete;
+            return result;
+        }
+        ++result.objects;
+        const auto id = item->id;
 
-    uint64_t moved = 0;
-    size_t processed = 0;
-    for (const auto& id : ids) {
         auto order = ranked(id);
         if (order.empty())
-            break;
+            continue;
         auto preferred = order.front();
 
-        std::vector<std::shared_ptr<Backend>> holders;
+        struct Holder {
+            std::shared_ptr<Backend> backend;
+            std::shared_ptr<LocalStore> store;
+        };
+        std::vector<Holder> holders;
         uint64_t estimated = 0;
         for (const auto& backend : snapshot()) {
-            try {
+            std::shared_ptr<LocalStore> store;
+            {
                 std::lock_guard lock(backend->mutex);
-                if (backend->online && backend->store && backend->store->has(id)) {
-                    holders.push_back(backend);
-                    estimated = std::max(estimated, backend->store->stored_size(id));
+                if (backend->online)
+                    store = backend->store;
+            }
+            if (!store)
+                continue;
+            try {
+                if (store->has(id)) {
+                    holders.push_back({backend, store});
+                    estimated = std::max(estimated, store->stored_size(id));
                 }
             } catch (...) {
             }
         }
-        if (holders.empty()) {
-            ++processed;
+        if (holders.empty())
             continue;
-        }
 
-        bool preferred_has = std::find(holders.begin(), holders.end(), preferred) != holders.end();
+        auto preferred_it = std::find_if(holders.begin(), holders.end(), [&](const Holder& holder) {
+            return holder.backend == preferred;
+        });
+        bool preferred_has = preferred_it != holders.end();
         if (!preferred_has) {
-            if (budget_bytes && moved && moved + estimated > budget_bytes)
-                break;
+            if (budget_bytes && result.bytes && result.bytes + estimated > budget_bytes)
+                return result;
+
             std::optional<Bytes> data;
             for (const auto& holder : holders) {
                 try {
-                    std::lock_guard lock(holder->mutex);
-                    if (holder->online && holder->store) {
-                        data = holder->store->get(id);
-                        if (data)
-                            break;
-                    }
+                    data = holder.store->get(id);
+                    if (data)
+                        break;
                 } catch (...) {
                 }
             }
-            if (data) {
-                bool installed = false;
+
+            std::shared_ptr<LocalStore> preferred_store;
+            {
+                std::lock_guard lock(preferred->mutex);
+                if (preferred->online)
+                    preferred_store = preferred->store;
+            }
+            if (data && preferred_store) {
                 try {
-                    std::lock_guard lock(preferred->mutex);
-                    if (preferred->online && preferred->store)
-                        installed = preferred->store->put(id, *data);
+                    if (preferred_store->put(id, *data)) {
+                        result.bytes += data->size();
+                        holders.push_back({preferred, preferred_store});
+                        preferred_has = true;
+                    }
                 } catch (...) {
-                }
-                if (installed) {
-                    moved += data->size();
-                    holders.push_back(preferred);
-                    preferred_has = true;
                 }
             }
         }
 
         if (preferred_has) {
             for (const auto& holder : holders) {
-                if (holder == preferred)
+                if (holder.backend == preferred)
                     continue;
                 try {
-                    std::lock_guard lock(holder->mutex);
-                    if (holder->online && holder->store)
-                        (void)holder->store->remove(id);
+                    (void)holder.store->remove(id);
                 } catch (...) {
                 }
             }
         }
-        ++processed;
-        if (budget_bytes && moved >= budget_bytes)
-            break;
+        if (budget_bytes && result.bytes >= budget_bytes)
+            return result;
     }
-    rebalance_offset_ = (rebalance_offset_ + processed) % ids.size();
-    return moved;
+    return result;
+}
+
+StoragePool::MaintenanceResult
+StoragePool::scrub_step(uint64_t budget_bytes, size_t operation_budget,
+                        const std::function<bool()>& should_yield) {
+    MaintenanceResult result;
+    while (!operation_budget || result.objects < operation_budget) {
+        if (should_yield && should_yield()) {
+            result.yielded = true;
+            return result;
+        }
+        bool pass_complete = false;
+        auto item = next_physical(scrub_cursor_, pass_complete);
+        if (!item) {
+            result.complete = pass_complete;
+            return result;
+        }
+        ++result.objects;
+        try {
+            auto data = item->store->get(item->id);
+            if (data)
+                result.bytes += data->size();
+        } catch (const std::exception& error) {
+            Log::warn("removing corrupt local object " + to_string(item->id) + " on " +
+                      item->path.string() + ": " + error.what());
+            try {
+                (void)item->store->remove(item->id);
+            } catch (...) {
+            }
+        }
+        if (budget_bytes && result.bytes >= budget_bytes)
+            return result;
+    }
+    return result;
+}
+
+uint64_t StoragePool::rebalance_once(uint64_t budget_bytes) {
+    uint64_t total = 0;
+    while (true) {
+        auto step = rebalance_step(budget_bytes ? budget_bytes - total : 0, 256);
+        total += step.bytes;
+        if (step.complete || (budget_bytes && total >= budget_bytes))
+            return total;
+    }
 }
 
 uint64_t StoragePool::used() const {
     uint64_t total = 0;
     for (const auto& backend : snapshot()) {
-        std::lock_guard lock(backend->mutex);
-        if (backend->online && backend->store)
-            total += backend->store->used();
+        std::shared_ptr<LocalStore> store;
+        {
+            std::lock_guard lock(backend->mutex);
+            if (backend->online)
+                store = backend->store;
+        }
+        if (store)
+            total += store->used();
     }
     return total;
 }
@@ -477,14 +664,17 @@ uint64_t StoragePool::used() const {
 uint64_t StoragePool::limit() const {
     uint64_t total = 0;
     for (const auto& backend : snapshot()) {
-        std::lock_guard lock(backend->mutex);
-        // Capacity is a topology weight, not a live free-space/online score.
-        // Keep a known configured backend in the advertised capacity while it
-        // is temporarily offline; removing it from configuration drops it.
-        if (backend->configured && backend->token_known) {
-            if (backend->cfg.limit > std::numeric_limits<uint64_t>::max() - total)
+        uint64_t capacity = 0;
+        bool include = false;
+        {
+            std::lock_guard lock(backend->mutex);
+            include = backend->configured && backend->token_known;
+            capacity = backend->cfg.limit;
+        }
+        if (include) {
+            if (capacity > std::numeric_limits<uint64_t>::max() - total)
                 return std::numeric_limits<uint64_t>::max();
-            total += backend->cfg.limit;
+            total += capacity;
         }
     }
     return total;

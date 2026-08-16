@@ -3,10 +3,11 @@
 #include "crypto.hpp"
 #include <atomic>
 #include <filesystem>
-#include <condition_variable>
 #include <mutex>
+#include <optional>
 #include <stop_token>
 #include <thread>
+#include <vector>
 namespace macha {
 class StorageLock {
     int fd_{-1};
@@ -19,12 +20,21 @@ class StorageLock {
 };
 
 class LocalStore {
+  public:
+    // A maintenance cursor owns the filesystem iterator state between scheduler
+    // slices. It deliberately does not hold any LocalStore mutex or file handle
+    // open across calls beyond what recursive_directory_iterator itself needs.
+    struct Cursor {
+        std::filesystem::recursive_directory_iterator iterator{};
+        bool initialized{};
+    };
+
+  private:
     std::filesystem::path root_, objects_;
     uint64_t limit_;
     std::array<uint8_t, 32> key_;
     std::atomic<uint64_t> used_{};
     mutable std::mutex m_;
-    mutable std::condition_variable scan_cv_;
     std::jthread scan_thread_;
     std::atomic_bool scan_complete_{};
     std::filesystem::path path(const ObjectId&) const;
@@ -39,19 +49,23 @@ class LocalStore {
     bool has(const ObjectId&) const;
     bool remove(const ObjectId&);
     std::vector<ObjectId> list() const;
+    // Returns one physical object and advances cursor. exhausted is true only
+    // when this cursor has reached the end of a complete pass; the next call
+    // starts a fresh pass.
+    std::optional<ObjectId> next_object(Cursor&, bool& exhausted) const;
     bool older_than(const ObjectId&, std::chrono::seconds) const;
     std::filesystem::path object_path(const ObjectId&) const;
     uint64_t stored_size(const ObjectId&) const;
     std::filesystem::file_time_type last_write(const ObjectId&) const;
     void touch(const ObjectId&);
     uint64_t used() const {
-        return used_;
+        return used_.load(std::memory_order_relaxed);
     }
     uint64_t limit() const {
         return limit_;
     }
     bool scan_complete() const {
-        return scan_complete_.load();
+        return scan_complete_.load(std::memory_order_acquire);
     }
 };
 NodeId load_or_create_node_id(const std::filesystem::path&);
