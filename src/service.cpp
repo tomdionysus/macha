@@ -210,11 +210,30 @@ void Service::loop(std::stop_token stop) {
                               [&](const ObjectId& id) { return live.contains(id); });
 
                 if (network_due) {
-                    auto used = store_.repair_once(static_cast<uint64_t>(network_credit), &live,
-                                                   &universal);
-                    if (used) {
-                        network_credit = std::max(0.0, network_credit - static_cast<double>(used));
-                    } else {
+                    const auto byte_budget = static_cast<uint64_t>(network_credit);
+                    const auto extent = std::max<uint64_t>(1, node_.config().extent_size);
+                    // The byte budget alone does not constrain have-object
+                    // probes: a settled or mostly-settled namespace could issue
+                    // thousands of synchronous control RPCs while consuming no
+                    // network credit. Bound each repair slice independently.
+                    const size_t operation_budget = static_cast<size_t>(std::clamp<uint64_t>(
+                        (byte_budget / extent) * 2, 8, 64));
+                    auto repair = store_.repair_step(
+                        byte_budget, operation_budget, &live, &universal,
+                        [this] {
+                            // End the current maintenance slice as soon as any
+                            // foreground I/O appears. The next scheduler pass
+                            // will re-evaluate busy_bandwidth_fraction normally.
+                            return store_.foreground_idle_for() <
+                                   node_.config().maintenance.foreground_quiet;
+                        });
+                    if (repair.bytes_transferred) {
+                        network_credit = std::max(
+                            0.0, network_credit - static_cast<double>(repair.bytes_transferred));
+                    }
+                    if (repair.yielded) {
+                        Log::debug("maintenance: repair yielded to foreground I/O");
+                    } else if (!repair.bytes_transferred && repair.complete) {
                         network_credit = 0.0;
                         network_quiescent_until = Clock::now() + policy.no_progress_backoff;
                         Log::debug("maintenance: repair quiescent; backing off no-progress scan");

@@ -1214,8 +1214,76 @@ void test_rpc_v7_frame_priority_and_variable_length() {
     CHECK(background.get().message.type == MessageType::ok);
     CHECK(client.stats().canonical_connections == 1);
 
+    // Cancellation can race with the writer while one frame is outside the
+    // outbound deque. The cancelled transfer must not be requeued after that
+    // frame, otherwise the peer sees continuation frames after cancel_transfer
+    // discarded its assembler state and tears down the canonical connection.
+    Bytes cancelled_payload(32 * 1024 * 1024, 0x43);
+    auto cancelled = client.call_async(endpoint, MessageType::put_object, cancelled_payload,
+                                       FrameType::speculative);
+    std::this_thread::sleep_for(2ms);
+    cancelled.cancel();
+    auto after_cancel = client.call(endpoint, MessageType::ping, Bytes{0x50}, 2s);
+    CHECK(after_cancel.message.type == MessageType::ok);
+    CHECK(client.stats().connections_created == 1);
+
     client.stop();
     server.stop();
+}
+
+void test_repair_step_is_bounded_and_yields() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto p1 = free_port();
+    auto p2 = free_port();
+
+    auto c1 = config_for(t.path() / "n1", keyfile, p1);
+    auto c2 = config_for(t.path() / "n2", keyfile, p2, {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 1;
+    c1.metadata_replication = c2.metadata_replication = 1;
+    c1.maintenance.idle_bandwidth_fraction = 0.0;
+    c2.maintenance.idle_bandwidth_fraction = 0.0;
+
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }));
+
+    auto bytes = pattern(512 * 1024);
+    auto id = object_id(bytes);
+    REQUIRE(s1.node().local_store().put(id, bytes));
+    REQUIRE(!s2.node().local_store().has(id));
+    std::set<ObjectId> live{id};
+    std::set<ObjectId> universal{id};
+    DistributedStore repair(s1.node());
+
+    auto yielded = repair.repair_step(8ULL * 1024 * 1024, 8, &live, &universal,
+                                      [] { return true; });
+    CHECK(yielded.yielded);
+    CHECK(!yielded.complete);
+    CHECK(yielded.bytes_transferred == 0);
+    CHECK(!s2.node().local_store().has(id));
+
+    // One remote operation is enough to probe but not both probe and upload.
+    // The pass must report itself incomplete rather than being mistaken for a
+    // quiescent namespace simply because it transferred zero bytes.
+    auto bounded = repair.repair_step(8ULL * 1024 * 1024, 1, &live, &universal);
+    CHECK(!bounded.complete);
+    CHECK(bounded.bytes_transferred == 0);
+    CHECK(!s2.node().local_store().has(id));
+
+    auto completed = repair.repair_step(8ULL * 1024 * 1024, 8, &live, &universal);
+    CHECK(completed.bytes_transferred == bytes.size());
+    CHECK(s2.node().local_store().has(id));
+
+    s2.stop();
+    s1.stop();
 }
 
 void test_rpc_v7_persistence_and_multiplexing() {
@@ -3769,6 +3837,7 @@ int main() {
         test_capacity_placement();
         test_async_rpc_move_ownership();
         test_rpc_v7_frame_priority_and_variable_length();
+        test_repair_step_is_bounded_and_yields();
         test_rpc_v7_persistence_and_multiplexing();
         test_rpc_v7_bidirectional_and_deduplication();
         test_mutual_bootstrap_prunes_cross_dial();
