@@ -747,6 +747,12 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     std::deque<Outbound> outbound_;
     std::map<uint64_t, FrameType> inbound_classes_; // guarded by outbound_mutex_
     std::set<uint64_t> cancelled_inbound_;          // guarded by outbound_mutex_
+    // Outbound request state must survive while the writer has temporarily
+    // removed an item from outbound_ to send one frame. Otherwise promotion or
+    // cancellation that arrives during send_fragment() misses the transfer and
+    // the writer requeues it at the old class (or requeues a cancelled upload).
+    std::map<uint64_t, FrameType> outbound_classes_; // guarded by outbound_mutex_
+    std::set<uint64_t> cancelled_outgoing_;          // guarded by outbound_mutex_
     std::atomic_uint64_t next_request_{1};           // TCP dialler owns odd request IDs.
     std::atomic_bool broken_{};
     std::atomic_bool retiring_{};
@@ -836,6 +842,8 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             }
             if (outbound_.size() >= max_peer_outbound)
                 throw std::runtime_error("peer outbound queue full");
+            if (!reply && request_id)
+                outbound_classes_[request_id] = frame_type;
             outbound_.push_back({request_id,
                                  frame_type,
                                  {message.type, Bytes(message.payload.begin(), message.payload.end())},
@@ -892,6 +900,9 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
 
         {
             std::lock_guard lock(outbound_mutex_);
+            if (auto found = outbound_classes_.find(request_id);
+                found != outbound_classes_.end())
+                found->second = more_urgent(type, found->second);
             for (auto& item : outbound_) {
                 if (!item.reply && item.request_id == request_id)
                     item.frame_type = more_urgent(type, item.frame_type);
@@ -906,9 +917,15 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     void cancel_outgoing(uint64_t request_id) {
         {
             std::lock_guard lock(outbound_mutex_);
+            const bool active = outbound_classes_.contains(request_id);
+            const auto before = outbound_.size();
             std::erase_if(outbound_, [&](const Outbound& item) {
                 return !item.reply && item.request_id == request_id;
             });
+            const bool removed_queued = outbound_.size() != before;
+            outbound_classes_.erase(request_id);
+            if (active && !removed_queued)
+                cancelled_outgoing_.insert(request_id);
         }
         try {
             queue_control(transfer_control(MessageType::cancel_transfer, request_id));
@@ -1016,7 +1033,14 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                             outbound_.push_back(std::move(item));
                         }
                     } else {
-                        outbound_.push_back(std::move(item));
+                        if (cancelled_outgoing_.erase(item.request_id)) {
+                            outbound_classes_.erase(item.request_id);
+                        } else {
+                            if (auto found = outbound_classes_.find(item.request_id);
+                                found != outbound_classes_.end())
+                                item.frame_type = more_urgent(found->second, item.frame_type);
+                            outbound_.push_back(std::move(item));
+                        }
                     }
                     maybe_queue_retire_locked();
                     outbound_cv_.notify_one();
@@ -1026,6 +1050,10 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                         inbound_classes_.erase(item.request_id);
                         cancelled_inbound_.erase(item.request_id);
                         maybe_queue_retire_locked();
+                    } else if (item.request_id) {
+                        std::lock_guard lock(outbound_mutex_);
+                        outbound_classes_.erase(item.request_id);
+                        cancelled_outgoing_.erase(item.request_id);
                     }
                     if (item.sent) {
                         try {
@@ -1052,6 +1080,8 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                     }
                 }
                 outbound_.clear();
+                outbound_classes_.clear();
+                cancelled_outgoing_.clear();
             }
             outbound_cv_.notify_all();
         }
@@ -1265,6 +1295,8 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                 }
             }
             outbound_.clear();
+            outbound_classes_.clear();
+            cancelled_outgoing_.clear();
         }
         if (reader_.joinable())
             reader_.request_stop();
@@ -1935,6 +1967,8 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
     std::deque<Outbound> outbound;
     std::map<uint64_t, FrameType> inbound_classes;
     std::set<uint64_t> cancelled_inbound;
+    std::map<uint64_t, FrameType> outbound_classes;
+    std::set<uint64_t> cancelled_outgoing;
     std::atomic_uint64_t next_request{2}; // TCP acceptor owns even request IDs.
     std::jthread reader;
     std::jthread writer;
@@ -1993,6 +2027,8 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
             }
             if (outbound.size() >= max_peer_outbound)
                 throw std::runtime_error("peer outbound queue full");
+            if (!reply && request_id)
+                outbound_classes[request_id] = frame_type;
             outbound.push_back({request_id,
                                 frame_type,
                                 {message.type, Bytes(message.payload.begin(), message.payload.end())},
@@ -2048,6 +2084,9 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
             return;
         {
             std::lock_guard lock(outbound_mutex);
+            if (auto found = outbound_classes.find(request_id);
+                found != outbound_classes.end())
+                found->second = more_urgent(type, found->second);
             for (auto& item : outbound) {
                 if (!item.reply && item.request_id == request_id)
                     item.frame_type = more_urgent(type, item.frame_type);
@@ -2062,9 +2101,15 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
     void cancel_outgoing(uint64_t request_id) {
         {
             std::lock_guard lock(outbound_mutex);
+            const bool active = outbound_classes.contains(request_id);
+            const auto before = outbound.size();
             std::erase_if(outbound, [&](const Outbound& item) {
                 return !item.reply && item.request_id == request_id;
             });
+            const bool removed_queued = outbound.size() != before;
+            outbound_classes.erase(request_id);
+            if (active && !removed_queued)
+                cancelled_outgoing.insert(request_id);
         }
         try {
             queue_control(transfer_control(MessageType::cancel_transfer, request_id));
@@ -2144,7 +2189,14 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                             outbound.push_back(std::move(item));
                         }
                     } else {
-                        outbound.push_back(std::move(item));
+                        if (cancelled_outgoing.erase(item.request_id)) {
+                            outbound_classes.erase(item.request_id);
+                        } else {
+                            if (auto found = outbound_classes.find(item.request_id);
+                                found != outbound_classes.end())
+                                item.frame_type = more_urgent(found->second, item.frame_type);
+                            outbound.push_back(std::move(item));
+                        }
                     }
                     maybe_queue_retire_locked();
                     outbound_cv.notify_one();
@@ -2154,6 +2206,10 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                         inbound_classes.erase(item.request_id);
                         cancelled_inbound.erase(item.request_id);
                         maybe_queue_retire_locked();
+                    } else if (item.request_id) {
+                        std::lock_guard lock(outbound_mutex);
+                        outbound_classes.erase(item.request_id);
+                        cancelled_outgoing.erase(item.request_id);
                     }
                     if (item.sent) {
                         try {
@@ -2181,6 +2237,8 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                     }
                 }
                 outbound.clear();
+                outbound_classes.clear();
+                cancelled_outgoing.clear();
             }
             outbound_cv.notify_all();
         }
@@ -2312,6 +2370,8 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                 }
             }
             outbound.clear();
+            outbound_classes.clear();
+            cancelled_outgoing.clear();
         }
         if (writer.joinable())
             writer.request_stop();

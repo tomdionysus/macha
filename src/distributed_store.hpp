@@ -4,6 +4,7 @@
 #include "replica_selector.hpp"
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -11,6 +12,14 @@
 
 namespace macha {
 class DistributedStore {
+  public:
+    struct RepairResult {
+        uint64_t bytes_transferred{};
+        bool complete{true};
+        bool yielded{};
+    };
+
+  private:
     struct SharedFetch {
         std::mutex mutex;
         std::condition_variable cv;
@@ -43,10 +52,12 @@ class DistributedStore {
     bool put_on(const NodeInfo&, const ObjectId&, std::span<const uint8_t>, bool foreground);
     std::optional<Bytes> get_from(const NodeInfo&, const ObjectId&, FrameType,
                                   const std::shared_ptr<SharedFetch>&,
-                                  Clock::time_point deadline, std::atomic_bool* cancelled);
+                                  Clock::time_point deadline, std::atomic_bool* cancelled,
+                                  const std::function<bool()>& abort = {});
     std::optional<Bytes> get_remote(const ObjectId&, size_t stripe, FrameType, bool foreground,
                                     bool opportunistic_persist, Clock::time_point deadline = {},
-                                    std::atomic_bool* cancelled = nullptr);
+                                    std::atomic_bool* cancelled = nullptr,
+                                    const std::function<bool()>& abort = {});
     void note_foreground(uint64_t);
     void note_network(uint64_t, Clock::duration);
 
@@ -72,6 +83,10 @@ class DistributedStore {
     // means unlimited. Returns bytes transferred across the network.
     uint64_t repair_once(uint64_t byte_budget = 0, const std::set<ObjectId>* live = nullptr,
                          const std::set<ObjectId>* universal = nullptr);
+    RepairResult repair_step(uint64_t byte_budget, size_t operation_budget,
+                             const std::set<ObjectId>* live = nullptr,
+                             const std::set<ObjectId>* universal = nullptr,
+                             const std::function<bool()>& should_yield = {});
     uint64_t scrub_once(uint64_t byte_budget = 0);
 
     uint64_t take_foreground_bytes() {

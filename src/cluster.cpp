@@ -5,6 +5,7 @@
 #include "log.hpp"
 
 #include <algorithm>
+#include <set>
 #include <thread>
 #include <unistd.h>
 
@@ -337,7 +338,9 @@ void NodeRuntime::loop(std::stop_token stop) {
         local_.refresh();
         members_.storage(local_.used(), local_.limit());
         members_.metadata_generation(meta_.current().generation);
+        std::set<std::pair<std::string, uint16_t>> exchanged;
         for (const auto& endpoint : cfg_.bootstrap) {
+            exchanged.emplace(endpoint.host, endpoint.port);
             try {
                 exchange(endpoint);
             } catch (const std::exception& error) {
@@ -346,6 +349,8 @@ void NodeRuntime::loop(std::stop_token stop) {
         }
         for (const auto& node : members_.all()) {
             if (node.id == id_)
+                continue;
+            if (!exchanged.emplace(node.host, node.port).second)
                 continue;
             try {
                 exchange({node.host, node.port});

@@ -18,8 +18,10 @@ int64_t steady_ms() {
         .count();
 }
 
-bool read_aborted(Clock::time_point deadline, const std::atomic_bool* cancelled) {
+bool read_aborted(Clock::time_point deadline, const std::atomic_bool* cancelled,
+                  const std::function<bool()>& abort = {}) {
     return (cancelled && cancelled->load(std::memory_order_relaxed)) ||
+           (abort && abort()) ||
            (deadline != Clock::time_point{} && Clock::now() >= deadline);
 }
 } // namespace
@@ -200,7 +202,8 @@ std::optional<Bytes> DistributedStore::get_from(const NodeInfo& target, const Ob
                                                 FrameType frame_type,
                                                 const std::shared_ptr<SharedFetch>& shared,
                                                 Clock::time_point deadline,
-                                                std::atomic_bool* cancelled) {
+                                                std::atomic_bool* cancelled,
+                                                const std::function<bool()>& abort) {
     try {
         if (target.id == n_.node_id())
             return n_.local_store().get(id);
@@ -220,7 +223,7 @@ std::optional<Bytes> DistributedStore::get_from(const NodeInfo& target, const Ob
                 rpc.promote(effective);
         }
         while (rpc.wait_for(std::chrono::milliseconds(25)) != std::future_status::ready) {
-            if (read_aborted(deadline, cancelled)) {
+            if (read_aborted(deadline, cancelled, abort)) {
                 // A shared fetch may have acquired other waiters after this
                 // caller became its leader.  Cancellation can abort the wire
                 // RPC only while nobody else depends on it; otherwise finish
@@ -266,7 +269,8 @@ std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t str
                                                   FrameType frame_type, bool foreground,
                                                   bool opportunistic_persist,
                                                   Clock::time_point deadline,
-                                                  std::atomic_bool* cancelled) {
+                                                  std::atomic_bool* cancelled,
+                                                  const std::function<bool()>& abort) {
     // A hard wall-clock deadline belongs to one caller, not to an ObjectId-wide
     // shared fetch. Probe reads therefore use a private transfer so expiry can
     // abort the underlying RPC. Cancellation-only playback reads retain normal
@@ -278,7 +282,7 @@ std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t str
             size_t attempt = 0;
             const auto work = foreground ? ReplicaWorkClass::foreground
                                          : ReplicaWorkClass::speculative;
-            while (!candidates.empty() && !read_aborted(deadline, cancelled)) {
+            while (!candidates.empty() && !read_aborted(deadline, cancelled, abort)) {
                 auto ordered = replica_selector_.order(candidates, stripe + attempt, work);
                 if (ordered.empty()) break;
                 const auto target = ordered.front();
@@ -289,7 +293,7 @@ std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t str
 
                 auto started = Clock::now();
                 replica_selector_.started(target, work);
-                auto data = get_from(target, id, frame_type, nullptr, deadline, cancelled);
+                auto data = get_from(target, id, frame_type, nullptr, deadline, cancelled, abort);
                 replica_selector_.finished(target, work, data ? data->size() : 0,
                                            Clock::now() - started, data.has_value());
                 if (data) return data;
@@ -302,7 +306,7 @@ std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t str
         std::set<NodeId> preferred_ids;
         for (const auto& node : preferred) preferred_ids.insert(node.id);
         auto data = try_private(std::move(preferred));
-        if (!data && !read_aborted(deadline, cancelled)) {
+        if (!data && !read_aborted(deadline, cancelled, abort)) {
             auto fallback = ranked(id);
             std::erase_if(fallback, [&](const NodeInfo& node) {
                 return preferred_ids.contains(node.id);
@@ -358,7 +362,7 @@ std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t str
             lock.lock();
         }
 
-        while (!shared->done && !read_aborted(deadline, cancelled))
+        while (!shared->done && !read_aborted(deadline, cancelled, abort))
             shared->cv.wait_for(lock, std::chrono::milliseconds(25));
         shared->waiters.fetch_sub(1, std::memory_order_relaxed);
         if (!shared->done)
@@ -417,7 +421,7 @@ std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t str
     auto try_candidates = [&](std::vector<NodeInfo> candidates) -> std::optional<Bytes> {
         std::erase_if(candidates, [&](const NodeInfo& node) { return node.id == n_.node_id(); });
         size_t attempt = 0;
-        while (!candidates.empty() && !read_aborted(deadline, cancelled)) {
+        while (!candidates.empty() && !read_aborted(deadline, cancelled, abort)) {
             ReplicaWorkClass work;
             {
                 std::lock_guard lock(shared->mutex);
@@ -454,7 +458,7 @@ std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t str
             // caller happened to become its leader.  A cancelled leader may
             // abort the wire RPC while it has no other waiters; once another
             // reader has joined, the shared transfer is allowed to complete.
-            auto data = get_from(target, id, transfer_type, shared, {}, cancelled);
+            auto data = get_from(target, id, transfer_type, shared, {}, cancelled, abort);
             {
                 std::lock_guard lock(shared->mutex);
                 replica_selector_.finished(target, shared->active_class,
@@ -638,7 +642,92 @@ uint64_t DistributedStore::scrub_once(uint64_t byte_budget) {
 
 uint64_t DistributedStore::repair_once(uint64_t byte_budget, const std::set<ObjectId>* live,
                                        const std::set<ObjectId>* universal) {
-    uint64_t transferred = 0;
+    return repair_step(byte_budget, 0, live, universal).bytes_transferred;
+}
+
+DistributedStore::RepairResult
+DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
+                              const std::set<ObjectId>* live,
+                              const std::set<ObjectId>* universal,
+                              const std::function<bool()>& should_yield) {
+    RepairResult result;
+    auto& transferred = result.bytes_transferred;
+    size_t operations = 0;
+
+    auto yielded = [&] {
+        if (should_yield && should_yield()) {
+            result.complete = false;
+            result.yielded = true;
+            return true;
+        }
+        return false;
+    };
+    auto reserve_operation = [&] {
+        if (operation_budget && operations >= operation_budget) {
+            result.complete = false;
+            return false;
+        }
+        ++operations;
+        return true;
+    };
+
+    auto maintenance_has_on = [&](const NodeInfo& target,
+                                  const ObjectId& id) -> std::optional<bool> {
+        if (target.id == n_.node_id())
+            return n_.local_store().has(id);
+        if (!reserve_operation() || yielded())
+            return std::nullopt;
+
+        Writer writer;
+        writer.fixed(id.bytes);
+        try {
+            auto rpc = n_.call_async(target, MessageType::have_object, writer.data());
+            while (rpc.wait_for(std::chrono::milliseconds(25)) != std::future_status::ready) {
+                if (yielded()) {
+                    rpc.cancel();
+                    return std::nullopt;
+                }
+            }
+            auto reply = rpc.get();
+            if (reply.message.type != MessageType::bool_reply)
+                return false;
+            Reader reader(reply.message.payload);
+            bool present = reader.u8() != 0;
+            reader.finish();
+            return present;
+        } catch (...) {
+            return false;
+        }
+    };
+
+    auto maintenance_put_on = [&](const NodeInfo& target, const ObjectId& id,
+                                  std::span<const uint8_t> data) -> std::optional<bool> {
+        if (target.id == n_.node_id())
+            return n_.local_store().put(id, data);
+        if (!reserve_operation() || yielded())
+            return std::nullopt;
+
+        Writer writer;
+        writer.fixed(id.bytes);
+        writer.bytes(data);
+        auto started = Clock::now();
+        try {
+            auto rpc = n_.call_async(target, MessageType::put_object, writer.data(),
+                                     FrameType::speculative);
+            while (rpc.wait_for(std::chrono::milliseconds(25)) != std::future_status::ready) {
+                if (yielded()) {
+                    rpc.cancel();
+                    return std::nullopt;
+                }
+            }
+            bool ok = rpc.get().message.type == MessageType::ok;
+            if (ok)
+                note_network(data.size(), Clock::now() - started);
+            return ok;
+        } catch (...) {
+            return false;
+        }
+    };
 
     // First, existing local replicas push toward the current deterministic owner
     // set. Deletion happens only after the target number of good replicas has
@@ -651,8 +740,12 @@ uint64_t DistributedStore::repair_once(uint64_t byte_budget, const std::set<Obje
         std::rotate(ids.begin(), ids.begin() + repair_offset_, ids.end());
         size_t processed = 0;
         for (const auto& id : ids) {
-            if (byte_budget && transferred >= byte_budget)
+            if (yielded())
                 break;
+            if (byte_budget && transferred >= byte_budget) {
+                result.complete = false;
+                break;
+            }
             if (!n_.local_store().has(id)) {
                 ++processed;
                 continue;
@@ -672,29 +765,33 @@ uint64_t DistributedStore::repair_once(uint64_t byte_budget, const std::set<Obje
             for (const auto& peer : nodes) {
                 if (keepers.size() >= target)
                     break;
-                bool present = false;
-                try {
-                    present = has_on(peer, id);
-                } catch (...) {
-                }
+                auto present_result = maintenance_has_on(peer, id);
+                if (!present_result)
+                    break;
+                bool present = *present_result;
                 if (!present) {
                     if (!source) {
                         source = n_.local_store().get(id);
                         if (!source)
                             break;
                     }
-                    if (byte_budget && transferred && transferred + source->size() > byte_budget)
+                    if (byte_budget && transferred && transferred + source->size() > byte_budget) {
+                        result.complete = false;
                         break;
-                    try {
-                        present = put_on(peer, id, *source, false);
-                        if (present && peer.id != n_.node_id())
-                            transferred += source->size();
-                    } catch (...) {
                     }
+                    auto put_result = maintenance_put_on(peer, id, *source);
+                    if (!put_result)
+                        break;
+                    present = *put_result;
+                    if (present && peer.id != n_.node_id())
+                        transferred += source->size();
                 }
                 if (present)
                     keepers.insert(peer.id);
             }
+
+            if (!result.complete)
+                break;
 
             if (!everywhere && keepers.size() >= target && !keepers.contains(n_.node_id()))
                 n_.local_store().remove(id);
@@ -716,8 +813,12 @@ uint64_t DistributedStore::repair_once(uint64_t byte_budget, const std::set<Obje
         std::rotate(live_ids.begin(), live_ids.begin() + pull_offset_, live_ids.end());
         size_t processed = 0;
         for (const auto& id : live_ids) {
-            if (byte_budget && transferred >= byte_budget)
+            if (yielded())
                 break;
+            if (byte_budget && transferred >= byte_budget) {
+                result.complete = false;
+                break;
+            }
             const bool everywhere = universal && universal->contains(id);
             if ((!everywhere && !should_own(id)) || n_.local_store().has(id)) {
                 ++processed;
@@ -734,7 +835,12 @@ uint64_t DistributedStore::repair_once(uint64_t byte_budget, const std::set<Obje
                 continue;
             }
 
-            auto data = get_remote(id, 0, FrameType::speculative, false, false);
+            if (!reserve_operation())
+                break;
+            auto data = get_remote(id, 0, FrameType::speculative, false, false, {}, nullptr,
+                                   should_yield);
+            if (yielded())
+                break;
             if (data) {
                 if (n_.local_store().put(id, *data))
                     transferred += data->size();
@@ -746,6 +852,6 @@ uint64_t DistributedStore::repair_once(uint64_t byte_budget, const std::set<Obje
         pull_offset_ = 0;
     }
 
-    return transferred;
+    return result;
 }
 } // namespace macha
