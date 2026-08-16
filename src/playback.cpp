@@ -740,6 +740,34 @@ struct PlaybackManager::Impl {
         return session;
     }
 
+    std::shared_ptr<Session> reuse_seek_session(const Session& old,
+                                                std::chrono::milliseconds requested_seek,
+                                                std::string_view trace) {
+        if (old.plan.mode == PlaybackMode::direct || !old.vod_plan) return {};
+        auto reseeked = reseek_hls_vod(*old.vod_plan, requested_seek);
+        if (!reseeked) return {};
+
+        auto session = std::make_shared<Session>();
+        session->id = old.id;
+        session->token = old.token;
+        session->item_id = old.item_id;
+        session->capabilities = old.capabilities;
+        session->preferences = old.preferences;
+        session->source = old.source;
+        session->source_entry = old.source_entry;
+        session->probe = old.probe;
+        session->plan = reseeked->playback;
+        session->vod_plan = std::move(*reseeked);
+        session->generation = old.generation;
+        session->touched = Clock::now();
+        Log::info("playback[" + std::string(trace) + "] seek fast-path media=" +
+                  session->source.media_id + " requested_ms=" +
+                  std::to_string(requested_seek.count()) + " aligned_ms=" +
+                  std::to_string(session->plan.seek.count()) + " segments=" +
+                  std::to_string(session->vod_plan->segment_durations.size()));
+        return session;
+    }
+
     Json session_json(const Session& session) const {
         Json::Array streams;
         for (const auto& stream : session.probe.streams) streams.push_back(stream_json(stream));
@@ -1024,14 +1052,27 @@ struct PlaybackManager::Impl {
         }
         std::string media_override;
         if (auto media = root.find("media_id"); media && media->isString()) media_override = media->asString();
-        auto media = media_override.empty() ? (old->item_id.empty() ? std::vector<std::string>{old->source.media_id}
-                                                                   : item_media(old->item_id))
-                                            : std::vector<std::string>{media_override};
-        auto replacement = resolve_session(old->item_id, std::move(media), old->capabilities, prefs,
-                                           trace, old->id, old->token);
-        replacement->generation = old->generation;
-        if (seek_ms) replacement->plan.seek = std::chrono::milliseconds(*seek_ms);
-        prepare_transformed_vod(*replacement, trace);
+
+        // A seek-only update does not alter representation, tracks, quality or
+        // codec negotiation. Reuse the prepared VOD random-access plan instead
+        // of resolving, probing and materialising the source index again.
+        const bool seek_only = seek_ms.has_value() && root.find("preferences") == nullptr &&
+                               media_override.empty();
+        std::shared_ptr<Session> replacement;
+        if (seek_only)
+            replacement = reuse_seek_session(*old, std::chrono::milliseconds(*seek_ms), trace);
+
+        if (!replacement) {
+            auto media = media_override.empty()
+                             ? (old->item_id.empty() ? std::vector<std::string>{old->source.media_id}
+                                                     : item_media(old->item_id))
+                             : std::vector<std::string>{media_override};
+            replacement = resolve_session(old->item_id, std::move(media), old->capabilities, prefs,
+                                          trace, old->id, old->token);
+            replacement->generation = old->generation;
+            if (seek_ms) replacement->plan.seek = std::chrono::milliseconds(*seek_ms);
+            prepare_transformed_vod(*replacement, trace);
+        }
         bool resources_reserved = false;
         try {
             reserve_resources(replacement->plan, old->id);

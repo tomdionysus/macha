@@ -323,24 +323,20 @@ void materialise_deferred_seek_index(AVFormatContext* format, int video_stream,
 
 std::vector<double> indexed_vod_durations(AVFormatContext* format, int video_stream,
                                           double duration_seconds, double requested_seek_seconds,
-                                          double segment_seconds, double& actual_seek_seconds) {
+                                          double segment_seconds, double& actual_seek_seconds,
+                                          std::vector<double>* reusable_keyframes = nullptr) {
     if (video_stream < 0 || video_stream >= static_cast<int>(format->nb_streams)) return {};
     auto* stream = format->streams[video_stream];
     const int entries = avformat_index_get_entries_count(stream);
     if (entries <= 0) return {};
 
     const int64_t input_start_us = format->start_time == AV_NOPTS_VALUE ? 0 : format->start_time;
-    const int64_t requested_us = input_start_us +
-        av_rescale_q(static_cast<int64_t>(std::llround(requested_seek_seconds * 1000.0)),
-                     AVRational{1, 1000}, AV_TIME_BASE_Q);
-    const int64_t requested_ts = av_rescale_q(requested_us, AV_TIME_BASE_Q, stream->time_base);
 
     std::vector<double> keyframes;
     keyframes.reserve(static_cast<size_t>(entries));
     for (int i = 0; i < entries; ++i) {
         const auto* entry = avformat_index_get_entry(stream, i);
         if (!entry || !(entry->flags & AVINDEX_KEYFRAME) || entry->timestamp == AV_NOPTS_VALUE) continue;
-        if (entry->timestamp < requested_ts) continue;
         const int64_t absolute_us = av_rescale_q(entry->timestamp, stream->time_base, AV_TIME_BASE_Q);
         const double seconds =
             std::max(0.0, static_cast<double>(absolute_us - input_start_us) / AV_TIME_BASE);
@@ -351,11 +347,42 @@ std::vector<double> indexed_vod_durations(AVFormatContext* format, int video_str
     auto plan = media_vod::indexed_plan(keyframes, duration_seconds, requested_seek_seconds,
                                         segment_seconds);
     if (!plan) return {};
+    if (reusable_keyframes) *reusable_keyframes = keyframes;
     actual_seek_seconds = plan->actual_seek_seconds;
     return std::move(plan->segment_durations);
 }
 
 } // namespace
+
+std::optional<HlsVodPlan> reseek_hls_vod(const HlsVodPlan& prepared,
+                                         std::chrono::milliseconds requested_seek) {
+    if (!prepared.reusable_seek || !(prepared.source_duration_seconds > 0.001) ||
+        !(prepared.seek_segment_seconds > 0.001))
+        return std::nullopt;
+
+    HlsVodPlan result = prepared;
+    const double requested_seconds = std::clamp(
+        requested_seek.count() / 1000.0, 0.0,
+        std::max(0.0, prepared.source_duration_seconds - 0.001));
+
+    if (!prepared.video_random_access_points.empty()) {
+        auto indexed = media_vod::indexed_plan(prepared.video_random_access_points,
+                                               prepared.source_duration_seconds,
+                                               requested_seconds,
+                                               prepared.seek_segment_seconds);
+        if (!indexed) return std::nullopt;
+        result.playback.seek = std::chrono::milliseconds(
+            static_cast<int64_t>(std::llround(indexed->actual_seek_seconds * 1000.0)));
+        result.segment_durations = std::move(indexed->segment_durations);
+    } else {
+        result.playback.seek = std::chrono::milliseconds(
+            static_cast<int64_t>(std::llround(requested_seconds * 1000.0)));
+        result.segment_durations = fixed_vod_durations(prepared.source_duration_seconds,
+                                                       requested_seconds,
+                                                       prepared.seek_segment_seconds);
+    }
+    return result;
+}
 
 namespace {
 
@@ -587,6 +614,9 @@ void setup_video_transcode(StreamPipeline& pipe, AVFormatContext* input, AVForma
     const auto* par = pipe.input_stream->codecpar;
     enc->height = choose_height(par, plan);
     enc->width = choose_width(par, enc->height);
+    enc->sample_aspect_ratio = pipe.input_stream->sample_aspect_ratio;
+    if (enc->sample_aspect_ratio.num <= 0 || enc->sample_aspect_ratio.den <= 0)
+        enc->sample_aspect_ratio = AVRational{1, 1};
     enc->pix_fmt = AV_PIX_FMT_YUV420P;
     auto frame_rate = av_guess_frame_rate(input, pipe.input_stream, nullptr);
     if (frame_rate.num <= 0 || frame_rate.den <= 0) frame_rate = AVRational{25, 1};
@@ -607,6 +637,7 @@ void setup_video_transcode(StreamPipeline& pipe, AVFormatContext* input, AVForma
     }
     av_require(avcodec_open2(enc, codec, nullptr), "open H.264 encoder");
     pipe.output_stream->time_base = enc->time_base;
+    pipe.output_stream->sample_aspect_ratio = enc->sample_aspect_ratio;
     av_require(avcodec_parameters_from_context(pipe.output_stream->codecpar, enc), "export video encoder parameters");
     pipe.output_stream->codecpar->codec_tag = 0;
     // The decoded pixel format is not guaranteed to be known until the first
@@ -963,6 +994,7 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
             if (type == MediaStreamType::video && input_stream->codecpar->codec_id == AV_CODEC_ID_HEVC)
                 pipe->output_stream->codecpar->codec_tag = codec_tag('h', 'v', 'c', '1');
             pipe->output_stream->time_base = input_stream->time_base;
+            pipe->output_stream->sample_aspect_ratio = input_stream->sample_aspect_ratio;
         } else if (type == MediaStreamType::video) {
             setup_video_transcode(*pipe, in, out, plan, segment_duration);
         } else {
@@ -1250,7 +1282,9 @@ class LibavMediaEngine final : public MediaEngine {
 
         HlsVodPlan result;
         result.playback = requested;
+        result.source_duration_seconds = source_duration_seconds;
         const double target = std::max(0.001, segment_duration.count() / 1000.0);
+        result.seek_segment_seconds = target;
         double requested_seek = std::clamp(requested.seek.count() / 1000.0, 0.0,
                                            std::max(0.0, source_duration_seconds - 0.001));
 
@@ -1273,7 +1307,7 @@ class LibavMediaEngine final : public MediaEngine {
                 double actual_seek = requested_seek;
                 result.segment_durations = indexed_vod_durations(
                     format, result.playback.video_stream, source_duration_seconds, requested_seek,
-                    target, actual_seek);
+                    target, actual_seek, &result.video_random_access_points);
                 if (!result.segment_durations.empty()) {
                     result.playback.seek = std::chrono::milliseconds(
                         static_cast<int64_t>(std::llround(actual_seek * 1000.0)));
@@ -1287,6 +1321,7 @@ class LibavMediaEngine final : public MediaEngine {
                     result.playback.video = MediaTransform::transcode;
                     result.playback.video_codec = "h264";
                     result.playback.mode = PlaybackMode::transcode;
+                    result.video_random_access_points.clear();
                     Log::info("media VOD planner falling back from remux to video transcode media=" +
                               source.media_id + " reason=unusable-keyframe-index");
                 }
@@ -1300,6 +1335,7 @@ class LibavMediaEngine final : public MediaEngine {
                     const int gop = std::max(1, static_cast<int>(std::llround(fps * target)));
                     segment = gop / fps;
                 }
+                result.seek_segment_seconds = segment;
                 result.segment_durations =
                     fixed_vod_durations(source_duration_seconds, requested_seek, segment);
                 result.playback.seek = std::chrono::milliseconds(
@@ -1314,6 +1350,7 @@ class LibavMediaEngine final : public MediaEngine {
 
         if (result.segment_durations.empty())
             throw std::runtime_error("VOD planning produced no media segments");
+        result.reusable_seek = true;
         Log::debug("media VOD plan media=" + source.media_id +
                    " mode=" + playback_mode_name(result.playback.mode) +
                    " seek_ms=" + std::to_string(result.playback.seek.count()) +

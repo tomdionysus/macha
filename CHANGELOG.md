@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.2 - 2026-08-16
+
+- make transformed seek-only session PATCHes reuse the session's already prepared VOD/random-access plan instead of resolving the media representation, probing the source and rebuilding the keyframe/Cues plan on every seek;
+- retain source duration, segment cadence and complete remux random-access points in `HlsVodPlan`, and derive replacement generations directly from that immutable planning state;
+- keep stream/track/quality/media changes on the full renegotiation path; only updates containing `seek_ms` and no other playback preference/media override use the fast path;
+- preserve source sample-aspect-ratio metadata through remux and H.264 transcode output so transformed playback does not change the original display aspect ratio;
+- add regression coverage proving a transformed seek-only PATCH starts a new generation without another probe or VOD preparation pass. Wire protocol remains v8.
+
 ## 0.8.1 - 2026-08-16
 
 - fixed transformed playback startup for Matroska/WebM sources whose FFmpeg stream index was only partially populated during probing. VOD planning now triggers the demuxer seek path so deferred Matroska Cues are materialised before keyframe planning;
