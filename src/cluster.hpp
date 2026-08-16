@@ -98,6 +98,11 @@ class NodeRuntime {
     uint64_t remote_metadata_generation() const {
         return remote_metadata_generation_.load();
     }
+    uint64_t known_metadata_generation() const {
+        const auto local = meta_.current().generation;
+        const auto remote = remote_metadata_generation_.load();
+        return local > remote ? local : remote;
+    }
     RpcStats rpc_stats() const {
         return client_.stats();
     }

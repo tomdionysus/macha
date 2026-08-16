@@ -8,7 +8,9 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <set>
 #include <stdexcept>
+#include <vector>
 namespace macha {
 class FsError : public std::runtime_error {
     int c_;
@@ -23,8 +25,13 @@ class FileSystem;
 class PlaybackTracker;
 
 struct MaintenanceObjects {
+    // Sorted/unique compact indexes. A vector is materially smaller than a
+    // tree node per extent on media namespaces containing millions of objects.
     std::vector<ObjectId> live;
     std::vector<ObjectId> garbage;
+    uint64_t metadata_generation{};
+    size_t entries{};
+    size_t extents{};
 };
 
 struct WriteHandleDiagnostics {
@@ -119,6 +126,9 @@ class FileSystem {
     uint64_t media_index_generation_{};
     bool media_index_valid_{};
     std::map<std::string, std::pair<std::string, FsEntry>> media_index_;
+    std::mutex maintenance_index_mutex_;
+    uint64_t maintenance_index_generation_{};
+    std::shared_ptr<const MaintenanceObjects> maintenance_index_;
     MetadataSnapshot snap();
     void commit_write(WriteHandle&, const FsEntry&, uint64_t,
                       const std::vector<ExtentRef>&, FsEntry*);
@@ -150,6 +160,7 @@ class FileSystem {
                      const std::vector<ExtentRef>&, FsEntry*);
     std::pair<uint64_t, uint64_t> logical_capacity() const;
     std::vector<ObjectId> live_objects();
+    std::shared_ptr<const MaintenanceObjects> maintenance_objects_cached();
     MaintenanceObjects maintenance_objects();
     DistributedStore& store() {
         return s_;

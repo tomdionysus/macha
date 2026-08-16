@@ -15,9 +15,28 @@ Repair works both ways:
 
 Background work is budgeted in bytes, not a fixed number of extents. The scheduler uses observed transfer rate, foreground activity and CPU load. Network repair, local disk rebalance and scrub have separate credits. With the default `busy_bandwidth_fraction: 0.0`, foreground I/O pauses background WAN repair.
 
-A settled complete pass that moves no bytes is treated as **quiescent**, not as permission to rescan immediately. Its credit is cleared and that maintenance class backs off for `no_progress_backoff_ms` (30 seconds by default). Local rebalance and scrub do not build whole-store vectors: each keeps a persistent physical-object cursor and examines at most a bounded number of objects per scheduler slice. An incomplete slice is not mistaken for quiescence. Scrub also pauses after reaching the end of a complete integrity pass before it starts again.
+A settled complete pass that moves no bytes is treated as **quiescent**, not as permission to rescan immediately. Its credit is cleared and that maintenance class backs off for `no_progress_backoff_ms` (30 seconds by default). Local rebalance, scrub and distributed push repair do not build whole-store vectors: each keeps a persistent physical-object cursor and examines at most a bounded number of objects per scheduler slice. Distributed pull repair advances the immutable ordered live-object index directly rather than copying it into a new vector on every slice. An incomplete slice is not mistaken for quiescence. Scrub also pauses after reaching the end of a complete integrity pass before it starts again.
 
-The full filesystem live-object inventory is built only when network repair has spendable budget or the garbage inventory is due. Catalogue and metadata repair checks are rate-limited to five seconds. Garbage/live-object inventory uses the larger of five seconds and `no_progress_backoff_ms`, so with the default configuration the expensive full inventory runs at most once every 30 seconds while settled.
+The filesystem live/garbage object index is immutable, stored as a compact sorted vector and cached by known metadata generation. Maintenance may ask for that index when network repair has spendable budget or garbage accounting is due, but an unchanged namespace reuses the cached index instead of walking every file and extent again. Metadata repair, catalogue verification and garbage accounting use the larger of five seconds and `no_progress_backoff_ms`; the default is therefore 30 seconds for settled background verification. These background verification passes defer while foreground I/O is active. A metadata generation change invalidates the live-object cache on demand.
+
+## Performance diagnostics
+
+`DEBUG` is intended for low-volume diagnosis. 0.8.3 reports slow maintenance stages, thread CPU consumption, RPC queue/handler latency, selected contended metadata/catalogue/RPC/storage locks, slow FUSE operations and aggregated local-storage GET latency. Long-lived worker threads are named (`macha-maint`, `macha-rpc-health`, `macha-rpc-ctl`, `macha-rpc-data`, `macha-hydrator`, and related names) so `top -H`, `perf` or macOS `sample` output can be correlated with Macha logs.
+
+`ALL` enables the old hot-path trace stream, including individual backend/object transfers, complete FUSE request/result records, read-payload hashes and detailed extent/write diagnostics. Disabled trace-level checks are lock-free. `ALL` is intentionally expensive and should not be used for throughput measurements.
+
+Useful 0.8.3 DEBUG records include:
+
+```text
+DIAG thread name=macha-maint wall_ms=5000 cpu_ms=... cpu_pct=... iterations=...
+DIAG node-stage stage=storage-refresh elapsed_ms=...
+DIAG maintenance-stage stage=network-repair elapsed_ms=... bytes=... push_examined=... pull_examined=... remote_ops=... complete=... yielded=...
+DIAG maintenance-inventory generation=... entries=... extents=... live=... garbage=... elapsed_ms=...
+DIAG rpc-server peer=... frame=control message=members queue_wait_ms=... handler_ms=...
+DIAG lock-wait lock=metadata.mutation wait_ms=...
+DIAG slow-fuse op=write path=... elapsed_ms=...
+DIAG storage-get window_ms=5000 gets=... bytes=... avg_ms=... max_ms=...
+```
 
 ## Cache and hydration
 

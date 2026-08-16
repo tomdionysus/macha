@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "catalogue.hpp"
+#include "diagnostics.hpp"
 
 #include "codec.hpp"
 #include "log.hpp"
@@ -273,6 +274,11 @@ void CatalogueManager::cache(const MetadataRecord& record, const MetadataSnapsho
 
 void CatalogueManager::repair_once() {
     try {
+        {
+            std::lock_guard lock(mutex_);
+            if (ready_ && cached_metadata_generation_ >= node_.known_metadata_generation())
+                return;
+        }
         auto record = metadata_.read_record();
         auto metadata = decode_snapshot(record.payload);
         {
@@ -453,7 +459,7 @@ void CatalogueManager::commit(const std::optional<ObjectId>& expected_root,
 
 CatalogueItem CatalogueManager::upsert(CatalogueItem item,
                                         std::optional<uint64_t> expected_revision) {
-    std::lock_guard mutation_lock(mutation_mutex_);
+    DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     auto current = current_snapshot();
     std::optional<ObjectId> expected_root;
     {
@@ -480,7 +486,7 @@ CatalogueItem CatalogueManager::upsert(CatalogueItem item,
 }
 
 bool CatalogueManager::erase(std::string_view id, std::optional<uint64_t> expected_revision) {
-    std::lock_guard mutation_lock(mutation_mutex_);
+    DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     auto current = current_snapshot();
     std::optional<ObjectId> expected_root;
     {
@@ -510,7 +516,7 @@ CatalogueArtwork CatalogueManager::stage_artwork(std::string role, std::string m
 
 void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& discovered,
                                          const std::set<std::string>& active_media_ids) {
-    std::lock_guard mutation_lock(mutation_mutex_);
+    DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     auto current = current_snapshot();
     std::optional<ObjectId> expected_root;
     {

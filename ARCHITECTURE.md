@@ -239,7 +239,7 @@ Separate credits exist for:
 
 Foreground I/O marks the store busy. During `foreground_quiet_ms`, local rebalance and scrub pause. With the default busy network fraction of zero, inter-node repair pauses as well. Credits are burst-capped.
 
-Local backend state is deliberately separated from disk execution. A backend mutex protects only configuration/online state and the current `shared_ptr<LocalStore>`; the pointer is copied and the mutex released before any filesystem operation. Health/control handling therefore never waits behind a backend directory walk or `LocalStore` shutdown. Scrub and local rebalance use independent persistent physical-object cursors, bounded per scheduler slice, rather than repeatedly materialising the full local object set.
+Local backend state is deliberately separated from disk execution. A backend mutex protects only configuration/online state and the current `shared_ptr<LocalStore>`; the pointer is copied and the mutex released before any filesystem operation. Health/control handling therefore never waits behind a backend directory walk or `LocalStore` shutdown. Scrub, local rebalance and distributed push repair use independent persistent physical-object cursors, bounded per scheduler slice, rather than repeatedly materialising the full local object set. Distributed pull repair advances the immutable ordered live-object index directly and does not copy the complete live set for each slice.
 
 ## Garbage collection
 

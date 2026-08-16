@@ -9,8 +9,12 @@
 #include <ctime>
 #include <map>
 #include <memory>
+#include <vector>
 
 namespace macha {
+
+std::chrono::milliseconds maintenance_background_interval(const MaintenanceConfig&);
+
 class Service {
     NodeRuntime node_;
     DistributedStore store_;
@@ -25,6 +29,10 @@ class Service {
     std::unique_ptr<HttpServer> catalogue_http_;
     std::jthread maintenance_;
     std::map<ObjectId, Clock::time_point> garbage_seen_;
+    uint64_t maintenance_inventory_generation_{};
+    std::shared_ptr<const std::vector<ObjectId>> maintenance_live_;
+    std::shared_ptr<const std::vector<ObjectId>> maintenance_universal_;
+    std::vector<ObjectId> maintenance_garbage_;
     void loop(std::stop_token);
     void collect_garbage(const std::vector<ObjectId>&);
 

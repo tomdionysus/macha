@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "diagnostics.hpp"
 #include "http.hpp"
 
 #include "json.hpp"
@@ -170,6 +171,7 @@ void HttpServer::stop() {
 }
 
 void HttpServer::run(std::stop_token stop) {
+    set_thread_name("macha-http-acc");
     int listen_fd = -1;
     try {
         addrinfo hints{};
@@ -255,6 +257,7 @@ void HttpServer::run(std::stop_token stop) {
 }
 
 void HttpServer::worker(std::stop_token stop) {
+    set_thread_name("macha-http-work");
     while (!stop.stop_requested()) {
         int fd = -1;
         {

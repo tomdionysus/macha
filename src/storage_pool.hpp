@@ -4,6 +4,7 @@
 #include "config.hpp"
 #include "local_store.hpp"
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -48,6 +49,14 @@ class StoragePool {
     std::vector<std::shared_ptr<Backend>> backends_;
     Cursor rebalance_cursor_;
     Cursor scrub_cursor_;
+    mutable std::atomic_uint64_t diag_gets_{};
+    mutable std::atomic_uint64_t diag_get_bytes_{};
+    mutable std::atomic_uint64_t diag_get_ms_{};
+    mutable std::atomic_uint64_t diag_get_max_ms_{};
+    mutable std::atomic_int64_t diag_get_report_ns_{};
+    mutable std::atomic_uint64_t full_list_scans_{};
+
+    void observe_get(size_t, uint64_t) const;
 
     std::vector<std::shared_ptr<Backend>> snapshot() const;
     std::filesystem::path identity_path(const std::filesystem::path&) const;
@@ -68,6 +77,7 @@ class StoragePool {
     bool has(const ObjectId&) const;
     bool remove(const ObjectId&);
     std::vector<ObjectId> list() const;
+    uint64_t full_list_scans() const { return full_list_scans_.load(std::memory_order_relaxed); }
     std::optional<ObjectId> next_object(Cursor&, bool& pass_complete) const;
     bool older_than(const ObjectId&, std::chrono::seconds) const;
 

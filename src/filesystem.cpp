@@ -100,13 +100,15 @@ ReadHandle::ReadHandle(DistributedStore& s, FsEntry e, PlaybackTracker* playback
     : s_(s), e_(std::move(e)), playback_(playback) {
     if (playback_)
         playback_session_ = playback_->open(std::move(path), e_);
-    Log::debug("DIAG read-handle open ptr=" +
+    if (Log::enabled(LogLevel::all))
+        Log::trace("DIAG read-handle open ptr=" +
                std::to_string(reinterpret_cast<uintptr_t>(this)) +
                " size=" + std::to_string(e_.size) +
                " extents=" + std::to_string(e_.extents.size()));
     for (size_t i = 0; i < e_.extents.size(); ++i) {
         const auto& x = e_.extents[i];
-        Log::debug("DIAG read-manifest ptr=" +
+        if (Log::enabled(LogLevel::all))
+            Log::trace("DIAG read-manifest ptr=" +
                    std::to_string(reinterpret_cast<uintptr_t>(this)) +
                    " index=" + std::to_string(i) +
                    " offset=" + std::to_string(x.offset) +
@@ -124,7 +126,8 @@ ReadHandle::~ReadHandle() {
 const Bytes& ReadHandle::extent(size_t i, Clock::time_point deadline,
                                 std::atomic_bool* cancelled) {
     if (cached_index_ == i) {
-        Log::debug("DIAG read-extent cache-hit ptr=" +
+        if (Log::enabled(LogLevel::all))
+            Log::trace("DIAG read-extent cache-hit ptr=" +
                    std::to_string(reinterpret_cast<uintptr_t>(this)) +
                    " index=" + std::to_string(i));
         return cached_extent_;
@@ -144,7 +147,8 @@ const Bytes& ReadHandle::extent(size_t i, Clock::time_point deadline,
         fail(EIO, "extent corrupt");
 
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
-    Log::debug("DIAG read-extent load ptr=" +
+    if (Log::enabled(LogLevel::all))
+        Log::trace("DIAG read-extent load ptr=" +
                std::to_string(reinterpret_cast<uintptr_t>(this)) +
                " index=" + std::to_string(i) +
                " offset=" + std::to_string(x.offset) +
@@ -197,7 +201,8 @@ WriteHandle::WriteHandle(FileSystem& f, std::string p, FsEntry b, bool trunc)
     : fs_(f), path_(std::move(p)), base_(std::move(b)), expected_(base_.version),
       sequential_(trunc), logical_(trunc ? 0 : base_.size), staged_(trunc ? 0 : base_.size),
       diagnostic_id_(next_write_handle_diagnostic_id.fetch_add(1, std::memory_order_relaxed)) {
-    Log::debug("WRITE handle-open id=" + std::to_string(diagnostic_id_) +
+    if (Log::enabled(LogLevel::all))
+        Log::trace("WRITE handle-open id=" + std::to_string(diagnostic_id_) +
                " path=" + path_ +
                " base_size=" + std::to_string(base_.size) +
                " base_version=" + std::to_string(base_.version) +
@@ -211,13 +216,14 @@ WriteHandle::~WriteHandle() {
 
 void WriteHandle::diagnostic_stage_extent(const char* label, size_t index, uint64_t offset,
                                           size_t length) {
-    if (!Log::enabled(LogLevel::debug) || temp_ < 0 || !length)
+    if (!Log::enabled(LogLevel::all) || temp_ < 0 || !length)
         return;
     try {
         Bytes bytes(length);
         const auto got = pra(temp_, bytes, offset);
         if (got != length) {
-            Log::debug("WRITE stage-check id=" + std::to_string(diagnostic_id_) +
+            if (Log::enabled(LogLevel::all))
+                Log::trace("WRITE stage-check id=" + std::to_string(diagnostic_id_) +
                        " label=" + label + " index=" + std::to_string(index) +
                        " offset=" + std::to_string(offset) +
                        " length=" + std::to_string(length) +
@@ -225,7 +231,8 @@ void WriteHandle::diagnostic_stage_extent(const char* label, size_t index, uint6
             return;
         }
         const auto hash = sha256(bytes);
-        Log::debug("WRITE stage-check id=" + std::to_string(diagnostic_id_) +
+        if (Log::enabled(LogLevel::all))
+            Log::trace("WRITE stage-check id=" + std::to_string(diagnostic_id_) +
                    " label=" + label + " index=" + std::to_string(index) +
                    " offset=" + std::to_string(offset) +
                    " length=" + std::to_string(length) +
@@ -234,17 +241,18 @@ void WriteHandle::diagnostic_stage_extent(const char* label, size_t index, uint6
                    " first16=" + edge_hex(bytes, true) +
                    " last16=" + edge_hex(bytes, false));
     } catch (const std::exception& error) {
-        Log::debug("WRITE stage-check id=" + std::to_string(diagnostic_id_) +
+        if (Log::enabled(LogLevel::all))
+            Log::trace("WRITE stage-check id=" + std::to_string(diagnostic_id_) +
                    " label=" + label + " index=" + std::to_string(index) +
                    " result=DIAGNOSTIC_ERROR message=" + error.what());
     }
 }
 
 void WriteHandle::diagnostic_stage_checkpoint(const char* label) {
-    if (!Log::enabled(LogLevel::debug) || temp_ < 0)
+    if (!Log::enabled(LogLevel::all) || temp_ < 0)
         return;
     const auto physical = fd_size(temp_);
-    Log::debug("WRITE stage-checkpoint id=" + std::to_string(diagnostic_id_) +
+    Log::trace("WRITE stage-checkpoint id=" + std::to_string(diagnostic_id_) +
                " label=" + label +
                " logical=" + std::to_string(logical_) +
                " staged=" + std::to_string(staged_) +
@@ -260,7 +268,7 @@ void WriteHandle::flush() {
         return;
     const auto offset = staged_;
     const auto length = buffer_.size();
-    const bool diagnostics = Log::enabled(LogLevel::debug);
+    const bool diagnostics = Log::enabled(LogLevel::all);
     const bool zero = diagnostics && all_zero(buffer_);
     const auto first = diagnostics ? edge_hex(buffer_, true) : std::string{};
     const auto last = diagnostics ? edge_hex(buffer_, false) : std::string{};
@@ -268,7 +276,8 @@ void WriteHandle::flush() {
     auto id = fs_.store().put(buffer_);
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
     if (diagnostics) {
-        Log::debug("WRITE extent-put id=" + std::to_string(diagnostic_id_) +
+        if (Log::enabled(LogLevel::all))
+            Log::trace("WRITE extent-put id=" + std::to_string(diagnostic_id_) +
                    " offset=" + std::to_string(offset) +
                    " length=" + std::to_string(length) +
                    " sha256=" + to_string(id) +
@@ -292,7 +301,8 @@ void WriteHandle::materialize() {
     if (temp_ < 0)
         fail(EIO, "cannot create staging file");
     temp_path_ = name.data();
-    Log::debug("WRITE materialize-begin id=" + std::to_string(diagnostic_id_) +
+    if (Log::enabled(LogLevel::all))
+        Log::trace("WRITE materialize-begin id=" + std::to_string(diagnostic_id_) +
                " path=" + path_ +
                " logical=" + std::to_string(logical_) +
                " staged=" + std::to_string(staged_) +
@@ -325,7 +335,8 @@ void WriteHandle::materialize() {
         fail(EIO, "staging truncate failed");
     diagnostic_stage_checkpoint("post-materialize");
     diagnostic_completed_extents_ = static_cast<size_t>(logical_ / fs_.extent_size());
-    Log::debug("WRITE materialize-end id=" + std::to_string(diagnostic_id_) +
+    if (Log::enabled(LogLevel::all))
+        Log::trace("WRITE materialize-end id=" + std::to_string(diagnostic_id_) +
                " physical=" + std::to_string(fd_size(temp_)) +
                " completed_extents=" + std::to_string(diagnostic_completed_extents_));
 }
@@ -334,7 +345,7 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
     if (d.empty())
         return 0;
 
-    const bool diagnostics = Log::enabled(LogLevel::debug);
+    const bool diagnostics = Log::enabled(LogLevel::all);
     const uint64_t sequence = ++diagnostic_write_sequence_;
     Hash256 input_hash{};
     if (diagnostics) {
@@ -356,7 +367,8 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
                 continue;
             ++overlap_count;
         }
-        Log::debug("WRITE ingress id=" + std::to_string(diagnostic_id_) +
+        if (Log::enabled(LogLevel::all))
+            Log::trace("WRITE ingress id=" + std::to_string(diagnostic_id_) +
                    " seq=" + std::to_string(sequence) +
                    " offset=" + std::to_string(off) +
                    " length=" + std::to_string(d.size()) +
@@ -379,7 +391,8 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
             const auto overlap_begin = std::max(off, i->offset);
             const auto overlap_end = std::min(current_end, previous_end);
             const bool exact = off == i->offset && d.size() == i->length;
-            Log::debug("WRITE overlap id=" + std::to_string(diagnostic_id_) +
+            if (Log::enabled(LogLevel::all))
+                Log::trace("WRITE overlap id=" + std::to_string(diagnostic_id_) +
                        " seq=" + std::to_string(sequence) +
                        " previous_seq=" + std::to_string(i->sequence) +
                        " current_offset=" + std::to_string(off) +
@@ -410,7 +423,8 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
                 flush();
         }
         if (diagnostics) {
-            Log::debug("WRITE accepted id=" + std::to_string(diagnostic_id_) +
+            if (Log::enabled(LogLevel::all))
+                Log::trace("WRITE accepted id=" + std::to_string(diagnostic_id_) +
                        " seq=" + std::to_string(sequence) +
                        " mode=sequential logical_after=" + std::to_string(logical_) +
                        " staged_after=" + std::to_string(staged_) +
@@ -418,7 +432,8 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
         }
     } else {
         if (temp_ < 0) {
-            Log::debug("WRITE nonsequential id=" + std::to_string(diagnostic_id_) +
+            if (Log::enabled(LogLevel::all))
+                Log::trace("WRITE nonsequential id=" + std::to_string(diagnostic_id_) +
                        " seq=" + std::to_string(sequence) +
                        " requested_offset=" + std::to_string(off) +
                        " logical=" + std::to_string(logical_) +
@@ -427,7 +442,8 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
             materialize();
             auto elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
-            Log::debug("WRITE materialized id=" + std::to_string(diagnostic_id_) +
+            if (Log::enabled(LogLevel::all))
+                Log::trace("WRITE materialized id=" + std::to_string(diagnostic_id_) +
                        " seq=" + std::to_string(sequence) +
                        " ms=" + std::to_string(elapsed.count()));
             sequential_ = false;
@@ -442,7 +458,8 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
                 const auto got = pra(temp_, readback, off);
                 if (got == d.size()) {
                     const auto readback_hash = sha256(readback);
-                    Log::debug("WRITE stage-write id=" + std::to_string(diagnostic_id_) +
+                    if (Log::enabled(LogLevel::all))
+                        Log::trace("WRITE stage-write id=" + std::to_string(diagnostic_id_) +
                                " seq=" + std::to_string(sequence) +
                                " offset=" + std::to_string(off) +
                                " length=" + std::to_string(d.size()) +
@@ -451,14 +468,16 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
                                " all_zero=" + std::to_string(all_zero(readback) ? 1 : 0) +
                                " verify=" + (readback_hash == input_hash ? "OK" : "MISMATCH"));
                 } else {
-                    Log::debug("WRITE stage-write id=" + std::to_string(diagnostic_id_) +
+                    if (Log::enabled(LogLevel::all))
+                        Log::trace("WRITE stage-write id=" + std::to_string(diagnostic_id_) +
                                " seq=" + std::to_string(sequence) +
                                " offset=" + std::to_string(off) +
                                " length=" + std::to_string(d.size()) +
                                " read=" + std::to_string(got) + " verify=SHORT");
                 }
             } catch (const std::exception& error) {
-                Log::debug("WRITE stage-write id=" + std::to_string(diagnostic_id_) +
+                if (Log::enabled(LogLevel::all))
+                    Log::trace("WRITE stage-write id=" + std::to_string(diagnostic_id_) +
                            " seq=" + std::to_string(sequence) +
                            " verify=DIAGNOSTIC_ERROR message=" + error.what());
             }
@@ -469,7 +488,8 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
                 const auto offset = static_cast<uint64_t>(index) * fs_.extent_size();
                 diagnostic_stage_extent("extent-complete", index, offset, fs_.extent_size());
             }
-            Log::debug("WRITE accepted id=" + std::to_string(diagnostic_id_) +
+            if (Log::enabled(LogLevel::all))
+                Log::trace("WRITE accepted id=" + std::to_string(diagnostic_id_) +
                        " seq=" + std::to_string(sequence) +
                        " mode=staged logical_after=" + std::to_string(logical_) +
                        " physical_after=" + std::to_string(fd_size(temp_)));
@@ -481,9 +501,9 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
 }
 void WriteHandle::truncate(uint64_t z) {
     std::lock_guard g(m_);
-    const bool diagnostics = Log::enabled(LogLevel::debug);
+    const bool diagnostics = Log::enabled(LogLevel::all);
     if (diagnostics) {
-        Log::debug("WRITE truncate-begin id=" + std::to_string(diagnostic_id_) +
+        Log::trace("WRITE truncate-begin id=" + std::to_string(diagnostic_id_) +
                    " requested=" + std::to_string(z) +
                    " logical_before=" + std::to_string(logical_) +
                    " staged_before=" + std::to_string(staged_) +
@@ -493,7 +513,8 @@ void WriteHandle::truncate(uint64_t z) {
                    " temp_size=" + std::to_string(fd_size(temp_)));
     }
     if (z == logical_) {
-        Log::debug("WRITE truncate-end id=" + std::to_string(diagnostic_id_) +
+        if (Log::enabled(LogLevel::all))
+            Log::trace("WRITE truncate-end id=" + std::to_string(diagnostic_id_) +
                    " result=NOOP logical_after=" + std::to_string(logical_));
         return;
     }
@@ -502,7 +523,8 @@ void WriteHandle::truncate(uint64_t z) {
         buffer_.clear();
         staged_ = logical_ = 0;
         dirty_ = true;
-        Log::debug("WRITE truncate-end id=" + std::to_string(diagnostic_id_) +
+        if (Log::enabled(LogLevel::all))
+            Log::trace("WRITE truncate-end id=" + std::to_string(diagnostic_id_) +
                    " result=SEQUENTIAL_RESET logical_after=0 staged_after=0");
         return;
     }
@@ -516,13 +538,15 @@ void WriteHandle::truncate(uint64_t z) {
     dirty_ = true;
     if (diagnostics)
         diagnostic_stage_checkpoint("post-truncate");
-    Log::debug("WRITE truncate-end id=" + std::to_string(diagnostic_id_) +
+    if (Log::enabled(LogLevel::all))
+        Log::trace("WRITE truncate-end id=" + std::to_string(diagnostic_id_) +
                " result=OK logical_after=" + std::to_string(logical_) +
                " physical_after=" + std::to_string(fd_size(temp_)));
 }
 void WriteHandle::rebuild() {
     auto rebuild_started = Clock::now();
-    Log::debug("WRITE rebuild-begin id=" + std::to_string(diagnostic_id_) +
+    if (Log::enabled(LogLevel::all))
+        Log::trace("WRITE rebuild-begin id=" + std::to_string(diagnostic_id_) +
                " logical=" + std::to_string(logical_) +
                " physical=" + std::to_string(fd_size(temp_)));
     diagnostic_stage_checkpoint("pre-rebuild");
@@ -535,7 +559,7 @@ void WriteHandle::rebuild() {
         size_t n = std::min<uint64_t>(b.size(), logical_ - o);
         if (pra(temp_, {b.data(), n}, o) != n)
             fail(EIO, "short staging read");
-        const bool diagnostics = Log::enabled(LogLevel::debug);
+        const bool diagnostics = Log::enabled(LogLevel::all);
         Hash256 plaintext_hash{};
         bool zero = false;
         std::string first, last;
@@ -550,7 +574,8 @@ void WriteHandle::rebuild() {
         auto elapsed =
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
         if (diagnostics) {
-            Log::debug("WRITE rebuild-extent id=" + std::to_string(diagnostic_id_) +
+            if (Log::enabled(LogLevel::all))
+                Log::trace("WRITE rebuild-extent id=" + std::to_string(diagnostic_id_) +
                        " index=" + std::to_string(index) +
                        " offset=" + std::to_string(o) +
                        " length=" + std::to_string(n) +
@@ -568,18 +593,21 @@ void WriteHandle::rebuild() {
     staged_ = logical_;
     auto rebuild_elapsed =
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - rebuild_started);
-    Log::debug("WRITE rebuild-end id=" + std::to_string(diagnostic_id_) +
+    if (Log::enabled(LogLevel::all))
+        Log::trace("WRITE rebuild-end id=" + std::to_string(diagnostic_id_) +
                " extents=" + std::to_string(extents_.size()) +
                " ms=" + std::to_string(rebuild_elapsed.count()));
 }
 void WriteHandle::commit() {
     std::lock_guard g(m_);
     if (!dirty_) {
-        Log::debug("WRITE commit-clean id=" + std::to_string(diagnostic_id_));
+        if (Log::enabled(LogLevel::all))
+            Log::trace("WRITE commit-clean id=" + std::to_string(diagnostic_id_));
         return;
     }
     auto commit_started = Clock::now();
-    Log::debug("WRITE commit-begin id=" + std::to_string(diagnostic_id_) +
+    if (Log::enabled(LogLevel::all))
+        Log::trace("WRITE commit-begin id=" + std::to_string(diagnostic_id_) +
                " logical=" + std::to_string(logical_) +
                " staged=" + std::to_string(staged_) +
                " buffer=" + std::to_string(buffer_.size()) +
@@ -592,7 +620,8 @@ void WriteHandle::commit() {
         flush();
     for (size_t i = 0; i < extents_.size(); ++i) {
         const auto& x = extents_[i];
-        Log::debug("WRITE manifest id=" + std::to_string(diagnostic_id_) +
+        if (Log::enabled(LogLevel::all))
+            Log::trace("WRITE manifest id=" + std::to_string(diagnostic_id_) +
                    " index=" + std::to_string(i) +
                    " offset=" + std::to_string(x.offset) +
                    " length=" + std::to_string(x.length) +
@@ -605,7 +634,8 @@ void WriteHandle::commit() {
     dirty_ = false;
     auto commit_elapsed =
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - commit_started);
-    Log::debug("WRITE commit-end id=" + std::to_string(diagnostic_id_) +
+    if (Log::enabled(LogLevel::all))
+        Log::trace("WRITE commit-end id=" + std::to_string(diagnostic_id_) +
                " committed_size=" + std::to_string(base_.size) +
                " committed_version=" + std::to_string(base_.version) +
                " ms=" + std::to_string(commit_elapsed.count()));
@@ -778,7 +808,8 @@ void FileSystem::rename(const std::string& a, const std::string& b, bool nr) {
         if (under(handle->path_, x)) {
             const auto before = handle->path_;
             handle->path_ = y + handle->path_.substr(x.size());
-            Log::debug("WRITE rename id=" + std::to_string(handle->diagnostic_id_) +
+            if (Log::enabled(LogLevel::all))
+                Log::trace("WRITE rename id=" + std::to_string(handle->diagnostic_id_) +
                        " from=" + before + " to=" + handle->path_);
         }
         ++i;
@@ -1078,25 +1109,57 @@ std::pair<uint64_t, uint64_t> FileSystem::logical_capacity() const {
     return {total, used};
 }
 std::vector<ObjectId> FileSystem::live_objects() {
-    return maintenance_objects().live;
+    auto cached = maintenance_objects_cached();
+    return {cached->live.begin(), cached->live.end()};
+}
+
+std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached() {
+    const auto known_generation = n_.known_metadata_generation();
+    {
+        std::lock_guard lock(maintenance_index_mutex_);
+        if (maintenance_index_ && maintenance_index_generation_ >= known_generation)
+            return maintenance_index_;
+    }
+
+    auto record = m_.read_record();
+    auto snapshot = decode_snapshot(record.payload);
+    std::vector<ObjectId> live;
+    size_t extents = 0;
+    for (const auto& [_, entry] : snapshot.entries) {
+        extents += entry.extents.size();
+        for (const auto& extent : entry.extents) {
+            if (!extent.hole)
+                live.push_back(extent.id);
+        }
+    }
+    std::sort(live.begin(), live.end());
+    live.erase(std::unique(live.begin(), live.end()), live.end());
+
+    std::vector<ObjectId> garbage;
+    garbage.reserve(snapshot.garbage.size());
+    for (const auto& candidate : snapshot.garbage) {
+        if (!std::binary_search(live.begin(), live.end(), candidate.id))
+            garbage.push_back(candidate.id);
+    }
+    std::sort(garbage.begin(), garbage.end());
+    garbage.erase(std::unique(garbage.begin(), garbage.end()), garbage.end());
+
+    auto built = std::make_shared<MaintenanceObjects>();
+    built->live = std::move(live);
+    built->garbage = std::move(garbage);
+    built->metadata_generation = record.generation;
+    built->entries = snapshot.entries.size();
+    built->extents = extents;
+
+    std::lock_guard lock(maintenance_index_mutex_);
+    if (!maintenance_index_ || record.generation >= maintenance_index_generation_) {
+        maintenance_index_generation_ = record.generation;
+        maintenance_index_ = built;
+    }
+    return maintenance_index_;
 }
 
 MaintenanceObjects FileSystem::maintenance_objects() {
-    auto snapshot = m_.snapshot();
-    std::set<ObjectId> live;
-    for (const auto& [_, entry] : snapshot.entries) {
-        for (const auto& extent : entry.extents) {
-            if (!extent.hole)
-                live.insert(extent.id);
-        }
-    }
-
-    std::set<ObjectId> garbage;
-    for (const auto& candidate : snapshot.garbage) {
-        if (!live.contains(candidate.id))
-            garbage.insert(candidate.id);
-    }
-
-    return {{live.begin(), live.end()}, {garbage.begin(), garbage.end()}};
+    return *maintenance_objects_cached();
 }
 } // namespace macha

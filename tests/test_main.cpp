@@ -139,7 +139,11 @@ class FakeMediaEngine final : public MediaEngine {
         Bytes segment{'s', 'e', 'g', 'm', 'e', 'n', 't'};
         REQUIRE(store->publish_init(std::move(init)));
         REQUIRE(store->publish_segment(std::move(segment), 4.0));
-        store->finish();
+        // The fake models a sequential VOD producer: the complete immutable
+        // playlist is available from the prepared duration plan, while only
+        // the first fragment needs to exist at startup. Do not mark the store
+        // finished after one fragment when the plan advertises more fragments;
+        // MediaSegmentStore correctly treats that as a truncated pipeline.
         return std::make_unique<FakeMediaEngineSession>(std::move(store));
     }
     std::string extract_webvtt(const MediaSource&, int,
@@ -779,15 +783,32 @@ void test_config() {
     CHECK(parse_log_level("ERROR") == LogLevel::error);
 
     ConsoleLogger info_logger(LogLevel::info);
+    CHECK(!info_logger.enabled(LogLevel::all));
     CHECK(!info_logger.enabled(LogLevel::debug));
     CHECK(info_logger.enabled(LogLevel::info));
     CHECK(info_logger.enabled(LogLevel::warn));
     CHECK(info_logger.enabled(LogLevel::error));
     ConsoleLogger all_logger(LogLevel::all);
+    CHECK(all_logger.enabled(LogLevel::all));
     CHECK(all_logger.enabled(LogLevel::debug));
     CHECK(all_logger.enabled(LogLevel::info));
     CHECK(all_logger.enabled(LogLevel::warn));
     CHECK(all_logger.enabled(LogLevel::error));
+    Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::warn));
+    CHECK(!Log::enabled(LogLevel::all));
+    CHECK(!Log::enabled(LogLevel::debug));
+    CHECK(!Log::enabled(LogLevel::info));
+    CHECK(Log::enabled(LogLevel::warn));
+    CHECK(Log::enabled(LogLevel::error));
+    Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
+    MaintenanceConfig maintenance_policy;
+    CHECK(maintenance_background_interval(maintenance_policy) == 30000ms);
+    maintenance_policy.no_progress_backoff = 2000ms;
+    CHECK(maintenance_background_interval(maintenance_policy) == 5000ms);
+    maintenance_policy.no_progress_backoff = 45000ms;
+    CHECK(maintenance_background_interval(maintenance_policy) == 45000ms);
+    CHECK(std::string(message_type_name(MessageType::members)) == "members");
+    CHECK(std::string(message_type_name(MessageType::get_object)) == "get_object");
 
 #ifdef MACHA_HAVE_YAML_CPP
     TempDir t;
@@ -1335,9 +1356,10 @@ void test_repair_step_is_bounded_and_yields() {
     auto id = object_id(bytes);
     REQUIRE(s1.node().local_store().put(id, bytes));
     REQUIRE(!s2.node().local_store().has(id));
-    std::set<ObjectId> live{id};
-    std::set<ObjectId> universal{id};
+    std::vector<ObjectId> live{id};
+    std::vector<ObjectId> universal{id};
     DistributedStore repair(s1.node());
+    const auto full_lists_before = s1.node().local_store().full_list_scans();
 
     auto yielded = repair.repair_step(8ULL * 1024 * 1024, 8, &live, &universal,
                                       [] { return true; });
@@ -1352,11 +1374,21 @@ void test_repair_step_is_bounded_and_yields() {
     auto bounded = repair.repair_step(8ULL * 1024 * 1024, 1, &live, &universal);
     CHECK(!bounded.complete);
     CHECK(bounded.bytes_transferred == 0);
+    CHECK(bounded.remote_operations == 1);
     CHECK(!s2.node().local_store().has(id));
 
     auto completed = repair.repair_step(8ULL * 1024 * 1024, 8, &live, &universal);
     CHECK(completed.bytes_transferred == bytes.size());
+    CHECK(completed.complete);
+    CHECK(completed.remote_operations <= 8);
     CHECK(s2.node().local_store().has(id));
+    CHECK(s1.node().local_store().full_list_scans() == full_lists_before);
+    CHECK(yielded.push_examined <= 64);
+    CHECK(bounded.push_examined <= 64);
+    CHECK(completed.push_examined <= 64);
+    CHECK(yielded.pull_examined <= 64);
+    CHECK(bounded.pull_examined <= 64);
+    CHECK(completed.pull_examined <= 64);
 
     s2.stop();
     s1.stop();
@@ -3155,6 +3187,14 @@ void test_catalogue_sync_search_and_artwork_gc() {
     c1.maintenance.garbage_grace = 0ms;
     c2.maintenance.garbage_grace = 0ms;
     c3.maintenance.garbage_grace = 0ms;
+    // Production defaults back settled maintenance off for 30 seconds. This
+    // fixture deliberately exercises cluster GC at the scheduler's 5-second
+    // minimum so its 10-second convergence assertion does not depend on the
+    // production no-progress interval.
+    c1.maintenance.no_progress_backoff = 1000ms;
+    c2.maintenance.no_progress_backoff = 1000ms;
+    c3.maintenance.no_progress_backoff = 1000ms;
+    CHECK(maintenance_background_interval(c1.maintenance) == 5000ms);
 
     Service s1(c1, keys);
     s1.start();
@@ -3311,6 +3351,20 @@ void test_three_node_cluster() {
               maintenance.garbage.end());
         CHECK(std::find(maintenance.live.begin(), maintenance.live.end(), deleted_id) ==
               maintenance.live.end());
+        auto inventory1 = s1.filesystem().maintenance_objects_cached();
+        auto inventory2 = s1.filesystem().maintenance_objects_cached();
+        CHECK(inventory1.get() == inventory2.get());
+        CHECK(inventory1->metadata_generation != 0);
+        CHECK(inventory1->entries >= 2);
+        CHECK(inventory1->extents >= 1);
+        CHECK(std::is_sorted(inventory1->live.begin(), inventory1->live.end()));
+        CHECK(std::adjacent_find(inventory1->live.begin(), inventory1->live.end()) ==
+              inventory1->live.end());
+        CHECK(std::is_sorted(inventory1->garbage.begin(), inventory1->garbage.end()));
+        s1.filesystem().mkdir("/inventory-generation-change", 0755, getuid(), getgid());
+        auto inventory3 = s1.filesystem().maintenance_objects_cached();
+        CHECK(inventory3->metadata_generation > inventory1->metadata_generation);
+        CHECK(inventory3.get() != inventory1.get());
 
         REQUIRE(wait_until([&] {
             try {

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "playback.hpp"
+#include "diagnostics.hpp"
 
 #include "crypto.hpp"
 #include "json.hpp"
@@ -1164,6 +1165,7 @@ struct PlaybackManager::Impl {
     }
 
     void cleanup(std::stop_token stop) {
+        set_thread_name("macha-play-gc");
         while (!stop.stop_requested()) {
             std::vector<std::shared_ptr<Session>> expired;
             {

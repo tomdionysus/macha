@@ -11,7 +11,7 @@ The complete example is `macha.yaml.example`. The important rules are short:
 - `state_path` is not bulk storage. Put it on reliable local system storage.
 - `failure_domain` describes shared fate. Machines in the same site should normally use the same value.
 
-`log_level` is one of `ALL`, `DEBUG`, `INFO`, `WARN` or `ERROR`; default `INFO`. `DEBUG` currently includes expensive write-path diagnostics and is not suitable for throughput measurements.
+`log_level` is one of `ALL`, `DEBUG`, `INFO`, `WARN` or `ERROR`; default `INFO`. `DEBUG` emits low-volume operational/performance diagnostics. `ALL` additionally enables per-object backend/object transfers, complete FUSE request/result traces, payload hashes and detailed extent/write traces; `ALL` is intentionally expensive and is not suitable for throughput measurements.
 
 Start with:
 
