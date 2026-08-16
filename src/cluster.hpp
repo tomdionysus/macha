@@ -95,8 +95,11 @@ class NodeRuntime {
     AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType);
     bool seed_metadata(const MetadataRecord&);
     bool checkpoint_metadata(const MetadataRecord&);
+    bool checkpoint_metadata_delta(const MetadataRecord& base, std::span<const uint8_t>,
+                                   const MetadataRecord& committed);
     bool commit_metadata(uint64_t, const Hash256&);
     bool cas_metadata(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
+    bool cas_metadata_delta(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
     void announce_metadata_generation(uint64_t);
     void enqueue_fetched(const ObjectId&, std::span<const uint8_t>, bool promote);
     void reconfigure_local(const Config&);

@@ -34,3 +34,13 @@ A future EVENT/live implementation should be an explicit media mode, not an alte
 - retain the current bounded memory/spill model without allowing a client request pattern to make production run away through an entire source.
 
 The 0.7.x request logs are useful regression fixtures: any future EVENT mode should make non-sequential edge requests expected and harmless rather than allowing them to redefine playback time unintentionally.
+
+## Metadata after 0.9.0
+
+0.9.0 removes whole-namespace network and durable-write amplification from ordinary mutation by using deterministic delta CAS plus an encrypted local journal. Three scaling costs remain deliberately visible rather than hidden behind another abstraction:
+
+- the canonical `MetadataSnapshot` is still re-encoded to derive every successor hash;
+- changing one very large file carries that file's complete extent manifest in the delta;
+- stale-node/read-repair still exchanges a complete snapshot rather than a range of journal deltas.
+
+If those become material, the next metadata work should be structural rather than another transport tweak: field/extent-manifest deltas for large `FsEntry` values, checkpoint-rooted journal range catch-up for stale replicas, and eventually a persistent indexed snapshot representation that does not require rebuilding the complete canonical byte stream for each mutation. Quorum ordering, mutation IDs and committed-checkpoint recovery should remain unchanged.

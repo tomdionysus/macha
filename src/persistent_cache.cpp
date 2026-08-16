@@ -80,6 +80,8 @@ void PersistentBlockCache::open_locked() {
 
 void PersistentBlockCache::reconfigure(CacheConfig config) {
     std::lock_guard writer(writer_mutex_);
+    std::lock_guard metadata_lock(metadata_mutex_);
+    cached_metadata_hash_.reset();
 
     std::shared_ptr<LocalStore> store;
     size_t limit = 0;
@@ -305,6 +307,8 @@ std::filesystem::path PersistentBlockCache::metadata_path(const CacheConfig& con
 
 void PersistentBlockCache::remember_metadata(const MetadataRecord& record) {
     std::lock_guard metadata_lock(metadata_mutex_);
+    if (cached_metadata_hash_ && *cached_metadata_hash_ == record.hash)
+        return;
     CacheConfig config;
     std::shared_ptr<LocalStore> store;
     {
@@ -323,6 +327,7 @@ void PersistentBlockCache::remember_metadata(const MetadataRecord& record) {
         writer.fixed(sealed.tag);
         writer.bytes(sealed.ciphertext);
         atomic_write(metadata_path(config), writer.data());
+        cached_metadata_hash_ = record.hash;
     } catch (const std::exception& error) {
         Log::debug("persistent metadata cache write: " + std::string(error.what()));
     }
@@ -353,7 +358,10 @@ std::optional<MetadataRecord> PersistentBlockCache::metadata() const {
         auto tag = reader.fixed<16>();
         auto ciphertext = reader.bytes();
         reader.finish();
-        return decode_metadata_record(aes_gcm_open(key_, nonce, tag, ciphertext, cache_meta_magic));
+        auto record =
+            decode_metadata_record(aes_gcm_open(key_, nonce, tag, ciphertext, cache_meta_magic));
+        cached_metadata_hash_ = record.hash;
+        return record;
     } catch (const std::exception& error) {
         Log::debug("persistent metadata cache read: " + std::string(error.what()));
         return {};

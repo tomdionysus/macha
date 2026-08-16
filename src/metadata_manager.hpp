@@ -59,6 +59,10 @@ class MetadataManager {
     CasResult cas_quorum(const std::vector<NodeInfo>&, const MetadataRecord&,
                          std::span<const uint8_t>, size_t required,
                          FrameType frame_type = FrameType::control);
+    CasResult cas_delta_quorum(const std::vector<NodeInfo>&, const MetadataRecord&,
+                               std::span<const uint8_t> delta,
+                               std::span<const uint8_t> proposed_payload, size_t required,
+                               FrameType frame_type = FrameType::control);
 
   public:
     explicit MetadataManager(NodeRuntime&);

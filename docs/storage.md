@@ -52,7 +52,7 @@ Scrub, local rebalance and distributed push repair use persistent filesystem cur
 
 The implemented filesystem operations cover ordinary media-library use: files and directories, create/open/read/write/truncate/unlink, mkdir/rmdir, rename, chmod/chown, timestamps, stat/statfs, directory enumeration, flush and fsync.
 
-0.8.7 does **not** implement symlinks, hard links, extended attributes, distributed advisory locks, full sparse-file semantics, or stable POSIX inode identity across every rename case. Access time is not tracked. Concurrent appenders use file-version CAS rather than a globally serialized append stream.
+0.9.0 does **not** implement symlinks, hard links, extended attributes, distributed advisory locks, full sparse-file semantics, or stable POSIX inode identity across every rename case. Access time is not tracked. Concurrent appenders use file-version CAS rather than a globally serialized append stream.
 
 A failed upload may leave unreachable immutable extents. Online garbage collection only removes objects known to have been dropped from committed metadata after a conservative grace period.
 
@@ -64,8 +64,11 @@ A failed upload may leave unreachable immutable extents. Online garbage collecti
     node.id
     backend-identities/
     metadata/
-        current.meta
-        committed.meta
+        checkpoint.meta
+        journal.log
+        # after first 0.9 migration from 0.8.x:
+        current.meta.v10
+        committed.meta.v10
     tmp/
 
 <storage backend>/
@@ -78,4 +81,4 @@ A failed upload may leave unreachable immutable extents. Online garbage collecti
     metadata/current.meta
 ```
 
-Object writes use unique temporary names, `fsync`, and atomic rename. The state path is exclusively locked so two processes cannot use one node identity at once.
+Object writes use unique temporary names, `fsync`, and atomic rename. Metadata journal records are individually encrypted/authenticated and fsynced before a CAS vote is acknowledged; commit markers are fsynced before the generation becomes a recovery witness. Idle maintenance periodically replaces the journal prefix with one durable full checkpoint. The state path is exclusively locked so two processes cannot use one node identity at once.

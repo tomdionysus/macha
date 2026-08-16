@@ -12,7 +12,7 @@ Losing only `storage` is simpler: namespace and node identity survive, and norma
 
 ## Metadata and split brain
 
-Namespace metadata is a versioned encrypted CAS record held by a configured voter set. Reads and mutations require majority evidence from that set.
+Namespace metadata is a versioned encrypted CAS history held by a configured voter set. The canonical state is a complete snapshot, but ordinary 0.9.0 mutations are transmitted and durably appended as deterministic deltas against an expected generation/hash. Full records are reserved for repair, recovery and policy changes. Reads and mutations still require the same majority evidence from the voter set.
 
 For three voters:
 
@@ -32,11 +32,11 @@ A peer pair uses up to two persistent authenticated bidirectional TCP lanes. `CO
 
 Each lane is canonical independently by authenticated `(NodeId, lane)`, not endpoint text. Simultaneous cross-dial deterministically leaves at most one connection for each lane and drains duplicates before closing them.
 
-Protocol v10 transfers logical RPCs as variable-length AES-256-GCM frames. The authenticated handshake includes the lane and negotiates `network.max_frame_size` to the lower peer limit. The default is 256 KiB and the allowed range is 4 KiB..4 MiB. Frames are not padded to that size and storage extent size is independent of transport frame size. v9-and-earlier peers are intentionally incompatible.
+Protocol v11 transfers logical RPCs as variable-length AES-256-GCM frames. The authenticated handshake includes the lane and negotiates `network.max_frame_size` to the lower peer limit. The default is 256 KiB and the allowed range is 4 KiB..4 MiB. Frames are not padded to that size and storage extent size is independent of transport frame size. v10-and-earlier peers are intentionally incompatible.
 
 For data-class requests, frame priority is `foreground` > `read_ahead` > `speculative`; scheduling is reconsidered after every frame. Transfer-local promotion and cancellation notifications remain on DATA because object-transfer request IDs are scoped to that lane. Health and membership never share a TCP byte stream with object payloads, so bulk retransmission/head-of-line blocking cannot directly delay liveness traffic.
 
-The v10 handshake uses ephemeral X25519 authenticated with HMAC from the shared cluster key. Directional keys are derived with HKDF-SHA256. Server dispatch separately services control and data work, with foreground chosen before read-ahead before speculative queued data. User-originated metadata mutations use read-ahead frame priority and background metadata repair uses speculative frame priority, but both remain on the CONTROL transport so foreground object traffic keeps the DATA connection to itself. Health and membership use control-priority frames on CONTROL and therefore pre-empt fragmented metadata there.
+The v11 handshake uses ephemeral X25519 authenticated with HMAC from the shared cluster key. Directional keys are derived with HKDF-SHA256. Server dispatch separately services control and data work, with foreground chosen before read-ahead before speculative queued data. User-originated metadata mutations use read-ahead frame priority and background metadata repair uses speculative frame priority, but both remain on the CONTROL transport so foreground object traffic keeps the DATA connection to itself. Health and membership use control-priority frames on CONTROL and therefore pre-empt fragmented metadata there.
 
 
 Nodes must be mutually reachable at their advertised addresses. There is no STUN, TURN, UPnP or NAT hole punching.

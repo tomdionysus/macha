@@ -23,7 +23,7 @@ The filesystem live/garbage object index is immutable, stored as a compact sorte
 
 ## Performance diagnostics
 
-`DEBUG` is intended for low-volume operational diagnosis. In 0.8.7 the broad per-thread CPU, lock, maintenance-stage, RPC queue/handler and aggregated storage timing telemetry remains `ALL`-only. `DEBUG` retains slow FUSE operations, compact slow metadata-mutation timings, slow foreground media reads, and slow write-stage timings so viewer and mount latency can be diagnosed without flooding the log. Long-lived worker threads remain named (`macha-maint`, `macha-rpc-health`, `macha-rpc-ctl`, `macha-rpc-data`, `macha-hydrator`, and related names) for `top -H`, `perf` or macOS `sample`.
+`DEBUG` is intended for low-volume operational diagnosis. In 0.9.0 the broad per-thread CPU, lock, maintenance-stage, RPC queue/handler and aggregated storage timing telemetry remains `ALL`-only. `DEBUG` retains slow FUSE operations, compact slow metadata-mutation timings, slow foreground media reads, and slow write-stage timings so viewer and mount latency can be diagnosed without flooding the log. Long-lived worker threads remain named (`macha-maint`, `macha-rpc-health`, `macha-rpc-ctl`, `macha-rpc-data`, `macha-hydrator`, and related names) for `top -H`, `perf` or macOS `sample`.
 
 `ALL` enables the old hot-path trace stream, including individual backend/object transfers, complete FUSE request/result records, read-payload hashes and detailed extent/write diagnostics. Disabled trace-level checks are lock-free. `ALL` is intentionally expensive and should not be used for throughput measurements.
 

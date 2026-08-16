@@ -24,6 +24,7 @@ class PersistentBlockCache {
     mutable std::mutex state_mutex_;
     std::mutex writer_mutex_;
     mutable std::mutex metadata_mutex_;
+    mutable std::optional<Hash256> cached_metadata_hash_;
     CacheConfig config_;
     std::array<uint8_t, 32> key_{};
     std::shared_ptr<LocalStore> store_;

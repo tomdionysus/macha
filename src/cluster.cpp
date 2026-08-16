@@ -247,6 +247,21 @@ bool NodeRuntime::checkpoint_metadata(const MetadataRecord& record) {
     return checkpointed;
 }
 
+bool NodeRuntime::checkpoint_metadata_delta(const MetadataRecord& base,
+                                            std::span<const uint8_t> delta,
+                                            const MetadataRecord& record) {
+    auto before = meta_.committed();
+    const bool checkpointed =
+        meta_.install_committed_delta(base.generation, base.hash, delta, record);
+    if (!checkpointed)
+        return false;
+    auto committed = meta_.committed();
+    members_.metadata_generation(committed.generation);
+    if (committed.hash != before.hash)
+        announce_metadata_generation(committed.generation);
+    return true;
+}
+
 bool NodeRuntime::commit_metadata(uint64_t generation, const Hash256& hash) {
     auto before = meta_.committed();
     const bool checkpointed = meta_.remember_current_committed(generation, hash);
@@ -254,7 +269,6 @@ bool NodeRuntime::commit_metadata(uint64_t generation, const Hash256& hash) {
         return false;
     auto committed = meta_.committed();
     members_.metadata_generation(committed.generation);
-    cache_.remember_metadata(committed);
     if (committed.hash != before.hash)
         announce_metadata_generation(committed.generation);
     return true;
@@ -266,6 +280,13 @@ bool NodeRuntime::cas_metadata(uint64_t generation, const Hash256& hash,
     // observed a quorum. It must not advance the advertised generation or the
     // durable committed checkpoint on its own.
     return meta_.cas(generation, hash, payload, out);
+}
+
+bool NodeRuntime::cas_metadata_delta(uint64_t generation, const Hash256& hash,
+                                     std::span<const uint8_t> delta, MetadataRecord* out) {
+    // Same proposal semantics as full CAS, but the accepted mutation is
+    // journaled as a compact deterministic delta instead of a full snapshot.
+    return meta_.cas_delta(generation, hash, delta, out);
 }
 
 RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcMessage& request) {
@@ -365,6 +386,25 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
                 // successful namespace mutation. A success acknowledgement only
                 // needs enough identity to prove which successor was installed;
                 // conflicts still return the complete current record below.
+                writer.u64(out.generation);
+                writer.fixed(out.previous.bytes);
+                writer.fixed(out.hash.bytes);
+            } else {
+                writer.bytes(encode_metadata_record(out));
+            }
+            return {MessageType::cas_reply, writer.take()};
+        }
+        case MessageType::cas_metadata_delta: {
+            Reader reader(request.payload);
+            auto generation = reader.u64();
+            Hash256 hash{reader.fixed<32>()};
+            auto delta = reader.bytes();
+            reader.finish();
+            MetadataRecord out;
+            bool ok = cas_metadata_delta(generation, hash, delta, &out);
+            Writer writer;
+            writer.u8(ok);
+            if (ok) {
                 writer.u64(out.generation);
                 writer.fixed(out.previous.bytes);
                 writer.fixed(out.hash.bytes);

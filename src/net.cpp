@@ -19,8 +19,8 @@
 
 namespace macha {
 namespace {
-constexpr uint16_t protocol_version = 9;
-constexpr uint32_t frame_magic = 0x4d433130; // "MC10"
+constexpr uint16_t protocol_version = 10;
+constexpr uint32_t frame_magic = 0x4d433131; // "MC11"
 constexpr size_t protocol_min_frame_size = 4 * 1024;
 constexpr size_t protocol_max_frame_size = 4 * 1024 * 1024;
 constexpr size_t max_message_size = 128 * 1024 * 1024;
@@ -116,7 +116,7 @@ Bytes label(const char* prefix, std::span<const uint8_t> data) {
 Bytes session_info(std::span<const uint8_t> transcript, const NodeId& client,
                    const NodeId& server, const char* direction) {
     Writer writer;
-    writer.string("macha/session/v10");
+    writer.string("macha/session/v11");
     writer.string(direction);
     writer.fixed(sha256(transcript).bytes);
     writer.fixed(client.bytes);
@@ -260,6 +260,7 @@ bool is_priority_data_message(MessageType type) {
     case MessageType::have_object:
     case MessageType::get_metadata:
     case MessageType::cas_metadata:
+    case MessageType::cas_metadata_delta:
     case MessageType::seed_metadata:
     case MessageType::checkpoint_metadata:
     case MessageType::commit_metadata:
@@ -411,6 +412,7 @@ const char* message_type_name(MessageType type) noexcept {
     case MessageType::put_object: return "put_object";
     case MessageType::get_metadata: return "get_metadata";
     case MessageType::cas_metadata: return "cas_metadata";
+    case MessageType::cas_metadata_delta: return "cas_metadata_delta";
     case MessageType::seed_metadata: return "seed_metadata";
     case MessageType::metadata_notice: return "metadata_notice";
     case MessageType::get_committed_metadata: return "get_committed_metadata";
@@ -491,7 +493,7 @@ NodeInfo SecureChannel::client_handshake(TransportLane lane) {
 
     Writer envelope;
     envelope.bytes(hello);
-    envelope.fixed(hmac_sha256(keys_.auth, label("client/v10", hello)));
+    envelope.fixed(hmac_sha256(keys_.auth, label("client/v11", hello)));
     send_blob(fd_, envelope.data());
 
     auto response = recv_blob(fd_, 16384);
@@ -500,7 +502,7 @@ NodeInfo SecureChannel::client_handshake(TransportLane lane) {
     auto remote_mac = response_reader.fixed<32>();
     response_reader.finish();
 
-    auto authenticated = label("server/v10", hello);
+    auto authenticated = label("server/v11", hello);
     authenticated.insert(authenticated.end(), ack.begin(), ack.end());
     if (!constant_time_equal(remote_mac, hmac_sha256(keys_.auth, authenticated)))
         throw std::runtime_error("peer auth failed");
@@ -555,7 +557,7 @@ NodeInfo SecureChannel::server_handshake(const std::string& remote_host) {
     auto remote_mac = envelope_reader.fixed<32>();
     envelope_reader.finish();
 
-    if (!constant_time_equal(remote_mac, hmac_sha256(keys_.auth, label("client/v10", hello))))
+    if (!constant_time_equal(remote_mac, hmac_sha256(keys_.auth, label("client/v11", hello))))
         throw std::runtime_error("client auth failed");
 
     Reader reader(hello);
@@ -598,7 +600,7 @@ NodeInfo SecureChannel::server_handshake(const std::string& remote_host) {
     encode_node_info(ack_writer, local_);
     auto ack = ack_writer.take();
 
-    auto authenticated = label("server/v10", hello);
+    auto authenticated = label("server/v11", hello);
     authenticated.insert(authenticated.end(), ack.begin(), ack.end());
     Writer response;
     response.bytes(ack);

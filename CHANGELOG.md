@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.0 - 2026-08-16
+
+- replaced ordinary whole-snapshot metadata mutation with deterministic delta CAS. Filesystem/catalogue mutations now transmit only changed mutation-sequence clocks, changed/deleted namespace entries, catalogue-root changes and newly appended garbage tombstones. The proposer still constructs the canonical resulting snapshot and every voter independently applies the delta and verifies the same generation/hash before acknowledging it; conflict replies and rare policy/reconfiguration operations retain the full-snapshot primitive;
+- replaced per-mutation `current.meta`/`committed.meta` rewrites with an encrypted append-only metadata journal. A successful voter CAS appends a durable prepare record and quorum commit appends a compact commit marker. Accepted-but-uncommitted votes therefore survive restart without becoming recovery witnesses; complete snapshots remain the repair/recovery interchange format;
+- added idle checkpoint compaction. After 128 journal records or 8 MiB of journal growth, the existing speculative metadata-maintenance pass writes one durable committed `checkpoint.meta` and truncates the journal. Checkpoint publication precedes truncation and replay ignores exact generations already covered by the checkpoint, so a crash in the compaction window is idempotent. Compaction never runs on the foreground mutation critical path;
+- automatically migrate 0.8.x metadata state on first 0.9.0 startup. The old committed snapshot becomes the journal checkpoint and any newer accepted current vote is preserved as an uncommitted full-seed journal record before the checkpoint is published. Successfully migrated `current.meta`/`committed.meta` files are renamed with `.v10` suffixes so accidentally starting an older binary fails rather than rolling namespace state backwards;
+- stopped synchronously rewriting the persistent SSD metadata-cache snapshot on every quorum commit. It is refreshed by full checkpoint/repair activity instead and skips identical hashes, leaving ordinary mutation durability entirely on the small voter journals;
+- added compact-delta observability: slow metadata mutation logs now report `mode=delta|snapshot`, `delta_bytes` and `snapshot_bytes`; idle compaction logs the generation, journal record/byte count and checkpoint snapshot size. Added regression coverage for delta codec/application, journal replay, uncommitted-vote recovery, torn-tail recovery and bounded compaction;
+- bumped the authenticated transport to v11 (`MC11`, `macha/session/v11`) for the new `cas_metadata_delta` RPC. v10-and-earlier peers are intentionally incompatible; rolling mixed-version operation is unsupported.
+
 ## 0.8.7 - 2026-08-16
 
 - replaced whole-file rematerialisation for ordinary append/resume writes with an extent-native fast path. Existing complete extents remain immutable manifest references; an unaligned final extent is fetched lazily at most once to seed the append buffer, after which only newly completed extents are stored. Repeated FUSE flush/fsync on an open handle re-arms only the committed partial tail, so later appends remain extent-native;
