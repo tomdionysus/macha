@@ -2395,6 +2395,11 @@ void test_fresh_and_resumed_write_exactness() {
     prefix_writer->commit();
     prefix_writer.reset();
 
+    const auto prefix_entry = service.filesystem().getattr("/resumed.bin");
+    REQUIRE(prefix_entry.extents.size() == 3);
+    const auto first_full = prefix_entry.extents[0];
+    const auto second_full = prefix_entry.extents[1];
+
     auto resumed_writer = service.filesystem().open_write("/resumed.bin", false);
     offset = prefix;
     while (offset < resumed.size()) {
@@ -2403,7 +2408,87 @@ void test_fresh_and_resumed_write_exactness() {
         offset += n;
     }
     resumed_writer->commit();
+    const auto resume_diag = resumed_writer->diagnostics();
+    CHECK(resume_diag.sequential);
+    CHECK(!resume_diag.temp_open);
+    CHECK(resume_diag.append_tail_fetches == 1);
+    CHECK(resume_diag.materialize_source_reads == 0);
+    CHECK(resume_diag.rebuild_reused_extents == 0);
+    CHECK(resume_diag.rebuild_put_extents == 0);
+
+    const auto resumed_entry = service.filesystem().getattr("/resumed.bin");
+    REQUIRE(resumed_entry.extents.size() >= 2);
+    CHECK(resumed_entry.extents[0] == first_full);
+    CHECK(resumed_entry.extents[1] == second_full);
     CHECK(read_exact("/resumed.bin", resumed.size()) == resumed);
+
+    // Extent-aligned resume is even cheaper: no old object is fetched at all.
+    auto aligned = pattern(5 * config.extent_size + 333);
+    service.filesystem().create_file("/aligned.bin", 0644, getuid(), getgid());
+    auto aligned_prefix = service.filesystem().open_write("/aligned.bin", true);
+    REQUIRE(aligned_prefix->write(0, {aligned.data(), 3 * config.extent_size}) ==
+            3 * config.extent_size);
+    aligned_prefix->commit();
+    aligned_prefix.reset();
+    const auto aligned_before = service.filesystem().getattr("/aligned.bin");
+    REQUIRE(aligned_before.extents.size() == 3);
+
+    auto aligned_writer = service.filesystem().open_write("/aligned.bin", false);
+    offset = 3 * config.extent_size;
+    while (offset < aligned.size()) {
+        const auto n = std::min<size_t>(77777, aligned.size() - offset);
+        REQUIRE(aligned_writer->write(offset, {aligned.data() + offset, n}) == n);
+        offset += n;
+    }
+    aligned_writer->commit();
+    const auto aligned_diag = aligned_writer->diagnostics();
+    CHECK(aligned_diag.sequential);
+    CHECK(!aligned_diag.temp_open);
+    CHECK(aligned_diag.append_tail_fetches == 0);
+    CHECK(aligned_diag.materialize_source_reads == 0);
+    CHECK(aligned_diag.rebuild_put_extents == 0);
+    const auto aligned_after = service.filesystem().getattr("/aligned.bin");
+    REQUIRE(aligned_after.extents.size() >= aligned_before.extents.size());
+    for (size_t i = 0; i < aligned_before.extents.size(); ++i)
+        CHECK(aligned_after.extents[i] == aligned_before.extents[i]);
+    CHECK(read_exact("/aligned.bin", aligned.size()) == aligned);
+
+    // A FUSE flush does not close the handle.  Appending again after a commit
+    // must lazily reopen only the newly committed partial tail, not materialise
+    // the complete file.
+    auto more = pattern(777);
+    const auto aligned_old_size = aligned.size();
+    aligned.insert(aligned.end(), more.begin(), more.end());
+    REQUIRE(aligned_writer->write(aligned_old_size, more) == more.size());
+    aligned_writer->commit();
+    const auto aligned_again_diag = aligned_writer->diagnostics();
+    CHECK(!aligned_again_diag.temp_open);
+    CHECK(aligned_again_diag.append_tail_fetches == 1);
+    CHECK(aligned_again_diag.materialize_source_reads == 0);
+    CHECK(aligned_again_diag.rebuild_put_extents == 0);
+    CHECK(read_exact("/aligned.bin", aligned.size()) == aligned);
+
+    // Arbitrary overwrite still uses staging, but unchanged extents are reused
+    // rather than re-put. Change one byte in a four-extent file and assert only
+    // the touched extent is newly stored at rebuild time.
+    auto random_write = pattern(4 * config.extent_size);
+    service.filesystem().create_file("/random.bin", 0644, getuid(), getgid());
+    auto random_seed = service.filesystem().open_write("/random.bin", true);
+    REQUIRE(random_seed->write(0, random_write) == random_write.size());
+    random_seed->commit();
+    random_seed.reset();
+    auto random_writer = service.filesystem().open_write("/random.bin", false);
+    const uint64_t changed_offset = config.extent_size + 1234;
+    const uint8_t changed = static_cast<uint8_t>(random_write[changed_offset] ^ 0x5a);
+    random_write[changed_offset] = changed;
+    REQUIRE(random_writer->write(changed_offset, {&changed, 1}) == 1);
+    random_writer->commit();
+    const auto random_diag = random_writer->diagnostics();
+    CHECK(random_diag.temp_open);
+    CHECK(random_diag.materialize_source_reads == 4);
+    CHECK(random_diag.rebuild_reused_extents == 3);
+    CHECK(random_diag.rebuild_put_extents == 1);
+    CHECK(read_exact("/random.bin", random_write.size()) == random_write);
 
     service.stop();
 }
@@ -3495,7 +3580,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
-    CHECK(status_body.find("\"server_version\":\"0.8.6\"") != std::string::npos);
+    CHECK(status_body.find("\"server_version\":\"0.8.7\"") != std::string::npos);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -4157,7 +4242,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == "0.8.6");
+    CHECK(playback_status_json.find("server_version")->asString() == "0.8.7");
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately

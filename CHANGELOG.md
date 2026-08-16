@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.7 - 2026-08-16
+
+- replaced whole-file rematerialisation for ordinary append/resume writes with an extent-native fast path. Existing complete extents remain immutable manifest references; an unaligned final extent is fetched lazily at most once to seed the append buffer, after which only newly completed extents are stored. Repeated FUSE flush/fsync on an open handle re-arms only the committed partial tail, so later appends remain extent-native;
+- changed the generic arbitrary-overwrite staging fallback to hash each rebuilt extent before storage and reuse an existing committed/staged `ExtentRef` when the bytes are unchanged. A random write therefore rereads the staged file as before but does not retransmit every unaffected object;
+- made mounted-filesystem object writes cooperatively cancellable. The FUSE adapter now owns the high-level libfuse session lifecycle directly, watches the session exit flag installed by libfuse signal handling, and cancels outstanding asynchronous `put_object` RPCs so SIGINT/SIGTERM cannot remain indefinitely behind a blocked FUSE write/flush callback;
+- extended write diagnostics with append-tail/materialisation/new-put/rebuild-reuse counters and retained the 0.8.6 slow-stage timing. Added regression coverage proving unaligned resume fetches only the partial tail, aligned resume fetches no old extents, append-after-flush stays on the fast path, and arbitrary overwrite reuses all untouched extents. Existing byte-for-byte fresh/resumed correctness coverage remains;
+- wire protocol remains v10. The metadata mutation model, playback/UI paths, RPC lane priorities, replication policy and transcoding behaviour are unchanged.
+
 ## 0.8.6 - 2026-08-16
 
 - decoupled catalogue/UI reads from unrelated filesystem metadata generations. Once a catalogue snapshot has been successfully synchronised, ordinary item/list/search API reads use that immutable snapshot immediately; background catalogue maintenance performs convergence. Existing content-addressed media IDs remain pinned to the immutable namespace snapshot that resolved them and only a media-ID cache miss consults newer namespace metadata. Catalogue maintenance still explicitly converges before producing GC liveness so stale API state cannot retain obsolete artwork indefinitely;

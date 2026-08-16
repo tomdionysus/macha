@@ -43,6 +43,11 @@ struct WriteHandleDiagnostics {
     bool sequential{};
     bool temp_open{};
     uint64_t temp_size{};
+    size_t append_tail_fetches{};
+    size_t materialize_source_reads{};
+    size_t new_extent_puts{};
+    size_t rebuild_reused_extents{};
+    size_t rebuild_put_extents{};
 };
 
 class ReadHandle {
@@ -76,12 +81,18 @@ class PlaybackTracker;
     uint64_t logical_{}, staged_{};
     std::vector<ExtentRef> extents_;
     Bytes buffer_;
+    std::optional<ExtentRef> append_tail_;
     int temp_{-1};
     std::filesystem::path temp_path_;
     mutable std::mutex m_;
     uint64_t diagnostic_id_{};
     uint64_t diagnostic_write_sequence_{};
     size_t diagnostic_completed_extents_{};
+    size_t append_tail_fetches_{};
+    size_t materialize_source_reads_{};
+    size_t new_extent_puts_{};
+    size_t rebuild_reused_extents_{};
+    size_t rebuild_put_extents_{};
     struct DiagnosticWriteRange {
         uint64_t sequence{};
         uint64_t offset{};
@@ -91,6 +102,7 @@ class PlaybackTracker;
     std::map<std::pair<uint64_t, size_t>, std::pair<uint64_t, Hash256>> diagnostic_exact_writes_;
     std::vector<DiagnosticWriteRange> diagnostic_writes_;
     std::chrono::milliseconds flush();
+    void prepare_append_tail();
     void materialize();
     void rebuild();
     void cleanup();
@@ -121,6 +133,7 @@ class FileSystem {
     PlaybackTracker* playback_{};
     std::mutex open_writes_mutex_;
     std::vector<std::weak_ptr<WriteHandle>> open_writes_;
+    std::atomic_bool write_cancelled_{};
     // Immutable media ids are used heavily by catalogue/playback resolution.
     // Cache their namespace lookup by metadata generation so playback startup
     // does not linearly re-hash every file for every candidate representation.
@@ -187,6 +200,11 @@ class FileSystem {
         return s_;
     }
     void note_interactive_activity(uint64_t bytes = 0) { s_.interactive_activity(bytes); }
+    void reset_write_cancellation() { write_cancelled_.store(false, std::memory_order_relaxed); }
+    void request_write_cancellation() { write_cancelled_.store(true, std::memory_order_relaxed); }
+    bool write_cancellation_requested() const {
+        return write_cancelled_.load(std::memory_order_relaxed);
+    }
     NodeRuntime& node() {
         return n_;
     }

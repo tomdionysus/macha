@@ -58,11 +58,14 @@ bool DistributedStore::should_own(const ObjectId& id) const {
                        [&](const NodeInfo& node) { return node.id == n_.node_id(); });
 }
 
-ObjectId DistributedStore::put(std::span<const uint8_t> data) {
+ObjectId DistributedStore::put(std::span<const uint8_t> data, std::atomic_bool* cancelled) {
     auto started = Clock::now();
     auto id = object_id(data);
-    if (!put(id, data))
+    if (!put(id, data, cancelled)) {
+        if (cancelled && cancelled->load(std::memory_order_relaxed))
+            throw std::runtime_error("object replication cancelled");
         throw std::runtime_error("object replication quorum unavailable");
+    }
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
     if (Log::enabled(LogLevel::all))
         Log::trace("DIAG object-put id=" + to_string(id) +
@@ -71,7 +74,7 @@ ObjectId DistributedStore::put(std::span<const uint8_t> data) {
     return id;
 }
 
-bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data) {
+bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, std::atomic_bool* cancelled) {
     if (object_id(data) != id)
         throw std::runtime_error("object hash mismatch");
     n_.note_activity(FrameType::read_ahead, data.size());
@@ -148,6 +151,13 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data) {
         return finish(true);
 
     while (true) {
+        if (cancelled && cancelled->load(std::memory_order_relaxed)) {
+            for (auto& item : pending) {
+                if (!item.done && item.rpc)
+                    item.rpc->cancel();
+            }
+            return finish(false);
+        }
         bool progressed = false;
         size_t failures = 0;
         for (auto& item : pending) {

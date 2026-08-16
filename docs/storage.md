@@ -18,7 +18,7 @@ metadata manifest
                               +--> node C / local disk
 ```
 
-Extents are addressed by SHA-256. Sequential writes publish completed extents as they are filled; the whole file is not held in memory. Random writes use a temporary file under `state_path/tmp`; commit rebuilds the extent manifest from staged bytes, with unchanged content deduplicating by object ID.
+Extents are addressed by SHA-256. Sequential writes publish completed extents as they are filled; the whole file is not held in memory. Reopening an existing file for append/resume preserves every complete committed extent by reference. If EOF is inside the final extent, only that one tail extent is fetched lazily to seed the append buffer; aligned appends fetch no old extent data. Repeated flush/fsync on an open append handle re-arms only the committed partial tail, so later writes remain extent-native. Random writes use a temporary file under `state_path/tmp`; commit rebuilds the extent manifest from staged bytes, but unchanged extents are matched by offset/length/content hash and their existing `ExtentRef` is reused instead of retransmitted.
 
 Reads try, in order:
 
@@ -52,7 +52,7 @@ Scrub, local rebalance and distributed push repair use persistent filesystem cur
 
 The implemented filesystem operations cover ordinary media-library use: files and directories, create/open/read/write/truncate/unlink, mkdir/rmdir, rename, chmod/chown, timestamps, stat/statfs, directory enumeration, flush and fsync.
 
-0.8.6 does **not** implement symlinks, hard links, extended attributes, distributed advisory locks, full sparse-file semantics, or stable POSIX inode identity across every rename case. Access time is not tracked. Concurrent appenders use file-version CAS rather than a globally serialized append stream.
+0.8.7 does **not** implement symlinks, hard links, extended attributes, distributed advisory locks, full sparse-file semantics, or stable POSIX inode identity across every rename case. Access time is not tracked. Concurrent appenders use file-version CAS rather than a globally serialized append stream.
 
 A failed upload may leave unreachable immutable extents. Online garbage collection only removes objects known to have been dropped from committed metadata after a conservative grace period.
 
