@@ -283,8 +283,15 @@ void CatalogueManager::repair_once() {
         auto metadata = decode_snapshot(record.payload);
         {
             std::lock_guard lock(mutex_);
-            if (ready_ && cached_root_ == metadata.catalogue_root &&
-                cached_metadata_generation_ == record.generation) {
+            if (ready_ && cached_root_ == metadata.catalogue_root) {
+                // Filesystem namespace mutations advance the global metadata
+                // generation far more often than the catalogue root changes.
+                // The catalogue object itself is immutable/content-addressed,
+                // so an unchanged root means the cached snapshot is still
+                // exactly current. Record convergence without reloading it.
+                cached_metadata_generation_ = record.generation;
+                last_sync_unix_ms_ = unix_ms();
+                error_.clear();
                 return;
             }
         }
@@ -293,13 +300,23 @@ void CatalogueManager::repair_once() {
         cache(record, metadata, std::move(snapshot));
     } catch (const std::exception& e) {
         std::lock_guard lock(mutex_);
-        ready_ = false;
+        // A failed convergence attempt must not invalidate a catalogue snapshot
+        // that was previously loaded successfully. API reads can continue from
+        // that immutable root while background maintenance retries convergence.
         error_ = e.what();
         throw;
     }
 }
 
 CatalogueSnapshot CatalogueManager::current_snapshot() {
+    {
+        std::lock_guard lock(mutex_);
+        if (ready_)
+            return cached_;
+    }
+    // Only the cold/uninitialised path synchronises inline. Once a catalogue
+    // root has been loaded, the service maintenance loop refreshes it in the
+    // background instead of making UI reads participate in metadata quorum I/O.
     repair_once();
     std::lock_guard lock(mutex_);
     return cached_;
@@ -684,9 +701,15 @@ std::optional<Bytes> CatalogueManager::artwork(const ObjectId& id) {
 }
 
 CatalogueMaintenance CatalogueManager::maintenance_objects() {
+    // Maintenance liveness must be based on converged catalogue metadata, not
+    // the deliberately stale-tolerant API cache returned by current_snapshot().
+    // Otherwise an obsolete catalogue root/artwork object can remain marked
+    // live indefinitely after a remote catalogue mutation, preventing GC.
     try {
-        (void)current_snapshot();
+        repair_once();
     } catch (...) {
+        // Conservative failure semantics: if convergence is unavailable, retain
+        // the last known catalogue objects rather than risk deleting live data.
     }
     std::lock_guard lock(mutex_);
     CatalogueMaintenance out;
