@@ -47,6 +47,7 @@ class LocalStore {
     void persist_accounting(uint64_t used, uint8_t operation, const ObjectId&, uint64_t size,
                             bool durable);
     void scan(std::stop_token);
+    bool remove_locked(const ObjectId&);
 
   public:
     LocalStore(std::filesystem::path, uint64_t, std::array<uint8_t, 32>);
@@ -55,12 +56,13 @@ class LocalStore {
     std::optional<Bytes> get(const ObjectId&) const;
     bool has(const ObjectId&) const;
     bool remove(const ObjectId&);
+    bool remove_if_older_than(const ObjectId&, std::chrono::milliseconds);
     std::vector<ObjectId> list() const;
     // Returns one physical object and advances cursor. exhausted is true only
     // when this cursor has reached the end of a complete pass; the next call
     // starts a fresh pass.
     std::optional<ObjectId> next_object(Cursor&, bool& exhausted) const;
-    bool older_than(const ObjectId&, std::chrono::seconds) const;
+    bool older_than(const ObjectId&, std::chrono::milliseconds) const;
     std::filesystem::path object_path(const ObjectId&) const;
     uint64_t stored_size(const ObjectId&) const;
     std::filesystem::file_time_type last_write(const ObjectId&) const;

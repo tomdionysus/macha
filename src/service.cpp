@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <ctime>
+#include <map>
 #include <set>
 #include <thread>
 
@@ -111,29 +112,62 @@ void Service::reload_config() {
     Log::info("reloaded storage backends, persistent cache, catalogue scanner, hydration and streaming limits");
 }
 
-void Service::collect_garbage(const std::vector<ObjectId>& garbage) {
+std::vector<GarbageRef> Service::collect_garbage(const std::vector<GarbageRef>& garbage) {
     const auto grace = node_.config().maintenance.garbage_grace;
-    const auto now = Clock::now();
-    const auto& candidates = garbage;
+    const auto grace_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(grace).count();
+    const auto now_ns = wall_time_ns();
+    std::vector<GarbageRef> matured;
+    matured.reserve(garbage.size());
 
-    for (auto it = garbage_seen_.begin(); it != garbage_seen_.end();) {
-        if (!std::binary_search(candidates.begin(), candidates.end(), it->first))
-            it = garbage_seen_.erase(it);
-        else
-            ++it;
+    for (const auto& candidate : garbage) {
+        // A zero retirement time is a pre-0.10.0 tombstone. It is deliberately
+        // ineligible until maintain_garbage_metadata() stamps it into the new
+        // lifecycle, giving existing stores a fresh full grace period on upgrade.
+        if (candidate.retired_at_ns <= 0 || now_ns < candidate.retired_at_ns ||
+            now_ns - candidate.retired_at_ns < grace_ns)
+            continue;
+
+        // A matured tombstone no longer protects the object from the physical
+        // reachability sweep. Do not delete authoritative bytes here: the sweep
+        // performs an atomic age-check-and-remove, so a recently reaffirmed
+        // identical object survives even if this retirement view is stale. A
+        // cache copy is disposable and can be dropped immediately.
+        node_.block_cache().remove(candidate.id);
+        matured.push_back(candidate);
     }
-    for (const auto& id : candidates)
-        garbage_seen_.try_emplace(id, now);
+    return matured;
+}
 
-    for (const auto& [id, first_seen] : garbage_seen_) {
-        if (now - first_seen >= grace) {
-            // The tombstone is cluster metadata, so every node independently
-            // removes its copy. A disconnected node sees the same tombstone
-            // after rejoining and converges without a remote-delete race.
-            node_.local_store().remove(id);
-            node_.block_cache().remove(id);
+void Service::maintain_garbage_metadata(const std::vector<GarbageRef>& erase,
+                                        const std::vector<GarbageRef>& stamp) {
+    if (erase.empty() && stamp.empty())
+        return;
+
+    std::map<ObjectId, GarbageRef> erase_expected;
+    std::map<ObjectId, GarbageRef> stamp_expected;
+    for (const auto& candidate : erase)
+        erase_expected[candidate.id] = candidate;
+    for (const auto& candidate : stamp)
+        stamp_expected[candidate.id] = candidate;
+
+    metadata_.mutate([&](MetadataSnapshot& snapshot) {
+        std::erase_if(snapshot.garbage, [&](const GarbageRef& current) {
+            auto expected = erase_expected.find(current.id);
+            return expected != erase_expected.end() && expected->second == current;
+        });
+
+        const auto retired = wall_time_ns();
+        for (auto& current : snapshot.garbage) {
+            auto expected = stamp_expected.find(current.id);
+            if (expected == stamp_expected.end() || expected->second != current)
+                continue;
+            // Legacy tombstones have neither a retirement time nor an ABA token.
+            // Stamping rather than immediately collecting them preserves old
+            // storage safely while allowing them to leave metadata after grace.
+            current.retired_at_ns = retired;
+            current.retirement_id = random_node_id();
         }
-    }
+    });
 }
 
 void Service::loop(std::stop_token stop) {
@@ -147,6 +181,7 @@ void Service::loop(std::stop_token stop) {
     auto last_garbage_inventory = Clock::time_point{};
     auto network_quiescent_until = Clock::time_point{};
     auto local_quiescent_until = Clock::time_point{};
+    auto gc_quiescent_until = Clock::time_point{};
     auto scrub_quiescent_until = Clock::time_point{};
     double network_credit = 0.0;
     double local_credit = 0.0;
@@ -228,12 +263,12 @@ void Service::loop(std::stop_token stop) {
             const bool garbage_due =
                 !busy && (last_garbage_inventory == Clock::time_point{} ||
                           now - last_garbage_inventory >= background_interval);
+            const bool gc_due = !busy && now >= gc_quiescent_until;
 
-            // Enumerating every live extent is O(namespace size), and doing it on
-            // every scheduler tick made a settled node burn CPU while performing
-            // no I/O. Build the inventory only when repair can actually spend a
-            // budget or when garbage accounting is due.
-            if (network_due || garbage_due) {
+            // Reachability GC, repair and explicit tombstone accounting share
+            // one immutable namespace inventory. Rebuild it only when one of
+            // those consumers can make progress or metadata has advanced.
+            if (network_due || garbage_due || gc_due) {
                 const auto inventory_stage = Clock::now();
                 auto objects = fs_.maintenance_objects_cached();
                 bool rebuilt_inventory = false;
@@ -242,7 +277,8 @@ void Service::loop(std::stop_token stop) {
                     auto live = std::make_shared<std::vector<ObjectId>>(objects->live);
                     auto universal = std::make_shared<std::vector<ObjectId>>();
                     auto catalogue_objects = catalogue_.maintenance_objects();
-                    live->insert(live->end(), catalogue_objects.live.begin(), catalogue_objects.live.end());
+                    live->insert(live->end(), catalogue_objects.live.begin(),
+                                 catalogue_objects.live.end());
                     universal->insert(universal->end(), catalogue_objects.universal.begin(),
                                       catalogue_objects.universal.end());
                     std::sort(live->begin(), live->end());
@@ -250,10 +286,18 @@ void Service::loop(std::stop_token stop) {
                     std::sort(universal->begin(), universal->end());
                     universal->erase(std::unique(universal->begin(), universal->end()),
                                      universal->end());
-                    maintenance_garbage_ = objects->garbage;
-                    std::erase_if(maintenance_garbage_, [&](const ObjectId& id) {
-                        return std::binary_search(live->begin(), live->end(), id);
-                    });
+
+                    maintenance_garbage_.clear();
+                    maintenance_stale_garbage_.clear();
+                    maintenance_garbage_.reserve(objects->garbage.size());
+                    maintenance_stale_garbage_.reserve(objects->garbage.size());
+                    for (const auto& garbage : objects->garbage) {
+                        if (std::binary_search(live->begin(), live->end(), garbage.id))
+                            maintenance_stale_garbage_.push_back(garbage);
+                        else
+                            maintenance_garbage_.push_back(garbage);
+                    }
+
                     maintenance_inventory_generation_ = objects->metadata_generation;
                     maintenance_live_ = std::move(live);
                     maintenance_universal_ = std::move(universal);
@@ -266,6 +310,8 @@ void Service::loop(std::stop_token stop) {
                                " extents=" + std::to_string(objects->extents) +
                                " live=" + std::to_string(maintenance_live_->size()) +
                                " garbage=" + std::to_string(maintenance_garbage_.size()) +
+                               " stale_garbage=" +
+                               std::to_string(maintenance_stale_garbage_.size()) +
                                " elapsed_ms=" + std::to_string(elapsed_ms(inventory_stage)));
                 }
 
@@ -310,9 +356,69 @@ void Service::loop(std::stop_token stop) {
                         Log::trace("maintenance: repair quiescent; backing off no-progress scan");
                     }
                 }
+
+                bool garbage_metadata_changed = false;
                 if (garbage_due) {
-                    collect_garbage(maintenance_garbage_);
+                    auto matured = collect_garbage(maintenance_garbage_);
+                    std::vector<GarbageRef> legacy;
+                    for (const auto& candidate : maintenance_garbage_) {
+                        if (candidate.retired_at_ns == 0)
+                            legacy.push_back(candidate);
+                    }
+
+                    auto erase = maintenance_stale_garbage_;
+                    erase.insert(erase.end(), matured.begin(), matured.end());
+                    if (!erase.empty() || !legacy.empty()) {
+                        maintain_garbage_metadata(erase, legacy);
+                        garbage_metadata_changed = true;
+                    }
                     last_garbage_inventory = now;
+                }
+
+                // Physical mark/sweep also catches objects that never acquired a
+                // tombstone at all (for example, a data put followed by process
+                // death before metadata CAS). Recent tombstones are protected for
+                // the same grace interval, and legacy tombstones remain protected
+                // until their first 0.10.x maintenance stamp has committed.
+                if (gc_due && !garbage_metadata_changed && maintenance_live_ &&
+                    maintenance_inventory_generation_ >= node_.known_metadata_generation()) {
+                    std::vector<ObjectId> protected_ids;
+                    protected_ids.reserve(maintenance_garbage_.size());
+                    const auto now_ns = wall_time_ns();
+                    const auto grace_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              policy.garbage_grace)
+                                              .count();
+                    for (const auto& candidate : maintenance_garbage_) {
+                        const bool matured = candidate.retired_at_ns > 0 &&
+                                             now_ns >= candidate.retired_at_ns &&
+                                             now_ns - candidate.retired_at_ns >= grace_ns;
+                        if (!matured)
+                            protected_ids.push_back(candidate.id);
+                    }
+                    std::sort(protected_ids.begin(), protected_ids.end());
+                    protected_ids.erase(std::unique(protected_ids.begin(), protected_ids.end()),
+                                        protected_ids.end());
+
+                    const auto gc_stage = Clock::now();
+                    auto gc = node_.local_store().gc_step(
+                        *maintenance_live_, protected_ids, policy.garbage_grace, 64,
+                        [this] {
+                            const auto quiet = node_.config().maintenance.foreground_quiet;
+                            return store_.foreground_idle_for() < quiet ||
+                                   store_.interactive_idle_for() < quiet;
+                        });
+                    log_slow_stage("garbage-collect", gc_stage,
+                                   "reclaimed_bytes=" + std::to_string(gc.bytes) +
+                                   " objects=" + std::to_string(gc.objects));
+                    if (gc.bytes && Log::enabled(LogLevel::debug))
+                        Log::debug("garbage collection reclaimed " + std::to_string(gc.bytes) +
+                                   " local bytes");
+                    if (gc.yielded) {
+                        Log::trace("maintenance: garbage collection yielded to foreground I/O");
+                    } else if (gc.complete) {
+                        gc_quiescent_until = Clock::now() + policy.no_progress_backoff;
+                        Log::trace("maintenance: garbage collection pass complete; backing off");
+                    }
                 }
             }
 

@@ -114,8 +114,9 @@ maintenance:
   # complete object set on every scheduler tick.
   no_progress_backoff_ms: 30000
 
-  # Committed garbage, including superseded catalogue snapshots/artwork, is
-  # retained for this grace period before each node removes its local copy.
+  # Recently retired objects and otherwise-unreachable physical objects must
+  # remain untouched for this long before reachability GC may reclaim them.
+  # Retirement tombstones are pruned after the same grace period.
   garbage_grace_ms: 86400000
 
 # The catalogue itself is cluster metadata and is always present on every node.

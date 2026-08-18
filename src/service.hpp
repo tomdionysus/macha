@@ -7,7 +7,6 @@
 #include "media_catalogue.hpp"
 #include "playback.hpp"
 #include <ctime>
-#include <map>
 #include <memory>
 #include <vector>
 
@@ -28,13 +27,15 @@ class Service {
     PlaybackManager streaming_;
     std::unique_ptr<HttpServer> catalogue_http_;
     std::jthread maintenance_;
-    std::map<ObjectId, Clock::time_point> garbage_seen_;
     uint64_t maintenance_inventory_generation_{};
     std::shared_ptr<const std::vector<ObjectId>> maintenance_live_;
     std::shared_ptr<const std::vector<ObjectId>> maintenance_universal_;
-    std::vector<ObjectId> maintenance_garbage_;
+    std::vector<GarbageRef> maintenance_garbage_;
+    std::vector<GarbageRef> maintenance_stale_garbage_;
     void loop(std::stop_token);
-    void collect_garbage(const std::vector<ObjectId>&);
+    std::vector<GarbageRef> collect_garbage(const std::vector<GarbageRef>&);
+    void maintain_garbage_metadata(const std::vector<GarbageRef>& erase,
+                                   const std::vector<GarbageRef>& stamp);
 
   public:
     Service(Config, ClusterKeys);

@@ -281,12 +281,19 @@ bool LocalStore::put(const ObjectId& i, std::span<const uint8_t> d) {
     if (object_id(d) != i)
         throw std::runtime_error("object hash mismatch");
     auto p = path(i);
-    if (std::filesystem::exists(p))
-        return true;
+    // Existing-object reaffirmation participates in the same mutation lock as
+    // age-conditional GC removal. This closes the check-age/remove race when a
+    // new write reuses an old content hash while maintenance is sweeping it.
     std::unique_lock g(m_);
-    wait_for_accounting(g);
-    if (std::filesystem::exists(p))
+    if (std::filesystem::exists(p)) {
+        touch(i);
         return true;
+    }
+    wait_for_accounting(g);
+    if (std::filesystem::exists(p)) {
+        touch(i);
+        return true;
+    }
     auto s = aes_gcm_seal(key_, d, i.bytes);
     Writer h;
     h.raw(M);
@@ -357,9 +364,7 @@ std::optional<Bytes> LocalStore::get(const ObjectId& i) const {
 bool LocalStore::has(const ObjectId& i) const {
     return std::filesystem::exists(path(i));
 }
-bool LocalStore::remove(const ObjectId& i) {
-    std::unique_lock g(m_);
-    wait_for_accounting(g);
+bool LocalStore::remove_locked(const ObjectId& i) {
     auto p = path(i);
     std::error_code e;
     auto n = std::filesystem::file_size(p, e);
@@ -379,6 +384,22 @@ bool LocalStore::remove(const ObjectId& i) {
     ObjectId none{};
     persist_accounting(before - n, accounting_none, none, 0, false);
     return true;
+}
+
+bool LocalStore::remove(const ObjectId& i) {
+    std::unique_lock g(m_);
+    wait_for_accounting(g);
+    return remove_locked(i);
+}
+
+bool LocalStore::remove_if_older_than(const ObjectId& i, std::chrono::milliseconds age) {
+    std::unique_lock g(m_);
+    wait_for_accounting(g);
+    std::error_code error;
+    const auto modified = std::filesystem::last_write_time(path(i), error);
+    if (error || std::filesystem::file_time_type::clock::now() - modified < age)
+        return false;
+    return remove_locked(i);
 }
 std::vector<ObjectId> LocalStore::list() const {
     std::vector<ObjectId> out;
@@ -452,7 +473,7 @@ void LocalStore::touch(const ObjectId& i) {
     std::error_code e;
     std::filesystem::last_write_time(path(i), std::filesystem::file_time_type::clock::now(), e);
 }
-bool LocalStore::older_than(const ObjectId& i, std::chrono::seconds age) const {
+bool LocalStore::older_than(const ObjectId& i, std::chrono::milliseconds age) const {
     std::error_code e;
     auto t = std::filesystem::last_write_time(path(i), e);
     if (e)

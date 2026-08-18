@@ -29,7 +29,7 @@ struct MaintenanceObjects {
     // Sorted/unique compact indexes. A vector is materially smaller than a
     // tree node per extent on media namespaces containing millions of objects.
     std::vector<ObjectId> live;
-    std::vector<ObjectId> garbage;
+    std::vector<GarbageRef> garbage;
     uint64_t metadata_generation{};
     size_t entries{};
     size_t extents{};

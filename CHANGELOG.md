@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.0 - 2026-08-18
+
+- replace tombstone-only object reclamation with bounded local reachability GC. Each node walks its own authoritative object files with a persistent cursor, marks the combined committed filesystem+catalogue object set live, and removes unreachable objects only after `maintenance.garbage_grace_ms`; this also reclaims immutable objects left behind when a data put completed but its metadata mutation never committed;
+- make physical GC cooperative with foreground work and bounded to 64 examined objects per scheduler slice. Age-check-and-remove is atomic with respect to `LocalStore::put()`, and reaffirming an already-present content hash refreshes its age, so a concurrent/retried write cannot lose an old identical object to the orphan sweep;
+- make garbage tombstones finite. SM8 records a committed retirement time plus an ABA-safe retirement ID; DLT2 can upsert and erase tombstones, live reachability removes stale tombstones, and matured retirements are pruned after the grace period. Pre-0.10 tombstones are stamped on first maintenance and receive a fresh full grace period rather than being collected immediately;
+- keep storage compatibility with existing installations without adding mixed-protocol fallback. SM5/SM6/SM7 snapshots remain readable, and persisted DLT1 journal records replay using the exact historical SM7 successor encoding so their stored hashes remain valid. Existing encrypted object files and backend/accounting layouts are unchanged; newly written metadata uses SM8/DLT2;
+- bump the authenticated transport to v13 (`MC13`, `macha/session/v13`, protocol field 13) for DLT2 metadata mutation. v12-and-earlier peers are intentionally incompatible; stop the whole cluster before upgrading. After 0.10.0 writes SM8/DLT2 metadata, rollback to 0.9.x metadata handling is unsupported.
+
 ## 0.9.4 - 2026-08-18
 
 - allow partial catalogue scans when configured roots are absent: available roots still add/update media, while destructive pruning is deferred until every configured root is traversable;

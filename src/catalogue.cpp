@@ -6,6 +6,7 @@
 #include "log.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <cctype>
 #include <cmath>
 #include <tuple>
@@ -93,10 +94,18 @@ double score(std::string_view query, const CatalogueItem& item) {
 }
 
 void append_garbage(MetadataSnapshot& snapshot, const ObjectId& id) {
-    if (std::find_if(snapshot.garbage.begin(), snapshot.garbage.end(),
-                     [&](const GarbageRef& candidate) { return candidate.id == id; }) ==
-        snapshot.garbage.end())
-        snapshot.garbage.push_back({id});
+    auto existing = std::find_if(snapshot.garbage.begin(), snapshot.garbage.end(),
+                                 [&](const GarbageRef& candidate) { return candidate.id == id; });
+    auto retired = wall_time_ns();
+    if (existing != snapshot.garbage.end()) {
+        if (retired <= existing->retired_at_ns &&
+            existing->retired_at_ns < std::numeric_limits<int64_t>::max())
+            retired = existing->retired_at_ns + 1;
+        existing->retired_at_ns = retired;
+        existing->retirement_id = random_node_id();
+    } else {
+        snapshot.garbage.push_back({id, retired, random_node_id()});
+    }
 }
 
 bool valid_kind(uint8_t value) {

@@ -44,3 +44,9 @@ The 0.7.x request logs are useful regression fixtures: any future EVENT mode sho
 - stale-node/read-repair still exchanges a complete snapshot rather than a range of journal deltas.
 
 If those become material, the next metadata work should be structural rather than another transport tweak: field/extent-manifest deltas for large `FsEntry` values, checkpoint-rooted journal range catch-up for stale replicas, and eventually a persistent indexed snapshot representation that does not require rebuilding the complete canonical byte stream for each mutation. Quorum ordering, mutation IDs and committed-checkpoint recovery should remain unchanged.
+
+## Physical small-object packing after 0.10.0
+
+0.10.0 garbage collection operates on logical content-addressed `ObjectId`s and the current local representation remains one encrypted `<sha256>.obj` file per object. `extent_size` is a logical chunk ceiling, not a fixed physical allocation unit, so GC does not need to repack partially dead 4 MiB containers.
+
+If large catalogues, subtitles or other future metadata create enough tiny objects for per-file filesystem overhead to matter, packing should remain a node-local `LocalStore` representation detail. The logical `ObjectId`, `ExtentRef`, DHT ownership and replication model should not change. A local index can map `ObjectId -> pack/offset/length`, while GC continues to mark individual object IDs. Pack compaction should be driven by reclaimable bytes/utilisation versus rewrite cost, with a minimum useful reclaim threshold, rather than by a fixed number of dead objects.

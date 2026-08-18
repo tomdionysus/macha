@@ -8,9 +8,9 @@ Macha is a C++20 distributed filesystem and media server for large, mostly immut
 
 There is no permanent master, cloud service or account system. Nodes share one cluster key, discover membership through bootstrap peers, and converge placement and replicas in the background.
 
-0.9.3 is usable but experimental. It is deliberately a media filesystem/server rather than a complete general-purpose POSIX filesystem. Streaming was introduced in 0.7.0 and links the FFmpeg libraries directly when enabled; no media subprocesses are launched.
+0.10.0 is usable but experimental. It is deliberately a media filesystem/server rather than a complete general-purpose POSIX filesystem. Streaming was introduced in 0.7.0 and links the FFmpeg libraries directly when enabled; no media subprocesses are launched.
 
-**0.9.x upgrade:** stop every node before upgrading. 0.9.0 first start migrates `state_path/metadata` to the checkpoint+journal format; 0.9.3 transport v12 rejects v11-and-earlier peers. Back up `state_path` first; rollback to a pre-0.9 binary after migration is unsupported.
+**0.10.0 upgrade:** stop every node before upgrading. Transport v13 rejects v12-and-earlier peers; mixed-version operation is not supported. Existing 0.9.x SM7 checkpoints, DLT1 metadata journals, encrypted object files and backend accounting are read in place. New metadata is written as SM8/DLT2. Back up `state_path` first; after 0.10.0 has written new metadata, rollback to 0.9.x is unsupported.
 
 ## Documentation
 

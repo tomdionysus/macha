@@ -37,6 +37,11 @@ NodeInfo self_info(const Config& config, const NodeId& id, uint64_t used, uint64
     return node;
 }
 
+bool current_metadata_delta(std::span<const uint8_t> data) {
+    static constexpr std::array<uint8_t, 8> magic{'D', 'H', 'T', 'M', 'D', 'L', 'T', '2'};
+    return data.size() >= magic.size() && std::equal(magic.begin(), magic.end(), data.begin());
+}
+
 RpcMessage error_reply(const std::string& text) {
     Writer writer;
     writer.string(text);
@@ -286,8 +291,11 @@ bool NodeRuntime::cas_metadata(uint64_t generation, const Hash256& hash,
 
 bool NodeRuntime::cas_metadata_delta(uint64_t generation, const Hash256& hash,
                                      std::span<const uint8_t> delta, MetadataRecord* out) {
-    // Same proposal semantics as full CAS, but the accepted mutation is
-    // journaled as a compact deterministic delta instead of a full snapshot.
+    // The v13 wire protocol has exactly one delta representation. MetadataReplica
+    // still understands DLT1 solely so an existing pre-0.10 journal can replay
+    // locally; accepting it here would turn storage migration into wire fallback.
+    if (!current_metadata_delta(delta))
+        throw std::runtime_error("unsupported metadata delta version");
     return meta_.cas_delta(generation, hash, delta, out);
 }
 

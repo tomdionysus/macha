@@ -24,6 +24,8 @@ struct CacheConfig {
 struct MaintenanceConfig {
     std::chrono::milliseconds interval{500};
     std::chrono::milliseconds foreground_quiet{2000};
+    // Minimum retirement/orphan age before authoritative reachability GC may
+    // reclaim an unreferenced physical object.
     std::chrono::milliseconds garbage_grace{std::chrono::hours(24)};
     double busy_bandwidth_fraction{0.0};
     double idle_bandwidth_fraction{0.50};
