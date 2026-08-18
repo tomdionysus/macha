@@ -103,8 +103,8 @@ class FakeMediaEngine final : public MediaEngine {
         result.format = "mov,mp4,m4a,3gp,3g2,mj2";
         result.duration_seconds = 60.0;
         result.bitrate = 4'000'000;
-        result.streams.push_back(MediaStreamInfo{0, MediaStreamType::video, "h264", "High", "", 1920, 1080, 0, 0, 8, true, false});
-        result.streams.push_back(MediaStreamInfo{1, MediaStreamType::audio, "aac", "LC", "eng", 0, 0, 2, 48000, 0, true, false});
+        result.streams.push_back(MediaStreamInfo{0, MediaStreamType::video, "h264", "High", "", 1920, 1080, 0, 0, 8, true, false, 3'700'000});
+        result.streams.push_back(MediaStreamInfo{1, MediaStreamType::audio, "aac", "LC", "eng", 0, 0, 2, 48000, 0, true, false, 192'000});
         result.streams.push_back(MediaStreamInfo{2, MediaStreamType::subtitle, "subrip", "", "eng", 0, 0, 0, 0, 0, false, false});
         return result;
     }
@@ -190,8 +190,8 @@ class BlockingMediaEngine final : public MediaEngine {
         result.format = "matroska,webm";
         result.duration_seconds = 60.0;
         result.bitrate = 4'000'000;
-        result.streams.push_back(MediaStreamInfo{0, MediaStreamType::video, "h264", "High", "", 1920, 1080, 0, 0, 8, true, false});
-        result.streams.push_back(MediaStreamInfo{1, MediaStreamType::audio, "aac", "LC", "eng", 0, 0, 2, 48000, 0, true, false});
+        result.streams.push_back(MediaStreamInfo{0, MediaStreamType::video, "h264", "High", "", 1920, 1080, 0, 0, 8, true, false, 3'700'000});
+        result.streams.push_back(MediaStreamInfo{1, MediaStreamType::audio, "aac", "LC", "eng", 0, 0, 2, 48000, 0, true, false, 192'000});
         return result;
     }
     HlsVodPlan prepare_hls_vod(const MediaSource&, const PlaybackPlan& plan, double duration_seconds,
@@ -3291,6 +3291,54 @@ void test_media_probe_and_online_catalogue_scanner() {
     CHECK(movie->title == "Blade Runner 2049");
     CHECK(movie->year == 2017);
 
+    struct MovieRegression { const char* path; const char* title; int year; };
+    for (const auto& regression : std::array{
+             MovieRegression{"/Movies/01 Men In Black 1 - Will Smith 1997 Eng Ita Multi-Subs 1080p [H264-mp4].mp4", "Men In Black 1", 1997},
+             MovieRegression{"/Movies/02 Men In Black 2 - Will Smith 2002 Eng Ita Multi-Subs 1080p [H264-mp4].mp4", "Men In Black 2", 2002},
+             MovieRegression{"/Movies/03 Men In Black 3 - Will Smith 2012 Eng Ita Multi-Subs 1080p [H264-mp4].mp4", "Men In Black 3", 2012},
+             MovieRegression{"/Movies/12.Monkeys.1995.1080p.BluRay.x264.AAC5.1.mp4", "12 Monkeys", 1995},
+             MovieRegression{"/Movies/1994.Pulp.Fiction.1920x816.BDRip.x264.DTS-HD.MA.mkv", "Pulp Fiction", 1994},
+         }) {
+        auto parsed = probe_media_path(regression.path, fake);
+        REQUIRE(parsed.has_value());
+        CHECK(parsed->kind == MediaProbeKind::movie);
+        CHECK(parsed->title == regression.title);
+        CHECK(parsed->year == regression.year);
+    }
+
+    struct EpisodeRegression {
+        const char* path;
+        const char* series;
+        int year;
+        int season;
+        int episode;
+        const char* title;
+    };
+    for (const auto& regression : std::array{
+             EpisodeRegression{"/TV/Big.Mistakes.S01E08.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Big Mistakes", 0, 1, 8, ""},
+             EpisodeRegression{"/TV/Stranger.Things.S05E01.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 1, ""},
+             EpisodeRegression{"/TV/Stranger.Things.S05E03.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 3, ""},
+             EpisodeRegression{"/TV/Stranger.Things.S05E04.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 4, ""},
+             EpisodeRegression{"/TV/Stranger.Things.S05E05.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 5, ""},
+             EpisodeRegression{"/TV/Stranger.Things.S05E06.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 6, ""},
+             EpisodeRegression{"/TV/Stranger.Things.S05E08.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 8, ""},
+             EpisodeRegression{"/TV/Black Books (2000)/Black Books (2000) - S01E01 - Cooking the Books (576p DVD x265 Ghost).mkv", "Black Books", 2000, 1, 1, "Cooking the Books"},
+             EpisodeRegression{"/TV/Black Books (2000)/S01E02.mkv", "Black Books", 2000, 1, 2, ""},
+             EpisodeRegression{"/TV/Blackadder.1982.S01-S04.1080p.BluRay.EAC3.2.0.x265-iVy/S01E01.mkv", "Blackadder", 1982, 1, 1, ""},
+             EpisodeRegression{"/TV/Black.Jesus.S01.1080p.AMZN.WEBRip.DDP5.1.x264-Cinefeel[rartv]/S01E01.mkv", "Black Jesus", 0, 1, 1, ""},
+             EpisodeRegression{"/TV/Black.Jesus.S02.1080p.WEB-DL.DD5.1.H.264-BTN[rartv]/S02E01.mkv", "Black Jesus", 0, 2, 1, ""},
+         }) {
+        auto parsed = probe_media_path(regression.path, fake);
+        REQUIRE(parsed.has_value());
+        CHECK(parsed->kind == MediaProbeKind::episode);
+        CHECK(parsed->series == regression.series);
+        CHECK(parsed->season == regression.season);
+        CHECK(parsed->episode == regression.episode);
+        CHECK(parsed->title == regression.title);
+        if (regression.year) CHECK(parsed->year == regression.year);
+        else CHECK(!parsed->year.has_value());
+    }
+
     auto track = probe_media_path(
         "/Music/Pink Floyd/The Dark Side of the Moon/01 - Speak to Me.flac", fake);
     REQUIRE(track.has_value());
@@ -3414,7 +3462,9 @@ void test_media_probe_and_online_catalogue_scanner() {
     scanner_config.musicbrainz.enabled = false;
     CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(),
                              scanner_config, std::move(fake_http));
+    const auto namespace_before_scan = service.filesystem().namespace_signature();
     CHECK(scanner.scan_once() == 1);
+    CHECK(service.filesystem().namespace_signature() == namespace_before_scan);
     auto catalogued = service.catalogue().get("tmdb:movie:335984");
     REQUIRE(catalogued.has_value());
     CHECK(catalogued->title == "Blade Runner 2049");
@@ -3438,6 +3488,7 @@ void test_media_probe_and_online_catalogue_scanner() {
     auto alternate_writer = service.filesystem().open_write(alternate, true);
     REQUIRE(alternate_writer->write(0, alternate_bytes) == alternate_bytes.size());
     alternate_writer->commit();
+    CHECK(service.filesystem().namespace_signature() != namespace_before_scan);
     auto alternate_id = file_media_id(service.filesystem().getattr(alternate));
     CHECK(alternate_id != media_id);
     CHECK(scanner.scan_once() == 1);
@@ -3676,7 +3727,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
-    CHECK(status_body.find("\"server_version\":\"0.9.0\"") != std::string::npos);
+    CHECK(status_body.find("\"server_version\":\"0.9.1\"") != std::string::npos);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -4338,7 +4389,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == "0.9.0");
+    CHECK(playback_status_json.find("server_version")->asString() == "0.9.1");
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately
@@ -4399,7 +4450,22 @@ void test_playback_sessions_and_streaming_http_bodies() {
     REQUIRE(created.status == 201);
     auto created_json = Json::parse(std::string(created.body.begin(), created.body.end()));
     CHECK(created_json.find("mode")->asString() == "direct");
-    CHECK(created_json.find("subtitle_url")->isNull());
+    REQUIRE(created_json.find("stream") != nullptr);
+    CHECK(created_json.find("stream")->find("subtitle_url")->isNull());
+    REQUIRE(created_json.find("source") != nullptr);
+    CHECK(created_json.find("source")->find("format")->asString() == "mov,mp4,m4a,3gp,3g2,mj2");
+    CHECK(created_json.find("source")->find("bitrate")->asUInt64() == 4'000'000);
+    REQUIRE(created_json.find("source")->find("streams")->isArray());
+    CHECK(created_json.find("source")->find("streams")->asArray().size() == 3);
+    CHECK(created_json.find("source")->find("streams")->asArray()[0].find("bitrate")->asUInt64() == 3'700'000);
+    CHECK(created_json.find("source")->find("streams")->asArray()[1].find("bitrate")->asUInt64() == 192'000);
+    REQUIRE(created_json.find("output") != nullptr);
+    CHECK(created_json.find("output")->find("video")->find("transform")->asString() == "copy");
+    CHECK(created_json.find("output")->find("video")->find("bitrate")->asUInt64() == 3'700'000);
+    CHECK(created_json.find("output")->find("audio")->find("transform")->asString() == "copy");
+    CHECK(created_json.find("output")->find("audio")->find("bitrate")->asUInt64() == 192'000);
+    REQUIRE(created_json.find("preferences") != nullptr);
+    CHECK(created_json.find("preferences")->find("mode")->asString() == "auto");
     REQUIRE(created_json.find("options") != nullptr);
     auto options = created_json.find("options");
     REQUIRE(options->find("audio_streams") != nullptr);
@@ -4408,8 +4474,10 @@ void test_playback_sessions_and_streaming_http_bodies() {
     CHECK(options->find("audio_streams")->asArray().front().isObject());
     REQUIRE(options->find("media_ids") != nullptr);
     CHECK(options->find("media_ids")->asArray().size() == 1);
+    REQUIRE(options->find("quality_heights") != nullptr);
+    CHECK(!options->find("quality_heights")->asArray().empty());
     auto session_id = created_json.find("session_id")->asString();
-    auto direct_url = created_json.find("stream_url")->asString();
+    auto direct_url = created_json.find("stream")->find("url")->asString();
 
     HttpRequest direct;
     direct.method = "GET";
@@ -4431,6 +4499,43 @@ void test_playback_sessions_and_streaming_http_bodies() {
     bad_track.path = "/api/v1/playback/sessions/" + session_id;
     bad_track.body.assign(bad_track_text.begin(), bad_track_text.end());
     CHECK(playback.handle(bad_track).status == 400);
+
+    // Quality is a real session preference, not a client-only label. Requesting
+    // 720p must rebuild the session at 720p and advertise only modes compatible
+    // with that quality constraint.
+    Json::Object quality_preferences{{"mode", "auto"}, {"max_height", 720}};
+    Json::Object quality_root{{"preferences", Json(std::move(quality_preferences))}};
+    auto quality_text = Json(std::move(quality_root)).dump();
+    HttpRequest quality;
+    quality.method = "PATCH";
+    quality.path = "/api/v1/playback/sessions/" + session_id;
+    quality.body.assign(quality_text.begin(), quality_text.end());
+    auto quality_response = playback.handle(quality);
+    REQUIRE(quality_response.status == 200);
+    auto quality_json = Json::parse(std::string(quality_response.body.begin(), quality_response.body.end()));
+    CHECK(quality_json.find("mode")->asString() == "transcode");
+    CHECK(quality_json.find("preferences")->find("mode")->asString() == "auto");
+    CHECK(quality_json.find("preferences")->find("max_height")->asInt64() == 720);
+    CHECK(quality_json.find("output")->find("video")->find("codec")->asString() == "h264");
+    CHECK(quality_json.find("output")->find("video")->find("height")->asInt64() == 720);
+    auto quality_modes = quality_json.find("options")->find("modes")->asArray();
+    CHECK(std::none_of(quality_modes.begin(), quality_modes.end(), [](const Json& mode) {
+        return mode.asString() == "direct" || mode.asString() == "remux";
+    }));
+
+    Json::Object restore_preferences{{"mode", "auto"}, {"max_height", Json(nullptr)},
+                                     {"max_bitrate", Json(nullptr)}};
+    Json::Object restore_root{{"preferences", Json(std::move(restore_preferences))}};
+    auto restore_text = Json(std::move(restore_root)).dump();
+    HttpRequest restore;
+    restore.method = "PATCH";
+    restore.path = "/api/v1/playback/sessions/" + session_id;
+    restore.body.assign(restore_text.begin(), restore_text.end());
+    auto restore_response = playback.handle(restore);
+    REQUIRE(restore_response.status == 200);
+    auto restore_json = Json::parse(std::string(restore_response.body.begin(), restore_response.body.end()));
+    CHECK(restore_json.find("mode")->asString() == "direct");
+    CHECK(restore_json.find("preferences")->find("max_height")->isNull());
 
     Json::Object unsupported_caps{{"containers", Json::Array{}},
                                   {"video_codecs", Json::Array{Json("vp9")}},
@@ -4458,8 +4563,13 @@ void test_playback_sessions_and_streaming_http_bodies() {
     REQUIRE(patched.status == 200);
     auto patched_json = Json::parse(std::string(patched.body.begin(), patched.body.end()));
     CHECK(patched_json.find("mode")->asString() == "transcode");
-    auto hls_url = patched_json.find("stream_url")->asString();
-    auto subtitle_url = patched_json.find("subtitle_url")->asString();
+    CHECK(patched_json.find("preferences")->find("mode")->asString() == "transcode");
+    CHECK(patched_json.find("output")->find("video")->find("transform")->asString() == "transcode");
+    CHECK(patched_json.find("output")->find("video")->find("codec")->asString() == "h264");
+    CHECK(patched_json.find("output")->find("audio")->find("transform")->asString() == "transcode");
+    CHECK(patched_json.find("output")->find("audio")->find("bitrate")->asUInt64() == 192000);
+    auto hls_url = patched_json.find("stream")->find("url")->asString();
+    auto subtitle_url = patched_json.find("stream")->find("subtitle_url")->asString();
 
     HttpRequest playlist;
     playlist.method = "GET";
@@ -4505,7 +4615,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     REQUIRE(path_created.status == 201);
     auto path_json = Json::parse(std::string(path_created.body.begin(), path_created.body.end()));
     auto path_session_id = path_json.find("session_id")->asString();
-    auto path_stream_url = path_json.find("stream_url")->asString();
+    auto path_stream_url = path_json.find("stream")->find("url")->asString();
 
     auto replacement_bytes = bytes;
     for (auto& byte : replacement_bytes) byte ^= 0x5a;

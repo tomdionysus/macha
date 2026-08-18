@@ -403,6 +403,84 @@ Json stream_json(const MediaStreamInfo& stream) {
     if (stream.channels) out["channels"] = stream.channels;
     if (stream.sample_rate) out["sample_rate"] = stream.sample_rate;
     if (stream.bit_depth) out["bit_depth"] = stream.bit_depth;
+    if (stream.bitrate) out["bitrate"] = stream.bitrate;
+    return Json(std::move(out));
+}
+
+const MediaStreamInfo* stream_at(const MediaProbeResult& probe, int index) {
+    if (index < 0) return nullptr;
+    for (const auto& stream : probe.streams)
+        if (stream.index == index) return &stream;
+    return nullptr;
+}
+
+std::string transform_name(MediaTransform transform) {
+    switch (transform) {
+    case MediaTransform::copy: return "copy";
+    case MediaTransform::transcode: return "transcode";
+    case MediaTransform::omit: return "omit";
+    }
+    return "omit";
+}
+
+Json preferences_json(const PlaybackPreferences& preferences) {
+    Json::Object out{{"mode", preferences.mode},
+                     {"max_height", preferences.max_height ? Json(*preferences.max_height) : Json(nullptr)},
+                     {"max_bitrate", preferences.max_bitrate ? Json(*preferences.max_bitrate) : Json(nullptr)},
+                     {"audio_stream", preferences.audio_stream ? Json(*preferences.audio_stream) : Json(nullptr)},
+                     {"subtitle_stream", preferences.subtitle_stream ? Json(*preferences.subtitle_stream) : Json(nullptr)},
+                     {"audio_language", preferences.audio_language},
+                     {"subtitle_language", preferences.subtitle_language}};
+    return Json(std::move(out));
+}
+
+Json output_json(const MediaProbeResult& probe, const PlaybackPlan& plan,
+                 std::string_view source_format) {
+    Json::Object out{{"format", plan.mode == PlaybackMode::direct ? std::string(source_format) : "mp4"}};
+
+    if (const auto* video = stream_at(probe, plan.video_stream); video && plan.video != MediaTransform::omit) {
+        Json::Object value{{"source_stream", video->index},
+                           {"transform", transform_name(plan.video)},
+                           {"codec", plan.video_codec}};
+        int height = video->height;
+        int width = video->width;
+        if (plan.video == MediaTransform::transcode && plan.target_height && video->height > *plan.target_height) {
+            height = std::max(2, *plan.target_height & ~1);
+            if (video->width > 0 && video->height > 0) {
+                width = static_cast<int>(std::llround(static_cast<double>(video->width) *
+                                                      static_cast<double>(height) /
+                                                      static_cast<double>(video->height)));
+                width = std::max(2, width & ~1);
+            }
+        }
+        if (width) value["width"] = width;
+        if (height) value["height"] = height;
+        if (plan.video == MediaTransform::copy) {
+            if (!video->profile.empty()) value["profile"] = video->profile;
+            if (video->bitrate) value["bitrate"] = video->bitrate;
+        }
+        if (plan.video == MediaTransform::transcode && plan.target_video_bitrate)
+            value["bitrate"] = *plan.target_video_bitrate;
+        out["video"] = Json(std::move(value));
+    }
+
+    if (const auto* audio = stream_at(probe, plan.audio_stream); audio && plan.audio != MediaTransform::omit) {
+        Json::Object value{{"source_stream", audio->index},
+                           {"transform", transform_name(plan.audio)},
+                           {"codec", plan.audio_codec}};
+        if (plan.audio == MediaTransform::transcode) {
+            value["channels"] = 2;
+            value["sample_rate"] = audio->sample_rate > 0 ? audio->sample_rate : 48000;
+            value["bitrate"] = static_cast<uint64_t>(192000);
+        } else {
+            if (audio->channels) value["channels"] = audio->channels;
+            if (audio->sample_rate) value["sample_rate"] = audio->sample_rate;
+            if (audio->bit_depth) value["bit_depth"] = audio->bit_depth;
+            if (audio->bitrate) value["bitrate"] = audio->bitrate;
+            if (!audio->profile.empty()) value["profile"] = audio->profile;
+        }
+        out["audio"] = Json(std::move(value));
+    }
     return Json(std::move(out));
 }
 
@@ -463,6 +541,21 @@ struct PlaybackManager::Impl {
 
     std::string public_stream_prefix(const Session& session) const {
         return "/api/v1/playback/stream/" + session.id + "/" + session.token;
+    }
+
+    bool plan_supported(const PlaybackPlan& plan) const {
+        if (!engine) return plan.video != MediaTransform::transcode && plan.audio != MediaTransform::transcode;
+        const auto status = engine->status();
+        if (plan.video == MediaTransform::transcode && !status.h264_encoder) return false;
+        if (plan.audio == MediaTransform::transcode && !status.aac_encoder) return false;
+        return true;
+    }
+
+    void require_plan_supported(const PlaybackPlan& plan) const {
+        if (plan_supported(plan)) return;
+        if (plan.video == MediaTransform::transcode && (!engine || !engine->status().h264_encoder))
+            throw std::invalid_argument("server H.264 encoder is unavailable");
+        throw std::invalid_argument("server AAC encoder is unavailable");
     }
 
     SourceLease create_source(std::string_view media_id) {
@@ -711,6 +804,7 @@ struct PlaybackManager::Impl {
                 auto lease = create_source(media_id);
                 auto probe = probe_source(lease, trace, resolve_deadline);
                 auto plan = negotiate(probe, lease.path, capabilities, preferences);
+                require_plan_supported(plan);
                 int rank = plan.mode == PlaybackMode::direct ? 0 : (plan.mode == PlaybackMode::remux ? 1 : 2);
                 Log::debug("playback[" + std::string(trace) + "] candidate media=" + media_id +
                            " mode=" + playback_mode_name(plan.mode) + " rank=" + std::to_string(rank));
@@ -776,54 +870,106 @@ struct PlaybackManager::Impl {
         Json::Object selected{{"video_stream", session.plan.video_stream},
                               {"audio_stream", session.plan.audio_stream},
                               {"subtitle_stream", session.plan.subtitle_stream}};
-        Json::Object transformations{{"video", session.plan.video == MediaTransform::copy ? "copy" :
-                                                   session.plan.video == MediaTransform::transcode ? "transcode" : "omit"},
-                                     {"audio", session.plan.audio == MediaTransform::copy ? "copy" :
-                                                   session.plan.audio == MediaTransform::transcode ? "transcode" : "omit"}};
         Json::Array modes;
         for (const auto* candidate : {"direct", "remux", "transcode"}) {
             auto preferences = session.preferences;
             preferences.mode = candidate;
             try {
-                (void)negotiate(session.probe, session.source.logical_path, session.capabilities, preferences);
-                modes.emplace_back(candidate);
+                const auto plan = negotiate(session.probe, session.source.logical_path,
+                                            session.capabilities, preferences);
+                if (plan_supported(plan)) modes.emplace_back(candidate);
             } catch (...) {}
+        }
+        Json::Array quality_heights;
+        if (const auto* video = stream_at(session.probe, session.plan.video_stream); video && video->height > 0) {
+            static constexpr std::array<int, 6> candidates{2160, 1440, 1080, 720, 480, 360};
+            for (const auto height : candidates) {
+                if (height >= video->height) continue;
+                auto preferences = session.preferences;
+                preferences.max_height = height;
+                try {
+                    const auto plan = negotiate(session.probe, session.source.logical_path,
+                                                session.capabilities, preferences);
+                    if (plan_supported(plan)) quality_heights.emplace_back(height);
+                } catch (...) {}
+            }
         }
         Json::Array audio_streams, subtitle_streams;
         for (const auto& stream : session.probe.streams) {
-            if (stream.type == MediaStreamType::audio) audio_streams.emplace_back(stream_json(stream));
-            if (stream.type == MediaStreamType::subtitle) subtitle_streams.emplace_back(stream_json(stream));
+            if (stream.type == MediaStreamType::audio) {
+                auto preferences = session.preferences;
+                preferences.audio_stream = stream.index;
+                preferences.audio_language.clear();
+                try {
+                    const auto plan = negotiate(session.probe, session.source.logical_path,
+                                                session.capabilities, preferences);
+                    if (plan_supported(plan)) audio_streams.emplace_back(stream_json(stream));
+                } catch (...) {}
+            }
+            if (stream.type == MediaStreamType::subtitle) {
+                auto preferences = session.preferences;
+                preferences.subtitle_stream = stream.index;
+                preferences.subtitle_language.clear();
+                try {
+                    const auto plan = negotiate(session.probe, session.source.logical_path,
+                                                session.capabilities, preferences);
+                    if (plan_supported(plan)) subtitle_streams.emplace_back(stream_json(stream));
+                } catch (...) {}
+            }
         }
         Json::Array media_ids;
         if (!session.item_id.empty()) {
             try {
-                for (const auto& media_id : item_media(session.item_id)) media_ids.emplace_back(media_id);
-            } catch (...) {}
-        } else {
-            media_ids.emplace_back(session.source.media_id);
+                for (const auto& media_id : item_media(session.item_id)) {
+                    // The active source remains valid for the lifetime of this
+                    // session lease. Alternate source controls should only expose
+                    // catalogue bindings that still resolve in the live namespace.
+                    if (media_id == session.source.media_id || fs.find_media(media_id))
+                        media_ids.emplace_back(media_id);
+                }
+            } catch (...) {
+                // Catalogue reconciliation may remove the item while an active
+                // session is still serving its immutable source lease. Keep that
+                // session usable rather than making serialization fail.
+            }
         }
+        if (std::none_of(media_ids.begin(), media_ids.end(), [&](const Json& id) {
+                return id.isString() && id.asString() == session.source.media_id;
+            }))
+            media_ids.emplace_back(session.source.media_id);
+        const bool can_change_quality = !quality_heights.empty() || session.preferences.max_height.has_value() ||
+                                        session.preferences.max_bitrate.has_value();
+        const bool can_switch_media = media_ids.size() > 1;
         Json::Object options{{"modes", Json(std::move(modes))},
+                             {"quality_heights", Json(std::move(quality_heights))},
                              {"media_ids", Json(std::move(media_ids))},
                              {"audio_streams", Json(std::move(audio_streams))},
                              {"subtitle_streams", Json(std::move(subtitle_streams))},
                              {"can_seek", true},
-                             {"can_change_quality", true},
-                             {"can_switch_media", !session.item_id.empty()}};
+                             {"can_change_quality", can_change_quality},
+                             {"can_switch_media", can_switch_media}};
+        const auto mime_type = session.plan.mode == PlaybackMode::direct
+                                   ? direct_mime(session.source.logical_path)
+                                   : "application/vnd.apple.mpegurl";
+        Json::Object source{{"path", session.source.logical_path},
+                            {"format", session.probe.format},
+                            {"size", session.source.size},
+                            {"bitrate", session.probe.bitrate},
+                            {"streams", Json(std::move(streams))}};
+        Json::Object stream{{"url", session.stream_url},
+                            {"mime_type", mime_type},
+                            {"subtitle_url", session.subtitle_url.empty() ? Json(nullptr) : Json(session.subtitle_url)}};
         Json::Object out{{"session_id", session.id},
                          {"media_id", session.source.media_id},
                          {"mode", playback_mode_name(session.plan.mode)},
-                         {"mime_type", session.plan.mode == PlaybackMode::direct ? direct_mime(session.source.logical_path)
-                                                                                : "application/vnd.apple.mpegurl"},
-                         {"stream_url", session.stream_url},
-                         {"subtitle_url", session.subtitle_url.empty() ? Json(nullptr) : Json(session.subtitle_url)},
-                         {"selected", Json(std::move(selected))},
-                         {"transform", Json(std::move(transformations))},
-                         {"options", Json(std::move(options))},
-                         {"streams", Json(std::move(streams))},
-                         {"source_format", session.probe.format},
                          {"duration_ms", static_cast<uint64_t>(std::max(0.0, session.probe.duration_seconds) * 1000.0)},
-                         {"source_bitrate", session.probe.bitrate},
-                         {"seek_ms", static_cast<uint64_t>(std::max<int64_t>(0, session.plan.seek.count()))}};
+                         {"seek_ms", static_cast<uint64_t>(std::max<int64_t>(0, session.plan.seek.count()))},
+                         {"preferences", preferences_json(session.preferences)},
+                         {"selection", Json(std::move(selected))},
+                         {"source", Json(std::move(source))},
+                         {"output", output_json(session.probe, session.plan, session.probe.format)},
+                         {"stream", Json(std::move(stream))},
+                         {"options", Json(std::move(options))}};
         if (!session.item_id.empty()) out["item_id"] = session.item_id;
         return Json(std::move(out));
     }

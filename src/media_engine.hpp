@@ -35,6 +35,7 @@ struct MediaStreamInfo {
     int bit_depth{};
     bool default_stream{};
     bool forced{};
+    uint64_t bitrate{};
 };
 
 struct MediaProbeResult {

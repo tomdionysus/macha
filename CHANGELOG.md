@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.1 - 2026-08-16
+
+- made the `/api/v1/playback/sessions` response server-authoritative for playback state. Sessions now return persisted preferences, resolved mode, selected streams, original source/container/stream metadata and the actual output stream description separately; source and copied stream bitrates are included when libav reports them, while transcoded output reports only deterministic encoder facts rather than inventing CRF bitrates;
+- made playback controls capability-driven. Session responses advertise only mode, quality, audio and subtitle choices that successfully negotiate under the current source, client capabilities and session constraints, and only source representations still present in the namespace. PATCHing mode/quality/track/media preferences with the current `seek_ms` rebuilds the generation at that logical position and the returned session is authoritative;
+- added debounced catalogue rescanning after committed namespace mutations. The elected scanner coordinator observes cluster metadata generation changes, waits `catalogue.scanner.mutation_debounce_ms` (default 30000 ms), compares a namespace-content signature that excludes catalogue metadata, and rescans only when file/directory content changed. Catalogue commits therefore do not self-trigger and a mutation during a scan schedules one follow-up pass;
+- hardened movie/TV path parsing for leading release years, dimensions such as `1920x816`, zero-padded collection ordinals, common release/codec/site suffixes, parenthesised years, season-range folders, and explicit `SxxEyy - Episode Title` names. Added regressions for the supplied Men In Black, 12 Monkeys, Pulp Fiction, Big Mistakes, Blackadder, Black Books, Black Jesus and Stranger Things examples;
+- wire protocol remains v11. The HTTP `/api/v1` playback session schema is intentionally changed in place; there is no compatibility shim because Macha Client is currently the sole implementation.
+
 ## 0.9.0 - 2026-08-16
 
 - replaced ordinary whole-snapshot metadata mutation with deterministic delta CAS. Filesystem/catalogue mutations now transmit only changed mutation-sequence clocks, changed/deleted namespace entries, catalogue-root changes and newly appended garbage tombstones. The proposer still constructs the canonical resulting snapshot and every voter independently applies the delta and verifies the same generation/hash before acknowledging it; conflict replies and rare policy/reconfiguration operations retain the full-snapshot primitive;

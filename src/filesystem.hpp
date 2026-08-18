@@ -194,6 +194,10 @@ class FileSystem {
                      const std::vector<ExtentRef>&, FsEntry*);
     std::pair<uint64_t, uint64_t> logical_capacity() const;
     std::vector<ObjectId> live_objects();
+    // Hash only namespace/content identity, deliberately excluding catalogue
+    // metadata. CatalogueScanner uses this after a metadata-generation debounce
+    // so its own catalogue commits cannot cause a rescan loop.
+    Hash256 namespace_signature(uint64_t* metadata_generation = nullptr);
     std::shared_ptr<const MaintenanceObjects> maintenance_objects_cached();
     MaintenanceObjects maintenance_objects();
     DistributedStore& store() {

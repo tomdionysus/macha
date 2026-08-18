@@ -6,7 +6,9 @@ The optional scanner walks configured roots in the distributed filesystem and po
 
 Only the lowest active node ID runs a scan, so a normally configured cluster does not make the same provider requests from every node. Enable the scanner consistently on all nodes if you want automatic failover of that role. Already-bound files are identified by their stable `macha:<sha256>` media identity and are not looked up or downloaded again on every pass. Scanner-owned entries are removed when their final media binding disappears; manually-created catalogue records are not garbage-collected by the scanner.
 
-Filename/path recognition is intentionally simple and conservative. Typical forms are `Show/Season 02/Show.S02E05.Title.mkv`, `Movie.Title.2024.mkv`, and `Artist/Album/01 - Track.flac`; `CD 2`/`Disc 2` music directories are also recognised. Unrecognised files are ignored. Embedded audio/video tags are not parsed in 0.7.0. A failure to read any configured scan root aborts that pass rather than treating the missing root as an empty library.
+Filename/path recognition is intentionally conservative. Typical forms are `Show/Season 02/Show.S02E05.Title.mkv`, `Show (2000) - S01E01 - Episode Title.mkv`, `Movie.Title.2024.mkv`, `2024.Movie.Title.1080p...mkv`, and `Artist/Album/01 - Track.flac`; `CD 2`/`Disc 2` music directories are also recognised. Common release noise such as resolution, source, codec, release-group and bracketed site tags is stripped after the semantic title/season/episode fields are found. Dimensions such as `1920x816` are not treated as years. Unrecognised files are ignored. Embedded audio/video tags are not used for catalogue naming. A failure to read any configured scan root aborts that pass rather than treating the missing root as an empty library.
+
+The coordinator also reacts to committed namespace mutations. A metadata-generation change starts/restarts a debounce timer; after `mutation_debounce_ms` (30 seconds by default) the scanner compares a deterministic namespace-content signature and runs only if files/directories actually changed. Catalogue-only metadata commits are excluded from that signature, so a scan cannot trigger itself. The periodic `interval_ms` scan remains as a safety/convergence pass.
 
 TMDB needs an API Read Access Token. Put the token alone in a file readable by Macha. MusicBrainz does not need an API key, but requires a meaningful contact string and is rate-limited by the provider; Macha spaces its MusicBrainz API requests accordingly. Configure only curated media roots:
 
@@ -15,6 +17,7 @@ catalogue:
   scanner:
     enabled: true
     interval_ms: 21600000
+    mutation_debounce_ms: 30000
     roots:
       - /Movies
       - /TV

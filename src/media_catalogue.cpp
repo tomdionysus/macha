@@ -108,12 +108,93 @@ bool audio_extension(std::string_view ext) {
 }
 
 std::optional<int32_t> year_from(std::string_view text) {
-    static const std::regex re(R"((?:^|[^0-9])((?:19|20)[0-9]{2})(?=[^0-9]|$))");
+    static const std::regex re(R"((?:19|20)[0-9]{2})");
     std::string owned(text);
     std::optional<int32_t> result;
-    for (std::sregex_iterator it(owned.begin(), owned.end(), re), end; it != end; ++it)
-        result = std::stoi((*it)[1].str());
+    for (std::sregex_iterator it(owned.begin(), owned.end(), re), end; it != end; ++it) {
+        const auto pos = static_cast<size_t>((*it).position());
+        const auto len = static_cast<size_t>((*it).length());
+        const bool numeric_left = pos && std::isdigit(static_cast<unsigned char>(owned[pos - 1]));
+        const bool numeric_right = pos + len < owned.size() &&
+                                   std::isdigit(static_cast<unsigned char>(owned[pos + len]));
+        if (numeric_left || numeric_right) continue;
+        // Dimensions such as 1920x816 are not release years. This is the main
+        // reason leading-year names such as 1994.Pulp.Fiction.1920x816 were
+        // previously parsed as a 1920 release.
+        if (pos + len < owned.size() && (owned[pos + len] == 'x' || owned[pos + len] == 'X') &&
+            pos + len + 1 < owned.size() &&
+            std::isdigit(static_cast<unsigned char>(owned[pos + len + 1])))
+            continue;
+        result = std::stoi((*it).str());
+    }
     return result;
+}
+
+std::string strip_release_noise(std::string value) {
+    static const std::regex technical(
+        R"((?:^|[ ._\-(\[]+)(?:[0-9]{3,4}x[0-9]{3,4}|2160p|1440p|1080p|720p|576p|480p|360p|uhd|bluray|blu-ray|bdrip|webrip|web-dl|webdl|hdtv|dvdrip|dvd|remux|amzn|nf|x264|x265|h264|h265|h\.264|h\.265|hevc|avc|av1|vp9|aac(?:[0-9.]*)?|eac3|ac3|ddp(?:[0-9.]*)?|dd(?:[0-9.]*)?|dts(?:-hd)?(?:[ .]ma)?|flac|opus|multi-subs|multisubs)\b.*$)",
+        std::regex::icase);
+    std::smatch match;
+    if (std::regex_search(value, match, technical))
+        value.resize(static_cast<size_t>(match.position()));
+    static const std::regex site_tag(R"([ ._-]*\[[^\]]+\]\s*$)", std::regex::icase);
+    value = std::regex_replace(value, site_tag, "");
+    return trim(value);
+}
+
+std::string remove_year_token(std::string value, int32_t year) {
+    const auto text = std::to_string(year);
+    auto pos = value.find(text);
+    if (pos == std::string::npos) return value;
+    size_t begin = pos;
+    size_t end = pos + text.size();
+    if (begin && value[begin - 1] == '(' && end < value.size() && value[end] == ')') {
+        --begin;
+        ++end;
+    }
+    value.replace(begin, end - begin, " ");
+    return value;
+}
+
+std::string clean_series_name(std::string value) {
+    value = strip_release_noise(std::move(value));
+    static const std::regex season_suffix(
+        R"((?:[ ._-]+)(?:s[0-9]{1,2}(?:[ ._-]*-[ ._-]*s?[0-9]{1,2})?|season[ ._-]*[0-9]{1,2})\s*$)",
+        std::regex::icase);
+    value = std::regex_replace(value, season_suffix, "");
+    if (auto year = year_from(value)) value = remove_year_token(std::move(value), *year);
+    return clean_title(value);
+}
+
+std::string clean_episode_title(std::string value) {
+    value = strip_release_noise(std::move(value));
+    return clean_title(value);
+}
+
+std::string movie_title_before_year(std::string value, const std::optional<int32_t>& year) {
+    if (year) {
+        auto pos = value.find(std::to_string(*year));
+        if (pos != std::string::npos) {
+            if (pos == 0) value.erase(0, 4);
+            else value.resize(pos);
+        }
+    }
+    value = strip_release_noise(std::move(value));
+
+    // Zero-padded collection ordinals are common release prefixes, while a
+    // genuine title such as "12 Monkeys" must remain intact.
+    static const std::regex ordinal(R"(^\s*0[0-9]{1,2}[ ._-]+)");
+    value = std::regex_replace(value, ordinal, "");
+
+    // A small but useful release-name convention: numbered collection entries
+    // sometimes append a principal actor after " - ". Limit this heuristic to
+    // titles whose pre-credit portion itself ends in a digit so ordinary
+    // hyphenated titles ("Star Wars - A New Hope") are not damaged.
+    static const std::regex numbered_credit(
+        R"(^(.+[0-9])\s+-\s+[A-Za-z][A-Za-z' .-]*$)", std::regex::icase);
+    std::smatch match;
+    if (std::regex_match(value, match, numbered_credit)) value = match[1].str();
+    return clean_title(value);
 }
 
 std::optional<int32_t> json_i32(const Json* value) {
@@ -299,35 +380,26 @@ std::optional<MediaProbe> probe_media_path(std::string_view path, const FsEntry&
         probe.kind = MediaProbeKind::episode;
         probe.season = std::stoi(m[2].str());
         probe.episode = std::stoi(m[3].str());
-        probe.title = m[4].matched ? clean_title(m[4].str()) : std::string{};
-        std::string prefix = clean_title(m[1].str());
+        probe.title = m[4].matched ? clean_episode_title(m[4].str()) : std::string{};
+        std::string prefix = clean_series_name(m[1].str());
         if (parts.size() >= 3) {
             static const std::regex season_dir(R"(^season\s*[0-9]{1,2}$)", std::regex::icase);
             auto parent = clean_title(parts[parts.size() - 2]);
-            if (std::regex_match(parent, season_dir)) probe.series = clean_title(parts[parts.size() - 3]);
+            if (std::regex_match(parent, season_dir)) probe.series = clean_series_name(parts[parts.size() - 3]);
         }
         if (probe.series.empty()) probe.series = prefix;
-        if (probe.series.empty() && parts.size() >= 2) probe.series = clean_title(parts[parts.size() - 2]);
-        probe.year = year_from(probe.series);
-        if (probe.year) {
-            auto pos = probe.series.find(std::to_string(*probe.year));
-            if (pos != std::string::npos) probe.series = trim(probe.series.substr(0, pos));
-        }
+        if (probe.series.empty() && parts.size() >= 2) probe.series = clean_series_name(parts[parts.size() - 2]);
+        // Prefer the raw filename/folder year before clean_series_name removes
+        // it; provider lookup benefits from a release year when one is present.
+        probe.year = year_from(m[1].str());
+        if (!probe.year && parts.size() >= 2) probe.year = year_from(parts[parts.size() - 2]);
         if (probe.series.empty()) return {};
         return probe;
     }
 
     probe.kind = MediaProbeKind::movie;
     probe.year = year_from(file_stem);
-    std::string title = file_stem;
-    if (probe.year) {
-        auto pos = title.find(std::to_string(*probe.year));
-        if (pos != std::string::npos) title.resize(pos);
-    }
-    static const std::regex technical(R"((.*?)(?:[ ._-]+(?:2160p|1080p|720p|uhd|bluray|blu-ray|webrip|web-dl|hdtv|dvdrip|x264|x265|h264|h265|hevc).*)$)",
-                                      std::regex::icase);
-    if (std::regex_match(title, m, technical)) title = m[1].str();
-    probe.title = clean_title(title);
+    probe.title = movie_title_before_year(file_stem, probe.year);
     if (probe.title.empty()) return {};
     return probe;
 }
@@ -351,7 +423,7 @@ RemoteHttpResponse CurlHttpClient::get(std::string_view url, const std::vector<s
     curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, 5000L);
     curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, 20000L);
     curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "Macha/0.9.0 (https://github.com/tomdionysus/macha)");
+    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "Macha/0.9.1 (https://github.com/tomdionysus/macha)");
     curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, curl_write);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &sink);
     struct curl_slist* raw_headers = nullptr;
@@ -514,7 +586,7 @@ Json MusicBrainzProvider::api(std::string_view path,
         const auto elapsed = std::chrono::steady_clock::now() - last_request_;
         if (elapsed < std::chrono::seconds(1)) std::this_thread::sleep_for(std::chrono::seconds(1) - elapsed);
     }
-    auto ua = "Macha/0.9.0 (" + config_.contact + ")";
+    auto ua = "Macha/0.9.1 (" + config_.contact + ")";
     auto q = query;
     q.emplace_back("fmt", "json");
     auto response = http_.get(query_url("https://musicbrainz.org/ws/2" + std::string(path), q),
@@ -809,15 +881,68 @@ size_t CatalogueScanner::scan_once() {
 
 void CatalogueScanner::loop(std::stop_token stop) {
     ThreadCpuReporter cpu_reporter("macha-scanner", std::chrono::seconds(5), true);
+    std::optional<Hash256> scanned_namespace;
+    std::optional<std::chrono::steady_clock::time_point> mutation_due;
+    auto observed_generation = node_.known_metadata_generation();
+    auto next_periodic = std::chrono::steady_clock::now();
+    bool was_coordinator = false;
+
     while (!stop.stop_requested()) {
-        try { (void)scan_once(); }
-        catch (const std::exception& e) { Log::warn("catalogue scan: " + std::string(e.what())); }
-        cpu_reporter.tick();
         CatalogueScannerConfig config;
         { std::lock_guard lock(config_mutex_); config = config_; }
-        auto until = std::chrono::steady_clock::now() + config.interval;
-        while (!stop.stop_requested() && std::chrono::steady_clock::now() < until)
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const auto now = std::chrono::steady_clock::now();
+        const bool is_coordinator = coordinator();
+        if (is_coordinator && !was_coordinator)
+            mutation_due = now; // a newly elected scanner must establish current state promptly
+        was_coordinator = is_coordinator;
+
+        const auto generation = node_.known_metadata_generation();
+        if (generation != observed_generation) {
+            observed_generation = generation;
+            mutation_due = now + config.mutation_debounce;
+            Log::debug("catalogue: metadata mutation observed; namespace rescan debounce reset generation=" +
+                       std::to_string(generation));
+        }
+
+        const bool periodic_due = now >= next_periodic;
+        const bool debounced_mutation_due = mutation_due && now >= *mutation_due;
+        if (config.enabled && is_coordinator && (periodic_due || debounced_mutation_due)) {
+            try {
+                const auto before = fs_.namespace_signature();
+                const bool namespace_changed = !scanned_namespace || before != *scanned_namespace;
+                if (periodic_due || namespace_changed) {
+                    if (debounced_mutation_due && namespace_changed && !periodic_due)
+                        Log::info("catalogue: namespace mutation settled; rescanning");
+                    (void)scan_once();
+                    uint64_t after_generation = 0;
+                    const auto after = fs_.namespace_signature(&after_generation);
+                    scanned_namespace = before;
+                    if (after != before) {
+                        // A namespace mutation raced the scan. Do not claim that
+                        // state as scanned; run again once the new mutation settles.
+                        mutation_due = std::chrono::steady_clock::now() + config.mutation_debounce;
+                    } else {
+                        scanned_namespace = after;
+                        mutation_due.reset();
+                    }
+                    // Record the generation represented by `after`, not a later
+                    // live value. A namespace commit racing immediately after the
+                    // signature read will then be observed on the next loop.
+                    observed_generation = after_generation;
+                    next_periodic = std::chrono::steady_clock::now() + config.interval;
+                } else {
+                    // The metadata generation changed only because catalogue or
+                    // other non-namespace state changed. Suppress a pointless scan.
+                    mutation_due.reset();
+                }
+            } catch (const std::exception& e) {
+                Log::warn("catalogue scan: " + std::string(e.what()));
+                mutation_due = std::chrono::steady_clock::now() + config.mutation_debounce;
+                next_periodic = std::chrono::steady_clock::now() + config.interval;
+            }
+        }
+        cpu_reporter.tick();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
 
