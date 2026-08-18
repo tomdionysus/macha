@@ -28,6 +28,7 @@ class PlaybackManager {
     PlaybackManager& operator=(const PlaybackManager&) = delete;
 
     void start();
+    void request_stop();
     void stop();
     void reconfigure(StreamingConfig);
     HttpResponse handle(const HttpRequest&);

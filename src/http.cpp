@@ -147,15 +147,27 @@ void HttpServer::close_queued_clients() {
 }
 
 void HttpServer::stop() {
+    if (!running_.load()) return;
+    request_stop();
     if (!running_.exchange(false)) return;
+    if (accept_thread_.joinable()) {
+        accept_thread_.join();
+    }
+    for (auto& worker_thread : workers_) {
+        if (worker_thread.joinable()) worker_thread.join();
+    }
+    workers_.clear();
+    bound_port_ = 0;
+}
+
+void HttpServer::request_stop() {
+    if (!running_.load()) return;
     if (const int listen_fd = listen_fd_.exchange(-1); listen_fd >= 0) {
         ::shutdown(listen_fd, SHUT_RDWR);
         ::close(listen_fd);
     }
-    if (accept_thread_.joinable()) {
+    if (accept_thread_.joinable())
         accept_thread_.request_stop();
-        accept_thread_.join();
-    }
     close_queued_clients();
     {
         std::lock_guard lock(active_mutex_);
@@ -163,11 +175,6 @@ void HttpServer::stop() {
     }
     for (auto& worker_thread : workers_) worker_thread.request_stop();
     queue_cv_.notify_all();
-    for (auto& worker_thread : workers_) {
-        if (worker_thread.joinable()) worker_thread.join();
-    }
-    workers_.clear();
-    bound_port_ = 0;
 }
 
 void HttpServer::run(std::stop_token stop) {

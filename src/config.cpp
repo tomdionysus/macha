@@ -88,6 +88,10 @@ void validate(Config& config) {
         throw std::runtime_error("network heartbeat and dead_after must be > 0");
     if (config.metadata_cache > std::chrono::seconds(5))
         throw std::runtime_error("metadata cache must be <= 5000ms");
+    if (config.filesystem.entry_timeout > std::chrono::seconds(5) ||
+        config.filesystem.attr_timeout > std::chrono::seconds(5) ||
+        config.filesystem.negative_timeout > std::chrono::seconds(5))
+        throw std::runtime_error("filesystem FUSE cache timeouts must be <= 5000ms");
     if (config.extent_size < 1024 * 1024 || config.extent_size > 64ULL * 1024 * 1024)
         throw std::runtime_error("extent size must be 1M..64M");
     if (config.catalogue.api.enabled && !config.catalogue.api.port)
@@ -264,6 +268,15 @@ void parse_filesystem(const YAML::Node& root, Config& c) {
         return;
     if (f["allow_other"])
         c.filesystem.allow_other = f["allow_other"].as<bool>();
+    if (f["entry_timeout_ms"])
+        c.filesystem.entry_timeout =
+            milliseconds(f["entry_timeout_ms"], "filesystem.entry_timeout_ms");
+    if (f["attr_timeout_ms"])
+        c.filesystem.attr_timeout =
+            milliseconds(f["attr_timeout_ms"], "filesystem.attr_timeout_ms");
+    if (f["negative_timeout_ms"])
+        c.filesystem.negative_timeout =
+            milliseconds(f["negative_timeout_ms"], "filesystem.negative_timeout_ms");
     if (f["root_uid"])
         c.filesystem.root_uid = f["root_uid"].as<uint32_t>();
     if (f["root_gid"])

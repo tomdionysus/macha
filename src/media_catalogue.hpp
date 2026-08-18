@@ -7,6 +7,7 @@
 #include "json.hpp"
 
 #include <chrono>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -57,15 +58,25 @@ struct RemoteHttpResponse {
 class HttpClient {
   public:
     virtual ~HttpClient() = default;
+    virtual void request_stop() noexcept {}
+    virtual void reset_stop() noexcept {}
+    virtual bool stop_requested() const noexcept { return false; }
     virtual RemoteHttpResponse get(std::string_view url,
                                    const std::vector<std::string>& headers = {},
                                    size_t maximum_bytes = 16 * 1024 * 1024) = 0;
 };
 
 class CurlHttpClient final : public HttpClient {
+    std::atomic_bool stop_requested_{};
+
   public:
     CurlHttpClient();
     ~CurlHttpClient() override;
+    void request_stop() noexcept override { stop_requested_.store(true, std::memory_order_relaxed); }
+    void reset_stop() noexcept override { stop_requested_.store(false, std::memory_order_relaxed); }
+    bool stop_requested() const noexcept override {
+        return stop_requested_.load(std::memory_order_relaxed);
+    }
     RemoteHttpResponse get(std::string_view, const std::vector<std::string>&, size_t) override;
 };
 
@@ -123,13 +134,16 @@ class CatalogueScanner {
     void configure_providers();
     bool coordinator() const;
     void loop(std::stop_token);
-    void walk(std::string_view root, std::vector<std::pair<std::string, FsEntry>>& out);
+    void walk(std::string_view root, std::vector<std::pair<std::string, FsEntry>>& out,
+              std::stop_token = {});
+    size_t scan_once(std::stop_token);
 
   public:
     CatalogueScanner(NodeRuntime&, FileSystem&, CatalogueManager&, CatalogueScannerConfig,
                      std::unique_ptr<HttpClient> = {});
     ~CatalogueScanner();
     void start();
+    void request_stop();
     void stop();
     void reconfigure(CatalogueScannerConfig);
     size_t scan_once();

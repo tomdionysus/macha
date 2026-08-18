@@ -264,6 +264,30 @@ class FakeHttpClient final : public HttpClient {
     }
 };
 
+class BlockingHttpClient final : public HttpClient {
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::atomic_bool entered_{};
+    std::atomic_bool stopped_{};
+
+  public:
+    bool entered() const { return entered_.load(); }
+    bool stopped() const { return stopped_.load(); }
+    void request_stop() noexcept override {
+        stopped_.store(true);
+        cv_.notify_all();
+    }
+    void reset_stop() noexcept override { stopped_.store(false); }
+    bool stop_requested() const noexcept override { return stopped_.load(); }
+    RemoteHttpResponse get(std::string_view, const std::vector<std::string>&, size_t) override {
+        entered_.store(true);
+        cv_.notify_all();
+        std::unique_lock lock(mutex_);
+        cv_.wait(lock, [&] { return stopped_.load(); });
+        throw std::runtime_error("synthetic HTTP cancellation");
+    }
+};
+
 uint16_t free_port() {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     REQUIRE(fd >= 0);
@@ -1124,6 +1148,9 @@ void test_config() {
             << "  prefer_metadata: true\n"
             << "filesystem:\n"
             << "  allow_other: true\n"
+            << "  entry_timeout_ms: 375\n"
+            << "  attr_timeout_ms: 225\n"
+            << "  negative_timeout_ms: 75\n"
             << "  root_uid: 501\n"
             << "  root_gid: 20\n"
             << "  root_mode: '0750'\n"
@@ -1216,6 +1243,9 @@ void test_config() {
     CHECK(yc.cache.max_blocks == 4096);
     CHECK(yc.log_level == LogLevel::warn);
     CHECK(yc.filesystem.allow_other);
+    CHECK(yc.filesystem.entry_timeout == 375ms);
+    CHECK(yc.filesystem.attr_timeout == 225ms);
+    CHECK(yc.filesystem.negative_timeout == 75ms);
     CHECK(yc.filesystem.root_uid == 501);
     CHECK(yc.filesystem.root_gid == 20);
     CHECK(yc.filesystem.root_mode == 0750);
@@ -3800,6 +3830,31 @@ void test_media_probe_and_online_catalogue_scanner() {
     CHECK(service.filesystem().readdir("/Movies").empty());
     CHECK(scanner.scan_once() == 0);
     CHECK(!service.catalogue().get("tmdb:movie:335984").has_value());
+
+    // Shutdown must not wait for a complete catalogue scan. request_stop()
+    // propagates into the HTTP client so an in-flight provider request is
+    // interrupted, and scan_once(stop) abandons the partial pass without a
+    // reconciliation commit.
+    const std::string shutdown_path = "/Movies/Shutdown.Test.2020.mkv";
+    service.filesystem().create_file(shutdown_path, 0644, getuid(), getgid());
+    auto shutdown_writer = service.filesystem().open_write(shutdown_path, true);
+    auto shutdown_bytes = pattern(32769);
+    REQUIRE(shutdown_writer->write(0, shutdown_bytes) == shutdown_bytes.size());
+    shutdown_writer->commit();
+
+    auto blocking_http = std::make_unique<BlockingHttpClient>();
+    auto* blocking_http_ptr = blocking_http.get();
+    auto cancel_config = scanner_config;
+    cancel_config.roots = {"/Movies"};
+    CatalogueScanner cancel_scanner(service.node(), service.filesystem(), service.catalogue(),
+                                    cancel_config, std::move(blocking_http));
+    cancel_scanner.start();
+    REQUIRE(wait_until([&] { return blocking_http_ptr->entered(); }, 1s));
+    const auto stop_started = Clock::now();
+    cancel_scanner.stop();
+    CHECK(blocking_http_ptr->stopped());
+    CHECK(Clock::now() - stop_started < 1s);
+
     service.stop();
 }
 
@@ -4068,7 +4123,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
-    CHECK(status_body.find("\"server_version\":\"0.10.0\"") != std::string::npos);
+    CHECK(status_body.find("\"server_version\":\"0.10.1\"") != std::string::npos);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -4731,7 +4786,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == "0.10.0");
+    CHECK(playback_status_json.find("server_version")->asString() == "0.10.1");
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately

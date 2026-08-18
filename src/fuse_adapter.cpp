@@ -415,7 +415,9 @@ int op_read(const char* path, char* buf, size_t size, off_t off, fuse_file_info*
             h->read = fs().open_read(h->path);
         }
         auto r = h && h->read ? h->read : fs().open_read(path);
-        auto n = r->read(static_cast<uint64_t>(off), {reinterpret_cast<uint8_t*>(buf), size});
+        auto n = r->read(static_cast<uint64_t>(off),
+                         {reinterpret_cast<uint8_t*>(buf), size}, {},
+                         fs().io_cancellation_flag());
         if (Log::enabled(LogLevel::all) && n) {
             auto bytes = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(buf), n);
             if (Log::enabled(LogLevel::all))
@@ -545,10 +547,23 @@ void* op_init(struct fuse_conn_info*, struct fuse_config* cfg) {
               " process_gid=" + std::to_string(getgid()) +
               " process_euid=" + std::to_string(geteuid()) +
               " process_egid=" + std::to_string(getegid()));
+    const auto& policy = fs().node().config().filesystem;
+    const auto seconds = [](std::chrono::milliseconds value) {
+        return std::chrono::duration<double>(value).count();
+    };
+    // Keep file-content caching conservative across opens, but allow short
+    // namespace/attribute caches. Zero timeouts make macFUSE bounce every
+    // lookup/stat through userspace and can turn a pathname failure into a
+    // kernel/userspace request storm.
     cfg->kernel_cache = 0;
-    cfg->entry_timeout = 0.0;
-    cfg->attr_timeout = 0.0;
-    cfg->negative_timeout = 0.0;
+    cfg->entry_timeout = seconds(policy.entry_timeout);
+    cfg->attr_timeout = seconds(policy.attr_timeout);
+    cfg->negative_timeout = seconds(policy.negative_timeout);
+    Log::debug("FUSE cache policy entry_timeout_ms=" +
+               std::to_string(policy.entry_timeout.count()) +
+               " attr_timeout_ms=" + std::to_string(policy.attr_timeout.count()) +
+               " negative_timeout_ms=" + std::to_string(policy.negative_timeout.count()) +
+               " kernel_cache=0");
     return fuse_get_context()->private_data;
 }
 
@@ -577,7 +592,8 @@ fuse_operations operations() {
 }
 } // namespace
 
-int run_fuse(FileSystem& filesystem, const std::filesystem::path& mount_path, bool allow_other) {
+int run_fuse(FileSystem& filesystem, const std::filesystem::path& mount_path, bool allow_other,
+             std::function<void()> request_shutdown) {
     auto mount = mount_path.string();
     const std::string options = allow_other ? "default_permissions,allow_other,fsname=macha"
                                             : "default_permissions,fsname=macha";
@@ -633,12 +649,14 @@ int run_fuse(FileSystem& filesystem, const std::filesystem::path& mount_path, bo
         return 6;
     }
 
-    filesystem.reset_write_cancellation();
+    filesystem.reset_io_cancellation();
     std::jthread shutdown_watcher([&](std::stop_token stop) {
         while (!stop.stop_requested()) {
             if (fuse_session_exited(session)) {
-                Log::debug("shutdown: FUSE session exit observed; cancelling filesystem writes");
-                filesystem.request_write_cancellation();
+                Log::debug("shutdown: FUSE session exit observed; requesting service shutdown");
+                filesystem.request_io_cancellation();
+                if (request_shutdown)
+                    request_shutdown();
                 return;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -650,7 +668,9 @@ int run_fuse(FileSystem& filesystem, const std::filesystem::path& mount_path, bo
     // interface on libfuse3/macFUSE while retaining the concurrent callbacks
     // previously selected by fuse_main() (we deliberately did not pass -s).
     int loop_rc = fuse_loop_mt(instance, 0);
-    filesystem.request_write_cancellation();
+    filesystem.request_io_cancellation();
+    if (request_shutdown)
+        request_shutdown();
     shutdown_watcher.request_stop();
     if (shutdown_watcher.joinable())
         shutdown_watcher.join();
