@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.2 - 2026-08-18
+
+- Canonicalise Arabic, Roman and common spelled-out number tokens when scoring catalogue provider titles. This allows provider results such as `Men in Grey II` and `Twelve Pebbles` to match release filenames using `Men In Grey 2` and `12 Pebbles` while retaining year scoring.
+- Add provider-level regressions for those two title variants; filename parsing remains unchanged.
+- Include the parsed movie/episode/track identity in catalogue `no provider match` debug messages so future provider-scoring failures are distinguishable from parser failures.
+
 ## 0.9.1 - 2026-08-16
 
 - made the `/api/v1/playback/sessions` response server-authoritative for playback state. Sessions now return persisted preferences, resolved mode, selected streams, original source/container/stream metadata and the actual output stream description separately; source and copied stream bitrates are included when libav reports them, while transcoded output reports only deterministic encoder facts rather than inventing CRF bitrates;

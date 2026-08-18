@@ -66,6 +66,41 @@ std::string normalized(std::string_view value) {
     return trim(out);
 }
 
+std::string comparable_title(std::string_view value) {
+    // Provider titles commonly spell sequel numbers differently from release
+    // filenames ("2" vs "II", "12" vs "Twelve"). Canonicalise isolated
+    // number tokens for matching only; preserve the parsed/display title.
+    static constexpr std::pair<std::string_view, std::string_view> aliases[] = {
+        {"zero", "0"}, {"one", "1"}, {"two", "2"}, {"three", "3"},
+        {"four", "4"}, {"five", "5"}, {"six", "6"}, {"seven", "7"},
+        {"eight", "8"}, {"nine", "9"}, {"ten", "10"}, {"eleven", "11"},
+        {"twelve", "12"}, {"thirteen", "13"}, {"fourteen", "14"},
+        {"fifteen", "15"}, {"sixteen", "16"}, {"seventeen", "17"},
+        {"eighteen", "18"}, {"nineteen", "19"}, {"twenty", "20"},
+        {"ii", "2"}, {"iii", "3"}, {"iv", "4"}, {"v", "5"},
+        {"vi", "6"}, {"vii", "7"}, {"viii", "8"}, {"ix", "9"},
+        {"x", "10"}, {"xi", "11"}, {"xii", "12"}, {"xiii", "13"},
+        {"xiv", "14"}, {"xv", "15"}, {"xvi", "16"}, {"xvii", "17"},
+        {"xviii", "18"}, {"xix", "19"}, {"xx", "20"},
+    };
+
+    std::istringstream in(normalized(value));
+    std::string out;
+    std::string token;
+    while (in >> token) {
+        std::string_view canonical = token;
+        for (const auto& [from, to] : aliases) {
+            if (token == from) {
+                canonical = to;
+                break;
+            }
+        }
+        if (!out.empty()) out.push_back(' ');
+        out.append(canonical);
+    }
+    return out;
+}
+
 std::string extension(std::string_view path) {
     auto slash = path.find_last_of('/');
     auto dot = path.find_last_of('.');
@@ -289,11 +324,11 @@ const Json* best_result(const Json& root, std::string_view title, std::string_vi
     if (!results || !results->isArray() || results->asArray().empty()) return nullptr;
     const Json* best = &results->asArray().front();
     int best_score = -1;
-    const auto wanted = normalized(title);
+    const auto wanted = comparable_title(title);
     for (const auto& candidate : results->asArray()) {
         if (!candidate.isObject()) continue;
         int score = 0;
-        auto name = normalized(json_string(candidate.find(title_key)));
+        auto name = comparable_title(json_string(candidate.find(title_key)));
         if (name == wanted) score += 100;
         else if (name.find(wanted) != std::string::npos || wanted.find(name) != std::string::npos) score += 40;
         if (year) {
@@ -423,7 +458,7 @@ RemoteHttpResponse CurlHttpClient::get(std::string_view url, const std::vector<s
     curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, 5000L);
     curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, 20000L);
     curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "Macha/0.9.1 (https://github.com/tomdionysus/macha)");
+    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "Macha/0.9.2 (https://github.com/tomdionysus/macha)");
     curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, curl_write);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &sink);
     struct curl_slist* raw_headers = nullptr;
@@ -586,7 +621,7 @@ Json MusicBrainzProvider::api(std::string_view path,
         const auto elapsed = std::chrono::steady_clock::now() - last_request_;
         if (elapsed < std::chrono::seconds(1)) std::this_thread::sleep_for(std::chrono::seconds(1) - elapsed);
     }
-    auto ua = "Macha/0.9.1 (" + config_.contact + ")";
+    auto ua = "Macha/0.9.2 (" + config_.contact + ")";
     auto q = query;
     q.emplace_back("fmt", "json");
     auto response = http_.get(query_url("https://musicbrainz.org/ws/2" + std::string(path), q),
@@ -835,7 +870,20 @@ size_t CatalogueScanner::scan_once() {
             if (match) break;
         }
         if (!match) {
-            Log::debug("catalogue: no provider match for " + path);
+            std::ostringstream parsed;
+            if (probe->kind == MediaProbeKind::movie) {
+                parsed << "movie title=\"" << probe->title << "\"";
+                if (probe->year) parsed << " year=" << *probe->year;
+            } else if (probe->kind == MediaProbeKind::episode) {
+                parsed << "episode series=\"" << probe->series << "\"";
+                if (probe->year) parsed << " year=" << *probe->year;
+                if (probe->season) parsed << " season=" << *probe->season;
+                if (probe->episode) parsed << " episode=" << *probe->episode;
+            } else {
+                parsed << "track artist=\"" << probe->artist << "\" album=\""
+                       << probe->album << "\" title=\"" << probe->title << "\"";
+            }
+            Log::debug("catalogue: no provider match for " + path + " parsed " + parsed.str());
             continue;
         }
         ++matched;
