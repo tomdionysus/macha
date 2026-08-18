@@ -79,9 +79,10 @@ struct CatalogueScannerConfig {
     bool enabled{};
     std::chrono::milliseconds interval{std::chrono::hours(6)};
     // Namespace mutations are coalesced before a scan. Large copies commonly
-    // publish many metadata generations; scanning only after they settle keeps
-    // the catalogue responsive without repeatedly walking half-written trees.
-    std::chrono::milliseconds mutation_debounce{30000};
+    // publish many metadata generations; wait for a quiet period where possible,
+    // but cap deferral so sustained writes still produce occasional catalogue scans.
+    std::chrono::milliseconds rescan_debounce{10000};
+    std::chrono::milliseconds rescan_max_delay{60000};
     std::vector<std::string> roots{"/"};
     size_t max_artwork_bytes{16 * 1024 * 1024};
     CatalogueTmdbConfig tmdb;

@@ -1012,6 +1012,8 @@ void test_config() {
             << "  scanner:\n"
             << "    enabled: true\n"
             << "    interval_ms: 60000\n"
+            << "    rescan_debounce_ms: 12000\n"
+            << "    rescan_max_delay_ms: 45000\n"
             << "    roots: [/TV, /Movies, /Music]\n"
             << "    max_artwork_bytes: 6M\n"
             << "    providers:\n"
@@ -1084,6 +1086,8 @@ void test_config() {
     CHECK(yc.catalogue.api.stream_chunk_bytes == 64ULL * 1024);
     CHECK(yc.catalogue.scanner.enabled);
     CHECK(yc.catalogue.scanner.interval == 60000ms);
+    CHECK(yc.catalogue.scanner.rescan_debounce == 12000ms);
+    CHECK(yc.catalogue.scanner.rescan_max_delay == 45000ms);
     CHECK(yc.catalogue.scanner.roots.size() == 3);
     CHECK(yc.catalogue.scanner.roots[0] == "/TV");
     CHECK(yc.catalogue.scanner.max_artwork_bytes == 6ULL * 1024 * 1024);

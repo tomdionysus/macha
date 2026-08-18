@@ -2,6 +2,9 @@
 
 ## 0.9.4 - 2026-08-18
 
+- allow partial catalogue scans when configured roots are absent: available roots still add/update media, while destructive pruning is deferred until every configured root is traversable;
+- rename the namespace rescan quiet-period setting to `catalogue.scanner.rescan_debounce_ms`, reduce its default to 10000 ms, and add `catalogue.scanner.rescan_max_delay_ms` (default 60000 ms) so continuous writes cannot postpone a pending catalogue scan indefinitely;
+- remove the per-generation `catalogue: metadata mutation observed; namespace rescan debounce reset` debug log; scanner logs now focus on actual rescan execution and partial-root conditions;
 - fix foreground object replication when a preferred owner cannot even launch its `put_object` RPC (for example, because an advertised endpoint is stale or unreachable). Synchronous launch failures and local-store failures now enter the same failed-replica accounting as completed negative RPCs, so the deterministic fallback owner is tried immediately instead of leaving `DistributedStore::put()` in an impossible quorum state forever;
 - add a bounded regression which makes an unreachable peer the preferred R=1 owner and proves the write falls back to the local second-ranked owner rather than requiring cancellation to escape;
 - remove the temporary `DIAG put-*` / DATA-route instrumentation used to isolate the reported rsync stall. Existing normal slow-write diagnostics remain unchanged;

@@ -947,6 +947,7 @@ void CatalogueScanner::loop(std::stop_token stop) {
     ThreadCpuReporter cpu_reporter("macha-scanner", std::chrono::seconds(5), true);
     std::optional<Hash256> scanned_namespace;
     std::optional<std::chrono::steady_clock::time_point> mutation_due;
+    std::optional<std::chrono::steady_clock::time_point> mutation_first_seen;
     auto observed_generation = node_.known_metadata_generation();
     auto next_periodic = std::chrono::steady_clock::now();
     bool was_coordinator = false;
@@ -956,38 +957,50 @@ void CatalogueScanner::loop(std::stop_token stop) {
         { std::lock_guard lock(config_mutex_); config = config_; }
         const auto now = std::chrono::steady_clock::now();
         const bool is_coordinator = coordinator();
-        if (is_coordinator && !was_coordinator)
+        if (is_coordinator && !was_coordinator) {
             mutation_due = now; // a newly elected scanner must establish current state promptly
+            if (!mutation_first_seen) mutation_first_seen = now;
+        }
         was_coordinator = is_coordinator;
 
         const auto generation = node_.known_metadata_generation();
         if (generation != observed_generation) {
             observed_generation = generation;
-            mutation_due = now + config.mutation_debounce;
-            Log::debug("catalogue: metadata mutation observed; namespace rescan debounce reset generation=" +
-                       std::to_string(generation));
+            if (!mutation_first_seen) mutation_first_seen = now;
+            mutation_due = now + config.rescan_debounce;
         }
 
         const bool periodic_due = now >= next_periodic;
         const bool debounced_mutation_due = mutation_due && now >= *mutation_due;
-        if (config.enabled && is_coordinator && (periodic_due || debounced_mutation_due)) {
+        const bool max_delayed_mutation_due = mutation_first_seen &&
+            now >= *mutation_first_seen + config.rescan_max_delay;
+        const bool mutation_rescan_due = debounced_mutation_due || max_delayed_mutation_due;
+        if (config.enabled && is_coordinator && (periodic_due || mutation_rescan_due)) {
             try {
                 const auto before = fs_.namespace_signature();
                 const bool namespace_changed = !scanned_namespace || before != *scanned_namespace;
                 if (periodic_due || namespace_changed) {
-                    if (debounced_mutation_due && namespace_changed && !periodic_due)
-                        Log::info("catalogue: namespace mutation settled; rescanning");
+                    if (mutation_rescan_due && namespace_changed && !periodic_due) {
+                        if (max_delayed_mutation_due && !debounced_mutation_due)
+                            Log::info("catalogue: namespace mutation max rescan delay reached; rescanning");
+                        else
+                            Log::info("catalogue: namespace mutation settled; rescanning");
+                    }
                     (void)scan_once();
                     uint64_t after_generation = 0;
                     const auto after = fs_.namespace_signature(&after_generation);
                     scanned_namespace = before;
                     if (after != before) {
-                        // A namespace mutation raced the scan. Do not claim that
-                        // state as scanned; run again once the new mutation settles.
-                        mutation_due = std::chrono::steady_clock::now() + config.mutation_debounce;
+                        // A namespace mutation raced the scan. This scan satisfies
+                        // the previous pending window; start a fresh bounded debounce
+                        // window for the state that arrived while it was running.
+                        const auto restart = std::chrono::steady_clock::now();
+                        mutation_first_seen = restart;
+                        mutation_due = restart + config.rescan_debounce;
                     } else {
                         scanned_namespace = after;
                         mutation_due.reset();
+                        mutation_first_seen.reset();
                     }
                     // Record the generation represented by `after`, not a later
                     // live value. A namespace commit racing immediately after the
@@ -998,11 +1011,14 @@ void CatalogueScanner::loop(std::stop_token stop) {
                     // The metadata generation changed only because catalogue or
                     // other non-namespace state changed. Suppress a pointless scan.
                     mutation_due.reset();
+                    mutation_first_seen.reset();
                 }
             } catch (const std::exception& e) {
                 Log::warn("catalogue scan: " + std::string(e.what()));
-                mutation_due = std::chrono::steady_clock::now() + config.mutation_debounce;
-                next_periodic = std::chrono::steady_clock::now() + config.interval;
+                const auto retry_from = std::chrono::steady_clock::now();
+                mutation_first_seen = retry_from;
+                mutation_due = retry_from + config.rescan_debounce;
+                next_periodic = retry_from + config.interval;
             }
         }
         cpu_reporter.tick();
