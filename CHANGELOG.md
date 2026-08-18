@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.10.3 - 2026-08-18
+
+- make catalogue roots properties of the movie, TV and music scan providers instead of one scanner-wide list; each provider traverses and parses only its own roots;
+- preserve complete live-media enumeration before bounded metadata enrichment, including partial-root safety, so provider request budgeting still cannot cause erroneous scanner pruning;
+- make music scanning read embedded audio tags first through libavformat over Macha's own distributed read path, including title, album artist/artist, album, track/disc, year/date and MusicBrainz IDs;
+- make music filename fallback conservative: recognise `Artist - Title` and canonical `Artist/Album/File` or disc-directory layouts, but do not promote arbitrary collection/grouping directories to artist/album metadata;
+- add MusicBrainz recording lookup when artist/title are known but no trustworthy album is available, and use embedded MusicBrainz release/recording/artist IDs when present;
+- replace the README logo asset with the supplied SVG;
+- change scanner configuration to `providers.movies`, `providers.tv` and `providers.music`, each with its own `roots` and nested metadata-provider configuration. The old scanner-wide `roots` and top-level `providers.tmdb` / `providers.musicbrainz` keys are removed;
+- wire and storage formats remain unchanged from 0.10.0.
+
 ## 0.10.2 - 2026-08-18
 
 - correct TMDB positive TV-search caching: cache the selected JSON result object itself rather than permitting the `const Json*` result to convert through `bool` into `Json(true)`; repeated show/season lookups now reuse valid cached provider data without additional HTTP requests;

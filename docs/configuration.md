@@ -69,6 +69,8 @@ On macOS, the mount keeps Macha namespace keys byte-preserving but adapts Unicod
 
 Online metadata-provider work is also bounded. `catalogue.scanner.max_provider_requests_per_scan` defaults to 32 (valid 1..10000). The scanner checks the budget between complete provider lookups rather than aborting a search/detail operation halfway through, then reconciles completed discoveries and schedules a continuation after `catalogue.scanner.provider_batch_delay_ms` (default 30000 ms, valid 1000..3600000). Semantic provider misses are cached in memory for the configured provider lifetime; network/HTTP failures are not negative-cached. Artwork byte downloads use the existing `max_artwork_bytes` limit and occur only for the bounded set of discoveries produced by the provider pass.
 
+Scanner roots are provider properties, not a global list. `providers.movies.roots`, `providers.tv.roots` and `providers.music.roots` define independent parsing domains. Their metadata resolver settings are nested under the provider (`tmdb` for movies/TV and `musicbrainz` for music). 0.10.3 intentionally removes the old scanner-wide `roots` and top-level `providers.tmdb` / `providers.musicbrainz` layout.
+
 ## Streaming configuration
 
 Streaming shares the catalogue HTTP listener. `streaming.enabled: true` therefore requires `catalogue.api.enabled: true`. Macha links `libavformat`, `libavcodec`, `libavutil`, `libswscale` and `libswresample` directly. It does not run the `ffmpeg` or `ffprobe` commands. Legacy `streaming.ffmpeg` and `streaming.ffprobe` keys from the first 0.7.0 build are accepted and ignored.

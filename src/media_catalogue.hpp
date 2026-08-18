@@ -34,6 +34,9 @@ struct MediaProbe {
     std::string album;
     std::optional<int32_t> disc;
     std::optional<int32_t> track;
+    std::optional<std::string> musicbrainz_recording_id;
+    std::optional<std::string> musicbrainz_release_id;
+    std::optional<std::string> musicbrainz_artist_id;
 };
 
 std::optional<MediaProbe> probe_media_path(std::string_view path, const FsEntry&);
@@ -109,17 +112,76 @@ class MusicBrainzProvider final : public MetadataProvider {
     HttpClient& http_;
     CatalogueMusicBrainzConfig config_;
     std::map<std::string, std::optional<Json>> release_cache_;
+    std::map<std::string, std::optional<Json>> release_id_cache_;
+    std::map<std::string, std::optional<Json>> recording_cache_;
     std::map<std::string, std::optional<std::string>> cover_cache_;
     std::chrono::steady_clock::time_point last_request_{};
 
     Json api(std::string_view path, const std::vector<std::pair<std::string, std::string>>& query = {});
+    std::optional<Json> release_by_id(std::string_view);
     std::optional<Json> find_release(const MediaProbe&);
+    std::optional<Json> find_recording(const MediaProbe&);
     std::optional<std::string> cover_url(std::string_view release_id);
 
   public:
     MusicBrainzProvider(HttpClient&, CatalogueMusicBrainzConfig);
     bool supports(MediaProbeKind) const override;
     std::optional<ProviderMatch> lookup(const MediaProbe&) override;
+};
+
+class CatalogueScanProvider {
+  public:
+    virtual ~CatalogueScanProvider() = default;
+    virtual std::string_view name() const noexcept = 0;
+    virtual const std::vector<std::string>& roots() const noexcept = 0;
+    virtual std::optional<MediaProbe> probe(FileSystem&, std::string_view root,
+                                            std::string_view path, const FsEntry&) = 0;
+    virtual std::optional<ProviderMatch> lookup(const MediaProbe&) = 0;
+};
+
+class MovieScanProvider final : public CatalogueScanProvider {
+    std::vector<std::string> roots_;
+    std::unique_ptr<TmdbProvider> metadata_;
+
+  public:
+    MovieScanProvider(HttpClient&, CatalogueMovieProviderConfig);
+    std::string_view name() const noexcept override { return "movies"; }
+    const std::vector<std::string>& roots() const noexcept override { return roots_; }
+    std::optional<MediaProbe> probe(FileSystem&, std::string_view, std::string_view,
+                                    const FsEntry&) override;
+    std::optional<ProviderMatch> lookup(const MediaProbe& probe) override {
+        return metadata_ ? metadata_->lookup(probe) : std::nullopt;
+    }
+};
+
+class TvScanProvider final : public CatalogueScanProvider {
+    std::vector<std::string> roots_;
+    std::unique_ptr<TmdbProvider> metadata_;
+
+  public:
+    TvScanProvider(HttpClient&, CatalogueTvProviderConfig);
+    std::string_view name() const noexcept override { return "tv"; }
+    const std::vector<std::string>& roots() const noexcept override { return roots_; }
+    std::optional<MediaProbe> probe(FileSystem&, std::string_view, std::string_view,
+                                    const FsEntry&) override;
+    std::optional<ProviderMatch> lookup(const MediaProbe& probe) override {
+        return metadata_ ? metadata_->lookup(probe) : std::nullopt;
+    }
+};
+
+class MusicScanProvider final : public CatalogueScanProvider {
+    std::vector<std::string> roots_;
+    std::unique_ptr<MusicBrainzProvider> metadata_;
+
+  public:
+    MusicScanProvider(HttpClient&, CatalogueMusicProviderConfig);
+    std::string_view name() const noexcept override { return "music"; }
+    const std::vector<std::string>& roots() const noexcept override { return roots_; }
+    std::optional<MediaProbe> probe(FileSystem&, std::string_view, std::string_view,
+                                    const FsEntry&) override;
+    std::optional<ProviderMatch> lookup(const MediaProbe& probe) override {
+        return metadata_ ? metadata_->lookup(probe) : std::nullopt;
+    }
 };
 
 class CatalogueScanner {
@@ -129,7 +191,7 @@ class CatalogueScanner {
     CatalogueScannerConfig config_;
     std::unique_ptr<HttpClient> http_;
     std::unique_ptr<HttpClient> provider_http_;
-    std::vector<std::unique_ptr<MetadataProvider>> providers_;
+    std::vector<std::unique_ptr<CatalogueScanProvider>> providers_;
     std::atomic_bool provider_continuation_{};
     std::jthread worker_;
     mutable std::mutex config_mutex_;

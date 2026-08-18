@@ -85,6 +85,24 @@ struct CatalogueMusicBrainzConfig {
     std::string cover_size{"500"};
 };
 
+struct CatalogueMovieProviderConfig {
+    bool enabled{true};
+    std::vector<std::string> roots{"/Movies"};
+    CatalogueTmdbConfig tmdb;
+};
+
+struct CatalogueTvProviderConfig {
+    bool enabled{true};
+    std::vector<std::string> roots{"/TV"};
+    CatalogueTmdbConfig tmdb;
+};
+
+struct CatalogueMusicProviderConfig {
+    bool enabled{true};
+    std::vector<std::string> roots{"/Music"};
+    CatalogueMusicBrainzConfig musicbrainz;
+};
+
 struct CatalogueScannerConfig {
     bool enabled{};
     std::chrono::milliseconds interval{std::chrono::hours(6)};
@@ -98,10 +116,10 @@ struct CatalogueScannerConfig {
     // rather than monopolising a scanner pass with remote lookups.
     size_t max_provider_requests_per_scan{32};
     std::chrono::milliseconds provider_batch_delay{30000};
-    std::vector<std::string> roots{"/"};
     size_t max_artwork_bytes{16 * 1024 * 1024};
-    CatalogueTmdbConfig tmdb;
-    CatalogueMusicBrainzConfig musicbrainz;
+    CatalogueMovieProviderConfig movies;
+    CatalogueTvProviderConfig tv;
+    CatalogueMusicProviderConfig music;
 };
 
 struct CatalogueConfig {

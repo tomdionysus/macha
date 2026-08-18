@@ -1231,18 +1231,31 @@ void test_config() {
             << "    rescan_max_delay_ms: 45000\n"
             << "    max_provider_requests_per_scan: 48\n"
             << "    provider_batch_delay_ms: 15000\n"
-            << "    roots: [/TV, /Movies, /Music]\n"
             << "    max_artwork_bytes: 6M\n"
             << "    providers:\n"
-            << "      tmdb:\n"
+            << "      movies:\n"
             << "        enabled: true\n"
-            << "        token_file: " << (t.path() / "tmdb.token").string() << "\n"
-            << "        language: en-GB\n"
-            << "        image_size: w500\n"
-            << "      musicbrainz:\n"
+            << "        roots: [/Movies]\n"
+            << "        tmdb:\n"
+            << "          enabled: true\n"
+            << "          token_file: " << (t.path() / "tmdb.token").string() << "\n"
+            << "          language: en-GB\n"
+            << "          image_size: w500\n"
+            << "      tv:\n"
             << "        enabled: true\n"
-            << "        contact: https://example.test/macha\n"
-            << "        cover_size: '500'\n"
+            << "        roots: [/TV]\n"
+            << "        tmdb:\n"
+            << "          enabled: true\n"
+            << "          token_file: " << (t.path() / "tmdb.token").string() << "\n"
+            << "          language: en-GB\n"
+            << "          image_size: w500\n"
+            << "      music:\n"
+            << "        enabled: true\n"
+            << "        roots: [/Music]\n"
+            << "        musicbrainz:\n"
+            << "          enabled: true\n"
+            << "          contact: https://example.test/macha\n"
+            << "          cover_size: '500'\n"
             << "streaming:\n"
             << "  enabled: true\n"
             << "  ffmpeg: /legacy/ignored/ffmpeg\n"
@@ -1310,15 +1323,18 @@ void test_config() {
     CHECK(yc.catalogue.scanner.rescan_max_delay == 45000ms);
     CHECK(yc.catalogue.scanner.max_provider_requests_per_scan == 48);
     CHECK(yc.catalogue.scanner.provider_batch_delay == 15000ms);
-    CHECK(yc.catalogue.scanner.roots.size() == 3);
-    CHECK(yc.catalogue.scanner.roots[0] == "/TV");
+    CHECK(yc.catalogue.scanner.movies.roots == std::vector<std::string>{"/Movies"});
+    CHECK(yc.catalogue.scanner.tv.roots == std::vector<std::string>{"/TV"});
+    CHECK(yc.catalogue.scanner.music.roots == std::vector<std::string>{"/Music"});
     CHECK(yc.catalogue.scanner.max_artwork_bytes == 6ULL * 1024 * 1024);
-    REQUIRE(yc.catalogue.scanner.tmdb.token_file.has_value());
-    CHECK(*yc.catalogue.scanner.tmdb.token_file == t.path() / "tmdb.token");
-    CHECK(yc.catalogue.scanner.tmdb.language == "en-GB");
-    CHECK(yc.catalogue.scanner.tmdb.image_size == "w500");
-    CHECK(yc.catalogue.scanner.musicbrainz.contact == "https://example.test/macha");
-    CHECK(yc.catalogue.scanner.musicbrainz.cover_size == "500");
+    REQUIRE(yc.catalogue.scanner.movies.tmdb.token_file.has_value());
+    CHECK(*yc.catalogue.scanner.movies.tmdb.token_file == t.path() / "tmdb.token");
+    CHECK(yc.catalogue.scanner.movies.tmdb.language == "en-GB");
+    CHECK(yc.catalogue.scanner.movies.tmdb.image_size == "w500");
+    REQUIRE(yc.catalogue.scanner.tv.tmdb.token_file.has_value());
+    CHECK(*yc.catalogue.scanner.tv.tmdb.token_file == t.path() / "tmdb.token");
+    CHECK(yc.catalogue.scanner.music.musicbrainz.contact == "https://example.test/macha");
+    CHECK(yc.catalogue.scanner.music.musicbrainz.cover_size == "500");
     CHECK(yc.streaming.enabled);
     REQUIRE(yc.streaming.temp_path.has_value());
     CHECK(*yc.streaming.temp_path == t.path() / "streams");
@@ -3767,6 +3783,27 @@ void test_media_probe_and_online_catalogue_scanner() {
     CHECK(mb_match->artwork.front().role == "cover");
     CHECK(mb_match->artwork.front().url == "https://images.example/500.jpg");
 
+    // If tags/filename give artist+title but no trustworthy album, use a
+    // recording search rather than inventing a release from directory names.
+    FakeHttpClient mb_recording_http;
+    mb_recording_http.add("/ws/2/recording?", 200, "application/json",
+        R"JSON({"recordings":[{"id":"rec-2","title":"The First Time (Raven Remix)","score":100,"artist-credit":[{"name":"Scooter","artist":{"id":"artist-2","name":"Scooter"}}]}]})JSON");
+    mb_recording_http.add("/ws/2/recording/rec-2", 200, "application/json",
+        R"JSON({"id":"rec-2","title":"The First Time (Raven Remix)","artist-credit":[{"name":"Scooter","artist":{"id":"artist-2","name":"Scooter"}}],"releases":[{"id":"rel-2","title":"The First Time"}]})JSON");
+    mb_recording_http.add("/ws/2/release/rel-2", 200, "application/json",
+        R"JSON({"id":"rel-2","title":"The First Time","date":"1995-05-01","artist-credit":[{"name":"Scooter","artist":{"id":"artist-2","name":"Scooter"}}],"release-group":{"id":"rg-2"},"media":[{"position":1,"tracks":[{"position":1,"title":"The First Time (Raven Remix)","recording":{"id":"rec-2","title":"The First Time (Raven Remix)"}}]}]})JSON");
+    MusicBrainzProvider mb_recording(mb_recording_http, mb_config);
+    MediaProbe recording_probe;
+    recording_probe.kind = MediaProbeKind::track;
+    recording_probe.artist = "Scooter";
+    recording_probe.title = "The First Time (Raven Remix)";
+    recording_probe.media_id = "macha:test-recording-fallback";
+    auto recording_match = mb_recording.lookup(recording_probe);
+    REQUIRE(recording_match.has_value());
+    CHECK(recording_match->items.size() == 3);
+    CHECK(recording_match->items[1].title == "The First Time");
+    CHECK(recording_match->items[2].external_ids.at("musicbrainz") == "rec-2");
+
     // Semantic provider misses are process-lifetime negative cache entries.
     // Transient HTTP failures still throw and are retried; only a successful
     // provider response saying "no match" is suppressed on later tracks/scans.
@@ -3825,6 +3862,77 @@ void test_media_probe_and_online_catalogue_scanner() {
     auto keys = load_cluster_keys(key);
     Service service(config, keys);
     service.start();
+
+    // Music scanning is tag-first and provider-root scoped. Deliberately put a
+    // tagged MP3 under misleading collection/grouping directories: embedded
+    // metadata must win, while untagged filename fallback must not manufacture
+    // an artist/album from those same directories.
+    service.filesystem().mkdir("/Music", 0755, getuid(), getgid());
+    const std::string collection = "/Music/Scooter Full Discography (Albums & Singles 1994-2011)";
+    service.filesystem().mkdir(collection, 0755, getuid(), getgid());
+    const std::string singles = collection + "/Singles";
+    service.filesystem().mkdir(singles, 0755, getuid(), getgid());
+    const std::string tagged_album = singles + "/14 - [1996] I'm Raving The Remixes CDM";
+    service.filesystem().mkdir(tagged_album, 0755, getuid(), getgid());
+    const std::string tagged_path = tagged_album + "/01 - Completely Wrong.mp3";
+
+    auto fixture_bytes = [](const char* name) {
+        auto path = std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "tests" / "fixtures" / name;
+        std::ifstream input(path, std::ios::binary);
+        REQUIRE(input.good());
+        std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        return Bytes(bytes.begin(), bytes.end());
+    };
+    auto write_fixture = [&](const std::string& path, const Bytes& bytes) {
+        service.filesystem().create_file(path, 0644, getuid(), getgid());
+        auto writer = service.filesystem().open_write(path, true);
+        REQUIRE(writer->write(0, bytes) == bytes.size());
+        writer->commit();
+    };
+
+    const auto tagged_bytes = fixture_bytes("tagged.mp3");
+    const auto untagged_bytes = fixture_bytes("untagged.mp3");
+    write_fixture(tagged_path, tagged_bytes);
+
+    FakeHttpClient music_probe_http;
+    CatalogueMusicProviderConfig music_source_config;
+    music_source_config.roots = {"/Music"};
+    music_source_config.musicbrainz.enabled = false;
+    MusicScanProvider music_source(music_probe_http, music_source_config);
+    auto tagged_entry = service.filesystem().getattr(tagged_path);
+    auto tagged_probe = music_source.probe(service.filesystem(), "/Music", tagged_path, tagged_entry);
+    REQUIRE(tagged_probe.has_value());
+    CHECK(tagged_probe->artist == "Scooter");
+    CHECK(tagged_probe->album == "I'm Raving The Remixes");
+    CHECK(tagged_probe->title == "I'm Raving (Progressive Remix)");
+    CHECK(tagged_probe->track == 1);
+    CHECK(tagged_probe->disc == 1);
+    CHECK(tagged_probe->year == 1996);
+    CHECK(tagged_probe->musicbrainz_recording_id == std::optional<std::string>{"rec-tagged-1"});
+    CHECK(tagged_probe->musicbrainz_release_id == std::optional<std::string>{"rel-tagged-1"});
+    CHECK(tagged_probe->musicbrainz_artist_id == std::optional<std::string>{"artist-tagged-1"});
+
+    const std::string loose_path = singles + "/Scooter - The First Time (Raven Remix).mp3";
+    write_fixture(loose_path, untagged_bytes);
+    auto loose_entry = service.filesystem().getattr(loose_path);
+    auto loose_probe = music_source.probe(service.filesystem(), "/Music", loose_path, loose_entry);
+    REQUIRE(loose_probe.has_value());
+    CHECK(loose_probe->artist == "Scooter");
+    CHECK(loose_probe->album.empty());
+    CHECK(loose_probe->title == "The First Time (Raven Remix)");
+
+    const std::string nested_album = singles + "/13 - [1996] I'm Raving CDM";
+    service.filesystem().mkdir(nested_album, 0755, getuid(), getgid());
+    const std::string nested_path = nested_album + "/01 - I'm Raving.mp3";
+    write_fixture(nested_path, untagged_bytes);
+    auto nested_entry = service.filesystem().getattr(nested_path);
+    auto nested_probe = music_source.probe(service.filesystem(), "/Music", nested_path, nested_entry);
+    REQUIRE(nested_probe.has_value());
+    CHECK(nested_probe->artist.empty());
+    CHECK(nested_probe->album.empty());
+    CHECK(nested_probe->track == 1);
+    CHECK(nested_probe->title == "I'm Raving");
+
     service.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
     service.filesystem().create_file("/Movies/Blade.Runner.2049.2017.1080p.mkv", 0644,
                                      getuid(), getgid());
@@ -3855,9 +3963,10 @@ void test_media_probe_and_online_catalogue_scanner() {
     // A missing configured root makes the pass partial: discoveries from
     // available roots are still ingested, but absence cannot prune existing
     // scanner-owned bindings until every root is traversable.
-    scanner_config.roots = {"/Movies", "/Missing"};
-    scanner_config.tmdb.token_file = scanner_token;
-    scanner_config.musicbrainz.enabled = false;
+    scanner_config.movies.roots = {"/Movies", "/Missing"};
+    scanner_config.movies.tmdb.token_file = scanner_token;
+    scanner_config.tv.enabled = false;
+    scanner_config.music.enabled = false;
     CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(),
                              scanner_config, std::move(fake_http));
     const auto namespace_before_scan = service.filesystem().namespace_signature();
@@ -3932,7 +4041,7 @@ void test_media_probe_and_online_catalogue_scanner() {
     auto blocking_http = std::make_unique<BlockingHttpClient>();
     auto* blocking_http_ptr = blocking_http.get();
     auto cancel_config = scanner_config;
-    cancel_config.roots = {"/Movies"};
+    cancel_config.movies.roots = {"/Movies"};
     CatalogueScanner cancel_scanner(service.node(), service.filesystem(), service.catalogue(),
                                     cancel_config, std::move(blocking_http));
     cancel_scanner.start();
@@ -3976,7 +4085,7 @@ void test_media_probe_and_online_catalogue_scanner() {
                      R"({"id":2003,"title":"Budget Three","release_date":"2022-01-01"})");
 
     auto budget_config = scanner_config;
-    budget_config.roots = {"/Budget"};
+    budget_config.movies.roots = {"/Budget"};
     budget_config.max_provider_requests_per_scan = 4;
     budget_config.provider_batch_delay = 1000ms;
     CatalogueScanner budget_scanner(service.node(), service.filesystem(), service.catalogue(),
@@ -4325,7 +4434,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
-    CHECK(status_body.find("\"server_version\":\"0.10.2\"") != std::string::npos);
+    CHECK(status_body.find("\"server_version\":\"0.10.3\"") != std::string::npos);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -4988,7 +5097,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == "0.10.2");
+    CHECK(playback_status_json.find("server_version")->asString() == "0.10.3");
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately
