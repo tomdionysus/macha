@@ -1350,6 +1350,7 @@ class LibavMediaEngine final : public MediaEngine {
             info.channels = par->ch_layout.nb_channels;
             info.sample_rate = par->sample_rate;
             info.bit_depth = par->bits_per_raw_sample;
+            if (par->bit_rate > 0) info.bitrate = static_cast<uint64_t>(par->bit_rate);
             info.default_stream = (stream->disposition & AV_DISPOSITION_DEFAULT) != 0;
             info.forced = (stream->disposition & AV_DISPOSITION_FORCED) != 0;
             result.streams.push_back(std::move(info));

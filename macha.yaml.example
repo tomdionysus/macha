@@ -1,4 +1,4 @@
-# Macha 0.9.0
+# Macha 0.9.1
 #
 # Copy this file per node. Paths, advertise address and failure_domain are
 # node-local. The cluster key contents and dht policy must match every node.
@@ -126,6 +126,8 @@ catalogue:
   scanner:
     enabled: false
     interval_ms: 21600000
+    # Coalesce namespace create/write/rename/delete bursts before rescanning.
+    mutation_debounce_ms: 30000
     roots:
       - /Movies
       - /TV

@@ -1405,6 +1405,29 @@ std::vector<ObjectId> FileSystem::live_objects() {
     return {cached->live.begin(), cached->live.end()};
 }
 
+Hash256 FileSystem::namespace_signature(uint64_t* metadata_generation) {
+    const auto view = m_.snapshot_view();
+    if (metadata_generation) *metadata_generation = view.generation;
+    Writer writer;
+    writer.u64(view.snapshot->entries.size());
+    for (const auto& [path, entry] : view.snapshot->entries) {
+        writer.string(path);
+        writer.u8(static_cast<uint8_t>(entry.type));
+        if (entry.type != EntryType::file)
+            continue;
+        writer.u64(entry.size);
+        writer.u32(entry.extents.size());
+        for (const auto& extent : entry.extents) {
+            writer.u64(extent.offset);
+            writer.u64(extent.length);
+            writer.u8(extent.hole);
+            if (!extent.hole)
+                writer.fixed(extent.id.bytes);
+        }
+    }
+    return sha256(writer.data());
+}
+
 std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached() {
     const auto known_generation = n_.known_metadata_generation();
     {

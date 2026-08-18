@@ -78,6 +78,10 @@ struct CatalogueMusicBrainzConfig {
 struct CatalogueScannerConfig {
     bool enabled{};
     std::chrono::milliseconds interval{std::chrono::hours(6)};
+    // Namespace mutations are coalesced before a scan. Large copies commonly
+    // publish many metadata generations; scanning only after they settle keeps
+    // the catalogue responsive without repeatedly walking half-written trees.
+    std::chrono::milliseconds mutation_debounce{30000};
     std::vector<std::string> roots{"/"};
     size_t max_artwork_bytes{16 * 1024 * 1024};
     CatalogueTmdbConfig tmdb;

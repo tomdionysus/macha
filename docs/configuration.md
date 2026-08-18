@@ -48,6 +48,10 @@ A YAML file is required. These CLI options override values from that file for on
 
 RPC duration itself is unbounded. Stall notices are observability thresholds; they do not cancel requests. Health/control traffic uses the same peer connection at absolute highest priority. A peer is marked dead only after that unified transport cannot establish liveness within `dead_after_ms`.
 
+## Catalogue scanner
+
+`catalogue.scanner.interval_ms` is the periodic safety scan interval. Committed namespace changes also schedule a scan after `catalogue.scanner.mutation_debounce_ms` (default 30000 ms, valid 1000..600000). The debounce is cluster-aware and is reset by further namespace changes; catalogue metadata written by the scanner itself is excluded from the content signature and does not schedule another pass.
+
 ## Streaming configuration
 
 Streaming shares the catalogue HTTP listener. `streaming.enabled: true` therefore requires `catalogue.api.enabled: true`. Macha links `libavformat`, `libavcodec`, `libavutil`, `libswscale` and `libswresample` directly. It does not run the `ffmpeg` or `ffprobe` commands. Legacy `streaming.ffmpeg` and `streaming.ffprobe` keys from the first 0.7.0 build are accepted and ignored.
