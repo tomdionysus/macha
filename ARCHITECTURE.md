@@ -259,7 +259,7 @@ Local backend state is deliberately separated from disk execution. A backend mut
 
 The committed metadata record is decoded once per observed metadata generation into an immutable shared snapshot. FUSE `getattr` performs a direct lookup in that snapshot; `readdir` uses a generation-matched directory-child path index rather than scanning every namespace entry. Media-id resolution similarly caches only paths, not duplicate `FsEntry` extent manifests. A new committed generation invalidates these views atomically. This keeps ordinary stat/list cost proportional to the requested entry/directory rather than to the complete media namespace.
 
-Macha namespace keys remain byte-preserving across platforms. On macOS the FUSE adapter, not metadata storage, implements the host Unicode contract: macFUSE high-level lookup is canonical-equivalence insensitive and names returned by `readdir` are converted to Unicode Normalization Form D. This allows namespace state written by older versions in either NFC or NFD to remain addressable without a metadata migration.
+Macha namespace keys remain byte-preserving across platforms. On macOS the runtime namespace index, not metadata storage, implements canonical-equivalent lookup: each stored path is indexed by its NFC form and lookup aliases resolve back to the exact persisted spelling. Names returned by FUSE `readdir` are converted to Unicode Normalization Form D as required by macFUSE/Finder. New names use NFC for the new leaf while retaining the actual stored spelling of an existing parent. This allows namespace state written by older versions in NFC, NFD or mixed per-component forms to remain addressable without a metadata migration.
 
 ## Garbage collection
 

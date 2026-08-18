@@ -616,11 +616,10 @@ int run_fuse(FileSystem& filesystem, const std::filesystem::path& mount_path, bo
     std::string options = allow_other ? "default_permissions,allow_other,fsname=macha"
                                       : "default_permissions,fsname=macha";
 #if defined(__APPLE__)
-    // macFUSE's high-level API can receive canonically equivalent pathnames in
-    // different Unicode normalization forms. Keep Macha's persisted namespace
-    // byte-preserving, but make lookup canonical-equivalence aware at the mount
-    // boundary. readdir() separately emits D-form names as macFUSE requires.
-    options += ",norm_insensitive";
+    // libfuse3 builds of macFUSE do not consistently expose the historical
+    // norm_insensitive mount option. Macha handles canonical-equivalent lookup
+    // in its runtime namespace index instead; readdir() still emits D-form names
+    // as required by macOS/macFUSE.
 #endif
 
     char cwd[4096]{};

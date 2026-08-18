@@ -11,4 +11,8 @@ namespace macha {
 // remain byte-for-byte unchanged for compatibility with existing stores.
 std::string macos_fuse_decomposed_name(std::string_view name);
 
+// Canonical lookup form used only for runtime path equivalence on macOS.
+// Persisted namespace strings are never rewritten by this helper.
+std::string macos_fuse_composed_name(std::string_view name);
+
 } // namespace macha

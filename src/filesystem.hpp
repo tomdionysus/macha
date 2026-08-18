@@ -148,10 +148,17 @@ class FileSystem {
         // manifests; duplicating every extent into the directory index would make
         // cache memory proportional to the namespace twice over.
         std::map<std::string, std::vector<std::pair<std::string, std::string>>, std::less<>> children;
+        // macOS can present canonically-equivalent UTF-8 path spellings across
+        // different VFS/FUSE operations. Keep persisted keys byte-preserving and
+        // resolve only the runtime alias back to the actual stored path.
+        std::map<std::string, std::string, std::less<>> canonical_paths;
+        std::set<std::string, std::less<>> ambiguous_canonical_paths;
     };
     std::mutex namespace_index_mutex_;
     std::shared_ptr<const NamespaceIndex> namespace_index_;
     std::shared_ptr<const NamespaceIndex> namespace_index();
+    std::optional<std::string> resolve_existing_path(const std::string&);
+    std::string resolve_new_path(const std::string&);
 
     std::mutex media_index_mutex_;
     uint64_t media_index_generation_{};
