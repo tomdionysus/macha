@@ -95,6 +95,7 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
         NodeInfo owner;
         std::optional<AsyncRpc> rpc;
         Clock::time_point started{};
+        Clock::time_point last_diag{};
         bool done{};
     };
 
@@ -137,7 +138,13 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
             PendingPut item;
             item.owner = owner;
             item.started = Clock::now();
+            item.last_diag = item.started;
             item.rpc.emplace(n_.call_async(owner, MessageType::put_object, payload, FrameType::read_ahead));
+            if (Log::enabled(LogLevel::debug))
+                Log::debug("DIAG put-quorum launch object=" + to_string(id) +
+                           " peer=" + to_string(owner.id).substr(0, 12) +
+                           " req=" + std::to_string(item.rpc->request_id()) +
+                           " bytes=" + std::to_string(data.size()));
             pending.push_back(std::move(item));
         } catch (...) {
             ++completed;
@@ -163,13 +170,30 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
         for (auto& item : pending) {
             if (item.done || !item.rpc)
                 continue;
-            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+                const auto now = Clock::now();
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - item.started);
+                if (elapsed >= std::chrono::seconds(2) &&
+                    now - item.last_diag >= std::chrono::seconds(5) &&
+                    Log::enabled(LogLevel::debug)) {
+                    item.last_diag = now;
+                    Log::debug("DIAG put-quorum pending object=" + to_string(id) +
+                               " peer=" + to_string(item.owner.id).substr(0, 12) +
+                               " req=" + std::to_string(item.rpc->request_id()) +
+                               " elapsed_ms=" + std::to_string(elapsed.count()) +
+                               " no_progress_ms=" + std::to_string(item.rpc->idle_for().count()) +
+                               " success=" + std::to_string(success) +
+                               "/" + std::to_string(need));
+                }
                 continue;
+            }
 
             item.done = true;
             ++completed;
             progressed = true;
             bool ok = false;
+            const auto request_id = item.rpc->request_id();
             try {
                 ok = item.rpc->get().message.type == MessageType::ok;
             } catch (...) {
@@ -177,6 +201,12 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
             const auto remote_elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - item.started);
             remote_max_time = std::max(remote_max_time, remote_elapsed);
+            if (Log::enabled(LogLevel::debug))
+                Log::debug("DIAG put-quorum complete object=" + to_string(id) +
+                           " peer=" + to_string(item.owner.id).substr(0, 12) +
+                           " req=" + std::to_string(request_id) +
+                           " ok=" + std::to_string(ok ? 1 : 0) +
+                           " elapsed_ms=" + std::to_string(remote_elapsed.count()));
             if (ok) {
                 ++success;
                 note_network(data.size(), Clock::now() - item.started);
