@@ -140,13 +140,12 @@ class AsyncRpc {
     std::function<void()> abort_;
     std::function<void(FrameType)> promote_;
     std::function<std::chrono::milliseconds()> idle_;
-    uint64_t request_id_{};
 
   public:
     AsyncRpc() = default;
     AsyncRpc(std::future<RpcReply>, std::function<void()>, std::function<void()>,
              std::function<void(FrameType)> = {},
-             std::function<std::chrono::milliseconds()> = {}, uint64_t request_id = 0);
+             std::function<std::chrono::milliseconds()> = {});
     ~AsyncRpc();
     AsyncRpc(AsyncRpc&&) noexcept;
     AsyncRpc& operator=(AsyncRpc&&) noexcept;
@@ -161,7 +160,6 @@ class AsyncRpc {
     void promote(FrameType);
     std::function<void(FrameType)> promotion_callback() const { return promote_; }
     std::chrono::milliseconds idle_for() const;
-    uint64_t request_id() const noexcept { return request_id_; }
 };
 
 class RpcClient {
