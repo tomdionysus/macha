@@ -128,10 +128,19 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
         if (owner.id == n_.node_id()) {
             ++completed;
             const auto started = Clock::now();
-            if (n_.local_store().put(id, data))
+            if (Log::enabled(LogLevel::debug))
+                Log::debug("DIAG put-quorum local-begin object=" + to_string(id) +
+                           " bytes=" + std::to_string(data.size()));
+            const bool stored = n_.local_store().put(id, data);
+            if (stored)
                 ++success;
-            local_store_time +=
+            const auto elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
+            local_store_time += elapsed;
+            if (Log::enabled(LogLevel::debug))
+                Log::debug("DIAG put-quorum local-end object=" + to_string(id) +
+                           " ok=" + std::to_string(stored ? 1 : 0) +
+                           " elapsed_ms=" + std::to_string(elapsed.count()));
             return;
         }
         try {
@@ -139,14 +148,33 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
             item.owner = owner;
             item.started = Clock::now();
             item.last_diag = item.started;
+            if (Log::enabled(LogLevel::debug))
+                Log::debug("DIAG put-quorum remote-begin object=" + to_string(id) +
+                           " peer=" + to_string(owner.id).substr(0, 12) +
+                           " endpoint=" + owner.host + ":" + std::to_string(owner.port) +
+                           " bytes=" + std::to_string(data.size()));
             item.rpc.emplace(n_.call_async(owner, MessageType::put_object, payload, FrameType::read_ahead));
+            if (Log::enabled(LogLevel::debug))
+                Log::debug("DIAG put-quorum rpc-created object=" + to_string(id) +
+                           " peer=" + to_string(owner.id).substr(0, 12) +
+                           " req=" + std::to_string(item.rpc->request_id()));
             if (Log::enabled(LogLevel::debug))
                 Log::debug("DIAG put-quorum launch object=" + to_string(id) +
                            " peer=" + to_string(owner.id).substr(0, 12) +
                            " req=" + std::to_string(item.rpc->request_id()) +
                            " bytes=" + std::to_string(data.size()));
             pending.push_back(std::move(item));
+        } catch (const std::exception& error) {
+            if (Log::enabled(LogLevel::debug))
+                Log::debug("DIAG put-quorum remote-launch-error object=" + to_string(id) +
+                           " peer=" + to_string(owner.id).substr(0, 12) +
+                           " error=\"" + error.what() + "\"");
+            ++completed;
         } catch (...) {
+            if (Log::enabled(LogLevel::debug))
+                Log::debug("DIAG put-quorum remote-launch-error object=" + to_string(id) +
+                           " peer=" + to_string(owner.id).substr(0, 12) +
+                           " error=\"unknown\"");
             ++completed;
         }
     };

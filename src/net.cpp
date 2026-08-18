@@ -36,12 +36,16 @@ bool diagnostic_put(MessageType type) noexcept {
     return type == MessageType::put_object;
 }
 
-std::string diagnostic_object(const RpcMessage& message) {
-    if (!diagnostic_put(message.type) || message.payload.size() < 32)
+std::string diagnostic_object(MessageType type, std::span<const uint8_t> payload) {
+    if (!diagnostic_put(type) || payload.size() < 32)
         return "-";
     ObjectId id{};
-    std::copy_n(message.payload.begin(), id.bytes.size(), id.bytes.begin());
+    std::copy_n(payload.begin(), id.bytes.size(), id.bytes.begin());
     return to_string(id);
+}
+
+std::string diagnostic_object(const RpcMessage& message) {
+    return diagnostic_object(message.type, message.payload);
 }
 
 void validate_frame_limit(size_t size) {
@@ -1285,7 +1289,12 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
           inbound_promoter_(std::move(inbound_promoter)),
           inbound_canceller_(std::move(inbound_canceller)),
           result_observer_(std::move(result_observer)) {
+        if (lane == TransportLane::data && Log::enabled(LogLevel::debug))
+            Log::debug("DIAG rpc-handshake client-begin lane=data");
         peer_ = channel_.client_handshake(lane);
+        if (lane == TransportLane::data && Log::enabled(LogLevel::debug))
+            Log::debug("DIAG rpc-handshake client-complete lane=data peer=" +
+                       to_string(peer_.id).substr(0, 12));
         peer_observer_(peer_);
         reader_ = std::jthread([this](std::stop_token stop) { reader_loop(stop); });
         writer_ = std::jthread([this](std::stop_token stop) { writer_loop(stop); });
@@ -1641,7 +1650,12 @@ RpcClient::connection(const Endpoint& endpoint, const NodeId* expected, NodeId* 
     }
 
     try {
+        if (lane == TransportLane::data && Log::enabled(LogLevel::debug))
+            Log::debug("DIAG rpc-dial begin lane=data endpoint=" + endpoint_key(endpoint) +
+                       (expected ? " expected=" + to_string(*expected).substr(0, 12) : ""));
         int fd = connect_socket(endpoint, connect_timeout_);
+        if (lane == TransportLane::data && Log::enabled(LogLevel::debug))
+            Log::debug("DIAG rpc-dial tcp-connected lane=data endpoint=" + endpoint_key(endpoint));
         auto fresh = std::make_shared<PeerConnection>(
             fd, keys_, local_(), max_frame_size_, lane, peer_observer_, metadata_observer_,
             [this](const NodeInfo& peer, RpcFrame frame, InboundReply reply) {
@@ -1730,6 +1744,13 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
                                      FrameType frame_type) {
     validate_frame_semantics(type, frame_type);
     const auto lane = lane_for(type, frame_type);
+    const bool diag_put = diagnostic_put(type) && Log::enabled(LogLevel::debug);
+    const auto diag_object = diag_put ? diagnostic_object(type, payload) : std::string{};
+    if (diag_put)
+        Log::debug("DIAG rpc-route begin object=" + diag_object +
+                   " endpoint=" + endpoint_key(endpoint) +
+                   " lane=" + transport_lane_name(lane) +
+                   (expected ? " expected=" + to_string(*expected).substr(0, 12) : ""));
 
     auto try_existing = [&](const NodeId& peer) -> std::optional<AsyncRpc> {
         std::shared_ptr<PeerConnection> outbound;
@@ -1748,6 +1769,10 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
         }
         if (outbound) {
             ++connections_reused_;
+            if (diag_put)
+                Log::debug("DIAG rpc-route existing-outbound object=" + diag_object +
+                           " peer=" + to_string(peer).substr(0, 12) +
+                           " lane=" + transport_lane_name(lane));
             try {
                 return outbound->call(type, payload, frame_type);
             } catch (const std::exception&) {
@@ -1755,6 +1780,10 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
         }
         if (inbound) {
             ++connections_reused_;
+            if (diag_put)
+                Log::debug("DIAG rpc-route existing-inbound object=" + diag_object +
+                           " peer=" + to_string(peer).substr(0, 12) +
+                           " lane=" + transport_lane_name(lane));
             try {
                 return inbound(type, payload, frame_type);
             } catch (const std::exception&) {
@@ -1768,7 +1797,16 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
             return std::move(*existing);
 
     NodeId actual{};
+    if (diag_put)
+        Log::debug("DIAG rpc-route need-connection object=" + diag_object +
+                   " endpoint=" + endpoint_key(endpoint) +
+                   " lane=" + transport_lane_name(lane));
     auto outbound = connection(endpoint, expected, &actual, lane);
+    if (diag_put)
+        Log::debug("DIAG rpc-route connection-return object=" + diag_object +
+                   " actual=" + to_string(actual).substr(0, 12) +
+                   " outbound=" + std::to_string(outbound ? 1 : 0) +
+                   " lane=" + transport_lane_name(lane));
     if (outbound && outbound->usable()) {
         try {
             return outbound->call(type, payload, frame_type);
@@ -2828,6 +2866,8 @@ void RpcServer::accept_loop(std::stop_token stop) {
 
         auto session = std::make_shared<Session>();
         session->remote_host = numeric_host(address, size);
+        if (Log::enabled(LogLevel::debug))
+            Log::debug("DIAG rpc-accept tcp-accepted remote=" + session->remote_host);
         session->channel = std::make_unique<SecureChannel>(client, keys_, local_, max_frame_size_);
         {
             std::lock_guard lock(sessions_mutex_);
@@ -2843,7 +2883,13 @@ void RpcServer::session_loop(Session* session) {
     set_thread_name("macha-accept-rd");
     MessageAssembler assembler;
     try {
+        if (Log::enabled(LogLevel::debug))
+            Log::debug("DIAG rpc-handshake server-begin remote=" + session->remote_host);
         session->peer = session->channel->server_handshake(session->remote_host);
+        if (Log::enabled(LogLevel::debug))
+            Log::debug("DIAG rpc-handshake server-complete remote=" + session->remote_host +
+                       " lane=" + transport_lane_name(session->channel->lane()) +
+                       " peer=" + to_string(session->peer.id).substr(0, 12));
         session->ready = true;
         session->start_writer();
         observer_(session->peer);
