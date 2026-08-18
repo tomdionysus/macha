@@ -3388,6 +3388,44 @@ void test_media_probe_and_online_catalogue_scanner() {
     CHECK(tv_match->items[2].media_ids == std::vector<std::string>{"macha:test-episode"});
     CHECK(tv_match->artwork.size() == 4);
 
+    // Provider title scoring must tolerate common number spelling differences
+    // between release filenames and canonical provider titles. The year remains
+    // part of the score, so this does not turn matching into a first-result win.
+    FakeHttpClient movie_http;
+    movie_http.add("query=Men%20In%20Black%202&language=en-GB&primary_release_year=2002",
+                   200, "application/json",
+                   R"({"results":[{"id":1001,"title":"Men in Black II","release_date":"2002-07-03"}]})");
+    movie_http.add("/movie/1001", 200, "application/json",
+                   R"({"id":1001,"title":"Men in Black II","release_date":"2002-07-03"})");
+    movie_http.add("query=12%20Monkeys&language=en-GB&primary_release_year=1995",
+                   200, "application/json",
+                   R"({"results":[{"id":1002,"title":"Twelve Monkeys","release_date":"1995-12-29"}]})");
+    movie_http.add("/movie/1002", 200, "application/json",
+                   R"({"id":1002,"title":"Twelve Monkeys","release_date":"1995-12-29"})");
+    TmdbProvider movie_tmdb(movie_http, tmdb_config);
+
+    MediaProbe mib_probe;
+    mib_probe.kind = MediaProbeKind::movie;
+    mib_probe.title = "Men In Black 2";
+    mib_probe.year = 2002;
+    mib_probe.media_id = "macha:test-mib2";
+    auto mib_match = movie_tmdb.lookup(mib_probe);
+    REQUIRE(mib_match.has_value());
+    REQUIRE(mib_match->items.size() == 1);
+    CHECK(mib_match->items.front().title == "Men in Black II");
+    CHECK(mib_match->items.front().media_ids == std::vector<std::string>{"macha:test-mib2"});
+
+    MediaProbe monkeys_probe;
+    monkeys_probe.kind = MediaProbeKind::movie;
+    monkeys_probe.title = "12 Monkeys";
+    monkeys_probe.year = 1995;
+    monkeys_probe.media_id = "macha:test-12-monkeys";
+    auto monkeys_match = movie_tmdb.lookup(monkeys_probe);
+    REQUIRE(monkeys_match.has_value());
+    REQUIRE(monkeys_match->items.size() == 1);
+    CHECK(monkeys_match->items.front().title == "Twelve Monkeys");
+    CHECK(monkeys_match->items.front().media_ids == std::vector<std::string>{"macha:test-12-monkeys"});
+
     // MusicBrainz resolves one release, then maps the local track onto its
     // recording; Cover Art Archive provides the front cover URL.
     FakeHttpClient mb_http;
