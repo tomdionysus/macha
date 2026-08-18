@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.3 - 2026-08-18
+
+- move catalogue-root transfer onto a dedicated metadata-object RPC carried by the CONTROL TCP session at speculative worker priority. A node that has converged metadata can now fetch or receive the immutable catalogue root without first establishing the DATA lane used for media/object payloads; root reads search every active peer because catalogue roots are universal rather than ordinary DHT-placement objects;
+- stop making catalogue readiness depend on eagerly downloading every referenced artwork object. A successfully decoded catalogue root is immediately usable for item/list/search operations; artwork locality remains visible in status and normal universal-object maintenance/on-demand fetch converges artwork independently;
+- publish catalogue roots with the same metadata-object transport before committing the new `catalogue_root` pointer, closing the failure mode where CONTROL metadata quorum succeeded while DATA-lane root replication failed;
+- add regressions proving metadata-object traffic stays on the existing CONTROL connection and that a catalogue with non-local artwork still becomes ready;
+- bump the authenticated transport to v12 (`MC12`, `macha/session/v12`) for the metadata-object RPC. v11-and-earlier peers are intentionally incompatible; stop the whole cluster before upgrading.
+
 ## 0.9.2 - 2026-08-18
 
 - Canonicalise Arabic, Roman and common spelled-out number tokens when scoring catalogue provider titles. This allows provider results such as `Men in Black II` and `Twelve Monkeys` to match release filenames using `Men In Black 2` and `12 Monkeys` while retaining year scoring.

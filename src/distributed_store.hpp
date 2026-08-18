@@ -79,7 +79,9 @@ class DistributedStore {
     bool has_on(const NodeInfo&, const ObjectId&);
     bool should_own(const ObjectId&) const;
     size_t replicate_all(const ObjectId&, std::span<const uint8_t>, bool foreground = false);
+    size_t replicate_metadata_all(const ObjectId&, std::span<const uint8_t>);
     bool ensure_local(const ObjectId&, bool foreground = false);
+    bool ensure_metadata_local(const ObjectId&);
     bool locally_available(const ObjectId&) const;
     bool hydration_available() const;
     bool hydrate(const ObjectId&, size_t stripe = 0,

@@ -618,6 +618,36 @@ size_t DistributedStore::replicate_all(const ObjectId& id, std::span<const uint8
     return success;
 }
 
+size_t DistributedStore::replicate_metadata_all(const ObjectId& id,
+                                                std::span<const uint8_t> data) {
+    size_t success = 0;
+    Writer writer;
+    writer.fixed(id.bytes);
+    writer.bytes(data);
+    const auto payload = writer.take();
+
+    for (const auto& target : n_.membership().active()) {
+        try {
+            if (target.id == n_.node_id()) {
+                if (n_.local_store().put(id, data))
+                    ++success;
+                continue;
+            }
+
+            auto started = Clock::now();
+            auto reply = n_.call(target, MessageType::put_metadata_object, payload,
+                                 FrameType::speculative);
+            if (reply.message.type == MessageType::ok) {
+                ++success;
+                note_network(data.size(), Clock::now() - started);
+            }
+        } catch (const std::exception& e) {
+            Log::debug("metadata object write " + target.host + ": " + e.what());
+        }
+    }
+    return success;
+}
+
 bool DistributedStore::locally_available(const ObjectId& id) const {
     return n_.local_store().has(id) || n_.block_cache().has(id);
 }
@@ -646,6 +676,50 @@ bool DistributedStore::ensure_local(const ObjectId& id, bool foreground) {
                            foreground ? FrameType::foreground : FrameType::speculative,
                            foreground, false);
     return data && n_.local_store().put(id, *data);
+}
+
+bool DistributedStore::ensure_metadata_local(const ObjectId& id) {
+    if (n_.local_store().has(id))
+        return true;
+    if (auto cached = n_.block_cache().get(id)) {
+        if (n_.local_store().put(id, *cached))
+            return true;
+    }
+
+    Writer writer;
+    writer.fixed(id.bytes);
+    const auto payload = writer.take();
+
+    // Catalogue roots are universal metadata objects rather than DHT data
+    // replicas. Search every currently active peer and keep the transfer on the
+    // CONTROL transport while using speculative worker priority so it cannot
+    // block health/quorum traffic or require a DATA session to exist.
+    for (const auto& target : n_.membership().active()) {
+        if (target.id == n_.node_id())
+            continue;
+        try {
+            auto started = Clock::now();
+            auto reply = n_.call(target, MessageType::get_metadata_object, payload,
+                                 FrameType::speculative);
+            if (reply.message.type != MessageType::metadata_object_reply)
+                continue;
+
+            Reader reader(reply.message.payload);
+            ObjectId returned{reader.fixed<32>()};
+            auto data = reader.bytes(128 * 1024 * 1024);
+            reader.finish();
+            if (returned != id || object_id(data) != id) {
+                Log::debug("metadata object read " + target.host + ": integrity failure");
+                continue;
+            }
+            note_network(data.size(), Clock::now() - started);
+            if (n_.local_store().put(id, data))
+                return true;
+        } catch (const std::exception& e) {
+            Log::debug("metadata object read " + target.host + ": " + e.what());
+        }
+    }
+    return false;
 }
 
 void DistributedStore::erase_all(const ObjectId& id) {

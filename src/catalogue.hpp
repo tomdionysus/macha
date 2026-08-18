@@ -101,7 +101,6 @@ class CatalogueManager {
     CatalogueSnapshot current_snapshot();
     void commit(const std::optional<ObjectId>& expected_root, const CatalogueSnapshot& next,
                 const std::set<ObjectId>& old_artwork);
-    void verify_and_replicate_artwork(const CatalogueSnapshot&);
 
   public:
     CatalogueManager(NodeRuntime&, DistributedStore&, MetadataManager&);

@@ -145,7 +145,9 @@ void NodeRuntime::stop() {
 }
 
 std::chrono::milliseconds NodeRuntime::stall_notice_for(MessageType type) const {
-    if (type == MessageType::get_object || type == MessageType::put_object)
+    if (type == MessageType::get_object || type == MessageType::put_object ||
+        type == MessageType::get_metadata_object ||
+        type == MessageType::put_metadata_object)
         return cfg_.data_stall_notice;
     return cfg_.control_stall_notice;
 }
@@ -312,7 +314,8 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             writer.u8(local_.has(id));
             return {MessageType::bool_reply, writer.take()};
         }
-        case MessageType::get_object: {
+        case MessageType::get_object:
+        case MessageType::get_metadata_object: {
             Reader reader(request.payload);
             ObjectId id{reader.fixed<32>()};
             reader.finish();
@@ -323,9 +326,13 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             Writer writer;
             writer.fixed(id.bytes);
             writer.bytes(*data);
-            return {MessageType::object_reply, writer.take()};
+            const auto reply = request.type == MessageType::get_metadata_object
+                                   ? MessageType::metadata_object_reply
+                                   : MessageType::object_reply;
+            return {reply, writer.take()};
         }
-        case MessageType::put_object: {
+        case MessageType::put_object:
+        case MessageType::put_metadata_object: {
             Reader reader(request.payload);
             ObjectId id{reader.fixed<32>()};
             auto data = reader.bytes(128 * 1024 * 1024);

@@ -1372,13 +1372,14 @@ void test_async_rpc_move_ownership() {
     CHECK(cancelled.load() == 2);
 }
 
-void test_rpc_v11_frame_priority_and_variable_length() {
+void test_rpc_v12_frame_priority_and_variable_length() {
     CHECK(frame_type_priority(FrameType::control) < frame_type_priority(FrameType::foreground));
     CHECK(frame_type_priority(FrameType::foreground) < frame_type_priority(FrameType::read_ahead));
     CHECK(frame_type_priority(FrameType::read_ahead) <
           frame_type_priority(FrameType::speculative));
     CHECK(default_frame_type(MessageType::ping) == FrameType::control);
     CHECK(default_frame_type(MessageType::get_object) == FrameType::foreground);
+    CHECK(default_frame_type(MessageType::get_metadata_object) == FrameType::speculative);
     CHECK(std::string(message_type_name(MessageType::commit_metadata)) == "commit_metadata");
     CHECK(std::string(message_type_name(MessageType::cas_metadata_delta)) ==
           "cas_metadata_delta");
@@ -1428,6 +1429,15 @@ void test_rpc_v11_frame_priority_and_variable_length() {
                                       FrameType::read_ahead, 2s);
     CHECK(metadata_reply.message.type == MessageType::ok);
     CHECK(metadata_reply.message.payload == Bytes{0x4d});
+
+    // Content-addressed metadata objects are potentially large and therefore
+    // run at speculative worker priority, but they deliberately stay on the
+    // CONTROL TCP session. Catalogue bootstrap must not require a DATA lane.
+    auto metadata_object_reply =
+        client.call(endpoint, MessageType::put_metadata_object, Bytes{0x43, 0x41, 0x54},
+                    FrameType::speculative, 2s);
+    CHECK(metadata_object_reply.message.type == MessageType::ok);
+    CHECK(client.stats().canonical_connections == 1);
 
     // Start a large speculative transfer, then introduce foreground work. The
     // writer reconsiders priority after every <=4 KiB variable-length frame, so
@@ -1535,7 +1545,7 @@ void test_repair_step_is_bounded_and_yields() {
     s1.stop();
 }
 
-void test_rpc_v11_persistence_and_multiplexing() {
+void test_rpc_v12_persistence_and_multiplexing() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -1612,7 +1622,7 @@ void test_rpc_v11_persistence_and_multiplexing() {
     server.stop();
 }
 
-void test_rpc_v11_bidirectional_and_deduplication() {
+void test_rpc_v12_bidirectional_and_deduplication() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -3601,6 +3611,55 @@ void test_catalogue_cache_ignores_unrelated_metadata_generation() {
     node.stop();
 }
 
+void test_catalogue_root_ready_without_local_artwork() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "node", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+
+    NodeRuntime node(config, keys);
+    DistributedStore store(node);
+    MetadataManager metadata(node);
+    CatalogueManager catalogue(node, store, metadata);
+    node.start();
+
+    CatalogueSnapshot snapshot;
+    CatalogueItem item;
+    item.id = "test:movie:artwork-missing";
+    item.kind = CatalogueKind::movie;
+    item.title = "Catalogue Still Loads";
+    item.revision = 1;
+    item.updated_ns = wall_time_ns();
+    CatalogueArtwork artwork;
+    artwork.role = "poster";
+    artwork.mime_type = "image/jpeg";
+    artwork.id = object_id(Bytes{0x01, 0x02, 0x03, 0x04});
+    item.artwork.push_back(artwork);
+    snapshot.items.emplace(item.id, item);
+
+    auto encoded = encode_catalogue(snapshot);
+    auto root = object_id(encoded);
+    REQUIRE(node.local_store().put(root, encoded));
+    REQUIRE(!node.local_store().has(artwork.id));
+
+    metadata.mutate([&](MetadataSnapshot& state) { state.catalogue_root = root; });
+    catalogue.repair_once();
+
+    auto status = catalogue.status();
+    CHECK(status.ready);
+    CHECK(status.items == 1);
+    CHECK(status.artwork_objects == 1);
+    CHECK(status.local_artwork_objects == 0);
+    auto loaded = catalogue.get(item.id);
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->title == item.title);
+
+    node.stop();
+}
+
 void test_media_index_cache_survives_namespace_churn() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
@@ -3765,7 +3824,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
-    CHECK(status_body.find("\"server_version\":\"0.9.1\"") != std::string::npos);
+    CHECK(status_body.find("\"server_version\":\"0.9.3\"") != std::string::npos);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -4427,7 +4486,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == "0.9.1");
+    CHECK(playback_status_json.find("server_version")->asString() == "0.9.3");
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately
@@ -4691,10 +4750,10 @@ int main() {
         test_placement();
         test_capacity_placement();
         test_async_rpc_move_ownership();
-        test_rpc_v11_frame_priority_and_variable_length();
+        test_rpc_v12_frame_priority_and_variable_length();
         test_repair_step_is_bounded_and_yields();
-        test_rpc_v11_persistence_and_multiplexing();
-        test_rpc_v11_bidirectional_and_deduplication();
+        test_rpc_v12_persistence_and_multiplexing();
+        test_rpc_v12_bidirectional_and_deduplication();
         test_mutual_bootstrap_prunes_cross_dial();
         test_rpc_v7_handshake_is_rejected();
         test_rpc_slow_control_does_not_abort_data();
@@ -4715,6 +4774,7 @@ int main() {
         test_cache_hydrator_fetches_to_persistent_cache();
         test_media_probe_and_online_catalogue_scanner();
         test_catalogue_cache_ignores_unrelated_metadata_generation();
+        test_catalogue_root_ready_without_local_artwork();
         test_media_index_cache_survives_namespace_churn();
         test_catalogue_sync_search_and_artwork_gc();
         test_media_segment_store_backpressure_and_spill();
