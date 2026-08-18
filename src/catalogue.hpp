@@ -5,6 +5,7 @@
 #include "metadata_manager.hpp"
 
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -72,6 +73,11 @@ struct CatalogueMaintenance {
     std::set<ObjectId> universal;
 };
 
+struct CatalogueArtworkContent {
+    std::string mime_type;
+    Bytes bytes;
+};
+
 Bytes encode_catalogue(const CatalogueSnapshot&);
 CatalogueSnapshot decode_catalogue(std::span<const uint8_t>);
 std::string catalogue_kind_name(CatalogueKind);
@@ -89,7 +95,7 @@ class CatalogueManager {
     mutable std::mutex mutex_;
     mutable std::mutex refresh_mutex_;
     mutable std::mutex mutation_mutex_;
-    CatalogueSnapshot cached_;
+    std::shared_ptr<const CatalogueSnapshot> cached_;
     std::optional<ObjectId> cached_root_;
     uint64_t cached_metadata_generation_{};
     Clock::time_point cache_until_{};
@@ -101,7 +107,7 @@ class CatalogueManager {
     static size_t durability_required(const MetadataSnapshot&, size_t active);
     CatalogueSnapshot load_root(const std::optional<ObjectId>&);
     void cache(const MetadataRecord&, const MetadataSnapshot&, CatalogueSnapshot);
-    CatalogueSnapshot current_snapshot();
+    std::shared_ptr<const CatalogueSnapshot> current_snapshot();
     void commit(const std::optional<ObjectId>& expected_root, const CatalogueSnapshot& next,
                 const std::set<ObjectId>& old_artwork);
 
@@ -109,6 +115,7 @@ class CatalogueManager {
     CatalogueManager(NodeRuntime&, DistributedStore&, MetadataManager&);
 
     void repair_once();
+    bool refresh_needed() const;
     CatalogueStatus status() const;
     CatalogueSnapshot snapshot();
     std::optional<CatalogueItem> get(std::string_view id);
@@ -125,7 +132,7 @@ class CatalogueManager {
     void reconcile_scanner(const std::vector<CatalogueItem>& discovered,
                            const std::set<std::string>& active_media_ids,
                            bool prune_missing = true);
-    std::optional<Bytes> artwork(const ObjectId&);
+    std::optional<CatalogueArtworkContent> artwork(const ObjectId&);
     CatalogueMaintenance maintenance_objects();
 };
 

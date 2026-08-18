@@ -2,9 +2,10 @@
 
 ## 0.10.4 - 2026-08-18
 
-- make catalogue API reads generation-aware and TTL-validated instead of treating the first successfully loaded in-memory snapshot as indefinitely current; a node serving a catalogue built on another node now synchronises on demand when metadata advances;
-- make catalogue refresh single-flight across API workers so one generation notice or TTL expiry produces at most one metadata/root convergence operation at a time;
-- retain the last coherent immutable catalogue snapshot as a warm-read fallback when quorum validation temporarily fails, while exposing the refresh error and cached/known metadata generations in catalogue status;
+- make catalogue API reads live but memory-fast: warm GET/list/search requests never perform metadata quorum or catalogue-root I/O; generation notices and the short validation TTL are converged by the service control plane, which atomically publishes the replacement immutable snapshot;
+- store the decoded catalogue as a shared immutable snapshot so ordinary API reads no longer copy the complete catalogue before selecting or searching items;
+- make artwork GETs use the same shared snapshot and return MIME metadata with the object lookup, removing the previous whole-catalogue copy and duplicate full artwork traversal for every poster/backdrop request;
+- keep catalogue refresh single-flight, retain the last coherent snapshot if background validation temporarily fails, and expose cached/known metadata generations in catalogue status;
 - make decoded metadata snapshot caching honour `metadata_cache_ms`, so a missed generation announcement cannot leave the decoded metadata view current forever; immutable decoded metadata and catalogue objects are still reused when their record/hash or catalogue root is unchanged;
 - add `known_metadata_generation` to `/api/v1/catalogue/status` for direct cache/convergence diagnosis;
 - wire/storage formats remain unchanged from 0.10.0.
