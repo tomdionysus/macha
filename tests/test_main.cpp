@@ -3571,7 +3571,10 @@ void test_media_probe_and_online_catalogue_scanner() {
 
     CatalogueScannerConfig scanner_config;
     scanner_config.enabled = true;
-    scanner_config.roots = {"/Movies"};
+    // A missing configured root makes the pass partial: discoveries from
+    // available roots are still ingested, but absence cannot prune existing
+    // scanner-owned bindings until every root is traversable.
+    scanner_config.roots = {"/Movies", "/Missing"};
     scanner_config.tmdb.token_file = scanner_token;
     scanner_config.musicbrainz.enabled = false;
     CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(),
@@ -3612,6 +3615,16 @@ void test_media_probe_and_online_catalogue_scanner() {
     CHECK(std::find(twice->media_ids.begin(), twice->media_ids.end(), alternate_id) != twice->media_ids.end());
 
     service.filesystem().unlink("/Movies/Blade.Runner.2049.2017.1080p.mkv");
+    std::this_thread::sleep_for(config.metadata_cache + 50ms);
+    CHECK(scanner.scan_once() == 0);
+    auto partial = service.catalogue().get("tmdb:movie:335984");
+    REQUIRE(partial.has_value());
+    CHECK(std::find(partial->media_ids.begin(), partial->media_ids.end(), media_id) != partial->media_ids.end());
+    CHECK(std::find(partial->media_ids.begin(), partial->media_ids.end(), alternate_id) != partial->media_ids.end());
+
+    // Once the previously unavailable root exists, the scan is complete and
+    // destructive reconciliation may safely remove the vanished first binding.
+    service.filesystem().mkdir("/Missing", 0755, getuid(), getgid());
     std::this_thread::sleep_for(config.metadata_cache + 50ms);
     CHECK(scanner.scan_once() == 0);
     auto remaining = service.catalogue().get("tmdb:movie:335984");

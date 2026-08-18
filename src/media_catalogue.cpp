@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cerrno>
 #include <fstream>
 #include <limits>
 #include <regex>
@@ -841,10 +842,25 @@ size_t CatalogueScanner::scan_once() {
     }
     if (!config.enabled || !coordinator()) return 0;
     std::vector<std::pair<std::string, FsEntry>> files;
-    // Failure to scan any configured root aborts the pass. Reconciliation is
-    // destructive for vanished scanner-owned bindings, so a temporarily
-    // unavailable root must never look like an empty library.
-    for (const auto& root : config.roots) walk(root, files);
+    size_t roots_scanned = 0;
+    size_t roots_unavailable = 0;
+    for (const auto& root : config.roots) {
+        try {
+            walk(root, files);
+            ++roots_scanned;
+        } catch (const FsError& e) {
+            if (e.code() != ENOENT) throw;
+            ++roots_unavailable;
+            Log::debug("catalogue scan: root unavailable root=" + root +
+                       " reason=" + e.what());
+        }
+    }
+    const bool complete_scan = roots_unavailable == 0;
+    if (!complete_scan) {
+        Log::info("catalogue scan: partial roots_scanned=" + std::to_string(roots_scanned) +
+                  " roots_unavailable=" + std::to_string(roots_unavailable) +
+                  " files=" + std::to_string(files.size()));
+    }
 
     auto existing = catalogue_.snapshot();
     std::set<std::string> bound;
@@ -922,7 +938,7 @@ size_t CatalogueScanner::scan_once() {
     std::vector<CatalogueItem> items;
     items.reserve(discovered.size());
     for (auto& [_, item] : discovered) items.push_back(std::move(item));
-    catalogue_.reconcile_scanner(items, active_media_ids);
+    catalogue_.reconcile_scanner(items, active_media_ids, complete_scan);
     if (matched) Log::info("catalogue scan matched " + std::to_string(matched) + " media files");
     return matched;
 }

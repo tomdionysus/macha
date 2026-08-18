@@ -523,7 +523,8 @@ CatalogueArtwork CatalogueManager::stage_artwork(std::string role, std::string m
 }
 
 void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& discovered,
-                                         const std::set<std::string>& active_media_ids) {
+                                         const std::set<std::string>& active_media_ids,
+                                         bool prune_missing) {
     DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     auto current = current_snapshot();
     std::optional<ObjectId> expected_root;
@@ -579,60 +580,62 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
         changed = true;
     }
 
-    // Only scanner-owned leaf bindings are reconciled against the namespace.
-    // Manually-created catalogue entries are never removed by the scanner.
-    for (auto& [_, item] : current.items) {
-        auto marker = item.external_ids.find("macha_scanner");
-        if (marker == item.external_ids.end() || marker->second != "1")
-            continue;
-        if (item.kind != CatalogueKind::movie && item.kind != CatalogueKind::episode &&
-            item.kind != CatalogueKind::track)
-            continue;
-        auto before = item.media_ids.size();
-        std::erase_if(item.media_ids, [&](const std::string& media) {
-            return !active_media_ids.contains(media);
-        });
-        if (item.media_ids.size() != before) {
-            ++item.revision;
-            item.updated_ns = wall_time_ns();
-            changed = true;
+    if (prune_missing) {
+        // Only scanner-owned leaf bindings are reconciled against a complete
+        // namespace scan. Manually-created catalogue entries are never removed.
+        for (auto& [_, item] : current.items) {
+            auto marker = item.external_ids.find("macha_scanner");
+            if (marker == item.external_ids.end() || marker->second != "1")
+                continue;
+            if (item.kind != CatalogueKind::movie && item.kind != CatalogueKind::episode &&
+                item.kind != CatalogueKind::track)
+                continue;
+            auto before = item.media_ids.size();
+            std::erase_if(item.media_ids, [&](const std::string& media) {
+                return !active_media_ids.contains(media);
+            });
+            if (item.media_ids.size() != before) {
+                ++item.revision;
+                item.updated_ns = wall_time_ns();
+                changed = true;
+            }
         }
-    }
 
-    for (auto it = current.items.begin(); it != current.items.end();) {
-        const auto marker = it->second.external_ids.find("macha_scanner");
-        const bool scanner = marker != it->second.external_ids.end() && marker->second == "1";
-        const bool leaf = it->second.kind == CatalogueKind::movie ||
-                          it->second.kind == CatalogueKind::episode ||
-                          it->second.kind == CatalogueKind::track;
-        if (scanner && leaf && it->second.media_ids.empty()) {
-            it = current.items.erase(it);
-            changed = true;
-        } else ++it;
-    }
-
-    // Remove now-empty scanner-created hierarchy nodes from the bottom up.
-    bool removed = true;
-    while (removed) {
-        removed = false;
         for (auto it = current.items.begin(); it != current.items.end();) {
             const auto marker = it->second.external_ids.find("macha_scanner");
             const bool scanner = marker != it->second.external_ids.end() && marker->second == "1";
-            const bool parent_kind = it->second.kind == CatalogueKind::show ||
-                                     it->second.kind == CatalogueKind::season ||
-                                     it->second.kind == CatalogueKind::artist ||
-                                     it->second.kind == CatalogueKind::album;
-            if (!scanner || !parent_kind) { ++it; continue; }
-            const auto id = it->second.id;
-            const bool has_child = std::any_of(current.items.begin(), current.items.end(),
-                                               [&](const auto& pair) {
-                                                   return pair.second.parent_id &&
-                                                          *pair.second.parent_id == id;
-                                               });
-            if (!has_child) {
+            const bool leaf = it->second.kind == CatalogueKind::movie ||
+                              it->second.kind == CatalogueKind::episode ||
+                              it->second.kind == CatalogueKind::track;
+            if (scanner && leaf && it->second.media_ids.empty()) {
                 it = current.items.erase(it);
-                changed = removed = true;
+                changed = true;
             } else ++it;
+        }
+
+        // Remove now-empty scanner-created hierarchy nodes from the bottom up.
+        bool removed = true;
+        while (removed) {
+            removed = false;
+            for (auto it = current.items.begin(); it != current.items.end();) {
+                const auto marker = it->second.external_ids.find("macha_scanner");
+                const bool scanner = marker != it->second.external_ids.end() && marker->second == "1";
+                const bool parent_kind = it->second.kind == CatalogueKind::show ||
+                                         it->second.kind == CatalogueKind::season ||
+                                         it->second.kind == CatalogueKind::artist ||
+                                         it->second.kind == CatalogueKind::album;
+                if (!scanner || !parent_kind) { ++it; continue; }
+                const auto id = it->second.id;
+                const bool has_child = std::any_of(current.items.begin(), current.items.end(),
+                                                   [&](const auto& pair) {
+                                                       return pair.second.parent_id &&
+                                                              *pair.second.parent_id == id;
+                                                   });
+                if (!has_child) {
+                    it = current.items.erase(it);
+                    changed = removed = true;
+                } else ++it;
+            }
         }
     }
 
