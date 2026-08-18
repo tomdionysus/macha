@@ -136,9 +136,13 @@ void validate(Config& config) {
         config.streaming.temp_path = config.state_path / "tmp" / "playback";
     if (config.catalogue.scanner.interval < std::chrono::seconds(10))
         throw std::runtime_error("catalogue.scanner.interval_ms must be >= 10000");
-    if (config.catalogue.scanner.mutation_debounce < std::chrono::seconds(1) ||
-        config.catalogue.scanner.mutation_debounce > std::chrono::minutes(10))
-        throw std::runtime_error("catalogue.scanner.mutation_debounce_ms must be 1000..600000");
+    if (config.catalogue.scanner.rescan_debounce < std::chrono::seconds(1) ||
+        config.catalogue.scanner.rescan_debounce > std::chrono::minutes(10))
+        throw std::runtime_error("catalogue.scanner.rescan_debounce_ms must be 1000..600000");
+    if (config.catalogue.scanner.rescan_max_delay < std::chrono::seconds(1))
+        throw std::runtime_error("catalogue.scanner.rescan_max_delay_ms must be >= 1000");
+    if (config.catalogue.scanner.rescan_max_delay < config.catalogue.scanner.rescan_debounce)
+        throw std::runtime_error("catalogue.scanner.rescan_max_delay_ms must be >= rescan_debounce_ms");
     if (config.catalogue.scanner.roots.empty())
         throw std::runtime_error("catalogue.scanner.roots must not be empty");
     for (const auto& root : config.catalogue.scanner.roots) {
@@ -295,9 +299,12 @@ void parse_catalogue(const YAML::Node& root, Config& c) {
             c.catalogue.scanner.enabled = scanner["enabled"].as<bool>();
         if (scanner["interval_ms"])
             c.catalogue.scanner.interval = milliseconds(scanner["interval_ms"], "catalogue.scanner.interval_ms");
-        if (scanner["mutation_debounce_ms"])
-            c.catalogue.scanner.mutation_debounce = milliseconds(
-                scanner["mutation_debounce_ms"], "catalogue.scanner.mutation_debounce_ms");
+        if (scanner["rescan_debounce_ms"])
+            c.catalogue.scanner.rescan_debounce = milliseconds(
+                scanner["rescan_debounce_ms"], "catalogue.scanner.rescan_debounce_ms");
+        if (scanner["rescan_max_delay_ms"])
+            c.catalogue.scanner.rescan_max_delay = milliseconds(
+                scanner["rescan_max_delay_ms"], "catalogue.scanner.rescan_max_delay_ms");
         if (scanner["max_artwork_bytes"])
             c.catalogue.scanner.max_artwork_bytes = yaml_size(scanner["max_artwork_bytes"]);
         if (auto roots = scanner["roots"]) {

@@ -127,7 +127,9 @@ catalogue:
     enabled: false
     interval_ms: 21600000
     # Coalesce namespace create/write/rename/delete bursts before rescanning.
-    mutation_debounce_ms: 30000
+    # Sustained mutation cannot defer a pending rescan beyond rescan_max_delay_ms.
+    rescan_debounce_ms: 10000
+    rescan_max_delay_ms: 60000
     roots:
       - /Movies
       - /TV

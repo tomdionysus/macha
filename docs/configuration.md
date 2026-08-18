@@ -50,7 +50,7 @@ RPC duration itself is unbounded. Stall notices are observability thresholds; th
 
 ## Catalogue scanner
 
-`catalogue.scanner.interval_ms` is the periodic safety scan interval. Committed namespace changes also schedule a scan after `catalogue.scanner.mutation_debounce_ms` (default 30000 ms, valid 1000..600000). The debounce is cluster-aware and is reset by further namespace changes; catalogue metadata written by the scanner itself is excluded from the content signature and does not schedule another pass.
+`catalogue.scanner.interval_ms` is the periodic safety scan interval. Committed namespace changes schedule a scan after `catalogue.scanner.rescan_debounce_ms` (default 10000 ms, valid 1000..600000). Further mutations reset that quiet-period timer, but `catalogue.scanner.rescan_max_delay_ms` (default 60000 ms, minimum 1000 and not less than `rescan_debounce_ms`) caps total deferral from the first unscanned mutation. Catalogue metadata written by the scanner itself is excluded from the namespace-content signature and does not cause a catalogue rescan.
 
 ## Streaming configuration
 
