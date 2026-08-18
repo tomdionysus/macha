@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.4 - 2026-08-18
+
+- make catalogue API reads generation-aware and TTL-validated instead of treating the first successfully loaded in-memory snapshot as indefinitely current; a node serving a catalogue built on another node now synchronises on demand when metadata advances;
+- make catalogue refresh single-flight across API workers so one generation notice or TTL expiry produces at most one metadata/root convergence operation at a time;
+- retain the last coherent immutable catalogue snapshot as a warm-read fallback when quorum validation temporarily fails, while exposing the refresh error and cached/known metadata generations in catalogue status;
+- make decoded metadata snapshot caching honour `metadata_cache_ms`, so a missed generation announcement cannot leave the decoded metadata view current forever; immutable decoded metadata and catalogue objects are still reused when their record/hash or catalogue root is unchanged;
+- add `known_metadata_generation` to `/api/v1/catalogue/status` for direct cache/convergence diagnosis;
+- wire/storage formats remain unchanged from 0.10.0.
+
 ## 0.10.3 - 2026-08-18
 
 - make catalogue roots properties of the movie, TV and music scan providers instead of one scanner-wide list; each provider traverses and parses only its own roots;

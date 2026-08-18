@@ -76,3 +76,18 @@ Replacing or deleting the last reference to artwork records a committed retireme
 
 
 Playback is deliberately separate from catalogue mutation. A playback session may be created from a catalogue `item_id`, in which case Macha evaluates every bound `media_id` and chooses the cheapest compatible representation, or directly from a `media_id`. See [Streaming](streaming.md).
+
+## Cache freshness
+
+Catalogue API reads use a decoded in-memory snapshot, but that snapshot is not treated
+as permanently current. Metadata generation announcements invalidate it immediately;
+`metadata_cache_ms` is also used as a validation TTL so a missed announcement cannot
+leave a serving node stale indefinitely. Validation only reloads the catalogue object
+when `catalogue_root` changes. An unchanged content-addressed root keeps the existing
+decoded catalogue in memory. Concurrent API requests share one refresh operation.
+
+If metadata validation temporarily fails after a catalogue has already been loaded,
+Macha serves that last coherent immutable snapshot and records the refresh error.
+`/api/v1/catalogue/status` exposes both `metadata_generation` (the cached catalogue's
+validated metadata generation) and `known_metadata_generation` (the newest generation
+the node knows exists).

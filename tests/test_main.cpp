@@ -4156,6 +4156,173 @@ void test_catalogue_cache_ignores_unrelated_metadata_generation() {
     node.stop();
 }
 
+void test_catalogue_read_refreshes_remote_generation() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c1 = config_for(t.path() / "catalogue-live-1", keyfile, free_port());
+    auto c2 = config_for(t.path() / "catalogue-live-2", keyfile, free_port(),
+                         {{"127.0.0.1", c1.port}});
+    c1.replication = c2.replication = 1;
+    c1.metadata_replication = c2.metadata_replication = 1;
+    c1.metadata_cache = c2.metadata_cache = 100ms;
+
+    NodeRuntime n1(c1, keys);
+    DistributedStore store1(n1);
+    MetadataManager metadata1(n1);
+    CatalogueManager catalogue1(n1, store1, metadata1);
+
+    NodeRuntime n2(c2, keys);
+    DistributedStore store2(n2);
+    MetadataManager metadata2(n2);
+    CatalogueManager catalogue2(n2, store2, metadata2);
+
+    // Form the initial namespace on the bootstrap-less founder before starting
+    // the joiner. A configured joiner is intentionally forbidden from inventing
+    // genesis while its bootstrap peer has not yet entered active membership.
+    n1.start();
+
+    CatalogueItem first;
+    first.id = "test:movie:remote-first";
+    first.kind = CatalogueKind::movie;
+    first.title = "Remote First";
+    first = catalogue1.upsert(first);
+
+    n2.start();
+
+    // Cold-load node two from node one's committed catalogue. There is no Service
+    // here, so no catalogue maintenance thread can refresh it behind the test.
+    REQUIRE(wait_until([&] {
+        try {
+            auto item = catalogue2.get(first.id);
+            return item && item->title == first.title;
+        } catch (...) {
+            return false;
+        }
+    }, 5s));
+    const auto before = catalogue2.status();
+    REQUIRE(before.ready);
+
+    CatalogueItem second;
+    second.id = "test:movie:remote-second";
+    second.kind = CatalogueKind::movie;
+    second.title = "Remote Second";
+    second = catalogue1.upsert(second);
+    const auto writer_status = catalogue1.status();
+
+    // Membership/metadata propagation tells node two that a newer generation
+    // exists. The catalogue itself is deliberately still the old cached root.
+    REQUIRE(wait_until([&] {
+        return n2.known_metadata_generation() >= writer_status.metadata_generation;
+    }, 5s));
+    const auto stale = catalogue2.status();
+    CHECK(stale.metadata_generation == before.metadata_generation);
+    CHECK(stale.known_metadata_generation >= writer_status.metadata_generation);
+    CHECK(stale.known_metadata_generation > stale.metadata_generation);
+
+    // The read itself must converge the catalogue immediately rather than wait
+    // for background maintenance. This is the 0.10.3 stale remote-API regression.
+    auto refreshed = catalogue2.get(second.id);
+    REQUIRE(refreshed.has_value());
+    CHECK(refreshed->title == second.title);
+    const auto after = catalogue2.status();
+    CHECK(after.metadata_generation >= writer_status.metadata_generation);
+    CHECK(after.metadata_generation == after.known_metadata_generation);
+
+    CatalogueApi api(catalogue2);
+    auto status_response = api.handle({.method = "GET",
+                                       .path = "/api/v1/catalogue/status",
+                                       .query = {},
+                                       .headers = {},
+                                       .body = {}});
+    REQUIRE(status_response.status == 200);
+    auto status_json = Json::parse(std::string(status_response.body.begin(),
+                                               status_response.body.end()));
+    REQUIRE(status_json.find("metadata_generation") != nullptr);
+    REQUIRE(status_json.find("known_metadata_generation") != nullptr);
+    CHECK(status_json.find("metadata_generation")->asInt64() ==
+          status_json.find("known_metadata_generation")->asInt64());
+
+    n2.stop();
+    n1.stop();
+}
+
+void test_metadata_decoded_cache_ttl_recovers_missed_notice() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c1 = config_for(t.path() / "metadata-ttl-1", keyfile, free_port());
+    auto c2 = config_for(t.path() / "metadata-ttl-2", keyfile, free_port(),
+                         {{"127.0.0.1", c1.port}});
+    c1.replication = c2.replication = 1;
+    c1.metadata_replication = c2.metadata_replication = 1;
+    c1.metadata_cache = c2.metadata_cache = 100ms;
+    // Keep ordinary heartbeat propagation outside this test window. We install a
+    // valid newer voter record directly to simulate a generation notice that was
+    // missed by node two; TTL validation must still discover it from quorum.
+    c1.heartbeat = c2.heartbeat = 5s;
+    c1.dead_after = c2.dead_after = 20s;
+
+    NodeRuntime n1(c1, keys);
+    NodeRuntime n2(c2, keys);
+    MetadataManager metadata1(n1);
+    MetadataManager metadata2(n2);
+
+    // Establish genesis on the founder first. The joiner may legitimately reject
+    // metadata reads with "waiting for bootstrap peer" during the brief interval
+    // between start() and membership convergence, so retry its initial read rather
+    // than turning that expected bootstrap state into an unhandled test failure.
+    n1.start();
+    const auto initial1 = metadata1.snapshot_view();
+    n2.start();
+
+    std::optional<MetadataSnapshotView> initial2;
+    REQUIRE(wait_until([&] {
+        try {
+            auto view = metadata2.snapshot_view();
+            if (view.generation != initial1.generation)
+                return false;
+            initial2 = std::move(view);
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+    }, 5s));
+    REQUIRE(initial2.has_value());
+
+    auto base = n1.metadata_replica().current();
+    auto changed = decode_snapshot(base.payload);
+    auto root = changed.entries.find("/");
+    REQUIRE(root != changed.entries.end());
+    ++root->second.version;
+
+    MetadataRecord next;
+    next.generation = base.generation + 1;
+    next.previous = base.hash;
+    next.payload = encode_snapshot(changed);
+    next.hash = metadata_hash(next.generation, next.previous, next.payload);
+    REQUIRE(n1.metadata_replica().seed(next));
+
+    // With no generation notice, the decoded view is legitimately reused until
+    // the configured metadata TTL expires.
+    CHECK(n2.known_metadata_generation() < next.generation);
+    CHECK(metadata2.snapshot_view().generation == initial2->generation);
+    std::this_thread::sleep_for(c2.metadata_cache + 50ms);
+    REQUIRE(n2.known_metadata_generation() < next.generation);
+
+    // Expiry must force a real metadata read, discover the newer voter record and
+    // replace the decoded snapshot. Before 0.10.4 cached_snapshot_view() ignored
+    // cache_until_ and this remained stale indefinitely without a notice.
+    auto refreshed = metadata2.snapshot_view();
+    CHECK(refreshed.generation == next.generation);
+    CHECK(n2.known_metadata_generation() >= next.generation);
+
+    n2.stop();
+    n1.stop();
+}
+
 void test_catalogue_root_ready_without_local_artwork() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
@@ -4434,7 +4601,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
-    CHECK(status_body.find("\"server_version\":\"0.10.3\"") != std::string::npos);
+    CHECK(status_body.find("\"server_version\":\"0.10.4\"") != std::string::npos);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -5097,7 +5264,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == "0.10.3");
+    CHECK(playback_status_json.find("server_version")->asString() == "0.10.4");
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately
@@ -5386,6 +5553,8 @@ int main() {
         test_cache_hydrator_fetches_to_persistent_cache();
         test_media_probe_and_online_catalogue_scanner();
         test_catalogue_cache_ignores_unrelated_metadata_generation();
+        test_catalogue_read_refreshes_remote_generation();
+        test_metadata_decoded_cache_ttl_recovers_missed_notice();
         test_catalogue_root_ready_without_local_artwork();
         test_macos_unicode_namespace_aliases();
         test_media_index_cache_survives_namespace_churn();

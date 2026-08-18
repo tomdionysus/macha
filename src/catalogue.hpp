@@ -58,6 +58,7 @@ struct CatalogueStatus {
     bool enabled{};
     bool ready{};
     uint64_t metadata_generation{};
+    uint64_t known_metadata_generation{};
     std::optional<ObjectId> root;
     size_t items{};
     size_t artwork_objects{};
@@ -86,10 +87,12 @@ class CatalogueManager {
     DistributedStore& store_;
     MetadataManager& metadata_;
     mutable std::mutex mutex_;
+    mutable std::mutex refresh_mutex_;
     mutable std::mutex mutation_mutex_;
     CatalogueSnapshot cached_;
     std::optional<ObjectId> cached_root_;
     uint64_t cached_metadata_generation_{};
+    Clock::time_point cache_until_{};
     uint64_t last_sync_unix_ms_{};
     bool ready_{};
     std::string error_;
