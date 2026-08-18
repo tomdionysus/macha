@@ -721,7 +721,7 @@ RemoteHttpResponse CurlHttpClient::get(std::string_view url, const std::vector<s
     curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, 5000L);
     curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, 20000L);
     curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "Macha/0.10.3 (https://github.com/tomdionysus/macha)");
+    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "Macha/0.10.4 (https://github.com/tomdionysus/macha)");
     curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, curl_cancelled);
     curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &stop_requested_);
@@ -921,7 +921,7 @@ Json MusicBrainzProvider::api(std::string_view path,
             std::this_thread::sleep_for(std::min(remaining, slice));
         }
     }
-    auto ua = "Macha/0.10.3 (" + config_.contact + ")";
+    auto ua = "Macha/0.10.4 (" + config_.contact + ")";
     auto q = query;
     q.emplace_back("fmt", "json");
     auto response = http_.get(query_url("https://musicbrainz.org/ws/2" + std::string(path), q),

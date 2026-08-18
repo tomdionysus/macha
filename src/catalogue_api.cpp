@@ -227,6 +227,7 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             auto status = catalogue_.status();
             std::string out = "{\"server_version\":" + json_escape(kServerVersion) + ",\"enabled\":true,\"ready\":" + std::string(status.ready ? "true" : "false");
             out += ",\"metadata_generation\":" + std::to_string(status.metadata_generation);
+            out += ",\"known_metadata_generation\":" + std::to_string(status.known_metadata_generation);
             out += ",\"root\":" + (status.root ? json_escape(to_string(*status.root)) : "null");
             out += ",\"items\":" + std::to_string(status.items);
             out += ",\"artwork_objects\":" + std::to_string(status.artwork_objects);

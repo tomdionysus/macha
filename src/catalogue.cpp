@@ -268,18 +268,30 @@ void CatalogueManager::cache(const MetadataRecord& record, const MetadataSnapsho
     cached_ = std::move(snapshot);
     cached_root_ = metadata.catalogue_root;
     cached_metadata_generation_ = record.generation;
+    cache_until_ = Clock::now() + node_.config().metadata_cache;
     last_sync_unix_ms_ = unix_ms();
     ready_ = true;
     error_.clear();
 }
 
 void CatalogueManager::repair_once() {
+    // Catalogue refresh is single-flight. API workers can all observe the same
+    // generation notice or TTL expiry at once; only one of them should perform
+    // metadata quorum I/O and fetch/decode a replacement immutable root.
+    std::lock_guard refresh_lock(refresh_mutex_);
     try {
         {
             std::lock_guard lock(mutex_);
-            if (ready_ && cached_metadata_generation_ >= node_.known_metadata_generation())
+            const auto now = Clock::now();
+            if (ready_ && cached_metadata_generation_ >= node_.known_metadata_generation() &&
+                now < cache_until_)
                 return;
         }
+
+        // MetadataManager supplies the short quorum cache. Generation notices
+        // invalidate it immediately; cache expiry provides the safety net when a
+        // notice is missed. A catalogue root is only reloaded when that metadata
+        // record actually points at a different immutable object.
         auto record = metadata_.read_record();
         auto metadata = decode_snapshot(record.payload);
         {
@@ -291,6 +303,7 @@ void CatalogueManager::repair_once() {
                 // so an unchanged root means the cached snapshot is still
                 // exactly current. Record convergence without reloading it.
                 cached_metadata_generation_ = record.generation;
+                cache_until_ = Clock::now() + node_.config().metadata_cache;
                 last_sync_unix_ms_ = unix_ms();
                 error_.clear();
                 return;
@@ -301,8 +314,8 @@ void CatalogueManager::repair_once() {
     } catch (const std::exception& e) {
         std::lock_guard lock(mutex_);
         // A failed convergence attempt must not invalidate a catalogue snapshot
-        // that was previously loaded successfully. API reads can continue from
-        // that immutable root while background maintenance retries convergence.
+        // that was previously loaded successfully. Warm API reads can continue
+        // from that immutable root while the next request/background pass retries.
         error_ = e.what();
         throw;
     }
@@ -311,14 +324,27 @@ void CatalogueManager::repair_once() {
 CatalogueSnapshot CatalogueManager::current_snapshot() {
     {
         std::lock_guard lock(mutex_);
-        if (ready_)
+        const auto now = Clock::now();
+        if (ready_ && cached_metadata_generation_ >= node_.known_metadata_generation() &&
+            now < cache_until_)
             return cached_;
     }
-    // Only the cold/uninitialised path synchronises inline. Once a catalogue
-    // root has been loaded, the service maintenance loop refreshes it in the
-    // background instead of making UI reads participate in metadata quorum I/O.
-    repair_once();
+
+    try {
+        repair_once();
+    } catch (...) {
+        // Availability beats freshness only when we have a coherent immutable
+        // snapshot to fall back to. Cold reads still fail until initial catalogue
+        // convergence succeeds. Status exposes cached vs known generation and the
+        // refresh error so a stale fallback is observable rather than silent.
+        std::lock_guard lock(mutex_);
+        if (!ready_)
+            throw;
+    }
+
     std::lock_guard lock(mutex_);
+    if (!ready_)
+        throw std::runtime_error("catalogue unavailable");
     return cached_;
 }
 
@@ -327,6 +353,7 @@ CatalogueStatus CatalogueManager::status() const {
     CatalogueStatus status;
     status.enabled = true;
     status.metadata_generation = cached_metadata_generation_;
+    status.known_metadata_generation = node_.known_metadata_generation();
     status.root = cached_root_;
     status.items = cached_.items.size();
     auto art = artwork_ids(cached_);

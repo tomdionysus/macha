@@ -157,7 +157,13 @@ std::optional<MetadataRecord> MetadataManager::cached_record() {
 
 std::optional<MetadataSnapshotView> MetadataManager::cached_snapshot_view() {
     std::lock_guard lock(cache_mutex_);
-    if (!decoded_cache_)
+    // The decoded snapshot is reusable indefinitely for a specific immutable
+    // metadata record, but it is not evidence that the record is still current.
+    // Honour the same short TTL as cached_record() so missed generation notices
+    // eventually force a quorum validation instead of making metadata stale forever.
+    if (!cache_ || !decoded_cache_ || Clock::now() >= cache_until_)
+        return {};
+    if (cache_->generation != decoded_generation_ || cache_->hash != decoded_hash_)
         return {};
     if (node_.metadata_replica().generation() > decoded_generation_ ||
         node_.remote_metadata_generation() > decoded_generation_)
