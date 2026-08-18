@@ -245,20 +245,12 @@ size_t CatalogueManager::durability_required(const MetadataSnapshot& metadata, s
 CatalogueSnapshot CatalogueManager::load_root(const std::optional<ObjectId>& root) {
     if (!root)
         return {};
-    if (!store_.ensure_local(*root, false))
+    if (!store_.ensure_metadata_local(*root))
         throw std::runtime_error("catalogue root object unavailable");
     auto data = node_.local_store().get(*root);
     if (!data)
         throw std::runtime_error("catalogue root object unavailable locally");
     return decode_catalogue(*data);
-}
-
-void CatalogueManager::verify_and_replicate_artwork(const CatalogueSnapshot& snapshot) {
-    auto ids = artwork_ids(snapshot);
-    for (const auto& id : ids) {
-        if (!store_.ensure_local(id, false))
-            throw std::runtime_error("catalogue artwork unavailable: " + to_string(id));
-    }
 }
 
 void CatalogueManager::cache(const MetadataRecord& record, const MetadataSnapshot& metadata,
@@ -296,7 +288,6 @@ void CatalogueManager::repair_once() {
             }
         }
         auto snapshot = load_root(metadata.catalogue_root);
-        verify_and_replicate_artwork(snapshot);
         cache(record, metadata, std::move(snapshot));
     } catch (const std::exception& e) {
         std::lock_guard lock(mutex_);
@@ -334,7 +325,7 @@ CatalogueStatus CatalogueManager::status() const {
     for (const auto& id : art)
         status.local_artwork_objects += node_.local_store().has(id) ? 1 : 0;
     const bool root_local = !cached_root_ || node_.local_store().has(*cached_root_);
-    status.ready = ready_ && root_local && status.local_artwork_objects == status.artwork_objects;
+    status.ready = ready_ && root_local;
     status.last_sync_unix_ms = last_sync_unix_ms_;
     status.error = error_;
     return status;
@@ -430,7 +421,7 @@ void CatalogueManager::commit(const std::optional<ObjectId>& expected_root,
         }
     };
 
-    const auto root_copies = store_.replicate_all(root, encoded, false);
+    const auto root_copies = store_.replicate_metadata_all(root, encoded);
     if (root_copies < required) {
         cleanup_uncommitted();
         throw std::runtime_error("catalogue root could not reach metadata durability quorum");

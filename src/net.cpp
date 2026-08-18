@@ -20,7 +20,7 @@
 namespace macha {
 namespace {
 constexpr uint16_t protocol_version = 10;
-constexpr uint32_t frame_magic = 0x4d433131; // "MC11"
+constexpr uint32_t frame_magic = 0x4d433132; // "MC12"
 constexpr size_t protocol_min_frame_size = 4 * 1024;
 constexpr size_t protocol_max_frame_size = 4 * 1024 * 1024;
 constexpr size_t max_message_size = 128 * 1024 * 1024;
@@ -116,7 +116,7 @@ Bytes label(const char* prefix, std::span<const uint8_t> data) {
 Bytes session_info(std::span<const uint8_t> transcript, const NodeId& client,
                    const NodeId& server, const char* direction) {
     Writer writer;
-    writer.string("macha/session/v11");
+    writer.string("macha/session/v12");
     writer.string(direction);
     writer.fixed(sha256(transcript).bytes);
     writer.fixed(client.bytes);
@@ -264,9 +264,12 @@ bool is_priority_data_message(MessageType type) {
     case MessageType::seed_metadata:
     case MessageType::checkpoint_metadata:
     case MessageType::commit_metadata:
+    case MessageType::get_metadata_object:
+    case MessageType::put_metadata_object:
     case MessageType::bool_reply:
     case MessageType::metadata_reply:
     case MessageType::cas_reply:
+    case MessageType::metadata_object_reply:
         return true;
     default:
         return false;
@@ -423,6 +426,8 @@ const char* message_type_name(MessageType type) noexcept {
     case MessageType::promote_foreground: return "promote_foreground";
     case MessageType::cancel_transfer: return "cancel_transfer";
     case MessageType::commit_metadata: return "commit_metadata";
+    case MessageType::get_metadata_object: return "get_metadata_object";
+    case MessageType::put_metadata_object: return "put_metadata_object";
     case MessageType::ok: return "ok";
     case MessageType::error: return "error";
     case MessageType::members_reply: return "members_reply";
@@ -430,6 +435,7 @@ const char* message_type_name(MessageType type) noexcept {
     case MessageType::object_reply: return "object_reply";
     case MessageType::metadata_reply: return "metadata_reply";
     case MessageType::cas_reply: return "cas_reply";
+    case MessageType::metadata_object_reply: return "metadata_object_reply";
     }
     return "unknown";
 }
@@ -441,6 +447,8 @@ unsigned frame_type_priority(FrameType type) noexcept {
 FrameType default_frame_type(MessageType type) noexcept {
     if (type == MessageType::get_object || type == MessageType::put_object)
         return FrameType::foreground;
+    if (type == MessageType::get_metadata_object || type == MessageType::put_metadata_object)
+        return FrameType::speculative;
     return FrameType::control;
 }
 
@@ -493,7 +501,7 @@ NodeInfo SecureChannel::client_handshake(TransportLane lane) {
 
     Writer envelope;
     envelope.bytes(hello);
-    envelope.fixed(hmac_sha256(keys_.auth, label("client/v11", hello)));
+    envelope.fixed(hmac_sha256(keys_.auth, label("client/v12", hello)));
     send_blob(fd_, envelope.data());
 
     auto response = recv_blob(fd_, 16384);
@@ -502,7 +510,7 @@ NodeInfo SecureChannel::client_handshake(TransportLane lane) {
     auto remote_mac = response_reader.fixed<32>();
     response_reader.finish();
 
-    auto authenticated = label("server/v11", hello);
+    auto authenticated = label("server/v12", hello);
     authenticated.insert(authenticated.end(), ack.begin(), ack.end());
     if (!constant_time_equal(remote_mac, hmac_sha256(keys_.auth, authenticated)))
         throw std::runtime_error("peer auth failed");
@@ -557,7 +565,7 @@ NodeInfo SecureChannel::server_handshake(const std::string& remote_host) {
     auto remote_mac = envelope_reader.fixed<32>();
     envelope_reader.finish();
 
-    if (!constant_time_equal(remote_mac, hmac_sha256(keys_.auth, label("client/v11", hello))))
+    if (!constant_time_equal(remote_mac, hmac_sha256(keys_.auth, label("client/v12", hello))))
         throw std::runtime_error("client auth failed");
 
     Reader reader(hello);
@@ -600,7 +608,7 @@ NodeInfo SecureChannel::server_handshake(const std::string& remote_host) {
     encode_node_info(ack_writer, local_);
     auto ack = ack_writer.take();
 
-    auto authenticated = label("server/v11", hello);
+    auto authenticated = label("server/v12", hello);
     authenticated.insert(authenticated.end(), ack.begin(), ack.end());
     Writer response;
     response.bytes(ack);

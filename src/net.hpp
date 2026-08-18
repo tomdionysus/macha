@@ -37,13 +37,16 @@ enum class MessageType : uint16_t {
     cancel_transfer = 16,
     commit_metadata = 17,
     cas_metadata_delta = 18,
+    get_metadata_object = 19,
+    put_metadata_object = 20,
     ok = 100,
     error = 101,
     members_reply = 102,
     bool_reply = 103,
     object_reply = 104,
     metadata_reply = 105,
-    cas_reply = 106
+    cas_reply = 106,
+    metadata_object_reply = 107
 };
 
 // Transport priority is a property of the frame type itself. There is no
