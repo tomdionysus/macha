@@ -264,8 +264,9 @@ CatalogueSnapshot CatalogueManager::load_root(const std::optional<ObjectId>& roo
 
 void CatalogueManager::cache(const MetadataRecord& record, const MetadataSnapshot& metadata,
                              CatalogueSnapshot snapshot) {
+    auto cached = std::make_shared<const CatalogueSnapshot>(std::move(snapshot));
     std::lock_guard lock(mutex_);
-    cached_ = std::move(snapshot);
+    cached_ = std::move(cached);
     cached_root_ = metadata.catalogue_root;
     cached_metadata_generation_ = record.generation;
     cache_until_ = Clock::now() + node_.config().metadata_cache;
@@ -321,67 +322,78 @@ void CatalogueManager::repair_once() {
     }
 }
 
-CatalogueSnapshot CatalogueManager::current_snapshot() {
+std::shared_ptr<const CatalogueSnapshot> CatalogueManager::current_snapshot() {
     {
         std::lock_guard lock(mutex_);
-        const auto now = Clock::now();
-        if (ready_ && cached_metadata_generation_ >= node_.known_metadata_generation() &&
-            now < cache_until_)
+        // Warm reads are deliberately memory-only. Catalogue convergence is a
+        // control-plane/background responsibility; an API GET must never block
+        // on metadata quorum I/O merely because a short validation TTL expired.
+        if (ready_ && cached_)
             return cached_;
     }
 
-    try {
-        repair_once();
-    } catch (...) {
-        // Availability beats freshness only when we have a coherent immutable
-        // snapshot to fall back to. Cold reads still fail until initial catalogue
-        // convergence succeeds. Status exposes cached vs known generation and the
-        // refresh error so a stale fallback is observable rather than silent.
-        std::lock_guard lock(mutex_);
-        if (!ready_)
-            throw;
-    }
+    // A genuinely cold manager has no coherent snapshot to serve, so its first
+    // read still has to establish one synchronously. Subsequent reads remain on
+    // the immutable shared snapshot while background convergence replaces it.
+    repair_once();
 
     std::lock_guard lock(mutex_);
-    if (!ready_)
+    if (!ready_ || !cached_)
         throw std::runtime_error("catalogue unavailable");
     return cached_;
 }
 
-CatalogueStatus CatalogueManager::status() const {
+bool CatalogueManager::refresh_needed() const {
     std::lock_guard lock(mutex_);
+    if (!ready_ || !cached_)
+        return true;
+    return cached_metadata_generation_ < node_.known_metadata_generation() ||
+           Clock::now() >= cache_until_;
+}
+
+CatalogueStatus CatalogueManager::status() const {
     CatalogueStatus status;
-    status.enabled = true;
-    status.metadata_generation = cached_metadata_generation_;
-    status.known_metadata_generation = node_.known_metadata_generation();
-    status.root = cached_root_;
-    status.items = cached_.items.size();
-    auto art = artwork_ids(cached_);
+    std::shared_ptr<const CatalogueSnapshot> cached;
+    {
+        std::lock_guard lock(mutex_);
+        status.enabled = true;
+        status.metadata_generation = cached_metadata_generation_;
+        status.known_metadata_generation = node_.known_metadata_generation();
+        status.root = cached_root_;
+        status.items = cached_ ? cached_->items.size() : 0;
+        status.ready = ready_;
+        status.last_sync_unix_ms = last_sync_unix_ms_;
+        status.error = error_;
+        cached = cached_;
+    }
+
+    // Potentially large artwork walks and backend existence probes must not hold
+    // the snapshot publication mutex; ordinary API reads only need that mutex
+    // long enough to acquire the immutable shared snapshot.
+    auto art = cached ? artwork_ids(*cached) : std::set<ObjectId>{};
     status.artwork_objects = art.size();
     for (const auto& id : art)
         status.local_artwork_objects += node_.local_store().has(id) ? 1 : 0;
-    const bool root_local = !cached_root_ || node_.local_store().has(*cached_root_);
-    status.ready = ready_ && root_local;
-    status.last_sync_unix_ms = last_sync_unix_ms_;
-    status.error = error_;
+    const bool root_local = !status.root || node_.local_store().has(*status.root);
+    status.ready = status.ready && root_local;
     return status;
 }
 
 CatalogueSnapshot CatalogueManager::snapshot() {
-    return current_snapshot();
+    return *current_snapshot();
 }
 
 std::optional<CatalogueItem> CatalogueManager::get(std::string_view id) {
     auto snapshot = current_snapshot();
-    auto it = snapshot.items.find(std::string(id));
-    return it == snapshot.items.end() ? std::optional<CatalogueItem>{} : it->second;
+    auto it = snapshot->items.find(std::string(id));
+    return it == snapshot->items.end() ? std::optional<CatalogueItem>{} : it->second;
 }
 
 std::vector<CatalogueItem> CatalogueManager::list(std::optional<CatalogueKind> kind,
                                                   std::optional<std::string_view> parent) {
     auto snapshot = current_snapshot();
     std::vector<CatalogueItem> out;
-    for (const auto& [_, item] : snapshot.items) {
+    for (const auto& [_, item] : snapshot->items) {
         if (kind && item.kind != *kind)
             continue;
         if (parent && (!item.parent_id || *item.parent_id != *parent))
@@ -399,7 +411,7 @@ std::vector<CatalogueItem> CatalogueManager::list(std::optional<CatalogueKind> k
 std::vector<CatalogueItem> CatalogueManager::search(std::string_view query, size_t limit) {
     auto snapshot = current_snapshot();
     std::vector<std::pair<double, CatalogueItem>> ranked;
-    for (const auto& [_, item] : snapshot.items) {
+    for (const auto& [_, item] : snapshot->items) {
         auto s = score(query, item);
         if (s > 0.0)
             ranked.emplace_back(s, item);
@@ -504,7 +516,8 @@ void CatalogueManager::commit(const std::optional<ObjectId>& expected_root,
 CatalogueItem CatalogueManager::upsert(CatalogueItem item,
                                         std::optional<uint64_t> expected_revision) {
     DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
-    auto current = current_snapshot();
+    repair_once();
+    auto current = *current_snapshot();
     std::optional<ObjectId> expected_root;
     {
         std::lock_guard lock(mutex_);
@@ -531,7 +544,8 @@ CatalogueItem CatalogueManager::upsert(CatalogueItem item,
 
 bool CatalogueManager::erase(std::string_view id, std::optional<uint64_t> expected_revision) {
     DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
-    auto current = current_snapshot();
+    repair_once();
+    auto current = *current_snapshot();
     std::optional<ObjectId> expected_root;
     {
         std::lock_guard lock(mutex_);
@@ -562,7 +576,8 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
                                          const std::set<std::string>& active_media_ids,
                                          bool prune_missing) {
     DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
-    auto current = current_snapshot();
+    repair_once();
+    auto current = *current_snapshot();
     std::optional<ObjectId> expected_root;
     {
         std::lock_guard lock(mutex_);
@@ -708,7 +723,7 @@ CatalogueArtwork CatalogueManager::put_artwork(std::string_view item_id, std::st
         if (!was_preexisting) {
             bool now_live = false;
             try {
-                now_live = artwork_ids(current_snapshot()).contains(art.id);
+                now_live = artwork_ids(*current_snapshot()).contains(art.id);
             } catch (...) {
                 now_live = true;
             }
@@ -720,14 +735,25 @@ CatalogueArtwork CatalogueManager::put_artwork(std::string_view item_id, std::st
     return art;
 }
 
-std::optional<Bytes> CatalogueManager::artwork(const ObjectId& id) {
+std::optional<CatalogueArtworkContent> CatalogueManager::artwork(const ObjectId& id) {
     auto current = current_snapshot();
-    auto ids = artwork_ids(current);
-    if (!ids.contains(id))
+    std::optional<std::string> mime_type;
+    for (const auto& [_, item] : current->items) {
+        auto it = std::find_if(item.artwork.begin(), item.artwork.end(),
+                               [&](const CatalogueArtwork& art) { return art.id == id; });
+        if (it != item.artwork.end()) {
+            mime_type = it->mime_type;
+            break;
+        }
+    }
+    if (!mime_type)
         return {};
     if (!store_.ensure_local(id, true))
         return {};
-    return node_.local_store().get(id);
+    auto bytes = node_.local_store().get(id);
+    if (!bytes)
+        return {};
+    return CatalogueArtworkContent{std::move(*mime_type), std::move(*bytes)};
 }
 
 CatalogueMaintenance CatalogueManager::maintenance_objects() {
@@ -741,13 +767,22 @@ CatalogueMaintenance CatalogueManager::maintenance_objects() {
         // Conservative failure semantics: if convergence is unavailable, retain
         // the last known catalogue objects rather than risk deleting live data.
     }
-    std::lock_guard lock(mutex_);
-    CatalogueMaintenance out;
-    if (cached_root_) {
-        out.live.insert(*cached_root_);
-        out.universal.insert(*cached_root_);
+    std::optional<ObjectId> root;
+    std::shared_ptr<const CatalogueSnapshot> cached;
+    {
+        std::lock_guard lock(mutex_);
+        root = cached_root_;
+        cached = cached_;
     }
-    for (const auto& id : artwork_ids(cached_)) {
+
+    CatalogueMaintenance out;
+    if (root) {
+        out.live.insert(*root);
+        out.universal.insert(*root);
+    }
+    if (!cached)
+        return out;
+    for (const auto& id : artwork_ids(*cached)) {
         out.live.insert(id);
         out.universal.insert(id);
     }

@@ -311,15 +311,9 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             if (!decoded || decoded->size() != 32) return error(400, "bad_id", "bad artwork object id");
             ObjectId id;
             std::copy(decoded->begin(), decoded->end(), id.bytes.begin());
-            auto bytes = catalogue_.artwork(id);
-            if (!bytes) return error(404, "not_found", "artwork not found");
-            std::string mime = "application/octet-stream";
-            auto snapshot = catalogue_.snapshot();
-            for (const auto& [_, item] : snapshot.items) {
-                auto it = std::find_if(item.artwork.begin(), item.artwork.end(), [&](const auto& art) { return art.id == id; });
-                if (it != item.artwork.end()) { mime = it->mime_type; break; }
-            }
-            return {200, mime, {}, std::move(*bytes)};
+            auto artwork = catalogue_.artwork(id);
+            if (!artwork) return error(404, "not_found", "artwork not found");
+            return {200, std::move(artwork->mime_type), {}, std::move(artwork->bytes)};
         }
 
         return error(404, "not_found", "endpoint not found");

@@ -79,15 +79,15 @@ Playback is deliberately separate from catalogue mutation. A playback session ma
 
 ## Cache freshness
 
-Catalogue API reads use a decoded in-memory snapshot, but that snapshot is not treated
-as permanently current. Metadata generation announcements invalidate it immediately;
-`metadata_cache_ms` is also used as a validation TTL so a missed announcement cannot
-leave a serving node stale indefinitely. Validation only reloads the catalogue object
-when `catalogue_root` changes. An unchanged content-addressed root keeps the existing
-decoded catalogue in memory. Concurrent API requests share one refresh operation.
+Catalogue API reads use a shared decoded in-memory snapshot. Once warm, GET/list/search
+never perform distributed metadata validation or reload a catalogue root on the request
+thread. Metadata generation announcements and `metadata_cache_ms` expiry instead make
+the service control plane converge the catalogue asynchronously. Validation only loads
+a new catalogue object when `catalogue_root` changes; an unchanged content-addressed
+root keeps the same decoded snapshot, and publication of a replacement is atomic.
 
 If metadata validation temporarily fails after a catalogue has already been loaded,
-Macha serves that last coherent immutable snapshot and records the refresh error.
+Macha continues serving that last coherent immutable snapshot and records the refresh error.
 `/api/v1/catalogue/status` exposes both `metadata_generation` (the cached catalogue's
 validated metadata generation) and `known_metadata_generation` (the newest generation
 the node knows exists).

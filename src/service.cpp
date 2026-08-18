@@ -258,11 +258,16 @@ void Service::loop(std::stop_token stop) {
                 last_metadata = now;
             }
 
-            // Metadata notices and foreground reads provide prompt convergence.
-            // Settled background verification uses the no-progress backoff rather
-            // than creating a control-plane quorum burst every five seconds.
-            if (!busy &&
-                (last_catalogue == Clock::time_point{} || now - last_catalogue >= background_interval)) {
+            // Catalogue GETs are memory-only. Convergence therefore belongs here:
+            // generation notices (or the short validation TTL) trigger a refresh
+            // independently of foreground activity, while the normal settled-state
+            // verification remains an idle/background operation. This keeps remote
+            // catalogue changes live without ever putting quorum I/O on an API thread.
+            const bool catalogue_refresh_needed = catalogue_.refresh_needed();
+            const bool catalogue_periodic =
+                last_catalogue == Clock::time_point{} ||
+                now - last_catalogue >= background_interval;
+            if (catalogue_refresh_needed || (!busy && catalogue_periodic)) {
                 const auto stage = Clock::now();
                 try {
                     catalogue_.repair_once();

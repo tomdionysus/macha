@@ -4156,7 +4156,7 @@ void test_catalogue_cache_ignores_unrelated_metadata_generation() {
     node.stop();
 }
 
-void test_catalogue_read_refreshes_remote_generation() {
+void test_catalogue_warm_read_defers_remote_refresh() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -4221,14 +4221,29 @@ void test_catalogue_read_refreshes_remote_generation() {
     CHECK(stale.known_metadata_generation >= writer_status.metadata_generation);
     CHECK(stale.known_metadata_generation > stale.metadata_generation);
 
-    // The read itself must converge the catalogue immediately rather than wait
-    // for background maintenance. This is the 0.10.3 stale remote-API regression.
+    // Warm reads must remain memory-only even when a newer generation is known.
+    // The serving API may briefly return the previous coherent snapshot while its
+    // background/control-plane worker converges; it must not perform quorum I/O
+    // on the request thread. refresh_needed() is the hand-off to that worker.
+    CHECK(catalogue2.refresh_needed());
+    auto still_cached = catalogue2.get(first.id);
+    REQUIRE(still_cached.has_value());
+    CHECK(still_cached->title == first.title);
+    CHECK(!catalogue2.get(second.id).has_value());
+    const auto after_read = catalogue2.status();
+    CHECK(after_read.metadata_generation == stale.metadata_generation);
+    CHECK(after_read.known_metadata_generation >= writer_status.metadata_generation);
+
+    // Simulate the Service control-plane pass. It must converge the immutable root
+    // and atomically publish the replacement snapshot for subsequent API reads.
+    catalogue2.repair_once();
     auto refreshed = catalogue2.get(second.id);
     REQUIRE(refreshed.has_value());
     CHECK(refreshed->title == second.title);
     const auto after = catalogue2.status();
     CHECK(after.metadata_generation >= writer_status.metadata_generation);
     CHECK(after.metadata_generation == after.known_metadata_generation);
+    CHECK(!catalogue2.refresh_needed());
 
     CatalogueApi api(catalogue2);
     auto status_response = api.handle({.method = "GET",
@@ -5553,7 +5568,7 @@ int main() {
         test_cache_hydrator_fetches_to_persistent_cache();
         test_media_probe_and_online_catalogue_scanner();
         test_catalogue_cache_ignores_unrelated_metadata_generation();
-        test_catalogue_read_refreshes_remote_generation();
+        test_catalogue_warm_read_defers_remote_refresh();
         test_metadata_decoded_cache_ttl_recovers_missed_notice();
         test_catalogue_root_ready_without_local_artwork();
         test_macos_unicode_namespace_aliases();
