@@ -4,6 +4,7 @@
 #include "codec.hpp"
 #include "hydration.hpp"
 #include "log.hpp"
+#include "macos_unicode.hpp"
 #include "placement.hpp"
 #include <algorithm>
 #include <atomic>
@@ -916,6 +917,14 @@ std::shared_ptr<const FileSystem::NamespaceIndex> FileSystem::namespace_index() 
     built->hash = view.hash;
     built->snapshot = std::move(view.snapshot);
     for (const auto& [path, entry] : built->snapshot->entries) {
+        const auto canonical = macos_fuse_composed_name(path);
+        auto [canonical_it, inserted] = built->canonical_paths.emplace(canonical, path);
+        if (!inserted && canonical_it->second != path) {
+            built->ambiguous_canonical_paths.insert(canonical);
+            if (Log::enabled(LogLevel::debug))
+                Log::debug("namespace contains canonically-equivalent duplicate paths canonical=" +
+                           canonical + " first=" + canonical_it->second + " second=" + path);
+        }
         if (path == "/")
             continue;
         built->children[parent_path(path)].push_back({base_name(path), path});
@@ -928,6 +937,39 @@ std::shared_ptr<const FileSystem::NamespaceIndex> FileSystem::namespace_index() 
     return namespace_index_;
 }
 
+std::optional<std::string> FileSystem::resolve_existing_path(const std::string& p) {
+    const auto q = normalize_path(p);
+    auto index = namespace_index();
+    if (index->snapshot->entries.contains(q))
+        return q;
+
+    const auto canonical = macos_fuse_composed_name(q);
+    if (index->ambiguous_canonical_paths.contains(canonical))
+        return {};
+    auto alias = index->canonical_paths.find(canonical);
+    if (alias == index->canonical_paths.end())
+        return {};
+    return alias->second;
+}
+
+std::string FileSystem::resolve_new_path(const std::string& p) {
+    const auto q = normalize_path(p);
+    if (auto existing = resolve_existing_path(q))
+        return *existing;
+    if (q == "/")
+        return q;
+
+    auto index = namespace_index();
+    const auto canonical = macos_fuse_composed_name(q);
+    if (index->ambiguous_canonical_paths.contains(canonical))
+        fail(EEXIST, "canonically equivalent name is ambiguous");
+
+    const auto requested_parent = parent_path(q);
+    const auto actual_parent = resolve_existing_path(requested_parent).value_or(requested_parent);
+    const auto leaf = macos_fuse_composed_name(base_name(q));
+    return actual_parent == "/" ? "/" + leaf : actual_parent + "/" + leaf;
+}
+
 void FileSystem::require_parent(const MetadataSnapshot& s, const std::string& p) {
     auto i = s.entries.find(parent_path(p));
     if (i == s.entries.end())
@@ -937,13 +979,19 @@ void FileSystem::require_parent(const MetadataSnapshot& s, const std::string& p)
 }
 FsEntry FileSystem::getattr(const std::string& p) {
     auto index = namespace_index();
-    auto i = index->snapshot->entries.find(normalize_path(p));
+    auto resolved = resolve_existing_path(p);
+    if (!resolved)
+        fail(ENOENT, "not found");
+    auto i = index->snapshot->entries.find(*resolved);
     if (i == index->snapshot->entries.end())
         fail(ENOENT, "not found");
     return i->second;
 }
 std::vector<std::pair<std::string, FsEntry>> FileSystem::readdir(const std::string& p) {
-    auto q = normalize_path(p);
+    auto resolved = resolve_existing_path(p);
+    if (!resolved)
+        fail(ENOENT, "not found");
+    auto q = *resolved;
     auto index = namespace_index();
     auto entry = index->snapshot->entries.find(q);
     if (entry == index->snapshot->entries.end())
@@ -963,7 +1011,7 @@ std::vector<std::pair<std::string, FsEntry>> FileSystem::readdir(const std::stri
     return result;
 }
 void FileSystem::mkdir(const std::string& p, uint32_t mode, uint32_t uid, uint32_t gid) {
-    auto q = normalize_path(p);
+    auto q = resolve_new_path(p);
     m_.mutate([&](MetadataSnapshot& s) {
         require_parent(s, q);
         if (s.entries.contains(q))
@@ -978,7 +1026,10 @@ void FileSystem::mkdir(const std::string& p, uint32_t mode, uint32_t uid, uint32
     });
 }
 void FileSystem::rmdir(const std::string& p) {
-    auto q = normalize_path(p);
+    auto resolved = resolve_existing_path(p);
+    if (!resolved)
+        fail(ENOENT, "missing");
+    auto q = *resolved;
     if (q == "/")
         fail(EBUSY, "root");
     m_.mutate([&](MetadataSnapshot& s) {
@@ -994,7 +1045,7 @@ void FileSystem::rmdir(const std::string& p) {
     });
 }
 FsEntry FileSystem::create_file(const std::string& p, uint32_t mode, uint32_t uid, uint32_t gid) {
-    auto q = normalize_path(p);
+    auto q = resolve_new_path(p);
     FsEntry e;
     e.type = EntryType::file;
     e.mode = mode & 07777;
@@ -1010,7 +1061,10 @@ FsEntry FileSystem::create_file(const std::string& p, uint32_t mode, uint32_t ui
     return e;
 }
 void FileSystem::unlink(const std::string& p) {
-    auto q = normalize_path(p);
+    auto resolved = resolve_existing_path(p);
+    if (!resolved)
+        fail(ENOENT, "missing");
+    auto q = *resolved;
     m_.mutate([&](MetadataSnapshot& s) {
         auto i = s.entries.find(q);
         if (i == s.entries.end())
@@ -1022,7 +1076,11 @@ void FileSystem::unlink(const std::string& p) {
     });
 }
 void FileSystem::rename(const std::string& a, const std::string& b, bool nr) {
-    auto x = normalize_path(a), y = normalize_path(b);
+    auto source = resolve_existing_path(a);
+    if (!source)
+        fail(ENOENT, "source missing");
+    auto x = *source;
+    auto y = resolve_new_path(b);
     if (x == "/" || y == "/")
         fail(EBUSY, "root");
     if (x == y)
@@ -1087,7 +1145,10 @@ void FileSystem::rename(const std::string& a, const std::string& b, bool nr) {
     }
 }
 void FileSystem::chmod(const std::string& p, uint32_t mode) {
-    auto q = normalize_path(p);
+    auto resolved = resolve_existing_path(p);
+    if (!resolved)
+        fail(ENOENT, "missing");
+    auto q = *resolved;
     m_.mutate([&](MetadataSnapshot& s) {
         auto j = s.entries.find(q);
         if (j == s.entries.end())
@@ -1099,7 +1160,10 @@ void FileSystem::chmod(const std::string& p, uint32_t mode) {
     });
 }
 void FileSystem::chown(const std::string& p, uint32_t u, uint32_t g, bool su, bool sg) {
-    auto q = normalize_path(p);
+    auto resolved = resolve_existing_path(p);
+    if (!resolved)
+        fail(ENOENT, "missing");
+    auto q = *resolved;
     m_.mutate([&](MetadataSnapshot& s) {
         auto i = s.entries.find(q);
         if (i == s.entries.end())
@@ -1113,7 +1177,10 @@ void FileSystem::chown(const std::string& p, uint32_t u, uint32_t g, bool su, bo
     });
 }
 void FileSystem::utimens(const std::string& p, int64_t mt) {
-    auto q = normalize_path(p);
+    auto resolved = resolve_existing_path(p);
+    if (!resolved)
+        fail(ENOENT, "missing");
+    auto q = *resolved;
     m_.mutate([&](MetadataSnapshot& s) {
         auto i = s.entries.find(q);
         if (i == s.entries.end())
@@ -1124,7 +1191,10 @@ void FileSystem::utimens(const std::string& p, int64_t mt) {
     });
 }
 void FileSystem::truncate_file(const std::string& p, uint64_t z) {
-    auto q = normalize_path(p);
+    auto resolved = resolve_existing_path(p);
+    if (!resolved)
+        fail(ENOENT, "missing");
+    auto q = *resolved;
     auto e = getattr(q);
     if (e.type != EntryType::file)
         fail(EISDIR, "directory");
@@ -1257,10 +1327,13 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
 }
 
 std::shared_ptr<ReadHandle> FileSystem::open_read(const std::string& p) {
-    auto e = getattr(p);
+    auto resolved = resolve_existing_path(p);
+    if (!resolved)
+        fail(ENOENT, "missing");
+    auto e = getattr(*resolved);
     if (e.type != EntryType::file)
         fail(EISDIR, "directory");
-    return open_read(e, p, false, FrameType::read_ahead);
+    return open_read(e, *resolved, false, FrameType::read_ahead);
 }
 
 std::shared_ptr<ReadHandle> FileSystem::open_read(const FsEntry& entry, const std::string& logical_path,
@@ -1274,15 +1347,18 @@ std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool t
     // Serialize path lookup/registration with rename so an opening writer cannot
     // miss a rename between resolving the entry and joining the handle registry.
     std::lock_guard handles(open_writes_mutex_);
-    auto e = getattr(p);
+    auto resolved = resolve_existing_path(p);
+    if (!resolved)
+        fail(ENOENT, "missing");
+    auto e = getattr(*resolved);
     if (e.type != EntryType::file)
         fail(EISDIR, "directory");
     if (trunc && e.size) {
-        truncate_file(p, 0);
-        e = getattr(p);
+        truncate_file(*resolved, 0);
+        e = getattr(*resolved);
     }
     auto handle =
-        std::make_shared<WriteHandle>(*this, normalize_path(p), e, trunc || !e.size);
+        std::make_shared<WriteHandle>(*this, *resolved, e, trunc || !e.size);
     for (auto i = open_writes_.begin(); i != open_writes_.end();) {
         if (i->expired())
             i = open_writes_.erase(i);
@@ -1294,7 +1370,7 @@ std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool t
 }
 
 std::optional<uint64_t> FileSystem::active_write_size(const std::string& p) {
-    const auto q = normalize_path(p);
+    const auto q = resolve_existing_path(p).value_or(normalize_path(p));
     std::vector<std::shared_ptr<WriteHandle>> matches;
     {
         std::lock_guard handles(open_writes_mutex_);
@@ -1321,7 +1397,7 @@ std::optional<uint64_t> FileSystem::active_write_size(const std::string& p) {
 }
 
 std::vector<WriteHandleDiagnostics> FileSystem::active_write_diagnostics(const std::string& p) {
-    const auto q = normalize_path(p);
+    const auto q = resolve_existing_path(p).value_or(normalize_path(p));
     std::vector<std::shared_ptr<WriteHandle>> matches;
     {
         std::lock_guard handles(open_writes_mutex_);

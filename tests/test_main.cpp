@@ -854,6 +854,9 @@ void test_metadata_codec_and_replica() {
     CHECK(macos_fuse_decomposed_name(cafe_name) == "Cafe\xcc\x81 del Mar");
     CHECK(macos_fuse_decomposed_name("Na Buachaill\xc3\xad lainn.mp3") ==
           "Na Buachailli\xcc\x81 lainn.mp3");
+    CHECK(macos_fuse_composed_name("Cafe\xcc\x81 del Mar") == cafe_name);
+    CHECK(macos_fuse_composed_name("Na Buachailli\xcc\x81 lainn.mp3") ==
+          "Na Buachaill\xc3\xad lainn.mp3");
 #else
     CHECK(macos_fuse_decomposed_name(cafe_name) == cafe_name);
 #endif
@@ -4093,6 +4096,70 @@ void test_catalogue_root_ready_without_local_artwork() {
     node.stop();
 }
 
+void test_macos_unicode_namespace_aliases() {
+#if defined(__APPLE__)
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "node", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+
+    NodeRuntime node(config, keys);
+    DistributedStore store(node);
+    MetadataManager metadata(node);
+    FileSystem filesystem(node, store, metadata);
+    node.start();
+
+    filesystem.mkdir("/Music", 0755, getuid(), getgid());
+
+    // Simulate namespace keys written by a previous version/client in D form.
+    // The runtime alias index must resolve NFC callbacks to the exact persisted
+    // spelling instead of rewriting the metadata representation.
+    const std::string nfd_dir = "/Music/Cafe\xcc\x81 del Mar";
+    const std::string nfd_file =
+        nfd_dir + "/01.Clannad - Na Buachailli\xcc\x81 lainn.mp3";
+    const std::string nfc_dir = "/Music/Caf\xc3\xa9 del Mar";
+    const std::string nfc_file =
+        nfc_dir + "/01.Clannad - Na Buachaill\xc3\xad lainn.mp3";
+
+    metadata.mutate([&](MetadataSnapshot& snapshot) {
+        FsEntry dir;
+        dir.type = EntryType::directory;
+        dir.mode = 0755;
+        dir.uid = getuid();
+        dir.gid = getgid();
+        dir.ctime_ns = dir.mtime_ns = wall_time_ns();
+        snapshot.entries[nfd_dir] = dir;
+
+        FsEntry file;
+        file.type = EntryType::file;
+        file.mode = 0644;
+        file.uid = getuid();
+        file.gid = getgid();
+        file.ctime_ns = file.mtime_ns = wall_time_ns();
+        snapshot.entries[nfd_file] = file;
+    });
+
+    CHECK(filesystem.getattr(nfc_dir).type == EntryType::directory);
+    CHECK(filesystem.getattr(nfc_file).type == EntryType::file);
+    auto listed = filesystem.readdir(nfc_dir);
+    REQUIRE(listed.size() == 1);
+    CHECK(listed.front().first == "01.Clannad - Na Buachailli\xcc\x81 lainn.mp3");
+
+    // A new NFC leaf under an old NFD parent must retain the exact stored parent
+    // spelling so require_parent() sees a real namespace key.
+    const std::string new_nfc = nfc_dir + "/Macha Caf\xc3\xa9 Test.mp3";
+    filesystem.create_file(new_nfc, 0644, getuid(), getgid());
+    const auto persisted = metadata.snapshot();
+    CHECK(persisted.entries.contains(nfd_dir + "/Macha Caf\xc3\xa9 Test.mp3"));
+    CHECK(filesystem.getattr(new_nfc).type == EntryType::file);
+
+    node.stop();
+#endif
+}
+
 void test_media_index_cache_survives_namespace_churn() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
@@ -5211,6 +5278,7 @@ int main() {
         test_media_probe_and_online_catalogue_scanner();
         test_catalogue_cache_ignores_unrelated_metadata_generation();
         test_catalogue_root_ready_without_local_artwork();
+        test_macos_unicode_namespace_aliases();
         test_media_index_cache_survives_namespace_churn();
         test_catalogue_sync_search_and_artwork_gc();
         test_media_segment_store_backpressure_and_spill();
