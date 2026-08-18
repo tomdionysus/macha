@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.4 - 2026-08-18
+
+- fix foreground object replication when a preferred owner cannot even launch its `put_object` RPC (for example, because an advertised endpoint is stale or unreachable). Synchronous launch failures and local-store failures now enter the same failed-replica accounting as completed negative RPCs, so the deterministic fallback owner is tried immediately instead of leaving `DistributedStore::put()` in an impossible quorum state forever;
+- add a bounded regression which makes an unreachable peer the preferred R=1 owner and proves the write falls back to the local second-ranked owner rather than requiring cancellation to escape;
+- remove the temporary `DIAG put-*` / DATA-route instrumentation used to isolate the reported rsync stall. Existing normal slow-write diagnostics remain unchanged;
+- wire protocol remains v12.
+
 ## 0.9.3 - 2026-08-18
 
 - move catalogue-root transfer onto a dedicated metadata-object RPC carried by the CONTROL TCP session at speculative worker priority. A node that has converged metadata can now fetch or receive the immutable catalogue root without first establishing the DATA lane used for media/object payloads; root reads search every active peer because catalogue roots are universal rather than ordinary DHT-placement objects;

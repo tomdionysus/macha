@@ -338,19 +338,7 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             auto data = reader.bytes(128 * 1024 * 1024);
             reader.finish();
             note_activity(frame_type, data.size());
-            const bool diag_put = request.type == MessageType::put_object;
-            const auto store_started = Clock::now();
-            if (diag_put && Log::enabled(LogLevel::debug))
-                Log::debug("DIAG put-store begin object=" + to_string(id) +
-                           " bytes=" + std::to_string(data.size()));
-            const bool stored = local_.put(id, data);
-            const auto store_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                Clock::now() - store_started);
-            if (diag_put && Log::enabled(LogLevel::debug))
-                Log::debug("DIAG put-store end object=" + to_string(id) +
-                           " ok=" + std::to_string(stored ? 1 : 0) +
-                           " ms=" + std::to_string(store_ms.count()));
-            if (!stored)
+            if (!local_.put(id, data))
                 return error_reply("storage limit reached");
             members_.storage(local_.used(), local_.limit());
             return {MessageType::ok, {}};

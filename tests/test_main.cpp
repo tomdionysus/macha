@@ -2137,6 +2137,72 @@ void test_early_replication_quorum() {
     s1.stop();
 }
 
+void test_put_falls_back_after_remote_launch_failure() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto local_port = free_port();
+    auto dead_port = free_port();
+
+    auto config = config_for(t.path() / "local", keyfile, local_port);
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.connect_timeout = 100ms;
+    config.heartbeat = 30s;
+    config.dead_after = 60s;
+
+    Service service(config, keys);
+    service.start();
+
+    NodeInfo unreachable;
+    unreachable.id = random_node_id();
+    unreachable.host = "127.0.0.1";
+    unreachable.port = dead_port; // free_port() closes the listener: connect must fail.
+    unreachable.failure_domain = "unreachable-site";
+    unreachable.capacity = config.storage_backends.front().limit;
+    unreachable.seen_unix_ms = unix_ms();
+    service.node().membership().observe(unreachable, true);
+    REQUIRE(service.node().membership().active().size() == 2);
+
+    Bytes data;
+    std::vector<NodeInfo> ranked;
+    for (uint32_t salt = 0; salt < 4096; ++salt) {
+        data = pattern(256 * 1024 + salt);
+        auto id = object_id(data);
+        ranked = capacity_placement_nodes(id.bytes, service.node().membership().active(), 1);
+        if (ranked.size() == 2 && ranked[0].id == unreachable.id &&
+            ranked[1].id == service.node().node_id())
+            break;
+        ranked.clear();
+    }
+    REQUIRE(ranked.size() == 2);
+
+    // Before 0.9.4, a synchronous call_async() failure incremented a dead
+    // "completed" counter but was not treated as a failed replica. With no
+    // pending RPC, the quorum loop then slept forever instead of trying the
+    // deterministic fallback owner. Keep a cancellation watchdog so this
+    // regression fails boundedly rather than hanging the entire test binary.
+    std::atomic_bool cancelled{false};
+    std::jthread watchdog([&](std::stop_token stop) {
+        const auto deadline = Clock::now() + 2s;
+        while (!stop.stop_requested() && Clock::now() < deadline)
+            std::this_thread::sleep_for(10ms);
+        if (!stop.stop_requested())
+            cancelled.store(true, std::memory_order_relaxed);
+    });
+
+    DistributedStore store(service.node());
+    auto id = object_id(data);
+    const bool stored = store.put(id, data, &cancelled);
+    watchdog.request_stop();
+
+    CHECK(stored);
+    CHECK(!cancelled.load(std::memory_order_relaxed));
+    CHECK(service.node().local_store().has(id));
+    service.stop();
+}
+
 void test_joiner_cannot_form_genesis() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
@@ -3824,7 +3890,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
-    CHECK(status_body.find("\"server_version\":\"0.9.3\"") != std::string::npos);
+    CHECK(status_body.find("\"server_version\":\"0.9.4\"") != std::string::npos);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -4486,7 +4552,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == "0.9.3");
+    CHECK(playback_status_json.find("server_version")->asString() == "0.9.4");
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately
@@ -4759,6 +4825,7 @@ int main() {
         test_rpc_slow_control_does_not_abort_data();
         test_rpc_health_and_control_not_starved_by_data();
         test_early_replication_quorum();
+        test_put_falls_back_after_remote_launch_failure();
         test_joiner_cannot_form_genesis();
         test_two_node_mutual_bootstrap_metadata_quorum();
         test_replication_policy_change_on_restart();

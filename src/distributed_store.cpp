@@ -95,14 +95,13 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
         NodeInfo owner;
         std::optional<AsyncRpc> rpc;
         Clock::time_point started{};
-        Clock::time_point last_diag{};
         bool done{};
     };
 
     std::vector<PendingPut> pending;
     pending.reserve(nodes.size());
     size_t success = 0;
-    size_t completed = 0;
+    size_t failed_replicas = 0;
     size_t next_fallback = target;
     std::chrono::milliseconds local_store_time{};
     std::chrono::milliseconds remote_max_time{};
@@ -126,56 +125,23 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
 
     auto launch = [&](const NodeInfo& owner) {
         if (owner.id == n_.node_id()) {
-            ++completed;
             const auto started = Clock::now();
-            if (Log::enabled(LogLevel::debug))
-                Log::debug("DIAG put-quorum local-begin object=" + to_string(id) +
-                           " bytes=" + std::to_string(data.size()));
-            const bool stored = n_.local_store().put(id, data);
-            if (stored)
+            if (n_.local_store().put(id, data))
                 ++success;
-            const auto elapsed =
+            else
+                ++failed_replicas;
+            local_store_time +=
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
-            local_store_time += elapsed;
-            if (Log::enabled(LogLevel::debug))
-                Log::debug("DIAG put-quorum local-end object=" + to_string(id) +
-                           " ok=" + std::to_string(stored ? 1 : 0) +
-                           " elapsed_ms=" + std::to_string(elapsed.count()));
             return;
         }
         try {
             PendingPut item;
             item.owner = owner;
             item.started = Clock::now();
-            item.last_diag = item.started;
-            if (Log::enabled(LogLevel::debug))
-                Log::debug("DIAG put-quorum remote-begin object=" + to_string(id) +
-                           " peer=" + to_string(owner.id).substr(0, 12) +
-                           " endpoint=" + owner.host + ":" + std::to_string(owner.port) +
-                           " bytes=" + std::to_string(data.size()));
             item.rpc.emplace(n_.call_async(owner, MessageType::put_object, payload, FrameType::read_ahead));
-            if (Log::enabled(LogLevel::debug))
-                Log::debug("DIAG put-quorum rpc-created object=" + to_string(id) +
-                           " peer=" + to_string(owner.id).substr(0, 12) +
-                           " req=" + std::to_string(item.rpc->request_id()));
-            if (Log::enabled(LogLevel::debug))
-                Log::debug("DIAG put-quorum launch object=" + to_string(id) +
-                           " peer=" + to_string(owner.id).substr(0, 12) +
-                           " req=" + std::to_string(item.rpc->request_id()) +
-                           " bytes=" + std::to_string(data.size()));
             pending.push_back(std::move(item));
-        } catch (const std::exception& error) {
-            if (Log::enabled(LogLevel::debug))
-                Log::debug("DIAG put-quorum remote-launch-error object=" + to_string(id) +
-                           " peer=" + to_string(owner.id).substr(0, 12) +
-                           " error=\"" + error.what() + "\"");
-            ++completed;
         } catch (...) {
-            if (Log::enabled(LogLevel::debug))
-                Log::debug("DIAG put-quorum remote-launch-error object=" + to_string(id) +
-                           " peer=" + to_string(owner.id).substr(0, 12) +
-                           " error=\"unknown\"");
-            ++completed;
+            ++failed_replicas;
         }
     };
 
@@ -194,34 +160,15 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
             return finish(false);
         }
         bool progressed = false;
-        size_t failures = 0;
         for (auto& item : pending) {
             if (item.done || !item.rpc)
                 continue;
-            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
-                const auto now = Clock::now();
-                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now - item.started);
-                if (elapsed >= std::chrono::seconds(2) &&
-                    now - item.last_diag >= std::chrono::seconds(5) &&
-                    Log::enabled(LogLevel::debug)) {
-                    item.last_diag = now;
-                    Log::debug("DIAG put-quorum pending object=" + to_string(id) +
-                               " peer=" + to_string(item.owner.id).substr(0, 12) +
-                               " req=" + std::to_string(item.rpc->request_id()) +
-                               " elapsed_ms=" + std::to_string(elapsed.count()) +
-                               " no_progress_ms=" + std::to_string(item.rpc->idle_for().count()) +
-                               " success=" + std::to_string(success) +
-                               "/" + std::to_string(need));
-                }
+            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
                 continue;
-            }
 
             item.done = true;
-            ++completed;
             progressed = true;
             bool ok = false;
-            const auto request_id = item.rpc->request_id();
             try {
                 ok = item.rpc->get().message.type == MessageType::ok;
             } catch (...) {
@@ -229,26 +176,23 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
             const auto remote_elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - item.started);
             remote_max_time = std::max(remote_max_time, remote_elapsed);
-            if (Log::enabled(LogLevel::debug))
-                Log::debug("DIAG put-quorum complete object=" + to_string(id) +
-                           " peer=" + to_string(item.owner.id).substr(0, 12) +
-                           " req=" + std::to_string(request_id) +
-                           " ok=" + std::to_string(ok ? 1 : 0) +
-                           " elapsed_ms=" + std::to_string(remote_elapsed.count()));
             if (ok) {
                 ++success;
                 note_network(data.size(), Clock::now() - item.started);
             } else {
-                ++failures;
+                ++failed_replicas;
             }
 
             if (success >= need)
                 return finish(true);
         }
 
-        while (failures && next_fallback < nodes.size() && success < need) {
+        while (failed_replicas && next_fallback < nodes.size() && success < need) {
+            --failed_replicas;
             launch(nodes[next_fallback++]);
-            --failures;
+            progressed = true;
+            if (success >= need)
+                return finish(true);
         }
 
         size_t unfinished = 0;

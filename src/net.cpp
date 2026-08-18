@@ -32,22 +32,6 @@ constexpr size_t frame_header_size = 28;
 constexpr uint8_t frame_first = 0x01;
 constexpr uint8_t frame_last = 0x02;
 
-bool diagnostic_put(MessageType type) noexcept {
-    return type == MessageType::put_object;
-}
-
-std::string diagnostic_object(MessageType type, std::span<const uint8_t> payload) {
-    if (!diagnostic_put(type) || payload.size() < 32)
-        return "-";
-    ObjectId id{};
-    std::copy_n(payload.begin(), id.bytes.size(), id.bytes.begin());
-    return to_string(id);
-}
-
-std::string diagnostic_object(const RpcMessage& message) {
-    return diagnostic_object(message.type, message.payload);
-}
-
 void validate_frame_limit(size_t size) {
     if (size < protocol_min_frame_size || size > protocol_max_frame_size)
         throw std::runtime_error("max frame size must be 4K..4M");
@@ -726,19 +710,18 @@ WireFragment SecureChannel::receive_fragment(
 
 AsyncRpc::AsyncRpc(std::future<RpcReply> future, std::function<void()> cancel,
                    std::function<void()> abort, std::function<void(FrameType)> promote,
-                   std::function<std::chrono::milliseconds()> idle, uint64_t request_id)
+                   std::function<std::chrono::milliseconds()> idle)
     : future_(std::move(future)), cancel_(std::move(cancel)), abort_(std::move(abort)),
-      promote_(std::move(promote)), idle_(std::move(idle)), request_id_(request_id) {}
+      promote_(std::move(promote)), idle_(std::move(idle)) {}
 
 AsyncRpc::AsyncRpc(AsyncRpc&& other) noexcept
     : future_(std::move(other.future_)), cancel_(std::move(other.cancel_)),
       abort_(std::move(other.abort_)), promote_(std::move(other.promote_)),
-      idle_(std::move(other.idle_)), request_id_(other.request_id_) {
+      idle_(std::move(other.idle_)) {
     other.cancel_ = {};
     other.abort_ = {};
     other.promote_ = {};
     other.idle_ = {};
-    other.request_id_ = 0;
 }
 
 AsyncRpc& AsyncRpc::operator=(AsyncRpc&& other) noexcept {
@@ -750,12 +733,10 @@ AsyncRpc& AsyncRpc::operator=(AsyncRpc&& other) noexcept {
     abort_ = std::move(other.abort_);
     promote_ = std::move(other.promote_);
     idle_ = std::move(other.idle_);
-    request_id_ = other.request_id_;
     other.cancel_ = {};
     other.abort_ = {};
     other.promote_ = {};
     other.idle_ = {};
-    other.request_id_ = 0;
     return *this;
 }
 
@@ -817,8 +798,6 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         std::promise<RpcReply> promise;
         Clock::time_point started{Clock::now()};
         std::atomic<int64_t> last_progress_ns{steady_ns()};
-        MessageType type{MessageType::error};
-        std::string object;
     };
 
     struct Outbound {
@@ -1162,12 +1141,6 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                         } catch (...) {
                         }
                     }
-                    if (diagnostic_put(item.message.type) && Log::enabled(LogLevel::debug))
-                        Log::debug("DIAG put-rpc client-sent peer=" +
-                                   to_string(peer_.id).substr(0, 12) +
-                                   " lane=" + transport_lane_name(channel_.lane()) +
-                                   " req=" + std::to_string(item.request_id) +
-                                   " object=" + diagnostic_object(item.message));
                 }
                 finish_retire_if_drained();
             }
@@ -1254,14 +1227,6 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                     Clock::now() - pending->started);
                 result_observer_(true, elapsed);
-                if (diagnostic_put(pending->type) && Log::enabled(LogLevel::debug))
-                    Log::debug("DIAG put-rpc client-reply peer=" +
-                               to_string(peer_.id).substr(0, 12) +
-                               " lane=" + transport_lane_name(channel_.lane()) +
-                               " req=" + std::to_string(frame->request_id) +
-                               " object=" + pending->object +
-                               " reply=" + message_type_name(frame->message.type) +
-                               " elapsed_ms=" + std::to_string(elapsed.count()));
                 pending->promise.set_value({peer_, std::move(frame->message)});
                 finish_retire_if_drained();
             }
@@ -1289,12 +1254,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
           inbound_promoter_(std::move(inbound_promoter)),
           inbound_canceller_(std::move(inbound_canceller)),
           result_observer_(std::move(result_observer)) {
-        if (lane == TransportLane::data && Log::enabled(LogLevel::debug))
-            Log::debug("DIAG rpc-handshake client-begin lane=data");
         peer_ = channel_.client_handshake(lane);
-        if (lane == TransportLane::data && Log::enabled(LogLevel::debug))
-            Log::debug("DIAG rpc-handshake client-complete lane=data peer=" +
-                       to_string(peer_.id).substr(0, 12));
         peer_observer_(peer_);
         reader_ = std::jthread([this](std::stop_token stop) { reader_loop(stop); });
         writer_ = std::jthread([this](std::stop_token stop) { writer_loop(stop); });
@@ -1319,8 +1279,6 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
 
         uint64_t id = 0;
         auto pending = std::make_shared<Pending>();
-        pending->type = type;
-        pending->object = diagnostic_object({type, Bytes(payload.begin(), payload.end())});
         auto future = pending->promise.get_future();
         {
             std::lock_guard admission(admission_mutex_);
@@ -1338,13 +1296,6 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             try {
                 (void)queue_message(id, frame_type,
                                     {type, Bytes(payload.begin(), payload.end())}, false);
-                if (diagnostic_put(type) && Log::enabled(LogLevel::debug))
-                    Log::debug("DIAG put-rpc client-queued peer=" +
-                               to_string(peer_.id).substr(0, 12) +
-                               " lane=" + transport_lane_name(channel_.lane()) +
-                               " req=" + std::to_string(id) +
-                               " object=" + pending->object +
-                               " bytes=" + std::to_string(payload.size()));
             } catch (...) {
                 DiagnosticLock lock(pending_mutex_, "rpc.client.pending");
                 pending_.erase(id);
@@ -1384,7 +1335,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             return std::chrono::milliseconds::max();
         };
         return AsyncRpc(std::move(future), std::move(cancel), std::move(abort),
-                        std::move(promote), std::move(idle), id);
+                        std::move(promote), std::move(idle));
     }
 
     void notify(const RpcMessage& message) {
@@ -1650,12 +1601,7 @@ RpcClient::connection(const Endpoint& endpoint, const NodeId* expected, NodeId* 
     }
 
     try {
-        if (lane == TransportLane::data && Log::enabled(LogLevel::debug))
-            Log::debug("DIAG rpc-dial begin lane=data endpoint=" + endpoint_key(endpoint) +
-                       (expected ? " expected=" + to_string(*expected).substr(0, 12) : ""));
         int fd = connect_socket(endpoint, connect_timeout_);
-        if (lane == TransportLane::data && Log::enabled(LogLevel::debug))
-            Log::debug("DIAG rpc-dial tcp-connected lane=data endpoint=" + endpoint_key(endpoint));
         auto fresh = std::make_shared<PeerConnection>(
             fd, keys_, local_(), max_frame_size_, lane, peer_observer_, metadata_observer_,
             [this](const NodeInfo& peer, RpcFrame frame, InboundReply reply) {
@@ -1744,13 +1690,6 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
                                      FrameType frame_type) {
     validate_frame_semantics(type, frame_type);
     const auto lane = lane_for(type, frame_type);
-    const bool diag_put = diagnostic_put(type) && Log::enabled(LogLevel::debug);
-    const auto diag_object = diag_put ? diagnostic_object(type, payload) : std::string{};
-    if (diag_put)
-        Log::debug("DIAG rpc-route begin object=" + diag_object +
-                   " endpoint=" + endpoint_key(endpoint) +
-                   " lane=" + transport_lane_name(lane) +
-                   (expected ? " expected=" + to_string(*expected).substr(0, 12) : ""));
 
     auto try_existing = [&](const NodeId& peer) -> std::optional<AsyncRpc> {
         std::shared_ptr<PeerConnection> outbound;
@@ -1769,10 +1708,6 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
         }
         if (outbound) {
             ++connections_reused_;
-            if (diag_put)
-                Log::debug("DIAG rpc-route existing-outbound object=" + diag_object +
-                           " peer=" + to_string(peer).substr(0, 12) +
-                           " lane=" + transport_lane_name(lane));
             try {
                 return outbound->call(type, payload, frame_type);
             } catch (const std::exception&) {
@@ -1780,10 +1715,6 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
         }
         if (inbound) {
             ++connections_reused_;
-            if (diag_put)
-                Log::debug("DIAG rpc-route existing-inbound object=" + diag_object +
-                           " peer=" + to_string(peer).substr(0, 12) +
-                           " lane=" + transport_lane_name(lane));
             try {
                 return inbound(type, payload, frame_type);
             } catch (const std::exception&) {
@@ -1797,16 +1728,7 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
             return std::move(*existing);
 
     NodeId actual{};
-    if (diag_put)
-        Log::debug("DIAG rpc-route need-connection object=" + diag_object +
-                   " endpoint=" + endpoint_key(endpoint) +
-                   " lane=" + transport_lane_name(lane));
     auto outbound = connection(endpoint, expected, &actual, lane);
-    if (diag_put)
-        Log::debug("DIAG rpc-route connection-return object=" + diag_object +
-                   " actual=" + to_string(actual).substr(0, 12) +
-                   " outbound=" + std::to_string(outbound ? 1 : 0) +
-                   " lane=" + transport_lane_name(lane));
     if (outbound && outbound->usable()) {
         try {
             return outbound->call(type, payload, frame_type);
@@ -2153,9 +2075,6 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
     struct Pending {
         std::promise<RpcReply> promise;
         std::atomic<int64_t> last_progress_ns{steady_ns()};
-        Clock::time_point started{Clock::now()};
-        MessageType type{MessageType::error};
-        std::string object;
     };
     struct Outbound {
         uint64_t request_id{};
@@ -2436,12 +2355,6 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                         } catch (...) {
                         }
                     }
-                    if (diagnostic_put(item.message.type) && Log::enabled(LogLevel::debug))
-                        Log::debug("DIAG put-rpc client-sent peer=" +
-                                   to_string(peer.id).substr(0, 12) +
-                                   " lane=" + transport_lane_name(channel->lane()) +
-                                   " req=" + std::to_string(item.request_id) +
-                                   " object=" + diagnostic_object(item.message));
                 }
                 maybe_finish_retire();
             }
@@ -2508,8 +2421,6 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
 
         uint64_t id = 0;
         auto item = std::make_shared<Pending>();
-        item->type = type;
-        item->object = diagnostic_object({type, Bytes(payload.begin(), payload.end())});
         auto future = item->promise.get_future();
         {
             std::lock_guard admission(admission_mutex);
@@ -2525,13 +2436,6 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
             try {
                 (void)queue_message(id, frame_type,
                                     {type, Bytes(payload.begin(), payload.end())}, false);
-                if (diagnostic_put(type) && Log::enabled(LogLevel::debug))
-                    Log::debug("DIAG put-rpc client-queued peer=" +
-                               to_string(peer.id).substr(0, 12) +
-                               " lane=" + transport_lane_name(channel->lane()) +
-                               " req=" + std::to_string(id) +
-                               " object=" + item->object +
-                               " bytes=" + std::to_string(payload.size()));
             } catch (...) {
                 DiagnosticLock lock(pending_mutex, "rpc.session.pending");
                 pending.erase(id);
@@ -2584,7 +2488,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                 std::chrono::nanoseconds(idle_ns));
         };
         return AsyncRpc(std::move(future), std::move(cancel), std::move(abort),
-                        std::move(promote), std::move(idle), id);
+                        std::move(promote), std::move(idle));
     }
 
     void close() {
@@ -2681,11 +2585,6 @@ void RpcServer::attach_client(RpcClient& client) {
 
 void RpcServer::enqueue_shared(const NodeInfo& peer, RpcFrame frame,
                                RpcClient::InboundReply reply) {
-    if (diagnostic_put(frame.message.type) && Log::enabled(LogLevel::debug))
-        Log::debug("DIAG put-rpc server-received peer=" + to_string(peer.id).substr(0, 12) +
-                   " lane=shared req=" + std::to_string(frame.request_id) +
-                   " object=" + diagnostic_object(frame.message) +
-                   " bytes=" + std::to_string(frame.message.payload.size()));
     const auto cls = request_class(frame.frame_type);
     {
         DiagnosticLock lock(request_mutex_, "rpc.server.queue");
@@ -2866,8 +2765,6 @@ void RpcServer::accept_loop(std::stop_token stop) {
 
         auto session = std::make_shared<Session>();
         session->remote_host = numeric_host(address, size);
-        if (Log::enabled(LogLevel::debug))
-            Log::debug("DIAG rpc-accept tcp-accepted remote=" + session->remote_host);
         session->channel = std::make_unique<SecureChannel>(client, keys_, local_, max_frame_size_);
         {
             std::lock_guard lock(sessions_mutex_);
@@ -2883,13 +2780,7 @@ void RpcServer::session_loop(Session* session) {
     set_thread_name("macha-accept-rd");
     MessageAssembler assembler;
     try {
-        if (Log::enabled(LogLevel::debug))
-            Log::debug("DIAG rpc-handshake server-begin remote=" + session->remote_host);
         session->peer = session->channel->server_handshake(session->remote_host);
-        if (Log::enabled(LogLevel::debug))
-            Log::debug("DIAG rpc-handshake server-complete remote=" + session->remote_host +
-                       " lane=" + transport_lane_name(session->channel->lane()) +
-                       " peer=" + to_string(session->peer.id).substr(0, 12));
         session->ready = true;
         session->start_writer();
         observer_(session->peer);
@@ -2986,29 +2877,11 @@ void RpcServer::session_loop(Session* session) {
                     pending = std::move(found->second);
                     session->pending.erase(found);
                 }
-                if (diagnostic_put(pending->type) && Log::enabled(LogLevel::debug)) {
-                    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        Clock::now() - pending->started);
-                    Log::debug("DIAG put-rpc client-reply peer=" +
-                               to_string(session->peer.id).substr(0, 12) +
-                               " lane=" + transport_lane_name(session->channel->lane()) +
-                               " req=" + std::to_string(frame->request_id) +
-                               " object=" + pending->object +
-                               " reply=" + message_type_name(frame->message.type) +
-                               " elapsed_ms=" + std::to_string(elapsed.count()));
-                }
                 pending->promise.set_value({session->peer, std::move(frame->message)});
                 session->maybe_finish_retire();
                 continue;
             }
 
-            if (diagnostic_put(frame->message.type) && Log::enabled(LogLevel::debug))
-                Log::debug("DIAG put-rpc server-received peer=" +
-                           to_string(session->peer.id).substr(0, 12) +
-                           " lane=" + transport_lane_name(session->channel->lane()) +
-                           " req=" + std::to_string(frame->request_id) +
-                           " object=" + diagnostic_object(frame->message) +
-                           " bytes=" + std::to_string(frame->message.payload.size()));
             const auto cls = request_class(frame->frame_type);
             session->register_inbound(frame->request_id, frame->frame_type);
             bool queued = false;
@@ -3062,32 +2935,13 @@ void RpcServer::execute(RequestJob job) {
 
     const auto execute_started = Clock::now();
     const auto queue_ms = elapsed_ms(job.queued_at);
-    const bool diag_put = diagnostic_put(job.frame.message.type);
-    const auto diag_object = diag_put ? diagnostic_object(job.frame.message) : std::string{};
-    if (diag_put && Log::enabled(LogLevel::debug))
-        Log::debug("DIAG put-rpc server-dispatch peer=" + to_string(job.peer.id).substr(0, 12) +
-                   " req=" + std::to_string(job.frame.request_id) +
-                   " object=" + diag_object +
-                   " queue_ms=" + std::to_string(queue_ms));
     try {
         auto reply = handler_(job.peer, job.frame.frame_type, job.frame.message);
-        if (diag_put && Log::enabled(LogLevel::debug))
-            Log::debug("DIAG put-rpc server-handler-done peer=" +
-                       to_string(job.peer.id).substr(0, 12) +
-                       " req=" + std::to_string(job.frame.request_id) +
-                       " object=" + diag_object +
-                       " reply=" + message_type_name(reply.type) +
-                       " handler_ms=" + std::to_string(elapsed_ms(execute_started)));
         if (job.reply) {
             job.reply(reply);
         } else if (job.session) {
             (void)job.session->queue_message(job.frame.request_id, job.frame.frame_type, reply, true);
         }
-        if (diag_put && Log::enabled(LogLevel::debug))
-            Log::debug("DIAG put-rpc server-reply-queued peer=" +
-                       to_string(job.peer.id).substr(0, 12) +
-                       " req=" + std::to_string(job.frame.request_id) +
-                       " object=" + diag_object);
     } catch (const std::exception& error) {
         Log::debug(std::string("RPC handler: ") + error.what());
         if (job.reply) {
