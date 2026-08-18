@@ -93,6 +93,11 @@ struct CatalogueScannerConfig {
     // but cap deferral so sustained writes still produce occasional catalogue scans.
     std::chrono::milliseconds rescan_debounce{10000};
     std::chrono::milliseconds rescan_max_delay{60000};
+    // Bound online provider metadata work per pass. When the budget is exhausted,
+    // the scanner commits the completed discoveries and schedules a continuation
+    // rather than monopolising a scanner pass with remote lookups.
+    size_t max_provider_requests_per_scan{32};
+    std::chrono::milliseconds provider_batch_delay{30000};
     std::vector<std::string> roots{"/"};
     size_t max_artwork_bytes{16 * 1024 * 1024};
     CatalogueTmdbConfig tmdb;

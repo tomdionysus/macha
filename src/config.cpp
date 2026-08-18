@@ -147,6 +147,12 @@ void validate(Config& config) {
         throw std::runtime_error("catalogue.scanner.rescan_max_delay_ms must be >= 1000");
     if (config.catalogue.scanner.rescan_max_delay < config.catalogue.scanner.rescan_debounce)
         throw std::runtime_error("catalogue.scanner.rescan_max_delay_ms must be >= rescan_debounce_ms");
+    if (!config.catalogue.scanner.max_provider_requests_per_scan ||
+        config.catalogue.scanner.max_provider_requests_per_scan > 10000)
+        throw std::runtime_error("catalogue.scanner.max_provider_requests_per_scan must be 1..10000");
+    if (config.catalogue.scanner.provider_batch_delay < std::chrono::seconds(1) ||
+        config.catalogue.scanner.provider_batch_delay > std::chrono::hours(1))
+        throw std::runtime_error("catalogue.scanner.provider_batch_delay_ms must be 1000..3600000");
     if (config.catalogue.scanner.roots.empty())
         throw std::runtime_error("catalogue.scanner.roots must not be empty");
     for (const auto& root : config.catalogue.scanner.roots) {
@@ -318,6 +324,12 @@ void parse_catalogue(const YAML::Node& root, Config& c) {
         if (scanner["rescan_max_delay_ms"])
             c.catalogue.scanner.rescan_max_delay = milliseconds(
                 scanner["rescan_max_delay_ms"], "catalogue.scanner.rescan_max_delay_ms");
+        if (scanner["max_provider_requests_per_scan"])
+            c.catalogue.scanner.max_provider_requests_per_scan =
+                scanner["max_provider_requests_per_scan"].as<size_t>();
+        if (scanner["provider_batch_delay_ms"])
+            c.catalogue.scanner.provider_batch_delay = milliseconds(
+                scanner["provider_batch_delay_ms"], "catalogue.scanner.provider_batch_delay_ms");
         if (scanner["max_artwork_bytes"])
             c.catalogue.scanner.max_artwork_bytes = yaml_size(scanner["max_artwork_bytes"]);
         if (auto roots = scanner["roots"]) {

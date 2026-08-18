@@ -61,9 +61,13 @@ filesystem:
 
 Each value may be set to zero to disable that cache class and may not exceed 5000 ms. These values are applied when the mount is created and therefore require a restart to change. `kernel_cache` remains disabled; these settings cache name/attribute answers, not immutable file contents across opens.
 
+On macOS, the mount keeps Macha namespace keys byte-preserving but adapts Unicode names to macFUSE's platform contract: high-level lookup uses canonical-equivalence-insensitive matching and `readdir` returns decomposed (D-form) names. This applies to every pathname component, including both directory names and file names; no metadata migration is performed.
+
 ## Catalogue scanner
 
 `catalogue.scanner.interval_ms` is the periodic safety scan interval. Committed namespace changes schedule a scan after `catalogue.scanner.rescan_debounce_ms` (default 10000 ms, valid 1000..600000). Further mutations reset that quiet-period timer, but `catalogue.scanner.rescan_max_delay_ms` (default 60000 ms, minimum 1000 and not less than `rescan_debounce_ms`) caps total deferral from the first unscanned mutation. Catalogue metadata written by the scanner itself is excluded from the namespace-content signature and does not cause a catalogue rescan.
+
+Online metadata-provider work is also bounded. `catalogue.scanner.max_provider_requests_per_scan` defaults to 32 (valid 1..10000). The scanner checks the budget between complete provider lookups rather than aborting a search/detail operation halfway through, then reconciles completed discoveries and schedules a continuation after `catalogue.scanner.provider_batch_delay_ms` (default 30000 ms, valid 1000..3600000). Semantic provider misses are cached in memory for the configured provider lifetime; network/HTTP failures are not negative-cached. Artwork byte downloads use the existing `max_artwork_bytes` limit and occur only for the bounded set of discoveries produced by the provider pass.
 
 ## Streaming configuration
 

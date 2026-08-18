@@ -7,6 +7,7 @@
 #include "local_store.hpp"
 #include "metadata.hpp"
 #include "media_catalogue.hpp"
+#include "macos_unicode.hpp"
 #include "media_timestamps.hpp"
 #include "media_vod.hpp"
 #include "net.hpp"
@@ -242,8 +243,10 @@ class FakeHttpClient final : public HttpClient {
         RemoteHttpResponse response;
     };
     std::vector<Route> routes_;
+    std::atomic_size_t requests_{};
 
   public:
+    size_t requests() const noexcept { return requests_.load(); }
     void add(std::string contains, long status, std::string content_type, std::string body) {
         RemoteHttpResponse response;
         response.status = status;
@@ -256,6 +259,7 @@ class FakeHttpClient final : public HttpClient {
                            RemoteHttpResponse{status, std::move(content_type), std::move(body)}});
     }
     RemoteHttpResponse get(std::string_view url, const std::vector<std::string>&, size_t) override {
+        requests_.fetch_add(1);
         for (const auto& route : routes_) {
             if (url.find(route.contains) != std::string_view::npos)
                 return route.response;
@@ -824,6 +828,13 @@ void test_metadata_codec_and_replica() {
     file.type = EntryType::file;
     file.size = 123;
     snap.entries["/movie.mkv"] = file;
+    const std::string unicode_dir = "/Music/Caf\xc3\xa9 del Mar pack 1 (1999-2004)";
+    const std::string unicode_file =
+        unicode_dir + "/01.Clannad - Na Buachaill\xc3\xad lainn.mp3";
+    FsEntry unicode_directory_entry;
+    unicode_directory_entry.type = EntryType::directory;
+    snap.entries[unicode_dir] = unicode_directory_entry;
+    snap.entries[unicode_file] = file;
     auto garbage_id = object_id(pattern(4096));
     auto retirement_id = random_node_id();
     snap.garbage.push_back({garbage_id, 123456789, retirement_id});
@@ -832,6 +843,20 @@ void test_metadata_codec_and_replica() {
     CHECK(decoded.metadata_voters == snap.metadata_voters);
     CHECK(decoded.mutation_sequences == snap.mutation_sequences);
     CHECK(decoded.entries.at("/movie.mkv").size == 123);
+    REQUIRE(decoded.entries.contains(unicode_dir));
+    REQUIRE(decoded.entries.contains(unicode_file));
+    CHECK(decoded.entries.at(unicode_dir).type == EntryType::directory);
+    CHECK(decoded.entries.at(unicode_file).type == EntryType::file);
+    // Persistent metadata remains byte-preserving. The macOS FUSE adapter owns
+    // the platform presentation rule and decomposes only names returned to macFUSE.
+    const std::string cafe_name = "Caf\xc3\xa9 del Mar";
+#if defined(__APPLE__)
+    CHECK(macos_fuse_decomposed_name(cafe_name) == "Cafe\xcc\x81 del Mar");
+    CHECK(macos_fuse_decomposed_name("Na Buachaill\xc3\xad lainn.mp3") ==
+          "Na Buachailli\xcc\x81 lainn.mp3");
+#else
+    CHECK(macos_fuse_decomposed_name(cafe_name) == cafe_name);
+#endif
     REQUIRE(decoded.garbage.size() == 1);
     CHECK(decoded.garbage.front().id == garbage_id);
     CHECK(decoded.garbage.front().retired_at_ns == 123456789);
@@ -1201,6 +1226,8 @@ void test_config() {
             << "    interval_ms: 60000\n"
             << "    rescan_debounce_ms: 12000\n"
             << "    rescan_max_delay_ms: 45000\n"
+            << "    max_provider_requests_per_scan: 48\n"
+            << "    provider_batch_delay_ms: 15000\n"
             << "    roots: [/TV, /Movies, /Music]\n"
             << "    max_artwork_bytes: 6M\n"
             << "    providers:\n"
@@ -1278,6 +1305,8 @@ void test_config() {
     CHECK(yc.catalogue.scanner.interval == 60000ms);
     CHECK(yc.catalogue.scanner.rescan_debounce == 12000ms);
     CHECK(yc.catalogue.scanner.rescan_max_delay == 45000ms);
+    CHECK(yc.catalogue.scanner.max_provider_requests_per_scan == 48);
+    CHECK(yc.catalogue.scanner.provider_batch_delay == 15000ms);
     CHECK(yc.catalogue.scanner.roots.size() == 3);
     CHECK(yc.catalogue.scanner.roots[0] == "/TV");
     CHECK(yc.catalogue.scanner.max_artwork_bytes == 6ULL * 1024 * 1024);
@@ -3658,6 +3687,15 @@ void test_media_probe_and_online_catalogue_scanner() {
     CHECK(tv_match->items[2].media_ids == std::vector<std::string>{"macha:test-episode"});
     CHECK(tv_match->artwork.size() == 4);
 
+    // Positive show/season results are cached as the actual JSON objects, not
+    // merely as truthy values. A second episode lookup must therefore remain
+    // usable without issuing another provider request.
+    const auto tv_requests = tmdb_http.requests();
+    auto tv_cached = tmdb.lookup(tv_probe);
+    REQUIRE(tv_cached.has_value());
+    CHECK(tv_cached->items.size() == 3);
+    CHECK(tmdb_http.requests() == tv_requests);
+
     // Provider title scoring must tolerate common number spelling differences
     // between release filenames and canonical provider titles. The year remains
     // part of the score, so this does not turn matching into a first-result win.
@@ -3725,6 +3763,52 @@ void test_media_probe_and_online_catalogue_scanner() {
     REQUIRE(!mb_match->artwork.empty());
     CHECK(mb_match->artwork.front().role == "cover");
     CHECK(mb_match->artwork.front().url == "https://images.example/500.jpg");
+
+    // Semantic provider misses are process-lifetime negative cache entries.
+    // Transient HTTP failures still throw and are retried; only a successful
+    // provider response saying "no match" is suppressed on later tracks/scans.
+    FakeHttpClient mb_miss_http;
+    mb_miss_http.add("/ws/2/release?", 200, "application/json", R"({"releases":[]})");
+    MusicBrainzProvider mb_miss(mb_miss_http, mb_config);
+    MediaProbe missing_track = music_probe;
+    missing_track.album = "Definitely Missing Album";
+    missing_track.title = "Track One";
+    CHECK(!mb_miss.lookup(missing_track).has_value());
+    CHECK(mb_miss_http.requests() == 1);
+    for (int track_number = 2; track_number <= 128; ++track_number) {
+        missing_track.title = "Track " + std::to_string(track_number);
+        missing_track.track = track_number;
+        CHECK(!mb_miss.lookup(missing_track).has_value());
+    }
+    CHECK(mb_miss_http.requests() == 1);
+
+    FakeHttpClient tmdb_miss_http;
+    tmdb_miss_http.add("/search/movie", 200, "application/json", R"({"results":[]})");
+    TmdbProvider tmdb_miss(tmdb_miss_http, tmdb_config);
+    MediaProbe missing_movie;
+    missing_movie.kind = MediaProbeKind::movie;
+    missing_movie.title = "Definitely Missing Movie";
+    missing_movie.year = 2026;
+    CHECK(!tmdb_miss.lookup(missing_movie).has_value());
+    CHECK(tmdb_miss_http.requests() == 1);
+    CHECK(!tmdb_miss.lookup(missing_movie).has_value());
+    CHECK(tmdb_miss_http.requests() == 1);
+
+    // Transport/provider failures are deliberately not negative-cached: the
+    // next scan gets another chance after a transient outage.
+    FakeHttpClient tmdb_error_http;
+    tmdb_error_http.add("/search/movie", 503, "application/json", R"({})");
+    TmdbProvider tmdb_error(tmdb_error_http, tmdb_config);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool threw = false;
+        try {
+            (void)tmdb_error.lookup(missing_movie);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        CHECK(threw);
+    }
+    CHECK(tmdb_error_http.requests() == 2);
 
     // End-to-end scanner: resolve a real distributed filesystem entry, fetch
     // poster/backdrop bytes, commit them with the catalogue, then prove a second
@@ -3854,6 +3938,57 @@ void test_media_probe_and_online_catalogue_scanner() {
     cancel_scanner.stop();
     CHECK(blocking_http_ptr->stopped());
     CHECK(Clock::now() - stop_started < 1s);
+
+    // Online metadata enrichment is bounded by actual provider HTTP requests,
+    // not by the number of files. Completed discoveries commit normally and a
+    // later pass resumes with already-bound media skipped.
+    service.filesystem().mkdir("/Budget", 0755, getuid(), getgid());
+    const std::array<std::pair<const char*, uint8_t>, 3> budget_files{{
+        {"/Budget/Budget.One.2020.mkv", 1},
+        {"/Budget/Budget.Two.2021.mkv", 2},
+        {"/Budget/Budget.Three.2022.mkv", 3},
+    }};
+    std::set<std::string> budget_media_ids;
+    for (const auto& [path, marker] : budget_files) {
+        service.filesystem().create_file(path, 0644, getuid(), getgid());
+        auto w = service.filesystem().open_write(path, true);
+        REQUIRE(w->write(0, Bytes{marker, 2, 3, 4}) == 4);
+        w->commit();
+        budget_media_ids.insert(file_media_id(service.filesystem().getattr(path)));
+    }
+    REQUIRE(budget_media_ids.size() == budget_files.size());
+    auto budget_http = std::make_unique<FakeHttpClient>();
+    auto* budget_http_ptr = budget_http.get();
+    budget_http->add("query=Budget%20One", 200, "application/json",
+                     R"({"results":[{"id":2001,"title":"Budget One","release_date":"2020-01-01"}]})");
+    budget_http->add("/movie/2001", 200, "application/json",
+                     R"({"id":2001,"title":"Budget One","release_date":"2020-01-01"})");
+    budget_http->add("query=Budget%20Two", 200, "application/json",
+                     R"({"results":[{"id":2002,"title":"Budget Two","release_date":"2021-01-01"}]})");
+    budget_http->add("/movie/2002", 200, "application/json",
+                     R"({"id":2002,"title":"Budget Two","release_date":"2021-01-01"})");
+    budget_http->add("query=Budget%20Three", 200, "application/json",
+                     R"({"results":[{"id":2003,"title":"Budget Three","release_date":"2022-01-01"}]})");
+    budget_http->add("/movie/2003", 200, "application/json",
+                     R"({"id":2003,"title":"Budget Three","release_date":"2022-01-01"})");
+
+    auto budget_config = scanner_config;
+    budget_config.roots = {"/Budget"};
+    budget_config.max_provider_requests_per_scan = 4;
+    budget_config.provider_batch_delay = 1000ms;
+    CatalogueScanner budget_scanner(service.node(), service.filesystem(), service.catalogue(),
+                                    budget_config, std::move(budget_http));
+    CHECK(budget_scanner.scan_once() == 2);
+    CHECK(budget_http_ptr->requests() == 4);
+    size_t first_batch_items = 0;
+    for (const auto* id : {"tmdb:movie:2001", "tmdb:movie:2002", "tmdb:movie:2003"})
+        if (service.catalogue().get(id).has_value()) ++first_batch_items;
+    CHECK(first_batch_items == 2);
+    CHECK(budget_scanner.scan_once() == 1);
+    CHECK(budget_http_ptr->requests() == 6);
+    CHECK(service.catalogue().get("tmdb:movie:2001").has_value());
+    CHECK(service.catalogue().get("tmdb:movie:2002").has_value());
+    CHECK(service.catalogue().get("tmdb:movie:2003").has_value());
 
     service.stop();
 }
@@ -4123,7 +4258,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
-    CHECK(status_body.find("\"server_version\":\"0.10.1\"") != std::string::npos);
+    CHECK(status_body.find("\"server_version\":\"0.10.2\"") != std::string::npos);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -4786,7 +4921,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == "0.10.1");
+    CHECK(playback_status_json.find("server_version")->asString() == "0.10.2");
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately

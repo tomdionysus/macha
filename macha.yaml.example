@@ -136,6 +136,10 @@ catalogue:
     # Sustained mutation cannot defer a pending rescan beyond rescan_max_delay_ms.
     rescan_debounce_ms: 10000
     rescan_max_delay_ms: 60000
+    # Bound synchronous online metadata-provider work per scanner pass.
+    # A completed batch continues later without blocking the whole scan indefinitely.
+    max_provider_requests_per_scan: 32
+    provider_batch_delay_ms: 30000
     roots:
       - /Movies
       - /TV

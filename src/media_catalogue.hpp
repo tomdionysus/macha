@@ -91,7 +91,8 @@ class TmdbProvider final : public MetadataProvider {
     HttpClient& http_;
     CatalogueTmdbConfig config_;
     std::string token_;
-    std::map<std::string, Json> show_cache_;
+    std::map<std::string, std::optional<Json>> movie_cache_;
+    std::map<std::string, std::optional<Json>> show_cache_;
     std::map<std::string, Json> season_cache_;
 
     Json api(std::string_view path, const std::vector<std::pair<std::string, std::string>>& query = {});
@@ -107,7 +108,7 @@ class TmdbProvider final : public MetadataProvider {
 class MusicBrainzProvider final : public MetadataProvider {
     HttpClient& http_;
     CatalogueMusicBrainzConfig config_;
-    std::map<std::string, Json> release_cache_;
+    std::map<std::string, std::optional<Json>> release_cache_;
     std::map<std::string, std::optional<std::string>> cover_cache_;
     std::chrono::steady_clock::time_point last_request_{};
 
@@ -127,7 +128,9 @@ class CatalogueScanner {
     CatalogueManager& catalogue_;
     CatalogueScannerConfig config_;
     std::unique_ptr<HttpClient> http_;
+    std::unique_ptr<HttpClient> provider_http_;
     std::vector<std::unique_ptr<MetadataProvider>> providers_;
+    std::atomic_bool provider_continuation_{};
     std::jthread worker_;
     mutable std::mutex config_mutex_;
 

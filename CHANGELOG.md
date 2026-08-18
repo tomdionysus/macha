@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.2 - 2026-08-18
+
+- correct TMDB positive TV-search caching: cache the selected JSON result object itself rather than permitting the `const Json*` result to convert through `bool` into `Json(true)`; repeated show/season lookups now reuse valid cached provider data without additional HTTP requests;
+- fix macOS/macFUSE Unicode pathname identity without rewriting persisted Macha namespace keys: mount high-level macFUSE with `norm_insensitive`, return directory-entry names in Unicode Normalization Form D as macFUSE requires, and include raw incoming/stored/emitted pathname bytes in `log_level=all` FUSE tracing; this covers accented file names as well as accented directory components and remains compatible with namespace metadata written by previous versions;
+- negative-cache semantic provider misses for TMDB movie/show searches and MusicBrainz release searches for the lifetime of the configured provider instance. Successful HTTP responses that contain no usable match are not retried for every duplicate file/track or every scanner pass; transport/HTTP failures are deliberately not cached and remain retryable;
+- bound synchronous online metadata enrichment with `catalogue.scanner.max_provider_requests_per_scan` (default 32). The budget is checked between complete provider lookups, so an in-progress search/detail lookup finishes and forward progress is guaranteed even with a very small budget; completed discoveries are reconciled normally and unfinished enrichment is continued after `catalogue.scanner.provider_batch_delay_ms` (default 30000);
+- separate full namespace/media-ID enumeration from provider enrichment so a provider-budgeted scan still has the complete live media set and cannot prune scanner-owned catalogue bindings merely because their provider work was deferred;
+- add regression coverage for byte-preserving accented file/directory metadata, macOS D-form directory-entry conversion, provider negative caching, provider request budgeting/continuation semantics, and the new scanner configuration.
+
 ## 0.10.1 - 2026-08-18
 
 - replace zero-duration FUSE entry/attribute/negative caches with short configurable defaults (`250/250/100 ms`) while retaining conservative file-content cache behaviour across opens;

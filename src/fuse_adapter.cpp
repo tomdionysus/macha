@@ -11,6 +11,7 @@
 #include "crypto.hpp"
 #include "diagnostics.hpp"
 #include "log.hpp"
+#include "macos_unicode.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
@@ -31,6 +32,7 @@
 #include <iomanip>
 #include <memory>
 #include <sstream>
+#include <string_view>
 #include <sys/stat.h>
 #include <thread>
 #include <sys/statvfs.h>
@@ -97,6 +99,18 @@ std::string hex(uint64_t value) {
     return out.str();
 }
 
+std::string byte_hex(std::string_view value) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string out;
+    if (!value.empty()) out.reserve(value.size() * 3 - 1);
+    for (unsigned char c : value) {
+        if (!out.empty()) out.push_back(' ');
+        out.push_back(digits[c >> 4]);
+        out.push_back(digits[c & 0x0f]);
+    }
+    return out;
+}
+
 std::string request_identity() {
     auto* c = fuse_get_context();
     if (!c)
@@ -109,7 +123,9 @@ void trace_request(const char* op, const char* path, const fuse_file_info* fi = 
     if (!Log::enabled(LogLevel::all))
         return;
     std::string message = std::string("FUSE TRACE request op=") + op + " path=" +
-                          (path ? path : "<null>") + " " + request_identity();
+                          (path ? path : "<null>");
+    if (path) message += " path_hex=" + byte_hex(path);
+    message += " " + request_identity();
     if (fi)
         message += " flags=" + hex(static_cast<unsigned int>(fi->flags)) +
                    " fh=" + std::to_string(fi->fh);
@@ -222,15 +238,17 @@ int op_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t, fuse_
             Log::trace(std::string("FUSE TRACE result op=readdir path=") + path +
                   " entries=" + std::to_string(entries.size()));
         for (auto& [name, entry] : entries) {
+            const auto fuse_name = macos_fuse_decomposed_name(name);
             if (Log::enabled(LogLevel::all))
-                Log::trace(std::string("FUSE TRACE dirent parent=") + path + " name=" + name + " " +
-                      entry_summary(entry));
+                Log::trace(std::string("FUSE TRACE dirent parent=") + path + " stored_name=" + name +
+                           " stored_hex=" + byte_hex(name) + " fuse_name=" + fuse_name +
+                           " fuse_hex=" + byte_hex(fuse_name) + " " + entry_summary(entry));
             struct stat st{};
             fill_stat(entry, st);
             const std::string child_path =
                 std::string(path) == "/" ? "/" + name : std::string(path) + "/" + name;
             apply_active_write_size(child_path, entry, st);
-            if (filler(buf, name.c_str(), &st, 0, FUSE_FILL_DIR_DEFAULTS))
+            if (filler(buf, fuse_name.c_str(), &st, 0, FUSE_FILL_DIR_DEFAULTS))
                 break;
         }
         return 0;
@@ -595,8 +613,15 @@ fuse_operations operations() {
 int run_fuse(FileSystem& filesystem, const std::filesystem::path& mount_path, bool allow_other,
              std::function<void()> request_shutdown) {
     auto mount = mount_path.string();
-    const std::string options = allow_other ? "default_permissions,allow_other,fsname=macha"
-                                            : "default_permissions,fsname=macha";
+    std::string options = allow_other ? "default_permissions,allow_other,fsname=macha"
+                                      : "default_permissions,fsname=macha";
+#if defined(__APPLE__)
+    // macFUSE's high-level API can receive canonically equivalent pathnames in
+    // different Unicode normalization forms. Keep Macha's persisted namespace
+    // byte-preserving, but make lookup canonical-equivalence aware at the mount
+    // boundary. readdir() separately emits D-form names as macFUSE requires.
+    options += ",norm_insensitive";
+#endif
 
     char cwd[4096]{};
     std::string cwd_text = getcwd(cwd, sizeof(cwd)) ? cwd : "<getcwd failed>";

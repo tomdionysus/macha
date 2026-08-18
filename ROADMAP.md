@@ -53,4 +53,6 @@ If large catalogues, subtitles or other future metadata create enough tiny objec
 
 ## macFUSE Unicode pathname correctness
 
-The macOS mount still has a pathname-identity defect to diagnose separately from 0.10.1 caching/shutdown work. It is not limited to directories: both an accented file name (`01.Clannad - Na Buachaillí lainn.mp3`) and accented directory trees (`Café del Mar ...`) have reproduced create/list/lookup inconsistencies. The source names have been measured as valid NFC UTF-8, and a created/listed accented directory could not subsequently be `stat()`ed under either NFC or NFD spelling. The next step is to log incoming FUSE callback path bytes and outgoing `readdir` name bytes before changing normalisation semantics.
+0.10.2 fixes the measured macOS pathname-identity failure at the adapter boundary rather than migrating Macha namespace metadata. macFUSE high-level lookup is mounted with `norm_insensitive`, while `readdir` presents stored names in Unicode Normalization Form D as required by macFUSE/Finder. Persisted namespace strings remain byte-preserving, so existing NFC or NFD names written by earlier Macha versions stay valid. `log_level=all` records incoming path bytes and both stored/emitted dirent bytes for future platform-specific diagnosis.
+
+The original reproductions covered both a file (`01.Clannad - Na Buachaillí lainn.mp3`) and an accented directory tree (`Café del Mar ...`); regression coverage must continue to treat both cases as part of the same mount contract.
