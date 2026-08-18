@@ -65,7 +65,7 @@ GET    /api/v1/catalogue/artwork/{sha256}
 
 Item mutations support `If-Match: "rev-N"` and return an `ETag`. If `token_file` is configured, clients must send that file's contents as a Bearer token. Keep a remotely exposed API authenticated and firewall-restricted.
 
-Replacing or deleting the last reference to artwork records its object ID in committed metadata garbage. After `maintenance.garbage_grace_ms` (24 hours by default), every node removes its local copy; a disconnected node performs the same deletion after it rejoins. A still-live reference always wins.
+Replacing or deleting the last reference to artwork records a committed retirement tombstone. The current catalogue root and all artwork referenced by it are part of the same live-object mark set as filesystem extents, so a still-live reference always wins. After `maintenance.garbage_grace_ms` (24 hours by default) the retirement is pruned and each node's bounded reachability sweep removes any old unreachable authoritative copy. A disconnected node does not need to retain or replay the tombstone forever: after rejoining, current catalogue reachability is sufficient to converge deletion.
 
 
 Playback is deliberately separate from catalogue mutation. A playback session may be created from a catalogue `item_id`, in which case Macha evaluates every bound `media_id` and chooses the cheapest compatible representation, or directly from a `media_id`. See [Streaming](streaming.md).

@@ -7,12 +7,14 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <set>
 #include <unistd.h>
 namespace macha {
 namespace {
 constexpr std::array<uint8_t, 8> SM5{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'},
     SM6{'D', 'H', 'T', 'M', 'E', 'T', 'A', '6'},
     SM7{'D', 'H', 'T', 'M', 'E', 'T', 'A', '7'},
+    SM8{'D', 'H', 'T', 'M', 'E', 'T', 'A', '8'},
     DM{'D', 'H', 'T', 'M', 'D', 'B', '0', '1'},
     MJ{'D', 'H', 'T', 'M', 'J', 'N', 'L', '1'};
 constexpr uint8_t JOURNAL_PREPARE_FULL = 1, JOURNAL_PREPARE_DELTA = 2,
@@ -60,6 +62,42 @@ FsEntry entry(Reader& r) {
     }
     return e;
 }
+Bytes encode_snapshot_v7(const MetadataSnapshot& s) {
+    // Exact pre-0.10.0 snapshot representation. This is used only while
+    // replaying DLT1 records from an existing metadata journal: the journal
+    // stores the successor hash, so reconstructing the historical SM7 bytes
+    // is part of on-disk compatibility. New snapshots are always SM8.
+    Writer w;
+    w.raw(SM7);
+    w.u32(s.metadata_voters.size());
+    for (const auto& v : s.metadata_voters)
+        w.fixed(v.bytes);
+    w.u32(s.data_replication);
+    w.u64(s.extent_size);
+    w.u32(s.mutation_sequences.size());
+    for (const auto& [node, sequence] : s.mutation_sequences) {
+        w.fixed(node.bytes);
+        w.u64(sequence);
+    }
+    w.u32(s.entries.size());
+    for (const auto& [path, value] : s.entries) {
+        w.string(path);
+        entry(w, value);
+    }
+    w.u8(s.catalogue_root.has_value());
+    if (s.catalogue_root)
+        w.fixed(s.catalogue_root->bytes);
+    w.u32(s.garbage.size());
+    for (const auto& garbage : s.garbage)
+        w.fixed(garbage.id.bytes);
+    return w.take();
+}
+
+bool metadata_delta_v1(std::span<const uint8_t> data) {
+    static constexpr std::array<uint8_t, 8> magic{'D', 'H', 'T', 'M', 'D', 'L', 'T', '1'};
+    return data.size() >= magic.size() && std::equal(magic.begin(), magic.end(), data.begin());
+}
+
 void writefile(const std::filesystem::path& p, std::span<const uint8_t> d) {
     auto t = p.string() + ".tmp." + std::to_string(getpid());
     int f = open(t.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -89,7 +127,7 @@ void writefile(const std::filesystem::path& p, std::span<const uint8_t> d) {
 } // namespace
 Bytes encode_snapshot(const MetadataSnapshot& s) {
     Writer w;
-    w.raw(SM7);
+    w.raw(SM8);
     w.u32(s.metadata_voters.size());
     for (auto& v : s.metadata_voters)
         w.fixed(v.bytes);
@@ -109,8 +147,11 @@ Bytes encode_snapshot(const MetadataSnapshot& s) {
     if (s.catalogue_root)
         w.fixed(s.catalogue_root->bytes);
     w.u32(s.garbage.size());
-    for (const auto& garbage : s.garbage)
+    for (const auto& garbage : s.garbage) {
         w.fixed(garbage.id.bytes);
+        w.i64(garbage.retired_at_ns);
+        w.fixed(garbage.retirement_id.bytes);
+    }
     return w.take();
 }
 MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
@@ -119,7 +160,8 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
     const bool v5 = std::equal(m.begin(), m.end(), SM5.begin());
     const bool v6 = std::equal(m.begin(), m.end(), SM6.begin());
     const bool v7 = std::equal(m.begin(), m.end(), SM7.begin());
-    if (!v5 && !v6 && !v7)
+    const bool v8 = std::equal(m.begin(), m.end(), SM8.begin());
+    if (!v5 && !v6 && !v7 && !v8)
         throw DecodeError("bad snapshot");
     auto nv = r.u32();
     if (nv > 1024)
@@ -131,7 +173,7 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
     }
     s.data_replication = r.u32();
     s.extent_size = r.u64();
-    if (v7) {
+    if (v7 || v8) {
         auto mutations = r.u32();
         if (mutations > 65536)
             throw DecodeError("too many metadata mutation origins");
@@ -150,7 +192,7 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
         if (!s.entries.emplace(p, entry(r)).second)
             throw DecodeError("duplicate path");
     }
-    if ((v6 || v7) && r.u8()) {
+    if ((v6 || v7 || v8) && r.u8()) {
         ObjectId root;
         root.bytes = r.fixed<32>();
         s.catalogue_root = root;
@@ -162,6 +204,12 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
     for (uint32_t i = 0; i < garbage_count; ++i) {
         GarbageRef garbage;
         garbage.id.bytes = r.fixed<32>();
+        if (v8) {
+            garbage.retired_at_ns = r.i64();
+            if (garbage.retired_at_ns < 0)
+                throw DecodeError("bad garbage retirement time");
+            garbage.retirement_id.bytes = r.fixed<16>();
+        }
         s.garbage.push_back(garbage);
     }
     r.finish();
@@ -172,7 +220,7 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
 }
 
 Bytes encode_metadata_delta(const MetadataDelta& delta) {
-    static constexpr std::array<uint8_t, 8> magic{'D', 'H', 'T', 'M', 'D', 'L', 'T', '1'};
+    static constexpr std::array<uint8_t, 8> magic{'D', 'H', 'T', 'M', 'D', 'L', 'T', '2'};
     Writer w;
     w.raw(magic);
     w.u32(delta.mutation_sequences.size());
@@ -194,17 +242,26 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
             throw std::runtime_error("metadata delta missing catalogue root");
         w.fixed(delta.catalogue_root->bytes);
     }
-    w.u32(delta.append_garbage.size());
-    for (const auto& garbage : delta.append_garbage)
+    w.u32(delta.erase_garbage.size());
+    for (const auto& id : delta.erase_garbage)
+        w.fixed(id.bytes);
+    w.u32(delta.upsert_garbage.size());
+    for (const auto& garbage : delta.upsert_garbage) {
         w.fixed(garbage.id.bytes);
+        w.i64(garbage.retired_at_ns);
+        w.fixed(garbage.retirement_id.bytes);
+    }
     return w.take();
 }
 
 MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
-    static constexpr std::array<uint8_t, 8> magic{'D', 'H', 'T', 'M', 'D', 'L', 'T', '1'};
+    static constexpr std::array<uint8_t, 8> magic_v1{'D', 'H', 'T', 'M', 'D', 'L', 'T', '1'};
+    static constexpr std::array<uint8_t, 8> magic_v2{'D', 'H', 'T', 'M', 'D', 'L', 'T', '2'};
     Reader r(data);
-    auto got = r.raw(magic.size());
-    if (!std::equal(got.begin(), got.end(), magic.begin()))
+    auto got = r.raw(magic_v1.size());
+    const bool v1 = std::equal(got.begin(), got.end(), magic_v1.begin());
+    const bool v2 = std::equal(got.begin(), got.end(), magic_v2.begin());
+    if (!v1 && !v2)
         throw DecodeError("bad metadata delta");
     MetadataDelta delta;
     auto sequences = r.u32();
@@ -243,14 +300,46 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
         id.bytes = r.fixed<32>();
         delta.catalogue_root = id;
     }
-    auto garbage = r.u32();
-    if (garbage > 10000000)
-        throw DecodeError("too much metadata delta garbage");
-    delta.append_garbage.reserve(garbage);
-    for (uint32_t i = 0; i < garbage; ++i) {
-        GarbageRef value;
-        value.id.bytes = r.fixed<32>();
-        delta.append_garbage.push_back(value);
+
+    if (v1) {
+        // DLT1 is retained only for replaying metadata journals written by
+        // pre-0.10.0 nodes. New network mutations are always DLT2.
+        auto garbage = r.u32();
+        if (garbage > 10000000)
+            throw DecodeError("too much metadata delta garbage");
+        delta.upsert_garbage.reserve(garbage);
+        for (uint32_t i = 0; i < garbage; ++i) {
+            GarbageRef value;
+            value.id.bytes = r.fixed<32>();
+            delta.upsert_garbage.push_back(value);
+        }
+    } else {
+        auto erased_garbage = r.u32();
+        if (erased_garbage > 10000000)
+            throw DecodeError("too many metadata delta garbage erases");
+        delta.erase_garbage.reserve(erased_garbage);
+        std::set<ObjectId> erased_ids;
+        for (uint32_t i = 0; i < erased_garbage; ++i) {
+            ObjectId id;
+            id.bytes = r.fixed<32>();
+            if (!erased_ids.insert(id).second)
+                throw DecodeError("duplicate metadata delta garbage erase");
+            delta.erase_garbage.push_back(id);
+        }
+        auto garbage = r.u32();
+        if (garbage > 10000000)
+            throw DecodeError("too many metadata delta garbage upserts");
+        delta.upsert_garbage.reserve(garbage);
+        std::set<ObjectId> upsert_ids;
+        for (uint32_t i = 0; i < garbage; ++i) {
+            GarbageRef value;
+            value.id.bytes = r.fixed<32>();
+            value.retired_at_ns = r.i64();
+            value.retirement_id.bytes = r.fixed<16>();
+            if (value.retired_at_ns < 0 || !upsert_ids.insert(value.id).second)
+                throw DecodeError("bad metadata delta garbage upsert");
+            delta.upsert_garbage.push_back(value);
+        }
     }
     r.finish();
     return delta;
@@ -295,12 +384,25 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
         }
     }
 
-    if (after.garbage.size() < before.garbage.size() ||
-        !std::equal(before.garbage.begin(), before.garbage.end(), after.garbage.begin()))
-        return {};
-    delta.append_garbage.insert(delta.append_garbage.end(),
-                                after.garbage.begin() + before.garbage.size(),
-                                after.garbage.end());
+    std::map<ObjectId, GarbageRef> before_garbage;
+    std::map<ObjectId, GarbageRef> after_garbage;
+    for (const auto& garbage : before.garbage) {
+        if (!before_garbage.emplace(garbage.id, garbage).second)
+            return {};
+    }
+    for (const auto& garbage : after.garbage) {
+        if (!after_garbage.emplace(garbage.id, garbage).second)
+            return {};
+    }
+    for (const auto& garbage : before.garbage) {
+        if (!after_garbage.contains(garbage.id))
+            delta.erase_garbage.push_back(garbage.id);
+    }
+    for (const auto& garbage : after.garbage) {
+        auto it = before_garbage.find(garbage.id);
+        if (it == before_garbage.end() || it->second != garbage)
+            delta.upsert_garbage.push_back(garbage);
+    }
 
     return delta;
 }
@@ -333,7 +435,17 @@ MetadataSnapshot apply_metadata_delta(const MetadataSnapshot& before, const Meta
         out.catalogue_root = delta.catalogue_root;
         break;
     }
-    out.garbage.insert(out.garbage.end(), delta.append_garbage.begin(), delta.append_garbage.end());
+    for (const auto& id : delta.erase_garbage) {
+        std::erase_if(out.garbage, [&](const GarbageRef& garbage) { return garbage.id == id; });
+    }
+    for (const auto& garbage : delta.upsert_garbage) {
+        auto it = std::find_if(out.garbage.begin(), out.garbage.end(),
+                               [&](const GarbageRef& value) { return value.id == garbage.id; });
+        if (it == out.garbage.end())
+            out.garbage.push_back(garbage);
+        else
+            *it = garbage;
+    }
     auto root = out.entries.find("/");
     if (root == out.entries.end() || root->second.type != EntryType::directory)
         throw DecodeError("metadata delta lost root");
@@ -574,7 +686,9 @@ void MetadataReplica::load_journal() {
                 throw std::runtime_error("metadata journal delta CAS chain broken");
             auto snapshot = decode_snapshot(cur_.payload);
             auto delta = decode_metadata_delta(body);
-            record.payload = encode_snapshot(apply_metadata_delta(snapshot, delta));
+            auto replayed = apply_metadata_delta(snapshot, delta);
+            record.payload = metadata_delta_v1(body) ? encode_snapshot_v7(replayed)
+                                                     : encode_snapshot(replayed);
             if (!valid_metadata_record(record))
                 throw std::runtime_error("metadata journal delta CAS hash invalid");
             cur_ = std::move(record);
@@ -680,7 +794,8 @@ bool MetadataReplica::cas_delta(uint64_t generation, const Hash256& hash,
     MetadataRecord next;
     next.generation = generation + 1;
     next.previous = hash;
-    next.payload = encode_snapshot(after);
+    next.payload = metadata_delta_v1(encoded_delta) ? encode_snapshot_v7(after)
+                                                     : encode_snapshot(after);
     next.hash = metadata_hash(next.generation, next.previous, next.payload);
     append_journal(JOURNAL_PREPARE_DELTA, next, encoded_delta);
     cur_ = next;
@@ -711,7 +826,9 @@ bool MetadataReplica::install_committed_delta(uint64_t generation, const Hash256
     MetadataRecord next;
     next.generation = generation + 1;
     next.previous = hash;
-    next.payload = encode_snapshot(apply_metadata_delta(before, delta));
+    auto after = apply_metadata_delta(before, delta);
+    next.payload = metadata_delta_v1(encoded_delta) ? encode_snapshot_v7(after)
+                                                     : encode_snapshot(after);
     next.hash = metadata_hash(next.generation, next.previous, next.payload);
     if (next.generation != committed.generation || next.previous != committed.previous ||
         next.hash != committed.hash || next.payload != committed.payload)

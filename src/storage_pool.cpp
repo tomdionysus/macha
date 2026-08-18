@@ -329,7 +329,11 @@ bool StoragePool::put(const ObjectId& id, std::span<const uint8_t> data) {
             path = backend->cfg.path;
         }
         try {
-            if (store->has(id) || store->put(id, data))
+            // put() is also an object reaffirmation. LocalStore::put() refreshes
+            // the physical age when the content hash already exists, which keeps
+            // reachability GC from racing a new write that reuses an old orphan.
+            // Do not short-circuit this through has().
+            if (store->put(id, data))
                 return true;
         } catch (const std::exception& error) {
             Log::debug("storage write failed " + path.string() + ": " + error.what());
@@ -536,7 +540,7 @@ std::optional<ObjectId> StoragePool::next_object(Cursor& cursor, bool& pass_comp
     return item ? std::optional<ObjectId>{item->id} : std::nullopt;
 }
 
-bool StoragePool::older_than(const ObjectId& id, std::chrono::seconds age) const {
+bool StoragePool::older_than(const ObjectId& id, std::chrono::milliseconds age) const {
     for (const auto& backend : snapshot()) {
         std::shared_ptr<LocalStore> store;
         {
@@ -686,6 +690,45 @@ StoragePool::scrub_step(uint64_t budget_bytes, size_t operation_budget,
         }
         if (budget_bytes && result.bytes >= budget_bytes)
             return result;
+    }
+    return result;
+}
+
+StoragePool::MaintenanceResult
+StoragePool::gc_step(const std::vector<ObjectId>& live,
+                     const std::vector<ObjectId>& protected_ids,
+                     std::chrono::milliseconds orphan_grace, size_t operation_budget,
+                     const std::function<bool()>& should_yield) {
+    MaintenanceResult result;
+    while (!operation_budget || result.objects < operation_budget) {
+        if (should_yield && should_yield()) {
+            result.yielded = true;
+            return result;
+        }
+        bool pass_complete = false;
+        auto item = next_physical(gc_cursor_, pass_complete);
+        if (!item) {
+            result.complete = pass_complete;
+            return result;
+        }
+        ++result.objects;
+        const auto& id = item->id;
+        if (std::binary_search(live.begin(), live.end(), id) ||
+            std::binary_search(protected_ids.begin(), protected_ids.end(), id))
+            continue;
+
+        try {
+            // Object age is the orphan grace for data that never reached a
+            // committed metadata reference. LocalStore::put() refreshes this
+            // timestamp when an existing content hash is reaffirmed, preventing
+            // a new write from racing an ancient orphan with identical bytes.
+            const auto bytes = item->store->stored_size(id);
+            if (item->store->remove_if_older_than(id, orphan_grace))
+                result.bytes += bytes;
+        } catch (const std::exception& error) {
+            Log::debug("garbage collection skipped local object " + to_string(id) +
+                       " on " + item->path.string() + ": " + error.what());
+        }
     }
     return result;
 }

@@ -76,8 +76,19 @@ uint64_t fd_size(int fd) {
 void queue_garbage(MetadataSnapshot& snapshot, const ObjectId& id) {
     auto existing = std::find_if(snapshot.garbage.begin(), snapshot.garbage.end(),
                                  [&](const GarbageRef& garbage) { return garbage.id == id; });
-    if (existing == snapshot.garbage.end())
-        snapshot.garbage.push_back({id});
+    auto retired = wall_time_ns();
+    if (existing != snapshot.garbage.end()) {
+        // Re-retiring the same content-addressed object is a new retirement.
+        // Force the token forwards even if the wall clock has moved backwards so
+        // maintenance cannot confuse an old prune decision with this one.
+        if (retired <= existing->retired_at_ns &&
+            existing->retired_at_ns < std::numeric_limits<int64_t>::max())
+            retired = existing->retired_at_ns + 1;
+        existing->retired_at_ns = retired;
+        existing->retirement_id = random_node_id();
+    } else {
+        snapshot.garbage.push_back({id, retired, random_node_id()});
+    }
 }
 
 void queue_garbage(MetadataSnapshot& snapshot, const FsEntry& entry) {
@@ -1450,14 +1461,20 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
     std::sort(live.begin(), live.end());
     live.erase(std::unique(live.begin(), live.end()), live.end());
 
-    std::vector<ObjectId> garbage;
-    garbage.reserve(snapshot.garbage.size());
-    for (const auto& candidate : snapshot.garbage) {
-        if (!std::binary_search(live.begin(), live.end(), candidate.id))
-            garbage.push_back(candidate.id);
-    }
-    std::sort(garbage.begin(), garbage.end());
-    garbage.erase(std::unique(garbage.begin(), garbage.end()), garbage.end());
+    // Preserve committed tombstone identity here. Service maintenance combines
+    // filesystem and catalogue liveness before deciding whether a retirement is
+    // a collection candidate; retaining retired_at_ns also makes pruning ABA-safe.
+    auto garbage = snapshot.garbage;
+    std::sort(garbage.begin(), garbage.end(), [](const GarbageRef& a, const GarbageRef& b) {
+        if (a.id != b.id)
+            return a.id < b.id;
+        return a.retired_at_ns > b.retired_at_ns;
+    });
+    garbage.erase(std::unique(garbage.begin(), garbage.end(),
+                              [](const GarbageRef& a, const GarbageRef& b) {
+                                  return a.id == b.id;
+                              }),
+                  garbage.end());
 
     auto built = std::make_shared<MaintenanceObjects>();
     built->live = std::move(live);

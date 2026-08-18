@@ -616,6 +616,68 @@ void test_storage_pool_and_persistent_cache() {
         CHECK(yielded.bytes == 0);
     }
 
+    // Reachability GC is a separate bounded physical cursor. It preserves live
+    // and recently-retired objects, ignores young uncommitted objects, and
+    // removes an old orphan that has no committed reference or tombstone.
+    auto put_gc_object = [&](uint8_t tag) {
+        auto data = pattern(96 * 1024 + tag);
+        data[0] ^= tag;
+        auto id = object_id(data);
+        REQUIRE(pool.put(id, data));
+        return std::pair<ObjectId, Bytes>{id, std::move(data)};
+    };
+    auto gc_live_object = put_gc_object(0x31);
+    auto gc_protected_object = put_gc_object(0x32);
+    auto gc_orphan_object = put_gc_object(0x33);
+    auto gc_young_object = put_gc_object(0x34);
+    const auto gc_live = gc_live_object.first;
+    const auto gc_protected = gc_protected_object.first;
+    const auto gc_orphan = gc_orphan_object.first;
+    const auto gc_young = gc_young_object.first;
+    auto age_object = [&](const ObjectId& id) {
+        for (const auto& disk : {disk1, disk2}) {
+            auto path = object_path(disk, id);
+            if (std::filesystem::exists(path))
+                std::filesystem::last_write_time(
+                    path, std::filesystem::file_time_type::clock::now() - 48h);
+        }
+    };
+    age_object(gc_live);
+    age_object(gc_protected);
+    age_object(gc_orphan);
+
+    std::vector<ObjectId> gc_live_set{gc_live};
+    std::vector<ObjectId> gc_protected_set{gc_protected};
+    std::sort(gc_live_set.begin(), gc_live_set.end());
+    std::sort(gc_protected_set.begin(), gc_protected_set.end());
+    bool gc_complete = false;
+    size_t gc_slices = 0;
+    uint64_t gc_reclaimed = 0;
+    while (!gc_complete && gc_slices++ < 256) {
+        auto step = pool.gc_step(gc_live_set, gc_protected_set, 24h, 3);
+        CHECK(step.objects <= 3);
+        gc_reclaimed += step.bytes;
+        gc_complete = step.complete;
+    }
+    CHECK(gc_complete);
+    CHECK(gc_reclaimed > 0);
+    CHECK(pool.has(gc_live));
+    CHECK(pool.has(gc_protected));
+    CHECK(!pool.has(gc_orphan));
+    CHECK(pool.has(gc_young));
+    auto gc_yielded = pool.gc_step(gc_live_set, gc_protected_set, 24h, 1, [] { return true; });
+    CHECK(gc_yielded.yielded);
+    CHECK(gc_yielded.objects == 0);
+
+    // Re-putting an identical hash reaffirms its physical age. This closes the
+    // race where a new uncommitted write reuses an ancient orphan already on an owner.
+    auto gc_reaffirmed_object = put_gc_object(0x35);
+    const auto gc_reaffirmed = gc_reaffirmed_object.first;
+    age_object(gc_reaffirmed);
+    CHECK(pool.older_than(gc_reaffirmed, 24h));
+    REQUIRE(pool.put(gc_reaffirmed, gc_reaffirmed_object.second));
+    CHECK(!pool.older_than(gc_reaffirmed, 24h));
+
     // Add a third disk live and migrate local placement without changing the
     // node identity or DHT replica accounting.
     pool.reconfigure({{disk1, 64ULL * 1024 * 1024},
@@ -739,7 +801,8 @@ void test_metadata_codec_and_replica() {
     file.size = 123;
     snap.entries["/movie.mkv"] = file;
     auto garbage_id = object_id(pattern(4096));
-    snap.garbage.push_back({garbage_id});
+    auto retirement_id = random_node_id();
+    snap.garbage.push_back({garbage_id, 123456789, retirement_id});
     auto encoded = encode_snapshot(snap);
     auto decoded = decode_snapshot(encoded);
     CHECK(decoded.metadata_voters == snap.metadata_voters);
@@ -747,6 +810,8 @@ void test_metadata_codec_and_replica() {
     CHECK(decoded.entries.at("/movie.mkv").size == 123);
     REQUIRE(decoded.garbage.size() == 1);
     CHECK(decoded.garbage.front().id == garbage_id);
+    CHECK(decoded.garbage.front().retired_at_ns == 123456789);
+    CHECK(decoded.garbage.front().retirement_id == retirement_id);
 
     auto delta_target = decoded;
     delta_target.mutation_sequences[a] = 8;
@@ -758,7 +823,7 @@ void test_metadata_codec_and_replica() {
     auto catalogue_id = object_id(pattern(1024));
     delta_target.catalogue_root = catalogue_id;
     auto garbage_id_2 = object_id(pattern(2048));
-    delta_target.garbage.push_back({garbage_id_2});
+    delta_target.garbage.push_back({garbage_id_2, 987654321, random_node_id()});
     auto compact = metadata_delta(decoded, delta_target);
     REQUIRE(compact.has_value());
     auto encoded_delta = encode_metadata_delta(*compact);
@@ -766,6 +831,101 @@ void test_metadata_codec_and_replica() {
     auto reconstructed = apply_metadata_delta(decoded, decoded_delta);
     CHECK(encode_snapshot(reconstructed) == encode_snapshot(delta_target));
     CHECK(encoded_delta.size() < encode_snapshot(delta_target).size());
+
+    // DLT2 represents tombstone replacement and pruning directly. This is the
+    // ordinary 0.10.x path used to stamp legacy records and bound garbage metadata.
+    auto garbage_compacted = delta_target;
+    garbage_compacted.garbage.erase(garbage_compacted.garbage.begin());
+    garbage_compacted.garbage.front().retired_at_ns += 1;
+    garbage_compacted.garbage.front().retirement_id = random_node_id();
+    auto garbage_delta = metadata_delta(delta_target, garbage_compacted);
+    REQUIRE(garbage_delta.has_value());
+    CHECK(garbage_delta->erase_garbage.size() == 1);
+    CHECK(garbage_delta->upsert_garbage.size() == 1);
+    auto garbage_delta_roundtrip = decode_metadata_delta(encode_metadata_delta(*garbage_delta));
+    CHECK(encode_snapshot(apply_metadata_delta(delta_target, garbage_delta_roundtrip)) ==
+          encode_snapshot(garbage_compacted));
+
+    // 0.9.4 SM7 snapshots remain valid on disk. Their tombstones intentionally
+    // decode as legacy (no retirement time/id) and are stamped by 0.10.x GC.
+    Writer old_v7;
+    const std::array<uint8_t, 8> old_v7_magic{'D', 'H', 'T', 'M', 'E', 'T', 'A', '7'};
+    old_v7.raw(old_v7_magic);
+    old_v7.u32(1);
+    old_v7.fixed(a.bytes);
+    old_v7.u32(1);
+    old_v7.u64(4ULL * 1024 * 1024);
+    old_v7.u32(1);
+    old_v7.fixed(a.bytes);
+    old_v7.u64(7);
+    old_v7.u32(1);
+    old_v7.string("/");
+    old_v7.u8(static_cast<uint8_t>(EntryType::directory));
+    old_v7.u32(0755);
+    old_v7.u32(0);
+    old_v7.u32(0);
+    old_v7.u64(0);
+    old_v7.i64(0);
+    old_v7.i64(0);
+    old_v7.u64(1);
+    old_v7.u32(0);
+    old_v7.u8(0);
+    old_v7.u32(1);
+    old_v7.fixed(garbage_id.bytes);
+    auto upgraded_v7 = decode_snapshot(old_v7.data());
+    REQUIRE(upgraded_v7.garbage.size() == 1);
+    CHECK(upgraded_v7.garbage.front().id == garbage_id);
+    CHECK(upgraded_v7.garbage.front().retired_at_ns == 0);
+    CHECK(upgraded_v7.garbage.front().retirement_id == NodeId{});
+
+    // DLT1 is accepted only as a persisted-journal format compatibility path.
+    // New encoders always emit DLT2; old 0.9.x journal records still replay.
+    Writer old_delta;
+    const std::array<uint8_t, 8> old_delta_magic{'D', 'H', 'T', 'M', 'D', 'L', 'T', '1'};
+    old_delta.raw(old_delta_magic);
+    old_delta.u32(0);
+    old_delta.u32(0);
+    old_delta.u32(0);
+    old_delta.u8(static_cast<uint8_t>(CatalogueDelta::unchanged));
+    old_delta.u32(1);
+    auto legacy_delta_id = object_id(pattern(3072));
+    old_delta.fixed(legacy_delta_id.bytes);
+    auto decoded_old_delta = decode_metadata_delta(old_delta.data());
+    REQUIRE(decoded_old_delta.upsert_garbage.size() == 1);
+    CHECK(decoded_old_delta.upsert_garbage.front().id == legacy_delta_id);
+    CHECK(decoded_old_delta.upsert_garbage.front().retired_at_ns == 0);
+    CHECK(decoded_old_delta.upsert_garbage.front().retirement_id == NodeId{});
+
+    // Storage compatibility includes the authenticated delta journal, not just
+    // accepting old payloads in isolation. DLT1 successor hashes were computed
+    // over SM7 bytes, so replay must reconstruct that exact historical encoding.
+    auto legacy_journal_path = t.path() / "legacy-journal-node";
+    MetadataReplica legacy_journal(legacy_journal_path, keys.storage);
+    MetadataRecord legacy_seed;
+    legacy_seed.generation = 17;
+    legacy_seed.previous = object_id(pattern(211));
+    legacy_seed.payload = old_v7.data();
+    legacy_seed.hash = metadata_hash(legacy_seed.generation, legacy_seed.previous,
+                                     legacy_seed.payload);
+    REQUIRE(legacy_journal.seed(legacy_seed));
+    REQUIRE(legacy_journal.remember_current_committed(legacy_seed.generation,
+                                                       legacy_seed.hash));
+    MetadataRecord legacy_successor;
+    REQUIRE(legacy_journal.cas_delta(legacy_seed.generation, legacy_seed.hash,
+                                     old_delta.data(), &legacy_successor));
+    REQUIRE(legacy_journal.remember_current_committed(legacy_successor.generation,
+                                                       legacy_successor.hash));
+    CHECK(std::equal(legacy_successor.payload.begin(), legacy_successor.payload.begin() + 8,
+                     old_v7_magic.begin()));
+    {
+        MetadataReplica replayed_legacy(legacy_journal_path, keys.storage);
+        CHECK(replayed_legacy.current().hash == legacy_successor.hash);
+        CHECK(replayed_legacy.committed().hash == legacy_successor.hash);
+        auto replayed_snapshot = decode_snapshot(replayed_legacy.current().payload);
+        REQUIRE(replayed_snapshot.garbage.size() == 2);
+        CHECK(replayed_snapshot.garbage.back().id == legacy_delta_id);
+        CHECK(replayed_snapshot.garbage.back().retired_at_ns == 0);
+    }
 
     // 0.4.0 metadata snapshots had no catalogue-root field. 0.5.0 must read
     // them directly so an existing namespace upgrades to an empty catalogue
@@ -1376,7 +1536,7 @@ void test_async_rpc_move_ownership() {
     CHECK(cancelled.load() == 2);
 }
 
-void test_rpc_v12_frame_priority_and_variable_length() {
+void test_rpc_v13_frame_priority_and_variable_length() {
     CHECK(frame_type_priority(FrameType::control) < frame_type_priority(FrameType::foreground));
     CHECK(frame_type_priority(FrameType::foreground) < frame_type_priority(FrameType::read_ahead));
     CHECK(frame_type_priority(FrameType::read_ahead) <
@@ -1549,7 +1709,7 @@ void test_repair_step_is_bounded_and_yields() {
     s1.stop();
 }
 
-void test_rpc_v12_persistence_and_multiplexing() {
+void test_rpc_v13_persistence_and_multiplexing() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -1626,7 +1786,7 @@ void test_rpc_v12_persistence_and_multiplexing() {
     server.stop();
 }
 
-void test_rpc_v12_bidirectional_and_deduplication() {
+void test_rpc_v13_bidirectional_and_deduplication() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -3879,9 +4039,10 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(s3.catalogue().list(CatalogueKind::episode).size() == 1);
     CHECK(s3.node().local_store().has(first_art.id));
 
-    // Replacing the poster makes the old object a persistent metadata garbage
-    // candidate. With a zero grace period in this test, cluster GC must delete
-    // it from every connected node while preserving the replacement.
+    // Replacing the poster retires the old object in committed metadata. With
+    // a zero grace period in this test, reachability GC must prune that retirement
+    // and delete the unreachable physical object on every connected node while
+    // preserving the replacement.
     auto second_art_bytes = pattern(96 * 1024 + 3);
     second_art_bytes[0] ^= 0xa5;
     auto second_art = s2.catalogue().put_artwork(show.id, "poster", "image/jpeg",
@@ -3907,7 +4068,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
-    CHECK(status_body.find("\"server_version\":\"0.9.4\"") != std::string::npos);
+    CHECK(status_body.find("\"server_version\":\"0.10.0\"") != std::string::npos);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -3963,8 +4124,8 @@ void test_three_node_cluster() {
         }
         writer->commit();
 
-        // Removing a committed file records explicit object tombstones; GC never
-        // guesses that an unreferenced object is safe to delete.
+        // Removing a committed file records an explicit retirement. Reachability
+        // GC uses the same live inventory for both tombstone pruning and orphan sweep.
         s1.filesystem().create_file("/media/delete-me.bin", 0644, getuid(), getgid());
         auto delete_data = pattern(131072);
         auto delete_writer = s1.filesystem().open_write("/media/delete-me.bin", true);
@@ -3975,7 +4136,8 @@ void test_three_node_cluster() {
         auto deleted_id = delete_entry.extents.front().id;
         s1.filesystem().unlink("/media/delete-me.bin");
         auto maintenance = s1.filesystem().maintenance_objects();
-        CHECK(std::find(maintenance.garbage.begin(), maintenance.garbage.end(), deleted_id) !=
+        CHECK(std::find_if(maintenance.garbage.begin(), maintenance.garbage.end(),
+                           [&](const GarbageRef& garbage) { return garbage.id == deleted_id; }) !=
               maintenance.garbage.end());
         CHECK(std::find(maintenance.live.begin(), maintenance.live.end(), deleted_id) ==
               maintenance.live.end());
@@ -4569,7 +4731,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == "0.9.4");
+    CHECK(playback_status_json.find("server_version")->asString() == "0.10.0");
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately
@@ -4833,10 +4995,10 @@ int main() {
         test_placement();
         test_capacity_placement();
         test_async_rpc_move_ownership();
-        test_rpc_v12_frame_priority_and_variable_length();
+        test_rpc_v13_frame_priority_and_variable_length();
         test_repair_step_is_bounded_and_yields();
-        test_rpc_v12_persistence_and_multiplexing();
-        test_rpc_v12_bidirectional_and_deduplication();
+        test_rpc_v13_persistence_and_multiplexing();
+        test_rpc_v13_bidirectional_and_deduplication();
         test_mutual_bootstrap_prunes_cross_dial();
         test_rpc_v7_handshake_is_rejected();
         test_rpc_slow_control_does_not_abort_data();

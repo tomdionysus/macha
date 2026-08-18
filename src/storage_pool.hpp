@@ -49,6 +49,7 @@ class StoragePool {
     std::vector<std::shared_ptr<Backend>> backends_;
     Cursor rebalance_cursor_;
     Cursor scrub_cursor_;
+    Cursor gc_cursor_;
     mutable std::atomic_uint64_t diag_gets_{};
     mutable std::atomic_uint64_t diag_get_bytes_{};
     mutable std::atomic_uint64_t diag_get_ms_{};
@@ -79,12 +80,21 @@ class StoragePool {
     std::vector<ObjectId> list() const;
     uint64_t full_list_scans() const { return full_list_scans_.load(std::memory_order_relaxed); }
     std::optional<ObjectId> next_object(Cursor&, bool& pass_complete) const;
-    bool older_than(const ObjectId&, std::chrono::seconds) const;
+    bool older_than(const ObjectId&, std::chrono::milliseconds) const;
 
     MaintenanceResult rebalance_step(uint64_t budget_bytes, size_t operation_budget,
                                      const std::function<bool()>& should_yield = {});
     MaintenanceResult scrub_step(uint64_t budget_bytes, size_t operation_budget,
                                  const std::function<bool()>& should_yield = {});
+    // Mark/sweep one bounded slice of authoritative local objects. `live` and
+    // `protected_ids` must be sorted/unique. An unreferenced object is removed
+    // only after it has also aged past orphan_grace; recent uncommitted puts
+    // therefore cannot race metadata commit.
+    MaintenanceResult gc_step(const std::vector<ObjectId>& live,
+                              const std::vector<ObjectId>& protected_ids,
+                              std::chrono::milliseconds orphan_grace,
+                              size_t operation_budget,
+                              const std::function<bool()>& should_yield = {});
 
     // Compatibility helper for callers/tests that explicitly request a complete
     // pass. Service maintenance uses rebalance_step() so a settled large store

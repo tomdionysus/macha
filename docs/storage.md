@@ -46,7 +46,7 @@ The first 0.8.4 startup of an older backend, or a missing/corrupt accounting jou
 
 Backend state locks never cover filesystem I/O. `StoragePool` snapshots the backend state and takes a `shared_ptr<LocalStore>`, releases the backend mutex, then performs the disk operation. A backend can therefore be refreshed, removed or marked offline without a long `get`, directory walk or accounting-thread shutdown blocking health/control RPCs. An in-flight operation may finish against the old `LocalStore`; the shared pointer keeps it alive safely until that operation returns.
 
-Scrub, local rebalance and distributed push repair use persistent filesystem cursors. They advance a bounded number of physical objects per scheduler slice instead of rebuilding a complete object list for every small maintenance budget. Distributed pull repair advances the cached ordered live-object index directly rather than copying it into a complete vector for each slice. Rebalance/repair declare quiescence only after a complete pass finds no work. Scrub pauses for `maintenance.no_progress_backoff_ms` after completing an integrity pass before starting at the beginning again.
+Scrub, local rebalance, reachability garbage collection and distributed push repair use independent persistent filesystem cursors. They advance a bounded number of physical objects per scheduler slice instead of rebuilding a complete object list for every small maintenance budget. Distributed pull repair advances the cached ordered live-object index directly rather than copying it into a complete vector for each slice. Rebalance/repair declare quiescence only after a complete pass finds no work. Scrub and a completed GC pass pause for `maintenance.no_progress_backoff_ms` before starting at the beginning again.
 
 ## Filesystem limits
 
@@ -54,7 +54,9 @@ The implemented filesystem operations cover ordinary media-library use: files an
 
 0.9.0 does **not** implement symlinks, hard links, extended attributes, distributed advisory locks, full sparse-file semantics, or stable POSIX inode identity across every rename case. Access time is not tracked. Concurrent appenders use file-version CAS rather than a globally serialized append stream.
 
-A failed upload may leave unreachable immutable extents. Online garbage collection only removes objects known to have been dropped from committed metadata after a conservative grace period.
+A failed or interrupted upload may leave immutable extents whose data put completed but whose metadata commit did not. 0.10.0 collects these as ordinary unreachable objects: each node compares its physical authoritative objects with the combined committed filesystem+catalogue live set and removes an unreferenced object only after its local file has remained untouched for `maintenance.garbage_grace_ms` (24 hours by default). The sweep is bounded and yields to playback/mounted-filesystem work. Reaffirming an existing content hash refreshes that age, and the final age-check/remove is atomic with respect to `LocalStore::put()`.
+
+Committed deletions still create retirement tombstones so recently dropped objects remain protected while metadata converges. Tombstones are no longer permanent: after their grace expires they are pruned from metadata, and a node which was offline long enough to miss one still discovers the dead object by reachability when it rejoins. Pre-0.10 tombstones are retained and stamped with a new retirement time on first 0.10.0 maintenance, giving an upgraded store a full grace period.
 
 ## On-disk layout
 

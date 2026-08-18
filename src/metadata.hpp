@@ -23,6 +23,14 @@ struct FsEntry {
 };
 struct GarbageRef {
     ObjectId id{};
+    // Wall-clock retirement time written into committed metadata. Zero denotes
+    // a tombstone written by metadata formats before 0.10.0; maintenance
+    // conservatively stamps those before making them eligible for collection.
+    int64_t retired_at_ns{};
+    // Unique retirement identity prevents an old maintenance decision from
+    // pruning a later retirement of the same content-addressed object. Empty
+    // means the tombstone came from a pre-0.10.0 snapshot/journal.
+    NodeId retirement_id{};
     auto operator<=>(const GarbageRef&) const = default;
 };
 
@@ -54,7 +62,8 @@ struct MetadataDelta {
     std::map<NodeId, uint64_t> mutation_sequences;
     std::map<std::string, FsEntry> upsert_entries;
     std::vector<std::string> erase_entries;
-    std::vector<GarbageRef> append_garbage;
+    std::vector<ObjectId> erase_garbage;
+    std::vector<GarbageRef> upsert_garbage;
     CatalogueDelta catalogue{CatalogueDelta::unchanged};
     std::optional<ObjectId> catalogue_root;
 };
