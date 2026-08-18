@@ -1360,8 +1360,8 @@ void PlaybackManager::start() {
 
 void PlaybackManager::stop() {
     if (!impl_ || !impl_->started) return;
+    request_stop();
     if (impl_->cleanup_thread.joinable()) {
-        impl_->cleanup_thread.request_stop();
         impl_->cleanup_thread.join();
     }
     std::vector<std::shared_ptr<Impl::Session>> sessions;
@@ -1372,6 +1372,12 @@ void PlaybackManager::stop() {
     }
     for (auto& session : sessions) impl_->stop_pipeline(*session);
     impl_->started = false;
+}
+
+void PlaybackManager::request_stop() {
+    if (!impl_ || !impl_->started) return;
+    if (impl_->cleanup_thread.joinable())
+        impl_->cleanup_thread.request_stop();
 }
 
 void PlaybackManager::reconfigure(StreamingConfig config) {

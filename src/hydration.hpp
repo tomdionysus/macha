@@ -158,6 +158,7 @@ class CacheHydrator {
     ~CacheHydrator();
     void add_provider(HydrationHintProvider&);
     void start();
+    void request_stop();
     void stop();
     void reconfigure(HydrationConfig);
     bool run_once();
@@ -175,6 +176,7 @@ class HydrationManager {
     HydrationManager(DistributedStore&, PlaybackTracker&, FileSystem&, CatalogueManager&,
                      HydrationConfig, size_t read_ahead_extents);
     void start();
+    void request_stop();
     void stop();
     void reconfigure(HydrationConfig, size_t read_ahead_extents);
     CacheHydrator& hydrator() { return hydrator_; }

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.1 - 2026-08-18
+
+- replace zero-duration FUSE entry/attribute/negative caches with short configurable defaults (`250/250/100 ms`) while retaining conservative file-content cache behaviour across opens;
+- make mounted shutdown two-phase: libfuse signal exit immediately requests service cancellation before waiting for the FUSE loop to drain;
+- cancel mounted extent reads as well as writes during shutdown;
+- make catalogue HTTP fetches abortable during scanner shutdown and stop a scan between traversal/provider/artwork units without committing a partial reconciliation;
+- signal scanner, hydrator, HTTP API, playback cleanup, service maintenance and node background work before joining any of them;
+- stop RPC transport before joining node maintenance so an in-flight maintenance RPC cannot hold shutdown behind its normal network timeout.
+
 ## 0.10.0 - 2026-08-18
 
 - replace tombstone-only object reclamation with bounded local reachability GC. Each node walks its own authoritative object files with a persistent cursor, marks the combined committed filesystem+catalogue object set live, and removes unreachable objects only after `maintenance.garbage_grace_ms`; this also reclaims immutable objects left behind when a data put completed but its metadata mutation never committed;

@@ -63,8 +63,25 @@ void Service::start() {
     maintenance_ = std::jthread([this](std::stop_token stop) { loop(stop); });
 }
 
+void Service::request_stop() {
+    // Phase one of shutdown is deliberately non-blocking. Signal anything
+    // that can be waiting on mounted-filesystem or catalogue work before any
+    // component is joined, so teardown cannot deadlock behind the first
+    // long-running subsystem in Service::stop().
+    fs_.request_io_cancellation();
+    scanner_.request_stop();
+    hydration_.request_stop();
+    if (catalogue_http_)
+        catalogue_http_->request_stop();
+    streaming_.request_stop();
+    if (maintenance_.joinable())
+        maintenance_.request_stop();
+    node_.request_stop();
+}
+
 void Service::stop() {
     Log::debug("shutdown: Service::stop begin");
+    request_stop();
     scanner_.stop();
     hydration_.stop();
     if (catalogue_http_)

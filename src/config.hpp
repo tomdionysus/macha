@@ -44,6 +44,14 @@ struct FilesystemConfig {
     // is intended to be used from the invoking user's session.
     bool allow_other{};
 
+    // Short-lived kernel-side namespace/attribute caches dramatically reduce
+    // FUSE request traffic without making remote namespace changes feel stale.
+    // File contents are still invalidated across opens (kernel_cache remains
+    // disabled in the FUSE adapter).
+    std::chrono::milliseconds entry_timeout{250};
+    std::chrono::milliseconds attr_timeout{250};
+    std::chrono::milliseconds negative_timeout{100};
+
     // These values become the ownership/mode of the distributed filesystem
     // root when a brand-new metadata group is formed. They are stored in DHT
     // metadata thereafter; changing the config does not rewrite an existing

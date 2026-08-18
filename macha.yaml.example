@@ -33,6 +33,11 @@ cache:
 # They are then persisted in distributed metadata.
 filesystem:
   allow_other: false
+  # Short FUSE namespace/attribute caches reduce kernel/userspace request
+  # storms. These do not enable persistent file-content caching across opens.
+  entry_timeout_ms: 250
+  attr_timeout_ms: 250
+  negative_timeout_ms: 100
   root_uid: 0
   root_gid: 0
   root_mode: "0755"

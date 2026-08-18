@@ -48,6 +48,19 @@ A YAML file is required. These CLI options override values from that file for on
 
 RPC duration itself is unbounded. Stall notices are observability thresholds; they do not cancel requests. Health/control traffic uses the same peer connection at absolute highest priority. A peer is marked dead only after that unified transport cannot establish liveness within `dead_after_ms`.
 
+## Mounted filesystem
+
+The FUSE adapter keeps file-content caching conservative across opens, but it uses short kernel-side namespace caches to avoid turning normal `getattr`/lookup activity into a kernel/userspace request storm:
+
+```yaml
+filesystem:
+  entry_timeout_ms: 250
+  attr_timeout_ms: 250
+  negative_timeout_ms: 100
+```
+
+Each value may be set to zero to disable that cache class and may not exceed 5000 ms. These values are applied when the mount is created and therefore require a restart to change. `kernel_cache` remains disabled; these settings cache name/attribute answers, not immutable file contents across opens.
+
 ## Catalogue scanner
 
 `catalogue.scanner.interval_ms` is the periodic safety scan interval. Committed namespace changes schedule a scan after `catalogue.scanner.rescan_debounce_ms` (default 10000 ms, valid 1000..600000). Further mutations reset that quiet-period timer, but `catalogue.scanner.rescan_max_delay_ms` (default 60000 ms, minimum 1000 and not less than `rescan_debounce_ms`) caps total deferral from the first unscanned mutation. Catalogue metadata written by the scanner itself is excluded from the namespace-content signature and does not cause a catalogue rescan.

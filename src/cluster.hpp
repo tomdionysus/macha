@@ -57,6 +57,7 @@ class NodeRuntime {
     NodeRuntime(Config, ClusterKeys);
     ~NodeRuntime();
     void start();
+    void request_stop();
     void stop();
     const Config& config() const {
         return cfg_;

@@ -310,14 +310,14 @@ std::chrono::milliseconds WriteHandle::flush() {
     const bool zero = diagnostics && all_zero(buffer_);
     const auto first = diagnostics ? edge_hex(buffer_, true) : std::string{};
     const auto last = diagnostics ? edge_hex(buffer_, false) : std::string{};
-    if (fs_.write_cancellation_requested())
+    if (fs_.io_cancellation_requested())
         fail(EINTR, "write cancelled");
     auto started = Clock::now();
     ObjectId id;
     try {
-        id = fs_.store().put(buffer_, &fs_.write_cancelled_);
+        id = fs_.store().put(buffer_, &fs_.io_cancelled_);
     } catch (...) {
-        if (fs_.write_cancellation_requested())
+        if (fs_.io_cancellation_requested())
             fail(EINTR, "write cancelled");
         throw;
     }
@@ -349,7 +349,7 @@ std::chrono::milliseconds WriteHandle::flush() {
 void WriteHandle::prepare_append_tail() {
     if (!append_tail_)
         return;
-    if (fs_.write_cancellation_requested())
+    if (fs_.io_cancellation_requested())
         fail(EINTR, "write cancelled");
 
     const auto tail = *append_tail_;
@@ -358,9 +358,9 @@ void WriteHandle::prepare_append_tail() {
         bytes.assign(static_cast<size_t>(tail.length), 0);
     } else {
         auto data = fs_.store().get(tail.id, static_cast<size_t>(tail.offset / fs_.extent_size()),
-                                    FrameType::read_ahead, {}, &fs_.write_cancelled_);
+                                    FrameType::read_ahead, {}, &fs_.io_cancelled_);
         if (!data) {
-            if (fs_.write_cancellation_requested())
+            if (fs_.io_cancellation_requested())
                 fail(EINTR, "write cancelled");
             fail(EIO, "cannot read append tail extent");
         }
@@ -385,7 +385,7 @@ void WriteHandle::materialize() {
         return;
     if (sequential_)
         prepare_append_tail();
-    if (fs_.write_cancellation_requested())
+    if (fs_.io_cancellation_requested())
         fail(EINTR, "write cancelled");
     auto d = fs_.node().config().state_path / "tmp";
     std::filesystem::create_directories(d);
@@ -407,7 +407,7 @@ void WriteHandle::materialize() {
                " temp=" + temp_path_.string());
     if (sequential_) {
         for (size_t i = 0; i < extents_.size(); ++i) {
-            if (fs_.write_cancellation_requested())
+            if (fs_.io_cancellation_requested())
                 fail(EINTR, "write cancelled");
             if (extents_[i].hole) {
                 Bytes zeros(static_cast<size_t>(extents_[i].length), 0);
@@ -415,10 +415,10 @@ void WriteHandle::materialize() {
                 continue;
             }
             auto x = fs_.store().get(extents_[i].id, i, FrameType::read_ahead, {},
-                                     &fs_.write_cancelled_);
+                                     &fs_.io_cancelled_);
             ++materialize_source_reads_;
             if (!x) {
-                if (fs_.write_cancellation_requested())
+                if (fs_.io_cancellation_requested())
                     fail(EINTR, "write cancelled");
                 fail(EIO, "cannot rematerialize staged extent");
             }
@@ -432,11 +432,11 @@ void WriteHandle::materialize() {
         uint64_t o = 0;
         while (o < base_.size) {
             size_t n = std::min<uint64_t>(b.size(), base_.size - o);
-            if (fs_.write_cancellation_requested())
+            if (fs_.io_cancellation_requested())
                 fail(EINTR, "write cancelled");
             ++materialize_source_reads_;
-            if (r.read(o, {b.data(), n}, {}, &fs_.write_cancelled_) != n) {
-                if (fs_.write_cancellation_requested())
+            if (r.read(o, {b.data(), n}, {}, &fs_.io_cancelled_) != n) {
+                if (fs_.io_cancellation_requested())
                     fail(EINTR, "write cancelled");
                 fail(EIO, "short source read");
             }
@@ -702,7 +702,7 @@ void WriteHandle::rebuild() {
     uint64_t o = 0;
     size_t index = 0;
     while (o < logical_) {
-        if (fs_.write_cancellation_requested())
+        if (fs_.io_cancellation_requested())
             fail(EINTR, "write cancelled");
         size_t n = std::min<uint64_t>(b.size(), logical_ - o);
         const auto read_started = Clock::now();
@@ -730,12 +730,12 @@ void WriteHandle::rebuild() {
             ++rebuild_reused_extents_;
         } else {
             const auto started = Clock::now();
-            const bool ok = fs_.store().put(id, bytes, &fs_.write_cancelled_);
+            const bool ok = fs_.store().put(id, bytes, &fs_.io_cancelled_);
             elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
             object_put_time += elapsed;
             if (!ok) {
-                if (fs_.write_cancellation_requested())
+                if (fs_.io_cancellation_requested())
                     fail(EINTR, "write cancelled");
                 fail(EIO, "object replication quorum unavailable");
             }

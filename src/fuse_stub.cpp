@@ -2,7 +2,7 @@
 #include "fuse_adapter.hpp"
 #include <stdexcept>
 namespace macha {
-int run_fuse(FileSystem&, const std::filesystem::path&, bool) {
+int run_fuse(FileSystem&, const std::filesystem::path&, bool, std::function<void()>) {
     throw std::runtime_error("FUSE support was not available when this binary was built");
 }
 } // namespace macha

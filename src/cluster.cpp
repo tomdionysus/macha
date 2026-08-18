@@ -125,28 +125,39 @@ void NodeRuntime::stop() {
         return;
     }
     Log::debug("shutdown: NodeRuntime::stop begin");
-    if (maintenance_.joinable()) {
-        Log::debug("shutdown: node maintenance request_stop");
-        maintenance_.request_stop();
-        Log::debug("shutdown: node maintenance joining");
-        maintenance_.join();
-        Log::debug("shutdown: node maintenance joined");
-    }
+    request_stop();
+    // Close transport before joining maintenance. A maintenance iteration may
+    // already be waiting on an RPC; closing the client/server first makes that
+    // wait fail promptly instead of holding shutdown behind network timeouts.
     Log::debug("shutdown: RpcServer::stop calling");
     server_.stop();
     Log::debug("shutdown: RpcServer::stop returned");
     Log::debug("shutdown: RpcClient::stop calling");
     client_.stop();
     Log::debug("shutdown: RpcClient::stop returned");
+    if (maintenance_.joinable()) {
+        Log::debug("shutdown: node maintenance joining");
+        maintenance_.join();
+        Log::debug("shutdown: node maintenance joined");
+    }
     if (local_writer_.joinable()) {
-        Log::debug("shutdown: local writer request_stop");
-        local_writer_.request_stop();
-        local_copy_cv_.notify_all();
         Log::debug("shutdown: local writer joining");
         local_writer_.join();
         Log::debug("shutdown: local writer joined");
     }
     Log::debug("shutdown: NodeRuntime::stop complete");
+}
+
+void NodeRuntime::request_stop() {
+    if (maintenance_.joinable()) {
+        Log::debug("shutdown: node maintenance request_stop");
+        maintenance_.request_stop();
+    }
+    if (local_writer_.joinable()) {
+        Log::debug("shutdown: local writer request_stop");
+        local_writer_.request_stop();
+        local_copy_cv_.notify_all();
+    }
 }
 
 std::chrono::milliseconds NodeRuntime::stall_notice_for(MessageType type) const {

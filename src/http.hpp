@@ -87,6 +87,7 @@ class HttpServer {
                std::function<bool(const HttpRequest&)> bearer_exempt = {});
     ~HttpServer();
     void start();
+    void request_stop();
     void stop();
     bool running() const { return running_.load(); }
     uint16_t bound_port() const { return bound_port_.load(); }

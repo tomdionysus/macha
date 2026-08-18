@@ -133,7 +133,10 @@ class FileSystem {
     PlaybackTracker* playback_{};
     std::mutex open_writes_mutex_;
     std::vector<std::weak_ptr<WriteHandle>> open_writes_;
-    std::atomic_bool write_cancelled_{};
+    // Cooperative cancellation for mounted-filesystem reads/writes during
+    // daemon shutdown. Namespace-only operations are short metadata calls;
+    // extent transfers carry this token into DistributedStore.
+    std::atomic_bool io_cancelled_{};
     // Immutable media ids are used heavily by catalogue/playback resolution.
     // Cache their namespace lookup by metadata generation so playback startup
     // does not linearly re-hash every file for every candidate representation.
@@ -204,11 +207,12 @@ class FileSystem {
         return s_;
     }
     void note_interactive_activity(uint64_t bytes = 0) { s_.interactive_activity(bytes); }
-    void reset_write_cancellation() { write_cancelled_.store(false, std::memory_order_relaxed); }
-    void request_write_cancellation() { write_cancelled_.store(true, std::memory_order_relaxed); }
-    bool write_cancellation_requested() const {
-        return write_cancelled_.load(std::memory_order_relaxed);
+    void reset_io_cancellation() { io_cancelled_.store(false, std::memory_order_relaxed); }
+    void request_io_cancellation() { io_cancelled_.store(true, std::memory_order_relaxed); }
+    bool io_cancellation_requested() const {
+        return io_cancelled_.load(std::memory_order_relaxed);
     }
+    std::atomic_bool* io_cancellation_flag() { return &io_cancelled_; }
     NodeRuntime& node() {
         return n_;
     }

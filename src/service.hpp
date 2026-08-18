@@ -41,6 +41,7 @@ class Service {
     Service(Config, ClusterKeys);
     ~Service();
     void start();
+    void request_stop();
     void stop();
     void reload_config();
     FileSystem& filesystem() {

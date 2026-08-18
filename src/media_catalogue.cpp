@@ -308,6 +308,11 @@ size_t curl_write(char* ptr, size_t size, size_t nmemb, void* opaque) {
     return bytes;
 }
 
+int curl_cancelled(void* opaque, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    auto* stop = static_cast<std::atomic_bool*>(opaque);
+    return stop && stop->load(std::memory_order_relaxed) ? 1 : 0;
+}
+
 std::string item_id(std::string_view provider, std::string_view kind, std::string_view id) {
     return std::string(provider) + ":" + std::string(kind) + ":" + std::string(id);
 }
@@ -448,6 +453,8 @@ CurlHttpClient::~CurlHttpClient() = default;
 
 RemoteHttpResponse CurlHttpClient::get(std::string_view url, const std::vector<std::string>& headers,
                                  size_t maximum_bytes) {
+    if (stop_requested_.load(std::memory_order_relaxed))
+        throw std::runtime_error("HTTP GET cancelled");
     std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(), curl_easy_cleanup);
     if (!curl) throw std::runtime_error("curl_easy_init failed");
     RemoteHttpResponse out;
@@ -459,7 +466,10 @@ RemoteHttpResponse CurlHttpClient::get(std::string_view url, const std::vector<s
     curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, 5000L);
     curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, 20000L);
     curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "Macha/0.10.0 (https://github.com/tomdionysus/macha)");
+    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "Macha/0.10.1 (https://github.com/tomdionysus/macha)");
+    curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, curl_cancelled);
+    curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &stop_requested_);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, curl_write);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &sink);
     struct curl_slist* raw_headers = nullptr;
@@ -467,7 +477,11 @@ RemoteHttpResponse CurlHttpClient::get(std::string_view url, const std::vector<s
     std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> header_guard(raw_headers, curl_slist_free_all);
     if (raw_headers) curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, raw_headers);
     auto rc = curl_easy_perform(curl.get());
-    if (rc != CURLE_OK) throw std::runtime_error(std::string("HTTP GET failed: ") + curl_easy_strerror(rc));
+    if (rc != CURLE_OK) {
+        if (rc == CURLE_ABORTED_BY_CALLBACK && stop_requested_.load(std::memory_order_relaxed))
+            throw std::runtime_error("HTTP GET cancelled");
+        throw std::runtime_error(std::string("HTTP GET failed: ") + curl_easy_strerror(rc));
+    }
     curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &out.status);
     char* content_type = nullptr;
     curl_easy_getinfo(curl.get(), CURLINFO_CONTENT_TYPE, &content_type);
@@ -619,10 +633,17 @@ bool MusicBrainzProvider::supports(MediaProbeKind kind) const {
 Json MusicBrainzProvider::api(std::string_view path,
                               const std::vector<std::pair<std::string, std::string>>& query) {
     if (last_request_ != std::chrono::steady_clock::time_point{}) {
-        const auto elapsed = std::chrono::steady_clock::now() - last_request_;
-        if (elapsed < std::chrono::seconds(1)) std::this_thread::sleep_for(std::chrono::seconds(1) - elapsed);
+        const auto due = last_request_ + std::chrono::seconds(1);
+        while (std::chrono::steady_clock::now() < due) {
+            if (http_.stop_requested())
+                throw std::runtime_error("MusicBrainz request cancelled");
+            const auto remaining = due - std::chrono::steady_clock::now();
+            const auto slice = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::min(remaining, slice));
+        }
     }
-    auto ua = "Macha/0.10.0 (" + config_.contact + ")";
+    auto ua = "Macha/0.10.1 (" + config_.contact + ")";
     auto q = query;
     q.emplace_back("fmt", "json");
     auto response = http_.get(query_url("https://musicbrainz.org/ws/2" + std::string(path), q),
@@ -804,10 +825,16 @@ bool CatalogueScanner::coordinator() const {
 void CatalogueScanner::start() {
     std::lock_guard lock(config_mutex_);
     if (!config_.enabled || worker_.joinable()) return;
+    http_->reset_stop();
     worker_ = std::jthread([this](std::stop_token stop) { loop(stop); });
 }
+void CatalogueScanner::request_stop() {
+    if (worker_.joinable()) worker_.request_stop();
+    http_->request_stop();
+}
 void CatalogueScanner::stop() {
-    if (worker_.joinable()) { worker_.request_stop(); worker_.join(); }
+    request_stop();
+    if (worker_.joinable()) worker_.join();
 }
 void CatalogueScanner::reconfigure(CatalogueScannerConfig config) {
     stop();
@@ -820,12 +847,14 @@ void CatalogueScanner::reconfigure(CatalogueScannerConfig config) {
 }
 
 void CatalogueScanner::walk(std::string_view root,
-                            std::vector<std::pair<std::string, FsEntry>>& out) {
+                            std::vector<std::pair<std::string, FsEntry>>& out,
+                            std::stop_token stop) {
     std::vector<std::string> pending{normalize_path(std::string(root))};
-    while (!pending.empty()) {
+    while (!pending.empty() && !stop.stop_requested()) {
         auto path = std::move(pending.back());
         pending.pop_back();
         for (auto& [name, entry] : fs_.readdir(path)) {
+            if (stop.stop_requested()) return;
             if (name == "." || name == "..") continue;
             auto child = path == "/" ? "/" + name : path + "/" + name;
             if (entry.type == EntryType::directory) pending.push_back(std::move(child));
@@ -834,19 +863,22 @@ void CatalogueScanner::walk(std::string_view root,
     }
 }
 
-size_t CatalogueScanner::scan_once() {
+size_t CatalogueScanner::scan_once() { return scan_once({}); }
+
+size_t CatalogueScanner::scan_once(std::stop_token stop) {
     CatalogueScannerConfig config;
     {
         std::lock_guard lock(config_mutex_);
         config = config_;
     }
-    if (!config.enabled || !coordinator()) return 0;
+    if (!config.enabled || !coordinator() || stop.stop_requested()) return 0;
     std::vector<std::pair<std::string, FsEntry>> files;
     size_t roots_scanned = 0;
     size_t roots_unavailable = 0;
     for (const auto& root : config.roots) {
         try {
-            walk(root, files);
+            walk(root, files, stop);
+            if (stop.stop_requested()) return 0;
             ++roots_scanned;
         } catch (const FsError& e) {
             if (e.code() != ENOENT) throw;
@@ -872,15 +904,18 @@ size_t CatalogueScanner::scan_once() {
     std::vector<RemoteArtwork> remote_art;
     size_t matched = 0;
     for (const auto& [path, entry] : files) {
+        if (stop.stop_requested()) return 0;
         auto probe = probe_media_path(path, entry);
         if (!probe) continue;
         active_media_ids.insert(probe->media_id);
         if (bound.contains(probe->media_id)) continue;
         std::optional<ProviderMatch> match;
         for (auto& provider : providers_) {
+            if (stop.stop_requested()) return 0;
             if (!provider->supports(probe->kind)) continue;
             try { match = provider->lookup(*probe); }
             catch (const std::exception& e) {
+                if (stop.stop_requested()) return 0;
                 Log::warn("catalogue lookup failed for " + path + ": " + e.what());
             }
             if (match) break;
@@ -915,6 +950,7 @@ size_t CatalogueScanner::scan_once() {
     }
 
     for (const auto& art : remote_art) {
+        if (stop.stop_requested()) return 0;
         CatalogueItem* target = nullptr;
         if (auto it = discovered.find(art.item_id); it != discovered.end()) target = &it->second;
         const CatalogueItem* old = nullptr;
@@ -922,6 +958,7 @@ size_t CatalogueScanner::scan_once() {
         if (!target || has_art_role(target, art.role) || has_art_role(old, art.role)) continue;
         try {
             auto response = http_->get(art.url, {}, config.max_artwork_bytes);
+            if (stop.stop_requested()) return 0;
             if (response.status != 200 || response.body.empty()) continue;
             auto mime = response.content_type;
             if (auto semi = mime.find(';'); semi != std::string::npos) mime.resize(semi);
@@ -931,6 +968,7 @@ size_t CatalogueScanner::scan_once() {
             }
             target->artwork.push_back(catalogue_.stage_artwork(art.role, mime, response.body));
         } catch (const std::exception& e) {
+            if (stop.stop_requested()) return 0;
             Log::warn("catalogue artwork failed for " + art.item_id + ": " + e.what());
         }
     }
@@ -938,6 +976,7 @@ size_t CatalogueScanner::scan_once() {
     std::vector<CatalogueItem> items;
     items.reserve(discovered.size());
     for (auto& [_, item] : discovered) items.push_back(std::move(item));
+    if (stop.stop_requested()) return 0;
     catalogue_.reconcile_scanner(items, active_media_ids, complete_scan);
     if (matched) Log::info("catalogue scan matched " + std::to_string(matched) + " media files");
     return matched;
@@ -986,7 +1025,8 @@ void CatalogueScanner::loop(std::stop_token stop) {
                         else
                             Log::info("catalogue: namespace mutation settled; rescanning");
                     }
-                    (void)scan_once();
+                    (void)scan_once(stop);
+                    if (stop.stop_requested()) break;
                     uint64_t after_generation = 0;
                     const auto after = fs_.namespace_signature(&after_generation);
                     scanned_namespace = before;

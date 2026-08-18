@@ -446,10 +446,15 @@ void CacheHydrator::start() {
 }
 
 void CacheHydrator::stop() {
+    request_stop();
+    if (worker_.joinable())
+        worker_.join();
+}
+
+void CacheHydrator::request_stop() {
     if (worker_.joinable()) {
         worker_.request_stop();
         cv_.notify_all();
-        worker_.join();
     }
 }
 
@@ -647,6 +652,10 @@ HydrationManager::HydrationManager(DistributedStore& store, PlaybackTracker& pla
 
 void HydrationManager::start() {
     hydrator_.start();
+}
+
+void HydrationManager::request_stop() {
+    hydrator_.request_stop();
 }
 
 void HydrationManager::stop() {
