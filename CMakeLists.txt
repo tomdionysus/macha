@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(macha VERSION 0.10.1 LANGUAGES CXX)
+project(macha VERSION 0.10.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -82,6 +82,7 @@ set(MACHA_CORE_SOURCES
     src/catalogue.cpp
     src/catalogue_api.cpp
     src/media_catalogue.cpp
+    src/macos_unicode.cpp
     src/hydration.cpp
     src/filesystem.cpp
     src/service.cpp
@@ -93,6 +94,10 @@ target_include_directories(macha_core PUBLIC
     ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(macha_core PUBLIC
     OpenSSL::Crypto Threads::Threads CURL::libcurl ${MACHA_YAML_TARGET} PkgConfig::LIBAV)
+if(APPLE)
+    find_library(MACHA_COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
+    target_link_libraries(macha_core PUBLIC ${MACHA_COREFOUNDATION_FRAMEWORK})
+endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(macha_core PRIVATE -Wall -Wextra -Wpedantic)

@@ -143,7 +143,9 @@ The scanner is filesystem-driven. It first classifies a path as movie, TV episod
 
 A successful provider match contributes catalogue hierarchy plus remote artwork descriptors. Artwork bytes are fetched before commit, staged as immutable objects and included in the same catalogue durability boundary. No provider URL is required for playback clients after the scan.
 
-The scanner uses stable `macha:<sha256>` file identities. An already-bound identity is skipped on later scans, avoiding repeated provider traffic and artwork downloads. Reconciliation removes vanished bindings only from scanner-owned leaves and prunes scanner-created empty parents; manual catalogue records remain untouched. If any configured root cannot be traversed, the pass fails before reconciliation so temporary namespace/storage loss cannot masquerade as deletion.
+The scanner uses stable `macha:<sha256>` file identities. An already-bound identity is skipped on later scans, avoiding repeated provider traffic and artwork downloads. Semantic provider misses from successful responses are negative-cached for the configured provider lifetime; transport/HTTP failures remain retryable. Scanner traversal first establishes the complete active media-ID set, then online provider work is bounded by `max_provider_requests_per_scan`. The budget is checked between complete provider lookups so search/detail operations are not split indefinitely; a budget-limited pass reconciles completed discoveries and schedules continuation after `provider_batch_delay_ms`.
+
+Reconciliation removes vanished bindings only from scanner-owned leaves and prunes scanner-created empty parents; manual catalogue records remain untouched. If any configured root cannot be traversed, discoveries from available roots may still be ingested, but destructive pruning is disabled for that partial pass so temporary namespace/storage loss cannot masquerade as deletion.
 
 The lowest active `NodeId` is the scanner coordinator. Scanner enablement is therefore intended to be consistent across cluster nodes; membership change moves the role without a permanent catalogue master. Catalogue CAS still protects against overlapping scans during membership transitions.
 
@@ -256,6 +258,8 @@ Local backend state is deliberately separated from disk execution. A backend mut
 ## Namespace read path
 
 The committed metadata record is decoded once per observed metadata generation into an immutable shared snapshot. FUSE `getattr` performs a direct lookup in that snapshot; `readdir` uses a generation-matched directory-child path index rather than scanning every namespace entry. Media-id resolution similarly caches only paths, not duplicate `FsEntry` extent manifests. A new committed generation invalidates these views atomically. This keeps ordinary stat/list cost proportional to the requested entry/directory rather than to the complete media namespace.
+
+Macha namespace keys remain byte-preserving across platforms. On macOS the FUSE adapter, not metadata storage, implements the host Unicode contract: macFUSE high-level lookup is canonical-equivalence insensitive and names returned by `readdir` are converted to Unicode Normalization Form D. This allows namespace state written by older versions in either NFC or NFD to remain addressable without a metadata migration.
 
 ## Garbage collection
 

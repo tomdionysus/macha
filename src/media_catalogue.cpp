@@ -369,6 +369,33 @@ bool has_art_role(const CatalogueItem* item, std::string_view role) {
                        [&](const auto& art) { return art.role == role; });
 }
 
+
+class BudgetHttpClient final : public HttpClient {
+    HttpClient& upstream_;
+    size_t limit_{};
+    size_t used_{};
+
+  public:
+    explicit BudgetHttpClient(HttpClient& upstream) : upstream_(upstream) {}
+
+    void reset_budget(size_t limit) noexcept {
+        limit_ = limit;
+        used_ = 0;
+    }
+    size_t used() const noexcept { return used_; }
+    bool exhausted() const noexcept { return used_ >= limit_; }
+
+    void request_stop() noexcept override { upstream_.request_stop(); }
+    void reset_stop() noexcept override { upstream_.reset_stop(); }
+    bool stop_requested() const noexcept override { return upstream_.stop_requested(); }
+
+    RemoteHttpResponse get(std::string_view url, const std::vector<std::string>& headers,
+                           size_t maximum_bytes) override {
+        ++used_;
+        return upstream_.get(url, headers, maximum_bytes);
+    }
+};
+
 } // namespace
 
 std::optional<MediaProbe> probe_media_path(std::string_view path, const FsEntry& entry) {
@@ -466,7 +493,7 @@ RemoteHttpResponse CurlHttpClient::get(std::string_view url, const std::vector<s
     curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, 5000L);
     curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, 20000L);
     curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "Macha/0.10.1 (https://github.com/tomdionysus/macha)");
+    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "Macha/0.10.2 (https://github.com/tomdionysus/macha)");
     curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, curl_cancelled);
     curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &stop_requested_);
@@ -516,8 +543,11 @@ std::optional<Json> TmdbProvider::find_show(const MediaProbe& probe) {
     std::vector<std::pair<std::string, std::string>> q{{"query", probe.series}, {"language", config_.language}};
     if (probe.year) q.emplace_back("first_air_date_year", std::to_string(*probe.year));
     auto root = api("/search/tv", q);
-    auto result = best_result(root, probe.series, "name", probe.year, "first_air_date");
-    if (!result) return {};
+    const auto* result = best_result(root, probe.series, "name", probe.year, "first_air_date");
+    if (!result) {
+        show_cache_[key] = std::nullopt;
+        return {};
+    }
     show_cache_[key] = *result;
     return *result;
 }
@@ -526,15 +556,35 @@ std::optional<ProviderMatch> TmdbProvider::lookup(const MediaProbe& probe) {
     if (!supports(probe.kind)) return {};
     ProviderMatch match;
     if (probe.kind == MediaProbeKind::movie) {
-        std::vector<std::pair<std::string, std::string>> q{{"query", probe.title}, {"language", config_.language}};
-        if (probe.year) q.emplace_back("primary_release_year", std::to_string(*probe.year));
-        auto search = api("/search/movie", q);
-        auto found = best_result(search, probe.title, "title", probe.year, "release_date");
-        if (!found) return {};
-        auto id_value = json_i32(found->find("id"));
-        if (!id_value) return {};
-        const auto tmdb_id = std::to_string(*id_value);
-        auto detail = api("/movie/" + tmdb_id, {{"language", config_.language}});
+        const auto key = normalized(probe.title) + "|" +
+                         (probe.year ? std::to_string(*probe.year) : "");
+        std::optional<Json> cached_detail;
+        if (auto it = movie_cache_.find(key); it != movie_cache_.end()) {
+            cached_detail = it->second;
+        } else {
+            std::vector<std::pair<std::string, std::string>> q{
+                {"query", probe.title}, {"language", config_.language}};
+            if (probe.year) q.emplace_back("primary_release_year", std::to_string(*probe.year));
+            auto search = api("/search/movie", q);
+            auto found = best_result(search, probe.title, "title", probe.year, "release_date");
+            if (!found) {
+                movie_cache_[key] = std::nullopt;
+                return {};
+            }
+            auto id_value = json_i32(found->find("id"));
+            if (!id_value) {
+                movie_cache_[key] = std::nullopt;
+                return {};
+            }
+            const auto tmdb_id = std::to_string(*id_value);
+            cached_detail = api("/movie/" + tmdb_id, {{"language", config_.language}});
+            movie_cache_[key] = cached_detail;
+        }
+        if (!cached_detail) return {};
+        const auto& detail = *cached_detail;
+        auto detail_id = json_i32(detail.find("id"));
+        if (!detail_id) return {};
+        const auto tmdb_id = std::to_string(*detail_id);
         CatalogueItem movie;
         movie.id = item_id("tmdb", "movie", tmdb_id);
         movie.kind = CatalogueKind::movie;
@@ -643,7 +693,7 @@ Json MusicBrainzProvider::api(std::string_view path,
             std::this_thread::sleep_for(std::min(remaining, slice));
         }
     }
-    auto ua = "Macha/0.10.1 (" + config_.contact + ")";
+    auto ua = "Macha/0.10.2 (" + config_.contact + ")";
     auto q = query;
     q.emplace_back("fmt", "json");
     auto response = http_.get(query_url("https://musicbrainz.org/ws/2" + std::string(path), q),
@@ -661,7 +711,10 @@ std::optional<Json> MusicBrainzProvider::find_release(const MediaProbe& probe) {
                  lucene_quote(probe.artist) + "\"";
     auto search = api("/release", {{"query", query}, {"limit", "10"}});
     auto releases = search.find("releases");
-    if (!releases || !releases->isArray() || releases->asArray().empty()) return {};
+    if (!releases || !releases->isArray() || releases->asArray().empty()) {
+        release_cache_[key] = std::nullopt;
+        return {};
+    }
     const Json* best = &releases->asArray().front();
     int best_score = -1;
     for (const auto& candidate : releases->asArray()) {
@@ -671,9 +724,15 @@ std::optional<Json> MusicBrainzProvider::find_release(const MediaProbe& probe) {
         if (auto s = json_i32(candidate.find("score"))) score += *s / 10;
         if (score > best_score) { best_score = score; best = &candidate; }
     }
-    if (best_score < 100) return {};
+    if (best_score < 100) {
+        release_cache_[key] = std::nullopt;
+        return {};
+    }
     auto release_id = json_string(best->find("id"));
-    if (release_id.empty()) return {};
+    if (release_id.empty()) {
+        release_cache_[key] = std::nullopt;
+        return {};
+    }
     auto detail = api("/release/" + release_id, {{"inc", "recordings+artist-credits+release-groups"}});
     release_cache_[key] = detail;
     return detail;
@@ -800,7 +859,8 @@ std::optional<ProviderMatch> MusicBrainzProvider::lookup(const MediaProbe& probe
 CatalogueScanner::CatalogueScanner(NodeRuntime& node, FileSystem& fs, CatalogueManager& catalogue,
                                    CatalogueScannerConfig config, std::unique_ptr<HttpClient> http)
     : node_(node), fs_(fs), catalogue_(catalogue), config_(std::move(config)),
-      http_(http ? std::move(http) : std::make_unique<CurlHttpClient>()) {
+      http_(http ? std::move(http) : std::make_unique<CurlHttpClient>()),
+      provider_http_(std::make_unique<BudgetHttpClient>(*http_)) {
     configure_providers();
 }
 CatalogueScanner::~CatalogueScanner() { stop(); }
@@ -808,11 +868,11 @@ CatalogueScanner::~CatalogueScanner() { stop(); }
 void CatalogueScanner::configure_providers() {
     providers_.clear();
     if (config_.tmdb.enabled) {
-        try { providers_.push_back(std::make_unique<TmdbProvider>(*http_, config_.tmdb)); }
+        try { providers_.push_back(std::make_unique<TmdbProvider>(*provider_http_, config_.tmdb)); }
         catch (const std::exception& e) { Log::warn("catalogue TMDB disabled: " + std::string(e.what())); }
     }
     if (config_.musicbrainz.enabled)
-        providers_.push_back(std::make_unique<MusicBrainzProvider>(*http_, config_.musicbrainz));
+        providers_.push_back(std::make_unique<MusicBrainzProvider>(*provider_http_, config_.musicbrainz));
 }
 
 bool CatalogueScanner::coordinator() const {
@@ -872,6 +932,10 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
         config = config_;
     }
     if (!config.enabled || !coordinator() || stop.stop_requested()) return 0;
+    provider_continuation_.store(false, std::memory_order_relaxed);
+    auto* budget_http = dynamic_cast<BudgetHttpClient*>(provider_http_.get());
+    if (!budget_http) throw std::runtime_error("catalogue provider HTTP budget unavailable");
+    budget_http->reset_budget(config.max_provider_requests_per_scan);
     std::vector<std::pair<std::string, FsEntry>> files;
     size_t roots_scanned = 0;
     size_t roots_unavailable = 0;
@@ -899,40 +963,58 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
     for (const auto& [_, item] : existing.items)
         bound.insert(item.media_ids.begin(), item.media_ids.end());
     std::set<std::string> active_media_ids;
-
-    std::map<std::string, CatalogueItem> discovered;
-    std::vector<RemoteArtwork> remote_art;
-    size_t matched = 0;
+    std::vector<std::pair<std::string, MediaProbe>> probes;
+    probes.reserve(files.size());
     for (const auto& [path, entry] : files) {
         if (stop.stop_requested()) return 0;
         auto probe = probe_media_path(path, entry);
         if (!probe) continue;
         active_media_ids.insert(probe->media_id);
-        if (bound.contains(probe->media_id)) continue;
+        if (!bound.contains(probe->media_id))
+            probes.emplace_back(path, std::move(*probe));
+    }
+
+    std::map<std::string, CatalogueItem> discovered;
+    std::vector<RemoteArtwork> remote_art;
+    size_t matched = 0;
+    size_t provider_items_processed = 0;
+    bool provider_budget_exhausted = false;
+    for (const auto& [path, probe] : probes) {
+        if (stop.stop_requested()) return 0;
         std::optional<ProviderMatch> match;
         for (auto& provider : providers_) {
             if (stop.stop_requested()) return 0;
-            if (!provider->supports(probe->kind)) continue;
-            try { match = provider->lookup(*probe); }
-            catch (const std::exception& e) {
+            if (!provider->supports(probe.kind)) continue;
+            // Finish one provider lookup atomically from the scanner's point of
+            // view. The request budget is checked between lookups so a tiny
+            // budget cannot permanently split search/detail progress.
+            if (budget_http->exhausted()) {
+                provider_budget_exhausted = true;
+                break;
+            }
+            try {
+                match = provider->lookup(probe);
+            } catch (const std::exception& e) {
                 if (stop.stop_requested()) return 0;
                 Log::warn("catalogue lookup failed for " + path + ": " + e.what());
             }
             if (match) break;
         }
+        if (provider_budget_exhausted) break;
+        ++provider_items_processed;
         if (!match) {
             std::ostringstream parsed;
-            if (probe->kind == MediaProbeKind::movie) {
-                parsed << "movie title=\"" << probe->title << "\"";
-                if (probe->year) parsed << " year=" << *probe->year;
-            } else if (probe->kind == MediaProbeKind::episode) {
-                parsed << "episode series=\"" << probe->series << "\"";
-                if (probe->year) parsed << " year=" << *probe->year;
-                if (probe->season) parsed << " season=" << *probe->season;
-                if (probe->episode) parsed << " episode=" << *probe->episode;
+            if (probe.kind == MediaProbeKind::movie) {
+                parsed << "movie title=\"" << probe.title << "\"";
+                if (probe.year) parsed << " year=" << *probe.year;
+            } else if (probe.kind == MediaProbeKind::episode) {
+                parsed << "episode series=\"" << probe.series << "\"";
+                if (probe.year) parsed << " year=" << *probe.year;
+                if (probe.season) parsed << " season=" << *probe.season;
+                if (probe.episode) parsed << " episode=" << *probe.episode;
             } else {
-                parsed << "track artist=\"" << probe->artist << "\" album=\""
-                       << probe->album << "\" title=\"" << probe->title << "\"";
+                parsed << "track artist=\"" << probe.artist << "\" album=\""
+                       << probe.album << "\" title=\"" << probe.title << "\"";
             }
             Log::debug("catalogue: no provider match for " + path + " parsed " + parsed.str());
             continue;
@@ -947,6 +1029,12 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
             }
         }
         remote_art.insert(remote_art.end(), match->artwork.begin(), match->artwork.end());
+    }
+    if (provider_budget_exhausted) {
+        provider_continuation_.store(true, std::memory_order_relaxed);
+        Log::info("catalogue: provider request budget reached requests=" +
+                  std::to_string(budget_http->used()) + " remaining_media=" +
+                  std::to_string(probes.size() - provider_items_processed));
     }
 
     for (const auto& art : remote_art) {
@@ -1046,7 +1134,11 @@ void CatalogueScanner::loop(std::stop_token stop) {
                     // live value. A namespace commit racing immediately after the
                     // signature read will then be observed on the next loop.
                     observed_generation = after_generation;
-                    next_periodic = std::chrono::steady_clock::now() + config.interval;
+                    const auto completed_at = std::chrono::steady_clock::now();
+                    if (provider_continuation_.exchange(false, std::memory_order_relaxed))
+                        next_periodic = completed_at + config.provider_batch_delay;
+                    else
+                        next_periodic = completed_at + config.interval;
                 } else {
                     // The metadata generation changed only because catalogue or
                     // other non-namespace state changed. Suppress a pointless scan.
