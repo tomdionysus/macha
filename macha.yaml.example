@@ -125,9 +125,9 @@ maintenance:
   garbage_grace_ms: 86400000
 
 # The catalogue itself is cluster metadata and is always present on every node.
-# The scanner and HTTP/JSON API are optional. Scanner roots should contain only
-# media you want automatically classified. Every configured root must be
-# readable for deletion reconciliation to run.
+# The scanner and HTTP/JSON API are optional. Each scan provider owns the roots
+# it is allowed to classify. Every enabled provider root must be readable for
+# deletion reconciliation to run.
 catalogue:
   scanner:
     enabled: false
@@ -140,24 +140,38 @@ catalogue:
     # A completed batch continues later without blocking the whole scan indefinitely.
     max_provider_requests_per_scan: 32
     provider_batch_delay_ms: 30000
-    roots:
-      - /Movies
-      - /TV
-      - /Music
     max_artwork_bytes: 16M
     providers:
-      # TMDB API Read Access Token, stored as the only content of this file.
-      tmdb:
+      movies:
         enabled: true
-        token_file: /etc/macha-tmdb.token
-        language: en-GB
-        image_size: w500
+        roots:
+          - /Movies
+        # TMDB API Read Access Token, stored as the only content of this file.
+        tmdb:
+          enabled: true
+          token_file: /etc/macha-tmdb.token
+          language: en-GB
+          image_size: w500
 
-      # MusicBrainz requires a meaningful application contact; no API key.
-      musicbrainz:
+      tv:
         enabled: true
-        contact: https://github.com/tomdionysus/macha
-        cover_size: "500"
+        roots:
+          - /TV
+        tmdb:
+          enabled: true
+          token_file: /etc/macha-tmdb.token
+          language: en-GB
+          image_size: w500
+
+      music:
+        enabled: true
+        roots:
+          - /Music
+        # MusicBrainz requires a meaningful application contact; no API key.
+        musicbrainz:
+          enabled: true
+          contact: https://github.com/tomdionysus/macha
+          cover_size: "500"
 
   api:
     enabled: true

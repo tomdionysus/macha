@@ -153,21 +153,44 @@ void validate(Config& config) {
     if (config.catalogue.scanner.provider_batch_delay < std::chrono::seconds(1) ||
         config.catalogue.scanner.provider_batch_delay > std::chrono::hours(1))
         throw std::runtime_error("catalogue.scanner.provider_batch_delay_ms must be 1000..3600000");
-    if (config.catalogue.scanner.roots.empty())
-        throw std::runtime_error("catalogue.scanner.roots must not be empty");
-    for (const auto& root : config.catalogue.scanner.roots) {
-        if (root.empty() || root.front() != '/')
-            throw std::runtime_error("catalogue.scanner.roots must contain absolute paths");
-    }
+    const auto validate_provider_roots = [](std::string_view name, bool enabled,
+                                            const std::vector<std::string>& roots) {
+        if (!enabled) return;
+        if (roots.empty())
+            throw std::runtime_error("catalogue.scanner.providers." + std::string(name) +
+                                     ".roots must not be empty");
+        for (const auto& root : roots) {
+            if (root.empty() || root.front() != '/')
+                throw std::runtime_error("catalogue.scanner.providers." + std::string(name) +
+                                         ".roots must contain absolute paths");
+        }
+    };
+    validate_provider_roots("movies", config.catalogue.scanner.movies.enabled,
+                            config.catalogue.scanner.movies.roots);
+    validate_provider_roots("tv", config.catalogue.scanner.tv.enabled,
+                            config.catalogue.scanner.tv.roots);
+    validate_provider_roots("music", config.catalogue.scanner.music.enabled,
+                            config.catalogue.scanner.music.roots);
     if (config.catalogue.scanner.max_artwork_bytes < 64 * 1024 ||
         config.catalogue.scanner.max_artwork_bytes > 128ULL * 1024 * 1024)
         throw std::runtime_error("catalogue.scanner.max_artwork_bytes must be 64K..128M");
-    if (config.catalogue.scanner.musicbrainz.enabled &&
-        config.catalogue.scanner.musicbrainz.contact.empty())
-        throw std::runtime_error("catalogue.scanner.providers.musicbrainz.contact is required");
-    if (config.catalogue.scanner.enabled && config.catalogue.scanner.tmdb.enabled &&
-        !config.catalogue.scanner.tmdb.token_file)
-        throw std::runtime_error("catalogue.scanner.providers.tmdb.token_file is required when TMDB scanning is enabled");
+    if (config.catalogue.scanner.music.enabled &&
+        config.catalogue.scanner.music.musicbrainz.enabled &&
+        config.catalogue.scanner.music.musicbrainz.contact.empty())
+        throw std::runtime_error(
+            "catalogue.scanner.providers.music.musicbrainz.contact is required");
+    if (config.catalogue.scanner.enabled &&
+        config.catalogue.scanner.movies.enabled &&
+        config.catalogue.scanner.movies.tmdb.enabled &&
+        !config.catalogue.scanner.movies.tmdb.token_file)
+        throw std::runtime_error(
+            "catalogue.scanner.providers.movies.tmdb.token_file is required when movie scanning is enabled");
+    if (config.catalogue.scanner.enabled &&
+        config.catalogue.scanner.tv.enabled &&
+        config.catalogue.scanner.tv.tmdb.enabled &&
+        !config.catalogue.scanner.tv.tmdb.token_file)
+        throw std::runtime_error(
+            "catalogue.scanner.providers.tv.tmdb.token_file is required when TV scanning is enabled");
     if (config.hydration.interval < std::chrono::milliseconds(10))
         throw std::runtime_error("hydration.interval_ms must be >= 10ms");
     if (config.hydration.active_timeout < std::chrono::milliseconds(1000))
@@ -332,24 +355,46 @@ void parse_catalogue(const YAML::Node& root, Config& c) {
                 scanner["provider_batch_delay_ms"], "catalogue.scanner.provider_batch_delay_ms");
         if (scanner["max_artwork_bytes"])
             c.catalogue.scanner.max_artwork_bytes = yaml_size(scanner["max_artwork_bytes"]);
-        if (auto roots = scanner["roots"]) {
-            if (!roots.IsSequence())
-                throw std::runtime_error("catalogue.scanner.roots must be a sequence");
-            c.catalogue.scanner.roots.clear();
-            for (const auto& root : roots)
-                c.catalogue.scanner.roots.push_back(root.as<std::string>());
-        }
         if (auto providers = scanner["providers"]) {
-            if (auto tmdb = providers["tmdb"]) {
-                if (tmdb["enabled"]) c.catalogue.scanner.tmdb.enabled = tmdb["enabled"].as<bool>();
-                if (tmdb["token_file"]) c.catalogue.scanner.tmdb.token_file = std::filesystem::path(tmdb["token_file"].as<std::string>());
-                if (tmdb["language"]) c.catalogue.scanner.tmdb.language = tmdb["language"].as<std::string>();
-                if (tmdb["image_size"]) c.catalogue.scanner.tmdb.image_size = tmdb["image_size"].as<std::string>();
+            const auto parse_roots = [](const YAML::Node& provider,
+                                        std::vector<std::string>& roots,
+                                        std::string_view name) {
+                auto configured = provider["roots"];
+                if (!configured) return;
+                if (!configured.IsSequence())
+                    throw std::runtime_error("catalogue.scanner.providers." +
+                                             std::string(name) + ".roots must be a sequence");
+                roots.clear();
+                for (const auto& root : configured)
+                    roots.push_back(root.as<std::string>());
+            };
+            const auto parse_tmdb = [](const YAML::Node& tmdb, CatalogueTmdbConfig& config) {
+                if (!tmdb) return;
+                if (tmdb["enabled"]) config.enabled = tmdb["enabled"].as<bool>();
+                if (tmdb["token_file"])
+                    config.token_file = std::filesystem::path(tmdb["token_file"].as<std::string>());
+                if (tmdb["language"]) config.language = tmdb["language"].as<std::string>();
+                if (tmdb["image_size"]) config.image_size = tmdb["image_size"].as<std::string>();
+            };
+
+            if (auto movies = providers["movies"]) {
+                if (movies["enabled"]) c.catalogue.scanner.movies.enabled = movies["enabled"].as<bool>();
+                parse_roots(movies, c.catalogue.scanner.movies.roots, "movies");
+                parse_tmdb(movies["tmdb"], c.catalogue.scanner.movies.tmdb);
             }
-            if (auto mb = providers["musicbrainz"]) {
-                if (mb["enabled"]) c.catalogue.scanner.musicbrainz.enabled = mb["enabled"].as<bool>();
-                if (mb["contact"]) c.catalogue.scanner.musicbrainz.contact = mb["contact"].as<std::string>();
-                if (mb["cover_size"]) c.catalogue.scanner.musicbrainz.cover_size = mb["cover_size"].as<std::string>();
+            if (auto tv = providers["tv"]) {
+                if (tv["enabled"]) c.catalogue.scanner.tv.enabled = tv["enabled"].as<bool>();
+                parse_roots(tv, c.catalogue.scanner.tv.roots, "tv");
+                parse_tmdb(tv["tmdb"], c.catalogue.scanner.tv.tmdb);
+            }
+            if (auto music = providers["music"]) {
+                if (music["enabled"]) c.catalogue.scanner.music.enabled = music["enabled"].as<bool>();
+                parse_roots(music, c.catalogue.scanner.music.roots, "music");
+                if (auto mb = music["musicbrainz"]) {
+                    if (mb["enabled"]) c.catalogue.scanner.music.musicbrainz.enabled = mb["enabled"].as<bool>();
+                    if (mb["contact"]) c.catalogue.scanner.music.musicbrainz.contact = mb["contact"].as<std::string>();
+                    if (mb["cover_size"]) c.catalogue.scanner.music.musicbrainz.cover_size = mb["cover_size"].as<std::string>();
+                }
             }
         }
     }
