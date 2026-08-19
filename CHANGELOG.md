@@ -2,6 +2,8 @@
 
 ## 0.12.0 - 2026-08-19
 
+- replace single-pass movie/TV/path parsing with extensible scored `MediaProbeCandidateGenerator` implementations; keep multiple hypotheses with evidence, retain the legacy parser as a low-scoring fallback, and allow bounded provider fallback across the best distinct candidates;
+- improve release-name inference around technical boundaries, competing year tokens, edition metadata, TV filename/directory agreement and tag-first music fallbacks; make TMDB comparison tolerant of punctuation, ampersands, sequel numerals and common title abbreviations while retaining year/rank safeguards;
 - replace monolithic on-demand WebVTT extraction with lazy time-segmented subtitle manifests aligned to the active playback timeline; subtitle segments are generated and cached only when requested;
 - correct FFmpeg ASS/SSA event parsing so style/event metadata such as `0,Default,0,0,0,...` is not emitted as subtitle text;
 - make subtitle-only playback-session PATCHes update the selected external WebVTT resource in place without replacing, seeking, or restarting the active A/V generation;

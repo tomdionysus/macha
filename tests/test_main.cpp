@@ -3697,20 +3697,47 @@ void test_media_probe_and_online_catalogue_scanner() {
     CHECK(movie->title == "Blade Runner 2049");
     CHECK(movie->year == 2017);
 
-    struct MovieRegression { const char* path; const char* title; int year; };
+    struct MovieRegression { const char* path; const char* title; int year; const char* edition{}; };
     for (const auto& regression : std::array{
              MovieRegression{"/Movies/01 Men In Black 1 - Will Smith 1997 Eng Ita Multi-Subs 1080p [H264-mp4].mp4", "Men In Black 1", 1997},
              MovieRegression{"/Movies/02 Men In Black 2 - Will Smith 2002 Eng Ita Multi-Subs 1080p [H264-mp4].mp4", "Men In Black 2", 2002},
              MovieRegression{"/Movies/03 Men In Black 3 - Will Smith 2012 Eng Ita Multi-Subs 1080p [H264-mp4].mp4", "Men In Black 3", 2012},
              MovieRegression{"/Movies/12.Monkeys.1995.1080p.BluRay.x264.AAC5.1.mp4", "12 Monkeys", 1995},
              MovieRegression{"/Movies/1994.Pulp.Fiction.1920x816.BDRip.x264.DTS-HD.MA.mkv", "Pulp Fiction", 1994},
+             MovieRegression{"/Movies/Apollo.13.1995.Remastered.1080p.BluRay.DDP.5.1.H.265-EDGE2020.mkv", "Apollo 13", 1995, "Remastered"},
+             MovieRegression{"/Movies/Bo.Burnham.Inside.2021.1080p.NF.WEBRip.DDP.5.1.H.265-EDGE2020.mkv", "Bo Burnham Inside", 2021},
+             MovieRegression{"/Movies/Corpse.Bride.2005.1080p.BluRay.DDP.5.1.H.265-EDGE2020.mkv", "Corpse Bride", 2005},
+             MovieRegression{"/Movies/Leon.the.Professional.Extended.1994.BrRip.x264.YIFY.mp4", "Leon the Professional", 1994, "Extended"},
+             MovieRegression{"/Movies/Requiem.For.A.Dream.DIRECTORS.CUT.2000.1080p.BrRip.x264.YIFY.mp4", "Requiem For A Dream", 2000, "DIRECTORS CUT"},
+             MovieRegression{"/Movies/Rebel.Moon.Part.One.Directors.Cut.1080p.NF.WEBRip.AAC5.1.10bits.x265-Rapta.mkv", "Rebel Moon Part One", 0, "Directors Cut"},
+             MovieRegression{"/Movies/2003.Kill.Bill-.Volume.1.1920x802.BDRip.x264.DTS-HD.MA.mkv", "Kill Bill Volume 1", 2003},
+             MovieRegression{"/Movies/Soldier - Sci-fi 1998 Eng Rus Comm Multi Subs 720p [H264-mp4].mp4", "Soldier", 1998},
          }) {
         auto parsed = probe_media_path(regression.path, fake);
         REQUIRE(parsed.has_value());
         CHECK(parsed->kind == MediaProbeKind::movie);
         CHECK(parsed->title == regression.title);
-        CHECK(parsed->year == regression.year);
+        if (regression.year) CHECK(parsed->year == regression.year);
+        else CHECK(!parsed->year.has_value());
+        if (regression.edition) CHECK(parsed->edition == std::optional<std::string>{regression.edition});
+        else CHECK(!parsed->edition.has_value());
     }
+
+    auto apollo_candidates = probe_media_candidates(
+        "/Movies/Apollo.13.1995.Remastered.1080p.BluRay.DDP.5.1.H.265-EDGE2020.mkv", fake);
+    REQUIRE(apollo_candidates.size() >= 2);
+    CHECK(apollo_candidates.front().generator == "movie-semantic");
+    CHECK(apollo_candidates.front().score > apollo_candidates.back().score);
+    CHECK(!apollo_candidates.front().evidence.empty());
+
+    auto compact_candidates = probe_media_candidates(
+        "/Movies/japhson-romeoandjuliet.mkv", fake);
+    auto compact = std::find_if(compact_candidates.begin(), compact_candidates.end(),
+                                [](const auto& candidate) {
+                                    return candidate.generator == "movie-compact-title";
+                                });
+    REQUIRE(compact != compact_candidates.end());
+    CHECK(compact->probe.title == "romeo and juliet");
 
     struct EpisodeRegression {
         const char* path;
@@ -3728,6 +3755,8 @@ void test_media_probe_and_online_catalogue_scanner() {
              EpisodeRegression{"/TV/Stranger.Things.S05E05.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 5, ""},
              EpisodeRegression{"/TV/Stranger.Things.S05E06.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 6, ""},
              EpisodeRegression{"/TV/Stranger.Things.S05E08.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 8, ""},
+             EpisodeRegression{"/TV/Battlestar Galactica (2003) Season 1-4 S01-S04 (1080p BluRay x265 HEVC 10bit AAC 5.1 RZeroX)/Season 2/Battlestar Galactica (2003) - S02E01 - Scattered (1080p BluRay x265 RZeroX).mkv", "Battlestar Galactica", 2003, 2, 1, "Scattered"},
+             EpisodeRegression{"/TV/Ballykissangel (1996)/Season 2/Ballykissangel - S02E09 - As Happy as a Turkey on Boxing Day.mkv", "Ballykissangel", 1996, 2, 9, "As Happy as a Turkey on Boxing Day"},
              EpisodeRegression{"/TV/Black Books (2000)/Black Books (2000) - S01E01 - Cooking the Books (576p DVD x265 Ghost).mkv", "Black Books", 2000, 1, 1, "Cooking the Books"},
              EpisodeRegression{"/TV/Black Books (2000)/S01E02.mkv", "Black Books", 2000, 1, 2, ""},
              EpisodeRegression{"/TV/Blackadder.1982.S01-S04.1080p.BluRay.EAC3.2.0.x265-iVy/S01E01.mkv", "Blackadder", 1982, 1, 1, ""},
@@ -3817,6 +3846,31 @@ void test_media_probe_and_online_catalogue_scanner() {
                    R"({"results":[{"id":1002,"title":"Twelve Monkeys","release_date":"1995-12-29"}]})");
     movie_http.add("/movie/1002", 200, "application/json",
                    R"({"id":1002,"title":"Twelve Monkeys","release_date":"1995-12-29"})");
+    movie_http.add("query=A%20Knights%20Tale&language=en-GB&primary_release_year=2001",
+                   200, "application/json",
+                   R"({"results":[{"id":1003,"title":"A Knight's Tale","release_date":"2001-05-11"}]})");
+    movie_http.add("/movie/1003", 200, "application/json",
+                   R"({"id":1003,"title":"A Knight's Tale","release_date":"2001-05-11"})");
+    movie_http.add("query=Kill%20Bill%20Volume%201&language=en-GB&primary_release_year=2003",
+                   200, "application/json",
+                   R"({"results":[{"id":1004,"title":"Kill Bill: Vol. 1","release_date":"2003-10-10"}]})");
+    movie_http.add("/movie/1004", 200, "application/json",
+                   R"({"id":1004,"title":"Kill Bill: Vol. 1","release_date":"2003-10-10"})");
+    movie_http.add("query=Shrek%204&language=en-GB&primary_release_year=2010",
+                   200, "application/json",
+                   R"({"results":[{"id":1005,"title":"Shrek Forever After","release_date":"2010-05-16"}]})");
+    movie_http.add("/movie/1005", 200, "application/json",
+                   R"({"id":1005,"title":"Shrek Forever After","release_date":"2010-05-16"})");
+    movie_http.add("query=Shichinin%20no%20samurai&language=en-GB&primary_release_year=1954",
+                   200, "application/json",
+                   R"({"results":[{"id":1006,"title":"Seven Samurai","release_date":"1954-04-26"}]})");
+    movie_http.add("/movie/1006", 200, "application/json",
+                   R"({"id":1006,"title":"Seven Samurai","release_date":"1954-04-26"})");
+    movie_http.add("query=Rebel%20Moon%20Part%20One&language=en-GB",
+                   200, "application/json",
+                   R"({"results":[{"id":1007,"title":"Rebel Moon - Part One: A Child of Fire","release_date":"2023-12-15"}]})");
+    movie_http.add("/movie/1007", 200, "application/json",
+                   R"({"id":1007,"title":"Rebel Moon - Part One: A Child of Fire","release_date":"2023-12-15"})");
     TmdbProvider movie_tmdb(movie_http, tmdb_config);
 
     MediaProbe mib_probe;
@@ -3840,6 +3894,46 @@ void test_media_probe_and_online_catalogue_scanner() {
     REQUIRE(monkeys_match->items.size() == 1);
     CHECK(monkeys_match->items.front().title == "Twelve Monkeys");
     CHECK(monkeys_match->items.front().media_ids == std::vector<std::string>{"macha:test-12-monkeys"});
+
+    auto punctuation_probe = mib_probe;
+    punctuation_probe.title = "A Knights Tale";
+    punctuation_probe.year = 2001;
+    punctuation_probe.media_id = "macha:test-knights";
+    auto punctuation_match = movie_tmdb.lookup(punctuation_probe);
+    REQUIRE(punctuation_match.has_value());
+    CHECK(punctuation_match->items.front().title == "A Knight's Tale");
+
+    auto volume_probe = mib_probe;
+    volume_probe.title = "Kill Bill Volume 1";
+    volume_probe.year = 2003;
+    volume_probe.media_id = "macha:test-kill-bill";
+    auto volume_match = movie_tmdb.lookup(volume_probe);
+    REQUIRE(volume_match.has_value());
+    CHECK(volume_match->items.front().title == "Kill Bill: Vol. 1");
+
+    auto franchise_probe = mib_probe;
+    franchise_probe.title = "Shrek 4";
+    franchise_probe.year = 2010;
+    franchise_probe.media_id = "macha:test-shrek4";
+    auto franchise_match = movie_tmdb.lookup(franchise_probe);
+    REQUIRE(franchise_match.has_value());
+    CHECK(franchise_match->items.front().title == "Shrek Forever After");
+
+    auto alias_probe = mib_probe;
+    alias_probe.title = "Shichinin no samurai";
+    alias_probe.year = 1954;
+    alias_probe.media_id = "macha:test-seven-samurai";
+    auto alias_match = movie_tmdb.lookup(alias_probe);
+    REQUIRE(alias_match.has_value());
+    CHECK(alias_match->items.front().title == "Seven Samurai");
+
+    auto expanded_title_probe = mib_probe;
+    expanded_title_probe.title = "Rebel Moon Part One";
+    expanded_title_probe.year.reset();
+    expanded_title_probe.media_id = "macha:test-rebel-moon";
+    auto expanded_title_match = movie_tmdb.lookup(expanded_title_probe);
+    REQUIRE(expanded_title_match.has_value());
+    CHECK(expanded_title_match->items.front().title == "Rebel Moon - Part One: A Child of Fire");
 
     // MusicBrainz resolves one release, then maps the local track onto its
     // recording; Cover Art Archive provides the front cover URL.

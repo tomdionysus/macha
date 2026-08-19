@@ -73,9 +73,10 @@ std::string normalized(std::string_view value) {
 }
 
 std::string comparable_title(std::string_view value) {
-    // Provider titles commonly spell sequel numbers differently from release
-    // filenames ("2" vs "II", "12" vs "Twelve"). Canonicalise isolated
-    // number tokens for matching only; preserve the parsed/display title.
+    // Matching is deliberately more forgiving than parsing. Filenames and
+    // providers disagree routinely on punctuation, apostrophes, ampersands,
+    // sequel numerals and abbreviations; none of those differences should
+    // force the parser to invent display punctuation that was not present.
     static constexpr std::pair<std::string_view, std::string_view> aliases[] = {
         {"zero", "0"}, {"one", "1"}, {"two", "2"}, {"three", "3"},
         {"four", "4"}, {"five", "5"}, {"six", "6"}, {"seven", "7"},
@@ -88,9 +89,30 @@ std::string comparable_title(std::string_view value) {
         {"x", "10"}, {"xi", "11"}, {"xii", "12"}, {"xiii", "13"},
         {"xiv", "14"}, {"xv", "15"}, {"xvi", "16"}, {"xvii", "17"},
         {"xviii", "18"}, {"xix", "19"}, {"xx", "20"},
+        {"volume", "vol"}, {"vol", "vol"},
     };
 
-    std::istringstream in(normalized(value));
+    std::string prepared;
+    prepared.reserve(value.size() + 8);
+    for (size_t i = 0; i < value.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(value[i]);
+        if (c == '&') {
+            prepared += " and ";
+        } else if (c == '\'') {
+            // Elide possessive punctuation so "Knight's" and "Knights"
+            // compare equally without changing the displayed/local title.
+            continue;
+        } else if (c == 0xe2 && i + 2 < value.size() &&
+                   static_cast<unsigned char>(value[i + 1]) == 0x80 &&
+                   (static_cast<unsigned char>(value[i + 2]) == 0x98 ||
+                    static_cast<unsigned char>(value[i + 2]) == 0x99)) {
+            i += 2; // UTF-8 left/right single quotation mark.
+        } else {
+            prepared.push_back(static_cast<char>(c));
+        }
+    }
+
+    std::istringstream in(normalized(prepared));
     std::string out;
     std::string token;
     while (in >> token) {
@@ -310,61 +332,21 @@ std::optional<MediaProbe> probe_music_path(FileSystem& fs, std::string_view root
                    " reason=" + e.what());
     }
 
-    auto file_stem = stem(path);
-    static const std::regex track_re(
-        R"(^\s*(?:(\d{1,2})[-.]\s*)?(\d{1,3})\s*[-_. ]+(.+)$)",
-        std::regex::icase);
-    std::smatch track_match;
-    std::string title_candidate = file_stem;
-    if (std::regex_match(file_stem, track_match, track_re)) {
-        if (!probe.disc && track_match[1].matched) probe.disc = std::stoi(track_match[1].str());
-        if (!probe.track) probe.track = std::stoi(track_match[2].str());
-        title_candidate = track_match[3].str();
-    }
-
-    // Filename evidence is substantially stronger than arbitrary directory
-    // depth. A loose "Artist - Title" file therefore remains useful even when
-    // it lives under collection/grouping folders such as "Singles".
-    static const std::regex artist_title(R"(^\s*(.+?)\s+-\s+(.+?)\s*$)");
-    std::smatch artist_title_match;
-    bool artist_from_filename = false;
-    if (std::regex_match(title_candidate, artist_title_match, artist_title)) {
-        if (probe.artist.empty()) {
-            probe.artist = clean_title(artist_title_match[1].str());
-            artist_from_filename = true;
-        }
-        if (probe.title.empty()) probe.title = clean_title(artist_title_match[2].str());
-    } else if (probe.title.empty()) {
-        probe.title = clean_title(title_candidate);
-    }
-
-    const auto normalized_root = normalize_path(std::string(root));
-    const auto root_parts = components(normalized_root);
-    const auto parts = components(path);
-    if (parts.size() >= root_parts.size() &&
-        std::equal(root_parts.begin(), root_parts.end(), parts.begin())) {
-        const auto relative_parts = parts.size() - root_parts.size();
-        if (relative_parts == 3) {
-            const auto candidate_artist = clean_title(parts[parts.size() - 3]);
-            const auto candidate_album = clean_title(parts[parts.size() - 2]);
-            if (probe.artist.empty()) {
-                probe.artist = candidate_artist;
-                if (probe.album.empty()) probe.album = candidate_album;
-            } else if (!artist_from_filename && probe.album.empty() &&
-                       normalized(probe.artist) == normalized(candidate_artist)) {
-                probe.album = candidate_album;
-            }
-        } else if (relative_parts == 4) {
-            static const std::regex disc_dir(R"(^(?:cd|disc|disk)\s*([0-9]{1,2})$)",
-                                             std::regex::icase);
-            std::smatch disc_match;
-            auto parent = clean_title(parts[parts.size() - 2]);
-            if (std::regex_match(parent, disc_match, disc_dir)) {
-                if (!probe.disc) probe.disc = std::stoi(disc_match[1].str());
-                if (probe.artist.empty()) probe.artist = clean_title(parts[parts.size() - 4]);
-                if (probe.album.empty()) probe.album = clean_title(parts[parts.size() - 3]);
-            }
-        }
+    // Embedded tags remain authoritative. Candidate generators provide only
+    // missing path-derived fields, so adding a new filename/layout heuristic
+    // can never silently override sane file metadata.
+    auto candidates = probe_media_candidates(path, entry, root);
+    auto fallback = std::find_if(candidates.begin(), candidates.end(), [](const auto& candidate) {
+        return candidate.probe.kind == MediaProbeKind::track;
+    });
+    if (fallback != candidates.end()) {
+        const auto& path_probe = fallback->probe;
+        if (probe.title.empty()) probe.title = path_probe.title;
+        if (probe.artist.empty()) probe.artist = path_probe.artist;
+        if (probe.album.empty()) probe.album = path_probe.album;
+        if (!probe.disc) probe.disc = path_probe.disc;
+        if (!probe.track) probe.track = path_probe.track;
+        if (!probe.year) probe.year = path_probe.year;
     }
 
     if (probe.title.empty() && !probe.musicbrainz_recording_id) return {};
@@ -422,8 +404,18 @@ std::string remove_year_token(std::string value, int32_t year) {
 
 std::string clean_series_name(std::string value) {
     value = strip_release_noise(std::move(value));
+
+    // Collection directories frequently append several structural descriptors,
+    // e.g. "Season 1-4 S01-S04" or "Complete Series". Remove the first strong
+    // bundle marker and everything after it; those tokens describe the layout,
+    // not the provider series title.
+    static const std::regex bundle_suffix(
+        R"((?:[ ._\-]+)(?:(?:season|seasons|series)[ ._\-]*[0-9]{1,2}[ ._\-]*-[ ._\-]*[0-9]{1,2}|s[0-9]{1,2}[ ._\-]*-[ ._\-]*s?[0-9]{1,2}|complete(?:[ ._\-]+series)?)(?:[ ._\-].*)?$)",
+        std::regex::icase);
+    value = std::regex_replace(value, bundle_suffix, "");
+
     static const std::regex season_suffix(
-        R"((?:[ ._-]+)(?:s[0-9]{1,2}(?:[ ._-]*-[ ._-]*s?[0-9]{1,2})?|season[ ._-]*[0-9]{1,2})\s*$)",
+        R"((?:[ ._\-]+)(?:s[0-9]{1,2}|season[ ._\-]*[0-9]{1,2}|series[ ._\-]*[0-9]{1,2})\s*$)",
         std::regex::icase);
     value = std::regex_replace(value, season_suffix, "");
     if (auto year = year_from(value)) value = remove_year_token(std::move(value), *year);
@@ -459,6 +451,392 @@ std::string movie_title_before_year(std::string value, const std::optional<int32
     std::smatch match;
     if (std::regex_match(value, match, numbered_credit)) value = match[1].str();
     return clean_title(value);
+}
+
+
+MediaProbe make_probe(std::string_view path, const FsEntry& entry, MediaProbeKind kind) {
+    MediaProbe probe;
+    probe.kind = kind;
+    probe.path = normalize_path(std::string(path));
+    probe.media_id = file_media_id(entry);
+    return probe;
+}
+
+struct EpisodePattern {
+    std::string prefix;
+    std::string suffix;
+    int32_t season{};
+    int32_t episode{};
+};
+
+std::optional<EpisodePattern> episode_pattern(std::string_view value) {
+    static const std::regex se_re(
+        R"((.*?)(?:[ ._-]+|^)s(\d{1,2})e(\d{1,3})(?:[ ._-]+(.*))?$)",
+        std::regex::icase);
+    static const std::regex x_re(
+        R"((.*?)(?:[ ._-]+|^)(\d{1,2})x(\d{1,3})(?:[ ._-]+(.*))?$)",
+        std::regex::icase);
+    std::string owned(value);
+    std::smatch match;
+    if (!std::regex_match(owned, match, se_re) && !std::regex_match(owned, match, x_re))
+        return {};
+    EpisodePattern out;
+    out.prefix = match[1].str();
+    out.season = std::stoi(match[2].str());
+    out.episode = std::stoi(match[3].str());
+    if (match[4].matched) out.suffix = match[4].str();
+    return out;
+}
+
+std::optional<int32_t> season_directory_number(std::string_view value) {
+    static const std::regex re(R"(^\s*(?:season|series)\s*([0-9]{1,2})\s*$)",
+                               std::regex::icase);
+    std::smatch match;
+    std::string owned = clean_title(std::string(value));
+    if (!std::regex_match(owned, match, re)) return {};
+    return std::stoi(match[1].str());
+}
+
+std::string strip_collection_ordinal(std::string value) {
+    static const std::regex ordinal(R"(^\s*0[0-9]{1,2}[ ._-]+)");
+    return std::regex_replace(value, ordinal, "");
+}
+
+std::pair<std::string, std::optional<std::string>> strip_movie_edition(std::string value) {
+    static const std::regex edition_re(
+        R"((?:^|[ ._\-]+)(director'?s?[ ._\-]+cut|extended(?:[ ._\-]+edition)?|remastered|unrated|special[ ._\-]+edition|theatrical(?:[ ._\-]+cut)?)(?=$|[ ._\-]+))",
+        std::regex::icase);
+    std::smatch match;
+    std::optional<std::string> edition;
+    while (std::regex_search(value, match, edition_re)) {
+        if (!edition) edition = clean_title(match[1].str());
+        value.replace(static_cast<size_t>(match.position()),
+                      static_cast<size_t>(match.length()), " ");
+    }
+    return {trim(value), edition};
+}
+
+struct YearPosition {
+    int32_t year{};
+    size_t pos{};
+    size_t length{};
+};
+
+std::vector<YearPosition> year_positions(std::string_view text) {
+    static const std::regex re(R"((?:19|20)[0-9]{2})");
+    std::string owned(text);
+    std::vector<YearPosition> out;
+    for (std::sregex_iterator it(owned.begin(), owned.end(), re), end; it != end; ++it) {
+        const auto pos = static_cast<size_t>((*it).position());
+        const auto len = static_cast<size_t>((*it).length());
+        if (pos && std::isdigit(static_cast<unsigned char>(owned[pos - 1]))) continue;
+        if (pos + len < owned.size() &&
+            std::isdigit(static_cast<unsigned char>(owned[pos + len]))) continue;
+        if (pos + len < owned.size() && (owned[pos + len] == 'x' || owned[pos + len] == 'X') &&
+            pos + len + 1 < owned.size() &&
+            std::isdigit(static_cast<unsigned char>(owned[pos + len + 1])))
+            continue;
+        out.push_back({std::stoi((*it).str()), pos, len});
+    }
+    return out;
+}
+
+int movie_year_score(std::string_view core, const YearPosition& year) {
+    int score = 60;
+    if (year.pos == 0) score += 55;
+    if (year.pos + year.length == core.size()) score += 80;
+    if (year.pos && core[year.pos - 1] == '(' && year.pos + year.length < core.size() &&
+        core[year.pos + year.length] == ')') score += 90;
+    if (!core.empty()) score += static_cast<int>((year.pos * 35) / core.size());
+    return score;
+}
+
+std::string title_for_movie_year(std::string core, const YearPosition& year) {
+    if (year.pos == 0) {
+        core.erase(0, year.length);
+    } else {
+        core.resize(year.pos);
+    }
+    core = strip_collection_ordinal(std::move(core));
+    return clean_title(core);
+}
+
+bool same_probe_identity(const MediaProbe& a, const MediaProbe& b) {
+    return a.kind == b.kind && a.title == b.title && a.year == b.year && a.edition == b.edition &&
+           a.series == b.series && a.season == b.season && a.episode == b.episode &&
+           a.artist == b.artist && a.album == b.album && a.disc == b.disc && a.track == b.track;
+}
+
+class SemanticMovieCandidateGenerator final : public MediaProbeCandidateGenerator {
+  public:
+    std::string_view name() const noexcept override { return "movie-semantic"; }
+
+    std::vector<MediaProbeCandidate> generate(std::string_view, std::string_view path,
+                                               const FsEntry& entry) const override {
+        if (!video_extension(extension(path)) || episode_pattern(stem(path))) return {};
+        auto core = strip_release_noise(stem(path));
+        auto [without_edition, edition] = strip_movie_edition(core);
+        core = std::move(without_edition);
+
+        std::vector<MediaProbeCandidate> out;
+        auto years = year_positions(core);
+        for (const auto& year : years) {
+            auto title = title_for_movie_year(core, year);
+            if (title.empty()) continue;
+            auto probe = make_probe(path, entry, MediaProbeKind::movie);
+            probe.title = std::move(title);
+            probe.year = year.year;
+            probe.edition = edition;
+            int score = 180 + movie_year_score(core, year);
+            std::vector<std::string> evidence{
+                "year before technical release boundary",
+                year.pos == 0 ? "leading release year" : "title/year boundary"};
+            if (edition) evidence.push_back("edition metadata separated from title");
+            out.push_back({std::move(probe), score, std::string(name()), std::move(evidence)});
+        }
+
+        if (years.empty()) {
+            auto title = clean_title(strip_collection_ordinal(core));
+            if (!title.empty()) {
+                auto probe = make_probe(path, entry, MediaProbeKind::movie);
+                probe.title = std::move(title);
+                probe.edition = edition;
+                int score = 175;
+                std::vector<std::string> evidence{"technical release boundary"};
+                if (edition) evidence.push_back("edition metadata separated from title");
+                out.push_back({std::move(probe), score, std::string(name()), std::move(evidence)});
+            }
+        }
+
+        // Release names occasionally append commentary/language/genre metadata
+        // after a human-readable " - ". Preserve the ordinary full-title
+        // hypothesis, but add a stronger split candidate when the right side
+        // contains a release year and obvious distribution metadata.
+        const auto split = core.find(" - ");
+        if (split != std::string::npos) {
+            const auto left = clean_title(strip_collection_ordinal(core.substr(0, split)));
+            const auto right = core.substr(split + 3);
+            if (!left.empty() && year_from(right)) {
+                static const std::regex release_words(
+                    R"(\b(?:eng|english|rus|ita|multi|subs?|comm|commentary|sci[ ._-]*fi|h264|h265|x264|x265)\b)",
+                    std::regex::icase);
+                if (std::regex_search(right, release_words)) {
+                    auto probe = make_probe(path, entry, MediaProbeKind::movie);
+                    probe.title = left;
+                    probe.year = year_from(right);
+                    probe.edition = edition;
+                    out.push_back({std::move(probe), 330, std::string(name()),
+                                   {"human title before release-description separator"}});
+                }
+            }
+        }
+        return out;
+    }
+};
+
+class CompactMovieTitleCandidateGenerator final : public MediaProbeCandidateGenerator {
+  public:
+    std::string_view name() const noexcept override { return "movie-compact-title"; }
+    std::vector<MediaProbeCandidate> generate(std::string_view, std::string_view path,
+                                               const FsEntry& entry) const override {
+        if (!video_extension(extension(path)) || episode_pattern(stem(path))) return {};
+        const auto raw = stem(path);
+        static const std::regex prefixed_compact(
+            R"(^([a-z0-9]{2,12})-([a-z][a-z0-9]{5,})$)");
+        std::smatch match;
+        if (!std::regex_match(raw, match, prefixed_compact)) return {};
+        std::string compact = match[2].str();
+        const auto and_pos = compact.find("and");
+        if (and_pos == std::string::npos || and_pos < 2 || and_pos + 5 > compact.size()) return {};
+        compact.insert(and_pos, " ");
+        compact.insert(and_pos + 4, " ");
+        auto probe = make_probe(path, entry, MediaProbeKind::movie);
+        probe.title = clean_title(compact);
+        return {{std::move(probe), 150, std::string(name()),
+                 {"compact uploader-prefix title hypothesis"}}};
+    }
+};
+
+class LegacyMovieCandidateGenerator final : public MediaProbeCandidateGenerator {
+  public:
+    std::string_view name() const noexcept override { return "movie-legacy"; }
+    std::vector<MediaProbeCandidate> generate(std::string_view, std::string_view path,
+                                               const FsEntry& entry) const override {
+        if (!video_extension(extension(path)) || episode_pattern(stem(path))) return {};
+        auto probe = make_probe(path, entry, MediaProbeKind::movie);
+        probe.year = year_from(stem(path));
+        probe.title = movie_title_before_year(stem(path), probe.year);
+        if (probe.title.empty()) return {};
+        return {{std::move(probe), 90, std::string(name()), {"legacy deterministic parser"}}};
+    }
+};
+
+class FilenameEpisodeCandidateGenerator final : public MediaProbeCandidateGenerator {
+  public:
+    std::string_view name() const noexcept override { return "episode-filename"; }
+    std::vector<MediaProbeCandidate> generate(std::string_view, std::string_view path,
+                                               const FsEntry& entry) const override {
+        if (!video_extension(extension(path))) return {};
+        auto pattern = episode_pattern(stem(path));
+        if (!pattern || clean_series_name(pattern->prefix).empty()) return {};
+        auto probe = make_probe(path, entry, MediaProbeKind::episode);
+        probe.series = clean_series_name(pattern->prefix);
+        probe.year = year_from(pattern->prefix);
+        probe.season = pattern->season;
+        probe.episode = pattern->episode;
+        probe.title = clean_episode_title(pattern->suffix);
+        int score = 260;
+        std::vector<std::string> evidence{"series prefix adjacent to SxxExx", "explicit episode marker"};
+
+        const auto parts = components(path);
+        if (parts.size() >= 3) {
+            if (auto parent_season = season_directory_number(parts[parts.size() - 2])) {
+                if (*parent_season == pattern->season) {
+                    score += 35;
+                    evidence.push_back("season directory agrees with filename");
+                }
+                const auto& raw_series_dir = parts[parts.size() - 3];
+                const auto dir_series = clean_series_name(raw_series_dir);
+                if (!probe.year && comparable_title(dir_series) == comparable_title(probe.series)) {
+                    probe.year = year_from(raw_series_dir);
+                    if (probe.year) {
+                        score += 25;
+                        evidence.push_back("series directory supplies matching year");
+                    }
+                }
+            }
+        }
+        return {{std::move(probe), score, std::string(name()), std::move(evidence)}};
+    }
+};
+
+class DirectoryEpisodeCandidateGenerator final : public MediaProbeCandidateGenerator {
+  public:
+    std::string_view name() const noexcept override { return "episode-directory"; }
+    std::vector<MediaProbeCandidate> generate(std::string_view, std::string_view path,
+                                               const FsEntry& entry) const override {
+        if (!video_extension(extension(path))) return {};
+        auto pattern = episode_pattern(stem(path));
+        if (!pattern) return {};
+        const auto parts = components(path);
+        if (parts.size() < 2) return {};
+
+        size_t series_index = parts.size() - 2;
+        int score = 175;
+        std::vector<std::string> evidence{"directory-derived series", "explicit episode marker"};
+        if (parts.size() >= 3) {
+            if (auto directory_season = season_directory_number(parts[parts.size() - 2])) {
+                series_index = parts.size() - 3;
+                if (*directory_season == pattern->season) {
+                    score += 45;
+                    evidence.push_back("season directory agrees with filename");
+                }
+            }
+        }
+        const auto raw_series = parts[series_index];
+        auto series = clean_series_name(raw_series);
+        if (series.empty()) return {};
+        auto probe = make_probe(path, entry, MediaProbeKind::episode);
+        probe.series = std::move(series);
+        probe.year = year_from(raw_series);
+        probe.season = pattern->season;
+        probe.episode = pattern->episode;
+        probe.title = clean_episode_title(pattern->suffix);
+        if (probe.year) {
+            score += 20;
+            evidence.push_back("series directory contains year");
+        }
+        return {{std::move(probe), score, std::string(name()), std::move(evidence)}};
+    }
+};
+
+class StructuredMusicCandidateGenerator final : public MediaProbeCandidateGenerator {
+  public:
+    std::string_view name() const noexcept override { return "music-structured-path"; }
+    std::vector<MediaProbeCandidate> generate(std::string_view root, std::string_view path,
+                                               const FsEntry& entry) const override {
+        if (!audio_extension(extension(path))) return {};
+        auto probe = make_probe(path, entry, MediaProbeKind::track);
+        auto title_candidate = stem(path);
+        static const std::regex track_re(
+            R"(^\s*(?:(\d{1,2})[-.]\s*)?(\d{1,3})\s*[-_. ]+(.+)$)", std::regex::icase);
+        std::smatch track_match;
+        if (std::regex_match(title_candidate, track_match, track_re)) {
+            if (track_match[1].matched) probe.disc = std::stoi(track_match[1].str());
+            probe.track = std::stoi(track_match[2].str());
+            title_candidate = track_match[3].str();
+        }
+
+        static const std::regex artist_title(R"(^\s*(.+?)\s+-\s+(.+?)\s*$)");
+        std::smatch artist_match;
+        bool artist_from_filename = false;
+        if (std::regex_match(title_candidate, artist_match, artist_title)) {
+            probe.artist = clean_title(artist_match[1].str());
+            probe.title = clean_title(artist_match[2].str());
+            artist_from_filename = true;
+        } else {
+            probe.title = clean_title(title_candidate);
+        }
+
+        const auto normalized_root = normalize_path(std::string(root));
+        const auto root_parts = components(normalized_root);
+        const auto parts = components(path);
+        if (!root.empty() && parts.size() >= root_parts.size() &&
+            std::equal(root_parts.begin(), root_parts.end(), parts.begin())) {
+            const auto relative_parts = parts.size() - root_parts.size();
+            if (relative_parts == 3) {
+                const auto candidate_artist = clean_title(parts[parts.size() - 3]);
+                const auto candidate_album = clean_title(parts[parts.size() - 2]);
+                if (probe.artist.empty()) probe.artist = candidate_artist;
+                if (probe.album.empty() && (!artist_from_filename ||
+                    comparable_title(probe.artist) == comparable_title(candidate_artist)))
+                    probe.album = candidate_album;
+            } else if (relative_parts == 4) {
+                static const std::regex disc_dir(R"(^(?:cd|disc|disk)\s*([0-9]{1,2})$)",
+                                                 std::regex::icase);
+                std::smatch disc_match;
+                auto parent = clean_title(parts[parts.size() - 2]);
+                if (std::regex_match(parent, disc_match, disc_dir)) {
+                    if (!probe.disc) probe.disc = std::stoi(disc_match[1].str());
+                    if (probe.artist.empty()) probe.artist = clean_title(parts[parts.size() - 4]);
+                    if (probe.album.empty()) probe.album = clean_title(parts[parts.size() - 3]);
+                }
+            }
+        } else if (parts.size() >= 3 && probe.artist.empty()) {
+            // Generic probe_media_path() has no configured root. Preserve the
+            // long-standing Artist/Album/File and Artist/Album/Disc/File
+            // fallbacks for tests and direct callers.
+            static const std::regex disc_dir(R"(^(?:cd|disc|disk)\s*([0-9]{1,2})$)",
+                                             std::regex::icase);
+            std::smatch disc_match;
+            auto parent = clean_title(parts[parts.size() - 2]);
+            if (parts.size() >= 4 && std::regex_match(parent, disc_match, disc_dir)) {
+                if (!probe.disc) probe.disc = std::stoi(disc_match[1].str());
+                probe.album = clean_title(parts[parts.size() - 3]);
+                probe.artist = clean_title(parts[parts.size() - 4]);
+            } else {
+                probe.album = parent;
+                probe.artist = clean_title(parts[parts.size() - 3]);
+            }
+        }
+
+        if (probe.title.empty()) return {};
+        int score = 190 + (probe.track ? 25 : 0) + (!probe.artist.empty() ? 20 : 0) +
+                    (!probe.album.empty() ? 20 : 0);
+        return {{std::move(probe), score, std::string(name()),
+                 {"structured music filename/path fallback"}}};
+    }
+};
+
+std::vector<std::unique_ptr<MediaProbeCandidateGenerator>> default_candidate_generators() {
+    std::vector<std::unique_ptr<MediaProbeCandidateGenerator>> generators;
+    generators.push_back(std::make_unique<FilenameEpisodeCandidateGenerator>());
+    generators.push_back(std::make_unique<DirectoryEpisodeCandidateGenerator>());
+    generators.push_back(std::make_unique<SemanticMovieCandidateGenerator>());
+    generators.push_back(std::make_unique<CompactMovieTitleCandidateGenerator>());
+    generators.push_back(std::make_unique<LegacyMovieCandidateGenerator>());
+    generators.push_back(std::make_unique<StructuredMusicCandidateGenerator>());
+    return generators;
 }
 
 std::optional<int32_t> json_i32(const Json* value) {
@@ -552,26 +930,61 @@ void add_art(std::vector<RemoteArtwork>& art, const std::string& item, std::stri
     if (!url.empty()) art.push_back({item, std::move(role), std::move(url)});
 }
 
+int title_similarity(std::string_view wanted, std::string_view candidate) {
+    const auto left = comparable_title(wanted);
+    const auto right = comparable_title(candidate);
+    if (left.empty() || right.empty()) return 0;
+    if (left == right) return 120;
+
+    std::set<std::string> left_tokens;
+    std::set<std::string> right_tokens;
+    std::istringstream left_in(left);
+    std::istringstream right_in(right);
+    for (std::string token; left_in >> token;) left_tokens.insert(std::move(token));
+    for (std::string token; right_in >> token;) right_tokens.insert(std::move(token));
+    size_t intersection = 0;
+    for (const auto& token : left_tokens)
+        if (right_tokens.contains(token)) ++intersection;
+    if (!intersection) return 0;
+    const auto denominator = left_tokens.size() + right_tokens.size();
+    int score = static_cast<int>((200 * intersection) / denominator);
+    if (left.find(right) != std::string::npos || right.find(left) != std::string::npos)
+        score += 15;
+    return std::min(score, 115);
+}
+
 const Json* best_result(const Json& root, std::string_view title, std::string_view title_key,
                         const std::optional<int32_t>& year, std::string_view date_key) {
     auto results = root.find("results");
     if (!results || !results->isArray() || results->asArray().empty()) return nullptr;
-    const Json* best = &results->asArray().front();
-    int best_score = -1;
-    const auto wanted = comparable_title(title);
+    const Json* best = nullptr;
+    int best_score = -1000;
+    size_t rank = 0;
     for (const auto& candidate : results->asArray()) {
-        if (!candidate.isObject()) continue;
-        int score = 0;
-        auto name = comparable_title(json_string(candidate.find(title_key)));
-        if (name == wanted) score += 100;
-        else if (name.find(wanted) != std::string::npos || wanted.find(name) != std::string::npos) score += 40;
+        if (!candidate.isObject()) {
+            ++rank;
+            continue;
+        }
+        int score = title_similarity(title, json_string(candidate.find(title_key)));
+        score += std::max(0, 18 - static_cast<int>(rank) * 3);
         if (year) {
             auto found_year = json_year(candidate.find(date_key));
-            if (found_year && *found_year == *year) score += 30;
+            if (found_year && *found_year == *year) {
+                score += 45;
+                // TMDB already ranked the result for our exact search query.
+                // Exact-year agreement on the top result is useful evidence
+                // for aliases/translations whose canonical provider title has
+                // little lexical overlap with the release filename.
+                if (rank == 0) score += 30;
+            } else if (found_year) score -= 35;
         }
-        if (score > best_score) { best_score = score; best = &candidate; }
+        if (score > best_score) {
+            best_score = score;
+            best = &candidate;
+        }
+        ++rank;
     }
-    const int minimum_score = year ? 70 : 80;
+    const int minimum_score = year ? 90 : 82;
     return best_score >= minimum_score ? best : nullptr;
 }
 
@@ -626,77 +1039,58 @@ class BudgetHttpClient final : public HttpClient {
 
 } // namespace
 
-std::optional<MediaProbe> probe_media_path(std::string_view path, const FsEntry& entry) {
+std::vector<MediaProbeCandidate> probe_media_candidates(std::string_view path,
+                                                        const FsEntry& entry,
+                                                        std::string_view root) {
     if (entry.type != EntryType::file || entry.size == 0) return {};
-    auto ext = extension(path);
-    auto parts = components(path);
-    if (parts.empty()) return {};
-
-    MediaProbe probe;
-    probe.path = normalize_path(std::string(path));
-    probe.media_id = file_media_id(entry);
-    auto file_stem = stem(path);
-
-    if (audio_extension(ext)) {
-        probe.kind = MediaProbeKind::track;
-        static const std::regex track_re(R"(^\s*(?:(\d{1,2})[-.]\s*)?(\d{1,3})\s*[-_. ]+(.+)$)",
-                                         std::regex::icase);
-        std::smatch m;
-        if (std::regex_match(file_stem, m, track_re)) {
-            if (m[1].matched) probe.disc = std::stoi(m[1].str());
-            probe.track = std::stoi(m[2].str());
-            probe.title = clean_title(m[3].str());
-        } else probe.title = clean_title(file_stem);
-        size_t album_index = parts.size() >= 2 ? parts.size() - 2 : 0;
-        if (parts.size() >= 4) {
-            static const std::regex disc_dir(R"(^(?:cd|disc|disk)\s*([0-9]{1,2})$)",
-                                             std::regex::icase);
-            std::smatch disc_match;
-            auto parent = clean_title(parts[parts.size() - 2]);
-            if (std::regex_match(parent, disc_match, disc_dir)) {
-                if (!probe.disc) probe.disc = std::stoi(disc_match[1].str());
-                album_index = parts.size() - 3;
+    static const auto generators = default_candidate_generators();
+    std::vector<MediaProbeCandidate> candidates;
+    for (const auto& generator : generators) {
+        auto generated = generator->generate(root, path, entry);
+        for (auto& candidate : generated) {
+            bool valid = false;
+            switch (candidate.probe.kind) {
+                case MediaProbeKind::movie:
+                    valid = !candidate.probe.title.empty();
+                    break;
+                case MediaProbeKind::episode:
+                    valid = !candidate.probe.series.empty() && candidate.probe.season &&
+                            candidate.probe.episode;
+                    break;
+                case MediaProbeKind::track:
+                    valid = !candidate.probe.title.empty();
+                    break;
+            }
+            if (!valid) continue;
+            auto duplicate = std::find_if(candidates.begin(), candidates.end(), [&](const auto& existing) {
+                return same_probe_identity(existing.probe, candidate.probe);
+            });
+            if (duplicate == candidates.end()) {
+                candidates.push_back(std::move(candidate));
+            } else {
+                duplicate->evidence.insert(duplicate->evidence.end(),
+                                           candidate.evidence.begin(), candidate.evidence.end());
+                if (candidate.score > duplicate->score) {
+                    duplicate->score = candidate.score;
+                    duplicate->generator = std::move(candidate.generator);
+                }
             }
         }
-        if (album_index < parts.size()) probe.album = clean_title(parts[album_index]);
-        if (album_index > 0) probe.artist = clean_title(parts[album_index - 1]);
-        if (probe.artist.empty() || probe.album.empty() || probe.title.empty()) return {};
-        return probe;
     }
+    std::stable_sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+        if (a.score != b.score) return a.score > b.score;
+        return a.generator < b.generator;
+    });
+    return candidates;
+}
 
-    if (!video_extension(ext)) return {};
-
-    static const std::regex se_re(R"((.*?)(?:[ ._-]+|^)s(\d{1,2})e(\d{1,3})(?:[ ._-]+(.*))?$)",
-                                  std::regex::icase);
-    static const std::regex x_re(R"((.*?)(?:[ ._-]+|^)(\d{1,2})x(\d{1,3})(?:[ ._-]+(.*))?$)",
-                                 std::regex::icase);
-    std::smatch m;
-    std::string owned = file_stem;
-    if (std::regex_match(owned, m, se_re) || std::regex_match(owned, m, x_re)) {
-        probe.kind = MediaProbeKind::episode;
-        probe.season = std::stoi(m[2].str());
-        probe.episode = std::stoi(m[3].str());
-        probe.title = m[4].matched ? clean_episode_title(m[4].str()) : std::string{};
-        std::string prefix = clean_series_name(m[1].str());
-        if (parts.size() >= 3) {
-            static const std::regex season_dir(R"(^season\s*[0-9]{1,2}$)", std::regex::icase);
-            auto parent = clean_title(parts[parts.size() - 2]);
-            if (std::regex_match(parent, season_dir)) probe.series = clean_series_name(parts[parts.size() - 3]);
-        }
-        if (probe.series.empty()) probe.series = prefix;
-        if (probe.series.empty() && parts.size() >= 2) probe.series = clean_series_name(parts[parts.size() - 2]);
-        // Prefer the raw filename/folder year before clean_series_name removes
-        // it; provider lookup benefits from a release year when one is present.
-        probe.year = year_from(m[1].str());
-        if (!probe.year && parts.size() >= 2) probe.year = year_from(parts[parts.size() - 2]);
-        if (probe.series.empty()) return {};
-        return probe;
-    }
-
-    probe.kind = MediaProbeKind::movie;
-    probe.year = year_from(file_stem);
-    probe.title = movie_title_before_year(file_stem, probe.year);
-    if (probe.title.empty()) return {};
+std::optional<MediaProbe> probe_media_path(std::string_view path, const FsEntry& entry) {
+    auto candidates = probe_media_candidates(path, entry);
+    if (candidates.empty()) return {};
+    auto probe = std::move(candidates.front().probe);
+    if (probe.kind == MediaProbeKind::track &&
+        (probe.artist.empty() || probe.album.empty() || probe.title.empty()))
+        return {};
     return probe;
 }
 
@@ -1202,12 +1596,14 @@ MovieScanProvider::MovieScanProvider(HttpClient& http, CatalogueMovieProviderCon
     }
 }
 
-std::optional<MediaProbe> MovieScanProvider::probe(FileSystem&, std::string_view,
-                                                   std::string_view path,
-                                                   const FsEntry& entry) {
-    auto probe = probe_media_path(path, entry);
-    if (!probe || probe->kind != MediaProbeKind::movie) return {};
-    return probe;
+std::vector<MediaProbeCandidate> MovieScanProvider::probe_candidates(
+    FileSystem&, std::string_view root, std::string_view path, const FsEntry& entry) {
+    auto candidates = probe_media_candidates(path, entry, root);
+    std::erase_if(candidates, [](const auto& candidate) {
+        return candidate.probe.kind != MediaProbeKind::movie;
+    });
+    if (candidates.size() > 4) candidates.resize(4);
+    return candidates;
 }
 
 TvScanProvider::TvScanProvider(HttpClient& http, CatalogueTvProviderConfig config)
@@ -1221,12 +1617,14 @@ TvScanProvider::TvScanProvider(HttpClient& http, CatalogueTvProviderConfig confi
     }
 }
 
-std::optional<MediaProbe> TvScanProvider::probe(FileSystem&, std::string_view,
-                                                std::string_view path,
-                                                const FsEntry& entry) {
-    auto probe = probe_media_path(path, entry);
-    if (!probe || probe->kind != MediaProbeKind::episode) return {};
-    return probe;
+std::vector<MediaProbeCandidate> TvScanProvider::probe_candidates(
+    FileSystem&, std::string_view root, std::string_view path, const FsEntry& entry) {
+    auto candidates = probe_media_candidates(path, entry, root);
+    std::erase_if(candidates, [](const auto& candidate) {
+        return candidate.probe.kind != MediaProbeKind::episode;
+    });
+    if (candidates.size() > 4) candidates.resize(4);
+    return candidates;
 }
 
 MusicScanProvider::MusicScanProvider(HttpClient& http, CatalogueMusicProviderConfig config)
@@ -1235,10 +1633,12 @@ MusicScanProvider::MusicScanProvider(HttpClient& http, CatalogueMusicProviderCon
         metadata_ = std::make_unique<MusicBrainzProvider>(http, std::move(config.musicbrainz));
 }
 
-std::optional<MediaProbe> MusicScanProvider::probe(FileSystem& fs, std::string_view root,
-                                                   std::string_view path,
-                                                   const FsEntry& entry) {
-    return probe_music_path(fs, root, path, entry);
+std::vector<MediaProbeCandidate> MusicScanProvider::probe_candidates(
+    FileSystem& fs, std::string_view root, std::string_view path, const FsEntry& entry) {
+    auto probe = probe_music_path(fs, root, path, entry);
+    if (!probe) return {};
+    return {{std::move(*probe), 1000, "music-tags-plus-path",
+             {"embedded tags preferred; candidate path fills missing fields"}}};
 }
 
 CatalogueScanner::CatalogueScanner(NodeRuntime& node, FileSystem& fs, CatalogueManager& catalogue,
@@ -1363,17 +1763,17 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
     struct PendingProbe {
         CatalogueScanProvider* provider{};
         std::string path;
-        MediaProbe probe;
+        std::vector<MediaProbeCandidate> candidates;
     };
     std::vector<PendingProbe> probes;
     probes.reserve(files.size());
     for (const auto& file : files) {
         if (stop.stop_requested()) return 0;
-        auto probe = file.provider->probe(fs_, file.root, file.path, file.entry);
-        if (!probe) continue;
-        active_media_ids.insert(probe->media_id);
-        if (!bound.contains(probe->media_id))
-            probes.push_back({file.provider, file.path, std::move(*probe)});
+        auto candidates = file.provider->probe_candidates(fs_, file.root, file.path, file.entry);
+        if (candidates.empty()) continue;
+        active_media_ids.insert(candidates.front().probe.media_id);
+        if (!bound.contains(candidates.front().probe.media_id))
+            probes.push_back({file.provider, file.path, std::move(candidates)});
     }
 
     std::map<std::string, CatalogueItem> discovered;
@@ -1383,28 +1783,41 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
     bool provider_budget_exhausted = false;
     for (const auto& pending : probes) {
         if (stop.stop_requested()) return 0;
-        // Finish one provider lookup atomically from the scanner's point of
-        // view. The request budget is checked between lookups so a tiny
-        // budget cannot permanently split search/detail progress.
         if (budget_http->exhausted()) {
             provider_budget_exhausted = true;
             break;
         }
+
         std::optional<ProviderMatch> match;
-        try {
-            match = pending.provider->lookup(pending.probe);
-        } catch (const std::exception& e) {
-            if (stop.stop_requested()) return 0;
-            Log::warn("catalogue " + std::string(pending.provider->name()) +
-                      " lookup failed for " + pending.path + ": " + e.what());
+        const MediaProbeCandidate* selected = nullptr;
+        size_t attempted = 0;
+        constexpr size_t max_candidate_attempts = 3;
+        for (const auto& candidate : pending.candidates) {
+            if (attempted >= max_candidate_attempts || budget_http->exhausted()) break;
+            try {
+                match = pending.provider->lookup(candidate.probe);
+            } catch (const std::exception& e) {
+                if (stop.stop_requested()) return 0;
+                Log::warn("catalogue " + std::string(pending.provider->name()) +
+                          " lookup failed for " + pending.path + " candidate=" +
+                          candidate.generator + ": " + e.what());
+            }
+            ++attempted;
+            if (match) {
+                selected = &candidate;
+                break;
+            }
         }
         ++provider_items_processed;
-        const auto& probe = pending.probe;
+
+        const auto& primary = pending.candidates.front();
+        const auto& probe = selected ? selected->probe : primary.probe;
         if (!match) {
             std::ostringstream parsed;
             if (probe.kind == MediaProbeKind::movie) {
                 parsed << "movie title=\"" << probe.title << "\"";
                 if (probe.year) parsed << " year=" << *probe.year;
+                if (probe.edition) parsed << " edition=\"" << *probe.edition << "\"";
             } else if (probe.kind == MediaProbeKind::episode) {
                 parsed << "episode series=\"" << probe.series << "\"";
                 if (probe.year) parsed << " year=" << *probe.year;
@@ -1414,9 +1827,21 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
                 parsed << "track artist=\"" << probe.artist << "\" album=\""
                        << probe.album << "\" title=\"" << probe.title << "\"";
             }
+            parsed << " candidate=" << primary.generator << " score=" << primary.score;
+            if (attempted > 1) parsed << " alternatives_tried=" << attempted;
             Log::debug("catalogue: no " + std::string(pending.provider->name()) +
                        " provider match for " + pending.path + " parsed " + parsed.str());
+            if (budget_http->exhausted()) {
+                provider_budget_exhausted = true;
+                break;
+            }
             continue;
+        }
+        if (selected && selected != &primary) {
+            Log::debug("catalogue: " + std::string(pending.provider->name()) +
+                       " provider matched fallback candidate for " + pending.path +
+                       " generator=" + selected->generator +
+                       " score=" + std::to_string(selected->score));
         }
         ++matched;
         for (auto& item : match->items) {
