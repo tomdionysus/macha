@@ -5,6 +5,7 @@ The complete example is `macha.yaml.example`. The important rules are short:
 - Every node uses the **same key contents**. The path may differ.
 - `network.advertise` must be reachable from the other nodes. `listen: 0.0.0.0` does not make `127.0.0.1` a useful advertised address.
 - `dht.replicas` and `dht.metadata_replicas` are cluster policy and must be identical on every node. They may be changed by stopping the whole cluster, changing every node, then restarting it. Do not roll replica-count changes through a running cluster; mixed policies are unsupported.
+- `dht.min_write_replicas` is cluster write policy and should be identical on every node. It is the degraded-mode durable floor for immutable extent writes (default `1`); healthy writes still use at least the normal replica quorum. `dht.write_stall_ms` (default `2500`) controls when a no-progress preferred PUT is hedged onto the next deterministic placement candidate. Desired replication is restored by background repair. Metadata continues to use its voter quorum.
 - `dht.extent_size` is fixed for an existing namespace.
 - Bootstrap may be one-way or symmetric. A node with configured bootstrap peers will not create a new namespace while none of them is reachable.
 - Storage backend directories must already exist. Missing paths are treated as missing disks, not created automatically.
@@ -35,6 +36,8 @@ A YAML file is required. These CLI options override values from that file for on
 --port PORT
 --replicas N
 --metadata-replicas N
+--min-write-replicas N
+--write-stall MS
 --extent-size SIZE               1M..64M; compiled default 16M
 --read-ahead N
 --connect-timeout MS             TCP connection attempt only

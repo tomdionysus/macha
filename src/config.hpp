@@ -181,6 +181,8 @@ struct Config {
     uint16_t port{7437};
     size_t replication{3};
     size_t metadata_replication{3};
+    size_t min_write_replicas{1};
+    std::chrono::milliseconds write_stall{2500};
     size_t extent_size{16 * 1024 * 1024};
     size_t read_ahead_extents{3};
     std::vector<Endpoint> bootstrap;

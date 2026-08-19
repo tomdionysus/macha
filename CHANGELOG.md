@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.0 - 2026-08-19
+
+- decouple immutable extent write availability from desired replica placement: `dht.min_write_replicas` (default `1`) is now the degraded-mode durable floor for data PUTs. Healthy writes still commit at the normal replica quorum; when that quorum cannot be reached without already-hedged stalled owners, the write may commit at the configured floor and repair restores desired placement later;
+- hedge stalled remote extent PUTs onto deterministic fallback owners after `dht.write_stall_ms` (default `2500`) of transport-level no progress. The original RPC remains valid and may still complete, but a stale preferred owner no longer blocks an otherwise writable cluster until membership expiry;
+- keep metadata mutation semantics unchanged: metadata continues to require its configured voter quorum;
+- wire and storage formats remain unchanged from 0.10.0.
+
 ## 0.10.4 - 2026-08-18
 
 - make catalogue API reads live but memory-fast: warm GET/list/search requests never perform metadata quorum or catalogue-root I/O; generation notices and the short validation TTL are converged by the service control plane, which atomically publishes the replacement immutable snapshot;

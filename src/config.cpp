@@ -74,8 +74,12 @@ void validate(Config& config) {
         if (backend.path.empty() || !backend.limit)
             throw std::runtime_error("each storage backend requires path and nonzero limit");
     }
-    if (!config.replication || !config.metadata_replication)
+    if (!config.replication || !config.metadata_replication || !config.min_write_replicas)
         throw std::runtime_error("replication must be nonzero");
+    if (config.min_write_replicas > config.replication)
+        throw std::runtime_error("dht.min_write_replicas must be <= dht.replicas");
+    if (config.write_stall.count() <= 0)
+        throw std::runtime_error("dht.write_stall_ms must be > 0");
     if (config.replication > 31 || config.metadata_replication > 31)
         throw std::runtime_error("replica count must be <= 31");
     if (config.read_ahead_extents > 64)
@@ -252,6 +256,10 @@ void parse_dht(const YAML::Node& root, Config& c) {
         c.replication = d["replicas"].as<size_t>();
     if (d["metadata_replicas"])
         c.metadata_replication = d["metadata_replicas"].as<size_t>();
+    if (d["min_write_replicas"])
+        c.min_write_replicas = d["min_write_replicas"].as<size_t>();
+    if (d["write_stall_ms"])
+        c.write_stall = milliseconds(d["write_stall_ms"], "dht.write_stall_ms");
     if (d["extent_size"])
         c.extent_size = yaml_size(d["extent_size"]);
     if (d["read_ahead"])
@@ -617,7 +625,8 @@ void print_usage(const char* executable) {
         << "--bootstrap HOST[:PORT] (repeatable)  --listen ADDR  --advertise HOST  --port PORT\n"
         << "--failure-domain NAME  --connect-timeout MS  --max-frame-size SIZE\n"
         << "--control-stall-notice MS  --data-stall-notice MS\n"
-        << "--metadata-cache MS  --replicas N  --metadata-replicas N  --extent-size SIZE\n"
+        << "--metadata-cache MS  --replicas N  --metadata-replicas N  --min-write-replicas N\n"
+        << "--write-stall MS  --extent-size SIZE\n"
         << "--read-ahead N  --mount PATH  --state-path PATH  --cache-path PATH --cache-blocks N\n"
         << "--log-level LEVEL  (ALL|DEBUG|INFO|WARN|ERROR; default INFO)  --help\n";
 }
@@ -680,6 +689,12 @@ Config parse_config(int argc, char** argv) {
         } else if (option == "--metadata-replicas") {
             config.metadata_replication =
                 parse_unsigned(need(i, "--metadata-replicas"), "metadata replica count");
+        } else if (option == "--min-write-replicas") {
+            config.min_write_replicas =
+                parse_unsigned(need(i, "--min-write-replicas"), "minimum write replica count");
+        } else if (option == "--write-stall") {
+            config.write_stall = std::chrono::milliseconds(
+                parse_unsigned(need(i, "--write-stall"), "write stall"));
         } else if (option == "--extent-size") {
             config.extent_size = parse_size(need(i, "--extent-size"));
         } else if (option == "--read-ahead") {

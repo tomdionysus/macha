@@ -1,4 +1,4 @@
-# Macha 0.9.1
+# Macha 0.11.0
 #
 # Copy this file per node. Paths, advertise address and failure_domain are
 # node-local. The cluster key contents and dht policy must match every node.
@@ -75,6 +75,14 @@ network:
 dht:
   replicas: 3
   metadata_replicas: 3
+
+  # Healthy immutable extent writes still commit at replica quorum. Degraded
+  # writes may commit at min_write_replicas and are repaired in the background.
+  # A stalled preferred owner spills to the next
+  # deterministic placement candidate after write_stall_ms without waiting for
+  # membership expiry. Metadata writes retain their separate voter quorum.
+  min_write_replicas: 1
+  write_stall_ms: 2500
   extent_size: 4M
   read_ahead: 3
   metadata_cache_ms: 250

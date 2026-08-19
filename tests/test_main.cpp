@@ -1193,6 +1193,8 @@ void test_config() {
             << "dht:\n"
             << "  replicas: 3\n"
             << "  metadata_replicas: 3\n"
+            << "  min_write_replicas: 2\n"
+            << "  write_stall_ms: 1750\n"
             << "  extent_size: 16M\n"
             << "  read_ahead: 5\n"
             << "bootstrap:\n"
@@ -1297,6 +1299,8 @@ void test_config() {
     CHECK(yc.max_frame_size == 192ULL * 1024);
     CHECK(yc.control_stall_notice == 4100ms);
     CHECK(yc.data_stall_notice == 88000ms);
+    CHECK(yc.min_write_replicas == 2);
+    CHECK(yc.write_stall == 1750ms);
     CHECK(yc.maintenance.interval == 250ms);
     CHECK(yc.maintenance.garbage_grace == 1234ms);
     CHECK(yc.maintenance.busy_bandwidth_fraction == 0.03);
@@ -1354,6 +1358,8 @@ void test_config() {
     // now always starts from an explicit YAML file.
     std::vector<std::string> override_args{"macha", "--config", yaml.string(),
                                             "--port", "8123", "--replicas", "5",
+                                            "--min-write-replicas", "3",
+                                            "--write-stall", "1600",
                                             "--read-ahead", "4", "--failure-domain", "site-a",
                                             "--connect-timeout", "1700",
                                             "--max-frame-size", "320K",
@@ -1367,6 +1373,8 @@ void test_config() {
     auto overridden = parse_config(static_cast<int>(override_argv.size()), override_argv.data());
     CHECK(overridden.port == 8123);
     CHECK(overridden.replication == 5);
+    CHECK(overridden.min_write_replicas == 3);
+    CHECK(overridden.write_stall == 1600ms);
     CHECK(overridden.read_ahead_extents == 4);
     CHECK(overridden.failure_domain == "site-a");
     CHECK(overridden.connect_timeout == 1700ms);
@@ -2377,6 +2385,74 @@ void test_early_replication_quorum() {
     slow_server.stop();
     fast_server.stop();
     s1.stop();
+}
+
+void test_put_spills_stalled_owners_and_commits_degraded_floor() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto local_port = free_port();
+    auto slow1_port = free_port();
+    auto slow2_port = free_port();
+
+    auto config = config_for(t.path() / "local-degraded", keyfile, local_port);
+    config.replication = 3;
+    config.metadata_replication = 1;
+    config.min_write_replicas = 1;
+    config.write_stall = 100ms;
+    config.heartbeat = 10s;
+    config.dead_after = 5s;
+
+    Service service(config, keys);
+    service.start();
+
+    auto slow_info = [](uint16_t port, const char* domain) {
+        NodeInfo info;
+        info.id = random_node_id();
+        info.host = "127.0.0.1";
+        info.port = port;
+        info.failure_domain = domain;
+        info.capacity = 1024ULL * 1024 * 1024;
+        info.seen_unix_ms = unix_ms();
+        return info;
+    };
+    auto slow1 = slow_info(slow1_port, "slow-site-1");
+    auto slow2 = slow_info(slow2_port, "slow-site-2");
+
+    auto delayed_put = [](const NodeInfo&, FrameType, const RpcMessage& request) {
+        if (request.type == MessageType::put_object)
+            std::this_thread::sleep_for(1500ms);
+        return RpcMessage{MessageType::ok, {}};
+    };
+    RpcServer slow1_server("127.0.0.1", slow1_port, keys, slow1, delayed_put,
+                           [](const NodeInfo&) {});
+    RpcServer slow2_server("127.0.0.1", slow2_port, keys, slow2, delayed_put,
+                           [](const NodeInfo&) {});
+    slow1_server.start();
+    slow2_server.start();
+
+    service.node().membership().observe(slow1, true);
+    service.node().membership().observe(slow2, true);
+    REQUIRE(service.node().membership().active().size() == 3);
+
+    // The local copy succeeds immediately, but the normal R=3 quorum requires
+    // two replicas. Both remote owners accept their RPCs and then make no
+    // progress. The write must spill/degrade at the explicit floor rather than
+    // wait for the 5s membership expiry (or for the delayed replies).
+    DistributedStore store(service.node());
+    auto data = pattern(128 * 1024);
+    auto id = object_id(data);
+    auto started = Clock::now();
+    CHECK(store.put(id, data));
+    auto elapsed = Clock::now() - started;
+    CHECK(elapsed >= 75ms);
+    CHECK(elapsed < 1s);
+    CHECK(service.node().local_store().has(id));
+
+    slow2_server.stop();
+    slow1_server.stop();
+    service.stop();
 }
 
 void test_put_falls_back_after_remote_launch_failure() {
@@ -4616,7 +4692,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
-    CHECK(status_body.find("\"server_version\":\"0.10.4\"") != std::string::npos);
+    CHECK(status_body.find("\"server_version\":\"0.11.0\"") != std::string::npos);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -5279,7 +5355,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == "0.10.4");
+    CHECK(playback_status_json.find("server_version")->asString() == "0.11.0");
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately
@@ -5552,6 +5628,7 @@ int main() {
         test_rpc_slow_control_does_not_abort_data();
         test_rpc_health_and_control_not_starved_by_data();
         test_early_replication_quorum();
+        test_put_spills_stalled_owners_and_commits_degraded_floor();
         test_put_falls_back_after_remote_launch_failure();
         test_joiner_cannot_form_genesis();
         test_two_node_mutual_bootstrap_metadata_quorum();
