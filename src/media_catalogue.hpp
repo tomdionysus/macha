@@ -21,6 +21,8 @@ namespace macha {
 
 enum class MediaProbeKind { movie, episode, track };
 
+enum class MediaProbeLookupStrategy { automatic, music_release_first, music_recording_first };
+
 struct MediaProbe {
     MediaProbeKind kind{MediaProbeKind::movie};
     std::string path;
@@ -38,6 +40,16 @@ struct MediaProbe {
     std::optional<std::string> musicbrainz_recording_id;
     std::optional<std::string> musicbrainz_release_id;
     std::optional<std::string> musicbrainz_artist_id;
+    std::string track_artist;
+    std::string album_artist;
+    MediaProbeLookupStrategy lookup_strategy{MediaProbeLookupStrategy::automatic};
+};
+
+struct MediaProbeContext {
+    std::string_view root;
+    std::string_view path;
+    const FsEntry& entry;
+    const MediaProbe* embedded_metadata{};
 };
 
 struct MediaProbeCandidate {
@@ -51,11 +63,10 @@ class MediaProbeCandidateGenerator {
   public:
     virtual ~MediaProbeCandidateGenerator() = default;
     virtual std::string_view name() const noexcept = 0;
-    virtual std::vector<MediaProbeCandidate> generate(std::string_view root,
-                                                       std::string_view path,
-                                                       const FsEntry&) const = 0;
+    virtual std::vector<MediaProbeCandidate> generate(const MediaProbeContext&) const = 0;
 };
 
+std::vector<MediaProbeCandidate> probe_media_candidates(const MediaProbeContext&);
 std::vector<MediaProbeCandidate> probe_media_candidates(std::string_view path, const FsEntry&,
                                                         std::string_view root = {});
 std::optional<MediaProbe> probe_media_path(std::string_view path, const FsEntry&);
@@ -115,9 +126,11 @@ class TmdbProvider final : public MetadataProvider {
     std::string token_;
     std::map<std::string, std::optional<Json>> movie_cache_;
     std::map<std::string, std::optional<Json>> show_cache_;
-    std::map<std::string, Json> season_cache_;
+    std::map<std::string, std::optional<Json>> season_cache_;
 
     Json api(std::string_view path, const std::vector<std::pair<std::string, std::string>>& query = {});
+    std::optional<Json> api_optional(std::string_view path,
+                                    const std::vector<std::pair<std::string, std::string>>& query = {});
     std::string image_url(std::string_view path) const;
     std::optional<Json> find_show(const MediaProbe&);
 
@@ -217,6 +230,7 @@ class CatalogueScanner {
     std::unique_ptr<HttpClient> http_;
     std::unique_ptr<HttpClient> provider_http_;
     std::vector<std::unique_ptr<CatalogueScanProvider>> providers_;
+    std::map<std::string, std::string> provider_resume_after_;
     std::atomic_bool provider_continuation_{};
     std::jthread worker_;
     mutable std::mutex config_mutex_;
