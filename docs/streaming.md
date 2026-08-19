@@ -14,6 +14,8 @@ The current transformed output is one HLS rendition using an `init.mp4` plus `.m
 
 ## Media engine boundary
 
+FFmpeg streams marked `AV_DISPOSITION_ATTACHED_PIC` are metadata images, not playable video. Macha preserves that disposition in probe results, reports the stream as non-playable/other media, and excludes it from video selection. This prevents an MP3 with embedded album art from being promoted into an HLS/fMP4 video pipeline.
+
 `PlaybackManager` owns policy and `MediaEngine` owns media operations. The interface contains media concepts (`probe`, `PlaybackPlan`, `MediaEngineSession`, fragments and subtitle extraction), not FFmpeg options. The current implementation is `LibavMediaEngine`, but another implementation can replace it without changing the HTTP/session API.
 
 Each media source is an immutable seekable `MediaInput`. The libav input `AVIOContext` maps read/seek callbacks directly onto the pinned Macha `ReadHandle`. There is no loopback HTTP hop and no FUSE dependency. Replacing or renaming a pathname after playback starts does not silently change the extents underneath that session.

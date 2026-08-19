@@ -600,15 +600,16 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
         item.external_ids["macha_scanner"] = "1";
         auto it = current.items.find(item.id);
         if (it != current.items.end()) {
-            // Retain downloaded artwork when a provider result does not carry a
-            // replacement for that role. Scanner refreshes are metadata-safe and
-            // do not churn immutable artwork objects on every pass.
+            // Scanner artwork is a candidate set, not one slot per role. Preserve
+            // every previously known immutable object unless the provider/local
+            // scan already supplied the same role+object again. This allows, for
+            // example, an embedded MP3 cover and a provider cover to coexist.
             for (const auto& art : it->second.artwork) {
-                const bool replaced = std::any_of(item.artwork.begin(), item.artwork.end(),
-                                                  [&](const auto& candidate) {
-                                                      return candidate.role == art.role;
-                                                  });
-                if (!replaced) item.artwork.push_back(art);
+                const bool already_present = std::any_of(
+                    item.artwork.begin(), item.artwork.end(), [&](const auto& candidate) {
+                        return candidate.role == art.role && candidate.id == art.id;
+                    });
+                if (!already_present) item.artwork.push_back(art);
             }
             // A provider match may represent another local file for an item
             // already known to the catalogue. Preserve existing bindings here;

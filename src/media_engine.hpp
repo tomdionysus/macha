@@ -36,6 +36,7 @@ struct MediaStreamInfo {
     bool default_stream{};
     bool forced{};
     uint64_t bitrate{};
+    bool attached_picture{};
 };
 
 struct MediaProbeResult {

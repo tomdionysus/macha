@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.3 - 2026-08-19
+
+- treat FFmpeg `AV_DISPOSITION_ATTACHED_PIC` streams as embedded artwork rather than playable video, so audio files with APIC/cover images remain audio-only during playback negotiation and can direct-play as MP3 where client capabilities allow;
+- ingest embedded audio cover art during the same tag-first catalogue probe and retain it alongside provider-supplied artwork instead of replacing one cover candidate with another;
+- make scanner artwork reconciliation identity-based (`role` + immutable object ID) rather than one-slot-per-role, allowing multiple cover candidates to coexist while still deduplicating identical artwork objects and repeated provider URLs.
+
 ## 0.12.2 - 2026-08-19
 
 - add Discogs as an optional authenticated fallback music metadata provider behind the existing `MetadataProvider` interface; MusicBrainz remains first choice, while Discogs can resolve release/track metadata and cover art when MusicBrainz misses or is temporarily unavailable;
