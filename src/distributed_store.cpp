@@ -84,7 +84,10 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
     if (nodes.empty())
         return false;
     const size_t target = std::min(n_.config().replication, nodes.size());
-    const size_t need = quorum(target);
+    const size_t floor = n_.config().min_write_replicas;
+    const size_t need = std::max(quorum(target), floor);
+    if (nodes.size() < floor)
+        return false;
 
     Writer writer;
     writer.fixed(id.bytes);
@@ -96,12 +99,13 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
         std::optional<AsyncRpc> rpc;
         Clock::time_point started{};
         bool done{};
+        bool spilled{};
     };
 
     std::vector<PendingPut> pending;
     pending.reserve(nodes.size());
     size_t success = 0;
-    size_t failed_replicas = 0;
+    size_t replacement_needed = 0;
     size_t next_fallback = target;
     std::chrono::milliseconds local_store_time{};
     std::chrono::milliseconds remote_max_time{};
@@ -114,6 +118,7 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
                        " bytes=" + std::to_string(data.size()) +
                        " replicas=" + std::to_string(target) +
                        " required=" + std::to_string(need) +
+                       " minimum=" + std::to_string(floor) +
                        " success=" + std::to_string(success) +
                        " local_ms=" + std::to_string(local_store_time.count()) +
                        " remote_max_ms=" + std::to_string(remote_max_time.count()) +
@@ -129,7 +134,7 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
             if (n_.local_store().put(id, data))
                 ++success;
             else
-                ++failed_replicas;
+                ++replacement_needed;
             local_store_time +=
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
             return;
@@ -141,7 +146,7 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
             item.rpc.emplace(n_.call_async(owner, MessageType::put_object, payload, FrameType::read_ahead));
             pending.push_back(std::move(item));
         } catch (...) {
-            ++failed_replicas;
+            ++replacement_needed;
         }
     };
 
@@ -163,8 +168,20 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
         for (auto& item : pending) {
             if (item.done || !item.rpc)
                 continue;
-            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+                if (!item.spilled && item.rpc->idle_for() >= n_.config().write_stall) {
+                    item.spilled = true;
+                    ++replacement_needed;
+                    progressed = true;
+                    if (Log::enabled(LogLevel::debug)) {
+                        Log::debug("object write stalled; spilling id=" + to_string(id) +
+                                   " peer=" + to_string(item.owner.id).substr(0, 12) +
+                                   " no_progress_ms=" +
+                                   std::to_string(item.rpc->idle_for().count()));
+                    }
+                }
                 continue;
+            }
 
             item.done = true;
             progressed = true;
@@ -179,35 +196,47 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
             if (ok) {
                 ++success;
                 note_network(data.size(), Clock::now() - item.started);
-            } else {
-                ++failed_replicas;
+            } else if (!item.spilled) {
+                ++replacement_needed;
             }
 
             if (success >= need)
                 return finish(true);
         }
 
-        while (failed_replicas && next_fallback < nodes.size() && success < need) {
-            --failed_replicas;
+        while (replacement_needed && next_fallback < nodes.size() && success < need) {
+            --replacement_needed;
             launch(nodes[next_fallback++]);
             progressed = true;
             if (success >= need)
                 return finish(true);
         }
 
+        size_t responsive_unfinished = 0;
         size_t unfinished = 0;
         for (const auto& item : pending) {
-            if (!item.done)
-                ++unfinished;
+            if (item.done)
+                continue;
+            ++unfinished;
+            if (!item.spilled)
+                ++responsive_unfinished;
         }
-        if (success + unfinished + (nodes.size() - next_fallback) < need)
+
+        // Preserve the normal replica quorum while responsive candidates can
+        // still satisfy it. Once every remaining path to that quorum is a
+        // stalled PUT that has already been hedged, allow the explicit durable
+        // floor to commit and let repair restore desired placement later.
+        if (success >= floor && success + responsive_unfinished < need)
+            return finish(true);
+
+        if (success + unfinished + (nodes.size() - next_fallback) < floor)
             break;
 
         if (!progressed)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    return finish(success >= need);
+    return finish(success >= floor);
 }
 
 bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,
