@@ -27,6 +27,7 @@ struct MediaProbe {
     std::string media_id;
     std::string title;
     std::optional<int32_t> year;
+    std::optional<std::string> edition;
     std::string series;
     std::optional<int32_t> season;
     std::optional<int32_t> episode;
@@ -39,6 +40,24 @@ struct MediaProbe {
     std::optional<std::string> musicbrainz_artist_id;
 };
 
+struct MediaProbeCandidate {
+    MediaProbe probe;
+    int score{};
+    std::string generator;
+    std::vector<std::string> evidence;
+};
+
+class MediaProbeCandidateGenerator {
+  public:
+    virtual ~MediaProbeCandidateGenerator() = default;
+    virtual std::string_view name() const noexcept = 0;
+    virtual std::vector<MediaProbeCandidate> generate(std::string_view root,
+                                                       std::string_view path,
+                                                       const FsEntry&) const = 0;
+};
+
+std::vector<MediaProbeCandidate> probe_media_candidates(std::string_view path, const FsEntry&,
+                                                        std::string_view root = {});
 std::optional<MediaProbe> probe_media_path(std::string_view path, const FsEntry&);
 
 struct RemoteArtwork {
@@ -134,8 +153,14 @@ class CatalogueScanProvider {
     virtual ~CatalogueScanProvider() = default;
     virtual std::string_view name() const noexcept = 0;
     virtual const std::vector<std::string>& roots() const noexcept = 0;
-    virtual std::optional<MediaProbe> probe(FileSystem&, std::string_view root,
-                                            std::string_view path, const FsEntry&) = 0;
+    virtual std::vector<MediaProbeCandidate> probe_candidates(FileSystem&, std::string_view root,
+                                                                std::string_view path, const FsEntry&) = 0;
+    std::optional<MediaProbe> probe(FileSystem& fs, std::string_view root,
+                                    std::string_view path, const FsEntry& entry) {
+        auto candidates = probe_candidates(fs, root, path, entry);
+        if (candidates.empty()) return {};
+        return std::move(candidates.front().probe);
+    }
     virtual std::optional<ProviderMatch> lookup(const MediaProbe&) = 0;
 };
 
@@ -147,8 +172,8 @@ class MovieScanProvider final : public CatalogueScanProvider {
     MovieScanProvider(HttpClient&, CatalogueMovieProviderConfig);
     std::string_view name() const noexcept override { return "movies"; }
     const std::vector<std::string>& roots() const noexcept override { return roots_; }
-    std::optional<MediaProbe> probe(FileSystem&, std::string_view, std::string_view,
-                                    const FsEntry&) override;
+    std::vector<MediaProbeCandidate> probe_candidates(FileSystem&, std::string_view, std::string_view,
+                                                        const FsEntry&) override;
     std::optional<ProviderMatch> lookup(const MediaProbe& probe) override {
         return metadata_ ? metadata_->lookup(probe) : std::nullopt;
     }
@@ -162,8 +187,8 @@ class TvScanProvider final : public CatalogueScanProvider {
     TvScanProvider(HttpClient&, CatalogueTvProviderConfig);
     std::string_view name() const noexcept override { return "tv"; }
     const std::vector<std::string>& roots() const noexcept override { return roots_; }
-    std::optional<MediaProbe> probe(FileSystem&, std::string_view, std::string_view,
-                                    const FsEntry&) override;
+    std::vector<MediaProbeCandidate> probe_candidates(FileSystem&, std::string_view, std::string_view,
+                                                        const FsEntry&) override;
     std::optional<ProviderMatch> lookup(const MediaProbe& probe) override {
         return metadata_ ? metadata_->lookup(probe) : std::nullopt;
     }
@@ -177,8 +202,8 @@ class MusicScanProvider final : public CatalogueScanProvider {
     MusicScanProvider(HttpClient&, CatalogueMusicProviderConfig);
     std::string_view name() const noexcept override { return "music"; }
     const std::vector<std::string>& roots() const noexcept override { return roots_; }
-    std::optional<MediaProbe> probe(FileSystem&, std::string_view, std::string_view,
-                                    const FsEntry&) override;
+    std::vector<MediaProbeCandidate> probe_candidates(FileSystem&, std::string_view, std::string_view,
+                                                        const FsEntry&) override;
     std::optional<ProviderMatch> lookup(const MediaProbe& probe) override {
         return metadata_ ? metadata_->lookup(probe) : std::nullopt;
     }
