@@ -4,6 +4,7 @@
 
 #include "crypto.hpp"
 #include "log.hpp"
+#include "macha_version.hpp"
 
 #include <curl/curl.h>
 
@@ -285,9 +286,9 @@ void apply_audio_metadata(FileSystem& fs, std::string_view path, const FsEntry& 
     }
 
     probe.title = metadata_value(format, {"title"});
-    auto album_artist = metadata_value(format, {"album artist", "album_artist", "albumartist"});
-    auto track_artist = metadata_value(format, {"artist"});
-    probe.artist = album_artist.empty() ? std::move(track_artist) : std::move(album_artist);
+    probe.album_artist = metadata_value(format, {"album artist", "album_artist", "albumartist"});
+    probe.track_artist = metadata_value(format, {"artist"});
+    probe.artist = probe.album_artist.empty() ? probe.track_artist : probe.album_artist;
     probe.album = metadata_value(format, {"album"});
     if (auto value = metadata_value(format, {"track", "tracknumber"}); !value.empty())
         probe.track = leading_integer(value);
@@ -315,8 +316,8 @@ void apply_audio_metadata(FileSystem& fs, std::string_view path, const FsEntry& 
     avio_context_free(&io);
 }
 
-std::optional<MediaProbe> probe_music_path(FileSystem& fs, std::string_view root,
-                                           std::string_view path, const FsEntry& entry) {
+std::optional<MediaProbe> read_music_metadata_probe(FileSystem& fs, std::string_view path,
+                                                     const FsEntry& entry) {
     if (entry.type != EntryType::file || entry.size == 0 ||
         !audio_extension(extension(path)))
         return {};
@@ -331,25 +332,6 @@ std::optional<MediaProbe> probe_music_path(FileSystem& fs, std::string_view root
         Log::debug("catalogue music tags unavailable path=" + std::string(path) +
                    " reason=" + e.what());
     }
-
-    // Embedded tags remain authoritative. Candidate generators provide only
-    // missing path-derived fields, so adding a new filename/layout heuristic
-    // can never silently override sane file metadata.
-    auto candidates = probe_media_candidates(path, entry, root);
-    auto fallback = std::find_if(candidates.begin(), candidates.end(), [](const auto& candidate) {
-        return candidate.probe.kind == MediaProbeKind::track;
-    });
-    if (fallback != candidates.end()) {
-        const auto& path_probe = fallback->probe;
-        if (probe.title.empty()) probe.title = path_probe.title;
-        if (probe.artist.empty()) probe.artist = path_probe.artist;
-        if (probe.album.empty()) probe.album = path_probe.album;
-        if (!probe.disc) probe.disc = path_probe.disc;
-        if (!probe.track) probe.track = path_probe.track;
-        if (!probe.year) probe.year = path_probe.year;
-    }
-
-    if (probe.title.empty() && !probe.musicbrainz_recording_id) return {};
     return probe;
 }
 
@@ -564,15 +546,17 @@ std::string title_for_movie_year(std::string core, const YearPosition& year) {
 bool same_probe_identity(const MediaProbe& a, const MediaProbe& b) {
     return a.kind == b.kind && a.title == b.title && a.year == b.year && a.edition == b.edition &&
            a.series == b.series && a.season == b.season && a.episode == b.episode &&
-           a.artist == b.artist && a.album == b.album && a.disc == b.disc && a.track == b.track;
+           a.artist == b.artist && a.album == b.album && a.disc == b.disc && a.track == b.track &&
+           a.lookup_strategy == b.lookup_strategy;
 }
 
 class SemanticMovieCandidateGenerator final : public MediaProbeCandidateGenerator {
   public:
     std::string_view name() const noexcept override { return "movie-semantic"; }
 
-    std::vector<MediaProbeCandidate> generate(std::string_view, std::string_view path,
-                                               const FsEntry& entry) const override {
+    std::vector<MediaProbeCandidate> generate(const MediaProbeContext& context) const override {
+        const auto path = context.path;
+        const auto& entry = context.entry;
         if (!video_extension(extension(path)) || episode_pattern(stem(path))) return {};
         auto core = strip_release_noise(stem(path));
         auto [without_edition, edition] = strip_movie_edition(core);
@@ -637,8 +621,9 @@ class SemanticMovieCandidateGenerator final : public MediaProbeCandidateGenerato
 class CompactMovieTitleCandidateGenerator final : public MediaProbeCandidateGenerator {
   public:
     std::string_view name() const noexcept override { return "movie-compact-title"; }
-    std::vector<MediaProbeCandidate> generate(std::string_view, std::string_view path,
-                                               const FsEntry& entry) const override {
+    std::vector<MediaProbeCandidate> generate(const MediaProbeContext& context) const override {
+        const auto path = context.path;
+        const auto& entry = context.entry;
         if (!video_extension(extension(path)) || episode_pattern(stem(path))) return {};
         const auto raw = stem(path);
         static const std::regex prefixed_compact(
@@ -660,8 +645,9 @@ class CompactMovieTitleCandidateGenerator final : public MediaProbeCandidateGene
 class LegacyMovieCandidateGenerator final : public MediaProbeCandidateGenerator {
   public:
     std::string_view name() const noexcept override { return "movie-legacy"; }
-    std::vector<MediaProbeCandidate> generate(std::string_view, std::string_view path,
-                                               const FsEntry& entry) const override {
+    std::vector<MediaProbeCandidate> generate(const MediaProbeContext& context) const override {
+        const auto path = context.path;
+        const auto& entry = context.entry;
         if (!video_extension(extension(path)) || episode_pattern(stem(path))) return {};
         auto probe = make_probe(path, entry, MediaProbeKind::movie);
         probe.year = year_from(stem(path));
@@ -674,8 +660,9 @@ class LegacyMovieCandidateGenerator final : public MediaProbeCandidateGenerator 
 class FilenameEpisodeCandidateGenerator final : public MediaProbeCandidateGenerator {
   public:
     std::string_view name() const noexcept override { return "episode-filename"; }
-    std::vector<MediaProbeCandidate> generate(std::string_view, std::string_view path,
-                                               const FsEntry& entry) const override {
+    std::vector<MediaProbeCandidate> generate(const MediaProbeContext& context) const override {
+        const auto path = context.path;
+        const auto& entry = context.entry;
         if (!video_extension(extension(path))) return {};
         auto pattern = episode_pattern(stem(path));
         if (!pattern || clean_series_name(pattern->prefix).empty()) return {};
@@ -710,11 +697,28 @@ class FilenameEpisodeCandidateGenerator final : public MediaProbeCandidateGenera
     }
 };
 
+class YearlessFilenameEpisodeCandidateGenerator final : public MediaProbeCandidateGenerator {
+  public:
+    std::string_view name() const noexcept override { return "episode-filename-yearless"; }
+    std::vector<MediaProbeCandidate> generate(const MediaProbeContext& context) const override {
+        FilenameEpisodeCandidateGenerator filename;
+        auto candidates = filename.generate(context);
+        if (candidates.empty() || !candidates.front().probe.year) return {};
+        auto candidate = std::move(candidates.front());
+        candidate.probe.year.reset();
+        candidate.score -= 45;
+        candidate.generator = std::string(name());
+        candidate.evidence.push_back("yearless provider fallback for ambiguous TV premiere year");
+        return {std::move(candidate)};
+    }
+};
+
 class DirectoryEpisodeCandidateGenerator final : public MediaProbeCandidateGenerator {
   public:
     std::string_view name() const noexcept override { return "episode-directory"; }
-    std::vector<MediaProbeCandidate> generate(std::string_view, std::string_view path,
-                                               const FsEntry& entry) const override {
+    std::vector<MediaProbeCandidate> generate(const MediaProbeContext& context) const override {
+        const auto path = context.path;
+        const auto& entry = context.entry;
         if (!video_extension(extension(path))) return {};
         auto pattern = episode_pattern(stem(path));
         if (!pattern) return {};
@@ -753,8 +757,10 @@ class DirectoryEpisodeCandidateGenerator final : public MediaProbeCandidateGener
 class StructuredMusicCandidateGenerator final : public MediaProbeCandidateGenerator {
   public:
     std::string_view name() const noexcept override { return "music-structured-path"; }
-    std::vector<MediaProbeCandidate> generate(std::string_view root, std::string_view path,
-                                               const FsEntry& entry) const override {
+    std::vector<MediaProbeCandidate> generate(const MediaProbeContext& context) const override {
+        const auto root = context.root;
+        const auto path = context.path;
+        const auto& entry = context.entry;
         if (!audio_extension(extension(path))) return {};
         auto probe = make_probe(path, entry, MediaProbeKind::track);
         auto title_candidate = stem(path);
@@ -828,13 +834,140 @@ class StructuredMusicCandidateGenerator final : public MediaProbeCandidateGenera
     }
 };
 
+bool has_embedded_music_tags(const MediaProbe& probe) {
+    return !probe.title.empty() || !probe.artist.empty() || !probe.album.empty() ||
+           probe.track || probe.disc || probe.year || probe.musicbrainz_recording_id ||
+           probe.musicbrainz_release_id || probe.musicbrainz_artist_id;
+}
+
+class RecordingFirstStructuredMusicCandidateGenerator final : public MediaProbeCandidateGenerator {
+  public:
+    std::string_view name() const noexcept override { return "music-structured-recording"; }
+    std::vector<MediaProbeCandidate> generate(const MediaProbeContext& context) const override {
+        StructuredMusicCandidateGenerator structured;
+        auto candidates = structured.generate(context);
+        std::vector<MediaProbeCandidate> out;
+        for (auto& candidate : candidates) {
+            if (candidate.probe.artist.empty() || candidate.probe.title.empty()) continue;
+            candidate.probe.lookup_strategy = MediaProbeLookupStrategy::music_recording_first;
+            candidate.score -= 20;
+            candidate.generator = std::string(name());
+            candidate.evidence.push_back("recording-first fallback for structured path metadata");
+            out.push_back(std::move(candidate));
+        }
+        return out;
+    }
+};
+
+class EmbeddedMusicTagsCandidateGenerator final : public MediaProbeCandidateGenerator {
+  public:
+    std::string_view name() const noexcept override { return "music-embedded-tags"; }
+    std::vector<MediaProbeCandidate> generate(const MediaProbeContext& context) const override {
+        if (!context.embedded_metadata || context.embedded_metadata->kind != MediaProbeKind::track ||
+            !has_embedded_music_tags(*context.embedded_metadata))
+            return {};
+        auto probe = *context.embedded_metadata;
+        if (probe.title.empty() && !probe.musicbrainz_recording_id) return {};
+        probe.lookup_strategy = (probe.musicbrainz_release_id || !probe.album.empty())
+            ? MediaProbeLookupStrategy::music_release_first
+            : MediaProbeLookupStrategy::music_recording_first;
+        int score = 900;
+        if (!probe.title.empty()) score += 35;
+        if (!probe.artist.empty()) score += 35;
+        if (!probe.album.empty()) score += 35;
+        if (probe.track) score += 15;
+        if (probe.musicbrainz_release_id) score += 120;
+        if (probe.musicbrainz_recording_id) score += 140;
+        return {{std::move(probe), score, std::string(name()),
+                 {"embedded audio metadata", "embedded tags remain authoritative"}}};
+    }
+};
+
+class RecordingFirstMusicTagsCandidateGenerator final : public MediaProbeCandidateGenerator {
+  public:
+    std::string_view name() const noexcept override { return "music-recording-tags"; }
+    std::vector<MediaProbeCandidate> generate(const MediaProbeContext& context) const override {
+        if (!context.embedded_metadata || context.embedded_metadata->kind != MediaProbeKind::track ||
+            !has_embedded_music_tags(*context.embedded_metadata))
+            return {};
+        auto probe = *context.embedded_metadata;
+        if (!probe.track_artist.empty()) probe.artist = probe.track_artist;
+        if ((probe.artist.empty() || probe.title.empty()) && !probe.musicbrainz_recording_id)
+            return {};
+        probe.lookup_strategy = MediaProbeLookupStrategy::music_recording_first;
+        int score = 860;
+        if (!probe.track_artist.empty()) score += 45;
+        if (!probe.album.empty()) score += 20;
+        if (probe.musicbrainz_recording_id) score += 180;
+        return {{std::move(probe), score, std::string(name()),
+                 {"recording-first MusicBrainz hypothesis",
+                  "track artist preferred over album artist for recording search"}}};
+    }
+};
+
+class TagsWithStructuredPathMusicCandidateGenerator final : public MediaProbeCandidateGenerator {
+  public:
+    std::string_view name() const noexcept override { return "music-tags-plus-path"; }
+    std::vector<MediaProbeCandidate> generate(const MediaProbeContext& context) const override {
+        if (!context.embedded_metadata || context.embedded_metadata->kind != MediaProbeKind::track ||
+            !has_embedded_music_tags(*context.embedded_metadata))
+            return {};
+        StructuredMusicCandidateGenerator structured;
+        auto path_candidates = structured.generate(context);
+        std::vector<MediaProbeCandidate> out;
+        for (const auto& path_candidate : path_candidates) {
+            auto probe = *context.embedded_metadata;
+            const auto& path_probe = path_candidate.probe;
+            bool filled = false;
+            if (probe.title.empty() && !path_probe.title.empty()) {
+                probe.title = path_probe.title;
+                filled = true;
+            }
+            if (probe.artist.empty() && !path_probe.artist.empty()) {
+                probe.artist = path_probe.artist;
+                filled = true;
+            }
+            if (probe.album.empty() && !path_probe.album.empty()) {
+                probe.album = path_probe.album;
+                filled = true;
+            }
+            if (!probe.disc && path_probe.disc) {
+                probe.disc = path_probe.disc;
+                filled = true;
+            }
+            if (!probe.track && path_probe.track) {
+                probe.track = path_probe.track;
+                filled = true;
+            }
+            if (!probe.year && path_probe.year) {
+                probe.year = path_probe.year;
+                filled = true;
+            }
+            if (!filled || (probe.title.empty() && !probe.musicbrainz_recording_id)) continue;
+            probe.lookup_strategy = (probe.musicbrainz_release_id || !probe.album.empty())
+                ? MediaProbeLookupStrategy::music_release_first
+                : MediaProbeLookupStrategy::music_recording_first;
+            int score = 760 + (!probe.artist.empty() ? 35 : 0) + (!probe.album.empty() ? 35 : 0) +
+                        (probe.track ? 20 : 0) + (probe.disc ? 10 : 0);
+            out.push_back({std::move(probe), score, std::string(name()),
+                           {"embedded tags supplemented by structured path evidence"}});
+        }
+        return out;
+    }
+};
+
 std::vector<std::unique_ptr<MediaProbeCandidateGenerator>> default_candidate_generators() {
     std::vector<std::unique_ptr<MediaProbeCandidateGenerator>> generators;
     generators.push_back(std::make_unique<FilenameEpisodeCandidateGenerator>());
+    generators.push_back(std::make_unique<YearlessFilenameEpisodeCandidateGenerator>());
     generators.push_back(std::make_unique<DirectoryEpisodeCandidateGenerator>());
     generators.push_back(std::make_unique<SemanticMovieCandidateGenerator>());
     generators.push_back(std::make_unique<CompactMovieTitleCandidateGenerator>());
     generators.push_back(std::make_unique<LegacyMovieCandidateGenerator>());
+    generators.push_back(std::make_unique<EmbeddedMusicTagsCandidateGenerator>());
+    generators.push_back(std::make_unique<RecordingFirstMusicTagsCandidateGenerator>());
+    generators.push_back(std::make_unique<TagsWithStructuredPathMusicCandidateGenerator>());
+    generators.push_back(std::make_unique<RecordingFirstStructuredMusicCandidateGenerator>());
     generators.push_back(std::make_unique<StructuredMusicCandidateGenerator>());
     return generators;
 }
@@ -1011,6 +1144,11 @@ bool has_art_role(const CatalogueItem* item, std::string_view role) {
 }
 
 
+class ProviderBudgetExhausted final : public std::runtime_error {
+  public:
+    ProviderBudgetExhausted() : std::runtime_error("catalogue provider request budget exhausted") {}
+};
+
 class BudgetHttpClient final : public HttpClient {
     HttpClient& upstream_;
     size_t limit_{};
@@ -1032,6 +1170,7 @@ class BudgetHttpClient final : public HttpClient {
 
     RemoteHttpResponse get(std::string_view url, const std::vector<std::string>& headers,
                            size_t maximum_bytes) override {
+        if (exhausted()) throw ProviderBudgetExhausted();
         ++used_;
         return upstream_.get(url, headers, maximum_bytes);
     }
@@ -1039,14 +1178,12 @@ class BudgetHttpClient final : public HttpClient {
 
 } // namespace
 
-std::vector<MediaProbeCandidate> probe_media_candidates(std::string_view path,
-                                                        const FsEntry& entry,
-                                                        std::string_view root) {
-    if (entry.type != EntryType::file || entry.size == 0) return {};
+std::vector<MediaProbeCandidate> probe_media_candidates(const MediaProbeContext& context) {
+    if (context.entry.type != EntryType::file || context.entry.size == 0) return {};
     static const auto generators = default_candidate_generators();
     std::vector<MediaProbeCandidate> candidates;
     for (const auto& generator : generators) {
-        auto generated = generator->generate(root, path, entry);
+        auto generated = generator->generate(context);
         for (auto& candidate : generated) {
             bool valid = false;
             switch (candidate.probe.kind) {
@@ -1084,6 +1221,12 @@ std::vector<MediaProbeCandidate> probe_media_candidates(std::string_view path,
     return candidates;
 }
 
+std::vector<MediaProbeCandidate> probe_media_candidates(std::string_view path,
+                                                        const FsEntry& entry,
+                                                        std::string_view root) {
+    return probe_media_candidates(MediaProbeContext{root, path, entry, nullptr});
+}
+
 std::optional<MediaProbe> probe_media_path(std::string_view path, const FsEntry& entry) {
     auto candidates = probe_media_candidates(path, entry);
     if (candidates.empty()) return {};
@@ -1115,7 +1258,8 @@ RemoteHttpResponse CurlHttpClient::get(std::string_view url, const std::vector<s
     curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, 5000L);
     curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, 20000L);
     curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "Macha/0.11.0 (https://github.com/tomdionysus/macha)");
+    const auto user_agent = std::string("Macha/") + std::string(kServerVersion) + " (https://github.com/tomdionysus/macha)";
+    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, user_agent.c_str());
     curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, curl_cancelled);
     curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &stop_requested_);
@@ -1149,6 +1293,17 @@ Json TmdbProvider::api(std::string_view path,
                        const std::vector<std::pair<std::string, std::string>>& query) {
     auto response = http_.get(query_url("https://api.themoviedb.org/3" + std::string(path), query),
                               {"Authorization: Bearer " + token_, "Accept: application/json"});
+    if (response.status != 200)
+        throw std::runtime_error("TMDB returned HTTP " + std::to_string(response.status));
+    return Json::parse(std::string_view(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
+}
+
+std::optional<Json> TmdbProvider::api_optional(
+    std::string_view path,
+    const std::vector<std::pair<std::string, std::string>>& query) {
+    auto response = http_.get(query_url("https://api.themoviedb.org/3" + std::string(path), query),
+                              {"Authorization: Bearer " + token_, "Accept: application/json"});
+    if (response.status == 404) return {};
     if (response.status != 200)
         throw std::runtime_error("TMDB returned HTTP " + std::to_string(response.status));
     return Json::parse(std::string_view(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
@@ -1233,15 +1388,17 @@ std::optional<ProviderMatch> TmdbProvider::lookup(const MediaProbe& probe) {
     if (!sid) return {};
     const auto series_id = std::to_string(*sid);
     const auto season_key = series_id + "|" + std::to_string(*probe.season);
-    Json season_json;
-    if (auto it = season_cache_.find(season_key); it != season_cache_.end()) season_json = it->second;
-    else {
-        season_json = api("/tv/" + series_id + "/season/" + std::to_string(*probe.season),
-                          {{"language", config_.language}});
+    std::optional<Json> season_json;
+    if (auto it = season_cache_.find(season_key); it != season_cache_.end()) {
+        season_json = it->second;
+    } else {
+        season_json = api_optional("/tv/" + series_id + "/season/" + std::to_string(*probe.season),
+                                   {{"language", config_.language}});
         season_cache_[season_key] = season_json;
     }
+    if (!season_json) return {};
     const Json* episode_json = nullptr;
-    if (auto episodes = season_json.find("episodes"); episodes && episodes->isArray()) {
+    if (auto episodes = season_json->find("episodes"); episodes && episodes->isArray()) {
         for (const auto& episode : episodes->asArray()) {
             auto n = json_i32(episode.find("episode_number"));
             if (n && *n == *probe.episode) { episode_json = &episode; break; }
@@ -1263,13 +1420,13 @@ std::optional<ProviderMatch> TmdbProvider::lookup(const MediaProbe& probe) {
     CatalogueItem season;
     season.id = item_id("tmdb", "season", series_id + ":" + std::to_string(*probe.season));
     season.kind = CatalogueKind::season;
-    season.title = json_string(season_json.find("name"));
+    season.title = json_string(season_json->find("name"));
     if (season.title.empty()) season.title = "Season " + std::to_string(*probe.season);
     season.sort_title = season.title;
-    season.synopsis = json_string(season_json.find("overview"));
+    season.synopsis = json_string(season_json->find("overview"));
     season.parent_id = show.id;
     season.season_number = probe.season;
-    season.external_ids["tmdb"] = json_i32(season_json.find("id")) ? std::to_string(*json_i32(season_json.find("id"))) : season.id;
+    season.external_ids["tmdb"] = json_i32(season_json->find("id")) ? std::to_string(*json_i32(season_json->find("id"))) : season.id;
     scanner_marker(season);
 
     CatalogueItem episode;
@@ -1290,7 +1447,7 @@ std::optional<ProviderMatch> TmdbProvider::lookup(const MediaProbe& probe) {
     match.items = {show, season, episode};
     add_art(match.artwork, show.id, "poster", image_url(json_string(show_json->find("poster_path"))));
     add_art(match.artwork, show.id, "backdrop", image_url(json_string(show_json->find("backdrop_path"))));
-    add_art(match.artwork, season.id, "poster", image_url(json_string(season_json.find("poster_path"))));
+    add_art(match.artwork, season.id, "poster", image_url(json_string(season_json->find("poster_path"))));
     add_art(match.artwork, episode.id, "still", image_url(json_string(episode_json->find("still_path"))));
     return match;
 }
@@ -1315,7 +1472,7 @@ Json MusicBrainzProvider::api(std::string_view path,
             std::this_thread::sleep_for(std::min(remaining, slice));
         }
     }
-    auto ua = "Macha/0.11.0 (" + config_.contact + ")";
+    auto ua = std::string("Macha/") + std::string(kServerVersion) + " (" + config_.contact + ")";
     auto q = query;
     q.emplace_back("fmt", "json");
     auto response = http_.get(query_url("https://musicbrainz.org/ws/2" + std::string(path), q),
@@ -1452,27 +1609,41 @@ std::optional<ProviderMatch> MusicBrainzProvider::lookup(const MediaProbe& probe
 
     std::optional<Json> recording_detail;
     std::optional<Json> release;
-    if (probe.musicbrainz_release_id || (!probe.artist.empty() && !probe.album.empty())) {
-        release = find_release(probe);
-    } else if (probe.musicbrainz_recording_id || (!probe.artist.empty() && !probe.title.empty())) {
+    auto resolve_recording_first = [&] {
         recording_detail = find_recording(probe);
-        if (recording_detail) {
-            std::string release_id;
-            if (auto releases = recording_detail->find("releases"); releases && releases->isArray()) {
-                for (const auto& candidate : releases->asArray()) {
-                    if (!candidate.isObject()) continue;
-                    const auto candidate_id = json_string(candidate.find("id"));
-                    if (candidate_id.empty()) continue;
-                    if (release_id.empty()) release_id = candidate_id;
-                    if (!probe.album.empty() &&
-                        normalized(json_string(candidate.find("title"))) == normalized(probe.album)) {
-                        release_id = candidate_id;
-                        break;
-                    }
+        if (!recording_detail) return;
+        std::string release_id;
+        int best_release_score = -1;
+        if (auto releases = recording_detail->find("releases"); releases && releases->isArray()) {
+            for (const auto& candidate : releases->asArray()) {
+                if (!candidate.isObject()) continue;
+                const auto candidate_id = json_string(candidate.find("id"));
+                if (candidate_id.empty()) continue;
+                int score = release_id.empty() ? 1 : 0;
+                if (!probe.album.empty())
+                    score += title_similarity(probe.album, json_string(candidate.find("title")));
+                if (score > best_release_score) {
+                    best_release_score = score;
+                    release_id = candidate_id;
                 }
             }
-            if (!release_id.empty()) release = release_by_id(release_id);
         }
+        if (!release_id.empty()) release = release_by_id(release_id);
+    };
+
+    switch (probe.lookup_strategy) {
+        case MediaProbeLookupStrategy::music_recording_first:
+            resolve_recording_first();
+            break;
+        case MediaProbeLookupStrategy::music_release_first:
+            release = find_release(probe);
+            break;
+        case MediaProbeLookupStrategy::automatic:
+            if (probe.musicbrainz_release_id || (!probe.artist.empty() && !probe.album.empty()))
+                release = find_release(probe);
+            else
+                resolve_recording_first();
+            break;
     }
     if (!release) return {};
 
@@ -1635,10 +1806,15 @@ MusicScanProvider::MusicScanProvider(HttpClient& http, CatalogueMusicProviderCon
 
 std::vector<MediaProbeCandidate> MusicScanProvider::probe_candidates(
     FileSystem& fs, std::string_view root, std::string_view path, const FsEntry& entry) {
-    auto probe = probe_music_path(fs, root, path, entry);
-    if (!probe) return {};
-    return {{std::move(*probe), 1000, "music-tags-plus-path",
-             {"embedded tags preferred; candidate path fills missing fields"}}};
+    auto embedded = read_music_metadata_probe(fs, path, entry);
+    if (!embedded) return {};
+    MediaProbeContext context{root, path, entry, &*embedded};
+    auto candidates = probe_media_candidates(context);
+    std::erase_if(candidates, [](const auto& candidate) {
+        return candidate.probe.kind != MediaProbeKind::track;
+    });
+    if (candidates.size() > 6) candidates.resize(6);
+    return candidates;
 }
 
 CatalogueScanner::CatalogueScanner(NodeRuntime& node, FileSystem& fs, CatalogueManager& catalogue,
@@ -1652,6 +1828,7 @@ CatalogueScanner::~CatalogueScanner() { stop(); }
 
 void CatalogueScanner::configure_providers() {
     providers_.clear();
+    provider_resume_after_.clear();
     if (config_.movies.enabled)
         providers_.push_back(std::make_unique<MovieScanProvider>(*provider_http_, config_.movies));
     if (config_.tv.enabled)
@@ -1781,34 +1958,48 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
     size_t matched = 0;
     size_t provider_items_processed = 0;
     bool provider_budget_exhausted = false;
-    for (const auto& pending : probes) {
-        if (stop.stop_requested()) return 0;
-        if (budget_http->exhausted()) {
-            provider_budget_exhausted = true;
-            break;
-        }
 
-        std::optional<ProviderMatch> match;
-        const MediaProbeCandidate* selected = nullptr;
-        size_t attempted = 0;
-        constexpr size_t max_candidate_attempts = 3;
-        for (const auto& candidate : pending.candidates) {
-            if (attempted >= max_candidate_attempts || budget_http->exhausted()) break;
-            try {
-                match = pending.provider->lookup(candidate.probe);
-            } catch (const std::exception& e) {
-                if (stop.stop_requested()) return 0;
-                Log::warn("catalogue " + std::string(pending.provider->name()) +
-                          " lookup failed for " + pending.path + " candidate=" +
-                          candidate.generator + ": " + e.what());
-            }
-            ++attempted;
-            if (match) {
-                selected = &candidate;
-                break;
+    struct ProviderQueueItem {
+        const PendingProbe* pending{};
+        size_t candidate_next{};
+        size_t attempted{};
+    };
+    struct ProviderQueue {
+        CatalogueScanProvider* provider{};
+        std::vector<ProviderQueueItem> items;
+        size_t next{};
+    };
+    std::vector<ProviderQueue> provider_queues;
+    provider_queues.reserve(providers_.size());
+    for (const auto& provider : providers_) {
+        ProviderQueue queue;
+        queue.provider = provider.get();
+        for (const auto& pending : probes)
+            if (pending.provider == provider.get()) queue.items.push_back({&pending});
+        std::sort(queue.items.begin(), queue.items.end(), [](const auto& a, const auto& b) {
+            return a.pending->path < b.pending->path;
+        });
+        if (!queue.items.empty()) {
+            const auto resume = provider_resume_after_.find(std::string(provider->name()));
+            if (resume != provider_resume_after_.end() && !resume->second.empty()) {
+                auto first = std::upper_bound(
+                    queue.items.begin(), queue.items.end(), resume->second,
+                    [](const std::string& path, const ProviderQueueItem& item) {
+                        return path < item.pending->path;
+                    });
+                if (first != queue.items.end())
+                    std::rotate(queue.items.begin(), first, queue.items.end());
             }
         }
+        provider_queues.push_back(std::move(queue));
+    }
+
+    auto finish_pending = [&](ProviderQueueItem& state,
+                              std::optional<ProviderMatch> match,
+                              const MediaProbeCandidate* selected) {
+        const auto& pending = *state.pending;
         ++provider_items_processed;
+        provider_resume_after_[std::string(pending.provider->name())] = pending.path;
 
         const auto& primary = pending.candidates.front();
         const auto& probe = selected ? selected->probe : primary.probe;
@@ -1828,14 +2019,10 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
                        << probe.album << "\" title=\"" << probe.title << "\"";
             }
             parsed << " candidate=" << primary.generator << " score=" << primary.score;
-            if (attempted > 1) parsed << " alternatives_tried=" << attempted;
+            if (state.attempted > 1) parsed << " alternatives_tried=" << state.attempted;
             Log::debug("catalogue: no " + std::string(pending.provider->name()) +
                        " provider match for " + pending.path + " parsed " + parsed.str());
-            if (budget_http->exhausted()) {
-                provider_budget_exhausted = true;
-                break;
-            }
-            continue;
+            return;
         }
         if (selected && selected != &primary) {
             Log::debug("catalogue: " + std::string(pending.provider->name()) +
@@ -1848,17 +2035,84 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
             auto [it, inserted] = discovered.emplace(item.id, item);
             if (!inserted) {
                 for (const auto& media : item.media_ids)
-                    if (std::find(it->second.media_ids.begin(), it->second.media_ids.end(), media) == it->second.media_ids.end())
+                    if (std::find(it->second.media_ids.begin(), it->second.media_ids.end(), media) ==
+                        it->second.media_ids.end())
                         it->second.media_ids.push_back(media);
             }
         }
         remote_art.insert(remote_art.end(), match->artwork.begin(), match->artwork.end());
+    };
+
+    enum class PendingStepResult {
+        retry,
+        complete,
+        budget_exhausted,
+    };
+
+    auto process_pending_step = [&](ProviderQueueItem& state) -> PendingStepResult {
+        const auto& pending = *state.pending;
+        constexpr size_t max_candidate_attempts = 5;
+        if (state.candidate_next >= pending.candidates.size() ||
+            state.attempted >= max_candidate_attempts) {
+            finish_pending(state, {}, nullptr);
+            return PendingStepResult::complete;
+        }
+        if (budget_http->exhausted()) return PendingStepResult::budget_exhausted;
+
+        const auto& candidate = pending.candidates[state.candidate_next];
+        std::optional<ProviderMatch> match;
+        try {
+            match = pending.provider->lookup(candidate.probe);
+        } catch (const ProviderBudgetExhausted&) {
+            return PendingStepResult::budget_exhausted;
+        } catch (const std::exception& e) {
+            if (stop.stop_requested()) return PendingStepResult::retry;
+            Log::warn("catalogue " + std::string(pending.provider->name()) +
+                      " lookup failed for " + pending.path + " candidate=" +
+                      candidate.generator + ": " + e.what());
+        }
+        ++state.attempted;
+        ++state.candidate_next;
+
+        if (match) {
+            finish_pending(state, std::move(match), &candidate);
+            return PendingStepResult::complete;
+        }
+        if (state.candidate_next >= pending.candidates.size() ||
+            state.attempted >= max_candidate_attempts) {
+            finish_pending(state, {}, nullptr);
+            return PendingStepResult::complete;
+        }
+        return PendingStepResult::retry;
+    };
+
+    while (!provider_budget_exhausted) {
+        bool advanced = false;
+        for (auto& queue : provider_queues) {
+            if (queue.next >= queue.items.size()) continue;
+            if (budget_http->exhausted()) {
+                provider_budget_exhausted = true;
+                break;
+            }
+            advanced = true;
+            auto result = process_pending_step(queue.items[queue.next]);
+            if (result == PendingStepResult::complete) ++queue.next;
+            if (stop.stop_requested()) return 0;
+            if (result == PendingStepResult::budget_exhausted || budget_http->exhausted()) {
+                provider_budget_exhausted = true;
+                break;
+            }
+        }
+        if (!advanced) break;
     }
+
     if (provider_budget_exhausted) {
         provider_continuation_.store(true, std::memory_order_relaxed);
         Log::info("catalogue: provider request budget reached requests=" +
                   std::to_string(budget_http->used()) + " remaining_media=" +
                   std::to_string(probes.size() - provider_items_processed));
+    } else {
+        provider_resume_after_.clear();
     }
 
     for (const auto& art : remote_art) {

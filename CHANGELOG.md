@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.12.1 - 2026-08-19
+
+- make bounded catalogue provider work fair across Movies, TV and Music using round-robin per-provider queues and one candidate hypothesis per provider turn, with continuation cursors and a hard HTTP request ceiling;
+- add a yearless TV filename candidate and cache TMDB season 404s as semantic misses, so ambiguous premiere years can fall back without repeating the same failed season request for every episode;
+- promote embedded audio metadata into `MediaProbeContext` and resolve Music through distinct embedded-tag, recording-first, tags-plus-path and structured-path candidate generators instead of collapsing tags and paths into one interpretation;
+- preserve album artist and track artist independently, allowing compilation releases to be identified by album context while recording-first MusicBrainz lookup uses the actual track artist and retains the album as a release-selection hint;
+- derive catalogue-provider HTTP user agents from the server version rather than stale hard-coded release strings.
+
 ## 0.12.0 - 2026-08-19
 
 - replace single-pass movie/TV/path parsing with extensible scored `MediaProbeCandidateGenerator` implementations; keep multiple hypotheses with evidence, retain the legacy parser as a low-scoring fallback, and allow bounded provider fallback across the best distinct candidates;

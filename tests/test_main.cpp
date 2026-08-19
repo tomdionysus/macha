@@ -256,9 +256,17 @@ class FakeHttpClient final : public HttpClient {
     };
     std::vector<Route> routes_;
     std::atomic_size_t requests_{};
+    mutable std::mutex urls_mutex_;
+    std::vector<std::string> urls_;
 
   public:
     size_t requests() const noexcept { return requests_.load(); }
+    size_t requests_containing(std::string_view needle) const {
+        std::lock_guard lock(urls_mutex_);
+        return static_cast<size_t>(std::count_if(urls_.begin(), urls_.end(), [&](const auto& url) {
+            return url.find(needle) != std::string::npos;
+        }));
+    }
     void add(std::string contains, long status, std::string content_type, std::string body) {
         RemoteHttpResponse response;
         response.status = status;
@@ -272,6 +280,10 @@ class FakeHttpClient final : public HttpClient {
     }
     RemoteHttpResponse get(std::string_view url, const std::vector<std::string>&, size_t) override {
         requests_.fetch_add(1);
+        {
+            std::lock_guard lock(urls_mutex_);
+            urls_.emplace_back(url);
+        }
         for (const auto& route : routes_) {
             if (url.find(route.contains) != std::string_view::npos)
                 return route.response;
@@ -3774,6 +3786,19 @@ void test_media_probe_and_online_catalogue_scanner() {
         else CHECK(!parsed->year.has_value());
     }
 
+    const auto battlestar_path =
+        "/TV/Battlestar Galactica (2003) Season 1-4 S01-S04 (1080p BluRay x265 HEVC 10bit AAC 5.1 RZeroX)/Season 2/Battlestar Galactica (2003) - S02E01 - Scattered (1080p BluRay x265 RZeroX).mkv";
+    auto battlestar_candidates = probe_media_candidates(battlestar_path, fake, "/TV");
+    auto battlestar_yearless = std::find_if(
+        battlestar_candidates.begin(), battlestar_candidates.end(), [](const auto& candidate) {
+            return candidate.generator == "episode-filename-yearless";
+        });
+    REQUIRE(battlestar_yearless != battlestar_candidates.end());
+    CHECK(battlestar_yearless->probe.series == "Battlestar Galactica");
+    CHECK(!battlestar_yearless->probe.year.has_value());
+    CHECK(battlestar_yearless->probe.season == 2);
+    CHECK(battlestar_yearless->probe.episode == 1);
+
     auto track = probe_media_path(
         "/Music/Pink Floyd/The Dark Side of the Moon/01 - Speak to Me.flac", fake);
     REQUIRE(track.has_value());
@@ -3791,6 +3816,51 @@ void test_media_probe_and_online_catalogue_scanner() {
     CHECK(disc_track->disc == 2);
     CHECK(disc_track->track == 3);
     CHECK(disc_track->title == "Hey You");
+
+    MediaProbe tagged_music;
+    tagged_music.kind = MediaProbeKind::track;
+    tagged_music.path = "/Music/Various Artists/Collected/04 - Teardrop.flac";
+    tagged_music.media_id = "macha:test-tagged-track";
+    tagged_music.title = "Teardrop";
+    tagged_music.album = "Collected";
+    tagged_music.album_artist = "Various Artists";
+    tagged_music.track_artist = "Massive Attack";
+    tagged_music.artist = tagged_music.album_artist;
+    auto tagged_candidates = probe_media_candidates(
+        MediaProbeContext{"/Music", tagged_music.path, fake, &tagged_music});
+    auto embedded_candidate = std::find_if(tagged_candidates.begin(), tagged_candidates.end(),
+                                           [](const auto& candidate) {
+                                               return candidate.generator == "music-embedded-tags";
+                                           });
+    auto recording_candidate = std::find_if(tagged_candidates.begin(), tagged_candidates.end(),
+                                            [](const auto& candidate) {
+                                                return candidate.generator == "music-recording-tags";
+                                            });
+    auto merged_candidate = std::find_if(tagged_candidates.begin(), tagged_candidates.end(),
+                                         [](const auto& candidate) {
+                                             return candidate.generator == "music-tags-plus-path";
+                                         });
+    REQUIRE(embedded_candidate != tagged_candidates.end());
+    REQUIRE(recording_candidate != tagged_candidates.end());
+    REQUIRE(merged_candidate != tagged_candidates.end());
+    CHECK(embedded_candidate->probe.artist == "Various Artists");
+    CHECK(embedded_candidate->probe.lookup_strategy ==
+          MediaProbeLookupStrategy::music_release_first);
+    CHECK(recording_candidate->probe.artist == "Massive Attack");
+    CHECK(recording_candidate->probe.album == "Collected");
+    CHECK(recording_candidate->probe.lookup_strategy ==
+          MediaProbeLookupStrategy::music_recording_first);
+    CHECK(merged_candidate->probe.track == 4);
+
+    auto untagged_music_candidates = probe_media_candidates(
+        "/Music/Pink Floyd/The Dark Side of the Moon/01 - Speak to Me.flac", fake, "/Music");
+    auto structured_recording = std::find_if(
+        untagged_music_candidates.begin(), untagged_music_candidates.end(), [](const auto& candidate) {
+            return candidate.generator == "music-structured-recording";
+        });
+    REQUIRE(structured_recording != untagged_music_candidates.end());
+    CHECK(structured_recording->probe.lookup_strategy ==
+          MediaProbeLookupStrategy::music_recording_first);
 
     // Provider unit: one season lookup yields the show/season/episode hierarchy
     // and all useful visual roles without requiring separate image metadata calls.
@@ -3831,6 +3901,38 @@ void test_media_probe_and_online_catalogue_scanner() {
     REQUIRE(tv_cached.has_value());
     CHECK(tv_cached->items.size() == 3);
     CHECK(tmdb_http.requests() == tv_requests);
+
+    // A year in a release name can identify a miniseries or special rather than
+    // TMDB's canonical ongoing series. A missing season is a semantic mismatch:
+    // cache that negative season result and let the scanner try the yearless
+    // episode candidate without repeatedly spending one request per episode.
+    FakeHttpClient battlestar_http;
+    battlestar_http.add("first_air_date_year=2003", 200, "application/json",
+                        R"({"results":[{"id":101,"name":"Battlestar Galactica","first_air_date":"2003-12-08"}]})");
+    battlestar_http.add("/tv/101/season/2", 404, "application/json", R"({})");
+    battlestar_http.add("query=Battlestar%20Galactica&language=en-GB", 200, "application/json",
+                        R"({"results":[{"id":1972,"name":"Battlestar Galactica","first_air_date":"2004-10-18"}]})");
+    battlestar_http.add("/tv/1972/season/2", 200, "application/json",
+                        R"({"id":202,"name":"Season 2","episodes":[{"id":203,"episode_number":1,"name":"Scattered"}]})");
+    TmdbProvider battlestar_tmdb(battlestar_http, tmdb_config);
+    MediaProbe battlestar_probe;
+    battlestar_probe.kind = MediaProbeKind::episode;
+    battlestar_probe.series = "Battlestar Galactica";
+    battlestar_probe.year = 2003;
+    battlestar_probe.season = 2;
+    battlestar_probe.episode = 1;
+    battlestar_probe.media_id = "macha:test-bsg";
+    CHECK(!battlestar_tmdb.lookup(battlestar_probe).has_value());
+    CHECK(battlestar_http.requests() == 2);
+    battlestar_probe.episode = 2;
+    CHECK(!battlestar_tmdb.lookup(battlestar_probe).has_value());
+    CHECK(battlestar_http.requests() == 2);
+    battlestar_probe.year.reset();
+    battlestar_probe.episode = 1;
+    auto battlestar_match = battlestar_tmdb.lookup(battlestar_probe);
+    REQUIRE(battlestar_match.has_value());
+    CHECK(battlestar_match->items.back().title == "Scattered");
+    CHECK(battlestar_http.requests() == 4);
 
     // Provider title scoring must tolerate common number spelling differences
     // between release filenames and canonical provider titles. The year remains
@@ -3985,6 +4087,28 @@ void test_media_probe_and_online_catalogue_scanner() {
     CHECK(recording_match->items.size() == 3);
     CHECK(recording_match->items[1].title == "The First Time");
     CHECK(recording_match->items[2].external_ids.at("musicbrainz") == "rec-2");
+
+    FakeHttpClient mb_compilation_http;
+    mb_compilation_http.add("/ws/2/recording?", 200, "application/json",
+        R"JSON({"recordings":[{"id":"rec-3","title":"Teardrop","score":100,"artist-credit":[{"name":"Massive Attack","artist":{"id":"artist-3","name":"Massive Attack"}}]}]})JSON");
+    mb_compilation_http.add("/ws/2/recording/rec-3", 200, "application/json",
+        R"JSON({"id":"rec-3","title":"Teardrop","artist-credit":[{"name":"Massive Attack","artist":{"id":"artist-3","name":"Massive Attack"}}],"releases":[{"id":"rel-other","title":"Mezzanine"},{"id":"rel-collected","title":"Collected"}]})JSON");
+    mb_compilation_http.add("/ws/2/release/rel-collected", 200, "application/json",
+        R"JSON({"id":"rel-collected","title":"Collected","date":"2006-03-27","artist-credit":[{"name":"Various Artists","artist":{"id":"artist-va","name":"Various Artists"}}],"release-group":{"id":"rg-collected"},"media":[{"position":1,"tracks":[{"position":4,"title":"Teardrop","recording":{"id":"rec-3","title":"Teardrop"}}]}]})JSON");
+    MusicBrainzProvider mb_compilation(mb_compilation_http, mb_config);
+    MediaProbe compilation_probe;
+    compilation_probe.kind = MediaProbeKind::track;
+    compilation_probe.artist = "Massive Attack";
+    compilation_probe.album = "Collected";
+    compilation_probe.title = "Teardrop";
+    compilation_probe.track = 4;
+    compilation_probe.lookup_strategy = MediaProbeLookupStrategy::music_recording_first;
+    compilation_probe.media_id = "macha:test-compilation";
+    auto compilation_match = mb_compilation.lookup(compilation_probe);
+    REQUIRE(compilation_match.has_value());
+    CHECK(compilation_match->items[0].title == "Various Artists");
+    CHECK(compilation_match->items[1].title == "Collected");
+    CHECK(compilation_match->items[2].title == "Teardrop");
 
     // Semantic provider misses are process-lifetime negative cache entries.
     // Transient HTTP failures still throw and are retried; only a successful
@@ -4283,6 +4407,51 @@ void test_media_probe_and_online_catalogue_scanner() {
     CHECK(service.catalogue().get("tmdb:movie:2001").has_value());
     CHECK(service.catalogue().get("tmdb:movie:2002").has_value());
     CHECK(service.catalogue().get("tmdb:movie:2003").has_value());
+
+    // Provider request budgeting is fair across media domains. A long run of
+    // movie misses must not consume the whole batch before TV and Music get a
+    // lookup opportunity.
+    service.filesystem().mkdir("/FairMovies", 0755, getuid(), getgid());
+    for (int i = 1; i <= 4; ++i) {
+        const auto path = "/FairMovies/Fair.Movie." + std::to_string(i) + ".mkv";
+        service.filesystem().create_file(path, 0644, getuid(), getgid());
+        auto w = service.filesystem().open_write(path, true);
+        REQUIRE(w->write(0, Bytes{static_cast<uint8_t>(i), 2, 3, 4}) == 4);
+        w->commit();
+    }
+    service.filesystem().mkdir("/FairTV", 0755, getuid(), getgid());
+    const std::string fair_tv = "/FairTV/Fair.Show.S01E01.mkv";
+    service.filesystem().create_file(fair_tv, 0644, getuid(), getgid());
+    auto fair_tv_writer = service.filesystem().open_write(fair_tv, true);
+    REQUIRE(fair_tv_writer->write(0, Bytes{9, 8, 7, 6}) == 4);
+    fair_tv_writer->commit();
+    service.filesystem().mkdir("/FairMusic", 0755, getuid(), getgid());
+    service.filesystem().mkdir("/FairMusic/Fair Artist", 0755, getuid(), getgid());
+    service.filesystem().mkdir("/FairMusic/Fair Artist/Fair Album", 0755, getuid(), getgid());
+    const std::string fair_music = "/FairMusic/Fair Artist/Fair Album/01 - Fair Track.mp3";
+    write_fixture(fair_music, untagged_bytes);
+
+    auto fair_http = std::make_unique<FakeHttpClient>();
+    auto* fair_http_ptr = fair_http.get();
+    fair_http->add("/search/movie", 200, "application/json", R"({"results":[]})");
+    fair_http->add("/search/tv", 200, "application/json", R"({"results":[]})");
+    fair_http->add("/ws/2/release?", 200, "application/json", R"({"releases":[]})");
+    auto fair_config = scanner_config;
+    fair_config.movies.roots = {"/FairMovies"};
+    fair_config.tv.enabled = true;
+    fair_config.tv.roots = {"/FairTV"};
+    fair_config.tv.tmdb.token_file = scanner_token;
+    fair_config.music.enabled = true;
+    fair_config.music.roots = {"/FairMusic"};
+    fair_config.music.musicbrainz.enabled = true;
+    fair_config.max_provider_requests_per_scan = 3;
+    CatalogueScanner fair_scanner(service.node(), service.filesystem(), service.catalogue(),
+                                  fair_config, std::move(fair_http));
+    CHECK(fair_scanner.scan_once() == 0);
+    CHECK(fair_http_ptr->requests() == 3);
+    CHECK(fair_http_ptr->requests_containing("/search/movie") == 1);
+    CHECK(fair_http_ptr->requests_containing("/search/tv") == 1);
+    CHECK(fair_http_ptr->requests_containing("/ws/2/release?") == 1);
 
     service.stop();
 }
@@ -4798,7 +4967,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
-    CHECK(status_body.find("\"server_version\":\"0.12.0\"") != std::string::npos);
+    CHECK(status_body.find("\"server_version\":\"0.12.1\"") != std::string::npos);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -5461,7 +5630,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == "0.12.0");
+    CHECK(playback_status_json.find("server_version")->asString() == "0.12.1");
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately

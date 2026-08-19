@@ -1,4 +1,4 @@
-# Macha 0.11.0
+# Macha 0.12.1
 #
 # Copy this file per node. Paths, advertise address and failure_domain are
 # node-local. The cluster key contents and dht policy must match every node.
