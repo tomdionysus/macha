@@ -184,6 +184,12 @@ void validate(Config& config) {
         throw std::runtime_error(
             "catalogue.scanner.providers.music.musicbrainz.contact is required");
     if (config.catalogue.scanner.enabled &&
+        config.catalogue.scanner.music.enabled &&
+        config.catalogue.scanner.music.discogs.enabled &&
+        !config.catalogue.scanner.music.discogs.token_file)
+        throw std::runtime_error(
+            "catalogue.scanner.providers.music.discogs.token_file is required when Discogs is enabled");
+    if (config.catalogue.scanner.enabled &&
         config.catalogue.scanner.movies.enabled &&
         config.catalogue.scanner.movies.tmdb.enabled &&
         !config.catalogue.scanner.movies.tmdb.token_file)
@@ -402,6 +408,12 @@ void parse_catalogue(const YAML::Node& root, Config& c) {
                     if (mb["enabled"]) c.catalogue.scanner.music.musicbrainz.enabled = mb["enabled"].as<bool>();
                     if (mb["contact"]) c.catalogue.scanner.music.musicbrainz.contact = mb["contact"].as<std::string>();
                     if (mb["cover_size"]) c.catalogue.scanner.music.musicbrainz.cover_size = mb["cover_size"].as<std::string>();
+                }
+                if (auto discogs = music["discogs"]) {
+                    if (discogs["enabled"]) c.catalogue.scanner.music.discogs.enabled = discogs["enabled"].as<bool>();
+                    if (discogs["token_file"])
+                        c.catalogue.scanner.music.discogs.token_file =
+                            std::filesystem::path(discogs["token_file"].as<std::string>());
                 }
             }
         }

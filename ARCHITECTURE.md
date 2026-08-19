@@ -141,7 +141,7 @@ This first implementation intentionally shares the filesystem metadata generatio
 
 ### Catalogue scanner
 
-The scanner schedules catalogue providers rather than globally classifying arbitrary paths. Each provider owns its discovery roots and parser, so movie, TV and music namespaces have independent semantics. The built-in movie and TV providers use TMDB metadata; the music provider reads embedded tags first and then uses MusicBrainz, with Cover Art Archive supplying album art. This boundary also permits later providers with no filesystem roots at all, such as live-TV or sport streaming catalogues, without changing reconciliation semantics.
+The scanner schedules catalogue providers rather than globally classifying arbitrary paths. Each provider owns its discovery roots and parser, so movie, TV and music namespaces have independent semantics. The built-in movie and TV providers use TMDB metadata. Music reads embedded tags first, generates scored local candidates, then offers each candidate to pluggable metadata providers in priority order: MusicBrainz first and optional Discogs fallback, with Cover Art Archive or Discogs supplying album art. This boundary also permits later providers with no filesystem roots at all, such as live-TV or sport streaming catalogues, without changing reconciliation semantics.
 
 A successful provider match contributes catalogue hierarchy plus remote artwork descriptors. Artwork bytes are fetched before commit, staged as immutable objects and included in the same catalogue durability boundary. No provider URL is required for playback clients after the scan.
 
