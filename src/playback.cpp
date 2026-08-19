@@ -76,6 +76,15 @@ bool fmp4_video_copy_supported(std::string_view codec) {
     return codec == "h264" || codec == "hevc" || codec == "av1";
 }
 
+bool webvtt_subtitle_supported(const MediaStreamInfo& stream) {
+    if (stream.type != MediaStreamType::subtitle) return false;
+    const auto codec = lower(stream.codec);
+    static constexpr std::array<std::string_view, 6> codecs{
+        "ass", "mov_text", "ssa", "subrip", "text", "webvtt"
+    };
+    return std::find(codecs.begin(), codecs.end(), codec) != codecs.end();
+}
+
 std::string file_mime(std::string_view name) {
     auto ext = extension(name);
     if (ext == ".m3u8") return "application/vnd.apple.mpegurl";
@@ -313,6 +322,8 @@ PlaybackPlan negotiate(const MediaProbeResult& probe, std::string_view logical_p
         subtitle = select_stream(probe, MediaStreamType::subtitle, prefs.subtitle_stream, prefs.subtitle_language);
     if (prefs.audio_stream && !audio) throw std::invalid_argument("requested audio stream does not exist");
     if (prefs.subtitle_stream && !subtitle) throw std::invalid_argument("requested subtitle stream does not exist");
+    if (subtitle && !webvtt_subtitle_supported(*subtitle))
+        throw std::invalid_argument("requested subtitle stream cannot be converted to WebVTT");
     if (!video && !audio) throw std::runtime_error("media contains no playable audio or video stream");
 
     PlaybackPlan plan;
@@ -782,7 +793,8 @@ struct PlaybackManager::Impl {
                       std::to_string(elapsed));
         }
         if (session.plan.subtitle_stream >= 0)
-            session.subtitle_url = prefix + "/" + std::to_string(session.generation) + "/subtitle.vtt";
+            session.subtitle_url = prefix + "/" + std::to_string(session.generation) +
+                                   "/subtitle-" + std::to_string(session.plan.subtitle_stream) + ".vtt";
     }
 
     std::shared_ptr<Session> resolve_session(std::string item_id, std::vector<std::string> media_ids,
@@ -861,6 +873,51 @@ struct PlaybackManager::Impl {
                   std::to_string(requested_seek.count()) + " aligned_ms=" +
                   std::to_string(session->plan.seek.count()) + " segments=" +
                   std::to_string(session->vod_plan->segment_durations.size()));
+        return session;
+    }
+
+    std::shared_ptr<Session> reuse_subtitle_session(const Session& old,
+                                                     PlaybackPreferences preferences,
+                                                     std::string_view trace) {
+        const MediaStreamInfo* subtitle = nullptr;
+        if (preferences.subtitle_stream || !preferences.subtitle_language.empty())
+            subtitle = select_stream(old.probe, MediaStreamType::subtitle,
+                                     preferences.subtitle_stream, preferences.subtitle_language);
+        if (preferences.subtitle_stream && !subtitle)
+            throw std::invalid_argument("requested subtitle stream does not exist");
+        if (subtitle && !webvtt_subtitle_supported(*subtitle))
+            throw std::invalid_argument("requested subtitle stream cannot be converted to WebVTT");
+
+        // Subtitle extraction is an independent WebVTT resource. Resolve only
+        // the subtitle selection here: re-running A/V negotiation could choose
+        // a different theoretical mode from the already-prepared live VOD
+        // generation. The active representation is deliberately copied intact.
+        auto session = std::make_shared<Session>();
+        session->id = old.id;
+        session->token = old.token;
+        session->item_id = old.item_id;
+        session->capabilities = old.capabilities;
+        session->preferences = std::move(preferences);
+        session->source = old.source;
+        session->source_entry = old.source_entry;
+        session->probe = old.probe;
+        session->plan = old.plan;
+        session->plan.subtitle_stream = subtitle ? subtitle->index : -1;
+        session->vod_plan = old.vod_plan;
+        session->generation = old.generation;
+        session->generation_dir = old.generation_dir;
+        session->engine_session = active_engine(old);
+        session->stream_url = old.stream_url;
+        if (session->plan.subtitle_stream >= 0) {
+            session->subtitle_url = public_stream_prefix(*session) + "/" +
+                                    std::to_string(session->generation) + "/subtitle-" +
+                                    std::to_string(session->plan.subtitle_stream) + ".vtt";
+        }
+        session->touched = Clock::now();
+        Log::info("playback[" + std::string(trace) + "] subtitle update media=" +
+                  session->source.media_id + " stream=" +
+                  std::to_string(session->plan.subtitle_stream) + " generation=" +
+                  std::to_string(session->generation));
         return session;
     }
 
@@ -1030,7 +1087,10 @@ struct PlaybackManager::Impl {
         auto name = std::string(rest.substr(slash3 + 1));
         if (name.empty() || name.find('/') != std::string::npos || name == "." || name == ".." || name.find("..") != std::string::npos)
             return http_error(400, "bad_path", "invalid stream object");
-        if (name == "subtitle.vtt") {
+        const auto expected_subtitle_name = session->plan.subtitle_stream >= 0
+                                                ? "subtitle-" + std::to_string(session->plan.subtitle_stream) + ".vtt"
+                                                : std::string{};
+        if (name == expected_subtitle_name || name == "subtitle.vtt") {
             if (session->plan.subtitle_stream < 0) return http_error(404, "not_found", "subtitle track not selected");
             std::lock_guard subtitle_lock(session->subtitle_mutex);
             if (!session->subtitle_data) {
@@ -1201,10 +1261,33 @@ struct PlaybackManager::Impl {
         std::string media_override;
         if (auto media = root.find("media_id"); media && media->isString()) media_override = media->asString();
 
+        const auto* preference_patch = root.find("preferences");
+        bool subtitle_only = false;
+        if (!seek_ms && media_override.empty() && root.asObject().size() == 1 &&
+            preference_patch && preference_patch->isObject() && !preference_patch->asObject().empty()) {
+            subtitle_only = std::all_of(preference_patch->asObject().begin(),
+                                        preference_patch->asObject().end(),
+                                        [](const auto& entry) {
+                                            return entry.first == "subtitle_stream" ||
+                                                   entry.first == "subtitle_language";
+                                        });
+        }
+        if (subtitle_only) {
+            auto replacement = reuse_subtitle_session(*old, std::move(prefs), trace);
+            {
+                std::lock_guard lock(mutex);
+                auto it = sessions.find(std::string(id));
+                if (it == sessions.end() || it->second != old)
+                    throw std::runtime_error("playback session changed during subtitle update");
+                it->second = replacement;
+            }
+            return http_json(200, session_json(*replacement).dump());
+        }
+
         // A seek-only update does not alter representation, tracks, quality or
         // codec negotiation. Reuse the prepared VOD random-access plan instead
         // of resolving, probing and materialising the source index again.
-        const bool seek_only = seek_ms.has_value() && root.find("preferences") == nullptr &&
+        const bool seek_only = seek_ms.has_value() && preference_patch == nullptr &&
                                media_override.empty();
         std::shared_ptr<Session> replacement;
         if (seek_only)

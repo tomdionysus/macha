@@ -107,6 +107,7 @@ class FakeMediaEngine final : public MediaEngine {
         result.streams.push_back(MediaStreamInfo{0, MediaStreamType::video, "h264", "High", "", 1920, 1080, 0, 0, 8, true, false, 3'700'000});
         result.streams.push_back(MediaStreamInfo{1, MediaStreamType::audio, "aac", "LC", "eng", 0, 0, 2, 48000, 0, true, false, 192'000});
         result.streams.push_back(MediaStreamInfo{2, MediaStreamType::subtitle, "subrip", "", "eng", 0, 0, 0, 0, 0, false, false});
+        result.streams.push_back(MediaStreamInfo{3, MediaStreamType::subtitle, "hdmv_pgs_subtitle", "", "eng", 0, 0, 0, 0, 0, false, false});
         return result;
     }
     HlsVodPlan prepare_hls_vod(const MediaSource&, const PlaybackPlan& plan, double duration_seconds,
@@ -4692,7 +4693,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
-    CHECK(status_body.find("\"server_version\":\"0.11.0\"") != std::string::npos);
+    CHECK(status_body.find("\"server_version\":\"0.12.0\"") != std::string::npos);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -5355,7 +5356,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == "0.11.0");
+    CHECK(playback_status_json.find("server_version")->asString() == "0.12.0");
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately
@@ -5422,7 +5423,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     CHECK(created_json.find("source")->find("format")->asString() == "mov,mp4,m4a,3gp,3g2,mj2");
     CHECK(created_json.find("source")->find("bitrate")->asUInt64() == 4'000'000);
     REQUIRE(created_json.find("source")->find("streams")->isArray());
-    CHECK(created_json.find("source")->find("streams")->asArray().size() == 3);
+    CHECK(created_json.find("source")->find("streams")->asArray().size() == 4);
     CHECK(created_json.find("source")->find("streams")->asArray()[0].find("bitrate")->asUInt64() == 3'700'000);
     CHECK(created_json.find("source")->find("streams")->asArray()[1].find("bitrate")->asUInt64() == 192'000);
     REQUIRE(created_json.find("output") != nullptr);
@@ -5438,6 +5439,10 @@ void test_playback_sessions_and_streaming_http_bodies() {
     REQUIRE(options->find("audio_streams")->isArray());
     REQUIRE(!options->find("audio_streams")->asArray().empty());
     CHECK(options->find("audio_streams")->asArray().front().isObject());
+    REQUIRE(options->find("subtitle_streams") != nullptr);
+    REQUIRE(options->find("subtitle_streams")->isArray());
+    REQUIRE(options->find("subtitle_streams")->asArray().size() == 1);
+    CHECK(options->find("subtitle_streams")->asArray().front().find("index")->asInt64() == 2);
     REQUIRE(options->find("media_ids") != nullptr);
     CHECK(options->find("media_ids")->asArray().size() == 1);
     REQUIRE(options->find("quality_heights") != nullptr);
@@ -5456,6 +5461,60 @@ void test_playback_sessions_and_streaming_http_bodies() {
     Bytes direct_bytes(1000);
     REQUIRE(direct_response.stream->read(0, direct_bytes) == direct_bytes.size());
     CHECK(std::equal(direct_bytes.begin(), direct_bytes.end(), bytes.begin() + 100));
+
+    // A subtitle-only PATCH must not rebuild or seek the A/V generation.
+    // The subtitle resource changes independently and gets a stream-specific
+    // URL so browser caches cannot return the previously-selected track.
+    const auto probes_before_subtitle = fake_engine_ptr->probes();
+    const auto prepares_before_subtitle = fake_engine_ptr->vod_prepares();
+    Json::Object subtitle_only_preferences{{"subtitle_stream", 2}};
+    Json::Object subtitle_only_root{{"preferences", Json(std::move(subtitle_only_preferences))}};
+    auto subtitle_only_text = Json(std::move(subtitle_only_root)).dump();
+    HttpRequest subtitle_only;
+    subtitle_only.method = "PATCH";
+    subtitle_only.path = "/api/v1/playback/sessions/" + session_id;
+    subtitle_only.body.assign(subtitle_only_text.begin(), subtitle_only_text.end());
+    auto subtitle_only_response = playback.handle(subtitle_only);
+    REQUIRE(subtitle_only_response.status == 200);
+    auto subtitle_only_json = Json::parse(std::string(subtitle_only_response.body.begin(),
+                                                      subtitle_only_response.body.end()));
+    CHECK(subtitle_only_json.find("stream")->find("url")->asString() == direct_url);
+    CHECK(subtitle_only_json.find("selection")->find("subtitle_stream")->asInt64() == 2);
+    CHECK(subtitle_only_json.find("stream")->find("subtitle_url")->asString().find("/1/subtitle-2.vtt") != std::string::npos);
+    CHECK(fake_engine_ptr->probes() == probes_before_subtitle);
+    CHECK(fake_engine_ptr->vod_prepares() == prepares_before_subtitle);
+
+    HttpRequest selected_subtitle;
+    selected_subtitle.method = "GET";
+    selected_subtitle.path = subtitle_only_json.find("stream")->find("subtitle_url")->asString();
+    auto selected_subtitle_response = playback.handle(selected_subtitle);
+    REQUIRE(selected_subtitle_response.status == 200);
+    CHECK(selected_subtitle_response.content_type.starts_with("text/vtt"));
+
+    Json::Object subtitle_off_preferences{{"subtitle_stream", Json(nullptr)},
+                                          {"subtitle_language", ""}};
+    Json::Object subtitle_off_root{{"preferences", Json(std::move(subtitle_off_preferences))}};
+    auto subtitle_off_text = Json(std::move(subtitle_off_root)).dump();
+    HttpRequest subtitle_off;
+    subtitle_off.method = "PATCH";
+    subtitle_off.path = "/api/v1/playback/sessions/" + session_id;
+    subtitle_off.body.assign(subtitle_off_text.begin(), subtitle_off_text.end());
+    auto subtitle_off_response = playback.handle(subtitle_off);
+    REQUIRE(subtitle_off_response.status == 200);
+    auto subtitle_off_json = Json::parse(std::string(subtitle_off_response.body.begin(),
+                                                     subtitle_off_response.body.end()));
+    CHECK(subtitle_off_json.find("stream")->find("url")->asString() == direct_url);
+    CHECK(subtitle_off_json.find("selection")->find("subtitle_stream")->asInt64() == -1);
+    CHECK(subtitle_off_json.find("stream")->find("subtitle_url")->isNull());
+
+    Json::Object bitmap_subtitle_preferences{{"subtitle_stream", 3}};
+    Json::Object bitmap_subtitle_root{{"preferences", Json(std::move(bitmap_subtitle_preferences))}};
+    auto bitmap_subtitle_text = Json(std::move(bitmap_subtitle_root)).dump();
+    HttpRequest bitmap_subtitle;
+    bitmap_subtitle.method = "PATCH";
+    bitmap_subtitle.path = "/api/v1/playback/sessions/" + session_id;
+    bitmap_subtitle.body.assign(bitmap_subtitle_text.begin(), bitmap_subtitle_text.end());
+    CHECK(playback.handle(bitmap_subtitle).status == 400);
 
     Json::Object bad_track_preferences{{"audio_stream", 99}};
     Json::Object bad_track_root{{"preferences", Json(std::move(bad_track_preferences))}};
@@ -5553,6 +5612,25 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto subtitle_response = playback.handle(subtitle);
     REQUIRE(subtitle_response.status == 200);
     CHECK(subtitle_response.content_type.starts_with("text/vtt"));
+
+    // The same in-place subtitle path must preserve a live transformed HLS
+    // generation as well; no replacement MediaEngineSession is started.
+    const auto plans_before_transformed_subtitle_off = fake_engine_ptr->started_plans().size();
+    Json::Object transformed_subtitle_off_preferences{{"subtitle_stream", Json(nullptr)},
+                                                      {"subtitle_language", ""}};
+    Json::Object transformed_subtitle_off_root{{"preferences", Json(std::move(transformed_subtitle_off_preferences))}};
+    auto transformed_subtitle_off_text = Json(std::move(transformed_subtitle_off_root)).dump();
+    HttpRequest transformed_subtitle_off;
+    transformed_subtitle_off.method = "PATCH";
+    transformed_subtitle_off.path = "/api/v1/playback/sessions/" + session_id;
+    transformed_subtitle_off.body.assign(transformed_subtitle_off_text.begin(), transformed_subtitle_off_text.end());
+    auto transformed_subtitle_off_response = playback.handle(transformed_subtitle_off);
+    REQUIRE(transformed_subtitle_off_response.status == 200);
+    auto transformed_subtitle_off_json = Json::parse(std::string(transformed_subtitle_off_response.body.begin(),
+                                                                 transformed_subtitle_off_response.body.end()));
+    CHECK(transformed_subtitle_off_json.find("stream")->find("url")->asString() == hls_url);
+    CHECK(transformed_subtitle_off_json.find("stream")->find("subtitle_url")->isNull());
+    CHECK(fake_engine_ptr->started_plans().size() == plans_before_transformed_subtitle_off);
 
     Json::Object second_preferences{{"mode", "transcode"}};
     Json::Object second_root{{"media_id", media_id}, {"preferences", Json(std::move(second_preferences))}};

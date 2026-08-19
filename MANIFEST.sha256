@@ -2,11 +2,11 @@
 3d076e065555c4a447d2e1cfde384e3460f7578bc0e958f265e671ec325a837e  ./.github/workflows/ci.yml
 0996592ff328090e74121fb0ed4c2174566719c8f3c2248a8a1102039925c141  ./.gitignore
 a86371bfcac17dfc4a89b0f1f7da323d0247dab672c2a135b4ce59a749334706  ./ARCHITECTURE.md
-19bab6df5a3e3be523a9b2a70b407b323e8b619e8bc3e0e4a37e1bf08c8f3c8c  ./CHANGELOG.md
-25330f5dc7add9494db24d60335ff66f1a3d74b5932d3d6db9b002bafd740bf2  ./CMakeLists.txt
+5921c2f57f3676bc5a1f5bb86263f795ab24e5eb49d8511ebb3762f003014fc1  ./CHANGELOG.md
+8728b8c47ac1cc1d88d4983f777d6ab43738e938e862f164790ed3f4552a87e1  ./CMakeLists.txt
 fadb9c276493c73a3676f645a1c35bb7a3e264b221ac1d82ca65efccb78c6eee  ./CONTRIBUTING.md
 3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986  ./LICENSE
-3a024ce9b3b81d1537d63f91ae1143e624ebebbe7a92efd24c05a24a4c5c25c0  ./README.md
+a8b6dd2267d210c2a4e5d5dd879a347cfbd2e5f73d454ddb6a8cc445a09ce7fd  ./README.md
 ea99eaa0a8a8fb77501202ba3ee132e04cc08693f7d9969d59bfbc79abbfdd54  ./ROADMAP.md
 580cc94c6d8cdc586f94ae022a245cc2e2292bf7f1a13f34d40ae30267dda68a  ./SECURITY.md
 45a4a058eb9cc62cd0d141265971dfe5aa190672c6c4d8cfcb6823beaee98345  ./docs/catalogue.md
@@ -16,7 +16,7 @@ e4b2e0d3ae275bbc3a5d1a5bab9bd637b7343b7812091828a9bc33df071c3fe7  ./docs/notes/N
 f34b14384e0104033676b84918b7b1e7d9f8753f75442dee3f7651a6558ff231  ./docs/operations.md
 ab629a024f7f9f021164fb954f52af239c9f8e8fae9442bcff9a25668f67cb4a  ./docs/quickstart.md
 f99f1acf26e84d78bc8704a8728fdf7405bbdc04a7c54ee288143d2d6d2acc49  ./docs/storage.md
-c29b106fca474ca5474cad717d846924e73d81c06f089bc97e0c4db0bc766a12  ./docs/streaming.md
+964d20d9b14ab721ff3aa5ccbde904cefeb7467c7788058d83db17b91dde2842  ./docs/streaming.md
 e5a1b2ef05207608afcc50d24f05c9ba422903b740f678cadf46108d611a685c  ./gfx/macha_logo.svg
 80cc468865bdf1d1e3a75a8af88e1e85ab25653f66e4a2d9f5c30e50f6148be5  ./gfx/macha_logo_original.svg
 234d474c9707d8efc08daa52086a19c94ee4dd16ec35f29f29c5cdba0290f940  ./macha.yaml.example
@@ -76,7 +76,7 @@ cda67edb7ee0003b4d2525d015dab51c0845d5da126aa316efb4d152ed758546  ./src/persiste
 ec305bab333808112906518928cab4adc3db0e75391c9fc403ebf64fe1455ca6  ./src/persistent_cache.hpp
 e88bdeb943bff99915a001863fd40dfa2f1047cdc7a4bc7c3ece742463e08a3a  ./src/placement.cpp
 e41ff05fde8b1b9664e51134af3193c00224b91b28dbd8b255c3f222ef1323f1  ./src/placement.hpp
-e73e6e0f5642d4f0634651065e2b2b40fc8726825c8af738ac8bec16e3a162fd  ./src/playback.cpp
+e8bfefed9c879d85c63089cb74035ed2fa8bcb0d150e9d88ab2c9d8fb5e82048  ./src/playback.cpp
 5d81616a14b0850666db660253e39ac4e84db14080f1dac9106607664228b547  ./src/playback.hpp
 b43523c0e4c977e708fa7d049f614f7e4016ac1455ca342b678167728579b267  ./src/replica_selector.cpp
 beeeaa132d79c36a1df69a4ada069a7c0ebbacd7d97d3c2b4663d92e87c7705c  ./src/replica_selector.hpp
@@ -91,4 +91,4 @@ ff8e337e7bff63deffa474244ce7ac3168a36a48e4e275eff5e0e54c3d6821cd  ./src/version.
 1d7bfa4c37bf1af28882c737a9efe02b01f12ff32e13bbad79355aff1abf37b5  ./systemd/macha.service
 f8bf1a7196152c456c0677eb7ac3f2086d9a03a00e4c6d6a849c86e2e3acecc6  ./tests/fixtures/tagged.mp3
 8896c4303ea9167a3c4a1388a467aa0ce37fff490977c4ae7ecd4fab9fbfd2d1  ./tests/fixtures/untagged.mp3
-2f75d6baad9899316f696a85dac6ffd6fcd437fe67ab61a8698aea3ceb470db6  ./tests/test_main.cpp
+b2bd08c2a83ca35a35f5e9f6e11475e82f0a1e375e07c7fc8a5e1e5b4b8c1aa9  ./tests/test_main.cpp
