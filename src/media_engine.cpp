@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "media_engine.hpp"
+#include "subtitle_text.hpp"
 
 #include "log.hpp"
 #include "media_timestamps.hpp"
@@ -83,40 +84,7 @@ std::string format_vtt_time(int64_t milliseconds) {
     return out.str();
 }
 
-std::string plain_ass_text(std::string text) {
-    // AVSubtitleRect::ass generally contains an ASS dialogue event. Keep only
-    // the text field and remove the most common inline formatting escapes.
-    size_t commas = 0;
-    size_t pos = 0;
-    for (; pos < text.size(); ++pos) {
-        if (text[pos] == ',' && ++commas == 9) {
-            ++pos;
-            break;
-        }
-    }
-    if (commas == 9) text.erase(0, pos);
-    std::string out;
-    out.reserve(text.size());
-    bool tag = false;
-    for (size_t i = 0; i < text.size(); ++i) {
-        if (text[i] == '{') {
-            tag = true;
-            continue;
-        }
-        if (text[i] == '}' && tag) {
-            tag = false;
-            continue;
-        }
-        if (tag) continue;
-        if (text[i] == '\\' && i + 1 < text.size() && (text[i + 1] == 'N' || text[i + 1] == 'n')) {
-            out.push_back('\n');
-            ++i;
-            continue;
-        }
-        out.push_back(text[i]);
-    }
-    return out;
-}
+
 
 struct InputIoState {
     std::shared_ptr<MediaInput> input;
@@ -1467,20 +1435,37 @@ class LibavMediaEngine final : public MediaEngine {
                                               config_.startup_timeout);
     }
 
-    std::string extract_webvtt(const MediaSource& source, int subtitle_stream,
-                               std::chrono::milliseconds seek) override {
+    std::string extract_webvtt_segment(const MediaSource& source, int subtitle_stream,
+                                       std::chrono::milliseconds range_start,
+                                       std::chrono::milliseconds range_end,
+                                       std::chrono::milliseconds timeline_origin) override {
+        if (range_end <= range_start)
+            throw std::invalid_argument("subtitle segment range must be non-empty");
+
         std::atomic_bool cancelled{};
         InputContext input(source, MediaReadPurpose::subtitle, &cancelled, config_.probe_bytes,
                            config_.probe_analyze_duration, config_.probe_timeout);
         auto* format = input.get();
-        auto probe_rc = avformat_find_stream_info(format, nullptr);
-        if (probe_rc < 0 && input.timed_out())
-            throw std::runtime_error("subtitle probe timed out after " +
-                                     std::to_string(config_.probe_timeout.count()) + " ms");
-        av_require(probe_rc, "read subtitle stream information");
-        input.clear_deadline();
-        if (subtitle_stream < 0 || subtitle_stream >= static_cast<int>(format->nb_streams) ||
-            format->streams[subtitle_stream]->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE)
+
+        // The playback session already probed this exact immutable source and
+        // selected a concrete subtitle stream. Avoid a second whole-file stream
+        // analysis for every four-second subtitle segment. Container headers are
+        // normally sufficient; fall back to find_stream_info only when they are
+        // not.
+        auto stream_ready = [&] {
+            return subtitle_stream >= 0 &&
+                   subtitle_stream < static_cast<int>(format->nb_streams) &&
+                   format->streams[subtitle_stream]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE &&
+                   format->streams[subtitle_stream]->codecpar->codec_id != AV_CODEC_ID_NONE;
+        };
+        if (!stream_ready()) {
+            auto probe_rc = avformat_find_stream_info(format, nullptr);
+            if (probe_rc < 0 && input.timed_out())
+                throw std::runtime_error("subtitle probe timed out after " +
+                                         std::to_string(config_.probe_timeout.count()) + " ms");
+            av_require(probe_rc, "read subtitle stream information");
+        }
+        if (!stream_ready())
             throw std::invalid_argument("selected subtitle stream does not exist");
 
         auto* stream = format->streams[subtitle_stream];
@@ -1489,55 +1474,107 @@ class LibavMediaEngine final : public MediaEngine {
         AVCodecContext* decoder = avcodec_alloc_context3(codec);
         if (!decoder) throw std::bad_alloc();
         try {
-            av_require(avcodec_parameters_to_context(decoder, stream->codecpar), "copy subtitle decoder parameters");
-            // Legacy subtitle decoding reports AVSubtitle::pts in AV_TIME_BASE.
-            // libavcodec needs the packet time base to perform that rescale.
+            av_require(avcodec_parameters_to_context(decoder, stream->codecpar),
+                       "copy subtitle decoder parameters");
             decoder->pkt_timebase = stream->time_base;
             av_require(avcodec_open2(decoder, codec, nullptr), "open subtitle decoder");
-            if (seek.count() > 0) {
-                auto target = av_rescale_q(seek.count(), AVRational{1, 1000}, AV_TIME_BASE_Q);
-                av_require(avformat_seek_file(format, -1, std::numeric_limits<int64_t>::min(), target,
-                                             std::numeric_limits<int64_t>::max(), AVSEEK_FLAG_BACKWARD),
+
+            const int64_t input_start_us = format->start_time == AV_NOPTS_VALUE ? 0 : format->start_time;
+            if (range_start.count() > 0) {
+                const auto target_us = input_start_us +
+                    av_rescale_q(range_start.count(), AVRational{1, 1000}, AV_TIME_BASE_Q);
+                const auto target = av_rescale_q(target_us, AV_TIME_BASE_Q, stream->time_base);
+                av_require(avformat_seek_file(format, subtitle_stream,
+                                             std::numeric_limits<int64_t>::min(), target,
+                                             std::numeric_limits<int64_t>::max(),
+                                             AVSEEK_FLAG_BACKWARD),
                            "seek subtitle stream");
+                avcodec_flush_buffers(decoder);
             }
+
             std::ostringstream out;
             out << "WEBVTT\n\n";
             AVPacket* packet = av_packet_alloc();
             if (!packet) throw std::bad_alloc();
             uint64_t cue = 0;
             int rc = 0;
-            while ((rc = av_read_frame(format, packet)) >= 0) {
+            bool past_range = false;
+            while (!past_range && (rc = av_read_frame(format, packet)) >= 0) {
+                // Keep ordinary A/V packets visible to the demux loop so they
+                // provide a bounded timeline cursor even when there is a long
+                // gap between subtitle cues. Otherwise asking for an empty
+                // four-second subtitle segment could scan forward until the
+                // next subtitle packet many minutes later. A small grace
+                // allows for normal cross-stream interleave/reordering.
+                const auto packet_time = packet->dts != AV_NOPTS_VALUE ? packet->dts : packet->pts;
+                if (packet_time != AV_NOPTS_VALUE && packet->stream_index >= 0 &&
+                    packet->stream_index < static_cast<int>(format->nb_streams)) {
+                    const auto* packet_stream = format->streams[packet->stream_index];
+                    const auto packet_us = av_rescale_q(packet_time, packet_stream->time_base, AV_TIME_BASE_Q);
+                    const auto packet_ms = av_rescale_q(packet_us - input_start_us, AV_TIME_BASE_Q,
+                                                        AVRational{1, 1000});
+                    if (packet_ms >= range_end.count() + 1500) {
+                        av_packet_unref(packet);
+                        past_range = true;
+                        break;
+                    }
+                }
+
                 if (packet->stream_index != subtitle_stream) {
                     av_packet_unref(packet);
                     continue;
                 }
+
+                const auto packet_pts = packet->pts;
                 AVSubtitle subtitle{};
                 int got = 0;
                 rc = avcodec_decode_subtitle2(decoder, &subtitle, &got, packet);
                 av_packet_unref(packet);
                 av_require(rc, "decode subtitle");
                 if (!got) continue;
-                auto base_ms = subtitle.pts == AV_NOPTS_VALUE
-                                   ? 0
-                                   : av_rescale_q(subtitle.pts, AV_TIME_BASE_Q, AVRational{1, 1000});
-                base_ms -= seek.count();
-                auto begin = base_ms + subtitle.start_display_time;
-                auto end = base_ms + subtitle.end_display_time;
-                if (end <= begin) end = begin + 2000;
-                std::string text;
-                for (unsigned i = 0; i < subtitle.num_rects; ++i) {
-                    auto* rect = subtitle.rects[i];
-                    std::string part;
-                    if (rect->text) part = rect->text;
-                    else if (rect->ass) part = plain_ass_text(rect->ass);
-                    if (!part.empty()) {
-                        if (!text.empty()) text.push_back('\n');
-                        text += part;
-                    }
+
+                int64_t base_ms = 0;
+                if (subtitle.pts != AV_NOPTS_VALUE) {
+                    base_ms = av_rescale_q(subtitle.pts - input_start_us, AV_TIME_BASE_Q,
+                                           AVRational{1, 1000});
+                } else if (packet_pts != AV_NOPTS_VALUE) {
+                    const auto packet_us = av_rescale_q(packet_pts, stream->time_base, AV_TIME_BASE_Q);
+                    base_ms = av_rescale_q(packet_us - input_start_us, AV_TIME_BASE_Q,
+                                           AVRational{1, 1000});
                 }
-                if (!text.empty() && end > 0) {
-                    out << ++cue << '\n' << format_vtt_time(begin) << " --> " << format_vtt_time(end)
-                        << '\n' << text << "\n\n";
+                auto begin_source = base_ms + subtitle.start_display_time;
+                auto end_source = base_ms + subtitle.end_display_time;
+                if (end_source <= begin_source) end_source = begin_source + 2000;
+
+                // Assign each cue to the segment in which it starts. The Web
+                // client keeps the immediately preceding segment mounted, so a
+                // cue is allowed to extend naturally across a segment boundary
+                // without being duplicated in the next segment.
+                if (begin_source >= range_end.count()) {
+                    past_range = true;
+                    avsubtitle_free(&subtitle);
+                    break;
+                }
+                if (begin_source >= range_start.count()) {
+                    std::string text;
+                    for (unsigned i = 0; i < subtitle.num_rects; ++i) {
+                        auto* rect = subtitle.rects[i];
+                        std::string part;
+                        if (rect->text) part = rect->text;
+                        else if (rect->ass) part = plain_ass_subtitle_text(rect->ass);
+                        if (!part.empty()) {
+                            if (!text.empty()) text.push_back('\n');
+                            text += part;
+                        }
+                    }
+                    if (!text.empty()) {
+                        const auto begin = begin_source - timeline_origin.count();
+                        const auto end = end_source - timeline_origin.count();
+                        if (end > 0) {
+                            out << ++cue << '\n' << format_vtt_time(begin) << " --> "
+                                << format_vtt_time(end) << '\n' << text << "\n\n";
+                        }
+                    }
                 }
                 avsubtitle_free(&subtitle);
             }
@@ -1550,6 +1587,7 @@ class LibavMediaEngine final : public MediaEngine {
             throw;
         }
     }
+
 };
 
 } // namespace

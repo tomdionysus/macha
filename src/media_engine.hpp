@@ -168,8 +168,9 @@ class MediaEngine {
         const MediaSource&, const HlsVodPlan&, std::chrono::milliseconds segment_duration,
         size_t max_ahead_segments, uint64_t segment_memory_bytes,
         const std::filesystem::path& spill_directory) = 0;
-    virtual std::string extract_webvtt(const MediaSource&, int subtitle_stream,
-                                       std::chrono::milliseconds seek = {}) = 0;
+    virtual std::string extract_webvtt_segment(
+        const MediaSource&, int subtitle_stream, std::chrono::milliseconds range_start,
+        std::chrono::milliseconds range_end, std::chrono::milliseconds timeline_origin = {}) = 0;
 };
 
 std::unique_ptr<MediaEngine> make_libav_media_engine(const StreamingConfig&);

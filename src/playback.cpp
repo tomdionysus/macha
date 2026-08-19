@@ -520,9 +520,12 @@ struct PlaybackManager::Impl {
         mutable std::mutex pipeline_mutex;
         std::shared_ptr<MediaEngineSession> engine_session;
         std::string stream_url;
+        struct SubtitleCache {
+            std::mutex mutex;
+            std::map<std::pair<int, uint64_t>, std::string> segments;
+        };
         std::string subtitle_url;
-        std::mutex subtitle_mutex;
-        std::optional<std::string> subtitle_data;
+        std::shared_ptr<SubtitleCache> subtitle_cache{std::make_shared<SubtitleCache>()};
         Clock::time_point touched{Clock::now()};
     };
 
@@ -756,7 +759,7 @@ struct PlaybackManager::Impl {
         session.generation_dir = *config.temp_path / session.id / std::to_string(session.generation);
         std::error_code ec;
         std::filesystem::remove_all(session.generation_dir, ec);
-        session.subtitle_data.reset();
+        session.subtitle_cache = std::make_shared<Session::SubtitleCache>();
         session.subtitle_url.clear();
         auto prefix = public_stream_prefix(session);
         if (session.plan.mode == PlaybackMode::direct) {
@@ -794,7 +797,8 @@ struct PlaybackManager::Impl {
         }
         if (session.plan.subtitle_stream >= 0)
             session.subtitle_url = prefix + "/" + std::to_string(session.generation) +
-                                   "/subtitle-" + std::to_string(session.plan.subtitle_stream) + ".vtt";
+                                   "/subtitle-" + std::to_string(session.plan.subtitle_stream) +
+                                   "/manifest.json";
     }
 
     std::shared_ptr<Session> resolve_session(std::string item_id, std::vector<std::string> media_ids,
@@ -908,10 +912,11 @@ struct PlaybackManager::Impl {
         session->generation_dir = old.generation_dir;
         session->engine_session = active_engine(old);
         session->stream_url = old.stream_url;
+        session->subtitle_cache = old.subtitle_cache;
         if (session->plan.subtitle_stream >= 0) {
             session->subtitle_url = public_stream_prefix(*session) + "/" +
                                     std::to_string(session->generation) + "/subtitle-" +
-                                    std::to_string(session->plan.subtitle_stream) + ".vtt";
+                                    std::to_string(session->plan.subtitle_stream) + "/manifest.json";
         }
         session->touched = Clock::now();
         Log::info("playback[" + std::string(trace) + "] subtitle update media=" +
@@ -1031,6 +1036,46 @@ struct PlaybackManager::Impl {
         return Json(std::move(out));
     }
 
+    std::vector<uint64_t> subtitle_segment_durations_ms(const Session& session) const {
+        std::vector<uint64_t> durations;
+        if (session.plan.mode != PlaybackMode::direct && session.vod_plan) {
+            durations.reserve(session.vod_plan->segment_durations.size());
+            for (double seconds : session.vod_plan->segment_durations)
+                durations.push_back(std::max<uint64_t>(1, static_cast<uint64_t>(std::llround(seconds * 1000.0))));
+            return durations;
+        }
+
+        const auto total_ms = static_cast<uint64_t>(std::max(0.0, session.probe.duration_seconds) * 1000.0);
+        const auto segment_ms = static_cast<uint64_t>(std::max<int64_t>(1, config.segment_duration.count()));
+        if (total_ms == 0) return durations;
+        for (uint64_t start = 0; start < total_ms; start += segment_ms)
+            durations.push_back(std::min(segment_ms, total_ms - start));
+        return durations;
+    }
+
+    Json subtitle_manifest(const Session& session, int stream_index) const {
+        Json::Array durations;
+        for (auto duration : subtitle_segment_durations_ms(session))
+            durations.emplace_back(duration);
+        return Json(Json::Object{
+            {"format", "macha-webvtt-segments"},
+            {"version", 1},
+            {"stream_index", stream_index},
+            {"segment_durations_ms", Json(std::move(durations))}
+        });
+    }
+
+    static std::optional<uint64_t> subtitle_segment_index(std::string_view name) {
+        constexpr std::string_view prefix = "segment-";
+        constexpr std::string_view suffix = ".vtt";
+        if (!name.starts_with(prefix) || !name.ends_with(suffix)) return {};
+        auto number = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+        uint64_t index = 0;
+        auto [end, ec] = std::from_chars(number.data(), number.data() + number.size(), index);
+        if (ec != std::errc{} || end != number.data() + number.size()) return {};
+        return index;
+    }
+
     static std::optional<uint64_t> segment_index(std::string_view name) {
         constexpr std::string_view prefix = "segment-";
         constexpr std::string_view suffix = ".m4s";
@@ -1085,29 +1130,76 @@ struct PlaybackManager::Impl {
         if (ec != std::errc{} || end != generation_text.data() + generation_text.size() || generation != session->generation)
             return http_error(404, "not_found", "stream generation not found");
         auto name = std::string(rest.substr(slash3 + 1));
-        if (name.empty() || name.find('/') != std::string::npos || name == "." || name == ".." || name.find("..") != std::string::npos)
+        if (name.empty() || name == "." || name == ".." || name.find("..") != std::string::npos)
             return http_error(400, "bad_path", "invalid stream object");
-        const auto expected_subtitle_name = session->plan.subtitle_stream >= 0
-                                                ? "subtitle-" + std::to_string(session->plan.subtitle_stream) + ".vtt"
-                                                : std::string{};
-        if (name == expected_subtitle_name || name == "subtitle.vtt") {
-            if (session->plan.subtitle_stream < 0) return http_error(404, "not_found", "subtitle track not selected");
-            std::lock_guard subtitle_lock(session->subtitle_mutex);
-            if (!session->subtitle_data) {
-                try {
-                    auto subtitle_seek = session->plan.mode == PlaybackMode::direct
-                                           ? std::chrono::milliseconds{} : session->plan.seek;
-                    session->subtitle_data = engine->extract_webvtt(session->source,
-                                                                    session->plan.subtitle_stream,
-                                                                    subtitle_seek);
-                } catch (const std::exception& e) {
-                    Log::warn("subtitle extraction failed session=" + session->id + " error=" + e.what());
-                    return http_error(503, "subtitle_unavailable", e.what());
+        if (name.starts_with("subtitle-")) {
+            auto slash = name.find('/');
+            if (slash == std::string::npos)
+                return http_error(404, "not_found", "subtitle object not found");
+            auto stream_text = std::string_view(name).substr(9, slash - 9);
+            int stream_index = -1;
+            auto [stream_end, stream_ec] = std::from_chars(stream_text.data(),
+                                                           stream_text.data() + stream_text.size(),
+                                                           stream_index);
+            if (stream_ec != std::errc{} || stream_end != stream_text.data() + stream_text.size() ||
+                stream_index != session->plan.subtitle_stream)
+                return http_error(404, "not_found", "subtitle track not selected");
+
+            const auto object_name = std::string_view(name).substr(slash + 1);
+            const auto durations = subtitle_segment_durations_ms(*session);
+            if (object_name == "manifest.json") {
+                auto text = subtitle_manifest(*session, stream_index).dump();
+                Bytes bytes(text.begin(), text.end());
+                auto response = bytes_response(request, std::move(bytes), "application/json; charset=utf-8");
+                response.headers["Cache-Control"] = "private, max-age=31536000, immutable";
+                return response;
+            }
+
+            auto index = subtitle_segment_index(object_name);
+            if (!index || *index >= durations.size())
+                return http_error(404, "not_found", "subtitle segment not found");
+
+            std::string data;
+            {
+                std::lock_guard subtitle_lock(session->subtitle_cache->mutex);
+                auto key = std::make_pair(stream_index, *index);
+                auto cached = session->subtitle_cache->segments.find(key);
+                if (cached != session->subtitle_cache->segments.end()) {
+                    data = cached->second;
+                } else {
+                    try {
+                        uint64_t local_start_ms = 0;
+                        for (uint64_t i = 0; i < *index; ++i) local_start_ms += durations[i];
+                        const auto origin_ms = session->plan.mode == PlaybackMode::direct
+                                                   ? int64_t{0} : session->plan.seek.count();
+                        const auto source_start_ms = origin_ms + static_cast<int64_t>(local_start_ms);
+                        const auto source_end_ms = source_start_ms + static_cast<int64_t>(durations[*index]);
+                        data = engine->extract_webvtt_segment(
+                            session->source, stream_index,
+                            std::chrono::milliseconds(source_start_ms),
+                            std::chrono::milliseconds(source_end_ms),
+                            std::chrono::milliseconds(origin_ms));
+                        session->subtitle_cache->segments.emplace(key, data);
+                        Log::debug("subtitle segment generated session=" + session->id +
+                                   " stream=" + std::to_string(stream_index) +
+                                   " index=" + std::to_string(*index) +
+                                   " bytes=" + std::to_string(data.size()));
+                    } catch (const std::exception& e) {
+                        Log::warn("subtitle extraction failed session=" + session->id +
+                                  " stream=" + std::to_string(stream_index) +
+                                  " index=" + std::to_string(*index) + " error=" + e.what());
+                        return http_error(503, "subtitle_unavailable", e.what());
+                    }
                 }
             }
-            Bytes bytes(session->subtitle_data->begin(), session->subtitle_data->end());
-            return bytes_response(request, std::move(bytes), "text/vtt; charset=utf-8");
+            Bytes bytes(data.begin(), data.end());
+            auto response = bytes_response(request, std::move(bytes), "text/vtt; charset=utf-8");
+            response.headers["Cache-Control"] = "private, max-age=31536000, immutable";
+            return response;
         }
+
+        if (name.find('/') != std::string::npos)
+            return http_error(400, "bad_path", "invalid stream object");
         auto active = active_engine(*session);
         if (!active) return http_error(404, "not_found", "transformed stream is not active");
         auto store = active->segments();
