@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.0 - 2026-08-19
+
+- make subtitle-only playback-session PATCHes update the selected external WebVTT resource in place without replacing, seeking, or restarting the active A/V generation;
+- give selected subtitle resources stream-specific URLs so switching tracks cannot reuse a cached WebVTT response from another track;
+- advertise only subtitle codecs that the in-process text decoder can convert to WebVTT, excluding bitmap formats such as PGS from `options.subtitle_streams`.
+
 ## 0.11.0 - 2026-08-19
 
 - decouple immutable extent write availability from desired replica placement: `dht.min_write_replicas` (default `1`) is now the degraded-mode durable floor for data PUTs. Healthy writes still commit at the normal replica quorum; when that quorum cannot be reached without already-hedged stalled owners, the write may commit at the configured floor and repair restores desired placement later;
