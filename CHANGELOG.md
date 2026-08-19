@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.12.2 - 2026-08-19
+
+- add Discogs as an optional authenticated fallback music metadata provider behind the existing `MetadataProvider` interface; MusicBrainz remains first choice, while Discogs can resolve release/track metadata and cover art when MusicBrainz misses or is temporarily unavailable;
+- add 60-second transient-provider circuit breaking for MusicBrainz and Discogs on HTTP 429/5xx or transport failure, and defer a music provider pass only when every configured music metadata provider is unavailable;
+- harden TMDB TV matching by treating a one-year premiere difference as weak evidence instead of a hard failure and requiring parsed episode titles to corroborate remote episode titles before accepting a match;
+- improve TV diagnostics with local/remote show and episode metadata plus episode-title scores, and strip leading file ordinals such as `01 -` from filename-derived series names.
+
 ## 0.12.1 - 2026-08-19
 
 - make bounded catalogue provider work fair across Movies, TV and Music using round-robin per-provider queues and one candidate hypothesis per provider turn, with continuation cursors and a hard HTTP request ceiling;

@@ -85,6 +85,11 @@ struct CatalogueMusicBrainzConfig {
     std::string cover_size{"500"};
 };
 
+struct CatalogueDiscogsConfig {
+    bool enabled{false};
+    std::optional<std::filesystem::path> token_file;
+};
+
 struct CatalogueMovieProviderConfig {
     bool enabled{true};
     std::vector<std::string> roots{"/Movies"};
@@ -101,6 +106,7 @@ struct CatalogueMusicProviderConfig {
     bool enabled{true};
     std::vector<std::string> roots{"/Music"};
     CatalogueMusicBrainzConfig musicbrainz;
+    CatalogueDiscogsConfig discogs;
 };
 
 struct CatalogueScannerConfig {

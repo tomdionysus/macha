@@ -116,6 +116,7 @@ class CurlHttpClient final : public HttpClient {
 class MetadataProvider {
   public:
     virtual ~MetadataProvider() = default;
+    virtual std::string_view name() const noexcept = 0;
     virtual bool supports(MediaProbeKind) const = 0;
     virtual std::optional<ProviderMatch> lookup(const MediaProbe&) = 0;
 };
@@ -136,6 +137,7 @@ class TmdbProvider final : public MetadataProvider {
 
   public:
     TmdbProvider(HttpClient&, CatalogueTmdbConfig);
+    std::string_view name() const noexcept override { return "tmdb"; }
     bool supports(MediaProbeKind) const override;
     std::optional<ProviderMatch> lookup(const MediaProbe&) override;
 };
@@ -148,6 +150,7 @@ class MusicBrainzProvider final : public MetadataProvider {
     std::map<std::string, std::optional<Json>> recording_cache_;
     std::map<std::string, std::optional<std::string>> cover_cache_;
     std::chrono::steady_clock::time_point last_request_{};
+    std::chrono::steady_clock::time_point unavailable_until_{};
 
     Json api(std::string_view path, const std::vector<std::pair<std::string, std::string>>& query = {});
     std::optional<Json> release_by_id(std::string_view);
@@ -157,6 +160,28 @@ class MusicBrainzProvider final : public MetadataProvider {
 
   public:
     MusicBrainzProvider(HttpClient&, CatalogueMusicBrainzConfig);
+    std::string_view name() const noexcept override { return "musicbrainz"; }
+    bool supports(MediaProbeKind) const override;
+    std::optional<ProviderMatch> lookup(const MediaProbe&) override;
+};
+
+class DiscogsProvider final : public MetadataProvider {
+    HttpClient& http_;
+    CatalogueDiscogsConfig config_;
+    std::string token_;
+    std::map<std::string, std::optional<Json>> search_cache_;
+    std::map<std::string, std::optional<Json>> release_cache_;
+    std::chrono::steady_clock::time_point last_request_{};
+    std::chrono::steady_clock::time_point unavailable_until_{};
+
+    Json api(std::string_view path,
+             const std::vector<std::pair<std::string, std::string>>& query = {});
+    std::optional<Json> release_by_id(std::string_view);
+    std::optional<Json> find_release(const MediaProbe&);
+
+  public:
+    DiscogsProvider(HttpClient&, CatalogueDiscogsConfig);
+    std::string_view name() const noexcept override { return "discogs"; }
     bool supports(MediaProbeKind) const override;
     std::optional<ProviderMatch> lookup(const MediaProbe&) override;
 };
@@ -209,7 +234,7 @@ class TvScanProvider final : public CatalogueScanProvider {
 
 class MusicScanProvider final : public CatalogueScanProvider {
     std::vector<std::string> roots_;
-    std::unique_ptr<MusicBrainzProvider> metadata_;
+    std::vector<std::unique_ptr<MetadataProvider>> metadata_;
 
   public:
     MusicScanProvider(HttpClient&, CatalogueMusicProviderConfig);
@@ -217,9 +242,7 @@ class MusicScanProvider final : public CatalogueScanProvider {
     const std::vector<std::string>& roots() const noexcept override { return roots_; }
     std::vector<MediaProbeCandidate> probe_candidates(FileSystem&, std::string_view, std::string_view,
                                                         const FsEntry&) override;
-    std::optional<ProviderMatch> lookup(const MediaProbe& probe) override {
-        return metadata_ ? metadata_->lookup(probe) : std::nullopt;
-    }
+    std::optional<ProviderMatch> lookup(const MediaProbe& probe) override;
 };
 
 class CatalogueScanner {

@@ -1282,6 +1282,9 @@ void test_config() {
             << "          enabled: true\n"
             << "          contact: https://example.test/macha\n"
             << "          cover_size: '500'\n"
+            << "        discogs:\n"
+            << "          enabled: true\n"
+            << "          token_file: " << (t.path() / "discogs.token").string() << "\n"
             << "streaming:\n"
             << "  enabled: true\n"
             << "  ffmpeg: /legacy/ignored/ffmpeg\n"
@@ -1363,6 +1366,9 @@ void test_config() {
     CHECK(*yc.catalogue.scanner.tv.tmdb.token_file == t.path() / "tmdb.token");
     CHECK(yc.catalogue.scanner.music.musicbrainz.contact == "https://example.test/macha");
     CHECK(yc.catalogue.scanner.music.musicbrainz.cover_size == "500");
+    CHECK(yc.catalogue.scanner.music.discogs.enabled);
+    REQUIRE(yc.catalogue.scanner.music.discogs.token_file.has_value());
+    CHECK(*yc.catalogue.scanner.music.discogs.token_file == t.path() / "discogs.token");
     CHECK(yc.streaming.enabled);
     REQUIRE(yc.streaming.temp_path.has_value());
     CHECK(*yc.streaming.temp_path == t.path() / "streams");
@@ -3769,6 +3775,8 @@ void test_media_probe_and_online_catalogue_scanner() {
              EpisodeRegression{"/TV/Stranger.Things.S05E08.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 8, ""},
              EpisodeRegression{"/TV/Battlestar Galactica (2003) Season 1-4 S01-S04 (1080p BluRay x265 HEVC 10bit AAC 5.1 RZeroX)/Season 2/Battlestar Galactica (2003) - S02E01 - Scattered (1080p BluRay x265 RZeroX).mkv", "Battlestar Galactica", 2003, 2, 1, "Scattered"},
              EpisodeRegression{"/TV/Ballykissangel (1996)/Season 2/Ballykissangel - S02E09 - As Happy as a Turkey on Boxing Day.mkv", "Ballykissangel", 1996, 2, 9, "As Happy as a Turkey on Boxing Day"},
+             EpisodeRegression{"/TV/Allo Allo 1984 Season 1 to 3 Complete DVDRip x264 [i_c]/Allo Allo 1984 Season 1/01 - Allo Allo S1e00 - The British Are Coming [Pilot].mkv", "Allo Allo", 0, 1, 0, "The British Are Coming [Pilot]"},
+             EpisodeRegression{"/TV/Test Show S01E01 - Ordinary Episode [rartv].mkv", "Test Show", 0, 1, 1, "Ordinary Episode"},
              EpisodeRegression{"/TV/Black Books (2000)/Black Books (2000) - S01E01 - Cooking the Books (576p DVD x265 Ghost).mkv", "Black Books", 2000, 1, 1, "Cooking the Books"},
              EpisodeRegression{"/TV/Black Books (2000)/S01E02.mkv", "Black Books", 2000, 1, 2, ""},
              EpisodeRegression{"/TV/Blackadder.1982.S01-S04.1080p.BluRay.EAC3.2.0.x265-iVy/S01E01.mkv", "Blackadder", 1982, 1, 1, ""},
@@ -3893,6 +3901,24 @@ void test_media_probe_and_online_catalogue_scanner() {
     CHECK(tv_match->items[2].media_ids == std::vector<std::string>{"macha:test-episode"});
     CHECK(tv_match->artwork.size() == 4);
 
+    // A one-year TV premiere difference is evidence, not a hard rejection.
+    // Release folders frequently use a pilot/miniseries/production year.
+    FakeHttpClient adjacent_year_http;
+    adjacent_year_http.add("query=Adjacent%20Year%20Show&language=en-GB", 200, "application/json",
+                           R"({"results":[{"id":1500,"name":"Adjacent Year Show","first_air_date":"2004-01-01"}]})");
+    adjacent_year_http.add("/tv/1500/season/1", 200, "application/json",
+                           R"({"id":1501,"name":"Season 1","episodes":[{"id":1502,"episode_number":1,"name":"Pilot"}]})");
+    TmdbProvider adjacent_year_tmdb(adjacent_year_http, tmdb_config);
+    MediaProbe adjacent_year_probe;
+    adjacent_year_probe.kind = MediaProbeKind::episode;
+    adjacent_year_probe.series = "Adjacent Year Show";
+    adjacent_year_probe.year = 2003;
+    adjacent_year_probe.season = 1;
+    adjacent_year_probe.episode = 1;
+    adjacent_year_probe.title = "Pilot";
+    adjacent_year_probe.media_id = "macha:adjacent-year";
+    CHECK(adjacent_year_tmdb.lookup(adjacent_year_probe).has_value());
+
     // Positive show/season results are cached as the actual JSON objects, not
     // merely as truthy values. A second episode lookup must therefore remain
     // usable without issuing another provider request.
@@ -3907,13 +3933,11 @@ void test_media_probe_and_online_catalogue_scanner() {
     // cache that negative season result and let the scanner try the yearless
     // episode candidate without repeatedly spending one request per episode.
     FakeHttpClient battlestar_http;
-    battlestar_http.add("first_air_date_year=2003", 200, "application/json",
-                        R"({"results":[{"id":101,"name":"Battlestar Galactica","first_air_date":"2003-12-08"}]})");
-    battlestar_http.add("/tv/101/season/2", 404, "application/json", R"({})");
     battlestar_http.add("query=Battlestar%20Galactica&language=en-GB", 200, "application/json",
-                        R"({"results":[{"id":1972,"name":"Battlestar Galactica","first_air_date":"2004-10-18"}]})");
+                        R"({"results":[{"id":1972,"name":"Battlestar Galactica","first_air_date":"2004-10-18"},{"id":101,"name":"Battlestar Galactica","first_air_date":"2003-12-08"}]})");
+    battlestar_http.add("/tv/101/season/2", 404, "application/json", R"({})");
     battlestar_http.add("/tv/1972/season/2", 200, "application/json",
-                        R"({"id":202,"name":"Season 2","episodes":[{"id":203,"episode_number":1,"name":"Scattered"}]})");
+                        R"({"id":202,"name":"Season 2","episodes":[{"id":203,"episode_number":1,"name":"Scattered"},{"id":204,"episode_number":2,"name":"Valley of Darkness"}]})");
     TmdbProvider battlestar_tmdb(battlestar_http, tmdb_config);
     MediaProbe battlestar_probe;
     battlestar_probe.kind = MediaProbeKind::episode;
@@ -3921,17 +3945,24 @@ void test_media_probe_and_online_catalogue_scanner() {
     battlestar_probe.year = 2003;
     battlestar_probe.season = 2;
     battlestar_probe.episode = 1;
+    battlestar_probe.title = "Scattered";
     battlestar_probe.media_id = "macha:test-bsg";
     CHECK(!battlestar_tmdb.lookup(battlestar_probe).has_value());
     CHECK(battlestar_http.requests() == 2);
     battlestar_probe.episode = 2;
+    battlestar_probe.title = "Valley of Darkness";
     CHECK(!battlestar_tmdb.lookup(battlestar_probe).has_value());
     CHECK(battlestar_http.requests() == 2);
     battlestar_probe.year.reset();
     battlestar_probe.episode = 1;
+    battlestar_probe.title = "Scattered";
     auto battlestar_match = battlestar_tmdb.lookup(battlestar_probe);
     REQUIRE(battlestar_match.has_value());
     CHECK(battlestar_match->items.back().title == "Scattered");
+    CHECK(battlestar_http.requests() == 4);
+
+    battlestar_probe.title = "Definitely Not Scattered";
+    CHECK(!battlestar_tmdb.lookup(battlestar_probe).has_value());
     CHECK(battlestar_http.requests() == 4);
 
     // Provider title scoring must tolerate common number spelling differences
@@ -4111,8 +4142,8 @@ void test_media_probe_and_online_catalogue_scanner() {
     CHECK(compilation_match->items[2].title == "Teardrop");
 
     // Semantic provider misses are process-lifetime negative cache entries.
-    // Transient HTTP failures still throw and are retried; only a successful
-    // provider response saying "no match" is suppressed on later tracks/scans.
+    // Only a successful provider response saying "no match" is suppressed on
+    // later tracks/scans; transient failures use the provider circuit instead.
     FakeHttpClient mb_miss_http;
     mb_miss_http.add("/ws/2/release?", 200, "application/json", R"({"releases":[]})");
     MusicBrainzProvider mb_miss(mb_miss_http, mb_config);
@@ -4127,6 +4158,69 @@ void test_media_probe_and_online_catalogue_scanner() {
         CHECK(!mb_miss.lookup(missing_track).has_value());
     }
     CHECK(mb_miss_http.requests() == 1);
+
+    FakeHttpClient mb_error_http;
+    mb_error_http.add("/ws/2/release?", 503, "application/json", R"({})");
+    MusicBrainzProvider mb_error(mb_error_http, mb_config);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool threw = false;
+        try {
+            (void)mb_error.lookup(music_probe);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        CHECK(threw);
+    }
+    CHECK(mb_error_http.requests() == 1);
+
+    // A transient MusicBrainz outage must not burn every music hypothesis.
+    // The circuit opens after one 503 and Discogs receives the same candidate.
+    TempDir discogs_temp;
+    auto discogs_token = discogs_temp.path() / "discogs.token";
+    {
+        std::ofstream out(discogs_token);
+        out << "discogs-test-token\n";
+    }
+    FakeHttpClient fallback_music_http;
+    fallback_music_http.add("musicbrainz.org/ws/2", 503, "application/json", R"({})");
+    fallback_music_http.add("api.discogs.com/database/search", 200, "application/json",
+                            R"({"results":[{"id":500,"type":"release","title":"Clannad - Crann Ull","year":1980}]})");
+    fallback_music_http.add("api.discogs.com/releases/500", 200, "application/json",
+                            R"({"id":500,"title":"Crann Ull","year":1980,"master_id":600,"artists":[{"id":700,"name":"Clannad"}],"tracklist":[{"position":"7","type_":"track","title":"Gathering Mushrooms"}],"images":[{"type":"primary","uri":"https://img.discogs.example/500.jpg"}]})");
+    CatalogueMusicProviderConfig fallback_music_config;
+    fallback_music_config.roots = {"/Music"};
+    fallback_music_config.musicbrainz.enabled = true;
+    fallback_music_config.discogs.enabled = true;
+    fallback_music_config.discogs.token_file = discogs_token;
+    MusicScanProvider fallback_music(fallback_music_http, fallback_music_config);
+    MediaProbe discogs_probe;
+    discogs_probe.kind = MediaProbeKind::track;
+    discogs_probe.path = "/Music/Clannad/1980 - Crann Ull/07.Clannad - Gathering Mushrooms.mp3";
+    discogs_probe.media_id = "macha:discogs-fallback";
+    discogs_probe.artist = "Clannad";
+    discogs_probe.album = "Crann Ull";
+    discogs_probe.title = "Gathering Mushrooms";
+    discogs_probe.year = 1980;
+    discogs_probe.track = 7;
+    discogs_probe.lookup_strategy = MediaProbeLookupStrategy::music_recording_first;
+    auto discogs_match = fallback_music.lookup(discogs_probe);
+    REQUIRE(discogs_match.has_value());
+    CHECK(discogs_match->items.size() == 3);
+    CHECK(discogs_match->items[0].id == "discogs:artist:700");
+    CHECK(discogs_match->items[1].id == "discogs:album:master:600");
+    CHECK(discogs_match->items[2].id == "discogs:track:500:7");
+    CHECK(discogs_match->items[2].title == "Gathering Mushrooms");
+    CHECK(fallback_music_http.requests_containing("musicbrainz.org/ws/2") == 1);
+    CHECK(fallback_music_http.requests_containing("api.discogs.com/database/search") == 1);
+    CHECK(fallback_music_http.requests_containing("api.discogs.com/releases/500") == 1);
+
+    // The MusicBrainz circuit is still open, while Discogs' successful search
+    // and release detail are cached.
+    auto discogs_cached = fallback_music.lookup(discogs_probe);
+    REQUIRE(discogs_cached.has_value());
+    CHECK(fallback_music_http.requests_containing("musicbrainz.org/ws/2") == 1);
+    CHECK(fallback_music_http.requests_containing("api.discogs.com/database/search") == 1);
+    CHECK(fallback_music_http.requests_containing("api.discogs.com/releases/500") == 1);
 
     FakeHttpClient tmdb_miss_http;
     tmdb_miss_http.add("/search/movie", 200, "application/json", R"({"results":[]})");
@@ -4967,7 +5061,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
-    CHECK(status_body.find("\"server_version\":\"0.12.1\"") != std::string::npos);
+    CHECK(status_body.find("\"server_version\":\"0.12.2\"") != std::string::npos);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -5630,7 +5724,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == "0.12.1");
+    CHECK(playback_status_json.find("server_version")->asString() == "0.12.2");
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately

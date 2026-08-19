@@ -17,6 +17,7 @@ extern "C" {
 #include <cctype>
 #include <charconv>
 #include <cerrno>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <regex>
@@ -365,8 +366,25 @@ std::string strip_release_noise(std::string value) {
     std::smatch match;
     if (std::regex_search(value, match, technical))
         value.resize(static_cast<size_t>(match.position()));
-    static const std::regex site_tag(R"([ ._-]*\[[^\]]+\]\s*$)", std::regex::icase);
-    value = std::regex_replace(value, site_tag, "");
+    // Trailing brackets are ambiguous: release/site tags such as [rartv],
+    // [EZTVx.to] and [i_c] are noise, but human episode qualifiers such as
+    // [Pilot] are semantic title text. Only remove brackets that look like
+    // distribution/source tags rather than every trailing bracketed phrase.
+    static const std::regex site_tag(R"([ ._-]*\[([^\]]+)\]\s*$)", std::regex::icase);
+    std::smatch site_match;
+    if (std::regex_search(value, site_match, site_tag)) {
+        auto tag = lower(trim(site_match[1].str()));
+        static const std::set<std::string> known_site_tags{
+            "eztv", "eztvx", "eztvx.to", "ettv", "galaxyrg", "i_c",
+            "qxr", "rarbg", "rartv", "tgx", "torrentgalaxy", "utr",
+            "yify", "yts", "yts.mx"};
+        const bool looks_like_site = tag.find('.') != std::string::npos ||
+                                     tag.find('_') != std::string::npos ||
+                                     tag.find('@') != std::string::npos ||
+                                     known_site_tags.contains(tag);
+        if (looks_like_site)
+            value.resize(static_cast<size_t>(site_match.position()));
+    }
     return trim(value);
 }
 
@@ -665,10 +683,12 @@ class FilenameEpisodeCandidateGenerator final : public MediaProbeCandidateGenera
         const auto& entry = context.entry;
         if (!video_extension(extension(path))) return {};
         auto pattern = episode_pattern(stem(path));
-        if (!pattern || clean_series_name(pattern->prefix).empty()) return {};
+        if (!pattern) return {};
+        const auto prefix = strip_collection_ordinal(pattern->prefix);
+        if (clean_series_name(prefix).empty()) return {};
         auto probe = make_probe(path, entry, MediaProbeKind::episode);
-        probe.series = clean_series_name(pattern->prefix);
-        probe.year = year_from(pattern->prefix);
+        probe.series = clean_series_name(prefix);
+        probe.year = year_from(prefix);
         probe.season = pattern->season;
         probe.episode = pattern->episode;
         probe.title = clean_episode_title(pattern->suffix);
@@ -1087,7 +1107,8 @@ int title_similarity(std::string_view wanted, std::string_view candidate) {
 }
 
 const Json* best_result(const Json& root, std::string_view title, std::string_view title_key,
-                        const std::optional<int32_t>& year, std::string_view date_key) {
+                        const std::optional<int32_t>& year, std::string_view date_key,
+                        bool allow_adjacent_year = false) {
     auto results = root.find("results");
     if (!results || !results->isArray() || results->asArray().empty()) return nullptr;
     const Json* best = nullptr;
@@ -1104,11 +1125,13 @@ const Json* best_result(const Json& root, std::string_view title, std::string_vi
             auto found_year = json_year(candidate.find(date_key));
             if (found_year && *found_year == *year) {
                 score += 45;
-                // TMDB already ranked the result for our exact search query.
-                // Exact-year agreement on the top result is useful evidence
-                // for aliases/translations whose canonical provider title has
-                // little lexical overlap with the release filename.
+                // Exact-year agreement on a highly ranked result is useful
+                // evidence for aliases/translations whose canonical provider
+                // title has little lexical overlap with the release filename.
                 if (rank == 0) score += 30;
+            } else if (allow_adjacent_year && found_year &&
+                       std::abs(*found_year - *year) == 1) {
+                score += 20;
             } else if (found_year) score -= 35;
         }
         if (score > best_score) {
@@ -1137,6 +1160,61 @@ std::string artist_credit_name(const Json* credit) {
     return out;
 }
 
+std::string discogs_artist_name(const Json& release) {
+    auto artists = release.find("artists");
+    if (!artists || !artists->isArray() || artists->asArray().empty())
+        return json_string(release.find("artists_sort"));
+    std::string out;
+    for (const auto& artist : artists->asArray()) {
+        if (!artist.isObject()) continue;
+        auto name = json_string(artist.find("name"));
+        // Discogs appends numeric disambiguators such as "Artist (2)". They
+        // identify the database entity, not the display credit.
+        static const std::regex suffix(R"(\s+\([0-9]+\)$)");
+        name = std::regex_replace(name, suffix, "");
+        if (name.empty()) continue;
+        if (!out.empty()) out += ", ";
+        out += name;
+    }
+    return out;
+}
+
+std::optional<int32_t> discogs_track_number(std::string_view position) {
+    size_t begin = 0;
+    while (begin < position.size() && !std::isdigit(static_cast<unsigned char>(position[begin]))) ++begin;
+    if (begin == position.size()) return {};
+    size_t end = begin;
+    while (end < position.size() && std::isdigit(static_cast<unsigned char>(position[end]))) ++end;
+    int32_t value{};
+    auto [ptr, ec] = std::from_chars(position.data() + begin, position.data() + end, value);
+    if (ec != std::errc{} || ptr != position.data() + end) return {};
+    return value;
+}
+
+std::string discogs_image_url(const Json& release) {
+    auto images = release.find("images");
+    if (!images || !images->isArray()) return {};
+    const Json* fallback = nullptr;
+    for (const auto& image : images->asArray()) {
+        if (!image.isObject()) continue;
+        if (!fallback) fallback = &image;
+        if (lower(json_string(image.find("type"))) != "primary") continue;
+        auto uri = json_string(image.find("uri"));
+        if (uri.empty()) uri = json_string(image.find("resource_url"));
+        if (!uri.empty()) return uri;
+    }
+    if (!fallback) return {};
+    auto uri = json_string(fallback->find("uri"));
+    if (uri.empty()) uri = json_string(fallback->find("resource_url"));
+    return uri;
+}
+
+std::pair<std::string, std::string> discogs_result_title(std::string_view value) {
+    const auto split = value.find(" - ");
+    if (split == std::string_view::npos) return {std::string(value), {}};
+    return {std::string(value.substr(0, split)), std::string(value.substr(split + 3))};
+}
+
 bool has_art_role(const CatalogueItem* item, std::string_view role) {
     if (!item) return false;
     return std::any_of(item->artwork.begin(), item->artwork.end(),
@@ -1148,6 +1226,19 @@ class ProviderBudgetExhausted final : public std::runtime_error {
   public:
     ProviderBudgetExhausted() : std::runtime_error("catalogue provider request budget exhausted") {}
 };
+
+class ProviderTemporarilyUnavailable final : public std::runtime_error {
+    std::string provider_;
+
+  public:
+    ProviderTemporarilyUnavailable(std::string provider, std::string message)
+        : std::runtime_error(std::move(message)), provider_(std::move(provider)) {}
+    const std::string& provider() const noexcept { return provider_; }
+};
+
+bool transient_provider_status(long status) {
+    return status == 429 || status >= 500;
+}
 
 class BudgetHttpClient final : public HttpClient {
     HttpClient& upstream_;
@@ -1318,9 +1409,13 @@ std::optional<Json> TmdbProvider::find_show(const MediaProbe& probe) {
     const auto key = normalized(probe.series) + "|" + (probe.year ? std::to_string(*probe.year) : "");
     if (auto it = show_cache_.find(key); it != show_cache_.end()) return it->second;
     std::vector<std::pair<std::string, std::string>> q{{"query", probe.series}, {"language", config_.language}};
-    if (probe.year) q.emplace_back("first_air_date_year", std::to_string(*probe.year));
+    // Do not use TMDB's exact first_air_date_year filter here. Local TV
+    // libraries often name a series after a pilot/miniseries/production year,
+    // while TMDB dates the regular series one year later. Score the year
+    // locally instead so +/-1 remains viable evidence rather than a hard miss.
     auto root = api("/search/tv", q);
-    const auto* result = best_result(root, probe.series, "name", probe.year, "first_air_date");
+    const auto* result = best_result(root, probe.series, "name", probe.year,
+                                     "first_air_date", true);
     if (!result) {
         show_cache_[key] = std::nullopt;
         return {};
@@ -1406,6 +1501,26 @@ std::optional<ProviderMatch> TmdbProvider::lookup(const MediaProbe& probe) {
     }
     if (!episode_json) return {};
 
+    const auto remote_episode_title = json_string(episode_json->find("name"));
+    int episode_title_score = 0;
+    if (!probe.title.empty() && !remote_episode_title.empty()) {
+        episode_title_score = title_similarity(probe.title, remote_episode_title);
+        // Once a candidate has discarded year evidence, the episode title is
+        // our strongest independent corroborator. Do not accept an unrelated
+        // show merely because it happens to contain the same SxxExx number.
+        if (episode_title_score < 75) return {};
+    }
+
+    Log::debug("catalogue: tmdb tv match path=" + probe.path +
+               " local_series=\"" + probe.series + "\" remote_series=\"" +
+               json_string(show_json->find("name")) + "\" remote_year=" +
+               std::to_string(json_year(show_json->find("first_air_date")).value_or(0)) +
+               " season=" + std::to_string(*probe.season) +
+               " episode=" + std::to_string(*probe.episode) +
+               " local_episode=\"" + probe.title + "\" remote_episode=\"" +
+               remote_episode_title + "\" episode_title_score=" +
+               std::to_string(episode_title_score));
+
     CatalogueItem show;
     show.id = item_id("tmdb", "tv", series_id);
     show.kind = CatalogueKind::show;
@@ -1461,6 +1576,10 @@ bool MusicBrainzProvider::supports(MediaProbeKind kind) const {
 
 Json MusicBrainzProvider::api(std::string_view path,
                               const std::vector<std::pair<std::string, std::string>>& query) {
+    const auto now = std::chrono::steady_clock::now();
+    if (unavailable_until_ > now)
+        throw ProviderTemporarilyUnavailable("musicbrainz", "MusicBrainz circuit open");
+
     if (last_request_ != std::chrono::steady_clock::time_point{}) {
         const auto due = last_request_ + std::chrono::seconds(1);
         while (std::chrono::steady_clock::now() < due) {
@@ -1475,9 +1594,23 @@ Json MusicBrainzProvider::api(std::string_view path,
     auto ua = std::string("Macha/") + std::string(kServerVersion) + " (" + config_.contact + ")";
     auto q = query;
     q.emplace_back("fmt", "json");
-    auto response = http_.get(query_url("https://musicbrainz.org/ws/2" + std::string(path), q),
-                              {"Accept: application/json", "User-Agent: " + ua});
+    RemoteHttpResponse response;
+    try {
+        response = http_.get(query_url("https://musicbrainz.org/ws/2" + std::string(path), q),
+                             {"Accept: application/json", "User-Agent: " + ua});
+    } catch (const ProviderBudgetExhausted&) {
+        throw;
+    } catch (const std::exception& e) {
+        unavailable_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        throw ProviderTemporarilyUnavailable(
+            "musicbrainz", "MusicBrainz transport unavailable: " + std::string(e.what()));
+    }
     last_request_ = std::chrono::steady_clock::now();
+    if (transient_provider_status(response.status)) {
+        unavailable_until_ = last_request_ + std::chrono::seconds(60);
+        throw ProviderTemporarilyUnavailable(
+            "musicbrainz", "MusicBrainz returned HTTP " + std::to_string(response.status));
+    }
     if (response.status != 200)
         throw std::runtime_error("MusicBrainz returned HTTP " + std::to_string(response.status));
     return Json::parse(std::string_view(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
@@ -1756,6 +1889,251 @@ std::optional<ProviderMatch> MusicBrainzProvider::lookup(const MediaProbe& probe
     return result;
 }
 
+
+DiscogsProvider::DiscogsProvider(HttpClient& http, CatalogueDiscogsConfig config)
+    : http_(http), config_(std::move(config)), token_(read_secret(config_.token_file)) {}
+
+bool DiscogsProvider::supports(MediaProbeKind kind) const {
+    return config_.enabled && !token_.empty() && kind == MediaProbeKind::track;
+}
+
+Json DiscogsProvider::api(std::string_view path,
+                          const std::vector<std::pair<std::string, std::string>>& query) {
+    const auto now = std::chrono::steady_clock::now();
+    if (unavailable_until_ > now)
+        throw ProviderTemporarilyUnavailable("discogs", "Discogs circuit open");
+
+    // Authenticated Discogs clients are limited to 60 requests/minute. Pace
+    // locally as well as obeying Macha's global per-scan HTTP budget.
+    if (last_request_ != std::chrono::steady_clock::time_point{}) {
+        const auto due = last_request_ + std::chrono::seconds(1);
+        while (std::chrono::steady_clock::now() < due) {
+            if (http_.stop_requested())
+                throw std::runtime_error("Discogs request cancelled");
+            const auto remaining = due - std::chrono::steady_clock::now();
+            const auto slice = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::min(remaining, slice));
+        }
+    }
+
+    RemoteHttpResponse response;
+    const auto user_agent = std::string("Macha/") + std::string(kServerVersion);
+    try {
+        response = http_.get(query_url("https://api.discogs.com" + std::string(path), query),
+                             {"Authorization: Discogs token=" + token_,
+                              "Accept: application/json",
+                              "User-Agent: " + user_agent});
+    } catch (const ProviderBudgetExhausted&) {
+        throw;
+    } catch (const std::exception& e) {
+        unavailable_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        throw ProviderTemporarilyUnavailable(
+            "discogs", "Discogs transport unavailable: " + std::string(e.what()));
+    }
+    last_request_ = std::chrono::steady_clock::now();
+    if (transient_provider_status(response.status)) {
+        unavailable_until_ = last_request_ + std::chrono::seconds(60);
+        throw ProviderTemporarilyUnavailable(
+            "discogs", "Discogs returned HTTP " + std::to_string(response.status));
+    }
+    if (response.status != 200)
+        throw std::runtime_error("Discogs returned HTTP " + std::to_string(response.status));
+    return Json::parse(std::string_view(reinterpret_cast<const char*>(response.body.data()),
+                                        response.body.size()));
+}
+
+std::optional<Json> DiscogsProvider::release_by_id(std::string_view release_id) {
+    if (release_id.empty()) return {};
+    const auto key = std::string(release_id);
+    if (auto it = release_cache_.find(key); it != release_cache_.end()) return it->second;
+    auto detail = api("/releases/" + key);
+    release_cache_[key] = detail;
+    return detail;
+}
+
+std::optional<Json> DiscogsProvider::find_release(const MediaProbe& probe) {
+    if (probe.artist.empty()) return {};
+    const auto recording_first =
+        probe.lookup_strategy == MediaProbeLookupStrategy::music_recording_first;
+    if (recording_first && probe.title.empty()) return {};
+    if (!recording_first && probe.album.empty()) return {};
+
+    const auto key = std::string(recording_first ? "track|" : "release|") +
+                     normalized(probe.artist) + "|" + normalized(probe.album) + "|" +
+                     normalized(probe.title) + "|" +
+                     (probe.year ? std::to_string(*probe.year) : "");
+    std::optional<Json> selected;
+    if (auto it = search_cache_.find(key); it != search_cache_.end()) {
+        selected = it->second;
+    } else {
+        std::vector<std::pair<std::string, std::string>> query{
+            {"type", "release"}, {"per_page", "10"}, {"artist", probe.artist}};
+        if (recording_first)
+            query.emplace_back("track", probe.title);
+        else if (!probe.album.empty())
+            query.emplace_back("release_title", probe.album);
+        // Keep album/year as local scoring evidence for recording-first lookup;
+        // hard provider filters would discard compilation and reissue matches.
+
+        auto root = api("/database/search", query);
+        const auto* results = root.find("results");
+        const Json* best = nullptr;
+        int best_score = -1000;
+        size_t rank = 0;
+        if (results && results->isArray()) {
+            for (const auto& candidate : results->asArray()) {
+                if (!candidate.isObject()) {
+                    ++rank;
+                    continue;
+                }
+                const auto [candidate_artist, candidate_release] =
+                    discogs_result_title(json_string(candidate.find("title")));
+                int score = recording_first ? 60 : title_similarity(probe.artist, candidate_artist);
+                if (!probe.album.empty()) score += title_similarity(probe.album, candidate_release);
+                score += std::max(0, 18 - static_cast<int>(rank) * 3);
+                if (probe.year) {
+                    auto candidate_year = json_i32(candidate.find("year"));
+                    if (candidate_year && *candidate_year == *probe.year)
+                        score += 30;
+                    else if (candidate_year && std::abs(*candidate_year - *probe.year) == 1)
+                        score += 10;
+                    else if (candidate_year)
+                        score -= 20;
+                }
+                if (score > best_score) {
+                    best_score = score;
+                    best = &candidate;
+                }
+                ++rank;
+            }
+        }
+        const int minimum = recording_first
+            ? (probe.album.empty() ? 60 : 100)
+            : (probe.album.empty() ? 90 : 145);
+        if (best && best_score >= minimum) selected = *best;
+        search_cache_[key] = selected;
+    }
+    if (!selected) return {};
+    auto id = json_i32(selected->find("id"));
+    if (!id) return {};
+    return release_by_id(std::to_string(*id));
+}
+
+std::optional<ProviderMatch> DiscogsProvider::lookup(const MediaProbe& probe) {
+    if (!supports(probe.kind)) return {};
+    auto release = find_release(probe);
+    if (!release) return {};
+
+    const auto release_id_value = json_i32(release->find("id"));
+    if (!release_id_value) return {};
+    const auto release_id = std::to_string(*release_id_value);
+    const auto release_title = json_string(release->find("title"));
+    const auto release_artist = discogs_artist_name(*release);
+    if (release_title.empty() || release_artist.empty()) return {};
+    const auto recording_first =
+        probe.lookup_strategy == MediaProbeLookupStrategy::music_recording_first;
+    if (!recording_first && !probe.artist.empty() &&
+        title_similarity(probe.artist, release_artist) < 65)
+        return {};
+    if (!recording_first && !probe.album.empty() &&
+        title_similarity(probe.album, release_title) < 55)
+        return {};
+
+    const Json* selected_track = nullptr;
+    int selected_score = -1;
+    size_t selected_index = 0;
+    if (auto tracklist = release->find("tracklist"); tracklist && tracklist->isArray()) {
+        size_t index = 0;
+        for (const auto& entry : tracklist->asArray()) {
+            if (!entry.isObject()) {
+                ++index;
+                continue;
+            }
+            const auto type = lower(json_string(entry.find("type_")));
+            if (!type.empty() && type != "track") {
+                ++index;
+                continue;
+            }
+            const auto title = json_string(entry.find("title"));
+            const auto position = json_string(entry.find("position"));
+            int score = 0;
+            if (!probe.title.empty()) score += title_similarity(probe.title, title);
+            if (probe.track) {
+                auto number = discogs_track_number(position);
+                if (number && *number == *probe.track) score += 80;
+            }
+            if (score > selected_score) {
+                selected_score = score;
+                selected_track = &entry;
+                selected_index = index;
+            }
+            ++index;
+        }
+    }
+    if (!selected_track) return {};
+    const auto selected_title = json_string(selected_track->find("title"));
+    const int selected_title_score = probe.title.empty() ? 0 : title_similarity(probe.title, selected_title);
+    if (!probe.title.empty() && selected_title_score < 60) return {};
+    if (probe.title.empty() && selected_score < 80) return {};
+    if (recording_first && !probe.artist.empty()) {
+        auto selected_artist = discogs_artist_name(*selected_track);
+        if (selected_artist.empty()) selected_artist = release_artist;
+        if (title_similarity(probe.artist, selected_artist) < 65) return {};
+    }
+
+    std::string artist_id;
+    if (auto artists = release->find("artists"); artists && artists->isArray() && !artists->asArray().empty()) {
+        if (auto id = json_i32(artists->asArray().front().find("id"))) artist_id = std::to_string(*id);
+    }
+    if (artist_id.empty()) artist_id = normalized(release_artist);
+
+    const auto master_id = json_i32(release->find("master_id")).value_or(0);
+    const auto album_key = master_id > 0 ? "master:" + std::to_string(master_id)
+                                         : "release:" + release_id;
+    auto position = json_string(selected_track->find("position"));
+    if (position.empty()) position = std::to_string(selected_index + 1);
+
+    CatalogueItem artist;
+    artist.id = item_id("discogs", "artist", artist_id);
+    artist.kind = CatalogueKind::artist;
+    artist.title = release_artist;
+    artist.sort_title = artist.title;
+    artist.external_ids["discogs"] = artist_id;
+    scanner_marker(artist);
+
+    CatalogueItem album;
+    album.id = item_id("discogs", "album", album_key);
+    album.kind = CatalogueKind::album;
+    album.title = release_title;
+    album.sort_title = album.title;
+    album.parent_id = artist.id;
+    album.year = json_i32(release->find("year"));
+    album.external_ids["discogs_release"] = release_id;
+    if (master_id > 0) album.external_ids["discogs_master"] = std::to_string(master_id);
+    scanner_marker(album);
+
+    CatalogueItem track;
+    track.id = item_id("discogs", "track", release_id + ":" + position);
+    track.kind = CatalogueKind::track;
+    track.title = selected_title.empty() ? probe.title : selected_title;
+    if (track.title.empty()) return {};
+    track.sort_title = track.title;
+    track.parent_id = album.id;
+    track.disc_number = probe.disc;
+    track.track_number = discogs_track_number(position).value_or(
+        probe.track.value_or(static_cast<int32_t>(selected_index + 1)));
+    track.external_ids["discogs_release"] = release_id;
+    track.external_ids["discogs_position"] = position;
+    track.media_ids = {probe.media_id};
+    scanner_marker(track);
+
+    ProviderMatch result;
+    result.items = {artist, album, track};
+    add_art(result.artwork, album.id, "cover", discogs_image_url(*release));
+    return result;
+}
+
 MovieScanProvider::MovieScanProvider(HttpClient& http, CatalogueMovieProviderConfig config)
     : roots_(std::move(config.roots)) {
     if (config.tmdb.enabled) {
@@ -1801,7 +2179,14 @@ std::vector<MediaProbeCandidate> TvScanProvider::probe_candidates(
 MusicScanProvider::MusicScanProvider(HttpClient& http, CatalogueMusicProviderConfig config)
     : roots_(std::move(config.roots)) {
     if (config.musicbrainz.enabled)
-        metadata_ = std::make_unique<MusicBrainzProvider>(http, std::move(config.musicbrainz));
+        metadata_.push_back(std::make_unique<MusicBrainzProvider>(http, std::move(config.musicbrainz)));
+    if (config.discogs.enabled) {
+        try {
+            metadata_.push_back(std::make_unique<DiscogsProvider>(http, std::move(config.discogs)));
+        } catch (const std::exception& e) {
+            Log::warn("catalogue Discogs metadata disabled: " + std::string(e.what()));
+        }
+    }
 }
 
 std::vector<MediaProbeCandidate> MusicScanProvider::probe_candidates(
@@ -1815,6 +2200,41 @@ std::vector<MediaProbeCandidate> MusicScanProvider::probe_candidates(
     });
     if (candidates.size() > 6) candidates.resize(6);
     return candidates;
+}
+
+
+std::optional<ProviderMatch> MusicScanProvider::lookup(const MediaProbe& probe) {
+    if (metadata_.empty()) return {};
+    bool any_reachable = false;
+    bool saw_transient = false;
+    std::string last_transient;
+    size_t provider_index = 0;
+    for (const auto& provider : metadata_) {
+        if (!provider->supports(probe.kind)) {
+            ++provider_index;
+            continue;
+        }
+        try {
+            auto match = provider->lookup(probe);
+            any_reachable = true;
+            if (match) {
+                if (provider_index > 0)
+                    Log::debug("catalogue: music metadata matched fallback provider=" +
+                               std::string(provider->name()) + " path=" + probe.path);
+                return match;
+            }
+        } catch (const ProviderTemporarilyUnavailable& e) {
+            saw_transient = true;
+            last_transient = e.what();
+            Log::debug("catalogue: music metadata provider unavailable provider=" +
+                       e.provider() + " path=" + probe.path + " reason=\"" + e.what() + "\"");
+        }
+        ++provider_index;
+    }
+    if (saw_transient && !any_reachable)
+        throw ProviderTemporarilyUnavailable("music", last_transient.empty()
+            ? "music metadata providers temporarily unavailable" : last_transient);
+    return {};
 }
 
 CatalogueScanner::CatalogueScanner(NodeRuntime& node, FileSystem& fs, CatalogueManager& catalogue,
@@ -1958,6 +2378,7 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
     size_t matched = 0;
     size_t provider_items_processed = 0;
     bool provider_budget_exhausted = false;
+    bool provider_deferred = false;
 
     struct ProviderQueueItem {
         const PendingProbe* pending{};
@@ -2047,6 +2468,7 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
         retry,
         complete,
         budget_exhausted,
+        provider_unavailable,
     };
 
     auto process_pending_step = [&](ProviderQueueItem& state) -> PendingStepResult {
@@ -2065,6 +2487,12 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
             match = pending.provider->lookup(candidate.probe);
         } catch (const ProviderBudgetExhausted&) {
             return PendingStepResult::budget_exhausted;
+        } catch (const ProviderTemporarilyUnavailable& e) {
+            if (stop.stop_requested()) return PendingStepResult::retry;
+            Log::warn("catalogue " + std::string(pending.provider->name()) +
+                      " provider temporarily unavailable for " + pending.path +
+                      " candidate=" + candidate.generator + ": " + e.what());
+            return PendingStepResult::provider_unavailable;
         } catch (const std::exception& e) {
             if (stop.stop_requested()) return PendingStepResult::retry;
             Log::warn("catalogue " + std::string(pending.provider->name()) +
@@ -2097,6 +2525,10 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
             advanced = true;
             auto result = process_pending_step(queue.items[queue.next]);
             if (result == PendingStepResult::complete) ++queue.next;
+            if (result == PendingStepResult::provider_unavailable) {
+                provider_deferred = true;
+                queue.next = queue.items.size();
+            }
             if (stop.stop_requested()) return 0;
             if (result == PendingStepResult::budget_exhausted || budget_http->exhausted()) {
                 provider_budget_exhausted = true;
@@ -2106,11 +2538,15 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
         if (!advanced) break;
     }
 
-    if (provider_budget_exhausted) {
+    if (provider_budget_exhausted || provider_deferred) {
         provider_continuation_.store(true, std::memory_order_relaxed);
-        Log::info("catalogue: provider request budget reached requests=" +
-                  std::to_string(budget_http->used()) + " remaining_media=" +
-                  std::to_string(probes.size() - provider_items_processed));
+        if (provider_budget_exhausted) {
+            Log::info("catalogue: provider request budget reached requests=" +
+                      std::to_string(budget_http->used()) + " remaining_media=" +
+                      std::to_string(probes.size() - provider_items_processed));
+        } else {
+            Log::info("catalogue: metadata provider temporarily unavailable; continuation scheduled");
+        }
     } else {
         provider_resume_after_.clear();
     }
