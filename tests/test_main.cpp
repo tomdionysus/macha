@@ -14,6 +14,7 @@
 #include "placement.hpp"
 #include "service.hpp"
 #include "storage_pool.hpp"
+#include "subtitle_text.hpp"
 #include "persistent_cache.hpp"
 #include "replica_selector.hpp"
 #include <arpa/inet.h>
@@ -96,6 +97,7 @@ class FakeMediaEngine final : public MediaEngine {
     std::vector<PlaybackPlan> started_plans_;
     std::atomic_uint probes_{};
     std::atomic_uint vod_prepares_{};
+    std::atomic_uint subtitle_segments_{};
   public:
     MediaEngineStatus status() const override { return {true, "fake", "fake-media-engine", true, true}; }
     MediaProbeResult probe(const MediaSource&, std::chrono::milliseconds = {}) override {
@@ -148,8 +150,14 @@ class FakeMediaEngine final : public MediaEngine {
         // MediaSegmentStore correctly treats that as a truncated pipeline.
         return std::make_unique<FakeMediaEngineSession>(std::move(store));
     }
-    std::string extract_webvtt(const MediaSource&, int,
-                               std::chrono::milliseconds) override {
+    std::string extract_webvtt_segment(const MediaSource&, int,
+                                       std::chrono::milliseconds range_start,
+                                       std::chrono::milliseconds range_end,
+                                       std::chrono::milliseconds timeline_origin) override {
+        ++subtitle_segments_;
+        (void)range_start;
+        (void)range_end;
+        (void)timeline_origin;
         return "WEBVTT\n\n00:00.000 --> 00:01.000\nsubtitle\n";
     }
     std::vector<PlaybackPlan> started_plans() const {
@@ -158,6 +166,7 @@ class FakeMediaEngine final : public MediaEngine {
     }
     unsigned probes() const { return probes_.load(); }
     unsigned vod_prepares() const { return vod_prepares_.load(); }
+    unsigned subtitle_segments() const { return subtitle_segments_.load(); }
 };
 
 class FailingProbeMediaEngine final : public MediaEngine {
@@ -175,8 +184,9 @@ class FailingProbeMediaEngine final : public MediaEngine {
                                                   const std::filesystem::path&) override {
         throw std::runtime_error("start_hls must not be called after a failed probe");
     }
-    std::string extract_webvtt(const MediaSource&, int, std::chrono::milliseconds) override {
-        throw std::runtime_error("extract_webvtt must not be called after a failed probe");
+    std::string extract_webvtt_segment(const MediaSource&, int, std::chrono::milliseconds,
+                                       std::chrono::milliseconds, std::chrono::milliseconds) override {
+        throw std::runtime_error("extract_webvtt_segment must not be called after a failed probe");
     }
 };
 
@@ -224,7 +234,8 @@ class BlockingMediaEngine final : public MediaEngine {
         ++starts_;
         return std::make_unique<FakeMediaEngineSession>(std::move(store));
     }
-    std::string extract_webvtt(const MediaSource&, int, std::chrono::milliseconds) override { return {}; }
+    std::string extract_webvtt_segment(const MediaSource&, int, std::chrono::milliseconds,
+                                       std::chrono::milliseconds, std::chrono::milliseconds) override { return {}; }
     unsigned starts() const { return starts_.load(); }
     void release() {
         std::shared_ptr<MediaSegmentStore> store;
@@ -5480,16 +5491,38 @@ void test_playback_sessions_and_streaming_http_bodies() {
                                                       subtitle_only_response.body.end()));
     CHECK(subtitle_only_json.find("stream")->find("url")->asString() == direct_url);
     CHECK(subtitle_only_json.find("selection")->find("subtitle_stream")->asInt64() == 2);
-    CHECK(subtitle_only_json.find("stream")->find("subtitle_url")->asString().find("/1/subtitle-2.vtt") != std::string::npos);
+    CHECK(subtitle_only_json.find("stream")->find("subtitle_url")->asString().find("/1/subtitle-2/manifest.json") != std::string::npos);
     CHECK(fake_engine_ptr->probes() == probes_before_subtitle);
     CHECK(fake_engine_ptr->vod_prepares() == prepares_before_subtitle);
 
-    HttpRequest selected_subtitle;
-    selected_subtitle.method = "GET";
-    selected_subtitle.path = subtitle_only_json.find("stream")->find("subtitle_url")->asString();
-    auto selected_subtitle_response = playback.handle(selected_subtitle);
-    REQUIRE(selected_subtitle_response.status == 200);
-    CHECK(selected_subtitle_response.content_type.starts_with("text/vtt"));
+    const auto subtitle_segments_before_manifest = fake_engine_ptr->subtitle_segments();
+    HttpRequest selected_subtitle_manifest;
+    selected_subtitle_manifest.method = "GET";
+    selected_subtitle_manifest.path = subtitle_only_json.find("stream")->find("subtitle_url")->asString();
+    auto selected_subtitle_manifest_response = playback.handle(selected_subtitle_manifest);
+    REQUIRE(selected_subtitle_manifest_response.status == 200);
+    CHECK(selected_subtitle_manifest_response.content_type.starts_with("application/json"));
+    CHECK(fake_engine_ptr->subtitle_segments() == subtitle_segments_before_manifest);
+    REQUIRE(selected_subtitle_manifest_response.stream != nullptr);
+    Bytes selected_subtitle_manifest_bytes(static_cast<size_t>(selected_subtitle_manifest_response.content_length()));
+    REQUIRE(selected_subtitle_manifest_response.stream->read(0, selected_subtitle_manifest_bytes) ==
+            selected_subtitle_manifest_bytes.size());
+    auto selected_subtitle_manifest_json = Json::parse(std::string(
+        selected_subtitle_manifest_bytes.begin(), selected_subtitle_manifest_bytes.end()));
+    CHECK(selected_subtitle_manifest_json.find("format")->asString() == "macha-webvtt-segments");
+    REQUIRE(selected_subtitle_manifest_json.find("segment_durations_ms")->asArray().size() == 15);
+
+    auto selected_subtitle_base = selected_subtitle_manifest.path.substr(0, selected_subtitle_manifest.path.rfind('/'));
+    HttpRequest selected_subtitle_segment;
+    selected_subtitle_segment.method = "GET";
+    selected_subtitle_segment.path = selected_subtitle_base + "/segment-0.vtt";
+    auto selected_subtitle_segment_response = playback.handle(selected_subtitle_segment);
+    REQUIRE(selected_subtitle_segment_response.status == 200);
+    CHECK(selected_subtitle_segment_response.content_type.starts_with("text/vtt"));
+    CHECK(fake_engine_ptr->subtitle_segments() == subtitle_segments_before_manifest + 1);
+    auto selected_subtitle_segment_again = playback.handle(selected_subtitle_segment);
+    REQUIRE(selected_subtitle_segment_again.status == 200);
+    CHECK(fake_engine_ptr->subtitle_segments() == subtitle_segments_before_manifest + 1);
 
     Json::Object subtitle_off_preferences{{"subtitle_stream", Json(nullptr)},
                                           {"subtitle_language", ""}};
@@ -5606,12 +5639,25 @@ void test_playback_sessions_and_streaming_http_bodies() {
     REQUIRE(playlist_response.stream->read(0, playlist_bytes) == playlist_bytes.size());
     CHECK(std::string(playlist_bytes.begin(), playlist_bytes.end()).find("#EXTM3U") != std::string::npos);
 
-    HttpRequest subtitle;
-    subtitle.method = "GET";
-    subtitle.path = subtitle_url;
-    auto subtitle_response = playback.handle(subtitle);
-    REQUIRE(subtitle_response.status == 200);
-    CHECK(subtitle_response.content_type.starts_with("text/vtt"));
+    HttpRequest subtitle_manifest_request;
+    subtitle_manifest_request.method = "GET";
+    subtitle_manifest_request.path = subtitle_url;
+    auto subtitle_manifest_response = playback.handle(subtitle_manifest_request);
+    REQUIRE(subtitle_manifest_response.status == 200);
+    CHECK(subtitle_manifest_response.content_type.starts_with("application/json"));
+    REQUIRE(subtitle_manifest_response.stream != nullptr);
+    Bytes subtitle_manifest_bytes(static_cast<size_t>(subtitle_manifest_response.content_length()));
+    REQUIRE(subtitle_manifest_response.stream->read(0, subtitle_manifest_bytes) == subtitle_manifest_bytes.size());
+    auto subtitle_manifest_json = Json::parse(std::string(subtitle_manifest_bytes.begin(),
+                                                          subtitle_manifest_bytes.end()));
+    REQUIRE(!subtitle_manifest_json.find("segment_durations_ms")->asArray().empty());
+    auto subtitle_base = subtitle_url.substr(0, subtitle_url.rfind('/'));
+    HttpRequest subtitle_segment;
+    subtitle_segment.method = "GET";
+    subtitle_segment.path = subtitle_base + "/segment-0.vtt";
+    auto subtitle_segment_response = playback.handle(subtitle_segment);
+    REQUIRE(subtitle_segment_response.status == 200);
+    CHECK(subtitle_segment_response.content_type.starts_with("text/vtt"));
 
     // The same in-place subtitle path must preserve a live transformed HLS
     // generation as well; no replacement MediaEngineSession is started.
@@ -5687,6 +5733,14 @@ void test_playback_sessions_and_streaming_http_bodies() {
 
 } // namespace
 
+
+void test_subtitle_text_normalisation() {
+    CHECK(plain_ass_subtitle_text("0,0,Default,,0,0,0,,Hello") == "Hello");
+    CHECK(plain_ass_subtitle_text("0,0,Default,,0,0,0,,Hello, world") == "Hello, world");
+    CHECK(plain_ass_subtitle_text("Dialogue: 0,0,Default,,0,0,0,,{\\i1}Hello{\\i0}\\Nworld") ==
+          "Hello\nworld");
+}
+
 int main() {
     try {
         test_codec_and_crypto();
@@ -5733,6 +5787,7 @@ int main() {
         test_media_vod_index_planning_rejects_partial_indexes();
         test_reseek_hls_vod_reuses_prepared_random_access_state();
         test_media_timestamp_repair();
+        test_subtitle_text_normalisation();
         test_http_server_serves_streams_concurrently();
         test_playback_probe_failure_is_stage_specific();
         test_concurrent_transcode_admission_is_reserved();

@@ -77,6 +77,7 @@ set(MACHA_CORE_SOURCES
     src/media_segments.cpp
     src/media_timestamps.cpp
     src/media_vod.cpp
+    src/subtitle_text.cpp
     src/media_engine.cpp
     src/playback.cpp
     src/catalogue.cpp
