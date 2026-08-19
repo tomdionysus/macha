@@ -59,6 +59,17 @@ struct MediaProbeCandidate {
     std::vector<std::string> evidence;
 };
 
+struct LocalArtworkCandidate {
+    std::string role;
+    std::string mime_type;
+    Bytes bytes;
+};
+
+struct MediaProbeFile {
+    std::vector<MediaProbeCandidate> candidates;
+    std::vector<LocalArtworkCandidate> artwork;
+};
+
 class MediaProbeCandidateGenerator {
   public:
     virtual ~MediaProbeCandidateGenerator() = default;
@@ -191,8 +202,12 @@ class CatalogueScanProvider {
     virtual ~CatalogueScanProvider() = default;
     virtual std::string_view name() const noexcept = 0;
     virtual const std::vector<std::string>& roots() const noexcept = 0;
-    virtual std::vector<MediaProbeCandidate> probe_candidates(FileSystem&, std::string_view root,
-                                                                std::string_view path, const FsEntry&) = 0;
+    virtual MediaProbeFile probe_file(FileSystem&, std::string_view root,
+                                      std::string_view path, const FsEntry&) = 0;
+    std::vector<MediaProbeCandidate> probe_candidates(FileSystem& fs, std::string_view root,
+                                                       std::string_view path, const FsEntry& entry) {
+        return probe_file(fs, root, path, entry).candidates;
+    }
     std::optional<MediaProbe> probe(FileSystem& fs, std::string_view root,
                                     std::string_view path, const FsEntry& entry) {
         auto candidates = probe_candidates(fs, root, path, entry);
@@ -210,8 +225,8 @@ class MovieScanProvider final : public CatalogueScanProvider {
     MovieScanProvider(HttpClient&, CatalogueMovieProviderConfig);
     std::string_view name() const noexcept override { return "movies"; }
     const std::vector<std::string>& roots() const noexcept override { return roots_; }
-    std::vector<MediaProbeCandidate> probe_candidates(FileSystem&, std::string_view, std::string_view,
-                                                        const FsEntry&) override;
+    MediaProbeFile probe_file(FileSystem&, std::string_view, std::string_view,
+                              const FsEntry&) override;
     std::optional<ProviderMatch> lookup(const MediaProbe& probe) override {
         return metadata_ ? metadata_->lookup(probe) : std::nullopt;
     }
@@ -225,8 +240,8 @@ class TvScanProvider final : public CatalogueScanProvider {
     TvScanProvider(HttpClient&, CatalogueTvProviderConfig);
     std::string_view name() const noexcept override { return "tv"; }
     const std::vector<std::string>& roots() const noexcept override { return roots_; }
-    std::vector<MediaProbeCandidate> probe_candidates(FileSystem&, std::string_view, std::string_view,
-                                                        const FsEntry&) override;
+    MediaProbeFile probe_file(FileSystem&, std::string_view, std::string_view,
+                              const FsEntry&) override;
     std::optional<ProviderMatch> lookup(const MediaProbe& probe) override {
         return metadata_ ? metadata_->lookup(probe) : std::nullopt;
     }
@@ -235,13 +250,15 @@ class TvScanProvider final : public CatalogueScanProvider {
 class MusicScanProvider final : public CatalogueScanProvider {
     std::vector<std::string> roots_;
     std::vector<std::unique_ptr<MetadataProvider>> metadata_;
+    size_t max_artwork_bytes_{};
 
   public:
-    MusicScanProvider(HttpClient&, CatalogueMusicProviderConfig);
+    MusicScanProvider(HttpClient&, CatalogueMusicProviderConfig,
+                      size_t max_artwork_bytes = 16 * 1024 * 1024);
     std::string_view name() const noexcept override { return "music"; }
     const std::vector<std::string>& roots() const noexcept override { return roots_; }
-    std::vector<MediaProbeCandidate> probe_candidates(FileSystem&, std::string_view, std::string_view,
-                                                        const FsEntry&) override;
+    MediaProbeFile probe_file(FileSystem&, std::string_view, std::string_view,
+                              const FsEntry&) override;
     std::optional<ProviderMatch> lookup(const MediaProbe& probe) override;
 };
 

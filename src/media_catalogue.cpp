@@ -24,6 +24,7 @@ extern "C" {
 #include <set>
 #include <sstream>
 #include <thread>
+#include <tuple>
 
 namespace macha {
 namespace {
@@ -256,8 +257,26 @@ int64_t audio_metadata_seek(void* opaque, int64_t offset, int whence) {
     return next;
 }
 
+std::string embedded_artwork_mime(std::span<const uint8_t> bytes) {
+    if (bytes.size() >= 3 && bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff)
+        return "image/jpeg";
+    static constexpr std::array<uint8_t, 8> png{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a};
+    if (bytes.size() >= png.size() && std::equal(png.begin(), png.end(), bytes.begin()))
+        return "image/png";
+    if (bytes.size() >= 12 && std::string_view(reinterpret_cast<const char*>(bytes.data()), 4) == "RIFF" &&
+        std::string_view(reinterpret_cast<const char*>(bytes.data() + 8), 4) == "WEBP")
+        return "image/webp";
+    if (bytes.size() >= 6) {
+        const auto header = std::string_view(reinterpret_cast<const char*>(bytes.data()), 6);
+        if (header == "GIF87a" || header == "GIF89a") return "image/gif";
+    }
+    if (bytes.size() >= 2 && bytes[0] == 'B' && bytes[1] == 'M') return "image/bmp";
+    return {};
+}
+
 void apply_audio_metadata(FileSystem& fs, std::string_view path, const FsEntry& entry,
-                          MediaProbe& probe) {
+                          MediaProbe& probe, std::vector<LocalArtworkCandidate>& artwork,
+                          size_t max_artwork_bytes) {
     auto handle = fs.open_read(entry, std::string(path), false, FrameType::read_ahead);
     AudioMetadataRead state{std::move(handle), entry.size, 0};
     constexpr int buffer_size = 64 * 1024;
@@ -313,27 +332,57 @@ void apply_audio_metadata(FileSystem& fs, std::string_view path, const FsEntry& 
     probe.musicbrainz_artist_id = optional_tag(
         {"musicbrainz artist id", "musicbrainz_artistid"});
 
+    for (unsigned i = 0; i < format->nb_streams; ++i) {
+        auto* stream = format->streams[i];
+        if (!(stream->disposition & AV_DISPOSITION_ATTACHED_PIC)) continue;
+        const auto& picture = stream->attached_pic;
+        if (!picture.data || picture.size <= 0) continue;
+        const auto size = static_cast<size_t>(picture.size);
+        if (size > max_artwork_bytes) {
+            Log::debug("catalogue embedded artwork ignored path=" + std::string(path) +
+                       " bytes=" + std::to_string(size) + " limit=" +
+                       std::to_string(max_artwork_bytes));
+            continue;
+        }
+        auto picture_bytes = std::span<const uint8_t>(picture.data, size);
+        auto mime = embedded_artwork_mime(picture_bytes);
+        if (mime.empty()) continue;
+        Bytes bytes(picture_bytes.begin(), picture_bytes.end());
+        const bool duplicate = std::any_of(artwork.begin(), artwork.end(), [&](const auto& existing) {
+            return existing.bytes == bytes;
+        });
+        if (!duplicate) artwork.push_back({"cover", std::move(mime), std::move(bytes)});
+    }
+
     avformat_close_input(&format);
     avio_context_free(&io);
 }
 
-std::optional<MediaProbe> read_music_metadata_probe(FileSystem& fs, std::string_view path,
-                                                     const FsEntry& entry) {
+struct MusicMetadataReadResult {
+    MediaProbe probe;
+    std::vector<LocalArtworkCandidate> artwork;
+};
+
+std::optional<MusicMetadataReadResult> read_music_metadata_probe(FileSystem& fs,
+                                                                  std::string_view path,
+                                                                  const FsEntry& entry,
+                                                                  size_t max_artwork_bytes) {
     if (entry.type != EntryType::file || entry.size == 0 ||
         !audio_extension(extension(path)))
         return {};
 
-    MediaProbe probe;
+    MusicMetadataReadResult result;
+    auto& probe = result.probe;
     probe.kind = MediaProbeKind::track;
     probe.path = normalize_path(std::string(path));
     probe.media_id = file_media_id(entry);
     try {
-        apply_audio_metadata(fs, path, entry, probe);
+        apply_audio_metadata(fs, path, entry, probe, result.artwork, max_artwork_bytes);
     } catch (const std::exception& e) {
         Log::debug("catalogue music tags unavailable path=" + std::string(path) +
                    " reason=" + e.what());
     }
-    return probe;
+    return result;
 }
 
 std::optional<int32_t> year_from(std::string_view text) {
@@ -1213,12 +1262,6 @@ std::pair<std::string, std::string> discogs_result_title(std::string_view value)
     const auto split = value.find(" - ");
     if (split == std::string_view::npos) return {std::string(value), {}};
     return {std::string(value.substr(0, split)), std::string(value.substr(split + 3))};
-}
-
-bool has_art_role(const CatalogueItem* item, std::string_view role) {
-    if (!item) return false;
-    return std::any_of(item->artwork.begin(), item->artwork.end(),
-                       [&](const auto& art) { return art.role == role; });
 }
 
 
@@ -2145,14 +2188,14 @@ MovieScanProvider::MovieScanProvider(HttpClient& http, CatalogueMovieProviderCon
     }
 }
 
-std::vector<MediaProbeCandidate> MovieScanProvider::probe_candidates(
+MediaProbeFile MovieScanProvider::probe_file(
     FileSystem&, std::string_view root, std::string_view path, const FsEntry& entry) {
     auto candidates = probe_media_candidates(path, entry, root);
     std::erase_if(candidates, [](const auto& candidate) {
         return candidate.probe.kind != MediaProbeKind::movie;
     });
     if (candidates.size() > 4) candidates.resize(4);
-    return candidates;
+    return {std::move(candidates), {}};
 }
 
 TvScanProvider::TvScanProvider(HttpClient& http, CatalogueTvProviderConfig config)
@@ -2166,18 +2209,19 @@ TvScanProvider::TvScanProvider(HttpClient& http, CatalogueTvProviderConfig confi
     }
 }
 
-std::vector<MediaProbeCandidate> TvScanProvider::probe_candidates(
+MediaProbeFile TvScanProvider::probe_file(
     FileSystem&, std::string_view root, std::string_view path, const FsEntry& entry) {
     auto candidates = probe_media_candidates(path, entry, root);
     std::erase_if(candidates, [](const auto& candidate) {
         return candidate.probe.kind != MediaProbeKind::episode;
     });
     if (candidates.size() > 4) candidates.resize(4);
-    return candidates;
+    return {std::move(candidates), {}};
 }
 
-MusicScanProvider::MusicScanProvider(HttpClient& http, CatalogueMusicProviderConfig config)
-    : roots_(std::move(config.roots)) {
+MusicScanProvider::MusicScanProvider(HttpClient& http, CatalogueMusicProviderConfig config,
+                                     size_t max_artwork_bytes)
+    : roots_(std::move(config.roots)), max_artwork_bytes_(max_artwork_bytes) {
     if (config.musicbrainz.enabled)
         metadata_.push_back(std::make_unique<MusicBrainzProvider>(http, std::move(config.musicbrainz)));
     if (config.discogs.enabled) {
@@ -2189,17 +2233,17 @@ MusicScanProvider::MusicScanProvider(HttpClient& http, CatalogueMusicProviderCon
     }
 }
 
-std::vector<MediaProbeCandidate> MusicScanProvider::probe_candidates(
+MediaProbeFile MusicScanProvider::probe_file(
     FileSystem& fs, std::string_view root, std::string_view path, const FsEntry& entry) {
-    auto embedded = read_music_metadata_probe(fs, path, entry);
+    auto embedded = read_music_metadata_probe(fs, path, entry, max_artwork_bytes_);
     if (!embedded) return {};
-    MediaProbeContext context{root, path, entry, &*embedded};
+    MediaProbeContext context{root, path, entry, &embedded->probe};
     auto candidates = probe_media_candidates(context);
     std::erase_if(candidates, [](const auto& candidate) {
         return candidate.probe.kind != MediaProbeKind::track;
     });
     if (candidates.size() > 6) candidates.resize(6);
-    return candidates;
+    return {std::move(candidates), std::move(embedded->artwork)};
 }
 
 
@@ -2254,7 +2298,8 @@ void CatalogueScanner::configure_providers() {
     if (config_.tv.enabled)
         providers_.push_back(std::make_unique<TvScanProvider>(*provider_http_, config_.tv));
     if (config_.music.enabled)
-        providers_.push_back(std::make_unique<MusicScanProvider>(*provider_http_, config_.music));
+        providers_.push_back(std::make_unique<MusicScanProvider>(*provider_http_, config_.music,
+                                                               config_.max_artwork_bytes));
 }
 
 bool CatalogueScanner::coordinator() const {
@@ -2354,23 +2399,41 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
 
     auto existing = catalogue_.snapshot();
     std::set<std::string> bound;
-    for (const auto& [_, item] : existing.items)
+    std::map<std::string, std::string> bound_artwork_target;
+    for (const auto& [_, item] : existing.items) {
         bound.insert(item.media_ids.begin(), item.media_ids.end());
+        if (item.kind == CatalogueKind::track) {
+            const auto target = item.parent_id.value_or(item.id);
+            for (const auto& media_id : item.media_ids) bound_artwork_target[media_id] = target;
+        }
+    }
     std::set<std::string> active_media_ids;
     struct PendingProbe {
         CatalogueScanProvider* provider{};
         std::string path;
         std::vector<MediaProbeCandidate> candidates;
+        std::vector<LocalArtworkCandidate> local_artwork;
+    };
+    struct BoundArtworkUpdate {
+        std::string item_id;
+        std::vector<LocalArtworkCandidate> artwork;
     };
     std::vector<PendingProbe> probes;
+    std::vector<BoundArtworkUpdate> bound_artwork_updates;
     probes.reserve(files.size());
     for (const auto& file : files) {
         if (stop.stop_requested()) return 0;
-        auto candidates = file.provider->probe_candidates(fs_, file.root, file.path, file.entry);
-        if (candidates.empty()) continue;
-        active_media_ids.insert(candidates.front().probe.media_id);
-        if (!bound.contains(candidates.front().probe.media_id))
-            probes.push_back({file.provider, file.path, std::move(candidates)});
+        auto probed = file.provider->probe_file(fs_, file.root, file.path, file.entry);
+        if (probed.candidates.empty()) continue;
+        const auto media_id = probed.candidates.front().probe.media_id;
+        active_media_ids.insert(media_id);
+        if (!bound.contains(media_id)) {
+            probes.push_back({file.provider, file.path, std::move(probed.candidates),
+                              std::move(probed.artwork)});
+        } else if (!probed.artwork.empty()) {
+            if (auto target = bound_artwork_target.find(media_id); target != bound_artwork_target.end())
+                bound_artwork_updates.push_back({target->second, std::move(probed.artwork)});
+        }
     }
 
     std::map<std::string, CatalogueItem> discovered;
@@ -2452,6 +2515,16 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
                        " score=" + std::to_string(selected->score));
         }
         ++matched;
+        std::string local_artwork_target;
+        for (const auto& item : match->items) {
+            if (item.kind != CatalogueKind::track) continue;
+            if (std::find(item.media_ids.begin(), item.media_ids.end(), probe.media_id) ==
+                item.media_ids.end())
+                continue;
+            local_artwork_target = item.parent_id.value_or(item.id);
+            break;
+        }
+
         for (auto& item : match->items) {
             auto [it, inserted] = discovered.emplace(item.id, item);
             if (!inserted) {
@@ -2461,6 +2534,27 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
                         it->second.media_ids.push_back(media);
             }
         }
+
+        if (!local_artwork_target.empty() && !pending.local_artwork.empty()) {
+            if (auto it = discovered.find(local_artwork_target); it != discovered.end()) {
+                for (const auto& art : pending.local_artwork) {
+                    try {
+                        auto staged = catalogue_.stage_artwork(art.role, art.mime_type, art.bytes);
+                        const bool duplicate = std::any_of(
+                            it->second.artwork.begin(), it->second.artwork.end(),
+                            [&](const auto& existing_art) {
+                                return existing_art.role == staged.role &&
+                                       existing_art.id == staged.id;
+                            });
+                        if (!duplicate) it->second.artwork.push_back(std::move(staged));
+                    } catch (const std::exception& e) {
+                        Log::warn("catalogue embedded artwork failed for " + pending.path +
+                                  ": " + e.what());
+                    }
+                }
+            }
+        }
+
         remote_art.insert(remote_art.end(), match->artwork.begin(), match->artwork.end());
     };
 
@@ -2551,13 +2645,13 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
         provider_resume_after_.clear();
     }
 
+    std::set<std::tuple<std::string, std::string, std::string>> fetched_remote_artwork;
     for (const auto& art : remote_art) {
         if (stop.stop_requested()) return 0;
+        if (!fetched_remote_artwork.emplace(art.item_id, art.role, art.url).second) continue;
         CatalogueItem* target = nullptr;
         if (auto it = discovered.find(art.item_id); it != discovered.end()) target = &it->second;
-        const CatalogueItem* old = nullptr;
-        if (auto it = existing.items.find(art.item_id); it != existing.items.end()) old = &it->second;
-        if (!target || has_art_role(target, art.role) || has_art_role(old, art.role)) continue;
+        if (!target) continue;
         try {
             auto response = http_->get(art.url, {}, config.max_artwork_bytes);
             if (stop.stop_requested()) return 0;
@@ -2568,10 +2662,44 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
                 Log::warn("catalogue artwork returned non-image content for " + art.item_id);
                 continue;
             }
-            target->artwork.push_back(catalogue_.stage_artwork(art.role, mime, response.body));
+            auto staged = catalogue_.stage_artwork(art.role, mime, response.body);
+            const auto same_artwork = [&](const CatalogueArtwork& existing_art) {
+                return existing_art.role == staged.role && existing_art.id == staged.id;
+            };
+            const bool already_discovered = std::any_of(target->artwork.begin(),
+                                                         target->artwork.end(), same_artwork);
+            bool already_existing = false;
+            if (auto it = existing.items.find(art.item_id); it != existing.items.end())
+                already_existing = std::any_of(it->second.artwork.begin(), it->second.artwork.end(),
+                                               same_artwork);
+            if (!already_discovered && !already_existing)
+                target->artwork.push_back(std::move(staged));
         } catch (const std::exception& e) {
             if (stop.stop_requested()) return 0;
             Log::warn("catalogue artwork failed for " + art.item_id + ": " + e.what());
+        }
+    }
+
+    for (const auto& update : bound_artwork_updates) {
+        CatalogueItem* target = nullptr;
+        if (auto it = discovered.find(update.item_id); it != discovered.end()) {
+            target = &it->second;
+        } else if (auto old = existing.items.find(update.item_id); old != existing.items.end()) {
+            target = &discovered.emplace(update.item_id, old->second).first->second;
+        }
+        if (!target) continue;
+        for (const auto& art : update.artwork) {
+            try {
+                auto staged = catalogue_.stage_artwork(art.role, art.mime_type, art.bytes);
+                const bool duplicate = std::any_of(
+                    target->artwork.begin(), target->artwork.end(), [&](const auto& existing_art) {
+                        return existing_art.role == staged.role && existing_art.id == staged.id;
+                    });
+                if (!duplicate) target->artwork.push_back(std::move(staged));
+            } catch (const std::exception& e) {
+                Log::warn("catalogue embedded artwork refresh failed for " + update.item_id +
+                          ": " + e.what());
+            }
         }
     }
 

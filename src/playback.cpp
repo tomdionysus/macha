@@ -291,6 +291,7 @@ PlaybackPreferences parse_preferences(const Json* value, PlaybackPreferences cur
 const MediaStreamInfo* first_stream(const MediaProbeResult& probe, MediaStreamType type) {
     const MediaStreamInfo* first = nullptr;
     for (const auto& stream : probe.streams) {
+        if (stream.attached_picture) continue;
         if (stream.type != type) continue;
         if (!first) first = &stream;
         if (stream.default_stream) return &stream;
@@ -408,7 +409,8 @@ Json stream_json(const MediaStreamInfo& stream) {
                      {"profile", stream.profile},
                      {"language", stream.language},
                      {"default", stream.default_stream},
-                     {"forced", stream.forced}};
+                     {"forced", stream.forced},
+                     {"attached_picture", stream.attached_picture}};
     if (stream.width) out["width"] = stream.width;
     if (stream.height) out["height"] = stream.height;
     if (stream.channels) out["channels"] = stream.channels;

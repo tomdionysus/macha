@@ -1309,7 +1309,8 @@ class LibavMediaEngine final : public MediaEngine {
             auto* par = stream->codecpar;
             MediaStreamInfo info;
             info.index = static_cast<int>(i);
-            info.type = stream_type(par->codec_type);
+            info.attached_picture = (stream->disposition & AV_DISPOSITION_ATTACHED_PIC) != 0;
+            info.type = info.attached_picture ? MediaStreamType::other : stream_type(par->codec_type);
             info.codec = avcodec_get_name(par->codec_id);
             if (const char* profile = avcodec_profile_name(par->codec_id, par->profile)) info.profile = profile;
             info.language = stream_language(stream);
