@@ -4523,9 +4523,19 @@ void test_media_probe_and_online_catalogue_scanner() {
     REQUIRE(service.catalogue().get("tmdb:movie:335984").has_value());
     CHECK(service.catalogue().get("tmdb:movie:335984")->revision == revision);
 
+    // Manual metadata editing is authoritative. A later scanner discovery for
+    // another local copy may add media bindings, but must not silently overwrite
+    // the user's descriptive changes.
+    auto manual = *service.catalogue().get("tmdb:movie:335984");
+    manual.title = "Blade Runner Custom";
+    manual.sort_title = manual.title;
+    manual.synopsis = "A manually edited synopsis.";
+    manual.external_ids["macha_metadata_locked"] = "1";
+    auto manually_saved = service.catalogue().upsert(std::move(manual), revision);
+    revision = manually_saved.revision;
+
     // A second file resolving to the same title adds another binding without
-    // losing the already-bound media identity. Deletion reconciles them one at
-    // a time and removes the scanner-owned item only after the final copy goes.
+    // losing the already-bound media identity.
     const std::string alternate = "/Movies/Blade.Runner.2049.2017.Remux.mkv";
     service.filesystem().create_file(alternate, 0644, getuid(), getgid());
     auto alternate_bytes = pattern(32769);
@@ -4538,9 +4548,33 @@ void test_media_probe_and_online_catalogue_scanner() {
     CHECK(scanner.scan_once() == 1);
     auto twice = service.catalogue().get("tmdb:movie:335984");
     REQUIRE(twice.has_value());
+    CHECK(twice->title == "Blade Runner Custom");
+    CHECK(twice->synopsis == "A manually edited synopsis.");
+    CHECK(twice->year == std::optional<int32_t>{2017});
+    CHECK(twice->artwork.size() == 2);
+    CHECK(twice->external_ids.at("tmdb") == "335984");
+    CHECK(twice->external_ids.at("macha_metadata_locked") == "1");
     CHECK(std::find(twice->media_ids.begin(), twice->media_ids.end(), media_id) != twice->media_ids.end());
     CHECK(std::find(twice->media_ids.begin(), twice->media_ids.end(), alternate_id) != twice->media_ids.end());
 
+    // Clear Metadata removes the catalogue entity rather than saving an empty
+    // matched item. Both underlying files therefore become unbound and the next
+    // scanner pass performs provider matching again from scratch.
+    CHECK(service.catalogue().clear_metadata("tmdb:movie:335984", twice->revision) == 1);
+    CHECK(!service.catalogue().get("tmdb:movie:335984").has_value());
+    CHECK(scanner.scan_once() == 2);
+    auto rematched = service.catalogue().get("tmdb:movie:335984");
+    REQUIRE(rematched.has_value());
+    CHECK(rematched->title == "Blade Runner 2049");
+    CHECK(rematched->synopsis == "A blade runner uncovers a long-buried secret.");
+    CHECK(rematched->external_ids.at("tmdb") == "335984");
+    CHECK(!rematched->external_ids.contains("macha_metadata_locked"));
+    CHECK(rematched->artwork.size() == 2);
+    CHECK(std::find(rematched->media_ids.begin(), rematched->media_ids.end(), media_id) != rematched->media_ids.end());
+    CHECK(std::find(rematched->media_ids.begin(), rematched->media_ids.end(), alternate_id) != rematched->media_ids.end());
+
+    // Deletion reconciles duplicate bindings one at a time and removes the
+    // scanner-owned item only after the final copy goes.
     service.filesystem().unlink("/Movies/Blade.Runner.2049.2017.1080p.mkv");
     std::this_thread::sleep_for(config.metadata_cache + 50ms);
     CHECK(scanner.scan_once() == 0);
@@ -5207,6 +5241,29 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(search_response.status == 200);
     std::string search_body(search_response.body.begin(), search_response.body.end());
     CHECK(search_body.find("episode:test:1:1") != std::string::npos);
+
+    // Clear Metadata is an atomic catalogue reset. Clearing a hierarchy parent
+    // also removes descendants so leaf media bindings cannot keep the old match
+    // alive and block a fresh scanner/provider lookup.
+    auto clear_response = api.handle({.method = "DELETE",
+                                      .path = "/api/v1/catalogue/items/show%3Atest/metadata",
+                                      .query = {},
+                                      .headers = {{"if-match", "\"rev-" + std::to_string(show.revision + 1) + "\""}},
+                                      .body = {}});
+    // The poster replacement did not mutate the copy of `show`; use the current
+    // revision if the optimistic request raced a catalogue refresh.
+    if (clear_response.status == 409) {
+        auto current_show = s3.catalogue().get(show.id);
+        REQUIRE(current_show.has_value());
+        clear_response = api.handle({.method = "DELETE",
+                                     .path = "/api/v1/catalogue/items/show%3Atest/metadata",
+                                     .query = {},
+                                     .headers = {{"if-match", "\"rev-" + std::to_string(current_show->revision) + "\""}},
+                                     .body = {}});
+    }
+    CHECK(clear_response.status == 204);
+    CHECK(!s3.catalogue().get(show.id).has_value());
+    CHECK(!s3.catalogue().get(episode.id).has_value());
 
     s3.stop();
     s2.stop();

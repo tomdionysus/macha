@@ -32,7 +32,8 @@ Service::Service(Config config, ClusterKeys keys)
       catalogue_(node_, store_, metadata_), fs_(node_, store_, metadata_, &playback_),
       scanner_(node_, fs_, catalogue_, node_.config().catalogue.scanner),
       hydration_(store_, playback_, fs_, catalogue_, node_.config().hydration,
-                 node_.config().read_ahead_extents), catalogue_api_(catalogue_),
+                 node_.config().read_ahead_extents),
+      catalogue_api_(catalogue_, [this] { scanner_.request_rescan(); }),
       streaming_(fs_, catalogue_, node_.config().catalogue.api, node_.config().streaming) {
     if (node_.config().catalogue.api.enabled) {
         catalogue_http_ = std::make_unique<HttpServer>(

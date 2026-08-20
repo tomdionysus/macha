@@ -263,6 +263,16 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
         constexpr std::string_view item_prefix = "/api/v1/catalogue/items/";
         if (request.path.starts_with(item_prefix)) {
             auto rest = std::string_view(request.path).substr(item_prefix.size());
+            auto metadata_suffix = rest.rfind("/metadata");
+            if (metadata_suffix != std::string_view::npos && metadata_suffix + 9 == rest.size() &&
+                request.method == "DELETE") {
+                auto id = url_decode(rest.substr(0, metadata_suffix));
+                if (!catalogue_.clear_metadata(id, expected_revision(request)))
+                    return error(404, "not_found", "catalogue item not found");
+                if (request_rescan_) request_rescan_();
+                return {204, "application/json; charset=utf-8", {}, {}};
+            }
+
             auto artwork_suffix = rest.rfind("/artwork");
             if (artwork_suffix != std::string_view::npos && artwork_suffix + 8 == rest.size() &&
                 request.method == "POST") {
