@@ -272,6 +272,7 @@ class CatalogueScanner {
     std::vector<std::unique_ptr<CatalogueScanProvider>> providers_;
     std::map<std::string, std::string> provider_resume_after_;
     std::atomic_bool provider_continuation_{};
+    std::atomic_bool rescan_requested_{};
     std::jthread worker_;
     mutable std::mutex config_mutex_;
 
@@ -280,7 +281,7 @@ class CatalogueScanner {
     void loop(std::stop_token);
     void walk(std::string_view root, std::vector<std::pair<std::string, FsEntry>>& out,
               std::stop_token = {});
-    size_t scan_once(std::stop_token);
+    size_t scan_once(std::stop_token, bool force = false);
 
   public:
     CatalogueScanner(NodeRuntime&, FileSystem&, CatalogueManager&, CatalogueScannerConfig,
@@ -290,6 +291,7 @@ class CatalogueScanner {
     void request_stop();
     void stop();
     void reconfigure(CatalogueScannerConfig);
+    void request_rescan();
     size_t scan_once();
 };
 

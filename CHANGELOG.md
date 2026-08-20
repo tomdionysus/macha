@@ -2,6 +2,7 @@
 
 ## 0.12.3 - 2026-08-19
 
+- make manual catalogue edits scanner-stable with an internal metadata lock, and add `DELETE /api/v1/catalogue/items/{id}/metadata` to remove an entity (plus dependent hierarchy entries), release its underlying media IDs for fresh provider matching, and request an immediate scanner pass on the serving node;
 - treat FFmpeg `AV_DISPOSITION_ATTACHED_PIC` streams as embedded artwork rather than playable video, so audio files with APIC/cover images remain audio-only during playback negotiation and can direct-play as MP3 where client capabilities allow;
 - ingest embedded audio cover art during the same tag-first catalogue probe and retain it alongside provider-supplied artwork instead of replacing one cover candidate with another;
 - make scanner artwork reconciliation identity-based (`role` + immutable object ID) rather than one-slot-per-role, allowing multiple cover candidates to coexist while still deduplicating identical artwork objects and repeated provider URLs.

@@ -562,6 +562,49 @@ bool CatalogueManager::erase(std::string_view id, std::optional<uint64_t> expect
     return true;
 }
 
+size_t CatalogueManager::clear_metadata(std::string_view id,
+                                        std::optional<uint64_t> expected_revision) {
+    DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
+    repair_once();
+    auto current = *current_snapshot();
+    std::optional<ObjectId> expected_root;
+    {
+        std::lock_guard lock(mutex_);
+        expected_root = cached_root_;
+    }
+
+    auto root = current.items.find(std::string(id));
+    if (root == current.items.end())
+        return 0;
+    if (expected_revision && root->second.revision != *expected_revision)
+        throw CatalogueConflict("catalogue item revision changed");
+
+    // Clearing metadata is deliberately stronger than editing an item blank.
+    // Remove the catalogue entity, and for hierarchy entities remove its
+    // descendants as well. The underlying media objects remain in the
+    // namespace, so their media IDs become unbound and the scanner can probe
+    // and match them again on a later pass.
+    std::set<std::string> removed_ids{root->first};
+    bool grew = true;
+    while (grew) {
+        grew = false;
+        for (const auto& [candidate_id, candidate] : current.items) {
+            if (removed_ids.contains(candidate_id) || !candidate.parent_id)
+                continue;
+            if (removed_ids.contains(*candidate.parent_id)) {
+                removed_ids.insert(candidate_id);
+                grew = true;
+            }
+        }
+    }
+
+    auto old_art = artwork_ids(current);
+    for (const auto& remove_id : removed_ids)
+        current.items.erase(remove_id);
+    commit(expected_root, current, old_art);
+    return removed_ids.size();
+}
+
 CatalogueArtwork CatalogueManager::stage_artwork(std::string role, std::string mime_type,
                                                    std::span<const uint8_t> bytes) {
     if (bytes.empty())
@@ -600,6 +643,29 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
         item.external_ids["macha_scanner"] = "1";
         auto it = current.items.find(item.id);
         if (it != current.items.end()) {
+            const auto manual = it->second.external_ids.find("macha_metadata_locked");
+            const bool metadata_locked =
+                manual != it->second.external_ids.end() && manual->second == "1";
+            if (metadata_locked) {
+                // A user-edited catalogue item remains authoritative for descriptive
+                // metadata. Scanner reconciliation still discovers additional local
+                // media bindings, and the complete-scan pass below still removes
+                // bindings that vanished from the namespace.
+                auto preserved = it->second;
+                preserved.media_ids.insert(preserved.media_ids.end(), item.media_ids.begin(),
+                                           item.media_ids.end());
+                std::sort(preserved.media_ids.begin(), preserved.media_ids.end());
+                preserved.media_ids.erase(
+                    std::unique(preserved.media_ids.begin(), preserved.media_ids.end()),
+                    preserved.media_ids.end());
+                if (preserved.media_ids == it->second.media_ids)
+                    continue;
+                ++preserved.revision;
+                preserved.updated_ns = wall_time_ns();
+                current.items[item.id] = std::move(preserved);
+                changed = true;
+                continue;
+            }
             // Scanner artwork is a candidate set, not one slot per role. Preserve
             // every previously known immutable object unless the provider/local
             // scan already supplied the same role+object again. This allows, for

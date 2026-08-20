@@ -124,6 +124,7 @@ class CatalogueManager {
     std::vector<CatalogueItem> search(std::string_view query, size_t limit = 50);
     CatalogueItem upsert(CatalogueItem, std::optional<uint64_t> expected_revision = {});
     bool erase(std::string_view id, std::optional<uint64_t> expected_revision = {});
+    size_t clear_metadata(std::string_view id, std::optional<uint64_t> expected_revision = {});
     CatalogueArtwork put_artwork(std::string_view item_id, std::string role,
                                  std::string mime_type, std::span<const uint8_t> bytes,
                                  std::optional<uint64_t> expected_revision = {});

@@ -2323,6 +2323,10 @@ void CatalogueScanner::stop() {
     request_stop();
     if (worker_.joinable()) worker_.join();
 }
+void CatalogueScanner::request_rescan() {
+    rescan_requested_.store(true, std::memory_order_relaxed);
+}
+
 void CatalogueScanner::reconfigure(CatalogueScannerConfig config) {
     stop();
     {
@@ -2350,15 +2354,15 @@ void CatalogueScanner::walk(std::string_view root,
     }
 }
 
-size_t CatalogueScanner::scan_once() { return scan_once({}); }
+size_t CatalogueScanner::scan_once() { return scan_once({}, false); }
 
-size_t CatalogueScanner::scan_once(std::stop_token stop) {
+size_t CatalogueScanner::scan_once(std::stop_token stop, bool force) {
     CatalogueScannerConfig config;
     {
         std::lock_guard lock(config_mutex_);
         config = config_;
     }
-    if (!config.enabled || !coordinator() || stop.stop_requested()) return 0;
+    if (!config.enabled || (!force && !coordinator()) || stop.stop_requested()) return 0;
     provider_continuation_.store(false, std::memory_order_relaxed);
     auto* budget_http = dynamic_cast<BudgetHttpClient*>(provider_http_.get());
     if (!budget_http) throw std::runtime_error("catalogue provider HTTP budget unavailable");
@@ -2651,7 +2655,13 @@ size_t CatalogueScanner::scan_once(std::stop_token stop) {
         if (!fetched_remote_artwork.emplace(art.item_id, art.role, art.url).second) continue;
         CatalogueItem* target = nullptr;
         if (auto it = discovered.find(art.item_id); it != discovered.end()) target = &it->second;
-        if (!target) continue;
+        const bool metadata_locked = [&] {
+            auto old = existing.items.find(art.item_id);
+            if (old == existing.items.end()) return false;
+            auto marker = old->second.external_ids.find("macha_metadata_locked");
+            return marker != old->second.external_ids.end() && marker->second == "1";
+        }();
+        if (!target || metadata_locked) continue;
         try {
             auto response = http_->get(art.url, {}, config.max_artwork_bytes);
             if (stop.stop_requested()) return 0;
@@ -2744,18 +2754,23 @@ void CatalogueScanner::loop(std::stop_token stop) {
         const bool max_delayed_mutation_due = mutation_first_seen &&
             now >= *mutation_first_seen + config.rescan_max_delay;
         const bool mutation_rescan_due = debounced_mutation_due || max_delayed_mutation_due;
-        if (config.enabled && is_coordinator && (periodic_due || mutation_rescan_due)) {
+        const bool explicit_rescan = config.enabled &&
+            rescan_requested_.exchange(false, std::memory_order_relaxed);
+        const bool scheduled_rescan = is_coordinator && (periodic_due || mutation_rescan_due);
+        if (config.enabled && (explicit_rescan || scheduled_rescan)) {
             try {
                 const auto before = fs_.namespace_signature();
                 const bool namespace_changed = !scanned_namespace || before != *scanned_namespace;
-                if (periodic_due || namespace_changed) {
-                    if (mutation_rescan_due && namespace_changed && !periodic_due) {
+                if (explicit_rescan || periodic_due || namespace_changed) {
+                    if (explicit_rescan) {
+                        Log::info("catalogue: explicit metadata reset; rescanning");
+                    } else if (mutation_rescan_due && namespace_changed && !periodic_due) {
                         if (max_delayed_mutation_due && !debounced_mutation_due)
                             Log::info("catalogue: namespace mutation max rescan delay reached; rescanning");
                         else
                             Log::info("catalogue: namespace mutation settled; rescanning");
                     }
-                    (void)scan_once(stop);
+                    (void)scan_once(stop, explicit_rescan);
                     if (stop.stop_requested()) break;
                     uint64_t after_generation = 0;
                     const auto after = fs_.namespace_signature(&after_generation);

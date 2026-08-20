@@ -75,11 +75,12 @@ GET    /api/v1/catalogue/search?q=expanse
 GET    /api/v1/catalogue/items/{id}
 PUT    /api/v1/catalogue/items/{id}
 DELETE /api/v1/catalogue/items/{id}
+DELETE /api/v1/catalogue/items/{id}/metadata
 POST   /api/v1/catalogue/items/{id}/artwork?role=poster&mime=image/jpeg
 GET    /api/v1/catalogue/artwork/{sha256}
 ```
 
-Item mutations support `If-Match: "rev-N"` and return an `ETag`. If `token_file` is configured, clients must send that file's contents as a Bearer token. Keep a remotely exposed API authenticated and firewall-restricted.
+Item mutations support `If-Match: "rev-N"` and return an `ETag`. `PUT` can mark an item with the internal `macha_metadata_locked=1` external ID so scanner reconciliation preserves manual descriptive changes while still reconciling live media bindings. `DELETE .../metadata` is the destructive rematch operation: it removes the selected catalogue entity and any descendants needed to release leaf media bindings, while leaving the underlying namespace media untouched. When the scanner is enabled, the serving node requests one explicit scanner pass immediately so those files can be probed and matched again; ordinary recurring scans remain coordinator-owned. If `token_file` is configured, clients must send that file's contents as a Bearer token. Keep a remotely exposed API authenticated and firewall-restricted.
 
 Replacing or deleting the last reference to artwork records a committed retirement tombstone. The current catalogue root and all artwork referenced by it are part of the same live-object mark set as filesystem extents, so a still-live reference always wins. After `maintenance.garbage_grace_ms` (24 hours by default) the retirement is pruned and each node's bounded reachability sweep removes any old unreachable authoritative copy. A disconnected node does not need to retain or replay the tombstone forever: after rejoining, current catalogue reachability is sufficient to converge deletion.
 
