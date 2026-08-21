@@ -15,7 +15,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-`libtorrent-rasterbar-dev` enables the integrated BitTorrent acquisition component. If it is omitted, Macha still builds the generic resumable filesystem ingest engine, but torrent acquisition is disabled.
+`libtorrent-rasterbar-dev` enables the integrated BitTorrent acquisition component. If it is omitted, Macha still builds the generic resumable filesystem ingest engine, but torrent acquisition is disabled. CMake prefers libtorrent's exported CMake package and falls back to pkg-config.
 
 macOS, with macFUSE already installed. Homebrew `ffmpeg@7` supplies the libav headers, libraries and pkg-config metadata; Macha does not execute the command-line program. The formula is keg-only, so Macha's CMake file discovers its Homebrew prefix automatically:
 
@@ -27,6 +27,8 @@ cmake -S . -B build \
   -DCURL_ROOT="$(brew --prefix curl)"
 cmake --build build -j
 ```
+
+Homebrew libtorrent is discovered through its exported CMake package (`LibtorrentRasterbar::torrent-rasterbar`), with pkg-config retained as a fallback.
 
 If you deliberately use another keg or non-Homebrew FFmpeg build, expose its `lib/pkgconfig` directory through `PKG_CONFIG_PATH` before configuring.
 

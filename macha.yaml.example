@@ -1,4 +1,4 @@
-# Macha 0.13.0
+# Macha 0.13.2
 #
 # Copy this file per node. Paths, advertise address and failure_domain are
 # node-local. The cluster key contents and dht policy must match every node.
@@ -63,6 +63,8 @@ fuse:
   request_workers: 24
   max_pending_requests: 4096
   commit_workers: 8
+  foreground_commit_workers: 1
+  publication_quiet_ms: 250
   max_pending_operations: 4096
   hydration_priority: 2000
   read_ahead_extents: 2

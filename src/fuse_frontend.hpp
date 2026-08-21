@@ -144,7 +144,7 @@ class FuseFrontend final : public HydrationHintProvider {
     void truncate(std::string_view path, uint64_t size);
     void flush(uint64_t inode);
     void fsync(uint64_t inode);
-    void release(uint64_t inode);
+    void release(uint64_t inode, bool writable);
 
     std::pair<uint64_t, uint64_t> logical_capacity() const;
     void note_interactive_activity(uint64_t bytes = 0);

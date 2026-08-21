@@ -66,6 +66,11 @@ struct FuseConfig {
     size_t request_workers{24};
     size_t max_pending_requests{4096};
     size_t commit_workers{8};
+    // While mounted filesystem activity is recent, cap asynchronous data
+    // publication so local spool acceptance remains responsive. Once the
+    // frontend is quiet, all commit_workers may drain the backlog.
+    size_t foreground_commit_workers{1};
+    std::chrono::milliseconds publication_quiet{250};
     size_t max_pending_operations{4096};
 
     // FUSE demand is emitted into the existing hydration scheduler.

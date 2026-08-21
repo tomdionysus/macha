@@ -4,6 +4,7 @@
 #include "crypto.hpp"
 #include "json.hpp"
 #include "log.hpp"
+#include "macha_version.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -216,7 +217,8 @@ lt::session_params make_session_params(const TorrentConfig& config) {
     if (config.max_upload_rate)
         settings.set_int(lt::settings_pack::upload_rate_limit,
                          static_cast<int>(std::min<uint64_t>(config.max_upload_rate, INT_MAX)));
-    settings.set_str(lt::settings_pack::user_agent, "Macha/0.13 libtorrent/" + std::string(lt::version()));
+    settings.set_str(lt::settings_pack::user_agent, "Macha/" + std::string(kServerVersion) +
+                     " libtorrent/" + std::string(lt::version()));
     return params;
 }
 
@@ -226,7 +228,6 @@ void harden_add_params(lt::add_torrent_params& atp, const TorrentConfig& config)
     // torrent metainfo file into a general-purpose server-side HTTP fetcher.
     atp.url_seeds.clear();
     atp.dht_nodes.clear();
-    atp.flags |= lt::torrent_flags::override_web_seeds;
     std::erase_if(atp.trackers, [](const std::string& tracker) { return !safe_tracker_url(tracker); });
     atp.tracker_tiers.assign(atp.trackers.size(), 0);
     if (!config.dht) atp.flags |= lt::torrent_flags::disable_dht;

@@ -114,6 +114,12 @@ void validate(Config& config) {
         throw std::runtime_error("fuse.request_workers must be 6..256");
     if (!config.fuse.commit_workers || config.fuse.commit_workers > 64)
         throw std::runtime_error("fuse.commit_workers must be 1..64");
+    if (!config.fuse.foreground_commit_workers ||
+        config.fuse.foreground_commit_workers > config.fuse.commit_workers)
+        throw std::runtime_error("fuse.foreground_commit_workers must be 1..commit_workers");
+    if (config.fuse.publication_quiet < std::chrono::milliseconds(0) ||
+        config.fuse.publication_quiet > std::chrono::seconds(5))
+        throw std::runtime_error("fuse.publication_quiet_ms must be 0..5000");
     if (!config.fuse.max_pending_requests || config.fuse.max_pending_requests > 65536 ||
         !config.fuse.max_pending_operations || config.fuse.max_pending_operations > 65536)
         throw std::runtime_error("fuse pending queue limits must be 1..65536");
@@ -394,6 +400,8 @@ void parse_fuse(const YAML::Node& root, Config& c) {
     if (f["request_workers"]) c.fuse.request_workers = f["request_workers"].as<size_t>();
     if (f["max_pending_requests"]) c.fuse.max_pending_requests = f["max_pending_requests"].as<size_t>();
     if (f["commit_workers"]) c.fuse.commit_workers = f["commit_workers"].as<size_t>();
+    if (f["foreground_commit_workers"]) c.fuse.foreground_commit_workers = f["foreground_commit_workers"].as<size_t>();
+    if (f["publication_quiet_ms"]) c.fuse.publication_quiet = milliseconds(f["publication_quiet_ms"], "fuse.publication_quiet_ms");
     if (f["max_pending_operations"]) c.fuse.max_pending_operations = f["max_pending_operations"].as<size_t>();
     if (f["hydration_priority"]) c.fuse.hydration_priority = f["hydration_priority"].as<uint32_t>();
     if (f["read_ahead_extents"]) c.fuse.read_ahead_extents = f["read_ahead_extents"].as<size_t>();

@@ -581,23 +581,36 @@ struct FuseFrontend::State {
         }
     }
 
+    bool data_slot_available() const {
+        const bool foreground_busy = config.publication_quiet.count() > 0 &&
+            fs.interactive_idle_for() < config.publication_quiet;
+        const auto limit = foreground_busy ? config.foreground_commit_workers : config.commit_workers;
+        return active_data.load(std::memory_order_relaxed) < limit;
+    }
+
     void data_loop(std::stop_token stop) {
         while (!stop.stop_requested() && !stopping.load()) {
             std::shared_ptr<Inode> inode;
             {
                 std::unique_lock lock(data_queue_mutex);
-                data_cv.wait(lock, stop, [&] { return !data_queue.empty() || stopping.load(); });
+                // Re-evaluate periodically because foreground activity may go
+                // quiet without another publication-queue event to wake us.
+                data_cv.wait_for(lock, stop, std::chrono::milliseconds(50), [&] {
+                    return stopping.load() || (!data_queue.empty() && data_slot_available());
+                });
                 if (stop.stop_requested() || stopping.load())
                     break;
+                if (data_queue.empty() || !data_slot_available())
+                    continue;
                 inode = data_queue.front();
                 data_queue.pop_front();
+                ++active_data;
             }
             {
                 std::lock_guard lock(inode->mutex);
                 inode->data_queued = false;
                 inode->data_running = true;
             }
-            ++active_data;
 
             bool retry = false;
             try {
@@ -627,6 +640,7 @@ struct FuseFrontend::State {
                     inode->data_deferred = true;
             }
             --active_data;
+            data_cv.notify_all();
             if (retry)
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             admit_deferred();
@@ -1364,12 +1378,16 @@ void FuseFrontend::fsync(uint64_t inode_id) {
     });
 }
 
-void FuseFrontend::release(uint64_t inode_id) {
+void FuseFrontend::release(uint64_t inode_id, bool writable) {
     dispatch(FuseOperationClass::lifecycle,
-             [this, inode_id](Clock::time_point deadline, std::atomic_bool& cancelled) {
+             [this, inode_id, writable](Clock::time_point deadline, std::atomic_bool& cancelled) {
         check_deadline(deadline, cancelled);
         auto inode = state_->resolve_inode(inode_id);
-        state_->request_data_publication(inode);
+        // flush()/fsync() are already write-handle-only in the adapter. Keep
+        // release symmetric: closing a read-only descriptor must not publish
+        // dirty data belonging to another writer on the same inode.
+        if (writable)
+            state_->request_data_publication(inode);
         std::lock_guard lock(inode->mutex);
         if (inode->open_handles)
             --inode->open_handles;
