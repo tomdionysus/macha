@@ -364,7 +364,7 @@ int op_release(const char* path, fuse_file_info* fi) {
     if (!h) return 0;
     int rc = 0;
     try {
-        frontend().release(h->file.inode);
+        frontend().release(h->file.inode, h->file.writable);
     } catch (const std::exception& e) {
         rc = fail("release", e);
     }

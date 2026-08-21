@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.13.2 - 2026-08-21
+
+- Fix libtorrent 2.1 builds under warnings-as-errors by removing use of the deprecated `torrent_flags::override_web_seeds` flag. Macha already strips magnet web-seed parameters and clears `.torrent` `url_seeds` before adding the torrent, preserving the hostile-input boundary without deprecated API.
+- Select CMake CMP0167 NEW when available so libtorrent 2.1's exported package resolves Boost through modern config-mode discovery without the CMake 3.30+ policy warning.
+
+## 0.13.1 - 2026-08-21
+
+- fix FUSE handle release semantics: closing a read-only handle no longer requests data publication for dirty writes owned by another handle on the same inode; writable-handle release retains final publication semantics;
+- add foreground-aware FUSE publication admission: configured `commit_workers` still drain backlog when the mount is quiet, but sustained mounted-filesystem activity defaults to one asynchronous publisher. This prevents several multi-second extent/metadata commits from contending with the local spool and causing bulk `rsync` writes to hit the bounded FUSE deadline;
+- add a regression test covering a dirty writer plus concurrent read-only handle, asserting that reader close leaves backend data unpublished and writer close publishes it exactly once;
+- prefer libtorrent-rasterbar's exported CMake package when available, including automatic Homebrew prefix discovery on macOS, with pkg-config retained as a fallback. This carries libtorrent's own Boost/OpenSSL/platform link requirements and fixes Homebrew libtorrent builds;
+- derive the libtorrent user-agent Macha version from the generated server version rather than a hard-coded `0.13` string.
+
 ## 0.13.0 - 2026-08-21
 
 - route all libav/FFmpeg diagnostics through Macha's logger with an independent configurable `ffmpeg_log_level`, so FFmpeg verbosity can be raised for media debugging without enabling Macha DEBUG/ALL output; default FFmpeg admission is `ERROR`;

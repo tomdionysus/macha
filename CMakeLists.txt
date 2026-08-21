@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
-project(macha VERSION 0.13.0 LANGUAGES CXX)
+
+# CMake 3.30 removed the legacy FindBoost module. libtorrent 2.1's exported
+# package uses find_dependency(Boost); select config-mode Boost discovery on
+# newer CMake while remaining compatible with older Raspberry Pi OS CMake.
+if(POLICY CMP0167)
+    cmake_policy(SET CMP0167 NEW)
+endif()
+
+project(macha VERSION 0.13.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,10 +25,10 @@ find_package(CURL REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(PkgConfig REQUIRED)
 
-# Homebrew versioned FFmpeg formulae are keg-only, so their .pc files are not
-# necessarily visible to pkg-config. Discover a suitable Homebrew prefix on
-# macOS before asking FindPkgConfig; ordinary system/pkg-config discovery is
-# unchanged on other platforms.
+# Homebrew versioned FFmpeg is keg-only and libtorrent's native CMake package
+# lives beneath its formula prefix. Discover both prefixes up front on macOS so
+# ordinary find_package/pkg-config calls work on Intel and Apple Silicon. Other
+# platforms retain their normal system discovery paths.
 if(APPLE)
     find_program(MACHA_BREW_EXECUTABLE brew HINTS /usr/local/bin /opt/homebrew/bin)
     if(MACHA_BREW_EXECUTABLE)
@@ -39,15 +47,45 @@ if(APPLE)
                 break()
             endif()
         endforeach()
+
+        execute_process(
+            COMMAND ${MACHA_BREW_EXECUTABLE} --prefix libtorrent-rasterbar
+            RESULT_VARIABLE MACHA_BREW_LIBTORRENT_RESULT
+            OUTPUT_VARIABLE MACHA_LIBTORRENT_PREFIX
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        if(MACHA_BREW_LIBTORRENT_RESULT EQUAL 0)
+            list(PREPEND CMAKE_PREFIX_PATH "${MACHA_LIBTORRENT_PREFIX}")
+            set(PKG_CONFIG_USE_CMAKE_PREFIX_PATH TRUE)
+            message(STATUS "Using Homebrew libtorrent from ${MACHA_LIBTORRENT_PREFIX}")
+        endif()
     endif()
 endif()
 
 # The in-process media engine uses public APIs present in FFmpeg 6 and later.
 pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET
     libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7 libswresample>=4)
-# BitTorrent acquisition is optional at build time. Generic filesystem ingest
-# remains available without libtorrent.
-pkg_check_modules(LIBTORRENT QUIET IMPORTED_TARGET libtorrent-rasterbar>=2.0)
+
+# BitTorrent acquisition is optional at build time. Prefer libtorrent's native
+# CMake package: it carries the exact compile definitions and transitive Boost,
+# OpenSSL and platform-framework requirements used to build the installed
+# library. pkg-config remains the fallback for distributions that only ship a
+# .pc file.
+set(MACHA_LIBTORRENT_TARGET "")
+find_package(LibtorrentRasterbar CONFIG QUIET)
+if(TARGET LibtorrentRasterbar::torrent-rasterbar)
+    if(DEFINED LibtorrentRasterbar_VERSION AND LibtorrentRasterbar_VERSION VERSION_LESS "2.0")
+        message(STATUS "Ignoring libtorrent-rasterbar ${LibtorrentRasterbar_VERSION}; Macha requires >= 2.0")
+    else()
+        set(MACHA_LIBTORRENT_TARGET LibtorrentRasterbar::torrent-rasterbar)
+    endif()
+endif()
+if(NOT MACHA_LIBTORRENT_TARGET)
+    pkg_check_modules(LIBTORRENT QUIET IMPORTED_TARGET libtorrent-rasterbar>=2.0)
+    if(TARGET PkgConfig::LIBTORRENT)
+        set(MACHA_LIBTORRENT_TARGET PkgConfig::LIBTORRENT)
+    endif()
+endif()
 
 if(TARGET yaml-cpp::yaml-cpp)
     set(MACHA_YAML_TARGET yaml-cpp::yaml-cpp)
@@ -103,10 +141,10 @@ target_include_directories(macha_core PUBLIC
     ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(macha_core PUBLIC
     OpenSSL::Crypto Threads::Threads CURL::libcurl ${MACHA_YAML_TARGET} PkgConfig::LIBAV)
-if(TARGET PkgConfig::LIBTORRENT)
-    target_link_libraries(macha_core PUBLIC PkgConfig::LIBTORRENT)
+if(MACHA_LIBTORRENT_TARGET)
+    target_link_libraries(macha_core PUBLIC ${MACHA_LIBTORRENT_TARGET})
     target_compile_definitions(macha_core PUBLIC MACHA_HAVE_LIBTORRENT=1)
-    message(STATUS "BitTorrent acquisition enabled (libtorrent-rasterbar)")
+    message(STATUS "BitTorrent acquisition enabled (${MACHA_LIBTORRENT_TARGET})")
 else()
     message(STATUS "libtorrent-rasterbar >= 2.0 not found; building generic ingest without BitTorrent acquisition")
 endif()

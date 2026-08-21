@@ -1301,6 +1301,8 @@ void test_config() {
             << "  request_workers: 18\n"
             << "  max_pending_requests: 2048\n"
             << "  commit_workers: 4\n"
+            << "  foreground_commit_workers: 2\n"
+            << "  publication_quiet_ms: 425\n"
             << "  max_pending_operations: 1024\n"
             << "  hydration_priority: 2500\n"
             << "  read_ahead_extents: 4\n"
@@ -1433,6 +1435,8 @@ void test_config() {
     CHECK(yc.fuse.request_workers == 18);
     CHECK(yc.fuse.max_pending_requests == 2048);
     CHECK(yc.fuse.commit_workers == 4);
+    CHECK(yc.fuse.foreground_commit_workers == 2);
+    CHECK(yc.fuse.publication_quiet == 425ms);
     CHECK(yc.fuse.max_pending_operations == 1024);
     CHECK(yc.fuse.hydration_priority == 2500);
     CHECK(yc.fuse.read_ahead_extents == 4);
@@ -3313,7 +3317,7 @@ void test_fuse_frontend_ordering_merging_and_cache() {
         const uint64_t tail_offset = 3 * config.extent_size;
         REQUIRE(frontend->write(inode, tail_offset, tail) == tail.size());
         std::copy(tail.begin(), tail.end(), expected.begin() + static_cast<ptrdiff_t>(tail_offset));
-        frontend->release(inode);
+        frontend->release(inode, true);
         REQUIRE(frontend->wait_for_idle(10s));
 
         CHECK(frontend->status().pending_data == 0);
@@ -3340,6 +3344,55 @@ void test_fuse_frontend_ordering_merging_and_cache() {
     service.stop();
 }
 
+void test_fuse_read_only_release_does_not_publish_writer_data() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-read-release", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.fuse.refresh_interval = 30s;
+    config.fuse.commit_workers = 1;
+
+    Service service(config, keys);
+    service.start();
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto writer = frontend->create("/growing.bin", 0600, getuid(), getgid(), true, true, false);
+        auto bytes = pattern(256 * 1024);
+        REQUIRE(frontend->write(writer.inode, 0, bytes) == bytes.size());
+
+        // A second process such as rsync --append-verify may open the file for
+        // basis reads while the writer still has dirty local data. Closing that
+        // reader must not turn into an implicit writer flush/publication.
+        auto reader = frontend->open("/growing.bin", true, false, false, false);
+        CHECK(reader.inode == writer.inode);
+        frontend->release(reader.inode, false);
+        REQUIRE(frontend->wait_for_idle(2s));
+
+        auto backend_before_writer_close = service.filesystem().getattr("/growing.bin");
+        CHECK(backend_before_writer_close.size == 0);
+        REQUIRE(frontend->dirty_ranges(writer.inode).size() == 1);
+
+        frontend->release(writer.inode, true);
+        REQUIRE(frontend->wait_for_idle(10s));
+        auto backend_after_writer_close = service.filesystem().getattr("/growing.bin");
+        CHECK(backend_after_writer_close.size == bytes.size());
+
+        auto stored = service.filesystem().open_read("/growing.bin");
+        Bytes actual(bytes.size());
+        size_t offset = 0;
+        while (offset < actual.size()) {
+            auto n = stored->read(offset, {actual.data() + offset, actual.size() - offset});
+            REQUIRE(n > 0);
+            offset += n;
+        }
+        CHECK(actual == bytes);
+    }
+    service.stop();
+}
+
 void test_fuse_frontend_unlink_and_rename_over_open_inode_ordering() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
@@ -3362,7 +3415,7 @@ void test_fuse_frontend_unlink_and_rename_over_open_inode_ordering() {
         auto doomed_data = pattern(65536);
         REQUIRE(frontend->write(doomed.inode, 0, doomed_data) == doomed_data.size());
         frontend->unlink("/doomed.bin");
-        frontend->release(doomed.inode);
+        frontend->release(doomed.inode, true);
         REQUIRE(frontend->wait_for_idle(10s));
         CHECK(!frontend->inode_for_path("/doomed.bin").has_value());
         bool missing = false;
@@ -3377,7 +3430,7 @@ void test_fuse_frontend_unlink_and_rename_over_open_inode_ordering() {
         auto destination = frontend->create("/target.bin", 0600, getuid(), getgid(), true, true, false);
         auto old_bytes = pattern(32768);
         REQUIRE(frontend->write(destination.inode, 0, old_bytes) == old_bytes.size());
-        frontend->release(destination.inode);
+        frontend->release(destination.inode, true);
         REQUIRE(frontend->wait_for_idle(10s));
 
         auto old_open = frontend->open("/target.bin", true, true, false, false);
@@ -3391,8 +3444,8 @@ void test_fuse_frontend_unlink_and_rename_over_open_inode_ordering() {
         frontend->flush(source.inode);
         frontend->rename("/replacement.bin", "/target.bin");
         REQUIRE(frontend->inode_for_path("/target.bin") == source.inode);
-        frontend->release(source.inode);
-        frontend->release(old_open.inode);
+        frontend->release(source.inode, true);
+        frontend->release(old_open.inode, true);
         REQUIRE(frontend->wait_for_idle(10s));
 
         CHECK(frontend->path_for_inode(old_open.inode).empty());
@@ -3485,7 +3538,7 @@ void test_fuse_frontend_read_overlay_truncate_and_hydration_hints() {
         REQUIRE(frontend->read(handle.inode, 39984, marker_view) == marker_view.size());
         CHECK(std::equal(marker.begin(), marker.end(), marker_view.begin() + 16));
 
-        frontend->release(handle.inode);
+        frontend->release(handle.inode, true);
         REQUIRE(frontend->wait_for_idle(10s));
         auto final = service.filesystem().getattr("/read.bin");
         CHECK(final.size == 65536);
@@ -5586,7 +5639,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
-    CHECK(status_body.find("\"server_version\":\"0.13.0\"") != std::string::npos);
+    CHECK(status_body.find("\"server_version\":\"0.13.2\"") != std::string::npos);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -6326,7 +6379,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == "0.13.0");
+    CHECK(playback_status_json.find("server_version")->asString() == "0.13.2");
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately
@@ -6730,6 +6783,7 @@ int main() {
         test_active_write_size_visibility();
         test_open_write_survives_rename();
         test_fuse_frontend_ordering_merging_and_cache();
+        test_fuse_read_only_release_does_not_publish_writer_data();
         test_fuse_frontend_unlink_and_rename_over_open_inode_ordering();
         test_fuse_frontend_read_overlay_truncate_and_hydration_hints();
         test_full_replica_fallback();
