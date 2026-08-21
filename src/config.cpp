@@ -138,6 +138,40 @@ void validate(Config& config) {
     if (config.maintenance.no_progress_backoff < std::chrono::milliseconds(500) ||
         config.maintenance.no_progress_backoff > std::chrono::hours(1))
         throw std::runtime_error("maintenance.no_progress_backoff_ms must be 500..3600000");
+    if (config.ingest.staging_path.empty())
+        config.ingest.staging_path = config.state_path / "tmp" / "ingest";
+    if (config.ingest.enabled && !config.catalogue.scanner.enabled)
+        throw std::runtime_error("ingest requires catalogue.scanner.enabled");
+    if (config.ingest.staging_limit < 1024ULL * 1024)
+        throw std::runtime_error("ingest.staging_limit must be >= 1M");
+    if (config.ingest.copy_chunk_bytes < 64ULL * 1024 ||
+        config.ingest.copy_chunk_bytes > 8ULL * 1024 * 1024)
+        throw std::runtime_error("ingest.copy_chunk_bytes must be 64K..8M");
+    if (config.ingest.checkpoint_bytes < config.ingest.copy_chunk_bytes ||
+        config.ingest.checkpoint_bytes > 4ULL * 1024 * 1024 * 1024)
+        throw std::runtime_error("ingest.checkpoint_bytes must be >= copy_chunk_bytes and <= 4G");
+    if (config.ingest.blocked_retry < std::chrono::milliseconds(500) ||
+        config.ingest.blocked_retry > std::chrono::minutes(10))
+        throw std::runtime_error("ingest.blocked_retry_ms must be 500..600000");
+    if (config.torrent.enabled && !config.ingest.enabled)
+        throw std::runtime_error("torrent requires ingest.enabled");
+#ifndef MACHA_HAVE_LIBTORRENT
+    if (config.torrent.enabled)
+        throw std::runtime_error("torrent support was not built (libtorrent-rasterbar not found)");
+#endif
+    if (!config.torrent.max_active || config.torrent.max_active > 64)
+        throw std::runtime_error("torrent.max_active must be 1..64");
+    for (const auto& provider : config.torrent.search_providers) {
+        if (!provider.enabled) continue;
+        if (provider.name.empty())
+            throw std::runtime_error("torrent.search.providers requires a non-empty name");
+        if (provider.type != "torznab")
+            throw std::runtime_error("unsupported torrent search provider type: " + provider.type);
+        if (!provider.url.starts_with("http://") && !provider.url.starts_with("https://"))
+            throw std::runtime_error("torrent search provider URL must use http or https");
+        if (!provider.max_results || provider.max_results > 1000)
+            throw std::runtime_error("torrent search provider max_results must be 1..1000");
+    }
     if (config.streaming.enabled && !config.catalogue.api.enabled)
         throw std::runtime_error("streaming requires catalogue.api.enabled");
     if (!config.streaming.max_sessions || config.streaming.max_sessions > 1024)
@@ -470,6 +504,55 @@ void parse_catalogue(const YAML::Node& root, Config& c) {
     }
 }
 
+void parse_ingest(const YAML::Node& root, Config& c) {
+    auto ingest = root["ingest"];
+    if (!ingest) return;
+    if (ingest["enabled"]) c.ingest.enabled = ingest["enabled"].as<bool>();
+    if (ingest["staging_path"])
+        c.ingest.staging_path = std::filesystem::path(ingest["staging_path"].as<std::string>());
+    if (ingest["staging_limit"]) c.ingest.staging_limit = yaml_size(ingest["staging_limit"]);
+    if (ingest["copy_chunk_bytes"]) c.ingest.copy_chunk_bytes = yaml_size(ingest["copy_chunk_bytes"]);
+    if (ingest["checkpoint_bytes"]) c.ingest.checkpoint_bytes = yaml_size(ingest["checkpoint_bytes"]);
+    if (ingest["blocked_retry_ms"])
+        c.ingest.blocked_retry = milliseconds(ingest["blocked_retry_ms"], "ingest.blocked_retry_ms");
+    if (auto roots = ingest["source_roots"]) {
+        if (!roots.IsSequence()) throw std::runtime_error("ingest.source_roots must be a sequence");
+        c.ingest.source_roots.clear();
+        for (const auto& value : roots)
+            c.ingest.source_roots.emplace_back(value.as<std::string>());
+    }
+}
+
+void parse_torrent(const YAML::Node& root, Config& c) {
+    auto torrent = root["torrent"];
+    if (!torrent) return;
+    if (torrent["enabled"]) c.torrent.enabled = torrent["enabled"].as<bool>();
+    if (torrent["max_active"]) c.torrent.max_active = torrent["max_active"].as<size_t>();
+    if (torrent["max_download_rate"]) c.torrent.max_download_rate = yaml_size(torrent["max_download_rate"]);
+    if (torrent["max_upload_rate"]) c.torrent.max_upload_rate = yaml_size(torrent["max_upload_rate"]);
+    if (torrent["dht"]) c.torrent.dht = torrent["dht"].as<bool>();
+    if (torrent["pex"]) c.torrent.pex = torrent["pex"].as<bool>();
+    if (torrent["lsd"]) c.torrent.lsd = torrent["lsd"].as<bool>();
+    if (auto search = torrent["search"]) {
+        if (auto providers = search["providers"]) {
+            if (!providers.IsSequence())
+                throw std::runtime_error("torrent.search.providers must be a sequence");
+            c.torrent.search_providers.clear();
+            for (const auto& value : providers) {
+                TorrentSearchProviderConfig provider;
+                if (value["enabled"]) provider.enabled = value["enabled"].as<bool>();
+                if (value["name"]) provider.name = value["name"].as<std::string>();
+                if (value["type"]) provider.type = value["type"].as<std::string>();
+                if (value["url"]) provider.url = value["url"].as<std::string>();
+                if (value["api_key_file"])
+                    provider.api_key_file = std::filesystem::path(value["api_key_file"].as<std::string>());
+                if (value["max_results"]) provider.max_results = value["max_results"].as<size_t>();
+                c.torrent.search_providers.push_back(std::move(provider));
+            }
+        }
+    }
+}
+
 void parse_streaming(const YAML::Node& root, Config& c) {
     auto streaming = root["streaming"];
     if (!streaming)
@@ -672,6 +755,8 @@ Config load_yaml_config(const std::filesystem::path& path) {
     parse_filesystem(root, c);
     parse_fuse(root, c);
     parse_catalogue(root, c);
+    parse_ingest(root, c);
+    parse_torrent(root, c);
     parse_streaming(root, c);
     parse_hydration(root, c);
 

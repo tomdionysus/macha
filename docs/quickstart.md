@@ -4,18 +4,23 @@ This is a disposable two-node local demo. It uses two metadata voters so both no
 
 ## Build
 
-Linux:
+Raspberry Pi OS / Debian 13 (Trixie):
 
 ```sh
-sudo apt install build-essential cmake pkg-config libssl-dev libyaml-cpp-dev libcurl4-openssl-dev libfuse3-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev
+sudo apt update
+sudo apt install build-essential cmake pkg-config libssl-dev libyaml-cpp-dev \
+  libcurl4-openssl-dev libfuse3-dev libavformat-dev libavcodec-dev \
+  libavutil-dev libswscale-dev libswresample-dev libtorrent-rasterbar-dev
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
+`libtorrent-rasterbar-dev` enables the integrated BitTorrent acquisition component. If it is omitted, Macha still builds the generic resumable filesystem ingest engine, but torrent acquisition is disabled.
+
 macOS, with macFUSE already installed. Homebrew `ffmpeg@7` supplies the libav headers, libraries and pkg-config metadata; Macha does not execute the command-line program. The formula is keg-only, so Macha's CMake file discovers its Homebrew prefix automatically:
 
 ```sh
-brew install cmake openssl@3 pkgconf yaml-cpp curl ffmpeg@7
+brew install cmake openssl@3 pkgconf yaml-cpp curl ffmpeg@7 libtorrent-rasterbar
 cmake -S . -B build \
   -DCMAKE_BUILD_TYPE=Release \
   -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \

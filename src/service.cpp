@@ -35,6 +35,10 @@ Service::Service(Config config, ClusterKeys keys)
       scanner_(node_, fs_, catalogue_, node_.config().catalogue.scanner),
       hydration_(store_, playback_, fs_, catalogue_, node_.config().hydration,
                  node_.config().read_ahead_extents),
+      ingest_(node_, fs_, node_.config().ingest),
+      torrents_(ingest_, node_.config().torrent, node_.config().state_path),
+      torrent_search_(node_.config().torrent),
+      acquisition_api_(ingest_, torrents_, torrent_search_),
       catalogue_api_(catalogue_, [this] { scanner_.request_rescan(); }),
       streaming_(fs_, catalogue_, node_.config().catalogue.api, node_.config().streaming) {
     if (node_.config().catalogue.api.enabled) {
@@ -43,6 +47,9 @@ Service::Service(Config config, ClusterKeys keys)
             [this](const HttpRequest& request) {
                 if (request.path.starts_with("/api/v1/playback/"))
                     return streaming_.handle(request);
+                if (request.path.starts_with("/api/v1/ingest/") ||
+                    request.path.starts_with("/api/v1/torrents/"))
+                    return acquisition_api_.handle(request);
                 return catalogue_api_.handle(request);
             },
             [this](const HttpRequest& request) { return streaming_.capability_request(request); });
@@ -55,6 +62,8 @@ Service::~Service() {
 
 void Service::start() {
     node_.start();
+    ingest_.start();
+    torrents_.start();
     streaming_.start();
     if (catalogue_http_)
         catalogue_http_->start();
@@ -72,6 +81,8 @@ void Service::request_stop() {
     // component is joined, so teardown cannot deadlock behind the first
     // long-running subsystem in Service::stop().
     fs_.request_io_cancellation();
+    torrents_.request_stop();
+    ingest_.request_stop();
     scanner_.request_stop();
     hydration_.request_stop();
     if (catalogue_http_)
@@ -85,6 +96,8 @@ void Service::request_stop() {
 void Service::stop() {
     Log::debug("shutdown: Service::stop begin");
     request_stop();
+    torrents_.stop();
+    ingest_.stop();
     scanner_.stop();
     hydration_.stop();
     if (catalogue_http_)
@@ -128,10 +141,12 @@ void Service::reload_config() {
     node_.reconfigure_local(updated);
     scanner_.reconfigure(updated.catalogue.scanner);
     hydration_.reconfigure(updated.hydration, updated.read_ahead_extents);
+    ingest_.reconfigure(updated.ingest);
+    torrents_.reconfigure(updated.torrent);
     if (streaming_restart_required)
         Log::warn("streaming enable/buffer/probe/path changes require restart; live limits were reloaded");
     streaming_.reconfigure(updated.streaming);
-    Log::info("reloaded storage backends, persistent cache, catalogue scanner, hydration and streaming limits");
+    Log::info("reloaded storage backends, persistent cache, catalogue scanner, ingest, torrent, hydration and streaming limits");
 }
 
 std::vector<GarbageRef> Service::collect_garbage(const std::vector<GarbageRef>& garbage) {
