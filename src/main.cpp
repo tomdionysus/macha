@@ -38,8 +38,8 @@ int main(int argc, char** argv) {
 
         if (config.mount_path) {
             std::filesystem::create_directories(*config.mount_path);
-            int rc = macha::run_fuse(service.filesystem(), *config.mount_path,
-                                        config.filesystem.allow_other,
+            int rc = macha::run_fuse(service.filesystem(), service.hydration().hydrator(),
+                                        *config.mount_path, config.fuse,
                                         [&service] { service.request_stop(); });
             macha::Log::debug("shutdown: main received FUSE return; stopping service");
             service.stop();

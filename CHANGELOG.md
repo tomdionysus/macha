@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.13.0 - 2026-08-21
+
+- replace the path-bound synchronous FUSE adapter with a bounded inode-based `FuseFrontend`; kernel callbacks now perform only local/bounded work and never synchronously require metadata quorum, remote replica placement, checkpoint propagation, catalogue work or maintenance;
+- add configurable FUSE operation-class deadlines, an absolute request ceiling, independent request workers and bounded namespace/data publication queues under the top-level `fuse:` YAML section; queue overload fails back to the kernel rather than waiting without bound;
+- keep stable frontend inode identities across rename and move namespace publication behind a FIFO asynchronous worker, including correct rename-over-open-destination and unlink-before-release semantics so a stale open descriptor cannot resurrect a pathname;
+- stage FUSE writes in a local append-only operation spool, preserve exact truncate/write ordering, coalesce overlapping/adjacent dirty ranges, deduplicate repeated publication requests, and publish sealed per-inode operation prefixes asynchronously through the existing `WriteHandle`/extent machinery;
+- define `fsync` as local spool durability plus queued publication, while distributed metadata/object convergence remains asynchronous; reads combine committed immutable extents with pending local operations and carry a hard FUSE deadline into remote extent retrieval;
+- make FUSE immediate demand a dynamic high-priority `HydrationHintProvider` in the existing cache architecture, with ordered configurable read-ahead and ordinary `DistributedStore` object-fetch coalescing; optionally write newly published FUSE extents through the existing persistent block cache;
+- make hydration providers lifetime-safe for dynamic add/remove while a hint collection is in flight;
+- protect the covered mountpoint after mounting and add an independent OS mount-table watchdog: unexpected FUSE/macFUSE disappearance leaves the naked directory non-writable and requests node shutdown, while clean unmount restores the original mode;
+- increase the catalogue namespace-rescan hard deferral ceiling from 60 seconds to 10 minutes while retaining the 10-second quiet-period debounce;
+- reduce the README logo display width to one third of its previous intrinsic size.
+
 ## 0.12.3 - 2026-08-19
 
 - make manual catalogue edits scanner-stable with an internal metadata lock, and add `DELETE /api/v1/catalogue/items/{id}/metadata` to remove an entity (plus dependent hierarchy entries), release its underlying media IDs for fresh provider matching, and request an immediate scanner pass on the serving node;

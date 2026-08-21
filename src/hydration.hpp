@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -144,7 +145,7 @@ class CacheHydrator {
     mutable std::mutex mutex_;
     std::condition_variable_any cv_;
     HydrationConfig config_;
-    std::vector<HydrationHintProvider*> providers_;
+    std::vector<std::shared_ptr<HydrationHintProvider>> providers_;
     HydrationScheduler scheduler_;
     std::map<ObjectId, Clock::time_point> failed_until_;
     std::jthread worker_;
@@ -156,7 +157,8 @@ class CacheHydrator {
   public:
     CacheHydrator(DistributedStore&, HydrationConfig);
     ~CacheHydrator();
-    void add_provider(HydrationHintProvider&);
+    void add_provider(std::shared_ptr<HydrationHintProvider>);
+    void remove_provider(const HydrationHintProvider*);
     void start();
     void request_stop();
     void stop();
@@ -167,9 +169,9 @@ class CacheHydrator {
 };
 
 class HydrationManager {
-    ReadAheadHintProvider read_ahead_;
-    CurrentFileHintProvider current_file_;
-    CatalogueSequenceHintProvider catalogue_sequence_;
+    std::shared_ptr<ReadAheadHintProvider> read_ahead_;
+    std::shared_ptr<CurrentFileHintProvider> current_file_;
+    std::shared_ptr<CatalogueSequenceHintProvider> catalogue_sequence_;
     CacheHydrator hydrator_;
 
   public:
@@ -180,6 +182,8 @@ class HydrationManager {
     void stop();
     void reconfigure(HydrationConfig, size_t read_ahead_extents);
     CacheHydrator& hydrator() { return hydrator_; }
+    void add_provider(std::shared_ptr<HydrationHintProvider> provider) { hydrator_.add_provider(std::move(provider)); }
+    void remove_provider(const HydrationHintProvider* provider) { hydrator_.remove_provider(provider); }
 };
 
 } // namespace macha

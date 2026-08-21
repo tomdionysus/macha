@@ -4,6 +4,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <cstdlib>
@@ -92,10 +93,35 @@ void validate(Config& config) {
         throw std::runtime_error("network heartbeat and dead_after must be > 0");
     if (config.metadata_cache > std::chrono::seconds(5))
         throw std::runtime_error("metadata cache must be <= 5000ms");
-    if (config.filesystem.entry_timeout > std::chrono::seconds(5) ||
-        config.filesystem.attr_timeout > std::chrono::seconds(5) ||
-        config.filesystem.negative_timeout > std::chrono::seconds(5))
-        throw std::runtime_error("filesystem FUSE cache timeouts must be <= 5000ms");
+    if (config.fuse.entry_timeout > std::chrono::seconds(5) ||
+        config.fuse.attr_timeout > std::chrono::seconds(5) ||
+        config.fuse.negative_timeout > std::chrono::seconds(5))
+        throw std::runtime_error("fuse kernel cache timeouts must be <= 5000ms");
+    const auto fuse_max = std::chrono::seconds(30);
+    const auto positive = [](std::chrono::milliseconds value) { return value.count() > 0; };
+    if (!positive(config.fuse.absolute_request_timeout) ||
+        config.fuse.absolute_request_timeout > fuse_max)
+        throw std::runtime_error("fuse.absolute_request_timeout_ms must be 1..30000");
+    const std::array fuse_timeouts{config.fuse.timeouts.lookup,
+                                   config.fuse.timeouts.namespace_mutation,
+                                   config.fuse.timeouts.read, config.fuse.timeouts.write,
+                                   config.fuse.timeouts.sync, config.fuse.timeouts.lifecycle};
+    for (auto timeout : fuse_timeouts) {
+        if (!positive(timeout) || timeout > config.fuse.absolute_request_timeout)
+            throw std::runtime_error("fuse operation timeouts must be >0 and <= absolute_request_timeout_ms");
+    }
+    if (config.fuse.request_workers < 6 || config.fuse.request_workers > 256)
+        throw std::runtime_error("fuse.request_workers must be 6..256");
+    if (!config.fuse.commit_workers || config.fuse.commit_workers > 64)
+        throw std::runtime_error("fuse.commit_workers must be 1..64");
+    if (!config.fuse.max_pending_requests || config.fuse.max_pending_requests > 65536 ||
+        !config.fuse.max_pending_operations || config.fuse.max_pending_operations > 65536)
+        throw std::runtime_error("fuse pending queue limits must be 1..65536");
+    if (config.fuse.read_ahead_extents > 64)
+        throw std::runtime_error("fuse.read_ahead_extents must be <= 64");
+    if (config.fuse.refresh_interval < std::chrono::milliseconds(50) ||
+        config.fuse.watchdog_interval < std::chrono::milliseconds(50))
+        throw std::runtime_error("fuse refresh/watchdog intervals must be >= 50ms");
     if (config.extent_size < 1024 * 1024 || config.extent_size > 64ULL * 1024 * 1024)
         throw std::runtime_error("extent size must be 1M..64M");
     if (config.catalogue.api.enabled && !config.catalogue.api.port)
@@ -309,23 +335,47 @@ void parse_filesystem(const YAML::Node& root, Config& c) {
     auto f = root["filesystem"];
     if (!f)
         return;
-    if (f["allow_other"])
-        c.filesystem.allow_other = f["allow_other"].as<bool>();
-    if (f["entry_timeout_ms"])
-        c.filesystem.entry_timeout =
-            milliseconds(f["entry_timeout_ms"], "filesystem.entry_timeout_ms");
-    if (f["attr_timeout_ms"])
-        c.filesystem.attr_timeout =
-            milliseconds(f["attr_timeout_ms"], "filesystem.attr_timeout_ms");
-    if (f["negative_timeout_ms"])
-        c.filesystem.negative_timeout =
-            milliseconds(f["negative_timeout_ms"], "filesystem.negative_timeout_ms");
     if (f["root_uid"])
         c.filesystem.root_uid = f["root_uid"].as<uint32_t>();
     if (f["root_gid"])
         c.filesystem.root_gid = f["root_gid"].as<uint32_t>();
     if (f["root_mode"])
         c.filesystem.root_mode = parse_mode(f["root_mode"], "filesystem.root_mode");
+
+    // 0.12.x compatibility: old FUSE keys under filesystem remain accepted.
+    if (f["allow_other"]) c.fuse.allow_other = f["allow_other"].as<bool>();
+    if (f["entry_timeout_ms"]) c.fuse.entry_timeout = milliseconds(f["entry_timeout_ms"], "filesystem.entry_timeout_ms");
+    if (f["attr_timeout_ms"]) c.fuse.attr_timeout = milliseconds(f["attr_timeout_ms"], "filesystem.attr_timeout_ms");
+    if (f["negative_timeout_ms"]) c.fuse.negative_timeout = milliseconds(f["negative_timeout_ms"], "filesystem.negative_timeout_ms");
+}
+
+void parse_fuse(const YAML::Node& root, Config& c) {
+    auto f = root["fuse"];
+    if (!f) return;
+    if (f["allow_other"]) c.fuse.allow_other = f["allow_other"].as<bool>();
+    if (f["entry_timeout_ms"]) c.fuse.entry_timeout = milliseconds(f["entry_timeout_ms"], "fuse.entry_timeout_ms");
+    if (f["attr_timeout_ms"]) c.fuse.attr_timeout = milliseconds(f["attr_timeout_ms"], "fuse.attr_timeout_ms");
+    if (f["negative_timeout_ms"]) c.fuse.negative_timeout = milliseconds(f["negative_timeout_ms"], "fuse.negative_timeout_ms");
+    if (f["absolute_request_timeout_ms"]) c.fuse.absolute_request_timeout = milliseconds(f["absolute_request_timeout_ms"], "fuse.absolute_request_timeout_ms");
+    if (f["request_workers"]) c.fuse.request_workers = f["request_workers"].as<size_t>();
+    if (f["max_pending_requests"]) c.fuse.max_pending_requests = f["max_pending_requests"].as<size_t>();
+    if (f["commit_workers"]) c.fuse.commit_workers = f["commit_workers"].as<size_t>();
+    if (f["max_pending_operations"]) c.fuse.max_pending_operations = f["max_pending_operations"].as<size_t>();
+    if (f["hydration_priority"]) c.fuse.hydration_priority = f["hydration_priority"].as<uint32_t>();
+    if (f["read_ahead_extents"]) c.fuse.read_ahead_extents = f["read_ahead_extents"].as<size_t>();
+    if (f["hint_lifetime_ms"]) c.fuse.hint_lifetime = milliseconds(f["hint_lifetime_ms"], "fuse.hint_lifetime_ms");
+    if (f["write_through_cache"]) c.fuse.write_through_cache = f["write_through_cache"].as<bool>();
+    if (f["refresh_interval_ms"]) c.fuse.refresh_interval = milliseconds(f["refresh_interval_ms"], "fuse.refresh_interval_ms");
+    if (f["fail_closed_mountpoint"]) c.fuse.fail_closed_mountpoint = f["fail_closed_mountpoint"].as<bool>();
+    if (f["watchdog_interval_ms"]) c.fuse.watchdog_interval = milliseconds(f["watchdog_interval_ms"], "fuse.watchdog_interval_ms");
+    if (auto t = f["timeouts"]) {
+        if (t["lookup_ms"]) c.fuse.timeouts.lookup = milliseconds(t["lookup_ms"], "fuse.timeouts.lookup_ms");
+        if (t["namespace_ms"]) c.fuse.timeouts.namespace_mutation = milliseconds(t["namespace_ms"], "fuse.timeouts.namespace_ms");
+        if (t["read_ms"]) c.fuse.timeouts.read = milliseconds(t["read_ms"], "fuse.timeouts.read_ms");
+        if (t["write_ms"]) c.fuse.timeouts.write = milliseconds(t["write_ms"], "fuse.timeouts.write_ms");
+        if (t["sync_ms"]) c.fuse.timeouts.sync = milliseconds(t["sync_ms"], "fuse.timeouts.sync_ms");
+        if (t["lifecycle_ms"]) c.fuse.timeouts.lifecycle = milliseconds(t["lifecycle_ms"], "fuse.timeouts.lifecycle_ms");
+    }
 }
 
 void parse_catalogue(const YAML::Node& root, Config& c) {
@@ -618,6 +668,7 @@ Config load_yaml_config(const std::filesystem::path& path) {
     parse_dht(root, c);
     parse_maintenance(root, c);
     parse_filesystem(root, c);
+    parse_fuse(root, c);
     parse_catalogue(root, c);
     parse_streaming(root, c);
     parse_hydration(root, c);

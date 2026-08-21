@@ -38,20 +38,48 @@ struct MaintenanceConfig {
     std::chrono::milliseconds no_progress_backoff{30000};
 };
 
-struct FilesystemConfig {
+struct FuseOperationTimeouts {
+    std::chrono::milliseconds lookup{1000};
+    std::chrono::milliseconds namespace_mutation{3000};
+    std::chrono::milliseconds read{10000};
+    std::chrono::milliseconds write{5000};
+    std::chrono::milliseconds sync{5000};
+    std::chrono::milliseconds lifecycle{2000};
+};
+
+struct FuseConfig {
     // Expose a FUSE mount to users other than the process that mounted it.
-    // Required on macFUSE when the daemon is started with sudo but the volume
-    // is intended to be used from the invoking user's session.
     bool allow_other{};
 
-    // Short-lived kernel-side namespace/attribute caches dramatically reduce
-    // FUSE request traffic without making remote namespace changes feel stale.
-    // File contents are still invalidated across opens (kernel_cache remains
-    // disabled in the FUSE adapter).
+    // Short-lived kernel-side namespace/attribute caches.
     std::chrono::milliseconds entry_timeout{250};
     std::chrono::milliseconds attr_timeout{250};
     std::chrono::milliseconds negative_timeout{100};
 
+    // Every kernel-facing operation is bounded by its semantic class and this
+    // absolute ceiling. The default remains far below macFUSE's 60s eject timeout.
+    FuseOperationTimeouts timeouts;
+    std::chrono::milliseconds absolute_request_timeout{15000};
+
+    // Local request broker and asynchronous publication queues.
+    size_t request_workers{24};
+    size_t max_pending_requests{4096};
+    size_t commit_workers{8};
+    size_t max_pending_operations{4096};
+
+    // FUSE demand is emitted into the existing hydration scheduler.
+    uint32_t hydration_priority{2000};
+    size_t read_ahead_extents{2};
+    std::chrono::milliseconds hint_lifetime{5000};
+    bool write_through_cache{true};
+
+    // Local metadata refresh and external mount-loss containment.
+    std::chrono::milliseconds refresh_interval{1000};
+    bool fail_closed_mountpoint{true};
+    std::chrono::milliseconds watchdog_interval{1000};
+};
+
+struct FilesystemConfig {
     // These values become the ownership/mode of the distributed filesystem
     // root when a brand-new metadata group is formed. They are stored in DHT
     // metadata thereafter; changing the config does not rewrite an existing
@@ -116,7 +144,7 @@ struct CatalogueScannerConfig {
     // publish many metadata generations; wait for a quiet period where possible,
     // but cap deferral so sustained writes still produce occasional catalogue scans.
     std::chrono::milliseconds rescan_debounce{10000};
-    std::chrono::milliseconds rescan_max_delay{60000};
+    std::chrono::milliseconds rescan_max_delay{600000};
     // Bound online provider metadata work per pass. When the budget is exhausted,
     // the scanner commits the completed discoveries and schedules a continuation
     // rather than monopolising a scanner pass with remote lookups.
@@ -174,6 +202,7 @@ struct Config {
     CacheConfig cache;
     MaintenanceConfig maintenance;
     FilesystemConfig filesystem;
+    FuseConfig fuse;
     CatalogueConfig catalogue;
     StreamingConfig streaming;
     HydrationConfig hydration;

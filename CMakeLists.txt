@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(macha VERSION 0.12.3 LANGUAGES CXX)
+project(macha VERSION 0.13.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -86,6 +86,7 @@ set(MACHA_CORE_SOURCES
     src/macos_unicode.cpp
     src/hydration.cpp
     src/filesystem.cpp
+    src/fuse_frontend.cpp
     src/service.cpp
 )
 

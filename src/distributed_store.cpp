@@ -683,6 +683,17 @@ bool DistributedStore::locally_available(const ObjectId& id) const {
     return n_.local_store().has(id) || n_.block_cache().has(id);
 }
 
+bool DistributedStore::cache_local(const ObjectId& id, std::span<const uint8_t> data) {
+    if (!n_.block_cache().enabled())
+        return false;
+    try {
+        return n_.block_cache().put(id, data);
+    } catch (const std::exception& e) {
+        Log::debug("cache write-through skipped object=" + to_string(id) + " error=" + e.what());
+        return false;
+    }
+}
+
 bool DistributedStore::hydration_available() const {
     return n_.block_cache().enabled();
 }

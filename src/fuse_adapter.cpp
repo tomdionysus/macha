@@ -1,24 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #define FUSE_USE_VERSION 31
 #if defined(__APPLE__)
-// macFUSE enables Darwin-specific libfuse3 callback signatures by default.
-// This filesystem deliberately uses the portable libfuse3 API on both Linux
-// and macOS.  Disabling the extensions keeps getattr/readdir/statfs ABI-compatible
-// with upstream libfuse3 (stat/statvfs) instead of fuse_darwin_attr/statfs.
 #define FUSE_DARWIN_ENABLE_EXTENSIONS 0
 #endif
 #include "fuse_adapter.hpp"
 #include "crypto.hpp"
 #include "diagnostics.hpp"
+#include "fuse_frontend.hpp"
 #include "log.hpp"
 #include "macos_unicode.hpp"
+
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
 #if defined(__APPLE__) && defined(__clang__)
-// macFUSE headers themselves use anonymous struct/union extensions.  Keep
-// -Werror for our code without promoting warnings in the third-party header.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wgnu-anonymous-struct"
 #pragma clang diagnostic ignored "-Wnested-anon-types"
@@ -29,68 +26,32 @@
 #if defined(__APPLE__) && defined(__clang__)
 #pragma clang diagnostic pop
 #endif
+#include <fstream>
 #include <iomanip>
 #include <memory>
 #include <sstream>
 #include <string_view>
 #include <sys/stat.h>
-#include <thread>
 #include <sys/statvfs.h>
+#include <thread>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/mount.h>
+#endif
 
 namespace macha {
 namespace {
-FileSystem& fs();
+
+FuseFrontend& frontend() {
+    return *static_cast<FuseFrontend*>(fuse_get_context()->private_data);
+}
 
 struct Handle {
-    std::string path;
-    std::shared_ptr<ReadHandle> read;
-    std::shared_ptr<WriteHandle> write;
+    FuseOpenHandle file;
 };
-
-struct FuseLatency {
-    const char* op;
-    const char* path;
-    bool enabled{Log::enabled(LogLevel::debug)};
-    Clock::time_point started{};
-
-    FuseLatency(const char* operation, const char* pathname)
-        : op(operation), path(pathname), started(enabled ? Clock::now() : Clock::time_point{}) {
-        // Metadata-only mount activity (rsync readdir/getattr in particular)
-        // must preempt maintenance even though it transfers no extent bytes.
-        fs().note_interactive_activity();
-    }
-
-    ~FuseLatency() noexcept {
-        try {
-            if (!enabled)
-                return;
-            const auto ms = elapsed_ms(started);
-            // Normal large-file writes on FUSE commonly take tens of
-            // milliseconds and logging every one obscures the actual stalls.
-            // Keep namespace latency sensitive, but only report data writes
-            // once they are clearly outside the normal streaming-write band.
-            const auto threshold_ms = std::strcmp(op, "write") == 0 ? 250 : 100;
-            if (ms >= threshold_ms)
-                Log::debug(std::string("DIAG slow-fuse op=") + op + " path=" +
-                           (path ? path : "<null>") + " elapsed_ms=" + std::to_string(ms));
-        } catch (...) {
-        }
-    }
-};
-
-FileSystem& fs() {
-    return *static_cast<FileSystem*>(fuse_get_context()->private_data);
-}
 
 Handle* handle(fuse_file_info* fi) {
     return fi && fi->fh ? reinterpret_cast<Handle*>(fi->fh) : nullptr;
-}
-
-std::string octal(uint64_t value) {
-    std::ostringstream out;
-    out << '0' << std::oct << value;
-    return out.str();
 }
 
 std::string hex(uint64_t value) {
@@ -113,15 +74,13 @@ std::string byte_hex(std::string_view value) {
 
 std::string request_identity() {
     auto* c = fuse_get_context();
-    if (!c)
-        return "uid=? gid=? pid=?";
+    if (!c) return "uid=? gid=? pid=?";
     return "uid=" + std::to_string(c->uid) + " gid=" + std::to_string(c->gid) +
            " pid=" + std::to_string(c->pid);
 }
 
 void trace_request(const char* op, const char* path, const fuse_file_info* fi = nullptr) {
-    if (!Log::enabled(LogLevel::all))
-        return;
+    if (!Log::enabled(LogLevel::all)) return;
     std::string message = std::string("FUSE TRACE request op=") + op + " path=" +
                           (path ? path : "<null>");
     if (path) message += " path_hex=" + byte_hex(path);
@@ -129,26 +88,41 @@ void trace_request(const char* op, const char* path, const fuse_file_info* fi = 
     if (fi)
         message += " flags=" + hex(static_cast<unsigned int>(fi->flags)) +
                    " fh=" + std::to_string(fi->fh);
-    if (Log::enabled(LogLevel::all))
-        Log::trace(message);
+    Log::trace(message);
 }
 
-std::string entry_summary(const FsEntry& e) {
-    return std::string("type=") + (e.type == EntryType::directory ? "directory" : "file") +
-           " mode=" + octal(e.mode) + " uid=" + std::to_string(e.uid) +
-           " gid=" + std::to_string(e.gid) + " size=" + std::to_string(e.size) +
-           " version=" + std::to_string(e.version) + " ctime_ns=" +
-           std::to_string(e.ctime_ns) + " mtime_ns=" + std::to_string(e.mtime_ns);
-}
+struct FuseLatency {
+    const char* op;
+    const char* path;
+    bool enabled{Log::enabled(LogLevel::debug)};
+    Clock::time_point started{};
+
+    FuseLatency(const char* operation, const char* pathname)
+        : op(operation), path(pathname), started(enabled ? Clock::now() : Clock::time_point{}) {
+        frontend().note_interactive_activity();
+    }
+
+    ~FuseLatency() noexcept {
+        try {
+            if (!enabled) return;
+            const auto ms = elapsed_ms(started);
+            const auto threshold_ms = std::strcmp(op, "write") == 0 ? 250 : 100;
+            if (ms >= threshold_ms)
+                Log::debug(std::string("DIAG slow-fuse op=") + op + " path=" +
+                           (path ? path : "<null>") + " elapsed_ms=" + std::to_string(ms));
+        } catch (...) {
+        }
+    }
+};
 
 int fail(const char* op, const std::exception& e) {
     if (auto* f = dynamic_cast<const FsError*>(&e)) {
         if (Log::enabled(LogLevel::all))
             Log::trace(std::string("FUSE TRACE failure op=") + op + " " + request_identity() +
-                   " errno=" + std::to_string(f->code()) + " message=" + e.what());
+                       " errno=" + std::to_string(f->code()) + " message=" + e.what());
         return -f->code();
     }
-    Log::warn(std::string("FUSE TRACE failure op=") + op + " " + request_identity() +
+    Log::warn(std::string("FUSE failure op=") + op + " " + request_identity() +
               " errno=" + std::to_string(EIO) + " message=" + e.what());
     return -EIO;
 }
@@ -187,41 +161,12 @@ void fill_stat(const FsEntry& e, struct stat& st) {
     set_time(st, e.mtime_ns);
 }
 
-void apply_active_write_size(const std::string& path, const FsEntry& e, struct stat& st) {
-    if (e.type != EntryType::file)
-        return;
-    auto active_size = fs().active_write_size(path);
-    if (!active_size)
-        return;
-    st.st_size = static_cast<off_t>(*active_size);
-    st.st_blocks = static_cast<blkcnt_t>((*active_size + 511) / 512);
-}
-
 int op_getattr(const char* path, struct stat* st, fuse_file_info* fi) {
     trace_request("getattr", path, fi);
     FuseLatency latency{"getattr", path};
     return guarded("getattr", [&] {
-        auto e = fs().getattr(path);
-        fill_stat(e, *st);
-        apply_active_write_size(path, e, *st);
-        if (Log::enabled(LogLevel::all)) {
-            auto active = fs().active_write_diagnostics(path);
-            Log::trace(std::string("FUSE TRACE result op=getattr path=") + path + " " +
-                       entry_summary(e) + " returned_size=" + std::to_string(st->st_size) +
-                       " active_writes=" + std::to_string(active.size()));
-            for (const auto& write : active) {
-                Log::trace(std::string("WRITE getattr-view path=") + path +
-                           " id=" + std::to_string(write.id) +
-                           " metadata_size=" + std::to_string(e.size) +
-                           " returned_size=" + std::to_string(st->st_size) +
-                           " logical_size=" + std::to_string(write.logical_size) +
-                           " staged_size=" + std::to_string(write.staged_size) +
-                           " buffer_size=" + std::to_string(write.buffer_size) +
-                           " sequential=" + std::to_string(write.sequential ? 1 : 0) +
-                           " temp_open=" + std::to_string(write.temp_open ? 1 : 0) +
-                           " temp_size=" + std::to_string(write.temp_size));
-            }
-        }
+        auto entry = frontend().getattr(path);
+        fill_stat(entry, *st);
         return 0;
     });
 }
@@ -233,23 +178,12 @@ int op_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t, fuse_
     return guarded("readdir", [&] {
         filler(buf, ".", nullptr, 0, FUSE_FILL_DIR_DEFAULTS);
         filler(buf, "..", nullptr, 0, FUSE_FILL_DIR_DEFAULTS);
-        auto entries = fs().readdir(path);
-        if (Log::enabled(LogLevel::all))
-            Log::trace(std::string("FUSE TRACE result op=readdir path=") + path +
-                  " entries=" + std::to_string(entries.size()));
+        auto entries = frontend().readdir(path);
         for (auto& [name, entry] : entries) {
-            const auto fuse_name = macos_fuse_decomposed_name(name);
-            if (Log::enabled(LogLevel::all))
-                Log::trace(std::string("FUSE TRACE dirent parent=") + path + " stored_name=" + name +
-                           " stored_hex=" + byte_hex(name) + " fuse_name=" + fuse_name +
-                           " fuse_hex=" + byte_hex(fuse_name) + " " + entry_summary(entry));
             struct stat st{};
             fill_stat(entry, st);
-            const std::string child_path =
-                std::string(path) == "/" ? "/" + name : std::string(path) + "/" + name;
-            apply_active_write_size(child_path, entry, st);
-            if (filler(buf, fuse_name.c_str(), &st, 0, FUSE_FILL_DIR_DEFAULTS))
-                break;
+            const auto fuse_name = macos_fuse_decomposed_name(name);
+            if (filler(buf, fuse_name.c_str(), &st, 0, FUSE_FILL_DIR_DEFAULTS)) break;
         }
         return 0;
     });
@@ -258,11 +192,9 @@ int op_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t, fuse_
 int op_mkdir(const char* path, mode_t mode) {
     trace_request("mkdir", path);
     FuseLatency latency{"mkdir", path};
-    if (Log::enabled(LogLevel::all))
-        Log::trace(std::string("FUSE TRACE argument op=mkdir mode=") + octal(mode));
     return guarded("mkdir", [&] {
         auto* c = fuse_get_context();
-        fs().mkdir(path, mode, c->uid, c->gid);
+        frontend().mkdir(path, mode, c->uid, c->gid);
         return 0;
     });
 }
@@ -270,35 +202,26 @@ int op_mkdir(const char* path, mode_t mode) {
 int op_rmdir(const char* path) {
     trace_request("rmdir", path);
     FuseLatency latency{"rmdir", path};
-    return guarded("rmdir", [&] {
-        fs().rmdir(path);
-        return 0;
-    });
+    return guarded("rmdir", [&] { frontend().rmdir(path); return 0; });
 }
 
 int op_unlink(const char* path) {
     trace_request("unlink", path);
     FuseLatency latency{"unlink", path};
-    return guarded("unlink", [&] {
-        fs().unlink(path);
-        return 0;
-    });
+    return guarded("unlink", [&] { frontend().unlink(path); return 0; });
 }
 
 int op_rename(const char* from, const char* to, unsigned int flags) {
     trace_request("rename", from);
     FuseLatency latency{"rename", from};
-    if (Log::enabled(LogLevel::all))
-        Log::trace(std::string("FUSE TRACE argument op=rename to=") + to + " flags=" + hex(flags));
     return guarded("rename", [&] {
         bool noreplace = false;
 #ifdef RENAME_NOREPLACE
         noreplace = (flags & RENAME_NOREPLACE) != 0;
         flags &= ~static_cast<unsigned int>(RENAME_NOREPLACE);
 #endif
-        if (flags)
-            return -EINVAL;
-        fs().rename(from, to, noreplace);
+        if (flags) return -EINVAL;
+        frontend().rename(from, to, noreplace);
         return 0;
     });
 }
@@ -306,22 +229,15 @@ int op_rename(const char* from, const char* to, unsigned int flags) {
 int op_chmod(const char* path, mode_t mode, fuse_file_info* fi) {
     trace_request("chmod", path, fi);
     FuseLatency latency{"chmod", path};
-    if (Log::enabled(LogLevel::all))
-        Log::trace(std::string("FUSE TRACE argument op=chmod mode=") + octal(mode));
-    return guarded("chmod", [&] {
-        fs().chmod(path, mode);
-        return 0;
-    });
+    return guarded("chmod", [&] { frontend().chmod(path, mode); return 0; });
 }
 
 int op_chown(const char* path, uid_t uid, gid_t gid, fuse_file_info* fi) {
     trace_request("chown", path, fi);
     FuseLatency latency{"chown", path};
-    if (Log::enabled(LogLevel::all))
-        Log::trace(std::string("FUSE TRACE argument op=chown uid=") + std::to_string(uid) +
-              " gid=" + std::to_string(gid));
     return guarded("chown", [&] {
-        fs().chown(path, uid, gid, uid != static_cast<uid_t>(-1), gid != static_cast<gid_t>(-1));
+        frontend().chown(path, uid, gid, uid != static_cast<uid_t>(-1),
+                         gid != static_cast<gid_t>(-1));
         return 0;
     });
 }
@@ -330,51 +246,31 @@ int op_utimens(const char* path, const struct timespec tv[2], fuse_file_info* fi
     trace_request("utimens", path, fi);
     FuseLatency latency{"utimens", path};
     return guarded("utimens", [&] {
-        int64_t ns;
-        if (tv[1].tv_nsec == UTIME_NOW)
-            ns = wall_time_ns();
-        else if (tv[1].tv_nsec == UTIME_OMIT)
-            return 0;
-        else
-            ns = static_cast<int64_t>(tv[1].tv_sec) * 1000000000LL + tv[1].tv_nsec;
-        fs().utimens(path, ns);
+        if (tv[1].tv_nsec == UTIME_OMIT) return 0;
+        const int64_t ns = tv[1].tv_nsec == UTIME_NOW
+                               ? wall_time_ns()
+                               : static_cast<int64_t>(tv[1].tv_sec) * 1000000000LL + tv[1].tv_nsec;
+        frontend().utimens(path, ns);
         return 0;
     });
+}
+
+void set_file_flags(fuse_file_info* fi) {
+    fi->direct_io = 0;
+    fi->keep_cache = 0;
 }
 
 int op_open(const char* path, fuse_file_info* fi) {
     trace_request("open", path, fi);
     FuseLatency latency{"open", path};
     return guarded("open", [&] {
-        auto e = fs().getattr(path);
-        if (e.type != EntryType::file)
-            return -EISDIR;
+        const int access = fi->flags & O_ACCMODE;
         auto h = std::make_unique<Handle>();
-        h->path = path;
-        int access = fi->flags & O_ACCMODE;
-        if (access == O_RDONLY || access == O_RDWR)
-            h->read = fs().open_read(path);
-        if (access == O_WRONLY || access == O_RDWR)
-            h->write = fs().open_write(path, (fi->flags & O_TRUNC) != 0);
-        // Files in this filesystem always have a meaningful logical size.
-        // Do not use direct I/O: it bypasses the kernel page/UBC cache and,
-        // especially on macOS/macFUSE, breaks mmap-based applications and can
-        // produce non-standard write behaviour.  keep_cache=0 still prevents
-        // stale data from surviving across opens.
-        fi->direct_io = 0;
-        fi->keep_cache = 0;
-        auto* read_ptr = h->read.get();
-        auto* write_ptr = h->write.get();
+        h->file = frontend().open(path, access == O_RDONLY || access == O_RDWR,
+                                  access == O_WRONLY || access == O_RDWR,
+                                  (fi->flags & O_APPEND) != 0, (fi->flags & O_TRUNC) != 0);
+        set_file_flags(fi);
         fi->fh = reinterpret_cast<uint64_t>(h.release());
-        if (Log::enabled(LogLevel::all))
-            Log::trace(std::string("FUSE TRACE result op=open path=") + path +
-                  " fh=" + std::to_string(fi->fh));
-        if (Log::enabled(LogLevel::all))
-            Log::trace(std::string("FUSE handle op=open path=") + path +
-                   " fh=" + std::to_string(fi->fh) +
-                   " read_ptr=" + std::to_string(reinterpret_cast<uintptr_t>(read_ptr)) +
-                   " write_id=" +
-                   std::to_string(write_ptr ? write_ptr->diagnostic_id() : 0));
         return 0;
     });
 }
@@ -382,37 +278,16 @@ int op_open(const char* path, fuse_file_info* fi) {
 int op_create(const char* path, mode_t mode, fuse_file_info* fi) {
     trace_request("create", path, fi);
     FuseLatency latency{"create", path};
-    if (Log::enabled(LogLevel::all))
-        Log::trace(std::string("FUSE TRACE argument op=create mode=") + octal(mode));
     return guarded("create", [&] {
+        const int access = fi->flags & O_ACCMODE;
         auto* c = fuse_get_context();
-        fs().create_file(path, mode, c->uid, c->gid);
         auto h = std::make_unique<Handle>();
-        h->path = path;
-        int access = fi->flags & O_ACCMODE;
-        if (access == O_RDONLY || access == O_RDWR)
-            h->read = fs().open_read(path);
-        if (access == O_WRONLY || access == O_RDWR)
-            h->write = fs().open_write(path, true);
-        // Files in this filesystem always have a meaningful logical size.
-        // Do not use direct I/O: it bypasses the kernel page/UBC cache and,
-        // especially on macOS/macFUSE, breaks mmap-based applications and can
-        // produce non-standard write behaviour.  keep_cache=0 still prevents
-        // stale data from surviving across opens.
-        fi->direct_io = 0;
-        fi->keep_cache = 0;
-        auto* read_ptr = h->read.get();
-        auto* write_ptr = h->write.get();
+        h->file = frontend().create(path, mode, c->uid, c->gid,
+                                    access == O_RDONLY || access == O_RDWR,
+                                    access == O_WRONLY || access == O_RDWR,
+                                    (fi->flags & O_APPEND) != 0);
+        set_file_flags(fi);
         fi->fh = reinterpret_cast<uint64_t>(h.release());
-        if (Log::enabled(LogLevel::all))
-            Log::trace(std::string("FUSE TRACE result op=create path=") + path +
-                  " fh=" + std::to_string(fi->fh));
-        if (Log::enabled(LogLevel::all))
-            Log::trace(std::string("FUSE handle op=create path=") + path +
-                   " fh=" + std::to_string(fi->fh) +
-                   " read_ptr=" + std::to_string(reinterpret_cast<uintptr_t>(read_ptr)) +
-                   " write_id=" +
-                   std::to_string(write_ptr ? write_ptr->diagnostic_id() : 0));
         return 0;
     });
 }
@@ -420,38 +295,20 @@ int op_create(const char* path, mode_t mode, fuse_file_info* fi) {
 int op_read(const char* path, char* buf, size_t size, off_t off, fuse_file_info* fi) {
     trace_request("read", path, fi);
     FuseLatency latency{"read", path};
-    if (Log::enabled(LogLevel::all))
-        Log::trace(std::string("FUSE TRACE argument op=read size=") + std::to_string(size) +
-              " offset=" + std::to_string(off));
     return guarded("read", [&] {
-        if (off < 0)
-            return -EINVAL;
+        if (off < 0) return -EINVAL;
         auto* h = handle(fi);
-        if (h && h->write) {
-            h->write->commit();
-            h->path = path;
-            h->read = fs().open_read(h->path);
+        uint64_t inode = 0;
+        if (h) {
+            if (!h->file.readable) return -EBADF;
+            inode = h->file.inode;
+        } else {
+            auto found = frontend().inode_for_path(path);
+            if (!found) return -ENOENT;
+            inode = *found;
         }
-        auto r = h && h->read ? h->read : fs().open_read(path);
-        auto n = r->read(static_cast<uint64_t>(off),
-                         {reinterpret_cast<uint8_t*>(buf), size}, {},
-                         fs().io_cancellation_flag());
-        if (Log::enabled(LogLevel::all) && n) {
-            auto bytes = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(buf), n);
-            if (Log::enabled(LogLevel::all))
-                Log::trace(std::string("READ egress path=") + path +
-                       " offset=" + std::to_string(off) +
-                       " length=" + std::to_string(n) +
-                       " sha256=" + to_string(sha256(bytes)) +
-                       " all_zero=" +
-                       std::to_string(std::all_of(bytes.begin(), bytes.end(),
-                                                  [](uint8_t b) { return b == 0; })
-                                          ? 1
-                                          : 0));
-        }
-        if (Log::enabled(LogLevel::all))
-            Log::trace(std::string("FUSE TRACE result op=read path=") + path +
-                   " bytes=" + std::to_string(n));
+        auto n = frontend().read(inode, static_cast<uint64_t>(off),
+                                 {reinterpret_cast<uint8_t*>(buf), size});
         return static_cast<int>(n);
     });
 }
@@ -459,23 +316,12 @@ int op_read(const char* path, char* buf, size_t size, off_t off, fuse_file_info*
 int op_write(const char* path, const char* buf, size_t size, off_t off, fuse_file_info* fi) {
     trace_request("write", path, fi);
     FuseLatency latency{"write", path};
-    if (Log::enabled(LogLevel::all))
-        Log::trace(std::string("FUSE TRACE argument op=write size=") + std::to_string(size) +
-              " offset=" + std::to_string(off));
     return guarded("write", [&] {
+        if (off < 0) return -EINVAL;
         auto* h = handle(fi);
-        if (!h || !h->write)
-            return -EBADF;
-        if (off < 0)
-            return -EINVAL;
-        uint64_t offset = static_cast<uint64_t>(off);
-        if ((fi->flags & O_APPEND) != 0)
-            offset = h->write->size();
-        auto n = h->write->write(offset, {reinterpret_cast<const uint8_t*>(buf), size});
-        h->read.reset();
-        if (Log::enabled(LogLevel::all))
-            Log::trace(std::string("FUSE TRACE result op=write path=") + path +
-                  " bytes=" + std::to_string(n));
+        if (!h || !h->file.writable) return -EBADF;
+        auto n = frontend().write(h->file.inode, static_cast<uint64_t>(off),
+                                  {reinterpret_cast<const uint8_t*>(buf), size}, h->file.append);
         return static_cast<int>(n);
     });
 }
@@ -483,15 +329,12 @@ int op_write(const char* path, const char* buf, size_t size, off_t off, fuse_fil
 int op_truncate(const char* path, off_t size, fuse_file_info* fi) {
     trace_request("truncate", path, fi);
     FuseLatency latency{"truncate", path};
-    if (Log::enabled(LogLevel::all))
-        Log::trace(std::string("FUSE TRACE argument op=truncate size=") + std::to_string(size));
     return guarded("truncate", [&] {
-        if (size < 0)
-            return -EINVAL;
-        if (auto* h = handle(fi); h && h->write)
-            h->write->truncate(static_cast<uint64_t>(size));
+        if (size < 0) return -EINVAL;
+        if (auto* h = handle(fi); h && h->file.writable)
+            frontend().truncate(h->file.inode, static_cast<uint64_t>(size));
         else
-            fs().truncate_file(path, static_cast<uint64_t>(size));
+            frontend().truncate(path, static_cast<uint64_t>(size));
         return 0;
     });
 }
@@ -500,10 +343,7 @@ int op_flush(const char* path, fuse_file_info* fi) {
     trace_request("flush", path, fi);
     FuseLatency latency{"flush", path};
     return guarded("flush", [&] {
-        if (auto* h = handle(fi); h && h->write)
-            h->write->commit();
-        if (Log::enabled(LogLevel::all))
-            Log::trace(std::string("FUSE TRACE result op=flush path=") + path + " rc=0");
+        if (auto* h = handle(fi); h && h->file.writable) frontend().flush(h->file.inode);
         return 0;
     });
 }
@@ -512,8 +352,7 @@ int op_fsync(const char* path, int, fuse_file_info* fi) {
     trace_request("fsync", path, fi);
     FuseLatency latency{"fsync", path};
     return guarded("fsync", [&] {
-        if (auto* h = handle(fi); h && h->write)
-            h->write->commit();
+        if (auto* h = handle(fi); h && h->file.writable) frontend().fsync(h->file.inode);
         return 0;
     });
 }
@@ -522,20 +361,15 @@ int op_release(const char* path, fuse_file_info* fi) {
     trace_request("release", path, fi);
     FuseLatency latency{"release", path};
     auto* h = handle(fi);
-    if (!h)
-        return 0;
+    if (!h) return 0;
     int rc = 0;
     try {
-        if (h->write)
-            h->write->commit();
+        frontend().release(h->file.inode);
     } catch (const std::exception& e) {
         rc = fail("release", e);
     }
     delete h;
     fi->fh = 0;
-    if (Log::enabled(LogLevel::all))
-        Log::trace(std::string("FUSE TRACE result op=release path=") + path +
-              " rc=" + std::to_string(rc));
     return rc;
 }
 
@@ -543,7 +377,7 @@ int op_statfs(const char* path, struct statvfs* st) {
     trace_request("statfs", path);
     FuseLatency latency{"statfs", path};
     return guarded("statfs", [&] {
-        auto [total, used] = fs().logical_capacity();
+        auto [total, used] = frontend().logical_capacity();
         constexpr uint64_t block = 4096;
         std::memset(st, 0, sizeof(*st));
         st->f_bsize = block;
@@ -559,29 +393,18 @@ int op_statfs(const char* path, struct statvfs* st) {
 }
 
 void* op_init(struct fuse_conn_info*, struct fuse_config* cfg) {
-    if (Log::enabled(LogLevel::all))
-        Log::trace(std::string("FUSE TRACE init ") + request_identity() +
-              " process_uid=" + std::to_string(getuid()) +
-              " process_gid=" + std::to_string(getgid()) +
-              " process_euid=" + std::to_string(geteuid()) +
-              " process_egid=" + std::to_string(getegid()));
-    const auto& policy = fs().node().config().filesystem;
+    const auto& policy = frontend().config();
     const auto seconds = [](std::chrono::milliseconds value) {
         return std::chrono::duration<double>(value).count();
     };
-    // Keep file-content caching conservative across opens, but allow short
-    // namespace/attribute caches. Zero timeouts make macFUSE bounce every
-    // lookup/stat through userspace and can turn a pathname failure into a
-    // kernel/userspace request storm.
     cfg->kernel_cache = 0;
     cfg->entry_timeout = seconds(policy.entry_timeout);
     cfg->attr_timeout = seconds(policy.attr_timeout);
     cfg->negative_timeout = seconds(policy.negative_timeout);
-    Log::debug("FUSE cache policy entry_timeout_ms=" +
-               std::to_string(policy.entry_timeout.count()) +
+    Log::debug("FUSE bounded frontend entry_timeout_ms=" + std::to_string(policy.entry_timeout.count()) +
                " attr_timeout_ms=" + std::to_string(policy.attr_timeout.count()) +
-               " negative_timeout_ms=" + std::to_string(policy.negative_timeout.count()) +
-               " kernel_cache=0");
+               " absolute_request_timeout_ms=" +
+               std::to_string(policy.absolute_request_timeout.count()));
     return fuse_get_context()->private_data;
 }
 
@@ -608,53 +431,114 @@ fuse_operations operations() {
     o.statfs = op_statfs;
     return o;
 }
-} // namespace
 
-int run_fuse(FileSystem& filesystem, const std::filesystem::path& mount_path, bool allow_other,
-             std::function<void()> request_shutdown) {
-    auto mount = mount_path.string();
-    std::string options = allow_other ? "default_permissions,allow_other,fsname=macha"
-                                      : "default_permissions,fsname=macha";
-#if defined(__APPLE__)
-    // libfuse3 builds of macFUSE do not consistently expose the historical
-    // norm_insensitive mount option. Macha handles canonical-equivalent lookup
-    // in its runtime namespace index instead; readdir() still emits D-form names
-    // as required by macOS/macFUSE.
+bool mount_table_contains(const std::string& mount) {
+#if defined(__linux__)
+    const auto unescape_mount_field = [](std::string value) {
+        for (const auto& [escaped, plain] :
+             std::array<std::pair<std::string_view, char>, 4>{{{"\\040", ' '}, {"\\011", '\t'},
+                                                               {"\\012", '\n'}, {"\\134", '\\'}}}) {
+            size_t pos = 0;
+            while ((pos = value.find(escaped, pos)) != std::string::npos) {
+                value.replace(pos, escaped.size(), 1, plain);
+                ++pos;
+            }
+        }
+        return value;
+    };
+    std::ifstream input("/proc/self/mountinfo");
+    std::string line;
+    while (std::getline(input, line)) {
+        std::istringstream fields(line);
+        std::string id, parent, device, root, mounted;
+        if (!(fields >> id >> parent >> device >> root >> mounted)) continue;
+        if (unescape_mount_field(mounted) != mount) continue;
+        auto separator = line.find(" - ");
+        if (separator == std::string::npos) return true;
+        auto tail = line.substr(separator + 3);
+        std::istringstream type_fields(tail);
+        std::string type, source;
+        type_fields >> type >> source;
+        return source == "macha" || type.starts_with("fuse");
+    }
+    return false;
+#elif defined(__APPLE__)
+    struct statfs* mounts = nullptr;
+    const int count = getmntinfo(&mounts, MNT_NOWAIT);
+    for (int i = 0; i < count; ++i) {
+        if (mount == mounts[i].f_mntonname) {
+            std::string source = mounts[i].f_mntfromname;
+            std::string type = mounts[i].f_fstypename;
+            return source.find("macha") != std::string::npos || type.find("fuse") != std::string::npos ||
+                   type.find("macfuse") != std::string::npos;
+        }
+    }
+    return false;
+#else
+    (void)mount;
+    return true;
 #endif
+}
 
-    char cwd[4096]{};
-    std::string cwd_text = getcwd(cwd, sizeof(cwd)) ? cwd : "<getcwd failed>";
-    if (Log::enabled(LogLevel::all))
-        Log::trace(std::string("FUSE TRACE mount begin path=") + mount + " options=" + options +
-              " process_uid=" + std::to_string(getuid()) +
-              " process_gid=" + std::to_string(getgid()) +
-              " process_euid=" + std::to_string(geteuid()) +
-              " process_egid=" + std::to_string(getegid()) + " cwd=" + cwd_text);
-    struct stat mount_stat {};
-    if (lstat(mount.c_str(), &mount_stat) == 0) {
-        if (Log::enabled(LogLevel::all))
-            Log::trace(std::string("FUSE TRACE mountpoint before mount mode=") +
-                  octal(static_cast<uint64_t>(mount_stat.st_mode & 07777)) +
-                  " uid=" + std::to_string(mount_stat.st_uid) +
-                  " gid=" + std::to_string(mount_stat.st_gid));
-    } else {
-        Log::warn(std::string("FUSE TRACE mountpoint lstat failed errno=") +
-                  std::to_string(errno) + " message=" + std::strerror(errno));
+class CoveredMountpointGuard {
+    int fd_{-1};
+    mode_t original_mode_{};
+    bool protected_{};
+    bool restore_{};
+
+  public:
+    explicit CoveredMountpointGuard(const std::string& path) {
+        fd_ = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
+        if (fd_ < 0) throw std::runtime_error("cannot open FUSE mountpoint for fail-closed guard");
+        struct stat st{};
+        if (::fstat(fd_, &st) != 0) {
+            const auto error = errno;
+            ::close(fd_);
+            fd_ = -1;
+            throw std::runtime_error("cannot stat FUSE mountpoint: " + std::string(std::strerror(error)));
+        }
+        original_mode_ = st.st_mode & 07777;
     }
 
-    // fuse_main() hides the session handle until it returns, which prevents a
-    // filesystem callback blocked in remote I/O from observing daemon shutdown.
-    // Use the equivalent high-level lifecycle directly so a watcher can observe
-    // fuse_session_exit() (set by libfuse's signal handlers) and cooperatively
-    // cancel outstanding mounted-filesystem writes.
+    ~CoveredMountpointGuard() {
+        if (fd_ >= 0) {
+            if (restore_ && protected_) (void)::fchmod(fd_, original_mode_);
+            ::close(fd_);
+        }
+    }
+
+    bool protect() {
+        if (fd_ < 0) return false;
+        const auto fail_closed_mode = static_cast<mode_t>(original_mode_ & ~0222);
+        if (::fchmod(fd_, fail_closed_mode) != 0) return false;
+        protected_ = true;
+        return true;
+    }
+
+    void restore_on_exit(bool value) { restore_ = value; }
+};
+
+} // namespace
+
+int run_fuse(FileSystem& filesystem, CacheHydrator& hydrator,
+             const std::filesystem::path& mount_path, const FuseConfig& config,
+             std::function<void()> request_shutdown) {
+    auto mount = mount_path.string();
+    std::string options = config.allow_other ? "default_permissions,allow_other,fsname=macha"
+                                             : "default_permissions,fsname=macha";
+
+    std::unique_ptr<CoveredMountpointGuard> mount_guard;
+    if (config.fail_closed_mountpoint)
+        mount_guard = std::make_unique<CoveredMountpointGuard>(mount);
+
+    auto fuse_frontend = std::make_shared<FuseFrontend>(filesystem, config);
+
     std::vector<std::string> fuse_arg_storage{"macha", "-o", options};
     std::vector<char*> fuse_argv;
-    fuse_argv.reserve(fuse_arg_storage.size());
-    for (auto& arg : fuse_arg_storage)
-        fuse_argv.push_back(arg.data());
+    for (auto& arg : fuse_arg_storage) fuse_argv.push_back(arg.data());
     struct fuse_args args = FUSE_ARGS_INIT(static_cast<int>(fuse_argv.size()), fuse_argv.data());
     auto ops = operations();
-    struct fuse* instance = fuse_new(&args, &ops, sizeof(ops), &filesystem);
+    struct fuse* instance = fuse_new(&args, &ops, sizeof(ops), fuse_frontend.get());
     if (!instance) {
         fuse_opt_free_args(&args);
         return 3;
@@ -665,8 +549,18 @@ int run_fuse(FileSystem& filesystem, const std::filesystem::path& mount_path, bo
         return 4;
     }
 
+    if (mount_guard && !mount_guard->protect()) {
+        Log::error("FUSE fail-closed mountpoint protection could not be installed");
+        fuse_unmount(instance);
+        fuse_destroy(instance);
+        fuse_opt_free_args(&args);
+        return 5;
+    }
+
+    hydrator.add_provider(fuse_frontend);
     auto* session = fuse_get_session(instance);
     if (fuse_set_signal_handlers(session) != 0) {
+        hydrator.remove_provider(fuse_frontend.get());
         fuse_unmount(instance);
         fuse_destroy(instance);
         fuse_opt_free_args(&args);
@@ -674,41 +568,66 @@ int run_fuse(FileSystem& filesystem, const std::filesystem::path& mount_path, bo
     }
 
     filesystem.reset_io_cancellation();
+    std::atomic_bool unexpected_mount_loss{false};
+    std::atomic_bool mount_seen{mount_table_contains(mount)};
+
+    std::jthread mount_watchdog([&](std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            std::this_thread::sleep_for(config.watchdog_interval);
+            if (stop.stop_requested()) break;
+            const bool mounted = mount_table_contains(mount);
+            if (mounted) {
+                mount_seen.store(true);
+                continue;
+            }
+            if (!mount_seen.load()) continue;
+            unexpected_mount_loss.store(true);
+            Log::error("FUSE mount disappeared unexpectedly; namespace is fail-closed and service shutdown is requested");
+            filesystem.request_io_cancellation();
+            if (request_shutdown) request_shutdown();
+            fuse_session_exit(session);
+            return;
+        }
+    });
+
     std::jthread shutdown_watcher([&](std::stop_token stop) {
         while (!stop.stop_requested()) {
             if (fuse_session_exited(session)) {
-                Log::debug("shutdown: FUSE session exit observed; requesting service shutdown");
                 filesystem.request_io_cancellation();
-                if (request_shutdown)
-                    request_shutdown();
+                if (request_shutdown) request_shutdown();
                 return;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     });
 
-    Log::debug("shutdown: entering FUSE main loop");
-    // FUSE_USE_VERSION=31 gives the stable fuse_loop_mt(fuse, clone_fd)
-    // interface on libfuse3/macFUSE while retaining the concurrent callbacks
-    // previously selected by fuse_main() (we deliberately did not pass -s).
-    int loop_rc = fuse_loop_mt(instance, 0);
+    Log::debug("shutdown: entering bounded FUSE main loop");
+    const int loop_rc = fuse_loop_mt(instance, 0);
+    if (loop_rc != 0) unexpected_mount_loss.store(true);
     filesystem.request_io_cancellation();
-    if (request_shutdown)
-        request_shutdown();
-    shutdown_watcher.request_stop();
-    if (shutdown_watcher.joinable())
-        shutdown_watcher.join();
+    if (request_shutdown) request_shutdown();
 
+    mount_watchdog.request_stop();
+    shutdown_watcher.request_stop();
+    if (mount_watchdog.joinable()) mount_watchdog.join();
+    if (shutdown_watcher.joinable()) shutdown_watcher.join();
+
+    hydrator.remove_provider(fuse_frontend.get());
+    fuse_frontend->stop();
     fuse_remove_signal_handlers(session);
     fuse_unmount(instance);
+
+    if (mount_guard) mount_guard->restore_on_exit(!unexpected_mount_loss.load());
+
     fuse_destroy(instance);
     fuse_opt_free_args(&args);
 
-    const int rc = loop_rc == 0 ? 0 : 8;
-    if (Log::enabled(LogLevel::all))
-        Log::trace(std::string("FUSE TRACE mount end rc=") + std::to_string(rc));
-    Log::debug("shutdown: FUSE main loop returned rc=" + std::to_string(rc));
-    return rc;
+    if (unexpected_mount_loss.load()) {
+        Log::error("FUSE frontend terminated unexpectedly; covered mountpoint remains non-writable");
+        return 8;
+    }
+    Log::debug("shutdown: FUSE main loop returned cleanly");
+    return 0;
 }
 
 } // namespace macha

@@ -207,9 +207,9 @@ size_t ReadHandle::read(uint64_t off, std::span<uint8_t> out, Clock::time_point 
     return done;
 }
 
-WriteHandle::WriteHandle(FileSystem& f, std::string p, FsEntry b, bool trunc)
+WriteHandle::WriteHandle(FileSystem& f, std::string p, FsEntry b, bool trunc, bool cache_puts)
     : fs_(f), path_(std::move(p)), base_(std::move(b)), expected_(base_.version),
-      sequential_(true), logical_(trunc ? 0 : base_.size), staged_(trunc ? 0 : base_.size),
+      sequential_(true), cache_puts_(cache_puts), logical_(trunc ? 0 : base_.size), staged_(trunc ? 0 : base_.size),
       diagnostic_id_(next_write_handle_diagnostic_id.fetch_add(1, std::memory_order_relaxed)) {
     buffer_.reserve(fs_.extent_size());
 
@@ -322,6 +322,8 @@ std::chrono::milliseconds WriteHandle::flush() {
             fail(EINTR, "write cancelled");
         throw;
     }
+    if (cache_puts_)
+        (void)fs_.store().cache_local(id, buffer_);
     ++new_extent_puts_;
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
     if (elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
@@ -740,6 +742,8 @@ void WriteHandle::rebuild() {
                     fail(EINTR, "write cancelled");
                 fail(EIO, "object replication quorum unavailable");
             }
+            if (cache_puts_)
+                (void)fs_.store().cache_local(id, bytes);
             result = {o, n, id, false};
             ++put_this_rebuild;
             ++rebuild_put_extents_;
@@ -1343,7 +1347,7 @@ std::shared_ptr<ReadHandle> FileSystem::open_read(const FsEntry& entry, const st
     return std::make_shared<ReadHandle>(s_, entry, track_playback ? playback_ : nullptr,
                                         normalize_path(logical_path), frame_type);
 }
-std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool trunc) {
+std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool trunc, bool cache_puts) {
     // Serialize path lookup/registration with rename so an opening writer cannot
     // miss a rename between resolving the entry and joining the handle registry.
     std::lock_guard handles(open_writes_mutex_);
@@ -1358,7 +1362,7 @@ std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool t
         e = getattr(*resolved);
     }
     auto handle =
-        std::make_shared<WriteHandle>(*this, *resolved, e, trunc || !e.size);
+        std::make_shared<WriteHandle>(*this, *resolved, e, trunc || !e.size, cache_puts);
     for (auto i = open_writes_.begin(); i != open_writes_.end();) {
         if (i->expired())
             i = open_writes_.erase(i);
@@ -1472,6 +1476,13 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
     if (out)
         *out = std::move(committed);
 }
+MetadataSnapshot FileSystem::local_snapshot() const {
+    const auto record = n_.metadata_replica().current();
+    if (!valid_metadata_record(record))
+        throw std::runtime_error("local metadata replica unavailable");
+    return decode_snapshot(record.payload);
+}
+
 std::pair<uint64_t, uint64_t> FileSystem::logical_capacity() const {
     auto ns = n_.membership().active();
     if (ns.empty())

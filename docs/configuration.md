@@ -53,22 +53,48 @@ RPC duration itself is unbounded. Stall notices are observability thresholds; th
 
 ## Mounted filesystem
 
-The FUSE adapter keeps file-content caching conservative across opens, but it uses short kernel-side namespace caches to avoid turning normal `getattr`/lookup activity into a kernel/userspace request storm:
+0.13.0 makes FUSE a bounded local frontend rather than a synchronous projection of distributed Macha. The kernel-facing layer keeps a stable inode graph, local write spool and ordered publication queues. No FUSE callback waits for metadata quorum, remote replica placement, checkpoint propagation, repair or catalogue work. When a request cannot be satisfied inside its configured deadline it fails to the kernel; accepted local work continues or is reconciled asynchronously where that is semantically valid.
+
+FUSE policy is configured separately from persistent filesystem-root metadata:
 
 ```yaml
-filesystem:
+fuse:
+  allow_other: false
   entry_timeout_ms: 250
   attr_timeout_ms: 250
   negative_timeout_ms: 100
+  absolute_request_timeout_ms: 15000
+  timeouts:
+    lookup_ms: 1000
+    namespace_ms: 3000
+    read_ms: 10000
+    write_ms: 5000
+    sync_ms: 5000
+    lifecycle_ms: 2000
+  request_workers: 24
+  max_pending_requests: 4096
+  commit_workers: 8
+  max_pending_operations: 4096
+  hydration_priority: 2000
+  read_ahead_extents: 2
+  hint_lifetime_ms: 5000
+  write_through_cache: true
+  refresh_interval_ms: 1000
+  fail_closed_mountpoint: true
+  watchdog_interval_ms: 1000
 ```
 
-Each value may be set to zero to disable that cache class and may not exceed 5000 ms. These values are applied when the mount is created and therefore require a restart to change. `kernel_cache` remains disabled; these settings cache name/attribute answers, not immutable file contents across opens.
+The six operation-class timeouts must be positive and may not exceed `absolute_request_timeout_ms`; that ceiling is itself limited to 30000 ms. `request_workers` is 6..256 so every class always has an independent execution lane. Queue saturation returns bounded backpressure (`EAGAIN`) rather than allowing a kernel request to wait indefinitely. `fsync` means the local FUSE spool is durable and publication has been requested; cluster-wide quorum/replica convergence remains asynchronous.
 
-On macOS, the mount keeps Macha namespace keys byte-preserving but adapts Unicode names to macFUSE's platform contract: high-level lookup uses canonical-equivalence-insensitive matching and `readdir` returns decomposed (D-form) names. This applies to every pathname component, including both directory names and file names; no metadata migration is performed.
+Reads combine the committed immutable manifest with pending local operations and carry the FUSE read deadline into remote extent retrieval. Kernel demand is also emitted as a high-priority `HydrationHintProvider` run into Macha's existing persistent-cache hydrator. Identical object fetches are already coalesced by `DistributedStore`, so FUSE demand and predictive hydration can share one transfer. `read_ahead_extents` controls the additional ordered hint window; it does not create a separate FUSE cache. With `write_through_cache: true`, extents produced by asynchronous FUSE publication are also inserted into the ordinary persistent block cache.
+
+`fail_closed_mountpoint` protects the covered directory after the mount is established. If FUSE/macFUSE disappears unexpectedly, the naked mountpoint remains non-writable so a continuing `rsync` fails instead of silently writing into the host directory. An independent OS mount-table watchdog requests Macha shutdown on mount loss. A deliberate clean unmount restores the original directory permissions.
+
+Short `entry_timeout_ms`, `attr_timeout_ms` and `negative_timeout_ms` values are kernel namespace/attribute caches only; each may be zero and may not exceed 5000 ms. `kernel_cache` remains disabled. On macOS, namespace keys remain byte-preserving while lookup uses canonical-equivalence-insensitive matching and `readdir` emits decomposed (D-form) names required by macFUSE.
 
 ## Catalogue scanner
 
-`catalogue.scanner.interval_ms` is the periodic safety scan interval. Committed namespace changes schedule a scan after `catalogue.scanner.rescan_debounce_ms` (default 10000 ms, valid 1000..600000). Further mutations reset that quiet-period timer, but `catalogue.scanner.rescan_max_delay_ms` (default 60000 ms, minimum 1000 and not less than `rescan_debounce_ms`) caps total deferral from the first unscanned mutation. Catalogue metadata written by the scanner itself is excluded from the namespace-content signature and does not cause a catalogue rescan.
+`catalogue.scanner.interval_ms` is the periodic safety scan interval. Committed namespace changes schedule a scan after `catalogue.scanner.rescan_debounce_ms` (default 10000 ms, valid 1000..600000). Further mutations reset that quiet-period timer, but `catalogue.scanner.rescan_max_delay_ms` (default 600000 ms, minimum 1000 and not less than `rescan_debounce_ms`) caps total deferral from the first unscanned mutation. Catalogue metadata written by the scanner itself is excluded from the namespace-content signature and does not cause a catalogue rescan.
 
 Online metadata-provider work is also bounded. `catalogue.scanner.max_provider_requests_per_scan` defaults to 32 (valid 1..10000). The scanner checks the budget between complete provider lookups rather than aborting a search/detail operation halfway through, then reconciles completed discoveries and schedules a continuation after `catalogue.scanner.provider_batch_delay_ms` (default 30000 ms, valid 1000..3600000). Semantic provider misses are cached in memory for the configured provider lifetime; network/HTTP failures are not negative-cached. Artwork byte downloads use the existing `max_artwork_bytes` limit and occur only for the bounded set of discoveries produced by the provider pass.
 
