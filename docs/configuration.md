@@ -14,13 +14,15 @@ The complete example is `macha.yaml.example`. The important rules are short:
 
 `log_level` is one of `ALL`, `DEBUG`, `INFO`, `WARN` or `ERROR`; default `INFO`. `DEBUG` emits low-volume operational/performance diagnostics. `ALL` additionally enables per-object backend/object transfers, complete FUSE request/result traces, payload hashes and detailed extent/write traces; `ALL` is intentionally expensive and is not suitable for throughput measurements.
 
+`ffmpeg_log_level` is independent and defaults to `ERROR`. It accepts `QUIET`, `PANIC`, `FATAL`, `ERROR`, `WARN`, `INFO`, `VERBOSE`, `DEBUG` or `TRACE`. libav output is routed through Macha's logger rather than written directly to stderr. The two thresholds deliberately do not constrain one another: for example, `log_level: INFO` with `ffmpeg_log_level: DEBUG` shows detailed FFmpeg diagnostics while keeping Macha's own DEBUG messages suppressed.
+
 Start with:
 
 ```sh
 macha --config /etc/macha.yaml
 ```
 
-Send `SIGHUP` to reload local storage-backend, cache and hydration configuration. Replica-count changes require a coordinated cluster stop/edit/restart; the old metadata quorum commits the new voter/data policy when the cluster comes back. `extent_size` cannot change for an existing namespace.
+Send `SIGHUP` to reload local storage-backend, cache, hydration and logging configuration. Replica-count changes require a coordinated cluster stop/edit/restart; the old metadata quorum commits the new voter/data policy when the cluster comes back. `extent_size` cannot change for an existing namespace.
 
 A YAML file is required. These CLI options override values from that file for one invocation:
 
@@ -47,6 +49,7 @@ A YAML file is required. These CLI options override values from that file for on
 --metadata-cache MS
 --mount PATH
 --log-level LEVEL
+--ffmpeg-log-level LEVEL
 ```
 
 RPC duration itself is unbounded. Stall notices are observability thresholds; they do not cancel requests. Health/control traffic uses the same peer connection at absolute highest priority. A peer is marked dead only after that unified transport cannot establish liveness within `dead_after_ms`.

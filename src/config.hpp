@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "ffmpeg_log.hpp"
 #include "log.hpp"
 #include "types.hpp"
 #include <chrono>
@@ -231,6 +232,7 @@ struct Config {
     std::chrono::milliseconds data_stall_notice{120000};
     std::chrono::milliseconds metadata_cache{250};
     LogLevel log_level{LogLevel::info};
+    FfmpegLogLevel ffmpeg_log_level{FfmpegLogLevel::error};
 };
 
 Config parse_config(int, char**);

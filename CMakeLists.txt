@@ -60,6 +60,7 @@ set(MACHA_CORE_SOURCES
     src/crypto.cpp
     src/config.cpp
     src/log.cpp
+    src/ffmpeg_log.cpp
     src/diagnostics.cpp
     src/placement.cpp
     src/membership.cpp

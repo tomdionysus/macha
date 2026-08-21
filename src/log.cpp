@@ -55,9 +55,6 @@ bool ConsoleLogger::enabled(LogLevel level) const noexcept {
 }
 
 void ConsoleLogger::log(LogLevel level, const std::string& message) {
-    if (!enabled(level))
-        return;
-
     auto now = std::chrono::system_clock::now();
     auto time = std::chrono::system_clock::to_time_t(now);
     std::tm tm{};
@@ -96,6 +93,10 @@ void Log::set_logger(std::shared_ptr<Logger> logger) {
         logger_ = std::move(logger);
     }
     enabled_mask_.store(mask, std::memory_order_release);
+}
+
+void Log::emit(LogLevel level, const std::string& value) {
+    logger()->log(level, value);
 }
 
 bool Log::enabled(LogLevel level) {

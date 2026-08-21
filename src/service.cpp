@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "service.hpp"
+#include "ffmpeg_log.hpp"
 #include "log.hpp"
 #include "diagnostics.hpp"
 #include <algorithm>
 #include <cmath>
 #include <ctime>
 #include <map>
+#include <memory>
 #include <set>
 #include <thread>
 
@@ -121,6 +123,8 @@ void Service::reload_config() {
         updated.streaming.probe_bytes != current_streaming.probe_bytes ||
         updated.streaming.probe_analyze_duration != current_streaming.probe_analyze_duration ||
         updated.streaming.probe_timeout != current_streaming.probe_timeout;
+    Log::set_logger(std::make_shared<ConsoleLogger>(updated.log_level));
+    configure_ffmpeg_logging(updated.ffmpeg_log_level);
     node_.reconfigure_local(updated);
     scanner_.reconfigure(updated.catalogue.scanner);
     hydration_.reconfigure(updated.hydration, updated.read_ahead_extents);

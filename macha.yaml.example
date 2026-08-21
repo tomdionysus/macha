@@ -15,6 +15,12 @@ mount_path: /srv/media
 # ALL includes expensive per-object/FUSE/payload/extent/write trace output; DEBUG is low-volume operational diagnosis.
 log_level: INFO
 
+# Independent libav/FFmpeg threshold. FFmpeg messages are routed through the
+# Macha logger, but this threshold is not limited by log_level above. Thus
+# log_level: INFO + ffmpeg_log_level: DEBUG is valid and useful.
+# QUIET, PANIC, FATAL, ERROR, WARN, INFO, VERBOSE, DEBUG or TRACE. Default: ERROR.
+ffmpeg_log_level: ERROR
+
 # Authoritative local DHT storage. Add as many independent backends as required.
 storage:
   - path: /mnt/media-a/dht

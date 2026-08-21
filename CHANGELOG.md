@@ -2,6 +2,7 @@
 
 ## 0.13.0 - 2026-08-21
 
+- route all libav/FFmpeg diagnostics through Macha's logger with an independent configurable `ffmpeg_log_level`, so FFmpeg verbosity can be raised for media debugging without enabling Macha DEBUG/ALL output; default FFmpeg admission is `ERROR`;
 - replace the path-bound synchronous FUSE adapter with a bounded inode-based `FuseFrontend`; kernel callbacks now perform only local/bounded work and never synchronously require metadata quorum, remote replica placement, checkpoint propagation, catalogue work or maintenance;
 - add configurable FUSE operation-class deadlines, an absolute request ceiling, independent request workers and bounded namespace/data publication queues under the top-level `fuse:` YAML section; queue overload fails back to the kernel rather than waiting without bound;
 - keep stable frontend inode identities across rename and move namespace publication behind a FIFO asynchronous worker, including correct rename-over-open-destination and unlink-before-release semantics so a stale open descriptor cannot resurrect a pathname;

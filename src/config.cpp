@@ -643,6 +643,8 @@ Config load_yaml_config(const std::filesystem::path& path) {
         c.mount_path = root["mount_path"].as<std::string>();
     if (root["log_level"])
         c.log_level = parse_log_level(root["log_level"].as<std::string>());
+    if (root["ffmpeg_log_level"])
+        c.ffmpeg_log_level = parse_ffmpeg_log_level(root["ffmpeg_log_level"].as<std::string>());
 
     auto storage = root["storage"];
     if (!storage || !storage.IsSequence())
@@ -691,7 +693,8 @@ void print_usage(const char* executable) {
         << "--metadata-cache MS  --replicas N  --metadata-replicas N  --min-write-replicas N\n"
         << "--write-stall MS  --extent-size SIZE\n"
         << "--read-ahead N  --mount PATH  --state-path PATH  --cache-path PATH --cache-blocks N\n"
-        << "--log-level LEVEL  (ALL|DEBUG|INFO|WARN|ERROR; default INFO)  --help\n";
+        << "--log-level LEVEL  (ALL|DEBUG|INFO|WARN|ERROR; default INFO)\n"
+        << "--ffmpeg-log-level LEVEL  (QUIET|PANIC|FATAL|ERROR|WARN|INFO|VERBOSE|DEBUG|TRACE; default ERROR)  --help\n";
 }
 
 Config parse_config(int argc, char** argv) {
@@ -778,6 +781,8 @@ Config parse_config(int argc, char** argv) {
                 parse_unsigned(need(i, "--metadata-cache"), "metadata cache"));
         } else if (option == "--log-level") {
             config.log_level = parse_log_level(need(i, "--log-level"));
+        } else if (option == "--ffmpeg-log-level") {
+            config.ffmpeg_log_level = parse_ffmpeg_log_level(need(i, "--ffmpeg-log-level"));
         } else if (option == "--help" || option == "-h") {
             print_usage(argv[0]);
             std::exit(0);
