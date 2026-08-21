@@ -237,6 +237,41 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             return json(200, std::move(out));
         }
 
+        if (request.method == "GET" && request.path == "/api/v1/catalogue/hints") {
+            Json::Array values;
+            for (const auto& hint : hints_.list()) {
+                Json::Object item;
+                item["id"] = hint.id;
+                item["path"] = hint.path;
+                item["priority"] = static_cast<int64_t>(hint.priority);
+                item["state"] = catalogue_hint_state_name(hint.state);
+                item["attempts"] = static_cast<uint64_t>(hint.attempts);
+                item["ready_after_unix_ms"] = hint.ready_after_unix_ms;
+                item["provider"] = hint.provider.empty() ? Json(nullptr) : Json(hint.provider);
+                item["media_id"] = hint.media_id.empty() ? Json(nullptr) : Json(hint.media_id);
+                item["result"] = hint.result.empty() ? Json(nullptr) : Json(hint.result);
+                item["error"] = hint.error.empty() ? Json(nullptr) : Json(hint.error);
+                Json::Array catalogue_ids;
+                for (const auto& id : hint.catalogue_item_ids) catalogue_ids.emplace_back(id);
+                item["catalogue_item_ids"] = std::move(catalogue_ids);
+                Json::Array origins;
+                for (const auto& origin : hint.origins) {
+                    Json::Object value;
+                    value["source"] = origin.source;
+                    value["source_ref"] = origin.source_ref;
+                    value["priority"] = static_cast<int64_t>(origin.priority);
+                    origins.emplace_back(std::move(value));
+                }
+                item["origins"] = std::move(origins);
+                item["created_unix_ms"] = hint.created_unix_ms;
+                item["updated_unix_ms"] = hint.updated_unix_ms;
+                values.emplace_back(std::move(item));
+            }
+            Json::Object out;
+            out["hints"] = std::move(values);
+            return json(200, Json(std::move(out)).dump());
+        }
+
         if (request.method == "GET" && request.path == "/api/v1/catalogue/items") {
             std::optional<CatalogueKind> kind;
             if (auto it = request.query.find("type"); it != request.query.end() && !it->second.empty()) {

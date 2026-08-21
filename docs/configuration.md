@@ -99,6 +99,9 @@ Short `entry_timeout_ms`, `attr_timeout_ms` and `negative_timeout_ms` values are
 
 ## Catalogue scanner
 
+Catalogue work is now queued persistently. Namespace traversal is a hint source and reconciliation authority; provider lookup is performed by catalogue hint workers. The built-in source priorities are ingest 100, explicit/manual rescan 80, namespace mutation 50 and periodic scan 10. These are scheduler priorities rather than correctness levels: all hints use the same provider matching rules.
+
+
 `catalogue.scanner.interval_ms` is the periodic safety scan interval. Committed namespace changes schedule a scan after `catalogue.scanner.rescan_debounce_ms` (default 10000 ms, valid 1000..600000). Further mutations reset that quiet-period timer, but `catalogue.scanner.rescan_max_delay_ms` (default 600000 ms, minimum 1000 and not less than `rescan_debounce_ms`) caps total deferral from the first unscanned mutation. Catalogue metadata written by the scanner itself is excluded from the namespace-content signature and does not cause a catalogue rescan.
 
 Online metadata-provider work is also bounded. `catalogue.scanner.max_provider_requests_per_scan` defaults to 32 (valid 1..10000). The scanner checks the budget between complete provider lookups rather than aborting a search/detail operation halfway through, then reconciles completed discoveries and schedules a continuation after `catalogue.scanner.provider_batch_delay_ms` (default 30000 ms, valid 1000..3600000). Semantic provider misses are cached in memory for the configured provider lifetime; network/HTTP failures are not negative-cached. Artwork byte downloads use the existing `max_artwork_bytes` limit and occur only for the bounded set of discoveries produced by the provider pass.
@@ -148,3 +151,14 @@ Source inspection is deliberately bounded because a probe may cause distributed 
 Changes to streaming session limits and timing are reloaded by `SIGHUP`. Enabling/disabling streaming, changing fragment-memory/probe policy or changing `temp_path` requires a restart.
 
 See [`macha.yaml.example`](../macha.yaml.example) for the complete example.
+
+
+### Ingest cleanup policy
+
+`ingest.cleanup.delete_owned_source_on_clear` defaults to `true`. An owned source is staging controlled by Macha, currently a completed torrent payload. Successful owned sources remain present after namespace import and catalogue processing until the operator explicitly clears the terminal job; clear then removes the source.
+
+`ingest.cleanup.delete_external_source_on_clear` defaults to `false`. Filesystem/USB sources are therefore preserved when their completed job is cleared unless the job explicitly requested `delete_source_on_clear: true`. When external deletion is enabled, Macha removes only source files recorded as successfully imported in that job and then prunes empty directories; unrelated/unrecognised files in the submitted tree are never removed by Clear.
+
+`ingest.cleanup.delete_owned_source_on_cancel` defaults to `true`. Cancelling a torrent or another owned acquisition removes its partial/staging payload immediately. These policies may be reloaded for newly submitted jobs; each job persists its resolved `delete_source_on_clear` decision.
+
+Generic ingest jobs expose copy progress followed by catalogue progress. After all namespace files are committed, a job enters `cataloguing`; it becomes `completed` once every associated catalogue hint is terminal, even when the terminal result contains `no_match` or `failed` entries. Use `POST /api/v1/ingest/jobs/{id}/clear` to remove a terminal job. Torrent jobs expose the same linked catalogue summary and use `POST /api/v1/torrents/jobs/{id}/clear`.

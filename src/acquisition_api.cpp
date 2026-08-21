@@ -15,14 +15,56 @@ Json optional_u64(const std::optional<uint64_t>& value) {
     return value ? Json(*value) : Json(nullptr);
 }
 
-Json ingest_job_json(const IngestJob& job, bool include_files) {
+Json catalogue_summary_json(const IngestJob& job, const CatalogueHintSummary* detail = nullptr) {
+    Json::Object out;
+    out["total"] = static_cast<uint64_t>(job.catalogue_total);
+    out["pending"] = static_cast<uint64_t>(job.catalogue_pending);
+    out["catalogued"] = static_cast<uint64_t>(job.catalogue_catalogued);
+    out["no_match"] = static_cast<uint64_t>(job.catalogue_no_match);
+    out["failed"] = static_cast<uint64_t>(job.catalogue_failed);
+    if (job.state == IngestJobState::cataloguing || job.catalogue_pending)
+        out["state"] = "processing";
+    else if (!job.catalogue_total && job.state != IngestJobState::completed)
+        out["state"] = "waiting";
+    else if (job.catalogue_failed || job.catalogue_no_match)
+        out["state"] = "completed_with_issues";
+    else
+        out["state"] = "completed";
+
+    if (detail) {
+        Json::Array items;
+        items.reserve(detail->hints.size());
+        for (const auto& hint : detail->hints) {
+            Json::Object item;
+            item["id"] = hint.id;
+            item["path"] = hint.path;
+            item["state"] = catalogue_hint_state_name(hint.state);
+            item["provider"] = hint.provider.empty() ? Json(nullptr) : Json(hint.provider);
+            item["media_id"] = hint.media_id.empty() ? Json(nullptr) : Json(hint.media_id);
+            item["priority"] = static_cast<int64_t>(hint.priority);
+            item["attempts"] = static_cast<uint64_t>(hint.attempts);
+            item["result"] = hint.result.empty() ? Json(nullptr) : Json(hint.result);
+            item["error"] = hint.error.empty() ? Json(nullptr) : Json(hint.error);
+            Json::Array ids;
+            for (const auto& id : hint.catalogue_item_ids) ids.emplace_back(id);
+            item["catalogue_item_ids"] = std::move(ids);
+            items.emplace_back(std::move(item));
+        }
+        out["items"] = std::move(items);
+    }
+    return Json(std::move(out));
+}
+
+Json ingest_job_json(const IngestJob& job, bool include_files,
+                     const CatalogueHintSummary* catalogue_detail = nullptr) {
     Json::Object out;
     out["id"] = job.id;
     out["source_type"] = job.source_type;
     out["source_ref"] = job.source_ref.empty() ? Json(nullptr) : Json(job.source_ref);
     out["display_name"] = job.display_name;
     out["source_path"] = job.source_path.string();
-    out["remove_source_on_complete"] = job.remove_source_on_complete;
+    out["source_owned"] = job.source_owned;
+    out["delete_source_on_clear"] = job.delete_source_on_clear;
     out["state"] = ingest_job_state_name(job.state);
     out["bytes_total"] = job.bytes_total;
     out["bytes_completed"] = job.bytes_completed;
@@ -37,6 +79,7 @@ Json ingest_job_json(const IngestJob& job, bool include_files) {
     out["current_file"] = job.current_file.empty() ? Json(nullptr) : Json(job.current_file);
     out["current_destination"] =
         job.current_destination.empty() ? Json(nullptr) : Json(job.current_destination);
+    out["catalogue"] = catalogue_summary_json(job, catalogue_detail);
     out["created_unix_ms"] = job.created_unix_ms;
     out["updated_unix_ms"] = job.updated_unix_ms;
     out["error"] = job.error.empty() ? Json(nullptr) : Json(job.error);
@@ -52,6 +95,7 @@ Json ingest_job_json(const IngestJob& job, bool include_files) {
             item["copied"] = file.copied;
             item["completed"] = file.completed;
             item["skipped"] = file.skipped;
+            item["catalogue_candidate"] = file.catalogue_candidate;
             files.emplace_back(std::move(item));
         }
         out["files"] = std::move(files);
@@ -72,6 +116,21 @@ Json torrent_job_json(const TorrentJob& job) {
     out["uploaded_total"] = job.uploaded_total;
     out["peers"] = static_cast<uint64_t>(job.peers);
     out["seeds"] = static_cast<uint64_t>(job.seeds);
+    Json::Object catalogue;
+    catalogue["total"] = static_cast<uint64_t>(job.catalogue_total);
+    catalogue["pending"] = static_cast<uint64_t>(job.catalogue_pending);
+    catalogue["catalogued"] = static_cast<uint64_t>(job.catalogue_catalogued);
+    catalogue["no_match"] = static_cast<uint64_t>(job.catalogue_no_match);
+    catalogue["failed"] = static_cast<uint64_t>(job.catalogue_failed);
+    if (job.catalogue_pending)
+        catalogue["state"] = "processing";
+    else if (job.catalogue_total && (job.catalogue_failed || job.catalogue_no_match))
+        catalogue["state"] = "completed_with_issues";
+    else if (job.catalogue_total)
+        catalogue["state"] = "completed";
+    else
+        catalogue["state"] = "waiting";
+    out["catalogue"] = std::move(catalogue);
     out["eta_seconds"] = optional_u64(job.eta_seconds);
     out["progress"] = job.bytes_total
                           ? Json(std::min(1.0, static_cast<double>(job.bytes_completed) /
@@ -123,6 +182,11 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             staging["accounted_bytes"] = status.accounted_bytes;
             Json::Object out;
             out["enabled"] = ingest_.enabled();
+            Json::Object cleanup;
+            cleanup["delete_owned_source_on_clear"] = ingest_.delete_owned_source_on_clear();
+            cleanup["delete_external_source_on_clear"] = ingest_.delete_external_source_on_clear();
+            cleanup["delete_owned_source_on_cancel"] = ingest_.delete_owned_source_on_cancel();
+            out["cleanup"] = std::move(cleanup);
             out["staging"] = std::move(staging);
             return http_json(200, Json(std::move(out)).dump());
         }
@@ -142,10 +206,14 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
                 return http_error(400, "bad_request", "path is required");
             std::string display_name;
             if (const auto* value = body.find("display_name")) display_name = value->asString();
-            bool remove_source = false;
-            if (const auto* value = body.find("remove_source")) remove_source = value->asBool();
+            std::optional<bool> delete_source_on_clear;
+            if (const auto* value = body.find("delete_source_on_clear"))
+                delete_source_on_clear = value->asBool();
+            else if (const auto* value = body.find("remove_source"))
+                delete_source_on_clear = value->asBool(); // 0.13 compatibility alias
             const auto id = ingest_.submit_path(path->asString(), "filesystem", {},
-                                                std::move(display_name), remove_source, false);
+                                                std::move(display_name), delete_source_on_clear,
+                                                false, false);
             Json::Object out;
             out["id"] = id;
             return http_json(202, Json(std::move(out)).dump());
@@ -155,15 +223,22 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             const auto existing = ingest_.job(target->first);
             if (request.method == "GET" && target->second.empty()) {
                 if (!existing) return http_error(404, "not_found", "ingest job not found");
-                return http_json(200, ingest_job_json(*existing, true).dump());
+                const auto summary = ingest_.catalogue_summary(target->first);
+                return http_json(200, ingest_job_json(*existing, true, &summary).dump());
             }
             if (request.method == "POST") {
                 bool changed = false;
                 if (target->second == "pause") changed = ingest_.pause(target->first);
                 else if (target->second == "resume") changed = ingest_.resume(target->first);
                 else if (target->second == "cancel") changed = ingest_.cancel(target->first);
+                else if (target->second == "clear") changed = ingest_.clear(target->first);
                 else return http_error(404, "not_found", "unknown ingest action");
                 if (!changed) return action_error(existing.has_value());
+                if (target->second == "clear") {
+                    Json::Object out;
+                    out["cleared"] = true;
+                    return http_json(200, Json(std::move(out)).dump());
+                }
                 auto updated = ingest_.job(target->first);
                 return http_json(200, ingest_job_json(*updated, false).dump());
             }
@@ -239,8 +314,14 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
                 if (target->second == "pause") changed = torrents_.pause(target->first);
                 else if (target->second == "resume") changed = torrents_.resume(target->first);
                 else if (target->second == "cancel") changed = torrents_.cancel(target->first);
+                else if (target->second == "clear") changed = torrents_.clear(target->first);
                 else return http_error(404, "not_found", "unknown torrent action");
                 if (!changed) return action_error(existing.has_value());
+                if (target->second == "clear") {
+                    Json::Object out;
+                    out["cleared"] = true;
+                    return http_json(200, Json(std::move(out)).dump());
+                }
                 auto updated = torrents_.job(target->first);
                 return http_json(200, torrent_job_json(*updated).dump());
             }

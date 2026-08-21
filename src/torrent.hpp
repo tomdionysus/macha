@@ -24,6 +24,7 @@ enum class TorrentJobState {
     verifying,
     downloaded,
     importing,
+    cataloguing,
     paused,
     blocked,
     completed,
@@ -48,6 +49,11 @@ struct TorrentJob {
     uint64_t uploaded_total{};
     unsigned peers{};
     unsigned seeds{};
+    size_t catalogue_total{};
+    size_t catalogue_pending{};
+    size_t catalogue_catalogued{};
+    size_t catalogue_no_match{};
+    size_t catalogue_failed{};
     std::optional<uint64_t> eta_seconds;
     std::optional<std::string> ingest_job_id;
     uint64_t created_unix_ms{};
@@ -144,6 +150,7 @@ class TorrentManager {
     bool pause(std::string_view id);
     bool resume(std::string_view id);
     bool cancel(std::string_view id);
+    bool clear(std::string_view id);
 };
 
 std::optional<std::string> sanitize_magnet_uri(std::string_view);

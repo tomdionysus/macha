@@ -173,6 +173,11 @@ Json torrent_job_json(const TorrentJob& job) {
     o["bytes_total"] = job.bytes_total;
     o["bytes_completed"] = job.bytes_completed;
     o["uploaded_total"] = job.uploaded_total;
+    o["catalogue_total"] = static_cast<uint64_t>(job.catalogue_total);
+    o["catalogue_pending"] = static_cast<uint64_t>(job.catalogue_pending);
+    o["catalogue_catalogued"] = static_cast<uint64_t>(job.catalogue_catalogued);
+    o["catalogue_no_match"] = static_cast<uint64_t>(job.catalogue_no_match);
+    o["catalogue_failed"] = static_cast<uint64_t>(job.catalogue_failed);
     o["ingest_job_id"] = job.ingest_job_id ? Json(*job.ingest_job_id) : Json(nullptr);
     o["created_unix_ms"] = job.created_unix_ms;
     o["updated_unix_ms"] = job.updated_unix_ms;
@@ -193,6 +198,11 @@ TorrentJob parse_torrent_job(const Json& value) {
     if (const auto* v = value.find("bytes_total")) job.bytes_total = v->asUInt64();
     if (const auto* v = value.find("bytes_completed")) job.bytes_completed = v->asUInt64();
     if (const auto* v = value.find("uploaded_total")) job.uploaded_total = v->asUInt64();
+    if (const auto* v = value.find("catalogue_total")) job.catalogue_total = static_cast<size_t>(v->asUInt64());
+    if (const auto* v = value.find("catalogue_pending")) job.catalogue_pending = static_cast<size_t>(v->asUInt64());
+    if (const auto* v = value.find("catalogue_catalogued")) job.catalogue_catalogued = static_cast<size_t>(v->asUInt64());
+    if (const auto* v = value.find("catalogue_no_match")) job.catalogue_no_match = static_cast<size_t>(v->asUInt64());
+    if (const auto* v = value.find("catalogue_failed")) job.catalogue_failed = static_cast<size_t>(v->asUInt64());
     if (const auto* v = value.find("ingest_job_id"); v && !v->isNull()) job.ingest_job_id = v->asString();
     if (const auto* v = value.find("created_unix_ms")) job.created_unix_ms = v->asUInt64();
     if (const auto* v = value.find("updated_unix_ms")) job.updated_unix_ms = v->asUInt64();
@@ -246,6 +256,7 @@ std::string torrent_job_state_name(TorrentJobState state) {
     case TorrentJobState::verifying: return "verifying";
     case TorrentJobState::downloaded: return "downloaded";
     case TorrentJobState::importing: return "importing";
+    case TorrentJobState::cataloguing: return "cataloguing";
     case TorrentJobState::paused: return "paused";
     case TorrentJobState::blocked: return "blocked";
     case TorrentJobState::completed: return "completed";
@@ -262,6 +273,7 @@ std::optional<TorrentJobState> parse_torrent_job_state(std::string_view state) {
     if (state == "verifying") return TorrentJobState::verifying;
     if (state == "downloaded") return TorrentJobState::downloaded;
     if (state == "importing") return TorrentJobState::importing;
+    if (state == "cataloguing") return TorrentJobState::cataloguing;
     if (state == "paused") return TorrentJobState::paused;
     if (state == "blocked") return TorrentJobState::blocked;
     if (state == "completed") return TorrentJobState::completed;
@@ -711,20 +723,64 @@ bool TorrentManager::cancel(std::string_view id) {
     if (it == jobs_.end()) return false;
     if (it->second.state == TorrentJobState::completed || it->second.state == TorrentJobState::cancelled) return false;
     if (it->second.ingest_job_id) (void)ingest_.cancel(*it->second.ingest_job_id);
+    const bool delete_payload = ingest_.delete_owned_source_on_cancel();
 #ifdef MACHA_HAVE_LIBTORRENT
     if (auto h = impl_->handles.find(it->first); h != impl_->handles.end()) {
-        impl_->session.remove_torrent(h->second, lt::session::delete_files | lt::session::delete_partfile);
+        if (delete_payload)
+            impl_->session.remove_torrent(h->second, lt::session::delete_files | lt::session::delete_partfile);
+        else
+            impl_->session.remove_torrent(h->second);
         impl_->handles.erase(h);
     }
 #endif
     ingest_.staging().release(it->first);
-    std::error_code ec;
-    std::filesystem::remove_all(it->second.save_path, ec);
+    if (delete_payload) {
+        std::error_code ec;
+        std::filesystem::remove_all(it->second.save_path, ec);
+        if (ec) Log::warn("torrent cancel staging cleanup failed id=" + it->first + ": " + ec.message());
+    }
     it->second.state = TorrentJobState::cancelled;
     it->second.download_rate = it->second.upload_rate = 0;
     it->second.eta_seconds.reset();
     it->second.updated_unix_ms = unix_ms();
     save_state_locked();
+    return true;
+}
+
+bool TorrentManager::clear(std::string_view id) {
+    TorrentJob terminal_job;
+    {
+        std::lock_guard lock(mutex_);
+        auto it = jobs_.find(std::string(id));
+        if (it == jobs_.end()) return false;
+        if (it->second.state != TorrentJobState::completed &&
+            it->second.state != TorrentJobState::cancelled &&
+            it->second.state != TorrentJobState::failed)
+            return false;
+        terminal_job = it->second;
+    }
+
+    bool linked_cleared = false;
+    if (terminal_job.ingest_job_id) {
+        if (auto linked = ingest_.job(*terminal_job.ingest_job_id)) {
+            if (!ingest_.clear(*terminal_job.ingest_job_id)) return false;
+            linked_cleared = true;
+        }
+    }
+    if (!linked_cleared && ingest_.delete_owned_source_on_clear()) {
+        std::error_code ec;
+        std::filesystem::remove_all(terminal_job.save_path, ec);
+        if (ec) throw std::runtime_error("cannot clear torrent staging payload: " + ec.message());
+    }
+    ingest_.staging().release(terminal_job.id);
+
+    std::lock_guard lock(mutex_);
+    auto it = jobs_.find(std::string(id));
+    if (it == jobs_.end()) return false;
+    if (it->second.state != terminal_job.state) return false;
+    jobs_.erase(it);
+    save_state_locked();
+    Log::info("torrent cleared id=" + terminal_job.id);
     return true;
 }
 
@@ -749,27 +805,36 @@ void TorrentManager::update_jobs() {
             if (!ingest_job) {
                 job.state = TorrentJobState::failed;
                 job.error = "associated ingest job disappeared";
-            } else if (ingest_job->state == IngestJobState::completed) {
-                job.state = TorrentJobState::completed;
-                job.error.clear();
-                ingest_.staging().release(id);
-            } else if (ingest_job->state == IngestJobState::failed ||
-                       ingest_job->state == IngestJobState::cancelled) {
-                job.state = TorrentJobState::failed;
-                job.error = "ingest " + ingest_job_state_name(ingest_job->state) +
-                            (ingest_job->error.empty() ? std::string{} : ": " + ingest_job->error);
             } else {
-                if (ingest_job->state == IngestJobState::paused)
-                    job.state = TorrentJobState::paused;
-                else if (ingest_job->state == IngestJobState::blocked)
-                    job.state = TorrentJobState::blocked;
-                else
-                    job.state = TorrentJobState::importing;
-                job.bytes_total = ingest_job->bytes_total;
-                job.bytes_completed = ingest_job->bytes_completed;
-                job.download_rate = ingest_job->rate_bytes_per_second;
-                job.eta_seconds = ingest_job->eta_seconds;
-                job.error = ingest_job->error;
+                job.catalogue_total = ingest_job->catalogue_total;
+                job.catalogue_pending = ingest_job->catalogue_pending;
+                job.catalogue_catalogued = ingest_job->catalogue_catalogued;
+                job.catalogue_no_match = ingest_job->catalogue_no_match;
+                job.catalogue_failed = ingest_job->catalogue_failed;
+                if (ingest_job->state == IngestJobState::completed) {
+                    job.state = TorrentJobState::completed;
+                    job.error.clear();
+                    ingest_.staging().release(id);
+                } else if (ingest_job->state == IngestJobState::failed ||
+                           ingest_job->state == IngestJobState::cancelled) {
+                    job.state = TorrentJobState::failed;
+                    job.error = "ingest " + ingest_job_state_name(ingest_job->state) +
+                                (ingest_job->error.empty() ? std::string{} : ": " + ingest_job->error);
+                } else {
+                    if (ingest_job->state == IngestJobState::paused)
+                        job.state = TorrentJobState::paused;
+                    else if (ingest_job->state == IngestJobState::blocked)
+                        job.state = TorrentJobState::blocked;
+                    else if (ingest_job->state == IngestJobState::cataloguing)
+                        job.state = TorrentJobState::cataloguing;
+                    else
+                        job.state = TorrentJobState::importing;
+                    job.bytes_total = ingest_job->bytes_total;
+                    job.bytes_completed = ingest_job->bytes_completed;
+                    job.download_rate = ingest_job->rate_bytes_per_second;
+                    job.eta_seconds = ingest_job->eta_seconds;
+                    job.error = ingest_job->error;
+                }
             }
             job.updated_unix_ms = unix_ms();
             changed = true;
@@ -838,7 +903,7 @@ void TorrentManager::update_jobs() {
             hit->second.pause();
             try {
                 const auto ingest_id = ingest_.submit_path(job.save_path, "torrent", job.id,
-                                                           job.name, true, true);
+                                                           job.name, std::nullopt, true, true);
                 job.ingest_job_id = ingest_id;
                 job.state = TorrentJobState::importing;
                 impl_->session.remove_torrent(hit->second);

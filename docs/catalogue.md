@@ -101,3 +101,8 @@ Macha continues serving that last coherent immutable snapshot and records the re
 `/api/v1/catalogue/status` exposes both `metadata_generation` (the cached catalogue's
 validated metadata generation) and `known_metadata_generation` (the newest generation
 the node knows exists).
+
+
+## Persistent catalogue hint queue
+
+0.14.0 schedules catalogue work through persisted coalescing path hints. Ingest completion, explicit rescans, namespace-mutation discovery and periodic discovery are independent producers with priorities 100, 80, 50 and 10. Duplicate paths coalesce while retaining origin provenance. Provider matches are accumulated for a bounded worker batch and committed together, preserving the previous scanner's efficient one-catalogue-mutation-per-batch behaviour. Complete namespace traversal remains the only source allowed to prune vanished media bindings. See `ARCHITECTURE.md` for the full scheduling model.

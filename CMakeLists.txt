@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.13.2 LANGUAGES CXX)
+project(macha VERSION 0.14.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -123,6 +123,7 @@ set(MACHA_CORE_SOURCES
     src/media_engine.cpp
     src/playback.cpp
     src/catalogue.cpp
+    src/catalogue_hints.cpp
     src/catalogue_api.cpp
     src/acquisition_api.cpp
     src/media_catalogue.cpp

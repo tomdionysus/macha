@@ -2,6 +2,7 @@
 #pragma once
 
 #include "catalogue.hpp"
+#include "catalogue_hints.hpp"
 #include "config.hpp"
 #include "filesystem.hpp"
 #include "json.hpp"
@@ -270,12 +271,11 @@ class CatalogueScanner {
     NodeRuntime& node_;
     FileSystem& fs_;
     CatalogueManager& catalogue_;
+    CatalogueHintQueue& hints_;
     CatalogueScannerConfig config_;
     std::unique_ptr<HttpClient> http_;
     std::unique_ptr<HttpClient> provider_http_;
     std::vector<std::unique_ptr<CatalogueScanProvider>> providers_;
-    std::map<std::string, std::string> provider_resume_after_;
-    std::atomic_bool provider_continuation_{};
     std::atomic_bool rescan_requested_{};
     std::jthread worker_;
     mutable std::mutex config_mutex_;
@@ -285,11 +285,29 @@ class CatalogueScanner {
     void loop(std::stop_token);
     void walk(std::string_view root, std::vector<std::pair<std::string, FsEntry>>& out,
               std::stop_token = {});
-    size_t scan_once(std::stop_token, bool force = false);
+    size_t scan_once(std::stop_token, bool force, std::string_view hint_source,
+                     int hint_priority, bool unique_source_ref = false);
+    struct PreparedHintMatch {
+        std::string hint_id;
+        std::string provider;
+        std::string media_id;
+        std::vector<std::string> catalogue_item_ids;
+        std::vector<CatalogueItem> items;
+        std::string result;
+        unsigned attempts{};
+    };
+    struct HintBatchResult {
+        size_t claimed{};
+        size_t catalogued{};
+    };
+
+    std::optional<PreparedHintMatch> prepare_hint(const CatalogueHint&, std::stop_token);
+    HintBatchResult process_hint_batch(std::stop_token, size_t max_hints);
+    CatalogueScanProvider* provider_for_path(std::string_view path, std::string& root) const;
 
   public:
-    CatalogueScanner(NodeRuntime&, FileSystem&, CatalogueManager&, CatalogueScannerConfig,
-                     std::unique_ptr<HttpClient> = {});
+    CatalogueScanner(NodeRuntime&, FileSystem&, CatalogueManager&, CatalogueHintQueue&,
+                     CatalogueScannerConfig, std::unique_ptr<HttpClient> = {});
     ~CatalogueScanner();
     void start();
     void request_stop();

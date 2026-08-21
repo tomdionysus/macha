@@ -246,6 +246,14 @@ ingest:
   copy_chunk_bytes: 1M
   checkpoint_bytes: 64M
   blocked_retry_ms: 5000
+  cleanup:
+    # Macha-owned sources (currently torrent staging) are retained after a
+    # successful ingest until the terminal job is explicitly cleared.
+    delete_owned_source_on_clear: true
+    # External sources such as USB/import directories are preserved by default.
+    delete_external_source_on_clear: false
+    # Cancelling an owned acquisition removes partial/staging payloads promptly.
+    delete_owned_source_on_cancel: true
 
 # Optional BitTorrent acquisition. libtorrent-rasterbar >= 2.0 is detected at
 # build time. Completed torrents are submitted to the generic ingest engine;
@@ -262,12 +270,13 @@ torrent:
   # Search providers are server-side only. Torznab responses are reduced to
   # typed result fields and acquisition URLs remain opaque to the frontend.
   search:
-    providers:
-      # - name: prowlarr
-      #   type: torznab
-      #   url: http://127.0.0.1:9696/api/v1/search
-      #   api_key_file: /etc/macha-prowlarr.key
-      #   max_results: 100
+    providers: []
+    # Replace [] with entries such as:
+    #   - name: prowlarr
+    #     type: torznab
+    #     url: http://127.0.0.1:9696/api/v1/search
+    #     api_key_file: /etc/macha-prowlarr.key
+    #     max_results: 100
 
 # Playback API and media transformation. Macha links libavformat/libavcodec
 # directly and reads the pinned logical Macha file through a custom AVIOContext.
