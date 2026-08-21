@@ -30,6 +30,9 @@
 #include <iostream>
 #include <netinet/in.h>
 #include <openssl/crypto.h>
+extern "C" {
+#include <libavutil/log.h>
+}
 #include <random>
 #include <set>
 #include <sstream>
@@ -58,6 +61,24 @@ int failures = 0;
             throw std::runtime_error(std::string("REQUIRE failed: ") + #expr);                     \
         }                                                                                          \
     } while (0)
+
+
+class CapturingLogger final : public Logger {
+    LogLevel level_;
+
+  public:
+    std::vector<std::pair<LogLevel, std::string>> records;
+
+    explicit CapturingLogger(LogLevel level) : level_(level) {}
+
+    bool enabled(LogLevel level) const noexcept override {
+        return level_ == LogLevel::all || static_cast<unsigned char>(level) >= static_cast<unsigned char>(level_);
+    }
+
+    void log(LogLevel level, const std::string& message) override {
+        records.emplace_back(level, message);
+    }
+};
 
 class TempDir {
     std::filesystem::path path_;
@@ -1185,11 +1206,17 @@ void test_metadata_codec_and_replica() {
 
 void test_config() {
     CHECK(Config{}.log_level == LogLevel::info);
+    CHECK(Config{}.ffmpeg_log_level == FfmpegLogLevel::error);
     CHECK(parse_log_level("all") == LogLevel::all);
     CHECK(parse_log_level("DEBUG") == LogLevel::debug);
     CHECK(parse_log_level("Info") == LogLevel::info);
     CHECK(parse_log_level("warning") == LogLevel::warn);
     CHECK(parse_log_level("ERROR") == LogLevel::error);
+    CHECK(parse_ffmpeg_log_level("quiet") == FfmpegLogLevel::quiet);
+    CHECK(parse_ffmpeg_log_level("WARN") == FfmpegLogLevel::warning);
+    CHECK(parse_ffmpeg_log_level("Verbose") == FfmpegLogLevel::verbose);
+    CHECK(parse_ffmpeg_log_level("DEBUG") == FfmpegLogLevel::debug);
+    CHECK(parse_ffmpeg_log_level("trace") == FfmpegLogLevel::trace);
 
     ConsoleLogger info_logger(LogLevel::info);
     CHECK(!info_logger.enabled(LogLevel::all));
@@ -1203,6 +1230,25 @@ void test_config() {
     CHECK(all_logger.enabled(LogLevel::info));
     CHECK(all_logger.enabled(LogLevel::warn));
     CHECK(all_logger.enabled(LogLevel::error));
+    auto capture = std::make_shared<CapturingLogger>(LogLevel::info);
+    Log::set_logger(capture);
+    Log::debug("macha debug must remain filtered");
+    Log::emit(LogLevel::debug, "ffmpeg: admitted debug must reach the sink");
+    CHECK(capture->records.size() == 1);
+    if (!capture->records.empty()) {
+        CHECK(capture->records.front().first == LogLevel::debug);
+        CHECK(capture->records.front().second == "ffmpeg: admitted debug must reach the sink");
+    }
+    capture->records.clear();
+    configure_ffmpeg_logging(FfmpegLogLevel::debug);
+    av_log(nullptr, AV_LOG_DEBUG, "independent FFmpeg debug\n");
+    av_log(nullptr, AV_LOG_TRACE, "filtered FFmpeg trace\n");
+    CHECK(capture->records.size() == 1);
+    if (!capture->records.empty()) {
+        CHECK(capture->records.front().first == LogLevel::debug);
+        CHECK(capture->records.front().second.find("independent FFmpeg debug") != std::string::npos);
+    }
+    configure_ffmpeg_logging(FfmpegLogLevel::error);
     Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::warn));
     CHECK(!Log::enabled(LogLevel::all));
     CHECK(!Log::enabled(LogLevel::debug));
@@ -1232,6 +1278,7 @@ void test_config() {
         out << "state_path: " << state.string() << "\n"
             << "key_file: " << keyfile << "\n"
             << "log_level: WARN\n"
+            << "ffmpeg_log_level: DEBUG\n"
             << "storage:\n"
             << "  - path: " << disk1.string() << "\n"
             << "    limit: 10T\n"
@@ -1377,6 +1424,7 @@ void test_config() {
     CHECK(yc.cache.path == cache_dir);
     CHECK(yc.cache.max_blocks == 4096);
     CHECK(yc.log_level == LogLevel::warn);
+    CHECK(yc.ffmpeg_log_level == FfmpegLogLevel::debug);
     CHECK(yc.fuse.allow_other);
     CHECK(yc.fuse.entry_timeout == 375ms);
     CHECK(yc.fuse.attr_timeout == 225ms);
@@ -1477,7 +1525,8 @@ void test_config() {
                                             "--control-stall-notice", "4200",
                                             "--data-stall-notice", "90000",
                                             "--metadata-cache", "125",
-                                            "--log-level", "DEBUG"};
+                                            "--log-level", "DEBUG",
+                                            "--ffmpeg-log-level", "WARNING"};
     std::vector<char*> override_argv;
     for (auto& arg : override_args)
         override_argv.push_back(arg.data());
@@ -1494,6 +1543,7 @@ void test_config() {
     CHECK(overridden.data_stall_notice == 90000ms);
     CHECK(overridden.metadata_cache == 125ms);
     CHECK(overridden.log_level == LogLevel::debug);
+    CHECK(overridden.ffmpeg_log_level == FfmpegLogLevel::warning);
 
     // Obsolete configuration surfaces are rejected rather than silently
     // translated onto current semantics.

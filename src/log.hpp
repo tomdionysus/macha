@@ -24,6 +24,8 @@ class Logger {
   public:
     virtual ~Logger() = default;
 
+    // enabled() is the source/filter decision. log() writes an already-approved
+    // record to the sink and must not apply an additional severity filter.
     virtual bool enabled(LogLevel) const noexcept = 0;
     virtual void log(LogLevel, const std::string&) = 0;
 
@@ -72,6 +74,11 @@ class Log {
   public:
     static void set_logger(std::shared_ptr<Logger>);
     static bool enabled(LogLevel);
+
+    // Emit an already-approved record through the common sink without applying
+    // Macha's process log-level filter. Source-specific bridges such as FFmpeg
+    // use this after applying their own independently configured threshold.
+    static void emit(LogLevel, const std::string&);
 
     static void trace(const std::string& value) {
         if (!enabled(LogLevel::all))

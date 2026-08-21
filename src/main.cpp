@@ -2,6 +2,7 @@
 #include "config.hpp"
 #include "crypto.hpp"
 #include "fuse_adapter.hpp"
+#include "ffmpeg_log.hpp"
 #include "log.hpp"
 #include "service.hpp"
 #include <atomic>
@@ -32,6 +33,7 @@ int main(int argc, char** argv) {
         auto config = macha::parse_config(argc, argv);
         macha::Log::set_logger(
             std::make_shared<macha::ConsoleLogger>(config.log_level));
+        macha::configure_ffmpeg_logging(config.ffmpeg_log_level);
         auto keys = macha::load_cluster_keys(config.key_file);
         macha::Service service(config, keys);
         service.start();
