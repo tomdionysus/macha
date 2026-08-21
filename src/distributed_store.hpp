@@ -83,6 +83,7 @@ class DistributedStore {
     bool ensure_local(const ObjectId&, bool foreground = false);
     bool ensure_metadata_local(const ObjectId&);
     bool locally_available(const ObjectId&) const;
+    bool cache_local(const ObjectId&, std::span<const uint8_t>);
     bool hydration_available() const;
     bool hydrate(const ObjectId&, size_t stripe = 0,
                  FrameType frame_type = FrameType::speculative);

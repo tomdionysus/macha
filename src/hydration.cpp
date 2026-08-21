@@ -433,9 +433,21 @@ CacheHydrator::~CacheHydrator() {
     stop();
 }
 
-void CacheHydrator::add_provider(HydrationHintProvider& provider) {
+void CacheHydrator::add_provider(std::shared_ptr<HydrationHintProvider> provider) {
+    if (!provider) return;
     std::lock_guard lock(mutex_);
-    providers_.push_back(&provider);
+    if (std::none_of(providers_.begin(), providers_.end(), [&](const auto& existing) {
+            return existing.get() == provider.get();
+        }))
+        providers_.push_back(std::move(provider));
+    cv_.notify_all();
+}
+
+void CacheHydrator::remove_provider(const HydrationHintProvider* provider) {
+    std::lock_guard lock(mutex_);
+    providers_.erase(std::remove_if(providers_.begin(), providers_.end(),
+                                    [&](const auto& existing) { return existing.get() == provider; }),
+                     providers_.end());
 }
 
 void CacheHydrator::start() {
@@ -466,13 +478,13 @@ void CacheHydrator::reconfigure(HydrationConfig config) {
 }
 
 std::vector<HydrationHint> CacheHydrator::collect_hints() {
-    std::vector<HydrationHintProvider*> providers;
+    std::vector<std::shared_ptr<HydrationHintProvider>> providers;
     {
         std::lock_guard lock(mutex_);
         providers = providers_;
     }
     std::vector<HydrationHint> out;
-    for (auto* provider : providers) {
+    for (const auto& provider : providers) {
         try {
             auto current = provider->hints();
             out.insert(out.end(), std::make_move_iterator(current.begin()),
@@ -643,8 +655,10 @@ void CacheHydrator::loop(std::stop_token stop) {
 HydrationManager::HydrationManager(DistributedStore& store, PlaybackTracker& playback,
                                    FileSystem& filesystem, CatalogueManager& catalogue,
                                    HydrationConfig config, size_t read_ahead_extents)
-    : read_ahead_(playback, config, read_ahead_extents), current_file_(playback, config),
-      catalogue_sequence_(playback, filesystem, catalogue, config), hydrator_(store, config) {
+    : read_ahead_(std::make_shared<ReadAheadHintProvider>(playback, config, read_ahead_extents)),
+      current_file_(std::make_shared<CurrentFileHintProvider>(playback, config)),
+      catalogue_sequence_(std::make_shared<CatalogueSequenceHintProvider>(playback, filesystem, catalogue, config)),
+      hydrator_(store, config) {
     hydrator_.add_provider(read_ahead_);
     hydrator_.add_provider(current_file_);
     hydrator_.add_provider(catalogue_sequence_);
@@ -663,9 +677,9 @@ void HydrationManager::stop() {
 }
 
 void HydrationManager::reconfigure(HydrationConfig config, size_t read_ahead_extents) {
-    read_ahead_.reconfigure(config, read_ahead_extents);
-    current_file_.reconfigure(config);
-    catalogue_sequence_.reconfigure(config);
+    read_ahead_->reconfigure(config, read_ahead_extents);
+    current_file_->reconfigure(config);
+    catalogue_sequence_->reconfigure(config);
     hydrator_.reconfigure(std::move(config));
 }
 

@@ -3,11 +3,15 @@
 Macha keeps the filesystem, metadata, inter-node placement and local storage layers separate. The point is not abstraction for its own sake: disk loss, node loss, network failure and cache eviction have different semantics and should fail independently.
 
 ```text
-FuseAdapter / FileSystem
-          |
-          +---- MetadataManager ---- voter quorum + committed checkpoints
-          |
-          +---- DistributedStore --- inter-node placement and repair
+FuseAdapter -> FuseFrontend
+                 |
+                 +---- local inode/namespace overlay + write spool
+                 +---- bounded request broker + async publication
+                 +---- FUSE hydration hints
+                           |
+FileSystem ----------------+---- MetadataManager ---- voter quorum + committed checkpoints
+                           |
+                           +---- DistributedStore --- inter-node placement and repair
                      |
                      +---- StoragePool -------- authoritative local replica
                      |       |  |  |
@@ -33,6 +37,20 @@ Service
    |       +---- bounded fMP4 SegmentStore / capability URLs
    +---- repair / local rebalance / scrub / GC scheduler
 ```
+
+## Bounded FUSE frontend
+
+The mounted filesystem is a local bounded frontend to Macha, not a synchronous projection of distributed state. `FuseAdapter` contains only libfuse/macFUSE translation and delegates kernel operations to `FuseFrontend`. `FuseFrontend` has no reason to wait for catalogue work, repair, checkpoint propagation or metadata quorum on a kernel callback. Every operation enters an operation-class broker with a configured deadline capped by an absolute ceiling; if local/bounded completion is impossible, the request fails to the kernel.
+
+The frontend seeds a process-local namespace/inode graph from the node's local committed metadata replica before mounting. Open file descriptions retain stable inode identity rather than paths. Rename therefore changes namespace edges, including whole directory subtrees, without invalidating an open descriptor. Namespace mutations update the local graph in kernel order and then enter a FIFO asynchronous publication queue. Replacing or unlinking a name detaches the old inode's published pathname, so later close/flush on an old descriptor cannot resurrect or overwrite the replacement.
+
+Writes are accepted into an append-only local operation spool under `state_path/fuse-spool`. The operation stream preserves the exact order of writes and truncates; overlapping/adjacent dirty ranges may be merged as scheduling state without changing byte semantics. `flush` and `release` request asynchronous publication. `fsync` additionally makes the local spool durable before requesting publication; it does not promise distributed quorum convergence. Publication workers seal an operation prefix, wait for that inode's accepted namespace sequence, replay it through the existing `WriteHandle`, and remove only the successfully published prefix. Later writes remain pending for a subsequent generation. This reuses Macha's existing extent hashing, sparse/rebuild behaviour, replication, garbage retirement and metadata-conflict handling instead of creating a second object writer.
+
+Reads snapshot the committed immutable manifest plus pending local operations. They do not commit a dirty writer first. Shrink/extend/write order is replayed over the committed data so an old suffix cannot reappear after truncate-and-extend. Any required remote extent fetch carries the FUSE read deadline and cancellation token. The frontend also emits immediate demand as a high-priority dynamic `HydrationHintProvider`; requested extents and configurable read-ahead therefore enter the same `CacheHydrator` used by playback prediction. `DistributedStore` coalesces duplicate object fetches, allowing FUSE and speculative/predictive demand to share one transfer. With `fuse.write_through_cache`, extents produced by FUSE publication are inserted into the existing `PersistentBlockCache`.
+
+Queue limits provide bounded backpressure. Namespace capacity is reserved before changing the local graph so a saturated publication queue returns `EAGAIN` without leaving a half-accepted mutation. File bytes already accepted into the spool are never dropped merely because the publication queue is full; their inode is marked deferred and admitted when capacity becomes available.
+
+FUSE itself remains outside Macha's control. When fail-closed mountpoint protection is enabled, the directory covered by the live mount has its write bits removed through a pre-mount file descriptor after mounting succeeds. An independent OS mount-table watchdog detects unexpected disappearance of the mount, requests node shutdown and leaves the naked directory protected so tools such as `rsync` fail rather than writing underneath the namespace. An intentional clean unmount restores the directory's original mode.
 
 ## StoragePool: one node, many disks
 

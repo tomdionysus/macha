@@ -14,7 +14,7 @@ Movie editions such as `Extended`, `Remastered` and `Director's Cut` are classif
 
 Music is tag-first but no longer single-hypothesis. Embedded container metadata is read once through libavformat over Macha's distributed read path and supplied to the same candidate interface as path evidence. Embedded APIC/attached-picture artwork is captured during that same read and stored as a `cover` artwork candidate alongside provider artwork; different immutable images are retained rather than collapsed merely because they share the same role. The default music candidates include authoritative embedded tags, a recording-first interpretation using the track artist, embedded tags supplemented by structured path fields, and a pure structured-path fallback. Album artist and track artist are kept separately, so compilation albums can retain `Various Artists` album context while recording-first provider lookup still searches by the performing artist. Each candidate is offered to configured music metadata providers in priority order; Discogs uses authenticated database search and release detail as a fallback rather than replacing MusicBrainz identity when MusicBrainz succeeds. `Artist - Title.ext` is recognised, and exact root-relative `Artist/Album/File` (plus `CD 2`/`Disc 2`) layouts remain useful, but arbitrary nested collection/grouping directories are not promoted to artists merely because of their depth. Missing configured provider roots make a scan partial: available roots are still ingested, but destructive reconciliation is suppressed until every configured root can be traversed. Other filesystem errors abort the pass.
 
-The coordinator also reacts to committed namespace mutations. A metadata-generation change starts/restarts `rescan_debounce_ms` (10 seconds by default). Continuous mutation cannot postpone the pending scan beyond `rescan_max_delay_ms` (60 seconds by default), measured from the first unscanned mutation. Before scanning, the coordinator compares a deterministic namespace-content signature and runs only if files/directories actually changed. Catalogue-only metadata commits are excluded from that signature, so a scan cannot trigger itself. The periodic `interval_ms` scan remains as a safety/convergence pass.
+The coordinator also reacts to committed namespace mutations. A metadata-generation change starts/restarts `rescan_debounce_ms` (10 seconds by default). Continuous mutation cannot postpone the pending scan beyond `rescan_max_delay_ms` (10 minutes by default), measured from the first unscanned mutation. Before scanning, the coordinator compares a deterministic namespace-content signature and runs only if files/directories actually changed. Catalogue-only metadata commits are excluded from that signature, so a scan cannot trigger itself. The periodic `interval_ms` scan remains as a safety/convergence pass.
 
 TMDB needs an API Read Access Token. Put the token alone in a file readable by Macha. MusicBrainz does not need an API key, but requires a meaningful contact string and is rate-limited by the provider; Macha spaces its MusicBrainz API requests accordingly. Discogs database search requires authentication; create a personal token and place only the token in a file readable by Macha. Configure only curated media roots:
 
@@ -24,7 +24,7 @@ catalogue:
     enabled: true
     interval_ms: 21600000
     rescan_debounce_ms: 10000
-    rescan_max_delay_ms: 60000
+    rescan_max_delay_ms: 600000
     max_artwork_bytes: 16M
     providers:
       movies:

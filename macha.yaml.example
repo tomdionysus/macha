@@ -1,4 +1,4 @@
-# Macha 0.12.3
+# Macha 0.13.0
 #
 # Copy this file per node. Paths, advertise address and failure_domain are
 # node-local. The cluster key contents and dht policy must match every node.
@@ -32,15 +32,39 @@ cache:
 # Root ownership/mode are used only when a brand-new namespace is formed.
 # They are then persisted in distributed metadata.
 filesystem:
-  allow_other: false
-  # Short FUSE namespace/attribute caches reduce kernel/userspace request
-  # storms. These do not enable persistent file-content caching across opens.
-  entry_timeout_ms: 250
-  attr_timeout_ms: 250
-  negative_timeout_ms: 100
   root_uid: 0
   root_gid: 0
   root_mode: "0755"
+
+# The mounted filesystem is a bounded local frontend. Kernel callbacks never
+# wait synchronously for metadata quorum, remote placement, repair or catalogue
+# work. Accepted namespace/data state is journalled locally and published by
+# asynchronous workers. Timeouts deliberately remain well below macFUSE's own
+# daemon timeout; a request fails to the kernel rather than hanging the mount.
+fuse:
+  allow_other: false
+  entry_timeout_ms: 250
+  attr_timeout_ms: 250
+  negative_timeout_ms: 100
+  absolute_request_timeout_ms: 15000
+  timeouts:
+    lookup_ms: 1000
+    namespace_ms: 3000
+    read_ms: 10000
+    write_ms: 5000
+    sync_ms: 5000
+    lifecycle_ms: 2000
+  request_workers: 24
+  max_pending_requests: 4096
+  commit_workers: 8
+  max_pending_operations: 4096
+  hydration_priority: 2000
+  read_ahead_extents: 2
+  hint_lifetime_ms: 5000
+  write_through_cache: true
+  refresh_interval_ms: 1000
+  fail_closed_mountpoint: true
+  watchdog_interval_ms: 1000
 
 network:
   # listen is the local bind address. advertise is what peers connect to.
@@ -143,7 +167,7 @@ catalogue:
     # Coalesce namespace create/write/rename/delete bursts before rescanning.
     # Sustained mutation cannot defer a pending rescan beyond rescan_max_delay_ms.
     rescan_debounce_ms: 10000
-    rescan_max_delay_ms: 60000
+    rescan_max_delay_ms: 600000
     # Bound synchronous online metadata-provider work per scanner pass.
     # A completed batch continues later without blocking the whole scan indefinitely.
     max_provider_requests_per_scan: 32

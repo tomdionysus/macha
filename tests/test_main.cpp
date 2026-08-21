@@ -3,6 +3,7 @@
 #include "config.hpp"
 #include "crypto.hpp"
 #include "filesystem.hpp"
+#include "fuse_frontend.hpp"
 #include "http.hpp"
 #include "local_store.hpp"
 #include "metadata.hpp"
@@ -1241,13 +1242,33 @@ void test_config() {
             << "  max_blocks: 4096\n"
             << "  prefer_metadata: true\n"
             << "filesystem:\n"
+            << "  root_uid: 501\n"
+            << "  root_gid: 20\n"
+            << "  root_mode: '0750'\n"
+            << "fuse:\n"
             << "  allow_other: true\n"
             << "  entry_timeout_ms: 375\n"
             << "  attr_timeout_ms: 225\n"
             << "  negative_timeout_ms: 75\n"
-            << "  root_uid: 501\n"
-            << "  root_gid: 20\n"
-            << "  root_mode: '0750'\n"
+            << "  absolute_request_timeout_ms: 14000\n"
+            << "  request_workers: 18\n"
+            << "  max_pending_requests: 2048\n"
+            << "  commit_workers: 4\n"
+            << "  max_pending_operations: 1024\n"
+            << "  hydration_priority: 2500\n"
+            << "  read_ahead_extents: 4\n"
+            << "  hint_lifetime_ms: 4500\n"
+            << "  write_through_cache: false\n"
+            << "  refresh_interval_ms: 750\n"
+            << "  fail_closed_mountpoint: true\n"
+            << "  watchdog_interval_ms: 650\n"
+            << "  timeouts:\n"
+            << "    lookup_ms: 900\n"
+            << "    namespace_ms: 2200\n"
+            << "    read_ms: 8000\n"
+            << "    write_ms: 3200\n"
+            << "    sync_ms: 4100\n"
+            << "    lifecycle_ms: 1700\n"
             << "network:\n"
             << "  listen: 127.0.0.1\n"
             << "  advertise: media.example\n"
@@ -1356,10 +1377,28 @@ void test_config() {
     CHECK(yc.cache.path == cache_dir);
     CHECK(yc.cache.max_blocks == 4096);
     CHECK(yc.log_level == LogLevel::warn);
-    CHECK(yc.filesystem.allow_other);
-    CHECK(yc.filesystem.entry_timeout == 375ms);
-    CHECK(yc.filesystem.attr_timeout == 225ms);
-    CHECK(yc.filesystem.negative_timeout == 75ms);
+    CHECK(yc.fuse.allow_other);
+    CHECK(yc.fuse.entry_timeout == 375ms);
+    CHECK(yc.fuse.attr_timeout == 225ms);
+    CHECK(yc.fuse.negative_timeout == 75ms);
+    CHECK(yc.fuse.absolute_request_timeout == 14000ms);
+    CHECK(yc.fuse.request_workers == 18);
+    CHECK(yc.fuse.max_pending_requests == 2048);
+    CHECK(yc.fuse.commit_workers == 4);
+    CHECK(yc.fuse.max_pending_operations == 1024);
+    CHECK(yc.fuse.hydration_priority == 2500);
+    CHECK(yc.fuse.read_ahead_extents == 4);
+    CHECK(yc.fuse.hint_lifetime == 4500ms);
+    CHECK(!yc.fuse.write_through_cache);
+    CHECK(yc.fuse.refresh_interval == 750ms);
+    CHECK(yc.fuse.fail_closed_mountpoint);
+    CHECK(yc.fuse.watchdog_interval == 650ms);
+    CHECK(yc.fuse.timeouts.lookup == 900ms);
+    CHECK(yc.fuse.timeouts.namespace_mutation == 2200ms);
+    CHECK(yc.fuse.timeouts.read == 8000ms);
+    CHECK(yc.fuse.timeouts.write == 3200ms);
+    CHECK(yc.fuse.timeouts.sync == 4100ms);
+    CHECK(yc.fuse.timeouts.lifecycle == 1700ms);
     CHECK(yc.filesystem.root_uid == 501);
     CHECK(yc.filesystem.root_gid == 20);
     CHECK(yc.filesystem.root_mode == 0750);
@@ -3153,6 +3192,269 @@ void test_open_write_survives_rename() {
     service.stop();
 }
 
+
+void test_fuse_frontend_ordering_merging_and_cache() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-ordering", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.extent_size = 1024 * 1024;
+    config.cache.path = t.path() / "cache";
+    config.cache.max_blocks = 64;
+    config.fuse.refresh_interval = 30s;
+    config.fuse.commit_workers = 2;
+    config.fuse.read_ahead_extents = 2;
+    config.fuse.write_through_cache = true;
+
+    Service service(config, keys);
+    service.start();
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto handle = frontend->create("/.rsync.tmp", 0600, getuid(), getgid(), true, true, false);
+        const auto inode = handle.inode;
+        REQUIRE(inode != 0);
+
+        Bytes expected(3 * config.extent_size + 8192, 0);
+        auto first = pattern(config.extent_size + 32768);
+        REQUIRE(frontend->write(inode, 0, first) == first.size());
+        std::copy(first.begin(), first.end(), expected.begin());
+
+        // Adjacent and overlapping writes are retained in exact byte order but
+        // expose one coalesced dirty range to the frontend scheduler.
+        auto adjacent = pattern(config.extent_size);
+        REQUIRE(frontend->write(inode, first.size(), adjacent) == adjacent.size());
+        std::copy(adjacent.begin(), adjacent.end(), expected.begin() + static_cast<ptrdiff_t>(first.size()));
+        auto patch = pattern(131072);
+        const uint64_t patch_offset = config.extent_size - 65536;
+        for (auto& byte : patch) byte ^= 0xa5;
+        REQUIRE(frontend->write(inode, patch_offset, patch) == patch.size());
+        std::copy(patch.begin(), patch.end(), expected.begin() + static_cast<ptrdiff_t>(patch_offset));
+
+        auto ranges = frontend->dirty_ranges(inode);
+        REQUIRE(ranges.size() == 1);
+        CHECK(ranges.front().offset == 0);
+        CHECK(ranges.front().length == first.size() + adjacent.size());
+
+        // Queue publication more than once. It is legal for the first commit to
+        // complete very quickly on a one-node test cluster, but pending work may
+        // never be double-counted and no duplicate bytes may result.
+        frontend->flush(inode);
+        frontend->flush(inode);
+        auto during = frontend->status();
+        CHECK(during.pending_data <= 1);
+        CHECK(during.active_data <= config.fuse.commit_workers);
+
+        // Rename twice while retaining the same open file description, then
+        // continue writing through that inode. No path lookup participates in
+        // the subsequent write/close sequence.
+        frontend->rename("/.rsync.tmp", "/.stage.tmp");
+        REQUIRE(frontend->inode_for_path("/.stage.tmp") == inode);
+        CHECK(frontend->path_for_inode(inode) == "/.stage.tmp");
+        frontend->rename("/.stage.tmp", "/movie.bin");
+        REQUIRE(frontend->inode_for_path("/movie.bin") == inode);
+        CHECK(!frontend->inode_for_path("/.rsync.tmp").has_value());
+        CHECK(!frontend->inode_for_path("/.stage.tmp").has_value());
+
+        auto tail = pattern(8192);
+        for (auto& byte : tail) byte ^= 0x3c;
+        const uint64_t tail_offset = 3 * config.extent_size;
+        REQUIRE(frontend->write(inode, tail_offset, tail) == tail.size());
+        std::copy(tail.begin(), tail.end(), expected.begin() + static_cast<ptrdiff_t>(tail_offset));
+        frontend->release(inode);
+        REQUIRE(frontend->wait_for_idle(10s));
+
+        CHECK(frontend->status().pending_data == 0);
+        auto entry = service.filesystem().getattr("/movie.bin");
+        CHECK(entry.size == expected.size());
+        auto reader = service.filesystem().open_read("/movie.bin");
+        Bytes actual(expected.size());
+        size_t offset = 0;
+        while (offset < actual.size()) {
+            auto n = reader->read(offset, {actual.data() + offset, actual.size() - offset});
+            REQUIRE(n > 0);
+            offset += n;
+        }
+        CHECK(actual == expected);
+
+        // FUSE write-back publication uses the ordinary extent writer and, when
+        // requested, also promotes each immutable extent into Macha's existing
+        // persistent block cache rather than maintaining a second FUSE cache.
+        REQUIRE(!entry.extents.empty());
+        for (const auto& extent : entry.extents)
+            if (!extent.hole)
+                CHECK(service.node().block_cache().has(extent.id));
+    }
+    service.stop();
+}
+
+void test_fuse_frontend_unlink_and_rename_over_open_inode_ordering() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-replace", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.fuse.refresh_interval = 30s;
+    config.fuse.commit_workers = 2;
+
+    Service service(config, keys);
+    service.start();
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+
+        // A dirty inode that is unlinked before release must never recreate its
+        // old pathname when the data-publication worker eventually sees it.
+        auto doomed = frontend->create("/doomed.bin", 0600, getuid(), getgid(), true, true, false);
+        auto doomed_data = pattern(65536);
+        REQUIRE(frontend->write(doomed.inode, 0, doomed_data) == doomed_data.size());
+        frontend->unlink("/doomed.bin");
+        frontend->release(doomed.inode);
+        REQUIRE(frontend->wait_for_idle(10s));
+        CHECK(!frontend->inode_for_path("/doomed.bin").has_value());
+        bool missing = false;
+        try { (void)service.filesystem().getattr("/doomed.bin"); }
+        catch (const FsError& e) { missing = e.code() == ENOENT; }
+        CHECK(missing);
+
+        // More subtle: POSIX rename may replace a destination which still has
+        // an open descriptor. The displaced inode remains a valid open identity,
+        // but it no longer owns that pathname. Releasing dirty data through the
+        // old descriptor must not overwrite/resurrect the new destination.
+        auto destination = frontend->create("/target.bin", 0600, getuid(), getgid(), true, true, false);
+        auto old_bytes = pattern(32768);
+        REQUIRE(frontend->write(destination.inode, 0, old_bytes) == old_bytes.size());
+        frontend->release(destination.inode);
+        REQUIRE(frontend->wait_for_idle(10s));
+
+        auto old_open = frontend->open("/target.bin", true, true, false, false);
+        std::array<uint8_t, 8> stale{{'S','T','A','L','E','!','!','!'}};
+        REQUIRE(frontend->write(old_open.inode, 0, stale) == stale.size());
+
+        auto source = frontend->create("/replacement.bin", 0600, getuid(), getgid(), true, true, false);
+        auto replacement = pattern(98304);
+        for (auto& byte : replacement) byte ^= 0x7d;
+        REQUIRE(frontend->write(source.inode, 0, replacement) == replacement.size());
+        frontend->flush(source.inode);
+        frontend->rename("/replacement.bin", "/target.bin");
+        REQUIRE(frontend->inode_for_path("/target.bin") == source.inode);
+        frontend->release(source.inode);
+        frontend->release(old_open.inode);
+        REQUIRE(frontend->wait_for_idle(10s));
+
+        CHECK(frontend->path_for_inode(old_open.inode).empty());
+        auto final = service.filesystem().getattr("/target.bin");
+        CHECK(final.size == replacement.size());
+        auto reader = service.filesystem().open_read("/target.bin");
+        Bytes actual(replacement.size());
+        size_t offset = 0;
+        while (offset < actual.size()) {
+            auto n = reader->read(offset, {actual.data() + offset, actual.size() - offset});
+            REQUIRE(n > 0);
+            offset += n;
+        }
+        CHECK(actual == replacement);
+    }
+    service.stop();
+}
+
+void test_fuse_frontend_read_overlay_truncate_and_hydration_hints() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-read", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.refresh_interval = 30s;
+    config.fuse.read_ahead_extents = 2;
+    config.fuse.hydration_priority = 2718;
+
+    Service service(config, keys);
+    service.start();
+    auto committed = pattern(4 * config.extent_size + 4096);
+    service.filesystem().create_file("/read.bin", 0644, getuid(), getgid());
+    auto seed = service.filesystem().open_write("/read.bin", true);
+    REQUIRE(seed->write(0, committed) == committed.size());
+    seed->commit();
+    seed.reset();
+    auto base_entry = service.filesystem().getattr("/read.bin");
+    REQUIRE(base_entry.extents.size() >= 5);
+
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto handle = frontend->open("/read.bin", true, true, false, false);
+
+        auto patch = pattern(16384);
+        for (auto& byte : patch) byte ^= 0x91;
+        const uint64_t patch_offset = 4096;
+        REQUIRE(frontend->write(handle.inode, patch_offset, patch) == patch.size());
+        Bytes view(32768);
+        REQUIRE(frontend->read(handle.inode, 0, view) == view.size());
+        auto expected_view = Bytes(committed.begin(), committed.begin() + static_cast<ptrdiff_t>(view.size()));
+        std::copy(patch.begin(), patch.end(), expected_view.begin() + static_cast<ptrdiff_t>(patch_offset));
+        CHECK(view == expected_view);
+
+        // A committed-range read emits one high-priority FUSE run into the
+        // ordinary hydration scheduler. Re-reading the same range replaces the
+        // inode's hint rather than duplicating work, and object IDs are unique.
+        // This must be tested while the committed extent is still inside the
+        // inode's logical EOF.
+        Bytes demand(4096);
+        REQUIRE(frontend->read(handle.inode, config.extent_size + 1024, demand) == demand.size());
+        REQUIRE(frontend->read(handle.inode, config.extent_size + 1024, demand) == demand.size());
+        auto hints = frontend->hints();
+        REQUIRE(hints.size() == 1);
+        CHECK(hints.front().run_id == "fuse:" + std::to_string(handle.inode));
+        CHECK(hints.front().priority == config.fuse.hydration_priority);
+        CHECK(hints.front().frame_type == FrameType::read_ahead);
+        REQUIRE(hints.front().objects.size() == 3);
+        CHECK(hints.front().objects[0] == base_entry.extents[1].id);
+        CHECK(hints.front().objects[1] == base_entry.extents[2].id);
+        CHECK(hints.front().objects[2] == base_entry.extents[3].id);
+        std::set<ObjectId> unique(hints.front().objects.begin(), hints.front().objects.end());
+        CHECK(unique.size() == hints.front().objects.size());
+
+        // Shrink then extend before publication. Bytes from the old committed
+        // suffix must not reappear; the extended region is logically zero until
+        // a later write overlays it.
+        frontend->truncate(handle.inode, 32768);
+        frontend->truncate(handle.inode, 65536);
+        Bytes extended(32768, 0xff);
+        REQUIRE(frontend->read(handle.inode, 32768, extended) == extended.size());
+        CHECK(std::all_of(extended.begin(), extended.end(), [](uint8_t b) { return b == 0; }));
+        Bytes beyond_eof(4096, 0xff);
+        CHECK(frontend->read(handle.inode, config.extent_size + 1024, beyond_eof) == 0);
+        std::array<uint8_t, 6> marker{{'M','A','C','H','A','!'}};
+        REQUIRE(frontend->write(handle.inode, 40000, marker) == marker.size());
+        Bytes marker_view(64, 0xff);
+        REQUIRE(frontend->read(handle.inode, 39984, marker_view) == marker_view.size());
+        CHECK(std::equal(marker.begin(), marker.end(), marker_view.begin() + 16));
+
+        frontend->release(handle.inode);
+        REQUIRE(frontend->wait_for_idle(10s));
+        auto final = service.filesystem().getattr("/read.bin");
+        CHECK(final.size == 65536);
+        auto reader = service.filesystem().open_read("/read.bin");
+        Bytes final_bytes(65536);
+        size_t offset = 0;
+        while (offset < final_bytes.size()) {
+            auto n = reader->read(offset, {final_bytes.data() + offset, final_bytes.size() - offset});
+            REQUIRE(n > 0);
+            offset += n;
+        }
+        CHECK(std::equal(patch.begin(), patch.end(), final_bytes.begin() + static_cast<ptrdiff_t>(patch_offset)));
+        CHECK(std::equal(marker.begin(), marker.end(), final_bytes.begin() + 40000));
+        CHECK(std::all_of(final_bytes.begin() + 32768, final_bytes.begin() + 40000,
+                          [](uint8_t b) { return b == 0; }));
+    }
+    service.stop();
+}
+
 void test_full_replica_fallback() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
@@ -3672,9 +3974,11 @@ void test_cache_hydrator_fetches_to_persistent_cache() {
         explicit StaticHints(std::vector<HydrationHint> hints) : hints_(std::move(hints)) {}
         std::string_view name() const override { return "test"; }
         std::vector<HydrationHint> hints() override { return hints_; }
-    } provider({{"current", {a, b}, 1000, "read_ahead"},
-                {"current", {a, b, c}, 700, "current_file"},
-                {"next", {n0, nnext}, 300, "next_episode"}});
+    };
+    auto provider = std::make_shared<StaticHints>(std::vector<HydrationHint>{
+        {"current", {a, b}, 1000, "read_ahead"},
+        {"current", {a, b, c}, 700, "current_file"},
+        {"next", {n0, nnext}, 300, "next_episode"}});
 
     HydrationConfig config;
     CacheHydrator hydrator(target, config);
@@ -3699,8 +4003,8 @@ void test_cache_hydrator_fetches_to_persistent_cache() {
     const auto parallel0 = make_remote(66);
     const auto parallel1 = make_remote(67);
     const auto parallel2 = make_remote(68);
-    StaticHints concurrent_provider(
-        {{"parallel", {parallel0, parallel1, parallel2}, 500, "current_file"}});
+    auto concurrent_provider = std::make_shared<StaticHints>(
+        std::vector<HydrationHint>{{"parallel", {parallel0, parallel1, parallel2}, 500, "current_file"}});
     HydrationConfig concurrent_config;
     concurrent_config.interval = 10ms;
     concurrent_config.max_inflight = 2;
@@ -5232,7 +5536,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
-    CHECK(status_body.find("\"server_version\":\"0.12.3\"") != std::string::npos);
+    CHECK(status_body.find("\"server_version\":\"0.13.0\"") != std::string::npos);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -5972,7 +6276,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == "0.12.3");
+    CHECK(playback_status_json.find("server_version")->asString() == "0.13.0");
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately
@@ -6375,6 +6679,9 @@ int main() {
         test_fresh_and_resumed_write_exactness();
         test_active_write_size_visibility();
         test_open_write_survives_rename();
+        test_fuse_frontend_ordering_merging_and_cache();
+        test_fuse_frontend_unlink_and_rename_over_open_inode_ordering();
+        test_fuse_frontend_read_overlay_truncate_and_hydration_hints();
         test_full_replica_fallback();
         test_replacement_node_recovers_namespace_and_replication();
         test_hydration_scheduler_and_prediction();
