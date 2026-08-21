@@ -2,6 +2,9 @@
 #pragma once
 #include "catalogue.hpp"
 #include "catalogue_api.hpp"
+#include "acquisition_api.hpp"
+#include "ingest.hpp"
+#include "torrent.hpp"
 #include "filesystem.hpp"
 #include "hydration.hpp"
 #include "media_catalogue.hpp"
@@ -23,6 +26,10 @@ class Service {
     FileSystem fs_;
     CatalogueScanner scanner_;
     HydrationManager hydration_;
+    IngestManager ingest_;
+    TorrentManager torrents_;
+    TorrentSearchManager torrent_search_;
+    AcquisitionApi acquisition_api_;
     CatalogueApi catalogue_api_;
     PlaybackManager streaming_;
     std::unique_ptr<HttpServer> catalogue_http_;

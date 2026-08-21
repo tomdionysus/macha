@@ -80,6 +80,10 @@ class MediaProbeCandidateGenerator {
 std::vector<MediaProbeCandidate> probe_media_candidates(const MediaProbeContext&);
 std::vector<MediaProbeCandidate> probe_media_candidates(std::string_view path, const FsEntry&,
                                                         std::string_view root = {});
+// Run the same candidate generators against a host-side file before it enters
+// the Macha namespace. Audio tags are read directly with libav when available.
+std::vector<MediaProbeCandidate> probe_host_media_candidates(const std::filesystem::path&,
+                                                             uint64_t size);
 std::optional<MediaProbe> probe_media_path(std::string_view path, const FsEntry&);
 
 struct RemoteArtwork {

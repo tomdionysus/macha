@@ -45,6 +45,9 @@ endif()
 # The in-process media engine uses public APIs present in FFmpeg 6 and later.
 pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET
     libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7 libswresample>=4)
+# BitTorrent acquisition is optional at build time. Generic filesystem ingest
+# remains available without libtorrent.
+pkg_check_modules(LIBTORRENT QUIET IMPORTED_TARGET libtorrent-rasterbar>=2.0)
 
 if(TARGET yaml-cpp::yaml-cpp)
     set(MACHA_YAML_TARGET yaml-cpp::yaml-cpp)
@@ -83,7 +86,10 @@ set(MACHA_CORE_SOURCES
     src/playback.cpp
     src/catalogue.cpp
     src/catalogue_api.cpp
+    src/acquisition_api.cpp
     src/media_catalogue.cpp
+    src/ingest.cpp
+    src/torrent.cpp
     src/macos_unicode.cpp
     src/hydration.cpp
     src/filesystem.cpp
@@ -97,6 +103,13 @@ target_include_directories(macha_core PUBLIC
     ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(macha_core PUBLIC
     OpenSSL::Crypto Threads::Threads CURL::libcurl ${MACHA_YAML_TARGET} PkgConfig::LIBAV)
+if(TARGET PkgConfig::LIBTORRENT)
+    target_link_libraries(macha_core PUBLIC PkgConfig::LIBTORRENT)
+    target_compile_definitions(macha_core PUBLIC MACHA_HAVE_LIBTORRENT=1)
+    message(STATUS "BitTorrent acquisition enabled (libtorrent-rasterbar)")
+else()
+    message(STATUS "libtorrent-rasterbar >= 2.0 not found; building generic ingest without BitTorrent acquisition")
+endif()
 if(APPLE)
     find_library(MACHA_COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
     target_link_libraries(macha_core PUBLIC ${MACHA_COREFOUNDATION_FRAMEWORK})

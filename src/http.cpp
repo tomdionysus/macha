@@ -46,6 +46,7 @@ std::string reason(int status) {
     switch (status) {
     case 200: return "OK";
     case 201: return "Created";
+    case 202: return "Accepted";
     case 204: return "No Content";
     case 206: return "Partial Content";
     case 400: return "Bad Request";

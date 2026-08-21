@@ -163,6 +163,39 @@ struct CatalogueConfig {
 };
 
 
+
+struct IngestConfig {
+    bool enabled{false};
+    // Host-local scratch used by acquisition producers (currently BitTorrent).
+    // External filesystem imports may stream directly from their source path.
+    std::filesystem::path staging_path;
+    uint64_t staging_limit{100ULL * 1024 * 1024 * 1024};
+    std::vector<std::filesystem::path> source_roots;
+    size_t copy_chunk_bytes{1024 * 1024};
+    uint64_t checkpoint_bytes{64ULL * 1024 * 1024};
+    std::chrono::milliseconds blocked_retry{5000};
+};
+
+struct TorrentSearchProviderConfig {
+    bool enabled{true};
+    std::string name;
+    std::string type{"torznab"};
+    std::string url;
+    std::optional<std::filesystem::path> api_key_file;
+    size_t max_results{100};
+};
+
+struct TorrentConfig {
+    bool enabled{false};
+    size_t max_active{4};
+    uint64_t max_download_rate{}; // bytes/s, 0 = unlimited
+    uint64_t max_upload_rate{};   // bytes/s, 0 = unlimited
+    bool dht{true};
+    bool pex{true};
+    bool lsd{true};
+    std::vector<TorrentSearchProviderConfig> search_providers;
+};
+
 struct StreamingConfig {
     bool enabled{};
     // libav is linked into Macha. temp_path is only an overflow store for old
@@ -205,6 +238,8 @@ struct Config {
     FilesystemConfig filesystem;
     FuseConfig fuse;
     CatalogueConfig catalogue;
+    IngestConfig ingest;
+    TorrentConfig torrent;
     StreamingConfig streaming;
     HydrationConfig hydration;
 

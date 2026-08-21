@@ -229,6 +229,44 @@ catalogue:
     max_queued_connections: 128
     stream_chunk_bytes: 256K
 
+# Persistent host-side ingest. Jobs may point at a regular file or recursively
+# import a directory (for example, a temporarily mounted USB disk). The source
+# path must be beneath one of source_roots unless it is an internal acquisition
+# producer such as BitTorrent. Planned namespace destinations and byte offsets
+# are checkpointed so jobs can pause/resume and survive daemon restarts.
+ingest:
+  enabled: false
+  staging_path: /var/lib/macha/tmp/ingest
+  staging_limit: 100G
+  source_roots:
+    - /mnt/import
+    - /media
+  copy_chunk_bytes: 1M
+  checkpoint_bytes: 64M
+  blocked_retry_ms: 5000
+
+# Optional BitTorrent acquisition. libtorrent-rasterbar >= 2.0 is detected at
+# build time. Completed torrents are submitted to the generic ingest engine;
+# torrent code does not write directly into the catalogue or Macha namespace.
+torrent:
+  enabled: false
+  max_active: 4
+  max_download_rate: 0B  # 0 = unlimited
+  max_upload_rate: 0B    # 0 = unlimited
+  dht: true
+  pex: true
+  lsd: true
+
+  # Search providers are server-side only. Torznab responses are reduced to
+  # typed result fields and acquisition URLs remain opaque to the frontend.
+  search:
+    providers:
+      # - name: prowlarr
+      #   type: torznab
+      #   url: http://127.0.0.1:9696/api/v1/search
+      #   api_key_file: /etc/macha-prowlarr.key
+      #   max_results: 100
+
 # Playback API and media transformation. Macha links libavformat/libavcodec
 # directly and reads the pinned logical Macha file through a custom AVIOContext.
 # No ffmpeg/ffprobe subprocess or loopback media source is involved.

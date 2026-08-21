@@ -274,6 +274,61 @@ std::string embedded_artwork_mime(std::span<const uint8_t> bytes) {
     return {};
 }
 
+void apply_format_audio_metadata(AVFormatContext* format, std::string_view path,
+                                 MediaProbe& probe,
+                                 std::vector<LocalArtworkCandidate>& artwork,
+                                 size_t max_artwork_bytes) {
+    probe.title = metadata_value(format, {"title"});
+    probe.album_artist = metadata_value(format, {"album artist", "album_artist", "albumartist"});
+    probe.track_artist = metadata_value(format, {"artist"});
+    probe.artist = probe.album_artist.empty() ? probe.track_artist : probe.album_artist;
+    probe.album = metadata_value(format, {"album"});
+    if (auto value = metadata_value(format, {"track", "tracknumber"}); !value.empty())
+        probe.track = leading_integer(value);
+    if (auto value = metadata_value(format, {"disc", "discnumber"}); !value.empty())
+        probe.disc = leading_integer(value);
+    if (auto value = metadata_value(format, {"date", "year"}); !value.empty())
+        probe.year = year_from(value);
+
+    auto optional_tag = [&](std::initializer_list<std::string_view> keys)
+        -> std::optional<std::string> {
+        auto value = metadata_value(format, keys);
+        if (value.empty()) return {};
+        return value;
+    };
+    probe.musicbrainz_recording_id = optional_tag(
+        {"musicbrainz track id", "musicbrainz_trackid", "musicbrainz recording id",
+         "musicbrainz_recordingid"});
+    probe.musicbrainz_release_id = optional_tag(
+        {"musicbrainz album id", "musicbrainz_albumid", "musicbrainz release id",
+         "musicbrainz_releaseid"});
+    probe.musicbrainz_artist_id = optional_tag(
+        {"musicbrainz artist id", "musicbrainz_artistid"});
+
+    if (max_artwork_bytes == 0) return;
+    for (unsigned i = 0; i < format->nb_streams; ++i) {
+        auto* stream = format->streams[i];
+        if (!stream || !(stream->disposition & AV_DISPOSITION_ATTACHED_PIC)) continue;
+        const auto& picture = stream->attached_pic;
+        if (!picture.data || picture.size <= 0) continue;
+        const auto size = static_cast<size_t>(picture.size);
+        if (size > max_artwork_bytes) {
+            Log::debug("catalogue embedded artwork ignored path=" + std::string(path) +
+                       " bytes=" + std::to_string(size) + " limit=" +
+                       std::to_string(max_artwork_bytes));
+            continue;
+        }
+        auto picture_bytes = std::span<const uint8_t>(picture.data, size);
+        auto mime = embedded_artwork_mime(picture_bytes);
+        if (mime.empty()) continue;
+        Bytes bytes(picture_bytes.begin(), picture_bytes.end());
+        const bool duplicate = std::any_of(artwork.begin(), artwork.end(), [&](const auto& existing) {
+            return existing.bytes == bytes;
+        });
+        if (!duplicate) artwork.push_back({"cover", std::move(mime), std::move(bytes)});
+    }
+}
+
 void apply_audio_metadata(FileSystem& fs, std::string_view path, const FsEntry& entry,
                           MediaProbe& probe, std::vector<LocalArtworkCandidate>& artwork,
                           size_t max_artwork_bytes) {
@@ -305,55 +360,7 @@ void apply_audio_metadata(FileSystem& fs, std::string_view path, const FsEntry& 
         return;
     }
 
-    probe.title = metadata_value(format, {"title"});
-    probe.album_artist = metadata_value(format, {"album artist", "album_artist", "albumartist"});
-    probe.track_artist = metadata_value(format, {"artist"});
-    probe.artist = probe.album_artist.empty() ? probe.track_artist : probe.album_artist;
-    probe.album = metadata_value(format, {"album"});
-    if (auto value = metadata_value(format, {"track", "tracknumber"}); !value.empty())
-        probe.track = leading_integer(value);
-    if (auto value = metadata_value(format, {"disc", "discnumber"}); !value.empty())
-        probe.disc = leading_integer(value);
-    if (auto value = metadata_value(format, {"date", "year"}); !value.empty())
-        probe.year = year_from(value);
-
-    auto optional_tag = [&](std::initializer_list<std::string_view> keys)
-        -> std::optional<std::string> {
-        auto value = metadata_value(format, keys);
-        if (value.empty()) return {};
-        return value;
-    };
-    probe.musicbrainz_recording_id = optional_tag(
-        {"musicbrainz track id", "musicbrainz_trackid", "musicbrainz recording id",
-         "musicbrainz_recordingid"});
-    probe.musicbrainz_release_id = optional_tag(
-        {"musicbrainz album id", "musicbrainz_albumid", "musicbrainz release id",
-         "musicbrainz_releaseid"});
-    probe.musicbrainz_artist_id = optional_tag(
-        {"musicbrainz artist id", "musicbrainz_artistid"});
-
-    for (unsigned i = 0; i < format->nb_streams; ++i) {
-        auto* stream = format->streams[i];
-        if (!(stream->disposition & AV_DISPOSITION_ATTACHED_PIC)) continue;
-        const auto& picture = stream->attached_pic;
-        if (!picture.data || picture.size <= 0) continue;
-        const auto size = static_cast<size_t>(picture.size);
-        if (size > max_artwork_bytes) {
-            Log::debug("catalogue embedded artwork ignored path=" + std::string(path) +
-                       " bytes=" + std::to_string(size) + " limit=" +
-                       std::to_string(max_artwork_bytes));
-            continue;
-        }
-        auto picture_bytes = std::span<const uint8_t>(picture.data, size);
-        auto mime = embedded_artwork_mime(picture_bytes);
-        if (mime.empty()) continue;
-        Bytes bytes(picture_bytes.begin(), picture_bytes.end());
-        const bool duplicate = std::any_of(artwork.begin(), artwork.end(), [&](const auto& existing) {
-            return existing.bytes == bytes;
-        });
-        if (!duplicate) artwork.push_back({"cover", std::move(mime), std::move(bytes)});
-    }
-
+    apply_format_audio_metadata(format, path, probe, artwork, max_artwork_bytes);
     avformat_close_input(&format);
     avio_context_free(&io);
 }
@@ -1361,6 +1368,33 @@ std::vector<MediaProbeCandidate> probe_media_candidates(std::string_view path,
     return probe_media_candidates(MediaProbeContext{root, path, entry, nullptr});
 }
 
+std::vector<MediaProbeCandidate> probe_host_media_candidates(const std::filesystem::path& path,
+                                                             uint64_t size) {
+    FsEntry entry;
+    entry.type = EntryType::file;
+    entry.size = size;
+
+    std::optional<MediaProbe> embedded;
+    const auto ext = lower(path.extension().string());
+    if (audio_extension(ext)) {
+        AVFormatContext* format = nullptr;
+        const auto opened = avformat_open_input(&format, path.string().c_str(), nullptr, nullptr);
+        if (opened >= 0 && format) {
+            MediaProbe probe;
+            probe.kind = MediaProbeKind::track;
+            probe.path = path.generic_string();
+            std::vector<LocalArtworkCandidate> ignored_artwork;
+            // Ingest only needs identity fields for placement. Artwork is read again
+            // by the ordinary catalogue scanner after the namespace write.
+            apply_format_audio_metadata(format, probe.path, probe, ignored_artwork, 0);
+            embedded = std::move(probe);
+        }
+        if (format) avformat_close_input(&format);
+    }
+    return probe_media_candidates(MediaProbeContext{{}, path.generic_string(), entry,
+                                                     embedded ? &*embedded : nullptr});
+}
+
 std::optional<MediaProbe> probe_media_path(std::string_view path, const FsEntry& entry) {
     auto candidates = probe_media_candidates(path, entry);
     if (candidates.empty()) return {};
@@ -1387,6 +1421,13 @@ RemoteHttpResponse CurlHttpClient::get(std::string_view url, const std::vector<s
     std::pair<Bytes*, size_t> sink{&out.body, maximum_bytes};
     const auto owned_url = std::string(url);
     curl_easy_setopt(curl.get(), CURLOPT_URL, owned_url.c_str());
+#if LIBCURL_VERSION_NUM >= 0x075500
+    curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(curl.get(), CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+    curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    curl_easy_setopt(curl.get(), CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
     curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl.get(), CURLOPT_MAXREDIRS, 5L);
     curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, 5000L);
