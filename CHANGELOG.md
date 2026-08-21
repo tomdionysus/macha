@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.14.0 - 2026-08-21
+
+- add a persistent, coalescing catalogue hint queue under `state_path/catalogue/hints.json`; namespace discovery, namespace-mutation scans, explicit rescans and ingest completion are producers, while catalogue provider workers consume path work independently of full-tree traversal; successful matches are reconciled in batches so a provider batch still costs one catalogue-root/metadata commit rather than one commit per file;
+- prioritise catalogue hints by source (`ingest` 100, manual rescan 80, namespace mutation 50, periodic scan 10) and schedule equal-priority work fairly across top-level catalogue roots; duplicate canonical paths coalesce, per-origin provenance is retained, stronger producers raise priority, and unchanged terminal negative results are reused until media identity changes or an explicit rescan reopens them;
+- preserve full namespace scans as the only destructive reconciliation authority: hint processing is additive/idempotent, while complete scans still prune vanished scanner-owned bindings and partial scans suppress pruning;
+- make ingest completion observable through catalogue results. Completed namespace files enqueue high-priority hints, ingest jobs remain `cataloguing` until their hints become terminal, then report matched/no-match/failed catalogue counts and per-file hint details through the acquisition API;
+- add `GET /api/v1/catalogue/hints` for queue diagnostics and expose hint provenance, priority, retry state, provider result and catalogue item IDs;
+- replace automatic post-copy source deletion with explicit terminal-job `clear` semantics. Macha-owned torrent staging is retained after successful ingest by default and deleted when the completed job is cleared; cancelled owned acquisitions delete partial/staging payloads immediately; external filesystem sources are preserved by default; when external-source deletion is explicitly enabled, only files in the persisted completed ingest plan are removed and unrelated files in the submitted tree are retained;
+- add configurable ingest cleanup policy (`delete_owned_source_on_clear`, `delete_external_source_on_clear`, `delete_owned_source_on_cancel`) and per-filesystem-job `delete_source_on_clear` override;
+- make torrent jobs expose a distinct `cataloguing` phase, propagate linked ingest catalogue status and add terminal `clear` handling for torrent and generic ingest jobs;
+- migrate persisted 0.13.x completed ingest jobs back through the catalogue-hint phase once after upgrade so already-imported media is reconsidered;
+- tolerate a null/comment-only `torrent.search.providers:` YAML node as an empty provider list and make the example configuration unambiguous with `providers: []`.
+
 ## 0.13.2 - 2026-08-21
 
 - Fix libtorrent 2.1 builds under warnings-as-errors by removing use of the deprecated `torrent_flags::override_web_seeds` flag. Macha already strips magnet web-seed parameters and clears `.torrent` `url_seeds` before adding the torrent, preserving the hostile-input boundary without deprecated API.

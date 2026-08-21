@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "catalogue.hpp"
+#include "catalogue_hints.hpp"
 #include "catalogue_api.hpp"
 #include "acquisition_api.hpp"
 #include "ingest.hpp"
@@ -24,6 +25,7 @@ class Service {
     CatalogueManager catalogue_;
     PlaybackTracker playback_;
     FileSystem fs_;
+    CatalogueHintQueue catalogue_hints_;
     CatalogueScanner scanner_;
     HydrationManager hydration_;
     IngestManager ingest_;
@@ -59,6 +61,9 @@ class Service {
     }
     CatalogueManager& catalogue() {
         return catalogue_;
+    }
+    CatalogueHintQueue& catalogue_hints() {
+        return catalogue_hints_;
     }
     HydrationManager& hydration() {
         return hydration_;

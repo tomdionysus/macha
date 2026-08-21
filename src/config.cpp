@@ -523,6 +523,14 @@ void parse_ingest(const YAML::Node& root, Config& c) {
     if (ingest["checkpoint_bytes"]) c.ingest.checkpoint_bytes = yaml_size(ingest["checkpoint_bytes"]);
     if (ingest["blocked_retry_ms"])
         c.ingest.blocked_retry = milliseconds(ingest["blocked_retry_ms"], "ingest.blocked_retry_ms");
+    if (auto cleanup = ingest["cleanup"]) {
+        if (cleanup["delete_owned_source_on_clear"])
+            c.ingest.delete_owned_source_on_clear = cleanup["delete_owned_source_on_clear"].as<bool>();
+        if (cleanup["delete_external_source_on_clear"])
+            c.ingest.delete_external_source_on_clear = cleanup["delete_external_source_on_clear"].as<bool>();
+        if (cleanup["delete_owned_source_on_cancel"])
+            c.ingest.delete_owned_source_on_cancel = cleanup["delete_owned_source_on_cancel"].as<bool>();
+    }
     if (auto roots = ingest["source_roots"]) {
         if (!roots.IsSequence()) throw std::runtime_error("ingest.source_roots must be a sequence");
         c.ingest.source_roots.clear();
@@ -543,19 +551,24 @@ void parse_torrent(const YAML::Node& root, Config& c) {
     if (torrent["lsd"]) c.torrent.lsd = torrent["lsd"].as<bool>();
     if (auto search = torrent["search"]) {
         if (auto providers = search["providers"]) {
-            if (!providers.IsSequence())
-                throw std::runtime_error("torrent.search.providers must be a sequence");
-            c.torrent.search_providers.clear();
-            for (const auto& value : providers) {
-                TorrentSearchProviderConfig provider;
-                if (value["enabled"]) provider.enabled = value["enabled"].as<bool>();
-                if (value["name"]) provider.name = value["name"].as<std::string>();
-                if (value["type"]) provider.type = value["type"].as<std::string>();
-                if (value["url"]) provider.url = value["url"].as<std::string>();
-                if (value["api_key_file"])
-                    provider.api_key_file = std::filesystem::path(value["api_key_file"].as<std::string>());
-                if (value["max_results"]) provider.max_results = value["max_results"].as<size_t>();
-                c.torrent.search_providers.push_back(std::move(provider));
+            // YAML `providers:` with only commented examples is a null node.
+            // Treat it exactly like an empty list rather than rejecting an
+            // otherwise valid torrent configuration.
+            if (!providers.IsNull()) {
+                if (!providers.IsSequence())
+                    throw std::runtime_error("torrent.search.providers must be a sequence");
+                c.torrent.search_providers.clear();
+                for (const auto& value : providers) {
+                    TorrentSearchProviderConfig provider;
+                    if (value["enabled"]) provider.enabled = value["enabled"].as<bool>();
+                    if (value["name"]) provider.name = value["name"].as<std::string>();
+                    if (value["type"]) provider.type = value["type"].as<std::string>();
+                    if (value["url"]) provider.url = value["url"].as<std::string>();
+                    if (value["api_key_file"])
+                        provider.api_key_file = std::filesystem::path(value["api_key_file"].as<std::string>());
+                    if (value["max_results"]) provider.max_results = value["max_results"].as<size_t>();
+                    c.torrent.search_providers.push_back(std::move(provider));
+                }
             }
         }
     }

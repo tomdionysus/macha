@@ -134,6 +134,7 @@ Json file_json(const IngestFileProgress& file) {
     o["source_mtime_ns"] = file.source_mtime_ns;
     o["completed"] = file.completed;
     o["skipped"] = file.skipped;
+    o["catalogue_candidate"] = file.catalogue_candidate;
     return o;
 }
 
@@ -144,12 +145,18 @@ Json job_json(const IngestJob& job) {
     o["source_ref"] = job.source_ref;
     o["display_name"] = job.display_name;
     o["source_path"] = job.source_path.string();
-    o["remove_source_on_complete"] = job.remove_source_on_complete;
+    o["source_owned"] = job.source_owned;
+    o["delete_source_on_clear"] = job.delete_source_on_clear;
     o["state"] = ingest_job_state_name(job.state);
     o["bytes_total"] = job.bytes_total;
     o["bytes_completed"] = job.bytes_completed;
     o["files_total"] = static_cast<uint64_t>(job.files_total);
     o["files_completed"] = static_cast<uint64_t>(job.files_completed);
+    o["catalogue_total"] = static_cast<uint64_t>(job.catalogue_total);
+    o["catalogue_pending"] = static_cast<uint64_t>(job.catalogue_pending);
+    o["catalogue_catalogued"] = static_cast<uint64_t>(job.catalogue_catalogued);
+    o["catalogue_no_match"] = static_cast<uint64_t>(job.catalogue_no_match);
+    o["catalogue_failed"] = static_cast<uint64_t>(job.catalogue_failed);
     o["current_file"] = job.current_file;
     o["current_destination"] = job.current_destination;
     o["created_unix_ms"] = job.created_unix_ms;
@@ -187,6 +194,7 @@ IngestFileProgress parse_file(const Json& value) {
     if (const auto* mtime = value.find("source_mtime_ns")) file.source_mtime_ns = mtime->asInt64();
     file.completed = json_bool(value, "completed");
     file.skipped = json_bool(value, "skipped");
+    file.catalogue_candidate = json_bool(value, "catalogue_candidate", !sidecar_extension(file.source_path));
     return file;
 }
 
@@ -197,12 +205,19 @@ IngestJob parse_job(const Json& value) {
     job.source_ref = json_string(value, "source_ref");
     job.display_name = json_string(value, "display_name");
     job.source_path = json_string(value, "source_path");
-    job.remove_source_on_complete = json_bool(value, "remove_source_on_complete");
+    job.source_owned = json_bool(value, "source_owned", job.source_type == "torrent");
+    job.delete_source_on_clear = json_bool(
+        value, "delete_source_on_clear", json_bool(value, "remove_source_on_complete", false));
     if (auto parsed = parse_ingest_job_state(json_string(value, "state"))) job.state = *parsed;
     job.bytes_total = json_u64(value, "bytes_total");
     job.bytes_completed = json_u64(value, "bytes_completed");
     job.files_total = static_cast<size_t>(json_u64(value, "files_total"));
     job.files_completed = static_cast<size_t>(json_u64(value, "files_completed"));
+    job.catalogue_total = static_cast<size_t>(json_u64(value, "catalogue_total"));
+    job.catalogue_pending = static_cast<size_t>(json_u64(value, "catalogue_pending"));
+    job.catalogue_catalogued = static_cast<size_t>(json_u64(value, "catalogue_catalogued"));
+    job.catalogue_no_match = static_cast<size_t>(json_u64(value, "catalogue_no_match"));
+    job.catalogue_failed = static_cast<size_t>(json_u64(value, "catalogue_failed"));
     job.current_file = json_string(value, "current_file");
     job.current_destination = json_string(value, "current_destination");
     job.created_unix_ms = json_u64(value, "created_unix_ms");
@@ -221,6 +236,7 @@ std::string ingest_job_state_name(IngestJobState state) {
     case IngestJobState::queued: return "queued";
     case IngestJobState::scanning: return "scanning";
     case IngestJobState::importing: return "importing";
+    case IngestJobState::cataloguing: return "cataloguing";
     case IngestJobState::paused: return "paused";
     case IngestJobState::blocked: return "blocked";
     case IngestJobState::completed: return "completed";
@@ -234,6 +250,7 @@ std::optional<IngestJobState> parse_ingest_job_state(std::string_view state) {
     if (state == "queued") return IngestJobState::queued;
     if (state == "scanning") return IngestJobState::scanning;
     if (state == "importing") return IngestJobState::importing;
+    if (state == "cataloguing") return IngestJobState::cataloguing;
     if (state == "paused") return IngestJobState::paused;
     if (state == "blocked") return IngestJobState::blocked;
     if (state == "completed") return IngestJobState::completed;
@@ -298,8 +315,9 @@ StagingStatus StagingArea::status() const {
     return out;
 }
 
-IngestManager::IngestManager(NodeRuntime& node, FileSystem& fs, IngestConfig config)
-    : node_(node), fs_(fs), config_(std::move(config)), staging_(config_),
+IngestManager::IngestManager(NodeRuntime& node, FileSystem& fs, CatalogueHintQueue& hints,
+                             IngestConfig config)
+    : node_(node), fs_(fs), hints_(hints), config_(std::move(config)), staging_(config_),
       state_file_(node_.config().state_path / "ingest" / "jobs.json") {
     if (config_.enabled) {
         std::filesystem::create_directories(state_file_.parent_path());
@@ -311,27 +329,47 @@ IngestManager::IngestManager(NodeRuntime& node, FileSystem& fs, IngestConfig con
 IngestManager::~IngestManager() { stop(); }
 
 void IngestManager::load_state() {
-    std::lock_guard lock(mutex_);
-    std::ifstream in(state_file_, std::ios::binary);
-    if (!in) return;
-    std::ostringstream text;
-    text << in.rdbuf();
-    try {
-        auto root = Json::parse(text.str());
-        const auto* jobs = root.find("jobs");
-        if (!jobs) return;
-        for (const auto& value : jobs->asArray()) {
-            auto job = parse_job(value);
-            if (job.id.empty()) continue;
-            // Work interrupted by daemon exit is restartable. Explicit pauses and
-            // terminal states remain exactly as the operator left them.
-            if (job.state == IngestJobState::scanning || job.state == IngestJobState::importing)
-                job.state = IngestJobState::queued;
-            jobs_[job.id] = std::move(job);
+    std::vector<std::pair<std::string, std::string>> migration_hints;
+    {
+        std::lock_guard lock(mutex_);
+        std::ifstream in(state_file_, std::ios::binary);
+        if (!in) return;
+        std::ostringstream text;
+        text << in.rdbuf();
+        try {
+            auto root = Json::parse(text.str());
+            const auto version = json_u64(root, "version", 1);
+            const auto* jobs = root.find("jobs");
+            if (!jobs) return;
+            for (const auto& value : jobs->asArray()) {
+                auto job = parse_job(value);
+                if (job.id.empty()) continue;
+                // Work interrupted by daemon exit is restartable. Explicit pauses and
+                // terminal states remain exactly as the operator left them.
+                if (job.state == IngestJobState::scanning || job.state == IngestJobState::importing)
+                    job.state = IngestJobState::queued;
+
+                // 0.13.x completed an ingest before catalogue work was observable.
+                // Promote those jobs back to the catalogue phase once so existing
+                // completed imports are repaired automatically after upgrade.
+                if (version < 2 && job.state == IngestJobState::completed) {
+                    bool queued_catalogue = false;
+                    for (const auto& file : job.files) {
+                        if (file.completed && file.catalogue_candidate) {
+                            migration_hints.emplace_back(job.id, file.destination_path);
+                            queued_catalogue = true;
+                        }
+                    }
+                    if (queued_catalogue) job.state = IngestJobState::cataloguing;
+                }
+                jobs_[job.id] = std::move(job);
+            }
+        } catch (const std::exception& e) {
+            Log::warn("ingest state ignored: " + std::string(e.what()));
         }
-    } catch (const std::exception& e) {
-        Log::warn("ingest state ignored: " + std::string(e.what()));
     }
+    for (const auto& [job_id, path] : migration_hints)
+        (void)hints_.submit(path, "ingest", job_id, CatalogueHintPriority::ingest);
 }
 
 void IngestManager::save_state_locked() const {
@@ -340,7 +378,7 @@ void IngestManager::save_state_locked() const {
     jobs.reserve(jobs_.size());
     for (const auto& [_, job] : jobs_) jobs.push_back(job_json(job));
     Json::Object root;
-    root["version"] = static_cast<uint64_t>(1);
+    root["version"] = static_cast<uint64_t>(2);
     root["jobs"] = std::move(jobs);
     const auto text = Json(std::move(root)).dump();
     const auto temp = state_file_.string() + ".tmp";
@@ -386,6 +424,9 @@ void IngestManager::reconfigure(IngestConfig config) {
     config_.blocked_retry = config.blocked_retry;
     config_.source_roots = std::move(config.source_roots);
     config_.staging_limit = config.staging_limit;
+    config_.delete_owned_source_on_clear = config.delete_owned_source_on_clear;
+    config_.delete_external_source_on_clear = config.delete_external_source_on_clear;
+    config_.delete_owned_source_on_cancel = config.delete_owned_source_on_cancel;
     staging_.reconfigure_limit(config.staging_limit);
 }
 
@@ -397,8 +438,9 @@ bool IngestManager::allowed_external_source(const std::filesystem::path& path) c
 
 std::string IngestManager::submit_path(const std::filesystem::path& source,
                                        std::string source_type, std::string source_ref,
-                                       std::string display_name, bool remove_source_on_complete,
-                                       bool trusted_internal_source) {
+                                       std::string display_name,
+                                       std::optional<bool> delete_source_on_clear,
+                                       bool trusted_internal_source, bool source_owned) {
     if (!config_.enabled) throw std::runtime_error("ingest is disabled");
     const auto normalized = existing_real_path(source);
     if (!trusted_internal_source && !allowed_external_source(normalized))
@@ -416,7 +458,9 @@ std::string IngestManager::submit_path(const std::filesystem::path& source,
     job.source_ref = std::move(source_ref);
     job.display_name = display_name.empty() ? normalized.filename().string() : std::move(display_name);
     job.source_path = normalized;
-    job.remove_source_on_complete = remove_source_on_complete;
+    job.source_owned = source_owned;
+    job.delete_source_on_clear = delete_source_on_clear.value_or(
+        source_owned ? config_.delete_owned_source_on_clear : config_.delete_external_source_on_clear);
     job.created_unix_ms = job.updated_unix_ms = now_ms();
 
     {
@@ -451,7 +495,9 @@ bool IngestManager::pause(std::string_view id) {
     std::lock_guard lock(mutex_);
     auto it = jobs_.find(std::string(id));
     if (it == jobs_.end()) return false;
-    if (it->second.state == IngestJobState::completed || it->second.state == IngestJobState::cancelled ||
+    if (it->second.state == IngestJobState::cataloguing ||
+        it->second.state == IngestJobState::completed ||
+        it->second.state == IngestJobState::cancelled ||
         it->second.state == IngestJobState::failed)
         return false;
     it->second.state = IngestJobState::paused;
@@ -478,6 +524,73 @@ bool IngestManager::resume(std::string_view id) {
     return true;
 }
 
+void IngestManager::cleanup_source(const IngestJob& job) {
+    if (job.source_path.empty()) return;
+    if (job.source_owned) {
+        if (!staging_.contains(job.source_path))
+            throw std::runtime_error("refusing to delete owned ingest source outside staging area");
+        std::error_code ec;
+        if (!std::filesystem::exists(job.source_path, ec)) return;
+        ec.clear();
+        if (std::filesystem::is_directory(job.source_path, ec) && !ec)
+            std::filesystem::remove_all(job.source_path, ec);
+        else {
+            ec.clear();
+            std::filesystem::remove(job.source_path, ec);
+        }
+        if (ec) throw std::runtime_error("cannot remove owned ingest source: " + ec.message());
+        return;
+    }
+
+    if (!allowed_external_source(job.source_path))
+        throw std::runtime_error("refusing to delete ingest source outside configured source roots");
+
+    // External directories may contain files that were not recognised or
+    // imported. Clear is move-like only for the files in the persisted ingest
+    // plan; never remove an arbitrary source tree wholesale. Empty directories
+    // are pruned afterwards, stopping at the submitted source root.
+    std::vector<std::filesystem::path> imported;
+    imported.reserve(job.files.size());
+    for (const auto& file : job.files) {
+        if (!file.completed || file.source_path.empty()) continue;
+        const auto source = existing_real_path(file.source_path);
+        if (!path_under(source, job.source_path) || !allowed_external_source(source))
+            throw std::runtime_error("refusing to delete planned source outside submitted ingest root");
+        imported.push_back(source);
+    }
+    std::sort(imported.begin(), imported.end(), [](const auto& a, const auto& b) {
+        return a.native().size() > b.native().size();
+    });
+    for (const auto& source : imported) {
+        std::error_code ec;
+        std::filesystem::remove(source, ec);
+        if (ec && ec != std::errc::no_such_file_or_directory)
+            throw std::runtime_error("cannot remove imported source file: " + ec.message());
+    }
+
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(job.source_path, ec)) return;
+    ec.clear();
+    std::vector<std::filesystem::path> parents;
+    for (const auto& source : imported) {
+        auto parent = source.parent_path();
+        while (path_under(parent, job.source_path) && parent != job.source_path) {
+            parents.push_back(parent);
+            parent = parent.parent_path();
+        }
+    }
+    std::sort(parents.begin(), parents.end(), [](const auto& a, const auto& b) {
+        return a.native().size() > b.native().size();
+    });
+    parents.erase(std::unique(parents.begin(), parents.end()), parents.end());
+    for (const auto& parent : parents) {
+        ec.clear();
+        (void)std::filesystem::remove(parent, ec); // only succeeds when empty
+    }
+    ec.clear();
+    (void)std::filesystem::remove(job.source_path, ec); // submitted directory, if now empty
+}
+
 bool IngestManager::cancel(std::string_view id) {
     IngestJob cancelled;
     bool active = false;
@@ -495,13 +608,137 @@ bool IngestManager::cancel(std::string_view id) {
         active = active_job_id_ == it->first;
         save_state_locked();
     }
-    if (!active) cleanup_partials(cancelled);
+    if (!active) {
+        cleanup_partials(cancelled);
+        if (cancelled.source_owned && config_.delete_owned_source_on_cancel) {
+            try { cleanup_source(cancelled); }
+            catch (const std::exception& e) {
+                Log::warn("ingest cancel source cleanup failed id=" + cancelled.id + ": " + e.what());
+            }
+        }
+    }
     cv_.notify_all();
     return true;
 }
 
+bool IngestManager::clear(std::string_view id) {
+    IngestJob terminal_job;
+    {
+        std::lock_guard lock(mutex_);
+        auto it = jobs_.find(std::string(id));
+        if (it == jobs_.end()) return false;
+        if (it->second.state != IngestJobState::completed &&
+            it->second.state != IngestJobState::cancelled &&
+            it->second.state != IngestJobState::failed)
+            return false;
+        terminal_job = it->second;
+    }
+
+    const bool delete_source = terminal_job.delete_source_on_clear &&
+        (terminal_job.state == IngestJobState::completed || terminal_job.source_owned);
+    if (delete_source) cleanup_source(terminal_job);
+    cleanup_partials(terminal_job);
+    (void)hints_.erase_origin("ingest", terminal_job.id);
+
+    {
+        std::lock_guard lock(mutex_);
+        auto it = jobs_.find(std::string(id));
+        if (it == jobs_.end()) return false;
+        if (it->second.state != terminal_job.state) return false;
+        jobs_.erase(it);
+        save_state_locked();
+    }
+    Log::info("ingest cleared id=" + terminal_job.id +
+              (delete_source ? " source_deleted=true" : " source_deleted=false"));
+    return true;
+}
+
+CatalogueHintSummary IngestManager::catalogue_summary(std::string_view id) const {
+    return hints_.summary("ingest", id);
+}
+
+bool IngestManager::delete_owned_source_on_clear() const {
+    std::lock_guard lock(mutex_);
+    return config_.delete_owned_source_on_clear;
+}
+
+bool IngestManager::delete_external_source_on_clear() const {
+    std::lock_guard lock(mutex_);
+    return config_.delete_external_source_on_clear;
+}
+
+bool IngestManager::delete_owned_source_on_cancel() const {
+    std::lock_guard lock(mutex_);
+    return config_.delete_owned_source_on_cancel;
+}
+
+void IngestManager::refresh_catalogue_jobs() {
+    std::vector<std::string> ids;
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto& [id, job] : jobs_)
+            if (job.state == IngestJobState::cataloguing) ids.push_back(id);
+    }
+
+    for (const auto& id : ids) {
+        auto summary = hints_.summary("ingest", id);
+        if (!summary.total) {
+            IngestJob job;
+            {
+                std::lock_guard lock(mutex_);
+                auto it = jobs_.find(id);
+                if (it == jobs_.end() || it->second.state != IngestJobState::cataloguing) continue;
+                job = it->second;
+            }
+            enqueue_catalogue_hints(job);
+            summary = hints_.summary("ingest", id);
+        }
+
+        std::lock_guard lock(mutex_);
+        auto it = jobs_.find(id);
+        if (it == jobs_.end() || it->second.state != IngestJobState::cataloguing) continue;
+        auto& job = it->second;
+        const auto previous = std::tuple{job.catalogue_total, job.catalogue_pending,
+                                         job.catalogue_catalogued, job.catalogue_no_match,
+                                         job.catalogue_failed, job.state};
+        job.catalogue_total = summary.total;
+        job.catalogue_pending = summary.pending;
+        job.catalogue_catalogued = summary.catalogued;
+        job.catalogue_no_match = summary.no_match;
+        job.catalogue_failed = summary.failed;
+        if ((summary.total == 0 || summary.pending == 0) && job.files_completed == job.files_total) {
+            job.state = IngestJobState::completed;
+            job.current_file.clear();
+            job.current_destination.clear();
+            job.rate_bytes_per_second = 0;
+            job.eta_seconds = 0;
+            job.error.clear();
+            Log::info("ingest completed id=" + id + " files=" +
+                      std::to_string(job.files_completed) + " catalogue_matched=" +
+                      std::to_string(job.catalogue_catalogued) + " catalogue_no_match=" +
+                      std::to_string(job.catalogue_no_match) + " catalogue_failed=" +
+                      std::to_string(job.catalogue_failed));
+        }
+        const auto current = std::tuple{job.catalogue_total, job.catalogue_pending,
+                                        job.catalogue_catalogued, job.catalogue_no_match,
+                                        job.catalogue_failed, job.state};
+        if (current != previous) {
+            job.updated_unix_ms = now_ms();
+            save_state_locked();
+        }
+    }
+}
+
+void IngestManager::enqueue_catalogue_hints(IngestJob& job) {
+    for (const auto& file : job.files) {
+        if (!file.completed || !file.catalogue_candidate || file.destination_path.empty()) continue;
+        (void)hints_.submit(file.destination_path, "ingest", job.id, CatalogueHintPriority::ingest);
+    }
+}
+
 void IngestManager::loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
+        refresh_catalogue_jobs();
         std::string selected;
         {
             std::unique_lock lock(mutex_);
@@ -532,9 +769,24 @@ void IngestManager::loop(std::stop_token stop) {
             active_job_id_ = selected;
         }
         process_job(selected, stop);
+        IngestJob after;
+        bool have_after = false;
         {
             std::lock_guard lock(mutex_);
             if (active_job_id_ == selected) active_job_id_.clear();
+            if (auto it = jobs_.find(selected); it != jobs_.end()) {
+                after = it->second;
+                have_after = true;
+            }
+        }
+        if (have_after && after.state == IngestJobState::cancelled) {
+            cleanup_partials(after);
+            if (after.source_owned && config_.delete_owned_source_on_cancel) {
+                try { cleanup_source(after); }
+                catch (const std::exception& e) {
+                    Log::warn("ingest cancel source cleanup failed id=" + after.id + ": " + e.what());
+                }
+            }
         }
     }
 }
@@ -546,7 +798,9 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
         auto it = jobs_.find(id);
         if (it == jobs_.end()) return;
         job = it->second;
-        if (job.state == IngestJobState::paused || job.state == IngestJobState::cancelled) return;
+        if (job.state == IngestJobState::paused || job.state == IngestJobState::cancelled ||
+            job.state == IngestJobState::cataloguing)
+            return;
     }
 
     try {
@@ -557,15 +811,14 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
             job.state == IngestJobState::blocked)
             return;
 
-        if (job.remove_source_on_complete) {
-            std::error_code ec;
-            if (std::filesystem::is_directory(job.source_path, ec))
-                std::filesystem::remove_all(job.source_path, ec);
-            else
-                std::filesystem::remove(job.source_path, ec);
-            if (ec) Log::warn("ingest completed but source cleanup failed id=" + job.id + ": " + ec.message());
-        }
-        job.state = IngestJobState::completed;
+        enqueue_catalogue_hints(job);
+        const auto summary = hints_.summary("ingest", job.id);
+        job.catalogue_total = summary.total;
+        job.catalogue_pending = summary.pending;
+        job.catalogue_catalogued = summary.catalogued;
+        job.catalogue_no_match = summary.no_match;
+        job.catalogue_failed = summary.failed;
+        job.state = summary.pending ? IngestJobState::cataloguing : IngestJobState::completed;
         job.current_file.clear();
         job.current_destination.clear();
         job.rate_bytes_per_second = 0;
@@ -577,12 +830,14 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
             jobs_[id] = job;
             save_state_locked();
         }
-        Log::info("ingest completed id=" + id + " files=" + std::to_string(job.files_completed) +
-                  " bytes=" + std::to_string(job.bytes_completed));
+        if (job.state == IngestJobState::cataloguing)
+            Log::info("ingest copied id=" + id + " files=" + std::to_string(job.files_completed) +
+                      " catalogue_pending=" + std::to_string(job.catalogue_pending));
+        else
+            Log::info("ingest completed id=" + id + " files=" + std::to_string(job.files_completed) +
+                      " bytes=" + std::to_string(job.bytes_completed));
     } catch (const std::exception& e) {
         if (stop.stop_requested()) {
-            // Shutdown interruption is recoverable. Any committed hidden partial
-            // is rediscovered by size when this job resumes after restart.
             job.updated_unix_ms = now_ms();
             std::lock_guard lock(mutex_);
             jobs_[id] = job;
@@ -743,6 +998,7 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
         planned.temporary_path = planned.destination_path + ".macha-ingest-" + job.id.substr(0, 12) + ".part";
         planned.size = size;
         planned.source_mtime_ns = host_mtime(source);
+        planned.catalogue_candidate = false;
         job.files.push_back(std::move(planned));
         job.bytes_total += size;
     }
@@ -844,6 +1100,8 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
             if (final.type == EntryType::file && final.size == file.size) {
                 file.copied = file.size;
                 file.completed = true;
+                if (file.catalogue_candidate)
+                    (void)hints_.submit(file.destination_path, "ingest", job.id, CatalogueHintPriority::ingest);
                 refresh_progress(job);
                 return true;
             }
@@ -951,6 +1209,8 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
     if (file.copied != file.size) throw std::runtime_error("ingest committed size mismatch");
     fs_.rename(file.temporary_path, file.destination_path, true);
     file.completed = true;
+    if (file.catalogue_candidate)
+        (void)hints_.submit(file.destination_path, "ingest", job.id, CatalogueHintPriority::ingest);
     ++job.files_completed;
     refresh_progress(job);
     return true;

@@ -1397,6 +1397,19 @@ void test_config() {
             << "        discogs:\n"
             << "          enabled: true\n"
             << "          token_file: " << (t.path() / "discogs.token").string() << "\n"
+            << "ingest:\n"
+            << "  enabled: true\n"
+            << "  staging_path: " << (t.path() / "ingest").string() << "\n"
+            << "  staging_limit: 12G\n"
+            << "  source_roots: [" << (t.path() / "import").string() << "]\n"
+            << "  cleanup:\n"
+            << "    delete_owned_source_on_clear: false\n"
+            << "    delete_external_source_on_clear: true\n"
+            << "    delete_owned_source_on_cancel: false\n"
+            << "torrent:\n"
+            << "  enabled: true\n"
+            << "  search:\n"
+            << "    providers:\n"
             << "streaming:\n"
             << "  enabled: true\n"
             << "  ffmpeg: /legacy/ignored/ffmpeg\n"
@@ -1502,6 +1515,14 @@ void test_config() {
     CHECK(yc.catalogue.scanner.music.discogs.enabled);
     REQUIRE(yc.catalogue.scanner.music.discogs.token_file.has_value());
     CHECK(*yc.catalogue.scanner.music.discogs.token_file == t.path() / "discogs.token");
+    CHECK(yc.ingest.enabled);
+    CHECK(yc.ingest.staging_path == t.path() / "ingest");
+    CHECK(yc.ingest.staging_limit == 12ULL * 1024 * 1024 * 1024);
+    CHECK(!yc.ingest.delete_owned_source_on_clear);
+    CHECK(yc.ingest.delete_external_source_on_clear);
+    CHECK(!yc.ingest.delete_owned_source_on_cancel);
+    CHECK(yc.torrent.enabled);
+    CHECK(yc.torrent.search_providers.empty());
     CHECK(yc.streaming.enabled);
     REQUIRE(yc.streaming.temp_path.has_value());
     CHECK(*yc.streaming.temp_path == t.path() / "streams");
@@ -4839,7 +4860,7 @@ void test_media_probe_and_online_catalogue_scanner() {
     music_art_config.music.musicbrainz.contact = "https://example.test/macha";
     music_art_config.music.discogs.enabled = false;
     music_art_config.max_provider_requests_per_scan = 8;
-    CatalogueScanner music_art_scanner(service.node(), service.filesystem(), service.catalogue(),
+    CatalogueScanner music_art_scanner(service.node(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
                                        music_art_config, std::move(music_art_http));
     CHECK(music_art_scanner.scan_once() == 1);
     auto music_album = service.catalogue().get("musicbrainz:album:rg-tagged-1");
@@ -4911,7 +4932,7 @@ void test_media_probe_and_online_catalogue_scanner() {
     scanner_config.movies.tmdb.token_file = scanner_token;
     scanner_config.tv.enabled = false;
     scanner_config.music.enabled = false;
-    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(),
+    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
                              scanner_config, std::move(fake_http));
     const auto namespace_before_scan = service.filesystem().namespace_signature();
     CHECK(scanner.scan_once() == 1);
@@ -5020,7 +5041,7 @@ void test_media_probe_and_online_catalogue_scanner() {
     auto* blocking_http_ptr = blocking_http.get();
     auto cancel_config = scanner_config;
     cancel_config.movies.roots = {"/Movies"};
-    CatalogueScanner cancel_scanner(service.node(), service.filesystem(), service.catalogue(),
+    CatalogueScanner cancel_scanner(service.node(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
                                     cancel_config, std::move(blocking_http));
     cancel_scanner.start();
     REQUIRE(wait_until([&] { return blocking_http_ptr->entered(); }, 1s));
@@ -5066,7 +5087,7 @@ void test_media_probe_and_online_catalogue_scanner() {
     budget_config.movies.roots = {"/Budget"};
     budget_config.max_provider_requests_per_scan = 4;
     budget_config.provider_batch_delay = 1000ms;
-    CatalogueScanner budget_scanner(service.node(), service.filesystem(), service.catalogue(),
+    CatalogueScanner budget_scanner(service.node(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
                                     budget_config, std::move(budget_http));
     CHECK(budget_scanner.scan_once() == 2);
     CHECK(budget_http_ptr->requests() == 4);
@@ -5117,7 +5138,7 @@ void test_media_probe_and_online_catalogue_scanner() {
     fair_config.music.roots = {"/FairMusic"};
     fair_config.music.musicbrainz.enabled = true;
     fair_config.max_provider_requests_per_scan = 3;
-    CatalogueScanner fair_scanner(service.node(), service.filesystem(), service.catalogue(),
+    CatalogueScanner fair_scanner(service.node(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
                                   fair_config, std::move(fair_http));
     CHECK(fair_scanner.scan_once() == 0);
     CHECK(fair_http_ptr->requests() == 3);
@@ -5177,6 +5198,171 @@ void test_catalogue_cache_ignores_unrelated_metadata_generation() {
     CHECK(after_repair->title == "Cached Movie");
 
     node.stop();
+}
+
+
+void test_catalogue_hint_queue_persistence_coalescing_and_priority() {
+    TempDir temp;
+    const auto state = temp.path() / "hint-state";
+
+    std::string no_match_id;
+    {
+        CatalogueHintQueue hints(state);
+        no_match_id = hints.submit("/Movies/Unknown.mkv", "scanner", "macha:rev-a",
+                                   CatalogueHintPriority::periodic_scan);
+        CHECK(hints.submit("//Movies//Unknown.mkv", "scanner", "macha:rev-a",
+                           CatalogueHintPriority::periodic_scan) == no_match_id);
+        REQUIRE(hints.list().size() == 1);
+        auto claimed = hints.claim_next();
+        REQUIRE(claimed.has_value());
+        CHECK(claimed->id == no_match_id);
+        hints.mark_no_match(no_match_id, "movies", "macha:rev-a", "no provider match");
+
+        // An unchanged namespace observation must reuse the terminal negative
+        // result rather than reopening provider work merely because its source
+        // or scan pass is different.
+        CHECK(hints.submit("/Movies/Unknown.mkv", "namespace", "macha:rev-a",
+                           CatalogueHintPriority::namespace_mutation) == no_match_id);
+        auto unchanged = hints.get(no_match_id);
+        REQUIRE(unchanged.has_value());
+        CHECK(unchanged->state == CatalogueHintState::no_match);
+
+        // Replacing bytes at the same path changes the stable media id and
+        // therefore reopens the coalesced work item at the stronger priority.
+        hints.submit("/Movies/Unknown.mkv", "namespace", "macha:rev-b",
+                     CatalogueHintPriority::namespace_mutation);
+        auto changed = hints.get(no_match_id);
+        REQUIRE(changed.has_value());
+        CHECK(changed->state == CatalogueHintState::queued);
+        CHECK(changed->priority == CatalogueHintPriority::namespace_mutation);
+        auto replacement = hints.claim_next();
+        REQUIRE(replacement.has_value());
+        hints.mark_no_match(replacement->id, "movies", "macha:rev-b", "still unmatched");
+
+        // Manual work always reopens terminal state; an ingest occurrence then
+        // raises the same canonical-path item to the highest current priority.
+        hints.submit("/Movies/Unknown.mkv", "manual", "manual:1",
+                     CatalogueHintPriority::manual_rescan);
+        hints.submit("/Movies/Unknown.mkv", "ingest", "job-1",
+                     CatalogueHintPriority::ingest);
+        auto coalesced = hints.get(no_match_id);
+        REQUIRE(coalesced.has_value());
+        CHECK(coalesced->state == CatalogueHintState::queued);
+        CHECK(coalesced->priority == CatalogueHintPriority::ingest);
+        CHECK(hints.summary("ingest", "job-1").pending == 1);
+        CHECK(hints.erase_origin("ingest", "job-1") == 1);
+        auto lowered = hints.get(no_match_id);
+        REQUIRE(lowered.has_value());
+        CHECK(lowered->priority == CatalogueHintPriority::manual_rescan);
+        hints.submit("/Movies/Unknown.mkv", "ingest", "job-1", CatalogueHintPriority::ingest);
+        auto in_flight = hints.claim_next();
+        REQUIRE(in_flight.has_value());
+        CHECK(in_flight->id == no_match_id);
+    }
+
+    // A claimed item is persisted as processing. Restart recovery must make it
+    // eligible again instead of losing work that was in-flight at daemon exit.
+    {
+        CatalogueHintQueue hints(state);
+        auto recovered = hints.get(no_match_id);
+        REQUIRE(recovered.has_value());
+        CHECK(recovered->state == CatalogueHintState::queued);
+    }
+
+    // Equal-priority work is fair across top-level catalogue roots rather than
+    // allowing a large Movies backlog to starve TV or Music indefinitely.
+    const auto fairness_state = temp.path() / "fairness-state";
+    CatalogueHintQueue fair(fairness_state);
+    fair.submit("/Movies/A.mkv", "scanner", "macha:a", 10);
+    fair.submit("/Movies/B.mkv", "scanner", "macha:b", 10);
+    fair.submit("/TV/Show/S01E01.mkv", "scanner", "macha:c", 10);
+    auto first = fair.claim_next();
+    auto second = fair.claim_next();
+    REQUIRE(first.has_value());
+    REQUIRE(second.has_value());
+    CHECK(first->path.starts_with("/Movies/"));
+    CHECK(second->path.starts_with("/TV/"));
+}
+
+void test_ingest_catalogue_feedback_and_external_clear_cleanup() {
+    TempDir temp;
+    auto keyfile = temp.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(temp.path() / "node", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.catalogue.scanner.enabled = false;
+    config.catalogue.scanner.movies.enabled = true;
+    config.catalogue.scanner.movies.roots = {"/Movies"};
+    config.catalogue.scanner.tv.enabled = false;
+    config.catalogue.scanner.music.enabled = false;
+    config.ingest.enabled = false; // use the explicit manager below
+
+    Service service(config, keys);
+    service.start();
+
+    const auto source_root = temp.path() / "external-import";
+    std::filesystem::create_directories(source_root);
+    const auto media = source_root / "Queue Test Movie 2024.mkv";
+    const auto unrelated = source_root / "do-not-delete.txt";
+    {
+        std::ofstream out(media, std::ios::binary);
+        auto bytes = pattern(512 * 1024);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+    }
+    {
+        std::ofstream out(unrelated);
+        out << "external source material not selected for ingest\n";
+    }
+
+    IngestConfig ingest_config;
+    ingest_config.enabled = true;
+    ingest_config.staging_path = temp.path() / "staging";
+    ingest_config.source_roots = {source_root};
+    ingest_config.copy_chunk_bytes = 64 * 1024;
+    ingest_config.checkpoint_bytes = 256 * 1024;
+    ingest_config.delete_external_source_on_clear = true;
+    IngestManager ingest(service.node(), service.filesystem(), service.catalogue_hints(),
+                         ingest_config);
+    ingest.start();
+    const auto job_id = ingest.submit_path(source_root);
+
+    REQUIRE(wait_until([&] {
+        auto job = ingest.job(job_id);
+        return job && job->state == IngestJobState::cataloguing;
+    }, 10s));
+    auto summary = service.catalogue_hints().summary("ingest", job_id);
+    REQUIRE(summary.total == 1);
+    REQUIRE(summary.pending == 1);
+    auto hint = service.catalogue_hints().claim_next();
+    REQUIRE(hint.has_value());
+    CHECK(hint->origins.size() == 1);
+    service.catalogue_hints().mark_catalogued(
+        hint->id, "movies", "macha:test-ingest-media", {"test:movie:queue"}, "synthetic match");
+
+    REQUIRE(wait_until([&] {
+        auto job = ingest.job(job_id);
+        return job && job->state == IngestJobState::completed;
+    }, 5s));
+    auto completed = ingest.job(job_id);
+    REQUIRE(completed.has_value());
+    CHECK(completed->catalogue_total == 1);
+    CHECK(completed->catalogue_pending == 0);
+    CHECK(completed->catalogue_catalogued == 1);
+    CHECK(completed->catalogue_no_match == 0);
+    CHECK(completed->catalogue_failed == 0);
+
+    REQUIRE(ingest.clear(job_id));
+    CHECK(!ingest.job(job_id).has_value());
+    CHECK(!std::filesystem::exists(media));
+    CHECK(std::filesystem::exists(unrelated));
+    CHECK(std::filesystem::exists(source_root));
+    CHECK(service.catalogue_hints().summary("ingest", job_id).total == 0);
+
+    ingest.stop();
+    service.stop();
 }
 
 void test_catalogue_warm_read_defers_remote_refresh() {
@@ -5268,7 +5454,8 @@ void test_catalogue_warm_read_defers_remote_refresh() {
     CHECK(after.metadata_generation == after.known_metadata_generation);
     CHECK(!catalogue2.refresh_needed());
 
-    CatalogueApi api(catalogue2);
+    CatalogueHintQueue catalogue2_hints(t.path() / "catalogue2-hints");
+    CatalogueApi api(catalogue2, catalogue2_hints);
     auto status_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/status",
                                        .query = {},
@@ -5630,7 +5817,7 @@ void test_catalogue_sync_search_and_artwork_gc() {
                !s3.node().local_store().has(first_art.id);
     }, 10s));
 
-    CatalogueApi api(s3.catalogue());
+    CatalogueApi api(s3.catalogue(), s3.catalogue_hints());
     auto status_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/status",
                                        .query = {},
@@ -6793,6 +6980,8 @@ int main() {
         test_cache_hydrator_fetches_to_persistent_cache();
         test_media_probe_and_online_catalogue_scanner();
         test_catalogue_cache_ignores_unrelated_metadata_generation();
+        test_catalogue_hint_queue_persistence_coalescing_and_priority();
+        test_ingest_catalogue_feedback_and_external_clear_cleanup();
         test_catalogue_warm_read_defers_remote_refresh();
         test_metadata_decoded_cache_ttl_recovers_missed_notice();
         test_catalogue_root_ready_without_local_artwork();

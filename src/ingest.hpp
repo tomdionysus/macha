@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "catalogue_hints.hpp"
 #include "config.hpp"
 #include "filesystem.hpp"
 
@@ -21,6 +22,7 @@ enum class IngestJobState {
     queued,
     scanning,
     importing,
+    cataloguing,
     paused,
     blocked,
     completed,
@@ -40,6 +42,7 @@ struct IngestFileProgress {
     int64_t source_mtime_ns{};
     bool completed{};
     bool skipped{};
+    bool catalogue_candidate{true};
 };
 
 struct IngestJob {
@@ -48,12 +51,18 @@ struct IngestJob {
     std::string source_ref;
     std::string display_name;
     std::filesystem::path source_path;
-    bool remove_source_on_complete{};
+    bool source_owned{};
+    bool delete_source_on_clear{};
     IngestJobState state{IngestJobState::queued};
     uint64_t bytes_total{};
     uint64_t bytes_completed{};
     size_t files_total{};
     size_t files_completed{};
+    size_t catalogue_total{};
+    size_t catalogue_pending{};
+    size_t catalogue_catalogued{};
+    size_t catalogue_no_match{};
+    size_t catalogue_failed{};
     std::string current_file;
     std::string current_destination;
     uint64_t rate_bytes_per_second{};
@@ -94,6 +103,7 @@ class StagingArea {
 class IngestManager {
     NodeRuntime& node_;
     FileSystem& fs_;
+    CatalogueHintQueue& hints_;
     IngestConfig config_;
     StagingArea staging_;
     std::filesystem::path state_file_;
@@ -112,6 +122,9 @@ class IngestManager {
     bool copy_file(IngestJob&, IngestFileProgress&, std::stop_token);
     void refresh_progress(IngestJob&, uint64_t sample_bytes = 0,
                           std::chrono::steady_clock::duration sample_time = {});
+    void refresh_catalogue_jobs();
+    void enqueue_catalogue_hints(IngestJob&);
+    void cleanup_source(const IngestJob&);
     std::string choose_destination(const std::filesystem::path&, uint64_t);
     bool allowed_external_source(const std::filesystem::path&) const;
     void ensure_namespace_parents(std::string_view path);
@@ -120,7 +133,7 @@ class IngestManager {
     void cleanup_partials(const IngestJob&);
 
   public:
-    IngestManager(NodeRuntime&, FileSystem&, IngestConfig);
+    IngestManager(NodeRuntime&, FileSystem&, CatalogueHintQueue&, IngestConfig);
     ~IngestManager();
 
     void start();
@@ -133,13 +146,19 @@ class IngestManager {
                             std::string source_type = "filesystem",
                             std::string source_ref = {},
                             std::string display_name = {},
-                            bool remove_source_on_complete = false,
-                            bool trusted_internal_source = false);
+                            std::optional<bool> delete_source_on_clear = {},
+                            bool trusted_internal_source = false,
+                            bool source_owned = false);
     std::vector<IngestJob> jobs() const;
     std::optional<IngestJob> job(std::string_view id) const;
     bool pause(std::string_view id);
     bool resume(std::string_view id);
     bool cancel(std::string_view id);
+    bool clear(std::string_view id);
+    CatalogueHintSummary catalogue_summary(std::string_view id) const;
+    bool delete_owned_source_on_clear() const;
+    bool delete_external_source_on_clear() const;
+    bool delete_owned_source_on_cancel() const;
     StagingArea& staging() noexcept { return staging_; }
     const StagingArea& staging() const noexcept { return staging_; }
 };

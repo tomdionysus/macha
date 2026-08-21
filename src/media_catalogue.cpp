@@ -2322,9 +2322,11 @@ std::optional<ProviderMatch> MusicScanProvider::lookup(const MediaProbe& probe) 
     return {};
 }
 
-CatalogueScanner::CatalogueScanner(NodeRuntime& node, FileSystem& fs, CatalogueManager& catalogue,
-                                   CatalogueScannerConfig config, std::unique_ptr<HttpClient> http)
-    : node_(node), fs_(fs), catalogue_(catalogue), config_(std::move(config)),
+CatalogueScanner::CatalogueScanner(NodeRuntime& node, FileSystem& fs,
+                                   CatalogueManager& catalogue, CatalogueHintQueue& hints,
+                                   CatalogueScannerConfig config,
+                                   std::unique_ptr<HttpClient> http)
+    : node_(node), fs_(fs), catalogue_(catalogue), hints_(hints), config_(std::move(config)),
       http_(http ? std::move(http) : std::make_unique<CurlHttpClient>()),
       provider_http_(std::make_unique<BudgetHttpClient>(*http_)) {
     configure_providers();
@@ -2333,7 +2335,6 @@ CatalogueScanner::~CatalogueScanner() { stop(); }
 
 void CatalogueScanner::configure_providers() {
     providers_.clear();
-    provider_resume_after_.clear();
     if (config_.movies.enabled)
         providers_.push_back(std::make_unique<MovieScanProvider>(*provider_http_, config_.movies));
     if (config_.tv.enabled)
@@ -2354,6 +2355,7 @@ void CatalogueScanner::start() {
     std::lock_guard lock(config_mutex_);
     if (!config_.enabled || worker_.joinable()) return;
     http_->reset_stop();
+    hints_.requeue_processing();
     worker_ = std::jthread([this](std::stop_token stop) { loop(stop); });
 }
 void CatalogueScanner::request_stop() {
@@ -2395,19 +2397,324 @@ void CatalogueScanner::walk(std::string_view root,
     }
 }
 
-size_t CatalogueScanner::scan_once() { return scan_once({}, false); }
+CatalogueScanProvider* CatalogueScanner::provider_for_path(std::string_view path,
+                                                           std::string& root) const {
+    CatalogueScanProvider* selected = nullptr;
+    size_t selected_root_length = 0;
+    const auto normalized = normalize_path(std::string(path));
+    for (const auto& provider : providers_) {
+        for (const auto& candidate_root_value : provider->roots()) {
+            const auto candidate_root = normalize_path(candidate_root_value);
+            const bool under = normalized == candidate_root ||
+                (normalized.size() > candidate_root.size() &&
+                 normalized.starts_with(candidate_root) &&
+                 normalized[candidate_root.size()] == '/');
+            if (!under || candidate_root.size() < selected_root_length) continue;
+            selected = provider.get();
+            selected_root_length = candidate_root.size();
+            root = candidate_root;
+        }
+    }
+    return selected;
+}
 
-size_t CatalogueScanner::scan_once(std::stop_token stop, bool force) {
+std::optional<CatalogueScanner::PreparedHintMatch>
+CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop) {
+    if (stop.stop_requested()) return {};
+    CatalogueScannerConfig config;
+    {
+        std::lock_guard lock(config_mutex_);
+        config = config_;
+    }
+
+    std::string root;
+    auto* provider = provider_for_path(hint.path, root);
+    if (!provider) {
+        hints_.mark_no_match(hint.id, {}, {}, "path is outside configured catalogue roots");
+        return {};
+    }
+
+    FsEntry entry;
+    try {
+        entry = fs_.getattr(hint.path);
+    } catch (const FsError& e) {
+        if (e.code() == ENOENT) {
+            hints_.fail(hint.id, "namespace path no longer exists");
+            return {};
+        }
+        throw;
+    }
+    if (entry.type != EntryType::file || entry.size == 0) {
+        hints_.mark_no_match(hint.id, std::string(provider->name()), {},
+                             "namespace path is not a non-empty media file");
+        return {};
+    }
+
+    auto probed = provider->probe_file(fs_, root, hint.path, entry);
+    if (stop.stop_requested()) return {};
+    if (probed.candidates.empty()) {
+        hints_.mark_no_match(hint.id, std::string(provider->name()), {},
+                             "no supported media candidate");
+        return {};
+    }
+    const auto media_id = probed.candidates.front().probe.media_id;
+
+    // A duplicate hint for media already bound to the catalogue is cheap: no
+    // remote provider lookup is required. Embedded artwork can still be merged.
+    auto existing = catalogue_.snapshot();
+    std::vector<std::string> existing_ids;
+    std::optional<CatalogueItem> artwork_target;
+    for (const auto& [id, item] : existing.items) {
+        if (std::find(item.media_ids.begin(), item.media_ids.end(), media_id) == item.media_ids.end())
+            continue;
+        existing_ids.push_back(id);
+        if (!probed.artwork.empty()) {
+            if (item.kind == CatalogueKind::track && item.parent_id) {
+                if (auto parent = existing.items.find(*item.parent_id); parent != existing.items.end())
+                    artwork_target = parent->second;
+            } else {
+                artwork_target = item;
+            }
+        }
+    }
+    if (!existing_ids.empty()) {
+        std::vector<CatalogueItem> updates;
+        if (artwork_target) {
+            bool changed = false;
+            for (const auto& art : probed.artwork) {
+                auto staged = catalogue_.stage_artwork(art.role, art.mime_type, art.bytes);
+                const bool duplicate = std::any_of(
+                    artwork_target->artwork.begin(), artwork_target->artwork.end(),
+                    [&](const auto& current) {
+                        return current.role == staged.role && current.id == staged.id;
+                    });
+                if (!duplicate) {
+                    artwork_target->artwork.push_back(std::move(staged));
+                    changed = true;
+                }
+            }
+            if (changed) updates.push_back(std::move(*artwork_target));
+        }
+        return PreparedHintMatch{hint.id, std::string(provider->name()), media_id,
+                                 std::move(existing_ids), std::move(updates),
+                                 "already catalogued", hint.attempts};
+    }
+
+    constexpr size_t max_candidate_attempts = 5;
+    std::optional<ProviderMatch> selected_match;
+    const MediaProbeCandidate* selected_candidate = nullptr;
+    size_t attempted = 0;
+    std::string last_error;
+    for (const auto& candidate : probed.candidates) {
+        if (stop.stop_requested()) return {};
+        if (attempted >= max_candidate_attempts) break;
+        ++attempted;
+        try {
+            auto match = provider->lookup(candidate.probe);
+            if (match) {
+                selected_match = std::move(match);
+                selected_candidate = &candidate;
+                break;
+            }
+        } catch (const ProviderBudgetExhausted&) {
+            hints_.defer(hint.id, "provider request budget exhausted",
+                         unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
+            return {};
+        } catch (const ProviderTemporarilyUnavailable& e) {
+            hints_.defer(hint.id, e.what(),
+                         unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
+            Log::warn("catalogue hint provider temporarily unavailable provider=" +
+                      std::string(provider->name()) + " path=" + hint.path + ": " + e.what());
+            return {};
+        } catch (const std::exception& e) {
+            last_error = e.what();
+            Log::warn("catalogue hint lookup failed provider=" + std::string(provider->name()) +
+                      " path=" + hint.path + " candidate=" + candidate.generator + ": " + e.what());
+        }
+    }
+
+    if (!selected_match || !selected_candidate) {
+        if (!last_error.empty()) {
+            if (hint.attempts >= 5)
+                hints_.fail(hint.id, last_error);
+            else
+                hints_.defer(hint.id, last_error,
+                             unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
+            return {};
+        }
+        std::string result = "no metadata provider match";
+        if (attempted > 1) result += " after " + std::to_string(attempted) + " candidates";
+        hints_.mark_no_match(hint.id, std::string(provider->name()), media_id, std::move(result));
+        Log::debug("catalogue hint: no provider match path=" + hint.path +
+                   " provider=" + std::string(provider->name()));
+        return {};
+    }
+
+    auto match = std::move(*selected_match);
+    const auto& probe = selected_candidate->probe;
+    std::string local_artwork_target;
+    for (const auto& item : match.items) {
+        if (item.kind != CatalogueKind::track) continue;
+        if (std::find(item.media_ids.begin(), item.media_ids.end(), probe.media_id) ==
+            item.media_ids.end())
+            continue;
+        local_artwork_target = item.parent_id.value_or(item.id);
+        break;
+    }
+    if (!local_artwork_target.empty() && !probed.artwork.empty()) {
+        auto target = std::find_if(match.items.begin(), match.items.end(), [&](const auto& item) {
+            return item.id == local_artwork_target;
+        });
+        if (target != match.items.end()) {
+            for (const auto& art : probed.artwork) {
+                try {
+                    auto staged = catalogue_.stage_artwork(art.role, art.mime_type, art.bytes);
+                    const bool duplicate = std::any_of(
+                        target->artwork.begin(), target->artwork.end(), [&](const auto& current) {
+                            return current.role == staged.role && current.id == staged.id;
+                        });
+                    if (!duplicate) target->artwork.push_back(std::move(staged));
+                } catch (const std::exception& e) {
+                    Log::warn("catalogue embedded artwork failed for " + hint.path + ": " + e.what());
+                }
+            }
+        }
+    }
+
+    std::set<std::tuple<std::string, std::string, std::string>> fetched_remote_artwork;
+    for (const auto& art : match.artwork) {
+        if (stop.stop_requested()) return {};
+        if (!fetched_remote_artwork.emplace(art.item_id, art.role, art.url).second) continue;
+        auto target = std::find_if(match.items.begin(), match.items.end(), [&](const auto& item) {
+            return item.id == art.item_id;
+        });
+        if (target == match.items.end()) continue;
+        if (auto old = existing.items.find(art.item_id); old != existing.items.end()) {
+            const auto locked = old->second.external_ids.find("macha_metadata_locked");
+            if (locked != old->second.external_ids.end() && locked->second == "1") continue;
+        }
+        try {
+            auto response = http_->get(art.url, {}, config.max_artwork_bytes);
+            if (response.status != 200 || response.body.empty()) continue;
+            auto mime = response.content_type;
+            if (auto semi = mime.find(';'); semi != std::string::npos) mime.resize(semi);
+            if (!mime.starts_with("image/")) continue;
+            auto staged = catalogue_.stage_artwork(art.role, mime, response.body);
+            const bool duplicate = std::any_of(
+                target->artwork.begin(), target->artwork.end(), [&](const auto& current) {
+                    return current.role == staged.role && current.id == staged.id;
+                });
+            if (!duplicate) target->artwork.push_back(std::move(staged));
+        } catch (const std::exception& e) {
+            if (stop.stop_requested()) return {};
+            Log::warn("catalogue artwork failed for " + art.item_id + ": " + e.what());
+        }
+    }
+
+    std::vector<std::string> item_ids;
+    item_ids.reserve(match.items.size());
+    for (const auto& item : match.items) item_ids.push_back(item.id);
+    return PreparedHintMatch{hint.id, std::string(provider->name()), probe.media_id,
+                             std::move(item_ids), std::move(match.items),
+                             "matched " + selected_candidate->generator, hint.attempts};
+}
+
+CatalogueScanner::HintBatchResult
+CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
+    CatalogueScannerConfig config;
+    {
+        std::lock_guard lock(config_mutex_);
+        config = config_;
+    }
+    auto* budget_http = dynamic_cast<BudgetHttpClient*>(provider_http_.get());
+    if (!budget_http) throw std::runtime_error("catalogue provider HTTP budget unavailable");
+
+    HintBatchResult out;
+    std::vector<PreparedHintMatch> prepared;
+    prepared.reserve(max_hints);
+    for (; out.claimed < max_hints && !stop.stop_requested() && !budget_http->exhausted();) {
+        auto hint = hints_.claim_next();
+        if (!hint) break;
+        ++out.claimed;
+        try {
+            if (auto match = prepare_hint(*hint, stop)) prepared.push_back(std::move(*match));
+        } catch (const CatalogueConflict& e) {
+            hints_.defer(hint->id, e.what(), unix_ms() + 500);
+        } catch (const std::exception& e) {
+            if (hint->attempts >= 5)
+                hints_.fail(hint->id, e.what());
+            else
+                hints_.defer(hint->id, e.what(),
+                             unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
+            Log::warn("catalogue hint failed path=" + hint->path + ": " + e.what());
+        }
+    }
+    if (stop.stop_requested()) {
+        hints_.requeue_processing();
+        return out;
+    }
+    if (prepared.empty()) return out;
+
+    std::vector<CatalogueItem> discovered;
+    std::set<std::string> active_media_ids;
+    for (const auto& match : prepared) {
+        active_media_ids.insert(match.media_id);
+        discovered.insert(discovered.end(), match.items.begin(), match.items.end());
+    }
+
+    try {
+        if (!discovered.empty())
+            catalogue_.reconcile_scanner(discovered, active_media_ids, false);
+    } catch (const CatalogueConflict& e) {
+        for (const auto& match : prepared)
+            hints_.defer(match.hint_id, e.what(), unix_ms() + 500);
+        return out;
+    } catch (const std::exception& e) {
+        for (const auto& match : prepared) {
+            if (match.attempts >= 5)
+                hints_.fail(match.hint_id, e.what());
+            else
+                hints_.defer(match.hint_id, e.what(),
+                             unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
+        }
+        Log::warn("catalogue hint batch reconcile failed: " + std::string(e.what()));
+        return out;
+    }
+
+    for (auto& match : prepared) {
+        hints_.mark_catalogued(match.hint_id, std::move(match.provider), std::move(match.media_id),
+                               std::move(match.catalogue_item_ids), std::move(match.result));
+        ++out.catalogued;
+    }
+    if (out.catalogued)
+        Log::info("catalogue hint batch matched " + std::to_string(out.catalogued) + " media files");
+    return out;
+}
+
+size_t CatalogueScanner::scan_once() {
+    (void)scan_once({}, false, "manual", CatalogueHintPriority::manual_rescan, true);
+    CatalogueScannerConfig config;
+    {
+        std::lock_guard lock(config_mutex_);
+        config = config_;
+    }
+    auto* budget_http = dynamic_cast<BudgetHttpClient*>(provider_http_.get());
+    if (!budget_http) throw std::runtime_error("catalogue provider HTTP budget unavailable");
+    budget_http->reset_budget(config.max_provider_requests_per_scan);
+    constexpr size_t max_hint_batch = 64;
+    return process_hint_batch({}, max_hint_batch).catalogued;
+}
+
+size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
+                                   std::string_view hint_source, int hint_priority,
+                                   bool unique_source_ref) {
     CatalogueScannerConfig config;
     {
         std::lock_guard lock(config_mutex_);
         config = config_;
     }
     if (!config.enabled || (!force && !coordinator()) || stop.stop_requested()) return 0;
-    provider_continuation_.store(false, std::memory_order_relaxed);
-    auto* budget_http = dynamic_cast<BudgetHttpClient*>(provider_http_.get());
-    if (!budget_http) throw std::runtime_error("catalogue provider HTTP budget unavailable");
-    budget_http->reset_budget(config.max_provider_requests_per_scan);
+
     struct ProviderFile {
         CatalogueScanProvider* provider{};
         std::string root;
@@ -2444,341 +2751,82 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force) {
 
     auto existing = catalogue_.snapshot();
     std::set<std::string> bound;
-    std::map<std::string, std::string> bound_artwork_target;
-    for (const auto& [_, item] : existing.items) {
+    for (const auto& [_, item] : existing.items)
         bound.insert(item.media_ids.begin(), item.media_ids.end());
-        if (item.kind == CatalogueKind::track) {
-            const auto target = item.parent_id.value_or(item.id);
-            for (const auto& media_id : item.media_ids) bound_artwork_target[media_id] = target;
-        }
-    }
+
     std::set<std::string> active_media_ids;
-    struct PendingProbe {
-        CatalogueScanProvider* provider{};
-        std::string path;
-        std::vector<MediaProbeCandidate> candidates;
-        std::vector<LocalArtworkCandidate> local_artwork;
-    };
-    struct BoundArtworkUpdate {
-        std::string item_id;
-        std::vector<LocalArtworkCandidate> artwork;
-    };
-    std::vector<PendingProbe> probes;
-    std::vector<BoundArtworkUpdate> bound_artwork_updates;
-    probes.reserve(files.size());
+    std::vector<CatalogueHintSubmission> submissions;
+    submissions.reserve(files.size());
+    const auto scan_ref = unique_source_ref
+        ? std::string(hint_source) + ":" + std::to_string(unix_ms())
+        : std::string{};
     for (const auto& file : files) {
         if (stop.stop_requested()) return 0;
         auto probed = file.provider->probe_file(fs_, file.root, file.path, file.entry);
         if (probed.candidates.empty()) continue;
         const auto media_id = probed.candidates.front().probe.media_id;
         active_media_ids.insert(media_id);
-        if (!bound.contains(media_id)) {
-            probes.push_back({file.provider, file.path, std::move(probed.candidates),
-                              std::move(probed.artwork)});
-        } else if (!probed.artwork.empty()) {
-            if (auto target = bound_artwork_target.find(media_id); target != bound_artwork_target.end())
-                bound_artwork_updates.push_back({target->second, std::move(probed.artwork)});
-        }
+        // Unbound media requires metadata lookup. Bound media with newly visible
+        // embedded artwork still gets a cheap hint so local artwork refreshes
+        // retain the behaviour of the pre-queue scanner without remote lookup.
+        if (!bound.contains(media_id) || !probed.artwork.empty())
+            submissions.push_back({file.path, std::string(hint_source),
+                                   unique_source_ref ? scan_ref : media_id,
+                                   hint_priority});
     }
 
-    std::map<std::string, CatalogueItem> discovered;
-    std::vector<RemoteArtwork> remote_art;
-    size_t matched = 0;
-    size_t provider_items_processed = 0;
-    bool provider_budget_exhausted = false;
-    bool provider_deferred = false;
-
-    struct ProviderQueueItem {
-        const PendingProbe* pending{};
-        size_t candidate_next{};
-        size_t attempted{};
-    };
-    struct ProviderQueue {
-        CatalogueScanProvider* provider{};
-        std::vector<ProviderQueueItem> items;
-        size_t next{};
-    };
-    std::vector<ProviderQueue> provider_queues;
-    provider_queues.reserve(providers_.size());
-    for (const auto& provider : providers_) {
-        ProviderQueue queue;
-        queue.provider = provider.get();
-        for (const auto& pending : probes)
-            if (pending.provider == provider.get()) queue.items.push_back({&pending});
-        std::sort(queue.items.begin(), queue.items.end(), [](const auto& a, const auto& b) {
-            return a.pending->path < b.pending->path;
-        });
-        if (!queue.items.empty()) {
-            const auto resume = provider_resume_after_.find(std::string(provider->name()));
-            if (resume != provider_resume_after_.end() && !resume->second.empty()) {
-                auto first = std::upper_bound(
-                    queue.items.begin(), queue.items.end(), resume->second,
-                    [](const std::string& path, const ProviderQueueItem& item) {
-                        return path < item.pending->path;
-                    });
-                if (first != queue.items.end())
-                    std::rotate(queue.items.begin(), first, queue.items.end());
-            }
-        }
-        provider_queues.push_back(std::move(queue));
-    }
-
-    auto finish_pending = [&](ProviderQueueItem& state,
-                              std::optional<ProviderMatch> match,
-                              const MediaProbeCandidate* selected) {
-        const auto& pending = *state.pending;
-        ++provider_items_processed;
-        provider_resume_after_[std::string(pending.provider->name())] = pending.path;
-
-        const auto& primary = pending.candidates.front();
-        const auto& probe = selected ? selected->probe : primary.probe;
-        if (!match) {
-            std::ostringstream parsed;
-            if (probe.kind == MediaProbeKind::movie) {
-                parsed << "movie title=\"" << probe.title << "\"";
-                if (probe.year) parsed << " year=" << *probe.year;
-                if (probe.edition) parsed << " edition=\"" << *probe.edition << "\"";
-            } else if (probe.kind == MediaProbeKind::episode) {
-                parsed << "episode series=\"" << probe.series << "\"";
-                if (probe.year) parsed << " year=" << *probe.year;
-                if (probe.season) parsed << " season=" << *probe.season;
-                if (probe.episode) parsed << " episode=" << *probe.episode;
-            } else {
-                parsed << "track artist=\"" << probe.artist << "\" album=\""
-                       << probe.album << "\" title=\"" << probe.title << "\"";
-            }
-            parsed << " candidate=" << primary.generator << " score=" << primary.score;
-            if (state.attempted > 1) parsed << " alternatives_tried=" << state.attempted;
-            Log::debug("catalogue: no " + std::string(pending.provider->name()) +
-                       " provider match for " + pending.path + " parsed " + parsed.str());
-            return;
-        }
-        if (selected && selected != &primary) {
-            Log::debug("catalogue: " + std::string(pending.provider->name()) +
-                       " provider matched fallback candidate for " + pending.path +
-                       " generator=" + selected->generator +
-                       " score=" + std::to_string(selected->score));
-        }
-        ++matched;
-        std::string local_artwork_target;
-        for (const auto& item : match->items) {
-            if (item.kind != CatalogueKind::track) continue;
-            if (std::find(item.media_ids.begin(), item.media_ids.end(), probe.media_id) ==
-                item.media_ids.end())
-                continue;
-            local_artwork_target = item.parent_id.value_or(item.id);
-            break;
-        }
-
-        for (auto& item : match->items) {
-            auto [it, inserted] = discovered.emplace(item.id, item);
-            if (!inserted) {
-                for (const auto& media : item.media_ids)
-                    if (std::find(it->second.media_ids.begin(), it->second.media_ids.end(), media) ==
-                        it->second.media_ids.end())
-                        it->second.media_ids.push_back(media);
-            }
-        }
-
-        if (!local_artwork_target.empty() && !pending.local_artwork.empty()) {
-            if (auto it = discovered.find(local_artwork_target); it != discovered.end()) {
-                for (const auto& art : pending.local_artwork) {
-                    try {
-                        auto staged = catalogue_.stage_artwork(art.role, art.mime_type, art.bytes);
-                        const bool duplicate = std::any_of(
-                            it->second.artwork.begin(), it->second.artwork.end(),
-                            [&](const auto& existing_art) {
-                                return existing_art.role == staged.role &&
-                                       existing_art.id == staged.id;
-                            });
-                        if (!duplicate) it->second.artwork.push_back(std::move(staged));
-                    } catch (const std::exception& e) {
-                        Log::warn("catalogue embedded artwork failed for " + pending.path +
-                                  ": " + e.what());
-                    }
-                }
-            }
-        }
-
-        remote_art.insert(remote_art.end(), match->artwork.begin(), match->artwork.end());
-    };
-
-    enum class PendingStepResult {
-        retry,
-        complete,
-        budget_exhausted,
-        provider_unavailable,
-    };
-
-    auto process_pending_step = [&](ProviderQueueItem& state) -> PendingStepResult {
-        const auto& pending = *state.pending;
-        constexpr size_t max_candidate_attempts = 5;
-        if (state.candidate_next >= pending.candidates.size() ||
-            state.attempted >= max_candidate_attempts) {
-            finish_pending(state, {}, nullptr);
-            return PendingStepResult::complete;
-        }
-        if (budget_http->exhausted()) return PendingStepResult::budget_exhausted;
-
-        const auto& candidate = pending.candidates[state.candidate_next];
-        std::optional<ProviderMatch> match;
-        try {
-            match = pending.provider->lookup(candidate.probe);
-        } catch (const ProviderBudgetExhausted&) {
-            return PendingStepResult::budget_exhausted;
-        } catch (const ProviderTemporarilyUnavailable& e) {
-            if (stop.stop_requested()) return PendingStepResult::retry;
-            Log::warn("catalogue " + std::string(pending.provider->name()) +
-                      " provider temporarily unavailable for " + pending.path +
-                      " candidate=" + candidate.generator + ": " + e.what());
-            return PendingStepResult::provider_unavailable;
-        } catch (const std::exception& e) {
-            if (stop.stop_requested()) return PendingStepResult::retry;
-            Log::warn("catalogue " + std::string(pending.provider->name()) +
-                      " lookup failed for " + pending.path + " candidate=" +
-                      candidate.generator + ": " + e.what());
-        }
-        ++state.attempted;
-        ++state.candidate_next;
-
-        if (match) {
-            finish_pending(state, std::move(match), &candidate);
-            return PendingStepResult::complete;
-        }
-        if (state.candidate_next >= pending.candidates.size() ||
-            state.attempted >= max_candidate_attempts) {
-            finish_pending(state, {}, nullptr);
-            return PendingStepResult::complete;
-        }
-        return PendingStepResult::retry;
-    };
-
-    while (!provider_budget_exhausted) {
-        bool advanced = false;
-        for (auto& queue : provider_queues) {
-            if (queue.next >= queue.items.size()) continue;
-            if (budget_http->exhausted()) {
-                provider_budget_exhausted = true;
-                break;
-            }
-            advanced = true;
-            auto result = process_pending_step(queue.items[queue.next]);
-            if (result == PendingStepResult::complete) ++queue.next;
-            if (result == PendingStepResult::provider_unavailable) {
-                provider_deferred = true;
-                queue.next = queue.items.size();
-            }
-            if (stop.stop_requested()) return 0;
-            if (result == PendingStepResult::budget_exhausted || budget_http->exhausted()) {
-                provider_budget_exhausted = true;
-                break;
-            }
-        }
-        if (!advanced) break;
-    }
-
-    if (provider_budget_exhausted || provider_deferred) {
-        provider_continuation_.store(true, std::memory_order_relaxed);
-        if (provider_budget_exhausted) {
-            Log::info("catalogue: provider request budget reached requests=" +
-                      std::to_string(budget_http->used()) + " remaining_media=" +
-                      std::to_string(probes.size() - provider_items_processed));
-        } else {
-            Log::info("catalogue: metadata provider temporarily unavailable; continuation scheduled");
-        }
-    } else {
-        provider_resume_after_.clear();
-    }
-
-    std::set<std::tuple<std::string, std::string, std::string>> fetched_remote_artwork;
-    for (const auto& art : remote_art) {
-        if (stop.stop_requested()) return 0;
-        if (!fetched_remote_artwork.emplace(art.item_id, art.role, art.url).second) continue;
-        CatalogueItem* target = nullptr;
-        if (auto it = discovered.find(art.item_id); it != discovered.end()) target = &it->second;
-        const bool metadata_locked = [&] {
-            auto old = existing.items.find(art.item_id);
-            if (old == existing.items.end()) return false;
-            auto marker = old->second.external_ids.find("macha_metadata_locked");
-            return marker != old->second.external_ids.end() && marker->second == "1";
-        }();
-        if (!target || metadata_locked) continue;
-        try {
-            auto response = http_->get(art.url, {}, config.max_artwork_bytes);
-            if (stop.stop_requested()) return 0;
-            if (response.status != 200 || response.body.empty()) continue;
-            auto mime = response.content_type;
-            if (auto semi = mime.find(';'); semi != std::string::npos) mime.resize(semi);
-            if (!mime.starts_with("image/")) {
-                Log::warn("catalogue artwork returned non-image content for " + art.item_id);
-                continue;
-            }
-            auto staged = catalogue_.stage_artwork(art.role, mime, response.body);
-            const auto same_artwork = [&](const CatalogueArtwork& existing_art) {
-                return existing_art.role == staged.role && existing_art.id == staged.id;
-            };
-            const bool already_discovered = std::any_of(target->artwork.begin(),
-                                                         target->artwork.end(), same_artwork);
-            bool already_existing = false;
-            if (auto it = existing.items.find(art.item_id); it != existing.items.end())
-                already_existing = std::any_of(it->second.artwork.begin(), it->second.artwork.end(),
-                                               same_artwork);
-            if (!already_discovered && !already_existing)
-                target->artwork.push_back(std::move(staged));
-        } catch (const std::exception& e) {
-            if (stop.stop_requested()) return 0;
-            Log::warn("catalogue artwork failed for " + art.item_id + ": " + e.what());
-        }
-    }
-
-    for (const auto& update : bound_artwork_updates) {
-        CatalogueItem* target = nullptr;
-        if (auto it = discovered.find(update.item_id); it != discovered.end()) {
-            target = &it->second;
-        } else if (auto old = existing.items.find(update.item_id); old != existing.items.end()) {
-            target = &discovered.emplace(update.item_id, old->second).first->second;
-        }
-        if (!target) continue;
-        for (const auto& art : update.artwork) {
-            try {
-                auto staged = catalogue_.stage_artwork(art.role, art.mime_type, art.bytes);
-                const bool duplicate = std::any_of(
-                    target->artwork.begin(), target->artwork.end(), [&](const auto& existing_art) {
-                        return existing_art.role == staged.role && existing_art.id == staged.id;
-                    });
-                if (!duplicate) target->artwork.push_back(std::move(staged));
-            } catch (const std::exception& e) {
-                Log::warn("catalogue embedded artwork refresh failed for " + update.item_id +
-                          ": " + e.what());
-            }
-        }
-    }
-
-    std::vector<CatalogueItem> items;
-    items.reserve(discovered.size());
-    for (auto& [_, item] : discovered) items.push_back(std::move(item));
+    const auto ids = hints_.submit_many(std::move(submissions));
     if (stop.stop_requested()) return 0;
-    catalogue_.reconcile_scanner(items, active_media_ids, complete_scan);
-    if (matched) Log::info("catalogue scan matched " + std::to_string(matched) + " media files");
-    return matched;
+    // Discovery is the only destructive catalogue source. Hint processing is
+    // additive and cannot infer absence from a single path.
+    catalogue_.reconcile_scanner({}, active_media_ids, complete_scan);
+    if (!ids.empty())
+        Log::info("catalogue scan queued " + std::to_string(ids.size()) + " media hints");
+    return ids.size();
 }
 
 void CatalogueScanner::loop(std::stop_token stop) {
-    ThreadCpuReporter cpu_reporter("macha-scanner", std::chrono::seconds(5), true);
+    ThreadCpuReporter cpu_reporter("macha-catalogue", std::chrono::seconds(5), true);
     std::optional<Hash256> scanned_namespace;
     std::optional<std::chrono::steady_clock::time_point> mutation_due;
     std::optional<std::chrono::steady_clock::time_point> mutation_first_seen;
     auto observed_generation = node_.known_metadata_generation();
     auto next_periodic = std::chrono::steady_clock::now();
+    auto next_hint_batch = std::chrono::steady_clock::now();
     bool was_coordinator = false;
 
     while (!stop.stop_requested()) {
         CatalogueScannerConfig config;
         { std::lock_guard lock(config_mutex_); config = config_; }
         const auto now = std::chrono::steady_clock::now();
+
+        // Every node may consume its own persistent hints. This makes an ingest
+        // performed on a non-coordinator responsive without requiring catalogue
+        // hint RPC forwarding; catalogue CAS/retry semantics resolve concurrent
+        // additive updates. Only the namespace-wide destructive reconciliation
+        // pass remains coordinator-owned.
+        if (config.enabled && now >= next_hint_batch) {
+            auto* budget_http = dynamic_cast<BudgetHttpClient*>(provider_http_.get());
+            if (!budget_http) throw std::runtime_error("catalogue provider HTTP budget unavailable");
+            budget_http->reset_budget(config.max_provider_requests_per_scan);
+            constexpr size_t max_hint_batch = 64;
+            const auto batch = process_hint_batch(stop, max_hint_batch);
+            if (batch.claimed) {
+                const auto completed = std::chrono::steady_clock::now();
+                next_hint_batch = budget_http->exhausted()
+                    ? completed + config.provider_batch_delay
+                    : completed + std::chrono::milliseconds(25);
+                if (budget_http->exhausted())
+                    Log::info("catalogue hint provider budget reached requests=" +
+                              std::to_string(budget_http->used()));
+            } else {
+                next_hint_batch = now + std::chrono::milliseconds(100);
+            }
+        }
+
         const bool is_coordinator = coordinator();
         if (is_coordinator && !was_coordinator) {
-            mutation_due = now; // a newly elected scanner must establish current state promptly
+            mutation_due = now;
             if (!mutation_first_seen) mutation_first_seen = now;
         }
         was_coordinator = is_coordinator;
@@ -2804,22 +2852,30 @@ void CatalogueScanner::loop(std::stop_token stop) {
                 const bool namespace_changed = !scanned_namespace || before != *scanned_namespace;
                 if (explicit_rescan || periodic_due || namespace_changed) {
                     if (explicit_rescan) {
-                        Log::info("catalogue: explicit metadata reset; rescanning");
+                        Log::info("catalogue: explicit rescan requested");
                     } else if (mutation_rescan_due && namespace_changed && !periodic_due) {
                         if (max_delayed_mutation_due && !debounced_mutation_due)
-                            Log::info("catalogue: namespace mutation max rescan delay reached; rescanning");
+                            Log::info("catalogue: namespace mutation max rescan delay reached; discovering");
                         else
-                            Log::info("catalogue: namespace mutation settled; rescanning");
+                            Log::info("catalogue: namespace mutation settled; discovering");
                     }
-                    (void)scan_once(stop, explicit_rescan);
+                    std::string_view hint_source = "scanner";
+                    int hint_priority = CatalogueHintPriority::periodic_scan;
+                    bool unique_source_ref = false;
+                    if (explicit_rescan) {
+                        hint_source = "manual";
+                        hint_priority = CatalogueHintPriority::manual_rescan;
+                        unique_source_ref = true;
+                    } else if (mutation_rescan_due && namespace_changed) {
+                        hint_source = "namespace";
+                        hint_priority = CatalogueHintPriority::namespace_mutation;
+                    }
+                    (void)scan_once(stop, explicit_rescan, hint_source,
+                                    hint_priority, unique_source_ref);
                     if (stop.stop_requested()) break;
                     uint64_t after_generation = 0;
                     const auto after = fs_.namespace_signature(&after_generation);
-                    scanned_namespace = before;
                     if (after != before) {
-                        // A namespace mutation raced the scan. This scan satisfies
-                        // the previous pending window; start a fresh bounded debounce
-                        // window for the state that arrived while it was running.
                         const auto restart = std::chrono::steady_clock::now();
                         mutation_first_seen = restart;
                         mutation_due = restart + config.rescan_debounce;
@@ -2828,18 +2884,12 @@ void CatalogueScanner::loop(std::stop_token stop) {
                         mutation_due.reset();
                         mutation_first_seen.reset();
                     }
-                    // Record the generation represented by `after`, not a later
-                    // live value. A namespace commit racing immediately after the
-                    // signature read will then be observed on the next loop.
                     observed_generation = after_generation;
-                    const auto completed_at = std::chrono::steady_clock::now();
-                    if (provider_continuation_.exchange(false, std::memory_order_relaxed))
-                        next_periodic = completed_at + config.provider_batch_delay;
-                    else
-                        next_periodic = completed_at + config.interval;
+                    next_periodic = std::chrono::steady_clock::now() + config.interval;
+                    // Newly discovered low-priority hints should be eligible
+                    // immediately after the reconciliation pass.
+                    next_hint_batch = std::min(next_hint_batch, std::chrono::steady_clock::now());
                 } else {
-                    // The metadata generation changed only because catalogue or
-                    // other non-namespace state changed. Suppress a pointless scan.
                     mutation_due.reset();
                     mutation_first_seen.reset();
                 }

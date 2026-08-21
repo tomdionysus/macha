@@ -32,14 +32,15 @@ void log_slow_stage(std::string_view stage, Clock::time_point started,
 Service::Service(Config config, ClusterKeys keys)
     : node_(std::move(config), keys), store_(node_), metadata_(node_),
       catalogue_(node_, store_, metadata_), fs_(node_, store_, metadata_, &playback_),
-      scanner_(node_, fs_, catalogue_, node_.config().catalogue.scanner),
+      catalogue_hints_(node_.config().state_path),
+      scanner_(node_, fs_, catalogue_, catalogue_hints_, node_.config().catalogue.scanner),
       hydration_(store_, playback_, fs_, catalogue_, node_.config().hydration,
                  node_.config().read_ahead_extents),
-      ingest_(node_, fs_, node_.config().ingest),
+      ingest_(node_, fs_, catalogue_hints_, node_.config().ingest),
       torrents_(ingest_, node_.config().torrent, node_.config().state_path),
       torrent_search_(node_.config().torrent),
       acquisition_api_(ingest_, torrents_, torrent_search_),
-      catalogue_api_(catalogue_, [this] { scanner_.request_rescan(); }),
+      catalogue_api_(catalogue_, catalogue_hints_, [this] { scanner_.request_rescan(); }),
       streaming_(fs_, catalogue_, node_.config().catalogue.api, node_.config().streaming) {
     if (node_.config().catalogue.api.enabled) {
         catalogue_http_ = std::make_unique<HttpServer>(

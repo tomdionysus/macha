@@ -179,6 +179,11 @@ struct IngestConfig {
     size_t copy_chunk_bytes{1024 * 1024};
     uint64_t checkpoint_bytes{64ULL * 1024 * 1024};
     std::chrono::milliseconds blocked_retry{5000};
+    // Cleanup policy is applied when a terminal job is explicitly cleared.
+    // "owned" means an internal producer such as the BitTorrent staging tree.
+    bool delete_owned_source_on_clear{true};
+    bool delete_external_source_on_clear{false};
+    bool delete_owned_source_on_cancel{true};
 };
 
 struct TorrentSearchProviderConfig {
