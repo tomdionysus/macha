@@ -1,4 +1,4 @@
-# Macha 0.14.1
+# Macha 0.14.4
 #
 # Copy this file per node. Paths, advertise address and failure_domain are
 # node-local. The cluster key contents and dht policy must match every node.
@@ -146,18 +146,19 @@ bootstrap:
 
 maintenance:
   # Background work is byte-budgeted and adaptive. Foreground I/O wins.
-  interval_ms: 500
+  interval_ms: 1000
   foreground_quiet_ms: 2000
   busy_bandwidth_fraction: 0.0
-  idle_bandwidth_fraction: 0.50
-  cpu_target: 0.35
+  idle_bandwidth_fraction: 0.10
+  cpu_target: 0.10
   initial_bandwidth: 32M
   max_bandwidth: 0B       # 0 = no configured cap; observed rate still applies.
-  scrub_fraction: 0.10
+  scrub_fraction: 0.02
 
   # A settled repair/rebalance/scrub pass backs off instead of rescanning the
-  # complete object set on every scheduler tick.
-  no_progress_backoff_ms: 30000
+  # complete object set. Metadata/catalogue control verification remains capped
+  # at a 30-second cadence independently of this data-plane backoff.
+  no_progress_backoff_ms: 300000
 
   # Recently retired objects and otherwise-unreachable physical objects must
   # remain untouched for this long before reachability GC may reclaim them.

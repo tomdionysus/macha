@@ -1483,6 +1483,10 @@ MetadataSnapshot FileSystem::local_snapshot() const {
     return decode_snapshot(record.payload);
 }
 
+MetadataSnapshotView FileSystem::local_snapshot_view() {
+    return m_.snapshot_view();
+}
+
 std::pair<uint64_t, uint64_t> FileSystem::logical_capacity() const {
     auto ns = n_.membership().active();
     if (ns.empty())

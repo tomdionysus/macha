@@ -146,7 +146,7 @@ Generated init/media fragments are published to memory. `segment_memory_bytes` b
 
 Source inspection is deliberately bounded because a probe may cause distributed extent reads. `probe_bytes` limits libavformat probing, `probe_analyze_duration_ms` limits media-time analysis, and `probe_timeout_ms` is the wall-clock guard for the complete media-representation inspection pass. All candidate media IDs share that deadline. It is propagated into Macha extent reads and outstanding remote object RPCs, so neither multiple representations nor a peer that stops making progress can multiply the session-creation delay. A timed-out probe fails with a stage-specific 503. Successfully probed immutable media IDs are cached.
 
-`maintenance.no_progress_backoff_ms` controls the quiescent backoff used after repair, local rebalance or scrub makes no progress. The default is 30000 ms. This prevents a settled node from repeatedly walking hot metadata merely because its byte credit has reached one extent.
+`maintenance.no_progress_backoff_ms` controls the quiescent backoff after repair, local rebalance, GC or scrub reaches a settled pass. The default is 300000 ms (5 minutes). Metadata/catalogue control verification is still capped at a 30-second cadence. The 0.14.4 idle defaults are `interval_ms: 1000`, `idle_bandwidth_fraction: 0.10`, `cpu_target: 0.10`, and `scrub_fraction: 0.02`; explicitly configured values keep their existing meaning.
 
 Changes to streaming session limits and timing are reloaded by `SIGHUP`. Enabling/disabling streaming, changing fragment-memory/probe policy or changing `temp_path` requires a restart.
 

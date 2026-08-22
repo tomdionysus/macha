@@ -206,6 +206,8 @@ class FileSystem {
                      const std::vector<ExtentRef>&, FsEntry*);
     std::pair<uint64_t, uint64_t> logical_capacity() const;
     MetadataSnapshot local_snapshot() const;
+    MetadataSnapshotView local_snapshot_view();
+    uint64_t known_metadata_generation() const noexcept { return n_.known_metadata_generation(); }
     std::vector<ObjectId> live_objects();
     // Hash only namespace/content identity, deliberately excluding catalogue
     // metadata. CatalogueScanner uses this after a metadata-generation debounce
