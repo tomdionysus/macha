@@ -322,6 +322,7 @@ class CatalogueScanner {
     void stop();
     void reconfigure(CatalogueScannerConfig);
     void request_rescan();
+    size_t request_media_rescan(const std::vector<std::string>& media_ids);
     size_t scan_once();
 };
 

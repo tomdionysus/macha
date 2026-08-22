@@ -92,15 +92,21 @@ class CatalogueHintQueue {
     std::map<std::string, CatalogueHint, std::less<>> hints_; // canonical path -> hint
     std::map<std::string, uint64_t, std::less<>> lane_served_;
     uint64_t schedule_sequence_{};
+    bool state_dirty_{};
+    size_t dirty_updates_{};
+    std::chrono::steady_clock::time_point dirty_since_{};
 
     void load_state();
     void save_state_locked() const;
+    void mark_state_dirty_locked();
+    void persist_dirty_state_locked(bool force = false);
     static bool terminal(CatalogueHintState) noexcept;
     static bool has_origin(const CatalogueHint&, std::string_view, std::string_view);
     void changed_locked();
 
   public:
     explicit CatalogueHintQueue(const std::filesystem::path& state_path);
+    ~CatalogueHintQueue();
 
     std::string submit(std::string path, std::string source, std::string source_ref,
                        int priority);

@@ -2,6 +2,13 @@
 
 ## 0.14.7 - 2026-08-22
 
+- stop Clear Metadata from forcing a full-library catalogue rescan: the mutation now returns the exact immutable media identities it released and queues only those paths for rematching; a definitely absent item returns 404 from current in-memory catalogue state without first entering distributed repair;
+- persist the catalogue scanner's last reconciled namespace identity and next safety-check deadline, so daemon restart or coordinator election does not itself traverse an unchanged library; upgrades without prior scanner state defer one migration reconciliation to the normal safety deadline, after which periodic safety checks compare namespace identity first and walk provider roots only when it actually changed;
+- coalesce terminal catalogue-hint persistence instead of rewriting the complete hints JSON for every matched/no-match item; the durable queue remains at-least-once, with admission/failure boundaries flushed immediately and ordinary worker progress flushed within two seconds or 32 updates;
+- stop the periodic DEBUG catalogue backlog line once `pending=0`; terminal history remains available through the catalogue hint/status API;
+- make playback media-id resolution consume MetadataManager's already-decoded immutable snapshot before falling back to authoritative quorum I/O, and retain a bounded immutable-media HLS VOD-plan cache across sessions;
+- remove the GitHub Actions workflow; contributors still build locally with `MACHA_WARNINGS_AS_ERRORS=ON`.
+- make torrent ingestion compile across libtorrent 2.0/2.1 API variants by using the common throwing `load_torrent_buffer` overload and treating version-specific pre-download torrent states as queued without an exhaustive enum switch.
 - Fix stop-token condition-variable waits that could swallow producer notifications because their predicates were permanently false.
 - Hydration wakeups now carry a monotonic revision, so providers can wake an idle hydrator immediately without reintroducing background polling or losing an event that races with scheduling.
 - Playback session cleanup now wakes correctly when sessions are created, touched, replaced, removed or the idle policy changes; a newly-created session can therefore expire even when the cleanup worker was previously idle.

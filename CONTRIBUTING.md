@@ -18,7 +18,7 @@ Changes to cluster, metadata, storage, crypto, transport or filesystem semantics
 - Prefer clear standard/POSIX interfaces.
 - Keep ownership and thread boundaries explicit.
 - Avoid frameworks, DI containers and new dependencies without a concrete reason.
-- Warnings are errors in CI.
+- Build with `MACHA_WARNINGS_AS_ERRORS=ON` before submitting changes.
 - Use `.clang-format`.
 - Version and document public, wire and on-disk format changes.
 

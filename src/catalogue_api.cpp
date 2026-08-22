@@ -304,9 +304,29 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             if (metadata_suffix != std::string_view::npos && metadata_suffix + 9 == rest.size() &&
                 request.method == "DELETE") {
                 auto id = url_decode(rest.substr(0, metadata_suffix));
-                if (!catalogue_.clear_metadata(id, expected_revision(request)))
+                const auto revision = expected_revision(request);
+                // A known-current negative is a routing/result decision, not a
+                // distributed metadata operation. Avoid a quorum repair merely
+                // to discover that this DELETE is a 404. If the local catalogue
+                // cannot prove the negative from current immutable state, fall
+                // through to the existing strong mutation path.
+                if (catalogue_.definitely_absent(id))
                     return error(404, "not_found", "catalogue item not found");
-                if (request_rescan_) request_rescan_();
+
+                auto cleared = catalogue_.clear_metadata_with_media(id, revision);
+                if (!cleared.removed_items)
+                    return error(404, "not_found", "catalogue item not found");
+                if (request_media_rescan_ && !cleared.media_ids.empty()) {
+                    try {
+                        request_media_rescan_(cleared.media_ids);
+                    } catch (const std::exception& e) {
+                        // The metadata mutation is already committed. Targeted
+                        // rematching is recoverable background work; the normal
+                        // namespace/safety scanner remains the fallback.
+                        Log::warn("catalogue metadata clear rematch enqueue failed: " +
+                                  std::string(e.what()));
+                    }
+                }
                 return {204, "application/json; charset=utf-8", {}, {}};
             }
 

@@ -23,6 +23,27 @@ std::atomic_uint64_t next_write_handle_diagnostic_id{1};
 [[noreturn]] void fail(int c, const std::string& s) {
     throw FsError(c, s);
 }
+Hash256 namespace_signature_for(const MetadataSnapshot& snapshot) {
+    Writer writer;
+    writer.u64(snapshot.entries.size());
+    for (const auto& [path, entry] : snapshot.entries) {
+        writer.string(path);
+        writer.u8(static_cast<uint8_t>(entry.type));
+        if (entry.type != EntryType::file)
+            continue;
+        writer.u64(entry.size);
+        writer.u32(entry.extents.size());
+        for (const auto& extent : entry.extents) {
+            writer.u64(extent.offset);
+            writer.u64(extent.length);
+            writer.u8(extent.hole);
+            if (!extent.hole)
+                writer.fixed(extent.id.bytes);
+        }
+    }
+    return sha256(writer.data());
+}
+
 bool under(const std::string& p, const std::string& r) {
     return p == r || (p.size() > r.size() && p.compare(0, r.size(), r) == 0 && p[r.size()] == '/');
 }
@@ -1289,45 +1310,66 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
         }
     }
 
-    const auto view = m_.snapshot_view();
-    std::lock_guard lock(media_index_mutex_);
+    auto install_and_lookup = [&](const MetadataSnapshotView& view)
+        -> std::optional<std::pair<std::string, FsEntry>> {
+        std::lock_guard lock(media_index_mutex_);
 
-    // Another lookup may have populated this id while snapshot_view() was in
-    // progress. Prefer it if so.
-    if (media_index_valid_ && media_index_snapshot_) {
-        auto found = media_index_.find(std::string(id));
-        if (found != media_index_.end()) {
-            auto entry = media_index_snapshot_->entries.find(found->second);
-            if (entry != media_index_snapshot_->entries.end() &&
-                entry->second.type == EntryType::file &&
-                file_media_id(entry->second) == id)
-                return std::pair{found->second, entry->second};
+        // Another lookup may have populated this id while the snapshot was
+        // acquired. Prefer that immutable hit first.
+        if (media_index_valid_ && media_index_snapshot_) {
+            auto found = media_index_.find(std::string(id));
+            if (found != media_index_.end()) {
+                auto entry = media_index_snapshot_->entries.find(found->second);
+                if (entry != media_index_snapshot_->entries.end() &&
+                    entry->second.type == EntryType::file &&
+                    file_media_id(entry->second) == id)
+                    return std::pair{found->second, entry->second};
+            }
+            if (media_index_namespace_revision_ == view.namespace_revision)
+                return {};
         }
-        if (media_index_generation_ == view.generation)
+
+        std::map<std::string, std::string> next;
+        for (const auto& [path, entry] : view.snapshot->entries) {
+            if (entry.type != EntryType::file)
+                continue;
+            next.emplace(file_media_id(entry), path);
+        }
+        media_index_ = std::move(next);
+        media_index_namespace_revision_ = view.namespace_revision;
+        media_index_snapshot_ = view.snapshot;
+        media_index_valid_ = true;
+        Log::debug("filesystem media index rebuilt namespace_revision=" +
+                   std::to_string(view.namespace_revision) + " metadata_generation=" +
+                   std::to_string(view.generation) + " files=" +
+                   std::to_string(media_index_.size()) + " source=memory");
+
+        auto found = media_index_.find(std::string(id));
+        if (found == media_index_.end())
+            return {};
+        auto entry = media_index_snapshot_->entries.find(found->second);
+        if (entry == media_index_snapshot_->entries.end() || entry->second.type != EntryType::file)
+            return {};
+        return std::pair{found->second, entry->second};
+    };
+
+    // Playback resolution is a data-plane operation. MetadataManager already
+    // owns a decoded immutable view in normal settled operation; use it before
+    // doing any quorum read. A hit is safe even if the view is slightly old
+    // because media IDs are content-derived. A miss is definitive only when the
+    // available view has caught up with every generation this node knows about.
+    if (auto available = m_.available_snapshot_view()) {
+        if (auto found = install_and_lookup(*available))
+            return found;
+        if (available->generation >= n_.known_metadata_generation())
             return {};
     }
 
-    std::map<std::string, std::string> next;
-    for (const auto& [path, entry] : view.snapshot->entries) {
-        if (entry.type != EntryType::file)
-            continue;
-        next.emplace(file_media_id(entry), path);
-    }
-    media_index_ = std::move(next);
-    media_index_generation_ = view.generation;
-    media_index_snapshot_ = view.snapshot;
-    media_index_valid_ = true;
-    Log::debug("filesystem media index rebuilt generation=" +
-               std::to_string(view.generation) + " files=" +
-               std::to_string(media_index_.size()));
-
-    auto found = media_index_.find(std::string(id));
-    if (found == media_index_.end())
-        return {};
-    auto entry = media_index_snapshot_->entries.find(found->second);
-    if (entry == media_index_snapshot_->entries.end() || entry->second.type != EntryType::file)
-        return {};
-    return std::pair{found->second, entry->second};
+    // Only a genuinely stale/missing decoded view may require authoritative
+    // metadata I/O. This preserves correctness for a just-published media ID
+    // without putting routine cold playback behind a multi-second quorum read.
+    const auto authoritative = m_.snapshot_view();
+    return install_and_lookup(authoritative);
 }
 
 std::shared_ptr<ReadHandle> FileSystem::open_read(const std::string& p) {
@@ -1514,24 +1556,16 @@ std::vector<ObjectId> FileSystem::live_objects() {
 Hash256 FileSystem::namespace_signature(uint64_t* metadata_generation) {
     const auto view = m_.snapshot_view();
     if (metadata_generation) *metadata_generation = view.generation;
-    Writer writer;
-    writer.u64(view.snapshot->entries.size());
-    for (const auto& [path, entry] : view.snapshot->entries) {
-        writer.string(path);
-        writer.u8(static_cast<uint8_t>(entry.type));
-        if (entry.type != EntryType::file)
-            continue;
-        writer.u64(entry.size);
-        writer.u32(entry.extents.size());
-        for (const auto& extent : entry.extents) {
-            writer.u64(extent.offset);
-            writer.u64(extent.length);
-            writer.u8(extent.hole);
-            if (!extent.hole)
-                writer.fixed(extent.id.bytes);
-        }
-    }
-    return sha256(writer.data());
+    return namespace_signature_for(*view.snapshot);
+}
+
+std::optional<Hash256> FileSystem::available_namespace_signature(
+    uint64_t* metadata_generation) const {
+    auto view = m_.available_snapshot_view();
+    if (!view)
+        return {};
+    if (metadata_generation) *metadata_generation = view->generation;
+    return namespace_signature_for(*view->snapshot);
 }
 
 std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached() {

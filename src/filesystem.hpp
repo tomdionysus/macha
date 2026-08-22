@@ -163,7 +163,7 @@ class FileSystem {
     std::string resolve_new_path(const std::string&);
 
     std::mutex media_index_mutex_;
-    uint64_t media_index_generation_{};
+    uint64_t media_index_namespace_revision_{};
     bool media_index_valid_{};
     // Keep the immutable snapshot that owns entries referenced by media_index_.
     // Existing content-addressed media ids remain valid across unrelated
@@ -223,6 +223,8 @@ class FileSystem {
     // metadata. CatalogueScanner uses this after a metadata-generation debounce
     // so its own catalogue commits cannot cause a rescan loop.
     Hash256 namespace_signature(uint64_t* metadata_generation = nullptr);
+    std::optional<Hash256> available_namespace_signature(
+        uint64_t* metadata_generation = nullptr) const;
     std::shared_ptr<const MaintenanceObjects> maintenance_objects_cached();
     MaintenanceObjects maintenance_objects();
     DistributedStore& store() {
