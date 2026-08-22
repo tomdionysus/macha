@@ -36,12 +36,14 @@ class PlaybackTracker {
     mutable std::mutex mutex_;
     std::map<uint64_t, PlaybackObservation> sessions_;
     uint64_t next_session_{1};
+    std::function<void()> change_callback_;
 
   public:
     uint64_t open(std::string path, const FsEntry&);
     void progress(uint64_t session, size_t extent_index);
     void close(uint64_t session);
     std::vector<PlaybackObservation> active(std::chrono::milliseconds timeout) const;
+    void set_change_callback(std::function<void()> callback);
 };
 
 struct HydrationHint {
@@ -68,6 +70,10 @@ class HydrationHintProvider {
     virtual ~HydrationHintProvider() = default;
     virtual std::string_view name() const = 0;
     virtual std::vector<HydrationHint> hints() = 0;
+    // Optional scheduling notification. Hints remain authoritative; this callback
+    // merely wakes an otherwise blocked hydrator when a producer already knows
+    // its hint set changed.
+    virtual void set_wake_callback(std::function<void()> callback) { (void)callback; }
 };
 
 // Weighted fair scheduler for ordered runs. Overlapping hints for the same run
@@ -144,6 +150,7 @@ class CacheHydrator {
     DistributedStore& store_;
     mutable std::mutex mutex_;
     std::condition_variable_any cv_;
+    std::atomic_uint64_t wake_revision_{};
     HydrationConfig config_;
     std::vector<std::shared_ptr<HydrationHintProvider>> providers_;
     HydrationScheduler scheduler_;
@@ -169,6 +176,7 @@ class CacheHydrator {
 };
 
 class HydrationManager {
+    PlaybackTracker& playback_;
     std::shared_ptr<ReadAheadHintProvider> read_ahead_;
     std::shared_ptr<CurrentFileHintProvider> current_file_;
     std::shared_ptr<CatalogueSequenceHintProvider> catalogue_sequence_;
@@ -177,6 +185,7 @@ class HydrationManager {
   public:
     HydrationManager(DistributedStore&, PlaybackTracker&, FileSystem&, CatalogueManager&,
                      HydrationConfig, size_t read_ahead_extents);
+    ~HydrationManager();
     void start();
     void request_stop();
     void stop();

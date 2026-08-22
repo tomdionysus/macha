@@ -37,6 +37,14 @@ enum class FuseRequestState : uint8_t {
     complete,
 };
 
+struct FuseEntryAttributes {
+    EntryType type{EntryType::file};
+    uint32_t mode{0644}, uid{}, gid{};
+    uint64_t size{};
+    int64_t ctime_ns{}, mtime_ns{};
+    uint64_t version{1};
+};
+
 struct FuseOpenHandle {
     uint64_t inode{};
     bool readable{};
@@ -174,12 +182,13 @@ class FuseFrontend final : public HydrationHintProvider {
 
     std::string_view name() const override { return "fuse"; }
     std::vector<HydrationHint> hints() override;
+    void set_wake_callback(std::function<void()> callback) override;
 
     std::chrono::milliseconds absolute_timeout() const;
     const FuseConfig& config() const;
 
-    FsEntry getattr(std::string_view path);
-    std::vector<std::pair<std::string, FsEntry>> readdir(std::string_view path);
+    FuseEntryAttributes getattr(std::string_view path);
+    std::vector<std::pair<std::string, FuseEntryAttributes>> readdir(std::string_view path);
     void mkdir(std::string_view path, uint32_t mode, uint32_t uid, uint32_t gid);
     void rmdir(std::string_view path);
     void unlink(std::string_view path);

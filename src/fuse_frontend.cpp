@@ -115,6 +115,11 @@ bool retryable_backend_error(const std::exception& error) {
     return true;
 }
 
+FuseEntryAttributes fuse_attributes(const FsEntry& entry) {
+    return FuseEntryAttributes{entry.type, entry.mode, entry.uid, entry.gid, entry.size,
+                               entry.ctime_ns, entry.mtime_ns, entry.version};
+}
+
 } // namespace
 
 struct FuseFrontend::State {
@@ -232,9 +237,10 @@ struct FuseFrontend::State {
 
     mutable std::mutex hint_mutex;
     std::map<uint64_t, HintState> hint_states;
+    std::function<void()> hint_wake_callback;
 
     std::mutex refresh_mutex;
-    uint64_t refreshed_metadata_generation{};
+    std::atomic_uint64_t refreshed_namespace_revision{};
 
     std::atomic_uint64_t timed_out_requests{};
     std::atomic_uint64_t merged_publications{};
@@ -614,11 +620,32 @@ struct FuseFrontend::State {
             std::shared_ptr<Inode> inode;
             {
                 std::unique_lock lock(data_queue_mutex);
-                // Re-evaluate periodically because foreground activity may go
-                // quiet without another publication-queue event to wake us.
-                data_cv.wait_for(lock, stop, std::chrono::milliseconds(50), [&] {
-                    return stopping.load() || (!data_queue.empty() && data_slot_available());
-                });
+                while (!stop.stop_requested() && !stopping.load()) {
+                    if (data_queue.empty()) {
+                        data_cv.wait(lock, stop, [&] {
+                            return stopping.load() || !data_queue.empty();
+                        });
+                        continue;
+                    }
+                    if (data_slot_available())
+                        break;
+
+                    // Active publications and writer close both notify data_cv.
+                    // The only transition without a producer event is expiry of
+                    // publication_quiet, so sleep directly to that deadline rather
+                    // than waking every 50 ms while the queue is throttled.
+                    const auto idle = fs.interactive_idle_for();
+                    if (open_writers.load(std::memory_order_relaxed) == 0 &&
+                        config.publication_quiet.count() > 0 && idle < config.publication_quiet) {
+                        data_cv.wait_for(lock, stop, config.publication_quiet - idle, [&] {
+                            return stopping.load() || data_queue.empty() || data_slot_available();
+                        });
+                    } else {
+                        data_cv.wait(lock, stop, [&] {
+                            return stopping.load() || data_queue.empty() || data_slot_available();
+                        });
+                    }
+                }
                 if (stop.stop_requested() || stopping.load())
                     break;
                 if (data_queue.empty() || !data_slot_available())
@@ -703,17 +730,26 @@ struct FuseFrontend::State {
         }
         if (!paths.contains(canonical_path("/")))
             throw std::runtime_error("FUSE frontend cannot initialise without namespace root");
-        refreshed_metadata_generation = view.generation;
+        refreshed_namespace_revision.store(view.namespace_revision, std::memory_order_release);
     }
 
     void refresh_namespace_if_stale() {
-        // Namespace synchronisation is demand-driven. No background timer wakes
-        // merely to ask whether metadata changed: a FUSE operation that actually
-        // needs namespace state performs one cheap generation comparison and only
-        // adopts the shared decoded snapshot when a newer generation is known.
-        // Serialising refreshes prevents concurrent lookup workers from rebuilding
-        // the same generation more than once.
+        // The overwhelmingly common FUSE metadata operation must be a lock-free
+        // generation comparison when nothing changed. Only an already-decoded
+        // local snapshot is eligible for adoption.
+        if (fs.available_namespace_revision() <=
+            refreshed_namespace_revision.load(std::memory_order_acquire))
+            return;
+
+        // A metadata-generation notice is only evidence that a newer snapshot
+        // exists somewhere in the cluster. It is not permission for a kernel
+        // getattr/readdir to perform quorum I/O. Adopt only an immutable snapshot
+        // which MetadataManager has already obtained and decoded; metadata repair
+        // is responsible for making newer generations locally available.
         std::lock_guard refresh_lock(refresh_mutex);
+        if (fs.available_namespace_revision() <=
+            refreshed_namespace_revision.load(std::memory_order_acquire))
+            return;
         {
             std::lock_guard queue_lock(namespace_queue_mutex);
             // Local FUSE namespace operations are already reflected optimistically
@@ -722,21 +758,12 @@ struct FuseFrontend::State {
             if (namespace_inflight || !namespace_queue.empty())
                 return;
         }
-        if (fs.known_metadata_generation() <= refreshed_metadata_generation)
-            return;
 
-        MetadataSnapshotView view;
-        try {
-            view = fs.local_snapshot_view();
-        } catch (const std::exception& e) {
-            // The existing coherent namespace view remains usable when a newer
-            // distributed generation is temporarily unreachable. A later FUSE
-            // namespace operation will retry without any background polling.
-            Log::debug("FUSE on-demand namespace refresh skipped: " + std::string(e.what()));
+        const auto available = fs.available_snapshot_view();
+        if (!available || available->namespace_revision <=
+            refreshed_namespace_revision.load(std::memory_order_acquire))
             return;
-        }
-        if (view.generation <= refreshed_metadata_generation)
-            return;
+        const auto& view = *available;
         const auto& snapshot = *view.snapshot;
         std::lock_guard lock(namespace_mutex);
         std::set<std::string, std::less<>> seen;
@@ -781,7 +808,7 @@ struct FuseFrontend::State {
             inode->published_path.reset();
             it = paths.erase(it);
         }
-        refreshed_metadata_generation = view.generation;
+        refreshed_namespace_revision.store(view.namespace_revision, std::memory_order_release);
     }
 
     void start() {
@@ -883,7 +910,7 @@ void FuseFrontend::note_timeout() {
     ++state_->timed_out_requests;
 }
 
-FsEntry FuseFrontend::getattr(std::string_view path) {
+FuseEntryAttributes FuseFrontend::getattr(std::string_view path) {
     const auto requested = std::string(path);
     return dispatch(FuseOperationClass::lookup, [this, requested](Clock::time_point deadline,
                                                                   std::atomic_bool& cancelled) {
@@ -899,18 +926,18 @@ FsEntry FuseFrontend::getattr(std::string_view path) {
         check_deadline(deadline, cancelled);
         if (inode->backend_error)
             throw FsError(*inode->backend_error, "asynchronous backend error");
-        return inode->visible;
+        return fuse_attributes(inode->visible);
     });
 }
 
-std::vector<std::pair<std::string, FsEntry>> FuseFrontend::readdir(std::string_view path) {
+std::vector<std::pair<std::string, FuseEntryAttributes>> FuseFrontend::readdir(std::string_view path) {
     const auto requested = canonical_path(path);
     return dispatch(FuseOperationClass::lookup, [this, requested](Clock::time_point deadline,
                                                                   std::atomic_bool& cancelled) {
         check_deadline(deadline, cancelled);
         state_->refresh_namespace_if_stale();
         check_deadline(deadline, cancelled);
-        std::vector<std::pair<std::string, FsEntry>> out;
+        std::vector<std::pair<std::string, FuseEntryAttributes>> out;
         std::lock_guard lock(state_->namespace_mutex);
         auto parent = state_->resolve_locked(requested);
         {
@@ -923,7 +950,7 @@ std::vector<std::pair<std::string, FsEntry>> FuseFrontend::readdir(std::string_v
             std::lock_guard inode_lock(inode->mutex);
             if (inode->current_path == "/" || parent_path(inode->current_path) != parent->current_path)
                 continue;
-            out.push_back({base_name(inode->current_path), inode->visible});
+            out.push_back({base_name(inode->current_path), fuse_attributes(inode->visible)});
         }
         std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
         return out;
@@ -1345,9 +1372,14 @@ size_t FuseFrontend::read(uint64_t inode_id, uint64_t offset, std::span<uint8_t>
                 last = i;
             }
             if (first < base.extents.size()) {
-                std::lock_guard hint_lock(state_->hint_mutex);
-                state_->hint_states[inode_id] =
-                    State::HintState{base, first, last, Clock::now() + state_->config.hint_lifetime};
+                std::function<void()> wake;
+                {
+                    std::lock_guard hint_lock(state_->hint_mutex);
+                    state_->hint_states[inode_id] =
+                        State::HintState{base, first, last, Clock::now() + state_->config.hint_lifetime};
+                    wake = state_->hint_wake_callback;
+                }
+                if (wake) wake();
             }
         }
         return count;
@@ -1576,6 +1608,11 @@ std::vector<HydrationHint> FuseFrontend::hints() {
         ++it;
     }
     return out;
+}
+
+void FuseFrontend::set_wake_callback(std::function<void()> callback) {
+    std::lock_guard lock(state_->hint_mutex);
+    state_->hint_wake_callback = std::move(callback);
 }
 
 void FuseFrontend::stop() {

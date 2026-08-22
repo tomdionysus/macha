@@ -10,7 +10,9 @@
 #include "hydration.hpp"
 #include "media_catalogue.hpp"
 #include "playback.hpp"
+#include <condition_variable>
 #include <ctime>
+#include <mutex>
 #include <memory>
 #include <vector>
 
@@ -36,6 +38,8 @@ class Service {
     PlaybackManager streaming_;
     std::unique_ptr<HttpServer> catalogue_http_;
     std::jthread maintenance_;
+    std::mutex maintenance_wait_mutex_;
+    std::condition_variable_any maintenance_wait_cv_;
     uint64_t maintenance_inventory_generation_{};
     std::shared_ptr<const std::vector<ObjectId>> maintenance_live_;
     std::shared_ptr<const std::vector<ObjectId>> maintenance_universal_;

@@ -34,6 +34,8 @@ class NodeRuntime {
     RpcClient client_;
     RpcServer server_;
     std::jthread maintenance_;
+    std::mutex maintenance_wait_mutex_;
+    std::condition_variable_any maintenance_wait_cv_;
     std::jthread local_writer_;
     std::mutex local_copy_mutex_;
     std::condition_variable local_copy_cv_;

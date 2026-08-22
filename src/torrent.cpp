@@ -556,7 +556,10 @@ void TorrentManager::start() {
 }
 
 void TorrentManager::request_stop() {
-    if (worker_.joinable()) worker_.request_stop();
+    if (worker_.joinable()) {
+        worker_.request_stop();
+        cv_.notify_all();
+    }
 }
 
 void TorrentManager::stop() {
@@ -570,6 +573,7 @@ void TorrentManager::reconfigure(TorrentConfig config) {
     config_.max_active = config.max_active;
     config_.max_download_rate = config.max_download_rate;
     config_.max_upload_rate = config.max_upload_rate;
+    cv_.notify_all();
 }
 
 void TorrentManager::restore_jobs() {
@@ -653,6 +657,7 @@ std::string TorrentManager::add_impl(std::string uri, bool allow_fetch) {
         impl_->handles[job.id] = std::move(handle);
         save_state_locked();
     }
+    cv_.notify_all();
     return job.id;
 #endif
 }
@@ -696,6 +701,7 @@ bool TorrentManager::pause(std::string_view id) {
     it->second.eta_seconds.reset();
     it->second.updated_unix_ms = unix_ms();
     save_state_locked();
+    cv_.notify_all();
     return true;
 }
 
@@ -714,6 +720,7 @@ bool TorrentManager::resume(std::string_view id) {
     it->second.error.clear();
     it->second.updated_unix_ms = unix_ms();
     save_state_locked();
+    cv_.notify_all();
     return true;
 }
 
@@ -744,6 +751,7 @@ bool TorrentManager::cancel(std::string_view id) {
     it->second.eta_seconds.reset();
     it->second.updated_unix_ms = unix_ms();
     save_state_locked();
+    cv_.notify_all();
     return true;
 }
 
@@ -781,13 +789,32 @@ bool TorrentManager::clear(std::string_view id) {
     jobs_.erase(it);
     save_state_locked();
     Log::info("torrent cleared id=" + terminal_job.id);
+    cv_.notify_all();
     return true;
+}
+
+bool TorrentManager::has_active_jobs_locked() const {
+    return std::any_of(jobs_.begin(), jobs_.end(), [](const auto& pair) {
+        const auto state = pair.second.state;
+        return state != TorrentJobState::completed && state != TorrentJobState::cancelled &&
+               state != TorrentJobState::failed && state != TorrentJobState::paused;
+    });
 }
 
 void TorrentManager::loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
         update_jobs();
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::unique_lock lock(mutex_);
+        if (has_active_jobs_locked()) {
+            // libtorrent and linked ingest jobs are external progress sources, so
+            // active jobs still receive a modest status sample cadence. A fully
+            // settled/paused manager blocks until an API operation wakes it.
+            cv_.wait_for(lock, stop, std::chrono::milliseconds(500), [this] {
+                return !has_active_jobs_locked();
+            });
+        } else {
+            cv_.wait(lock, stop, [this] { return has_active_jobs_locked(); });
+        }
     }
 }
 

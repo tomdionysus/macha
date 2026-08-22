@@ -149,7 +149,7 @@ void set_time(struct stat& st, int64_t ns) {
 #endif
 }
 
-void fill_stat(const FsEntry& e, struct stat& st) {
+void fill_stat(const FuseEntryAttributes& e, struct stat& st) {
     std::memset(&st, 0, sizeof(st));
     st.st_mode = (e.type == EntryType::directory ? S_IFDIR : S_IFREG) | e.mode;
     st.st_nlink = e.type == EntryType::directory ? 2 : 1;

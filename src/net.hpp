@@ -205,6 +205,8 @@ class RpcClient {
     std::atomic_uint64_t connections_created_{};
     std::atomic_uint64_t connections_reused_{};
     std::jthread health_thread_;
+    std::mutex health_wait_mutex_;
+    std::condition_variable_any health_wait_cv_;
     std::mutex inbound_mutex_;
     InboundHandler inbound_handler_;
     InboundPromoter inbound_promoter_;

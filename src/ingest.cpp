@@ -755,12 +755,36 @@ void IngestManager::loop(std::stop_token stop) {
                 }
             }
             if (selected.empty()) {
-                cv_.wait_for(lock, stop, std::chrono::milliseconds(500), [&] {
-                    if (stop.stop_requested()) return true;
+                const bool cataloguing = std::any_of(jobs_.begin(), jobs_.end(), [](const auto& pair) {
+                    return pair.second.state == IngestJobState::cataloguing;
+                });
+                std::optional<uint64_t> blocked_ready_ms;
+                for (const auto& [_, job] : jobs_) {
+                    if (job.state != IngestJobState::blocked) continue;
+                    const auto ready = job.updated_unix_ms +
+                        static_cast<uint64_t>(config_.blocked_retry.count());
+                    if (!blocked_ready_ms || ready < *blocked_ready_ms) blocked_ready_ms = ready;
+                }
+
+                auto queued = [&] {
                     return std::any_of(jobs_.begin(), jobs_.end(), [](const auto& pair) {
                         return pair.second.state == IngestJobState::queued;
                     });
-                });
+                };
+
+                if (cataloguing) {
+                    // Catalogue completion is currently persisted by the hint queue
+                    // rather than callback-driven into ingest. Poll only while a
+                    // copied job is genuinely awaiting that external result.
+                    cv_.wait_for(lock, stop, std::chrono::milliseconds(500), queued);
+                } else if (blocked_ready_ms) {
+                    const auto remaining_ms = *blocked_ready_ms > now ? *blocked_ready_ms - now : 0;
+                    cv_.wait_for(lock, stop, std::chrono::milliseconds(remaining_ms), queued);
+                } else {
+                    // Terminal/paused-only job sets are quiescent. New work and all
+                    // relevant API state changes already notify this condition.
+                    cv_.wait(lock, stop, queued);
+                }
                 continue;
             }
         }

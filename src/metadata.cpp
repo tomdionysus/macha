@@ -570,6 +570,11 @@ uint64_t MetadataReplica::generation() const {
     return cur_.generation;
 }
 
+uint64_t MetadataReplica::committed_generation() const {
+    std::lock_guard g(m_);
+    return committed_.generation;
+}
+
 void MetadataReplica::append_journal(uint8_t kind, const MetadataRecord& record,
                                      std::span<const uint8_t> body) {
     Writer plain;

@@ -55,9 +55,9 @@ struct FuseConfig {
     bool allow_other{};
 
     // Short-lived kernel-side namespace/attribute caches.
-    std::chrono::milliseconds entry_timeout{250};
-    std::chrono::milliseconds attr_timeout{250};
-    std::chrono::milliseconds negative_timeout{100};
+    std::chrono::milliseconds entry_timeout{1000};
+    std::chrono::milliseconds attr_timeout{1000};
+    std::chrono::milliseconds negative_timeout{500};
 
     // Every kernel-facing operation is bounded by its semantic class and this
     // absolute ceiling. The default remains far below macFUSE's 60s eject timeout.

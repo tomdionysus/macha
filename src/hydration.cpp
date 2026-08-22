@@ -160,24 +160,45 @@ const CatalogueItem* next_catalogue_item(const CatalogueSnapshot& snapshot,
 } // namespace
 
 uint64_t PlaybackTracker::open(std::string path, const FsEntry& entry) {
-    std::lock_guard lock(mutex_);
-    const auto session = next_session_++;
-    sessions_.emplace(session, PlaybackObservation{session, std::move(path), entry, {}, Clock::now()});
+    std::function<void()> callback;
+    uint64_t session{};
+    {
+        std::lock_guard lock(mutex_);
+        session = next_session_++;
+        sessions_.emplace(session, PlaybackObservation{session, std::move(path), entry, {}, Clock::now()});
+        callback = change_callback_;
+    }
+    if (callback) callback();
     return session;
 }
 
 void PlaybackTracker::progress(uint64_t session, size_t extent_index) {
-    std::lock_guard lock(mutex_);
-    auto it = sessions_.find(session);
-    if (it == sessions_.end())
-        return;
-    it->second.current_extent = extent_index;
-    it->second.last_activity = Clock::now();
+    std::function<void()> callback;
+    {
+        std::lock_guard lock(mutex_);
+        auto it = sessions_.find(session);
+        if (it == sessions_.end())
+            return;
+        it->second.current_extent = extent_index;
+        it->second.last_activity = Clock::now();
+        callback = change_callback_;
+    }
+    if (callback) callback();
 }
 
 void PlaybackTracker::close(uint64_t session) {
+    std::function<void()> callback;
+    {
+        std::lock_guard lock(mutex_);
+        if (!sessions_.erase(session)) return;
+        callback = change_callback_;
+    }
+    if (callback) callback();
+}
+
+void PlaybackTracker::set_change_callback(std::function<void()> callback) {
     std::lock_guard lock(mutex_);
-    sessions_.erase(session);
+    change_callback_ = std::move(callback);
 }
 
 std::vector<PlaybackObservation> PlaybackTracker::active(std::chrono::milliseconds timeout) const {
@@ -431,23 +452,40 @@ CacheHydrator::CacheHydrator(DistributedStore& store, HydrationConfig config)
 
 CacheHydrator::~CacheHydrator() {
     stop();
+    std::vector<std::shared_ptr<HydrationHintProvider>> providers;
+    {
+        std::lock_guard lock(mutex_);
+        providers.swap(providers_);
+    }
+    for (const auto& provider : providers) provider->set_wake_callback({});
 }
 
 void CacheHydrator::add_provider(std::shared_ptr<HydrationHintProvider> provider) {
     if (!provider) return;
-    std::lock_guard lock(mutex_);
-    if (std::none_of(providers_.begin(), providers_.end(), [&](const auto& existing) {
-            return existing.get() == provider.get();
-        }))
-        providers_.push_back(std::move(provider));
-    cv_.notify_all();
+    provider->set_wake_callback([this] { wake(); });
+    {
+        std::lock_guard lock(mutex_);
+        if (std::none_of(providers_.begin(), providers_.end(), [&](const auto& existing) {
+                return existing.get() == provider.get();
+            }))
+            providers_.push_back(std::move(provider));
+    }
+    wake();
 }
 
 void CacheHydrator::remove_provider(const HydrationHintProvider* provider) {
-    std::lock_guard lock(mutex_);
-    providers_.erase(std::remove_if(providers_.begin(), providers_.end(),
-                                    [&](const auto& existing) { return existing.get() == provider; }),
-                     providers_.end());
+    std::shared_ptr<HydrationHintProvider> removed;
+    {
+        std::lock_guard lock(mutex_);
+        auto found = std::find_if(providers_.begin(), providers_.end(),
+                                  [&](const auto& existing) { return existing.get() == provider; });
+        if (found != providers_.end()) {
+            removed = *found;
+            providers_.erase(found);
+        }
+    }
+    if (removed) removed->set_wake_callback({});
+    wake();
 }
 
 void CacheHydrator::start() {
@@ -471,10 +509,12 @@ void CacheHydrator::request_stop() {
 }
 
 void CacheHydrator::reconfigure(HydrationConfig config) {
-    std::lock_guard lock(mutex_);
-    config_ = std::move(config);
-    status_.enabled = config_.enabled;
-    cv_.notify_all();
+    {
+        std::lock_guard lock(mutex_);
+        config_ = std::move(config);
+        status_.enabled = config_.enabled;
+    }
+    wake();
 }
 
 std::vector<HydrationHint> CacheHydrator::collect_hints() {
@@ -549,11 +589,13 @@ HydrationStatus CacheHydrator::status() const {
 }
 
 void CacheHydrator::wake() {
+    wake_revision_.fetch_add(1, std::memory_order_release);
     cv_.notify_all();
 }
 
 void CacheHydrator::loop(std::stop_token stop) {
     ThreadCpuReporter cpu_reporter("macha-hydrator", std::chrono::seconds(5), true);
+    uint64_t observed_wake_revision = wake_revision_.load(std::memory_order_acquire);
     struct Pending {
         HydrationRequest request;
         std::future<bool> future;
@@ -642,8 +684,35 @@ void CacheHydrator::loop(std::stop_token stop) {
 
         cpu_reporter.tick();
         std::unique_lock lock(mutex_);
-        const auto interval = config_.interval;
-        cv_.wait_for(lock, stop, interval, [] { return false; });
+        const auto wake_changed = [&] {
+            return wake_revision_.load(std::memory_order_acquire) != observed_wake_revision;
+        };
+
+        // A provider may have signalled while this pass was collecting hints or
+        // dispatching I/O. Do not swallow that edge by taking a fresh baseline
+        // immediately before sleeping; consume it with another scheduling pass.
+        if (wake_changed()) {
+            observed_wake_revision = wake_revision_.load(std::memory_order_acquire);
+            continue;
+        }
+
+        if (!pending.empty()) {
+            // std::future has no portable completion notification. Poll only while
+            // real hydration I/O is outstanding; provider notifications still
+            // interrupt the wait immediately.
+            cv_.wait_for(lock, stop, config_.interval, wake_changed);
+            observed_wake_revision = wake_revision_.load(std::memory_order_acquire);
+            continue;
+        }
+
+        std::optional<Clock::time_point> retry_at;
+        for (const auto& [_, deadline] : failed_until_)
+            if (!retry_at || deadline < *retry_at) retry_at = deadline;
+        if (retry_at)
+            cv_.wait_until(lock, stop, *retry_at, wake_changed);
+        else
+            cv_.wait(lock, stop, wake_changed);
+        observed_wake_revision = wake_revision_.load(std::memory_order_acquire);
     }
 
     for (auto& item : pending) {
@@ -655,13 +724,20 @@ void CacheHydrator::loop(std::stop_token stop) {
 HydrationManager::HydrationManager(DistributedStore& store, PlaybackTracker& playback,
                                    FileSystem& filesystem, CatalogueManager& catalogue,
                                    HydrationConfig config, size_t read_ahead_extents)
-    : read_ahead_(std::make_shared<ReadAheadHintProvider>(playback, config, read_ahead_extents)),
+    : playback_(playback),
+      read_ahead_(std::make_shared<ReadAheadHintProvider>(playback, config, read_ahead_extents)),
       current_file_(std::make_shared<CurrentFileHintProvider>(playback, config)),
       catalogue_sequence_(std::make_shared<CatalogueSequenceHintProvider>(playback, filesystem, catalogue, config)),
       hydrator_(store, config) {
+    playback_.set_change_callback([this] { hydrator_.wake(); });
     hydrator_.add_provider(read_ahead_);
     hydrator_.add_provider(current_file_);
     hydrator_.add_provider(catalogue_sequence_);
+}
+
+HydrationManager::~HydrationManager() {
+    playback_.set_change_callback({});
+    stop();
 }
 
 void HydrationManager::start() {

@@ -1487,6 +1487,10 @@ MetadataSnapshotView FileSystem::local_snapshot_view() {
     return m_.snapshot_view();
 }
 
+std::optional<MetadataSnapshotView> FileSystem::available_snapshot_view() const {
+    return m_.available_snapshot_view();
+}
+
 std::pair<uint64_t, uint64_t> FileSystem::logical_capacity() const {
     auto ns = n_.membership().active();
     if (ns.empty())

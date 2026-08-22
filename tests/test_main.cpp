@@ -1298,6 +1298,10 @@ void test_config() {
     CHECK(maintenance_policy.cpu_target == 0.10);
     CHECK(maintenance_policy.scrub_fraction == 0.02);
     CHECK(maintenance_policy.no_progress_backoff == 300000ms);
+    FuseConfig fuse_defaults;
+    CHECK(fuse_defaults.entry_timeout == 1000ms);
+    CHECK(fuse_defaults.attr_timeout == 1000ms);
+    CHECK(fuse_defaults.negative_timeout == 500ms);
     CHECK(maintenance_background_interval(maintenance_policy) == 30000ms);
     maintenance_policy.no_progress_backoff = 2000ms;
     CHECK(maintenance_background_interval(maintenance_policy) == 5000ms);
@@ -3999,6 +4003,14 @@ void test_hydration_scheduler_and_prediction() {
     CHECK(tail_hints[0].objects.back() == synthetic.extents[5].id);
     tracker.close(session);
 
+    std::atomic_uint playback_changes{};
+    tracker.set_change_callback([&] { ++playback_changes; });
+    auto notified_session = tracker.open("/notified.mkv", synthetic);
+    tracker.progress(notified_session, 2);
+    tracker.close(notified_session);
+    CHECK(playback_changes.load() == 3);
+    tracker.set_change_callback({});
+
     auto renamed = synthetic;
     renamed.mode = 0600;
     renamed.uid = 1234;
@@ -4283,6 +4295,49 @@ void test_cache_hydrator_fetches_to_persistent_cache() {
     CHECK(n2.block_cache().has(parallel0));
     CHECK(n2.block_cache().has(parallel1));
     CHECK(n2.block_cache().has(parallel2));
+
+    // With no work the production hydrator must block, not sample providers at
+    // hydration.interval. A producer notification wakes it immediately when a
+    // new hint becomes available.
+    const auto event_object = make_remote(69);
+    class NotifyingHints final : public HydrationHintProvider {
+        mutable std::mutex mutex_;
+        std::vector<HydrationHint> hints_;
+        std::function<void()> wake_;
+      public:
+        std::atomic_uint calls{};
+        std::string_view name() const override { return "notifying-test"; }
+        std::vector<HydrationHint> hints() override {
+            ++calls;
+            std::lock_guard lock(mutex_);
+            return hints_;
+        }
+        void set_wake_callback(std::function<void()> callback) override {
+            std::lock_guard lock(mutex_);
+            wake_ = std::move(callback);
+        }
+        void publish(std::vector<HydrationHint> hints) {
+            std::function<void()> wake;
+            {
+                std::lock_guard lock(mutex_);
+                hints_ = std::move(hints);
+                wake = wake_;
+            }
+            if (wake) wake();
+        }
+    };
+    auto notifying_provider = std::make_shared<NotifyingHints>();
+    HydrationConfig event_config;
+    event_config.interval = 5ms;
+    event_config.max_inflight = 1;
+    CacheHydrator event_hydrator(target, event_config);
+    event_hydrator.add_provider(notifying_provider);
+    event_hydrator.start();
+    std::this_thread::sleep_for(75ms);
+    CHECK(notifying_provider->calls.load() <= 2);
+    notifying_provider->publish({{"event", {event_object}, 1000, "event-test"}});
+    REQUIRE(wait_until([&] { return n2.block_cache().has(event_object); }, 3s));
+    event_hydrator.stop();
 
     n2.stop();
     n1.stop();
@@ -5610,6 +5665,22 @@ void test_catalogue_warm_read_defers_remote_refresh() {
     CHECK(stale.known_metadata_generation >= writer_status.metadata_generation);
     CHECK(stale.known_metadata_generation > stale.metadata_generation);
 
+    // A remote generation notice must not turn ordinary kernel metadata traffic
+    // into quorum reads. FUSE may adopt a newer snapshot only after some control-
+    // plane owner has already decoded it locally. Repeated getattr therefore
+    // leaves MetadataManager's available generation unchanged.
+    FileSystem fs2(n2, store2, metadata2);
+    FuseConfig fuse_config;
+    fuse_config.commit_workers = 1;
+    auto frontend = std::make_shared<FuseFrontend>(fs2, fuse_config);
+    const auto available_before_fuse = metadata2.available_snapshot_view();
+    REQUIRE(available_before_fuse.has_value());
+    const auto namespace_revision_before = metadata2.available_namespace_revision();
+    for (int i = 0; i < 64; ++i) CHECK(frontend->getattr("/").type == EntryType::directory);
+    const auto available_after_fuse = metadata2.available_snapshot_view();
+    REQUIRE(available_after_fuse.has_value());
+    CHECK(available_after_fuse->generation == available_before_fuse->generation);
+
     // Warm reads must remain memory-only even when a newer generation is known.
     // The serving API may briefly return the previous coherent snapshot while its
     // background/control-plane worker converges; it must not perform quorum I/O
@@ -5633,6 +5704,14 @@ void test_catalogue_warm_read_defers_remote_refresh() {
     CHECK(after.metadata_generation >= writer_status.metadata_generation);
     CHECK(after.metadata_generation == after.known_metadata_generation);
     CHECK(!catalogue2.refresh_needed());
+    CHECK(frontend->getattr("/").type == EntryType::directory);
+    auto available_after_repair = metadata2.available_snapshot_view();
+    REQUIRE(available_after_repair.has_value());
+    CHECK(available_after_repair->generation >= writer_status.metadata_generation);
+    // This metadata change only moved the catalogue root, so it must not force
+    // FUSE to rebuild its namespace graph.
+    CHECK(metadata2.available_namespace_revision() == namespace_revision_before);
+    frontend->stop();
 
     CatalogueHintQueue catalogue2_hints(t.path() / "catalogue2-hints");
     CatalogueApi api(catalogue2, catalogue2_hints);
@@ -7108,6 +7187,25 @@ void test_playback_sessions_and_streaming_http_bodies() {
     remove_path.method = "DELETE";
     remove_path.path = "/api/v1/playback/sessions/" + path_session_id;
     CHECK(playback.handle(remove_path).status == 204);
+
+    // Session creation must wake an otherwise indefinitely-blocked cleanup
+    // worker. A short idle timeout catches the condition_variable_any mistake
+    // where notify_all() was paired with a predicate that could never become
+    // true and therefore silently swallowed the notification.
+    streaming.session_idle = 50ms;
+    playback.reconfigure(streaming);
+    auto expiring = playback.handle(create);
+    REQUIRE(expiring.status == 201);
+    REQUIRE(wait_until([&] {
+        HttpRequest status_request;
+        status_request.method = "GET";
+        status_request.path = "/api/v1/playback/status";
+        auto response = playback.handle(status_request);
+        if (response.status != 200) return false;
+        auto body = Json::parse(std::string(response.body.begin(), response.body.end()));
+        return body.find("sessions") && body.find("sessions")->asUInt64() == 0;
+    }, 1s));
+
     playback.stop();
     service.stop();
 }
