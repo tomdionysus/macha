@@ -207,6 +207,9 @@ class CatalogueScanProvider {
     virtual ~CatalogueScanProvider() = default;
     virtual std::string_view name() const noexcept = 0;
     virtual const std::vector<std::string>& roots() const noexcept = 0;
+    // Cheap namespace-discovery predicate. This must never open/read media;
+    // expensive tag/container probing belongs to hint processing.
+    virtual bool accepts_path(std::string_view path) const noexcept = 0;
     virtual MediaProbeFile probe_file(FileSystem&, std::string_view root,
                                       std::string_view path, const FsEntry&) = 0;
     std::vector<MediaProbeCandidate> probe_candidates(FileSystem& fs, std::string_view root,
@@ -230,6 +233,7 @@ class MovieScanProvider final : public CatalogueScanProvider {
     MovieScanProvider(HttpClient&, CatalogueMovieProviderConfig);
     std::string_view name() const noexcept override { return "movies"; }
     const std::vector<std::string>& roots() const noexcept override { return roots_; }
+    bool accepts_path(std::string_view path) const noexcept override;
     MediaProbeFile probe_file(FileSystem&, std::string_view, std::string_view,
                               const FsEntry&) override;
     std::optional<ProviderMatch> lookup(const MediaProbe& probe) override {
@@ -245,6 +249,7 @@ class TvScanProvider final : public CatalogueScanProvider {
     TvScanProvider(HttpClient&, CatalogueTvProviderConfig);
     std::string_view name() const noexcept override { return "tv"; }
     const std::vector<std::string>& roots() const noexcept override { return roots_; }
+    bool accepts_path(std::string_view path) const noexcept override;
     MediaProbeFile probe_file(FileSystem&, std::string_view, std::string_view,
                               const FsEntry&) override;
     std::optional<ProviderMatch> lookup(const MediaProbe& probe) override {
@@ -262,6 +267,7 @@ class MusicScanProvider final : public CatalogueScanProvider {
                       size_t max_artwork_bytes = 16 * 1024 * 1024);
     std::string_view name() const noexcept override { return "music"; }
     const std::vector<std::string>& roots() const noexcept override { return roots_; }
+    bool accepts_path(std::string_view path) const noexcept override;
     MediaProbeFile probe_file(FileSystem&, std::string_view, std::string_view,
                               const FsEntry&) override;
     std::optional<ProviderMatch> lookup(const MediaProbe& probe) override;

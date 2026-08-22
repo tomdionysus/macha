@@ -5455,8 +5455,9 @@ void test_catalogue_hint_queue_persistence_coalescing_and_priority() {
         CHECK(in_flight->id == no_match_id);
     }
 
-    // A claimed item is persisted as processing. Restart recovery must make it
-    // eligible again instead of losing work that was in-flight at daemon exit.
+    // Claim ownership is deliberately not persisted: if the daemon exits while
+    // a hint is in flight, the durable queued/deferred state provides at-least-once
+    // replay without a full hints.json rewrite merely to record `processing`.
     {
         CatalogueHintQueue hints(state);
         auto recovered = hints.get(no_match_id);
