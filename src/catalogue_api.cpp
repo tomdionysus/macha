@@ -246,6 +246,7 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 item["priority"] = static_cast<int64_t>(hint.priority);
                 item["state"] = catalogue_hint_state_name(hint.state);
                 item["attempts"] = static_cast<uint64_t>(hint.attempts);
+                item["failures"] = static_cast<uint64_t>(hint.failures);
                 item["candidate_cursor"] = static_cast<uint64_t>(hint.candidate_cursor);
                 item["ready_after_unix_ms"] = hint.ready_after_unix_ms;
                 item["provider"] = hint.provider.empty() ? Json(nullptr) : Json(hint.provider);

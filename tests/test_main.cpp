@@ -5488,6 +5488,39 @@ void test_catalogue_hint_queue_persistence_coalescing_and_priority() {
         CHECK(recovered->candidate_cursor == 2);
     }
 
+    // Repeated per-item failures become a persisted terminal dead letter rather
+    // than remaining runnable forever. The failure counter is distinct from
+    // scheduling attempts and survives restart for API/operator inspection.
+    const auto failure_state = temp.path() / "failure-state";
+    std::string failure_id;
+    {
+        CatalogueHintQueue failure_queue(failure_state);
+        failure_id = failure_queue.submit("/Movies/Broken.mkv", "scanner", "macha:broken",
+                                          CatalogueHintPriority::periodic_scan);
+        REQUIRE(failure_queue.claim_next().has_value());
+        CHECK(!failure_queue.record_failure(failure_id, "first failure", 0, 2));
+        auto once = failure_queue.get(failure_id);
+        REQUIRE(once.has_value());
+        CHECK(once->state == CatalogueHintState::deferred);
+        CHECK(once->failures == 1);
+        REQUIRE(failure_queue.claim_next().has_value());
+        CHECK(failure_queue.record_failure(failure_id, "second failure", 0, 2));
+        auto dead = failure_queue.get(failure_id);
+        REQUIRE(dead.has_value());
+        CHECK(dead->state == CatalogueHintState::failed);
+        CHECK(dead->failures == 2);
+        CHECK(dead->error == "second failure");
+        CHECK(!failure_queue.claim_next().has_value());
+    }
+    {
+        CatalogueHintQueue failure_queue(failure_state);
+        auto dead = failure_queue.get(failure_id);
+        REQUIRE(dead.has_value());
+        CHECK(dead->state == CatalogueHintState::failed);
+        CHECK(dead->failures == 2);
+        CHECK(!failure_queue.claim_next().has_value());
+    }
+
     // Equal-priority work is fair across top-level catalogue roots rather than
     // allowing a large Movies backlog to starve TV or Music indefinitely.
     const auto fairness_state = temp.path() / "fairness-state";

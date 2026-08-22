@@ -56,6 +56,7 @@ struct CatalogueHint {
     int priority{};
     CatalogueHintState state{CatalogueHintState::queued};
     unsigned attempts{};
+    unsigned failures{};
     size_t candidate_cursor{};
     uint64_t created_unix_ms{};
     uint64_t updated_unix_ms{};
@@ -112,6 +113,8 @@ class CatalogueHintQueue {
                        std::string result = {});
     void advance_candidate(std::string_view id, size_t next_cursor);
     void defer(std::string_view id, std::string error, uint64_t retry_after_unix_ms);
+    bool record_failure(std::string_view id, std::string error,
+                        uint64_t retry_after_unix_ms, unsigned max_failures);
     void fail(std::string_view id, std::string error);
     void requeue_processing();
 
