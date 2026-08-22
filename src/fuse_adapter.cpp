@@ -604,17 +604,6 @@ int run_fuse(FileSystem& filesystem, CacheHydrator& hydrator,
         }
     });
 
-    std::jthread shutdown_watcher([&](std::stop_token stop) {
-        while (!stop.stop_requested()) {
-            if (fuse_session_exited(session)) {
-                filesystem.request_io_cancellation();
-                if (request_shutdown) request_shutdown();
-                return;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-    });
-
     Log::debug("shutdown: entering bounded FUSE main loop");
     const int loop_rc = fuse_loop_mt(instance, 0);
     if (loop_rc != 0) unexpected_mount_loss.store(true);
@@ -622,9 +611,7 @@ int run_fuse(FileSystem& filesystem, CacheHydrator& hydrator,
     if (request_shutdown) request_shutdown();
 
     mount_watchdog.request_stop();
-    shutdown_watcher.request_stop();
     if (mount_watchdog.joinable()) mount_watchdog.join();
-    if (shutdown_watcher.joinable()) shutdown_watcher.join();
 
     hydrator.remove_provider(fuse_frontend.get());
     fuse_frontend->stop();

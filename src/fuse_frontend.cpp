@@ -233,7 +233,7 @@ struct FuseFrontend::State {
     mutable std::mutex hint_mutex;
     std::map<uint64_t, HintState> hint_states;
 
-    std::jthread refresh_worker;
+    std::mutex refresh_mutex;
     uint64_t refreshed_metadata_generation{};
 
     std::atomic_uint64_t timed_out_requests{};
@@ -706,19 +706,35 @@ struct FuseFrontend::State {
         refreshed_metadata_generation = view.generation;
     }
 
-    void refresh_namespace() {
+    void refresh_namespace_if_stale() {
+        // Namespace synchronisation is demand-driven. No background timer wakes
+        // merely to ask whether metadata changed: a FUSE operation that actually
+        // needs namespace state performs one cheap generation comparison and only
+        // adopts the shared decoded snapshot when a newer generation is known.
+        // Serialising refreshes prevents concurrent lookup workers from rebuilding
+        // the same generation more than once.
+        std::lock_guard refresh_lock(refresh_mutex);
         {
             std::lock_guard queue_lock(namespace_queue_mutex);
+            // Local FUSE namespace operations are already reflected optimistically
+            // in paths/inodes. Do not race a backend publication with a snapshot
+            // adoption; a subsequent namespace-facing request will retry.
             if (namespace_inflight || !namespace_queue.empty())
                 return;
         }
-        // The old path decoded and rebuilt the complete namespace every refresh
-        // interval even when metadata had not changed. The generation check is
-        // deliberately lock-free/cheap; only an observed metadata advance asks
-        // MetadataManager for its shared immutable decoded snapshot.
         if (fs.known_metadata_generation() <= refreshed_metadata_generation)
             return;
-        auto view = fs.local_snapshot_view();
+
+        MetadataSnapshotView view;
+        try {
+            view = fs.local_snapshot_view();
+        } catch (const std::exception& e) {
+            // The existing coherent namespace view remains usable when a newer
+            // distributed generation is temporarily unreachable. A later FUSE
+            // namespace operation will retry without any background polling.
+            Log::debug("FUSE on-demand namespace refresh skipped: " + std::string(e.what()));
+            return;
+        }
         if (view.generation <= refreshed_metadata_generation)
             return;
         const auto& snapshot = *view.snapshot;
@@ -768,19 +784,6 @@ struct FuseFrontend::State {
         refreshed_metadata_generation = view.generation;
     }
 
-    void refresh_loop(std::stop_token stop) {
-        while (!stop.stop_requested() && !stopping.load()) {
-            std::this_thread::sleep_for(config.refresh_interval);
-            if (stop.stop_requested() || stopping.load())
-                break;
-            try {
-                refresh_namespace();
-            } catch (const std::exception& e) {
-                Log::debug("FUSE local namespace refresh skipped: " + std::string(e.what()));
-            }
-        }
-    }
-
     void start() {
         initialise_namespace();
 
@@ -801,7 +804,6 @@ struct FuseFrontend::State {
         data_workers.reserve(config.commit_workers);
         for (size_t i = 0; i < config.commit_workers; ++i)
             data_workers.emplace_back([this](std::stop_token stop) { data_loop(stop); });
-        refresh_worker = std::jthread([this](std::stop_token stop) { refresh_loop(stop); });
     }
 
     void stop() {
@@ -812,12 +814,10 @@ struct FuseFrontend::State {
         publication_cv.notify_all();
         for (auto& queue : broker)
             queue.cv.notify_all();
-        if (refresh_worker.joinable()) refresh_worker.request_stop();
         if (namespace_worker.joinable()) namespace_worker.request_stop();
         for (auto& worker : data_workers) worker.request_stop();
         for (auto& queue : broker)
             for (auto& worker : queue.workers) worker.request_stop();
-        if (refresh_worker.joinable()) refresh_worker.join();
         if (namespace_worker.joinable()) namespace_worker.join();
         for (auto& worker : data_workers) if (worker.joinable()) worker.join();
         for (auto& queue : broker) {
@@ -888,6 +888,8 @@ FsEntry FuseFrontend::getattr(std::string_view path) {
     return dispatch(FuseOperationClass::lookup, [this, requested](Clock::time_point deadline,
                                                                   std::atomic_bool& cancelled) {
         check_deadline(deadline, cancelled);
+        state_->refresh_namespace_if_stale();
+        check_deadline(deadline, cancelled);
         std::shared_ptr<State::Inode> inode;
         {
             std::lock_guard lock(state_->namespace_mutex);
@@ -905,6 +907,8 @@ std::vector<std::pair<std::string, FsEntry>> FuseFrontend::readdir(std::string_v
     const auto requested = canonical_path(path);
     return dispatch(FuseOperationClass::lookup, [this, requested](Clock::time_point deadline,
                                                                   std::atomic_bool& cancelled) {
+        check_deadline(deadline, cancelled);
+        state_->refresh_namespace_if_stale();
         check_deadline(deadline, cancelled);
         std::vector<std::pair<std::string, FsEntry>> out;
         std::lock_guard lock(state_->namespace_mutex);
@@ -932,6 +936,8 @@ void FuseFrontend::mkdir(std::string_view path, uint32_t mode, uint32_t uid, uin
              [this, requested, mode, uid, gid](Clock::time_point deadline,
                                                std::atomic_bool& cancelled) {
         std::lock_guard accept(state_->namespace_apply_mutex);
+        check_deadline(deadline, cancelled);
+        state_->refresh_namespace_if_stale();
         check_deadline(deadline, cancelled);
         if (!state_->namespace_capacity_available())
             throw FsError(EAGAIN, "FUSE namespace publication queue saturated");
@@ -967,6 +973,8 @@ void FuseFrontend::rmdir(std::string_view path) {
              [this, requested](Clock::time_point deadline, std::atomic_bool& cancelled) {
         std::lock_guard accept(state_->namespace_apply_mutex);
         check_deadline(deadline, cancelled);
+        state_->refresh_namespace_if_stale();
+        check_deadline(deadline, cancelled);
         if (!state_->namespace_capacity_available())
             throw FsError(EAGAIN, "FUSE namespace publication queue saturated");
         State::NamespaceOp op;
@@ -1000,6 +1008,8 @@ void FuseFrontend::unlink(std::string_view path) {
              [this, requested](Clock::time_point deadline, std::atomic_bool& cancelled) {
         std::lock_guard accept(state_->namespace_apply_mutex);
         check_deadline(deadline, cancelled);
+        state_->refresh_namespace_if_stale();
+        check_deadline(deadline, cancelled);
         if (!state_->namespace_capacity_available())
             throw FsError(EAGAIN, "FUSE namespace publication queue saturated");
         State::NamespaceOp op;
@@ -1027,6 +1037,8 @@ void FuseFrontend::rename(std::string_view from, std::string_view to, bool norep
              [this, source, destination, noreplace](Clock::time_point deadline,
                                                      std::atomic_bool& cancelled) {
         std::lock_guard accept(state_->namespace_apply_mutex);
+        check_deadline(deadline, cancelled);
+        state_->refresh_namespace_if_stale();
         check_deadline(deadline, cancelled);
         if (!state_->namespace_capacity_available())
             throw FsError(EAGAIN, "FUSE namespace publication queue saturated");
@@ -1097,6 +1109,8 @@ void FuseFrontend::chmod(std::string_view path, uint32_t mode) {
              [this, requested, mode](Clock::time_point deadline, std::atomic_bool& cancelled) {
         std::lock_guard accept(state_->namespace_apply_mutex);
         check_deadline(deadline, cancelled);
+        state_->refresh_namespace_if_stale();
+        check_deadline(deadline, cancelled);
         if (!state_->namespace_capacity_available()) throw FsError(EAGAIN, "namespace queue saturated");
         State::NamespaceOp op;
         {
@@ -1122,6 +1136,8 @@ void FuseFrontend::chown(std::string_view path, uint32_t uid, uint32_t gid, bool
                                                            std::atomic_bool& cancelled) {
         std::lock_guard accept(state_->namespace_apply_mutex);
         check_deadline(deadline, cancelled);
+        state_->refresh_namespace_if_stale();
+        check_deadline(deadline, cancelled);
         if (!state_->namespace_capacity_available()) throw FsError(EAGAIN, "namespace queue saturated");
         State::NamespaceOp op;
         {
@@ -1146,6 +1162,8 @@ void FuseFrontend::utimens(std::string_view path, int64_t mtime_ns) {
              [this, requested, mtime_ns](Clock::time_point deadline, std::atomic_bool& cancelled) {
         std::lock_guard accept(state_->namespace_apply_mutex);
         check_deadline(deadline, cancelled);
+        state_->refresh_namespace_if_stale();
+        check_deadline(deadline, cancelled);
         if (!state_->namespace_capacity_available()) throw FsError(EAGAIN, "namespace queue saturated");
         State::NamespaceOp op;
         {
@@ -1169,6 +1187,8 @@ FuseOpenHandle FuseFrontend::open(std::string_view path, bool readable, bool wri
     return dispatch(FuseOperationClass::lifecycle,
                     [this, requested, readable, writable, append, truncate_on_open](
                         Clock::time_point deadline, std::atomic_bool& cancelled) {
+        check_deadline(deadline, cancelled);
+        state_->refresh_namespace_if_stale();
         check_deadline(deadline, cancelled);
         std::shared_ptr<State::Inode> inode;
         {
@@ -1199,6 +1219,8 @@ FuseOpenHandle FuseFrontend::create(std::string_view path, uint32_t mode, uint32
                     [this, requested, mode, uid, gid, readable, writable, append](
                         Clock::time_point deadline, std::atomic_bool& cancelled) {
         std::lock_guard accept(state_->namespace_apply_mutex);
+        check_deadline(deadline, cancelled);
+        state_->refresh_namespace_if_stale();
         check_deadline(deadline, cancelled);
         if (!state_->namespace_capacity_available())
             throw FsError(EAGAIN, "FUSE namespace publication queue saturated");
@@ -1454,7 +1476,8 @@ std::string FuseFrontend::path_for_inode(uint64_t id) const {
     return inode->current_path;
 }
 
-std::optional<uint64_t> FuseFrontend::inode_for_path(std::string_view path) const {
+std::optional<uint64_t> FuseFrontend::inode_for_path(std::string_view path) {
+    state_->refresh_namespace_if_stale();
     std::lock_guard lock(state_->namespace_mutex);
     auto found = state_->paths.find(canonical_path(path));
     if (found == state_->paths.end()) return {};

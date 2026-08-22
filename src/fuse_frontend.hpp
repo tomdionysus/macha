@@ -203,7 +203,7 @@ class FuseFrontend final : public HydrationHintProvider {
     std::pair<uint64_t, uint64_t> logical_capacity() const;
     void note_interactive_activity(uint64_t bytes = 0);
     std::string path_for_inode(uint64_t inode) const;
-    std::optional<uint64_t> inode_for_path(std::string_view path) const;
+    std::optional<uint64_t> inode_for_path(std::string_view path);
     std::vector<FuseDirtyRange> dirty_ranges(uint64_t inode) const;
     FuseFrontendStatus status() const;
     bool wait_for_idle(std::chrono::milliseconds timeout = std::chrono::seconds(10));

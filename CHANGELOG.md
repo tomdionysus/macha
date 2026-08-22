@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.14.5 - 2026-08-22
+
+- remove the FUSE namespace refresh timer entirely. Namespace-facing FUSE operations now validate the known metadata generation on demand and adopt `MetadataManager`'s shared immutable decoded snapshot only when their cached namespace generation is stale; a completely idle mount therefore performs no namespace refresh work;
+- serialise on-demand namespace adoption so concurrent lookup workers cannot rebuild the same generation repeatedly, while retaining the existing coherent local view if a newer distributed generation is temporarily unreachable;
+- remove the 10 ms `fuse_session_exited()` shutdown polling thread. `fuse_loop_mt()` already returns when the session exits, and the normal post-loop shutdown path performs cancellation and service shutdown;
+- remove the obsolete `fuse.refresh_interval_ms` setting. Existing YAML keys are harmlessly ignored; `fuse.watchdog_interval_ms` remains because mount-table loss is external OS state that still requires periodic observation;
+- add regression coverage showing a FUSE frontend sees namespace mutations made outside that frontend on the next namespace request without a refresh timer.
+
 ## 0.14.4 - 2026-08-22
 
 - Eliminated the dominant idle FUSE cost: namespace refresh now checks metadata generation first and reuses the shared immutable decoded metadata snapshot only when metadata actually advances.
