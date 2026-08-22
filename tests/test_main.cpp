@@ -1349,7 +1349,7 @@ void test_config() {
             << "  read_ahead_extents: 4\n"
             << "  hint_lifetime_ms: 4500\n"
             << "  write_through_cache: false\n"
-            << "  refresh_interval_ms: 750\n"
+            << "  refresh_interval_ms: 750\n" // legacy 0.14.4 key: accepted and ignored
             << "  fail_closed_mountpoint: true\n"
             << "  watchdog_interval_ms: 650\n"
             << "  timeouts:\n"
@@ -1496,7 +1496,6 @@ void test_config() {
     CHECK(yc.fuse.read_ahead_extents == 4);
     CHECK(yc.fuse.hint_lifetime == 4500ms);
     CHECK(!yc.fuse.write_through_cache);
-    CHECK(yc.fuse.refresh_interval == 750ms);
     CHECK(yc.fuse.fail_closed_mountpoint);
     CHECK(yc.fuse.watchdog_interval == 650ms);
     CHECK(yc.fuse.timeouts.lookup == 900ms);
@@ -3382,7 +3381,6 @@ void test_fuse_frontend_ordering_merging_and_cache() {
     config.extent_size = 1024 * 1024;
     config.cache.path = t.path() / "cache";
     config.cache.max_blocks = 64;
-    config.fuse.refresh_interval = 30s;
     config.fuse.commit_workers = 2;
     config.fuse.read_ahead_extents = 2;
     config.fuse.write_through_cache = true;
@@ -3476,7 +3474,6 @@ void test_fuse_read_only_release_does_not_publish_writer_data() {
     auto config = config_for(t.path() / "fuse-read-release", keyfile, free_port());
     config.replication = 1;
     config.metadata_replication = 1;
-    config.fuse.refresh_interval = 30s;
     config.fuse.commit_workers = 1;
 
     Service service(config, keys);
@@ -3525,7 +3522,6 @@ void test_fuse_frontend_unlink_and_rename_over_open_inode_ordering() {
     auto config = config_for(t.path() / "fuse-replace", keyfile, free_port());
     config.replication = 1;
     config.metadata_replication = 1;
-    config.fuse.refresh_interval = 30s;
     config.fuse.commit_workers = 2;
 
     Service service(config, keys);
@@ -3597,7 +3593,6 @@ void test_fuse_frontend_read_overlay_truncate_and_hydration_hints() {
     config.replication = 1;
     config.metadata_replication = 1;
     config.extent_size = 1024 * 1024;
-    config.fuse.refresh_interval = 30s;
     config.fuse.read_ahead_extents = 2;
     config.fuse.hydration_priority = 2718;
 
@@ -3678,6 +3673,48 @@ void test_fuse_frontend_read_overlay_truncate_and_hydration_hints() {
         CHECK(std::equal(marker.begin(), marker.end(), final_bytes.begin() + 40000));
         CHECK(std::all_of(final_bytes.begin() + 32768, final_bytes.begin() + 40000,
                           [](uint8_t b) { return b == 0; }));
+    }
+    service.stop();
+}
+
+void test_fuse_frontend_namespace_refresh_is_demand_driven() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-demand-refresh", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.fuse.commit_workers = 1;
+
+    Service service(config, keys);
+    service.start();
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+
+        bool missing = false;
+        try { (void)frontend->getattr("/external"); }
+        catch (const FsError& e) { missing = e.code() == ENOENT; }
+        CHECK(missing);
+
+        // Mutate the namespace outside the FUSE frontend. There is no refresh
+        // timer: the next namespace-facing FUSE request observes the metadata
+        // generation advance and adopts MetadataManager's shared decoded view.
+        service.filesystem().mkdir("/external", 0755, getuid(), getgid());
+        auto external = frontend->getattr("/external");
+        CHECK(external.type == EntryType::directory);
+
+        service.filesystem().create_file("/external/media.bin", 0644, getuid(), getgid());
+        auto entries = frontend->readdir("/external");
+        CHECK(std::any_of(entries.begin(), entries.end(), [](const auto& item) {
+            return item.first == "media.bin";
+        }));
+
+        service.filesystem().unlink("/external/media.bin");
+        missing = false;
+        try { (void)frontend->getattr("/external/media.bin"); }
+        catch (const FsError& e) { missing = e.code() == ENOENT; }
+        CHECK(missing);
     }
     service.stop();
 }
@@ -7119,6 +7156,7 @@ int main() {
         RUN_TEST(test_fuse_read_only_release_does_not_publish_writer_data);
         RUN_TEST(test_fuse_frontend_unlink_and_rename_over_open_inode_ordering);
         RUN_TEST(test_fuse_frontend_read_overlay_truncate_and_hydration_hints);
+        RUN_TEST(test_fuse_frontend_namespace_refresh_is_demand_driven);
         RUN_TEST(test_full_replica_fallback);
         RUN_TEST(test_replacement_node_recovers_namespace_and_replication);
         RUN_TEST(test_hydration_scheduler_and_prediction);

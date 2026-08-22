@@ -82,7 +82,6 @@ struct FuseConfig {
     bool write_through_cache{true};
 
     // Local metadata refresh and external mount-loss containment.
-    std::chrono::milliseconds refresh_interval{1000};
     bool fail_closed_mountpoint{true};
     std::chrono::milliseconds watchdog_interval{1000};
 };

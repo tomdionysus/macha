@@ -1,4 +1,4 @@
-# Macha 0.14.4
+# Macha 0.14.5
 #
 # Copy this file per node. Paths, advertise address and failure_domain are
 # node-local. The cluster key contents and dht policy must match every node.
@@ -70,7 +70,6 @@ fuse:
   read_ahead_extents: 2
   hint_lifetime_ms: 5000
   write_through_cache: true
-  refresh_interval_ms: 1000
   fail_closed_mountpoint: true
   watchdog_interval_ms: 1000
 

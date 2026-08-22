@@ -125,9 +125,8 @@ void validate(Config& config) {
         throw std::runtime_error("fuse pending queue limits must be 1..65536");
     if (config.fuse.read_ahead_extents > 64)
         throw std::runtime_error("fuse.read_ahead_extents must be <= 64");
-    if (config.fuse.refresh_interval < std::chrono::milliseconds(50) ||
-        config.fuse.watchdog_interval < std::chrono::milliseconds(50))
-        throw std::runtime_error("fuse refresh/watchdog intervals must be >= 50ms");
+    if (config.fuse.watchdog_interval < std::chrono::milliseconds(50))
+        throw std::runtime_error("fuse.watchdog_interval_ms must be >= 50ms");
     if (config.extent_size < 1024 * 1024 || config.extent_size > 64ULL * 1024 * 1024)
         throw std::runtime_error("extent size must be 1M..64M");
     if (config.catalogue.api.enabled && !config.catalogue.api.port)
@@ -407,7 +406,6 @@ void parse_fuse(const YAML::Node& root, Config& c) {
     if (f["read_ahead_extents"]) c.fuse.read_ahead_extents = f["read_ahead_extents"].as<size_t>();
     if (f["hint_lifetime_ms"]) c.fuse.hint_lifetime = milliseconds(f["hint_lifetime_ms"], "fuse.hint_lifetime_ms");
     if (f["write_through_cache"]) c.fuse.write_through_cache = f["write_through_cache"].as<bool>();
-    if (f["refresh_interval_ms"]) c.fuse.refresh_interval = milliseconds(f["refresh_interval_ms"], "fuse.refresh_interval_ms");
     if (f["fail_closed_mountpoint"]) c.fuse.fail_closed_mountpoint = f["fail_closed_mountpoint"].as<bool>();
     if (f["watchdog_interval_ms"]) c.fuse.watchdog_interval = milliseconds(f["watchdog_interval_ms"], "fuse.watchdog_interval_ms");
     if (auto t = f["timeouts"]) {
