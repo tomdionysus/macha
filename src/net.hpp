@@ -296,6 +296,7 @@ class RpcServer {
     std::deque<RequestJob> foreground_requests_;
     std::deque<RequestJob> read_ahead_requests_;
     std::deque<RequestJob> speculative_requests_;
+    size_t active_nonforeground_data_{};
     std::mutex sessions_mutex_;
     std::vector<std::shared_ptr<Session>> sessions_;
     RpcClient* shared_client_{};

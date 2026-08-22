@@ -26,6 +26,11 @@ constexpr size_t protocol_max_frame_size = 4 * 1024 * 1024;
 constexpr size_t max_message_size = 128 * 1024 * 1024;
 constexpr size_t control_worker_count = 2;
 constexpr size_t data_worker_count = 8;
+// Lower-priority object writes/repair must never occupy every execution slot.
+// Keep capacity ready for viewer-blocking reads even when all DATA workers would
+// otherwise already be inside synchronous storage handlers.
+constexpr size_t foreground_data_worker_reserve = 2;
+static_assert(foreground_data_worker_reserve < data_worker_count);
 constexpr size_t max_pending_requests = 512;
 constexpr size_t max_peer_outbound = 256;
 constexpr size_t frame_header_size = 28;
@@ -3003,17 +3008,46 @@ void RpcServer::data_worker_loop(std::stop_token stop) {
     ThreadCpuReporter cpu_reporter("macha-rpc-data");
     while (true) {
         RequestJob job;
+        bool nonforeground = false;
         {
             std::unique_lock lock(request_mutex_);
-            request_cv_.wait(lock, [&] { return stop.stop_requested() || data_ready(); });
+            request_cv_.wait(lock, [&] {
+                if (stop.stop_requested())
+                    return true;
+                if (!foreground_requests_.empty())
+                    return true;
+                const auto lower_limit = data_worker_count - foreground_data_worker_reserve;
+                return active_nonforeground_data_ < lower_limit &&
+                       (!read_ahead_requests_.empty() || !speculative_requests_.empty());
+            });
             if (stop.stop_requested() && !data_ready())
                 return;
-            auto cls = next_data_class();
+
+            RequestClass cls;
+            if (!foreground_requests_.empty()) {
+                cls = RequestClass::foreground;
+            } else {
+                const auto lower_limit = data_worker_count - foreground_data_worker_reserve;
+                if (!stop.stop_requested() && active_nonforeground_data_ >= lower_limit)
+                    continue;
+                cls = !read_ahead_requests_.empty() ? RequestClass::read_ahead
+                                                    : RequestClass::speculative;
+                ++active_nonforeground_data_;
+                nonforeground = true;
+            }
             auto& requests = queue(cls);
             job = std::move(requests.front());
             requests.pop_front();
         }
         execute(std::move(job));
+        if (nonforeground) {
+            {
+                std::lock_guard lock(request_mutex_);
+                if (active_nonforeground_data_)
+                    --active_nonforeground_data_;
+            }
+            request_cv_.notify_all();
+        }
         cpu_reporter.tick();
     }
 }

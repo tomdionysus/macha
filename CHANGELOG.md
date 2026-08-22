@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.14.8 - 2026-08-22
+
+- classify write-handle traffic as interactive rather than playback foreground traffic. This prevents asynchronous FUSE publication from refreshing the playback quiet deadline itself after every replay chunk, which could stall publication for `publication_quiet` between chunks and make `wait_for_idle()` time out; writes still suppress maintenance through the interactive activity class;
+- make seek updates semantic rather than syntactic: a `PATCH` that supplies `seek_ms` plus preferences identical to the active session now reuses the prepared random-access/VOD plan instead of reopening container metadata and remote extents merely because the client repeated its current preferences;
+- make playback demand visible before the first object read completes, so the first slow cache/remote read immediately suppresses lower-priority convergence work instead of becoming the read that has to wait for that work;
+- treat asynchronous FUSE data publication as background convergence once bytes are safe in the local spool: while playback is active, new publications do not start and an active publication yields between bounded replay chunks and before metadata commit, then resumes after the configured publication quiet period;
+- reserve two of the eight DATA RPC execution slots from lower-priority read-ahead/speculative work. Foreground playback/probe/seek requests can therefore enter a storage handler even when bulk FUSE/object publication has saturated the lower-priority queue; foreground work may still use the full pool when needed;
+- add regression coverage for seek requests that repeat unchanged preferences, FUSE publication quiescence during playback, and foreground DATA execution under a saturated lower-priority worker pool.
+
 ## 0.14.7 - 2026-08-22
 
 - stop Clear Metadata from forcing a full-library catalogue rescan: the mutation now returns the exact immutable media identities it released and queues only those paths for rematching; a definitely absent item returns 404 from current in-memory catalogue state without first entering distributed repair;

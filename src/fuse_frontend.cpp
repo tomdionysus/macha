@@ -531,6 +531,28 @@ struct FuseFrontend::State {
         return snapshot;
     }
 
+    bool playback_quiet() const {
+        return config.publication_quiet.count() <= 0 ||
+               fs.foreground_idle_for() >= config.publication_quiet;
+    }
+
+    void wait_for_playback_quiet() {
+        while (!stopping.load(std::memory_order_relaxed) && !playback_quiet()) {
+            const auto idle = fs.foreground_idle_for();
+            const auto remaining = idle < config.publication_quiet
+                                       ? config.publication_quiet - idle
+                                       : std::chrono::milliseconds(0);
+            if (remaining <= std::chrono::milliseconds(0))
+                break;
+            std::unique_lock lock(data_queue_mutex);
+            data_cv.wait_for(lock, remaining, [&] {
+                return stopping.load(std::memory_order_relaxed);
+            });
+        }
+        if (stopping.load(std::memory_order_relaxed))
+            throw FsError(EINTR, "FUSE publication stopping");
+    }
+
     void replay_data(const std::shared_ptr<Inode>& inode, DataSnapshot snapshot) {
         if (snapshot.operations.empty())
             return;
@@ -569,11 +591,17 @@ struct FuseFrontend::State {
             if (stopping.load())
                 throw FsError(EINTR, "FUSE publication stopping");
             if (op.kind == DataOp::Kind::truncate) {
+                wait_for_playback_quiet();
                 writer->truncate(op.size);
                 continue;
             }
             uint64_t done = 0;
             while (done < op.length) {
+                // FUSE write bytes are already durable in the local spool.  The
+                // distributed publication is therefore background convergence,
+                // and viewer-blocking playback gets to stop it between bounded
+                // replay chunks rather than competing for disk/RPC service.
+                wait_for_playback_quiet();
                 const auto chunk = static_cast<size_t>(std::min<uint64_t>(buffer.size(), op.length - done));
                 if (pread_exact(snapshot.spool_fd, {buffer.data(), chunk}, op.spool_offset + done) != chunk)
                     throw FsError(EIO, "short read from FUSE write spool");
@@ -587,6 +615,7 @@ struct FuseFrontend::State {
         // namespace publication and other FUSE data commits to avoid a fan-out
         // of large metadata CAS attempts fighting over the same snapshot.
         {
+            wait_for_playback_quiet();
             std::lock_guard backend(publication_mutex);
             writer->commit();
         }
@@ -607,11 +636,17 @@ struct FuseFrontend::State {
     }
 
     bool data_slot_available() const {
-        const bool recent_foreground = config.publication_quiet.count() > 0 &&
+        // Playback is stricter than mounted-filesystem foreground activity.
+        // FUSE data has already been admitted to the local spool, so starting a
+        // distributed publication while a viewer is waiting serves no latency
+        // purpose and only creates storage/network contention.
+        if (!playback_quiet())
+            return false;
+        const bool recent_mount_activity = config.publication_quiet.count() > 0 &&
             fs.interactive_idle_for() < config.publication_quiet;
-        const bool foreground_busy =
-            open_writers.load(std::memory_order_relaxed) > 0 || recent_foreground;
-        const auto limit = foreground_busy ? config.foreground_commit_workers : config.commit_workers;
+        const bool mount_busy =
+            open_writers.load(std::memory_order_relaxed) > 0 || recent_mount_activity;
+        const auto limit = mount_busy ? config.foreground_commit_workers : config.commit_workers;
         return active_data.load(std::memory_order_relaxed) < limit;
     }
 
@@ -634,10 +669,18 @@ struct FuseFrontend::State {
                     // The only transition without a producer event is expiry of
                     // publication_quiet, so sleep directly to that deadline rather
                     // than waking every 50 ms while the queue is throttled.
-                    const auto idle = fs.interactive_idle_for();
+                    const auto playback_idle = fs.foreground_idle_for();
+                    if (config.publication_quiet.count() > 0 &&
+                        playback_idle < config.publication_quiet) {
+                        data_cv.wait_for(lock, stop, config.publication_quiet - playback_idle, [&] {
+                            return stopping.load() || data_queue.empty() || data_slot_available();
+                        });
+                        continue;
+                    }
+                    const auto mount_idle = fs.interactive_idle_for();
                     if (open_writers.load(std::memory_order_relaxed) == 0 &&
-                        config.publication_quiet.count() > 0 && idle < config.publication_quiet) {
-                        data_cv.wait_for(lock, stop, config.publication_quiet - idle, [&] {
+                        config.publication_quiet.count() > 0 && mount_idle < config.publication_quiet) {
+                        data_cv.wait_for(lock, stop, config.publication_quiet - mount_idle, [&] {
                             return stopping.load() || data_queue.empty() || data_slot_available();
                         });
                     } else {

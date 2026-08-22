@@ -2579,6 +2579,64 @@ void test_rpc_health_and_control_not_starved_by_data() {
     server.stop();
 }
 
+void test_rpc_foreground_not_starved_by_busy_data_workers() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto port = free_port();
+
+    NodeInfo server_info;
+    server_info.id = random_node_id();
+    server_info.host = "127.0.0.1";
+    server_info.port = port;
+    server_info.failure_domain = "server-site";
+
+    std::atomic_int lower_started{};
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, FrameType frame_type, const RpcMessage& request) {
+            if (request.type == MessageType::put_object && frame_type != FrameType::foreground) {
+                ++lower_started;
+                std::this_thread::sleep_for(400ms);
+            }
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {});
+    server.start();
+
+    NodeInfo client_info;
+    client_info.id = random_node_id();
+    client_info.host = "127.0.0.1";
+    client_info.port = free_port();
+    client_info.failure_domain = "client-site";
+    RpcClient client(keys, [client_info] { return client_info; }, [](const NodeInfo&) {},
+                     [](uint64_t) {}, 500ms, 100ms, 2s);
+    Endpoint endpoint{"127.0.0.1", port};
+
+    // Lower-priority work may use most of the DATA execution pool, but it must
+    // leave execution capacity for a playback/seek read that arrives later.
+    std::vector<AsyncRpc> bulk;
+    for (int i = 0; i < 8; ++i)
+        bulk.push_back(client.call_async(endpoint, MessageType::put_object, Bytes{0x42},
+                                         FrameType::read_ahead));
+    REQUIRE(wait_until([&] { return lower_started.load() >= 6; }, 1s));
+
+    auto started = Clock::now();
+    auto foreground = client.call(endpoint, MessageType::get_object, Bytes{0x46},
+                                  FrameType::foreground, 100ms);
+    CHECK(foreground.message.type == MessageType::ok);
+    CHECK(Clock::now() - started < 200ms);
+
+    for (auto& rpc : bulk) {
+        REQUIRE(rpc.wait_for(2s) == std::future_status::ready);
+        CHECK(rpc.get().message.type == MessageType::ok);
+    }
+
+    client.stop();
+    server.stop();
+}
+
 void test_early_replication_quorum() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
@@ -3489,6 +3547,10 @@ void test_fuse_frontend_ordering_merging_and_cache() {
         frontend->release(inode, true);
         REQUIRE(frontend->wait_for_idle(10s));
 
+        // Write publication is interactive I/O, not playback. If the backend
+        // writer marks its own replay chunks as foreground, the publication
+        // quiet policy self-throttles by one full quiet interval per chunk.
+        CHECK(service.filesystem().foreground_idle_for() >= 1h);
         CHECK(frontend->status().pending_data == 0);
         auto entry = service.filesystem().getattr("/movie.bin");
         CHECK(entry.size == expected.size());
@@ -3509,6 +3571,47 @@ void test_fuse_frontend_ordering_merging_and_cache() {
         for (const auto& extent : entry.extents)
             if (!extent.hole)
                 CHECK(service.node().block_cache().has(extent.id));
+    }
+    service.stop();
+}
+
+void test_fuse_publication_yields_to_playback() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-playback-yield", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 300ms;
+
+    Service service(config, keys);
+    service.start();
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto handle = frontend->create("/playback-yield.bin", 0600, getuid(), getgid(), true, true, false);
+        const auto inode = handle.inode;
+        REQUIRE(inode != 0);
+        REQUIRE(frontend->wait_for_idle(5s));
+
+        auto payload = pattern(512 * 1024);
+        REQUIRE(frontend->write(inode, 0, payload) == payload.size());
+
+        // Playback demand is recorded before its storage read begins.  Bytes
+        // already accepted by FUSE stay in the local spool, while distributed
+        // publication waits for the viewer-critical quiet window to expire.
+        service.filesystem().store().foreground_activity(1);
+        frontend->release(inode, true);
+        std::this_thread::sleep_for(100ms);
+        auto during = frontend->status();
+        CHECK(during.pending_data + during.active_data >= 1);
+        CHECK(service.filesystem().getattr("/playback-yield.bin").size == 0);
+
+        REQUIRE(frontend->wait_for_idle(5s));
+        CHECK(service.filesystem().getattr("/playback-yield.bin").size == payload.size());
     }
     service.stop();
 }
@@ -7240,6 +7343,28 @@ void test_playback_sessions_and_streaming_http_bodies() {
     REQUIRE(plans.size() == 2);
     CHECK(plans.back().seek == 35s);
 
+    // The web client may include its current preferences in every PATCH.  If
+    // those preferences are unchanged, the request is still semantically a
+    // seek-only update and must retain the reusable random-access plan.
+    Json::Object redundant_seek_preferences{{"mode", "remux"}};
+    Json::Object redundant_seek_root{{"seek_ms", 47000},
+                                     {"preferences", Json(std::move(redundant_seek_preferences))}};
+    auto redundant_seek_text = Json(std::move(redundant_seek_root)).dump();
+    HttpRequest redundant_seek;
+    redundant_seek.method = "PATCH";
+    redundant_seek.path = fast_seek.path;
+    redundant_seek.body.assign(redundant_seek_text.begin(), redundant_seek_text.end());
+    auto redundant_seek_response = playback.handle(redundant_seek);
+    REQUIRE(redundant_seek_response.status == 200);
+    auto redundant_seek_json = Json::parse(std::string(redundant_seek_response.body.begin(),
+                                                       redundant_seek_response.body.end()));
+    CHECK(redundant_seek_json.find("seek_ms")->asInt64() == 47000);
+    CHECK(fake_engine_ptr->probes() == probes_before_seek);
+    CHECK(fake_engine_ptr->vod_prepares() == prepares_before_seek);
+    plans = fake_engine_ptr->started_plans();
+    REQUIRE(plans.size() == 3);
+    CHECK(plans.back().seek == 47s);
+
     HttpRequest remove_initial_seek;
     remove_initial_seek.method = "DELETE";
     remove_initial_seek.path = "/api/v1/playback/sessions/" + initial_seek_json.find("session_id")->asString();
@@ -7624,6 +7749,7 @@ int main() {
         RUN_TEST(test_rpc_v7_handshake_is_rejected);
         RUN_TEST(test_rpc_slow_control_does_not_abort_data);
         RUN_TEST(test_rpc_health_and_control_not_starved_by_data);
+        RUN_TEST(test_rpc_foreground_not_starved_by_busy_data_workers);
         RUN_TEST(test_early_replication_quorum);
         RUN_TEST(test_put_spills_stalled_owners_and_commits_degraded_floor);
         RUN_TEST(test_put_falls_back_after_remote_launch_failure);
@@ -7637,6 +7763,7 @@ int main() {
         RUN_TEST(test_active_write_size_visibility);
         RUN_TEST(test_open_write_survives_rename);
         RUN_TEST(test_fuse_frontend_ordering_merging_and_cache);
+        RUN_TEST(test_fuse_publication_yields_to_playback);
         RUN_TEST(test_fuse_read_only_release_does_not_publish_writer_data);
         RUN_TEST(test_fuse_frontend_unlink_and_rename_over_open_inode_ordering);
         RUN_TEST(test_fuse_frontend_read_overlay_truncate_and_hydration_hints);

@@ -49,6 +49,10 @@ playback[a1b2c3d4] session create complete ... elapsed_ms=...
 
 `probe_timeout_ms` places one wall-clock bound on the complete representation-selection pass; candidate media IDs share the remaining budget. The same deadline is propagated through `ReadHandle` into remote DHT object fetches, where an outstanding media RPC is cancelled when it expires. `startup_timeout_ms` independently bounds the wait for the first transformed fragment. A 503 therefore identifies whether inspection or transformed-output startup failed instead of presenting as one long opaque request.
 
+Playback/probe/seek object reads are foreground traffic. Foreground demand is recorded before storage access begins, lower-priority DATA RPC execution retains reserved worker capacity for it, and asynchronous FUSE publication pauses while playback is active. FUSE writes already accepted into the local spool remain locally durable and resume distributed publication after the playback quiet window; a bulk copy through the mount is therefore not allowed to consume all execution/storage service needed to start or seek a stream.
+
+Seek-only updates are determined by effective session policy rather than JSON shape. A client may resend its current `preferences` object together with `seek_ms`; when those preferences are unchanged Macha reuses the active immutable media probe and reusable VOD/random-access plan instead of performing a fresh container-planning pass.
+
 ## Public HTTP behaviour
 
 The catalogue/playback HTTP server uses a bounded accepted-connection queue and configurable worker pool. Response bodies may be in-memory or streaming sources, so direct media and generated segments are not assembled into one huge response. Several clients and several simultaneous HLS fragment requests can be active independently.
