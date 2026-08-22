@@ -4,6 +4,7 @@
 #include <chrono>
 #include <compare>
 #include <condition_variable>
+#include <functional>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -113,6 +114,8 @@ class CatalogueHintQueue {
                        std::string result = {});
     void advance_candidate(std::string_view id, size_t next_cursor);
     void defer(std::string_view id, std::string error, uint64_t retry_after_unix_ms);
+    size_t defer_matching(const std::function<bool(const CatalogueHint&)>& predicate,
+                          std::string error, uint64_t retry_after_unix_ms);
     bool record_failure(std::string_view id, std::string error,
                         uint64_t retry_after_unix_ms, unsigned max_failures);
     void fail(std::string_view id, std::string error);

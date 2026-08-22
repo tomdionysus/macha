@@ -481,6 +481,34 @@ void CatalogueHintQueue::defer(std::string_view id, std::string error, uint64_t 
     changed_locked();
 }
 
+size_t CatalogueHintQueue::defer_matching(
+    const std::function<bool(const CatalogueHint&)>& predicate,
+    std::string error, uint64_t retry_after_unix_ms) {
+    const auto now = now_ms();
+    std::lock_guard lock(mutex_);
+    size_t deferred = 0;
+    for (auto& [_, hint] : hints_) {
+        if (hint.state != CatalogueHintState::queued &&
+            hint.state != CatalogueHintState::deferred &&
+            hint.state != CatalogueHintState::processing)
+            continue;
+        if (!predicate(hint))
+            continue;
+        hint.state = CatalogueHintState::deferred;
+        hint.error = error;
+        hint.ready_after_unix_ms = std::max(hint.ready_after_unix_ms, retry_after_unix_ms);
+        hint.updated_unix_ms = now;
+        ++deferred;
+    }
+    if (deferred) {
+        // Provider outage is one scheduling event, not N independent hint
+        // failures. Persist and wake once for the complete affected provider set.
+        save_state_locked();
+        changed_locked();
+    }
+    return deferred;
+}
+
 bool CatalogueHintQueue::record_failure(std::string_view id, std::string error,
                                         uint64_t retry_after_unix_ms,
                                         unsigned max_failures) {

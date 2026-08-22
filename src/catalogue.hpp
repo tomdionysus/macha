@@ -106,7 +106,7 @@ class CatalogueManager {
     static std::set<ObjectId> artwork_ids(const CatalogueSnapshot&);
     static size_t durability_required(const MetadataSnapshot&, size_t active);
     CatalogueSnapshot load_root(const std::optional<ObjectId>&);
-    void cache(const MetadataRecord&, const MetadataSnapshot&, CatalogueSnapshot);
+    void cache(uint64_t metadata_generation, const MetadataSnapshot&, CatalogueSnapshot);
     std::shared_ptr<const CatalogueSnapshot> current_snapshot();
     void commit(const std::optional<ObjectId>& expected_root, const CatalogueSnapshot& next,
                 const std::set<ObjectId>& old_artwork);
