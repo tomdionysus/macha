@@ -374,7 +374,11 @@ std::optional<CatalogueHint> CatalogueHintQueue::claim_next() {
     ++best->second.attempts;
     best->second.updated_unix_ms = now;
     lane_served_[scheduling_lane(best->second.path)] = ++schedule_sequence_;
-    save_state_locked();
+    // `processing` is an in-memory ownership state, not durable truth. Persisting
+    // it rewrites the complete hint queue for every claim. If the process dies
+    // before completion, leaving the durable state queued/deferred simply makes
+    // the item replay once after restart, which is the desired at-least-once
+    // recovery behaviour. Terminal/deferred transitions remain durable.
     return best->second;
 }
 

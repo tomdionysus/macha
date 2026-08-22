@@ -2234,6 +2234,10 @@ MovieScanProvider::MovieScanProvider(HttpClient& http, CatalogueMovieProviderCon
     }
 }
 
+bool MovieScanProvider::accepts_path(std::string_view path) const noexcept {
+    return video_extension(extension(path));
+}
+
 MediaProbeFile MovieScanProvider::probe_file(
     FileSystem&, std::string_view root, std::string_view path, const FsEntry& entry) {
     auto candidates = probe_media_candidates(path, entry, root);
@@ -2253,6 +2257,10 @@ TvScanProvider::TvScanProvider(HttpClient& http, CatalogueTvProviderConfig confi
             Log::warn("catalogue TV metadata disabled: " + std::string(e.what()));
         }
     }
+}
+
+bool TvScanProvider::accepts_path(std::string_view path) const noexcept {
+    return video_extension(extension(path));
 }
 
 MediaProbeFile TvScanProvider::probe_file(
@@ -2277,6 +2285,10 @@ MusicScanProvider::MusicScanProvider(HttpClient& http, CatalogueMusicProviderCon
             Log::warn("catalogue Discogs metadata disabled: " + std::string(e.what()));
         }
     }
+}
+
+bool MusicScanProvider::accepts_path(std::string_view path) const noexcept {
+    return audio_extension(extension(path));
 }
 
 MediaProbeFile MusicScanProvider::probe_file(
@@ -2456,6 +2468,28 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
         return {};
     }
 
+    const auto media_id = file_media_id(entry);
+    auto existing = catalogue_.snapshot();
+    std::vector<std::string> existing_ids;
+    for (const auto& [id, item] : existing.items) {
+        if (std::find(item.media_ids.begin(), item.media_ids.end(), media_id) != item.media_ids.end())
+            existing_ids.push_back(id);
+    }
+
+    const bool manual_refresh = std::any_of(
+        hint.origins.begin(), hint.origins.end(),
+        [](const auto& origin) { return origin.source == "manual"; });
+
+    // Exact media identity is content-derived from the immutable extent manifest.
+    // If this object is already bound, a passive scanner/ingest retry has no new
+    // information to discover. Do not reopen/decrypt it merely to rediscover the
+    // same embedded tags. Manual rescans deliberately retain the full probe path.
+    if (!existing_ids.empty() && !manual_refresh) {
+        return PreparedHintMatch{hint.id, std::string(provider->name()), media_id,
+                                 std::move(existing_ids), {},
+                                 "already catalogued", hint.attempts};
+    }
+
     auto probed = provider->probe_file(fs_, root, hint.path, entry);
     if (stop.stop_requested()) return {};
     if (probed.candidates.empty()) {
@@ -2463,27 +2497,23 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
                              "no supported media candidate");
         return {};
     }
-    const auto media_id = probed.candidates.front().probe.media_id;
 
-    // A duplicate hint for media already bound to the catalogue is cheap: no
-    // remote provider lookup is required. Embedded artwork can still be merged.
-    auto existing = catalogue_.snapshot();
-    std::vector<std::string> existing_ids;
+    // A manual refresh of an already-bound immutable file may still merge newly
+    // supported embedded artwork, but it never needs an online metadata lookup.
     std::optional<CatalogueItem> artwork_target;
-    for (const auto& [id, item] : existing.items) {
-        if (std::find(item.media_ids.begin(), item.media_ids.end(), media_id) == item.media_ids.end())
-            continue;
-        existing_ids.push_back(id);
-        if (!probed.artwork.empty()) {
-            if (item.kind == CatalogueKind::track && item.parent_id) {
-                if (auto parent = existing.items.find(*item.parent_id); parent != existing.items.end())
-                    artwork_target = parent->second;
-            } else {
-                artwork_target = item;
+    if (!existing_ids.empty()) {
+        for (const auto& [id, item] : existing.items) {
+            if (std::find(item.media_ids.begin(), item.media_ids.end(), media_id) == item.media_ids.end())
+                continue;
+            if (!probed.artwork.empty()) {
+                if (item.kind == CatalogueKind::track && item.parent_id) {
+                    if (auto parent = existing.items.find(*item.parent_id); parent != existing.items.end())
+                        artwork_target = parent->second;
+                } else {
+                    artwork_target = item;
+                }
             }
         }
-    }
-    if (!existing_ids.empty()) {
         std::vector<CatalogueItem> updates;
         if (artwork_target) {
             bool changed = false;
@@ -2724,7 +2754,7 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
                                std::move(match.catalogue_item_ids), std::move(match.result));
         ++out.catalogued;
     }
-    if (out.catalogued)
+    if (out.catalogued && max_hints > 1)
         Log::info("catalogue hint batch matched " + std::to_string(out.catalogued) + " media files");
     return out;
 }
@@ -2800,14 +2830,21 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
         : std::string{};
     for (const auto& file : files) {
         if (stop.stop_requested()) return 0;
-        auto probed = file.provider->probe_file(fs_, file.root, file.path, file.entry);
-        if (probed.candidates.empty()) continue;
-        const auto media_id = probed.candidates.front().probe.media_id;
+        if (!file.provider->accepts_path(file.path)) continue;
+
+        // Discovery answers only "which immutable media objects exist?". The
+        // media id is available directly from FsEntry; opening every file here
+        // duplicates the expensive libav/tag probe that the hint consumer must
+        // perform for genuinely unbound media. On an old library that turned one
+        // repair pass into two complete media reads per item.
+        const auto media_id = file_media_id(file.entry);
         active_media_ids.insert(media_id);
-        // Unbound media requires metadata lookup. Bound media with newly visible
-        // embedded artwork still gets a cheap hint so local artwork refreshes
-        // retain the behaviour of the pre-queue scanner without remote lookup.
-        if (!bound.contains(media_id) || !probed.artwork.empty())
+
+        // An exact bound media id is already known. Byte changes produce a new
+        // id and therefore queue normal enrichment. Manual rescans intentionally
+        // queue bound objects so newly-supported embedded metadata/artwork can be
+        // revisited on demand.
+        if (!bound.contains(media_id) || force)
             submissions.push_back({file.path, std::string(hint_source),
                                    unique_source_ref ? scan_ref : media_id,
                                    hint_priority});
@@ -2832,6 +2869,7 @@ void CatalogueScanner::loop(std::stop_token stop) {
     auto next_periodic = std::chrono::steady_clock::now();
     auto next_hint_batch = std::chrono::steady_clock::now();
     auto hint_revision = hints_.revision();
+    bool provider_budget_open = false;
     bool was_coordinator = false;
 
     while (!stop.stop_requested()) {
@@ -2847,21 +2885,55 @@ void CatalogueScanner::loop(std::stop_token stop) {
         if (config.enabled && now >= next_hint_batch) {
             auto* budget_http = dynamic_cast<BudgetHttpClient*>(provider_http_.get());
             if (!budget_http) throw std::runtime_error("catalogue provider HTTP budget unavailable");
-            budget_http->reset_budget(config.max_provider_requests_per_scan);
-            constexpr size_t max_hint_batch = 64;
-            const auto batch = process_hint_batch(stop, max_hint_batch);
+            if (!provider_budget_open) {
+                budget_http->reset_budget(config.max_provider_requests_per_scan);
+                provider_budget_open = true;
+            }
+
+            // A large old library may legitimately have hundreds of unbound
+            // items requiring one real libav/tag/provider repair each. That work
+            // is necessary, but it is background work: one expensive item must
+            // not monopolise a core continuously. Measure this thread's actual
+            // CPU for one scheduling unit and pace subsequent work to the same
+            // CPU target used by the maintenance subsystem. Blocking network/I/O
+            // time already counts as quiet time and therefore is not penalised.
+            const auto work_started = Clock::now();
+            const auto cpu_started = thread_cpu_time_ns();
+            const auto batch = process_hint_batch(stop, 1);
+            const auto completed = Clock::now();
+            auto cooldown = std::chrono::milliseconds(25);
+            const auto cpu_completed = thread_cpu_time_ns();
+            const double cpu_target = node_.config().maintenance.cpu_target;
+            if (cpu_started && cpu_completed >= cpu_started && cpu_target > 0.0) {
+                const auto cpu_ns = cpu_completed - cpu_started;
+                const auto wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    completed - work_started).count();
+                const auto desired_wall_ns = static_cast<int64_t>(
+                    static_cast<double>(cpu_ns) / cpu_target);
+                if (desired_wall_ns > wall_ns) {
+                    cooldown = std::max(
+                        cooldown,
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::nanoseconds(desired_wall_ns - wall_ns)));
+                }
+            }
+
             if (batch.claimed) {
-                const auto completed = std::chrono::steady_clock::now();
-                next_hint_batch = budget_http->exhausted()
-                    ? completed + config.provider_batch_delay
-                    : completed + std::chrono::milliseconds(25);
-                if (budget_http->exhausted())
+                if (budget_http->exhausted()) {
+                    provider_budget_open = false;
+                    next_hint_batch = std::max(completed + cooldown,
+                                               completed + config.provider_batch_delay);
                     Log::info("catalogue hint provider budget reached requests=" +
                               std::to_string(budget_http->used()));
+                } else {
+                    next_hint_batch = completed + cooldown;
+                }
             } else if (auto delay = hints_.next_ready_delay()) {
-                next_hint_batch = std::chrono::steady_clock::now() + *delay;
+                provider_budget_open = false;
+                next_hint_batch = Clock::now() + *delay;
             } else {
-                next_hint_batch = std::chrono::steady_clock::time_point::max();
+                provider_budget_open = false;
+                next_hint_batch = Clock::time_point::max();
             }
             hint_revision = hints_.revision();
         }
