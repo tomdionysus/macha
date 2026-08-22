@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <cmath>
 #include <ctime>
+#include <fstream>
 #include <map>
 #include <memory>
+#include <limits>
 #include <set>
 #include <thread>
 
@@ -21,6 +23,58 @@ std::chrono::milliseconds maintenance_background_interval(const MaintenanceConfi
 }
 
 namespace {
+
+std::filesystem::path scrub_due_path(const std::filesystem::path& state_path) {
+    return state_path / "maintenance" / "scrub.next";
+}
+
+void persist_scrub_due(const std::filesystem::path& path, uint64_t due_unix_ms) {
+    std::filesystem::create_directories(path.parent_path());
+    auto temp = path;
+    temp += ".tmp";
+    {
+        std::ofstream out(temp, std::ios::trunc);
+        if (!out)
+            throw std::runtime_error("cannot write scrub schedule " + temp.string());
+        out << due_unix_ms << '\n';
+        out.flush();
+        if (!out)
+            throw std::runtime_error("cannot flush scrub schedule " + temp.string());
+    }
+    std::error_code error;
+    std::filesystem::rename(temp, path, error);
+    if (error) {
+        std::filesystem::remove(temp, error);
+        throw std::runtime_error("cannot publish scrub schedule " + path.string());
+    }
+}
+
+uint64_t initialise_scrub_due(const std::filesystem::path& state_path,
+                              std::chrono::milliseconds interval) {
+    const auto path = scrub_due_path(state_path);
+    {
+        std::ifstream in(path);
+        uint64_t due{};
+        if (in >> due && due)
+            return due;
+    }
+
+    const auto now = unix_ms();
+    const auto interval_ms = static_cast<uint64_t>(std::max<int64_t>(1, interval.count()));
+    const auto due = now > std::numeric_limits<uint64_t>::max() - interval_ms
+        ? std::numeric_limits<uint64_t>::max()
+        : now + interval_ms;
+    try {
+        persist_scrub_due(path, due);
+    } catch (const std::exception& error) {
+        // The schedule file is only a neighbourliness hint. Failure to persist it
+        // must not stop the server; this process still honours the in-memory due time.
+        Log::debug("maintenance: scrub schedule persistence unavailable: " +
+                   std::string(error.what()));
+    }
+    return due;
+}
+
 void log_slow_stage(std::string_view stage, Clock::time_point started,
                     const std::string& detail = {}) {
     const auto ms = elapsed_ms(started);
@@ -225,7 +279,8 @@ void Service::loop(std::stop_token stop) {
     auto network_quiescent_until = Clock::time_point{};
     auto local_quiescent_until = Clock::time_point{};
     auto gc_quiescent_until = Clock::time_point{};
-    auto scrub_quiescent_until = Clock::time_point{};
+    auto scrub_due_unix_ms = initialise_scrub_due(node_.config().state_path,
+                                                   policy.scrub_interval);
     double network_credit = 0.0;
     double local_credit = 0.0;
     double scrub_credit = 0.0;
@@ -270,8 +325,17 @@ void Service::loop(std::stop_token stop) {
         double burst_cap = std::max<double>(node_.config().extent_size, bandwidth * 5.0);
         network_credit = std::min(burst_cap, network_credit + rate * wall_seconds);
         local_credit = std::min(burst_cap, local_credit + rate * wall_seconds);
-        scrub_credit = std::min(burst_cap,
-                                scrub_credit + rate * policy.scrub_fraction * wall_seconds);
+        const auto wall_now_ms = unix_ms();
+        const bool scrub_due = policy.scrub_fraction > 0.0 &&
+                               wall_now_ms >= scrub_due_unix_ms;
+        if (scrub_due) {
+            scrub_credit = std::min(
+                burst_cap, scrub_credit + rate * policy.scrub_fraction * wall_seconds);
+        } else {
+            // Do not bank weeks of scrub credit and explode into a large burst when
+            // the next campaign becomes due. Outside a campaign, scrub is truly idle.
+            scrub_credit = 0.0;
+        }
 
         try {
             // Remote generation notices wake no kernel/FUSE path and perform no
@@ -504,7 +568,7 @@ void Service::loop(std::stop_token stop) {
                 }
             }
 
-            if (!busy && now >= scrub_quiescent_until &&
+            if (!busy && scrub_due &&
                 scrub_credit >= node_.config().extent_size) {
                 const auto scrub_stage = Clock::now();
                 auto scrub = node_.local_store().scrub_step(
@@ -522,12 +586,25 @@ void Service::loop(std::stop_token stop) {
                 if (scrub.yielded) {
                     Log::trace("maintenance: scrub yielded to foreground I/O");
                 } else if (scrub.complete) {
-                    // A scrub is a complete integrity pass, not an endless loop.
-                    // After reaching the end, pause before beginning at object zero
-                    // again even though useful bytes were checked during the pass.
+                    // A proactive scrub is a low-frequency integrity campaign. Once
+                    // the complete physical pass finishes, stay genuinely idle until
+                    // the next scheduled campaign instead of restarting after the
+                    // generic no-progress backoff used by repair/rebalance.
                     scrub_credit = 0.0;
-                    scrub_quiescent_until = Clock::now() + policy.no_progress_backoff;
-                    Log::trace("maintenance: scrub pass complete; backing off");
+                    const auto completed = unix_ms();
+                    const auto interval_ms = static_cast<uint64_t>(policy.scrub_interval.count());
+                    scrub_due_unix_ms =
+                        completed > std::numeric_limits<uint64_t>::max() - interval_ms
+                            ? std::numeric_limits<uint64_t>::max()
+                            : completed + interval_ms;
+                    try {
+                        persist_scrub_due(scrub_due_path(node_.config().state_path),
+                                          scrub_due_unix_ms);
+                    } catch (const std::exception& error) {
+                        Log::debug("maintenance: scrub schedule persistence unavailable: " +
+                                   std::string(error.what()));
+                    }
+                    Log::trace("maintenance: scrub pass complete; next campaign scheduled");
                 }
             }
 
