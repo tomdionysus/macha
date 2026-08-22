@@ -262,13 +262,13 @@ CatalogueSnapshot CatalogueManager::load_root(const std::optional<ObjectId>& roo
     return decode_catalogue(*data);
 }
 
-void CatalogueManager::cache(const MetadataRecord& record, const MetadataSnapshot& metadata,
+void CatalogueManager::cache(uint64_t metadata_generation, const MetadataSnapshot& metadata,
                              CatalogueSnapshot snapshot) {
     auto cached = std::make_shared<const CatalogueSnapshot>(std::move(snapshot));
     std::lock_guard lock(mutex_);
     cached_ = std::move(cached);
     cached_root_ = metadata.catalogue_root;
-    cached_metadata_generation_ = record.generation;
+    cached_metadata_generation_ = metadata_generation;
     cache_until_ = Clock::now() + node_.config().metadata_cache;
     last_sync_unix_ms_ = unix_ms();
     ready_ = true;
@@ -289,12 +289,30 @@ void CatalogueManager::repair_once() {
                 return;
         }
 
-        // MetadataManager supplies the short quorum cache. Generation notices
-        // invalidate it immediately; cache expiry provides the safety net when a
-        // notice is missed. A catalogue root is only reloaded when that metadata
-        // record actually points at a different immutable object.
-        auto record = metadata_.read_record();
-        auto metadata = decode_snapshot(record.payload);
+        // MetadataManager is the owner of authoritative/quorum metadata reads.
+        // Catalogue convergence consumes the decoded immutable view it has
+        // already established instead of independently repeating the same quorum
+        // read whenever the catalogue TTL expires or a generation notice arrives.
+        // A genuinely cold CatalogueManager may bootstrap MetadataManager once;
+        // after that this path is strictly memory-only.
+        auto view = metadata_.available_snapshot_view();
+        if (!view) {
+            (void)metadata_.read_record();
+            view = metadata_.available_snapshot_view();
+        }
+        if (!view)
+            throw std::runtime_error("catalogue metadata snapshot unavailable after successful read");
+
+        // If a newer generation is merely known but has not yet been acquired,
+        // leave convergence to MetadataManager::repair_once(). Do not create a
+        // second quorum reader from CatalogueManager. refresh_needed() remains
+        // true, so the catalogue will adopt the view immediately after metadata
+        // maintenance publishes it.
+        if (view->generation < node_.known_metadata_generation())
+            return;
+
+        const auto generation = view->generation;
+        const auto& metadata = *view->snapshot;
         {
             std::lock_guard lock(mutex_);
             if (ready_ && cached_root_ == metadata.catalogue_root) {
@@ -303,7 +321,7 @@ void CatalogueManager::repair_once() {
                 // The catalogue object itself is immutable/content-addressed,
                 // so an unchanged root means the cached snapshot is still
                 // exactly current. Record convergence without reloading it.
-                cached_metadata_generation_ = record.generation;
+                cached_metadata_generation_ = generation;
                 cache_until_ = Clock::now() + node_.config().metadata_cache;
                 last_sync_unix_ms_ = unix_ms();
                 error_.clear();
@@ -311,7 +329,7 @@ void CatalogueManager::repair_once() {
             }
         }
         auto snapshot = load_root(metadata.catalogue_root);
-        cache(record, metadata, std::move(snapshot));
+        cache(generation, metadata, std::move(snapshot));
     } catch (const std::exception& e) {
         std::lock_guard lock(mutex_);
         // A failed convergence attempt must not invalidate a catalogue snapshot
@@ -510,7 +528,7 @@ void CatalogueManager::commit(const std::optional<ObjectId>& expected_root,
 
     auto committed_record = metadata_.read_record();
     auto committed_metadata = decode_snapshot(committed_record.payload);
-    cache(committed_record, committed_metadata, next);
+    cache(committed_record.generation, committed_metadata, next);
 }
 
 CatalogueItem CatalogueManager::upsert(CatalogueItem item,

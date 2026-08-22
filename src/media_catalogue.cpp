@@ -1279,11 +1279,16 @@ class ProviderBudgetExhausted final : public std::runtime_error {
 
 class ProviderTemporarilyUnavailable final : public std::runtime_error {
     std::string provider_;
+    std::chrono::milliseconds retry_after_;
 
   public:
-    ProviderTemporarilyUnavailable(std::string provider, std::string message)
-        : std::runtime_error(std::move(message)), provider_(std::move(provider)) {}
+    ProviderTemporarilyUnavailable(
+        std::string provider, std::string message,
+        std::chrono::milliseconds retry_after = std::chrono::seconds(60))
+        : std::runtime_error(std::move(message)), provider_(std::move(provider)),
+          retry_after_(retry_after) {}
     const std::string& provider() const noexcept { return provider_; }
+    std::chrono::milliseconds retry_after() const noexcept { return retry_after_; }
 };
 
 bool transient_provider_status(long status) {
@@ -2534,10 +2539,23 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
                      unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
         return {};
     } catch (const ProviderTemporarilyUnavailable& e) {
-        hints_.defer(hint.id, e.what(),
-                     unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
+        // Temporary availability is provider state, not per-media state. The
+        // old code deferred only this hint; the next hint for the same scan
+        // provider was immediately claimed, reprobed locally and then discovered
+        // the exact same already-open provider circuit. A large library therefore
+        // turned one remote outage into continuous local media probing.
+        const auto retry_delay = std::max(config.provider_batch_delay, e.retry_after());
+        const auto retry_at = unix_ms() + static_cast<uint64_t>(retry_delay.count());
+        const auto deferred = hints_.defer_matching(
+            [&](const CatalogueHint& queued) {
+                std::string queued_root;
+                return provider_for_path(queued.path, queued_root) == provider;
+            },
+            e.what(), retry_at);
         Log::warn("catalogue hint provider temporarily unavailable provider=" +
-                  std::string(provider->name()) + " path=" + hint.path + ": " + e.what());
+                  std::string(provider->name()) + " path=" + hint.path +
+                  " deferred_hints=" + std::to_string(deferred) +
+                  " retry_ms=" + std::to_string(retry_delay.count()) + ": " + e.what());
         return {};
     } catch (const std::exception& e) {
         Log::warn("catalogue hint lookup failed provider=" + std::string(provider->name()) +
