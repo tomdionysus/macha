@@ -37,8 +37,13 @@ class MetadataManager {
     std::vector<NodeInfo> voter_nodes(const std::vector<NodeId>&) const;
     MetadataRecord latest(const std::vector<MetadataRecord>&) const;
     MetadataRecord discover_or_form();
-    std::optional<MetadataRecord> recover_from_committed_checkpoints(
-        const std::vector<NodeInfo>& active);
+    struct RecoverySurvey {
+        bool complete{};
+        bool durable_history{};
+        std::optional<MetadataRecord> recovered;
+    };
+
+    RecoverySurvey recover_from_committed_checkpoints(const std::vector<NodeInfo>& active);
     MetadataRecord read_group(const std::vector<NodeId>&,
                               FrameType frame_type = FrameType::control);
     MetadataRecord read_record_base();

@@ -6,6 +6,7 @@
 #include "fuse_frontend.hpp"
 #include "http.hpp"
 #include "local_store.hpp"
+#include "macha_version.hpp"
 #include "metadata.hpp"
 #include "media_catalogue.hpp"
 #include "macos_unicode.hpp"
@@ -62,6 +63,41 @@ int failures = 0;
         }                                                                                          \
     } while (0)
 
+
+
+template <typename Fn>
+void run_test_case(std::string_view name, Fn&& fn) {
+    const auto started = std::chrono::steady_clock::now();
+    const auto failures_before = failures;
+    std::cout << "[TEST] START " << name << '\n' << std::flush;
+    try {
+        fn();
+    } catch (const std::exception& e) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started);
+        std::cerr << "[TEST] END " << name << " status=FAIL elapsed_ms=" << elapsed.count()
+                  << " exception=\"" << e.what() << "\"\n";
+        throw;
+    } catch (...) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started);
+        std::cerr << "[TEST] END " << name << " status=FAIL elapsed_ms=" << elapsed.count()
+                  << " exception=unknown\n";
+        throw;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    const auto new_failures = failures - failures_before;
+    if (new_failures == 0) {
+        std::cout << "[TEST] END " << name << " status=PASS elapsed_ms=" << elapsed.count()
+                  << '\n' << std::flush;
+    } else {
+        std::cerr << "[TEST] END " << name << " status=FAIL elapsed_ms=" << elapsed.count()
+                  << " checks=" << new_failures << '\n';
+    }
+}
+
+#define RUN_TEST(test_fn) run_test_case(#test_fn, [] { test_fn(); })
 
 class CapturingLogger final : public Logger {
     LogLevel level_;
@@ -2730,6 +2766,68 @@ void test_joiner_cannot_form_genesis() {
 }
 
 
+void test_bootstrap_joiner_requires_complete_checkpoint_survey() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    const auto unreachable_port = free_port();
+    auto config = config_for(t.path() / "checkpoint-survey", keyfile, free_port(),
+                             {{"127.0.0.1", unreachable_port}});
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.dead_after = 10s;
+
+    NodeRuntime node(config, keys);
+    node.start();
+
+    // Keep an unreachable peer in active membership and choose its identity so
+    // metadata HRW would select this fresh node as the sole genesis voter. This
+    // deterministically exercises the dangerous pre-0.14.2 path: both metadata
+    // RPC surveys fail, yet a replication-1 joiner could previously form an
+    // empty generation-2 namespace on itself.
+    static constexpr char label[] = "macha/metadata-placement/v1";
+    const auto placement_key =
+        sha256({reinterpret_cast<const uint8_t*>(label), sizeof(label) - 1});
+    NodeInfo phantom;
+    phantom.host = "127.0.0.1";
+    phantom.failure_domain = "unreachable-bootstrap";
+    phantom.port = unreachable_port;
+    phantom.capacity = 512ULL * 1024 * 1024;
+    phantom.seen_unix_ms = unix_ms();
+
+    const auto self = node.membership().self();
+    bool selected_self = false;
+    for (uint32_t candidate = 1; candidate < 100000 && !selected_self; ++candidate) {
+        phantom.id = {};
+        phantom.id.bytes[0] = static_cast<uint8_t>(candidate >> 24U);
+        phantom.id.bytes[1] = static_cast<uint8_t>(candidate >> 16U);
+        phantom.id.bytes[2] = static_cast<uint8_t>(candidate >> 8U);
+        phantom.id.bytes[3] = static_cast<uint8_t>(candidate);
+        if (phantom.id == self.id)
+            continue;
+        auto ranked = rendezvous_nodes(placement_key.bytes, {self, phantom}, 1);
+        selected_self = !ranked.empty() && ranked.front().id == self.id;
+    }
+    REQUIRE(selected_self);
+    node.membership().observe(phantom, true);
+
+    MetadataManager metadata(node);
+    bool rejected = false;
+    try {
+        (void)metadata.snapshot_view();
+    } catch (const std::exception& error) {
+        rejected = std::string(error.what()).find("bootstrap checkpoint survey") !=
+                   std::string::npos;
+    }
+    CHECK(rejected);
+    CHECK(node.metadata_replica().current().generation <= 1);
+    CHECK(node.metadata_replica().committed().generation <= 1);
+
+    node.stop();
+}
+
+
 void test_two_node_mutual_bootstrap_metadata_quorum() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
@@ -5269,6 +5367,30 @@ void test_catalogue_hint_queue_persistence_coalescing_and_priority() {
         CHECK(recovered->state == CatalogueHintState::queued);
     }
 
+    // Candidate fallback progress is queue state, not provider-process state.
+    // Persist it so a restart cannot repeatedly retry the first hypothesis and
+    // defeat fair scheduling.
+    const auto cursor_state = temp.path() / "cursor-state";
+    std::string cursor_id;
+    {
+        CatalogueHintQueue cursor(cursor_state);
+        cursor_id = cursor.submit("/Music/Artist/Album/01 - Track.mp3", "scanner",
+                                  "macha:cursor", CatalogueHintPriority::periodic_scan);
+        auto claimed = cursor.claim_next();
+        REQUIRE(claimed.has_value());
+        cursor.advance_candidate(cursor_id, 2);
+        auto advanced = cursor.get(cursor_id);
+        REQUIRE(advanced.has_value());
+        CHECK(advanced->candidate_cursor == 2);
+    }
+    {
+        CatalogueHintQueue cursor(cursor_state);
+        auto recovered = cursor.get(cursor_id);
+        REQUIRE(recovered.has_value());
+        CHECK(recovered->state == CatalogueHintState::queued);
+        CHECK(recovered->candidate_cursor == 2);
+    }
+
     // Equal-priority work is fair across top-level catalogue roots rather than
     // allowing a large Movies backlog to starve TV or Music indefinitely.
     const auto fairness_state = temp.path() / "fairness-state";
@@ -5826,7 +5948,9 @@ void test_catalogue_sync_search_and_artwork_gc() {
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
-    CHECK(status_body.find("\"server_version\":\"0.13.2\"") != std::string::npos);
+    auto status_json = Json::parse(status_body);
+    REQUIRE(status_json.find("server_version") != nullptr);
+    CHECK(status_json.find("server_version")->asString() == kServerVersion);
     auto search_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
@@ -6566,7 +6690,7 @@ void test_playback_sessions_and_streaming_http_bodies() {
     auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == "0.13.2");
+    CHECK(playback_status_json.find("server_version")->asString() == kServerVersion);
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately
@@ -6942,69 +7066,70 @@ void test_subtitle_text_normalisation() {
 
 int main() {
     try {
-        test_codec_and_crypto();
-        test_local_store();
-        test_storage_pool_and_persistent_cache();
-        test_metadata_codec_and_replica();
-        test_config();
-        test_placement();
-        test_capacity_placement();
-        test_async_rpc_move_ownership();
-        test_rpc_v13_frame_priority_and_variable_length();
-        test_repair_step_is_bounded_and_yields();
-        test_rpc_v13_persistence_and_multiplexing();
-        test_rpc_v13_bidirectional_and_deduplication();
-        test_mutual_bootstrap_prunes_cross_dial();
-        test_rpc_v7_handshake_is_rejected();
-        test_rpc_slow_control_does_not_abort_data();
-        test_rpc_health_and_control_not_starved_by_data();
-        test_early_replication_quorum();
-        test_put_spills_stalled_owners_and_commits_degraded_floor();
-        test_put_falls_back_after_remote_launch_failure();
-        test_joiner_cannot_form_genesis();
-        test_two_node_mutual_bootstrap_metadata_quorum();
-        test_replication_policy_change_on_restart();
-        test_genesis_root_configuration();
-        test_open_write_metadata_merge();
-        test_fresh_and_resumed_write_exactness();
-        test_active_write_size_visibility();
-        test_open_write_survives_rename();
-        test_fuse_frontend_ordering_merging_and_cache();
-        test_fuse_read_only_release_does_not_publish_writer_data();
-        test_fuse_frontend_unlink_and_rename_over_open_inode_ordering();
-        test_fuse_frontend_read_overlay_truncate_and_hydration_hints();
-        test_full_replica_fallback();
-        test_replacement_node_recovers_namespace_and_replication();
-        test_hydration_scheduler_and_prediction();
-        test_replica_selector();
-        test_cache_hydrator_fetches_to_persistent_cache();
-        test_media_probe_and_online_catalogue_scanner();
-        test_catalogue_cache_ignores_unrelated_metadata_generation();
-        test_catalogue_hint_queue_persistence_coalescing_and_priority();
-        test_ingest_catalogue_feedback_and_external_clear_cleanup();
-        test_catalogue_warm_read_defers_remote_refresh();
-        test_metadata_decoded_cache_ttl_recovers_missed_notice();
-        test_catalogue_root_ready_without_local_artwork();
-        test_macos_unicode_namespace_aliases();
-        test_media_index_cache_survives_namespace_churn();
-        test_catalogue_sync_search_and_artwork_gc();
-        test_media_segment_store_backpressure_and_spill();
-        test_media_vod_index_planning_rejects_partial_indexes();
-        test_reseek_hls_vod_reuses_prepared_random_access_state();
-        test_media_timestamp_repair();
-        test_subtitle_text_normalisation();
-        test_http_server_serves_streams_concurrently();
-        test_playback_probe_failure_is_stage_specific();
-        test_attached_picture_audio_direct_play();
-        test_concurrent_transcode_admission_is_reserved();
-        test_playback_sessions_and_streaming_http_bodies();
-        test_three_node_cluster();
+        RUN_TEST(test_codec_and_crypto);
+        RUN_TEST(test_local_store);
+        RUN_TEST(test_storage_pool_and_persistent_cache);
+        RUN_TEST(test_metadata_codec_and_replica);
+        RUN_TEST(test_config);
+        RUN_TEST(test_placement);
+        RUN_TEST(test_capacity_placement);
+        RUN_TEST(test_async_rpc_move_ownership);
+        RUN_TEST(test_rpc_v13_frame_priority_and_variable_length);
+        RUN_TEST(test_repair_step_is_bounded_and_yields);
+        RUN_TEST(test_rpc_v13_persistence_and_multiplexing);
+        RUN_TEST(test_rpc_v13_bidirectional_and_deduplication);
+        RUN_TEST(test_mutual_bootstrap_prunes_cross_dial);
+        RUN_TEST(test_rpc_v7_handshake_is_rejected);
+        RUN_TEST(test_rpc_slow_control_does_not_abort_data);
+        RUN_TEST(test_rpc_health_and_control_not_starved_by_data);
+        RUN_TEST(test_early_replication_quorum);
+        RUN_TEST(test_put_spills_stalled_owners_and_commits_degraded_floor);
+        RUN_TEST(test_put_falls_back_after_remote_launch_failure);
+        RUN_TEST(test_joiner_cannot_form_genesis);
+        RUN_TEST(test_bootstrap_joiner_requires_complete_checkpoint_survey);
+        RUN_TEST(test_two_node_mutual_bootstrap_metadata_quorum);
+        RUN_TEST(test_replication_policy_change_on_restart);
+        RUN_TEST(test_genesis_root_configuration);
+        RUN_TEST(test_open_write_metadata_merge);
+        RUN_TEST(test_fresh_and_resumed_write_exactness);
+        RUN_TEST(test_active_write_size_visibility);
+        RUN_TEST(test_open_write_survives_rename);
+        RUN_TEST(test_fuse_frontend_ordering_merging_and_cache);
+        RUN_TEST(test_fuse_read_only_release_does_not_publish_writer_data);
+        RUN_TEST(test_fuse_frontend_unlink_and_rename_over_open_inode_ordering);
+        RUN_TEST(test_fuse_frontend_read_overlay_truncate_and_hydration_hints);
+        RUN_TEST(test_full_replica_fallback);
+        RUN_TEST(test_replacement_node_recovers_namespace_and_replication);
+        RUN_TEST(test_hydration_scheduler_and_prediction);
+        RUN_TEST(test_replica_selector);
+        RUN_TEST(test_cache_hydrator_fetches_to_persistent_cache);
+        RUN_TEST(test_media_probe_and_online_catalogue_scanner);
+        RUN_TEST(test_catalogue_cache_ignores_unrelated_metadata_generation);
+        RUN_TEST(test_catalogue_hint_queue_persistence_coalescing_and_priority);
+        RUN_TEST(test_ingest_catalogue_feedback_and_external_clear_cleanup);
+        RUN_TEST(test_catalogue_warm_read_defers_remote_refresh);
+        RUN_TEST(test_metadata_decoded_cache_ttl_recovers_missed_notice);
+        RUN_TEST(test_catalogue_root_ready_without_local_artwork);
+        RUN_TEST(test_macos_unicode_namespace_aliases);
+        RUN_TEST(test_media_index_cache_survives_namespace_churn);
+        RUN_TEST(test_catalogue_sync_search_and_artwork_gc);
+        RUN_TEST(test_media_segment_store_backpressure_and_spill);
+        RUN_TEST(test_media_vod_index_planning_rejects_partial_indexes);
+        RUN_TEST(test_reseek_hls_vod_reuses_prepared_random_access_state);
+        RUN_TEST(test_media_timestamp_repair);
+        RUN_TEST(test_subtitle_text_normalisation);
+        RUN_TEST(test_http_server_serves_streams_concurrently);
+        RUN_TEST(test_playback_probe_failure_is_stage_specific);
+        RUN_TEST(test_attached_picture_audio_direct_play);
+        RUN_TEST(test_concurrent_transcode_admission_is_reserved);
+        RUN_TEST(test_playback_sessions_and_streaming_http_bodies);
+        RUN_TEST(test_three_node_cluster);
     } catch (const std::exception& e) {
         std::cerr << "Unhandled test exception: " << e.what() << '\n';
         return 2;
     }
     if (failures) {
-        std::cerr << failures << " test(s) failed\n";
+        std::cerr << failures << " check(s) failed\n";
         return 1;
     }
     std::cout << "All tests passed\n";

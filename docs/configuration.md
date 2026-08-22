@@ -78,7 +78,7 @@ fuse:
   max_pending_requests: 4096
   commit_workers: 8
   foreground_commit_workers: 1
-  publication_quiet_ms: 250
+  publication_quiet_ms: 5000
   max_pending_operations: 4096
   hydration_priority: 2000
   read_ahead_extents: 2
@@ -89,7 +89,7 @@ fuse:
   watchdog_interval_ms: 1000
 ```
 
-The six operation-class timeouts must be positive and may not exceed `absolute_request_timeout_ms`; that ceiling is itself limited to 30000 ms. `request_workers` is 6..256 so every class always has an independent execution lane. Queue saturation returns bounded backpressure (`EAGAIN`) rather than allowing a kernel request to wait indefinitely. `fsync` means the local FUSE spool is durable and publication has been requested; cluster-wide quorum/replica convergence remains asynchronous. `commit_workers` is the maximum asynchronous data-publication concurrency once the mount is quiet. While any FUSE operation has occurred within `publication_quiet_ms`, only `foreground_commit_workers` publishers are admitted (default one), preventing a bulk rsync from competing with a full fan-out of extent/metadata commits while it is still feeding the local spool.
+The six operation-class timeout values must be positive and may not exceed `absolute_request_timeout_ms`; that ceiling is itself limited to 30000 ms. For read-only lookup/read work they remain hard cooperative deadlines. Mutating requests may be rejected with `ETIMEDOUT` while still queued, but once a write, namespace mutation, sync or lifecycle operation starts Macha waits for its real result instead of returning an ambiguous timeout while local side effects continue. `request_workers` is 6..256 so every class always has an independent execution lane. Queue saturation returns bounded backpressure (`EAGAIN`) rather than allowing a kernel request to wait indefinitely. `fsync` means the local FUSE spool is durable and publication has been requested; cluster-wide quorum/replica convergence remains asynchronous. `commit_workers` is the maximum asynchronous extent-publication concurrency once the mount is genuinely quiet. While any writable FUSE handle remains open, or any FUSE activity occurred within `publication_quiet_ms`, only `foreground_commit_workers` publishers are admitted (default one). The default quiet period is five seconds so a short rsync inter-file gap cannot unleash the full publication fan-out. Final metadata commits are serialised even when several workers prepare immutable extents concurrently.
 
 Reads combine the committed immutable manifest with pending local operations and carry the FUSE read deadline into remote extent retrieval. Kernel demand is also emitted as a high-priority `HydrationHintProvider` run into Macha's existing persistent-cache hydrator. Identical object fetches are already coalesced by `DistributedStore`, so FUSE demand and predictive hydration can share one transfer. `read_ahead_extents` controls the additional ordered hint window; it does not create a separate FUSE cache. With `write_through_cache: true`, extents produced by asynchronous FUSE publication are also inserted into the ordinary persistent block cache.
 

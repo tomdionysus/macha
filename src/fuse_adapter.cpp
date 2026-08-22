@@ -404,7 +404,12 @@ void* op_init(struct fuse_conn_info*, struct fuse_config* cfg) {
     Log::debug("FUSE bounded frontend entry_timeout_ms=" + std::to_string(policy.entry_timeout.count()) +
                " attr_timeout_ms=" + std::to_string(policy.attr_timeout.count()) +
                " absolute_request_timeout_ms=" +
-               std::to_string(policy.absolute_request_timeout.count()));
+               std::to_string(policy.absolute_request_timeout.count()) +
+               " commit_workers=" + std::to_string(policy.commit_workers) +
+               " foreground_commit_workers=" +
+               std::to_string(policy.foreground_commit_workers) +
+               " publication_quiet_ms=" +
+               std::to_string(policy.publication_quiet.count()));
     return fuse_get_context()->private_data;
 }
 
@@ -572,17 +577,26 @@ int run_fuse(FileSystem& filesystem, CacheHydrator& hydrator,
     std::atomic_bool mount_seen{mount_table_contains(mount)};
 
     std::jthread mount_watchdog([&](std::stop_token stop) {
+        size_t consecutive_misses = 0;
+        constexpr size_t missing_threshold = 3;
         while (!stop.stop_requested()) {
             std::this_thread::sleep_for(config.watchdog_interval);
             if (stop.stop_requested()) break;
             const bool mounted = mount_table_contains(mount);
             if (mounted) {
                 mount_seen.store(true);
+                consecutive_misses = 0;
                 continue;
             }
             if (!mount_seen.load()) continue;
+            if (++consecutive_misses < missing_threshold) {
+                Log::debug("FUSE mount-table watchdog miss " +
+                           std::to_string(consecutive_misses) + "/" +
+                           std::to_string(missing_threshold) + " mount=" + mount);
+                continue;
+            }
             unexpected_mount_loss.store(true);
-            Log::error("FUSE mount disappeared unexpectedly; namespace is fail-closed and service shutdown is requested");
+            Log::error("FUSE mount disappeared for three consecutive watchdog checks; namespace is fail-closed and service shutdown is requested");
             filesystem.request_io_cancellation();
             if (request_shutdown) request_shutdown();
             fuse_session_exit(session);

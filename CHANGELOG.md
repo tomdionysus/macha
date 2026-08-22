@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.14.3 - 2026-08-22
+
+- make catalogue provider-budget scheduling fair at the metadata-candidate boundary: a hint now persists its fallback candidate cursor and yields after one metadata hypothesis so one path cannot consume the whole provider batch before other catalogue roots get a turn; provider lookups may still issue the multiple HTTP requests required to resolve one hypothesis;
+- make catalogue fallback progress restart-safe by persisting the candidate cursor in hint state and resetting it when media content/provenance reopens the hint or the hint reaches a terminal result;
+- remove stale hard-coded `0.13.2` server-version expectations from catalogue/playback API tests and compare against `kServerVersion`;
+- log every test case start and end with PASS/FAIL status and elapsed milliseconds, including the failing test name before propagating an exception; raise the CTest suite timeout from 60 to 300 seconds because the current integration suite legitimately exceeds one minute.
+
+## 0.14.2 - 2026-08-22
+
+- make bootstrap metadata formation fail closed after an incomplete committed-checkpoint survey. A fresh configured joiner may no longer fall through to genesis merely because a transient metadata RPC failed while another active node may hold durable namespace history; this fixes the intermittent replication-1 replacement race where rendezvous could select the fresh node and create an empty generation-2 namespace instead of recovering the surviving checkpoint;
+- carry checkpoint-survey completeness and durable-history evidence out of replacement recovery so genesis is permitted only when every active member answered and all committed records are genuinely virgin; preserve symmetric bootstrap genesis when all active peers positively report generation 1;
+- add a deterministic regression test with an unreachable active bootstrap peer whose identity is chosen so the fresh node would otherwise win single-voter genesis placement.
+
+## 0.14.1 - 2026-08-21
+
+- fix ambiguous bounded-FUSE mutation timeouts: lookup/read requests remain hard cancellable, but write/namespace/sync/lifecycle requests may now time out only while queued; once a local mutation starts Macha waits for its actual result instead of returning `ETIMEDOUT` while spool or namespace side effects continue asynchronously;
+- treat transient asynchronous publication transport failures including `ECONNABORTED`, `ENOTCONN`, `ECONNREFUSED`, `EHOSTUNREACH` and `EPIPE` as retryable, preventing a temporary peer/transport failure from poisoning the inode and being returned directly to a later rsync write;
+- make publication admission track open writable FUSE handles in addition to recent callback activity, and raise the default post-foreground quiet period from 250 ms to 5 seconds so brief rsync gaps cannot start the full publication fan-out;
+- serialise final FUSE metadata commits while retaining concurrent immutable-extent preparation, avoiding several large metadata CAS operations contending for the same snapshot;
+- require three consecutive mount-table watchdog misses before declaring the FUSE mount lost, avoiding fail-closed shutdown on one transient mount-table observation; extend bounded-frontend DEBUG startup output with publication concurrency settings.
+
 ## 0.14.0 - 2026-08-21
 
 - add a persistent, coalescing catalogue hint queue under `state_path/catalogue/hints.json`; namespace discovery, namespace-mutation scans, explicit rescans and ingest completion are producers, while catalogue provider workers consume path work independently of full-tree traversal; successful matches are reconciled in batches so a provider batch still costs one catalogue-root/metadata commit rather than one commit per file;
