@@ -234,6 +234,7 @@ struct FuseFrontend::State {
     std::map<uint64_t, HintState> hint_states;
 
     std::jthread refresh_worker;
+    uint64_t refreshed_metadata_generation{};
 
     std::atomic_uint64_t timed_out_requests{};
     std::atomic_uint64_t merged_publications{};
@@ -686,7 +687,8 @@ struct FuseFrontend::State {
     }
 
     void initialise_namespace() {
-        auto snapshot = fs.local_snapshot();
+        auto view = fs.local_snapshot_view();
+        const auto& snapshot = *view.snapshot;
         std::filesystem::create_directories(spool_dir);
         std::lock_guard lock(namespace_mutex);
         for (const auto& [path, entry] : snapshot.entries) {
@@ -701,6 +703,7 @@ struct FuseFrontend::State {
         }
         if (!paths.contains(canonical_path("/")))
             throw std::runtime_error("FUSE frontend cannot initialise without namespace root");
+        refreshed_metadata_generation = view.generation;
     }
 
     void refresh_namespace() {
@@ -709,7 +712,16 @@ struct FuseFrontend::State {
             if (namespace_inflight || !namespace_queue.empty())
                 return;
         }
-        auto snapshot = fs.local_snapshot();
+        // The old path decoded and rebuilt the complete namespace every refresh
+        // interval even when metadata had not changed. The generation check is
+        // deliberately lock-free/cheap; only an observed metadata advance asks
+        // MetadataManager for its shared immutable decoded snapshot.
+        if (fs.known_metadata_generation() <= refreshed_metadata_generation)
+            return;
+        auto view = fs.local_snapshot_view();
+        if (view.generation <= refreshed_metadata_generation)
+            return;
+        const auto& snapshot = *view.snapshot;
         std::lock_guard lock(namespace_mutex);
         std::set<std::string, std::less<>> seen;
         for (const auto& [path, entry] : snapshot.entries) {
@@ -753,6 +765,7 @@ struct FuseFrontend::State {
             inode->published_path.reset();
             it = paths.erase(it);
         }
+        refreshed_metadata_generation = view.generation;
     }
 
     void refresh_loop(std::stop_token stop) {

@@ -1293,11 +1293,16 @@ void test_config() {
     CHECK(Log::enabled(LogLevel::error));
     Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
     MaintenanceConfig maintenance_policy;
+    CHECK(maintenance_policy.interval == 1000ms);
+    CHECK(maintenance_policy.idle_bandwidth_fraction == 0.10);
+    CHECK(maintenance_policy.cpu_target == 0.10);
+    CHECK(maintenance_policy.scrub_fraction == 0.02);
+    CHECK(maintenance_policy.no_progress_backoff == 300000ms);
     CHECK(maintenance_background_interval(maintenance_policy) == 30000ms);
     maintenance_policy.no_progress_backoff = 2000ms;
     CHECK(maintenance_background_interval(maintenance_policy) == 5000ms);
     maintenance_policy.no_progress_backoff = 45000ms;
-    CHECK(maintenance_background_interval(maintenance_policy) == 45000ms);
+    CHECK(maintenance_background_interval(maintenance_policy) == 30000ms);
     CHECK(std::string(message_type_name(MessageType::members)) == "members");
     CHECK(std::string(message_type_name(MessageType::get_object)) == "get_object");
 
@@ -5404,6 +5409,22 @@ void test_catalogue_hint_queue_persistence_coalescing_and_priority() {
     REQUIRE(second.has_value());
     CHECK(first->path.starts_with("/Movies/"));
     CHECK(second->path.starts_with("/TV/"));
+
+    // An idle consumer blocks on the queue revision instead of polling the
+    // complete persisted hint map. A new submission wakes it immediately.
+    const auto wake_state = temp.path() / "wake-state";
+    CatalogueHintQueue wake(wake_state);
+    const auto revision = wake.revision();
+    CHECK(!wake.wait_for_change({}, revision, 5ms));
+    std::jthread producer([&] {
+        std::this_thread::sleep_for(20ms);
+        wake.submit("/Movies/Wake.mkv", "ingest", "wake-job",
+                    CatalogueHintPriority::ingest);
+    });
+    CHECK(wake.wait_for_change({}, revision, 500ms));
+    auto ready_delay = wake.next_ready_delay();
+    REQUIRE(ready_delay.has_value());
+    CHECK(*ready_delay == 0ms);
 }
 
 void test_ingest_catalogue_feedback_and_external_clear_cleanup() {

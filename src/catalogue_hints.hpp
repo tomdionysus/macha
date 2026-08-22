@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <chrono>
 #include <compare>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -9,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <stop_token>
 #include <string_view>
 #include <vector>
 
@@ -79,6 +82,8 @@ struct CatalogueHintSummary {
 class CatalogueHintQueue {
     std::filesystem::path state_file_;
     mutable std::mutex mutex_;
+    std::condition_variable_any change_cv_;
+    uint64_t revision_{};
     std::map<std::string, CatalogueHint, std::less<>> hints_; // canonical path -> hint
     std::map<std::string, uint64_t, std::less<>> lane_served_;
     uint64_t schedule_sequence_{};
@@ -87,6 +92,7 @@ class CatalogueHintQueue {
     void save_state_locked() const;
     static bool terminal(CatalogueHintState) noexcept;
     static bool has_origin(const CatalogueHint&, std::string_view, std::string_view);
+    void changed_locked();
 
   public:
     explicit CatalogueHintQueue(const std::filesystem::path& state_path);
@@ -95,6 +101,10 @@ class CatalogueHintQueue {
                        int priority);
     std::vector<std::string> submit_many(std::vector<CatalogueHintSubmission>);
     std::optional<CatalogueHint> claim_next();
+    std::optional<std::chrono::milliseconds> next_ready_delay() const;
+    uint64_t revision() const;
+    bool wait_for_change(std::stop_token, uint64_t observed_revision,
+                         std::chrono::milliseconds timeout);
     void mark_catalogued(std::string_view id, std::string provider, std::string media_id,
                          std::vector<std::string> catalogue_item_ids,
                          std::string result = {});

@@ -23,20 +23,22 @@ struct CacheConfig {
 };
 
 struct MaintenanceConfig {
-    std::chrono::milliseconds interval{500};
+    std::chrono::milliseconds interval{1000};
     std::chrono::milliseconds foreground_quiet{2000};
     // Minimum retirement/orphan age before authoritative reachability GC may
     // reclaim an unreferenced physical object.
     std::chrono::milliseconds garbage_grace{std::chrono::hours(24)};
     double busy_bandwidth_fraction{0.0};
-    double idle_bandwidth_fraction{0.50};
-    double cpu_target{0.35};
+    double idle_bandwidth_fraction{0.10};
+    double cpu_target{0.10};
     uint64_t initial_bandwidth{32ULL * 1024 * 1024};
     uint64_t max_bandwidth{}; // 0 = no configured cap; observed bandwidth is still used.
-    double scrub_fraction{0.10};
+    double scrub_fraction{0.02};
     // A complete no-op maintenance pass must not immediately rescan the same
-    // settled object set simply because byte credit remains available.
-    std::chrono::milliseconds no_progress_backoff{30000};
+    // settled object set simply because byte credit remains available. Five
+    // minutes is deliberately long: a healthy settled media server should be
+    // close to quiescent rather than continuously proving that it is settled.
+    std::chrono::milliseconds no_progress_backoff{300000};
 };
 
 struct FuseOperationTimeouts {

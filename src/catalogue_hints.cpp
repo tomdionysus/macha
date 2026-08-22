@@ -167,6 +167,11 @@ bool CatalogueHintQueue::has_origin(const CatalogueHint& hint, std::string_view 
     });
 }
 
+void CatalogueHintQueue::changed_locked() {
+    ++revision_;
+    change_cv_.notify_all();
+}
+
 CatalogueHintQueue::CatalogueHintQueue(const std::filesystem::path& state_path)
     : state_file_(state_path / "catalogue" / "hints.json") {
     std::filesystem::create_directories(state_file_.parent_path());
@@ -322,7 +327,10 @@ std::vector<std::string> CatalogueHintQueue::submit_many(
         ids.push_back(hint.id);
         changed = true;
     }
-    if (changed) save_state_locked();
+    if (changed) {
+        save_state_locked();
+        changed_locked();
+    }
     return ids;
 }
 
@@ -367,6 +375,35 @@ std::optional<CatalogueHint> CatalogueHintQueue::claim_next() {
     return best->second;
 }
 
+std::optional<std::chrono::milliseconds> CatalogueHintQueue::next_ready_delay() const {
+    const auto now = now_ms();
+    std::lock_guard lock(mutex_);
+    std::optional<uint64_t> earliest;
+    for (const auto& [_, hint] : hints_) {
+        if (hint.state != CatalogueHintState::queued && hint.state != CatalogueHintState::deferred)
+            continue;
+        if (hint.ready_after_unix_ms <= now)
+            return std::chrono::milliseconds(0);
+        if (!earliest || hint.ready_after_unix_ms < *earliest)
+            earliest = hint.ready_after_unix_ms;
+    }
+    if (!earliest) return {};
+    return std::chrono::milliseconds(*earliest - now);
+}
+
+uint64_t CatalogueHintQueue::revision() const {
+    std::lock_guard lock(mutex_);
+    return revision_;
+}
+
+bool CatalogueHintQueue::wait_for_change(std::stop_token stop, uint64_t observed_revision,
+                                         std::chrono::milliseconds timeout) {
+    std::unique_lock lock(mutex_);
+    return change_cv_.wait_for(lock, stop, timeout, [&] {
+        return revision_ != observed_revision;
+    });
+}
+
 void CatalogueHintQueue::mark_catalogued(std::string_view id, std::string provider,
                                          std::string media_id,
                                          std::vector<std::string> catalogue_item_ids,
@@ -387,6 +424,7 @@ void CatalogueHintQueue::mark_catalogued(std::string_view id, std::string provid
     discard_ephemeral_origins(hint);
     if (hint.origins.empty()) hints_.erase(it);
     save_state_locked();
+    changed_locked();
 }
 
 void CatalogueHintQueue::mark_no_match(std::string_view id, std::string provider,
@@ -406,6 +444,7 @@ void CatalogueHintQueue::mark_no_match(std::string_view id, std::string provider
     hint.updated_unix_ms = now_ms();
     if (hint.origins.empty()) hints_.erase(it);
     save_state_locked();
+    changed_locked();
 }
 
 void CatalogueHintQueue::advance_candidate(std::string_view id, size_t next_cursor) {
@@ -420,6 +459,7 @@ void CatalogueHintQueue::advance_candidate(std::string_view id, size_t next_curs
     hint.ready_after_unix_ms = 0;
     hint.updated_unix_ms = now_ms();
     save_state_locked();
+    changed_locked();
 }
 
 void CatalogueHintQueue::defer(std::string_view id, std::string error, uint64_t retry_after_unix_ms) {
@@ -432,6 +472,7 @@ void CatalogueHintQueue::defer(std::string_view id, std::string error, uint64_t 
     hint.ready_after_unix_ms = retry_after_unix_ms;
     hint.updated_unix_ms = now_ms();
     save_state_locked();
+    changed_locked();
 }
 
 void CatalogueHintQueue::fail(std::string_view id, std::string error) {
@@ -446,6 +487,7 @@ void CatalogueHintQueue::fail(std::string_view id, std::string error) {
     hint.updated_unix_ms = now_ms();
     if (hint.origins.empty()) hints_.erase(it);
     save_state_locked();
+    changed_locked();
 }
 
 void CatalogueHintQueue::requeue_processing() {
@@ -458,7 +500,7 @@ void CatalogueHintQueue::requeue_processing() {
         hint.updated_unix_ms = now_ms();
         changed = true;
     }
-    if (changed) save_state_locked();
+    if (changed) { save_state_locked(); changed_locked(); }
 }
 
 std::vector<CatalogueHint> CatalogueHintQueue::list() const {
@@ -514,7 +556,7 @@ size_t CatalogueHintQueue::erase_origin(std::string_view source, std::string_vie
         if (origins.empty() && terminal(it->second.state)) it = hints_.erase(it);
         else ++it;
     }
-    if (removed) save_state_locked();
+    if (removed) { save_state_locked(); changed_locked(); }
     return removed;
 }
 

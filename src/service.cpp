@@ -14,7 +14,10 @@
 namespace macha {
 
 std::chrono::milliseconds maintenance_background_interval(const MaintenanceConfig& policy) {
-    return std::max(std::chrono::milliseconds(5000), policy.no_progress_backoff);
+    // Settled object passes may sleep for minutes, but metadata/catalogue control
+    // convergence should still be verified regularly.
+    return std::clamp(policy.no_progress_backoff, std::chrono::milliseconds(5000),
+                      std::chrono::milliseconds(30000));
 }
 
 namespace {

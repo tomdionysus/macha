@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.14.4 - 2026-08-22
+
+- Eliminated the dominant idle FUSE cost: namespace refresh now checks metadata generation first and reuses the shared immutable decoded metadata snapshot only when metadata actually advances.
+- Made catalogue hint consumption event-driven. An idle scanner no longer linearly scans the persisted hint/negative-result map at 10 Hz; deferred hints wake at their next eligible time and new hints notify the worker immediately.
+- Reduced default settled maintenance pressure: 1 s scheduler interval, 10% idle bandwidth/CPU targets, 2% scrub share and a 5 minute completed-pass backoff. Metadata/catalogue control verification remains capped at 30 seconds.
+
 ## 0.14.3 - 2026-08-22
 
 - make catalogue provider-budget scheduling fair at the metadata-candidate boundary: a hint now persists its fallback candidate cursor and yields after one metadata hypothesis so one path cannot consume the whole provider batch before other catalogue roots get a turn; provider lookups may still issue the multiple HTTP requests required to resolve one hypothesis;

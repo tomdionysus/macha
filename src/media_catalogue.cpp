@@ -2807,6 +2807,7 @@ void CatalogueScanner::loop(std::stop_token stop) {
     auto observed_generation = node_.known_metadata_generation();
     auto next_periodic = std::chrono::steady_clock::now();
     auto next_hint_batch = std::chrono::steady_clock::now();
+    auto hint_revision = hints_.revision();
     bool was_coordinator = false;
 
     while (!stop.stop_requested()) {
@@ -2833,9 +2834,12 @@ void CatalogueScanner::loop(std::stop_token stop) {
                 if (budget_http->exhausted())
                     Log::info("catalogue hint provider budget reached requests=" +
                               std::to_string(budget_http->used()));
+            } else if (auto delay = hints_.next_ready_delay()) {
+                next_hint_batch = std::chrono::steady_clock::now() + *delay;
             } else {
-                next_hint_batch = now + std::chrono::milliseconds(100);
+                next_hint_batch = std::chrono::steady_clock::time_point::max();
             }
+            hint_revision = hints_.revision();
         }
 
         const bool is_coordinator = coordinator();
@@ -2916,7 +2920,31 @@ void CatalogueScanner::loop(std::stop_token stop) {
             }
         }
         cpu_reporter.tick();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        // Hint submission is event-driven. Keep a one-second ceiling only for
+        // cheap coordinator/metadata-generation observation; do not linearly
+        // scan the persisted negative-result map ten times per second while idle.
+        const auto sleep_from = std::chrono::steady_clock::now();
+        auto wake_at = sleep_from + std::chrono::seconds(1);
+        if (config.enabled) {
+            wake_at = std::min(wake_at, next_periodic);
+            wake_at = std::min(wake_at, next_hint_batch);
+            if (mutation_due) wake_at = std::min(wake_at, *mutation_due);
+            if (mutation_first_seen)
+                wake_at = std::min(wake_at, *mutation_first_seen + config.rescan_max_delay);
+        }
+        auto wait_for = std::chrono::duration_cast<std::chrono::milliseconds>(wake_at - sleep_from);
+        if (wait_for < std::chrono::milliseconds(0)) wait_for = std::chrono::milliseconds(0);
+        const auto before_revision = hints_.revision();
+        if (before_revision != hint_revision) {
+            hint_revision = before_revision;
+            next_hint_batch = std::min(next_hint_batch, std::chrono::steady_clock::now());
+            continue;
+        }
+        if (hints_.wait_for_change(stop, before_revision, wait_for)) {
+            hint_revision = hints_.revision();
+            next_hint_batch = std::min(next_hint_batch, std::chrono::steady_clock::now());
+        }
     }
 }
 
