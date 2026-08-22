@@ -152,9 +152,12 @@ maintenance:
   cpu_target: 0.10
   initial_bandwidth: 32M
   max_bandwidth: 0B       # 0 = no configured cap; observed rate still applies.
+  # Proactive physical integrity scrub is a scheduled campaign, not continuous
+  # idle work. The due time survives daemon restarts. Reads verify integrity too.
   scrub_fraction: 0.02
+  scrub_interval_ms: 2592000000  # 30 days
 
-  # A settled repair/rebalance/scrub pass backs off instead of rescanning the
+  # A settled repair/rebalance/GC pass backs off instead of rescanning the
   # complete object set. Metadata/catalogue control verification remains capped
   # at a 30-second cadence independently of this data-plane backoff.
   no_progress_backoff_ms: 300000

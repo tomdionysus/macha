@@ -1337,6 +1337,7 @@ void test_config() {
     CHECK(maintenance_policy.idle_bandwidth_fraction == 0.10);
     CHECK(maintenance_policy.cpu_target == 0.10);
     CHECK(maintenance_policy.scrub_fraction == 0.02);
+    CHECK(maintenance_policy.scrub_interval == std::chrono::hours(24 * 30));
     CHECK(maintenance_policy.no_progress_backoff == 300000ms);
     FuseConfig fuse_defaults;
     CHECK(fuse_defaults.entry_timeout == 1000ms);
@@ -1427,6 +1428,7 @@ void test_config() {
             << "  busy_bandwidth_fraction: 0.03\n"
             << "  idle_bandwidth_fraction: 0.60\n"
             << "  cpu_target: 0.40\n"
+            << "  scrub_interval_ms: 7776000000\n"
             << "hydration:\n"
             << "  enabled: true\n"
             << "  interval_ms: 75\n"
@@ -1561,6 +1563,7 @@ void test_config() {
     CHECK(yc.maintenance.interval == 250ms);
     CHECK(yc.maintenance.garbage_grace == 1234ms);
     CHECK(yc.maintenance.busy_bandwidth_fraction == 0.03);
+    CHECK(yc.maintenance.scrub_interval == std::chrono::hours(24 * 90));
     CHECK(yc.hydration.enabled);
     CHECK(yc.hydration.interval == 75ms);
     CHECK(yc.hydration.active_timeout == 12000ms);

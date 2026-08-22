@@ -143,6 +143,9 @@ void validate(Config& config) {
     if (config.maintenance.no_progress_backoff < std::chrono::milliseconds(500) ||
         config.maintenance.no_progress_backoff > std::chrono::hours(1))
         throw std::runtime_error("maintenance.no_progress_backoff_ms must be 500..3600000");
+    if (config.maintenance.scrub_interval < std::chrono::minutes(1) ||
+        config.maintenance.scrub_interval > std::chrono::hours(24 * 365))
+        throw std::runtime_error("maintenance.scrub_interval_ms must be 60000..31536000000");
     if (config.ingest.staging_path.empty())
         config.ingest.staging_path = config.state_path / "tmp" / "ingest";
     if (config.ingest.enabled && !config.catalogue.scanner.enabled)
@@ -365,6 +368,9 @@ void parse_maintenance(const YAML::Node& root, Config& c) {
         c.maintenance.max_bandwidth = yaml_size(m["max_bandwidth"]);
     if (m["scrub_fraction"])
         c.maintenance.scrub_fraction = parse_fraction(m["scrub_fraction"], "scrub_fraction");
+    if (m["scrub_interval_ms"])
+        c.maintenance.scrub_interval =
+            milliseconds(m["scrub_interval_ms"], "maintenance.scrub_interval_ms");
     if (m["no_progress_backoff_ms"])
         c.maintenance.no_progress_backoff =
             milliseconds(m["no_progress_backoff_ms"], "maintenance.no_progress_backoff_ms");

@@ -34,6 +34,11 @@ struct MaintenanceConfig {
     uint64_t initial_bandwidth{32ULL * 1024 * 1024};
     uint64_t max_bandwidth{}; // 0 = no configured cap; observed bandwidth is still used.
     double scrub_fraction{0.02};
+    // Proactive full-object integrity scrub is a campaign, not continuous idle
+    // work. The next campaign due-time is persisted under state_path so daemon
+    // restarts do not restart or continually postpone the schedule. Ordinary
+    // reads still authenticate and content-hash every object they consume.
+    std::chrono::milliseconds scrub_interval{std::chrono::hours(24 * 30)};
     // A complete no-op maintenance pass must not immediately rescan the same
     // settled object set simply because byte credit remains available. Five
     // minutes is deliberately long: a healthy settled media server should be
