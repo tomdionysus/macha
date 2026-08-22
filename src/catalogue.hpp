@@ -78,6 +78,11 @@ struct CatalogueArtworkContent {
     Bytes bytes;
 };
 
+struct CatalogueClearResult {
+    size_t removed_items{};
+    std::vector<std::string> media_ids;
+};
+
 Bytes encode_catalogue(const CatalogueSnapshot&);
 CatalogueSnapshot decode_catalogue(std::span<const uint8_t>);
 std::string catalogue_kind_name(CatalogueKind);
@@ -124,6 +129,9 @@ class CatalogueManager {
     std::vector<CatalogueItem> search(std::string_view query, size_t limit = 50);
     CatalogueItem upsert(CatalogueItem, std::optional<uint64_t> expected_revision = {});
     bool erase(std::string_view id, std::optional<uint64_t> expected_revision = {});
+    bool definitely_absent(std::string_view id) const;
+    CatalogueClearResult clear_metadata_with_media(
+        std::string_view id, std::optional<uint64_t> expected_revision = {});
     size_t clear_metadata(std::string_view id, std::optional<uint64_t> expected_revision = {});
     CatalogueArtwork put_artwork(std::string_view item_id, std::string role,
                                  std::string mime_type, std::span<const uint8_t> bytes,

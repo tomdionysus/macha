@@ -13,6 +13,7 @@
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <cmath>
 #include <exception>
 #include <fcntl.h>
@@ -542,6 +543,9 @@ struct PlaybackManager::Impl {
     uint64_t cleanup_revision{};
     std::map<std::string, std::shared_ptr<Session>, std::less<>> sessions;
     std::map<std::string, MediaProbeResult, std::less<>> probe_cache;
+    std::map<std::string, HlsVodPlan, std::less<>> vod_plan_cache;
+    std::deque<std::string> vod_plan_cache_order;
+    static constexpr size_t max_vod_plan_cache_entries = 64;
     // Session/pipeline admission happens before a newly-created pipeline is
     // visible in `sessions`.  Reserve those slots explicitly so concurrent
     // POST/PATCH requests cannot all pass the same resource-limit check.
@@ -739,9 +743,40 @@ struct PlaybackManager::Impl {
         throw std::runtime_error("timed out waiting for first fragmented-MP4 segment");
     }
 
+    std::string vod_plan_key(const Session& session) const {
+        const auto& plan = session.plan;
+        std::ostringstream key;
+        key << session.source.media_id << '|'
+            << static_cast<int>(plan.mode) << '|'
+            << plan.video_stream << '|' << plan.audio_stream << '|' << plan.subtitle_stream << '|'
+            << static_cast<int>(plan.video) << '|' << static_cast<int>(plan.audio) << '|'
+            << plan.video_codec << '|' << plan.audio_codec << '|'
+            << (plan.target_height ? *plan.target_height : -1) << '|'
+            << (plan.target_video_bitrate ? *plan.target_video_bitrate : 0) << '|'
+            << plan.seek.count() << '|' << config.segment_duration.count() << '|'
+            << (session.preferences.mode != "remux" &&
+                session.capabilities.video_codecs.contains("h264"));
+        return key.str();
+    }
+
     void prepare_transformed_vod(Session& session, std::string_view trace) {
         session.vod_plan.reset();
         if (session.plan.mode == PlaybackMode::direct) return;
+
+        const auto cache_key = vod_plan_key(session);
+        {
+            std::lock_guard lock(mutex);
+            if (auto it = vod_plan_cache.find(cache_key); it != vod_plan_cache.end()) {
+                session.plan = it->second.playback;
+                session.vod_plan = it->second;
+                Log::debug("playback[" + std::string(trace) +
+                           "] VOD plan cache-hit media=" + session.source.media_id +
+                           " segments=" +
+                           std::to_string(session.vod_plan->segment_durations.size()));
+                return;
+            }
+        }
+
         auto started = Clock::now();
         auto prepared = engine->prepare_hls_vod(session.source, session.plan,
                                                 session.probe.duration_seconds, config.segment_duration,
@@ -755,6 +790,17 @@ struct PlaybackManager::Impl {
                    " segments=" + std::to_string(prepared.segment_durations.size()) +
                    " elapsed_ms=" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
                        Clock::now() - started).count()));
+        {
+            std::lock_guard lock(mutex);
+            if (!vod_plan_cache.contains(cache_key)) {
+                while (vod_plan_cache_order.size() >= max_vod_plan_cache_entries) {
+                    vod_plan_cache.erase(vod_plan_cache_order.front());
+                    vod_plan_cache_order.pop_front();
+                }
+                vod_plan_cache_order.push_back(cache_key);
+            }
+            vod_plan_cache[cache_key] = prepared;
+        }
         session.vod_plan = std::move(prepared);
     }
 

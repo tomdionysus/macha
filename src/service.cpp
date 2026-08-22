@@ -97,7 +97,10 @@ Service::Service(Config config, ClusterKeys keys)
       torrents_(ingest_, node_.config().torrent, node_.config().state_path),
       torrent_search_(node_.config().torrent),
       acquisition_api_(ingest_, torrents_, torrent_search_),
-      catalogue_api_(catalogue_, catalogue_hints_, [this] { scanner_.request_rescan(); }),
+      catalogue_api_(catalogue_, catalogue_hints_,
+                     [this](const std::vector<std::string>& media_ids) {
+                         scanner_.request_media_rescan(media_ids);
+                     }),
       streaming_(fs_, catalogue_, node_.config().catalogue.api, node_.config().streaming) {
     if (node_.config().catalogue.api.enabled) {
         catalogue_http_ = std::make_unique<HttpServer>(

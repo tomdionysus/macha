@@ -632,9 +632,14 @@ std::string TorrentManager::add_impl(std::string uri, bool allow_fetch) {
         if (fetched.status < 200 || fetched.status >= 300)
             throw std::runtime_error("torrent URL returned HTTP " + std::to_string(fetched.status));
         std::vector<char> buffer(fetched.body.begin(), fetched.body.end());
-        lt::error_code ec;
-        atp = lt::load_torrent_buffer(lt::span<char const>(buffer.data(), buffer.size()), ec, {});
-        if (ec) throw std::runtime_error("invalid .torrent file: " + ec.message());
+        try {
+            // Use the throwing overload shared by libtorrent 2.0 and 2.1.
+            // Some 2.1 distro builds no longer expose the deprecated
+            // error_code/limits overload used by older builds.
+            atp = lt::load_torrent_buffer(lt::span<char const>(buffer.data(), buffer.size()));
+        } catch (const std::exception& e) {
+            throw std::runtime_error("invalid .torrent file: " + std::string(e.what()));
+        }
         // Do not persist a potentially credential-bearing ephemeral download URL
         // as the only restart source. Persist a canonical magnet constructed from
         // the parsed metainfo instead.
@@ -909,21 +914,23 @@ void TorrentManager::update_jobs() {
             }
         }
 
-        switch (status.state) {
-        case lt::torrent_status::checking_files:
-        case lt::torrent_status::checking_resume_data:
+        // Do not switch exhaustively on libtorrent's state enum. 2.1 adds
+        // queued_for_checking/allocating in configurations where older builds
+        // do not expose those names, and -Wswitch then turns the otherwise
+        // harmless API difference into a build failure. Unknown/pre-download
+        // states remain queued until they enter one of the stable states below.
+        if (status.state == lt::torrent_status::checking_files ||
+            status.state == lt::torrent_status::checking_resume_data) {
             job.state = TorrentJobState::verifying;
-            break;
-        case lt::torrent_status::downloading_metadata:
+        } else if (status.state == lt::torrent_status::downloading_metadata) {
             job.state = TorrentJobState::metadata;
-            break;
-        case lt::torrent_status::downloading:
+        } else if (status.state == lt::torrent_status::downloading) {
             job.state = TorrentJobState::downloading;
-            break;
-        case lt::torrent_status::finished:
-        case lt::torrent_status::seeding:
+        } else if (status.state == lt::torrent_status::finished ||
+                   status.state == lt::torrent_status::seeding) {
             job.state = TorrentJobState::downloaded;
-            break;
+        } else {
+            job.state = TorrentJobState::queued;
         }
 
         if (job.state == TorrentJobState::downloaded) {

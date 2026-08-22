@@ -42,6 +42,82 @@ std::string trim(std::string value) {
     return value;
 }
 
+struct ScannerPersistentState {
+    std::optional<Hash256> namespace_signature;
+    uint64_t next_safety_scan_unix_ms{};
+    bool reconciled{true};
+};
+
+std::filesystem::path scanner_state_path(const std::filesystem::path& state_path) {
+    return state_path / "catalogue" / "scanner.state";
+}
+
+ScannerPersistentState load_scanner_state(const std::filesystem::path& state_path) {
+    ScannerPersistentState state;
+    std::ifstream in(scanner_state_path(state_path));
+    if (!in)
+        return state;
+
+    std::string signature;
+    uint64_t next_due{};
+    if (!(in >> signature >> next_due))
+        return {};
+    int reconciled = 1;
+    if (in >> reconciled)
+        state.reconciled = reconciled != 0;
+    auto bytes = unhex(signature);
+    if (!bytes || bytes->size() != state.namespace_signature.emplace().bytes.size())
+        return {};
+    std::copy(bytes->begin(), bytes->end(), state.namespace_signature->bytes.begin());
+    state.next_safety_scan_unix_ms = next_due;
+    return state;
+}
+
+void persist_scanner_state(const std::filesystem::path& state_path, const Hash256& signature,
+                           uint64_t next_safety_scan_unix_ms, bool reconciled = true) {
+    const auto path = scanner_state_path(state_path);
+    std::filesystem::create_directories(path.parent_path());
+    auto temp = path;
+    temp += ".tmp";
+    {
+        std::ofstream out(temp, std::ios::trunc);
+        if (!out)
+            throw std::runtime_error("cannot write catalogue scanner state " + temp.string());
+        out << to_string(signature) << ' ' << next_safety_scan_unix_ms << ' '
+            << (reconciled ? 1 : 0) << '\n';
+        out.flush();
+        if (!out)
+            throw std::runtime_error("cannot flush catalogue scanner state " + temp.string());
+    }
+    std::error_code error;
+    std::filesystem::rename(temp, path, error);
+    if (error) {
+        std::filesystem::remove(path, error);
+        error.clear();
+        std::filesystem::rename(temp, path, error);
+    }
+    if (error)
+        throw std::runtime_error("cannot publish catalogue scanner state: " + error.message());
+}
+
+uint64_t next_scan_due_unix_ms(std::chrono::milliseconds interval) {
+    const auto now = unix_ms();
+    const auto delta = static_cast<uint64_t>(std::max<int64_t>(1, interval.count()));
+    return now > std::numeric_limits<uint64_t>::max() - delta
+        ? std::numeric_limits<uint64_t>::max()
+        : now + delta;
+}
+
+Clock::time_point steady_due_from_unix_ms(uint64_t due_unix_ms) {
+    const auto wall_now = unix_ms();
+    if (!due_unix_ms || due_unix_ms <= wall_now)
+        return Clock::now();
+    const auto remaining = due_unix_ms - wall_now;
+    const auto capped = std::min<uint64_t>(
+        remaining, static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
+    return Clock::now() + std::chrono::milliseconds(static_cast<int64_t>(capped));
+}
+
 std::string clean_title(std::string value) {
     for (auto& c : value) {
         if (c == '.' || c == '_' || c == '-') c = ' ';
@@ -2532,6 +2608,59 @@ void CatalogueScanner::request_rescan() {
     rescan_requested_.store(true, std::memory_order_relaxed);
 }
 
+size_t CatalogueScanner::request_media_rescan(const std::vector<std::string>& media_ids) {
+    if (media_ids.empty())
+        return 0;
+    {
+        std::lock_guard lock(config_mutex_);
+        if (!config_.enabled)
+            return 0;
+    }
+
+    std::set<std::string> wanted(media_ids.begin(), media_ids.end());
+    std::vector<CatalogueHintSubmission> submissions;
+
+    // Metadata clear already knows exactly which immutable media identities
+    // became unbound. Resolve those identities against the already-decoded
+    // namespace and enqueue only the affected paths; never turn a one-item
+    // mutation into a forced full-library rescan.
+    std::optional<MetadataSnapshotView> available = fs_.available_snapshot_view();
+    std::optional<MetadataSnapshot> local;
+    const MetadataSnapshot* snapshot = nullptr;
+    if (available) {
+        snapshot = available->snapshot.get();
+    } else {
+        // This is host-local durable metadata only, not a quorum read. It is a
+        // best-effort rematch accelerator; the ordinary namespace/safety scan
+        // remains the correctness fallback if the local replica is stale.
+        try {
+            local = fs_.local_snapshot();
+            snapshot = &*local;
+        } catch (...) {
+            return 0;
+        }
+    }
+
+    for (const auto& [path, entry] : snapshot->entries) {
+        if (entry.type != EntryType::file)
+            continue;
+        const auto media_id = file_media_id(entry);
+        if (!wanted.contains(media_id))
+            continue;
+        std::string root;
+        auto* provider = provider_for_path(path, root);
+        if (!provider || !provider->accepts_path(path))
+            continue;
+        submissions.push_back({path, "manual", media_id,
+                               CatalogueHintPriority::manual_rescan});
+    }
+
+    const auto queued = hints_.submit_many(std::move(submissions)).size();
+    Log::debug("catalogue metadata clear targeted rematch media_ids=" +
+               std::to_string(wanted.size()) + " queued=" + std::to_string(queued));
+    return queued;
+}
+
 void CatalogueScanner::reconfigure(CatalogueScannerConfig config) {
     stop();
     {
@@ -3007,21 +3136,90 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
 
 void CatalogueScanner::loop(std::stop_token stop) {
     ThreadCpuReporter cpu_reporter("macha-catalogue", std::chrono::seconds(5), true);
-    std::optional<Hash256> scanned_namespace;
+    CatalogueScannerConfig initial_config;
+    { std::lock_guard lock(config_mutex_); initial_config = config_; }
+    const auto persisted = load_scanner_state(node_.config().state_path);
+    std::optional<Hash256> scanned_namespace = persisted.namespace_signature;
+    bool scanner_state_reconciled = !persisted.namespace_signature || persisted.reconciled;
+    // Migration from pre-scanner.state releases: the durable hint-state file is
+    // created only once catalogue work has been admitted. It remains present
+    // even if all ephemeral successful hints have since been discarded, making
+    // it a better "this library has already been through scanner operation"
+    // marker than the current in-memory hint count. Migration seeds the current
+    // identity without scanning immediately, but marks it unverified so one full
+    // reconciliation is still performed at the ordinary safety deadline.
+    const bool prior_scan_evidence = std::filesystem::exists(
+        node_.config().state_path / "catalogue" / "hints.json");
     std::optional<std::chrono::steady_clock::time_point> mutation_due;
     std::optional<std::chrono::steady_clock::time_point> mutation_first_seen;
     auto observed_generation = node_.known_metadata_generation();
-    auto next_periodic = std::chrono::steady_clock::now();
+    const auto initial_now = Clock::now();
+    auto next_periodic = persisted.next_safety_scan_unix_ms
+        ? std::min(steady_due_from_unix_ms(persisted.next_safety_scan_unix_ms),
+                   initial_now + initial_config.interval)
+        : (prior_scan_evidence ? initial_now + initial_config.interval : initial_now);
     auto next_hint_batch = std::chrono::steady_clock::now();
     auto next_backlog_log = std::chrono::steady_clock::now();
     auto hint_revision = hints_.revision();
     bool provider_budget_open = false;
     bool was_coordinator = false;
+    bool initial_signature_checked = false;
+
+    auto namespace_identity = [&]() -> std::pair<Hash256, uint64_t> {
+        uint64_t generation = 0;
+        if (auto available = fs_.available_namespace_signature(&generation);
+            available && generation >= node_.known_metadata_generation())
+            return {*available, generation};
+        // MetadataManager owns convergence. Only if its decoded immutable view
+        // is absent/stale do we fall back to the strong snapshot path. Settled
+        // periodic safety checks therefore remain local.
+        auto signature = fs_.namespace_signature(&generation);
+        return {signature, generation};
+    };
 
     while (!stop.stop_requested()) {
         CatalogueScannerConfig config;
         { std::lock_guard lock(config_mutex_); config = config_; }
         const auto now = std::chrono::steady_clock::now();
+
+        // On restart, compare the last successfully reconciled namespace
+        // identity against MetadataManager's already-decoded view. Coordinator
+        // election itself is not evidence of a namespace mutation and must not
+        // launch a full discovery pass. For the one-time migration from older
+        // state (no scanner.state), an existing durable hint-state file is
+        // sufficient evidence that this library has already been operated by
+        // the scanner: seed the current signature as unverified and schedule one
+        // full reconciliation at the normal safety interval instead of reopening
+        // the entire historical result set immediately.
+        if (!initial_signature_checked) {
+            uint64_t available_generation = 0;
+            if (auto current = fs_.available_namespace_signature(&available_generation);
+                current && available_generation >= node_.known_metadata_generation()) {
+                // Do not seed/reconcile scanner state from a decoded snapshot
+                // that is already known to be stale. Metadata convergence owns
+                // fetching/decoding the advertised generation; this loop will
+                // observe the immutable view cheaply once it catches up.
+                initial_signature_checked = true;
+                observed_generation = std::max(observed_generation, available_generation);
+                if (scanned_namespace) {
+                    if (*current != *scanned_namespace) {
+                        mutation_first_seen = now;
+                        mutation_due = now + config.rescan_debounce;
+                    }
+                } else if (prior_scan_evidence) {
+                    scanned_namespace = *current;
+                    scanner_state_reconciled = false;
+                    const auto next_due = next_scan_due_unix_ms(config.interval);
+                    next_periodic = steady_due_from_unix_ms(next_due);
+                    try {
+                        persist_scanner_state(node_.config().state_path, *current, next_due, false);
+                    } catch (const std::exception& e) {
+                        Log::debug("catalogue scanner state persistence unavailable: " +
+                                   std::string(e.what()));
+                    }
+                }
+            }
+        }
 
         // Every node may consume its own persistent hints. This makes an ingest
         // performed on a non-coordinator responsive without requiring catalogue
@@ -3085,7 +3283,9 @@ void CatalogueScanner::loop(std::stop_token stop) {
         }
 
         const bool is_coordinator = coordinator();
-        if (is_coordinator && !was_coordinator) {
+        if (is_coordinator && !was_coordinator && !scanned_namespace && !prior_scan_evidence) {
+            // A genuinely fresh scanner still needs an initial discovery. A
+            // normal coordinator hand-off does not.
             mutation_due = now;
             if (!mutation_first_seen) mutation_first_seen = now;
         }
@@ -3108,11 +3308,14 @@ void CatalogueScanner::loop(std::stop_token stop) {
         const bool scheduled_rescan = is_coordinator && (periodic_due || mutation_rescan_due);
         if (config.enabled && (explicit_rescan || scheduled_rescan)) {
             try {
-                const auto before = fs_.namespace_signature();
+                const auto [before, before_generation] = namespace_identity();
                 const bool namespace_changed = !scanned_namespace || before != *scanned_namespace;
-                if (explicit_rescan || periodic_due || namespace_changed) {
+                const bool reconciliation_due = !scanner_state_reconciled;
+                if (explicit_rescan || namespace_changed || reconciliation_due) {
                     if (explicit_rescan) {
                         Log::info("catalogue: explicit rescan requested");
+                    } else if (reconciliation_due && periodic_due && !namespace_changed) {
+                        Log::info("catalogue: persisted scanner-state migration safety reconciliation; discovering");
                     } else if (mutation_rescan_due && namespace_changed && !periodic_due) {
                         if (max_delayed_mutation_due && !debounced_mutation_due)
                             Log::info("catalogue: namespace mutation max rescan delay reached; discovering");
@@ -3133,25 +3336,53 @@ void CatalogueScanner::loop(std::stop_token stop) {
                     (void)scan_once(stop, explicit_rescan, hint_source,
                                     hint_priority, unique_source_ref);
                     if (stop.stop_requested()) break;
-                    uint64_t after_generation = 0;
-                    const auto after = fs_.namespace_signature(&after_generation);
+                    const auto [after, after_generation] = namespace_identity();
                     if (after != before) {
                         const auto restart = std::chrono::steady_clock::now();
                         mutation_first_seen = restart;
                         mutation_due = restart + config.rescan_debounce;
                     } else {
                         scanned_namespace = after;
+                        scanner_state_reconciled = true;
                         mutation_due.reset();
                         mutation_first_seen.reset();
                     }
                     observed_generation = after_generation;
-                    next_periodic = std::chrono::steady_clock::now() + config.interval;
+                    const auto next_due = next_scan_due_unix_ms(config.interval);
+                    next_periodic = steady_due_from_unix_ms(next_due);
+                    if (scanned_namespace) {
+                        try {
+                            persist_scanner_state(node_.config().state_path,
+                                                  *scanned_namespace, next_due,
+                                                  scanner_state_reconciled);
+                        } catch (const std::exception& e) {
+                            Log::debug("catalogue scanner state persistence unavailable: " +
+                                       std::string(e.what()));
+                        }
+                    }
                     // Newly discovered low-priority hints should be eligible
                     // immediately after the reconciliation pass.
                     next_hint_batch = std::min(next_hint_batch, std::chrono::steady_clock::now());
                 } else {
+                    // A periodic safety pass first verifies the authoritative
+                    // namespace identity. If it is byte-for-byte the same as the
+                    // last successful reconciliation, walking every catalogue
+                    // root cannot discover anything new. Advance the persisted
+                    // safety deadline without reopening historical hints.
                     mutation_due.reset();
                     mutation_first_seen.reset();
+                    scanned_namespace = before;
+                    observed_generation = before_generation;
+                    if (periodic_due) {
+                        const auto next_due = next_scan_due_unix_ms(config.interval);
+                        next_periodic = steady_due_from_unix_ms(next_due);
+                        try {
+                            persist_scanner_state(node_.config().state_path, before, next_due, true);
+                        } catch (const std::exception& e) {
+                            Log::debug("catalogue scanner state persistence unavailable: " +
+                                       std::string(e.what()));
+                        }
+                    }
                 }
             } catch (const std::exception& e) {
                 Log::warn("catalogue scan: " + std::string(e.what()));
@@ -3165,15 +3396,22 @@ void CatalogueScanner::loop(std::stop_token stop) {
 
         const auto log_now = std::chrono::steady_clock::now();
         if (log_now >= next_backlog_log && Log::enabled(LogLevel::debug)) {
-            const auto backlog = hints_.summary();
-            Log::debug("catalogue backlog pending=" + std::to_string(backlog.pending) +
-                       " queued=" + std::to_string(backlog.queued) +
-                       " processing=" + std::to_string(backlog.processing) +
-                       " deferred=" + std::to_string(backlog.deferred) +
-                       " failed=" + std::to_string(backlog.failed) +
-                       " catalogued=" + std::to_string(backlog.catalogued) +
-                       " no_match=" + std::to_string(backlog.no_match) +
-                       " total=" + std::to_string(backlog.total));
+            // next_hint_batch==max is the worker's established no-pending-work
+            // state. Do not even walk the terminal hint map merely to suppress a
+            // zero-backlog line every 30 seconds.
+            if (next_hint_batch != Clock::time_point::max()) {
+                const auto backlog = hints_.summary();
+                if (backlog.pending != 0) {
+                    Log::debug("catalogue backlog pending=" + std::to_string(backlog.pending) +
+                               " queued=" + std::to_string(backlog.queued) +
+                               " processing=" + std::to_string(backlog.processing) +
+                               " deferred=" + std::to_string(backlog.deferred) +
+                               " failed=" + std::to_string(backlog.failed) +
+                               " catalogued=" + std::to_string(backlog.catalogued) +
+                               " no_match=" + std::to_string(backlog.no_match) +
+                               " total=" + std::to_string(backlog.total));
+                }
+            }
             next_backlog_log = log_now + std::chrono::seconds(30);
         }
 

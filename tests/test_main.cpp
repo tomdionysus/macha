@@ -5392,11 +5392,28 @@ void test_media_probe_and_online_catalogue_scanner() {
     CHECK(std::find(twice->media_ids.begin(), twice->media_ids.end(), alternate_id) != twice->media_ids.end());
 
     // Clear Metadata removes the catalogue entity rather than saving an empty
-    // matched item. Both underlying files therefore become unbound and the next
-    // scanner pass performs provider matching again from scratch.
-    CHECK(service.catalogue().clear_metadata("tmdb:movie:335984", twice->revision) == 1);
+    // matched item. It also returns the exact immutable media identities that
+    // became unbound, so recovery can enqueue only those files instead of
+    // reopening every terminal/no-match hint in the library.
+    auto cleared = service.catalogue().clear_metadata_with_media(
+        "tmdb:movie:335984", twice->revision);
+    CHECK(cleared.removed_items == 1);
+    CHECK(cleared.media_ids.size() == 2);
+    CHECK(std::find(cleared.media_ids.begin(), cleared.media_ids.end(), media_id) !=
+          cleared.media_ids.end());
+    CHECK(std::find(cleared.media_ids.begin(), cleared.media_ids.end(), alternate_id) !=
+          cleared.media_ids.end());
     CHECK(!service.catalogue().get("tmdb:movie:335984").has_value());
-    CHECK(scanner.scan_once() == 2);
+    CHECK(scanner.request_media_rescan(cleared.media_ids) == 2);
+    CHECK(service.catalogue_hints().summary().pending == 2);
+    scanner.start();
+    REQUIRE(wait_until([&] {
+        auto item = service.catalogue().get("tmdb:movie:335984");
+        return item && service.catalogue_hints().summary().pending == 0;
+    }, 5s));
+    scanner.stop();
+    CHECK(std::filesystem::exists(service.node().config().state_path /
+                                  "catalogue" / "scanner.state"));
     auto rematched = service.catalogue().get("tmdb:movie:335984");
     REQUIRE(rematched.has_value());
     CHECK(rematched->title == "Blade Runner 2049");
@@ -5449,6 +5466,10 @@ void test_media_probe_and_online_catalogue_scanner() {
     cancel_config.movies.roots = {"/Movies"};
     CatalogueScanner cancel_scanner(service.node(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
                                     cancel_config, std::move(blocking_http));
+    // Scanner startup is intentionally idle on an already-operated library.
+    // Explicitly request the pass whose in-flight provider request this test
+    // exercises, rather than depending on the old startup-rescan behaviour.
+    cancel_scanner.request_rescan();
     cancel_scanner.start();
     REQUIRE(wait_until([&] { return blocking_http_ptr->entered(); }, 1s));
     const auto stop_started = Clock::now();
@@ -5595,6 +5616,10 @@ void test_catalogue_cache_ignores_unrelated_metadata_generation() {
     auto cached = catalogue.get("test:movie:1");
     REQUIRE(cached.has_value());
     CHECK(cached->title == "Cached Movie");
+    // The global metadata generation is newer, but the decoded immutable view
+    // proves that catalogue_root did not change. A missing-item mutation can
+    // therefore return 404 without entering quorum repair.
+    CHECK(catalogue.definitely_absent("test:movie:missing"));
 
     // Background convergence should also recognise that an unchanged
     // content-addressed root does not need to be reloaded.
@@ -5606,6 +5631,66 @@ void test_catalogue_cache_ignores_unrelated_metadata_generation() {
     node.stop();
 }
 
+
+void test_catalogue_scanner_restart_does_not_rescan_unchanged_namespace() {
+    TempDir temp;
+    auto keyfile = temp.path() / "cluster.key";
+    write_key(keyfile);
+    auto config = config_for(temp.path() / "store", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.catalogue.scanner.enabled = false; // explicit scanner below
+    auto keys = load_cluster_keys(keyfile);
+    Service service(config, keys);
+    service.start();
+
+    service.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
+    service.filesystem().create_file("/Movies/Unbound.2026.mkv", 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write("/Movies/Unbound.2026.mkv", true);
+    auto bytes = pattern(4096);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+
+    // Simulate an upgrade from the pre-scanner.state queue implementation. The
+    // durable hint-state file remains even when every historical ephemeral hint
+    // has been discarded. Restart/coordinator election must seed scanner.state
+    // from the current immutable namespace and wait for the normal safety
+    // interval; it must not interpret process start as a reason to walk /Movies.
+    std::filesystem::create_directories(config.state_path / "catalogue");
+    {
+        std::ofstream out(config.state_path / "catalogue" / "hints.json");
+        out << R"({"version":2,"hints":[]})";
+    }
+
+    auto token = temp.path() / "tmdb.token";
+    {
+        std::ofstream out(token);
+        out << "test-token\n";
+    }
+    CatalogueScannerConfig scanner_config;
+    scanner_config.enabled = true;
+    scanner_config.interval = 1h;
+    scanner_config.rescan_debounce = 50ms;
+    scanner_config.rescan_max_delay = 1s;
+    scanner_config.movies.roots = {"/Movies"};
+    scanner_config.movies.tmdb.token_file = token;
+    scanner_config.tv.enabled = false;
+    scanner_config.music.enabled = false;
+
+    auto fake_http = std::make_unique<FakeHttpClient>();
+    auto* fake_http_ptr = fake_http.get();
+    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(),
+                             service.catalogue_hints(), scanner_config, std::move(fake_http));
+    scanner.start();
+    REQUIRE(wait_until([&] {
+        return std::filesystem::exists(config.state_path / "catalogue" / "scanner.state");
+    }, 1s));
+    std::this_thread::sleep_for(150ms);
+    CHECK(service.catalogue_hints().summary().total == 0);
+    CHECK(fake_http_ptr->requests() == 0);
+    scanner.stop();
+    service.stop();
+}
 
 void test_catalogue_hint_queue_persistence_coalescing_and_priority() {
     TempDir temp;
@@ -5683,6 +5768,26 @@ void test_catalogue_hint_queue_persistence_coalescing_and_priority() {
         auto recovered = hints.get(no_match_id);
         REQUIRE(recovered.has_value());
         CHECK(recovered->state == CatalogueHintState::queued);
+    }
+
+    // Terminal worker progress is intentionally coalesced rather than forcing a
+    // complete hints.json rewrite per item. Destruction is a durability boundary:
+    // the final dirty terminal state must still survive a clean shutdown.
+    const auto terminal_state = temp.path() / "terminal-state";
+    std::string terminal_id;
+    {
+        CatalogueHintQueue terminal_queue(terminal_state);
+        terminal_id = terminal_queue.submit("/Movies/Terminal.mkv", "scanner", "macha:terminal",
+                                            CatalogueHintPriority::periodic_scan);
+        REQUIRE(terminal_queue.claim_next().has_value());
+        terminal_queue.mark_no_match(terminal_id, "movies", "macha:terminal", "no match");
+        CHECK(terminal_queue.summary().pending == 0);
+    }
+    {
+        CatalogueHintQueue terminal_queue(terminal_state);
+        auto recovered = terminal_queue.get(terminal_id);
+        REQUIRE(recovered.has_value());
+        CHECK(recovered->state == CatalogueHintState::no_match);
     }
 
     // Candidate fallback progress is queue state, not provider-process state.
@@ -6331,6 +6436,14 @@ void test_catalogue_sync_search_and_artwork_gc() {
     }, 10s));
 
     CatalogueApi api(s3.catalogue(), s3.catalogue_hints());
+    CHECK(!s3.catalogue().definitely_absent(show.id));
+    CHECK(s3.catalogue().definitely_absent("show:does-not-exist"));
+    auto missing_clear = api.handle({.method = "DELETE",
+                                     .path = "/api/v1/catalogue/items/show%3Adoes-not-exist/metadata",
+                                     .query = {},
+                                     .headers = {},
+                                     .body = {}});
+    CHECK(missing_clear.status == 404);
     auto status_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/status",
                                        .query = {},
@@ -7132,6 +7245,24 @@ void test_playback_sessions_and_streaming_http_bodies() {
     remove_initial_seek.path = "/api/v1/playback/sessions/" + initial_seek_json.find("session_id")->asString();
     CHECK(playback.handle(remove_initial_seek).status == 204);
 
+    // Reopening the same immutable media with the same transformed plan should
+    // reuse both the probe and prepared VOD/random-access plan. The first
+    // fragment still belongs to a fresh pipeline generation, but source/index
+    // inspection is not repeated merely because the previous session ended.
+    const auto probes_before_reopen = fake_engine_ptr->probes();
+    const auto prepares_before_reopen = fake_engine_ptr->vod_prepares();
+    auto reopened_seek = playback.handle(initial_seek);
+    REQUIRE(reopened_seek.status == 201);
+    CHECK(fake_engine_ptr->probes() == probes_before_reopen);
+    CHECK(fake_engine_ptr->vod_prepares() == prepares_before_reopen);
+    auto reopened_seek_json = Json::parse(std::string(reopened_seek.body.begin(),
+                                                      reopened_seek.body.end()));
+    HttpRequest remove_reopened_seek;
+    remove_reopened_seek.method = "DELETE";
+    remove_reopened_seek.path = "/api/v1/playback/sessions/" +
+                                reopened_seek_json.find("session_id")->asString();
+    CHECK(playback.handle(remove_reopened_seek).status == 204);
+
     Json::Object create_root{{"media_id", media_id}};
     auto create_text = Json(std::move(create_root)).dump();
     HttpRequest create;
@@ -7517,6 +7648,7 @@ int main() {
         RUN_TEST(test_cache_hydrator_fetches_to_persistent_cache);
         RUN_TEST(test_media_probe_and_online_catalogue_scanner);
         RUN_TEST(test_catalogue_cache_ignores_unrelated_metadata_generation);
+        RUN_TEST(test_catalogue_scanner_restart_does_not_rescan_unchanged_namespace);
         RUN_TEST(test_catalogue_hint_queue_persistence_coalescing_and_priority);
         RUN_TEST(test_ingest_catalogue_feedback_and_external_clear_cleanup);
         RUN_TEST(test_catalogue_warm_read_defers_remote_refresh);

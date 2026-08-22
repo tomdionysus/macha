@@ -228,6 +228,38 @@ void CatalogueHintQueue::save_state_locked() const {
     if (ec) throw std::runtime_error("cannot replace catalogue hint state: " + ec.message());
 }
 
+void CatalogueHintQueue::mark_state_dirty_locked() {
+    if (!state_dirty_) {
+        state_dirty_ = true;
+        dirty_since_ = std::chrono::steady_clock::now();
+    }
+    ++dirty_updates_;
+}
+
+void CatalogueHintQueue::persist_dirty_state_locked(bool force) {
+    if (!state_dirty_) return;
+    constexpr size_t max_coalesced_updates = 32;
+    constexpr auto max_coalesce_delay = std::chrono::seconds(2);
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && dirty_updates_ < max_coalesced_updates &&
+        now - dirty_since_ < max_coalesce_delay)
+        return;
+    save_state_locked();
+    state_dirty_ = false;
+    dirty_updates_ = 0;
+    dirty_since_ = {};
+}
+
+CatalogueHintQueue::~CatalogueHintQueue() {
+    try {
+        std::lock_guard lock(mutex_);
+        persist_dirty_state_locked(true);
+    } catch (const std::exception& e) {
+        Log::warn("catalogue hint state flush failed during shutdown: " +
+                  std::string(e.what()));
+    }
+}
+
 std::vector<std::string> CatalogueHintQueue::submit_many(
     std::vector<CatalogueHintSubmission> submissions) {
     const auto now = now_ms();
@@ -331,7 +363,11 @@ std::vector<std::string> CatalogueHintQueue::submit_many(
         changed = true;
     }
     if (changed) {
-        save_state_locked();
+        mark_state_dirty_locked();
+        // New work is an admission boundary: once submit returns, the hint must
+        // survive a crash. Bulk scanner submission is already coalesced by
+        // submit_many(), so this is one write per discovery pass, not per item.
+        persist_dirty_state_locked(true);
         changed_locked();
     }
     return ids;
@@ -406,6 +442,12 @@ uint64_t CatalogueHintQueue::revision() const {
 bool CatalogueHintQueue::wait_for_change(std::stop_token stop, uint64_t observed_revision,
                                          std::chrono::milliseconds timeout) {
     std::unique_lock lock(mutex_);
+    // Terminal/candidate worker updates are intentionally coalesced. The
+    // scanner revisits this wait at least once per second while active, so a
+    // dirty queue is persisted within two seconds even if no further hints
+    // mutate. A crash inside that window replays at most the recent work, which
+    // preserves the queue's existing at-least-once semantics.
+    persist_dirty_state_locked(false);
     return change_cv_.wait_for(lock, stop, timeout, [&] {
         return revision_ != observed_revision;
     });
@@ -431,7 +473,8 @@ void CatalogueHintQueue::mark_catalogued(std::string_view id, std::string provid
     hint.updated_unix_ms = now_ms();
     discard_ephemeral_origins(hint);
     if (hint.origins.empty()) hints_.erase(it);
-    save_state_locked();
+    mark_state_dirty_locked();
+    persist_dirty_state_locked(false);
     changed_locked();
 }
 
@@ -452,7 +495,8 @@ void CatalogueHintQueue::mark_no_match(std::string_view id, std::string provider
     hint.ready_after_unix_ms = 0;
     hint.updated_unix_ms = now_ms();
     if (hint.origins.empty()) hints_.erase(it);
-    save_state_locked();
+    mark_state_dirty_locked();
+    persist_dirty_state_locked(false);
     changed_locked();
 }
 
@@ -468,7 +512,8 @@ void CatalogueHintQueue::advance_candidate(std::string_view id, size_t next_curs
     hint.error.clear();
     hint.ready_after_unix_ms = 0;
     hint.updated_unix_ms = now_ms();
-    save_state_locked();
+    mark_state_dirty_locked();
+    persist_dirty_state_locked(false);
     changed_locked();
 }
 
@@ -481,7 +526,8 @@ void CatalogueHintQueue::defer(std::string_view id, std::string error, uint64_t 
     hint.error = std::move(error);
     hint.ready_after_unix_ms = retry_after_unix_ms;
     hint.updated_unix_ms = now_ms();
-    save_state_locked();
+    mark_state_dirty_locked();
+    persist_dirty_state_locked(false);
     changed_locked();
 }
 
@@ -507,7 +553,8 @@ size_t CatalogueHintQueue::defer_matching(
     if (deferred) {
         // Provider outage is one scheduling event, not N independent hint
         // failures. Persist and wake once for the complete affected provider set.
-        save_state_locked();
+        mark_state_dirty_locked();
+        persist_dirty_state_locked(true);
         changed_locked();
     }
     return deferred;
@@ -536,7 +583,8 @@ bool CatalogueHintQueue::record_failure(std::string_view id, std::string error,
         hint.state = CatalogueHintState::deferred;
         hint.ready_after_unix_ms = retry_after_unix_ms;
     }
-    save_state_locked();
+    mark_state_dirty_locked();
+    persist_dirty_state_locked(true);
     changed_locked();
     return gave_up;
 }
@@ -554,7 +602,8 @@ void CatalogueHintQueue::fail(std::string_view id, std::string error) {
     hint.updated_unix_ms = now_ms();
     // Failed hints are the persistent dead-letter/give-up list. Explicit origin
     // removal may still erase them later, but failure itself must remain visible.
-    save_state_locked();
+    mark_state_dirty_locked();
+    persist_dirty_state_locked(true);
     changed_locked();
 }
 
@@ -568,7 +617,11 @@ void CatalogueHintQueue::requeue_processing() {
         hint.updated_unix_ms = now_ms();
         changed = true;
     }
-    if (changed) { save_state_locked(); changed_locked(); }
+    if (changed) {
+        mark_state_dirty_locked();
+        persist_dirty_state_locked(true);
+        changed_locked();
+    }
 }
 
 std::vector<CatalogueHint> CatalogueHintQueue::list() const {
@@ -659,7 +712,11 @@ size_t CatalogueHintQueue::erase_origin(std::string_view source, std::string_vie
         if (origins.empty() && terminal(it->second.state)) it = hints_.erase(it);
         else ++it;
     }
-    if (removed) { save_state_locked(); changed_locked(); }
+    if (removed) {
+        mark_state_dirty_locked();
+        persist_dirty_state_locked(true);
+        changed_locked();
+    }
     return removed;
 }
 

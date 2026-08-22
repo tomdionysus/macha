@@ -12,11 +12,13 @@ namespace macha {
 class CatalogueApi {
     CatalogueManager& catalogue_;
     CatalogueHintQueue& hints_;
-    std::function<void()> request_rescan_;
+    std::function<void(const std::vector<std::string>&)> request_media_rescan_;
   public:
-    CatalogueApi(CatalogueManager& catalogue, CatalogueHintQueue& hints,
-                 std::function<void()> request_rescan = {})
-        : catalogue_(catalogue), hints_(hints), request_rescan_(std::move(request_rescan)) {}
+    CatalogueApi(
+        CatalogueManager& catalogue, CatalogueHintQueue& hints,
+        std::function<void(const std::vector<std::string>&)> request_media_rescan = {})
+        : catalogue_(catalogue), hints_(hints),
+          request_media_rescan_(std::move(request_media_rescan)) {}
     HttpResponse handle(const HttpRequest&);
 };
 

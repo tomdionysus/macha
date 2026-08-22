@@ -580,8 +580,40 @@ bool CatalogueManager::erase(std::string_view id, std::optional<uint64_t> expect
     return true;
 }
 
-size_t CatalogueManager::clear_metadata(std::string_view id,
-                                        std::optional<uint64_t> expected_revision) {
+bool CatalogueManager::definitely_absent(std::string_view id) const {
+    std::optional<ObjectId> cached_root;
+    uint64_t cached_generation{};
+    {
+        std::lock_guard lock(mutex_);
+        if (!ready_ || !cached_)
+            return false;
+        if (cached_->items.contains(std::string(id)))
+            return false;
+        cached_root = cached_root_;
+        cached_generation = cached_metadata_generation_;
+    }
+
+    // This is intentionally only an early-negative test. A stale catalogue
+    // snapshot must never turn a potentially valid mutation into a false 404.
+    const auto known_generation = node_.known_metadata_generation();
+    if (cached_generation >= known_generation)
+        return true;
+
+    // Global metadata generations also advance for namespace, garbage and voter
+    // changes. If MetadataManager has already decoded the known generation and
+    // its immutable catalogue root is unchanged, the cached catalogue is still
+    // exactly current even though its bookkeeping generation is older. This is
+    // a memory-only proof and avoids a quorum repair for a definite 404.
+    if (auto available = metadata_.available_snapshot_view();
+        available && available->generation >= known_generation &&
+        available->snapshot->catalogue_root == cached_root)
+        return true;
+
+    return false;
+}
+
+CatalogueClearResult CatalogueManager::clear_metadata_with_media(
+    std::string_view id, std::optional<uint64_t> expected_revision) {
     DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     repair_once();
     auto current = *current_snapshot();
@@ -593,15 +625,14 @@ size_t CatalogueManager::clear_metadata(std::string_view id,
 
     auto root = current.items.find(std::string(id));
     if (root == current.items.end())
-        return 0;
+        return {};
     if (expected_revision && root->second.revision != *expected_revision)
         throw CatalogueConflict("catalogue item revision changed");
 
     // Clearing metadata is deliberately stronger than editing an item blank.
     // Remove the catalogue entity, and for hierarchy entities remove its
-    // descendants as well. The underlying media objects remain in the
-    // namespace, so their media IDs become unbound and the scanner can probe
-    // and match them again on a later pass.
+    // descendants as well. Preserve the immutable media identities before the
+    // removal so the caller can enqueue only those files for re-enrichment.
     std::set<std::string> removed_ids{root->first};
     bool grew = true;
     while (grew) {
@@ -616,11 +647,27 @@ size_t CatalogueManager::clear_metadata(std::string_view id,
         }
     }
 
+    std::set<std::string> media_ids;
+    for (const auto& remove_id : removed_ids) {
+        auto item = current.items.find(remove_id);
+        if (item != current.items.end())
+            media_ids.insert(item->second.media_ids.begin(), item->second.media_ids.end());
+    }
+
     auto old_art = artwork_ids(current);
     for (const auto& remove_id : removed_ids)
         current.items.erase(remove_id);
     commit(expected_root, current, old_art);
-    return removed_ids.size();
+
+    CatalogueClearResult result;
+    result.removed_items = removed_ids.size();
+    result.media_ids.assign(media_ids.begin(), media_ids.end());
+    return result;
+}
+
+size_t CatalogueManager::clear_metadata(std::string_view id,
+                                        std::optional<uint64_t> expected_revision) {
+    return clear_metadata_with_media(id, expected_revision).removed_items;
 }
 
 CatalogueArtwork CatalogueManager::stage_artwork(std::string role, std::string mime_type,
