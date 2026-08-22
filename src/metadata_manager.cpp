@@ -137,9 +137,14 @@ MetadataRecord MetadataManager::cache_record(const MetadataRecord& record) {
         cache_ = record;
         cache_until_ = Clock::now() + node_.config().metadata_cache;
         if (!decoded_cache_ || decoded_generation_ != record.generation || decoded_hash_ != record.hash) {
+            const bool namespace_changed =
+                !decoded_cache_ || decoded_cache_->entries != decoded->entries;
             decoded_cache_ = std::move(decoded);
             decoded_generation_ = record.generation;
             decoded_hash_ = record.hash;
+            if (namespace_changed) ++decoded_namespace_revision_;
+            available_generation_.store(decoded_generation_, std::memory_order_release);
+            available_namespace_revision_.store(decoded_namespace_revision_, std::memory_order_release);
         }
     }
     return record;
@@ -168,7 +173,7 @@ std::optional<MetadataSnapshotView> MetadataManager::cached_snapshot_view() {
     if (node_.metadata_replica().generation() > decoded_generation_ ||
         node_.remote_metadata_generation() > decoded_generation_)
         return {};
-    return MetadataSnapshotView{decoded_generation_, decoded_hash_, decoded_cache_};
+    return MetadataSnapshotView{decoded_generation_, decoded_namespace_revision_, decoded_hash_, decoded_cache_};
 }
 
 bool MetadataManager::seed_quorum(const std::vector<NodeInfo>& nodes,
@@ -1267,7 +1272,7 @@ MetadataSnapshotView MetadataManager::snapshot_view() {
         if (decoded_cache_ &&
             (decoded_generation_ > record.generation ||
              (decoded_generation_ == record.generation && decoded_hash_ >= record.hash))) {
-            return MetadataSnapshotView{decoded_generation_, decoded_hash_, decoded_cache_};
+            return MetadataSnapshotView{decoded_generation_, decoded_namespace_revision_, decoded_hash_, decoded_cache_};
         }
     }
 
@@ -1276,7 +1281,17 @@ MetadataSnapshotView MetadataManager::snapshot_view() {
     // Decode that exact generation rather than turning cache churn into FUSE
     // EIO.  This path is exceptional; normal operations reuse decoded_cache_.
     auto decoded = std::make_shared<MetadataSnapshot>(decode_snapshot(record.payload));
-    return MetadataSnapshotView{record.generation, record.hash, std::move(decoded)};
+    return MetadataSnapshotView{record.generation, 0, record.hash, std::move(decoded)};
+}
+
+std::optional<MetadataSnapshotView> MetadataManager::available_snapshot_view() const {
+    // This is deliberately a no-I/O view.  Consumers such as FUSE use it to
+    // adopt a newer snapshot which MetadataManager has already obtained and
+    // decoded, but never to turn an OS metadata lookup into quorum traffic.
+    std::lock_guard lock(cache_mutex_);
+    if (!decoded_cache_)
+        return {};
+    return MetadataSnapshotView{decoded_generation_, decoded_namespace_revision_, decoded_hash_, decoded_cache_};
 }
 
 MetadataSnapshot MetadataManager::snapshot() {

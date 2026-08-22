@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.14.7 - 2026-08-22
+
+- Fix stop-token condition-variable waits that could swallow producer notifications because their predicates were permanently false.
+- Hydration wakeups now carry a monotonic revision, so providers can wake an idle hydrator immediately without reintroducing background polling or losing an event that races with scheduling.
+- Playback session cleanup now wakes correctly when sessions are created, touched, replaced, removed or the idle policy changes; a newly-created session can therefore expire even when the cleanup worker was previously idle.
+- Active torrent status sampling can now be interrupted immediately when the job set becomes fully paused/terminal instead of waiting for the next 500 ms sample.
+- Add regression coverage for event-driven hydration wakeup and playback idle-session expiry.
+
+## 0.14.6 - 2026-08-22
+
+- make FUSE namespace adoption strictly local and cheap: kernel `getattr`/`readdir` traffic never performs distributed metadata I/O merely because a newer remote metadata generation has been advertised; the control-plane maintenance owner obtains/decodes newer snapshots and FUSE adopts only an already-available immutable view;
+- separate FUSE namespace revision from global metadata generation so catalogue-root, garbage-accounting, voter and other metadata-only commits do not rebuild the FUSE inode/path graph; the common unchanged FUSE lookup path is now a lock-free revision comparison;
+- stop copying complete extent manifests for kernel metadata operations: `getattr` and `readdir` return compact FUSE attribute records containing only type/mode/owner/size/timestamps/version;
+- make idle FUSE publication workers block indefinitely until data work is queued, waking only for queue/admission changes or the configured post-foreground quiet deadline;
+- make speculative hydration notification-driven while idle. Playback progress and FUSE demand wake the hydrator directly; the configured sampling interval is retained only while real asynchronous hydration I/O is outstanding, and failed objects wake at their retry deadline;
+- make playback session GC sleep until the earliest actual session expiry, idle/paused ingest and torrent workers block until work arrives, and replace short-slice node-heartbeat/RPC-health/service-maintenance sleeps with stop-aware condition waits;
+- remove the full metadata-record copy from the node heartbeat path by reading only the replica generation; allow background maintenance CPU credit to fall to zero when the process is already above its configured CPU target;
+- raise default FUSE kernel attribute/entry cache TTLs from 250 ms to 1 s and negative lookup TTL from 100 ms to 500 ms, reducing macOS metadata callback churn while keeping namespace visibility deliberately short-lived;
+- add regression coverage for no-I/O FUSE behaviour while a remote generation is known, catalogue-only metadata changes not advancing namespace revision, hydration idle blocking/direct wakeup, playback-change hydration notifications, and the new FUSE cache defaults.
+
 ## 0.14.5 - 2026-08-22
 
 - remove the FUSE namespace refresh timer entirely. Namespace-facing FUSE operations now validate the known metadata generation on demand and adopt `MetadataManager`'s shared immutable decoded snapshot only when their cached namespace generation is stale; a completely idle mount therefore performs no namespace refresh work;

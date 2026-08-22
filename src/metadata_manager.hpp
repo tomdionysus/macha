@@ -4,6 +4,7 @@
 #include "cluster.hpp"
 #include "placement.hpp"
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -12,6 +13,7 @@
 namespace macha {
 struct MetadataSnapshotView {
     uint64_t generation{};
+    uint64_t namespace_revision{};
     Hash256 hash{};
     std::shared_ptr<const MetadataSnapshot> snapshot;
 };
@@ -20,11 +22,14 @@ class MetadataManager {
     NodeRuntime& node_;
     Hash256 placement_key_;
     std::mutex mutation_mutex_;
-    std::mutex cache_mutex_;
+    mutable std::mutex cache_mutex_;
     std::optional<MetadataRecord> cache_;
     Clock::time_point cache_until_{};
     std::shared_ptr<const MetadataSnapshot> decoded_cache_;
     uint64_t decoded_generation_{};
+    std::atomic_uint64_t available_generation_{};
+    uint64_t decoded_namespace_revision_{};
+    std::atomic_uint64_t available_namespace_revision_{};
     Hash256 decoded_hash_{};
 
     struct CasResult {
@@ -74,6 +79,13 @@ class MetadataManager {
     MetadataRecord read_record();
     MetadataSnapshot snapshot();
     MetadataSnapshotView snapshot_view();
+    std::optional<MetadataSnapshotView> available_snapshot_view() const;
+    uint64_t available_snapshot_generation() const noexcept {
+        return available_generation_.load(std::memory_order_acquire);
+    }
+    uint64_t available_namespace_revision() const noexcept {
+        return available_namespace_revision_.load(std::memory_order_acquire);
+    }
     MetadataRecord mutate(const std::function<void(MetadataSnapshot&)>&, size_t retries = 8);
     void repair_once();
 };

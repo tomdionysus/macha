@@ -1874,9 +1874,10 @@ void RpcClient::health_loop(std::stop_token stop) {
     };
 
     while (!stop.stop_requested()) {
-        auto until = Clock::now() + heartbeat_;
-        while (!stop.stop_requested() && Clock::now() < until)
-            std::this_thread::sleep_for(std::min(std::chrono::milliseconds(50), heartbeat_));
+        {
+            std::unique_lock wait_lock(health_wait_mutex_);
+            health_wait_cv_.wait_for(wait_lock, stop, heartbeat_, [] { return false; });
+        }
         if (stop.stop_requested())
             return;
 
@@ -2038,6 +2039,7 @@ void RpcClient::stop() {
     Log::debug("shutdown: RpcClient::stop begin");
     if (health_thread_.joinable()) {
         health_thread_.request_stop();
+        health_wait_cv_.notify_all();
         health_thread_.join();
     }
     set_inbound_handler({});

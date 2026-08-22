@@ -152,6 +152,7 @@ void NodeRuntime::request_stop() {
     if (maintenance_.joinable()) {
         Log::debug("shutdown: node maintenance request_stop");
         maintenance_.request_stop();
+        maintenance_wait_cv_.notify_all();
     }
     if (local_writer_.joinable()) {
         Log::debug("shutdown: local writer request_stop");
@@ -491,7 +492,7 @@ void NodeRuntime::loop(std::stop_token stop) {
             Log::trace("DIAG node-stage stage=storage-refresh elapsed_ms=" +
                        std::to_string(refresh_ms));
         members_.storage(local_.used(), local_.limit());
-        members_.metadata_generation(meta_.current().generation);
+        members_.metadata_generation(meta_.generation());
         std::set<std::pair<std::string, uint16_t>> exchanged;
         const auto known_nodes = members_.all();
         for (const auto& endpoint : cfg_.bootstrap) {
@@ -527,9 +528,8 @@ void NodeRuntime::loop(std::stop_token stop) {
             }
         }
         cpu_reporter.tick();
-        auto until = Clock::now() + cfg_.heartbeat;
-        while (!stop.stop_requested() && Clock::now() < until)
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::unique_lock wait_lock(maintenance_wait_mutex_);
+        maintenance_wait_cv_.wait_for(wait_lock, stop, cfg_.heartbeat, [] { return false; });
     }
 }
 

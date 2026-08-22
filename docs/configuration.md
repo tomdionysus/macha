@@ -63,9 +63,9 @@ FUSE policy is configured separately from persistent filesystem-root metadata:
 ```yaml
 fuse:
   allow_other: false
-  entry_timeout_ms: 250
-  attr_timeout_ms: 250
-  negative_timeout_ms: 100
+  entry_timeout_ms: 1000
+  attr_timeout_ms: 1000
+  negative_timeout_ms: 500
   absolute_request_timeout_ms: 15000
   timeouts:
     lookup_ms: 1000

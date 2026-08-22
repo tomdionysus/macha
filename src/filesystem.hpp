@@ -207,6 +207,16 @@ class FileSystem {
     std::pair<uint64_t, uint64_t> logical_capacity() const;
     MetadataSnapshot local_snapshot() const;
     MetadataSnapshotView local_snapshot_view();
+    std::optional<MetadataSnapshotView> available_snapshot_view() const;
+    uint64_t available_snapshot_generation() const noexcept {
+        return m_.available_snapshot_generation();
+    }
+    uint64_t available_namespace_revision() const noexcept {
+        return m_.available_namespace_revision();
+    }
+    uint64_t local_committed_metadata_generation() const noexcept {
+        return n_.metadata_replica().committed_generation();
+    }
     uint64_t known_metadata_generation() const noexcept { return n_.known_metadata_generation(); }
     std::vector<ObjectId> live_objects();
     // Hash only namespace/content identity, deliberately excluding catalogue

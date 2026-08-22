@@ -12,6 +12,7 @@
 #include <cctype>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <exception>
 #include <fcntl.h>
@@ -537,6 +538,8 @@ struct PlaybackManager::Impl {
     std::unique_ptr<MediaEngine> engine;
     std::jthread cleanup_thread;
     mutable std::mutex mutex;
+    std::condition_variable_any cleanup_cv;
+    uint64_t cleanup_revision{};
     std::map<std::string, std::shared_ptr<Session>, std::less<>> sessions;
     std::map<std::string, MediaProbeResult, std::less<>> probe_cache;
     // Session/pipeline admission happens before a newly-created pipeline is
@@ -1116,6 +1119,7 @@ struct PlaybackManager::Impl {
                 return http_error(404, "not_found", "stream not found");
             session = it->second;
             session->touched = Clock::now();
+            signal_cleanup_locked();
         }
         if (request.method != "GET" && request.method != "HEAD") return http_error(405, "method", "GET or HEAD required");
         if (rest == "direct") {
@@ -1291,6 +1295,7 @@ struct PlaybackManager::Impl {
             {
                 std::lock_guard lock(mutex);
                 sessions[session->id] = session;
+                signal_cleanup_locked();
                 if (pending_sessions) --pending_sessions;
                 release_resources_locked(session->plan);
                 resources_reserved = false;
@@ -1320,6 +1325,7 @@ struct PlaybackManager::Impl {
             if (it == sessions.end()) return http_error(404, "not_found", "playback session not found");
             session = it->second;
             session->touched = Clock::now();
+            signal_cleanup_locked();
         }
         auto result = session_json(*session);
         if (auto active = active_engine(*session)) {
@@ -1413,6 +1419,7 @@ struct PlaybackManager::Impl {
                 if (it == sessions.end() || it->second != old)
                     throw std::runtime_error("playback session changed during update");
                 it->second = replacement;
+                signal_cleanup_locked();
                 release_resources_locked(replacement->plan);
                 resources_reserved = false;
             }
@@ -1435,6 +1442,7 @@ struct PlaybackManager::Impl {
             if (it == sessions.end()) return http_error(404, "not_found", "playback session not found");
             session = it->second;
             sessions.erase(it);
+            signal_cleanup_locked();
         }
         stop_pipeline(*session);
         std::error_code ec;
@@ -1489,20 +1497,38 @@ struct PlaybackManager::Impl {
         return http_error(404, "not_found", "endpoint not found");
     }
 
+    void signal_cleanup_locked() {
+        ++cleanup_revision;
+        cleanup_cv.notify_all();
+    }
+
     void cleanup(std::stop_token stop) {
         set_thread_name("macha-play-gc");
         while (!stop.stop_requested()) {
             std::vector<std::shared_ptr<Session>> expired;
+            std::optional<Clock::time_point> next_expiry;
             {
-                std::lock_guard lock(mutex);
-                auto now = Clock::now();
+                std::unique_lock lock(mutex);
+                const auto now = Clock::now();
                 for (auto it = sessions.begin(); it != sessions.end();) {
-                    if (now - it->second->touched >= config.session_idle) {
+                    const auto expires = it->second->touched + config.session_idle;
+                    if (now >= expires) {
                         expired.push_back(it->second);
                         it = sessions.erase(it);
                     } else {
+                        if (!next_expiry || expires < *next_expiry) next_expiry = expires;
                         ++it;
                     }
+                }
+
+                if (expired.empty()) {
+                    const auto observed_revision = cleanup_revision;
+                    const auto changed = [&] { return cleanup_revision != observed_revision; };
+                    if (next_expiry)
+                        cleanup_cv.wait_until(lock, stop, *next_expiry, changed);
+                    else
+                        cleanup_cv.wait(lock, stop, changed);
+                    continue;
                 }
             }
             for (auto& session : expired) {
@@ -1510,8 +1536,6 @@ struct PlaybackManager::Impl {
                 std::error_code ec;
                 std::filesystem::remove_all(*config.temp_path / session->id, ec);
             }
-            for (int i = 0; i < 10 && !stop.stop_requested(); ++i)
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
 };
@@ -1553,8 +1577,10 @@ void PlaybackManager::stop() {
 
 void PlaybackManager::request_stop() {
     if (!impl_ || !impl_->started) return;
-    if (impl_->cleanup_thread.joinable())
+    if (impl_->cleanup_thread.joinable()) {
         impl_->cleanup_thread.request_stop();
+        impl_->cleanup_cv.notify_all();
+    }
 }
 
 void PlaybackManager::reconfigure(StreamingConfig config) {
@@ -1568,6 +1594,7 @@ void PlaybackManager::reconfigure(StreamingConfig config) {
     impl_->config.startup_timeout = config.startup_timeout;
     impl_->config.segment_duration = config.segment_duration;
     impl_->config.max_ahead_segments = config.max_ahead_segments;
+    impl_->signal_cleanup_locked();
 }
 
 HttpResponse PlaybackManager::handle(const HttpRequest& request) {

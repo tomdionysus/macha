@@ -5,6 +5,7 @@
 #include "ingest.hpp"
 #include "media_catalogue.hpp"
 
+#include <condition_variable>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -120,6 +121,7 @@ class TorrentManager {
     TorrentConfig config_;
     std::filesystem::path state_file_;
     mutable std::mutex mutex_;
+    std::condition_variable_any cv_;
     std::map<std::string, TorrentJob, std::less<>> jobs_;
     std::unique_ptr<Impl> impl_;
     std::jthread worker_;
@@ -129,6 +131,7 @@ class TorrentManager {
     void restore_jobs();
     void loop(std::stop_token);
     void update_jobs();
+    bool has_active_jobs_locked() const;
     std::string add_impl(std::string uri, bool allow_fetch);
 
   public:

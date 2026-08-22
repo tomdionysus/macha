@@ -92,8 +92,10 @@ void Service::request_stop() {
     if (catalogue_http_)
         catalogue_http_->request_stop();
     streaming_.request_stop();
-    if (maintenance_.joinable())
+    if (maintenance_.joinable()) {
         maintenance_.request_stop();
+        maintenance_wait_cv_.notify_all();
+    }
     node_.request_stop();
 }
 
@@ -262,7 +264,7 @@ void Service::loop(std::stop_token stop) {
         // fixed block-per-tick pattern.
         double cpu_scale = 1.0;
         if (cpu_load > policy.cpu_target)
-            cpu_scale = std::clamp(policy.cpu_target / cpu_load, 0.05, 1.0);
+            cpu_scale = std::clamp(policy.cpu_target / cpu_load, 0.0, 1.0);
 
         double rate = bandwidth * fraction * cpu_scale;
         double burst_cap = std::max<double>(node_.config().extent_size, bandwidth * 5.0);
@@ -272,10 +274,15 @@ void Service::loop(std::stop_token stop) {
                                 scrub_credit + rate * policy.scrub_fraction * wall_seconds);
 
         try {
-            // Metadata maintenance is small but quorum-oriented. Keep it regular
-            // while avoiding a control-plane RPC burst on every scheduler tick.
-            if (!busy &&
-                (last_metadata == Clock::time_point{} || now - last_metadata >= background_interval)) {
+            // Remote generation notices wake no kernel/FUSE path and perform no
+            // quorum I/O themselves. The maintenance owner advances the coherent
+            // local metadata snapshot promptly, while settled verification remains
+            // a bounded periodic control-plane task.
+            const bool metadata_refresh_needed =
+                node_.known_metadata_generation() > node_.metadata_replica().committed_generation();
+            const bool metadata_periodic =
+                last_metadata == Clock::time_point{} || now - last_metadata >= background_interval;
+            if (metadata_refresh_needed || (!busy && metadata_periodic)) {
                 const auto stage = Clock::now();
                 metadata_.repair_once();
                 log_slow_stage("metadata-repair", stage);
@@ -529,9 +536,8 @@ void Service::loop(std::stop_token stop) {
         }
 
         cpu_reporter.tick();
-        auto until = Clock::now() + policy.interval;
-        while (!stop.stop_requested() && Clock::now() < until)
-            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        std::unique_lock wait_lock(maintenance_wait_mutex_);
+        maintenance_wait_cv_.wait_for(wait_lock, stop, policy.interval, [] { return false; });
     }
 }
 } // namespace macha

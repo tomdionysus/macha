@@ -101,6 +101,7 @@ class MetadataReplica {
     MetadataRecord current() const;
     MetadataRecord committed() const;
     uint64_t generation() const;
+    uint64_t committed_generation() const;
     bool cas(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
     bool cas_delta(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
     bool install_committed_delta(uint64_t, const Hash256&, std::span<const uint8_t>,
