@@ -336,6 +336,23 @@ PlaybackPlan negotiate(const MediaProbeResult& probe, std::string_view logical_p
     plan.audio_stream = audio ? audio->index : -1;
     plan.subtitle_stream = subtitle ? subtitle->index : -1;
 
+    if (prefs.mode != "auto" && prefs.mode != "direct" && prefs.mode != "remux" && prefs.mode != "transcode")
+        throw std::invalid_argument("preferences.mode must be auto, direct, remux or transcode");
+    plan.video = video ? MediaTransform::copy : MediaTransform::omit;
+    plan.audio = audio ? MediaTransform::copy : MediaTransform::omit;
+    plan.video_codec = video ? lower(video->codec) : std::string{};
+    plan.audio_codec = audio ? lower(audio->codec) : std::string{};
+
+    // Direct is an explicit byte-stream override, not a negotiated playback
+    // mode. The client has asked for the original media object and accepts
+    // responsibility for whether it can decode that object. Preserve probing
+    // and track metadata for the session API, but do not apply capability,
+    // resolution, bitrate or HLS constraints to this mode.
+    if (prefs.mode == "direct") {
+        plan.mode = PlaybackMode::direct;
+        return plan;
+    }
+
     const auto source_container = direct_container(logical_path);
     bool direct_container_ok = !source_container.empty() && caps.containers.contains(source_container);
     bool video_direct = !video || caps.video_codecs.contains(lower(video->codec));
@@ -346,18 +363,6 @@ PlaybackPlan negotiate(const MediaProbeResult& probe, std::string_view logical_p
     if (video && caps.max_width && video->width > *caps.max_width) size_direct = false;
     bool bitrate_direct = !prefs.max_bitrate || !probe.bitrate || probe.bitrate <= *prefs.max_bitrate;
     bool can_direct = direct_container_ok && video_direct && audio_direct && size_direct && bitrate_direct;
-
-    if (prefs.mode != "auto" && prefs.mode != "direct" && prefs.mode != "remux" && prefs.mode != "transcode")
-        throw std::invalid_argument("preferences.mode must be auto, direct, remux or transcode");
-    plan.video = video ? MediaTransform::copy : MediaTransform::omit;
-    plan.audio = audio ? MediaTransform::copy : MediaTransform::omit;
-    plan.video_codec = video ? lower(video->codec) : std::string{};
-    plan.audio_codec = audio ? lower(audio->codec) : std::string{};
-    if (prefs.mode == "direct") {
-        if (!can_direct) throw std::invalid_argument("requested direct play is incompatible with this source/capability set");
-        plan.mode = PlaybackMode::direct;
-        return plan;
-    }
     if (prefs.mode == "auto" && can_direct) {
         plan.mode = PlaybackMode::direct;
         return plan;
@@ -985,8 +990,8 @@ struct PlaybackManager::Impl {
         Json::Object selected{{"video_stream", session.plan.video_stream},
                               {"audio_stream", session.plan.audio_stream},
                               {"subtitle_stream", session.plan.subtitle_stream}};
-        Json::Array modes;
-        for (const auto* candidate : {"direct", "remux", "transcode"}) {
+        Json::Array modes{Json("direct")};
+        for (const auto* candidate : {"remux", "transcode"}) {
             auto preferences = session.preferences;
             preferences.mode = candidate;
             try {
