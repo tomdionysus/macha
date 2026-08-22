@@ -40,6 +40,7 @@ Json hint_json(const CatalogueHint& hint) {
     out["priority"] = static_cast<int64_t>(hint.priority);
     out["state"] = catalogue_hint_state_name(hint.state);
     out["attempts"] = static_cast<uint64_t>(hint.attempts);
+    out["failures"] = static_cast<uint64_t>(hint.failures);
     out["candidate_cursor"] = static_cast<uint64_t>(hint.candidate_cursor);
     out["created_unix_ms"] = hint.created_unix_ms;
     out["updated_unix_ms"] = hint.updated_unix_ms;
@@ -105,6 +106,7 @@ CatalogueHint parse_hint(const Json& value) {
     if (const auto* priority = value.find("priority")) hint.priority = static_cast<int>(priority->asInt64());
     if (auto state = parse_catalogue_hint_state(json_string(value, "state"))) hint.state = *state;
     hint.attempts = static_cast<unsigned>(json_u64(value, "attempts"));
+    hint.failures = static_cast<unsigned>(json_u64(value, "failures"));
     hint.candidate_cursor = static_cast<size_t>(json_u64(value, "candidate_cursor"));
     hint.created_unix_ms = json_u64(value, "created_unix_ms");
     hint.updated_unix_ms = json_u64(value, "updated_unix_ms");
@@ -308,6 +310,7 @@ std::vector<std::string> CatalogueHintQueue::submit_many(
         if (inserted || reopen_terminal) {
             hint.state = CatalogueHintState::queued;
             hint.attempts = 0;
+            hint.failures = 0;
             hint.candidate_cursor = 0;
             hint.ready_after_unix_ms = 0;
             hint.provider.clear();
@@ -413,6 +416,7 @@ void CatalogueHintQueue::mark_catalogued(std::string_view id, std::string provid
     if (it == hints_.end()) return;
     auto& hint = it->second;
     hint.state = CatalogueHintState::catalogued;
+    hint.failures = 0;
     hint.candidate_cursor = 0;
     hint.provider = std::move(provider);
     hint.media_id = std::move(media_id);
@@ -434,6 +438,7 @@ void CatalogueHintQueue::mark_no_match(std::string_view id, std::string provider
     if (it == hints_.end()) return;
     auto& hint = it->second;
     hint.state = CatalogueHintState::no_match;
+    hint.failures = 0;
     hint.candidate_cursor = 0;
     hint.provider = std::move(provider);
     hint.media_id = std::move(media_id);
@@ -454,6 +459,7 @@ void CatalogueHintQueue::advance_candidate(std::string_view id, size_t next_curs
     auto& hint = it->second;
     hint.state = CatalogueHintState::queued;
     hint.attempts = 0;
+    hint.failures = 0;
     hint.candidate_cursor = next_cursor;
     hint.error.clear();
     hint.ready_after_unix_ms = 0;
@@ -475,17 +481,47 @@ void CatalogueHintQueue::defer(std::string_view id, std::string error, uint64_t 
     changed_locked();
 }
 
+bool CatalogueHintQueue::record_failure(std::string_view id, std::string error,
+                                        uint64_t retry_after_unix_ms,
+                                        unsigned max_failures) {
+    std::lock_guard lock(mutex_);
+    auto it = std::find_if(hints_.begin(), hints_.end(),
+                           [&](const auto& pair) { return pair.second.id == id; });
+    if (it == hints_.end()) return false;
+    auto& hint = it->second;
+    ++hint.failures;
+    hint.error = std::move(error);
+    hint.updated_unix_ms = now_ms();
+    const bool gave_up = max_failures != 0 && hint.failures >= max_failures;
+    if (gave_up) {
+        hint.state = CatalogueHintState::failed;
+        hint.candidate_cursor = 0;
+        hint.ready_after_unix_ms = 0;
+        Log::warn("catalogue hint gave up path=" + hint.path +
+                  " failures=" + std::to_string(hint.failures) +
+                  ": " + hint.error);
+    } else {
+        hint.state = CatalogueHintState::deferred;
+        hint.ready_after_unix_ms = retry_after_unix_ms;
+    }
+    save_state_locked();
+    changed_locked();
+    return gave_up;
+}
+
 void CatalogueHintQueue::fail(std::string_view id, std::string error) {
     std::lock_guard lock(mutex_);
     auto it = std::find_if(hints_.begin(), hints_.end(), [&](const auto& pair) { return pair.second.id == id; });
     if (it == hints_.end()) return;
     auto& hint = it->second;
     hint.state = CatalogueHintState::failed;
+    hint.failures = std::max(1u, hint.failures);
     hint.candidate_cursor = 0;
     hint.error = std::move(error);
     hint.ready_after_unix_ms = 0;
     hint.updated_unix_ms = now_ms();
-    if (hint.origins.empty()) hints_.erase(it);
+    // Failed hints are the persistent dead-letter/give-up list. Explicit origin
+    // removal may still erase them later, but failure itself must remain visible.
     save_state_locked();
     changed_locked();
 }

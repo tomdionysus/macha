@@ -2419,7 +2419,8 @@ CatalogueScanProvider* CatalogueScanner::provider_for_path(std::string_view path
 }
 
 std::optional<CatalogueScanner::PreparedHintMatch>
-CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop) {
+CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
+                               const MetadataSnapshot& namespace_snapshot) {
     if (stop.stop_requested()) return {};
     CatalogueScannerConfig config;
     {
@@ -2434,16 +2435,16 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop) 
         return {};
     }
 
-    FsEntry entry;
-    try {
-        entry = fs_.getattr(hint.path);
-    } catch (const FsError& e) {
-        if (e.code() == ENOENT) {
-            hints_.fail(hint.id, "namespace path no longer exists");
-            return {};
-        }
-        throw;
+    // The batch owns one immutable namespace snapshot. Do not call
+    // FileSystem::getattr() here: that path may acquire authoritative metadata
+    // and previously rebuilt/read metadata separately for every hint.
+    const auto path = normalize_path(hint.path);
+    auto entry_it = namespace_snapshot.entries.find(path);
+    if (entry_it == namespace_snapshot.entries.end()) {
+        hints_.fail(hint.id, "namespace path no longer exists");
+        return {};
     }
+    const auto& entry = entry_it->second;
     if (entry.type != EntryType::file || entry.size == 0) {
         hints_.mark_no_match(hint.id, std::string(provider->name()), {},
                              "namespace path is not a non-empty media file");
@@ -2541,11 +2542,9 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop) 
     } catch (const std::exception& e) {
         Log::warn("catalogue hint lookup failed provider=" + std::string(provider->name()) +
                   " path=" + hint.path + " candidate=" + candidate.generator + ": " + e.what());
-        if (hint.attempts >= 5)
-            hints_.fail(hint.id, e.what());
-        else
-            hints_.defer(hint.id, e.what(),
-                         unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
+        hints_.record_failure(hint.id, e.what(),
+                              unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()),
+                              5);
         return {};
     }
 
@@ -2646,20 +2645,30 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
     HintBatchResult out;
     std::vector<PreparedHintMatch> prepared;
     prepared.reserve(max_hints);
+
+    // Acquire one coherent decoded namespace view lazily for the complete
+    // batch. An empty queue therefore causes no metadata work at all. Normally
+    // this is a pure cache read; a cold-start batch may populate it once.
+    std::optional<MetadataSnapshotView> namespace_view;
+
     for (; out.claimed < max_hints && !stop.stop_requested() && !budget_http->exhausted();) {
         auto hint = hints_.claim_next();
         if (!hint) break;
         ++out.claimed;
         try {
-            if (auto match = prepare_hint(*hint, stop)) prepared.push_back(std::move(*match));
+            if (!namespace_view) {
+                namespace_view = fs_.available_snapshot_view();
+                if (!namespace_view)
+                    namespace_view = fs_.local_snapshot_view();
+            }
+            if (auto match = prepare_hint(*hint, stop, *namespace_view->snapshot))
+                prepared.push_back(std::move(*match));
         } catch (const CatalogueConflict& e) {
-            hints_.defer(hint->id, e.what(), unix_ms() + 500);
+            hints_.record_failure(hint->id, e.what(), unix_ms() + 500, 120);
         } catch (const std::exception& e) {
-            if (hint->attempts >= 5)
-                hints_.fail(hint->id, e.what());
-            else
-                hints_.defer(hint->id, e.what(),
-                             unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
+            hints_.record_failure(hint->id, e.what(),
+                                  unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()),
+                                  5);
             Log::warn("catalogue hint failed path=" + hint->path + ": " + e.what());
         }
     }
@@ -2681,16 +2690,13 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
             catalogue_.reconcile_scanner(discovered, active_media_ids, false);
     } catch (const CatalogueConflict& e) {
         for (const auto& match : prepared)
-            hints_.defer(match.hint_id, e.what(), unix_ms() + 500);
+            hints_.record_failure(match.hint_id, e.what(), unix_ms() + 500, 120);
         return out;
     } catch (const std::exception& e) {
-        for (const auto& match : prepared) {
-            if (match.attempts >= 5)
-                hints_.fail(match.hint_id, e.what());
-            else
-                hints_.defer(match.hint_id, e.what(),
-                             unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
-        }
+        for (const auto& match : prepared)
+            hints_.record_failure(
+                match.hint_id, e.what(),
+                unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()), 5);
         Log::warn("catalogue hint batch reconcile failed: " + std::string(e.what()));
         return out;
     }
