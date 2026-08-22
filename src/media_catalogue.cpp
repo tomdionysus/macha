@@ -479,7 +479,38 @@ std::string clean_series_name(std::string value) {
 }
 
 std::string clean_episode_title(std::string value) {
+    // Scene names often encode a possessive apostrophe as a dot because dots
+    // are also word separators (for example "Tasty.Tudi.s"). Recover that
+    // punctuation before generic release-noise/title cleanup destroys the
+    // distinction between a possessive and a standalone letter S.
+    for (size_t i = 1; i + 1 < value.size(); ++i) {
+        if (value[i] != '.' || (value[i + 1] != 's' && value[i + 1] != 'S')) continue;
+        if (!std::isalnum(static_cast<unsigned char>(value[i - 1]))) continue;
+        if (i + 2 < value.size() &&
+            std::isalnum(static_cast<unsigned char>(value[i + 2]))) continue;
+        value[i] = '\'';
+    }
     value = strip_release_noise(std::move(value));
+    return clean_title(value);
+}
+
+std::string clean_music_artist_directory(std::string value) {
+    static const std::regex discography_suffix(
+        R"(^\s*(.+?)\s+[ ._-]*discography(?:[ ._@\[(].*)?$)", std::regex::icase);
+    std::smatch match;
+    if (std::regex_match(value, match, discography_suffix)) value = match[1].str();
+    return clean_title(value);
+}
+
+std::string clean_music_album_directory(std::string value,
+                                        std::optional<int32_t>& year) {
+    static const std::regex year_prefix(
+        R"(^\s*((?:19|20)[0-9]{2})\s*[ ._-]+\s*(.+?)\s*$)", std::regex::icase);
+    std::smatch match;
+    if (std::regex_match(value, match, year_prefix)) {
+        if (!year) year = std::stoi(match[1].str());
+        value = match[2].str();
+    }
     return clean_title(value);
 }
 
@@ -523,14 +554,15 @@ struct EpisodePattern {
     std::string suffix;
     int32_t season{};
     int32_t episode{};
+    std::optional<int32_t> episode_end;
 };
 
 std::optional<EpisodePattern> episode_pattern(std::string_view value) {
     static const std::regex se_re(
-        R"((.*?)(?:[ ._-]+|^)s(\d{1,2})e(\d{1,3})(?:[ ._-]+(.*))?$)",
+        R"((.*?)(?:[ ._-]+|^)s(\d{1,2})e(\d{1,3})(?:[ ._-]*(?:-|e)[ ._-]*e?(\d{1,3}))?(?:[ ._-]+(.*))?$)",
         std::regex::icase);
     static const std::regex x_re(
-        R"((.*?)(?:[ ._-]+|^)(\d{1,2})x(\d{1,3})(?:[ ._-]+(.*))?$)",
+        R"((.*?)(?:[ ._-]+|^)(\d{1,2})x(\d{1,3})(?:[ ._-]*-[ ._-]*(\d{1,3}))?(?:[ ._-]+(.*))?$)",
         std::regex::icase);
     std::string owned(value);
     std::smatch match;
@@ -540,7 +572,11 @@ std::optional<EpisodePattern> episode_pattern(std::string_view value) {
     out.prefix = match[1].str();
     out.season = std::stoi(match[2].str());
     out.episode = std::stoi(match[3].str());
-    if (match[4].matched) out.suffix = match[4].str();
+    if (match[4].matched) {
+        const auto episode_end = std::stoi(match[4].str());
+        if (episode_end >= out.episode) out.episode_end = episode_end;
+    }
+    if (match[5].matched) out.suffix = match[5].str();
     return out;
 }
 
@@ -549,6 +585,7 @@ std::optional<int32_t> season_directory_number(std::string_view value) {
                                std::regex::icase);
     std::smatch match;
     std::string owned = clean_title(std::string(value));
+    if (lower(owned) == "specials") return 0;
     if (!std::regex_match(owned, match, re)) return {};
     return std::stoi(match[1].str());
 }
@@ -620,6 +657,7 @@ std::string title_for_movie_year(std::string core, const YearPosition& year) {
 bool same_probe_identity(const MediaProbe& a, const MediaProbe& b) {
     return a.kind == b.kind && a.title == b.title && a.year == b.year && a.edition == b.edition &&
            a.series == b.series && a.season == b.season && a.episode == b.episode &&
+           a.episode_end == b.episode_end &&
            a.artist == b.artist && a.album == b.album && a.disc == b.disc && a.track == b.track &&
            a.lookup_strategy == b.lookup_strategy;
 }
@@ -747,6 +785,7 @@ class FilenameEpisodeCandidateGenerator final : public MediaProbeCandidateGenera
         probe.year = year_from(prefix);
         probe.season = pattern->season;
         probe.episode = pattern->episode;
+        probe.episode_end = pattern->episode_end;
         probe.title = clean_episode_title(pattern->suffix);
         int score = 260;
         std::vector<std::string> evidence{"series prefix adjacent to SxxExx", "explicit episode marker"};
@@ -821,6 +860,7 @@ class DirectoryEpisodeCandidateGenerator final : public MediaProbeCandidateGener
         probe.year = year_from(raw_series);
         probe.season = pattern->season;
         probe.episode = pattern->episode;
+        probe.episode_end = pattern->episode_end;
         probe.title = clean_episode_title(pattern->suffix);
         if (probe.year) {
             score += 20;
@@ -867,8 +907,8 @@ class StructuredMusicCandidateGenerator final : public MediaProbeCandidateGenera
             std::equal(root_parts.begin(), root_parts.end(), parts.begin())) {
             const auto relative_parts = parts.size() - root_parts.size();
             if (relative_parts == 3) {
-                const auto candidate_artist = clean_title(parts[parts.size() - 3]);
-                const auto candidate_album = clean_title(parts[parts.size() - 2]);
+                const auto candidate_artist = clean_music_artist_directory(parts[parts.size() - 3]);
+                const auto candidate_album = clean_music_album_directory(parts[parts.size() - 2], probe.year);
                 if (probe.artist.empty()) probe.artist = candidate_artist;
                 if (probe.album.empty() && (!artist_from_filename ||
                     comparable_title(probe.artist) == comparable_title(candidate_artist)))
@@ -880,8 +920,10 @@ class StructuredMusicCandidateGenerator final : public MediaProbeCandidateGenera
                 auto parent = clean_title(parts[parts.size() - 2]);
                 if (std::regex_match(parent, disc_match, disc_dir)) {
                     if (!probe.disc) probe.disc = std::stoi(disc_match[1].str());
-                    if (probe.artist.empty()) probe.artist = clean_title(parts[parts.size() - 4]);
-                    if (probe.album.empty()) probe.album = clean_title(parts[parts.size() - 3]);
+                    if (probe.artist.empty())
+                        probe.artist = clean_music_artist_directory(parts[parts.size() - 4]);
+                    if (probe.album.empty())
+                        probe.album = clean_music_album_directory(parts[parts.size() - 3], probe.year);
                 }
             }
         } else if (parts.size() >= 3 && probe.artist.empty()) {
@@ -894,11 +936,11 @@ class StructuredMusicCandidateGenerator final : public MediaProbeCandidateGenera
             auto parent = clean_title(parts[parts.size() - 2]);
             if (parts.size() >= 4 && std::regex_match(parent, disc_match, disc_dir)) {
                 if (!probe.disc) probe.disc = std::stoi(disc_match[1].str());
-                probe.album = clean_title(parts[parts.size() - 3]);
-                probe.artist = clean_title(parts[parts.size() - 4]);
+                probe.album = clean_music_album_directory(parts[parts.size() - 3], probe.year);
+                probe.artist = clean_music_artist_directory(parts[parts.size() - 4]);
             } else {
-                probe.album = parent;
-                probe.artist = clean_title(parts[parts.size() - 3]);
+                probe.album = clean_music_album_directory(parts[parts.size() - 2], probe.year);
+                probe.artist = clean_music_artist_directory(parts[parts.size() - 3]);
             }
         }
 
@@ -1571,44 +1613,136 @@ std::optional<ProviderMatch> TmdbProvider::lookup(const MediaProbe& probe) {
     auto sid = json_i32(show_json->find("id"));
     if (!sid) return {};
     const auto series_id = std::to_string(*sid);
-    const auto season_key = series_id + "|" + std::to_string(*probe.season);
-    std::optional<Json> season_json;
-    if (auto it = season_cache_.find(season_key); it != season_cache_.end()) {
-        season_json = it->second;
-    } else {
-        season_json = api_optional("/tv/" + series_id + "/season/" + std::to_string(*probe.season),
+
+    auto load_season = [&](int32_t season_number) -> std::optional<Json> {
+        const auto season_key = series_id + "|" + std::to_string(season_number);
+        if (auto it = season_cache_.find(season_key); it != season_cache_.end())
+            return it->second;
+        auto season = api_optional("/tv/" + series_id + "/season/" + std::to_string(season_number),
                                    {{"language", config_.language}});
-        season_cache_[season_key] = season_json;
-    }
-    if (!season_json) return {};
-    const Json* episode_json = nullptr;
-    if (auto episodes = season_json->find("episodes"); episodes && episodes->isArray()) {
+        season_cache_[season_key] = season;
+        return season;
+    };
+
+    auto numbered_episode = [](const Json& season, int32_t wanted) -> const Json* {
+        auto episodes = season.find("episodes");
+        if (!episodes || !episodes->isArray()) return nullptr;
         for (const auto& episode : episodes->asArray()) {
-            auto n = json_i32(episode.find("episode_number"));
-            if (n && *n == *probe.episode) { episode_json = &episode; break; }
+            auto number = json_i32(episode.find("episode_number"));
+            if (number && *number == wanted) return &episode;
+        }
+        return nullptr;
+    };
+
+    auto title_episode = [&](const Json& season, std::string_view wanted,
+                             int minimum_score = 90) -> const Json* {
+        if (wanted.empty()) return nullptr;
+        auto episodes = season.find("episodes");
+        if (!episodes || !episodes->isArray()) return nullptr;
+        const Json* best = nullptr;
+        int best_score = -1;
+        for (const auto& episode : episodes->asArray()) {
+            const auto score = title_similarity(wanted, json_string(episode.find("name")));
+            if (score > best_score) {
+                best_score = score;
+                best = &episode;
+            }
+        }
+        return best_score >= minimum_score ? best : nullptr;
+    };
+
+    auto standalone_special = [&]() -> std::optional<ProviderMatch> {
+        if (*probe.season != 0 || probe.title.empty()) return {};
+        MediaProbe movie_probe = probe;
+        movie_probe.kind = MediaProbeKind::movie;
+        movie_probe.title = clean_title(probe.series + " " + probe.title);
+        movie_probe.year.reset();
+        movie_probe.edition.reset();
+        movie_probe.series.clear();
+        movie_probe.season.reset();
+        movie_probe.episode.reset();
+        movie_probe.episode_end.reset();
+        return lookup(movie_probe);
+    };
+
+    int32_t resolved_season_number = *probe.season;
+    auto season_json = load_season(resolved_season_number);
+
+    // A common legacy/library convention keeps a pilot/miniseries under the
+    // parent show's Specials folder even where TMDB models that exact-year
+    // programme as its own one-season show. If the exact-year show has no
+    // season zero, try the same episode number in season one before discarding
+    // an otherwise strong series/year identity.
+    if (!season_json && resolved_season_number == 0 && probe.year &&
+        json_year(show_json->find("first_air_date")) == probe.year &&
+        comparable_title(json_string(show_json->find("name"))) == comparable_title(probe.series)) {
+        auto season_one = load_season(1);
+        if (season_one && numbered_episode(*season_one, *probe.episode)) {
+            season_json = std::move(season_one);
+            resolved_season_number = 1;
         }
     }
-    if (!episode_json) return {};
 
-    const auto remote_episode_title = json_string(episode_json->find("name"));
-    int episode_title_score = 0;
-    if (!probe.title.empty() && !remote_episode_title.empty()) {
-        episode_title_score = title_similarity(probe.title, remote_episode_title);
-        // Once a candidate has discarded year evidence, the episode title is
-        // our strongest independent corroborator. Do not accept an unrelated
-        // show merely because it happens to contain the same SxxExx number.
-        if (episode_title_score < 75) return {};
+    if (!season_json) {
+        if (auto movie = standalone_special()) return movie;
+        return {};
     }
 
+    const Json* episode_json = numbered_episode(*season_json, *probe.episode);
+    bool remapped_by_title = false;
+    int episode_title_score = 0;
+    if (episode_json && !probe.title.empty()) {
+        const auto remote_title = json_string(episode_json->find("name"));
+        if (!remote_title.empty()) episode_title_score = title_similarity(probe.title, remote_title);
+    }
+
+    // Episode numbers are the primary identity once series + year are known.
+    // For yearless fallbacks the title remains the independent corroborator;
+    // if numbering differs (notably specials under alternate ordering schemes),
+    // remap by a strong title match within the already-resolved TMDB season.
+    const bool weak_episode_title = episode_json && !probe.title.empty() && episode_title_score < 75;
+    if (!episode_json || weak_episode_title) {
+        if (const auto* by_title = title_episode(*season_json, probe.title)) {
+            episode_json = by_title;
+            remapped_by_title = true;
+            episode_title_score = title_similarity(probe.title,
+                                                    json_string(episode_json->find("name")));
+        } else if (!episode_json || !probe.year || resolved_season_number == 0) {
+            if (auto movie = standalone_special()) return movie;
+            return {};
+        }
+    }
+
+    if (!episode_json) {
+        if (auto movie = standalone_special()) return movie;
+        return {};
+    }
+
+    std::vector<const Json*> episode_jsons{episode_json};
+    if (probe.episode_end && *probe.episode_end > *probe.episode && !remapped_by_title) {
+        episode_jsons.clear();
+        for (int32_t number = *probe.episode; number <= *probe.episode_end; ++number) {
+            const auto* ranged = numbered_episode(*season_json, number);
+            if (!ranged) {
+                if (auto movie = standalone_special()) return movie;
+                return {};
+            }
+            episode_jsons.push_back(ranged);
+        }
+    }
+
+    const auto remote_episode_title = json_string(episode_json->find("name"));
     Log::debug("catalogue: tmdb tv match path=" + probe.path +
                " local_series=\"" + probe.series + "\" remote_series=\"" +
                json_string(show_json->find("name")) + "\" remote_year=" +
                std::to_string(json_year(show_json->find("first_air_date")).value_or(0)) +
-               " season=" + std::to_string(*probe.season) +
-               " episode=" + std::to_string(*probe.episode) +
+               " season=" + std::to_string(resolved_season_number) +
+               " episode=" + std::to_string(json_i32(episode_json->find("episode_number")).value_or(*probe.episode)) +
+               (probe.episode_end ? " episode_end=" + std::to_string(*probe.episode_end) : std::string{}) +
                " local_episode=\"" + probe.title + "\" remote_episode=\"" +
                remote_episode_title + "\" episode_title_score=" +
-               std::to_string(episode_title_score));
+               std::to_string(episode_title_score) +
+               (remapped_by_title ? " remapped_by_title=1" : ""));
 
     CatalogueItem show;
     show.id = item_id("tmdb", "tv", series_id);
@@ -1622,37 +1756,48 @@ std::optional<ProviderMatch> TmdbProvider::lookup(const MediaProbe& probe) {
     scanner_marker(show);
 
     CatalogueItem season;
-    season.id = item_id("tmdb", "season", series_id + ":" + std::to_string(*probe.season));
+    season.id = item_id("tmdb", "season",
+                        series_id + ":" + std::to_string(resolved_season_number));
     season.kind = CatalogueKind::season;
     season.title = json_string(season_json->find("name"));
-    if (season.title.empty()) season.title = "Season " + std::to_string(*probe.season);
+    if (season.title.empty()) season.title = "Season " + std::to_string(resolved_season_number);
     season.sort_title = season.title;
     season.synopsis = json_string(season_json->find("overview"));
     season.parent_id = show.id;
-    season.season_number = probe.season;
-    season.external_ids["tmdb"] = json_i32(season_json->find("id")) ? std::to_string(*json_i32(season_json->find("id"))) : season.id;
+    season.season_number = resolved_season_number;
+    season.external_ids["tmdb"] = json_i32(season_json->find("id"))
+        ? std::to_string(*json_i32(season_json->find("id"))) : season.id;
     scanner_marker(season);
 
-    CatalogueItem episode;
-    auto eid = json_i32(episode_json->find("id"));
-    episode.id = item_id("tmdb", "episode", eid ? std::to_string(*eid) : series_id + ":" + std::to_string(*probe.season) + ":" + std::to_string(*probe.episode));
-    episode.kind = CatalogueKind::episode;
-    episode.title = json_string(episode_json->find("name"));
-    if (episode.title.empty()) episode.title = probe.title.empty() ? "Episode " + std::to_string(*probe.episode) : probe.title;
-    episode.sort_title = episode.title;
-    episode.synopsis = json_string(episode_json->find("overview"));
-    episode.parent_id = season.id;
-    episode.season_number = probe.season;
-    episode.episode_number = probe.episode;
-    if (eid) episode.external_ids["tmdb"] = std::to_string(*eid);
-    episode.media_ids = {probe.media_id};
-    scanner_marker(episode);
-
-    match.items = {show, season, episode};
+    match.items = {show, season};
     add_art(match.artwork, show.id, "poster", image_url(json_string(show_json->find("poster_path"))));
     add_art(match.artwork, show.id, "backdrop", image_url(json_string(show_json->find("backdrop_path"))));
     add_art(match.artwork, season.id, "poster", image_url(json_string(season_json->find("poster_path"))));
-    add_art(match.artwork, episode.id, "still", image_url(json_string(episode_json->find("still_path"))));
+
+    for (const auto* remote_episode : episode_jsons) {
+        const auto remote_number = json_i32(remote_episode->find("episode_number")).value_or(*probe.episode);
+        CatalogueItem episode;
+        auto eid = json_i32(remote_episode->find("id"));
+        episode.id = item_id("tmdb", "episode", eid ? std::to_string(*eid)
+            : series_id + ":" + std::to_string(resolved_season_number) + ":" +
+              std::to_string(remote_number));
+        episode.kind = CatalogueKind::episode;
+        episode.title = json_string(remote_episode->find("name"));
+        if (episode.title.empty())
+            episode.title = probe.title.empty() ? "Episode " + std::to_string(remote_number)
+                                                : probe.title;
+        episode.sort_title = episode.title;
+        episode.synopsis = json_string(remote_episode->find("overview"));
+        episode.parent_id = season.id;
+        episode.season_number = resolved_season_number;
+        episode.episode_number = remote_number;
+        if (eid) episode.external_ids["tmdb"] = std::to_string(*eid);
+        episode.media_ids = {probe.media_id};
+        scanner_marker(episode);
+        match.items.push_back(episode);
+        add_art(match.artwork, episode.id, "still",
+                image_url(json_string(remote_episode->find("still_path"))));
+    }
     return match;
 }
 

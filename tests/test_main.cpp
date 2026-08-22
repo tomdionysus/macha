@@ -4490,6 +4490,8 @@ void test_media_probe_and_online_catalogue_scanner() {
              EpisodeRegression{"/TV/Blackadder.1982.S01-S04.1080p.BluRay.EAC3.2.0.x265-iVy/S01E01.mkv", "Blackadder", 1982, 1, 1, ""},
              EpisodeRegression{"/TV/Black.Jesus.S01.1080p.AMZN.WEBRip.DDP5.1.x264-Cinefeel[rartv]/S01E01.mkv", "Black Jesus", 0, 1, 1, ""},
              EpisodeRegression{"/TV/Black.Jesus.S02.1080p.WEB-DL.DD5.1.H.264-BTN[rartv]/S02E01.mkv", "Black Jesus", 0, 2, 1, ""},
+             EpisodeRegression{"/TV/Black.Jesus.S02.1080p.WEB-DL.DD5.1.H.264-BTN[rartv]/Black.Jesus.S02E05.Tasty.Tudi.s.1080p.WEB-DL.DD5.1.H.264-BTN.mkv", "Black Jesus", 0, 2, 5, "Tasty Tudi's"},
+             EpisodeRegression{"/TV/Black.Jesus.S02.1080p.WEB-DL.DD5.1.H.264-BTN[rartv]/Black.Jesus.S02E07.Thy.Neighbor.s.Strife.1080p.WEB-DL.DD5.1.H.264-BTN.mkv", "Black Jesus", 0, 2, 7, "Thy Neighbor's Strife"},
          }) {
         auto parsed = probe_media_path(regression.path, fake);
         REQUIRE(parsed.has_value());
@@ -4501,6 +4503,26 @@ void test_media_probe_and_online_catalogue_scanner() {
         if (regression.year) CHECK(parsed->year == regression.year);
         else CHECK(!parsed->year.has_value());
     }
+
+    auto multi_episode = probe_media_path(
+        "/TV/Battlestar Galactica (2003)/Season 4/Battlestar Galactica (2003) - S04E19-E20 - Daybreak (1080p BluRay x265 RZeroX).mkv", fake);
+    REQUIRE(multi_episode.has_value());
+    CHECK(multi_episode->kind == MediaProbeKind::episode);
+    CHECK(multi_episode->series == "Battlestar Galactica");
+    CHECK(multi_episode->year == 2003);
+    CHECK(multi_episode->season == 4);
+    CHECK(multi_episode->episode == 19);
+    CHECK(multi_episode->episode_end == 20);
+    CHECK(multi_episode->title == "Daybreak");
+
+    auto special_directory = probe_media_path(
+        "/TV/Battlestar Galactica (2003)/Specials/Battlestar Galactica (2003) - S00E23 - The Resistance (1) (480p BluRay x265 RZeroX).mkv", fake);
+    REQUIRE(special_directory.has_value());
+    CHECK(special_directory->series == "Battlestar Galactica");
+    CHECK(special_directory->year == 2003);
+    CHECK(special_directory->season == 0);
+    CHECK(special_directory->episode == 23);
+    CHECK(special_directory->title == "The Resistance (1)");
 
     const auto battlestar_path =
         "/TV/Battlestar Galactica (2003) Season 1-4 S01-S04 (1080p BluRay x265 HEVC 10bit AAC 5.1 RZeroX)/Season 2/Battlestar Galactica (2003) - S02E01 - Scattered (1080p BluRay x265 RZeroX).mkv";
@@ -4532,6 +4554,14 @@ void test_media_probe_and_online_catalogue_scanner() {
     CHECK(disc_track->disc == 2);
     CHECK(disc_track->track == 3);
     CHECK(disc_track->title == "Hey You");
+
+    auto discography_track = probe_media_path(
+        "/Music/A Tribe Called Quest Discography @ 320 (8 Albums)(RAP)(by dragan09)/1990 - Peoples Instinctive Travels And The Path/16 Can I Kick It_ (Extended Bollerho.mp3", fake);
+    REQUIRE(discography_track.has_value());
+    CHECK(discography_track->artist == "A Tribe Called Quest");
+    CHECK(discography_track->album == "Peoples Instinctive Travels And The Path");
+    CHECK(discography_track->year == 1990);
+    CHECK(discography_track->track == 16);
 
     MediaProbe tagged_music;
     tagged_music.kind = MediaProbeKind::track;
@@ -4672,6 +4702,144 @@ void test_media_probe_and_online_catalogue_scanner() {
     battlestar_probe.title = "Definitely Not Scattered";
     CHECK(!battlestar_tmdb.lookup(battlestar_probe).has_value());
     CHECK(battlestar_http.requests() == 4);
+
+    // Strong series/year/season/episode identity must not be vetoed by small
+    // filename-title differences. TMDB's title is canonical; release titles are
+    // secondary evidence once the numbered identity is strong.
+    FakeHttpClient title_variation_http;
+    title_variation_http.add("query=Blue%20Lights&language=en-GB", 200, "application/json",
+                             R"({"results":[{"id":2000,"name":"Blue Lights","first_air_date":"2023-03-27"}]})");
+    title_variation_http.add("/tv/2000/season/1", 200, "application/json",
+                             R"({"id":2001,"name":"Season 1","episodes":[{"id":2006,"episode_number":6,"name":"Love the One You're With"}]})");
+    TmdbProvider title_variation_tmdb(title_variation_http, tmdb_config);
+    MediaProbe title_variation_probe;
+    title_variation_probe.kind = MediaProbeKind::episode;
+    title_variation_probe.series = "Blue Lights";
+    title_variation_probe.year = 2023;
+    title_variation_probe.season = 1;
+    title_variation_probe.episode = 6;
+    title_variation_probe.title = "Love the One You Are With";
+    title_variation_probe.media_id = "macha:blue-lights-s01e06";
+    auto title_variation_match = title_variation_tmdb.lookup(title_variation_probe);
+    REQUIRE(title_variation_match.has_value());
+    CHECK(title_variation_match->items.back().title == "Love the One You're With");
+
+    // Dots replacing apostrophes in release names are a punctuation artefact,
+    // not evidence that an otherwise matching episode is different.
+    FakeHttpClient possessive_http;
+    possessive_http.add("query=Black%20Jesus&language=en-GB", 200, "application/json",
+                        R"({"results":[{"id":2100,"name":"Black Jesus","first_air_date":"2014-08-07"}]})");
+    possessive_http.add("/tv/2100/season/2", 200, "application/json",
+                        R"({"id":2101,"name":"Season 2","episodes":[{"id":2105,"episode_number":5,"name":"Tasty Tudi's"}]})");
+    TmdbProvider possessive_tmdb(possessive_http, tmdb_config);
+    MediaProbe possessive_probe;
+    possessive_probe.kind = MediaProbeKind::episode;
+    possessive_probe.series = "Black Jesus";
+    possessive_probe.season = 2;
+    possessive_probe.episode = 5;
+    possessive_probe.title = "Tasty Tudi's";
+    possessive_probe.media_id = "macha:black-jesus-s02e05";
+    auto possessive_match = possessive_tmdb.lookup(possessive_probe);
+    REQUIRE(possessive_match.has_value());
+    CHECK(possessive_match->items.back().title == "Tasty Tudi's");
+
+    // Specials are especially prone to numbering differences between metadata
+    // ordering schemes. Keep the already-resolved show/season, but allow a very
+    // strong title to remap the local special number to TMDB's canonical one.
+    FakeHttpClient special_remap_http;
+    special_remap_http.add("query=Battlestar%20Galactica&language=en-GB", 200, "application/json",
+                           R"({"results":[{"id":1972,"name":"Battlestar Galactica","first_air_date":"2004-10-18"}]})");
+    special_remap_http.add("/tv/1972/season/0", 200, "application/json",
+                           R"json({"id":2200,"name":"Specials","episodes":[{"id":2202,"episode_number":2,"name":"The Resistance (1)"},{"id":2223,"episode_number":23,"name":"Unrelated Special"}]})json");
+    TmdbProvider special_remap_tmdb(special_remap_http, tmdb_config);
+    MediaProbe special_remap_probe;
+    special_remap_probe.kind = MediaProbeKind::episode;
+    special_remap_probe.series = "Battlestar Galactica";
+    special_remap_probe.season = 0;
+    special_remap_probe.episode = 23;
+    special_remap_probe.title = "The Resistance (1)";
+    special_remap_probe.media_id = "macha:bsg-resistance-1";
+    auto special_remap_match = special_remap_tmdb.lookup(special_remap_probe);
+    REQUIRE(special_remap_match.has_value());
+    CHECK(special_remap_match->items.back().episode_number == 2);
+    CHECK(special_remap_match->items.back().title == "The Resistance (1)");
+
+    // Some legacy Specials layouts contain a programme that TMDB models as a
+    // separate one-season TV entity. Exact-year identity plus missing season 0
+    // is enough to try the corresponding season-1 episode.
+    FakeHttpClient miniseries_http;
+    miniseries_http.add("query=Battlestar%20Galactica&language=en-GB", 200, "application/json",
+                        R"({"results":[{"id":101,"name":"Battlestar Galactica","first_air_date":"2003-12-08"}]})");
+    miniseries_http.add("/tv/101/season/0", 404, "application/json", R"({})");
+    miniseries_http.add("/tv/101/season/1", 200, "application/json",
+                        R"({"id":2300,"name":"Miniseries","episodes":[{"id":2301,"episode_number":1,"name":"Part 1"},{"id":2302,"episode_number":2,"name":"Part 2"}]})");
+    TmdbProvider miniseries_tmdb(miniseries_http, tmdb_config);
+    MediaProbe miniseries_probe;
+    miniseries_probe.kind = MediaProbeKind::episode;
+    miniseries_probe.series = "Battlestar Galactica";
+    miniseries_probe.year = 2003;
+    miniseries_probe.season = 0;
+    miniseries_probe.episode = 1;
+    miniseries_probe.title = "Battlestar Galactica The Miniseries (1)";
+    miniseries_probe.media_id = "macha:bsg-miniseries-1";
+    auto miniseries_match = miniseries_tmdb.lookup(miniseries_probe);
+    REQUIRE(miniseries_match.has_value());
+    CHECK(miniseries_match->items[1].season_number == 1);
+    CHECK(miniseries_match->items.back().episode_number == 1);
+
+    // If a legacy special is a standalone TMDB movie rather than an episode,
+    // recover it through the movie catalogue path instead of dropping it.
+    FakeHttpClient standalone_special_http;
+    standalone_special_http.add("query=Battlestar%20Galactica&language=en-GB", 200, "application/json",
+                                R"({"results":[{"id":101,"name":"Battlestar Galactica","first_air_date":"2003-12-08"}]})");
+    standalone_special_http.add("/tv/101/season/0", 404, "application/json", R"({})");
+    standalone_special_http.add("/tv/101/season/1", 200, "application/json",
+                                R"({"id":2400,"name":"Miniseries","episodes":[{"id":2401,"episode_number":1,"name":"Part 1"},{"id":2402,"episode_number":2,"name":"Part 2"}]})");
+    standalone_special_http.add("query=Battlestar%20Galactica%20The%20Plan&language=en-GB", 200, "application/json",
+                                R"({"results":[{"id":2403,"title":"Battlestar Galactica: The Plan","release_date":"2009-10-27"}]})");
+    standalone_special_http.add("/movie/2403", 200, "application/json",
+                                R"({"id":2403,"title":"Battlestar Galactica: The Plan","release_date":"2009-10-27"})");
+    TmdbProvider standalone_special_tmdb(standalone_special_http, tmdb_config);
+    MediaProbe standalone_special_probe;
+    standalone_special_probe.kind = MediaProbeKind::episode;
+    standalone_special_probe.series = "Battlestar Galactica";
+    standalone_special_probe.year = 2003;
+    standalone_special_probe.season = 0;
+    standalone_special_probe.episode = 22;
+    standalone_special_probe.title = "The Plan";
+    standalone_special_probe.media_id = "macha:bsg-the-plan";
+    auto standalone_special_match = standalone_special_tmdb.lookup(standalone_special_probe);
+    REQUIRE(standalone_special_match.has_value());
+    REQUIRE(standalone_special_match->items.size() == 1);
+    CHECK(standalone_special_match->items.front().kind == CatalogueKind::movie);
+    CHECK(standalone_special_match->items.front().title == "Battlestar Galactica: The Plan");
+    CHECK(standalone_special_match->items.front().media_ids ==
+          std::vector<std::string>{"macha:bsg-the-plan"});
+
+    // Multi-episode files retain one media object while emitting every TMDB
+    // episode identity covered by the filename range.
+    FakeHttpClient range_http;
+    range_http.add("query=Range%20Show&language=en-GB", 200, "application/json",
+                   R"({"results":[{"id":2500,"name":"Range Show","first_air_date":"2020-01-01"}]})");
+    range_http.add("/tv/2500/season/4", 200, "application/json",
+                   R"({"id":2501,"name":"Season 4","episodes":[{"id":2519,"episode_number":19,"name":"Part One"},{"id":2520,"episode_number":20,"name":"Part Two"}]})");
+    TmdbProvider range_tmdb(range_http, tmdb_config);
+    MediaProbe range_probe;
+    range_probe.kind = MediaProbeKind::episode;
+    range_probe.series = "Range Show";
+    range_probe.year = 2020;
+    range_probe.season = 4;
+    range_probe.episode = 19;
+    range_probe.episode_end = 20;
+    range_probe.title = "Combined Finale";
+    range_probe.media_id = "macha:range-show-finale";
+    auto range_match = range_tmdb.lookup(range_probe);
+    REQUIRE(range_match.has_value());
+    REQUIRE(range_match->items.size() == 4);
+    CHECK(range_match->items[2].episode_number == 19);
+    CHECK(range_match->items[3].episode_number == 20);
+    CHECK(range_match->items[2].media_ids == std::vector<std::string>{"macha:range-show-finale"});
+    CHECK(range_match->items[3].media_ids == std::vector<std::string>{"macha:range-show-finale"});
 
     // Provider title scoring must tolerate common number spelling differences
     // between release filenames and canonical provider titles. The year remains

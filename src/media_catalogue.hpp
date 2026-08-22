@@ -34,6 +34,7 @@ struct MediaProbe {
     std::string series;
     std::optional<int32_t> season;
     std::optional<int32_t> episode;
+    std::optional<int32_t> episode_end;
     std::string artist;
     std::string album;
     std::optional<int32_t> disc;
