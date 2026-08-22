@@ -52,6 +52,12 @@ struct MetadataRecord {
     Bytes payload;
 };
 
+struct MetadataIdentity {
+    uint64_t generation{};
+    Hash256 hash{};
+    auto operator<=>(const MetadataIdentity&) const = default;
+};
+
 enum class CatalogueDelta : uint8_t { unchanged = 0, clear = 1, set = 2 };
 
 // Compact deterministic mutation from one canonical metadata snapshot to the
@@ -100,6 +106,8 @@ class MetadataReplica {
     MetadataReplica(std::filesystem::path, std::array<uint8_t, 32>);
     MetadataRecord current() const;
     MetadataRecord committed() const;
+    MetadataIdentity current_identity() const;
+    MetadataIdentity committed_identity() const;
     uint64_t generation() const;
     uint64_t committed_generation() const;
     bool cas(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);

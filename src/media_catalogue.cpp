@@ -2868,6 +2868,7 @@ void CatalogueScanner::loop(std::stop_token stop) {
     auto observed_generation = node_.known_metadata_generation();
     auto next_periodic = std::chrono::steady_clock::now();
     auto next_hint_batch = std::chrono::steady_clock::now();
+    auto next_backlog_log = std::chrono::steady_clock::now();
     auto hint_revision = hints_.revision();
     bool provider_budget_open = false;
     bool was_coordinator = false;
@@ -3016,6 +3017,20 @@ void CatalogueScanner::loop(std::stop_token stop) {
             }
         }
         cpu_reporter.tick();
+
+        const auto log_now = std::chrono::steady_clock::now();
+        if (log_now >= next_backlog_log && Log::enabled(LogLevel::debug)) {
+            const auto backlog = hints_.summary();
+            Log::debug("catalogue backlog pending=" + std::to_string(backlog.pending) +
+                       " queued=" + std::to_string(backlog.queued) +
+                       " processing=" + std::to_string(backlog.processing) +
+                       " deferred=" + std::to_string(backlog.deferred) +
+                       " failed=" + std::to_string(backlog.failed) +
+                       " catalogued=" + std::to_string(backlog.catalogued) +
+                       " no_match=" + std::to_string(backlog.no_match) +
+                       " total=" + std::to_string(backlog.total));
+            next_backlog_log = log_now + std::chrono::seconds(30);
+        }
 
         // Hint submission is event-driven. Keep a one-second ceiling only for
         // cheap coordinator/metadata-generation observation; do not linearly

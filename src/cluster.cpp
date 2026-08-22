@@ -48,6 +48,22 @@ RpcMessage error_reply(const std::string& text) {
     return {MessageType::error, writer.take()};
 }
 
+MetadataIdentity encoded_metadata_identity(std::span<const uint8_t> data) {
+    Reader reader(data);
+    MetadataIdentity identity;
+    identity.generation = reader.u64();
+    (void)reader.fixed<32>(); // previous hash
+    identity.hash.bytes = reader.fixed<32>();
+    return identity;
+}
+
+RpcMessage metadata_identity_reply(const MetadataIdentity& identity) {
+    Writer writer;
+    writer.u64(identity.generation);
+    writer.fixed(identity.hash.bytes);
+    return {MessageType::metadata_identity_reply, writer.take()};
+}
+
 int64_t activity_now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch())
         .count();
@@ -376,16 +392,38 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             return {MessageType::metadata_reply, encode_metadata_record(meta_.current())};
         case MessageType::get_committed_metadata:
             return {MessageType::metadata_reply, encode_metadata_record(meta_.committed())};
+        case MessageType::get_metadata_identity:
+            return metadata_identity_reply(meta_.current_identity());
         case MessageType::seed_metadata: {
-            auto metadata = decode_metadata_record(request.payload);
+            // Full repair records are large. If the sender is redundantly
+            // offering the exact immutable record we already hold, the header
+            // identity is sufficient to acknowledge it; do not copy/hash/decode
+            // the 20+ MiB payload again.
+            const auto identity = encoded_metadata_identity(request.payload);
+            bool ok = identity == meta_.current_identity();
+            if (!ok) {
+                auto metadata = decode_metadata_record(request.payload);
+                ok = seed_metadata(metadata);
+            }
             Writer writer;
-            writer.u8(seed_metadata(metadata));
+            writer.u8(ok);
             return {MessageType::bool_reply, writer.take()};
         }
         case MessageType::checkpoint_metadata: {
-            auto metadata = decode_metadata_record(request.payload);
+            // Same optimisation for durable checkpoints. If the record is
+            // already current but not yet committed, the compact generation+
+            // hash commit is enough; only an actually different record needs
+            // the full validation/decode path.
+            const auto identity = encoded_metadata_identity(request.payload);
+            bool ok = identity == meta_.committed_identity();
+            if (!ok && identity == meta_.current_identity())
+                ok = commit_metadata(identity.generation, identity.hash);
+            if (!ok) {
+                auto metadata = decode_metadata_record(request.payload);
+                ok = checkpoint_metadata(metadata);
+            }
             Writer writer;
-            writer.u8(checkpoint_metadata(metadata));
+            writer.u8(ok);
             return {MessageType::bool_reply, writer.take()};
         }
         case MessageType::commit_metadata: {

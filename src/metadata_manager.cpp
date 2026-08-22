@@ -45,6 +45,12 @@ struct PendingBool {
     bool done{};
 };
 
+struct PendingIdentity {
+    NodeInfo owner;
+    std::optional<AsyncRpc> rpc;
+    bool done{};
+};
+
 struct PendingCas {
     NodeInfo owner;
     std::optional<AsyncRpc> rpc;
@@ -58,6 +64,17 @@ bool bool_reply(const RpcReply& reply) {
     bool ok = reader.u8() != 0;
     reader.finish();
     return ok;
+}
+
+std::optional<MetadataIdentity> identity_reply(const RpcReply& reply) {
+    if (reply.message.type != MessageType::metadata_identity_reply)
+        return {};
+    Reader reader(reply.message.payload);
+    MetadataIdentity identity;
+    identity.generation = reader.u64();
+    identity.hash.bytes = reader.fixed<32>();
+    reader.finish();
+    return identity;
 }
 
 std::pair<bool, MetadataRecord> cas_reply(const RpcReply& reply) {
@@ -301,14 +318,14 @@ bool MetadataManager::checkpoint_quorum(const std::vector<NodeInfo>& nodes,
 }
 
 bool MetadataManager::commit_quorum(const std::vector<NodeInfo>& nodes,
-                                    const MetadataRecord& record, size_t required,
-                                    FrameType frame_type) {
+                                    uint64_t generation, const Hash256& hash,
+                                    size_t required, FrameType frame_type) {
     if (!required)
         return true;
 
     Writer writer;
-    writer.u64(record.generation);
-    writer.fixed(record.hash.bytes);
+    writer.u64(generation);
+    writer.fixed(hash.bytes);
     const auto encoded = writer.take();
 
     size_t success = 0;
@@ -319,7 +336,7 @@ bool MetadataManager::commit_quorum(const std::vector<NodeInfo>& nodes,
     for (const auto& owner : nodes) {
         if (owner.id == node_.node_id()) {
             ++completed;
-            if (node_.commit_metadata(record.generation, record.hash))
+            if (node_.commit_metadata(generation, hash))
                 ++success;
             continue;
         }
@@ -364,6 +381,63 @@ bool MetadataManager::commit_quorum(const std::vector<NodeInfo>& nodes,
     }
 
     return success >= required;
+}
+
+void MetadataManager::commit_all_best_effort(const std::vector<NodeInfo>& nodes,
+                                             uint64_t generation, const Hash256& hash,
+                                             FrameType frame_type) {
+    Writer writer;
+    writer.u64(generation);
+    writer.fixed(hash.bytes);
+    const auto encoded = writer.take();
+
+    std::vector<PendingBool> pending;
+    pending.reserve(nodes.size());
+    for (const auto& owner : nodes) {
+        if (owner.id == node_.node_id()) {
+            (void)node_.commit_metadata(generation, hash);
+            continue;
+        }
+        try {
+            PendingBool item;
+            item.owner = owner;
+            item.rpc.emplace(
+                node_.call_async(owner, MessageType::commit_metadata, encoded, frame_type));
+            pending.push_back(std::move(item));
+        } catch (const std::exception& error) {
+            Log::debug("metadata compact commit " + owner.host + ": " + error.what());
+        }
+    }
+
+    for (;;) {
+        bool pending_work = false;
+        bool progressed = false;
+        for (auto& item : pending) {
+            if (item.done || !item.rpc)
+                continue;
+            pending_work = true;
+            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+                continue;
+            item.done = true;
+            progressed = true;
+            try {
+                if (!bool_reply(item.rpc->get()))
+                    Log::debug("metadata compact commit rejected by " + item.owner.host);
+            } catch (const std::exception& error) {
+                Log::debug("metadata compact commit " + item.owner.host + ": " + error.what());
+            }
+        }
+        if (!pending_work)
+            return;
+        if (!progressed)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+void MetadataManager::refresh_cache_identity(const MetadataIdentity& identity) {
+    std::lock_guard lock(cache_mutex_);
+    if (cache_ && cache_->generation == identity.generation && cache_->hash == identity.hash)
+        cache_until_ = Clock::now() + node_.config().metadata_cache;
 }
 
 void MetadataManager::seed_all_best_effort(const std::vector<NodeInfo>& nodes,
@@ -1339,7 +1413,8 @@ MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot
             auto current_nodes = voter_nodes(current_voters);
             const auto current_need = quorum(current_voters.size());
             const auto commit_started = Clock::now();
-            (void)commit_quorum(current_nodes, current, current_need, FrameType::read_ahead);
+            (void)commit_quorum(current_nodes, current.generation, current.hash, current_need,
+                                FrameType::read_ahead);
             (void)node_.checkpoint_metadata(current);
             const auto commit_ms = elapsed_ms(commit_started);
             cache_record(current);
@@ -1408,7 +1483,8 @@ MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot
             // compact generation+hash RPC; checkpoint compaction is local and
             // periodic, while non-quorum replicas converge through repair.
             const auto commit_started = Clock::now();
-            (void)commit_quorum(nodes, *result.committed, need, FrameType::read_ahead);
+            (void)commit_quorum(nodes, result.committed->generation, result.committed->hash, need,
+                                FrameType::read_ahead);
             if (used_delta) {
                 if (!node_.checkpoint_metadata_delta(current, delta_payload, *result.committed))
                     (void)node_.checkpoint_metadata(*result.committed);
@@ -1442,22 +1518,158 @@ MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot
 }
 
 void MetadataManager::repair_once() {
-    auto local = node_.metadata_replica().current();
-    auto voters = voters_of(local);
-    auto record = voters.empty()
-        ? read_record_uncached()
-        : maybe_reconfigure(read_group(voters, FrameType::speculative));
-    voters = voters_of(record);
-    auto voter_replicas = voter_nodes(voters);
-    seed_quorum(voter_replicas, record, quorum(voters.size()), FrameType::speculative);
-    checkpoint_quorum(voter_replicas, record, quorum(voters.size()), FrameType::speculative);
+    // Full metadata records are intentionally large: the namespace may contain
+    // tens of thousands of immutable extent references. Repair must therefore
+    // compare cheap immutable identities before transferring a complete record.
+    // A settled cluster should exchange only generation+hash probes; full
+    // snapshots are reserved for an actual divergence, stale replica, voter
+    // transition or mixed-version peer.
+    auto full_repair = [this] {
+        auto local = node_.metadata_replica().current();
+        auto voters = voters_of(local);
+        auto record = voters.empty()
+            ? read_record_uncached()
+            : maybe_reconfigure(read_group(voters, FrameType::speculative));
+        voters = voters_of(record);
+        auto voter_replicas = voter_nodes(voters);
+        seed_quorum(voter_replicas, record, quorum(voters.size()), FrameType::speculative);
+        checkpoint_quorum(voter_replicas, record, quorum(voters.size()),
+                          FrameType::speculative);
 
-    // Namespace checkpoints are recovery witnesses on every active node. Full
-    // repair snapshots stay on CONTROL at speculative frame priority; health
-    // and membership can pre-empt their fragmented frames, while DATA remains
-    // reserved for object traffic.
-    seed_all_best_effort(node_.membership().active(), record, FrameType::speculative);
+        // Namespace checkpoints are recovery witnesses on every active node.
+        // Only the slow path broadcasts a complete snapshot.
+        seed_all_best_effort(node_.membership().active(), record, FrameType::speculative);
+        node_.metadata_replica().compact();
+        cache_record(record);
+    };
+
+    const auto local_identity = node_.metadata_replica().current_identity();
+    const auto view = available_snapshot_view();
+    const auto active = node_.membership().active();
+
+    // If we do not already have the exact decoded local record, or cluster
+    // policy itself needs attention, retain the authoritative full repair path.
+    if (!view || view->generation != local_identity.generation ||
+        view->hash != local_identity.hash || view->snapshot->metadata_voters.empty() ||
+        view->snapshot->metadata_voters.size() != node_.config().metadata_replication ||
+        view->snapshot->data_replication != node_.config().replication) {
+        full_repair();
+        return;
+    }
+
+    const auto& voters = view->snapshot->metadata_voters;
+    std::map<NodeId, NodeInfo> active_by_id;
+    for (const auto& owner : active)
+        active_by_id.emplace(owner.id, owner);
+    for (const auto& voter : voters) {
+        if (!active_by_id.contains(voter)) {
+            full_repair();
+            return;
+        }
+    }
+
+    std::map<NodeId, MetadataIdentity> identities;
+    identities.emplace(node_.node_id(), local_identity);
+    std::vector<PendingIdentity> pending;
+    pending.reserve(active.size());
+    for (const auto& owner : active) {
+        if (owner.id == node_.node_id())
+            continue;
+        try {
+            PendingIdentity item;
+            item.owner = owner;
+            item.rpc.emplace(node_.call_async(owner, MessageType::get_metadata_identity, {},
+                                              FrameType::speculative));
+            pending.push_back(std::move(item));
+        } catch (...) {
+            // Missing identities are handled below: a missing voter forces the
+            // old authoritative path; a non-voter receives a normal full repair.
+        }
+    }
+
+    for (;;) {
+        bool pending_work = false;
+        bool progressed = false;
+        for (auto& item : pending) {
+            if (item.done || !item.rpc)
+                continue;
+            pending_work = true;
+            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+                continue;
+            item.done = true;
+            progressed = true;
+            try {
+                if (auto identity = identity_reply(item.rpc->get()))
+                    identities[item.owner.id] = *identity;
+            } catch (...) {
+            }
+        }
+        if (!pending_work)
+            break;
+        if (!progressed)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    // Every voter must report the exact same current immutable record before
+    // the no-payload path is allowed. Any minority proposal, same-generation
+    // hash conflict, unreachable voter, or old peer falls back to read_group(),
+    // preserving the existing recovery/reconfiguration semantics.
+    for (const auto& voter : voters) {
+        auto found = identities.find(voter);
+        if (found == identities.end() || found->second != local_identity) {
+            full_repair();
+            return;
+        }
+    }
+
+    auto voter_replicas = voter_nodes(voters);
+    const auto need = quorum(voters.size());
+    bool voter_commit_needed =
+        node_.metadata_replica().committed_identity() != local_identity;
+    for (const auto& voter : voters) {
+        auto found = active_by_id.find(voter);
+        if (found != active_by_id.end() &&
+            found->second.metadata_generation < local_identity.generation)
+            voter_commit_needed = true;
+    }
+    if (voter_commit_needed &&
+        !commit_quorum(voter_replicas, local_identity.generation, local_identity.hash, need,
+                       FrameType::speculative)) {
+        full_repair();
+        return;
+    }
+
+    std::vector<NodeInfo> compact_commit;
+    std::vector<NodeInfo> full_checkpoint;
+    for (const auto& owner : active) {
+        auto found = identities.find(owner.id);
+        if (found != identities.end() && found->second == local_identity) {
+            if (owner.metadata_generation < local_identity.generation)
+                compact_commit.push_back(owner);
+        } else if (std::find(voters.begin(), voters.end(), owner.id) == voters.end()) {
+            full_checkpoint.push_back(owner);
+        }
+    }
+
+    if (!compact_commit.empty())
+        commit_all_best_effort(compact_commit, local_identity.generation, local_identity.hash,
+                               FrameType::speculative);
+
+    if (!full_checkpoint.empty()) {
+        // Voter consensus above proves the local current record before it is
+        // copied. Re-check the identity after taking the large copy so a
+        // concurrent mutation cannot make us push an obsolete snapshot.
+        auto record = node_.metadata_replica().current();
+        if (record.generation != local_identity.generation || record.hash != local_identity.hash) {
+            full_repair();
+            return;
+        }
+        seed_all_best_effort(full_checkpoint, record, FrameType::speculative);
+        cache_record(record);
+    } else {
+        refresh_cache_identity(local_identity);
+    }
+
     node_.metadata_replica().compact();
-    cache_record(record);
 }
 } // namespace macha

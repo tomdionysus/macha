@@ -565,6 +565,16 @@ MetadataRecord MetadataReplica::committed() const {
     return committed_;
 }
 
+MetadataIdentity MetadataReplica::current_identity() const {
+    std::lock_guard g(m_);
+    return {cur_.generation, cur_.hash};
+}
+
+MetadataIdentity MetadataReplica::committed_identity() const {
+    std::lock_guard g(m_);
+    return {committed_.generation, committed_.hash};
+}
+
 uint64_t MetadataReplica::generation() const {
     std::lock_guard g(m_);
     return cur_.generation;

@@ -62,8 +62,11 @@ class MetadataManager {
                      FrameType frame_type = FrameType::control);
     bool checkpoint_quorum(const std::vector<NodeInfo>&, const MetadataRecord&, size_t required,
                            FrameType frame_type = FrameType::control);
-    bool commit_quorum(const std::vector<NodeInfo>&, const MetadataRecord&, size_t required,
-                       FrameType frame_type);
+    bool commit_quorum(const std::vector<NodeInfo>&, uint64_t generation, const Hash256&,
+                       size_t required, FrameType frame_type);
+    void commit_all_best_effort(const std::vector<NodeInfo>&, uint64_t generation,
+                                const Hash256&, FrameType frame_type);
+    void refresh_cache_identity(const MetadataIdentity&);
     void seed_all_best_effort(const std::vector<NodeInfo>&, const MetadataRecord&,
                               FrameType frame_type = FrameType::control);
     CasResult cas_quorum(const std::vector<NodeInfo>&, const MetadataRecord&,
