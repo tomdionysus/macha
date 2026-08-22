@@ -7187,6 +7187,133 @@ void test_attached_picture_audio_direct_play() {
     service.stop();
 }
 
+void test_forced_direct_bypasses_client_capabilities() {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_replication = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/test.mp4", 0644, getuid(), getgid());
+    auto bytes = pattern(128 * 1024 + 17);
+    auto writer = service.filesystem().open_write("/media/test.mp4", true);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto media_id = file_media_id(service.filesystem().getattr("/media/test.mp4"));
+
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback";
+    streaming.startup_timeout = 2s;
+    auto fake_engine = std::make_unique<FakeMediaEngine>();
+    auto* fake_engine_ptr = fake_engine.get();
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             std::move(fake_engine));
+    playback.start();
+
+    // Direct is a byte-stream override. Deliberately claim that the client can
+    // decode none of the source container/codecs, cannot consume HLS, and has
+    // absurd resolution/bitrate limits. None of those negotiation constraints
+    // may reject an explicit Direct request.
+    Json::Object incompatible_caps{{"containers", Json::Array{Json("webm")}},
+                                   {"video_codecs", Json::Array{Json("vp9")}},
+                                   {"audio_codecs", Json::Array{Json("opus")}},
+                                   {"hls_fmp4", false},
+                                   {"max_width", 1},
+                                   {"max_height", 1}};
+    Json::Object direct_prefs{{"mode", "direct"},
+                              {"max_height", 1},
+                              {"max_bitrate", static_cast<uint64_t>(1)}};
+    Json::Object direct_root{{"media_id", media_id},
+                             {"capabilities", Json(std::move(incompatible_caps))},
+                             {"preferences", Json(std::move(direct_prefs))}};
+    auto direct_text = Json(std::move(direct_root)).dump();
+    HttpRequest direct_create;
+    direct_create.method = "POST";
+    direct_create.path = "/api/v1/playback/sessions";
+    direct_create.body.assign(direct_text.begin(), direct_text.end());
+    auto direct_created = playback.handle(direct_create);
+    REQUIRE(direct_created.status == 201);
+    auto direct_json = Json::parse(std::string(direct_created.body.begin(), direct_created.body.end()));
+    CHECK(direct_json.find("mode")->asString() == "direct");
+    CHECK(direct_json.find("stream")->find("url")->asString().ends_with("/direct"));
+    auto direct_modes = direct_json.find("options")->find("modes")->asArray();
+    CHECK(std::any_of(direct_modes.begin(), direct_modes.end(), [](const Json& mode) {
+        return mode.asString() == "direct";
+    }));
+    CHECK(fake_engine_ptr->vod_prepares() == 0);
+    CHECK(fake_engine_ptr->started_plans().empty());
+
+    HttpRequest direct_range;
+    direct_range.method = "GET";
+    direct_range.path = direct_json.find("stream")->find("url")->asString();
+    direct_range.headers["range"] = "bytes=123-1122";
+    auto direct_range_response = playback.handle(direct_range);
+    REQUIRE(direct_range_response.status == 206);
+    REQUIRE(direct_range_response.stream != nullptr);
+    CHECK(direct_range_response.content_length() == 1000);
+    Bytes direct_bytes(1000);
+    REQUIRE(direct_range_response.stream->read(0, direct_bytes) == direct_bytes.size());
+    CHECK(std::equal(direct_bytes.begin(), direct_bytes.end(), bytes.begin() + 123));
+
+    HttpRequest remove_direct;
+    remove_direct.method = "DELETE";
+    remove_direct.path = "/api/v1/playback/sessions/" + direct_json.find("session_id")->asString();
+    CHECK(playback.handle(remove_direct).status == 204);
+
+    // Auto still negotiates normally. Make MP4 direct-play incompatible while
+    // keeping fMP4 remux compatible: the session must start as remux, advertise
+    // Direct unconditionally, and honour an explicit switch to Direct.
+    Json::Object remux_caps{{"containers", Json::Array{Json("webm")}},
+                            {"video_codecs", Json::Array{Json("h264")}},
+                            {"audio_codecs", Json::Array{Json("aac")}},
+                            {"hls_fmp4", true}};
+    Json::Object remux_root{{"media_id", media_id},
+                            {"capabilities", Json(std::move(remux_caps))}};
+    auto remux_text = Json(std::move(remux_root)).dump();
+    HttpRequest remux_create;
+    remux_create.method = "POST";
+    remux_create.path = "/api/v1/playback/sessions";
+    remux_create.body.assign(remux_text.begin(), remux_text.end());
+    auto remux_created = playback.handle(remux_create);
+    REQUIRE(remux_created.status == 201);
+    auto remux_json = Json::parse(std::string(remux_created.body.begin(), remux_created.body.end()));
+    CHECK(remux_json.find("mode")->asString() == "remux");
+    auto remux_modes = remux_json.find("options")->find("modes")->asArray();
+    CHECK(std::any_of(remux_modes.begin(), remux_modes.end(), [](const Json& mode) {
+        return mode.asString() == "direct";
+    }));
+
+    Json::Object switch_preferences{{"mode", "direct"}};
+    Json::Object switch_root{{"preferences", Json(std::move(switch_preferences))}};
+    auto switch_text = Json(std::move(switch_root)).dump();
+    HttpRequest switch_direct;
+    switch_direct.method = "PATCH";
+    switch_direct.path = "/api/v1/playback/sessions/" + remux_json.find("session_id")->asString();
+    switch_direct.body.assign(switch_text.begin(), switch_text.end());
+    auto switched = playback.handle(switch_direct);
+    REQUIRE(switched.status == 200);
+    auto switched_json = Json::parse(std::string(switched.body.begin(), switched.body.end()));
+    CHECK(switched_json.find("mode")->asString() == "direct");
+    CHECK(switched_json.find("preferences")->find("mode")->asString() == "direct");
+    CHECK(switched_json.find("stream")->find("url")->asString().ends_with("/direct"));
+
+    HttpRequest remove_switched;
+    remove_switched.method = "DELETE";
+    remove_switched.path = "/api/v1/playback/sessions/" + switched_json.find("session_id")->asString();
+    CHECK(playback.handle(remove_switched).status == 204);
+
+    playback.stop();
+    service.stop();
+}
+
 void test_concurrent_transcode_admission_is_reserved() {
     TempDir t;
     auto keyfile = t.path() / "key";
@@ -7792,6 +7919,7 @@ int main() {
         RUN_TEST(test_http_server_serves_streams_concurrently);
         RUN_TEST(test_playback_probe_failure_is_stage_specific);
         RUN_TEST(test_attached_picture_audio_direct_play);
+        RUN_TEST(test_forced_direct_bypasses_client_capabilities);
         RUN_TEST(test_concurrent_transcode_admission_is_reserved);
         RUN_TEST(test_playback_sessions_and_streaming_http_bodies);
         RUN_TEST(test_three_node_cluster);
