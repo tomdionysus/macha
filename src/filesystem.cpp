@@ -638,7 +638,7 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
         }
     }
     dirty_ = true;
-    fs_.store().foreground_activity(d.size());
+    fs_.store().interactive_activity(d.size());
     const auto total =
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - operation_started);
     if (total >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {

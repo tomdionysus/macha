@@ -567,6 +567,11 @@ std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, Fr
                                            std::atomic_bool* cancelled) {
     const bool foreground = frame_type == FrameType::foreground;
     const bool interactive = frame_type == FrameType::foreground || frame_type == FrameType::read_ahead;
+    // Record foreground demand before touching local/cache/network storage.
+    // Completion-time accounting alone is too late to suppress lower-priority
+    // publication when the very first playback read is the one being delayed.
+    if (foreground)
+        note_foreground(0);
     auto started = Clock::now();
     auto log_playback_read = [&](std::string_view source, size_t bytes, bool ok) {
         const auto elapsed =

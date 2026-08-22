@@ -232,6 +232,8 @@ struct PlaybackPreferences {
     std::optional<int> subtitle_stream;
     std::string audio_language;
     std::string subtitle_language;
+
+    bool operator==(const PlaybackPreferences&) const = default;
 };
 
 void read_string_set(const Json* object, std::string_view key, std::set<std::string>& out) {
@@ -1433,8 +1435,12 @@ struct PlaybackManager::Impl {
         // A seek-only update does not alter representation, tracks, quality or
         // codec negotiation. Reuse the prepared VOD random-access plan instead
         // of resolving, probing and materialising the source index again.
-        const bool seek_only = seek_ms.has_value() && preference_patch == nullptr &&
-                               media_override.empty();
+        // Clients commonly resend their current preferences with a seek.  A
+        // semantically unchanged preference object must not turn a seek into a
+        // fresh probe/VOD-planning pass; that re-opens container metadata and
+        // remote extents precisely when the viewer is waiting for the seek.
+        const bool seek_only = seek_ms.has_value() && media_override.empty() &&
+                               prefs == old->preferences;
         std::shared_ptr<Session> replacement;
         if (seek_only)
             replacement = reuse_seek_session(*old, std::chrono::milliseconds(*seek_ms), trace);
