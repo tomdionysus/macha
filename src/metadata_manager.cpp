@@ -878,10 +878,11 @@ MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial)
     throw std::runtime_error("metadata policy change conflict");
 }
 
-std::optional<MetadataRecord> MetadataManager::recover_from_committed_checkpoints(
+MetadataManager::RecoverySurvey MetadataManager::recover_from_committed_checkpoints(
     const std::vector<NodeInfo>& active) {
+    RecoverySurvey survey;
     if (active.size() < 2)
-        return {};
+        return survey;
 
     struct Checkpoint {
         NodeInfo owner;
@@ -944,8 +945,9 @@ std::optional<MetadataRecord> MetadataManager::recover_from_committed_checkpoint
     // itself around an apparently-live peer.
     if (failed || checkpoints.size() != active.size()) {
         Log::debug("metadata recovery waiting for active checkpoint witnesses");
-        return {};
+        return survey;
     }
+    survey.complete = true;
 
     std::vector<Checkpoint> durable;
     std::vector<NodeInfo> fresh;
@@ -955,8 +957,9 @@ std::optional<MetadataRecord> MetadataManager::recover_from_committed_checkpoint
         else
             durable.push_back(checkpoint);
     }
+    survey.durable_history = !durable.empty();
     if (durable.empty() || fresh.empty())
-        return {};
+        return survey;
 
     uint64_t highest_generation = 0;
     for (const auto& checkpoint : durable)
@@ -976,14 +979,14 @@ std::optional<MetadataRecord> MetadataManager::recover_from_committed_checkpoint
         }
     }
     if (!base)
-        return {};
+        return survey;
 
     auto snapshot = decode_snapshot(base->payload);
     const size_t target = snapshot.metadata_voters.size();
     if (!target)
         throw std::runtime_error("metadata recovery checkpoint has no voter group");
     if (active.size() < target)
-        return {};
+        return survey;
     if (snapshot.extent_size != node_.config().extent_size)
         throw std::runtime_error(
             "metadata recovery checkpoint extent size does not match configuration");
@@ -1000,7 +1003,7 @@ std::optional<MetadataRecord> MetadataManager::recover_from_committed_checkpoint
 
     const size_t old_need = quorum(snapshot.metadata_voters.size());
     if (surviving_voters.size() >= old_need)
-        return {}; // Normal quorum recovery/reconfiguration must win when possible.
+        return survey; // Normal quorum recovery/reconfiguration must win when possible.
 
     const size_t missing = target - surviving_voters.size();
     std::set<NodeId> old_voter_ids(snapshot.metadata_voters.begin(), snapshot.metadata_voters.end());
@@ -1012,12 +1015,12 @@ std::optional<MetadataRecord> MetadataManager::recover_from_committed_checkpoint
     if (replacements.size() < missing) {
         Log::debug("metadata recovery waiting for " + std::to_string(missing) +
                    " fresh replacement node(s)");
-        return {};
+        return survey;
     }
 
     auto ranked = rendezvous_nodes(placement_key_.bytes, replacements, missing);
     if (ranked.size() != missing)
-        return {};
+        return survey;
 
     std::vector<NodeId> next_voters = surviving_voters;
     for (const auto& owner : ranked)
@@ -1038,7 +1041,7 @@ std::optional<MetadataRecord> MetadataManager::recover_from_committed_checkpoint
         auto found = std::find_if(active.begin(), active.end(),
                                   [&](const auto& owner) { return owner.id == id; });
         if (found == active.end())
-            return {};
+            return survey;
         next_nodes.push_back(*found);
     }
 
@@ -1047,16 +1050,17 @@ std::optional<MetadataRecord> MetadataManager::recover_from_committed_checkpoint
     // present do we checkpoint the successor. This keeps an interrupted
     // recovery attempt out of the durable witness set used by the next retry.
     if (!seed_quorum(next_nodes, recovery, quorum(next_nodes.size())))
-        return {};
+        return survey;
     if (!checkpoint_quorum(next_nodes, recovery, quorum(next_nodes.size())))
-        return {};
+        return survey;
 
     (void)node_.checkpoint_metadata(recovery);
     seed_all_best_effort(active, recovery);
     Log::info("metadata voter group recovered from committed checkpoint generation " +
               std::to_string(base->generation) + " using " + std::to_string(missing) +
               " fresh replacement node(s)");
-    return recovery;
+    survey.recovered = std::move(recovery);
+    return survey;
 }
 
 MetadataRecord MetadataManager::discover_or_form() {
@@ -1130,26 +1134,41 @@ MetadataRecord MetadataManager::discover_or_form() {
                 Log::debug("metadata discovery candidate: " + std::string(error.what()));
             }
         }
-        if (auto recovered = recover_from_committed_checkpoints(active))
-            return cache_record(*recovered);
+        auto recovery = recover_from_committed_checkpoints(active);
+        if (recovery.recovered)
+            return cache_record(*recovery.recovered);
         throw std::runtime_error(
             "no discovered metadata voter group has quorum; waiting for replacement recovery");
     }
 
-    if (auto recovered = recover_from_committed_checkpoints(active))
-        return cache_record(*recovered);
+    auto recovery = recover_from_committed_checkpoints(active);
+    if (recovery.recovered)
+        return cache_record(*recovery.recovered);
 
     const size_t target = node_.config().metadata_replication;
     if (active.size() < target) {
         throw std::runtime_error("metadata group forming: need " + std::to_string(target) +
                                  " active nodes, have " + std::to_string(active.size()));
     }
-    // A configured joiner must not invent a new namespace while none of its
-    // bootstrap peers are reachable. Once at least one peer is known, genesis
-    // can be formed deterministically by the configured voter set; requiring a
-    // special bootstrap-less founder would make symmetric bootstrap impossible.
-    if (!node_.config().bootstrap.empty() && active.size() == 1) {
-        throw std::runtime_error("metadata group forming: waiting for bootstrap peer");
+    // A configured joiner must not invent a namespace until active bootstrap
+    // peers have positively proved that no committed post-genesis history
+    // exists. Symmetric virgin peers may still form genesis once that survey is
+    // complete; an inconclusive survey always fails closed.
+    if (!node_.config().bootstrap.empty()) {
+        if (active.size() == 1)
+            throw std::runtime_error("metadata group forming: waiting for bootstrap peer");
+        // A configured joiner may only create genesis after every currently
+        // active member has positively answered the committed-checkpoint survey
+        // and that survey proves there is no durable post-genesis history. A
+        // transient RPC failure must fail closed here: with metadata replication
+        // one, rendezvous could otherwise select the fresh node itself and let it
+        // create an empty namespace while a survivor still holds the real cluster.
+        if (!recovery.complete)
+            throw std::runtime_error(
+                "metadata group forming: waiting for bootstrap checkpoint survey");
+        if (recovery.durable_history)
+            throw std::runtime_error(
+                "metadata group forming: durable bootstrap metadata requires recovery");
     }
 
     auto selected = rendezvous_nodes(placement_key_.bytes, active, target);

@@ -53,6 +53,7 @@ struct CatalogueHint {
     int priority{};
     CatalogueHintState state{CatalogueHintState::queued};
     unsigned attempts{};
+    size_t candidate_cursor{};
     uint64_t created_unix_ms{};
     uint64_t updated_unix_ms{};
     uint64_t ready_after_unix_ms{};
@@ -99,6 +100,7 @@ class CatalogueHintQueue {
                          std::string result = {});
     void mark_no_match(std::string_view id, std::string provider, std::string media_id,
                        std::string result = {});
+    void advance_candidate(std::string_view id, size_t next_cursor);
     void defer(std::string_view id, std::string error, uint64_t retry_after_unix_ms);
     void fail(std::string_view id, std::string error);
     void requeue_processing();

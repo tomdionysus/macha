@@ -118,8 +118,8 @@ void validate(Config& config) {
         config.fuse.foreground_commit_workers > config.fuse.commit_workers)
         throw std::runtime_error("fuse.foreground_commit_workers must be 1..commit_workers");
     if (config.fuse.publication_quiet < std::chrono::milliseconds(0) ||
-        config.fuse.publication_quiet > std::chrono::seconds(5))
-        throw std::runtime_error("fuse.publication_quiet_ms must be 0..5000");
+        config.fuse.publication_quiet > std::chrono::seconds(30))
+        throw std::runtime_error("fuse.publication_quiet_ms must be 0..30000");
     if (!config.fuse.max_pending_requests || config.fuse.max_pending_requests > 65536 ||
         !config.fuse.max_pending_operations || config.fuse.max_pending_operations > 65536)
         throw std::runtime_error("fuse pending queue limits must be 1..65536");

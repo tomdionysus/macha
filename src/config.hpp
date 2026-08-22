@@ -70,7 +70,7 @@ struct FuseConfig {
     // publication so local spool acceptance remains responsive. Once the
     // frontend is quiet, all commit_workers may drain the backlog.
     size_t foreground_commit_workers{1};
-    std::chrono::milliseconds publication_quiet{250};
+    std::chrono::milliseconds publication_quiet{5000};
     size_t max_pending_operations{4096};
 
     // FUSE demand is emitted into the existing hydration scheduler.

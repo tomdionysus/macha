@@ -101,6 +101,12 @@ bool retryable_backend_error(const std::exception& error) {
         case ENETDOWN:
         case ENETUNREACH:
         case ECONNRESET:
+        case ECONNABORTED:
+        case ENOTCONN:
+        case ECONNREFUSED:
+        case EHOSTUNREACH:
+        case EPIPE:
+        case EBUSY:
             return true;
         default:
             return false;
@@ -214,6 +220,11 @@ struct FuseFrontend::State {
     std::deque<std::shared_ptr<Inode>> data_queue;
     std::vector<std::jthread> data_workers;
     std::atomic_size_t active_data{};
+    // Number of writable FUSE handles currently open. A writable handle is a
+    // stronger foreground signal than a recent-operation timer: while rsync is
+    // feeding a file, background publication must not fan out merely because
+    // there was a short gap between kernel callbacks.
+    std::atomic_size_t open_writers{};
 
     std::array<BrokerQueue, 6> broker;
     std::atomic_size_t broker_pending{};
@@ -564,7 +575,14 @@ struct FuseFrontend::State {
                 done += chunk;
             }
         }
-        writer->commit();
+        // Extent creation may proceed concurrently, but metadata publication
+        // is one shared namespace transaction. Serialise the final commit with
+        // namespace publication and other FUSE data commits to avoid a fan-out
+        // of large metadata CAS attempts fighting over the same snapshot.
+        {
+            std::lock_guard backend(publication_mutex);
+            writer->commit();
+        }
         auto committed = writer->committed_entry();
 
         std::lock_guard lock(inode->mutex);
@@ -582,8 +600,10 @@ struct FuseFrontend::State {
     }
 
     bool data_slot_available() const {
-        const bool foreground_busy = config.publication_quiet.count() > 0 &&
+        const bool recent_foreground = config.publication_quiet.count() > 0 &&
             fs.interactive_idle_for() < config.publication_quiet;
+        const bool foreground_busy =
+            open_writers.load(std::memory_order_relaxed) > 0 || recent_foreground;
         const auto limit = foreground_busy ? config.foreground_commit_workers : config.commit_workers;
         return active_data.load(std::memory_order_relaxed) < limit;
     }
@@ -1153,6 +1173,8 @@ FuseOpenHandle FuseFrontend::open(std::string_view path, bool readable, bool wri
             inode->visible.size = 0;
         }
         ++inode->open_handles;
+        if (writable)
+            state_->open_writers.fetch_add(1, std::memory_order_relaxed);
         return FuseOpenHandle{inode->id, readable, writable, append};
     });
 }
@@ -1185,6 +1207,8 @@ FuseOpenHandle FuseFrontend::create(std::string_view path, uint32_t mode, uint32
             inode->current_path = requested;
             inode->namespace_sequence = state_->next_namespace_sequence++;
             inode->open_handles = 1;
+            if (writable)
+                state_->open_writers.fetch_add(1, std::memory_order_relaxed);
             state_->paths[requested] = inode;
             state_->inodes[inode->id] = inode;
             op = {State::NamespaceOp::Kind::create, inode->namespace_sequence, requested, {}, false,
@@ -1388,9 +1412,18 @@ void FuseFrontend::release(uint64_t inode_id, bool writable) {
         // dirty data belonging to another writer on the same inode.
         if (writable)
             state_->request_data_publication(inode);
-        std::lock_guard lock(inode->mutex);
-        if (inode->open_handles)
-            --inode->open_handles;
+        bool closed = false;
+        {
+            std::lock_guard lock(inode->mutex);
+            if (inode->open_handles) {
+                --inode->open_handles;
+                closed = true;
+            }
+        }
+        if (writable && closed) {
+            state_->open_writers.fetch_sub(1, std::memory_order_relaxed);
+            state_->data_cv.notify_all();
+        }
     });
 }
 

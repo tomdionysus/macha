@@ -2501,49 +2501,63 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop) 
     }
 
     constexpr size_t max_candidate_attempts = 5;
+    const auto candidate_limit = std::min(max_candidate_attempts, probed.candidates.size());
+    if (hint.candidate_cursor >= candidate_limit) {
+        std::string result = "no metadata provider match";
+        if (candidate_limit > 1)
+            result += " after " + std::to_string(candidate_limit) + " candidates";
+        hints_.mark_no_match(hint.id, std::string(provider->name()), media_id, std::move(result));
+        Log::debug("catalogue hint: no provider match path=" + hint.path +
+                   " provider=" + std::string(provider->name()));
+        return {};
+    }
+
+    // One scheduling turn evaluates one metadata hypothesis. Some provider
+    // lookups legitimately require several HTTP requests (for example a
+    // MusicBrainz search followed by release detail), so fairness must be at
+    // the candidate-hypothesis boundary rather than at the HTTP-request
+    // boundary. Persisting the cursor lets the queue yield to another root and
+    // resume the next fallback without repeating earlier hypotheses after a
+    // restart.
+    const auto& candidate = probed.candidates[hint.candidate_cursor];
     std::optional<ProviderMatch> selected_match;
     const MediaProbeCandidate* selected_candidate = nullptr;
-    size_t attempted = 0;
-    std::string last_error;
-    for (const auto& candidate : probed.candidates) {
-        if (stop.stop_requested()) return {};
-        if (attempted >= max_candidate_attempts) break;
-        ++attempted;
-        try {
-            auto match = provider->lookup(candidate.probe);
-            if (match) {
-                selected_match = std::move(match);
-                selected_candidate = &candidate;
-                break;
-            }
-        } catch (const ProviderBudgetExhausted&) {
-            hints_.defer(hint.id, "provider request budget exhausted",
-                         unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
-            return {};
-        } catch (const ProviderTemporarilyUnavailable& e) {
+    try {
+        auto match = provider->lookup(candidate.probe);
+        if (match) {
+            selected_match = std::move(match);
+            selected_candidate = &candidate;
+        }
+    } catch (const ProviderBudgetExhausted&) {
+        hints_.defer(hint.id, "provider request budget exhausted",
+                     unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
+        return {};
+    } catch (const ProviderTemporarilyUnavailable& e) {
+        hints_.defer(hint.id, e.what(),
+                     unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
+        Log::warn("catalogue hint provider temporarily unavailable provider=" +
+                  std::string(provider->name()) + " path=" + hint.path + ": " + e.what());
+        return {};
+    } catch (const std::exception& e) {
+        Log::warn("catalogue hint lookup failed provider=" + std::string(provider->name()) +
+                  " path=" + hint.path + " candidate=" + candidate.generator + ": " + e.what());
+        if (hint.attempts >= 5)
+            hints_.fail(hint.id, e.what());
+        else
             hints_.defer(hint.id, e.what(),
                          unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
-            Log::warn("catalogue hint provider temporarily unavailable provider=" +
-                      std::string(provider->name()) + " path=" + hint.path + ": " + e.what());
-            return {};
-        } catch (const std::exception& e) {
-            last_error = e.what();
-            Log::warn("catalogue hint lookup failed provider=" + std::string(provider->name()) +
-                      " path=" + hint.path + " candidate=" + candidate.generator + ": " + e.what());
-        }
+        return {};
     }
 
     if (!selected_match || !selected_candidate) {
-        if (!last_error.empty()) {
-            if (hint.attempts >= 5)
-                hints_.fail(hint.id, last_error);
-            else
-                hints_.defer(hint.id, last_error,
-                             unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
+        const auto next_cursor = hint.candidate_cursor + 1;
+        if (next_cursor < candidate_limit) {
+            hints_.advance_candidate(hint.id, next_cursor);
             return {};
         }
         std::string result = "no metadata provider match";
-        if (attempted > 1) result += " after " + std::to_string(attempted) + " candidates";
+        if (candidate_limit > 1)
+            result += " after " + std::to_string(candidate_limit) + " candidates";
         hints_.mark_no_match(hint.id, std::string(provider->name()), media_id, std::move(result));
         Log::debug("catalogue hint: no provider match path=" + hint.path +
                    " provider=" + std::string(provider->name()));

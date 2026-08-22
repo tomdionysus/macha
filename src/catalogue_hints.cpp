@@ -40,6 +40,7 @@ Json hint_json(const CatalogueHint& hint) {
     out["priority"] = static_cast<int64_t>(hint.priority);
     out["state"] = catalogue_hint_state_name(hint.state);
     out["attempts"] = static_cast<uint64_t>(hint.attempts);
+    out["candidate_cursor"] = static_cast<uint64_t>(hint.candidate_cursor);
     out["created_unix_ms"] = hint.created_unix_ms;
     out["updated_unix_ms"] = hint.updated_unix_ms;
     out["ready_after_unix_ms"] = hint.ready_after_unix_ms;
@@ -104,6 +105,7 @@ CatalogueHint parse_hint(const Json& value) {
     if (const auto* priority = value.find("priority")) hint.priority = static_cast<int>(priority->asInt64());
     if (auto state = parse_catalogue_hint_state(json_string(value, "state"))) hint.state = *state;
     hint.attempts = static_cast<unsigned>(json_u64(value, "attempts"));
+    hint.candidate_cursor = static_cast<size_t>(json_u64(value, "candidate_cursor"));
     hint.created_unix_ms = json_u64(value, "created_unix_ms");
     hint.updated_unix_ms = json_u64(value, "updated_unix_ms");
     hint.ready_after_unix_ms = json_u64(value, "ready_after_unix_ms");
@@ -198,7 +200,7 @@ void CatalogueHintQueue::save_state_locked() const {
     hints.reserve(hints_.size());
     for (const auto& [_, hint] : hints_) hints.push_back(hint_json(hint));
     Json::Object root;
-    root["version"] = static_cast<uint64_t>(1);
+    root["version"] = static_cast<uint64_t>(2);
     root["hints"] = std::move(hints);
     const auto text = Json(std::move(root)).dump();
     const auto temp = state_file_.string() + ".tmp";
@@ -301,6 +303,7 @@ std::vector<std::string> CatalogueHintQueue::submit_many(
         if (inserted || reopen_terminal) {
             hint.state = CatalogueHintState::queued;
             hint.attempts = 0;
+            hint.candidate_cursor = 0;
             hint.ready_after_unix_ms = 0;
             hint.provider.clear();
             hint.media_id.clear();
@@ -373,6 +376,7 @@ void CatalogueHintQueue::mark_catalogued(std::string_view id, std::string provid
     if (it == hints_.end()) return;
     auto& hint = it->second;
     hint.state = CatalogueHintState::catalogued;
+    hint.candidate_cursor = 0;
     hint.provider = std::move(provider);
     hint.media_id = std::move(media_id);
     hint.catalogue_item_ids = std::move(catalogue_item_ids);
@@ -392,6 +396,7 @@ void CatalogueHintQueue::mark_no_match(std::string_view id, std::string provider
     if (it == hints_.end()) return;
     auto& hint = it->second;
     hint.state = CatalogueHintState::no_match;
+    hint.candidate_cursor = 0;
     hint.provider = std::move(provider);
     hint.media_id = std::move(media_id);
     hint.catalogue_item_ids.clear();
@@ -400,6 +405,20 @@ void CatalogueHintQueue::mark_no_match(std::string_view id, std::string provider
     hint.ready_after_unix_ms = 0;
     hint.updated_unix_ms = now_ms();
     if (hint.origins.empty()) hints_.erase(it);
+    save_state_locked();
+}
+
+void CatalogueHintQueue::advance_candidate(std::string_view id, size_t next_cursor) {
+    std::lock_guard lock(mutex_);
+    auto it = std::find_if(hints_.begin(), hints_.end(), [&](const auto& pair) { return pair.second.id == id; });
+    if (it == hints_.end()) return;
+    auto& hint = it->second;
+    hint.state = CatalogueHintState::queued;
+    hint.attempts = 0;
+    hint.candidate_cursor = next_cursor;
+    hint.error.clear();
+    hint.ready_after_unix_ms = 0;
+    hint.updated_unix_ms = now_ms();
     save_state_locked();
 }
 
@@ -421,6 +440,7 @@ void CatalogueHintQueue::fail(std::string_view id, std::string error) {
     if (it == hints_.end()) return;
     auto& hint = it->second;
     hint.state = CatalogueHintState::failed;
+    hint.candidate_cursor = 0;
     hint.error = std::move(error);
     hint.ready_after_unix_ms = 0;
     hint.updated_unix_ms = now_ms();

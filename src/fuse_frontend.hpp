@@ -30,6 +30,13 @@ enum class FuseOperationClass : uint8_t {
     lifecycle,
 };
 
+enum class FuseRequestState : uint8_t {
+    queued,
+    running,
+    cancelled,
+    complete,
+};
+
 struct FuseOpenHandle {
     uint64_t inode{};
     bool readable{};
@@ -68,25 +75,58 @@ class FuseFrontend final : public HydrationHintProvider {
     auto dispatch(FuseOperationClass operation, Fn&& fn)
         -> std::invoke_result_t<Fn, Clock::time_point, std::atomic_bool&> {
         using Result = std::invoke_result_t<Fn, Clock::time_point, std::atomic_bool&>;
-        auto timeout = std::min(timeout_for(operation), absolute_timeout());
+        const auto timeout = std::min(timeout_for(operation), absolute_timeout());
         const auto deadline = Clock::now() + timeout;
+        const bool complete_once_started =
+            operation != FuseOperationClass::lookup && operation != FuseOperationClass::read;
         auto cancelled = std::make_shared<std::atomic_bool>(false);
+        auto request_state =
+            std::make_shared<std::atomic<FuseRequestState>>(FuseRequestState::queued);
         auto promise = std::make_shared<std::promise<Result>>();
         auto future = promise->get_future();
 
-        auto task = [promise, cancelled, fn = std::forward<Fn>(fn)](
+        auto task = [promise, cancelled, request_state, complete_once_started,
+                     fn = std::forward<Fn>(fn)](
                         Clock::time_point task_deadline, std::atomic_bool& task_cancelled) mutable {
+            // A mutating FUSE request may be rejected while it is still queued,
+            // but once it starts it must have exactly one observable outcome.
+            // Returning ETIMEDOUT while a pwrite/truncate/namespace mutation is
+            // already executing leaves the kernel unable to know whether the
+            // mutation happened. Read-only requests remain cooperatively
+            // cancellable after they begin.
+            if (Clock::now() >= task_deadline) {
+                auto expected = FuseRequestState::queued;
+                if (request_state->compare_exchange_strong(
+                        expected, FuseRequestState::cancelled, std::memory_order_acq_rel)) {
+                    task_cancelled.store(true, std::memory_order_relaxed);
+                    try {
+                        promise->set_exception(std::make_exception_ptr(
+                            FsError(ETIMEDOUT, "FUSE request deadline exceeded before execution")));
+                    } catch (...) {
+                    }
+                }
+                return;
+            }
+
+            auto expected = FuseRequestState::queued;
+            if (!request_state->compare_exchange_strong(
+                    expected, FuseRequestState::running, std::memory_order_acq_rel))
+                return;
+
             try {
-                if (task_cancelled.load(std::memory_order_relaxed) ||
-                    Clock::now() >= task_deadline)
-                    throw FsError(ETIMEDOUT, "FUSE request deadline exceeded before execution");
+                const auto effective_deadline =
+                    complete_once_started ? Clock::time_point::max() : task_deadline;
                 if constexpr (std::is_void_v<Result>) {
-                    fn(task_deadline, task_cancelled);
+                    fn(effective_deadline, task_cancelled);
+                    request_state->store(FuseRequestState::complete, std::memory_order_release);
                     promise->set_value();
                 } else {
-                    promise->set_value(fn(task_deadline, task_cancelled));
+                    auto result = fn(effective_deadline, task_cancelled);
+                    request_state->store(FuseRequestState::complete, std::memory_order_release);
+                    promise->set_value(std::move(result));
                 }
             } catch (...) {
+                request_state->store(FuseRequestState::complete, std::memory_order_release);
                 try {
                     promise->set_exception(std::current_exception());
                 } catch (...) {
@@ -98,9 +138,23 @@ class FuseFrontend final : public HydrationHintProvider {
             throw FsError(EAGAIN, "FUSE request broker saturated");
 
         if (future.wait_until(deadline) != std::future_status::ready) {
-            cancelled->store(true, std::memory_order_relaxed);
-            note_timeout();
-            throw FsError(ETIMEDOUT, "FUSE request deadline exceeded");
+            auto expected = FuseRequestState::queued;
+            if (request_state->compare_exchange_strong(
+                    expected, FuseRequestState::cancelled, std::memory_order_acq_rel)) {
+                cancelled->store(true, std::memory_order_relaxed);
+                note_timeout();
+                throw FsError(ETIMEDOUT, "FUSE request deadline exceeded before execution");
+            }
+
+            if (!complete_once_started && expected == FuseRequestState::running) {
+                cancelled->store(true, std::memory_order_relaxed);
+                note_timeout();
+                throw FsError(ETIMEDOUT, "FUSE request deadline exceeded");
+            }
+
+            // A mutation has already started. Wait for its actual result rather
+            // than manufacture a timeout while its side effects continue.
+            future.wait();
         }
         if constexpr (std::is_void_v<Result>) {
             future.get();

@@ -7,6 +7,7 @@
 Committed namespace checkpoints are therefore retained on every active node, not only metadata voters. If an old voter is permanently lost and a fresh replacement joins, the surviving nodes can reconstruct the voter set from an agreed committed checkpoint. The replacement then walks the recovered live-object set and pulls the extents it should own.
 
 This is intentionally not a partition escape hatch. Recovery waits until apparently-active peers are either reachable or age out under `dead_after_ms`, requires the surviving committed checkpoints to agree, and requires fresh replacement node(s) for the missing voter seats. If an old voter quorum still exists, normal quorum recovery wins.
+A node configured with bootstrap peers also fails closed before genesis: every active member must complete the committed-checkpoint survey, and any durable post-genesis checkpoint suppresses fresh namespace formation. A transient bootstrap metadata RPC therefore delays formation rather than creating a second empty namespace.
 
 Losing only `storage` is simpler: namespace and node identity survive, and normal object repair restores missing replicas. Losing `state_path` is replacement, not disk failure.
 
