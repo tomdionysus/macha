@@ -73,6 +73,9 @@ struct CatalogueHint {
 struct CatalogueHintSummary {
     size_t total{};
     size_t pending{};
+    size_t queued{};
+    size_t processing{};
+    size_t deferred{};
     size_t catalogued{};
     size_t no_match{};
     size_t failed{};
@@ -123,6 +126,7 @@ class CatalogueHintQueue {
 
     std::vector<CatalogueHint> list() const;
     std::optional<CatalogueHint> get(std::string_view id) const;
+    CatalogueHintSummary summary() const;
     CatalogueHintSummary summary(std::string_view source, std::string_view source_ref) const;
     size_t erase_origin(std::string_view source, std::string_view source_ref);
 };

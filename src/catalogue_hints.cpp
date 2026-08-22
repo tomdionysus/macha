@@ -590,6 +590,32 @@ std::optional<CatalogueHint> CatalogueHintQueue::get(std::string_view id) const 
     return it->second;
 }
 
+CatalogueHintSummary CatalogueHintQueue::summary() const {
+    CatalogueHintSummary out;
+    std::lock_guard lock(mutex_);
+    for (const auto& [_, hint] : hints_) {
+        ++out.total;
+        switch (hint.state) {
+        case CatalogueHintState::catalogued: ++out.catalogued; break;
+        case CatalogueHintState::no_match: ++out.no_match; break;
+        case CatalogueHintState::failed: ++out.failed; break;
+        case CatalogueHintState::queued:
+            ++out.pending;
+            ++out.queued;
+            break;
+        case CatalogueHintState::processing:
+            ++out.pending;
+            ++out.processing;
+            break;
+        case CatalogueHintState::deferred:
+            ++out.pending;
+            ++out.deferred;
+            break;
+        }
+    }
+    return out;
+}
+
 CatalogueHintSummary CatalogueHintQueue::summary(std::string_view source,
                                                  std::string_view source_ref) const {
     CatalogueHintSummary out;
@@ -603,8 +629,17 @@ CatalogueHintSummary CatalogueHintQueue::summary(std::string_view source,
         case CatalogueHintState::no_match: ++out.no_match; break;
         case CatalogueHintState::failed: ++out.failed; break;
         case CatalogueHintState::queued:
+            ++out.pending;
+            ++out.queued;
+            break;
         case CatalogueHintState::processing:
-        case CatalogueHintState::deferred: ++out.pending; break;
+            ++out.pending;
+            ++out.processing;
+            break;
+        case CatalogueHintState::deferred:
+            ++out.pending;
+            ++out.deferred;
+            break;
         }
     }
     return out;

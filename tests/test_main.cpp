@@ -1131,6 +1131,10 @@ void test_metadata_codec_and_replica() {
     auto replica_path = t.path() / "node";
     MetadataReplica replica(replica_path, keys.storage);
     auto current = replica.current();
+    CHECK(replica.current_identity().generation == current.generation);
+    CHECK(replica.current_identity().hash == current.hash);
+    CHECK(replica.committed_identity().generation == replica.committed().generation);
+    CHECK(replica.committed_identity().hash == replica.committed().hash);
     CHECK(replica.committed().hash == current.hash);
     MetadataRecord next;
     REQUIRE(replica.cas(current.generation, current.hash, encoded, &next));
@@ -1238,6 +1242,42 @@ void test_metadata_codec_and_replica() {
     CHECK(compacted_again.current().generation == 66);
     CHECK(compacted_again.current().hash == compacted_again.committed().hash);
 
+}
+
+void test_metadata_identity_rpc() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c1 = config_for(t.path() / "identity-1", keyfile, free_port());
+    auto c2 = config_for(t.path() / "identity-2", keyfile, free_port(),
+                         {{"127.0.0.1", c1.port}});
+    c1.replication = c2.replication = 1;
+    c1.metadata_replication = c2.metadata_replication = 1;
+
+    NodeRuntime n1(c1, keys);
+    NodeRuntime n2(c2, keys);
+    n1.start();
+    n2.start();
+    REQUIRE(wait_until([&] { return n1.membership().active().size() >= 2; }, 5s));
+
+    auto peers = n1.membership().active();
+    auto found = std::find_if(peers.begin(), peers.end(),
+                              [&](const NodeInfo& peer) { return peer.id == n2.node_id(); });
+    REQUIRE(found != peers.end());
+    auto reply = n1.call(*found, MessageType::get_metadata_identity, {},
+                         FrameType::speculative);
+    REQUIRE(reply.message.type == MessageType::metadata_identity_reply);
+    CHECK(reply.message.payload.size() == sizeof(uint64_t) + 32);
+    Reader reader(reply.message.payload);
+    MetadataIdentity observed;
+    observed.generation = reader.u64();
+    observed.hash.bytes = reader.fixed<32>();
+    reader.finish();
+    CHECK(observed == n2.metadata_replica().current_identity());
+
+    n2.stop();
+    n1.stop();
 }
 
 void test_config() {
@@ -5411,7 +5451,16 @@ void test_catalogue_hint_queue_persistence_coalescing_and_priority() {
         auto claimed = hints.claim_next();
         REQUIRE(claimed.has_value());
         CHECK(claimed->id == no_match_id);
+        auto processing_summary = hints.summary();
+        CHECK(processing_summary.total == 1);
+        CHECK(processing_summary.pending == 1);
+        CHECK(processing_summary.queued == 0);
+        CHECK(processing_summary.processing == 1);
+        CHECK(processing_summary.deferred == 0);
         hints.mark_no_match(no_match_id, "movies", "macha:rev-a", "no provider match");
+        auto terminal_summary = hints.summary();
+        CHECK(terminal_summary.pending == 0);
+        CHECK(terminal_summary.no_match == 1);
 
         // An unchanged namespace observation must reuse the terminal negative
         // result rather than reopening provider work merely because its source
@@ -7260,6 +7309,7 @@ int main() {
         RUN_TEST(test_local_store);
         RUN_TEST(test_storage_pool_and_persistent_cache);
         RUN_TEST(test_metadata_codec_and_replica);
+        RUN_TEST(test_metadata_identity_rpc);
         RUN_TEST(test_config);
         RUN_TEST(test_placement);
         RUN_TEST(test_capacity_placement);
