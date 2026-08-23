@@ -186,6 +186,9 @@ void Service::reload_config() {
     auto updated = load_yaml_config(*node_.config().config_file);
     if (updated.state_path != node_.config().state_path || updated.key_file != node_.config().key_file)
         throw std::runtime_error("state_path/key_file cannot be changed by live reload");
+    if (updated.fuse.spool_path != node_.config().fuse.spool_path ||
+        updated.fuse.operation_journal_path != node_.config().fuse.operation_journal_path)
+        throw std::runtime_error("FUSE spool/journal paths cannot be changed by live reload");
     if (updated.extent_size != node_.config().extent_size)
         throw std::runtime_error("extent_size cannot be changed for an existing namespace");
     if (updated.replication != node_.config().replication ||

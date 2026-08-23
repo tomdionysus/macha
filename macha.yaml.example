@@ -49,6 +49,16 @@ filesystem:
 # daemon timeout; a request fails to the kernel rather than hanging the mount.
 fuse:
   allow_other: false
+
+  # Durable FUSE admission state can be placed independently of state_path.
+  # spool_path may hold the full unpublished byte backlog. The operation
+  # journal is small descriptor/control state and may live on another device.
+  # If omitted, compatibility defaults are:
+  #   spool_path: <state_path>/fuse-spool
+  #   operation_journal_path: <spool_path>/operations.log
+  spool_path: /var/spool/macha/fuse
+  operation_journal_path: /var/lib/macha/fuse-operations.log
+
   entry_timeout_ms: 1000
   attr_timeout_ms: 1000
   negative_timeout_ms: 500

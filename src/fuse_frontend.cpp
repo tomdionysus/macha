@@ -335,6 +335,7 @@ struct FuseFrontend::State {
     FuseConfig config;
     std::filesystem::path spool_dir;
     std::filesystem::path journal_path;
+    std::filesystem::path journal_dir;
     // Admission serialises the descriptor+operation pair against journal
     // compaction. Without it, the last completing operation could reset the
     // journal after an inode descriptor was observed as present but before the
@@ -391,8 +392,10 @@ struct FuseFrontend::State {
 
     explicit State(FileSystem& filesystem, FuseConfig policy)
         : fs(filesystem), config(std::move(policy)),
-          spool_dir(fs.node().config().state_path / "fuse-spool"),
-          journal_path(spool_dir / "operations.log") {}
+          spool_dir(config.spool_path.value_or(fs.node().config().state_path / "fuse-spool")),
+          journal_path(config.operation_journal_path.value_or(spool_dir / "operations.log")),
+          journal_dir(journal_path.parent_path().empty() ? std::filesystem::path(".")
+                                                        : journal_path.parent_path()) {}
 
     ~State() {
         if (journal_fd >= 0)
@@ -497,7 +500,7 @@ struct FuseFrontend::State {
     }
 
     void install_empty_journal_locked() {
-        std::filesystem::create_directories(spool_dir);
+        std::filesystem::create_directories(journal_dir);
         const auto temp = journal_path.string() + ".tmp." + std::to_string(getpid()) + "." +
                           std::to_string(unix_ms());
         int fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
@@ -511,7 +514,7 @@ struct FuseFrontend::State {
             fd = -1;
             if (::rename(temp.c_str(), journal_path.c_str()) != 0)
                 throw FsError(errno, "cannot install FUSE operation journal");
-            sync_directory(spool_dir);
+            sync_directory(journal_dir);
         } catch (...) {
             if (fd >= 0)
                 ::close(fd);
@@ -798,6 +801,7 @@ struct FuseFrontend::State {
 
     JournalRecovery load_journal() {
         std::filesystem::create_directories(spool_dir);
+        std::filesystem::create_directories(journal_dir);
         std::lock_guard lock(journal_mutex);
         if (!std::filesystem::exists(journal_path))
             install_empty_journal_locked();
