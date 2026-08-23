@@ -307,8 +307,10 @@ int op_read(const char* path, char* buf, size_t size, off_t off, fuse_file_info*
             if (!found) return -ENOENT;
             inode = *found;
         }
-        auto n = frontend().read(inode, static_cast<uint64_t>(off),
-                                 {reinterpret_cast<uint8_t*>(buf), size});
+        auto n = h ? frontend().read(h->file, static_cast<uint64_t>(off),
+                                      {reinterpret_cast<uint8_t*>(buf), size})
+                   : frontend().read(inode, static_cast<uint64_t>(off),
+                                     {reinterpret_cast<uint8_t*>(buf), size});
         return static_cast<int>(n);
     });
 }

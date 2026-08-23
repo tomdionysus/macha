@@ -213,6 +213,14 @@ FuseEntryAttributes fuse_attributes(const FsEntry& entry) {
 
 } // namespace
 
+class FuseReadSession {
+  public:
+    std::mutex mutex;
+    uint64_t inode{};
+    uint64_t base_version{};
+    std::shared_ptr<ReadHandle> reader;
+};
+
 struct FuseFrontend::State {
     struct DataOp {
         enum class Kind : uint8_t { write, truncate };
@@ -242,6 +250,12 @@ struct FuseFrontend::State {
         int spool_fd{-1};
         std::filesystem::path spool_path;
         uint64_t spool_end{};
+        // Writes admitted to the local spool can wait together for one durable
+        // payload+journal barrier. admitted_size reserves O_APPEND offsets while
+        // those writes are not yet visible to readers.
+        uint64_t admitted_size{};
+        size_t durability_pending{};
+        std::condition_variable_any durability_cv;
         size_t open_handles{};
         bool data_queued{};
         bool data_running{};
@@ -317,6 +331,12 @@ struct FuseFrontend::State {
         std::function<void(Clock::time_point, std::atomic_bool&)> fn;
     };
 
+    struct DurabilityTicket {
+        std::shared_ptr<Inode> inode;
+        DataOp op;
+        std::promise<void> complete;
+    };
+
     struct BrokerQueue {
         std::mutex mutex;
         std::condition_variable_any cv;
@@ -346,6 +366,18 @@ struct FuseFrontend::State {
     bool journal_poisoned{};
     std::atomic_uint64_t journal_epoch{1};
     std::atomic_size_t durable_pending_operations{};
+    // Descriptor admission may precede the group-committed data-op frame. Keep
+    // journal compaction from dropping that descriptor in the gap.
+    std::atomic_size_t journal_inflight_admissions{};
+
+    std::mutex durability_mutex;
+    std::condition_variable_any durability_cv;
+    std::deque<std::shared_ptr<DurabilityTicket>> durability_queue;
+    std::jthread durability_worker;
+    bool durability_poisoned{};
+    std::exception_ptr durability_error;
+    std::atomic_uint64_t durability_batches{};
+    std::atomic_uint64_t durability_writes{};
 
     mutable std::mutex namespace_mutex;
     std::map<std::string, std::shared_ptr<Inode>, std::less<>> paths;
@@ -533,25 +565,34 @@ struct FuseFrontend::State {
         journal_poisoned = false;
     }
 
-    void append_journal_record_locked(std::span<const uint8_t> payload) {
-        if (journal_poisoned)
-            throw FsError(EIO, "FUSE operation journal is unavailable after a previous write failure");
+    static Bytes journal_frame(std::span<const uint8_t> payload) {
         if (payload.size() > max_journal_record)
             throw FsError(EFBIG, "FUSE operation journal record too large");
         Writer frame;
         frame.u32(static_cast<uint32_t>(payload.size()));
         frame.raw(payload);
         frame.fixed(sha256(payload).bytes);
+        return frame.data();
+    }
+
+    void append_journal_records_locked(const std::vector<Bytes>& payloads) {
+        if (journal_poisoned)
+            throw FsError(EIO, "FUSE operation journal is unavailable after a previous write failure");
+        if (payloads.empty())
+            return;
         const auto start = ::lseek(journal_fd, 0, SEEK_END);
         if (start < 0)
             throw FsError(errno, "cannot seek FUSE operation journal");
         try {
-            write_exact(journal_fd, frame.data());
+            for (const auto& payload : payloads) {
+                auto frame = journal_frame(payload);
+                write_exact(journal_fd, frame);
+            }
             fsync_fd(journal_fd, "cannot sync FUSE operation journal");
         } catch (...) {
-            // Never leave a known torn frame in front of later successful
-            // records: recovery deliberately stops at the first incomplete
-            // frame. Roll the failed append back to its exact previous end.
+            // A durability batch is all-or-nothing from recovery's point of
+            // view. Do not leave earlier records from a failed batch in front
+            // of later successful records.
             bool rolled_back = false;
             if (::ftruncate(journal_fd, start) == 0) {
                 try {
@@ -566,8 +607,15 @@ struct FuseFrontend::State {
         }
     }
 
+    void append_journal_record_locked(std::span<const uint8_t> payload) {
+        std::vector<Bytes> payloads;
+        payloads.emplace_back(payload.begin(), payload.end());
+        append_journal_records_locked(payloads);
+    }
+
     void reset_journal_locked() {
-        if (durable_pending_operations.load(std::memory_order_relaxed) != 0)
+        if (durable_pending_operations.load(std::memory_order_relaxed) != 0 ||
+            journal_inflight_admissions.load(std::memory_order_relaxed) != 0)
             return;
         if (journal_fd >= 0) {
             ::close(journal_fd);
@@ -620,6 +668,30 @@ struct FuseFrontend::State {
         std::lock_guard lock(journal_mutex);
         append_journal_record_locked(payload.data());
         durable_pending_operations.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void journal_data_batch(const std::vector<std::shared_ptr<DurabilityTicket>>& batch) {
+        std::vector<Bytes> payloads;
+        payloads.reserve(batch.size());
+        for (const auto& ticket : batch) {
+            Writer payload;
+            payload.u8(static_cast<uint8_t>(JournalRecord::data_op));
+            encode_data_op(payload, ticket->inode->id, ticket->op);
+            payloads.push_back(payload.data());
+        }
+
+        std::lock_guard admission_lock(journal_admission_mutex);
+        {
+            std::lock_guard journal_lock(journal_mutex);
+            append_journal_records_locked(payloads);
+        }
+        durable_pending_operations.fetch_add(batch.size(), std::memory_order_relaxed);
+        const auto previous =
+            journal_inflight_admissions.fetch_sub(batch.size(), std::memory_order_relaxed);
+        if (previous < batch.size()) {
+            journal_inflight_admissions.store(0, std::memory_order_relaxed);
+            Log::error("FUSE journal admission accounting underflow after durable batch");
+        }
     }
 
     void journal_namespace_published(uint64_t sequence) {
@@ -880,6 +952,173 @@ struct FuseFrontend::State {
             if (fd >= 0)
                 ::close(fd);
             throw;
+        }
+    }
+
+    void throw_if_durability_poisoned() {
+        std::lock_guard lock(durability_mutex);
+        if (!durability_poisoned)
+            return;
+        if (durability_error)
+            std::rethrow_exception(durability_error);
+        throw FsError(EIO, "FUSE durability coordinator is unavailable");
+    }
+
+    void wait_for_inode_durability(const std::shared_ptr<Inode>& inode,
+                                   Clock::time_point deadline, std::atomic_bool& cancelled) {
+        std::unique_lock lock(inode->mutex);
+        while (inode->durability_pending && !inode->backend_error) {
+            if (deadline == Clock::time_point::max()) {
+                inode->durability_cv.wait(lock);
+            } else if (inode->durability_cv.wait_until(lock, deadline) == std::cv_status::timeout) {
+                check_deadline(deadline, cancelled);
+            }
+        }
+        if (inode->backend_error)
+            throw FsError(*inode->backend_error, "FUSE inode durability error");
+        check_deadline(deadline, cancelled);
+    }
+
+    std::future<void> enqueue_durability(const std::shared_ptr<DurabilityTicket>& ticket) {
+        auto future = ticket->complete.get_future();
+        {
+            std::lock_guard lock(durability_mutex);
+            // Queue even after a concurrent poison transition: the coordinator
+            // owns failure accounting for admitted descriptors and inode state.
+            durability_queue.push_back(ticket);
+        }
+        durability_cv.notify_one();
+        return future;
+    }
+
+    static int durability_error_code(const std::exception_ptr& error) {
+        try {
+            if (error)
+                std::rethrow_exception(error);
+        } catch (const FsError& e) {
+            return e.code();
+        } catch (...) {
+        }
+        return EIO;
+    }
+
+    void fail_durability_batch(const std::vector<std::shared_ptr<DurabilityTicket>>& batch,
+                               const std::exception_ptr& error) {
+        {
+            std::lock_guard admission_lock(journal_admission_mutex);
+            const auto previous =
+                journal_inflight_admissions.fetch_sub(batch.size(), std::memory_order_relaxed);
+            if (previous < batch.size()) {
+                journal_inflight_admissions.store(0, std::memory_order_relaxed);
+                Log::error("FUSE journal admission accounting underflow after durability failure");
+            }
+        }
+        const auto code = durability_error_code(error);
+        for (const auto& ticket : batch) {
+            {
+                std::lock_guard lock(ticket->inode->mutex);
+                ticket->inode->backend_error = code;
+                if (ticket->inode->durability_pending)
+                    --ticket->inode->durability_pending;
+                if (!ticket->inode->durability_pending)
+                    ticket->inode->admitted_size = ticket->inode->visible.size;
+            }
+            ticket->inode->durability_cv.notify_all();
+            try {
+                ticket->complete.set_exception(error);
+            } catch (...) {
+            }
+        }
+    }
+
+    void finish_durability_batch(const std::vector<std::shared_ptr<DurabilityTicket>>& batch) {
+        for (const auto& ticket : batch) {
+            auto inode = ticket->inode;
+            {
+                std::lock_guard lock(inode->mutex);
+                // Tickets are enqueued while holding the inode lock, so their
+                // per-inode sequence order is identical to reservation order.
+                inode->data_ops.push_back(ticket->op);
+                inode->visible.size =
+                    std::max<uint64_t>(inode->visible.size, ticket->op.offset + ticket->op.length);
+                inode->visible.mtime_ns = ticket->op.mtime_ns;
+                inode->visible.ctime_ns = ticket->op.ctime_ns;
+                if (inode->durability_pending)
+                    --inode->durability_pending;
+                if (!inode->durability_pending)
+                    inode->admitted_size = inode->visible.size;
+            }
+            inode->durability_cv.notify_all();
+            ticket->complete.set_value();
+        }
+    }
+
+    void durability_loop(std::stop_token stop) {
+        while (true) {
+            std::vector<std::shared_ptr<DurabilityTicket>> batch;
+            {
+                std::unique_lock lock(durability_mutex);
+                durability_cv.wait(lock, [&] {
+                    return stop.stop_requested() || !durability_queue.empty();
+                });
+                if (durability_queue.empty() && stop.stop_requested())
+                    break;
+
+                // Give concurrently admitted FUSE writes a very small window to
+                // share the two durability barriers. Single writers retain the
+                // same acknowledgement semantics; concurrent writers amortise
+                // spool and journal fsyncs rather than serialising them.
+                if (!stop.stop_requested())
+                    durability_cv.wait_for(lock, std::chrono::milliseconds(2), [&] {
+                        return stop.stop_requested();
+                    });
+                batch.assign(durability_queue.begin(), durability_queue.end());
+                durability_queue.clear();
+                if (durability_poisoned) {
+                    auto error = durability_error ? durability_error : std::make_exception_ptr(
+                        FsError(EIO, "FUSE durability coordinator is unavailable"));
+                    lock.unlock();
+                    fail_durability_batch(batch, error);
+                    continue;
+                }
+            }
+
+            const auto started = Clock::now();
+            try {
+                std::set<int> spool_fds;
+                for (const auto& ticket : batch) {
+                    std::lock_guard lock(ticket->inode->mutex);
+                    if (ticket->inode->spool_fd < 0)
+                        throw FsError(EIO, "missing FUSE write spool during durability commit");
+                    spool_fds.insert(ticket->inode->spool_fd);
+                }
+                for (auto fd : spool_fds)
+                    fsync_fd(fd, "FUSE local spool group sync failed");
+
+                // Payload durability precedes descriptor durability exactly as
+                // before. The only semantic change is that all descriptors in
+                // this batch share one journal fsync.
+                journal_data_batch(batch);
+                finish_durability_batch(batch);
+                durability_batches.fetch_add(1, std::memory_order_relaxed);
+                durability_writes.fetch_add(batch.size(), std::memory_order_relaxed);
+
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now() - started).count();
+                if (Log::enabled(LogLevel::debug) && elapsed >= 100)
+                    Log::debug("DIAG FUSE durability batch writes=" +
+                               std::to_string(batch.size()) + " spool_fds=" +
+                               std::to_string(spool_fds.size()) + " elapsed_ms=" +
+                               std::to_string(elapsed));
+            } catch (...) {
+                auto error = std::current_exception();
+                {
+                    std::lock_guard lock(durability_mutex);
+                    durability_poisoned = true;
+                    durability_error = error;
+                }
+                fail_durability_batch(batch, error);
+            }
         }
     }
 
@@ -1412,7 +1651,7 @@ struct FuseFrontend::State {
                 inode->data_ops.end());
             inode->published_data_sequence =
                 std::max(inode->published_data_sequence, snapshot.target_sequence);
-            if (inode->data_ops.empty() && inode->spool_fd >= 0) {
+            if (inode->data_ops.empty() && !inode->durability_pending && inode->spool_fd >= 0) {
                 if (::ftruncate(inode->spool_fd, 0) == 0) {
                     inode->spool_end = 0;
                     fsync_fd(inode->spool_fd, "cannot sync retired FUSE spool");
@@ -2133,7 +2372,7 @@ struct FuseFrontend::State {
                 inode->data_ops.end());
             inode->unconfirmed_data_entry.reset();
             inode->unconfirmed_data_sequence = 0;
-            if (inode->data_ops.empty() && inode->spool_fd >= 0) {
+            if (inode->data_ops.empty() && !inode->durability_pending && inode->spool_fd >= 0) {
                 if (::ftruncate(inode->spool_fd, 0) != 0) {
                     spool_clean = false;
                     Log::warn("cannot truncate retired FUSE spool inode=" +
@@ -2259,7 +2498,8 @@ struct FuseFrontend::State {
             // in-place content changes and stay attached to the same open inode.
             const bool replaced_open_inode =
                 content_changed &&
-                (!inode->data_ops.empty() || inode->unconfirmed_data_entry ||
+                (!inode->data_ops.empty() || inode->durability_pending ||
+                 inode->unconfirmed_data_entry ||
                  (inode->open_handles != 0 && entry.version <= inode->base.version));
             if (replaced_open_inode && path != "/") {
                 inode->published_path.reset();
@@ -2274,9 +2514,11 @@ struct FuseFrontend::State {
                 continue;
             }
             inode->published_path = path;
-            if (inode->data_ops.empty() && !inode->unconfirmed_data_entry) {
+            if (inode->data_ops.empty() && !inode->durability_pending &&
+                !inode->unconfirmed_data_entry) {
                 inode->base = entry;
                 inode->visible = entry;
+                inode->admitted_size = entry.size;
             }
         }
 
@@ -2300,6 +2542,10 @@ struct FuseFrontend::State {
     void start() {
         auto recovery = load_journal();
         initialise_namespace(std::move(recovery));
+
+        // Local write durability is independent of distributed publication. It
+        // must be available before broker write workers can accept callbacks.
+        durability_worker = std::jthread([this](std::stop_token stop) { durability_loop(stop); });
 
         // Guarantee at least one independent worker for each operation class,
         // then distribute the remaining budget toward reads/writes/lookups.
@@ -2343,6 +2589,15 @@ struct FuseFrontend::State {
         for (auto& queue : broker) {
             queue.cv.notify_all();
             for (auto& worker : queue.workers) if (worker.joinable()) worker.join();
+        }
+
+        // Broker writers wait for their durability tickets. Keep the durability
+        // coordinator alive until all broker workers have returned, then drain
+        // any final admitted batch before stopping it.
+        if (durability_worker.joinable()) {
+            durability_worker.request_stop();
+            durability_cv.notify_all();
+            durability_worker.join();
         }
     }
 };
@@ -2477,6 +2732,7 @@ void FuseFrontend::mkdir(std::string_view path, uint32_t mode, uint32_t uid, uin
             const auto now = wall_time_ns();
             inode->visible.ctime_ns = inode->visible.mtime_ns = now;
             inode->base = inode->visible;
+            inode->admitted_size = inode->visible.size;
             inode->current_path = requested;
             inode->namespace_sequence = state_->next_namespace_sequence++;
 
@@ -2831,6 +3087,8 @@ FuseOpenHandle FuseFrontend::open(std::string_view path, bool readable, bool wri
             std::lock_guard lock(state_->namespace_mutex);
             inode = state_->resolve_locked(requested);
         }
+        if (truncate_on_open)
+            state_->wait_for_inode_durability(inode, deadline, cancelled);
         std::lock_guard inode_lock(inode->mutex);
         if (inode->visible.type != EntryType::file)
             throw FsError(EISDIR, "directory");
@@ -2855,11 +3113,17 @@ FuseOpenHandle FuseFrontend::open(std::string_view path, bool readable, bool wri
             inode->visible.size = 0;
             inode->visible.mtime_ns = now;
             inode->visible.ctime_ns = now;
+            inode->admitted_size = 0;
         }
         ++inode->open_handles;
         if (writable)
             state_->open_writers.fetch_add(1, std::memory_order_relaxed);
-        return FuseOpenHandle{inode->id, readable, writable, append};
+        std::shared_ptr<FuseReadSession> read_session;
+        if (readable) {
+            read_session = std::make_shared<FuseReadSession>();
+            read_session->inode = inode->id;
+        }
+        return FuseOpenHandle{inode->id, readable, writable, append, std::move(read_session)};
     });
 }
 
@@ -2891,6 +3155,7 @@ FuseOpenHandle FuseFrontend::create(std::string_view path, uint32_t mode, uint32
             const auto now = wall_time_ns();
             inode->visible.ctime_ns = inode->visible.mtime_ns = now;
             inode->base = inode->visible;
+            inode->admitted_size = inode->visible.size;
             inode->current_path = requested;
             inode->namespace_sequence = state_->next_namespace_sequence++;
             inode->open_handles = 1;
@@ -2914,13 +3179,19 @@ FuseOpenHandle FuseFrontend::create(std::string_view path, uint32_t mode, uint32
             state_->inodes[inode->id] = inode;
             state_->enqueue_namespace(std::move(op));
         }
-        return FuseOpenHandle{inode->id, readable, writable, append};
+        std::shared_ptr<FuseReadSession> read_session;
+        if (readable) {
+            read_session = std::make_shared<FuseReadSession>();
+            read_session->inode = inode->id;
+        }
+        return FuseOpenHandle{inode->id, readable, writable, append, std::move(read_session)};
     });
 }
 
-size_t FuseFrontend::read(uint64_t inode_id, uint64_t offset, std::span<uint8_t> output) {
+size_t FuseFrontend::read_impl(uint64_t inode_id, const std::shared_ptr<FuseReadSession>& read_session,
+                               uint64_t offset, std::span<uint8_t> output) {
     return dispatch(FuseOperationClass::read,
-                    [this, inode_id, offset, output](Clock::time_point deadline,
+                    [this, inode_id, read_session, offset, output](Clock::time_point deadline,
                                                      std::atomic_bool& cancelled) {
         auto inode = state_->resolve_inode(inode_id);
         FsEntry base;
@@ -2951,7 +3222,20 @@ size_t FuseFrontend::read(uint64_t inode_id, uint64_t offset, std::span<uint8_t>
         if (offset < base_limit) {
             const auto base_count = static_cast<size_t>(
                 std::min<uint64_t>(count, base_limit - offset));
-            auto reader = state_->fs.open_read(base, logical_path, false, FrameType::read_ahead);
+            std::shared_ptr<ReadHandle> reader;
+            if (read_session) {
+                std::lock_guard session_lock(read_session->mutex);
+                if (read_session->inode != inode_id)
+                    throw FsError(EBADF, "FUSE read session inode mismatch");
+                if (!read_session->reader || read_session->base_version != base.version) {
+                    read_session->reader =
+                        state_->fs.open_read(base, logical_path, false, FrameType::read_ahead);
+                    read_session->base_version = base.version;
+                }
+                reader = read_session->reader;
+            } else {
+                reader = state_->fs.open_read(base, logical_path, false, FrameType::read_ahead);
+            }
             size_t done = 0;
             while (done < base_count) {
                 check_deadline(deadline, cancelled);
@@ -3023,6 +3307,17 @@ size_t FuseFrontend::read(uint64_t inode_id, uint64_t offset, std::span<uint8_t>
     });
 }
 
+size_t FuseFrontend::read(uint64_t inode_id, uint64_t offset, std::span<uint8_t> output) {
+    return read_impl(inode_id, {}, offset, output);
+}
+
+size_t FuseFrontend::read(const FuseOpenHandle& handle, uint64_t offset,
+                          std::span<uint8_t> output) {
+    if (!handle.readable)
+        throw FsError(EBADF, "FUSE handle is not readable");
+    return read_impl(handle.inode, handle.read_session, offset, output);
+}
+
 size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const uint8_t> data,
                            bool append) {
     Bytes owned(data.begin(), data.end());
@@ -3030,66 +3325,80 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
                     [this, inode_id, offset, append, owned = std::move(owned)](
                         Clock::time_point deadline, std::atomic_bool& cancelled) {
         auto inode = state_->resolve_inode(inode_id);
-        std::lock_guard lock(inode->mutex);
+        state_->throw_if_durability_poisoned();
         check_deadline(deadline, cancelled);
-        if (inode->visible.type != EntryType::file)
-            throw FsError(EISDIR, "directory");
-        if (inode->backend_error)
-            throw FsError(*inode->backend_error, "asynchronous backend error");
-        const auto target = append ? inode->visible.size : offset;
-        const auto fd = state_->ensure_spool_locked(inode);
-        const auto spool_offset = inode->spool_end;
-        const auto rollback_unacknowledged_tail = [&] {
-            // No durable operation points at [spool_offset, end), so a failed
-            // request must not leave that tail looking like accepted work.
-            if (::ftruncate(fd, static_cast<off_t>(spool_offset)) == 0) {
-                try {
-                    fsync_fd(fd, "cannot sync rolled-back FUSE spool");
-                } catch (const std::exception& e) {
-                    Log::error("cannot sync rolled-back FUSE spool inode=" +
-                               std::to_string(inode->id) + " error=" + e.what());
-                }
-            } else {
-                Log::error("cannot roll back unacknowledged FUSE spool tail inode=" +
-                           std::to_string(inode->id) + " error=" + std::strerror(errno));
+
+        auto ticket = std::make_shared<State::DurabilityTicket>();
+        ticket->inode = inode;
+        std::future<void> durable;
+        uint64_t spool_offset = 0;
+        int fd = -1;
+        {
+            std::lock_guard lock(inode->mutex);
+            if (inode->visible.type != EntryType::file)
+                throw FsError(EISDIR, "directory");
+            if (inode->backend_error)
+                throw FsError(*inode->backend_error, "asynchronous backend error");
+            if (!inode->durability_pending)
+                inode->admitted_size = inode->visible.size;
+
+            const auto target = append ? inode->admitted_size : offset;
+            fd = state_->ensure_spool_locked(inode);
+            spool_offset = inode->spool_end;
+            const auto seq = inode->next_data_sequence;
+            const auto now = wall_time_ns();
+            ticket->op.kind = State::DataOp::Kind::write;
+            ticket->op.sequence = seq;
+            ticket->op.offset = target;
+            ticket->op.length = static_cast<uint64_t>(owned.size());
+            ticket->op.spool_offset = spool_offset;
+            ticket->op.mtime_ns = now;
+            ticket->op.ctime_ns = now;
+
+            // Keep the inode descriptor alive across the asynchronous gap between
+            // payload admission and the group-committed data-op frame. The
+            // admission count prevents journal compaction in that gap.
+            {
+                std::lock_guard journal_admission(state_->journal_admission_mutex);
+                state_->journal_inode_locked(inode);
+                state_->journal_inflight_admissions.fetch_add(1, std::memory_order_relaxed);
             }
-        };
 
-        const auto seq = inode->next_data_sequence;
-        const auto now = wall_time_ns();
-        State::DataOp op;
-        op.kind = State::DataOp::Kind::write;
-        op.sequence = seq;
-        op.offset = target;
-        op.length = static_cast<uint64_t>(owned.size());
-        op.spool_offset = spool_offset;
-        op.mtime_ns = now;
-        op.ctime_ns = now;
-        try {
-            if (pwrite_exact(fd, owned, spool_offset) != owned.size())
-                throw FsError(errno ? errno : EIO, "short FUSE spool write");
+            try {
+                if (pwrite_exact(fd, owned, spool_offset) != owned.size())
+                    throw FsError(errno ? errno : EIO, "short FUSE spool write");
+            } catch (...) {
+                {
+                    std::lock_guard journal_admission(state_->journal_admission_mutex);
+                    const auto previous = state_->journal_inflight_admissions.fetch_sub(
+                        1, std::memory_order_relaxed);
+                    if (!previous)
+                        state_->journal_inflight_admissions.store(0, std::memory_order_relaxed);
+                }
+                // No later reservation can exist while this inode lock is held,
+                // so the failed, unacknowledged tail can be removed exactly.
+                if (::ftruncate(fd, static_cast<off_t>(spool_offset)) == 0) {
+                    try {
+                        fsync_fd(fd, "cannot sync rolled-back FUSE spool");
+                    } catch (const std::exception& e) {
+                        Log::error("cannot sync rolled-back FUSE spool inode=" +
+                                   std::to_string(inode->id) + " error=" + e.what());
+                    }
+                }
+                throw;
+            }
 
-            // A successful write means both payload and intent survive a daemon
-            // restart. Sync the bytes first, then append+sync the descriptor
-            // which makes those bytes reachable.
-            fsync_fd(fd, "FUSE local spool write sync failed");
-            check_deadline(deadline, cancelled);
-            std::lock_guard journal_admission(state_->journal_admission_mutex);
-            state_->journal_inode_locked(inode);
-            state_->journal_data_operation(inode->id, op);
-        } catch (...) {
-            // The write has not been acknowledged. Recovery can also preserve
-            // an unexplained tail if the process dies before this rollback, but
-            // while still alive we return the spool to its exact admitted end.
-            rollback_unacknowledged_tail();
-            throw;
+            inode->spool_end += owned.size();
+            inode->admitted_size =
+                std::max<uint64_t>(inode->admitted_size, target + owned.size());
+            inode->next_data_sequence = seq + 1;
+            ++inode->durability_pending;
+            // Queue while still holding the inode lock so per-inode journal
+            // sequence order exactly follows spool reservation order.
+            durable = state_->enqueue_durability(ticket);
         }
-        inode->next_data_sequence = seq + 1;
-        inode->data_ops.push_back(op);
-        inode->spool_end += owned.size();
-        inode->visible.size = std::max<uint64_t>(inode->visible.size, target + owned.size());
-        inode->visible.mtime_ns = now;
-        inode->visible.ctime_ns = now;
+
+        durable.get();
         return owned.size();
     });
 }
@@ -3098,6 +3407,7 @@ void FuseFrontend::truncate(uint64_t inode_id, uint64_t size) {
     dispatch(FuseOperationClass::write,
              [this, inode_id, size](Clock::time_point deadline, std::atomic_bool& cancelled) {
         auto inode = state_->resolve_inode(inode_id);
+        state_->wait_for_inode_durability(inode, deadline, cancelled);
         std::lock_guard lock(inode->mutex);
         check_deadline(deadline, cancelled);
         if (inode->visible.type != EntryType::file)
@@ -3122,6 +3432,7 @@ void FuseFrontend::truncate(uint64_t inode_id, uint64_t size) {
         inode->visible.size = size;
         inode->visible.mtime_ns = now;
         inode->visible.ctime_ns = now;
+        inode->admitted_size = size;
     });
 }
 
@@ -3137,6 +3448,7 @@ void FuseFrontend::flush(uint64_t inode_id) {
              [this, inode_id](Clock::time_point deadline, std::atomic_bool& cancelled) {
         check_deadline(deadline, cancelled);
         auto inode = state_->resolve_inode(inode_id);
+        state_->wait_for_inode_durability(inode, deadline, cancelled);
         state_->request_data_publication(inode);
     });
 }
@@ -3145,6 +3457,7 @@ void FuseFrontend::fsync(uint64_t inode_id) {
     dispatch(FuseOperationClass::sync,
              [this, inode_id](Clock::time_point deadline, std::atomic_bool& cancelled) {
         auto inode = state_->resolve_inode(inode_id);
+        state_->wait_for_inode_durability(inode, deadline, cancelled);
         int fd = -1;
         {
             std::lock_guard lock(inode->mutex);
@@ -3174,6 +3487,8 @@ void FuseFrontend::release(uint64_t inode_id, bool writable) {
              [this, inode_id, writable](Clock::time_point deadline, std::atomic_bool& cancelled) {
         check_deadline(deadline, cancelled);
         auto inode = state_->resolve_inode(inode_id);
+        if (writable)
+            state_->wait_for_inode_durability(inode, deadline, cancelled);
         // flush()/fsync() are already write-handle-only in the adapter. Keep
         // release symmetric: closing a read-only descriptor must not publish
         // dirty data belonging to another writer on the same inode.
@@ -3262,6 +3577,8 @@ FuseFrontendStatus FuseFrontend::status() const {
     out.timed_out_requests = state_->timed_out_requests.load();
     out.merged_publications = state_->merged_publications.load();
     out.backend_failures = state_->backend_failures.load();
+    out.durability_batches = state_->durability_batches.load();
+    out.durability_writes = state_->durability_writes.load();
     return out;
 }
 

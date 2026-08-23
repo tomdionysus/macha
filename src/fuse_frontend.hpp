@@ -45,11 +45,14 @@ struct FuseEntryAttributes {
     uint64_t version{1};
 };
 
+class FuseReadSession;
+
 struct FuseOpenHandle {
     uint64_t inode{};
     bool readable{};
     bool writable{};
     bool append{};
+    std::shared_ptr<FuseReadSession> read_session;
 };
 
 struct FuseFrontendStatus {
@@ -60,6 +63,8 @@ struct FuseFrontendStatus {
     uint64_t timed_out_requests{};
     uint64_t merged_publications{};
     uint64_t backend_failures{};
+    uint64_t durability_batches{};
+    uint64_t durability_writes{};
 };
 
 struct FuseDirtyRange {
@@ -78,6 +83,8 @@ class FuseFrontend final : public HydrationHintProvider {
     std::chrono::milliseconds timeout_for(FuseOperationClass) const;
     bool submit_task(FuseOperationClass, Clock::time_point, std::shared_ptr<std::atomic_bool>,
                      std::function<void(Clock::time_point, std::atomic_bool&)>);
+    size_t read_impl(uint64_t inode, const std::shared_ptr<FuseReadSession>&,
+                     uint64_t offset, std::span<uint8_t>);
 
     template <class Fn>
     auto dispatch(FuseOperationClass operation, Fn&& fn)
@@ -202,6 +209,7 @@ class FuseFrontend final : public HydrationHintProvider {
     FuseOpenHandle create(std::string_view path, uint32_t mode, uint32_t uid, uint32_t gid,
                           bool readable, bool writable, bool append);
     size_t read(uint64_t inode, uint64_t offset, std::span<uint8_t>);
+    size_t read(const FuseOpenHandle&, uint64_t offset, std::span<uint8_t>);
     size_t write(uint64_t inode, uint64_t offset, std::span<const uint8_t>, bool append = false);
     void truncate(uint64_t inode, uint64_t size);
     void truncate(std::string_view path, uint64_t size);

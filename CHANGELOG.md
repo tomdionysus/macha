@@ -2,6 +2,7 @@
 
 ## 0.14.12 - 2026-08-23
 
+- retain one immutable `ReadHandle` per open readable FUSE descriptor so sequential callbacks reuse the already fetched/decrypted extent, and group concurrent local spool durability commits so payload fsyncs and operation-journal fsyncs are amortised without weakening the existing acknowledged-write crash guarantee;
 - make the FUSE payload spool and durable operation journal independently configurable with `fuse.spool_path` and `fuse.operation_journal_path`; omitting them preserves the existing `state_path/fuse-spool` and `<spool>/operations.log` locations;
 - preserve non-empty FUSE spool files which have no recoverable operation-journal attribution as durable `*.orphan.*` quarantine artifacts instead of aborting frontend startup and unwinding the whole node; the bytes are never guessed at or replayed without descriptors, but an upgrade/recovery artifact can no longer terminate RPC membership and continuous peer reconnect/backoff;
 - keep journal-referenced missing/short spools fail-closed, because those cases prove that durable operation metadata exists for bytes which are actually unavailable and therefore cannot be safely reconstructed.
