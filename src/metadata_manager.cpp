@@ -1216,7 +1216,7 @@ MetadataRecord MetadataManager::discover_or_form() {
         auto recovery = recover_from_committed_checkpoints(active);
         if (recovery.recovered)
             return cache_record(*recovery.recovered);
-        throw std::runtime_error(
+        throw MetadataNotReady(
             "no discovered metadata voter group has quorum; waiting for replacement recovery");
     }
 
@@ -1226,8 +1226,8 @@ MetadataRecord MetadataManager::discover_or_form() {
 
     const size_t target = node_.config().metadata_replication;
     if (active.size() < target) {
-        throw std::runtime_error("metadata group forming: need " + std::to_string(target) +
-                                 " active nodes, have " + std::to_string(active.size()));
+        throw MetadataNotReady("metadata group forming: need " + std::to_string(target) +
+                               " active nodes, have " + std::to_string(active.size()));
     }
     // A configured joiner must not invent a namespace until active bootstrap
     // peers have positively proved that no committed post-genesis history
@@ -1235,7 +1235,7 @@ MetadataRecord MetadataManager::discover_or_form() {
     // complete; an inconclusive survey always fails closed.
     if (!node_.config().bootstrap.empty()) {
         if (active.size() == 1)
-            throw std::runtime_error("metadata group forming: waiting for bootstrap peer");
+            throw MetadataNotReady("metadata group forming: waiting for bootstrap peer");
         // A configured joiner may only create genesis after every currently
         // active member has positively answered the committed-checkpoint survey
         // and that survey proves there is no durable post-genesis history. A
@@ -1243,10 +1243,10 @@ MetadataRecord MetadataManager::discover_or_form() {
         // one, rendezvous could otherwise select the fresh node itself and let it
         // create an empty namespace while a survivor still holds the real cluster.
         if (!recovery.complete)
-            throw std::runtime_error(
+            throw MetadataNotReady(
                 "metadata group forming: waiting for bootstrap checkpoint survey");
         if (recovery.durable_history)
-            throw std::runtime_error(
+            throw MetadataNotReady(
                 "metadata group forming: durable bootstrap metadata requires recovery");
     }
 
@@ -1290,7 +1290,7 @@ MetadataRecord MetadataManager::discover_or_form() {
         }
     }
 
-    throw std::runtime_error("metadata voter group formation quorum unavailable");
+    throw MetadataNotReady("metadata voter group formation quorum unavailable");
 }
 
 MetadataRecord MetadataManager::read_record_base() {

@@ -1893,8 +1893,23 @@ struct FuseFrontend::State {
             sync_directory(spool_dir);
     }
 
+    MetadataSnapshotView wait_for_initial_namespace() {
+        bool announced = false;
+        for (;;) {
+            try {
+                return fs.local_snapshot_view();
+            } catch (const MetadataNotReady& error) {
+                if (!announced) {
+                    Log::debug("FUSE waiting for initial metadata: " + std::string(error.what()));
+                    announced = true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+    }
+
     void initialise_namespace(JournalRecovery recovery) {
-        auto view = fs.local_snapshot_view();
+        auto view = wait_for_initial_namespace();
         const auto& snapshot = *view.snapshot;
         std::filesystem::create_directories(spool_dir);
         reconcile_recovery(recovery, snapshot);
