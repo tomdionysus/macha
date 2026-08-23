@@ -3596,6 +3596,68 @@ void test_open_write_survives_rename() {
 }
 
 
+void test_fuse_frontend_accepts_metadata_after_genesis_wait() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+
+    auto c1 = config_for(t.path() / "genesis-n1", keyfile, p1);
+    auto c2 = config_for(t.path() / "genesis-n2", keyfile, p2, {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 1;
+    c1.metadata_replication = c2.metadata_replication = 2;
+
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+
+    bool waiting = false;
+    try {
+        (void)s1.filesystem().local_snapshot_view();
+    } catch (const MetadataNotReady&) {
+        waiting = true;
+    }
+    REQUIRE(waiting);
+
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }));
+
+    REQUIRE(wait_until([&] {
+        try {
+            (void)s1.filesystem().local_snapshot_view();
+            return true;
+        } catch (const MetadataNotReady&) {
+            return false;
+        }
+    }));
+    REQUIRE(wait_until([&] {
+        try {
+            (void)s2.filesystem().local_snapshot_view();
+            return true;
+        } catch (const MetadataNotReady&) {
+            return false;
+        }
+    }));
+
+    auto f1 = std::make_shared<FuseFrontend>(s1.filesystem(), c1.fuse);
+    auto f2 = std::make_shared<FuseFrontend>(s2.filesystem(), c2.fuse);
+    CHECK(s1.node().metadata_replica().current().generation > 1);
+    CHECK(s2.node().metadata_replica().current().generation > 1);
+
+    f1->stop();
+    f2->stop();
+    f1.reset();
+    f2.reset();
+    s2.stop();
+    s1.stop();
+}
+
+
 void test_fuse_frontend_ordering_merging_and_cache() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
@@ -8387,6 +8449,7 @@ int main() {
         RUN_TEST(test_fresh_and_resumed_write_exactness);
         RUN_TEST(test_active_write_size_visibility);
         RUN_TEST(test_open_write_survives_rename);
+        RUN_TEST(test_fuse_frontend_accepts_metadata_after_genesis_wait);
         RUN_TEST(test_fuse_frontend_ordering_merging_and_cache);
         RUN_TEST(test_fuse_publication_yields_to_playback);
         RUN_TEST(test_fuse_durable_journal_recovers_namespace_and_data);

@@ -9,8 +9,18 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 
 namespace macha {
+
+// Metadata discovery can legitimately be incomplete while a new cluster is
+// forming or while a previously committed voter group is recovering.  This is
+// a lifecycle state, not a daemon-fatal error.
+class MetadataNotReady final : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
+
 struct MetadataSnapshotView {
     uint64_t generation{};
     uint64_t namespace_revision{};
