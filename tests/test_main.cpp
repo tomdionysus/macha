@@ -30,6 +30,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <latch>
 #include <mutex>
 #include <netinet/in.h>
 #include <openssl/crypto.h>
@@ -4434,6 +4435,132 @@ void test_fuse_frontend_read_overlay_truncate_and_hydration_hints() {
     service.stop();
 }
 
+
+void test_fuse_group_commit_batches_concurrent_writes() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-group-commit", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.fuse.publication_quiet = 30s;
+    config.fuse.request_workers = 24;
+
+    Service service(config, keys);
+    service.start();
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto handle = frontend->create("/batch.bin", 0644, getuid(), getgid(), true, true, false);
+
+        constexpr size_t writers = 12;
+        constexpr size_t chunk_size = 32 * 1024;
+        std::latch ready(writers);
+        std::latch start(1);
+        std::vector<std::thread> threads;
+        std::vector<Bytes> chunks;
+        chunks.reserve(writers);
+        for (size_t i = 0; i < writers; ++i) {
+            auto chunk = pattern(chunk_size);
+            for (auto& byte : chunk)
+                byte ^= static_cast<uint8_t>(i * 17U + 3U);
+            chunks.push_back(std::move(chunk));
+        }
+        std::atomic_size_t completed{};
+        std::mutex error_mutex;
+        std::exception_ptr error;
+        for (size_t i = 0; i < writers; ++i) {
+            threads.emplace_back([&, i] {
+                ready.count_down();
+                start.wait();
+                try {
+                    if (frontend->write(handle.inode, i * chunk_size, chunks[i]) == chunk_size)
+                        completed.fetch_add(1, std::memory_order_relaxed);
+                } catch (...) {
+                    std::lock_guard lock(error_mutex);
+                    if (!error) error = std::current_exception();
+                }
+            });
+        }
+        ready.wait();
+        start.count_down();
+        for (auto& thread : threads)
+            thread.join();
+        if (error)
+            std::rethrow_exception(error);
+        REQUIRE(completed.load() == writers);
+
+        auto status = frontend->status();
+        CHECK(status.durability_writes == writers);
+        // Concurrent write callbacks must share at least one durability batch;
+        // otherwise the frontend has regressed to an fsync pair per request.
+        CHECK(status.durability_batches < status.durability_writes);
+
+        Bytes actual(writers * chunk_size);
+        REQUIRE(frontend->read(handle, 0, actual) == actual.size());
+        for (size_t i = 0; i < writers; ++i)
+            CHECK(std::equal(chunks[i].begin(), chunks[i].end(),
+                             actual.begin() + static_cast<ptrdiff_t>(i * chunk_size)));
+
+        frontend->release(handle.inode, true);
+    }
+    service.stop();
+}
+
+void test_fuse_open_read_reuses_extent_until_manifest_changes() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-open-read-cache", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.extent_size = 1024 * 1024;
+
+    Service service(config, keys);
+    service.start();
+    auto bytes = pattern(config.extent_size * 2);
+    service.filesystem().create_file("/read-cache.bin", 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write("/read-cache.bin", true);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    writer.reset();
+    auto entry = service.filesystem().getattr("/read-cache.bin");
+    REQUIRE(entry.extents.size() >= 2);
+
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto handle = frontend->open("/read-cache.bin", true, false, false, false);
+
+        Bytes first(4096);
+        REQUIRE(frontend->read(handle, 0, first) == first.size());
+        CHECK(std::equal(first.begin(), first.end(), bytes.begin()));
+
+        // ReadHandle caches the whole immutable extent. Removing the backing
+        // object after the first callback makes reuse observable: a second read
+        // through the same open FUSE handle must still be served from that
+        // retained extent, whereas constructing a new ReadHandle per callback
+        // would immediately fail here.
+        service.filesystem().store().erase_all(entry.extents.front().id);
+        Bytes second(4096);
+        REQUIRE(frontend->read(handle, 8192, second) == second.size());
+        CHECK(std::equal(second.begin(), second.end(), bytes.begin() + 8192));
+
+        auto fresh = frontend->open("/read-cache.bin", true, false, false, false);
+        bool unavailable = false;
+        try {
+            Bytes probe(4096);
+            (void)frontend->read(fresh, 16384, probe);
+        } catch (const FsError& e) {
+            unavailable = e.code() == EIO || e.code() == ETIMEDOUT;
+        }
+        CHECK(unavailable);
+        frontend->release(fresh.inode, false);
+        frontend->release(handle.inode, false);
+    }
+    service.stop();
+}
+
 void test_fuse_frontend_namespace_refresh_is_demand_driven() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
@@ -8581,6 +8708,8 @@ int main() {
         RUN_TEST(test_fuse_read_only_release_does_not_publish_writer_data);
         RUN_TEST(test_fuse_frontend_unlink_and_rename_over_open_inode_ordering);
         RUN_TEST(test_fuse_frontend_read_overlay_truncate_and_hydration_hints);
+        RUN_TEST(test_fuse_group_commit_batches_concurrent_writes);
+        RUN_TEST(test_fuse_open_read_reuses_extent_until_manifest_changes);
         RUN_TEST(test_fuse_frontend_namespace_refresh_is_demand_driven);
         RUN_TEST(test_full_replica_fallback);
         RUN_TEST(test_replacement_node_recovers_namespace_and_replication);
