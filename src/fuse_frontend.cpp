@@ -244,6 +244,11 @@ struct FuseFrontend::State {
         uint64_t namespace_sequence{};
         uint64_t next_data_sequence{1};
         uint64_t requested_data_sequence{};
+        // Highest write/truncate sequence whose spool bytes and journal record
+        // have completed the local durability barrier. data_ops may also contain
+        // newer POSIX-buffered writes which are visible through this node but
+        // are not eligible for distributed publication yet.
+        uint64_t durable_data_sequence{};
         uint64_t published_data_sequence{};
         uint64_t requested_namespace_sequence{};
         std::vector<DataOp> data_ops;
@@ -334,7 +339,6 @@ struct FuseFrontend::State {
     struct DurabilityTicket {
         std::shared_ptr<Inode> inode;
         DataOp op;
-        std::promise<void> complete;
     };
 
     struct BrokerQueue {
@@ -979,8 +983,39 @@ struct FuseFrontend::State {
         check_deadline(deadline, cancelled);
     }
 
-    std::future<void> enqueue_durability(const std::shared_ptr<DurabilityTicket>& ticket) {
-        auto future = ticket->complete.get_future();
+    uint64_t durable_sequence(const std::shared_ptr<Inode>& inode) const {
+        std::lock_guard lock(inode->mutex);
+        return inode->durable_data_sequence;
+    }
+
+    void wait_for_inode_publication(const std::shared_ptr<Inode>& inode, uint64_t target,
+                                    Clock::time_point deadline, std::atomic_bool& cancelled) {
+        if (!target)
+            return;
+        std::unique_lock queue_lock(data_queue_mutex);
+        while (true) {
+            {
+                std::lock_guard inode_lock(inode->mutex);
+                if (inode->backend_error)
+                    throw FsError(*inode->backend_error, "FUSE inode publication error");
+                // replay_data advances this only after WriteHandle::commit() has
+                // made every referenced extent durable to the configured data
+                // policy and committed the resulting file metadata. Local
+                // snapshot confirmation/overlay retirement may lag, but cluster
+                // durability has already been achieved at this watermark.
+                if (inode->published_data_sequence >= target)
+                    return;
+            }
+            check_deadline(deadline, cancelled);
+            if (deadline == Clock::time_point::max()) {
+                data_cv.wait(queue_lock);
+            } else if (data_cv.wait_until(queue_lock, deadline) == std::cv_status::timeout) {
+                check_deadline(deadline, cancelled);
+            }
+        }
+    }
+
+    void enqueue_durability(const std::shared_ptr<DurabilityTicket>& ticket) {
         {
             std::lock_guard lock(durability_mutex);
             // Queue even after a concurrent poison transition: the coordinator
@@ -988,7 +1023,6 @@ struct FuseFrontend::State {
             durability_queue.push_back(ticket);
         }
         durability_cv.notify_one();
-        return future;
     }
 
     static int durability_error_code(const std::exception_ptr& error) {
@@ -1024,10 +1058,6 @@ struct FuseFrontend::State {
                     ticket->inode->admitted_size = ticket->inode->visible.size;
             }
             ticket->inode->durability_cv.notify_all();
-            try {
-                ticket->complete.set_exception(error);
-            } catch (...) {
-            }
         }
     }
 
@@ -1036,20 +1066,19 @@ struct FuseFrontend::State {
             auto inode = ticket->inode;
             {
                 std::lock_guard lock(inode->mutex);
-                // Tickets are enqueued while holding the inode lock, so their
-                // per-inode sequence order is identical to reservation order.
-                inode->data_ops.push_back(ticket->op);
-                inode->visible.size =
-                    std::max<uint64_t>(inode->visible.size, ticket->op.offset + ticket->op.length);
-                inode->visible.mtime_ns = ticket->op.mtime_ns;
-                inode->visible.ctime_ns = ticket->op.ctime_ns;
+                // write() made the operation immediately visible before it
+                // returned. The durability worker only advances the publication
+                // watermark after payload -> journal ordering is on stable
+                // storage. A single worker consumes tickets FIFO, so per-inode
+                // sequences become durable in admission order.
+                inode->durable_data_sequence =
+                    std::max(inode->durable_data_sequence, ticket->op.sequence);
                 if (inode->durability_pending)
                     --inode->durability_pending;
                 if (!inode->durability_pending)
                     inode->admitted_size = inode->visible.size;
             }
             inode->durability_cv.notify_all();
-            ticket->complete.set_value();
         }
     }
 
@@ -1064,12 +1093,14 @@ struct FuseFrontend::State {
                 if (durability_queue.empty() && stop.stop_requested())
                     break;
 
-                // Give concurrently admitted FUSE writes a very small window to
-                // share the two durability barriers. Single writers retain the
-                // same acknowledgement semantics; concurrent writers amortise
-                // spool and journal fsyncs rather than serialising them.
+                // POSIX write() acknowledgement is decoupled from stable
+                // storage, so even one sequential writer can place several
+                // operations in this queue before the barrier runs. Give those
+                // admissions a very small coalescing window and amortise the
+                // spool+journal fsync pair across the batch. close/release and
+                // fsync explicitly wait for the resulting durability watermark.
                 if (!stop.stop_requested())
-                    durability_cv.wait_for(lock, std::chrono::milliseconds(2), [&] {
+                    durability_cv.wait_for(lock, std::chrono::milliseconds(25), [&] {
                         return stop.stop_requested();
                     });
                 batch.assign(durability_queue.begin(), durability_queue.end());
@@ -1095,9 +1126,11 @@ struct FuseFrontend::State {
                 for (auto fd : spool_fds)
                     fsync_fd(fd, "FUSE local spool group sync failed");
 
-                // Payload durability precedes descriptor durability exactly as
-                // before. The only semantic change is that all descriptors in
-                // this batch share one journal fsync.
+                // Payload durability always precedes descriptor durability.
+                // A process/power failure before this point may lose an
+                // acknowledged-but-not-synchronised write (normal POSIX write
+                // semantics), but recovery can never observe a durable data-op
+                // descriptor whose spool bytes were not made durable first.
                 journal_data_batch(batch);
                 finish_durability_batch(batch);
                 durability_batches.fetch_add(1, std::memory_order_relaxed);
@@ -1310,9 +1343,13 @@ struct FuseFrontend::State {
         bool enqueue = false;
         {
             std::lock_guard inode_lock(inode->mutex);
-            if (inode->data_ops.empty())
+            if (inode->data_ops.empty() ||
+                inode->durable_data_sequence <= inode->published_data_sequence)
                 return;
-            inode->requested_data_sequence = inode->data_ops.back().sequence;
+            // Never expose acknowledged-but-not-yet-durable local writes to the
+            // distributed publication path. They remain a node-local overlay
+            // until the durability worker advances this watermark.
+            inode->requested_data_sequence = inode->durable_data_sequence;
             inode->requested_namespace_sequence = inode->namespace_sequence;
             // Only one committed-but-not-yet-observed data generation may be in
             // flight for an inode. Keeping later writes in the durable overlay
@@ -1679,10 +1716,11 @@ struct FuseFrontend::State {
                 }
                 uint64_t done = 0;
                 while (done < op.length) {
-                    // The write bytes and their operation descriptor were fsynced
-                    // before acknowledgement. Distributed publication is therefore
-                    // convergence work and may yield to viewer playback between
-                    // bounded replay chunks without losing accepted input.
+                    // Only the locally durable prefix reaches this path. The
+                    // write bytes and operation descriptor have completed the
+                    // spool -> journal durability barrier, so distributed
+                    // publication may yield to viewer playback between bounded
+                    // replay chunks without endangering recoverable input.
                     wait_for_playback_quiet();
                     const auto chunk = static_cast<size_t>(
                         std::min<uint64_t>(buffer.size(), op.length - done));
@@ -2231,8 +2269,12 @@ struct FuseFrontend::State {
                 }
             }
             apply_pending_data_metadata(*inode, inode->data_ops);
-            if (!inode->data_ops.empty())
-                inode->requested_data_sequence = inode->data_ops.back().sequence;
+            if (!inode->data_ops.empty()) {
+                inode->durable_data_sequence = inode->data_ops.back().sequence;
+                inode->requested_data_sequence = inode->durable_data_sequence;
+            } else {
+                inode->durable_data_sequence = done;
+            }
             auto published = recovery.data_published.find(id);
             if (published != recovery.data_published.end() && published->second.first > done) {
                 inode->published_data_sequence = published->second.first;
@@ -3110,6 +3152,7 @@ FuseOpenHandle FuseFrontend::open(std::string_view path, bool readable, bool wri
             }
             inode->next_data_sequence = seq + 1;
             inode->data_ops.push_back(op);
+            inode->durable_data_sequence = seq;
             inode->visible.size = 0;
             inode->visible.mtime_ns = now;
             inode->visible.ctime_ns = now;
@@ -3330,7 +3373,6 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
 
         auto ticket = std::make_shared<State::DurabilityTicket>();
         ticket->inode = inode;
-        std::future<void> durable;
         uint64_t spool_offset = 0;
         int fd = -1;
         {
@@ -3392,13 +3434,30 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
             inode->admitted_size =
                 std::max<uint64_t>(inode->admitted_size, target + owned.size());
             inode->next_data_sequence = seq + 1;
+
+            // POSIX write() makes accepted bytes immediately visible to this
+            // node, but does not imply stable storage. Keep the operation in the
+            // local overlay now; the durability worker advances
+            // durable_data_sequence only after spool fsync -> journal append ->
+            // journal fsync. Distributed publication is clamped to that durable
+            // prefix, so relaxing write acknowledgement cannot expose an
+            // unstable generation to other nodes or metadata quorum.
+            inode->data_ops.push_back(ticket->op);
+            inode->visible.size =
+                std::max<uint64_t>(inode->visible.size, target + owned.size());
+            inode->visible.mtime_ns = now;
+            inode->visible.ctime_ns = now;
             ++inode->durability_pending;
+
             // Queue while still holding the inode lock so per-inode journal
             // sequence order exactly follows spool reservation order.
-            durable = state_->enqueue_durability(ticket);
+            state_->enqueue_durability(ticket);
         }
 
-        durable.get();
+        // Normal POSIX semantics: successful write() means the bytes have been
+        // accepted by this filesystem instance, not that they have reached
+        // stable storage. release()/close waits for local spool+journal
+        // durability; fsync additionally waits for distributed publication.
         return owned.size();
     });
 }
@@ -3429,6 +3488,7 @@ void FuseFrontend::truncate(uint64_t inode_id, uint64_t size) {
         }
         inode->next_data_sequence = seq + 1;
         inode->data_ops.push_back(op);
+        inode->durable_data_sequence = seq;
         inode->visible.size = size;
         inode->visible.mtime_ns = now;
         inode->visible.ctime_ns = now;
@@ -3448,8 +3508,11 @@ void FuseFrontend::flush(uint64_t inode_id) {
              [this, inode_id](Clock::time_point deadline, std::atomic_bool& cancelled) {
         check_deadline(deadline, cancelled);
         auto inode = state_->resolve_inode(inode_id);
-        state_->wait_for_inode_durability(inode, deadline, cancelled);
+        // POSIX flush is not a stable-storage barrier. Opportunistically publish
+        // whatever prefix has already completed local durability and return;
+        // release() is the close-time local durability boundary.
         state_->request_data_publication(inode);
+        check_deadline(deadline, cancelled);
     });
 }
 
@@ -3457,28 +3520,21 @@ void FuseFrontend::fsync(uint64_t inode_id) {
     dispatch(FuseOperationClass::sync,
              [this, inode_id](Clock::time_point deadline, std::atomic_bool& cancelled) {
         auto inode = state_->resolve_inode(inode_id);
+
+        // First make every accepted local write recoverable. The durability
+        // worker enforces payload fsync -> journal append -> journal fsync, so no
+        // extra per-fd fsync is required here once the watermark is reached.
         state_->wait_for_inode_durability(inode, deadline, cancelled);
-        int fd = -1;
-        {
-            std::lock_guard lock(inode->mutex);
-            if (inode->spool_fd >= 0)
-                fd = ::dup(inode->spool_fd);
-        }
-        if (fd >= 0) {
-            int rc;
-            do { rc = ::fsync(fd); } while (rc != 0 && errno == EINTR);
-            const int saved = errno;
-            ::close(fd);
-            if (rc != 0)
-                throw FsError(saved, "FUSE local spool fsync failed");
-        }
-        {
-            std::lock_guard journal_lock(state_->journal_mutex);
-            if (state_->journal_fd >= 0)
-                fsync_fd(state_->journal_fd, "FUSE local operation journal fsync failed");
-        }
+        const auto target = state_->durable_sequence(inode);
         check_deadline(deadline, cancelled);
+
+        // Macha's fsync is deliberately stronger than merely syncing the local
+        // staging file: require the durable prefix to finish its normal
+        // DistributedStore + metadata commit before returning. This does not
+        // weaken or bypass quorum policy; it waits for the existing publication
+        // machinery to satisfy it.
         state_->request_data_publication(inode);
+        state_->wait_for_inode_publication(inode, target, deadline, cancelled);
     });
 }
 
