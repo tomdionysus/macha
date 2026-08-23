@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.14.11 - 2026-08-23
+
+- make metadata startup identify the exact encrypted checkpoint/journal path and journal byte offset when authentication or replay fails instead of terminating with the context-free `AES-GCM authentication failed`;
+- recover a complete-length but unauthenticated final metadata-journal frame as a torn append: preserve the rejected tail as `journal.log.corrupt.*`, durably trim only the unauthenticated EOF frame, and keep corruption before later records fatal;
+- when the primary metadata checkpoint/journal is not recoverable, use the independently encrypted persistent metadata-cache snapshot as a non-authoritative recovery seed, quarantine the damaged primary files, persist a `metadata/recovery.required` marker, and require a successful quorum metadata read before stale local state can be used for mutation or isolated read fallback;
+- refresh the independent persistent metadata snapshot on compact delta/commit paths as well as full checkpoints, so it remains a current recovery source instead of drifting behind ordinary namespace mutations;
+- route metadata checkpoint replacement through the shared fsync+rename durability primitive and check metadata-journal fsync/close failures rather than acknowledging persistence after ignored host I/O errors.
+
 ## 0.14.10 - 2026-08-23
 
 - preserve the 0.14.9 global ordered FUSE operation journal as the crash-recovery authority, while fixing remote namespace replacement so an open/dirty inode is detached from a pathname whose content was replaced elsewhere and cannot later publish stale writes into the replacement;

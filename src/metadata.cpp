@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "metadata.hpp"
 #include "codec.hpp"
+#include "durable_file.hpp"
 #include "log.hpp"
 #include <algorithm>
 #include <cerrno>
@@ -99,30 +100,69 @@ bool metadata_delta_v1(std::span<const uint8_t> data) {
 }
 
 void writefile(const std::filesystem::path& p, std::span<const uint8_t> d) {
-    auto t = p.string() + ".tmp." + std::to_string(getpid());
-    int f = open(t.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (f < 0)
-        throw std::runtime_error(strerror(errno));
-    size_t q = 0;
-    while (q < d.size()) {
-        auto n = write(f, d.data() + q, d.size() - q);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            close(f);
-            throw std::runtime_error(strerror(errno));
-        }
-        q += n;
+    durable_replace_file(
+        p, std::string_view(reinterpret_cast<const char*>(d.data()), d.size()));
+}
+
+void truncate_durable(const std::filesystem::path& path, size_t size) {
+    int fd = open(path.c_str(), O_WRONLY);
+    if (fd < 0)
+        throw std::runtime_error("cannot open metadata journal for truncation " + path.string() +
+                                 ": " + strerror(errno));
+    if (ftruncate(fd, static_cast<off_t>(size)) != 0) {
+        const auto error = errno;
+        close(fd);
+        throw std::runtime_error("cannot truncate metadata journal " + path.string() + ": " +
+                                 strerror(error));
     }
-    fsync(f);
-    close(f);
-    if (rename(t.c_str(), p.c_str()))
-        throw std::runtime_error(strerror(errno));
-    int dirfd = open(p.parent_path().c_str(), O_RDONLY | O_DIRECTORY);
-    if (dirfd >= 0) {
-        (void)fsync(dirfd);
-        close(dirfd);
+    if (fsync(fd) != 0) {
+        const auto error = errno;
+        close(fd);
+        throw std::runtime_error("cannot sync truncated metadata journal " + path.string() +
+                                 ": " + strerror(error));
     }
+    if (close(fd) != 0)
+        throw std::runtime_error("cannot close truncated metadata journal " + path.string() +
+                                 ": " + strerror(errno));
+}
+
+std::filesystem::path quarantine_journal_tail(const std::filesystem::path& path,
+                                              std::span<const uint8_t> tail) {
+    const auto quarantine = path.string() + ".corrupt." + std::to_string(wall_time_ns());
+    durable_replace_file(
+        quarantine,
+        std::string_view(reinterpret_cast<const char*>(tail.data()), tail.size()));
+    return quarantine;
+}
+
+void sync_directory(const std::filesystem::path& path) {
+    const auto directory = path.parent_path().empty() ? std::filesystem::path(".")
+                                                      : path.parent_path();
+    int fd = open(directory.c_str(), O_RDONLY | O_DIRECTORY);
+    if (fd < 0)
+        throw std::runtime_error("cannot open metadata directory " + directory.string() +
+                                 ": " + strerror(errno));
+    if (fsync(fd) != 0) {
+        const auto error = errno;
+        close(fd);
+        throw std::runtime_error("cannot sync metadata directory " + directory.string() +
+                                 ": " + strerror(error));
+    }
+    if (close(fd) != 0)
+        throw std::runtime_error("cannot close metadata directory " + directory.string() +
+                                 ": " + strerror(errno));
+}
+
+std::optional<std::filesystem::path> quarantine_metadata_file(
+    const std::filesystem::path& path, const std::string& suffix) {
+    if (!std::filesystem::exists(path))
+        return {};
+    const auto quarantine = std::filesystem::path(path.string() + suffix);
+    if (rename(path.c_str(), quarantine.c_str()) != 0)
+        throw std::runtime_error("cannot quarantine metadata file " + path.string() +
+                                 ": " + strerror(errno));
+    sync_directory(path);
+    return quarantine;
 }
 } // namespace
 Bytes encode_snapshot(const MetadataSnapshot& s) {
@@ -494,65 +534,135 @@ MetadataRecord genesis_metadata() {
 bool valid_metadata_record(const MetadataRecord& m) {
     return m.generation && metadata_hash(m.generation, m.previous, m.payload) == m.hash;
 }
-MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32> k)
+MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32> k,
+                                 std::optional<MetadataRecord> recovery_seed)
     : p_(r / "metadata" / "current.meta"),
       committed_p_(r / "metadata" / "committed.meta"),
       checkpoint_p_(r / "metadata" / "checkpoint.meta"),
-      journal_p_(r / "metadata" / "journal.log"), key_(k) {
+      journal_p_(r / "metadata" / "journal.log"),
+      recovery_p_(r / "metadata" / "recovery.required"), key_(k) {
     std::filesystem::create_directories(checkpoint_p_.parent_path());
 
-    if (auto checkpoint = load(checkpoint_p_)) {
-        cur_ = *checkpoint;
-        committed_ = *checkpoint;
-        load_journal();
+    auto valid_seed = [&]() -> std::optional<MetadataRecord> {
+        if (!recovery_seed || !valid_metadata_record(*recovery_seed))
+            return {};
+        try {
+            (void)decode_snapshot(recovery_seed->payload);
+            return recovery_seed;
+        } catch (...) {
+            return {};
+        }
+    };
+
+    // If a previous startup already entered recovery, never silently promote
+    // its fallback checkpoint to authoritative merely because this restart can
+    // decrypt it. It remains read-only/stale until quorum checkpointing clears
+    // the durable recovery marker.
+    if (std::filesystem::exists(recovery_p_)) {
+        recovery_required_ = true;
+        try {
+            if (auto checkpoint = load(checkpoint_p_)) {
+                cur_ = *checkpoint;
+                committed_ = *checkpoint;
+                load_journal();
+                Log::warn("metadata replica still requires quorum recovery path=" +
+                          checkpoint_p_.parent_path().string() +
+                          " generation=" + std::to_string(committed_.generation));
+                return;
+            }
+        } catch (const std::exception& error) {
+            Log::error("metadata recovery checkpoint unreadable: " + std::string(error.what()));
+        }
+        auto seed = valid_seed();
+        if (!seed)
+            throw std::runtime_error("metadata recovery required but no valid persistent metadata "
+                                     "cache seed is available at " + recovery_p_.string());
+        recover_from_seed(*seed, "continuing previously marked metadata recovery");
         return;
     }
 
-    // 0.8.x migration. The old format kept a fully materialised current and
-    // committed snapshot. Preserve the committed record as the journal base and
-    // represent a newer accepted-but-not-committed current record as a trusted
-    // full seed entry. After the new files are durable, rename the old files so
-    // accidentally starting a pre-0.9 binary fails instead of silently rolling
-    // the namespace backwards.
-    auto current = load(p_);
-    auto committed = load(committed_p_);
-    if (current.has_value() != committed.has_value())
-        throw std::runtime_error(
-            "incomplete metadata state: current.meta and committed.meta are both required");
+    try {
+        if (auto checkpoint = load(checkpoint_p_)) {
+            cur_ = *checkpoint;
+            committed_ = *checkpoint;
+            load_journal();
+            return;
+        }
 
-    if (!current) {
-        cur_ = genesis_metadata();
-        committed_ = cur_;
-        reset_checkpoint(committed_);
-        return;
+        // 0.8.x migration. The old format kept a fully materialised current and
+        // committed snapshot. Preserve the committed record as the journal base and
+        // represent a newer accepted-but-not-committed current record as a trusted
+        // full seed entry. After the new files are durable, rename the old files so
+        // accidentally starting a pre-0.9 binary fails instead of silently rolling
+        // the namespace backwards.
+        auto current = load(p_);
+        auto committed = load(committed_p_);
+        if (current.has_value() != committed.has_value())
+            throw std::runtime_error(
+                "incomplete metadata state: current.meta and committed.meta are both required");
+
+        if (!current) {
+            cur_ = genesis_metadata();
+            committed_ = cur_;
+            reset_checkpoint(committed_);
+            return;
+        }
+
+        if (committed->generation > current->generation)
+            throw std::runtime_error("metadata committed generation is newer than current");
+        if (committed->generation == current->generation && committed->hash != current->hash)
+            throw std::runtime_error("metadata current/committed generation conflict");
+
+        cur_ = *committed;
+        committed_ = *committed;
+        if (current->hash != committed->hash) {
+            writefile(journal_p_, {});
+            journal_records_ = 0;
+            journal_bytes_ = 0;
+            append_journal(JOURNAL_SEED_FULL, *current, current->payload);
+            persist(checkpoint_p_, committed_);
+            cur_ = *current;
+        } else {
+            reset_checkpoint(committed_);
+        }
+
+        std::error_code ec;
+        std::filesystem::rename(p_, p_.string() + ".v10", ec);
+        ec.clear();
+        std::filesystem::rename(committed_p_, committed_p_.string() + ".v10", ec);
+    } catch (const std::exception& error) {
+        auto seed = valid_seed();
+        if (!seed)
+            throw;
+        recover_from_seed(*seed, error.what());
+    }
+}
+
+void MetadataReplica::recover_from_seed(const MetadataRecord& seed, const std::string& reason) {
+    const auto stamp = ".corrupt." + std::to_string(wall_time_ns());
+    durable_replace_file(recovery_p_, reason);
+
+    std::vector<std::filesystem::path> quarantined;
+    for (const auto& path : {checkpoint_p_, journal_p_, p_, committed_p_}) {
+        if (auto moved = quarantine_metadata_file(path, stamp))
+            quarantined.push_back(*moved);
     }
 
-    if (committed->generation > current->generation)
-        throw std::runtime_error("metadata committed generation is newer than current");
-    if (committed->generation == current->generation && committed->hash != current->hash)
-        throw std::runtime_error("metadata current/committed generation conflict");
+    cur_ = seed;
+    committed_ = seed;
+    reset_checkpoint(seed);
+    recovery_required_ = true;
 
-    cur_ = *committed;
-    committed_ = *committed;
-    if (current->hash != committed->hash) {
-        // Migration ordering matters for an accepted-but-not-committed vote:
-        // make its journal seed durable before publishing checkpoint.meta. If
-        // we crash earlier, the old v10 files remain authoritative and migration
-        // simply retries; if we crash later, replay cannot forget the vote.
-        writefile(journal_p_, {});
-        journal_records_ = 0;
-        journal_bytes_ = 0;
-        append_journal(JOURNAL_SEED_FULL, *current, current->payload);
-        persist(checkpoint_p_, committed_);
-        cur_ = *current;
-    } else {
-        reset_checkpoint(committed_);
+    std::string preserved;
+    for (const auto& path : quarantined) {
+        if (!preserved.empty())
+            preserved += ",";
+        preserved += path.string();
     }
-
-    std::error_code ec;
-    std::filesystem::rename(p_, p_.string() + ".v10", ec);
-    ec.clear();
-    std::filesystem::rename(committed_p_, committed_p_.string() + ".v10", ec);
+    Log::error("metadata primary state failed authentication/validation; using persistent cache "
+               "seed pending quorum recovery generation=" + std::to_string(seed.generation) +
+               " state=" + checkpoint_p_.parent_path().string() +
+               " preserved=" + preserved + " reason=" + reason);
 }
 
 MetadataRecord MetadataReplica::current() const {
@@ -583,6 +693,27 @@ uint64_t MetadataReplica::generation() const {
 uint64_t MetadataReplica::committed_generation() const {
     std::lock_guard g(m_);
     return committed_.generation;
+}
+
+bool MetadataReplica::recovery_required() const {
+    std::lock_guard g(m_);
+    return recovery_required_;
+}
+
+void MetadataReplica::mark_recovered() {
+    std::lock_guard g(m_);
+    if (!recovery_required_)
+        return;
+    std::error_code error;
+    const bool removed = std::filesystem::remove(recovery_p_, error);
+    if (error)
+        throw std::runtime_error("cannot clear metadata recovery marker " + recovery_p_.string() +
+                                 ": " + error.message());
+    if (removed)
+        sync_directory(recovery_p_);
+    recovery_required_ = false;
+    Log::info("metadata quorum recovery complete generation=" +
+              std::to_string(committed_.generation));
 }
 
 void MetadataReplica::append_journal(uint8_t kind, const MetadataRecord& record,
@@ -626,9 +757,12 @@ void MetadataReplica::append_journal(uint8_t kind, const MetadataRecord& record,
     if (fsync(fd)) {
         auto error = errno;
         close(fd);
-        throw std::runtime_error(strerror(error));
+        throw std::runtime_error("cannot sync metadata journal " + journal_p_.string() + ": " +
+                                 strerror(error));
     }
-    close(fd);
+    if (close(fd) != 0)
+        throw std::runtime_error("cannot close metadata journal " + journal_p_.string() + ": " +
+                                 strerror(errno));
     ++journal_records_;
     journal_bytes_ += bytes.size();
 }
@@ -640,96 +774,142 @@ void MetadataReplica::load_journal() {
         return;
 
     std::ifstream stream(journal_p_, std::ios::binary);
+    if (!stream)
+        throw std::runtime_error("cannot open metadata journal " + journal_p_.string());
     Bytes bytes(std::istreambuf_iterator<char>(stream), {});
     size_t offset = 0;
     size_t valid = 0;
     auto input = std::span<const uint8_t>(bytes);
+    std::string trailing_problem;
 
     while (offset + 4 <= bytes.size()) {
         Reader header(input.subspan(offset, 4));
         auto length = header.u32();
         header.finish();
-        if (length > 256U * 1024U * 1024U)
-            throw std::runtime_error("metadata journal record too large");
-        if (offset + 4ULL + length > bytes.size())
-            break; // interrupted append: discard the incomplete trailing frame.
+        if (length > 256U * 1024U * 1024U) {
+            throw std::runtime_error("metadata journal " + journal_p_.string() +
+                                     " offset=" + std::to_string(offset) +
+                                     ": record too large");
+        }
+        if (offset + 4ULL + length > bytes.size()) {
+            trailing_problem = "incomplete trailing frame";
+            break;
+        }
 
+        const bool final_frame = offset + 4ULL + length == bytes.size();
         auto frame = input.subspan(offset + 4, length);
-        Reader envelope(frame);
-        auto nonce = envelope.fixed<12>();
-        auto tag = envelope.fixed<16>();
-        auto ciphertext = envelope.bytes();
-        envelope.finish();
-        auto plaintext = aes_gcm_open(key_, nonce, tag, ciphertext, MJ);
-        Reader record_reader(plaintext);
-        auto kind = record_reader.u8();
-        MetadataRecord record;
-        record.generation = record_reader.u64();
-        record.previous.bytes = record_reader.fixed<32>();
-        record.hash.bytes = record_reader.fixed<32>();
-        auto body = record_reader.bytes();
-        record_reader.finish();
+        std::array<uint8_t, 12> nonce{};
+        std::array<uint8_t, 16> tag{};
+        Bytes ciphertext;
+        try {
+            Reader envelope(frame);
+            nonce = envelope.fixed<12>();
+            tag = envelope.fixed<16>();
+            ciphertext = envelope.bytes();
+            envelope.finish();
+        } catch (const std::exception& error) {
+            throw std::runtime_error("metadata journal " + journal_p_.string() +
+                                     " offset=" + std::to_string(offset) +
+                                     ": malformed encrypted frame: " + error.what());
+        }
 
-        // Compaction writes the new checkpoint before truncating the old
-        // journal. A crash in that small window legitimately leaves journal
-        // frames already represented by the checkpoint; ignore only those
-        // exact/older generations and replay anything newer.
-        if (record.generation < committed_.generation ||
-            (record.generation == committed_.generation && record.hash == committed_.hash)) {
-            offset += 4 + length;
-            valid = offset;
-            ++journal_records_;
-            journal_bytes_ += 4 + length;
-            continue;
-        }
-        if (record.generation == committed_.generation && record.hash != committed_.hash)
-            throw std::runtime_error("metadata journal conflicts with checkpoint");
-
-        switch (kind) {
-        case JOURNAL_PREPARE_FULL: {
-            if (record.generation != cur_.generation + 1 || record.previous != cur_.hash)
-                throw std::runtime_error("metadata journal full CAS chain broken");
-            record.payload = std::move(body);
-            if (!valid_metadata_record(record))
-                throw std::runtime_error("metadata journal full CAS hash invalid");
-            (void)decode_snapshot(record.payload);
-            cur_ = std::move(record);
-            break;
-        }
-        case JOURNAL_PREPARE_DELTA: {
-            if (record.generation != cur_.generation + 1 || record.previous != cur_.hash)
-                throw std::runtime_error("metadata journal delta CAS chain broken");
-            auto snapshot = decode_snapshot(cur_.payload);
-            auto delta = decode_metadata_delta(body);
-            auto replayed = apply_metadata_delta(snapshot, delta);
-            record.payload = metadata_delta_v1(body) ? encode_snapshot_v7(replayed)
-                                                     : encode_snapshot(replayed);
-            if (!valid_metadata_record(record))
-                throw std::runtime_error("metadata journal delta CAS hash invalid");
-            cur_ = std::move(record);
-            break;
-        }
-        case JOURNAL_SEED_FULL: {
-            record.payload = std::move(body);
-            if (!valid_metadata_record(record))
-                throw std::runtime_error("metadata journal seed hash invalid");
-            (void)decode_snapshot(record.payload);
-            if (record.generation < cur_.generation)
-                throw std::runtime_error("metadata journal seed moved backwards");
-            if (record.generation == cur_.generation && record.hash != cur_.hash)
-                throw std::runtime_error("metadata journal seed generation conflict");
-            cur_ = std::move(record);
-            break;
-        }
-        case JOURNAL_COMMIT:
-            if (record.generation == committed_.generation && record.hash == committed_.hash)
+        Bytes plaintext;
+        try {
+            plaintext = aes_gcm_open(key_, nonce, tag, ciphertext, MJ);
+        } catch (const std::exception& error) {
+            // A journal append writes one complete authenticated frame and then
+            // fsyncs it. A host/storage failure can nevertheless leave the file
+            // length extended while the final ciphertext/tag is only partially
+            // durable. No later frame can depend on an unauthenticated final
+            // frame. Preserve those bytes for diagnosis and replay only the
+            // authenticated prefix. Authentication failure anywhere except EOF
+            // remains fatal: silently skipping a middle frame would break the
+            // metadata chain and could roll the namespace backwards.
+            if (final_frame && std::string_view(error.what()) ==
+                                   "AES-GCM authentication failed") {
+                trailing_problem = "final frame failed AES-GCM authentication";
                 break;
-            if (record.generation != cur_.generation || record.hash != cur_.hash)
-                throw std::runtime_error("metadata journal commit does not match current");
-            committed_ = cur_;
-            break;
-        default:
-            throw std::runtime_error("unknown metadata journal record");
+            }
+            throw std::runtime_error("metadata journal " + journal_p_.string() +
+                                     " offset=" + std::to_string(offset) + ": " +
+                                     error.what());
+        }
+
+        try {
+            Reader record_reader(plaintext);
+            auto kind = record_reader.u8();
+            MetadataRecord record;
+            record.generation = record_reader.u64();
+            record.previous.bytes = record_reader.fixed<32>();
+            record.hash.bytes = record_reader.fixed<32>();
+            auto body = record_reader.bytes();
+            record_reader.finish();
+
+            // Compaction writes the new checkpoint before truncating the old
+            // journal. A crash in that small window legitimately leaves journal
+            // frames already represented by the checkpoint; ignore only those
+            // exact/older generations and replay anything newer.
+            if (record.generation < committed_.generation ||
+                (record.generation == committed_.generation && record.hash == committed_.hash)) {
+                offset += 4 + length;
+                valid = offset;
+                ++journal_records_;
+                journal_bytes_ += 4 + length;
+                continue;
+            }
+            if (record.generation == committed_.generation && record.hash != committed_.hash)
+                throw std::runtime_error("conflicts with checkpoint");
+
+            switch (kind) {
+            case JOURNAL_PREPARE_FULL: {
+                if (record.generation != cur_.generation + 1 || record.previous != cur_.hash)
+                    throw std::runtime_error("full CAS chain broken");
+                record.payload = std::move(body);
+                if (!valid_metadata_record(record))
+                    throw std::runtime_error("full CAS hash invalid");
+                (void)decode_snapshot(record.payload);
+                cur_ = std::move(record);
+                break;
+            }
+            case JOURNAL_PREPARE_DELTA: {
+                if (record.generation != cur_.generation + 1 || record.previous != cur_.hash)
+                    throw std::runtime_error("delta CAS chain broken");
+                auto snapshot = decode_snapshot(cur_.payload);
+                auto delta = decode_metadata_delta(body);
+                auto replayed = apply_metadata_delta(snapshot, delta);
+                record.payload = metadata_delta_v1(body) ? encode_snapshot_v7(replayed)
+                                                         : encode_snapshot(replayed);
+                if (!valid_metadata_record(record))
+                    throw std::runtime_error("delta CAS hash invalid");
+                cur_ = std::move(record);
+                break;
+            }
+            case JOURNAL_SEED_FULL: {
+                record.payload = std::move(body);
+                if (!valid_metadata_record(record))
+                    throw std::runtime_error("seed hash invalid");
+                (void)decode_snapshot(record.payload);
+                if (record.generation < cur_.generation)
+                    throw std::runtime_error("seed moved backwards");
+                if (record.generation == cur_.generation && record.hash != cur_.hash)
+                    throw std::runtime_error("seed generation conflict");
+                cur_ = std::move(record);
+                break;
+            }
+            case JOURNAL_COMMIT:
+                if (record.generation == committed_.generation && record.hash == committed_.hash)
+                    break;
+                if (record.generation != cur_.generation || record.hash != cur_.hash)
+                    throw std::runtime_error("commit does not match current");
+                committed_ = cur_;
+                break;
+            default:
+                throw std::runtime_error("unknown record type " + std::to_string(kind));
+            }
+        } catch (const std::exception& error) {
+            throw std::runtime_error("metadata journal " + journal_p_.string() +
+                                     " offset=" + std::to_string(offset) + ": " +
+                                     error.what());
         }
 
         offset += 4 + length;
@@ -739,12 +919,16 @@ void MetadataReplica::load_journal() {
     }
 
     if (valid != bytes.size()) {
-        std::filesystem::resize_file(journal_p_, valid);
-        int fd = open(journal_p_.c_str(), O_WRONLY);
-        if (fd >= 0) {
-            (void)fsync(fd);
-            close(fd);
-        }
+        if (trailing_problem.empty())
+            trailing_problem = "trailing bytes after last complete frame";
+        auto tail = input.subspan(valid);
+        const auto quarantine = quarantine_journal_tail(journal_p_, tail);
+        truncate_durable(journal_p_, valid);
+        Log::warn("metadata journal recovered path=" + journal_p_.string() +
+                  " offset=" + std::to_string(valid) +
+                  " discarded_bytes=" + std::to_string(tail.size()) +
+                  " quarantine=" + quarantine.string() +
+                  " reason=" + trailing_problem);
     }
 }
 
@@ -934,17 +1118,23 @@ void MetadataReplica::persist(const std::filesystem::path& path, const MetadataR
 std::optional<MetadataRecord> MetadataReplica::load(const std::filesystem::path& path) const {
     if (!std::filesystem::exists(path))
         return {};
-    std::ifstream stream(path, std::ios::binary);
-    Bytes bytes(std::istreambuf_iterator<char>(stream), {});
-    Reader reader(bytes);
-    auto magic = reader.raw(8);
-    if (!std::equal(magic.begin(), magic.end(), DM.begin()))
-        throw std::runtime_error("bad metadata file");
-    auto nonce = reader.fixed<12>();
-    auto tag = reader.fixed<16>();
-    auto ciphertext = reader.bytes();
-    reader.finish();
-    return decode_metadata_record(aes_gcm_open(key_, nonce, tag, ciphertext, DM));
+    try {
+        std::ifstream stream(path, std::ios::binary);
+        if (!stream)
+            throw std::runtime_error("cannot open");
+        Bytes bytes(std::istreambuf_iterator<char>(stream), {});
+        Reader reader(bytes);
+        auto magic = reader.raw(8);
+        if (!std::equal(magic.begin(), magic.end(), DM.begin()))
+            throw std::runtime_error("bad metadata file header");
+        auto nonce = reader.fixed<12>();
+        auto tag = reader.fixed<16>();
+        auto ciphertext = reader.bytes();
+        reader.finish();
+        return decode_metadata_record(aes_gcm_open(key_, nonce, tag, ciphertext, DM));
+    } catch (const std::exception& error) {
+        throw std::runtime_error("metadata file " + path.string() + ": " + error.what());
+    }
 }
 
 Hash256 metadata_namespace_signature(const MetadataSnapshot& snapshot) {

@@ -92,27 +92,33 @@ class MetadataReplica {
     std::filesystem::path committed_p_;
     std::filesystem::path checkpoint_p_;
     std::filesystem::path journal_p_;
+    std::filesystem::path recovery_p_;
     std::array<uint8_t, 32> key_;
     mutable std::mutex m_;
     MetadataRecord cur_;
     MetadataRecord committed_;
     size_t journal_records_{};
     uint64_t journal_bytes_{};
+    bool recovery_required_{};
     void persist(const std::filesystem::path&, const MetadataRecord&);
     std::optional<MetadataRecord> load(const std::filesystem::path&) const;
     void append_journal(uint8_t, const MetadataRecord&, std::span<const uint8_t> = {});
     void load_journal();
     void compact_if_needed();
     void reset_checkpoint(const MetadataRecord&);
+    void recover_from_seed(const MetadataRecord&, const std::string&);
 
   public:
-    MetadataReplica(std::filesystem::path, std::array<uint8_t, 32>);
+    MetadataReplica(std::filesystem::path, std::array<uint8_t, 32>,
+                    std::optional<MetadataRecord> recovery_seed = {});
     MetadataRecord current() const;
     MetadataRecord committed() const;
     MetadataIdentity current_identity() const;
     MetadataIdentity committed_identity() const;
     uint64_t generation() const;
     uint64_t committed_generation() const;
+    bool recovery_required() const;
+    void mark_recovered();
     bool cas(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
     bool cas_delta(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
     bool install_committed_delta(uint64_t, const Hash256&, std::span<const uint8_t>,
