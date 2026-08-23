@@ -23,6 +23,8 @@ class ThreadCpuReporter {
     uint64_t iterations_{};
     std::chrono::milliseconds interval_;
     bool report_idle_{};
+    bool debug_high_cpu_{};
+    Clock::time_point debug_last_report_{};
 
   public:
     explicit ThreadCpuReporter(std::string name,

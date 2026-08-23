@@ -2,6 +2,7 @@
 #include "codec.hpp"
 #include "config.hpp"
 #include "crypto.hpp"
+#include "diagnostics.hpp"
 #include "filesystem.hpp"
 #include "fuse_frontend.hpp"
 #include "http.hpp"
@@ -29,6 +30,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <netinet/in.h>
 #include <openssl/crypto.h>
 extern "C" {
@@ -113,6 +115,30 @@ class CapturingLogger final : public Logger {
 
     void log(LogLevel level, const std::string& message) override {
         records.emplace_back(level, message);
+    }
+};
+
+class ConcurrentCapturingLogger final : public Logger {
+    LogLevel level_;
+    mutable std::mutex mutex_;
+    std::vector<std::pair<LogLevel, std::string>> records_;
+
+  public:
+    explicit ConcurrentCapturingLogger(LogLevel level) : level_(level) {}
+
+    bool enabled(LogLevel level) const noexcept override {
+        return level_ == LogLevel::all ||
+               static_cast<unsigned char>(level) >= static_cast<unsigned char>(level_);
+    }
+
+    void log(LogLevel level, const std::string& message) override {
+        std::lock_guard lock(mutex_);
+        records_.emplace_back(level, message);
+    }
+
+    std::vector<std::pair<LogLevel, std::string>> records() const {
+        std::lock_guard lock(mutex_);
+        return records_;
     }
 };
 
@@ -1389,6 +1415,34 @@ void test_metadata_identity_rpc() {
 
     n2.stop();
     n1.stop();
+}
+
+void test_thread_cpu_reporter_debug_escalation() {
+    auto capture = std::make_shared<ConcurrentCapturingLogger>(LogLevel::debug);
+    Log::set_logger(capture);
+
+    ThreadCpuReporter reporter("macha-test-hot", 25ms, true);
+    const auto busy_until = Clock::now() + 100ms;
+    while (Clock::now() < busy_until)
+        reporter.tick();
+
+    auto records = capture->records();
+    const auto high = std::find_if(records.begin(), records.end(), [](const auto& record) {
+        return record.first == LogLevel::debug &&
+               record.second.find("DIAG high thread CPU name=macha-test-hot") != std::string::npos;
+    });
+    CHECK(high != records.end());
+
+    std::this_thread::sleep_for(600ms);
+    reporter.tick();
+    records = capture->records();
+    const auto recovered = std::find_if(records.begin(), records.end(), [](const auto& record) {
+        return record.first == LogLevel::debug &&
+               record.second.find("DIAG thread CPU recovered name=macha-test-hot") != std::string::npos;
+    });
+    CHECK(recovered != records.end());
+
+    Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
 }
 
 void test_config() {
@@ -6348,6 +6402,70 @@ void test_catalogue_scanner_restart_does_not_rescan_unchanged_namespace() {
     service.stop();
 }
 
+void test_catalogue_non_coordinator_idle_does_not_spin() {
+    TempDir temp;
+    auto keyfile = temp.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+
+    auto c1 = config_for(temp.path() / "catalogue-idle-1", keyfile, free_port());
+    auto c2 = config_for(temp.path() / "catalogue-idle-2", keyfile, free_port(),
+                         {{"127.0.0.1", c1.port}});
+    c1.replication = c2.replication = 1;
+    c1.metadata_replication = c2.metadata_replication = 1;
+    c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = false;
+    c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
+
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }, 5s));
+
+    Service* non_coordinator = s1.node().node_id() > s2.node().node_id() ? &s1 : &s2;
+    CatalogueScannerConfig scanner_config;
+    scanner_config.enabled = true;
+    scanner_config.interval = 1h;
+    scanner_config.movies.enabled = false;
+    scanner_config.tv.enabled = false;
+    scanner_config.music.enabled = false;
+
+    auto capture = std::make_shared<ConcurrentCapturingLogger>(LogLevel::all);
+    Log::set_logger(capture);
+    CatalogueScanner scanner(non_coordinator->node(), non_coordinator->filesystem(),
+                             non_coordinator->catalogue(), non_coordinator->catalogue_hints(),
+                             scanner_config, std::make_unique<FakeHttpClient>());
+    scanner.start();
+    std::this_thread::sleep_for(5500ms);
+    scanner.stop();
+    const auto records = capture->records();
+    Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
+
+    uint64_t max_iterations = 0;
+    bool saw_report = false;
+    for (const auto& [level, message] : records) {
+        if (level != LogLevel::all ||
+            message.find("DIAG thread name=macha-catalogue") == std::string::npos)
+            continue;
+        const auto marker = message.find(" iterations=");
+        REQUIRE(marker != std::string::npos);
+        max_iterations = std::max(max_iterations,
+                                  std::stoull(message.substr(marker + 12)));
+        saw_report = true;
+    }
+    CHECK(saw_report);
+    // The idle non-coordinator has only the one-second membership/coordinator
+    // observation cadence. A stale coordinator-only deadline must never turn
+    // this into a zero-timeout polling loop.
+    CHECK(max_iterations <= 20);
+
+    s2.stop();
+    s1.stop();
+}
+
 void test_catalogue_hint_queue_persistence_coalescing_and_priority() {
     TempDir temp;
     const auto state = temp.path() / "hint-state";
@@ -8424,6 +8542,7 @@ int main() {
         RUN_TEST(test_storage_pool_and_persistent_cache);
         RUN_TEST(test_metadata_codec_and_replica);
         RUN_TEST(test_metadata_identity_rpc);
+        RUN_TEST(test_thread_cpu_reporter_debug_escalation);
         RUN_TEST(test_config);
         RUN_TEST(test_placement);
         RUN_TEST(test_capacity_placement);
@@ -8470,6 +8589,7 @@ int main() {
         RUN_TEST(test_media_probe_and_online_catalogue_scanner);
         RUN_TEST(test_catalogue_cache_ignores_unrelated_metadata_generation);
         RUN_TEST(test_catalogue_scanner_restart_does_not_rescan_unchanged_namespace);
+        RUN_TEST(test_catalogue_non_coordinator_idle_does_not_spin);
         RUN_TEST(test_catalogue_hint_queue_persistence_coalescing_and_priority);
         RUN_TEST(test_ingest_catalogue_feedback_and_external_clear_cleanup);
         RUN_TEST(test_catalogue_warm_read_defers_remote_refresh);
