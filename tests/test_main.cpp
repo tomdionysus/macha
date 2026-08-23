@@ -4009,7 +4009,7 @@ void test_fuse_durable_journal_trims_checksum_invalid_complete_tail() {
     service.stop();
 }
 
-void test_fuse_durable_journal_rejects_unreferenced_spool() {
+void test_fuse_durable_journal_preserves_unreferenced_spool() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -4029,14 +4029,25 @@ void test_fuse_durable_journal_rejects_unreferenced_spool() {
         REQUIRE(out.good());
     }
 
-    bool rejected = false;
-    try {
-        auto should_fail = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
-        should_fail->stop();
-    } catch (const std::exception&) {
-        rejected = true;
+    {
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        recovered->stop();
     }
-    CHECK(rejected);
+
+    const auto original = spool_dir / "inode-999.spool";
+    CHECK(!std::filesystem::exists(original));
+    bool preserved = false;
+    for (const auto& entry : std::filesystem::directory_iterator(spool_dir)) {
+        const auto name = entry.path().filename().string();
+        if (!name.starts_with("inode-999.spool.orphan."))
+            continue;
+        std::ifstream in(entry.path(), std::ios::binary);
+        std::string bytes((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+        CHECK(bytes == "unattributed bytes");
+        preserved = true;
+    }
+    CHECK(preserved);
     service.stop();
 }
 
@@ -8369,7 +8380,7 @@ int main() {
         RUN_TEST(test_fuse_durable_journal_recovers_ordered_mutations);
         RUN_TEST(test_fuse_durable_journal_trims_torn_tail);
         RUN_TEST(test_fuse_durable_journal_trims_checksum_invalid_complete_tail);
-        RUN_TEST(test_fuse_durable_journal_rejects_unreferenced_spool);
+        RUN_TEST(test_fuse_durable_journal_preserves_unreferenced_spool);
         RUN_TEST(test_fuse_durable_journal_rejects_missing_spool);
         RUN_TEST(test_fuse_read_only_release_does_not_publish_writer_data);
         RUN_TEST(test_fuse_frontend_unlink_and_rename_over_open_inode_ordering);

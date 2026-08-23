@@ -1812,6 +1812,19 @@ struct FuseFrontend::State {
         inode->spool_end = required;
     }
 
+    void preserve_unreferenced_spool(const std::filesystem::path& path, uint64_t size,
+                                    std::string_view reason) {
+        const auto preserved = path.string() + ".orphan." + std::to_string(unix_ms()) + "." +
+                               std::to_string(getpid());
+        if (::rename(path.c_str(), preserved.c_str()) != 0)
+            throw FsError(errno, "cannot preserve unreferenced FUSE spool");
+        sync_directory(spool_dir);
+        Log::warn("preserved unreferenced FUSE spool path=" + path.string() +
+                  " bytes=" + std::to_string(size) + " as=" + preserved +
+                  " reason=" + std::string(reason) +
+                  "; no durable journal attribution exists, so bytes were not replayed");
+    }
+
     void validate_recovery_spools(const JournalRecovery& recovery) {
         std::error_code ec;
         bool directory_changed = false;
@@ -1840,9 +1853,10 @@ struct FuseFrontend::State {
                     ec.clear();
                     continue;
                 }
-                throw std::runtime_error(
-                    "unrecognised non-empty FUSE spool cannot be safely recovered: " +
-                    entry.path().string());
+                const auto size = entry.file_size();
+                preserve_unreferenced_spool(entry.path(), size, "unrecognised spool filename");
+                directory_changed = true;
+                continue;
             }
             if (recovery.data_history_inodes.contains(id)) {
                 if (pending_data_count(recovery, id) > 0)
@@ -1865,9 +1879,9 @@ struct FuseFrontend::State {
                 ec.clear();
                 continue;
             }
-            throw std::runtime_error(
-                "unreferenced non-empty FUSE spool cannot be safely recovered: " +
-                entry.path().string() + " bytes=" + std::to_string(size));
+            preserve_unreferenced_spool(entry.path(), size,
+                                        "operation journal has no history for inode");
+            directory_changed = true;
         }
         if (ec)
             throw std::runtime_error("cannot enumerate FUSE spool directory: " + ec.message());
