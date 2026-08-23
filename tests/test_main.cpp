@@ -6452,8 +6452,9 @@ void test_catalogue_non_coordinator_idle_does_not_spin() {
             continue;
         const auto marker = message.find(" iterations=");
         REQUIRE(marker != std::string::npos);
-        max_iterations = std::max(max_iterations,
-                                  std::stoull(message.substr(marker + 12)));
+        max_iterations = std::max(
+            max_iterations,
+            static_cast<uint64_t>(std::stoull(message.substr(marker + 12))));
         saw_report = true;
     }
     CHECK(saw_report);
