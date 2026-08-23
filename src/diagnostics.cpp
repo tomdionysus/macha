@@ -16,6 +16,22 @@
 #endif
 
 namespace macha {
+namespace {
+constexpr double debug_high_thread_cpu_pct = 10.0;
+constexpr double debug_recovered_thread_cpu_pct = 5.0;
+constexpr auto debug_high_thread_cpu_repeat = std::chrono::seconds(60);
+
+std::string thread_cpu_message(std::string_view prefix, std::string_view name,
+                               int64_t wall_ms, uint64_t cpu_ms, double pct,
+                               uint64_t iterations) {
+    const auto tenths = static_cast<long long>(std::llround(pct * 10.0));
+    return std::string(prefix) + " name=" + std::string(name) +
+           " wall_ms=" + std::to_string(wall_ms) +
+           " cpu_ms=" + std::to_string(cpu_ms) + " cpu_pct=" +
+           std::to_string(tenths / 10) + "." + std::to_string(std::abs(tenths % 10)) +
+           " iterations=" + std::to_string(iterations);
+}
+} // namespace
 
 void set_thread_name(std::string_view name) noexcept {
     try {
@@ -77,14 +93,31 @@ void ThreadCpuReporter::tick(uint64_t iterations) {
                                       static_cast<double>(wall_ns))
                                    : 0.0;
 
+    const auto wall_ms = wall_ns / 1'000'000;
+    const auto cpu_ms = cpu_ns / 1'000'000;
     if (Log::enabled(LogLevel::all) && (report_idle_ || pct >= 1.0 || iterations_ > 0)) {
-        const auto wall_ms = wall_ns / 1'000'000;
-        const auto cpu_ms = cpu_ns / 1'000'000;
-        const auto tenths = static_cast<long long>(std::llround(pct * 10.0));
-        Log::trace("DIAG thread name=" + name_ + " wall_ms=" + std::to_string(wall_ms) +
-                   " cpu_ms=" + std::to_string(cpu_ms) + " cpu_pct=" +
-                   std::to_string(tenths / 10) + "." + std::to_string(std::abs(tenths % 10)) +
-                   " iterations=" + std::to_string(iterations_));
+        Log::trace(thread_cpu_message("DIAG thread", name_, wall_ms, cpu_ms, pct, iterations_));
+    }
+
+    // ALL already carries the complete periodic stream. DEBUG should stay quiet
+    // for healthy threads but must make sustained CPU consumption attributable
+    // without requiring an operator to reproduce the incident at ALL. Use
+    // hysteresis and a long repeat interval so a genuinely hot worker is visible
+    // without turning the diagnostic itself into log traffic.
+    if (!Log::enabled(LogLevel::all) && Log::enabled(LogLevel::debug)) {
+        if (pct >= debug_high_thread_cpu_pct) {
+            if (!debug_high_cpu_ ||
+                now - debug_last_report_ >= debug_high_thread_cpu_repeat) {
+                Log::debug(thread_cpu_message("DIAG high thread CPU", name_, wall_ms,
+                                              cpu_ms, pct, iterations_));
+                debug_last_report_ = now;
+            }
+            debug_high_cpu_ = true;
+        } else if (debug_high_cpu_ && pct <= debug_recovered_thread_cpu_pct) {
+            Log::debug(thread_cpu_message("DIAG thread CPU recovered", name_, wall_ms,
+                                          cpu_ms, pct, iterations_));
+            debug_high_cpu_ = false;
+        }
     }
 
     wall_started_ = now;

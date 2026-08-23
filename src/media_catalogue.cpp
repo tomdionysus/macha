@@ -3433,11 +3433,18 @@ void CatalogueScanner::loop(std::stop_token stop) {
         const auto sleep_from = std::chrono::steady_clock::now();
         auto wake_at = sleep_from + std::chrono::seconds(1);
         if (config.enabled) {
-            wake_at = std::min(wake_at, next_periodic);
+            // Hint work is node-local and may wake every scanner. Periodic and
+            // namespace-mutation reconciliation are coordinator-owned; an
+            // overdue coordinator deadline on a non-coordinator must not turn
+            // its idle loop into a zero-timeout spin. The one-second ceiling
+            // remains the bounded coordinator/membership observation interval.
             wake_at = std::min(wake_at, next_hint_batch);
-            if (mutation_due) wake_at = std::min(wake_at, *mutation_due);
-            if (mutation_first_seen)
-                wake_at = std::min(wake_at, *mutation_first_seen + config.rescan_max_delay);
+            if (is_coordinator) {
+                wake_at = std::min(wake_at, next_periodic);
+                if (mutation_due) wake_at = std::min(wake_at, *mutation_due);
+                if (mutation_first_seen)
+                    wake_at = std::min(wake_at, *mutation_first_seen + config.rescan_max_delay);
+            }
         }
         auto wait_for = std::chrono::duration_cast<std::chrono::milliseconds>(wake_at - sleep_from);
         if (wait_for < std::chrono::milliseconds(0)) wait_for = std::chrono::milliseconds(0);
