@@ -84,6 +84,9 @@ MetadataRecord decode_metadata_record(std::span<const uint8_t>);
 Hash256 metadata_hash(uint64_t, const Hash256&, std::span<const uint8_t>);
 MetadataRecord genesis_metadata();
 bool valid_metadata_record(const MetadataRecord&);
+// Deterministic identity of namespace paths and immutable file content. Deliberately
+// excludes catalogue/garbage/voter state and non-content stat metadata.
+Hash256 metadata_namespace_signature(const MetadataSnapshot&);
 class MetadataReplica {
     std::filesystem::path p_;
     std::filesystem::path committed_p_;

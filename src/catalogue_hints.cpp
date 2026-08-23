@@ -2,6 +2,7 @@
 #include "catalogue_hints.hpp"
 
 #include "crypto.hpp"
+#include "durable_file.hpp"
 #include "filesystem.hpp"
 #include "json.hpp"
 #include "log.hpp"
@@ -205,27 +206,12 @@ void CatalogueHintQueue::load_state() {
 void CatalogueHintQueue::save_state_locked() const {
     Json::Array hints;
     hints.reserve(hints_.size());
-    for (const auto& [_, hint] : hints_) hints.push_back(hint_json(hint));
+    for (const auto& [_, hint] : hints_)
+        hints.push_back(hint_json(hint));
     Json::Object root;
     root["version"] = static_cast<uint64_t>(2);
     root["hints"] = std::move(hints);
-    const auto text = Json(std::move(root)).dump();
-    const auto temp = state_file_.string() + ".tmp";
-    {
-        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-        if (!out) throw std::runtime_error("cannot write catalogue hint state " + temp);
-        out.write(text.data(), static_cast<std::streamsize>(text.size()));
-        out.flush();
-        if (!out) throw std::runtime_error("cannot flush catalogue hint state " + temp);
-    }
-    std::error_code ec;
-    std::filesystem::rename(temp, state_file_, ec);
-    if (ec) {
-        std::filesystem::remove(state_file_, ec);
-        ec.clear();
-        std::filesystem::rename(temp, state_file_, ec);
-    }
-    if (ec) throw std::runtime_error("cannot replace catalogue hint state: " + ec.message());
+    durable_replace_file(state_file_, Json(std::move(root)).dump());
 }
 
 void CatalogueHintQueue::mark_state_dirty_locked() {

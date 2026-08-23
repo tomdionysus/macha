@@ -290,8 +290,8 @@ class CatalogueScanner {
     void configure_providers();
     bool coordinator() const;
     void loop(std::stop_token);
-    void walk(std::string_view root, std::vector<std::pair<std::string, FsEntry>>& out,
-              std::stop_token = {});
+    void walk(std::string_view root, const MetadataSnapshot& namespace_snapshot,
+              std::vector<std::pair<std::string, FsEntry>>& out, std::stop_token = {});
     size_t scan_once(std::stop_token, bool force, std::string_view hint_source,
                      int hint_priority, bool unique_source_ref = false);
     struct PreparedHintMatch {

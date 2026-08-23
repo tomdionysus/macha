@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ingest.hpp"
+#include "durable_file.hpp"
 
 #include "crypto.hpp"
 #include "json.hpp"
@@ -380,23 +381,7 @@ void IngestManager::save_state_locked() const {
     Json::Object root;
     root["version"] = static_cast<uint64_t>(2);
     root["jobs"] = std::move(jobs);
-    const auto text = Json(std::move(root)).dump();
-    const auto temp = state_file_.string() + ".tmp";
-    {
-        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-        if (!out) throw std::runtime_error("cannot write ingest state " + temp);
-        out.write(text.data(), static_cast<std::streamsize>(text.size()));
-        out.flush();
-        if (!out) throw std::runtime_error("cannot flush ingest state " + temp);
-    }
-    std::error_code ec;
-    std::filesystem::rename(temp, state_file_, ec);
-    if (ec) {
-        std::filesystem::remove(state_file_, ec);
-        ec.clear();
-        std::filesystem::rename(temp, state_file_, ec);
-    }
-    if (ec) throw std::runtime_error("cannot replace ingest state: " + ec.message());
+    durable_replace_file(state_file_, Json(std::move(root)).dump());
 }
 
 void IngestManager::start() {
@@ -466,7 +451,12 @@ std::string IngestManager::submit_path(const std::filesystem::path& source,
     {
         std::lock_guard lock(mutex_);
         jobs_[job.id] = job;
-        save_state_locked();
+        try {
+            save_state_locked();
+        } catch (...) {
+            jobs_.erase(job.id);
+            throw;
+        }
     }
     cv_.notify_all();
     Log::info("ingest queued id=" + job.id + " source=" + normalized.string());
@@ -500,11 +490,17 @@ bool IngestManager::pause(std::string_view id) {
         it->second.state == IngestJobState::cancelled ||
         it->second.state == IngestJobState::failed)
         return false;
+    const auto previous = it->second;
     it->second.state = IngestJobState::paused;
     it->second.rate_bytes_per_second = 0;
     it->second.eta_seconds.reset();
     it->second.updated_unix_ms = now_ms();
-    save_state_locked();
+    try {
+        save_state_locked();
+    } catch (...) {
+        it->second = previous;
+        throw;
+    }
     cv_.notify_all();
     return true;
 }
@@ -516,10 +512,16 @@ bool IngestManager::resume(std::string_view id) {
     if (it->second.state != IngestJobState::paused && it->second.state != IngestJobState::blocked &&
         it->second.state != IngestJobState::failed)
         return false;
+    const auto previous = it->second;
     it->second.state = IngestJobState::queued;
     it->second.error.clear();
     it->second.updated_unix_ms = now_ms();
-    save_state_locked();
+    try {
+        save_state_locked();
+    } catch (...) {
+        it->second = previous;
+        throw;
+    }
     cv_.notify_all();
     return true;
 }
@@ -600,13 +602,19 @@ bool IngestManager::cancel(std::string_view id) {
         if (it == jobs_.end()) return false;
         if (it->second.state == IngestJobState::completed || it->second.state == IngestJobState::cancelled)
             return false;
+        const auto previous = it->second;
         it->second.state = IngestJobState::cancelled;
         it->second.rate_bytes_per_second = 0;
         it->second.eta_seconds.reset();
         it->second.updated_unix_ms = now_ms();
         cancelled = it->second;
         active = active_job_id_ == it->first;
-        save_state_locked();
+        try {
+            save_state_locked();
+        } catch (...) {
+            it->second = previous;
+            throw;
+        }
     }
     if (!active) {
         cleanup_partials(cancelled);

@@ -125,6 +125,7 @@ class SecureChannel {
     SecureChannel& operator=(const SecureChannel&) = delete;
     NodeInfo client_handshake(TransportLane);
     NodeInfo server_handshake(const std::string& remote_host);
+    void set_io_timeout(std::chrono::milliseconds);
     void send_fragment(uint64_t request_id, FrameType, MessageType, bool first, bool last,
                        std::span<const uint8_t>,
                        const std::function<void(size_t)>& progress = {});
@@ -299,6 +300,7 @@ class RpcServer {
     size_t active_nonforeground_data_{};
     std::mutex sessions_mutex_;
     std::vector<std::shared_ptr<Session>> sessions_;
+    std::atomic_size_t pre_auth_sessions_{};
     RpcClient* shared_client_{};
 
     static RequestClass request_class(FrameType);

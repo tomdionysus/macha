@@ -33,6 +33,8 @@ constexpr size_t foreground_data_worker_reserve = 2;
 static_assert(foreground_data_worker_reserve < data_worker_count);
 constexpr size_t max_pending_requests = 512;
 constexpr size_t max_peer_outbound = 256;
+constexpr size_t max_pre_auth_sessions = 8;
+constexpr auto rpc_handshake_timeout = std::chrono::seconds(5);
 constexpr size_t frame_header_size = 28;
 constexpr uint8_t frame_first = 0x01;
 constexpr uint8_t frame_last = 0x02;
@@ -49,6 +51,32 @@ void socket_options(int fd) {
 #endif
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+}
+
+void socket_timeout(int fd, std::chrono::milliseconds timeout) {
+    timeval value{};
+    if (timeout.count() > 0) {
+        value.tv_sec = static_cast<time_t>(timeout.count() / 1000);
+        value.tv_usec = static_cast<suseconds_t>((timeout.count() % 1000) * 1000);
+    }
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &value, sizeof(value)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &value, sizeof(value)) != 0)
+        throw std::runtime_error(std::string("socket timeout: ") + strerror(errno));
+}
+
+bool allowed_on_lane(TransportLane lane, MessageType type) noexcept {
+    const bool object_message = type == MessageType::get_object ||
+                                type == MessageType::put_object ||
+                                type == MessageType::object_reply;
+    if (lane == TransportLane::control)
+        return !object_message;
+    if (object_message)
+        return true;
+    // These are transport/session replies or controls which can legitimately
+    // accompany object traffic on an established DATA session.
+    return type == MessageType::ok || type == MessageType::error ||
+           type == MessageType::session_retire || type == MessageType::promote_read_ahead ||
+           type == MessageType::promote_foreground || type == MessageType::cancel_transfer;
 }
 
 void send_all(int fd, std::span<const uint8_t> bytes,
@@ -471,6 +499,13 @@ SecureChannel::~SecureChannel() {
     close_fd();
 }
 
+void SecureChannel::set_io_timeout(std::chrono::milliseconds timeout) {
+    std::lock_guard lock(close_mutex_);
+    if (fd_ < 0)
+        throw std::runtime_error("closed socket");
+    socket_timeout(fd_, timeout);
+}
+
 void SecureChannel::close_fd() {
     std::lock_guard lock(close_mutex_);
     if (fd_ >= 0) {
@@ -700,6 +735,9 @@ WireFragment SecureChannel::receive_fragment(
     if (size > negotiated_max_frame_size_ || counter != rx_counter_ + 1)
         throw std::runtime_error("bad frame sequence");
     validate_frame_semantics(message_type, frame_type);
+    if (!allowed_on_lane(lane_, message_type))
+        throw std::runtime_error("message " + std::string(message_type_name(message_type)) +
+                                 " is invalid on " + transport_lane_name(lane_) + " lane");
 
     std::array<uint8_t, 12> nonce{};
     std::array<uint8_t, 16> tag{};
@@ -1263,7 +1301,9 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
           inbound_promoter_(std::move(inbound_promoter)),
           inbound_canceller_(std::move(inbound_canceller)),
           result_observer_(std::move(result_observer)) {
+        channel_.set_io_timeout(rpc_handshake_timeout);
         peer_ = channel_.client_handshake(lane);
+        channel_.set_io_timeout(std::chrono::milliseconds(0));
         peer_observer_(peer_);
         reader_ = std::jthread([this](std::stop_token stop) { reader_loop(stop); });
         writer_ = std::jthread([this](std::stop_token stop) { writer_loop(stop); });
@@ -2774,24 +2814,61 @@ void RpcServer::accept_loop(std::stop_token stop) {
             continue;
         socket_options(client);
 
-        auto session = std::make_shared<Session>();
-        session->remote_host = numeric_host(address, size);
-        session->channel = std::make_unique<SecureChannel>(client, keys_, local_, max_frame_size_);
-        {
-            std::lock_guard lock(sessions_mutex_);
-            sessions_.push_back(session);
+        size_t pre_auth = pre_auth_sessions_.load(std::memory_order_relaxed);
+        while (pre_auth < max_pre_auth_sessions &&
+               !pre_auth_sessions_.compare_exchange_weak(
+                   pre_auth, pre_auth + 1, std::memory_order_acq_rel,
+                   std::memory_order_relaxed)) {
         }
-        session->reader = std::jthread([this, raw = session.get()](std::stop_token) {
-            session_loop(raw);
-        });
+        if (pre_auth >= max_pre_auth_sessions) {
+            ::shutdown(client, SHUT_RDWR);
+            ::close(client);
+            continue;
+        }
+
+        bool channel_owns_client = false;
+        bool registered = false;
+        std::shared_ptr<Session> session;
+        try {
+            session = std::make_shared<Session>();
+            session->remote_host = numeric_host(address, size);
+            session->channel =
+                std::make_unique<SecureChannel>(client, keys_, local_, max_frame_size_);
+            channel_owns_client = true;
+            session->channel->set_io_timeout(rpc_handshake_timeout);
+            {
+                std::lock_guard lock(sessions_mutex_);
+                sessions_.push_back(session);
+                registered = true;
+            }
+            session->reader = std::jthread([this, raw = session.get()](std::stop_token) {
+                session_loop(raw);
+            });
+        } catch (...) {
+            pre_auth_sessions_.fetch_sub(1, std::memory_order_acq_rel);
+            if (registered) {
+                std::lock_guard lock(sessions_mutex_);
+                std::erase_if(sessions_, [&](const auto& candidate) {
+                    return candidate == session;
+                });
+            }
+            if (!channel_owns_client) {
+                ::shutdown(client, SHUT_RDWR);
+                ::close(client);
+            }
+        }
     }
 }
 
 void RpcServer::session_loop(Session* session) {
     set_thread_name("macha-accept-rd");
     MessageAssembler assembler;
+    bool pre_auth_slot = true;
     try {
         session->peer = session->channel->server_handshake(session->remote_host);
+        pre_auth_sessions_.fetch_sub(1, std::memory_order_acq_rel);
+        pre_auth_slot = false;
+        session->channel->set_io_timeout(std::chrono::milliseconds(0));
         session->ready = true;
         session->start_writer();
         observer_(session->peer);
@@ -2925,6 +3002,9 @@ void RpcServer::session_loop(Session* session) {
         Log::debug(std::string("RPC session: ") + error.what());
         session->fail_pending(error.what());
     }
+
+    if (pre_auth_slot)
+        pre_auth_sessions_.fetch_sub(1, std::memory_order_acq_rel);
 
     if (shared_client_ && session->peer.id != NodeId{})
         shared_client_->unregister_inbound(session->peer.id, session->channel->lane(),

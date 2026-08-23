@@ -71,6 +71,9 @@ struct CatalogueStatus {
 struct CatalogueMaintenance {
     std::set<ObjectId> live;
     std::set<ObjectId> universal;
+    // False means current catalogue metadata could not be fully converged, so
+    // the live set is conservative but incomplete and physical GC must not run.
+    bool complete{true};
 };
 
 struct CatalogueArtworkContent {
@@ -114,7 +117,8 @@ class CatalogueManager {
     void cache(uint64_t metadata_generation, const MetadataSnapshot&, CatalogueSnapshot);
     std::shared_ptr<const CatalogueSnapshot> current_snapshot();
     void commit(const std::optional<ObjectId>& expected_root, const CatalogueSnapshot& next,
-                const std::set<ObjectId>& old_artwork);
+                const std::set<ObjectId>& old_artwork,
+                std::optional<Hash256> expected_namespace = std::nullopt);
 
   public:
     CatalogueManager(NodeRuntime&, DistributedStore&, MetadataManager&);
@@ -140,7 +144,8 @@ class CatalogueManager {
                                    std::span<const uint8_t> bytes);
     void reconcile_scanner(const std::vector<CatalogueItem>& discovered,
                            const std::set<std::string>& active_media_ids,
-                           bool prune_missing = true);
+                           bool prune_missing = true,
+                           std::optional<Hash256> expected_namespace = std::nullopt);
     std::optional<CatalogueArtworkContent> artwork(const ObjectId&);
     CatalogueMaintenance maintenance_objects();
 };

@@ -947,6 +947,27 @@ std::optional<MetadataRecord> MetadataReplica::load(const std::filesystem::path&
     return decode_metadata_record(aes_gcm_open(key_, nonce, tag, ciphertext, DM));
 }
 
+Hash256 metadata_namespace_signature(const MetadataSnapshot& snapshot) {
+    Writer writer;
+    writer.u64(snapshot.entries.size());
+    for (const auto& [path, entry] : snapshot.entries) {
+        writer.string(path);
+        writer.u8(static_cast<uint8_t>(entry.type));
+        if (entry.type != EntryType::file)
+            continue;
+        writer.u64(entry.size);
+        writer.u32(entry.extents.size());
+        for (const auto& extent : entry.extents) {
+            writer.u64(extent.offset);
+            writer.u64(extent.length);
+            writer.u8(extent.hole);
+            if (!extent.hole)
+                writer.fixed(extent.id.bytes);
+        }
+    }
+    return sha256(writer.data());
+}
+
 std::string normalize_path(const std::string& p) {
     std::vector<std::string> v;
     size_t i = 0;

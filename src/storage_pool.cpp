@@ -3,6 +3,7 @@
 
 #include "codec.hpp"
 #include "diagnostics.hpp"
+#include "durable_file.hpp"
 #include "log.hpp"
 #include "placement.hpp"
 
@@ -26,21 +27,6 @@ std::string read_text(const std::filesystem::path& path) {
     while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())))
         text.pop_back();
     return text;
-}
-
-void atomic_text(const std::filesystem::path& path, const std::string& text) {
-    std::filesystem::create_directories(path.parent_path());
-    auto tmp = path.string() + ".tmp." + std::to_string(getpid()) + "." + std::to_string(unix_ms());
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out)
-            throw std::runtime_error("cannot create " + tmp);
-        out << text << '\n';
-        out.flush();
-        if (!out)
-            throw std::runtime_error("cannot write " + tmp);
-    }
-    std::filesystem::rename(tmp, path);
 }
 
 std::string marker_text(const NodeId& node, const NodeId& token) {
@@ -177,15 +163,15 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
             token = marker_token;
             token_known = true;
             if (!have_state)
-                atomic_text(state_id, marker_text(node_id_, marker_token));
+                durable_replace_file(state_id, marker_text(node_id_, marker_token) + "\n");
         } else if (have_state) {
             deactivate(backend, existing, "known backend marker is absent", generation);
             return false;
         } else {
             token = random_node_id();
             token_known = true;
-            atomic_text(marker, marker_text(node_id_, token));
-            atomic_text(state_id, marker_text(node_id_, token));
+            durable_replace_file(marker, marker_text(node_id_, token) + "\n");
+            durable_replace_file(state_id, marker_text(node_id_, token) + "\n");
         }
 
         NodeId marker_node{}, marker_token{};
@@ -442,6 +428,22 @@ bool StoragePool::has(const ObjectId& id) const {
     return false;
 }
 
+bool StoragePool::valid(const ObjectId& id) const {
+    for (const auto& backend : ranked(id)) {
+        std::shared_ptr<LocalStore> store;
+        {
+            std::lock_guard lock(backend->mutex);
+            if (backend->online)
+                store = backend->store;
+        }
+        if (!store)
+            continue;
+        if (store->valid(id))
+            return true;
+    }
+    return false;
+}
+
 bool StoragePool::remove(const ObjectId& id) {
     bool removed = false;
     for (const auto& backend : snapshot()) {
@@ -598,7 +600,7 @@ StoragePool::rebalance_step(uint64_t budget_bytes, size_t operation_budget,
             if (!store)
                 continue;
             try {
-                if (store->has(id)) {
+                if (store->valid(id)) {
                     holders.push_back({backend, store});
                     estimated = std::max(estimated, store->stored_size(id));
                 }
@@ -634,7 +636,7 @@ StoragePool::rebalance_step(uint64_t budget_bytes, size_t operation_budget,
             }
             if (data && preferred_store) {
                 try {
-                    if (preferred_store->put(id, *data)) {
+                    if (preferred_store->put(id, *data) && preferred_store->valid(id)) {
                         result.bytes += data->size();
                         holders.push_back({preferred, preferred_store});
                         preferred_has = true;

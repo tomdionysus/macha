@@ -833,8 +833,16 @@ struct FuseFrontend::State {
                 Hash256 expected;
                 std::copy_n(bytes.begin() + static_cast<ptrdiff_t>(position + 4 + length), 32,
                             expected.bytes.begin());
-                if (sha256(payload) != expected)
+                if (sha256(payload) != expected) {
+                    // A crash can leave the final append at its full logical
+                    // length while some tail sectors (including the checksum)
+                    // were not durably written. Only an EOF checksum failure is
+                    // therefore a recoverable torn append; corruption before a
+                    // later frame remains fatal.
+                    if (position + frame_size == bytes.size())
+                        break;
                     throw std::runtime_error("FUSE operation journal checksum mismatch");
+                }
                 parse_journal_record(recovery, payload);
                 position += frame_size;
                 last_good = position;
@@ -2207,6 +2215,31 @@ struct FuseFrontend::State {
             }
             auto inode = found->second;
             std::lock_guard inode_lock(inode->mutex);
+            const bool content_changed = !same_file_content(inode->base, entry);
+            // Metadata snapshots do not carry a stable distributed inode id.
+            // A dirty/open inode whose name now denotes replacement content
+            // must be detached from that pathname before any queued publication
+            // can run; otherwise old writes can be committed into the new file.
+            // For a read-only descriptor, a non-advancing entry version plus
+            // changed content is the replacement/rename-over signature produced
+            // by current filesystem metadata. Advancing versions remain ordinary
+            // in-place content changes and stay attached to the same open inode.
+            const bool replaced_open_inode =
+                content_changed &&
+                (!inode->data_ops.empty() || inode->unconfirmed_data_entry ||
+                 (inode->open_handles != 0 && entry.version <= inode->base.version));
+            if (replaced_open_inode && path != "/") {
+                inode->published_path.reset();
+                auto replacement = std::make_shared<Inode>();
+                replacement->id = next_inode++;
+                replacement->base = entry;
+                replacement->visible = entry;
+                replacement->current_path = path;
+                replacement->published_path = path;
+                found->second = replacement;
+                inodes[replacement->id] = std::move(replacement);
+                continue;
+            }
             inode->published_path = path;
             if (inode->data_ops.empty() && !inode->unconfirmed_data_entry) {
                 inode->base = entry;
@@ -2221,10 +2254,10 @@ struct FuseFrontend::State {
             }
             auto inode = it->second;
             std::lock_guard inode_lock(inode->mutex);
-            if (inode->open_handles || !inode->data_ops.empty() || inode->unconfirmed_data_entry) {
-                ++it;
-                continue;
-            }
+            // Remote unlink has the same POSIX name semantics as a local unlink:
+            // remove the directory edge immediately. Open handles and dirty
+            // state retain the detached inode object, but never ownership of the
+            // old pathname and therefore cannot resurrect it on publication.
             inode->published_path.reset();
             it = paths.erase(it);
         }

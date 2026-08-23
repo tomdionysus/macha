@@ -109,6 +109,7 @@ struct CatalogueApiConfig {
     size_t max_request_bytes{8 * 1024 * 1024};
     size_t workers{16};
     size_t max_queued_connections{128};
+    std::chrono::milliseconds client_io_timeout{30000};
     size_t stream_chunk_bytes{256 * 1024};
 };
 

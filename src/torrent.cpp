@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "torrent.hpp"
+#include "durable_file.hpp"
 
 #include "crypto.hpp"
 #include "json.hpp"
@@ -528,25 +529,7 @@ void TorrentManager::save_state_locked() const {
     Json::Object root;
     root["version"] = static_cast<uint64_t>(1);
     root["jobs"] = std::move(jobs);
-    const auto text = Json(std::move(root)).dump();
-    const auto temp = state_file_.string() + ".tmp";
-    {
-        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-        if (!out) throw std::runtime_error("cannot write torrent state");
-        out.write(text.data(), static_cast<std::streamsize>(text.size()));
-        out.flush();
-    }
-    std::error_code ec;
-    std::filesystem::permissions(temp, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-                                 std::filesystem::perm_options::replace, ec);
-    ec.clear();
-    std::filesystem::rename(temp, state_file_, ec);
-    if (ec) {
-        std::filesystem::remove(state_file_, ec);
-        ec.clear();
-        std::filesystem::rename(temp, state_file_, ec);
-    }
-    if (ec) throw std::runtime_error("cannot replace torrent state: " + ec.message());
+    durable_replace_file(state_file_, Json(std::move(root)).dump());
 }
 
 void TorrentManager::start() {
@@ -660,7 +643,28 @@ std::string TorrentManager::add_impl(std::string uri, bool allow_fetch) {
         std::lock_guard lock(mutex_);
         jobs_[job.id] = job;
         impl_->handles[job.id] = std::move(handle);
-        save_state_locked();
+        try {
+            save_state_locked();
+        } catch (...) {
+            // The API must not report a failed admission while libtorrent keeps
+            // unacknowledged work running. Roll the live handle and in-memory
+            // record back before propagating the persistence failure.
+            if (auto h = impl_->handles.find(job.id); h != impl_->handles.end()) {
+                try {
+                    impl_->session.remove_torrent(
+                        h->second, lt::session::delete_files | lt::session::delete_partfile);
+                } catch (...) {
+                    // Preserve the original durable-state error. remove_torrent
+                    // is best-effort cleanup here; erase the manager handle so
+                    // this failed request cannot later be driven by our worker.
+                }
+                impl_->handles.erase(h);
+            }
+            jobs_.erase(job.id);
+            std::error_code ec;
+            std::filesystem::remove_all(job.save_path, ec);
+            throw;
+        }
     }
     cv_.notify_all();
     return job.id;
