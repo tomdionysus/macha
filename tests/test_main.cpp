@@ -3616,6 +3616,310 @@ void test_fuse_publication_yields_to_playback() {
     service.stop();
 }
 
+void test_fuse_durable_journal_recovers_namespace_and_data() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-journal-recovery", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 30s;
+
+    Service service(config, keys);
+    service.start();
+    uint64_t inode = 0;
+    auto payload = pattern(384 * 1024 + 17);
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+
+        // Hold asynchronous convergence behind a viewer-critical quiet window.
+        // The namespace and bytes below are nevertheless successful FUSE
+        // operations and therefore must be reconstructable from local state.
+        service.filesystem().store().foreground_activity(1);
+        frontend->mkdir("/TV", 0755, getuid(), getgid());
+        frontend->mkdir("/TV/Buffy", 0755, getuid(), getgid());
+        auto handle = frontend->create("/TV/Buffy/S07E01.mp4", 0644, getuid(), getgid(),
+                                       true, true, false);
+        inode = handle.inode;
+        REQUIRE(frontend->write(inode, 0, payload) == payload.size());
+        frontend->release(inode, true);
+
+        CHECK(frontend->inode_for_path("/TV").has_value());
+        CHECK(frontend->inode_for_path("/TV/Buffy/S07E01.mp4") == inode);
+        auto before = frontend->getattr("/TV/Buffy/S07E01.mp4");
+        CHECK(before.size == payload.size());
+
+        // Simulate the frontend process boundary while distributed publication
+        // is still blocked. stop() must not need to publish the accepted work.
+        frontend->stop();
+    }
+
+    auto replay_config = config.fuse;
+    replay_config.publication_quiet = 0ms;
+    {
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay_config);
+        REQUIRE(recovered->inode_for_path("/TV").has_value());
+        REQUIRE(recovered->inode_for_path("/TV/Buffy").has_value());
+        auto recovered_inode = recovered->inode_for_path("/TV/Buffy/S07E01.mp4");
+        REQUIRE(recovered_inode.has_value());
+        CHECK(recovered->getattr("/TV/Buffy/S07E01.mp4").size == payload.size());
+
+        Bytes local(payload.size());
+        REQUIRE(recovered->read(*recovered_inode, 0, local) == local.size());
+        CHECK(local == payload);
+
+        REQUIRE(recovered->wait_for_idle(15s));
+        auto committed = service.filesystem().getattr("/TV/Buffy/S07E01.mp4");
+        CHECK(committed.size == payload.size());
+        auto reader = service.filesystem().open_read("/TV/Buffy/S07E01.mp4");
+        Bytes actual(payload.size());
+        size_t offset = 0;
+        while (offset < actual.size()) {
+            auto n = reader->read(offset, {actual.data() + offset, actual.size() - offset});
+            REQUIRE(n > 0);
+            offset += n;
+        }
+        CHECK(actual == payload);
+
+        const auto journal = config.state_path / "fuse-spool" / "operations.log";
+        REQUIRE(std::filesystem::exists(journal));
+        CHECK(std::filesystem::file_size(journal) == 8);
+    }
+    service.stop();
+}
+
+void test_fuse_durable_journal_recovers_ordered_mutations() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-journal-ordering", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 30s;
+
+    Service service(config, keys);
+    service.start();
+
+    const auto initial = pattern(192 * 1024 + 31);
+    const auto tail = pattern(24 * 1024 + 7);
+    Bytes expected(initial.begin(), initial.begin() + 64 * 1024);
+    expected.resize(96 * 1024, 0);
+    expected.insert(expected.end(), tail.begin(), tail.end());
+
+    constexpr std::string_view old_path = "/TV/Buffy/S07E01.mp4";
+    constexpr std::string_view new_dir = "/TV/Buffy The Vampire Slayer";
+    constexpr std::string_view new_path = "/TV/Buffy The Vampire Slayer/S07E01.mp4";
+    constexpr std::string_view removed_path = "/TV/Buffy The Vampire Slayer/S07E02.mp4";
+
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        service.filesystem().store().foreground_activity(1);
+
+        frontend->mkdir("/TV", 0755, getuid(), getgid());
+        frontend->mkdir("/TV/Buffy", 0755, getuid(), getgid());
+        auto first = frontend->create(old_path, 0644, getuid(), getgid(), true, true, false);
+        REQUIRE(frontend->write(first.inode, 0, initial) == initial.size());
+        frontend->truncate(first.inode, 64 * 1024);
+        REQUIRE(frontend->write(first.inode, 96 * 1024, tail) == tail.size());
+        frontend->release(first.inode, true);
+
+        frontend->rename("/TV/Buffy", new_dir);
+        auto removed = frontend->create(removed_path, 0644, getuid(), getgid(), true, true, false);
+        auto removed_bytes = pattern(32 * 1024 + 3);
+        REQUIRE(frontend->write(removed.inode, 0, removed_bytes) == removed_bytes.size());
+        frontend->release(removed.inode, true);
+        frontend->unlink(removed_path);
+
+        // Root metadata uses inode 1 and therefore exercises recovery of the
+        // one stable inode which is never allocated from next_inode.
+        frontend->chmod("/", 0700);
+
+        CHECK(!frontend->inode_for_path(old_path).has_value());
+        REQUIRE(frontend->inode_for_path(new_path).has_value());
+        CHECK(!frontend->inode_for_path(removed_path).has_value());
+        CHECK(frontend->getattr(new_path).size == expected.size());
+        CHECK(frontend->getattr("/").mode == 0700);
+        frontend->stop();
+    }
+
+    // First recovery remains publication-blocked: these assertions are about
+    // reconstruction from committed metadata plus the durable local journal,
+    // not about work which happened to converge quickly in the background.
+    {
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        CHECK(!recovered->inode_for_path(old_path).has_value());
+        auto recovered_inode = recovered->inode_for_path(new_path);
+        REQUIRE(recovered_inode.has_value());
+        CHECK(!recovered->inode_for_path(removed_path).has_value());
+        CHECK(recovered->getattr(new_path).size == expected.size());
+        CHECK(recovered->getattr("/").mode == 0700);
+
+        Bytes local(expected.size());
+        REQUIRE(recovered->read(*recovered_inode, 0, local) == local.size());
+        CHECK(local == expected);
+        recovered->stop();
+    }
+
+    // A second restart removes the artificial quiet window and verifies that
+    // the recovered operation order can converge to the ordinary filesystem.
+    auto replay_config = config.fuse;
+    replay_config.publication_quiet = 0ms;
+    {
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay_config);
+        REQUIRE(recovered->wait_for_idle(20s));
+
+        bool old_missing = false;
+        try { (void)service.filesystem().getattr(std::string(old_path)); }
+        catch (const FsError& e) { old_missing = e.code() == ENOENT; }
+        CHECK(old_missing);
+
+        bool removed_missing = false;
+        try { (void)service.filesystem().getattr(std::string(removed_path)); }
+        catch (const FsError& e) { removed_missing = e.code() == ENOENT; }
+        CHECK(removed_missing);
+
+        auto committed = service.filesystem().getattr(std::string(new_path));
+        CHECK(committed.size == expected.size());
+        CHECK(service.filesystem().getattr("/").mode == 0700);
+
+        auto reader = service.filesystem().open_read(std::string(new_path));
+        Bytes actual(expected.size());
+        size_t offset = 0;
+        while (offset < actual.size()) {
+            auto n = reader->read(offset, {actual.data() + offset, actual.size() - offset});
+            REQUIRE(n > 0);
+            offset += n;
+        }
+        CHECK(actual == expected);
+    }
+    service.stop();
+}
+
+void test_fuse_durable_journal_trims_torn_tail() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-journal-torn-tail", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 30s;
+
+    Service service(config, keys);
+    service.start();
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        service.filesystem().store().foreground_activity(1);
+        frontend->mkdir("/pending", 0755, getuid(), getgid());
+        REQUIRE(frontend->inode_for_path("/pending").has_value());
+        frontend->stop();
+    }
+
+    const auto journal = config.state_path / "fuse-spool" / "operations.log";
+    const auto valid_size = std::filesystem::file_size(journal);
+    REQUIRE(valid_size > 8);
+    {
+        std::ofstream out(journal, std::ios::binary | std::ios::app);
+        REQUIRE(out.good());
+        const char torn[] = {char(0), char(0), char(0)};
+        out.write(torn, sizeof(torn));
+        REQUIRE(out.good());
+    }
+    REQUIRE(std::filesystem::file_size(journal) == valid_size + 3);
+
+    {
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        REQUIRE(recovered->inode_for_path("/pending").has_value());
+        CHECK(std::filesystem::file_size(journal) == valid_size);
+        recovered->stop();
+    }
+    service.stop();
+}
+
+void test_fuse_durable_journal_rejects_unreferenced_spool() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-journal-orphan", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+
+    Service service(config, keys);
+    service.start();
+    const auto spool_dir = config.state_path / "fuse-spool";
+    std::filesystem::create_directories(spool_dir);
+    {
+        std::ofstream out(spool_dir / "inode-999.spool", std::ios::binary | std::ios::trunc);
+        REQUIRE(out.good());
+        out << "unattributed bytes";
+        REQUIRE(out.good());
+    }
+
+    bool rejected = false;
+    try {
+        auto should_fail = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        should_fail->stop();
+    } catch (const std::exception&) {
+        rejected = true;
+    }
+    CHECK(rejected);
+    service.stop();
+}
+
+void test_fuse_durable_journal_rejects_missing_spool() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-journal-missing-spool", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 30s;
+
+    Service service(config, keys);
+    service.start();
+    service.filesystem().create_file("/recover.bin", 0600, getuid(), getgid());
+    uint64_t inode = 0;
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto handle = frontend->open("/recover.bin", true, true, false, false);
+        inode = handle.inode;
+        auto payload = pattern(128 * 1024);
+        REQUIRE(frontend->write(inode, 0, payload) == payload.size());
+        service.filesystem().store().foreground_activity(1);
+        frontend->release(inode, true);
+        frontend->stop();
+    }
+
+    const auto spool = config.state_path / "fuse-spool" /
+                       ("inode-" + std::to_string(inode) + ".spool");
+    REQUIRE(std::filesystem::exists(spool));
+    REQUIRE(std::filesystem::remove(spool));
+
+    bool rejected = false;
+    try {
+        auto should_fail = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        should_fail->stop();
+    } catch (const std::exception&) {
+        rejected = true;
+    }
+    CHECK(rejected);
+    service.stop();
+}
+
 void test_fuse_read_only_release_does_not_publish_writer_data() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
@@ -7656,8 +7960,9 @@ void test_playback_sessions_and_streaming_http_bodies() {
     CHECK(playback.handle(bad_track).status == 400);
 
     // Quality is a real session preference, not a client-only label. Requesting
-    // 720p must rebuild the session at 720p and advertise only modes compatible
-    // with that quality constraint.
+    // 720p must rebuild the negotiated Auto session at 720p. Remux is not a
+    // valid quality-preserving choice here, while Direct remains exposed as the
+    // explicit byte-stream override and deliberately ignores quality constraints.
     Json::Object quality_preferences{{"mode", "auto"}, {"max_height", 720}};
     Json::Object quality_root{{"preferences", Json(std::move(quality_preferences))}};
     auto quality_text = Json(std::move(quality_root)).dump();
@@ -7674,8 +7979,14 @@ void test_playback_sessions_and_streaming_http_bodies() {
     CHECK(quality_json.find("output")->find("video")->find("codec")->asString() == "h264");
     CHECK(quality_json.find("output")->find("video")->find("height")->asInt64() == 720);
     auto quality_modes = quality_json.find("options")->find("modes")->asArray();
+    CHECK(std::any_of(quality_modes.begin(), quality_modes.end(), [](const Json& mode) {
+        return mode.asString() == "direct";
+    }));
     CHECK(std::none_of(quality_modes.begin(), quality_modes.end(), [](const Json& mode) {
-        return mode.asString() == "direct" || mode.asString() == "remux";
+        return mode.asString() == "remux";
+    }));
+    CHECK(std::any_of(quality_modes.begin(), quality_modes.end(), [](const Json& mode) {
+        return mode.asString() == "transcode";
     }));
 
     Json::Object restore_preferences{{"mode", "auto"}, {"max_height", Json(nullptr)},
@@ -7891,6 +8202,11 @@ int main() {
         RUN_TEST(test_open_write_survives_rename);
         RUN_TEST(test_fuse_frontend_ordering_merging_and_cache);
         RUN_TEST(test_fuse_publication_yields_to_playback);
+        RUN_TEST(test_fuse_durable_journal_recovers_namespace_and_data);
+        RUN_TEST(test_fuse_durable_journal_recovers_ordered_mutations);
+        RUN_TEST(test_fuse_durable_journal_trims_torn_tail);
+        RUN_TEST(test_fuse_durable_journal_rejects_unreferenced_spool);
+        RUN_TEST(test_fuse_durable_journal_rejects_missing_spool);
         RUN_TEST(test_fuse_read_only_release_does_not_publish_writer_data);
         RUN_TEST(test_fuse_frontend_unlink_and_rename_over_open_inode_ordering);
         RUN_TEST(test_fuse_frontend_read_overlay_truncate_and_hydration_hints);
