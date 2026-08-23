@@ -1470,6 +1470,8 @@ void test_config() {
     auto disk1 = t.path() / "disk1";
     auto disk2 = t.path() / "disk2";
     auto cache_dir = t.path() / "cache";
+    auto fuse_spool = t.path() / "fuse-spool";
+    auto fuse_journal = t.path() / "fuse-journal" / "operations.log";
     {
         std::ofstream out(yaml);
         out << "state_path: " << state.string() << "\n"
@@ -1491,6 +1493,8 @@ void test_config() {
             << "  root_mode: '0750'\n"
             << "fuse:\n"
             << "  allow_other: true\n"
+            << "  spool_path: " << fuse_spool.string() << "\n"
+            << "  operation_journal_path: " << fuse_journal.string() << "\n"
             << "  entry_timeout_ms: 375\n"
             << "  attr_timeout_ms: 225\n"
             << "  negative_timeout_ms: 75\n"
@@ -1640,6 +1644,10 @@ void test_config() {
     CHECK(yc.log_level == LogLevel::warn);
     CHECK(yc.ffmpeg_log_level == FfmpegLogLevel::debug);
     CHECK(yc.fuse.allow_other);
+    REQUIRE(yc.fuse.spool_path.has_value());
+    CHECK(*yc.fuse.spool_path == fuse_spool);
+    REQUIRE(yc.fuse.operation_journal_path.has_value());
+    CHECK(*yc.fuse.operation_journal_path == fuse_journal);
     CHECK(yc.fuse.entry_timeout == 375ms);
     CHECK(yc.fuse.attr_timeout == 225ms);
     CHECK(yc.fuse.negative_timeout == 75ms);
@@ -3741,6 +3749,9 @@ void test_fuse_durable_journal_recovers_namespace_and_data() {
     config.fuse.commit_workers = 1;
     config.fuse.foreground_commit_workers = 1;
     config.fuse.publication_quiet = 30s;
+    config.fuse.spool_path = t.path() / "external-fuse-spool";
+    config.fuse.operation_journal_path =
+        t.path() / "external-fuse-journal" / "operations.log";
 
     Service service(config, keys);
     service.start();
@@ -3798,9 +3809,11 @@ void test_fuse_durable_journal_recovers_namespace_and_data() {
         }
         CHECK(actual == payload);
 
-        const auto journal = config.state_path / "fuse-spool" / "operations.log";
+        const auto journal = *config.fuse.operation_journal_path;
         REQUIRE(std::filesystem::exists(journal));
         CHECK(std::filesystem::file_size(journal) == 8);
+        CHECK(std::filesystem::exists(*config.fuse.spool_path));
+        CHECK(!std::filesystem::exists(config.state_path / "fuse-spool"));
     }
     service.stop();
 }

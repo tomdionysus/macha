@@ -97,6 +97,10 @@ void validate(Config& config) {
         config.fuse.attr_timeout > std::chrono::seconds(5) ||
         config.fuse.negative_timeout > std::chrono::seconds(5))
         throw std::runtime_error("fuse kernel cache timeouts must be <= 5000ms");
+    if (config.fuse.spool_path && config.fuse.spool_path->empty())
+        throw std::runtime_error("fuse.spool_path must not be empty");
+    if (config.fuse.operation_journal_path && config.fuse.operation_journal_path->empty())
+        throw std::runtime_error("fuse.operation_journal_path must not be empty");
     const auto fuse_max = std::chrono::seconds(30);
     const auto positive = [](std::chrono::milliseconds value) { return value.count() > 0; };
     if (!positive(config.fuse.absolute_request_timeout) ||
@@ -401,6 +405,11 @@ void parse_fuse(const YAML::Node& root, Config& c) {
     auto f = root["fuse"];
     if (!f) return;
     if (f["allow_other"]) c.fuse.allow_other = f["allow_other"].as<bool>();
+    if (f["spool_path"])
+        c.fuse.spool_path = std::filesystem::path(f["spool_path"].as<std::string>());
+    if (f["operation_journal_path"])
+        c.fuse.operation_journal_path =
+            std::filesystem::path(f["operation_journal_path"].as<std::string>());
     if (f["entry_timeout_ms"]) c.fuse.entry_timeout = milliseconds(f["entry_timeout_ms"], "fuse.entry_timeout_ms");
     if (f["attr_timeout_ms"]) c.fuse.attr_timeout = milliseconds(f["attr_timeout_ms"], "fuse.attr_timeout_ms");
     if (f["negative_timeout_ms"]) c.fuse.negative_timeout = milliseconds(f["negative_timeout_ms"], "fuse.negative_timeout_ms");

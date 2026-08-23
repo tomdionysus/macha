@@ -59,6 +59,15 @@ struct FuseConfig {
     // Expose a FUSE mount to users other than the process that mounted it.
     bool allow_other{};
 
+    // Durable local admission state. By default the spool remains at
+    // state_path/fuse-spool and the operation journal lives inside it as
+    // operations.log for compatibility with 0.13/0.14.x. Either location may
+    // be moved independently. The spool can contain the full unpublished byte
+    // backlog; the journal contains only the descriptors which make those bytes
+    // and optimistic namespace mutations recoverable after restart.
+    std::optional<std::filesystem::path> spool_path;
+    std::optional<std::filesystem::path> operation_journal_path;
+
     // Short-lived kernel-side namespace/attribute caches.
     std::chrono::milliseconds entry_timeout{1000};
     std::chrono::milliseconds attr_timeout{1000};
