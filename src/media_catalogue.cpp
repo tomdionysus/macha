@@ -2671,20 +2671,27 @@ void CatalogueScanner::reconfigure(CatalogueScannerConfig config) {
     start();
 }
 
-void CatalogueScanner::walk(std::string_view root,
+void CatalogueScanner::walk(std::string_view root, const MetadataSnapshot& namespace_snapshot,
                             std::vector<std::pair<std::string, FsEntry>>& out,
                             std::stop_token stop) {
-    std::vector<std::string> pending{normalize_path(std::string(root))};
-    while (!pending.empty() && !stop.stop_requested()) {
-        auto path = std::move(pending.back());
-        pending.pop_back();
-        for (auto& [name, entry] : fs_.readdir(path)) {
-            if (stop.stop_requested()) return;
-            if (name == "." || name == "..") continue;
-            auto child = path == "/" ? "/" + name : path + "/" + name;
-            if (entry.type == EntryType::directory) pending.push_back(std::move(child));
-            else out.emplace_back(std::move(child), std::move(entry));
-        }
+    const auto normalized = normalize_path(std::string(root));
+    const auto root_entry = namespace_snapshot.entries.find(normalized);
+    if (root_entry == namespace_snapshot.entries.end())
+        throw FsError(ENOENT, "missing");
+    if (root_entry->second.type != EntryType::directory)
+        throw FsError(ENOTDIR, "catalogue root is not a directory");
+
+    // A destructive discovery pass must describe one immutable namespace
+    // generation. Enumerating the snapshot directly is both cheaper than a
+    // sequence of readdir() calls and prevents a mutation between directories
+    // from manufacturing an absence that never existed in any generation.
+    const auto prefix = normalized == "/" ? std::string("/") : normalized + "/";
+    auto it = namespace_snapshot.entries.lower_bound(prefix);
+    for (; it != namespace_snapshot.entries.end(); ++it) {
+        if (stop.stop_requested()) return;
+        if (!it->first.starts_with(prefix)) break;
+        if (it->second.type == EntryType::file)
+            out.emplace_back(it->first, it->second);
     }
 }
 
@@ -3063,6 +3070,8 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
         std::string path;
         FsEntry entry;
     };
+    const auto namespace_view = fs_.local_snapshot_view();
+    const auto& namespace_snapshot = *namespace_view.snapshot;
     std::vector<ProviderFile> files;
     size_t roots_scanned = 0;
     size_t roots_unavailable = 0;
@@ -3070,7 +3079,7 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
         for (const auto& root : provider->roots()) {
             std::vector<std::pair<std::string, FsEntry>> root_files;
             try {
-                walk(root, root_files, stop);
+                walk(root, namespace_snapshot, root_files, stop);
                 if (stop.stop_requested()) return 0;
                 ++roots_scanned;
                 for (auto& [path, entry] : root_files)
@@ -3128,7 +3137,10 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
     if (stop.stop_requested()) return 0;
     // Discovery is the only destructive catalogue source. Hint processing is
     // additive and cannot infer absence from a single path.
-    catalogue_.reconcile_scanner({}, active_media_ids, complete_scan);
+    catalogue_.reconcile_scanner(
+        {}, active_media_ids, complete_scan,
+        complete_scan ? std::optional<Hash256>(metadata_namespace_signature(namespace_snapshot))
+                      : std::nullopt);
     if (!ids.empty())
         Log::info("catalogue scan queued " + std::to_string(ids.size()) + " media hints");
     return ids.size();

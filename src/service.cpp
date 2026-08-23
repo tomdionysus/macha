@@ -392,11 +392,12 @@ void Service::loop(std::stop_token stop) {
                 const auto inventory_stage = Clock::now();
                 auto objects = fs_.maintenance_objects_cached();
                 bool rebuilt_inventory = false;
-                if (!maintenance_live_ ||
+                if (!maintenance_live_ || !maintenance_catalogue_complete_ ||
                     maintenance_inventory_generation_ != objects->metadata_generation) {
                     auto live = std::make_shared<std::vector<ObjectId>>(objects->live);
                     auto universal = std::make_shared<std::vector<ObjectId>>();
                     auto catalogue_objects = catalogue_.maintenance_objects();
+                    maintenance_catalogue_complete_ = catalogue_objects.complete;
                     live->insert(live->end(), catalogue_objects.live.begin(),
                                  catalogue_objects.live.end());
                     universal->insert(universal->end(), catalogue_objects.universal.begin(),
@@ -478,7 +479,7 @@ void Service::loop(std::stop_token stop) {
                 }
 
                 bool garbage_metadata_changed = false;
-                if (garbage_due) {
+                if (garbage_due && maintenance_catalogue_complete_) {
                     auto matured = collect_garbage(maintenance_garbage_);
                     std::vector<GarbageRef> legacy;
                     for (const auto& candidate : maintenance_garbage_) {
@@ -500,7 +501,8 @@ void Service::loop(std::stop_token stop) {
                 // death before metadata CAS). Recent tombstones are protected for
                 // the same grace interval, and legacy tombstones remain protected
                 // until their first 0.10.x maintenance stamp has committed.
-                if (gc_due && !garbage_metadata_changed && maintenance_live_ &&
+                if (gc_due && maintenance_catalogue_complete_ && !garbage_metadata_changed &&
+                    maintenance_live_ &&
                     maintenance_inventory_generation_ >= node_.known_metadata_generation()) {
                     std::vector<ObjectId> protected_ids;
                     protected_ids.reserve(maintenance_garbage_.size());

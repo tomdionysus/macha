@@ -449,47 +449,29 @@ std::vector<CatalogueItem> CatalogueManager::search(std::string_view query, size
 
 void CatalogueManager::commit(const std::optional<ObjectId>& expected_root,
                               const CatalogueSnapshot& next,
-                              const std::set<ObjectId>& old_artwork) {
+                              const std::set<ObjectId>& old_artwork,
+                              std::optional<Hash256> expected_namespace) {
     auto encoded = encode_catalogue(next);
     auto root = object_id(encoded);
     auto metadata_record = metadata_.read_record();
     auto metadata_snapshot = decode_snapshot(metadata_record.payload);
     if (metadata_snapshot.catalogue_root != expected_root)
         throw CatalogueConflict("catalogue changed concurrently");
+    if (expected_namespace &&
+        metadata_namespace_signature(metadata_snapshot) != *expected_namespace)
+        throw CatalogueConflict("namespace changed during catalogue reconciliation");
 
     const auto active = node_.membership().active();
     const auto required = durability_required(metadata_snapshot, active.size());
     auto new_artwork = artwork_ids(next);
-    std::set<ObjectId> staged_artwork;
-    std::set_difference(new_artwork.begin(), new_artwork.end(), old_artwork.begin(),
-                        old_artwork.end(),
-                        std::inserter(staged_artwork, staged_artwork.end()));
-
-    auto cleanup_uncommitted = [&] {
-        std::optional<ObjectId> live_root;
-        std::set<ObjectId> live_artwork;
-        try {
-            auto latest_record = metadata_.read_record();
-            auto latest_metadata = decode_snapshot(latest_record.payload);
-            live_root = latest_metadata.catalogue_root;
-            if (live_root)
-                live_artwork = artwork_ids(load_root(live_root));
-        } catch (...) {
-            // If current reachability cannot be established, retain staged
-            // content rather than risk deleting a concurrently committed object.
-            return;
-        }
-        if (root != expected_root && live_root != root)
-            store_.erase_all(root);
-        for (const auto& id : staged_artwork) {
-            if (!live_artwork.contains(id))
-                store_.erase_all(id);
-        }
-    };
 
     const auto root_copies = store_.replicate_metadata_all(root, encoded);
     if (root_copies < required) {
-        cleanup_uncommitted();
+        // Never synchronously erase staged content here. Catalogue staging is
+        // content-addressed and can race another successful commit which makes
+        // the same hash live after any reachability check we could perform.
+        // Unreferenced staging is an ordinary orphan and is reclaimed safely by
+        // the grace-period reachability collector.
         throw std::runtime_error("catalogue root could not reach metadata durability quorum");
     }
 
@@ -497,14 +479,12 @@ void CatalogueManager::commit(const std::optional<ObjectId>& expected_root,
         auto data = node_.local_store().get(id);
         if (!data) {
             if (!store_.ensure_local(id, false)) {
-                cleanup_uncommitted();
                 throw std::runtime_error("referenced artwork object is unavailable: " +
                                          to_string(id));
             }
             data = node_.local_store().get(id);
         }
         if (!data || store_.replicate_all(id, *data, false) < required) {
-            cleanup_uncommitted();
             throw std::runtime_error("artwork could not reach metadata durability quorum");
         }
     }
@@ -513,6 +493,9 @@ void CatalogueManager::commit(const std::optional<ObjectId>& expected_root,
         metadata_.mutate([&](MetadataSnapshot& metadata) {
             if (metadata.catalogue_root != expected_root)
                 throw CatalogueConflict("catalogue changed concurrently");
+            if (expected_namespace &&
+                metadata_namespace_signature(metadata) != *expected_namespace)
+                throw CatalogueConflict("namespace changed during catalogue reconciliation");
             if (metadata.catalogue_root && *metadata.catalogue_root != root)
                 append_garbage(metadata, *metadata.catalogue_root);
             metadata.catalogue_root = root;
@@ -522,7 +505,9 @@ void CatalogueManager::commit(const std::optional<ObjectId>& expected_root,
             }
         });
     } catch (...) {
-        cleanup_uncommitted();
+        // As above, failed/stale staged objects are deliberately left for the
+        // reachability collector. Immediate distributed deletion is not safe
+        // against a concurrent commit of the same content hash.
         throw;
     }
 
@@ -682,7 +667,8 @@ CatalogueArtwork CatalogueManager::stage_artwork(std::string role, std::string m
 
 void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& discovered,
                                          const std::set<std::string>& active_media_ids,
-                                         bool prune_missing) {
+                                         bool prune_missing,
+                                         std::optional<Hash256> expected_namespace) {
     DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     repair_once();
     auto current = *current_snapshot();
@@ -823,7 +809,7 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
     }
 
     if (changed)
-        commit(expected_root, current, old_art);
+        commit(expected_root, current, old_art, expected_namespace);
 }
 
 CatalogueArtwork CatalogueManager::put_artwork(std::string_view item_id, std::string role,
@@ -840,7 +826,6 @@ CatalogueArtwork CatalogueManager::put_artwork(std::string_view item_id, std::st
 
     CatalogueArtwork art = stage_artwork(std::move(role), std::move(mime_type), bytes);
 
-    auto previous_art = item->artwork;
     std::erase_if(item->artwork, [&](const CatalogueArtwork& existing) {
         return existing.role == art.role;
     });
@@ -848,20 +833,10 @@ CatalogueArtwork CatalogueManager::put_artwork(std::string_view item_id, std::st
     try {
         (void)upsert(*item, item->revision);
     } catch (...) {
-        const bool was_preexisting = std::any_of(previous_art.begin(), previous_art.end(),
-                                                 [&](const auto& existing) {
-                                                     return existing.id == art.id;
-                                                 });
-        if (!was_preexisting) {
-            bool now_live = false;
-            try {
-                now_live = artwork_ids(*current_snapshot()).contains(art.id);
-            } catch (...) {
-                now_live = true;
-            }
-            if (!now_live)
-                (void)node_.local_store().remove(art.id);
-        }
+        // stage_artwork() is content-addressed. A concurrent successful commit
+        // may make this exact hash live at any point after our failed upsert, so
+        // even local check-then-delete cleanup is unsafe. Leave failed staging
+        // as an unreachable orphan for the grace-period reachability collector.
         throw;
     }
     return art;
@@ -893,11 +868,36 @@ CatalogueMaintenance CatalogueManager::maintenance_objects() {
     // the deliberately stale-tolerant API cache returned by current_snapshot().
     // Otherwise an obsolete catalogue root/artwork object can remain marked
     // live indefinitely after a remote catalogue mutation, preventing GC.
+    CatalogueMaintenance out;
+    std::optional<ObjectId> metadata_root;
+    uint64_t metadata_generation = 0;
+    bool metadata_current = false;
+    try {
+        auto view = metadata_.available_snapshot_view();
+        if (!view || view->generation < node_.known_metadata_generation()) {
+            (void)metadata_.read_record();
+            view = metadata_.available_snapshot_view();
+        }
+        if (view) {
+            metadata_generation = view->generation;
+            metadata_current = view->generation >= node_.known_metadata_generation();
+            metadata_root = view->snapshot->catalogue_root;
+            if (metadata_root) {
+                // The metadata reference itself is unconditionally live even if
+                // the immutable root cannot currently be fetched or decoded.
+                out.live.insert(*metadata_root);
+                out.universal.insert(*metadata_root);
+            }
+        }
+    } catch (...) {
+        metadata_current = false;
+    }
+
+    bool repair_ok = true;
     try {
         repair_once();
     } catch (...) {
-        // Conservative failure semantics: if convergence is unavailable, retain
-        // the last known catalogue objects rather than risk deleting live data.
+        repair_ok = false;
     }
     std::optional<ObjectId> root;
     std::shared_ptr<const CatalogueSnapshot> cached;
@@ -907,10 +907,15 @@ CatalogueMaintenance CatalogueManager::maintenance_objects() {
         cached = cached_;
     }
 
-    CatalogueMaintenance out;
     if (root) {
         out.live.insert(*root);
         out.universal.insert(*root);
+    }
+    {
+        std::lock_guard lock(mutex_);
+        const bool root_converged = cached_root_ == metadata_root &&
+                                    cached_metadata_generation_ >= metadata_generation;
+        out.complete = metadata_current && repair_ok && root_converged;
     }
     if (!cached)
         return out;

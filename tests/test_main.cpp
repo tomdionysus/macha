@@ -1448,6 +1448,7 @@ void test_config() {
             << "    max_request_bytes: 2M\n"
             << "    workers: 7\n"
             << "    max_queued_connections: 33\n"
+            << "    client_io_timeout_ms: 45000\n"
             << "    stream_chunk_bytes: 64K\n"
             << "  scanner:\n"
             << "    enabled: true\n"
@@ -1580,6 +1581,7 @@ void test_config() {
     CHECK(yc.catalogue.api.max_request_bytes == 2ULL * 1024 * 1024);
     CHECK(yc.catalogue.api.workers == 7);
     CHECK(yc.catalogue.api.max_queued_connections == 33);
+    CHECK(yc.catalogue.api.client_io_timeout == 45000ms);
     CHECK(yc.catalogue.api.stream_chunk_bytes == 64ULL * 1024);
     CHECK(yc.catalogue.scanner.enabled);
     CHECK(yc.catalogue.scanner.interval == 60000ms);
@@ -3840,6 +3842,56 @@ void test_fuse_durable_journal_trims_torn_tail() {
     {
         auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
         REQUIRE(recovered->inode_for_path("/pending").has_value());
+        CHECK(std::filesystem::file_size(journal) == valid_size);
+        recovered->stop();
+    }
+    service.stop();
+}
+
+void test_fuse_durable_journal_trims_checksum_invalid_complete_tail() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-journal-checksum-tail", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 30s;
+
+    Service service(config, keys);
+    service.start();
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        service.filesystem().store().foreground_activity(1);
+        frontend->mkdir("/pending-checksum", 0755, getuid(), getgid());
+        frontend->stop();
+    }
+
+    const auto journal = config.state_path / "fuse-spool" / "operations.log";
+    const auto valid_size = std::filesystem::file_size(journal);
+    REQUIRE(valid_size > 8);
+    {
+        std::ofstream out(journal, std::ios::binary | std::ios::app);
+        REQUIRE(out.good());
+        // Complete [length=1][payload][checksum] frame with an intentionally
+        // invalid checksum. A crash may expose this full logical length even
+        // though the tail was not durably written.
+        const std::array<char, 37> torn = [] {
+            std::array<char, 37> value{};
+            value[3] = 1;
+            value[4] = static_cast<char>(0xff);
+            return value;
+        }();
+        out.write(torn.data(), static_cast<std::streamsize>(torn.size()));
+        REQUIRE(out.good());
+    }
+    REQUIRE(std::filesystem::file_size(journal) == valid_size + 37);
+
+    {
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        REQUIRE(recovered->inode_for_path("/pending-checksum").has_value());
         CHECK(std::filesystem::file_size(journal) == valid_size);
         recovered->stop();
     }
@@ -8205,6 +8257,7 @@ int main() {
         RUN_TEST(test_fuse_durable_journal_recovers_namespace_and_data);
         RUN_TEST(test_fuse_durable_journal_recovers_ordered_mutations);
         RUN_TEST(test_fuse_durable_journal_trims_torn_tail);
+        RUN_TEST(test_fuse_durable_journal_trims_checksum_invalid_complete_tail);
         RUN_TEST(test_fuse_durable_journal_rejects_unreferenced_spool);
         RUN_TEST(test_fuse_durable_journal_rejects_missing_spool);
         RUN_TEST(test_fuse_read_only_release_does_not_publish_writer_data);

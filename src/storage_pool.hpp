@@ -76,6 +76,7 @@ class StoragePool {
     bool put(const ObjectId&, std::span<const uint8_t>);
     std::optional<Bytes> get(const ObjectId&) const;
     bool has(const ObjectId&) const;
+    bool valid(const ObjectId&) const;
     bool remove(const ObjectId&);
     std::vector<ObjectId> list() const;
     uint64_t full_list_scans() const { return full_list_scans_.load(std::memory_order_relaxed); }

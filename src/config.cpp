@@ -137,6 +137,9 @@ void validate(Config& config) {
         throw std::runtime_error("catalogue.api.workers must be 1..256");
     if (!config.catalogue.api.max_queued_connections || config.catalogue.api.max_queued_connections > 4096)
         throw std::runtime_error("catalogue.api.max_queued_connections must be 1..4096");
+    if (config.catalogue.api.client_io_timeout < std::chrono::seconds(1) ||
+        config.catalogue.api.client_io_timeout > std::chrono::minutes(5))
+        throw std::runtime_error("catalogue.api.client_io_timeout_ms must be 1000..300000");
     if (config.catalogue.api.stream_chunk_bytes < 16 * 1024 ||
         config.catalogue.api.stream_chunk_bytes > 4ULL * 1024 * 1024)
         throw std::runtime_error("catalogue.api.stream_chunk_bytes must be 16K..4M");
@@ -443,6 +446,9 @@ void parse_catalogue(const YAML::Node& root, Config& c) {
             c.catalogue.api.workers = api["workers"].as<size_t>();
         if (api["max_queued_connections"])
             c.catalogue.api.max_queued_connections = api["max_queued_connections"].as<size_t>();
+        if (api["client_io_timeout_ms"])
+            c.catalogue.api.client_io_timeout =
+                milliseconds(api["client_io_timeout_ms"], "catalogue.api.client_io_timeout_ms");
         if (api["stream_chunk_bytes"])
             c.catalogue.api.stream_chunk_bytes = yaml_size(api["stream_chunk_bytes"]);
     }

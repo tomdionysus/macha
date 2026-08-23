@@ -628,7 +628,7 @@ std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, Fr
 
 bool DistributedStore::has_on(const NodeInfo& target, const ObjectId& id) {
     if (target.id == n_.node_id())
-        return n_.local_store().has(id);
+        return n_.local_store().valid(id);
     Writer writer;
     writer.fixed(id.bytes);
     auto reply = n_.call(target, MessageType::have_object, writer.data());
@@ -713,7 +713,7 @@ bool DistributedStore::hydrate(const ObjectId& id, size_t stripe, FrameType fram
 }
 
 bool DistributedStore::ensure_local(const ObjectId& id, bool foreground) {
-    if (n_.local_store().has(id))
+    if (n_.local_store().valid(id))
         return true;
     if (auto cached = n_.block_cache().get(id)) {
         if (n_.local_store().put(id, *cached))
@@ -726,7 +726,7 @@ bool DistributedStore::ensure_local(const ObjectId& id, bool foreground) {
 }
 
 bool DistributedStore::ensure_metadata_local(const ObjectId& id) {
-    if (n_.local_store().has(id))
+    if (n_.local_store().valid(id))
         return true;
     if (auto cached = n_.block_cache().get(id)) {
         if (n_.local_store().put(id, *cached))
@@ -862,7 +862,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     auto maintenance_has_on = [&](const NodeInfo& target,
                                   const ObjectId& id) -> std::optional<bool> {
         if (target.id == n_.node_id())
-            return n_.local_store().has(id);
+            return n_.local_store().valid(id);
         if (!reserve_operation() || yielded())
             return std::nullopt;
 
@@ -1035,7 +1035,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             const ObjectId id = *it;
             const bool everywhere = universal &&
                                     std::binary_search(universal->begin(), universal->end(), id);
-            if ((!everywhere && !should_own(id)) || n_.local_store().has(id)) {
+            if ((!everywhere && !should_own(id)) || n_.local_store().valid(id)) {
                 repair_pull_after_ = id;
                 ++it;
                 ++scanned_total;

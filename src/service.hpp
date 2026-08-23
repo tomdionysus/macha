@@ -43,6 +43,7 @@ class Service {
     uint64_t maintenance_inventory_generation_{};
     std::shared_ptr<const std::vector<ObjectId>> maintenance_live_;
     std::shared_ptr<const std::vector<ObjectId>> maintenance_universal_;
+    bool maintenance_catalogue_complete_{true};
     std::vector<GarbageRef> maintenance_garbage_;
     std::vector<GarbageRef> maintenance_stale_garbage_;
     void loop(std::stop_token);

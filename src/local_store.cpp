@@ -286,13 +286,31 @@ bool LocalStore::put(const ObjectId& i, std::span<const uint8_t> d) {
     // new write reuses an old content hash while maintenance is sweeping it.
     std::unique_lock g(m_);
     if (std::filesystem::exists(p)) {
-        touch(i);
-        return true;
+        try {
+            auto existing = get(i);
+            if (existing && existing->size() == d.size() &&
+                std::equal(existing->begin(), existing->end(), d.begin())) {
+                touch(i);
+                return true;
+            }
+        } catch (...) {
+            // A pathname is not a valid replica. Fall through to the mutation
+            // path and atomically replace it with the caller's known-good bytes.
+        }
     }
     wait_for_accounting(g);
     if (std::filesystem::exists(p)) {
-        touch(i);
-        return true;
+        try {
+            auto existing = get(i);
+            if (existing && existing->size() == d.size() &&
+                std::equal(existing->begin(), existing->end(), d.begin())) {
+                touch(i);
+                return true;
+            }
+        } catch (...) {
+        }
+        if (!remove_locked(i) && std::filesystem::exists(p))
+            throw std::runtime_error("cannot replace corrupt local object");
     }
     auto s = aes_gcm_seal(key_, d, i.bytes);
     Writer h;
@@ -363,6 +381,13 @@ std::optional<Bytes> LocalStore::get(const ObjectId& i) const {
 }
 bool LocalStore::has(const ObjectId& i) const {
     return std::filesystem::exists(path(i));
+}
+bool LocalStore::valid(const ObjectId& i) const noexcept {
+    try {
+        return get(i).has_value();
+    } catch (...) {
+        return false;
+    }
 }
 bool LocalStore::remove_locked(const ObjectId& i) {
     auto p = path(i);

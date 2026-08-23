@@ -9,12 +9,16 @@
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <cerrno>
+#include <cstring>
 #include <fstream>
 #include <netdb.h>
+#include <poll.h>
 #include <sstream>
 #include <stdexcept>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 namespace macha {
@@ -72,6 +76,42 @@ std::optional<std::string> read_token(const std::optional<std::filesystem::path>
     while (!token.empty() && std::isspace(static_cast<unsigned char>(token.back()))) token.pop_back();
     if (token.empty()) throw std::runtime_error("catalogue API token file is empty");
     return token;
+}
+
+
+void set_client_io_timeout(int fd, std::chrono::milliseconds timeout) {
+    timeval value{};
+    value.tv_sec = static_cast<time_t>(timeout.count() / 1000);
+    value.tv_usec = static_cast<suseconds_t>((timeout.count() % 1000) * 1000);
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &value, sizeof(value)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &value, sizeof(value)) != 0)
+        throw std::runtime_error("cannot set HTTP client I/O timeout: " +
+                                 std::string(std::strerror(errno)));
+}
+
+
+ssize_t recv_before(int fd, void* data, size_t size, Clock::time_point deadline) {
+    while (true) {
+        const auto now = Clock::now();
+        if (now >= deadline) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        pollfd item{fd, POLLIN, 0};
+        const auto wait_ms = static_cast<int>(std::max<int64_t>(1, remaining.count()));
+        const int ready = ::poll(&item, 1, wait_ms);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready <= 0) {
+            if (ready == 0) errno = ETIMEDOUT;
+            return -1;
+        }
+        const auto n = ::recv(fd, data, size, 0);
+        if (n < 0 && errno == EINTR)
+            continue;
+        return n;
+    }
 }
 
 bool send_all(int fd, const void* data, size_t size, int flags) {
@@ -294,6 +334,9 @@ void HttpServer::worker(std::stop_token stop) {
 }
 
 void HttpServer::handle_client(int fd) {
+    // Queue depth and worker count bound admission; the socket timeout also
+    // bounds occupancy so a stalled/incomplete client cannot pin a worker forever.
+    set_client_io_timeout(fd, config_.client_io_timeout);
 #ifdef SO_NOSIGPIPE
     int no_sigpipe = 1;
     (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
@@ -304,11 +347,12 @@ void HttpServer::handle_client(int fd) {
     constexpr int send_flags = 0;
 #endif
 
+    const auto request_deadline = Clock::now() + config_.client_io_timeout;
     std::string input;
     std::array<char, 8192> buffer{};
     auto header_end = std::string::npos;
     while ((header_end = input.find("\r\n\r\n")) == std::string::npos) {
-        auto n = recv(fd, buffer.data(), buffer.size(), 0);
+        auto n = recv_before(fd, buffer.data(), buffer.size(), request_deadline);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return;
         input.append(buffer.data(), static_cast<size_t>(n));
@@ -353,7 +397,9 @@ void HttpServer::handle_client(int fd) {
         auto body_start = header_end + 4;
         request.body.insert(request.body.end(), input.begin() + static_cast<std::ptrdiff_t>(body_start), input.end());
         while (request.body.size() < content_length) {
-            auto n = recv(fd, buffer.data(), std::min(buffer.size(), content_length - request.body.size()), 0);
+            auto n = recv_before(fd, buffer.data(),
+                                 std::min(buffer.size(), content_length - request.body.size()),
+                                 request_deadline);
             if (n < 0 && errno == EINTR) continue;
             if (n <= 0) return;
             request.body.insert(request.body.end(), buffer.begin(), buffer.begin() + n);

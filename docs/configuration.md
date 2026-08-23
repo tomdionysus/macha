@@ -117,6 +117,8 @@ Scanner roots are provider properties, not a global list. `providers.movies.root
 
 Streaming shares the catalogue HTTP listener. `streaming.enabled: true` therefore requires `catalogue.api.enabled: true`. Macha links `libavformat`, `libavcodec`, `libavutil`, `libswscale` and `libswresample` directly. It does not run the `ffmpeg` or `ffprobe` commands. Legacy `streaming.ffmpeg` and `streaming.ffprobe` keys from the first 0.7.0 build are accepted and ignored.
 
+`catalogue.api.client_io_timeout_ms` bounds the lifetime of an incomplete request and blocking socket I/O performed by a catalogue HTTP worker. It defaults to 30000 ms and accepts 1000..300000 ms. Streaming response writes use the same socket timeout so a client that stops reading cannot retain a worker indefinitely.
+
 ```yaml
 catalogue:
   api:
@@ -127,6 +129,7 @@ catalogue:
     max_request_bytes: 8M
     workers: 16
     max_queued_connections: 128
+    client_io_timeout_ms: 30000
     stream_chunk_bytes: 256K
 
 streaming:

@@ -55,6 +55,9 @@ class LocalStore {
     bool put(const ObjectId&, std::span<const uint8_t>);
     std::optional<Bytes> get(const ObjectId&) const;
     bool has(const ObjectId&) const;
+    // Strong presence predicate for durability/repair decisions. Unlike has(),
+    // this authenticates the encrypted object and re-verifies its content hash.
+    bool valid(const ObjectId&) const noexcept;
     bool remove(const ObjectId&);
     bool remove_if_older_than(const ObjectId&, std::chrono::milliseconds);
     std::vector<ObjectId> list() const;

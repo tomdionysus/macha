@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.14.10 - 2026-08-23
+
+- preserve the 0.14.9 global ordered FUSE operation journal as the crash-recovery authority, while fixing remote namespace replacement so an open/dirty inode is detached from a pathname whose content was replaced elsewhere and cannot later publish stale writes into the replacement;
+- recover an otherwise-valid FUSE journal when the final full-length frame has a bad checksum, treating only the EOF frame as a torn append while retaining fatal handling for corruption before subsequent records;
+- stop failed catalogue commits and artwork updates from synchronously deleting staged content-addressed objects. Failed staging is now reclaimed only by the existing grace-period reachability GC, removing check-then-delete races with concurrent successful commits of the same hash;
+- make catalogue discovery enumerate one immutable metadata snapshot and fence destructive reconciliation with that snapshot's namespace signature at the metadata mutation boundary, so pruning cannot commit after the namespace it scanned has changed;
+- make catalogue maintenance fail closed for physical GC when current catalogue reachability cannot be converged. The metadata-referenced catalogue root remains protected even when its contents are temporarily unavailable;
+- make replica-presence decisions used by quorum, repair, rebalance and local hydration authenticate/decrypt and hash-verify stored objects. Re-putting known-good bytes now replaces an existing corrupt replica instead of counting its pathname as success;
+- bound unauthenticated RPC admission to eight concurrent inbound handshakes and apply a five-second handshake I/O deadline to both inbound and outbound authentication, clean up failed reader-thread creation, and enforce CONTROL/DATA message classes at the secure-channel receive boundary for both inbound and outbound-created peer sessions;
+- bound catalogue HTTP client I/O occupancy with `catalogue.api.client_io_timeout_ms` (default 30000 ms, valid 1000..300000), preventing incomplete or stalled clients from pinning a bounded worker indefinitely;
+- add one fsync+atomic-rename durable state-file primitive and use it for accepted catalogue hints, resumable ingest/torrent job state, and storage-backend identity. Failed ingest/torrent admission now rolls back newly queued/live work rather than returning failure while unacknowledged work remains active;
+- add architecture regression coverage for FUSE replacement/torn-tail recovery, catalogue staging/pruning/GC safety, corrupt-replica healing and repair accounting, RPC pre-auth/lane enforcement, HTTP slow-client occupancy, and durable control-state boundaries.
+
 ## 0.14.9 - 2026-08-22
 
 - add a durable local FUSE operation journal at `state_path/fuse-spool/operations.log`. Namespace mutations and ordered write/truncate descriptors are fsynced locally before the corresponding FUSE mutation is acknowledged; write payload bytes are fsynced to the per-inode spool before their journal descriptor is made durable;

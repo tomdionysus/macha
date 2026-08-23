@@ -232,6 +232,7 @@ catalogue:
     # HTTP workers serve catalogue requests, direct media and HLS fragments.
     workers: 16
     max_queued_connections: 128
+    client_io_timeout_ms: 30000
     stream_chunk_bytes: 256K
 
 # Persistent host-side ingest. Jobs may point at a regular file or recursively

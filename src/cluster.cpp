@@ -347,7 +347,10 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             ObjectId id{reader.fixed<32>()};
             reader.finish();
             Writer writer;
-            writer.u8(local_.has(id));
+            // Replica-presence RPCs are durability decisions, not directory
+            // existence probes. Authenticate/decrypt/hash the object before
+            // allowing repair or write quorum logic to count this replica.
+            writer.u8(local_.valid(id));
             return {MessageType::bool_reply, writer.take()};
         }
         case MessageType::get_object:

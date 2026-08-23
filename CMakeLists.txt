@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.14.9 LANGUAGES CXX)
+project(macha VERSION 0.14.10 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -103,6 +103,7 @@ set(MACHA_CORE_SOURCES
     src/log.cpp
     src/ffmpeg_log.cpp
     src/diagnostics.cpp
+    src/durable_file.cpp
     src/placement.cpp
     src/membership.cpp
     src/local_store.cpp
@@ -224,6 +225,21 @@ if(MACHA_BUILD_TESTS)
     endif()
     add_test(NAME macha-tests COMMAND macha-tests)
     set_tests_properties(macha-tests PROPERTIES TIMEOUT 300)
+
+    # Architecture regressions encode durability and distributed-identity
+    # invariants separately from broad functional coverage.
+    add_executable(macha-architecture-regressions tests/test_architecture_failures.cpp)
+    target_link_libraries(macha-architecture-regressions PRIVATE macha_core)
+    target_compile_definitions(macha-architecture-regressions PRIVATE
+        MACHA_HAVE_YAML_CPP=1 MACHA_AUDIT_WITH_MEDIA_CATALOGUE=1)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(macha-architecture-regressions PRIVATE -Wall -Wextra -Wpedantic)
+        if(MACHA_WARNINGS_AS_ERRORS)
+            target_compile_options(macha-architecture-regressions PRIVATE -Werror)
+        endif()
+    endif()
+    add_test(NAME macha-architecture-regressions COMMAND macha-architecture-regressions)
+    set_tests_properties(macha-architecture-regressions PROPERTIES TIMEOUT 180)
 endif()
 
 include(GNUInstallDirs)

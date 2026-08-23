@@ -23,26 +23,6 @@ std::atomic_uint64_t next_write_handle_diagnostic_id{1};
 [[noreturn]] void fail(int c, const std::string& s) {
     throw FsError(c, s);
 }
-Hash256 namespace_signature_for(const MetadataSnapshot& snapshot) {
-    Writer writer;
-    writer.u64(snapshot.entries.size());
-    for (const auto& [path, entry] : snapshot.entries) {
-        writer.string(path);
-        writer.u8(static_cast<uint8_t>(entry.type));
-        if (entry.type != EntryType::file)
-            continue;
-        writer.u64(entry.size);
-        writer.u32(entry.extents.size());
-        for (const auto& extent : entry.extents) {
-            writer.u64(extent.offset);
-            writer.u64(extent.length);
-            writer.u8(extent.hole);
-            if (!extent.hole)
-                writer.fixed(extent.id.bytes);
-        }
-    }
-    return sha256(writer.data());
-}
 
 bool under(const std::string& p, const std::string& r) {
     return p == r || (p.size() > r.size() && p.compare(0, r.size(), r) == 0 && p[r.size()] == '/');
@@ -1556,7 +1536,7 @@ std::vector<ObjectId> FileSystem::live_objects() {
 Hash256 FileSystem::namespace_signature(uint64_t* metadata_generation) {
     const auto view = m_.snapshot_view();
     if (metadata_generation) *metadata_generation = view.generation;
-    return namespace_signature_for(*view.snapshot);
+    return metadata_namespace_signature(*view.snapshot);
 }
 
 std::optional<Hash256> FileSystem::available_namespace_signature(
@@ -1565,7 +1545,7 @@ std::optional<Hash256> FileSystem::available_namespace_signature(
     if (!view)
         return {};
     if (metadata_generation) *metadata_generation = view->generation;
-    return namespace_signature_for(*view->snapshot);
+    return metadata_namespace_signature(*view->snapshot);
 }
 
 std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached() {
