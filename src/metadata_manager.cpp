@@ -1302,7 +1302,10 @@ MetadataRecord MetadataManager::read_record_base() {
 }
 
 MetadataRecord MetadataManager::read_record_uncached() {
-    return maybe_reconfigure(read_record_base());
+    auto record = maybe_reconfigure(read_record_base());
+    if (node_.metadata_replica().recovery_required())
+        node_.metadata_replica().mark_recovered();
+    return record;
 }
 
 MetadataRecord MetadataManager::read_record() {
@@ -1317,7 +1320,8 @@ MetadataRecord MetadataManager::read_record() {
         // safety even when its optimistic base came from the durable local replica.
         auto local = node_.metadata_replica().current();
         auto voters = voters_of(local);
-        if (local.generation > 1 && !voters.empty()) {
+        if (!node_.metadata_replica().recovery_required() && local.generation > 1 &&
+            !voters.empty()) {
             Log::debug("metadata quorum unavailable; using persisted read-only snapshot: " +
                        std::string(error.what()));
             return cache_record(local);
@@ -1392,12 +1396,16 @@ MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot
         MetadataRecord current;
         auto local = node_.metadata_replica().current();
         auto local_voters = voters_of(local);
-        if (force_quorum_read || local_voters.empty() || local.generation <= 1 ||
+        const bool recovering = node_.metadata_replica().recovery_required();
+        if (force_quorum_read || recovering || local_voters.empty() || local.generation <= 1 ||
             node_.remote_metadata_generation() > local.generation) {
-            if (local_voters.empty() || local.generation <= 1)
+            if (local_voters.empty() || local.generation <= 1) {
                 current = read_record_uncached();
-            else
+            } else {
                 current = maybe_reconfigure(read_group(local_voters, FrameType::read_ahead));
+                if (recovering)
+                    node_.metadata_replica().mark_recovered();
+            }
         } else {
             current = maybe_reconfigure(local);
         }

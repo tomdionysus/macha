@@ -75,7 +75,7 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
       id_(load_or_create_node_id(cfg_.state_path)),
       local_(cfg_.state_path, id_, cfg_.storage_backends, keys_.storage),
       cache_(cfg_.cache, keys_.storage),
-      meta_(cfg_.state_path, keys_.storage),
+      meta_(cfg_.state_path, keys_.storage, cache_.metadata()),
       members_(self_info(cfg_, id_, local_.used(), local_.limit(), meta_.committed().generation),
                cfg_.dead_after),
       client_(
@@ -292,6 +292,7 @@ bool NodeRuntime::checkpoint_metadata_delta(const MetadataRecord& base,
         return false;
     auto committed = meta_.committed();
     members_.metadata_generation(committed.generation);
+    cache_.remember_metadata(committed);
     if (committed.hash != before.hash)
         announce_metadata_generation(committed.generation);
     return true;
@@ -304,6 +305,7 @@ bool NodeRuntime::commit_metadata(uint64_t generation, const Hash256& hash) {
         return false;
     auto committed = meta_.committed();
     members_.metadata_generation(committed.generation);
+    cache_.remember_metadata(committed);
     if (committed.hash != before.hash)
         announce_metadata_generation(committed.generation);
     return true;

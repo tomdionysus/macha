@@ -1216,6 +1216,117 @@ void test_metadata_codec_and_replica() {
         CHECK(recovered.committed().hash == uncommitted_base_hash);
     }
 
+    // A crash can extend the file to the complete frame length while leaving
+    // the final encrypted bytes/tag unauthenticated. Preserve that tail for
+    // diagnosis and replay the authenticated prefix; a bad frame in the middle
+    // remains fatal because skipping it would break the metadata chain.
+    const auto authenticated_journal_size =
+        std::filesystem::file_size(uncommitted_path / "metadata" / "journal.log");
+    {
+        Writer envelope;
+        std::array<uint8_t, 12> nonce{};
+        std::array<uint8_t, 16> tag{};
+        envelope.fixed(nonce);
+        envelope.fixed(tag);
+        const Bytes ciphertext{0x42};
+        envelope.bytes(ciphertext);
+        auto payload = envelope.take();
+        Writer frame;
+        frame.u32(static_cast<uint32_t>(payload.size()));
+        frame.raw(payload);
+        auto bytes = frame.take();
+        std::ofstream tail(uncommitted_path / "metadata" / "journal.log",
+                           std::ios::binary | std::ios::app);
+        tail.write(reinterpret_cast<const char*>(bytes.data()),
+                   static_cast<std::streamsize>(bytes.size()));
+    }
+    {
+        MetadataReplica recovered(uncommitted_path, keys.storage);
+        CHECK(recovered.current().hash == uncommitted_next.hash);
+        CHECK(recovered.committed().hash == uncommitted_base_hash);
+        CHECK(std::filesystem::file_size(uncommitted_path / "metadata" / "journal.log") ==
+              authenticated_journal_size);
+        bool preserved = false;
+        for (const auto& entry :
+             std::filesystem::directory_iterator(uncommitted_path / "metadata")) {
+            preserved |= entry.path().filename().string().starts_with("journal.log.corrupt.");
+        }
+        CHECK(preserved);
+    }
+
+    // The persistent metadata cache is an independently encrypted committed
+    // snapshot. If the primary checkpoint is damaged, it may seed startup but
+    // is explicitly marked non-authoritative until quorum checkpointing clears
+    // the recovery marker. The damaged primary files remain quarantined.
+    auto damaged_checkpoint_path = t.path() / "damaged-checkpoint-node";
+    MetadataRecord recovery_seed;
+    {
+        MetadataReplica replica(damaged_checkpoint_path, keys.storage);
+        recovery_seed = replica.committed();
+    }
+    {
+        auto checkpoint = damaged_checkpoint_path / "metadata" / "checkpoint.meta";
+        std::fstream file(checkpoint, std::ios::binary | std::ios::in | std::ios::out);
+        REQUIRE(file.good());
+        file.seekg(40);
+        char byte{};
+        file.read(&byte, 1);
+        REQUIRE(file.good());
+        byte ^= 0x5a;
+        file.seekp(40);
+        file.write(&byte, 1);
+        file.flush();
+        REQUIRE(file.good());
+    }
+    {
+        MetadataReplica recovered(damaged_checkpoint_path, keys.storage, recovery_seed);
+        CHECK(recovered.recovery_required());
+        CHECK(recovered.committed().hash == recovery_seed.hash);
+        bool preserved = false;
+        for (const auto& entry :
+             std::filesystem::directory_iterator(damaged_checkpoint_path / "metadata")) {
+            preserved |= entry.path().filename().string().starts_with("checkpoint.meta.corrupt.");
+        }
+        CHECK(preserved);
+        recovered.mark_recovered();
+        CHECK(!recovered.recovery_required());
+    }
+    CHECK(!std::filesystem::exists(damaged_checkpoint_path / "metadata" / "recovery.required"));
+    {
+        MetadataReplica reopened_recovered(damaged_checkpoint_path, keys.storage);
+        CHECK(reopened_recovered.committed().hash == recovery_seed.hash);
+    }
+
+    // Without an independent recovery seed, primary authentication failure is
+    // still fail-closed and identifies the exact file rather than surfacing a
+    // context-free AES error.
+    auto no_seed_path = t.path() / "damaged-checkpoint-no-seed";
+    {
+        MetadataReplica replica(no_seed_path, keys.storage);
+    }
+    {
+        auto checkpoint = no_seed_path / "metadata" / "checkpoint.meta";
+        std::fstream file(checkpoint, std::ios::binary | std::ios::in | std::ios::out);
+        REQUIRE(file.good());
+        file.seekg(40);
+        char byte{};
+        file.read(&byte, 1);
+        REQUIRE(file.good());
+        byte ^= 0x5a;
+        file.seekp(40);
+        file.write(&byte, 1);
+        file.flush();
+        REQUIRE(file.good());
+    }
+    try {
+        MetadataReplica should_fail(no_seed_path, keys.storage);
+        CHECK(false);
+    } catch (const std::exception& error) {
+        const std::string message = error.what();
+        CHECK(message.find("checkpoint.meta") != std::string::npos);
+        CHECK(message.find("AES-GCM authentication failed") != std::string::npos);
+    }
+
     // Periodic compaction bounds replay. 64 committed mutations produce 128
     // prepare+commit journal records; the threshold checkpoints and truncates
     // them rather than allowing an unbounded replay log.
