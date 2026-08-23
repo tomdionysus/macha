@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.14.9 - 2026-08-22
+
+- add a durable local FUSE operation journal at `state_path/fuse-spool/operations.log`. Namespace mutations and ordered write/truncate descriptors are fsynced locally before the corresponding FUSE mutation is acknowledged; write payload bytes are fsynced to the per-inode spool before their journal descriptor is made durable;
+- reconstruct the optimistic FUSE namespace and pending data overlay at frontend startup from the local committed metadata snapshot plus the operation journal, then resume asynchronous namespace/data publication in recorded order. Rename/unlink state shadows stale committed paths while a durable local operation remains unconfirmed, preventing a stale snapshot from resurrecting a locally accepted name;
+- retain durable publication markers until MetadataManager's decoded snapshot demonstrates the namespace/content effect. Completed spool data is truncated and synced before an otherwise-idle journal is compacted, so a restart does not silently detach non-empty spool bytes from their operation history;
+- fail FUSE frontend startup when a journal-referenced spool is missing/short or when a non-empty `inode-*.spool` has no recoverable journal history. A torn final journal frame is trimmed to the last checksum-valid frame; an unexplained tail on an otherwise referenced spool is preserved as an `.orphan.*` file and reported rather than treated as acknowledged data;
+- require pre-0.14.9 upgrades to drain pending FUSE publication before restart when possible: legacy non-empty spool files have no operation journal describing their pathname/order and are therefore refused rather than guessed at;
+- serialise journal admission/compaction and preserve inode-before-journal lock ordering, including rename-over/subtree rename, and make data publication wait through the inode's latest accepted namespace sequence so rename/unlink cannot race an older pathname commit;
+- add restart-boundary regression coverage for pending mkdir/create/write recovery, ordered write/truncate/write plus directory rename/unlink/root metadata recovery, torn-tail recovery, missing referenced spool rejection and unreferenced non-empty spool rejection.
+- correct the 0.14.9 restart-boundary test harness to use the maximum valid 30-second `fuse.publication_quiet` window rather than an invalid one-hour value; this changes test setup only, not FUSE runtime semantics.
+
 ## 0.14.8 - 2026-08-22
 
 - classify write-handle traffic as interactive rather than playback foreground traffic. This prevents asynchronous FUSE publication from refreshing the playback quiet deadline itself after every replay chunk, which could stall publication for `publication_quiet` between chunks and make `wait_for_idle()` time out; writes still suppress maintenance through the interactive activity class;
