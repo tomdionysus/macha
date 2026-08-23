@@ -4436,7 +4436,7 @@ void test_fuse_frontend_read_overlay_truncate_and_hydration_hints() {
 }
 
 
-void test_fuse_group_commit_batches_concurrent_writes() {
+void test_fuse_buffered_writes_batch_until_close_durability() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
@@ -4453,55 +4453,73 @@ void test_fuse_group_commit_batches_concurrent_writes() {
         auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
         auto handle = frontend->create("/batch.bin", 0644, getuid(), getgid(), true, true, false);
 
-        constexpr size_t writers = 12;
-        constexpr size_t chunk_size = 32 * 1024;
-        std::latch ready(writers);
-        std::latch start(1);
-        std::vector<std::thread> threads;
+        // Sequential callbacks are the important case: write() no longer waits
+        // for each local fsync pair, so one ordinary writer can build a batch
+        // before close/release establishes the local durability boundary.
+        constexpr size_t writes = 128;
+        constexpr size_t chunk_size = 4096;
         std::vector<Bytes> chunks;
-        chunks.reserve(writers);
-        for (size_t i = 0; i < writers; ++i) {
+        chunks.reserve(writes);
+        for (size_t i = 0; i < writes; ++i) {
             auto chunk = pattern(chunk_size);
             for (auto& byte : chunk)
                 byte ^= static_cast<uint8_t>(i * 17U + 3U);
             chunks.push_back(std::move(chunk));
+            REQUIRE(frontend->write(handle.inode, i * chunk_size, chunks.back()) == chunk_size);
         }
-        std::atomic_size_t completed{};
-        std::mutex error_mutex;
-        std::exception_ptr error;
-        for (size_t i = 0; i < writers; ++i) {
-            threads.emplace_back([&, i] {
-                ready.count_down();
-                start.wait();
-                try {
-                    if (frontend->write(handle.inode, i * chunk_size, chunks[i]) == chunk_size)
-                        completed.fetch_add(1, std::memory_order_relaxed);
-                } catch (...) {
-                    std::lock_guard lock(error_mutex);
-                    if (!error) error = std::current_exception();
-                }
-            });
-        }
-        ready.wait();
-        start.count_down();
-        for (auto& thread : threads)
-            thread.join();
-        if (error)
-            std::rethrow_exception(error);
-        REQUIRE(completed.load() == writers);
 
-        auto status = frontend->status();
-        CHECK(status.durability_writes == writers);
-        // Concurrent write callbacks must share at least one durability batch;
-        // otherwise the frontend has regressed to an fsync pair per request.
-        CHECK(status.durability_batches < status.durability_writes);
-
-        Bytes actual(writers * chunk_size);
+        // POSIX-buffered writes are immediately visible through the local FUSE
+        // view before their close-time stable-storage barrier.
+        Bytes actual(writes * chunk_size);
         REQUIRE(frontend->read(handle, 0, actual) == actual.size());
-        for (size_t i = 0; i < writers; ++i)
+        for (size_t i = 0; i < writes; ++i)
             CHECK(std::equal(chunks[i].begin(), chunks[i].end(),
                              actual.begin() + static_cast<ptrdiff_t>(i * chunk_size)));
 
+        // close/release must not return until every accepted write has completed
+        // spool fsync -> journal append -> journal fsync.
+        frontend->release(handle.inode, true);
+        auto status = frontend->status();
+        CHECK(status.durability_writes == writes);
+        CHECK(status.durability_batches < status.durability_writes);
+    }
+    service.stop();
+}
+
+void test_fuse_fsync_waits_for_distributed_publication() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-fsync-publication", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.fuse.publication_quiet = 0ms;
+    config.fuse.timeouts.sync = 10s;
+
+    Service service(config, keys);
+    service.start();
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto handle = frontend->create("/sync.bin", 0644, getuid(), getgid(), true, true, false);
+        auto bytes = pattern(2 * 1024 * 1024 + 12345);
+        REQUIRE(frontend->write(handle.inode, 0, bytes) == bytes.size());
+
+        // fsync is Macha's cluster-durability boundary: after it returns, the
+        // ordinary FileSystem view (which has no access to the FUSE spool
+        // overlay) must already expose the complete committed generation.
+        frontend->fsync(handle.inode);
+        auto committed = service.filesystem().getattr("/sync.bin");
+        CHECK(committed.size == bytes.size());
+        auto reader = service.filesystem().open_read("/sync.bin");
+        Bytes actual(bytes.size());
+        size_t done = 0;
+        while (done < actual.size()) {
+            auto n = reader->read(done, {actual.data() + done, actual.size() - done});
+            REQUIRE(n > 0);
+            done += n;
+        }
+        CHECK(actual == bytes);
         frontend->release(handle.inode, true);
     }
     service.stop();
@@ -8708,7 +8726,8 @@ int main() {
         RUN_TEST(test_fuse_read_only_release_does_not_publish_writer_data);
         RUN_TEST(test_fuse_frontend_unlink_and_rename_over_open_inode_ordering);
         RUN_TEST(test_fuse_frontend_read_overlay_truncate_and_hydration_hints);
-        RUN_TEST(test_fuse_group_commit_batches_concurrent_writes);
+        RUN_TEST(test_fuse_buffered_writes_batch_until_close_durability);
+        RUN_TEST(test_fuse_fsync_waits_for_distributed_publication);
         RUN_TEST(test_fuse_open_read_reuses_extent_until_manifest_changes);
         RUN_TEST(test_fuse_frontend_namespace_refresh_is_demand_driven);
         RUN_TEST(test_full_replica_fallback);
