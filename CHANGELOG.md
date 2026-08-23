@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.14.12 - 2026-08-23
+
+- preserve non-empty FUSE spool files which have no recoverable operation-journal attribution as durable `*.orphan.*` quarantine artifacts instead of aborting frontend startup and unwinding the whole node; the bytes are never guessed at or replayed without descriptors, but an upgrade/recovery artifact can no longer terminate RPC membership and continuous peer reconnect/backoff;
+- keep journal-referenced missing/short spools fail-closed, because those cases prove that durable operation metadata exists for bytes which are actually unavailable and therefore cannot be safely reconstructed.
+
 ## 0.14.11 - 2026-08-23
 
 - make metadata startup identify the exact encrypted checkpoint/journal path and journal byte offset when authentication or replay fails instead of terminating with the context-free `AES-GCM authentication failed`;

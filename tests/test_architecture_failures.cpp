@@ -262,6 +262,51 @@ void test_fuse_open_inode_identity_survives_external_replace_and_unlink() {
     node.stop();
 }
 
+void test_unreferenced_fuse_spool_is_preserved_without_killing_frontend() {
+    TempDir t;
+    const auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "node", keyfile, free_port());
+
+    NodeRuntime node(config, keys);
+    DistributedStore store(node);
+    MetadataManager metadata(node);
+    FileSystem fs(node, store, metadata);
+    node.start();
+
+    const auto spool_dir = config.state_path / "fuse-spool";
+    std::filesystem::create_directories(spool_dir);
+    const auto orphan = spool_dir / "inode-4406.spool";
+    const std::string payload = "previous-version unattributed FUSE bytes";
+    {
+        std::ofstream out(orphan, std::ios::binary | std::ios::trunc);
+        REQUIRE(out.good());
+        out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+        REQUIRE(out.good());
+    }
+
+    // Unattributed bytes cannot be safely replayed, but they also cannot make
+    // the entire node unavailable. Preserve them outside the active spool
+    // namespace and allow FUSE startup to continue.
+    FuseFrontend frontend(fs, config.fuse);
+    CHECK(!std::filesystem::exists(orphan));
+    bool preserved = false;
+    for (const auto& entry : std::filesystem::directory_iterator(spool_dir)) {
+        if (!entry.path().filename().string().starts_with("inode-4406.spool.orphan."))
+            continue;
+        std::ifstream in(entry.path(), std::ios::binary);
+        std::string actual((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+        CHECK(actual == payload);
+        preserved = true;
+    }
+    CHECK(preserved);
+
+    frontend.stop();
+    node.stop();
+}
+
 void test_dirty_open_inode_never_writes_remote_replacement() {
     TempDir t;
     const auto keyfile = t.path() / "cluster.key";
@@ -813,6 +858,7 @@ extern "C" int fsync(int fd) {
 
 int main() {
     RUN_CASE(test_fuse_open_inode_identity_survives_external_replace_and_unlink);
+    RUN_CASE(test_unreferenced_fuse_spool_is_preserved_without_killing_frontend);
     RUN_CASE(test_dirty_open_inode_never_writes_remote_replacement);
     RUN_CASE(test_failed_catalogue_commit_never_deletes_live_filesystem_object);
     RUN_CASE(test_scanner_prune_is_fenced_to_scanned_namespace);
