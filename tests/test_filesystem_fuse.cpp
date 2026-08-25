@@ -920,6 +920,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_spool_descriptors_are_bounded) 
     {
         auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
         service.filesystem().store().foreground_activity(1);
+        const auto before_dirty = linux_open_fd_count();
         for (size_t i = 0; i < dirty_inodes; ++i) {
             auto handle = frontend->create("/fd-" + std::to_string(i), 0644,
                                            getuid(), getgid(), true, true, false);
@@ -927,6 +928,11 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_spool_descriptors_are_bounded) 
             REQUIRE(frontend->write(handle.inode, 0, byte) == byte.size());
             frontend->release(handle.inode, true);
         }
+        // Publication remains deliberately blocked, so every inode still has a
+        // durable dirty spool. Those spools must not retain one live descriptor
+        // each after their local durability batches have completed.
+        const auto after_dirty = linux_open_fd_count();
+        CHECK(after_dirty <= before_dirty + 8);
         frontend->stop();
     }
 
@@ -949,6 +955,72 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_spool_descriptors_are_bounded) 
         recovered->stop();
     }
 #endif
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_idle_spool_descriptor_reopens_for_append) {
+    TestService fixture("fuse-idle-spool-reopen");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 30s;
+
+    auto& service = fixture.start();
+    const auto first = pattern(64 * 1024 + 13, 17);
+    const auto second = pattern(48 * 1024 + 7, 93);
+    Bytes expected = first;
+    expected.insert(expected.end(), second.begin(), second.end());
+
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        service.filesystem().store().foreground_activity(1);
+        auto created = frontend->create("/append-after-idle.bin", 0644, getuid(), getgid(),
+                                        true, true, false);
+        const auto inode = created.inode;
+        REQUIRE(frontend->write(inode, 0, first) == first.size());
+        frontend->release(inode, true);
+
+#if defined(__linux__)
+        // release() waits for local durability. The idle dirty inode may retain
+        // its spool pathname and bytes, but not the write-time descriptor.
+        const auto before_reopen = linux_open_fd_count();
+#endif
+
+        auto reopened = frontend->open("/append-after-idle.bin", true, true, true, false);
+        REQUIRE(reopened.inode == inode);
+        REQUIRE(frontend->write(inode, 0, second, true) == second.size());
+        frontend->release(inode, true);
+
+#if defined(__linux__)
+        const auto after_reopen = linux_open_fd_count();
+        CHECK(after_reopen <= before_reopen + 2);
+#endif
+
+        Bytes local(expected.size());
+        REQUIRE(frontend->read(inode, 0, local) == local.size());
+        CHECK(local == expected);
+        frontend->stop();
+    }
+
+    auto drain = config.fuse;
+    drain.publication_quiet = 0ms;
+    {
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), drain);
+        REQUIRE(recovered->wait_for_idle(15s));
+        auto committed = service.filesystem().getattr("/append-after-idle.bin");
+        CHECK(committed.size == expected.size());
+        auto reader = service.filesystem().open_read("/append-after-idle.bin");
+        Bytes actual(expected.size());
+        size_t offset = 0;
+        while (offset < actual.size()) {
+            auto n = reader->read(offset, {actual.data() + offset, actual.size() - offset});
+            REQUIRE(n > 0);
+            offset += n;
+        }
+        CHECK(actual == expected);
+        recovered->stop();
+    }
 }
 
 MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_recovery_starts_without_new_fuse_activity) {

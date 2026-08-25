@@ -1116,6 +1116,18 @@ struct FuseFrontend::State {
         return EIO;
     }
 
+    static void close_idle_spool_locked(Inode& inode) {
+        // The retained descriptor exists only to bridge write admission to the
+        // local payload+journal durability barrier. Distributed publication and
+        // overlay reads reopen spool_path independently, so keeping one fd per
+        // dirty inode until publication completes turns a publication backlog
+        // into an unbounded process-wide descriptor population.
+        if (inode.durability_pending || inode.spool_fd < 0)
+            return;
+        ::close(inode.spool_fd);
+        inode.spool_fd = -1;
+    }
+
     void fail_durability_batch(const std::vector<std::shared_ptr<DurabilityTicket>>& batch,
                                const std::exception_ptr& error) {
         {
@@ -1134,8 +1146,10 @@ struct FuseFrontend::State {
                 ticket->inode->backend_error = code;
                 if (ticket->inode->durability_pending)
                     --ticket->inode->durability_pending;
-                if (!ticket->inode->durability_pending)
+                if (!ticket->inode->durability_pending) {
                     ticket->inode->admitted_size = ticket->inode->visible.size;
+                    close_idle_spool_locked(*ticket->inode);
+                }
             }
             ticket->inode->durability_cv.notify_all();
         }
@@ -1155,8 +1169,10 @@ struct FuseFrontend::State {
                     std::max(inode->durable_data_sequence, ticket->op.sequence);
                 if (inode->durability_pending)
                     --inode->durability_pending;
-                if (!inode->durability_pending)
+                if (!inode->durability_pending) {
                     inode->admitted_size = inode->visible.size;
+                    close_idle_spool_locked(*inode);
+                }
             }
             inode->durability_cv.notify_all();
         }
