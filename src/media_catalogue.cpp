@@ -2743,9 +2743,19 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
         return {};
     }
     const auto& entry = entry_it->second;
-    if (entry.type != EntryType::file || entry.size == 0) {
+    if (entry.type != EntryType::file) {
         hints_.mark_no_match(hint.id, std::string(provider->name()), {},
-                             "namespace path is not a non-empty media file");
+                             "namespace path is not a media file");
+        return {};
+    }
+    if (entry.size == 0) {
+        // A zero-length committed file can be a transient namespace shell while
+        // durable FUSE data is still being published. It has no meaningful
+        // immutable media identity yet, so do not negative-cache it as a
+        // provider miss. A later namespace generation/source_ref will reopen
+        // the hint as soon as committed content becomes visible.
+        hints_.defer(hint.id, "namespace media file has no committed content yet",
+                     unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
         return {};
     }
 
@@ -3114,6 +3124,12 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
     for (const auto& file : files) {
         if (stop.stop_requested()) return 0;
         if (!file.provider->accepts_path(file.path)) continue;
+        // Zero-length files do not yet have a meaningful immutable media
+        // identity. During durable FUSE recovery they are commonly committed
+        // namespace shells whose data/extents will appear in a later metadata
+        // generation. Do not queue them and, critically, do not collapse every
+        // such path onto the shared empty-file hash in active_media_ids.
+        if (file.entry.size == 0) continue;
 
         // Discovery answers only "which immutable media objects exist?". The
         // media id is available directly from FsEntry; opening every file here
