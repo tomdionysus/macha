@@ -13,6 +13,7 @@
 namespace macha {
 namespace {
 
+#if !defined(__linux__)
 void sync_file(const std::filesystem::path& path) {
     if (path.empty())
         return;
@@ -48,6 +49,7 @@ void sync_directory(const std::filesystem::path& path) {
         throw std::runtime_error("cannot sync durability directory: " +
                                  std::string(strerror(saved)));
 }
+#endif
 
 } // namespace
 
