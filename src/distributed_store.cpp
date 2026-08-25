@@ -61,7 +61,7 @@ bool DistributedStore::should_own(const ObjectId& id) const {
 ObjectId DistributedStore::put(std::span<const uint8_t> data, std::atomic_bool* cancelled) {
     auto started = Clock::now();
     auto id = object_id(data);
-    if (!put(id, data, cancelled)) {
+    if (!put_impl(id, data, cancelled, nullptr)) {
         if (cancelled && cancelled->load(std::memory_order_relaxed))
             throw std::runtime_error("object replication cancelled");
         throw std::runtime_error("object replication quorum unavailable");
@@ -74,7 +74,29 @@ ObjectId DistributedStore::put(std::span<const uint8_t> data, std::atomic_bool* 
     return id;
 }
 
-bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, std::atomic_bool* cancelled) {
+bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data,
+                           std::atomic_bool* cancelled) {
+    return put_impl(id, data, cancelled, nullptr);
+}
+
+ObjectId DistributedStore::put_deferred(std::span<const uint8_t> data, DurabilityBatch& batch,
+                                        std::atomic_bool* cancelled) {
+    auto id = object_id(data);
+    if (!put_impl(id, data, cancelled, &batch)) {
+        if (cancelled && cancelled->load(std::memory_order_relaxed))
+            throw std::runtime_error("object replication cancelled");
+        throw std::runtime_error("object replication quorum unavailable");
+    }
+    return id;
+}
+
+bool DistributedStore::put_deferred(const ObjectId& id, std::span<const uint8_t> data,
+                                    DurabilityBatch& batch, std::atomic_bool* cancelled) {
+    return put_impl(id, data, cancelled, &batch);
+}
+
+bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
+                                std::atomic_bool* cancelled, DurabilityBatch* batch) {
     if (object_id(data) != id)
         throw std::runtime_error("object hash mismatch");
     n_.note_activity(FrameType::read_ahead, data.size());
@@ -105,12 +127,25 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
     std::vector<PendingPut> pending;
     pending.reserve(nodes.size());
     size_t success = 0;
+    std::vector<DurableReplica> successful_replicas;
     size_t replacement_needed = 0;
     size_t next_fallback = target;
     std::chrono::milliseconds local_store_time{};
     std::chrono::milliseconds remote_max_time{};
 
-    auto finish = [&](bool ok) {
+    auto finish = [&](bool ok, size_t required) {
+        if (ok && batch) {
+            std::sort(successful_replicas.begin(), successful_replicas.end(),
+                      [](const DurableReplica& a, const DurableReplica& b) {
+                          if (a.id != b.id)
+                              return a.id < b.id;
+                          return a.epoch < b.epoch;
+                      });
+            successful_replicas.erase(
+                std::unique(successful_replicas.begin(), successful_replicas.end()),
+                successful_replicas.end());
+            batch->requirements.push_back({id, required, successful_replicas});
+        }
         const auto elapsed =
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - operation_started);
         if (elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
@@ -131,10 +166,14 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
     auto launch = [&](const NodeInfo& owner) {
         if (owner.id == n_.node_id()) {
             const auto started = Clock::now();
-            if (n_.local_store().put(id, data))
+            const auto durability = batch ? StoreWriteDurability::deferred
+                                          : StoreWriteDurability::immediate;
+            if (n_.local_store().put(id, data, durability)) {
                 ++success;
-            else
+                successful_replicas.push_back({owner.id, n_.durability_epoch()});
+            } else {
                 ++replacement_needed;
+            }
             local_store_time +=
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
             return;
@@ -143,7 +182,8 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
             PendingPut item;
             item.owner = owner;
             item.started = Clock::now();
-            item.rpc.emplace(n_.call_async(owner, MessageType::put_object, payload, FrameType::read_ahead));
+            const auto type = batch ? MessageType::put_object_deferred : MessageType::put_object;
+            item.rpc.emplace(n_.call_async(owner, type, payload, FrameType::read_ahead));
             pending.push_back(std::move(item));
         } catch (...) {
             ++replacement_needed;
@@ -154,7 +194,7 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
         launch(nodes[i]);
 
     if (success >= need)
-        return finish(true);
+        return finish(true, need);
 
     while (true) {
         if (cancelled && cancelled->load(std::memory_order_relaxed)) {
@@ -162,7 +202,7 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
                 if (!item.done && item.rpc)
                     item.rpc->cancel();
             }
-            return finish(false);
+            return finish(false, need);
         }
         bool progressed = false;
         for (auto& item : pending) {
@@ -186,22 +226,33 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
             item.done = true;
             progressed = true;
             bool ok = false;
+            std::optional<NodeId> durability_epoch;
             try {
-                ok = item.rpc->get().message.type == MessageType::ok;
+                auto reply = item.rpc->get();
+                ok = reply.message.type == MessageType::ok;
+                if (ok && batch) {
+                    Reader reader(reply.message.payload);
+                    NodeId epoch{reader.fixed<16>()};
+                    reader.finish();
+                    durability_epoch = epoch;
+                }
             } catch (...) {
+                ok = false;
             }
             const auto remote_elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - item.started);
             remote_max_time = std::max(remote_max_time, remote_elapsed);
             if (ok) {
                 ++success;
+                successful_replicas.push_back(
+                    {item.owner.id, batch ? *durability_epoch : NodeId{}});
                 note_network(data.size(), Clock::now() - item.started);
             } else if (!item.spilled) {
                 ++replacement_needed;
             }
 
             if (success >= need)
-                return finish(true);
+                return finish(true, need);
         }
 
         while (replacement_needed && next_fallback < nodes.size() && success < need) {
@@ -209,7 +260,7 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
             launch(nodes[next_fallback++]);
             progressed = true;
             if (success >= need)
-                return finish(true);
+                return finish(true, need);
         }
 
         size_t responsive_unfinished = 0;
@@ -227,7 +278,7 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
         // stalled PUT that has already been hedged, allow the explicit durable
         // floor to commit and let repair restore desired placement later.
         if (success >= floor && success + responsive_unfinished < need)
-            return finish(true);
+            return finish(true, floor);
 
         if (success + unfinished + (nodes.size() - next_fallback) < floor)
             break;
@@ -236,7 +287,94 @@ bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data, st
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    return finish(success >= floor);
+    return finish(success >= floor, floor);
+}
+
+bool DistributedStore::durability_barrier(const DurabilityBatch& batch) {
+    if (batch.empty())
+        return true;
+
+    std::vector<DurableReplica> wanted;
+    for (const auto& requirement : batch.requirements)
+        wanted.insert(wanted.end(), requirement.replicas.begin(), requirement.replicas.end());
+    std::sort(wanted.begin(), wanted.end(), [](const DurableReplica& a, const DurableReplica& b) {
+        if (a.id != b.id)
+            return a.id < b.id;
+        return a.epoch < b.epoch;
+    });
+    wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+
+    std::vector<DurableReplica> durable;
+    const DurableReplica local{n_.node_id(), n_.durability_epoch()};
+    if (std::find(wanted.begin(), wanted.end(), local) != wanted.end()) {
+        try {
+            n_.local_store().durability_barrier();
+            durable.push_back(local);
+        } catch (const std::exception& error) {
+            Log::warn("local storage durability barrier failed: " + std::string(error.what()));
+        }
+    }
+
+    std::map<NodeId, NodeInfo> peers;
+    for (const auto& peer : n_.membership().all())
+        peers.emplace(peer.id, peer);
+
+    struct PendingBarrier {
+        DurableReplica replica{};
+        std::optional<AsyncRpc> rpc;
+    };
+    std::vector<PendingBarrier> pending;
+    for (const auto& replica : wanted) {
+        if (replica.id == n_.node_id())
+            continue;
+        auto found = peers.find(replica.id);
+        if (found == peers.end())
+            continue;
+        try {
+            Writer payload;
+            payload.fixed(replica.epoch.bytes);
+            PendingBarrier item;
+            item.replica = replica;
+            item.rpc.emplace(n_.call_async(found->second, MessageType::object_durability_barrier,
+                                           payload.data(), FrameType::read_ahead));
+            pending.push_back(std::move(item));
+        } catch (...) {
+        }
+    }
+
+    for (auto& item : pending) {
+        try {
+            if (item.rpc && item.rpc->get().message.type == MessageType::ok)
+                durable.push_back(item.replica);
+        } catch (...) {
+        }
+    }
+    std::sort(durable.begin(), durable.end(), [](const DurableReplica& a, const DurableReplica& b) {
+        if (a.id != b.id)
+            return a.id < b.id;
+        return a.epoch < b.epoch;
+    });
+    durable.erase(std::unique(durable.begin(), durable.end()), durable.end());
+
+    for (const auto& requirement : batch.requirements) {
+        size_t count = 0;
+        for (const auto& replica : requirement.replicas) {
+            if (std::binary_search(durable.begin(), durable.end(), replica,
+                                   [](const DurableReplica& a, const DurableReplica& b) {
+                                       if (a.id != b.id)
+                                           return a.id < b.id;
+                                       return a.epoch < b.epoch;
+                                   }))
+                ++count;
+        }
+        if (count < requirement.required) {
+            Log::debug("object durability quorum unavailable id=" + to_string(requirement.id) +
+                       " required=" + std::to_string(requirement.required) +
+                       " durable=" + std::to_string(count));
+            return false;
+        }
+    }
+    return true;
 }
 
 bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,

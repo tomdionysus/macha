@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.15.1 - 2026-08-25
+
+- move spool-backed publication durability from per-extent `fsync()` transactions to explicit publication generations: authoritative extents are staged with buffered writes, exact replica placements cross one stable-storage barrier before metadata commit, and ordinary non-WAL-backed object PUTs retain their existing immediate-durability contract;
+- make deferred replica acknowledgements process-epoch-bound and make local barriers target the exact storage-backend instances which accepted provisional objects, so a node/backend restart or disappearance between placement and publication cannot be mistaken for durable quorum;
+- treat the FUSE spool plus operation journal as the write-ahead log for publication, preserve the last published manifest until the new generation is durable, bypass cache admission during crash recovery, and add backward-compatible per-chunk spool digests so missing, truncated or corrupt dirty data abandons only the affected inode generation;
+- make the persistent block cache explicitly ephemeral: cache objects, evictions and cache metadata no longer issue stable-storage barriers, and startup reconciliation remains sufficient because the complete cache may be discarded after a crash;
+- change authoritative capacity accounting for deferred generations to one durable DIRTY marker plus one post-barrier CLEAN checkpoint, retaining O(1) clean-start accounting while falling back to the existing object-tree reconciliation after a crash in the middle of a generation;
+- add architecture regressions for generation-batched durability, strict reaffirmation of provisional objects, pre-metadata durability ordering, ephemeral-cache barrier elimination, stale remote durability epochs, missing-spool isolation and checksum-corrupt spool recovery.
+
 ## 0.15.0 - 2026-08-25
 
 - replace the legacy monolithic backend test runner and separate architecture-regression executable with one self-registering `macha-tests` framework; each case is process-isolated, independent cases execute concurrently under a weighted slot budget, and per-case timings/timeouts make slow or wedged tests attributable;

@@ -208,9 +208,11 @@ size_t ReadHandle::read(uint64_t off, std::span<uint8_t> out, Clock::time_point 
     return done;
 }
 
-WriteHandle::WriteHandle(FileSystem& f, std::string p, FsEntry b, bool trunc, bool cache_puts)
+WriteHandle::WriteHandle(FileSystem& f, std::string p, FsEntry b, bool trunc, bool cache_puts,
+                         WriteDurability durability)
     : fs_(f), path_(std::move(p)), base_(std::move(b)), expected_(base_.version),
-      sequential_(true), cache_puts_(cache_puts), logical_(trunc ? 0 : base_.size), staged_(trunc ? 0 : base_.size),
+      sequential_(true), cache_puts_(cache_puts), durability_(durability),
+      logical_(trunc ? 0 : base_.size), staged_(trunc ? 0 : base_.size),
       diagnostic_id_(next_write_handle_diagnostic_id.fetch_add(1, std::memory_order_relaxed)) {
     buffer_.reserve(fs_.extent_size());
 
@@ -317,7 +319,10 @@ std::chrono::milliseconds WriteHandle::flush() {
     auto started = Clock::now();
     ObjectId id;
     try {
-        id = fs_.store().put(buffer_, &fs_.io_cancelled_);
+        if (durability_ == WriteDurability::publication_generation)
+            id = fs_.store().put_deferred(buffer_, durability_batch_, &fs_.io_cancelled_);
+        else
+            id = fs_.store().put(buffer_, &fs_.io_cancelled_);
     } catch (...) {
         if (fs_.io_cancellation_requested())
             fail(EINTR, "write cancelled");
@@ -734,7 +739,10 @@ void WriteHandle::rebuild() {
             ++rebuild_reused_extents_;
         } else {
             const auto started = Clock::now();
-            const bool ok = fs_.store().put(id, bytes, &fs_.io_cancelled_);
+            const bool ok = durability_ == WriteDurability::publication_generation
+                                ? fs_.store().put_deferred(id, bytes, durability_batch_,
+                                                           &fs_.io_cancelled_)
+                                : fs_.store().put(id, bytes, &fs_.io_cancelled_);
             elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
             object_put_time += elapsed;
@@ -838,6 +846,19 @@ void WriteHandle::commit() {
                    " length=" + std::to_string(x.length) +
                    " id=" + to_string(x.id));
     }
+    if (durability_ == WriteDurability::publication_generation && !durability_batch_.empty()) {
+        const auto durability_started = Clock::now();
+        if (!fs_.store().durability_barrier(durability_batch_))
+            fail(EIO, "object durability quorum unavailable before publication");
+        durability_batch_.clear();
+        const auto durability_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - durability_started);
+        if (durability_elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug))
+            Log::debug("write stage id=" + std::to_string(diagnostic_id_) +
+                       " path=" + path_ + " stage=durability-barrier ms=" +
+                       std::to_string(durability_elapsed.count()));
+    }
+
     FsEntry committed;
     const auto metadata_started = Clock::now();
     fs_.commit_write(*this, base_, logical_, extents_, &committed);
@@ -1369,7 +1390,8 @@ std::shared_ptr<ReadHandle> FileSystem::open_read(const FsEntry& entry, const st
     return std::make_shared<ReadHandle>(s_, entry, track_playback ? playback_ : nullptr,
                                         normalize_path(logical_path), frame_type);
 }
-std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool trunc, bool cache_puts) {
+std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool trunc,
+                                                    bool cache_puts, WriteDurability durability) {
     // Serialize path lookup/registration with rename so an opening writer cannot
     // miss a rename between resolving the entry and joining the handle registry.
     std::lock_guard handles(open_writes_mutex_);
@@ -1384,7 +1406,8 @@ std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool t
         e = getattr(*resolved);
     }
     auto handle =
-        std::make_shared<WriteHandle>(*this, *resolved, e, trunc || !e.size, cache_puts);
+        std::make_shared<WriteHandle>(*this, *resolved, e, trunc || !e.size, cache_puts,
+                                      durability);
     for (auto i = open_writes_.begin(); i != open_writes_.end();) {
         if (i->expired())
             i = open_writes_.erase(i);

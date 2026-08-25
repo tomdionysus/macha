@@ -47,6 +47,12 @@ class StoragePool {
     std::array<uint8_t, 32> key_{};
     mutable std::mutex mutex_;
     std::vector<std::shared_ptr<Backend>> backends_;
+    struct DeferredStore {
+        std::shared_ptr<Backend> backend;
+        std::shared_ptr<LocalStore> store;
+    };
+    std::mutex durability_mutex_;
+    std::vector<DeferredStore> deferred_stores_;
     Cursor rebalance_cursor_;
     Cursor scrub_cursor_;
     Cursor gc_cursor_;
@@ -73,7 +79,9 @@ class StoragePool {
     void reconfigure(const std::vector<StorageBackendConfig>&);
     void refresh();
 
-    bool put(const ObjectId&, std::span<const uint8_t>);
+    bool put(const ObjectId&, std::span<const uint8_t>,
+             StoreWriteDurability = StoreWriteDurability::immediate);
+    void durability_barrier();
     std::optional<Bytes> get(const ObjectId&) const;
     bool has(const ObjectId&) const;
     bool valid(const ObjectId&) const;

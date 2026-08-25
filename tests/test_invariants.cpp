@@ -19,6 +19,7 @@ Config config_for(const std::filesystem::path& path, const std::filesystem::path
 #if defined(__linux__)
 std::atomic_bool track_fsync{false};
 std::atomic_uint64_t fsync_calls{0};
+std::atomic_uint64_t syncfs_calls{0};
 #endif
 
 MACHA_TEST("invariants", test_fuse_open_inode_identity_survives_external_replace_and_unlink) {
@@ -431,6 +432,155 @@ MACHA_TEST("invariants", test_rpc_pre_auth_admission_is_bounded) {
 #endif
 }
 
+MACHA_TEST("invariants", test_authoritative_deferred_generation_batches_stable_storage_barriers) {
+#if defined(__linux__)
+    TempDir t;
+    const auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    LocalStore store(t.path() / "objects", 64ULL * 1024 * 1024, keys.storage);
+    REQUIRE(wait_until([&] { return store.scan_complete(); }));
+
+    const auto strict_a = pattern(256 * 1024, 31);
+    const auto strict_b = pattern(256 * 1024, 32);
+    fsync_calls = 0;
+    syncfs_calls = 0;
+    track_fsync = true;
+    REQUIRE(store.put(object_id(strict_a), strict_a, StoreWriteDurability::immediate));
+    REQUIRE(store.put(object_id(strict_b), strict_b, StoreWriteDurability::immediate));
+    track_fsync = false;
+    const auto strict_fsyncs = fsync_calls.load(std::memory_order_relaxed);
+    CHECK(strict_fsyncs >= 6);
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 0);
+
+    const auto deferred_a = pattern(256 * 1024, 33);
+    const auto deferred_b = pattern(256 * 1024, 34);
+    fsync_calls = 0;
+    syncfs_calls = 0;
+    track_fsync = true;
+    REQUIRE(store.put(object_id(deferred_a), deferred_a, StoreWriteDurability::deferred));
+    REQUIRE(store.put(object_id(deferred_b), deferred_b, StoreWriteDurability::deferred));
+
+    // One durable DIRTY accounting checkpoint begins the whole generation. No
+    // object or directory fsync is performed while the WAL-backed generation is
+    // merely provisional.
+    CHECK(fsync_calls.load(std::memory_order_relaxed) == 1);
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 0);
+
+    store.durability_barrier();
+    track_fsync = false;
+
+    // Linux establishes one filesystem-wide data+metadata barrier, then one
+    // small durable CLEAN accounting checkpoint. The cost is O(generations), not
+    // O(extents), while strict callers above retain their original contract.
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
+    CHECK(fsync_calls.load(std::memory_order_relaxed) == 2);
+    CHECK(store.get(object_id(deferred_a)) == std::optional<Bytes>{deferred_a});
+    CHECK(store.get(object_id(deferred_b)) == std::optional<Bytes>{deferred_b});
+#else
+    std::cout << "[ARCH-REGRESSION] syncfs generation check is Linux-only; skipped\n";
+#endif
+}
+
+MACHA_TEST("invariants", test_immediate_reaffirmation_flushes_provisional_generation) {
+#if defined(__linux__)
+    TempDir t;
+    const auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    LocalStore store(t.path() / "objects", 64ULL * 1024 * 1024, keys.storage);
+    REQUIRE(wait_until([&] { return store.scan_complete(); }));
+
+    const auto bytes = pattern(256 * 1024, 35);
+    const auto id = object_id(bytes);
+    REQUIRE(store.put(id, bytes, StoreWriteDurability::deferred));
+
+    fsync_calls = 0;
+    syncfs_calls = 0;
+    track_fsync = true;
+    REQUIRE(store.put(id, bytes, StoreWriteDurability::immediate));
+    track_fsync = false;
+
+    // A strict caller must never accidentally reaffirm a pathname installed by
+    // a still-provisional publication generation. Reusing the same hash forces
+    // that generation through its filesystem barrier before strict put returns.
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
+    CHECK(fsync_calls.load(std::memory_order_relaxed) == 1); // CLEAN accounting checkpoint
+#else
+    std::cout << "[ARCH-REGRESSION] provisional reaffirmation check is Linux-only; skipped\n";
+#endif
+}
+
+MACHA_TEST("invariants", test_publication_generation_barrier_precedes_metadata_commit) {
+#if defined(__linux__)
+    TestNode fixture("publication-generation");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.extent_size = 64 * 1024;
+    fixture.start();
+    auto& fs = fixture.filesystem();
+    fs.create_file("/generation.bin", 0644, getuid(), getgid());
+
+    const auto bytes = pattern(config.extent_size * 8, 37);
+    auto writer = fs.open_write("/generation.bin", true, false,
+                                WriteDurability::publication_generation);
+    fsync_calls = 0;
+    syncfs_calls = 0;
+    track_fsync = true;
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+
+    // Eight authoritative extents are provisional but the WAL-backed caller has
+    // not yet asked to publish their manifest, so no filesystem durability
+    // barrier has occurred.
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 0);
+    writer->commit();
+    track_fsync = false;
+
+    // All eight extents are covered by one generation barrier before metadata
+    // publication. The committed namespace must immediately read back in full.
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
+    auto reader = fs.open_read("/generation.bin");
+    Bytes actual(bytes.size());
+    size_t done = 0;
+    while (done < actual.size()) {
+        const auto count = reader->read(done, {actual.data() + done, actual.size() - done});
+        REQUIRE(count > 0);
+        done += count;
+    }
+    CHECK(actual == bytes);
+#else
+    std::cout << "[ARCH-REGRESSION] publication generation syncfs check is Linux-only; skipped\n";
+#endif
+}
+
+MACHA_TEST("invariants", test_persistent_cache_is_explicitly_ephemeral) {
+#if defined(__linux__)
+    TempDir t;
+    const auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    PersistentBlockCache cache({t.path() / "cache", 2, true}, keys.storage);
+
+    const auto a = pattern(64 * 1024, 41);
+    const auto b = pattern(64 * 1024, 42);
+    const auto c = pattern(64 * 1024, 43);
+    fsync_calls = 0;
+    syncfs_calls = 0;
+    track_fsync = true;
+    REQUIRE(cache.put(object_id(a), a));
+    REQUIRE(cache.put(object_id(b), b));
+    REQUIRE(cache.put(object_id(c), c)); // includes one eviction
+    track_fsync = false;
+
+    CHECK(cache.blocks() == 2);
+    CHECK(fsync_calls.load(std::memory_order_relaxed) == 0);
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 0);
+#else
+    std::cout << "[ARCH-REGRESSION] cache fsync interception check is Linux-only; skipped\n";
+#endif
+}
+
 MACHA_TEST("invariants", test_control_plane_hint_admission_is_storage_durable) {
 #if defined(__linux__)
     TempDir t;
@@ -447,6 +597,45 @@ MACHA_TEST("invariants", test_control_plane_hint_admission_is_storage_durable) {
 #else
     std::cout << "[ARCH-REGRESSION] fsync interception check is Linux-only; skipped\n";
 #endif
+}
+
+MACHA_TEST("invariants", test_deferred_object_barrier_rejects_stale_process_epoch) {
+    TestCluster cluster(ConfigProfile::isolated);
+    auto config = cluster.node_config("durability-epoch");
+    config.replication = 1;
+    config.metadata_replication = 1;
+    NodeRuntime node(config, cluster.keys());
+    node.start();
+
+    const auto bytes = pattern(64 * 1024, 46);
+    const auto id = object_id(bytes);
+    Writer request;
+    request.fixed(id.bytes);
+    request.bytes(bytes);
+    const Endpoint endpoint{"127.0.0.1", config.port};
+    auto placed = node.call(endpoint, MessageType::put_object_deferred, request.data(),
+                            FrameType::read_ahead);
+    REQUIRE(placed.message.type == MessageType::ok);
+    Reader placed_reply(placed.message.payload);
+    NodeId acknowledged_epoch{placed_reply.fixed<16>()};
+    placed_reply.finish();
+    CHECK(acknowledged_epoch == node.durability_epoch());
+
+    Writer stale;
+    auto wrong_epoch = random_node_id();
+    while (wrong_epoch == acknowledged_epoch)
+        wrong_epoch = random_node_id();
+    stale.fixed(wrong_epoch.bytes);
+    auto rejected = node.call(endpoint, MessageType::object_durability_barrier, stale.data(),
+                              FrameType::read_ahead);
+    CHECK(rejected.message.type == MessageType::error);
+
+    Writer current;
+    current.fixed(acknowledged_epoch.bytes);
+    auto durable = node.call(endpoint, MessageType::object_durability_barrier, current.data(),
+                             FrameType::read_ahead);
+    CHECK(durable.message.type == MessageType::ok);
+    node.stop();
 }
 
 MACHA_TEST("invariants", test_authenticated_receiver_enforces_transport_lane) {
@@ -552,5 +741,11 @@ extern "C" int fsync(int fd) {
     if (track_fsync.load(std::memory_order_relaxed))
         fsync_calls.fetch_add(1, std::memory_order_relaxed);
     return static_cast<int>(::syscall(SYS_fsync, fd));
+}
+
+extern "C" int syncfs(int fd) {
+    if (track_fsync.load(std::memory_order_relaxed))
+        syncfs_calls.fetch_add(1, std::memory_order_relaxed);
+    return static_cast<int>(::syscall(SYS_syncfs, fd));
 }
 #endif

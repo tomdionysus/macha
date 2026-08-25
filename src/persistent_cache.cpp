@@ -37,8 +37,9 @@ void atomic_write(const std::filesystem::path& path, std::span<const uint8_t> by
         throw std::runtime_error("cannot create cache metadata: " + std::string(strerror(errno)));
     try {
         write_all(fd, bytes);
-        if (::fsync(fd))
-            throw std::runtime_error("cannot sync cache metadata: " + std::string(strerror(errno)));
+        // Cache metadata is a hint, not authoritative state. A crash may lose
+        // it wholesale; startup simply ignores a torn/missing record and the
+        // cache remains disposable by contract.
         if (::close(fd))
             throw std::runtime_error("cannot close cache metadata: " + std::string(strerror(errno)));
         fd = -1;
@@ -68,7 +69,8 @@ void PersistentBlockCache::open_locked() {
         return;
     try {
         store_ = std::make_shared<LocalStore>(config_.path,
-                                              std::numeric_limits<uint64_t>::max(), key_);
+                                              std::numeric_limits<uint64_t>::max(), key_,
+                                              LocalStoreMode::ephemeral);
         rebuild_lru_locked();
     } catch (const std::exception& error) {
         store_.reset();
@@ -152,8 +154,9 @@ void PersistentBlockCache::trim_to_limit(const std::shared_ptr<LocalStore>& stor
             lru_.pop_front();
         }
 
-        // LocalStore serialises physical mutations internally.  This may fsync,
-        // so deliberately do it without state_mutex_: foreground cache readers
+        // LocalStore serialises physical mutations internally. Cache mode is
+        // intentionally ephemeral and never establishes stable-storage barriers, so
+        // deliberately do it without state_mutex_: foreground cache readers
         // only need a shared_ptr snapshot and continue independently.
         (void)store->remove(*victim);
     }
@@ -181,7 +184,8 @@ bool PersistentBlockCache::put(const ObjectId& id, std::span<const uint8_t> data
             return true;
         }
 
-        // Make one slot before doing the expensive encrypted/fsynced put.  No
+        // Make one slot before doing the encrypted put. No durability barrier is
+        // required for cache data; a crash may discard the entire cache. No
         // recursive directory walk is performed here; lru_ is authoritative
         // for this cache process after the one-time open reconciliation.
         while (true) {

@@ -70,6 +70,8 @@ void socket_timeout(int fd, std::chrono::milliseconds timeout) {
 bool allowed_on_lane(TransportLane lane, MessageType type) noexcept {
     const bool object_message = type == MessageType::get_object ||
                                 type == MessageType::put_object ||
+                                type == MessageType::put_object_deferred ||
+                                type == MessageType::object_durability_barrier ||
                                 type == MessageType::object_reply;
     if (lane == TransportLane::control)
         return !object_message;
@@ -288,6 +290,8 @@ FrameType decode_frame_type(uint8_t value) {
 
 bool is_bulk_message(MessageType type) {
     return type == MessageType::get_object || type == MessageType::put_object ||
+           type == MessageType::put_object_deferred ||
+           type == MessageType::object_durability_barrier ||
            type == MessageType::object_reply;
 }
 
@@ -451,6 +455,8 @@ const char* message_type_name(MessageType type) noexcept {
     case MessageType::have_object: return "have_object";
     case MessageType::get_object: return "get_object";
     case MessageType::put_object: return "put_object";
+    case MessageType::put_object_deferred: return "put_object_deferred";
+    case MessageType::object_durability_barrier: return "object_durability_barrier";
     case MessageType::get_metadata: return "get_metadata";
     case MessageType::cas_metadata: return "cas_metadata";
     case MessageType::cas_metadata_delta: return "cas_metadata_delta";
@@ -485,7 +491,9 @@ unsigned frame_type_priority(FrameType type) noexcept {
 }
 
 FrameType default_frame_type(MessageType type) noexcept {
-    if (type == MessageType::get_object || type == MessageType::put_object)
+    if (type == MessageType::get_object || type == MessageType::put_object ||
+        type == MessageType::put_object_deferred ||
+        type == MessageType::object_durability_barrier)
         return FrameType::foreground;
     if (type == MessageType::get_metadata_object || type == MessageType::put_metadata_object)
         return FrameType::speculative;
@@ -1481,7 +1489,9 @@ TransportLane RpcClient::lane_for(MessageType type, FrameType frame_type) noexce
     // behind control messages, but it deliberately travels on the separate
     // CONTROL TCP session. This prevents multi-megabyte namespace CAS/repair
     // traffic from sharing a socket with foreground media reads.
-    if (type == MessageType::get_object || type == MessageType::put_object)
+    if (type == MessageType::get_object || type == MessageType::put_object ||
+        type == MessageType::put_object_deferred ||
+        type == MessageType::object_durability_barrier)
         return TransportLane::data;
     (void)frame_type;
     return TransportLane::control;

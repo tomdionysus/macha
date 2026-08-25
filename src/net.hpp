@@ -40,6 +40,8 @@ enum class MessageType : uint16_t {
     get_metadata_object = 19,
     put_metadata_object = 20,
     get_metadata_identity = 21,
+    put_object_deferred = 22,
+    object_durability_barrier = 23,
     ok = 100,
     error = 101,
     members_reply = 102,
