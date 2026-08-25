@@ -221,6 +221,28 @@ class FuseReadSession {
     std::shared_ptr<ReadHandle> reader;
 };
 
+class ScopedFd {
+    int fd_{-1};
+
+  public:
+    ScopedFd() = default;
+    explicit ScopedFd(int fd) : fd_(fd) {}
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+    ~ScopedFd() {
+        if (fd_ >= 0)
+            ::close(fd_);
+    }
+
+    int get() const noexcept { return fd_; }
+
+    void reset(int fd = -1) {
+        if (fd_ >= 0)
+            ::close(fd_);
+        fd_ = fd;
+    }
+};
+
 struct FuseFrontend::State {
     struct DataOp {
         enum class Kind : uint8_t { write, truncate };
@@ -1360,6 +1382,53 @@ struct FuseFrontend::State {
         }
     }
 
+    bool retire_spool_locked(Inode& inode) {
+        if (inode.spool_path.empty()) {
+            if (inode.spool_fd >= 0) {
+                ::close(inode.spool_fd);
+                inode.spool_fd = -1;
+            }
+            inode.spool_end = 0;
+            return true;
+        }
+
+        int fd = inode.spool_fd;
+        bool temporary = false;
+        if (fd < 0) {
+            fd = ::open(inode.spool_path.c_str(), O_RDWR);
+            if (fd < 0) {
+                Log::warn("cannot open retired FUSE spool inode=" +
+                          std::to_string(inode.id) + " error=" + std::strerror(errno));
+                return false;
+            }
+            temporary = true;
+        }
+
+        bool clean = true;
+        if (::ftruncate(fd, 0) != 0) {
+            clean = false;
+            Log::warn("cannot truncate retired FUSE spool inode=" +
+                      std::to_string(inode.id) + " error=" + std::strerror(errno));
+        } else {
+            inode.spool_end = 0;
+            try {
+                fsync_fd(fd, "cannot sync retired FUSE spool");
+            } catch (const std::exception& e) {
+                clean = false;
+                Log::warn("cannot sync retired FUSE spool inode=" +
+                          std::to_string(inode.id) + " error=" + e.what());
+            }
+        }
+
+        if (temporary) {
+            ::close(fd);
+        } else {
+            ::close(inode.spool_fd);
+            inode.spool_fd = -1;
+        }
+        return clean;
+    }
+
     void request_data_publication(const std::shared_ptr<Inode>& inode) {
         bool enqueue = false;
         {
@@ -1630,7 +1699,7 @@ struct FuseFrontend::State {
         uint64_t required_namespace_sequence{};
         std::vector<DataOp> operations;
         std::optional<std::string> published_path;
-        int spool_fd{-1};
+        std::filesystem::path spool_path;
     };
 
     DataSnapshot snapshot_data(const std::shared_ptr<Inode>& inode) {
@@ -1647,7 +1716,7 @@ struct FuseFrontend::State {
         snapshot.required_namespace_sequence =
             std::max(inode->requested_namespace_sequence, inode->namespace_sequence);
         snapshot.published_path = inode->published_path;
-        snapshot.spool_fd = inode->spool_fd;
+        snapshot.spool_path = inode->spool_path;
         for (const auto& op : inode->data_ops) {
             if (op.sequence > inode->published_data_sequence &&
                 op.sequence <= snapshot.target_sequence)
@@ -1709,20 +1778,15 @@ struct FuseFrontend::State {
                 inode->data_ops.end());
             inode->published_data_sequence =
                 std::max(inode->published_data_sequence, snapshot.target_sequence);
-            if (inode->data_ops.empty() && !inode->durability_pending && inode->spool_fd >= 0) {
-                if (::ftruncate(inode->spool_fd, 0) == 0) {
-                    inode->spool_end = 0;
-                    fsync_fd(inode->spool_fd, "cannot sync retired FUSE spool");
-                } else {
-                    spool_clean = false;
-                }
-            }
+            if (inode->data_ops.empty() && !inode->durability_pending)
+                spool_clean = retire_spool_locked(*inode);
             if (journal_idle && spool_clean)
                 reset_journal_if_idle();
             return;
         }
 
         std::shared_ptr<WriteHandle> writer;
+        ScopedFd replay_spool;
         try {
             writer = fs.open_write(*snapshot.published_path, false, config.write_through_cache);
             constexpr size_t chunk_size = 256 * 1024;
@@ -1745,8 +1809,13 @@ struct FuseFrontend::State {
                     wait_for_playback_quiet();
                     const auto chunk = static_cast<size_t>(
                         std::min<uint64_t>(buffer.size(), op.length - done));
-                    if (snapshot.spool_fd < 0 ||
-                        pread_exact(snapshot.spool_fd, {buffer.data(), chunk},
+                    if (replay_spool.get() < 0) {
+                        const int fd = ::open(snapshot.spool_path.c_str(), O_RDONLY);
+                        if (fd < 0)
+                            throw FsError(errno, "cannot open FUSE write spool for publication");
+                        replay_spool.reset(fd);
+                    }
+                    if (pread_exact(replay_spool.get(), {buffer.data(), chunk},
                                     op.spool_offset + done) != chunk)
                         throw FsError(EIO, "short read from FUSE write spool");
                     if (writer->write(op.offset + done, {buffer.data(), chunk}) != chunk)
@@ -2108,9 +2177,9 @@ struct FuseFrontend::State {
         ::close(fd);
         if (size > required)
             quarantine_spool_tail(inode->spool_path, required, size);
-        inode->spool_fd = ::open(inode->spool_path.c_str(), O_RDWR);
-        if (inode->spool_fd < 0)
-            throw FsError(errno, "cannot reopen recovered FUSE spool");
+        // Recovery validates durable spool state but does not retain one file
+        // descriptor per dirty inode. Replay/read paths open the spool lazily.
+        inode->spool_fd = -1;
         inode->spool_end = required;
     }
 
@@ -2435,22 +2504,8 @@ struct FuseFrontend::State {
                 inode->data_ops.end());
             inode->unconfirmed_data_entry.reset();
             inode->unconfirmed_data_sequence = 0;
-            if (inode->data_ops.empty() && !inode->durability_pending && inode->spool_fd >= 0) {
-                if (::ftruncate(inode->spool_fd, 0) != 0) {
-                    spool_clean = false;
-                    Log::warn("cannot truncate retired FUSE spool inode=" +
-                              std::to_string(inode->id) + " error=" + std::strerror(errno));
-                } else {
-                    inode->spool_end = 0;
-                    try {
-                        fsync_fd(inode->spool_fd, "cannot sync retired FUSE spool");
-                    } catch (const std::exception& e) {
-                        spool_clean = false;
-                        Log::warn("cannot sync retired FUSE spool inode=" +
-                                  std::to_string(inode->id) + " error=" + e.what());
-                    }
-                }
-            }
+            if (inode->data_ops.empty() && !inode->durability_pending)
+                spool_clean = retire_spool_locked(*inode);
             more = inode->requested_data_sequence > inode->published_data_sequence;
             if (more)
                 inode->data_deferred = true;
@@ -3261,7 +3316,7 @@ size_t FuseFrontend::read_impl(uint64_t inode_id, const std::shared_ptr<FuseRead
         FsEntry base;
         FsEntry visible;
         std::vector<State::DataOp> operations;
-        int spool_fd = -1;
+        std::filesystem::path spool_path;
         std::string logical_path;
         {
             std::lock_guard lock(inode->mutex);
@@ -3270,7 +3325,7 @@ size_t FuseFrontend::read_impl(uint64_t inode_id, const std::shared_ptr<FuseRead
             base = inode->base;
             visible = inode->visible;
             operations = inode->data_ops;
-            spool_fd = inode->spool_fd;
+            spool_path = inode->spool_path;
             logical_path = inode->current_path.empty() ? std::string("<unlinked>") : inode->current_path;
         }
         if (offset >= visible.size || output.empty())
@@ -3314,6 +3369,7 @@ size_t FuseFrontend::read_impl(uint64_t inode_id, const std::shared_ptr<FuseRead
         }
 
         uint64_t virtual_size = base.size;
+        ScopedFd spool;
         for (const auto& op : operations) {
             check_deadline(deadline, cancelled);
             if (op.kind == State::DataOp::Kind::truncate) {
@@ -3327,17 +3383,22 @@ size_t FuseFrontend::read_impl(uint64_t inode_id, const std::shared_ptr<FuseRead
                 virtual_size = op.size;
                 continue;
             }
-            if (spool_fd < 0)
-                throw FsError(EIO, "missing FUSE write spool");
             const auto write_begin = op.offset;
             const auto write_end = op.offset + op.length;
             const auto copy_begin = std::max<uint64_t>(offset, write_begin);
             const auto copy_end = std::min<uint64_t>(offset + count, write_end);
             if (copy_begin < copy_end) {
+                if (spool.get() < 0) {
+                    const int fd = ::open(spool_path.c_str(), O_RDONLY);
+                    if (fd < 0)
+                        throw FsError(errno, "cannot open FUSE write spool for read");
+                    spool.reset(fd);
+                }
                 const auto n = static_cast<size_t>(copy_end - copy_begin);
-                const auto spool = op.spool_offset + (copy_begin - write_begin);
-                if (pread_exact(spool_fd,
-                                {output.data() + static_cast<size_t>(copy_begin - offset), n}, spool) != n)
+                const auto spool_offset = op.spool_offset + (copy_begin - write_begin);
+                if (pread_exact(spool.get(),
+                                {output.data() + static_cast<size_t>(copy_begin - offset), n},
+                                spool_offset) != n)
                     throw FsError(EIO, "short FUSE spool read");
             }
             virtual_size = std::max(virtual_size, write_end);

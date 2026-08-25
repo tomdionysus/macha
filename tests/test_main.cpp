@@ -4181,6 +4181,69 @@ void test_fuse_durable_journal_preserves_unreferenced_spool() {
     service.stop();
 }
 
+#if defined(__linux__)
+size_t linux_open_fd_count() {
+    std::error_code ec;
+    size_t count = 0;
+    for (std::filesystem::directory_iterator it("/proc/self/fd", ec), end;
+         !ec && it != end; it.increment(ec))
+        ++count;
+    REQUIRE(!ec);
+    return count;
+}
+#endif
+
+void test_fuse_recovery_spool_descriptors_are_bounded() {
+#if defined(__linux__)
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-recovery-fd-bound", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 60s;
+
+    Service service(config, keys);
+    service.start();
+    constexpr size_t dirty_inodes = 16;
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        service.filesystem().store().foreground_activity(1);
+        for (size_t i = 0; i < dirty_inodes; ++i) {
+            auto handle = frontend->create("/fd-" + std::to_string(i), 0644,
+                                           getuid(), getgid(), true, true, false);
+            const Bytes byte{static_cast<uint8_t>(i)};
+            REQUIRE(frontend->write(handle.inode, 0, byte) == byte.size());
+            frontend->release(handle.inode, true);
+        }
+        frontend->stop();
+    }
+
+    const auto before_recovery = linux_open_fd_count();
+    {
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        const auto after_recovery = linux_open_fd_count();
+        CHECK(after_recovery <= before_recovery + 8);
+        recovered->stop();
+    }
+
+    auto drain = config.fuse;
+    drain.publication_quiet = 0ms;
+    const auto before_drain = linux_open_fd_count();
+    {
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), drain);
+        REQUIRE(recovered->wait_for_idle(30s));
+        const auto after_drain = linux_open_fd_count();
+        CHECK(after_drain <= before_drain + 8);
+        recovered->stop();
+    }
+    service.stop();
+#endif
+}
+
 void append_fuse_journal_test_record(const std::filesystem::path& journal,
                                      std::span<const uint8_t> payload) {
     Writer frame;
@@ -8829,6 +8892,7 @@ int main() {
         RUN_TEST(test_fuse_durable_journal_trims_torn_tail);
         RUN_TEST(test_fuse_durable_journal_trims_checksum_invalid_complete_tail);
         RUN_TEST(test_fuse_durable_journal_preserves_unreferenced_spool);
+        RUN_TEST(test_fuse_recovery_spool_descriptors_are_bounded);
         RUN_TEST(test_fuse_durable_journal_accepts_authoritative_data_done_without_published_prefix);
         RUN_TEST(test_fuse_durable_journal_rejects_unbacked_data_done);
         RUN_TEST(test_fuse_durable_journal_rejects_missing_spool);
