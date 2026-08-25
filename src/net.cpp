@@ -24,6 +24,9 @@ constexpr uint32_t frame_magic = 0x4d433133; // "MC13"
 constexpr size_t protocol_min_frame_size = 4 * 1024;
 constexpr size_t protocol_max_frame_size = 4 * 1024 * 1024;
 constexpr size_t max_message_size = 128 * 1024 * 1024;
+// Fast health/membership RPCs must never queue behind storage-backed control
+// handlers such as metadata checkpointing.
+constexpr size_t fast_control_worker_count = 2;
 constexpr size_t control_worker_count = 2;
 constexpr size_t data_worker_count = 8;
 // Lower-priority object writes/repair must never occupy every execution slot.
@@ -2594,6 +2597,11 @@ RpcServer::RequestClass RpcServer::request_class(FrameType type) {
     return RequestClass::speculative;
 }
 
+bool RpcServer::fast_control_request(const RpcFrame& frame) {
+    return frame.frame_type == FrameType::control &&
+           (frame.message.type == MessageType::ping || frame.message.type == MessageType::members);
+}
+
 std::deque<RpcServer::RequestJob>& RpcServer::queue(RequestClass cls) {
     switch (cls) {
     case RequestClass::control:
@@ -2636,10 +2644,11 @@ void RpcServer::attach_client(RpcClient& client) {
 
 void RpcServer::enqueue_shared(const NodeInfo& peer, RpcFrame frame,
                                RpcClient::InboundReply reply) {
+    const bool fast = fast_control_request(frame);
     const auto cls = request_class(frame.frame_type);
     {
         DiagnosticLock lock(request_mutex_, "rpc.server.queue");
-        auto& requests = queue(cls);
+        auto& requests = fast ? fast_control_requests_ : queue(cls);
         if (requests.size() >= max_pending_requests)
             throw std::runtime_error("RPC server request queue full");
         requests.push_back({{}, peer, std::move(frame), std::move(reply)});
@@ -2717,8 +2726,12 @@ void RpcServer::start() {
     bound_port_ = bound;
     listen_fd_ = fd;
 
+    fast_control_workers_.reserve(fast_control_worker_count);
     control_workers_.reserve(control_worker_count);
     data_workers_.reserve(data_worker_count);
+    for (size_t i = 0; i < fast_control_worker_count; ++i)
+        fast_control_workers_.emplace_back(
+            [this](std::stop_token stop) { fast_control_worker_loop(stop); });
     for (size_t i = 0; i < control_worker_count; ++i)
         control_workers_.emplace_back(
             [this](std::stop_token stop) { control_worker_loop(stop); });
@@ -2762,19 +2775,22 @@ void RpcServer::stop() {
     reap_sessions(true);
     Log::debug("shutdown: RPC sessions reaped");
 
+    for (auto& worker : fast_control_workers_)
+        worker.request_stop();
     for (auto& worker : control_workers_)
         worker.request_stop();
     for (auto& worker : data_workers_)
         worker.request_stop();
     request_cv_.notify_all();
+    fast_control_workers_.clear();
     control_workers_.clear();
     data_workers_.clear();
 
     std::vector<std::function<void(const RpcMessage&)>> dropped;
     {
         DiagnosticLock lock(request_mutex_, "rpc.server.queue");
-        for (auto* requests : {&control_requests_, &foreground_requests_, &read_ahead_requests_,
-                               &speculative_requests_}) {
+        for (auto* requests : {&fast_control_requests_, &control_requests_, &foreground_requests_,
+                               &read_ahead_requests_, &speculative_requests_}) {
             for (auto& job : *requests) {
                 if (job.reply)
                     dropped.push_back(job.reply);
@@ -2970,12 +2986,14 @@ void RpcServer::session_loop(Session* session) {
                 continue;
             }
 
+            const bool fast = fast_control_request(*frame);
             const auto cls = request_class(frame->frame_type);
             session->register_inbound(frame->request_id, frame->frame_type);
             bool queued = false;
             {
                 DiagnosticLock lock(request_mutex_, "rpc.server.queue");
-                if (queue(cls).size() < max_pending_requests) {
+                auto& requests = fast ? fast_control_requests_ : queue(cls);
+                if (requests.size() < max_pending_requests) {
                     std::shared_ptr<Session> shared;
                     {
                         std::lock_guard sessions_lock(sessions_mutex_);
@@ -2988,8 +3006,8 @@ void RpcServer::session_loop(Session* session) {
                     }
                     if (shared) {
                         ++shared->active_requests;
-                        queue(cls).push_back({std::move(shared), session->peer,
-                                             std::move(*frame), {}});
+                        requests.push_back({std::move(shared), session->peer,
+                                            std::move(*frame), {}});
                         queued = true;
                     }
                 }
@@ -3062,6 +3080,25 @@ void RpcServer::execute(RequestJob job) {
         if (job.session->active_requests.load())
             --job.session->active_requests;
         job.session->maybe_finish_retire();
+    }
+}
+
+void RpcServer::fast_control_worker_loop(std::stop_token stop) {
+    ThreadCpuReporter cpu_reporter("macha-rpc-fast");
+    while (true) {
+        RequestJob job;
+        {
+            std::unique_lock lock(request_mutex_);
+            request_cv_.wait(lock, [&] {
+                return stop.stop_requested() || !fast_control_requests_.empty();
+            });
+            if (stop.stop_requested() && fast_control_requests_.empty())
+                return;
+            job = std::move(fast_control_requests_.front());
+            fast_control_requests_.pop_front();
+        }
+        execute(std::move(job));
+        cpu_reporter.tick();
     }
 }
 

@@ -289,10 +289,12 @@ class RpcServer {
     uint16_t bound_port_{};
     std::jthread accept_thread_;
     enum class RequestClass { control, foreground, read_ahead, speculative };
+    std::vector<std::jthread> fast_control_workers_;
     std::vector<std::jthread> control_workers_;
     std::vector<std::jthread> data_workers_;
     std::mutex request_mutex_;
     std::condition_variable request_cv_;
+    std::deque<RequestJob> fast_control_requests_;
     std::deque<RequestJob> control_requests_;
     std::deque<RequestJob> foreground_requests_;
     std::deque<RequestJob> read_ahead_requests_;
@@ -304,11 +306,13 @@ class RpcServer {
     RpcClient* shared_client_{};
 
     static RequestClass request_class(FrameType);
+    static bool fast_control_request(const RpcFrame&);
     std::deque<RequestJob>& queue(RequestClass);
     bool data_ready() const;
     RequestClass next_data_class() const;
     void accept_loop(std::stop_token);
     void session_loop(Session*);
+    void fast_control_worker_loop(std::stop_token);
     void control_worker_loop(std::stop_token);
     void data_worker_loop(std::stop_token);
     void execute(RequestJob);

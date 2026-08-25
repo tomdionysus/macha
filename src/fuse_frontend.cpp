@@ -272,6 +272,10 @@ struct FuseFrontend::State {
         // are not eligible for distributed publication yet.
         uint64_t durable_data_sequence{};
         uint64_t published_data_sequence{};
+        // Highest data sequence reconstructed from the durable journal at
+        // startup. Publications which still include this prefix are recovery
+        // work and use the separate recovery concurrency budget.
+        uint64_t recovery_data_sequence{};
         uint64_t requested_namespace_sequence{};
         std::vector<DataOp> data_ops;
         int spool_fd{-1};
@@ -422,11 +426,17 @@ struct FuseFrontend::State {
     std::mutex publication_mutex;
     std::condition_variable_any publication_cv;
 
+    struct DataQueueItem {
+        std::shared_ptr<Inode> inode;
+        bool recovery{};
+    };
+
     std::mutex data_queue_mutex;
     std::condition_variable_any data_cv;
-    std::deque<std::shared_ptr<Inode>> data_queue;
+    std::deque<DataQueueItem> data_queue;
     std::vector<std::jthread> data_workers;
     std::atomic_size_t active_data{};
+    std::atomic_size_t active_recovery_data{};
     // Number of writable FUSE handles currently open. A writable handle is a
     // stronger foreground signal than a recent-operation timer: while rsync is
     // feeding a file, background publication must not fan out merely because
@@ -1468,7 +1478,8 @@ struct FuseFrontend::State {
         }
         inode->data_queued = true;
         inode->data_deferred = false;
-        data_queue.push_back(inode);
+        const bool recovery = inode->published_data_sequence < inode->recovery_data_sequence;
+        data_queue.push_back({inode, recovery});
         data_cv.notify_one();
     }
 
@@ -1490,7 +1501,8 @@ struct FuseFrontend::State {
                 continue;
             inode->data_deferred = false;
             inode->data_queued = true;
-            data_queue.push_back(inode);
+            const bool recovery = inode->published_data_sequence < inode->recovery_data_sequence;
+            data_queue.push_back({inode, recovery});
         }
         data_cv.notify_all();
     }
@@ -1859,7 +1871,7 @@ struct FuseFrontend::State {
             (void)confirm_data_from_snapshot(inode, *available->snapshot);
     }
 
-    bool data_slot_available() const {
+    bool data_global_slot_available() const {
         // Playback is stricter than mounted-filesystem foreground activity.
         // FUSE data has already been admitted to the local spool, so starting a
         // distributed publication while a viewer is waiting serves no latency
@@ -1874,9 +1886,37 @@ struct FuseFrontend::State {
         return active_data.load(std::memory_order_relaxed) < limit;
     }
 
+    size_t effective_recovery_commit_workers() const {
+        return std::min(config.recovery_commit_workers, config.commit_workers);
+    }
+
+    auto runnable_data_locked() {
+        if (!data_global_slot_available())
+            return data_queue.end();
+
+        // Live publication always wins over crash-recovery convergence. A large
+        // recovered backlog must never leave a newly closed/fsynced file queued
+        // behind hundreds of old inodes.
+        auto live = std::find_if(data_queue.begin(), data_queue.end(),
+                                 [](const DataQueueItem& item) { return !item.recovery; });
+        if (live != data_queue.end())
+            return live;
+
+        if (active_recovery_data.load(std::memory_order_relaxed) >=
+            effective_recovery_commit_workers())
+            return data_queue.end();
+        return std::find_if(data_queue.begin(), data_queue.end(),
+                            [](const DataQueueItem& item) { return item.recovery; });
+    }
+
+    bool runnable_data_available_locked() {
+        return runnable_data_locked() != data_queue.end();
+    }
+
     void data_loop(std::stop_token stop) {
         while (!stop.stop_requested() && !stopping.load()) {
             std::shared_ptr<Inode> inode;
+            bool recovery = false;
             {
                 std::unique_lock lock(data_queue_mutex);
                 while (!stop.stop_requested() && !stopping.load()) {
@@ -1886,7 +1926,7 @@ struct FuseFrontend::State {
                         });
                         continue;
                     }
-                    if (data_slot_available())
+                    if (runnable_data_available_locked())
                         break;
 
                     // Active publications and writer close both notify data_cv.
@@ -1897,7 +1937,8 @@ struct FuseFrontend::State {
                     if (config.publication_quiet.count() > 0 &&
                         playback_idle < config.publication_quiet) {
                         data_cv.wait_for(lock, stop, config.publication_quiet - playback_idle, [&] {
-                            return stopping.load() || data_queue.empty() || data_slot_available();
+                            return stopping.load() || data_queue.empty() ||
+                                   runnable_data_available_locked();
                         });
                         continue;
                     }
@@ -1905,21 +1946,27 @@ struct FuseFrontend::State {
                     if (open_writers.load(std::memory_order_relaxed) == 0 &&
                         config.publication_quiet.count() > 0 && mount_idle < config.publication_quiet) {
                         data_cv.wait_for(lock, stop, config.publication_quiet - mount_idle, [&] {
-                            return stopping.load() || data_queue.empty() || data_slot_available();
+                            return stopping.load() || data_queue.empty() ||
+                                   runnable_data_available_locked();
                         });
                     } else {
                         data_cv.wait(lock, stop, [&] {
-                            return stopping.load() || data_queue.empty() || data_slot_available();
+                            return stopping.load() || data_queue.empty() ||
+                                   runnable_data_available_locked();
                         });
                     }
                 }
                 if (stop.stop_requested() || stopping.load())
                     break;
-                if (data_queue.empty() || !data_slot_available())
+                auto selected = runnable_data_locked();
+                if (selected == data_queue.end())
                     continue;
-                inode = data_queue.front();
-                data_queue.pop_front();
+                inode = selected->inode;
+                recovery = selected->recovery;
+                data_queue.erase(selected);
                 ++active_data;
+                if (recovery)
+                    ++active_recovery_data;
             }
             {
                 std::lock_guard lock(inode->mutex);
@@ -1955,6 +2002,8 @@ struct FuseFrontend::State {
                     inode->data_deferred = true;
             }
             --active_data;
+            if (recovery)
+                --active_recovery_data;
             data_cv.notify_all();
             if (retry)
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -2374,6 +2423,7 @@ struct FuseFrontend::State {
             } else {
                 inode->published_data_sequence = done;
             }
+            inode->recovery_data_sequence = inode->durable_data_sequence;
             inode->requested_namespace_sequence = inode->namespace_sequence;
             recover_spool(inode, inode->data_ops);
             if (!inode->current_path.empty()) {
@@ -3699,6 +3749,9 @@ FuseFrontendStatus FuseFrontend::status() const {
     {
         std::lock_guard lock(state_->data_queue_mutex);
         out.pending_data = state_->data_queue.size();
+        out.pending_recovery_data = static_cast<size_t>(std::count_if(
+            state_->data_queue.begin(), state_->data_queue.end(),
+            [](const State::DataQueueItem& item) { return item.recovery; }));
     }
     // Deferred-but-not-admitted work is pending; active work is reported
     // separately and deliberately not double-counted in pending_data.
@@ -3712,6 +3765,7 @@ FuseFrontendStatus FuseFrontend::status() const {
         }
     }
     out.active_data = state_->active_data.load();
+    out.active_recovery_data = state_->active_recovery_data.load();
     out.timed_out_requests = state_->timed_out_requests.load();
     out.merged_publications = state_->merged_publications.load();
     out.backend_failures = state_->backend_failures.load();

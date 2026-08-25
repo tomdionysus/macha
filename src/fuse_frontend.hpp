@@ -59,7 +59,9 @@ struct FuseFrontendStatus {
     size_t broker_pending{};
     size_t pending_namespace{};
     size_t pending_data{};
+    size_t pending_recovery_data{};
     size_t active_data{};
+    size_t active_recovery_data{};
     uint64_t timed_out_requests{};
     uint64_t merged_publications{};
     uint64_t backend_failures{};
