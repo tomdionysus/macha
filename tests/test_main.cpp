@@ -6602,6 +6602,87 @@ void test_media_probe_and_online_catalogue_scanner() {
 }
 
 
+void test_catalogue_zero_length_files_wait_for_committed_content() {
+    TempDir temp;
+    auto keyfile = temp.path() / "cluster.key";
+    write_key(keyfile);
+    auto config = config_for(temp.path() / "node", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.catalogue.scanner.enabled = false;
+    auto keys = load_cluster_keys(keyfile);
+    Service service(config, keys);
+    service.start();
+
+    service.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
+    const std::string path = "/Movies/Transient.Movie.2026.mkv";
+    service.filesystem().create_file(path, 0644, getuid(), getgid());
+    const auto empty_entry = service.filesystem().getattr(path);
+    REQUIRE(empty_entry.type == EntryType::file);
+    REQUIRE(empty_entry.size == 0);
+    const auto empty_media_id = file_media_id(empty_entry);
+
+    auto token = temp.path() / "tmdb.token";
+    {
+        std::ofstream out(token);
+        out << "test-token\n";
+    }
+    auto fake_http = std::make_unique<FakeHttpClient>();
+    auto* fake_http_ptr = fake_http.get();
+    fake_http->add("/search/movie", 200, "application/json",
+                   R"({"results":[{"id":4242,"title":"Transient Movie","release_date":"2026-01-01"}]})");
+    fake_http->add("/movie/4242", 200, "application/json",
+                   R"({"id":4242,"title":"Transient Movie","release_date":"2026-01-01"})");
+
+    CatalogueScannerConfig scanner_config;
+    scanner_config.enabled = true;
+    scanner_config.movies.roots = {"/Movies"};
+    scanner_config.movies.tmdb.token_file = token;
+    scanner_config.tv.enabled = false;
+    scanner_config.music.enabled = false;
+    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(),
+                             service.catalogue_hints(), scanner_config, std::move(fake_http));
+
+    // Discovery must not manufacture one shared immutable identity for every
+    // zero-length namespace shell, queue provider work, or contact TMDB.
+    CHECK(scanner.scan_once() == 0);
+    CHECK(service.catalogue_hints().summary().total == 0);
+    CHECK(fake_http_ptr->requests() == 0);
+
+    // A hint admitted just before the namespace becomes visible can still race
+    // with publication. It must remain pending rather than becoming a durable
+    // semantic no-match for a file whose content has not committed yet.
+    const auto hint_id = service.catalogue_hints().submit(
+        path, "namespace", empty_media_id, CatalogueHintPriority::namespace_mutation);
+    CHECK(scanner.scan_once() == 0);
+    auto waiting = service.catalogue_hints().get(hint_id);
+    REQUIRE(waiting.has_value());
+    CHECK(waiting->state == CatalogueHintState::deferred);
+    CHECK(waiting->result.empty());
+    CHECK(waiting->error == "namespace media file has no committed content yet");
+    CHECK(fake_http_ptr->requests() == 0);
+
+    // Once the real extent manifest commits, the changed media identity reopens
+    // the same path and normal provider matching proceeds immediately.
+    auto writer = service.filesystem().open_write(path, true);
+    auto bytes = pattern(32768);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    const auto committed_entry = service.filesystem().getattr(path);
+    REQUIRE(committed_entry.size == bytes.size());
+    const auto committed_media_id = file_media_id(committed_entry);
+    CHECK(committed_media_id != empty_media_id);
+
+    CHECK(scanner.scan_once() == 1);
+    auto item = service.catalogue().get("tmdb:movie:4242");
+    REQUIRE(item.has_value());
+    CHECK(item->media_ids == std::vector<std::string>{committed_media_id});
+    CHECK(fake_http_ptr->requests() == 2);
+
+    service.stop();
+}
+
+
 void test_catalogue_cache_ignores_unrelated_metadata_generation() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
@@ -8909,6 +8990,7 @@ int main() {
         RUN_TEST(test_replica_selector);
         RUN_TEST(test_cache_hydrator_fetches_to_persistent_cache);
         RUN_TEST(test_media_probe_and_online_catalogue_scanner);
+        RUN_TEST(test_catalogue_zero_length_files_wait_for_committed_content);
         RUN_TEST(test_catalogue_cache_ignores_unrelated_metadata_generation);
         RUN_TEST(test_catalogue_scanner_restart_does_not_rescan_unchanged_namespace);
         RUN_TEST(test_catalogue_non_coordinator_idle_does_not_spin);
