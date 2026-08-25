@@ -82,9 +82,14 @@ struct FuseConfig {
     size_t request_workers{24};
     size_t max_pending_requests{4096};
     size_t commit_workers{8};
+    // Crash-recovered publication is convergence of already-durable local
+    // writes. Keep its storage pressure bounded independently of normal live
+    // publication so restart recovery cannot make the node unresponsive.
+    // The effective limit is min(recovery_commit_workers, commit_workers).
+    size_t recovery_commit_workers{2};
     // While mounted filesystem activity is recent, cap asynchronous data
     // publication so local spool acceptance remains responsive. Once the
-    // frontend is quiet, all commit_workers may drain the backlog.
+    // frontend is quiet, all commit_workers may drain the live backlog.
     size_t foreground_commit_workers{1};
     std::chrono::milliseconds publication_quiet{5000};
     size_t max_pending_operations{4096};

@@ -1506,6 +1506,7 @@ void test_config() {
     CHECK(maintenance_policy.scrub_interval == std::chrono::hours(24 * 30));
     CHECK(maintenance_policy.no_progress_backoff == 300000ms);
     FuseConfig fuse_defaults;
+    CHECK(fuse_defaults.recovery_commit_workers == 2);
     CHECK(fuse_defaults.entry_timeout == 1000ms);
     CHECK(fuse_defaults.attr_timeout == 1000ms);
     CHECK(fuse_defaults.negative_timeout == 500ms);
@@ -1557,6 +1558,7 @@ void test_config() {
             << "  request_workers: 18\n"
             << "  max_pending_requests: 2048\n"
             << "  commit_workers: 4\n"
+            << "  recovery_commit_workers: 3\n"
             << "  foreground_commit_workers: 2\n"
             << "  publication_quiet_ms: 425\n"
             << "  max_pending_operations: 1024\n"
@@ -1710,6 +1712,7 @@ void test_config() {
     CHECK(yc.fuse.request_workers == 18);
     CHECK(yc.fuse.max_pending_requests == 2048);
     CHECK(yc.fuse.commit_workers == 4);
+    CHECK(yc.fuse.recovery_commit_workers == 3);
     CHECK(yc.fuse.foreground_commit_workers == 2);
     CHECK(yc.fuse.publication_quiet == 425ms);
     CHECK(yc.fuse.max_pending_operations == 1024);
@@ -2750,6 +2753,75 @@ void test_rpc_health_and_control_not_starved_by_data() {
         REQUIRE(rpc.wait_for(1s) == std::future_status::ready);
         CHECK(rpc.get().message.type == MessageType::ok);
     }
+
+    client.stop();
+    server.stop();
+}
+
+void test_rpc_health_not_starved_by_slow_control_handlers() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto port = free_port();
+
+    NodeInfo server_info;
+    server_info.id = random_node_id();
+    server_info.host = "127.0.0.1";
+    server_info.port = port;
+    server_info.failure_domain = "server-site";
+
+    std::atomic_int slow_entered{};
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (request.type == MessageType::have_object) {
+                ++slow_entered;
+                std::this_thread::sleep_for(400ms);
+                return RpcMessage{MessageType::bool_reply, Bytes{1}};
+            }
+            if (request.type == MessageType::members)
+                return RpcMessage{MessageType::members_reply, {}};
+            if (request.type == MessageType::ping)
+                return RpcMessage{MessageType::ok, {}};
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {});
+    server.start();
+
+    NodeInfo client_info;
+    client_info.id = random_node_id();
+    client_info.host = "127.0.0.1";
+    client_info.port = free_port();
+    client_info.failure_domain = "client-site";
+
+    RpcClient client(keys, [client_info] { return client_info; }, [](const NodeInfo&) {},
+                     [](uint64_t) {}, 500ms, 100ms, 2s);
+    Endpoint endpoint{"127.0.0.1", port};
+
+    // Occupy both ordinary control handlers with storage-shaped work. Health
+    // and membership must use the reserved fast-control executor rather than
+    // queue behind those handlers.
+    auto slow1 = client.call_async(endpoint, MessageType::have_object, Bytes{1},
+                                   FrameType::control);
+    auto slow2 = client.call_async(endpoint, MessageType::have_object, Bytes{2},
+                                   FrameType::control);
+    REQUIRE(wait_until([&] { return slow_entered.load() == 2; }, 1s));
+
+    auto started = Clock::now();
+    auto health = client.call(endpoint, MessageType::ping, {}, 20ms);
+    CHECK(health.message.type == MessageType::ok);
+    CHECK(Clock::now() - started < 150ms);
+
+    started = Clock::now();
+    auto members = client.call(endpoint, MessageType::members, {}, 20ms);
+    CHECK(members.message.type == MessageType::members_reply);
+    CHECK(Clock::now() - started < 150ms);
+
+    REQUIRE(slow1.wait_for(1s) == std::future_status::ready);
+    REQUIRE(slow2.wait_for(1s) == std::future_status::ready);
+    CHECK(slow1.get().message.type == MessageType::bool_reply);
+    CHECK(slow2.get().message.type == MessageType::bool_reply);
 
     client.stop();
     server.stop();
@@ -4242,6 +4314,73 @@ void test_fuse_recovery_spool_descriptors_are_bounded() {
     }
     service.stop();
 #endif
+}
+
+void test_fuse_recovery_publication_concurrency_is_bounded() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-recovery-concurrency", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 4;
+    config.fuse.recovery_commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 30s;
+
+    Service service(config, keys);
+    service.start();
+    constexpr size_t files = 4;
+    auto payload = pattern(4 * config.extent_size);
+    for (size_t i = 0; i < files; ++i)
+        service.filesystem().create_file("/recover-" + std::to_string(i) + ".bin",
+                                         0644, getuid(), getgid());
+
+    // Make the first frontend leave a real durable backlog rather than racing
+    // the local object store while the test is constructing it.
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        service.filesystem().store().foreground_activity(1);
+        for (size_t i = 0; i < files; ++i) {
+            auto handle = frontend->open("/recover-" + std::to_string(i) + ".bin",
+                                         true, true, false, false);
+            REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
+            frontend->release(handle.inode, true);
+        }
+        CHECK(frontend->status().pending_data >= files);
+        frontend->stop();
+    }
+
+    auto drain = config.fuse;
+    drain.publication_quiet = 0ms;
+    size_t max_recovery_active = 0;
+    {
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), drain);
+        const auto deadline = Clock::now() + 30s;
+        while (Clock::now() < deadline) {
+            auto status = recovered->status();
+            max_recovery_active = std::max(max_recovery_active, status.active_recovery_data);
+            CHECK(status.active_recovery_data <= drain.recovery_commit_workers);
+            CHECK(status.pending_recovery_data <= status.pending_data);
+            if (!status.pending_data && !status.active_data)
+                break;
+            std::this_thread::sleep_for(1ms);
+        }
+        REQUIRE(recovered->wait_for_idle(30s));
+        recovered->stop();
+    }
+
+    // At least one recovered publisher must have been observed unless the
+    // complete 16-MiB backlog drained between constructor return and the first
+    // status sample. Either way, final content proves the recovery path ran.
+    CHECK(max_recovery_active <= drain.recovery_commit_workers);
+    for (size_t i = 0; i < files; ++i) {
+        auto entry = service.filesystem().getattr("/recover-" + std::to_string(i) + ".bin");
+        CHECK(entry.size == payload.size());
+    }
+    service.stop();
 }
 
 void append_fuse_journal_test_record(const std::filesystem::path& journal,
@@ -8952,6 +9091,7 @@ int main() {
         RUN_TEST(test_rpc_v7_handshake_is_rejected);
         RUN_TEST(test_rpc_slow_control_does_not_abort_data);
         RUN_TEST(test_rpc_health_and_control_not_starved_by_data);
+        RUN_TEST(test_rpc_health_not_starved_by_slow_control_handlers);
         RUN_TEST(test_rpc_foreground_not_starved_by_busy_data_workers);
         RUN_TEST(test_early_replication_quorum);
         RUN_TEST(test_put_spills_stalled_owners_and_commits_degraded_floor);
@@ -8974,6 +9114,7 @@ int main() {
         RUN_TEST(test_fuse_durable_journal_trims_checksum_invalid_complete_tail);
         RUN_TEST(test_fuse_durable_journal_preserves_unreferenced_spool);
         RUN_TEST(test_fuse_recovery_spool_descriptors_are_bounded);
+        RUN_TEST(test_fuse_recovery_publication_concurrency_is_bounded);
         RUN_TEST(test_fuse_durable_journal_accepts_authoritative_data_done_without_published_prefix);
         RUN_TEST(test_fuse_durable_journal_rejects_unbacked_data_done);
         RUN_TEST(test_fuse_durable_journal_rejects_missing_spool);
