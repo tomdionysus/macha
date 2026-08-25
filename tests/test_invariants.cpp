@@ -517,7 +517,7 @@ MACHA_TEST("invariants", test_publication_generation_barrier_precedes_metadata_c
     auto& config = fixture.config();
     config.replication = 1;
     config.metadata_replication = 1;
-    config.extent_size = 64 * 1024;
+    config.extent_size = 1024 * 1024;
     fixture.start();
     auto& fs = fixture.filesystem();
     fs.create_file("/generation.bin", 0644, getuid(), getgid());
