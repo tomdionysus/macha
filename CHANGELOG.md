@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.15.0 - 2026-08-25
+
+- replace the legacy monolithic backend test runner and separate architecture-regression executable with one self-registering `macha-tests` framework; each case is process-isolated, independent cases execute concurrently under a weighted slot budget, and per-case timings/timeouts make slow or wedged tests attributable;
+- preserve all 97 pre-0.15 functional/architecture test situations while folding architecture invariants into their owning subsystem or the unified invariant suite; remove only two duplicate architecture implementations whose exact production contracts are already exercised by the FUSE durable-journal and LocalStore tests;
+- remove synchronization-by-sleep from RPC/HTTP concurrency regressions in favour of explicit gates that prove the competing production operation is actually blocked before the assertion is made, and scale several policy intervals so timing tests preserve the same ordering invariant without paying production-duration waits;
+- extract the durable FUSE journal frame scanner as production code shared by recovery and tests: retain the two real restart/torn-tail lifecycle regressions, then exhaust every final-frame cut boundary plus EOF checksum and mid-journal corruption semantics without restarting FUSE for each case;
+- add cheap state/property coverage for metadata-delta transitions, hydration scheduling, weighted capacity placement, durable state-file replacement, torrent URI safety, and complete torrent/ingest/catalogue-hint state round trips;
+- add optional `MACHA_TEST_COVERAGE=ON` GCC/Clang instrumentation so branch coverage can be compared when future scenario tests are consolidated.
+
 ## 0.14.12 - 2026-08-23
 
 - retain one immutable `ReadHandle` per open readable FUSE descriptor so sequential callbacks reuse the already fetched/decrypted extent; adopt normal POSIX buffered-write acknowledgement for FUSE payloads, batch local spool+journal durability asynchronously, make writable close/release the local crash-recovery boundary, and make `fsync()` wait through the existing distributed extent + metadata commit policy before returning;

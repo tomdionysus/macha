@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "fuse_frontend.hpp"
 
+#include "fuse_journal.hpp"
 #include "codec.hpp"
 #include "crypto.hpp"
 #include "log.hpp"
@@ -476,7 +477,6 @@ struct FuseFrontend::State {
 
     static constexpr std::array<uint8_t, 8> journal_magic{
         'M', 'A', 'C', 'H', 'F', 'U', 'S', '1'};
-    static constexpr uint32_t max_journal_record = 16U * 1024U * 1024U;
 
     static void encode_namespace_op(Writer& writer, const NamespaceOp& op) {
         writer.u8(static_cast<uint8_t>(op.kind));
@@ -605,16 +605,6 @@ struct FuseFrontend::State {
         journal_poisoned = false;
     }
 
-    static Bytes journal_frame(std::span<const uint8_t> payload) {
-        if (payload.size() > max_journal_record)
-            throw FsError(EFBIG, "FUSE operation journal record too large");
-        Writer frame;
-        frame.u32(static_cast<uint32_t>(payload.size()));
-        frame.raw(payload);
-        frame.fixed(sha256(payload).bytes);
-        return frame.data();
-    }
-
     void append_journal_records_locked(const std::vector<Bytes>& payloads) {
         if (journal_poisoned)
             throw FsError(EIO, "FUSE operation journal is unavailable after a previous write failure");
@@ -625,7 +615,9 @@ struct FuseFrontend::State {
             throw FsError(errno, "cannot seek FUSE operation journal");
         try {
             for (const auto& payload : payloads) {
-                auto frame = journal_frame(payload);
+                if (payload.size() > fuse_journal_max_record)
+                    throw FsError(EFBIG, "FUSE operation journal record too large");
+                auto frame = fuse_journal_frame(payload);
                 write_exact(journal_fd, frame);
             }
             fsync_fd(journal_fd, "cannot sync FUSE operation journal");
@@ -798,15 +790,6 @@ struct FuseFrontend::State {
         return done;
     }
 
-    static uint32_t journal_be32(std::span<const uint8_t> bytes) {
-        if (bytes.size() < 4)
-            throw DecodeError("truncated FUSE journal frame length");
-        return (static_cast<uint32_t>(bytes[0]) << 24) |
-               (static_cast<uint32_t>(bytes[1]) << 16) |
-               (static_cast<uint32_t>(bytes[2]) << 8) |
-               static_cast<uint32_t>(bytes[3]);
-    }
-
     void parse_journal_record(JournalRecovery& recovery, std::span<const uint8_t> payload,
                               size_t frame_offset) {
         Reader reader(payload);
@@ -955,35 +938,12 @@ struct FuseFrontend::State {
                 throw std::runtime_error("unsupported or corrupt FUSE operation journal header");
 
             JournalRecovery recovery;
-            size_t position = journal_magic.size();
-            size_t last_good = position;
-            while (position < bytes.size()) {
-                if (bytes.size() - position < 4)
-                    break;
-                const auto length = journal_be32({bytes.data() + position, 4});
-                if (length > max_journal_record)
-                    throw std::runtime_error("FUSE operation journal record length is corrupt");
-                const size_t frame_size = 4ULL + length + 32ULL;
-                if (bytes.size() - position < frame_size)
-                    break;
-                std::span<const uint8_t> payload(bytes.data() + position + 4, length);
-                Hash256 expected;
-                std::copy_n(bytes.begin() + static_cast<ptrdiff_t>(position + 4 + length), 32,
-                            expected.bytes.begin());
-                if (sha256(payload) != expected) {
-                    // A crash can leave the final append at its full logical
-                    // length while some tail sectors (including the checksum)
-                    // were not durably written. Only an EOF checksum failure is
-                    // therefore a recoverable torn append; corruption before a
-                    // later frame remains fatal.
-                    if (position + frame_size == bytes.size())
-                        break;
-                    throw std::runtime_error("FUSE operation journal checksum mismatch");
-                }
-                parse_journal_record(recovery, payload, position);
-                position += frame_size;
-                last_good = position;
-            }
+            const auto scan = scan_fuse_journal_frames(
+                bytes, journal_magic.size(),
+                [&](std::span<const uint8_t> payload, size_t frame_offset) {
+                    parse_journal_record(recovery, payload, frame_offset);
+                });
+            const auto last_good = scan.last_good;
             if (last_good != bytes.size()) {
                 if (::ftruncate(fd, static_cast<off_t>(last_good)) != 0)
                     throw FsError(errno, "cannot trim torn FUSE operation journal tail");

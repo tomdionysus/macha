@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.14.12 LANGUAGES CXX)
+project(macha VERSION 0.15.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,6 +18,7 @@ configure_file(src/version.hpp.in ${CMAKE_CURRENT_BINARY_DIR}/generated/macha_ve
 option(MACHA_ENABLE_FUSE "Build the FUSE mount adapter when available" ON)
 option(MACHA_BUILD_TESTS "Build tests" ON)
 option(MACHA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
+option(MACHA_TEST_COVERAGE "Instrument the backend test build for source/branch coverage" OFF)
 
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(Threads REQUIRED)
@@ -133,6 +134,7 @@ set(MACHA_CORE_SOURCES
     src/macos_unicode.cpp
     src/hydration.cpp
     src/filesystem.cpp
+    src/fuse_journal.cpp
     src/fuse_frontend.cpp
     src/service.cpp
 )
@@ -214,32 +216,49 @@ endif()
 if(MACHA_BUILD_TESTS)
     include(CTest)
     enable_testing()
-    add_executable(macha-tests tests/test_main.cpp)
+
+    # One process-isolated, self-registering test executable. The runner itself
+    # parallelises cases, so `ctest` does not need to know about internal test
+    # partitioning and architecture regressions cannot drift into a second suite.
+    add_executable(macha-tests
+        tests/main.cpp
+        tests/test_framework.cpp
+        tests/test_foundations.cpp
+        tests/test_storage_metadata.cpp
+        tests/test_rpc_cluster.cpp
+        tests/test_filesystem_fuse.cpp
+        tests/test_hydration_catalogue.cpp
+        tests/test_media_playback.cpp
+        tests/test_invariants.cpp
+        tests/test_models.cpp)
     target_link_libraries(macha-tests PRIVATE macha_core)
-    target_compile_definitions(macha-tests PRIVATE MACHA_HAVE_YAML_CPP=1 MACHA_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    target_compile_definitions(macha-tests PRIVATE
+        MACHA_HAVE_YAML_CPP=1
+        MACHA_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(macha-tests PRIVATE -Wall -Wextra -Wpedantic)
         if(MACHA_WARNINGS_AS_ERRORS)
             target_compile_options(macha-tests PRIVATE -Werror)
         endif()
     endif()
-    add_test(NAME macha-tests COMMAND macha-tests)
-    set_tests_properties(macha-tests PROPERTIES TIMEOUT 300)
-
-    # Architecture regressions encode durability and distributed-identity
-    # invariants separately from broad functional coverage.
-    add_executable(macha-architecture-regressions tests/test_architecture_failures.cpp)
-    target_link_libraries(macha-architecture-regressions PRIVATE macha_core)
-    target_compile_definitions(macha-architecture-regressions PRIVATE
-        MACHA_HAVE_YAML_CPP=1 MACHA_AUDIT_WITH_MEDIA_CATALOGUE=1)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-        target_compile_options(macha-architecture-regressions PRIVATE -Wall -Wextra -Wpedantic)
-        if(MACHA_WARNINGS_AS_ERRORS)
-            target_compile_options(macha-architecture-regressions PRIVATE -Werror)
+    if(MACHA_TEST_COVERAGE)
+        if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+            target_compile_options(macha_core PRIVATE --coverage)
+            target_compile_options(macha-tests PRIVATE --coverage)
+            target_link_options(macha-tests PRIVATE --coverage)
+        elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
+            target_compile_options(macha_core PRIVATE -fprofile-instr-generate -fcoverage-mapping)
+            target_compile_options(macha-tests PRIVATE -fprofile-instr-generate -fcoverage-mapping)
+            target_link_options(macha-tests PRIVATE -fprofile-instr-generate)
+        else()
+            message(FATAL_ERROR "MACHA_TEST_COVERAGE requires GCC, Clang or AppleClang")
         endif()
     endif()
-    add_test(NAME macha-architecture-regressions COMMAND macha-architecture-regressions)
-    set_tests_properties(macha-architecture-regressions PROPERTIES TIMEOUT 180)
+
+    add_test(NAME macha-tests COMMAND macha-tests)
+    # Individual cases have stricter child-process deadlines. This is only a
+    # suite-level deadman for CI infrastructure failures.
+    set_tests_properties(macha-tests PROPERTIES TIMEOUT 300)
 endif()
 
 include(GNUInstallDirs)

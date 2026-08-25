@@ -274,6 +274,14 @@ class MusicScanProvider final : public CatalogueScanProvider {
     std::optional<ProviderMatch> lookup(const MediaProbe& probe) override;
 };
 
+// Enumerate the file members of one catalogue root from a single immutable
+// metadata snapshot.  Discovery and the namespace signature used for destructive
+// reconciliation must come from the same generation; callers must not combine
+// this result with live readdir()/getattr() state.
+std::vector<std::pair<std::string, FsEntry>> catalogue_snapshot_files(
+    std::string_view root, const MetadataSnapshot& namespace_snapshot,
+    std::stop_token stop = {});
+
 class CatalogueScanner {
     NodeRuntime& node_;
     FileSystem& fs_;
@@ -286,12 +294,11 @@ class CatalogueScanner {
     std::atomic_bool rescan_requested_{};
     std::jthread worker_;
     mutable std::mutex config_mutex_;
+    std::chrono::milliseconds diagnostic_interval_{std::chrono::seconds(5)};
 
     void configure_providers();
     bool coordinator() const;
     void loop(std::stop_token);
-    void walk(std::string_view root, const MetadataSnapshot& namespace_snapshot,
-              std::vector<std::pair<std::string, FsEntry>>& out, std::stop_token = {});
     size_t scan_once(std::stop_token, bool force, std::string_view hint_source,
                      int hint_priority, bool unique_source_ref = false);
     struct PreparedHintMatch {
@@ -315,7 +322,8 @@ class CatalogueScanner {
 
   public:
     CatalogueScanner(NodeRuntime&, FileSystem&, CatalogueManager&, CatalogueHintQueue&,
-                     CatalogueScannerConfig, std::unique_ptr<HttpClient> = {});
+                     CatalogueScannerConfig, std::unique_ptr<HttpClient> = {},
+                     std::chrono::milliseconds diagnostic_interval = std::chrono::seconds(5));
     ~CatalogueScanner();
     void start();
     void request_stop();
