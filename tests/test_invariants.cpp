@@ -3,6 +3,7 @@
 
 #if defined(__linux__)
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #endif
 
 using namespace macha;
@@ -438,7 +439,10 @@ MACHA_TEST("invariants", test_authoritative_deferred_generation_batches_stable_s
     const auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
     const auto keys = load_cluster_keys(keyfile);
-    LocalStore store(t.path() / "objects", 64ULL * 1024 * 1024, keys.storage);
+    const auto root = t.path() / "objects";
+    auto domain = std::make_shared<DurabilityDomain>(1, root, 20ms);
+    LocalStore store(root, 64ULL * 1024 * 1024, keys.storage,
+                     LocalStoreMode::authoritative, domain);
     REQUIRE(wait_until([&] { return store.scan_complete(); }));
 
     const auto strict_a = pattern(256 * 1024, 31);
@@ -446,41 +450,208 @@ MACHA_TEST("invariants", test_authoritative_deferred_generation_batches_stable_s
     fsync_calls = 0;
     syncfs_calls = 0;
     track_fsync = true;
-    REQUIRE(store.put(object_id(strict_a), strict_a, StoreWriteDurability::immediate));
-    REQUIRE(store.put(object_id(strict_b), strict_b, StoreWriteDurability::immediate));
+    REQUIRE(store.put(object_id(strict_a), strict_a));
+    REQUIRE(store.put(object_id(strict_b), strict_b));
     track_fsync = false;
-    const auto strict_fsyncs = fsync_calls.load(std::memory_order_relaxed);
-    CHECK(strict_fsyncs >= 6);
-    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 0);
+
+    // Strict puts now use exactly the same write/rename/generation path as WAL-
+    // backed publication. The first authoritative mutation marks accounting
+    // DIRTY once; each strict caller requests physical durability through its
+    // domain generation. There are no per-object or directory fsyncs.
+    CHECK(fsync_calls.load(std::memory_order_relaxed) == 1);
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 2);
 
     const auto deferred_a = pattern(256 * 1024, 33);
     const auto deferred_b = pattern(256 * 1024, 34);
     fsync_calls = 0;
     syncfs_calls = 0;
     track_fsync = true;
-    const auto deferred_a_generation = store.put_deferred(object_id(deferred_a), deferred_a);
-    const auto deferred_b_generation = store.put_deferred(object_id(deferred_b), deferred_b);
-    REQUIRE(deferred_a_generation.has_value());
-    REQUIRE(deferred_b_generation.has_value());
-
-    // One durable DIRTY accounting checkpoint begins the whole generation. No
-    // object or directory fsync is performed while the WAL-backed generation is
-    // merely provisional.
-    CHECK(fsync_calls.load(std::memory_order_relaxed) == 1);
+    const auto ga = store.put_deferred(object_id(deferred_a), deferred_a);
+    const auto gb = store.put_deferred(object_id(deferred_b), deferred_b);
+    REQUIRE(ga.has_value());
+    REQUIRE(gb.has_value());
+    REQUIRE(*gb > *ga);
+    CHECK(fsync_calls.load(std::memory_order_relaxed) == 0);
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 0);
 
-    store.durability_barrier(*deferred_b_generation);
+    store.durability_barrier(*gb);
     track_fsync = false;
-
-    // Linux establishes one filesystem-wide data+metadata barrier, then one
-    // small durable CLEAN accounting checkpoint. The cost is O(generations), not
-    // O(extents), while strict callers above retain their original contract.
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
-    CHECK(fsync_calls.load(std::memory_order_relaxed) == 2);
+    CHECK(fsync_calls.load(std::memory_order_relaxed) == 0);
     CHECK(store.get(object_id(deferred_a)) == std::optional<Bytes>{deferred_a});
     CHECK(store.get(object_id(deferred_b)) == std::optional<Bytes>{deferred_b});
 #else
     std::cout << "[ARCH-REGRESSION] syncfs generation check is Linux-only; skipped\n";
+#endif
+}
+
+MACHA_TEST("invariants", test_accounting_dirty_marker_is_process_session_scoped) {
+#if defined(__linux__)
+    TempDir t;
+    const auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto root = t.path() / "objects";
+    auto domain = std::make_shared<DurabilityDomain>(1, root, 10ms);
+    LocalStore store(root, 64ULL * 1024 * 1024, keys.storage,
+                     LocalStoreMode::authoritative, domain);
+    REQUIRE(wait_until([&] { return store.scan_complete(); }));
+
+    fsync_calls = 0;
+    syncfs_calls = 0;
+    track_fsync = true;
+    const auto a = pattern(128 * 1024, 44);
+    const auto b = pattern(128 * 1024, 45);
+    const auto c = pattern(128 * 1024, 46);
+    const auto ga = store.put_deferred(object_id(a), a);
+    const auto gb = store.put_deferred(object_id(b), b);
+    REQUIRE(ga.has_value());
+    REQUIRE(gb.has_value());
+    store.durability_barrier(*gb);
+    const auto gc = store.put_deferred(object_id(c), c);
+    REQUIRE(gc.has_value());
+    store.durability_barrier(*gc);
+    track_fsync = false;
+
+    // Capacity accounting is derived state. It is made crash-detectably DIRTY
+    // once before the first mutation and is not toggled CLEAN/DIRTY around each
+    // publication generation. Clean teardown checkpoints it after a final
+    // domain barrier outside this measured scope.
+    CHECK(fsync_calls.load(std::memory_order_relaxed) == 1);
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 2);
+#else
+    std::cout << "[ARCH-REGRESSION] accounting session check is Linux-only; skipped\n";
+#endif
+}
+
+
+MACHA_TEST("invariants", test_unclean_accounting_recovery_establishes_durable_baseline) {
+#if defined(__linux__)
+    TempDir t;
+    const auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto root = t.path() / "objects";
+    const auto a = pattern(128 * 1024, 140);
+    const auto b = pattern(128 * 1024, 141);
+    uint64_t clean_used = 0;
+    {
+        LocalStore store(root, 64ULL * 1024 * 1024, keys.storage);
+        REQUIRE(wait_until([&] { return store.scan_complete(); }));
+        REQUIRE(store.put(object_id(a), a));
+        clean_used = store.used();
+    }
+
+    const auto child = ::fork();
+    REQUIRE(child >= 0);
+    if (child == 0) {
+        try {
+            LocalStore store(root, 64ULL * 1024 * 1024, keys.storage);
+            if (!store.scan_complete())
+                _exit(20);
+            const auto generation = store.put_deferred(object_id(b), b);
+            if (!generation.has_value())
+                _exit(21);
+            // Deliberately bypass LocalStore destruction/clean accounting. This
+            // models an unclean process exit while the OS itself keeps running.
+            _exit(0);
+        } catch (...) {
+            _exit(22);
+        }
+    }
+    int status = 0;
+    REQUIRE(::waitpid(child, &status, 0) == child);
+    REQUIRE(WIFEXITED(status));
+    REQUIRE(WEXITSTATUS(status) == 0);
+
+    fsync_calls = 0;
+    syncfs_calls = 0;
+    track_fsync = true;
+    {
+        auto domain = std::make_shared<DurabilityDomain>(1, root, 10ms);
+        LocalStore recovered(root, 64ULL * 1024 * 1024, keys.storage,
+                             LocalStoreMode::authoritative, domain);
+        REQUIRE(wait_until([&] { return recovered.scan_complete(); }, 5s));
+        CHECK(recovered.used() > clean_used);
+        REQUIRE(recovered.get(object_id(b)).has_value());
+    }
+    track_fsync = false;
+
+    // DIRTY accounting forces a tree reconciliation and one physical baseline
+    // before generation-zero existing objects can be used as durability proof.
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) >= 1);
+#else
+    std::cout << "[ARCH-REGRESSION] unclean accounting baseline check is Linux-only; skipped\n";
+#endif
+}
+
+MACHA_TEST("invariants", test_restart_durable_reaffirmation_requires_no_new_barrier) {
+#if defined(__linux__)
+    TempDir t;
+    const auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto root = t.path() / "objects";
+    const auto bytes = pattern(128 * 1024, 142);
+    const auto id = object_id(bytes);
+    {
+        LocalStore store(root, 64ULL * 1024 * 1024, keys.storage);
+        REQUIRE(wait_until([&] { return store.scan_complete(); }));
+        REQUIRE(store.put(id, bytes));
+    }
+
+    auto domain = std::make_shared<DurabilityDomain>(1, root, 100ms);
+    LocalStore reopened(root, 64ULL * 1024 * 1024, keys.storage,
+                        LocalStoreMode::authoritative, domain);
+    REQUIRE(reopened.scan_complete());
+
+    fsync_calls = 0;
+    syncfs_calls = 0;
+    track_fsync = true;
+    const auto generation = reopened.put_deferred(id, bytes);
+    REQUIRE(generation.has_value());
+    CHECK(*generation == 0);
+    reopened.durability_barrier(*generation);
+    track_fsync = false;
+    CHECK(fsync_calls.load(std::memory_order_relaxed) == 0);
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 0);
+#else
+    std::cout << "[ARCH-REGRESSION] restart reaffirmation check is Linux-only; skipped\n";
+#endif
+}
+
+MACHA_TEST("invariants", test_authoritative_delete_is_lazy_durability) {
+#if defined(__linux__)
+    TempDir t;
+    const auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto root = t.path() / "objects";
+    const auto bytes = pattern(128 * 1024, 143);
+    const auto id = object_id(bytes);
+    {
+        LocalStore store(root, 64ULL * 1024 * 1024, keys.storage);
+        REQUIRE(wait_until([&] { return store.scan_complete(); }));
+        REQUIRE(store.put(id, bytes));
+    }
+
+    auto domain = std::make_shared<DurabilityDomain>(1, root, 100ms);
+    LocalStore reopened(root, 64ULL * 1024 * 1024, keys.storage,
+                        LocalStoreMode::authoritative, domain);
+    REQUIRE(reopened.scan_complete());
+    fsync_calls = 0;
+    syncfs_calls = 0;
+    track_fsync = true;
+    REQUIRE(reopened.remove(id));
+    track_fsync = false;
+
+    // The first mutation dirties derived accounting once. The unlink itself is
+    // intentionally not a synchronous durability event: losing it in a crash
+    // leaks unreachable garbage, never published media.
+    CHECK(fsync_calls.load(std::memory_order_relaxed) == 1);
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 0);
+#else
+    std::cout << "[ARCH-REGRESSION] lazy deletion check is Linux-only; skipped\n";
 #endif
 }
 
@@ -490,7 +661,10 @@ MACHA_TEST("invariants", test_local_store_barrier_remembers_complete_physical_cu
     const auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
     const auto keys = load_cluster_keys(keyfile);
-    LocalStore store(t.path() / "objects", 64ULL * 1024 * 1024, keys.storage);
+    const auto root = t.path() / "objects";
+    auto domain = std::make_shared<DurabilityDomain>(1, root, 10ms);
+    LocalStore store(root, 64ULL * 1024 * 1024, keys.storage,
+                     LocalStoreMode::authoritative, domain);
     REQUIRE(wait_until([&] { return store.scan_complete(); }));
 
     const auto a = pattern(256 * 1024, 47);
@@ -507,11 +681,9 @@ MACHA_TEST("invariants", test_local_store_barrier_remembers_complete_physical_cu
     store.durability_barrier(*ga);
     track_fsync = false;
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
+    CHECK(fsync_calls.load(std::memory_order_relaxed) == 0);
     CHECK(store.durable_generation() >= *gb);
 
-    // Start a newer dirty generation after the physical cut. A queued barrier
-    // for gb must still return immediately: gb was made durable by the earlier
-    // syncfs even though newer unrelated data is now provisional.
     const auto c = pattern(256 * 1024, 49);
     const auto gc = store.put_deferred(object_id(c), c);
     REQUIRE(gc.has_value());
@@ -525,63 +697,106 @@ MACHA_TEST("invariants", test_local_store_barrier_remembers_complete_physical_cu
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 0);
     CHECK(fsync_calls.load(std::memory_order_relaxed) == 0);
 
-    fsync_calls = 0;
     syncfs_calls = 0;
     track_fsync = true;
     store.durability_barrier(*gc);
     track_fsync = false;
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
-    CHECK(fsync_calls.load(std::memory_order_relaxed) == 1);
 #else
     std::cout << "[ARCH-REGRESSION] local generation cut check is Linux-only; skipped\n";
 #endif
 }
 
-MACHA_TEST("invariants", test_storage_pool_generation_advances_with_group_commit) {
+MACHA_TEST("invariants", test_durability_domain_group_commits_independent_publications) {
 #if defined(__linux__)
     TempDir t;
     const auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
     const auto keys = load_cluster_keys(keyfile);
-    const auto disk = t.path() / "disk";
-    std::filesystem::create_directories(disk);
-    StoragePool pool(t.path() / "state", random_node_id(),
-                     {{disk, 64ULL * 1024 * 1024}}, keys.storage);
-    REQUIRE(wait_until([&] { return pool.online_backends() == 1; }));
+    const auto root = t.path() / "objects";
+    auto domain = std::make_shared<DurabilityDomain>(1, root, 120ms);
+    LocalStore store(root, 64ULL * 1024 * 1024, keys.storage,
+                     LocalStoreMode::authoritative, domain);
+    REQUIRE(wait_until([&] { return store.scan_complete(); }));
 
     const auto a = pattern(256 * 1024, 50);
-    const auto b = pattern(256 * 1024, 51);
-    const auto ga = pool.put_deferred(object_id(a), a);
-    const auto gb = pool.put_deferred(object_id(b), b);
+    const auto ga = store.put_deferred(object_id(a), a);
     REQUIRE(ga.has_value());
-    REQUIRE(gb.has_value());
-    REQUIRE(*gb > *ga);
 
-    fsync_calls = 0;
     syncfs_calls = 0;
     track_fsync = true;
-    pool.durability_barrier(*ga);
-    track_fsync = false;
-    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
-    CHECK(pool.durable_generation() >= *gb);
+    auto first = std::async(std::launch::async, [&] { store.durability_barrier(*ga); });
+    std::this_thread::sleep_for(30ms);
+
+    const auto b = pattern(256 * 1024, 51);
+    const auto gb = store.put_deferred(object_id(b), b);
+    REQUIRE(gb.has_value());
+    auto second = std::async(std::launch::async, [&] { store.durability_barrier(*gb); });
+    std::this_thread::sleep_for(30ms);
 
     const auto c = pattern(256 * 1024, 52);
-    const auto gc = pool.put_deferred(object_id(c), c);
+    const auto gc = store.put_deferred(object_id(c), c);
     REQUIRE(gc.has_value());
+    auto third = std::async(std::launch::async, [&] { store.durability_barrier(*gc); });
 
-    syncfs_calls = 0;
-    track_fsync = true;
-    pool.durability_barrier(*gb);
+    first.get();
+    second.get();
+    third.get();
     track_fsync = false;
-    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 0);
+
+    // Three independent publication completions entered the same physical
+    // domain inside one scheduling window. Exactly one filesystem barrier must
+    // satisfy all three tickets.
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
+    CHECK(domain->durable_generation() >= *gc);
+#else
+    std::cout << "[ARCH-REGRESSION] durability group-commit check is Linux-only; skipped\n";
+#endif
+}
+
+MACHA_TEST("invariants", test_storage_pool_tokens_name_physical_domain_and_backend_incarnation) {
+#if defined(__linux__)
+    TempDir t;
+    const auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto disk_a = t.path() / "disk-a";
+    const auto disk_b = t.path() / "disk-b";
+    std::filesystem::create_directories(disk_a);
+    std::filesystem::create_directories(disk_b);
+    StoragePool pool(t.path() / "state", random_node_id(),
+                     {{disk_a, 64ULL * 1024 * 1024}, {disk_b, 64ULL * 1024 * 1024}},
+                     keys.storage, 100ms);
+    REQUIRE(wait_until([&] { return pool.online_backends() == 2; }));
+
+    std::optional<StoragePool::DurabilityToken> first;
+    std::optional<StoragePool::DurabilityToken> second;
+    for (uint8_t seed = 60; seed < 120 && !second; ++seed) {
+        const auto bytes = pattern(128 * 1024, seed);
+        const auto token = pool.put_deferred(object_id(bytes), bytes);
+        REQUIRE(token.has_value());
+        if (!first)
+            first = token;
+        else if (token->backend_instance != first->backend_instance)
+            second = token;
+    }
+    REQUIRE(first.has_value());
+    REQUIRE(second.has_value());
+    CHECK(first->domain == second->domain); // both configured paths are on TempDir's filesystem
+    CHECK(first->backend_instance != second->backend_instance);
 
     syncfs_calls = 0;
     track_fsync = true;
-    pool.durability_barrier(*gc);
+    auto a = std::async(std::launch::async, [&] { pool.durability_barrier(*first); });
+    auto b = std::async(std::launch::async, [&] { pool.durability_barrier(*second); });
+    a.get();
+    b.get();
     track_fsync = false;
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
+    CHECK(pool.durability_covered(*first));
+    CHECK(pool.durability_covered(*second));
 #else
-    std::cout << "[ARCH-REGRESSION] storage-pool generation cut check is Linux-only; skipped\n";
+    std::cout << "[ARCH-REGRESSION] storage-domain token check is Linux-only; skipped\n";
 #endif
 }
 
@@ -591,7 +806,10 @@ MACHA_TEST("invariants", test_immediate_reaffirmation_flushes_provisional_genera
     const auto keyfile = t.path() / "cluster.key";
     write_key(keyfile);
     const auto keys = load_cluster_keys(keyfile);
-    LocalStore store(t.path() / "objects", 64ULL * 1024 * 1024, keys.storage);
+    const auto root = t.path() / "objects";
+    auto domain = std::make_shared<DurabilityDomain>(1, root, 50ms);
+    LocalStore store(root, 64ULL * 1024 * 1024, keys.storage,
+                     LocalStoreMode::authoritative, domain);
     REQUIRE(wait_until([&] { return store.scan_complete(); }));
 
     const auto bytes = pattern(256 * 1024, 35);
@@ -601,14 +819,11 @@ MACHA_TEST("invariants", test_immediate_reaffirmation_flushes_provisional_genera
     fsync_calls = 0;
     syncfs_calls = 0;
     track_fsync = true;
-    REQUIRE(store.put(id, bytes, StoreWriteDurability::immediate));
+    REQUIRE(store.put(id, bytes));
     track_fsync = false;
 
-    // A strict caller must never accidentally reaffirm a pathname installed by
-    // a still-provisional publication generation. Reusing the same hash forces
-    // that generation through its filesystem barrier before strict put returns.
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
-    CHECK(fsync_calls.load(std::memory_order_relaxed) == 1); // CLEAN accounting checkpoint
+    CHECK(fsync_calls.load(std::memory_order_relaxed) == 0);
 #else
     std::cout << "[ARCH-REGRESSION] provisional reaffirmation check is Linux-only; skipped\n";
 #endif
@@ -632,16 +847,10 @@ MACHA_TEST("invariants", test_publication_generation_barrier_precedes_metadata_c
     syncfs_calls = 0;
     track_fsync = true;
     REQUIRE(writer->write(0, bytes) == bytes.size());
-
-    // Eight authoritative extents are provisional but the WAL-backed caller has
-    // not yet asked to publish their manifest, so no filesystem durability
-    // barrier has occurred.
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 0);
     writer->commit();
     track_fsync = false;
 
-    // All eight extents are covered by one generation barrier before metadata
-    // publication. The committed namespace must immediately read back in full.
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
     auto reader = fs.open_read("/generation.bin");
     Bytes actual(bytes.size());
@@ -673,7 +882,7 @@ MACHA_TEST("invariants", test_persistent_cache_is_explicitly_ephemeral) {
     track_fsync = true;
     REQUIRE(cache.put(object_id(a), a));
     REQUIRE(cache.put(object_id(b), b));
-    REQUIRE(cache.put(object_id(c), c)); // includes one eviction
+    REQUIRE(cache.put(object_id(c), c));
     track_fsync = false;
 
     CHECK(cache.blocks() == 2);
@@ -693,9 +902,6 @@ MACHA_TEST("invariants", test_control_plane_hint_admission_is_storage_durable) {
     (void)hints.submit("/Movies/Durable.mkv", "manual", "manual:1",
                        CatalogueHintPriority::manual_rescan);
     track_fsync = false;
-
-    // Crash-safe atomic replacement requires durability of the temp file and
-    // publication of the rename in its parent directory before submit returns.
     CHECK(fsync_calls.load() >= 2);
 #else
     std::cout << "[ARCH-REGRESSION] fsync interception check is Linux-only; skipped\n";
@@ -721,27 +927,106 @@ MACHA_TEST("invariants", test_deferred_object_barrier_rejects_stale_process_epoc
     REQUIRE(placed.message.type == MessageType::ok);
     Reader placed_reply(placed.message.payload);
     NodeId acknowledged_epoch{placed_reply.fixed<16>()};
-    const auto acknowledged_generation = placed_reply.u64();
+    const auto domain = placed_reply.u64();
+    const auto generation = placed_reply.u64();
+    const auto backend_instance = placed_reply.u64();
     placed_reply.finish();
     CHECK(acknowledged_epoch == node.durability_epoch());
 
-    Writer stale;
+    auto barrier_payload = [&](const NodeId& epoch) {
+        Writer writer;
+        writer.fixed(epoch.bytes);
+        writer.u64(domain);
+        writer.u64(generation);
+        writer.u64(backend_instance);
+        return writer.take();
+    };
+
     auto wrong_epoch = random_node_id();
     while (wrong_epoch == acknowledged_epoch)
         wrong_epoch = random_node_id();
-    stale.fixed(wrong_epoch.bytes);
-    stale.u64(acknowledged_generation);
-    auto rejected = node.call(endpoint, MessageType::object_durability_barrier, stale.data(),
+    auto stale = barrier_payload(wrong_epoch);
+    auto rejected = node.call(endpoint, MessageType::object_durability_barrier, stale,
                               FrameType::read_ahead);
     CHECK(rejected.message.type == MessageType::error);
 
-    Writer current;
-    current.fixed(acknowledged_epoch.bytes);
-    current.u64(acknowledged_generation);
-    auto durable = node.call(endpoint, MessageType::object_durability_barrier, current.data(),
+    auto current = barrier_payload(acknowledged_epoch);
+    auto durable = node.call(endpoint, MessageType::object_durability_barrier, current,
                              FrameType::read_ahead);
     CHECK(durable.message.type == MessageType::ok);
     node.stop();
+}
+
+MACHA_TEST("invariants", test_rpc_durability_barrier_group_commits_independent_publications) {
+#if defined(__linux__)
+    TestCluster cluster(ConfigProfile::isolated);
+    auto config = cluster.node_config("durability-group-rpc");
+    config.replication = 1;
+    config.metadata_replication = 1;
+    NodeRuntime node(config, cluster.keys());
+    node.start();
+    const Endpoint endpoint{"127.0.0.1", config.port};
+
+    struct RemoteToken {
+        NodeId epoch{};
+        uint64_t domain{};
+        uint64_t generation{};
+        uint64_t backend_instance{};
+    };
+    auto defer = [&](uint8_t seed) {
+        const auto bytes = pattern(64 * 1024, seed);
+        Writer request;
+        request.fixed(object_id(bytes).bytes);
+        request.bytes(bytes);
+        auto reply = node.call(endpoint, MessageType::put_object_deferred, request.data(),
+                               FrameType::read_ahead);
+        REQUIRE(reply.message.type == MessageType::ok);
+        Reader reader(reply.message.payload);
+        RemoteToken token;
+        token.epoch.bytes = reader.fixed<16>();
+        token.domain = reader.u64();
+        token.generation = reader.u64();
+        token.backend_instance = reader.u64();
+        reader.finish();
+        return token;
+    };
+    auto barrier = [&](const RemoteToken& token) {
+        Writer request;
+        request.fixed(token.epoch.bytes);
+        request.u64(token.domain);
+        request.u64(token.generation);
+        request.u64(token.backend_instance);
+        return node.call(endpoint, MessageType::object_durability_barrier, request.data(),
+                         FrameType::read_ahead);
+    };
+
+    const auto a = defer(53);
+    syncfs_calls = 0;
+    track_fsync = true;
+    auto first = std::async(std::launch::async, [&] { return barrier(a); });
+    std::this_thread::sleep_for(75ms);
+    const auto b = defer(54);
+    auto second = std::async(std::launch::async, [&] { return barrier(b); });
+    std::this_thread::sleep_for(75ms);
+    const auto c = defer(55);
+    auto third = std::async(std::launch::async, [&] { return barrier(c); });
+
+    REQUIRE(first.get().message.type == MessageType::ok);
+    REQUIRE(second.get().message.type == MessageType::ok);
+    REQUIRE(third.get().message.type == MessageType::ok);
+    track_fsync = false;
+
+    CHECK(a.epoch == b.epoch);
+    CHECK(b.epoch == c.epoch);
+    CHECK(a.domain == b.domain);
+    CHECK(b.domain == c.domain);
+    CHECK(a.backend_instance == b.backend_instance);
+    CHECK(b.backend_instance == c.backend_instance);
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
+    node.stop();
+#else
+    std::cout << "[ARCH-REGRESSION] RPC group-commit check is Linux-only; skipped\n";
+#endif
 }
 
 MACHA_TEST("invariants", test_rpc_durability_barrier_reuses_already_covered_generation) {
@@ -754,6 +1039,12 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_reuses_already_covered_gene
     node.start();
     const Endpoint endpoint{"127.0.0.1", config.port};
 
+    struct RemoteToken {
+        NodeId epoch{};
+        uint64_t domain{};
+        uint64_t generation{};
+        uint64_t backend_instance{};
+    };
     auto defer = [&](uint8_t seed) {
         const auto bytes = pattern(64 * 1024, seed);
         Writer request;
@@ -763,48 +1054,56 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_reuses_already_covered_gene
                                FrameType::read_ahead);
         REQUIRE(reply.message.type == MessageType::ok);
         Reader reader(reply.message.payload);
-        NodeId epoch{reader.fixed<16>()};
-        const auto generation = reader.u64();
+        RemoteToken token;
+        token.epoch.bytes = reader.fixed<16>();
+        token.domain = reader.u64();
+        token.generation = reader.u64();
+        token.backend_instance = reader.u64();
         reader.finish();
-        return std::pair{epoch, generation};
+        return token;
     };
-    auto barrier = [&](const NodeId& epoch, uint64_t generation) {
+    auto barrier = [&](const RemoteToken& token) {
         Writer request;
-        request.fixed(epoch.bytes);
-        request.u64(generation);
+        request.fixed(token.epoch.bytes);
+        request.u64(token.domain);
+        request.u64(token.generation);
+        request.u64(token.backend_instance);
         return node.call(endpoint, MessageType::object_durability_barrier, request.data(),
                          FrameType::read_ahead);
     };
 
-    const auto [epoch_a, ga] = defer(53);
-    const auto [epoch_b, gb] = defer(54);
-    REQUIRE(epoch_a == epoch_b);
-    REQUIRE(gb > ga);
+    const auto a = defer(56);
+    const auto b = defer(57);
+    REQUIRE(a.epoch == b.epoch);
+    REQUIRE(a.domain == b.domain);
+    REQUIRE(a.backend_instance == b.backend_instance);
+    REQUIRE(b.generation > a.generation);
 
     syncfs_calls = 0;
     track_fsync = true;
-    auto first = barrier(epoch_a, ga);
+    auto first = barrier(a);
     track_fsync = false;
     REQUIRE(first.message.type == MessageType::ok);
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
 
-    // Make the store dirty again after the cut, exactly as the local FUSE
-    // recovery writer does in production. The queued barrier for gb was already
-    // covered by the first syncfs and must not flush this newer generation.
-    const auto [epoch_c, gc] = defer(55);
-    REQUIRE(epoch_c == epoch_a);
-    REQUIRE(gc > gb);
+    // The physical cut for a covered b as well. Make the domain dirty again
+    // with c; waiting for b must not flush this newer generation.
+    const auto c = defer(58);
+    REQUIRE(c.epoch == a.epoch);
+    REQUIRE(c.domain == a.domain);
+    REQUIRE(c.backend_instance == a.backend_instance);
+    REQUIRE(c.generation > b.generation);
 
     syncfs_calls = 0;
     track_fsync = true;
-    auto covered = barrier(epoch_b, gb);
+    auto covered = barrier(b);
     track_fsync = false;
     REQUIRE(covered.message.type == MessageType::ok);
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 0);
 
     syncfs_calls = 0;
     track_fsync = true;
-    auto latest = barrier(epoch_c, gc);
+    auto latest = barrier(c);
     track_fsync = false;
     REQUIRE(latest.message.type == MessageType::ok);
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);

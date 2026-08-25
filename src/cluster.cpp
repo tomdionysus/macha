@@ -324,7 +324,7 @@ bool NodeRuntime::cas_metadata(uint64_t generation, const Hash256& hash,
 
 bool NodeRuntime::cas_metadata_delta(uint64_t generation, const Hash256& hash,
                                      std::span<const uint8_t> delta, MetadataRecord* out) {
-    // The v14 wire protocol has exactly one delta representation. MetadataReplica
+    // The v15 wire protocol has exactly one delta representation. MetadataReplica
     // still understands DLT1 solely so an existing pre-0.10 journal can replay
     // locally; accepting it here would turn storage migration into wire fallback.
     if (!current_metadata_delta(delta))
@@ -394,10 +394,12 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
                 // newer writes are currently dirty on this node.
                 Writer reply;
                 reply.fixed(durability_epoch_.bytes);
-                reply.u64(*generation);
+                reply.u64(generation->domain);
+                reply.u64(generation->generation);
+                reply.u64(generation->backend_instance);
                 return {MessageType::ok, reply.take()};
             }
-            if (!local_.put(id, data, StoreWriteDurability::immediate))
+            if (!local_.put(id, data))
                 return error_reply("storage limit reached");
             members_.storage(local_.used(), local_.limit());
             return {MessageType::ok, {}};
@@ -405,12 +407,15 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
         case MessageType::object_durability_barrier: {
             Reader reader(request.payload);
             NodeId expected_epoch{reader.fixed<16>()};
+            const auto domain = reader.u64();
             const auto required_generation = reader.u64();
+            const auto backend_instance = reader.u64();
             reader.finish();
             if (expected_epoch != durability_epoch_)
                 return error_reply("storage durability epoch changed");
             try {
-                local_.durability_barrier(required_generation);
+                local_.durability_barrier({domain, required_generation, backend_instance},
+                                          DurabilityUrgency::batchable);
                 members_.storage(local_.used(), local_.limit());
                 return {MessageType::ok, {}};
             } catch (const std::exception& error) {

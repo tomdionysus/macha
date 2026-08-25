@@ -14,13 +14,17 @@ FileSystem ----------------+---- MetadataManager ---- voter quorum + committed c
                            +---- DistributedStore --- inter-node placement and repair
                      |
                      +---- StoragePool -------- authoritative local replica
-                     |       |  |  |
-                     |      HDD HDD ...
+                     |       |
+                     |       +---- DurabilityDomain(s) -- one coordinator/filesystem
+                     |                    |  |
+                     |                   HDD HDD ...
                      |
                      +---- PersistentBlockCache - non-DHT cache
                      |
                      +---- RpcClient/RpcServer
                              CONTROL + DATA connections per active peer
+
+Authoritative object durability is filesystem-scoped rather than store- or RPC-scoped. `LocalStore` completes immutable filesystem mutations and receives process-local generations from a shared `DurabilityDomain`; strict callers wait immediately, while WAL-backed FUSE publication submits batchable tickets which the domain group-commits. Capacity accounting is derived state (DIRTY once per mutation session, CLEAN on durable shutdown), and cache storage has no durability contract. The complete invariants and crash matrix are documented in [`docs/durability.md`](docs/durability.md).
 
 NodeRuntime
    +---- state_path: node.id, metadata, backend identities, temp writes
@@ -204,13 +208,13 @@ Namespace mutation always requires quorum.
 
 If quorum is unavailable, a node may use its last valid post-genesis snapshot for read-only namespace access. It can read files only where the required extents exist in authoritative storage or cache. It cannot invent missing blocks or mutate the namespace.
 
-## Transport v11
+## Transport v15
 
 Each active peer pair can have two persistent authenticated bidirectional TCP lanes. `CONTROL` carries health, membership and other small control-plane RPCs. `DATA` carries object traffic only. Metadata remains on the CONTROL transport even when classified as read-ahead or speculative work. The DATA lane is lazy and is opened when object traffic is first required. Separating the TCP sequence spaces prevents retransmission or kernel buffering of bulk payloads from head-of-line blocking liveness and membership traffic.
 
 Both lanes are canonical independently by authenticated `(NodeId, lane)`, not hostname or socket direction. Simultaneous cross-dial arbitration therefore leaves at most one CONTROL and one DATA connection per peer. The TCP dialler owns odd request IDs and the acceptor owns even request IDs on each lane, so either end can originate work without request/reply ambiguity. Requests may complete out of order and cancellation of one request does not tear down unrelated work.
 
-The authenticated v14 handshake includes the requested lane and negotiates `max_frame_size`; the lower configured ceiling wins. Logical messages are split into variable-length frames no larger than that ceiling. Storage extents remain storage objects and are not transport framing units. Each frame is independently AES-256-GCM protected. v13-and-earlier peers are rejected at the protocol boundary. v14 retains the authenticated two-lane handshake and permits prioritised metadata frames without placing metadata payloads on the DATA transport; DATA is reserved for object traffic.
+The authenticated v15 handshake includes the requested lane and negotiates `max_frame_size`; the lower configured ceiling wins. Logical messages are split into variable-length frames no larger than that ceiling. Storage extents remain storage objects and are not transport framing units. Each frame is independently AES-256-GCM protected. v14-and-earlier peers are rejected at the protocol boundary. v15 retains the authenticated two-lane handshake and permits prioritised metadata frames without placing metadata payloads on the DATA transport; DATA is reserved for object traffic.
 
 For queued data-class work, frame type defines priority completely: foreground, read-ahead, then speculative. `foreground` is reserved for media playback/probe/seek and other viewer-blocking reads. Mounted-filesystem reads/writes and useful read-ahead use `read_ahead`; repair and low-value prediction use `speculative`. The outbound scheduler selects the most urgent runnable transfer for every frame and returns to scheduling immediately afterwards. A promotion notification can raise an existing transfer and cancellation stops queued remainder frames without disturbing other request IDs. Object-transfer promotion and cancellation notifications remain on DATA because their request IDs are scoped to that connection. Metadata and placement probes may carry read-ahead/speculative frame classes on CONTROL; the frame scheduler therefore lets control-priority health and membership messages pre-empt them between fragments. DATA remains free of metadata payloads, preserving the viewer-critical object path.
 

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <limits>
 #include <set>
+#include <tuple>
 
 namespace macha {
 namespace {
@@ -141,12 +142,18 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
                               return a.id < b.id;
                           if (a.epoch != b.epoch)
                               return a.epoch < b.epoch;
+                          if (a.domain != b.domain)
+                              return a.domain < b.domain;
+                          if (a.backend_instance != b.backend_instance)
+                              return a.backend_instance < b.backend_instance;
                           return a.generation < b.generation;
                       });
             std::vector<DurableReplica> coalesced;
             for (const auto& replica : successful_replicas) {
                 if (!coalesced.empty() && coalesced.back().id == replica.id &&
-                    coalesced.back().epoch == replica.epoch) {
+                    coalesced.back().epoch == replica.epoch &&
+                    coalesced.back().domain == replica.domain &&
+                    coalesced.back().backend_instance == replica.backend_instance) {
                     coalesced.back().generation =
                         std::max(coalesced.back().generation, replica.generation);
                 } else {
@@ -177,14 +184,15 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
         if (owner.id == n_.node_id()) {
             const auto started = Clock::now();
             if (batch) {
-                if (const auto generation = n_.local_store().put_deferred(id, data)) {
+                if (const auto token = n_.local_store().put_deferred(id, data)) {
                     ++success;
                     successful_replicas.push_back(
-                        {owner.id, n_.durability_epoch(), *generation});
+                        {owner.id, n_.durability_epoch(), token->domain, token->generation,
+                         token->backend_instance});
                 } else {
                     ++replacement_needed;
                 }
-            } else if (n_.local_store().put(id, data, StoreWriteDurability::immediate)) {
+            } else if (n_.local_store().put(id, data)) {
                 ++success;
             } else {
                 ++replacement_needed;
@@ -242,14 +250,18 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
             progressed = true;
             bool ok = false;
             std::optional<NodeId> durability_epoch;
+            uint64_t durability_domain = 0;
             uint64_t durability_generation = 0;
+            uint64_t durability_backend_instance = 0;
             try {
                 auto reply = item.rpc->get();
                 ok = reply.message.type == MessageType::ok;
                 if (ok && batch) {
                     Reader reader(reply.message.payload);
                     NodeId epoch{reader.fixed<16>()};
+                    durability_domain = reader.u64();
                     durability_generation = reader.u64();
+                    durability_backend_instance = reader.u64();
                     reader.finish();
                     durability_epoch = epoch;
                 }
@@ -263,7 +275,8 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
                 ++success;
                 if (batch)
                     successful_replicas.push_back(
-                        {item.owner.id, *durability_epoch, durability_generation});
+                        {item.owner.id, *durability_epoch, durability_domain,
+                         durability_generation, durability_backend_instance});
                 note_network(data.size(), Clock::now() - item.started);
             } else if (!item.spilled) {
                 ++replacement_needed;
@@ -312,34 +325,24 @@ bool DistributedStore::durability_barrier(const DurabilityBatch& batch) {
     if (batch.empty())
         return true;
 
-    // Collapse every object requirement to the highest generation needed from
-    // each process-epoch-bound replica. A single barrier can then satisfy every
-    // earlier placement on that replica, and the remote store can acknowledge
-    // immediately when a previous filesystem cut already covered it.
-    std::map<std::pair<NodeId, NodeId>, uint64_t> wanted_map;
+    // Coalesce by exact process-epoch-bound physical placement. Requests which
+    // share a filesystem domain still reach the same DurabilityDomain and are
+    // group-committed there; the backend incarnation remains part of the token
+    // so a reopened/replaced backend cannot satisfy an old placement.
+    using ReplicaKey = std::tuple<NodeId, NodeId, uint64_t, uint64_t>;
+    std::map<ReplicaKey, uint64_t> wanted_map;
     for (const auto& requirement : batch.requirements) {
         for (const auto& replica : requirement.replicas) {
-            auto& generation = wanted_map[{replica.id, replica.epoch}];
+            auto& generation = wanted_map[
+                {replica.id, replica.epoch, replica.domain, replica.backend_instance}];
             generation = std::max(generation, replica.generation);
         }
     }
     std::vector<DurableReplica> wanted;
     wanted.reserve(wanted_map.size());
-    for (const auto& [key, generation] : wanted_map)
-        wanted.push_back({key.first, key.second, generation});
-
-    std::map<std::pair<NodeId, NodeId>, uint64_t> durable;
-    for (const auto& replica : wanted) {
-        if (replica.id != n_.node_id())
-            continue;
-        if (replica.epoch != n_.durability_epoch())
-            continue;
-        try {
-            n_.local_store().durability_barrier(replica.generation);
-            durable[{replica.id, replica.epoch}] = replica.generation;
-        } catch (const std::exception& error) {
-            Log::warn("local storage durability barrier failed: " + std::string(error.what()));
-        }
+    for (const auto& [key, generation] : wanted_map) {
+        wanted.push_back({std::get<0>(key), std::get<1>(key), std::get<2>(key), generation,
+                          std::get<3>(key)});
     }
 
     std::map<NodeId, NodeInfo> peers;
@@ -351,6 +354,10 @@ bool DistributedStore::durability_barrier(const DurabilityBatch& batch) {
         std::optional<AsyncRpc> rpc;
     };
     std::vector<PendingBarrier> pending;
+
+    // Launch remote waits before blocking on the local domain. This aligns the
+    // batch windows across replicas, so a publication does not unnecessarily
+    // serialize one physical durability cut per node.
     for (const auto& replica : wanted) {
         if (replica.id == n_.node_id())
             continue;
@@ -360,7 +367,9 @@ bool DistributedStore::durability_barrier(const DurabilityBatch& batch) {
         try {
             Writer payload;
             payload.fixed(replica.epoch.bytes);
+            payload.u64(replica.domain);
             payload.u64(replica.generation);
+            payload.u64(replica.backend_instance);
             PendingBarrier item;
             item.replica = replica;
             item.rpc.emplace(n_.call_async(found->second, MessageType::object_durability_barrier,
@@ -370,10 +379,27 @@ bool DistributedStore::durability_barrier(const DurabilityBatch& batch) {
         }
     }
 
+    std::map<ReplicaKey, uint64_t> durable;
+    for (const auto& replica : wanted) {
+        if (replica.id != n_.node_id() || replica.epoch != n_.durability_epoch())
+            continue;
+        try {
+            n_.local_store().durability_barrier(
+                {replica.domain, replica.generation, replica.backend_instance},
+                DurabilityUrgency::batchable);
+            durable[{replica.id, replica.epoch, replica.domain, replica.backend_instance}] =
+                replica.generation;
+        } catch (const std::exception& error) {
+            Log::warn("local storage durability barrier failed: " + std::string(error.what()));
+        }
+    }
+
     for (auto& item : pending) {
         try {
-            if (item.rpc && item.rpc->get().message.type == MessageType::ok)
-                durable[{item.replica.id, item.replica.epoch}] = item.replica.generation;
+            if (item.rpc && item.rpc->get().message.type == MessageType::ok) {
+                durable[{item.replica.id, item.replica.epoch, item.replica.domain,
+                         item.replica.backend_instance}] = item.replica.generation;
+            }
         } catch (...) {
         }
     }
@@ -381,7 +407,8 @@ bool DistributedStore::durability_barrier(const DurabilityBatch& batch) {
     for (const auto& requirement : batch.requirements) {
         size_t count = 0;
         for (const auto& replica : requirement.replicas) {
-            const auto found = durable.find({replica.id, replica.epoch});
+            const auto found = durable.find(
+                {replica.id, replica.epoch, replica.domain, replica.backend_instance});
             if (found != durable.end() && found->second >= replica.generation)
                 ++count;
         }

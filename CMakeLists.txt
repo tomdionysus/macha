@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.15.2 LANGUAGES CXX)
+project(macha VERSION 0.16.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -105,6 +105,7 @@ set(MACHA_CORE_SOURCES
     src/ffmpeg_log.cpp
     src/diagnostics.cpp
     src/durable_file.cpp
+    src/durability_domain.cpp
     src/placement.cpp
     src/membership.cpp
     src/local_store.cpp

@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "crypto.hpp"
+#include "durability_domain.hpp"
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <stop_token>
@@ -49,20 +52,19 @@ class LocalStore {
     mutable std::mutex m_;
     std::jthread scan_thread_;
     std::atomic_bool scan_complete_{};
+    std::atomic_bool scan_failed_{};
     std::atomic_bool accounting_trusted_{};
     int accounting_fd_{-1};
     uint64_t accounting_sequence_{};
     unsigned accounting_slot_{};
     bool accounting_dirty_{};
-    uint64_t mutation_generation_{};
-    uint64_t durable_generation_{};
-#if !defined(__linux__)
-    // Linux can establish one filesystem-wide durability generation with
-    // syncfs(). Portable fallback platforms retain the paths touched by a
-    // deferred generation and fsync them only at the publication barrier.
-    std::vector<std::filesystem::path> deferred_files_;
-    std::vector<std::filesystem::path> deferred_directories_;
-#endif
+    std::shared_ptr<DurabilityDomain> durability_domain_;
+    uint64_t last_mutation_generation_{};
+    // Only objects created/replaced in this process and not yet known durable
+    // need a non-zero generation on reaffirmation. Keeping this exact avoids
+    // making an old durable object wait behind unrelated current writes.
+    std::map<ObjectId, uint64_t> provisional_generations_;
+    std::deque<std::pair<uint64_t, ObjectId>> provisional_order_;
     std::filesystem::path path(const ObjectId&) const;
     void wait_for_accounting(std::unique_lock<std::mutex>&) const;
     bool restore_accounting();
@@ -70,30 +72,34 @@ class LocalStore {
                             bool durable);
     void mark_accounting_dirty_locked();
     void checkpoint_accounting_locked();
+    void reap_durable_generations_locked();
     bool put_impl(const ObjectId&, std::span<const uint8_t>, StoreWriteDurability, uint64_t*);
-    void durability_barrier_locked(uint64_t required_generation);
     void scan(std::stop_token);
-    bool remove_locked(const ObjectId&, StoreWriteDurability);
+    bool remove_locked(const ObjectId&);
 
   public:
     LocalStore(std::filesystem::path, uint64_t, std::array<uint8_t, 32>,
-               LocalStoreMode = LocalStoreMode::authoritative);
+               LocalStoreMode = LocalStoreMode::authoritative,
+               std::shared_ptr<DurabilityDomain> = {});
     ~LocalStore();
-    bool put(const ObjectId&, std::span<const uint8_t>,
-             StoreWriteDurability = StoreWriteDurability::immediate);
+    // Strict authoritative write: success means the object crossed its
+    // DurabilityDomain before return. WAL/replayable callers must use
+    // put_deferred() and retain the returned generation.
+    bool put(const ObjectId&, std::span<const uint8_t>);
     // Stage one WAL-backed authoritative mutation and return the local mutation
     // generation which must be durable before that placement can be published.
     std::optional<uint64_t> put_deferred(const ObjectId&, std::span<const uint8_t>);
-    // Establish stable storage through required_generation. A barrier which has
-    // already covered that generation is a no-op even if newer mutations are
-    // currently dirty; one physical barrier may therefore group-commit many
-    // otherwise independent publication generations.
-    void durability_barrier(uint64_t required_generation);
+    // Await stable storage through a physical-filesystem generation. The
+    // DurabilityDomain, not LocalStore, owns the actual barrier and may group
+    // this request with unrelated publications on the same filesystem.
+    void durability_barrier(uint64_t required_generation,
+                            DurabilityUrgency = DurabilityUrgency::batchable);
     // Flush every deferred authoritative mutation currently admitted. Used by
     // strict reaffirmation/destruction; publication paths should use the
     // generation-qualified overload above.
     void durability_barrier();
     uint64_t durable_generation() const;
+    uint64_t durability_domain_id() const noexcept;
     std::optional<Bytes> get(const ObjectId&) const;
     bool has(const ObjectId&) const;
     // Strong presence predicate for durability/repair decisions. Unlike has(),
