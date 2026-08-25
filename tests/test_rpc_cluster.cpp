@@ -37,7 +37,7 @@ MACHA_TEST("rpc_cluster", test_async_rpc_move_ownership) {
     CHECK(cancelled.load() == 2);
 }
 
-MACHA_TEST("rpc_cluster", test_rpc_v14_frame_priority_and_variable_length) {
+MACHA_TEST("rpc_cluster", test_rpc_v15_frame_priority_and_variable_length) {
     CHECK(frame_type_priority(FrameType::control) < frame_type_priority(FrameType::foreground));
     CHECK(frame_type_priority(FrameType::foreground) < frame_type_priority(FrameType::read_ahead));
     CHECK(frame_type_priority(FrameType::read_ahead) <
@@ -139,7 +139,7 @@ MACHA_TEST("rpc_cluster", test_rpc_v14_frame_priority_and_variable_length) {
     server.stop();
 }
 
-MACHA_TEST("rpc_cluster", test_rpc_v14_persistence_and_multiplexing) {
+MACHA_TEST("rpc_cluster", test_rpc_v15_persistence_and_multiplexing) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
     auto port = free_port();
@@ -221,7 +221,7 @@ MACHA_TEST("rpc_cluster", test_rpc_v14_persistence_and_multiplexing) {
     server.stop();
 }
 
-MACHA_TEST("rpc_cluster", test_rpc_v14_bidirectional_and_deduplication) {
+MACHA_TEST("rpc_cluster", test_rpc_v15_bidirectional_and_deduplication) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
 

@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -34,6 +35,14 @@ class StoragePool {
         bool yielded{};
     };
 
+    struct DurabilityToken {
+        uint64_t domain{};
+        uint64_t generation{};
+        uint64_t backend_instance{};
+
+        bool valid() const noexcept { return domain && backend_instance; }
+    };
+
   private:
     struct CursorItem {
         std::shared_ptr<Backend> backend;
@@ -45,18 +54,13 @@ class StoragePool {
     std::filesystem::path state_path_;
     NodeId node_id_;
     std::array<uint8_t, 32> key_{};
+    std::chrono::milliseconds durability_batch_window_{500};
     mutable std::mutex mutex_;
     std::vector<std::shared_ptr<Backend>> backends_;
-    struct DeferredGeneration {
-        uint64_t generation{};
-        std::shared_ptr<Backend> backend;
-        std::shared_ptr<LocalStore> store;
-        uint64_t local_generation{};
-    };
-    mutable std::mutex durability_mutex_;
-    uint64_t mutation_generation_{};
-    uint64_t durable_generation_{};
-    std::vector<DeferredGeneration> deferred_generations_;
+    mutable std::mutex domain_mutex_;
+    uint64_t next_domain_id_{1};
+    uint64_t next_backend_instance_{1};
+    std::map<uint64_t, std::shared_ptr<DurabilityDomain>> domains_by_device_;
     Cursor rebalance_cursor_;
     Cursor scrub_cursor_;
     Cursor gc_cursor_;
@@ -76,19 +80,22 @@ class StoragePool {
                     const std::string&, uint64_t expected_generation = 0) const;
     std::vector<std::shared_ptr<Backend>> ranked(const ObjectId&) const;
     std::optional<CursorItem> next_physical(Cursor&, bool& pass_complete) const;
+    std::shared_ptr<DurabilityDomain> domain_for(const std::filesystem::path&);
 
   public:
     StoragePool(std::filesystem::path state_path, NodeId, std::vector<StorageBackendConfig>,
-                std::array<uint8_t, 32> key);
+                std::array<uint8_t, 32> key,
+                std::chrono::milliseconds durability_batch_window = std::chrono::milliseconds(500));
     void reconfigure(const std::vector<StorageBackendConfig>&);
     void refresh();
 
-    bool put(const ObjectId&, std::span<const uint8_t>,
-             StoreWriteDurability = StoreWriteDurability::immediate);
-    std::optional<uint64_t> put_deferred(const ObjectId&, std::span<const uint8_t>);
-    void durability_barrier(uint64_t required_generation);
-    void durability_barrier();
-    uint64_t durable_generation() const;
+    // Strict write. Provisional callers use put_deferred() so the durability
+    // token cannot be discarded accidentally.
+    bool put(const ObjectId&, std::span<const uint8_t>);
+    std::optional<DurabilityToken> put_deferred(const ObjectId&, std::span<const uint8_t>);
+    void durability_barrier(const DurabilityToken&,
+                            DurabilityUrgency = DurabilityUrgency::batchable);
+    bool durability_covered(const DurabilityToken&) const;
     std::optional<Bytes> get(const ObjectId&) const;
     bool has(const ObjectId&) const;
     bool valid(const ObjectId&) const;

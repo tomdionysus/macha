@@ -13,6 +13,7 @@
 #include <fstream>
 #include <limits>
 #include <set>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace macha {
@@ -57,14 +58,18 @@ struct StoragePool::Backend {
     bool online{};
     bool configured{true};
     uint64_t generation{1};
+    uint64_t instance_id{};
+    std::shared_ptr<DurabilityDomain> durability_domain;
     std::shared_ptr<LocalStore> store;
     std::string last_error;
 };
 
 StoragePool::StoragePool(std::filesystem::path state_path, NodeId node_id,
                          std::vector<StorageBackendConfig> configs,
-                         std::array<uint8_t, 32> key)
-    : state_path_(std::move(state_path)), node_id_(node_id), key_(key) {
+                         std::array<uint8_t, 32> key,
+                         std::chrono::milliseconds durability_batch_window)
+    : state_path_(std::move(state_path)), node_id_(node_id), key_(key),
+      durability_batch_window_(durability_batch_window) {
     reconfigure(configs);
     refresh();
 }
@@ -72,6 +77,23 @@ StoragePool::StoragePool(std::filesystem::path state_path, NodeId node_id,
 std::vector<std::shared_ptr<StoragePool::Backend>> StoragePool::snapshot() const {
     DiagnosticLock lock(mutex_, "storage.pool");
     return backends_;
+}
+
+std::shared_ptr<DurabilityDomain> StoragePool::domain_for(const std::filesystem::path& path) {
+    struct stat st {};
+    if (::stat(path.c_str(), &st) != 0)
+        throw std::runtime_error("cannot stat storage durability domain " + path.string());
+    const auto device = static_cast<uint64_t>(st.st_dev);
+    std::lock_guard lock(domain_mutex_);
+    if (const auto found = domains_by_device_.find(device); found != domains_by_device_.end() &&
+        !found->second->failed()) {
+        found->second->add_representative(path);
+        return found->second;
+    }
+    auto domain = std::make_shared<DurabilityDomain>(next_domain_id_++, path,
+                                                     durability_batch_window_);
+    domains_by_device_[device] = domain;
+    return domain;
 }
 
 std::filesystem::path StoragePool::identity_path(const std::filesystem::path& path) const {
@@ -95,6 +117,8 @@ void StoragePool::deactivate(const std::shared_ptr<Backend>& backend,
         log = backend->online || backend->last_error != reason;
         backend->online = false;
         retired = std::move(backend->store);
+        backend->durability_domain.reset();
+        backend->instance_id = 0;
         backend->last_error = reason;
     }
     // LocalStore destruction may join its accounting thread. Never do that
@@ -180,8 +204,22 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
             throw std::runtime_error("backend marker changed");
 
         auto store = existing;
-        if (!store)
-            store = std::make_shared<LocalStore>(cfg.path, cfg.limit, key_);
+        std::shared_ptr<DurabilityDomain> durability_domain;
+        uint64_t instance_id = 0;
+        if (!store) {
+            durability_domain = domain_for(cfg.path);
+            {
+                std::lock_guard lock(domain_mutex_);
+                instance_id = next_backend_instance_++;
+            }
+            store = std::make_shared<LocalStore>(cfg.path, cfg.limit, key_,
+                                                 LocalStoreMode::authoritative,
+                                                 durability_domain);
+        } else {
+            std::lock_guard lock(backend->mutex);
+            durability_domain = backend->durability_domain;
+            instance_id = backend->instance_id;
+        }
 
         bool installed = false;
         {
@@ -191,6 +229,8 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
                 backend->token = token;
                 backend->token_known = token_known;
                 backend->store = store;
+                backend->durability_domain = durability_domain;
+                backend->instance_id = instance_id;
                 backend->online = true;
                 backend->last_error.clear();
                 installed = true;
@@ -303,11 +343,7 @@ std::vector<std::shared_ptr<StoragePool::Backend>> StoragePool::ranked(const Obj
     return out;
 }
 
-bool StoragePool::put(const ObjectId& id, std::span<const uint8_t> data,
-                      StoreWriteDurability durability) {
-    if (durability == StoreWriteDurability::deferred)
-        return put_deferred(id, data).has_value();
-
+bool StoragePool::put(const ObjectId& id, std::span<const uint8_t> data) {
     for (const auto& backend : ranked(id)) {
         std::shared_ptr<LocalStore> store;
         std::filesystem::path path;
@@ -323,7 +359,7 @@ bool StoragePool::put(const ObjectId& id, std::span<const uint8_t> data,
             // the physical age when the content hash already exists, which keeps
             // reachability GC from racing a new write that reuses an old orphan.
             // Do not short-circuit this through has().
-            if (store->put(id, data, StoreWriteDurability::immediate))
+            if (store->put(id, data))
                 return true;
         } catch (const std::exception& error) {
             Log::debug("storage write failed " + path.string() + ": " + error.what());
@@ -333,35 +369,40 @@ bool StoragePool::put(const ObjectId& id, std::span<const uint8_t> data,
     return false;
 }
 
-std::optional<uint64_t> StoragePool::put_deferred(const ObjectId& id,
-                                                  std::span<const uint8_t> data) {
+std::optional<StoragePool::DurabilityToken> StoragePool::put_deferred(
+    const ObjectId& id, std::span<const uint8_t> data) {
     for (const auto& backend : ranked(id)) {
         std::shared_ptr<LocalStore> store;
         std::filesystem::path path;
+        uint64_t backend_instance = 0;
+        uint64_t domain = 0;
         {
             std::lock_guard lock(backend->mutex);
-            if (!backend->online || !backend->store)
+            if (!backend->online || !backend->store || !backend->durability_domain ||
+                !backend->instance_id)
                 continue;
             store = backend->store;
             path = backend->cfg.path;
+            backend_instance = backend->instance_id;
+            domain = backend->durability_domain->id();
         }
         try {
-            const auto local_generation = store->put_deferred(id, data);
-            if (!local_generation)
+            const auto generation = store->put_deferred(id, data);
+            if (!generation)
                 continue;
 
-            std::lock_guard durability_lock(durability_mutex_);
-            // A concurrent barrier may have crossed this LocalStore generation
-            // between physical placement and registration. In that case the
-            // placement is already covered by the pool's last acknowledged
-            // generation and needs no new pending generation of its own.
-            if (*local_generation <= store->durable_generation())
-                return durable_generation_;
-
-            const auto generation = ++mutation_generation_;
-            deferred_generations_.push_back(
-                {generation, backend, store, *local_generation});
-            return generation;
+            // The placement token names the exact backend incarnation which
+            // accepted the object. If it disappeared/reopened while put() was
+            // in progress, do not allow the new incarnation to satisfy the old
+            // publication requirement merely because it shares a filesystem.
+            {
+                std::lock_guard lock(backend->mutex);
+                if (!backend->online || backend->store != store ||
+                    backend->instance_id != backend_instance ||
+                    !backend->durability_domain || backend->durability_domain->id() != domain)
+                    continue;
+            }
+            return DurabilityToken{domain, *generation, backend_instance};
         } catch (const std::exception& error) {
             Log::debug("storage deferred write failed " + path.string() + ": " + error.what());
             deactivate(backend, store, error.what());
@@ -370,83 +411,53 @@ std::optional<uint64_t> StoragePool::put_deferred(const ObjectId& id,
     return {};
 }
 
-void StoragePool::durability_barrier(uint64_t required_generation) {
-    std::lock_guard durability_lock(durability_mutex_);
-    if (required_generation <= durable_generation_)
-        return;
-    if (required_generation > mutation_generation_)
-        throw std::runtime_error("storage-pool durability generation was never admitted");
-
-    struct Target {
-        std::shared_ptr<Backend> backend;
+void StoragePool::durability_barrier(const DurabilityToken& token, DurabilityUrgency urgency) {
+    if (!token.valid())
+        throw std::runtime_error("invalid storage durability token");
+    for (const auto& backend : snapshot()) {
         std::shared_ptr<LocalStore> store;
-        uint64_t local_generation{};
-    };
-    std::vector<Target> targets;
-    for (const auto& item : deferred_generations_) {
-        if (item.generation > required_generation)
-            break;
-        auto found = std::find_if(targets.begin(), targets.end(), [&](const Target& target) {
-            return target.store == item.store;
-        });
-        if (found == targets.end()) {
-            targets.push_back({item.backend, item.store, item.local_generation});
-        } else {
-            found->local_generation = std::max(found->local_generation, item.local_generation);
-        }
-    }
-
-    for (const auto& target : targets) {
         std::filesystem::path path;
         {
-            std::lock_guard lock(target.backend->mutex);
-            path = target.backend->cfg.path;
+            std::lock_guard lock(backend->mutex);
+            if (!backend->online || !backend->store || !backend->durability_domain ||
+                backend->instance_id != token.backend_instance ||
+                backend->durability_domain->id() != token.domain)
+                continue;
+            store = backend->store;
+            path = backend->cfg.path;
         }
         try {
-            target.store->durability_barrier(target.local_generation);
+            store->durability_barrier(token.generation, urgency);
+            {
+                std::lock_guard lock(backend->mutex);
+                if (!backend->online || backend->store != store ||
+                    backend->instance_id != token.backend_instance ||
+                    !backend->durability_domain || backend->durability_domain->id() != token.domain)
+                    throw std::runtime_error(
+                        "storage durability placement changed while awaiting barrier");
+            }
+            return;
         } catch (const std::exception& error) {
             Log::warn("storage durability barrier failed " + path.string() + ": " + error.what());
-            deactivate(target.backend, target.store, error.what());
+            deactivate(backend, store, error.what());
             throw;
         }
     }
+    throw std::runtime_error("storage durability placement is no longer available");
+}
 
-    // A LocalStore barrier is a physical filesystem cut and can make later
-    // mutations durable as collateral group commit. Advance the node-wide
-    // frontier through every contiguous placement whose exact store generation
-    // is now known durable, not merely through the generation requested by this
-    // caller. This is what prevents queued stale barrier RPCs from repeatedly
-    // flushing unrelated newer recovery traffic.
-    for (const auto& item : deferred_generations_) {
-        if (item.generation <= durable_generation_)
+bool StoragePool::durability_covered(const DurabilityToken& token) const {
+    if (!token.valid())
+        return false;
+    for (const auto& backend : snapshot()) {
+        std::lock_guard lock(backend->mutex);
+        if (!backend->online || !backend->store || !backend->durability_domain ||
+            backend->instance_id != token.backend_instance ||
+            backend->durability_domain->id() != token.domain)
             continue;
-        if (item.store->durable_generation() < item.local_generation)
-            break;
-        durable_generation_ = item.generation;
+        return backend->durability_domain->durable_generation() >= token.generation;
     }
-    deferred_generations_.erase(
-        deferred_generations_.begin(),
-        std::find_if(deferred_generations_.begin(), deferred_generations_.end(),
-                     [&](const DeferredGeneration& item) {
-                         return item.generation > durable_generation_;
-                     }));
-
-    if (required_generation > durable_generation_)
-        throw std::runtime_error("storage-pool durability barrier did not cover requested generation");
-}
-
-void StoragePool::durability_barrier() {
-    uint64_t generation = 0;
-    {
-        std::lock_guard durability_lock(durability_mutex_);
-        generation = mutation_generation_;
-    }
-    durability_barrier(generation);
-}
-
-uint64_t StoragePool::durable_generation() const {
-    std::lock_guard durability_lock(durability_mutex_);
-    return durable_generation_;
+    return false;
 }
 
 void StoragePool::observe_get(size_t bytes, uint64_t elapsed) const {

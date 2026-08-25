@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.16.0 - 2026-08-25
+
+- replace layered store/RPC/FUSE ownership of authoritative object barriers with one filesystem-scoped `DurabilityDomain` per `st_dev`; completed filesystem mutations receive process-local generations, publication waits on generation tickets, and only the domain coordinator performs authoritative object `syncfs()`/portable fallback barriers;
+- add scheduled group commit for replayable publication generations: batchable FUSE/distributed durability requests share a 500 ms domain window while strict writes use the same ticket path with immediate scheduling, and generation cuts are captured before the physical barrier without blocking admission of later writes;
+- remove StoragePool's synthetic node-wide generation ledger and carry the accepting physical placement directly as `(process epoch, durability domain, generation, backend incarnation)`; transport v15 and v15-authenticated session labels fence the new semantics and intentionally reject older peers;
+- move authoritative capacity accounting out of publication transactions: one durable DIRTY marker covers the process/store mutation session, normal publication and GC update derived in-memory usage without accounting fsyncs, clean teardown writes one exact CLEAN checkpoint, and unclean restart reconciles the object tree then establishes one physical durability baseline before trusting pre-existing objects;
+- make authoritative deletion lazily durable and retain the explicitly ephemeral cache path, so lost unlink durability can only retain unreachable garbage and cache loss remains a cache miss; successful FUSE publication continues to retire completed spool files by immediate best-effort unlink after durable journal completion;
+- add `docs/durability.md` with the authority tiers, invariants, domain/ticket model, group-commit rules, crash matrix, accounting/GC/cache semantics and expected observability, and add regressions for session-scoped accounting, unclean-process baseline recovery, physical-cut coverage, filesystem-domain sharing, backend incarnation fencing, local/RPC group commit and publication-before-metadata ordering.
+
 ## 0.15.2 - 2026-08-25
 
 - replace boolean deferred-durability state with monotonic LocalStore and node-wide StoragePool generations so a filesystem barrier records the complete physical cut it actually made durable; queued barriers for already-covered generations now return immediately even when newer unrelated recovery writes have made the store dirty again;
