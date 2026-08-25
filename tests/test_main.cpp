@@ -4181,6 +4181,113 @@ void test_fuse_durable_journal_preserves_unreferenced_spool() {
     service.stop();
 }
 
+void append_fuse_journal_test_record(const std::filesystem::path& journal,
+                                     std::span<const uint8_t> payload) {
+    Writer frame;
+    frame.u32(static_cast<uint32_t>(payload.size()));
+    frame.raw(payload);
+    frame.fixed(sha256(payload).bytes);
+    auto bytes = frame.take();
+
+    std::ofstream out(journal, std::ios::binary | std::ios::app);
+    REQUIRE(out.good());
+    out.write(reinterpret_cast<const char*>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+    out.flush();
+    REQUIRE(out.good());
+}
+
+void test_fuse_durable_journal_accepts_authoritative_data_done_without_published_prefix() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-journal-done-recovery", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 30s;
+
+    Service service(config, keys);
+    service.start();
+
+    uint64_t inode = 0;
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        // Keep distributed publication behind the quiet-period gate. release()
+        // still waits for the local spool+journal durability boundary.
+        service.filesystem().store().foreground_activity(1);
+        auto handle =
+            frontend->create("/done-authoritative.bin", 0644, getuid(), getgid(),
+                             true, true, false);
+        inode = handle.inode;
+        const Bytes payload{0x10, 0x20, 0x30, 0x40};
+        REQUIRE(frontend->write(inode, 0, payload) == payload.size());
+        frontend->release(inode, true);
+        frontend->stop();
+    }
+
+    const auto spool_dir =
+        config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
+    const auto journal = config.fuse.operation_journal_path.value_or(
+        spool_dir / "operations.log");
+
+    // Model the precise crash state seen in production: the checksum-valid
+    // completion marker survives but its earlier data_published proof does not.
+    // A newly created inode's first data operation has sequence 1.
+    Writer done;
+    done.u8(7); // persisted JournalRecord::data_done value
+    done.u64(inode);
+    done.u64(1);
+    append_fuse_journal_test_record(journal, done.data());
+
+    {
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        CHECK(recovered->inode_for_path("/done-authoritative.bin").has_value());
+        recovered->stop();
+    }
+    service.stop();
+}
+
+void test_fuse_durable_journal_rejects_unbacked_data_done() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-journal-unbacked-done", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+
+    Service service(config, keys);
+    service.start();
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        frontend->stop();
+    }
+
+    const auto spool_dir =
+        config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
+    const auto journal = config.fuse.operation_journal_path.value_or(
+        spool_dir / "operations.log");
+
+    Writer done;
+    done.u8(7); // persisted JournalRecord::data_done value
+    done.u64(999);
+    done.u64(1);
+    append_fuse_journal_test_record(journal, done.data());
+
+    bool rejected = false;
+    try {
+        auto should_fail = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        should_fail->stop();
+    } catch (const std::exception&) {
+        rejected = true;
+    }
+    CHECK(rejected);
+    service.stop();
+}
+
 void test_fuse_durable_journal_rejects_missing_spool() {
     TempDir t;
     auto keyfile = t.path() / "cluster.key";
@@ -8722,6 +8829,8 @@ int main() {
         RUN_TEST(test_fuse_durable_journal_trims_torn_tail);
         RUN_TEST(test_fuse_durable_journal_trims_checksum_invalid_complete_tail);
         RUN_TEST(test_fuse_durable_journal_preserves_unreferenced_spool);
+        RUN_TEST(test_fuse_durable_journal_accepts_authoritative_data_done_without_published_prefix);
+        RUN_TEST(test_fuse_durable_journal_rejects_unbacked_data_done);
         RUN_TEST(test_fuse_durable_journal_rejects_missing_spool);
         RUN_TEST(test_fuse_read_only_release_does_not_publish_writer_data);
         RUN_TEST(test_fuse_frontend_unlink_and_rename_over_open_inode_ordering);

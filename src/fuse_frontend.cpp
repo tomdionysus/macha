@@ -771,7 +771,8 @@ struct FuseFrontend::State {
                static_cast<uint32_t>(bytes[3]);
     }
 
-    void parse_journal_record(JournalRecovery& recovery, std::span<const uint8_t> payload) {
+    void parse_journal_record(JournalRecovery& recovery, std::span<const uint8_t> payload,
+                              size_t frame_offset) {
         Reader reader(payload);
         const auto raw_type = reader.u8();
         if (raw_type < static_cast<uint8_t>(JournalRecord::inode) ||
@@ -862,12 +863,32 @@ struct FuseFrontend::State {
         case JournalRecord::data_done: {
             const auto inode = reader.u64();
             const auto sequence = reader.u64();
-            auto published = recovery.data_published.find(inode);
-            if (published == recovery.data_published.end() || published->second.first < sequence)
-                throw DecodeError("FUSE data completion marker has no published prefix");
+
+            // A durable data_done is the retirement watermark. Runtime emits it
+            // only after the target generation has been committed and observed,
+            // and spool reclamation is ordered after this marker. Recovery may
+            // therefore trust it even when the older, redundant data_published
+            // proof is missing, but only when the journal itself contains the
+            // exact ordered data operation being retired.
+            auto operations = recovery.data_ops.find(inode);
+            const bool has_operation =
+                operations != recovery.data_ops.end() &&
+                std::any_of(operations->second.begin(), operations->second.end(),
+                            [&](const DataOp& op) { return op.sequence == sequence; });
+            if (!has_operation)
+                throw DecodeError("FUSE data completion marker has no operation prefix");
+
             auto done = recovery.data_done.find(inode);
             if (done != recovery.data_done.end() && done->second >= sequence)
                 throw DecodeError("non-monotonic FUSE data completion marker");
+
+            auto published = recovery.data_published.find(inode);
+            if (published == recovery.data_published.end() || published->second.first < sequence) {
+                Log::warn("FUSE journal recovery accepted data completion without published "
+                          "prefix inode=" + std::to_string(inode) +
+                          " sequence=" + std::to_string(sequence) +
+                          " frame_offset=" + std::to_string(frame_offset));
+            }
             recovery.data_done[inode] = sequence;
             break;
         }
@@ -923,7 +944,7 @@ struct FuseFrontend::State {
                         break;
                     throw std::runtime_error("FUSE operation journal checksum mismatch");
                 }
-                parse_journal_record(recovery, payload);
+                parse_journal_record(recovery, payload, position);
                 position += frame_size;
                 last_good = position;
             }
