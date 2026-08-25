@@ -455,6 +455,32 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_ordering_merging_and_cache) {
     }
 }
 
+MACHA_TEST("filesystem_fuse", test_fuse_completed_publication_unlinks_retired_spool) {
+    TestService fixture("fuse-spool-retire-unlink");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 0ms;
+
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto handle = frontend->create("/retire-spool.bin", 0600, getuid(), getgid(),
+                                   true, true, false);
+    const auto payload = pattern(2 * 1024 * 1024 + 17, 71);
+    REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
+    frontend->release(handle.inode, true);
+    REQUIRE(frontend->wait_for_idle(10s));
+
+    const auto spool_dir =
+        config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
+    const auto spool = spool_dir / ("inode-" + std::to_string(handle.inode) + ".spool");
+    CHECK(!std::filesystem::exists(spool));
+    frontend->stop();
+}
+
 MACHA_TEST("filesystem_fuse", test_fuse_publication_yields_to_playback) {
     TestService fixture("fuse-playback-yield");
     auto& config = fixture.config();

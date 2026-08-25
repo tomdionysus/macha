@@ -1429,46 +1429,27 @@ struct FuseFrontend::State {
             return true;
         }
 
-        int fd = inode.spool_fd;
-        bool temporary = false;
-        if (fd < 0) {
-            fd = ::open(inode.spool_path.c_str(), O_RDWR);
-            if (fd < 0) {
-                if (errno == ENOENT) {
-                    inode.spool_end = 0;
-                    inode.spool_path.clear();
-                    return true;
-                }
-                Log::warn("cannot open retired FUSE spool inode=" +
-                          std::to_string(inode.id) + " error=" + std::strerror(errno));
-                return false;
-            }
-            temporary = true;
-        }
-
-        bool clean = true;
-        if (::ftruncate(fd, 0) != 0) {
-            clean = false;
-            Log::warn("cannot truncate retired FUSE spool inode=" +
-                      std::to_string(inode.id) + " error=" + std::strerror(errno));
-        } else {
-            inode.spool_end = 0;
-            try {
-                fsync_fd(fd, "cannot sync retired FUSE spool");
-            } catch (const std::exception& e) {
-                clean = false;
-                Log::warn("cannot sync retired FUSE spool inode=" +
-                          std::to_string(inode.id) + " error=" + e.what());
-            }
-        }
-
-        if (temporary) {
-            ::close(fd);
-        } else {
+        // data_done/data_abandoned is durable before retirement reaches here.
+        // The spool is therefore no longer part of the crash-recovery source of
+        // truth and can be unlinked immediately. We deliberately do not fsync
+        // the directory: if the unlink itself is lost in a crash, startup sees
+        // an already-completed journal generation and removes the harmless stale
+        // spool then. This avoids both an unnecessary retirement barrier and an
+        // unbounded population of zero-length spool inodes during long uptimes.
+        if (inode.spool_fd >= 0) {
             ::close(inode.spool_fd);
             inode.spool_fd = -1;
         }
-        return clean;
+
+        const auto retired_path = inode.spool_path;
+        if (::unlink(retired_path.c_str()) != 0 && errno != ENOENT) {
+            Log::warn("cannot unlink retired FUSE spool inode=" +
+                      std::to_string(inode.id) + " error=" + std::strerror(errno));
+            return false;
+        }
+        inode.spool_end = 0;
+        inode.spool_path.clear();
+        return true;
     }
 
     void request_data_publication(const std::shared_ptr<Inode>& inode) {
@@ -2436,8 +2417,8 @@ struct FuseFrontend::State {
                 if (pending_data_count(recovery, id) > 0)
                     continue;
                 // A crash may occur after the durable data_done record but
-                // before journal compaction/truncation of its spool. The done
-                // watermark proves these bytes are no longer part of recovery.
+                // before the best-effort spool unlink reaches stable storage.
+                // The done watermark proves these bytes are no longer recovery data.
                 std::filesystem::remove(entry.path(), ec);
                 if (ec)
                     throw std::runtime_error("cannot remove retired FUSE spool: " + ec.message());

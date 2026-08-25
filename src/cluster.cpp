@@ -324,7 +324,7 @@ bool NodeRuntime::cas_metadata(uint64_t generation, const Hash256& hash,
 
 bool NodeRuntime::cas_metadata_delta(uint64_t generation, const Hash256& hash,
                                      std::span<const uint8_t> delta, MetadataRecord* out) {
-    // The v13 wire protocol has exactly one delta representation. MetadataReplica
+    // The v14 wire protocol has exactly one delta representation. MetadataReplica
     // still understands DLT1 solely so an existing pre-0.10 journal can replay
     // locally; accepting it here would turn storage migration into wire fallback.
     if (!current_metadata_delta(delta))
@@ -383,31 +383,34 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             auto data = reader.bytes(128 * 1024 * 1024);
             reader.finish();
             note_activity(frame_type, data.size());
-            const auto durability = request.type == MessageType::put_object_deferred
-                                        ? StoreWriteDurability::deferred
-                                        : StoreWriteDurability::immediate;
-            if (!local_.put(id, data, durability))
-                return error_reply("storage limit reached");
-            members_.storage(local_.used(), local_.limit());
             if (request.type == MessageType::put_object_deferred) {
-                // Bind provisional placement to this exact process lifetime. A
-                // node which crashes after acknowledging the PUT but before the
-                // generation barrier must not let a post-restart barrier make
-                // the old provisional acknowledgement count as durable.
+                const auto generation = local_.put_deferred(id, data);
+                if (!generation)
+                    return error_reply("storage limit reached");
+                members_.storage(local_.used(), local_.limit());
+                // Bind provisional placement to this exact process lifetime and
+                // exact node-wide mutation generation. A later barrier for an
+                // already-covered generation is a no-op even when unrelated
+                // newer writes are currently dirty on this node.
                 Writer reply;
                 reply.fixed(durability_epoch_.bytes);
+                reply.u64(*generation);
                 return {MessageType::ok, reply.take()};
             }
+            if (!local_.put(id, data, StoreWriteDurability::immediate))
+                return error_reply("storage limit reached");
+            members_.storage(local_.used(), local_.limit());
             return {MessageType::ok, {}};
         }
         case MessageType::object_durability_barrier: {
             Reader reader(request.payload);
             NodeId expected_epoch{reader.fixed<16>()};
+            const auto required_generation = reader.u64();
             reader.finish();
             if (expected_epoch != durability_epoch_)
                 return error_reply("storage durability epoch changed");
             try {
-                local_.durability_barrier();
+                local_.durability_barrier(required_generation);
                 members_.storage(local_.used(), local_.limit());
                 return {MessageType::ok, {}};
             } catch (const std::exception& error) {

@@ -334,8 +334,8 @@ void LocalStore::checkpoint_accounting_locked() {
     accounting_trusted_.store(true, std::memory_order_release);
 }
 
-bool LocalStore::put(const ObjectId& i, std::span<const uint8_t> d,
-                     StoreWriteDurability durability) {
+bool LocalStore::put_impl(const ObjectId& i, std::span<const uint8_t> d,
+                          StoreWriteDurability durability, uint64_t* deferred_generation) {
     if (object_id(d) != i)
         throw std::runtime_error("object hash mismatch");
     auto p = path(i);
@@ -355,7 +355,10 @@ bool LocalStore::put(const ObjectId& i, std::span<const uint8_t> d,
                 // reaffirming the object to the immediate caller.
                 if (mode_ == LocalStoreMode::authoritative &&
                     durability == StoreWriteDurability::immediate && accounting_dirty_)
-                    durability_barrier_locked();
+                    durability_barrier_locked(mutation_generation_);
+                if (deferred_generation)
+                    *deferred_generation = accounting_dirty_ ? mutation_generation_
+                                                               : durable_generation_;
                 touch(i);
                 return true;
             }
@@ -377,7 +380,10 @@ bool LocalStore::put(const ObjectId& i, std::span<const uint8_t> d,
                 // reaffirming the object to the immediate caller.
                 if (mode_ == LocalStoreMode::authoritative &&
                     durability == StoreWriteDurability::immediate && accounting_dirty_)
-                    durability_barrier_locked();
+                    durability_barrier_locked(mutation_generation_);
+                if (deferred_generation)
+                    *deferred_generation = accounting_dirty_ ? mutation_generation_
+                                                               : durable_generation_;
                 touch(i);
                 return true;
             }
@@ -443,6 +449,11 @@ bool LocalStore::put(const ObjectId& i, std::span<const uint8_t> d,
             // destructor performs a final durable sync. The older slot retains the
             // durable pending record until then, so crash recovery remains O(1).
             persist_accounting(before + need, accounting_none, none, 0, false);
+        }
+        if (deferred) {
+            ++mutation_generation_;
+            if (deferred_generation)
+                *deferred_generation = mutation_generation_;
         }
         return true;
     } catch (...) {
@@ -524,9 +535,14 @@ bool LocalStore::remove_locked(const ObjectId& i, StoreWriteDurability durabilit
     return true;
 }
 
-void LocalStore::durability_barrier_locked() {
-    if (mode_ == LocalStoreMode::ephemeral || accounting_fd_ < 0 || !accounting_dirty_)
+void LocalStore::durability_barrier_locked(uint64_t required_generation) {
+    if (mode_ == LocalStoreMode::ephemeral || accounting_fd_ < 0 ||
+        required_generation <= durable_generation_)
         return;
+    if (required_generation > mutation_generation_)
+        throw std::runtime_error("storage durability generation was never admitted");
+    if (!accounting_dirty_)
+        throw std::runtime_error("storage durability generation accounting state is inconsistent");
 
 #if defined(__linux__)
     int rc;
@@ -545,15 +561,38 @@ void LocalStore::durability_barrier_locked() {
         syncdir(directory);
 #endif
 
-    // Only advertise exact O(1) accounting after every object mutation in this
-    // generation is stable. A crash before this checkpoint sees DIRTY and does
-    // the existing background object-tree reconciliation instead of trusting a
-    // stale byte count.
+    // syncfs/fsync above is a cut through every deferred mutation admitted while
+    // the store lock is held, not merely through the caller's requested point.
+    // Remember the complete cut so later barriers for older generations are
+    // immediate even after newer writes make accounting dirty again.
+    const auto cut = mutation_generation_;
     checkpoint_accounting_locked();
+    durable_generation_ = cut;
 #if !defined(__linux__)
     deferred_files_.clear();
     deferred_directories_.clear();
 #endif
+}
+
+bool LocalStore::put(const ObjectId& id, std::span<const uint8_t> data,
+                     StoreWriteDurability durability) {
+    return put_impl(id, data, durability, nullptr);
+}
+
+std::optional<uint64_t> LocalStore::put_deferred(const ObjectId& id,
+                                                 std::span<const uint8_t> data) {
+    uint64_t generation = 0;
+    if (!put_impl(id, data, StoreWriteDurability::deferred, &generation))
+        return {};
+    return generation;
+}
+
+void LocalStore::durability_barrier(uint64_t required_generation) {
+    if (mode_ == LocalStoreMode::ephemeral || accounting_fd_ < 0)
+        return;
+    std::unique_lock g(m_);
+    wait_for_accounting(g);
+    durability_barrier_locked(required_generation);
 }
 
 void LocalStore::durability_barrier() {
@@ -561,7 +600,12 @@ void LocalStore::durability_barrier() {
         return;
     std::unique_lock g(m_);
     wait_for_accounting(g);
-    durability_barrier_locked();
+    durability_barrier_locked(mutation_generation_);
+}
+
+uint64_t LocalStore::durable_generation() const {
+    std::lock_guard g(m_);
+    return durable_generation_;
 }
 
 bool LocalStore::remove(const ObjectId& i) {

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.15.2 - 2026-08-25
+
+- replace boolean deferred-durability state with monotonic LocalStore and node-wide StoragePool generations so a filesystem barrier records the complete physical cut it actually made durable; queued barriers for already-covered generations now return immediately even when newer unrelated recovery writes have made the store dirty again;
+- bump the authenticated cluster transport to v14 and extend provisional replica acknowledgements and durability-barrier RPCs from process epoch alone to `(process epoch, generation)`, coalesce per-replica requirements to the highest generation needed, and retain exact backend/store generation mappings so group commit remains correct with multiple storage backends;
+- advance StoragePool durability through every contiguous deferred placement whose underlying LocalStore generation was covered incidentally by a barrier, eliminating repeated `syncfs()` calls from stale RPC data-worker barriers without weakening publication quorum or restart fencing;
+- retire completed or abandoned FUSE spools by immediate best-effort unlink after the durable journal completion marker instead of truncate+`fsync`+deferred startup cleanup; a crash may resurrect only an already-completed pathname, which existing recovery cleanup safely removes;
+- add Linux architecture regressions for remembered LocalStore cuts, node-wide StoragePool group commit, RPC-level reuse of an already-covered generation after newer dirty writes, and immediate successful spool retirement, while updating the existing deferred-replica epoch test for generation-qualified wire tokens.
+
 ## 0.15.1 - 2026-08-25
 
 - move spool-backed publication durability from per-extent `fsync()` transactions to explicit publication generations: authoritative extents are staged with buffered writes, exact replica placements cross one stable-storage barrier before metadata commit, and ordinary non-WAL-backed object PUTs retain their existing immediate-durability contract;

@@ -458,8 +458,10 @@ MACHA_TEST("invariants", test_authoritative_deferred_generation_batches_stable_s
     fsync_calls = 0;
     syncfs_calls = 0;
     track_fsync = true;
-    REQUIRE(store.put(object_id(deferred_a), deferred_a, StoreWriteDurability::deferred));
-    REQUIRE(store.put(object_id(deferred_b), deferred_b, StoreWriteDurability::deferred));
+    const auto deferred_a_generation = store.put_deferred(object_id(deferred_a), deferred_a);
+    const auto deferred_b_generation = store.put_deferred(object_id(deferred_b), deferred_b);
+    REQUIRE(deferred_a_generation.has_value());
+    REQUIRE(deferred_b_generation.has_value());
 
     // One durable DIRTY accounting checkpoint begins the whole generation. No
     // object or directory fsync is performed while the WAL-backed generation is
@@ -467,7 +469,7 @@ MACHA_TEST("invariants", test_authoritative_deferred_generation_batches_stable_s
     CHECK(fsync_calls.load(std::memory_order_relaxed) == 1);
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 0);
 
-    store.durability_barrier();
+    store.durability_barrier(*deferred_b_generation);
     track_fsync = false;
 
     // Linux establishes one filesystem-wide data+metadata barrier, then one
@@ -482,6 +484,107 @@ MACHA_TEST("invariants", test_authoritative_deferred_generation_batches_stable_s
 #endif
 }
 
+MACHA_TEST("invariants", test_local_store_barrier_remembers_complete_physical_cut) {
+#if defined(__linux__)
+    TempDir t;
+    const auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    LocalStore store(t.path() / "objects", 64ULL * 1024 * 1024, keys.storage);
+    REQUIRE(wait_until([&] { return store.scan_complete(); }));
+
+    const auto a = pattern(256 * 1024, 47);
+    const auto b = pattern(256 * 1024, 48);
+    const auto ga = store.put_deferred(object_id(a), a);
+    const auto gb = store.put_deferred(object_id(b), b);
+    REQUIRE(ga.has_value());
+    REQUIRE(gb.has_value());
+    REQUIRE(*gb > *ga);
+
+    fsync_calls = 0;
+    syncfs_calls = 0;
+    track_fsync = true;
+    store.durability_barrier(*ga);
+    track_fsync = false;
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
+    CHECK(store.durable_generation() >= *gb);
+
+    // Start a newer dirty generation after the physical cut. A queued barrier
+    // for gb must still return immediately: gb was made durable by the earlier
+    // syncfs even though newer unrelated data is now provisional.
+    const auto c = pattern(256 * 1024, 49);
+    const auto gc = store.put_deferred(object_id(c), c);
+    REQUIRE(gc.has_value());
+    REQUIRE(*gc > *gb);
+
+    fsync_calls = 0;
+    syncfs_calls = 0;
+    track_fsync = true;
+    store.durability_barrier(*gb);
+    track_fsync = false;
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 0);
+    CHECK(fsync_calls.load(std::memory_order_relaxed) == 0);
+
+    fsync_calls = 0;
+    syncfs_calls = 0;
+    track_fsync = true;
+    store.durability_barrier(*gc);
+    track_fsync = false;
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
+    CHECK(fsync_calls.load(std::memory_order_relaxed) == 1);
+#else
+    std::cout << "[ARCH-REGRESSION] local generation cut check is Linux-only; skipped\n";
+#endif
+}
+
+MACHA_TEST("invariants", test_storage_pool_generation_advances_with_group_commit) {
+#if defined(__linux__)
+    TempDir t;
+    const auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto disk = t.path() / "disk";
+    std::filesystem::create_directories(disk);
+    StoragePool pool(t.path() / "state", random_node_id(),
+                     {{disk, 64ULL * 1024 * 1024}}, keys.storage);
+    REQUIRE(wait_until([&] { return pool.online_backends() == 1; }));
+
+    const auto a = pattern(256 * 1024, 50);
+    const auto b = pattern(256 * 1024, 51);
+    const auto ga = pool.put_deferred(object_id(a), a);
+    const auto gb = pool.put_deferred(object_id(b), b);
+    REQUIRE(ga.has_value());
+    REQUIRE(gb.has_value());
+    REQUIRE(*gb > *ga);
+
+    fsync_calls = 0;
+    syncfs_calls = 0;
+    track_fsync = true;
+    pool.durability_barrier(*ga);
+    track_fsync = false;
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
+    CHECK(pool.durable_generation() >= *gb);
+
+    const auto c = pattern(256 * 1024, 52);
+    const auto gc = pool.put_deferred(object_id(c), c);
+    REQUIRE(gc.has_value());
+
+    syncfs_calls = 0;
+    track_fsync = true;
+    pool.durability_barrier(*gb);
+    track_fsync = false;
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 0);
+
+    syncfs_calls = 0;
+    track_fsync = true;
+    pool.durability_barrier(*gc);
+    track_fsync = false;
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
+#else
+    std::cout << "[ARCH-REGRESSION] storage-pool generation cut check is Linux-only; skipped\n";
+#endif
+}
+
 MACHA_TEST("invariants", test_immediate_reaffirmation_flushes_provisional_generation) {
 #if defined(__linux__)
     TempDir t;
@@ -493,7 +596,7 @@ MACHA_TEST("invariants", test_immediate_reaffirmation_flushes_provisional_genera
 
     const auto bytes = pattern(256 * 1024, 35);
     const auto id = object_id(bytes);
-    REQUIRE(store.put(id, bytes, StoreWriteDurability::deferred));
+    REQUIRE(store.put_deferred(id, bytes).has_value());
 
     fsync_calls = 0;
     syncfs_calls = 0;
@@ -618,6 +721,7 @@ MACHA_TEST("invariants", test_deferred_object_barrier_rejects_stale_process_epoc
     REQUIRE(placed.message.type == MessageType::ok);
     Reader placed_reply(placed.message.payload);
     NodeId acknowledged_epoch{placed_reply.fixed<16>()};
+    const auto acknowledged_generation = placed_reply.u64();
     placed_reply.finish();
     CHECK(acknowledged_epoch == node.durability_epoch());
 
@@ -626,16 +730,88 @@ MACHA_TEST("invariants", test_deferred_object_barrier_rejects_stale_process_epoc
     while (wrong_epoch == acknowledged_epoch)
         wrong_epoch = random_node_id();
     stale.fixed(wrong_epoch.bytes);
+    stale.u64(acknowledged_generation);
     auto rejected = node.call(endpoint, MessageType::object_durability_barrier, stale.data(),
                               FrameType::read_ahead);
     CHECK(rejected.message.type == MessageType::error);
 
     Writer current;
     current.fixed(acknowledged_epoch.bytes);
+    current.u64(acknowledged_generation);
     auto durable = node.call(endpoint, MessageType::object_durability_barrier, current.data(),
                              FrameType::read_ahead);
     CHECK(durable.message.type == MessageType::ok);
     node.stop();
+}
+
+MACHA_TEST("invariants", test_rpc_durability_barrier_reuses_already_covered_generation) {
+#if defined(__linux__)
+    TestCluster cluster(ConfigProfile::isolated);
+    auto config = cluster.node_config("durability-generation-rpc");
+    config.replication = 1;
+    config.metadata_replication = 1;
+    NodeRuntime node(config, cluster.keys());
+    node.start();
+    const Endpoint endpoint{"127.0.0.1", config.port};
+
+    auto defer = [&](uint8_t seed) {
+        const auto bytes = pattern(64 * 1024, seed);
+        Writer request;
+        request.fixed(object_id(bytes).bytes);
+        request.bytes(bytes);
+        auto reply = node.call(endpoint, MessageType::put_object_deferred, request.data(),
+                               FrameType::read_ahead);
+        REQUIRE(reply.message.type == MessageType::ok);
+        Reader reader(reply.message.payload);
+        NodeId epoch{reader.fixed<16>()};
+        const auto generation = reader.u64();
+        reader.finish();
+        return std::pair{epoch, generation};
+    };
+    auto barrier = [&](const NodeId& epoch, uint64_t generation) {
+        Writer request;
+        request.fixed(epoch.bytes);
+        request.u64(generation);
+        return node.call(endpoint, MessageType::object_durability_barrier, request.data(),
+                         FrameType::read_ahead);
+    };
+
+    const auto [epoch_a, ga] = defer(53);
+    const auto [epoch_b, gb] = defer(54);
+    REQUIRE(epoch_a == epoch_b);
+    REQUIRE(gb > ga);
+
+    syncfs_calls = 0;
+    track_fsync = true;
+    auto first = barrier(epoch_a, ga);
+    track_fsync = false;
+    REQUIRE(first.message.type == MessageType::ok);
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
+
+    // Make the store dirty again after the cut, exactly as the local FUSE
+    // recovery writer does in production. The queued barrier for gb was already
+    // covered by the first syncfs and must not flush this newer generation.
+    const auto [epoch_c, gc] = defer(55);
+    REQUIRE(epoch_c == epoch_a);
+    REQUIRE(gc > gb);
+
+    syncfs_calls = 0;
+    track_fsync = true;
+    auto covered = barrier(epoch_b, gb);
+    track_fsync = false;
+    REQUIRE(covered.message.type == MessageType::ok);
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 0);
+
+    syncfs_calls = 0;
+    track_fsync = true;
+    auto latest = barrier(epoch_c, gc);
+    track_fsync = false;
+    REQUIRE(latest.message.type == MessageType::ok);
+    CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
+    node.stop();
+#else
+    std::cout << "[ARCH-REGRESSION] RPC generation reuse check is Linux-only; skipped\n";
+#endif
 }
 
 MACHA_TEST("invariants", test_authenticated_receiver_enforces_transport_lane) {

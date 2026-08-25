@@ -27,6 +27,7 @@ class DistributedStore {
     struct DurableReplica {
         NodeId id{};
         NodeId epoch{};
+        uint64_t generation{};
 
         friend bool operator==(const DurableReplica&, const DurableReplica&) = default;
     };
