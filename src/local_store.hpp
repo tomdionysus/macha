@@ -2,6 +2,7 @@
 #pragma once
 #include "crypto.hpp"
 #include <atomic>
+#include <cstdint>
 #include <filesystem>
 #include <mutex>
 #include <optional>
@@ -19,6 +20,16 @@ class StorageLock {
     StorageLock& operator=(const StorageLock&) = delete;
 };
 
+enum class StoreWriteDurability : uint8_t {
+    immediate,
+    deferred,
+};
+
+enum class LocalStoreMode : uint8_t {
+    authoritative,
+    ephemeral,
+};
+
 class LocalStore {
   public:
     // A maintenance cursor owns the filesystem iterator state between scheduler
@@ -33,6 +44,7 @@ class LocalStore {
     std::filesystem::path root_, objects_, accounting_path_;
     uint64_t limit_;
     std::array<uint8_t, 32> key_;
+    LocalStoreMode mode_{LocalStoreMode::authoritative};
     std::atomic<uint64_t> used_{};
     mutable std::mutex m_;
     std::jthread scan_thread_;
@@ -41,18 +53,35 @@ class LocalStore {
     int accounting_fd_{-1};
     uint64_t accounting_sequence_{};
     unsigned accounting_slot_{};
+    bool accounting_dirty_{};
+#if !defined(__linux__)
+    // Linux can establish one filesystem-wide durability generation with
+    // syncfs(). Portable fallback platforms retain the paths touched by a
+    // deferred generation and fsync them only at the publication barrier.
+    std::vector<std::filesystem::path> deferred_files_;
+    std::vector<std::filesystem::path> deferred_directories_;
+#endif
     std::filesystem::path path(const ObjectId&) const;
     void wait_for_accounting(std::unique_lock<std::mutex>&) const;
     bool restore_accounting();
     void persist_accounting(uint64_t used, uint8_t operation, const ObjectId&, uint64_t size,
                             bool durable);
+    void mark_accounting_dirty_locked();
+    void checkpoint_accounting_locked();
+    void durability_barrier_locked();
     void scan(std::stop_token);
-    bool remove_locked(const ObjectId&);
+    bool remove_locked(const ObjectId&, StoreWriteDurability);
 
   public:
-    LocalStore(std::filesystem::path, uint64_t, std::array<uint8_t, 32>);
+    LocalStore(std::filesystem::path, uint64_t, std::array<uint8_t, 32>,
+               LocalStoreMode = LocalStoreMode::authoritative);
     ~LocalStore();
-    bool put(const ObjectId&, std::span<const uint8_t>);
+    bool put(const ObjectId&, std::span<const uint8_t>,
+             StoreWriteDurability = StoreWriteDurability::immediate);
+    // Establish stable storage for every deferred authoritative mutation which
+    // completed before this call. The caller uses this as the publication
+    // generation barrier immediately before metadata makes those objects live.
+    void durability_barrier();
     std::optional<Bytes> get(const ObjectId&) const;
     bool has(const ObjectId&) const;
     // Strong presence predicate for durability/repair decisions. Unlike has(),

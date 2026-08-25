@@ -20,6 +20,7 @@ constexpr size_t accounting_body_size = accounting_slot_size - 32;
 constexpr uint8_t accounting_none = 0;
 constexpr uint8_t accounting_put = 1;
 constexpr uint8_t accounting_remove = 2;
+constexpr uint8_t accounting_dirty = 3;
 
 struct AccountingRecord {
     uint64_t sequence{};
@@ -99,7 +100,7 @@ std::optional<AccountingRecord> decode_accounting(std::span<const uint8_t> bytes
         record.operation = reader.u8();
         record.size = reader.u64();
         record.id.bytes = reader.fixed<32>();
-        if (record.operation > accounting_remove)
+        if (record.operation > accounting_dirty)
             return {};
         return record;
     } catch (...) {
@@ -158,6 +159,21 @@ void syncdir(const std::filesystem::path& p) {
         close(f);
     }
 }
+
+#if !defined(__linux__)
+void sync_file(const std::filesystem::path& p) {
+    int f = ::open(p.c_str(), O_RDONLY);
+    if (f < 0)
+        throw std::runtime_error("cannot open deferred object for sync: " +
+                                 std::string(strerror(errno)));
+    int rc;
+    do { rc = ::fsync(f); } while (rc != 0 && errno == EINTR);
+    const int saved = errno;
+    ::close(f);
+    if (rc != 0)
+        throw std::runtime_error("cannot sync deferred object: " + std::string(strerror(saved)));
+}
+#endif
 } // namespace
 
 StorageLock::StorageLock(const std::filesystem::path& root) {
@@ -181,10 +197,19 @@ StorageLock::~StorageLock() {
     }
 }
 
-LocalStore::LocalStore(std::filesystem::path r, uint64_t l, std::array<uint8_t, 32> k)
+LocalStore::LocalStore(std::filesystem::path r, uint64_t l, std::array<uint8_t, 32> k,
+                       LocalStoreMode mode)
     : root_(std::move(r)), objects_(root_ / "objects"),
-      accounting_path_(root_ / ".macha.accounting"), limit_(l), key_(k) {
+      accounting_path_(root_ / ".macha.accounting"), limit_(l), key_(k), mode_(mode) {
     std::filesystem::create_directories(objects_);
+    if (mode_ == LocalStoreMode::ephemeral) {
+        // Cache contents are explicitly disposable. Reconcile their byte count
+        // from the directory tree and never create a false durability contract
+        // through the authoritative accounting journal.
+        scan_thread_ = std::jthread([this](std::stop_token stop) { scan(stop); });
+        return;
+    }
+
     accounting_fd_ = ::open(accounting_path_.c_str(), O_RDWR | O_CREAT, 0600);
     if (accounting_fd_ < 0)
         throw std::runtime_error("cannot open accounting state: " + std::string(strerror(errno)));
@@ -204,7 +229,14 @@ LocalStore::~LocalStore() {
         scan_thread_.join();
     }
     if (accounting_fd_ >= 0) {
-        if (accounting_trusted_.load(std::memory_order_acquire)) {
+        try {
+            durability_barrier();
+        } catch (...) {
+            // Destructors cannot report a failed final checkpoint. A durable
+            // dirty marker remains behind, forcing exact tree reconciliation
+            // rather than trusting stale accounting on the next start.
+        }
+        if (accounting_trusted_.load(std::memory_order_acquire) && !accounting_dirty_) {
             try {
                 ObjectId none{};
                 persist_accounting(used_.load(std::memory_order_relaxed), accounting_none, none, 0, true);
@@ -256,6 +288,13 @@ bool LocalStore::restore_accounting() {
 
     accounting_sequence_ = best->sequence;
     accounting_slot_ = best_slot;
+    if (best->operation == accounting_dirty) {
+        // A deferred publication generation began but never installed a clean
+        // accounting checkpoint. Object data may be wholly durable, partially
+        // durable, or absent; the object tree is authoritative and is rebuilt
+        // in the background before new capacity mutations are admitted.
+        return false;
+    }
     uint64_t restored = best->used;
     if (best->operation == accounting_put) {
         if (std::filesystem::exists(path(best->id))) {
@@ -277,7 +316,26 @@ bool LocalStore::restore_accounting() {
     }
     return true;
 }
-bool LocalStore::put(const ObjectId& i, std::span<const uint8_t> d) {
+
+void LocalStore::mark_accounting_dirty_locked() {
+    if (mode_ == LocalStoreMode::ephemeral || accounting_dirty_)
+        return;
+    ObjectId none{};
+    persist_accounting(used_.load(std::memory_order_relaxed), accounting_dirty, none, 0, true);
+    accounting_dirty_ = true;
+}
+
+void LocalStore::checkpoint_accounting_locked() {
+    if (mode_ == LocalStoreMode::ephemeral || !accounting_dirty_)
+        return;
+    ObjectId none{};
+    persist_accounting(used_.load(std::memory_order_relaxed), accounting_none, none, 0, true);
+    accounting_dirty_ = false;
+    accounting_trusted_.store(true, std::memory_order_release);
+}
+
+bool LocalStore::put(const ObjectId& i, std::span<const uint8_t> d,
+                     StoreWriteDurability durability) {
     if (object_id(d) != i)
         throw std::runtime_error("object hash mismatch");
     auto p = path(i);
@@ -290,6 +348,14 @@ bool LocalStore::put(const ObjectId& i, std::span<const uint8_t> d) {
             auto existing = get(i);
             if (existing && existing->size() == d.size() &&
                 std::equal(existing->begin(), existing->end(), d.begin())) {
+                // An immediate caller may encounter an object installed by a
+                // concurrent WAL-backed generation which has not crossed its
+                // stable-storage barrier yet. Preserve the historical strict
+                // put() contract by making that generation durable before
+                // reaffirming the object to the immediate caller.
+                if (mode_ == LocalStoreMode::authoritative &&
+                    durability == StoreWriteDurability::immediate && accounting_dirty_)
+                    durability_barrier_locked();
                 touch(i);
                 return true;
             }
@@ -304,12 +370,20 @@ bool LocalStore::put(const ObjectId& i, std::span<const uint8_t> d) {
             auto existing = get(i);
             if (existing && existing->size() == d.size() &&
                 std::equal(existing->begin(), existing->end(), d.begin())) {
+                // An immediate caller may encounter an object installed by a
+                // concurrent WAL-backed generation which has not crossed its
+                // stable-storage barrier yet. Preserve the historical strict
+                // put() contract by making that generation durable before
+                // reaffirming the object to the immediate caller.
+                if (mode_ == LocalStoreMode::authoritative &&
+                    durability == StoreWriteDurability::immediate && accounting_dirty_)
+                    durability_barrier_locked();
                 touch(i);
                 return true;
             }
         } catch (...) {
         }
-        if (!remove_locked(i) && std::filesystem::exists(p))
+        if (!remove_locked(i, durability) && std::filesystem::exists(p))
             throw std::runtime_error("cannot replace corrupt local object");
     }
     auto s = aes_gcm_seal(key_, d, i.bytes);
@@ -322,10 +396,23 @@ bool LocalStore::put(const ObjectId& i, std::span<const uint8_t> d) {
     if (used_.load(std::memory_order_relaxed) + need > limit_)
         return false;
     const auto before = used_.load(std::memory_order_relaxed);
-    // Make the single pending mutation durable before changing the object tree.
-    // If the process dies after rename, startup resolves this record by checking
-    // only this content-addressed path rather than scanning the complete store.
-    persist_accounting(before, accounting_put, i, need, true);
+    const bool ephemeral = mode_ == LocalStoreMode::ephemeral;
+    const bool deferred = !ephemeral && durability == StoreWriteDurability::deferred;
+    const bool transactional_accounting = !ephemeral && !deferred && !accounting_dirty_;
+
+    if (deferred) {
+        // The spool/journal is the WAL for this publication generation. Persist
+        // one DIRTY accounting marker before the first provisional object, then
+        // allow the OS to batch all object data and namespace changes until the
+        // publication barrier.
+        mark_accounting_dirty_locked();
+    } else if (transactional_accounting) {
+        // Ordinary authoritative puts retain the historical immediate contract:
+        // a successful return means this individual object and its pathname are
+        // stable, while the small pending record keeps accounting O(1) recoverable.
+        persist_accounting(before, accounting_put, i, need, true);
+    }
+
     std::filesystem::create_directories(p.parent_path());
     auto t = p.string() + ".tmp." + std::to_string(getpid()) + "." + std::to_string(unix_ms());
     int f = ::open(t.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
@@ -334,27 +421,36 @@ bool LocalStore::put(const ObjectId& i, std::span<const uint8_t> d) {
     try {
         wa(f, h.data());
         wa(f, s.ciphertext);
-        if (fsync(f))
+        if (!ephemeral && !deferred && fsync(f))
             throw std::runtime_error(strerror(errno));
         if (close(f))
             throw std::runtime_error(strerror(errno));
         f = -1;
         if (rename(t.c_str(), p.c_str()))
             throw std::runtime_error(strerror(errno));
-        syncdir(p.parent_path());
+        if (!ephemeral && !deferred)
+            syncdir(p.parent_path());
+#if !defined(__linux__)
+        if (deferred) {
+            deferred_files_.push_back(p);
+            deferred_directories_.push_back(p.parent_path());
+        }
+#endif
         used_.store(before + need, std::memory_order_relaxed);
-        ObjectId none{};
-        // The next mutation's durable intent also flushes this clean checkpoint;
-        // destructor performs a final durable sync. The older slot retains the
-        // durable pending record until then, so crash recovery remains O(1).
-        persist_accounting(before + need, accounting_none, none, 0, false);
+        if (transactional_accounting) {
+            ObjectId none{};
+            // The next mutation's durable intent also flushes this clean checkpoint;
+            // destructor performs a final durable sync. The older slot retains the
+            // durable pending record until then, so crash recovery remains O(1).
+            persist_accounting(before + need, accounting_none, none, 0, false);
+        }
         return true;
     } catch (...) {
         if (f >= 0)
             close(f);
         std::error_code e;
         std::filesystem::remove(t, e);
-        if (!std::filesystem::exists(p)) {
+        if (transactional_accounting && !std::filesystem::exists(p)) {
             ObjectId none{};
             try { persist_accounting(before, accounting_none, none, 0, true); } catch (...) {}
         }
@@ -389,7 +485,7 @@ bool LocalStore::valid(const ObjectId& i) const noexcept {
         return false;
     }
 }
-bool LocalStore::remove_locked(const ObjectId& i) {
+bool LocalStore::remove_locked(const ObjectId& i, StoreWriteDurability durability) {
     auto p = path(i);
     std::error_code e;
     auto n = std::filesystem::file_size(p, e);
@@ -398,23 +494,80 @@ bool LocalStore::remove_locked(const ObjectId& i) {
     const auto before = used_.load(std::memory_order_relaxed);
     if (n > before)
         throw std::runtime_error("local accounting underflow");
-    persist_accounting(before, accounting_remove, i, n, true);
+
+    const bool ephemeral = mode_ == LocalStoreMode::ephemeral;
+    const bool deferred = !ephemeral && durability == StoreWriteDurability::deferred;
+    const bool transactional_accounting = !ephemeral && !deferred && !accounting_dirty_;
+    if (deferred)
+        mark_accounting_dirty_locked();
+    else if (transactional_accounting)
+        persist_accounting(before, accounting_remove, i, n, true);
+
     if (!std::filesystem::remove(p, e)) {
-        ObjectId none{};
-        persist_accounting(before, accounting_none, none, 0, true);
+        if (transactional_accounting) {
+            ObjectId none{};
+            persist_accounting(before, accounting_none, none, 0, true);
+        }
         return false;
     }
-    syncdir(p.parent_path());
+    if (!ephemeral && !deferred)
+        syncdir(p.parent_path());
+#if !defined(__linux__)
+    if (deferred)
+        deferred_directories_.push_back(p.parent_path());
+#endif
     used_.store(before - n, std::memory_order_relaxed);
-    ObjectId none{};
-    persist_accounting(before - n, accounting_none, none, 0, false);
+    if (transactional_accounting) {
+        ObjectId none{};
+        persist_accounting(before - n, accounting_none, none, 0, false);
+    }
     return true;
+}
+
+void LocalStore::durability_barrier_locked() {
+    if (mode_ == LocalStoreMode::ephemeral || accounting_fd_ < 0 || !accounting_dirty_)
+        return;
+
+#if defined(__linux__)
+    int rc;
+    do { rc = ::syncfs(accounting_fd_); } while (rc != 0 && errno == EINTR);
+    if (rc != 0)
+        throw std::runtime_error("cannot sync deferred storage generation: " +
+                                 std::string(strerror(errno)));
+#else
+    for (const auto& file : deferred_files_)
+        sync_file(file);
+    std::sort(deferred_directories_.begin(), deferred_directories_.end());
+    deferred_directories_.erase(
+        std::unique(deferred_directories_.begin(), deferred_directories_.end()),
+        deferred_directories_.end());
+    for (const auto& directory : deferred_directories_)
+        syncdir(directory);
+#endif
+
+    // Only advertise exact O(1) accounting after every object mutation in this
+    // generation is stable. A crash before this checkpoint sees DIRTY and does
+    // the existing background object-tree reconciliation instead of trusting a
+    // stale byte count.
+    checkpoint_accounting_locked();
+#if !defined(__linux__)
+    deferred_files_.clear();
+    deferred_directories_.clear();
+#endif
+}
+
+void LocalStore::durability_barrier() {
+    if (mode_ == LocalStoreMode::ephemeral || accounting_fd_ < 0)
+        return;
+    std::unique_lock g(m_);
+    wait_for_accounting(g);
+    durability_barrier_locked();
 }
 
 bool LocalStore::remove(const ObjectId& i) {
     std::unique_lock g(m_);
     wait_for_accounting(g);
-    return remove_locked(i);
+    return remove_locked(i, StoreWriteDurability::immediate);
 }
 
 bool LocalStore::remove_if_older_than(const ObjectId& i, std::chrono::milliseconds age) {
@@ -424,7 +577,7 @@ bool LocalStore::remove_if_older_than(const ObjectId& i, std::chrono::millisecon
     const auto modified = std::filesystem::last_write_time(path(i), error);
     if (error || std::filesystem::file_time_type::clock::now() - modified < age)
         return false;
-    return remove_locked(i);
+    return remove_locked(i, StoreWriteDurability::immediate);
 }
 std::vector<ObjectId> LocalStore::list() const {
     std::vector<ObjectId> out;
@@ -549,9 +702,12 @@ void LocalStore::scan(std::stop_token stop) {
     {
         std::lock_guard guard(m_);
         used_.store(n, std::memory_order_relaxed);
-        ObjectId none{};
-        persist_accounting(n, accounting_none, none, 0, true);
-        accounting_trusted_.store(true, std::memory_order_release);
+        if (mode_ == LocalStoreMode::authoritative) {
+            ObjectId none{};
+            persist_accounting(n, accounting_none, none, 0, true);
+            accounting_trusted_.store(true, std::memory_order_release);
+            accounting_dirty_ = false;
+        }
         scan_complete_.store(true, std::memory_order_release);
     }
     Log::debug("storage accounting scan complete path=" + root_.string() +

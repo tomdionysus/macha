@@ -245,6 +245,8 @@ class ScopedFd {
 };
 
 struct FuseFrontend::State {
+    static constexpr size_t spool_checksum_chunk_size = 256 * 1024;
+
     struct DataOp {
         enum class Kind : uint8_t { write, truncate };
         Kind kind{Kind::write};
@@ -255,6 +257,9 @@ struct FuseFrontend::State {
         uint64_t size{};
         int64_t mtime_ns{};
         int64_t ctime_ns{};
+        // New journal records carry one SHA-256 per bounded spool chunk. Empty
+        // means a legacy pre-checksum record and remains replay-compatible.
+        std::vector<Hash256> spool_hashes;
     };
 
     struct Inode {
@@ -282,6 +287,11 @@ struct FuseFrontend::State {
         int spool_fd{-1};
         std::filesystem::path spool_path;
         uint64_t spool_end{};
+        // Recovery-local validation failure. The durable journal remains the
+        // authority for which generation is pending, but a missing/truncated
+        // spool invalidates only this inode's dirty generation rather than the
+        // complete mounted filesystem.
+        std::optional<std::string> recovery_spool_error;
         // Writes admitted to the local spool can wait together for one durable
         // payload+journal barrier. admitted_size reserves O_APPEND offsets while
         // those writes are not yet visible to readers.
@@ -331,6 +341,7 @@ struct FuseFrontend::State {
         namespace_done = 5,
         data_published = 6,
         data_done = 7,
+        data_abandoned = 8,
     };
 
     struct JournalInode {
@@ -552,6 +563,11 @@ struct FuseFrontend::State {
         writer.u64(op.size);
         writer.i64(op.mtime_ns);
         writer.i64(op.ctime_ns);
+        if (op.spool_hashes.size() > UINT32_MAX)
+            throw FsError(EFBIG, "too many FUSE spool checksum chunks");
+        writer.u32(static_cast<uint32_t>(op.spool_hashes.size()));
+        for (const auto& hash : op.spool_hashes)
+            writer.fixed(hash.bytes);
     }
 
     static std::pair<uint64_t, DataOp> decode_data_op(Reader& reader) {
@@ -568,6 +584,23 @@ struct FuseFrontend::State {
         op.size = reader.u64();
         op.mtime_ns = reader.i64();
         op.ctime_ns = reader.i64();
+        if (reader.remaining()) {
+            const auto count = reader.u32();
+            const auto maximum = op.kind == DataOp::Kind::write
+                                     ? (op.length + spool_checksum_chunk_size - 1) /
+                                           spool_checksum_chunk_size
+                                     : 0;
+            if (count > maximum)
+                throw DecodeError("FUSE data journal checksum count is invalid");
+            op.spool_hashes.reserve(count);
+            for (uint32_t i = 0; i < count; ++i) {
+                Hash256 hash;
+                hash.bytes = reader.fixed<32>();
+                op.spool_hashes.push_back(hash);
+            }
+            if (op.kind == DataOp::Kind::write && count != maximum)
+                throw DecodeError("FUSE data journal checksum coverage is incomplete");
+        }
         return {inode, op};
     }
 
@@ -775,6 +808,20 @@ struct FuseFrontend::State {
         return previous == retired;
     }
 
+    bool journal_data_abandoned(uint64_t inode, uint64_t sequence, size_t retired) {
+        std::lock_guard admission_lock(journal_admission_mutex);
+        Writer payload;
+        payload.u8(static_cast<uint8_t>(JournalRecord::data_abandoned));
+        payload.u64(inode);
+        payload.u64(sequence);
+        std::lock_guard lock(journal_mutex);
+        append_journal_record_locked(payload.data());
+        const auto previous = durable_pending_operations.fetch_sub(retired, std::memory_order_relaxed);
+        if (previous < retired)
+            throw std::logic_error("FUSE journal data abandonment underflow");
+        return previous == retired;
+    }
+
     static size_t read_fd_all(int fd, std::span<uint8_t> out) {
         size_t done = 0;
         while (done < out.size()) {
@@ -795,7 +842,7 @@ struct FuseFrontend::State {
         Reader reader(payload);
         const auto raw_type = reader.u8();
         if (raw_type < static_cast<uint8_t>(JournalRecord::inode) ||
-            raw_type > static_cast<uint8_t>(JournalRecord::data_done))
+            raw_type > static_cast<uint8_t>(JournalRecord::data_abandoned))
             throw DecodeError("unknown FUSE journal record type");
         const auto type = static_cast<JournalRecord>(raw_type);
         switch (type) {
@@ -908,6 +955,22 @@ struct FuseFrontend::State {
                           " sequence=" + std::to_string(sequence) +
                           " frame_offset=" + std::to_string(frame_offset));
             }
+            recovery.data_done[inode] = sequence;
+            break;
+        }
+        case JournalRecord::data_abandoned: {
+            const auto inode = reader.u64();
+            const auto sequence = reader.u64();
+            auto operations = recovery.data_ops.find(inode);
+            const bool has_operation =
+                operations != recovery.data_ops.end() &&
+                std::any_of(operations->second.begin(), operations->second.end(),
+                            [&](const DataOp& op) { return op.sequence == sequence; });
+            if (!has_operation)
+                throw DecodeError("FUSE data abandonment marker has no operation prefix");
+            auto done = recovery.data_done.find(inode);
+            if (done != recovery.data_done.end() && done->second >= sequence)
+                throw DecodeError("non-monotonic FUSE data abandonment marker");
             recovery.data_done[inode] = sequence;
             break;
         }
@@ -1371,6 +1434,11 @@ struct FuseFrontend::State {
         if (fd < 0) {
             fd = ::open(inode.spool_path.c_str(), O_RDWR);
             if (fd < 0) {
+                if (errno == ENOENT) {
+                    inode.spool_end = 0;
+                    inode.spool_path.clear();
+                    return true;
+                }
                 Log::warn("cannot open retired FUSE spool inode=" +
                           std::to_string(inode.id) + " error=" + std::strerror(errno));
                 return false;
@@ -1723,9 +1791,71 @@ struct FuseFrontend::State {
             throw FsError(EINTR, "FUSE publication stopping");
     }
 
-    void replay_data(const std::shared_ptr<Inode>& inode, DataSnapshot snapshot) {
+    void abandon_corrupt_data(const std::shared_ptr<Inode>& inode, std::string_view reason) {
+        uint64_t target = 0;
+        size_t retired = 0;
+        {
+            std::lock_guard lock(inode->mutex);
+            // Do not discard a file while newly accepted writes are still on
+            // their way to the local spool+journal barrier. Once that admission
+            // settles, retrying this publication can abandon the complete dirty
+            // generation atomically.
+            if (inode->durability_pending)
+                throw FsError(EAGAIN, "FUSE spool corruption raced pending write durability");
+            target = inode->durable_data_sequence;
+            retired = static_cast<size_t>(std::count_if(
+                inode->data_ops.begin(), inode->data_ops.end(),
+                [&](const DataOp& op) { return op.sequence <= target; }));
+        }
+        if (!retired)
+            return;
+
+        // Abandonment is itself journaled before the spool is reclaimed. A
+        // crash at any later point therefore cannot resurrect corrupt bytes.
+        const bool journal_idle = journal_data_abandoned(inode->id, target, retired);
+        bool spool_clean = true;
+        {
+            std::lock_guard lock(inode->mutex);
+            inode->data_ops.erase(
+                std::remove_if(inode->data_ops.begin(), inode->data_ops.end(),
+                               [&](const DataOp& op) { return op.sequence <= target; }),
+                inode->data_ops.end());
+            inode->published_data_sequence = std::max(inode->published_data_sequence, target);
+            inode->requested_data_sequence = inode->published_data_sequence;
+            inode->recovery_data_sequence = inode->published_data_sequence;
+            inode->unconfirmed_data_sequence = 0;
+            inode->unconfirmed_data_entry.reset();
+            // Preserve the last published generation. Only the dirty overlay is
+            // dropped; immutable extents already referenced by metadata are
+            // never touched by spool corruption handling.
+            inode->visible.size = inode->base.size;
+            inode->visible.mtime_ns = inode->base.mtime_ns;
+            inode->visible.ctime_ns = inode->base.ctime_ns;
+            if (inode->data_ops.empty())
+                spool_clean = retire_spool_locked(*inode);
+        }
+        if (journal_idle && spool_clean)
+            reset_journal_if_idle();
+        Log::warn("dropped corrupt FUSE spool generation inode=" + std::to_string(inode->id) +
+                  " sequence=" + std::to_string(target) + " reason=" + std::string(reason));
+        data_cv.notify_all();
+    }
+
+    void replay_data(const std::shared_ptr<Inode>& inode, DataSnapshot snapshot, bool recovery) {
         if (snapshot.operations.empty())
             return;
+
+        if (recovery) {
+            std::optional<std::string> spool_error;
+            {
+                std::lock_guard lock(inode->mutex);
+                spool_error = inode->recovery_spool_error;
+            }
+            if (spool_error) {
+                abandon_corrupt_data(inode, *spool_error);
+                return;
+            }
+        }
 
         // Order data only behind namespace mutations which are actually still
         // unpublished. A recovered inode descriptor can retain an old namespace
@@ -1775,7 +1905,14 @@ struct FuseFrontend::State {
         std::shared_ptr<WriteHandle> writer;
         ScopedFd replay_spool;
         try {
-            writer = fs.open_write(*snapshot.published_path, false, config.write_through_cache);
+            // The durable spool+journal is the WAL for this publication. New
+            // extents may therefore be staged provisionally and group-synced
+            // once, immediately before metadata publication. Crash-recovery
+            // replay deliberately bypasses cache admission so a large backlog
+            // cannot evict the useful working set merely by being replayed.
+            writer = fs.open_write(*snapshot.published_path, false,
+                                   config.write_through_cache && !recovery,
+                                   WriteDurability::publication_generation);
             constexpr size_t chunk_size = 256 * 1024;
             Bytes buffer(chunk_size);
             for (const auto& op : snapshot.operations) {
@@ -1803,8 +1940,23 @@ struct FuseFrontend::State {
                         replay_spool.reset(fd);
                     }
                     if (pread_exact(replay_spool.get(), {buffer.data(), chunk},
-                                    op.spool_offset + done) != chunk)
+                                    op.spool_offset + done) != chunk) {
+                        if (recovery) {
+                            abandon_corrupt_data(inode, "short read from FUSE write spool");
+                            return;
+                        }
                         throw FsError(EIO, "short read from FUSE write spool");
+                    }
+                    if (!op.spool_hashes.empty()) {
+                        const auto checksum_index = static_cast<size_t>(
+                            done / State::spool_checksum_chunk_size);
+                        if (checksum_index >= op.spool_hashes.size() ||
+                            sha256(std::span<const uint8_t>{buffer.data(), chunk}) !=
+                                op.spool_hashes[checksum_index]) {
+                            abandon_corrupt_data(inode, "payload checksum mismatch");
+                            return;
+                        }
+                    }
                     if (writer->write(op.offset + done, {buffer.data(), chunk}) != chunk)
                         throw FsError(EIO, "short replay into Macha write handle");
                     done += chunk;
@@ -1970,7 +2122,7 @@ struct FuseFrontend::State {
             bool retry = false;
             try {
                 auto snapshot = snapshot_data(inode);
-                replay_data(inode, std::move(snapshot));
+                replay_data(inode, std::move(snapshot), recovery);
             } catch (const std::exception& e) {
                 ++backend_failures;
                 retry = retryable_backend_error(e);
@@ -2203,8 +2355,14 @@ struct FuseFrontend::State {
             return;
         inode->spool_path = spool_dir / ("inode-" + std::to_string(inode->id) + ".spool");
         int fd = ::open(inode->spool_path.c_str(), O_RDWR);
-        if (fd < 0)
-            throw std::runtime_error("FUSE journal references missing spool " + inode->spool_path.string());
+        if (fd < 0) {
+            if (errno == ENOENT) {
+                inode->recovery_spool_error = "durable journal references missing spool";
+                inode->spool_end = 0;
+                return;
+            }
+            throw FsError(errno, "cannot open recovered FUSE spool");
+        }
         struct stat statbuf {};
         if (::fstat(fd, &statbuf) != 0) {
             const int saved = errno;
@@ -2214,7 +2372,10 @@ struct FuseFrontend::State {
         const auto size = static_cast<uint64_t>(statbuf.st_size);
         if (size < required) {
             ::close(fd);
-            throw std::runtime_error("FUSE spool is shorter than its durable operation journal");
+            inode->recovery_spool_error =
+                "spool is shorter than its durable operation journal";
+            inode->spool_end = size;
+            return;
         }
         ::close(fd);
         if (size > required)
@@ -3506,6 +3667,14 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
             ticket->op.spool_offset = spool_offset;
             ticket->op.mtime_ns = now;
             ticket->op.ctime_ns = now;
+            for (size_t checksum_offset = 0; checksum_offset < owned.size();
+                 checksum_offset += State::spool_checksum_chunk_size) {
+                const auto checksum_size = std::min(State::spool_checksum_chunk_size,
+                                                    owned.size() - checksum_offset);
+                ticket->op.spool_hashes.push_back(
+                    sha256(std::span<const uint8_t>{owned.data() + checksum_offset,
+                                                    checksum_size}));
+            }
 
             // Keep the inode descriptor alive across the asynchronous gap between
             // payload admission and the group-committed data-op frame. The

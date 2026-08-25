@@ -73,6 +73,7 @@ int64_t activity_now_ms() {
 NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
     : cfg_(normalize_config(std::move(config))), keys_(keys), state_lock_(cfg_.state_path),
       id_(load_or_create_node_id(cfg_.state_path)),
+      durability_epoch_(random_node_id()),
       local_(cfg_.state_path, id_, cfg_.storage_backends, keys_.storage),
       cache_(cfg_.cache, keys_.storage),
       meta_(cfg_.state_path, keys_.storage, cache_.metadata()),
@@ -179,6 +180,8 @@ void NodeRuntime::request_stop() {
 
 std::chrono::milliseconds NodeRuntime::stall_notice_for(MessageType type) const {
     if (type == MessageType::get_object || type == MessageType::put_object ||
+        type == MessageType::put_object_deferred ||
+        type == MessageType::object_durability_barrier ||
         type == MessageType::get_metadata_object ||
         type == MessageType::put_metadata_object)
         return cfg_.data_stall_notice;
@@ -373,16 +376,43 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             return {reply, writer.take()};
         }
         case MessageType::put_object:
+        case MessageType::put_object_deferred:
         case MessageType::put_metadata_object: {
             Reader reader(request.payload);
             ObjectId id{reader.fixed<32>()};
             auto data = reader.bytes(128 * 1024 * 1024);
             reader.finish();
             note_activity(frame_type, data.size());
-            if (!local_.put(id, data))
+            const auto durability = request.type == MessageType::put_object_deferred
+                                        ? StoreWriteDurability::deferred
+                                        : StoreWriteDurability::immediate;
+            if (!local_.put(id, data, durability))
                 return error_reply("storage limit reached");
             members_.storage(local_.used(), local_.limit());
+            if (request.type == MessageType::put_object_deferred) {
+                // Bind provisional placement to this exact process lifetime. A
+                // node which crashes after acknowledging the PUT but before the
+                // generation barrier must not let a post-restart barrier make
+                // the old provisional acknowledgement count as durable.
+                Writer reply;
+                reply.fixed(durability_epoch_.bytes);
+                return {MessageType::ok, reply.take()};
+            }
             return {MessageType::ok, {}};
+        }
+        case MessageType::object_durability_barrier: {
+            Reader reader(request.payload);
+            NodeId expected_epoch{reader.fixed<16>()};
+            reader.finish();
+            if (expected_epoch != durability_epoch_)
+                return error_reply("storage durability epoch changed");
+            try {
+                local_.durability_barrier();
+                members_.storage(local_.used(), local_.limit());
+                return {MessageType::ok, {}};
+            } catch (const std::exception& error) {
+                return error_reply(std::string("storage durability barrier failed: ") + error.what());
+            }
         }
         case MessageType::delete_object: {
             Reader reader(request.payload);

@@ -24,6 +24,25 @@ class DistributedStore {
         bool yielded{};
     };
 
+    struct DurableReplica {
+        NodeId id{};
+        NodeId epoch{};
+
+        friend bool operator==(const DurableReplica&, const DurableReplica&) = default;
+    };
+
+    struct DurabilityRequirement {
+        ObjectId id{};
+        size_t required{};
+        std::vector<DurableReplica> replicas;
+    };
+
+    struct DurabilityBatch {
+        std::vector<DurabilityRequirement> requirements;
+        bool empty() const noexcept { return requirements.empty(); }
+        void clear() { requirements.clear(); }
+    };
+
   private:
     struct SharedFetch {
         std::mutex mutex;
@@ -54,6 +73,7 @@ class DistributedStore {
     std::map<ObjectId, std::weak_ptr<SharedFetch>> fetches_;
     ReplicaSelector replica_selector_;
 
+    bool put_impl(const ObjectId&, std::span<const uint8_t>, std::atomic_bool*, DurabilityBatch*);
     std::vector<NodeInfo> ranked(const ObjectId&) const;
     std::vector<NodeInfo> owners(const ObjectId&) const;
     bool put_on(const NodeInfo&, const ObjectId&, std::span<const uint8_t>, bool foreground);
@@ -72,6 +92,11 @@ class DistributedStore {
     explicit DistributedStore(NodeRuntime& n) : n_(n) {}
     ObjectId put(std::span<const uint8_t>, std::atomic_bool* cancelled = nullptr);
     bool put(const ObjectId&, std::span<const uint8_t>, std::atomic_bool* cancelled = nullptr);
+    ObjectId put_deferred(std::span<const uint8_t>, DurabilityBatch&,
+                          std::atomic_bool* cancelled = nullptr);
+    bool put_deferred(const ObjectId&, std::span<const uint8_t>, DurabilityBatch&,
+                      std::atomic_bool* cancelled = nullptr);
+    bool durability_barrier(const DurabilityBatch&);
     std::optional<Bytes> get(const ObjectId&, size_t stripe = 0, bool foreground = true,
                              Clock::time_point deadline = {}, std::atomic_bool* cancelled = nullptr);
     std::optional<Bytes> get(const ObjectId&, size_t stripe, FrameType,

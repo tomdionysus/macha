@@ -69,6 +69,11 @@ class ReadHandle {
     size_t read(uint64_t, std::span<uint8_t>, Clock::time_point deadline = {},
                 std::atomic_bool* cancelled = nullptr);
 };
+enum class WriteDurability : uint8_t {
+    immediate,
+    publication_generation,
+};
+
 class WriteHandle {
     friend class FileSystem;
 class PlaybackTracker;
@@ -79,6 +84,8 @@ class PlaybackTracker;
     uint64_t expected_{};
     bool sequential_{}, dirty_{};
     bool cache_puts_{};
+    WriteDurability durability_{WriteDurability::immediate};
+    DistributedStore::DurabilityBatch durability_batch_;
     uint64_t logical_{}, staged_{};
     std::vector<ExtentRef> extents_;
     Bytes buffer_;
@@ -111,7 +118,8 @@ class PlaybackTracker;
     void diagnostic_stage_checkpoint(const char*);
 
   public:
-    WriteHandle(FileSystem&, std::string, FsEntry, bool, bool cache_puts = false);
+    WriteHandle(FileSystem&, std::string, FsEntry, bool, bool cache_puts = false,
+                WriteDurability = WriteDurability::immediate);
     ~WriteHandle();
     size_t write(uint64_t, std::span<const uint8_t>);
     void truncate(uint64_t);
@@ -199,7 +207,8 @@ class FileSystem {
                                           bool track_playback = true,
                                           FrameType frame_type = FrameType::foreground);
     std::optional<std::pair<std::string, FsEntry>> find_media(std::string_view);
-    std::shared_ptr<WriteHandle> open_write(const std::string&, bool, bool cache_puts = false);
+    std::shared_ptr<WriteHandle> open_write(const std::string&, bool, bool cache_puts = false,
+                                            WriteDurability = WriteDurability::immediate);
     std::optional<uint64_t> active_write_size(const std::string&);
     std::vector<WriteHandleDiagnostics> active_write_diagnostics(const std::string&);
     void commit_file(const std::string&, const FsEntry&, uint64_t,

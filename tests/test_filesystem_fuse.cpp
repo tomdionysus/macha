@@ -1195,7 +1195,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_rejects_unbacked_data_do
     CHECK(rejected);
 }
 
-MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_rejects_missing_spool) {
+MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_drops_only_inode_with_missing_spool) {
     TestService fixture("fuse-journal-missing-spool");
     auto& config = fixture.config();
     config.replication = 1;
@@ -1223,14 +1223,75 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_rejects_missing_spool) {
     REQUIRE(std::filesystem::exists(spool));
     REQUIRE(std::filesystem::remove(spool));
 
-    bool rejected = false;
-    try {
-        auto should_fail = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
-        should_fail->stop();
-    } catch (const std::exception&) {
-        rejected = true;
+    // The spool/journal is a per-inode WAL. Losing one dirty spool invalidates
+    // that generation, not the complete filesystem. Recovery journals the
+    // abandonment and falls back to the last committed manifest (empty here).
+    config.fuse.publication_quiet = 0ms;
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    REQUIRE(recovered->wait_for_idle(10s));
+    CHECK(service.filesystem().getattr("/recover.bin").size == 0);
+    recovered->stop();
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_recovery_checksum_drops_corrupt_generation_and_preserves_published_file) {
+    TestService fixture("fuse-journal-corrupt-spool");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 30s;
+
+    auto& service = fixture.start();
+    const auto published = pattern(768 * 1024, 61);
+    write_file(service.filesystem(), "/recover-corrupt.bin", published);
+
+    uint64_t inode = 0;
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto handle = frontend->open("/recover-corrupt.bin", true, true, false, false);
+        inode = handle.inode;
+        const auto replacement = pattern(published.size(), 62);
+        REQUIRE(frontend->write(inode, 0, replacement) == replacement.size());
+        service.filesystem().store().foreground_activity(1);
+        frontend->release(inode, true);
+        frontend->stop();
     }
-    CHECK(rejected);
+
+    const auto spool = config.state_path / "fuse-spool" /
+                       ("inode-" + std::to_string(inode) + ".spool");
+    REQUIRE(std::filesystem::exists(spool));
+    {
+        std::fstream file(spool, std::ios::binary | std::ios::in | std::ios::out);
+        REQUIRE(file.good());
+        char byte{};
+        file.read(&byte, 1);
+        REQUIRE(file.good());
+        byte ^= 0x5a;
+        file.seekp(0);
+        file.write(&byte, 1);
+        file.flush();
+        REQUIRE(file.good());
+    }
+
+    config.fuse.publication_quiet = 0ms;
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    REQUIRE(recovered->wait_for_idle(10s));
+
+    const auto committed = service.filesystem().getattr("/recover-corrupt.bin");
+    CHECK(committed.size == published.size());
+    auto reader = service.filesystem().open_read("/recover-corrupt.bin");
+    Bytes actual(published.size());
+    size_t done = 0;
+    while (done < actual.size()) {
+        const auto count = reader->read(done, {actual.data() + done, actual.size() - done});
+        REQUIRE(count > 0);
+        done += count;
+    }
+    CHECK(actual == published);
+    if (std::filesystem::exists(spool))
+        CHECK(std::filesystem::file_size(spool) == 0);
+    recovered->stop();
 }
 
 MACHA_TEST("filesystem_fuse", test_fuse_read_only_release_does_not_publish_writer_data) {

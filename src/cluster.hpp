@@ -26,6 +26,7 @@ class NodeRuntime {
     ClusterKeys keys_;
     StorageLock state_lock_;
     NodeId id_;
+    NodeId durability_epoch_;
     StoragePool local_;
     PersistentBlockCache cache_;
     MetadataReplica meta_;
@@ -69,6 +70,9 @@ class NodeRuntime {
     }
     NodeId node_id() const {
         return id_;
+    }
+    NodeId durability_epoch() const {
+        return durability_epoch_;
     }
     StoragePool& local_store() {
         return local_;
