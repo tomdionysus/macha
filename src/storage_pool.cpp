@@ -305,6 +305,9 @@ std::vector<std::shared_ptr<StoragePool::Backend>> StoragePool::ranked(const Obj
 
 bool StoragePool::put(const ObjectId& id, std::span<const uint8_t> data,
                       StoreWriteDurability durability) {
+    if (durability == StoreWriteDurability::deferred)
+        return put_deferred(id, data).has_value();
+
     for (const auto& backend : ranked(id)) {
         std::shared_ptr<LocalStore> store;
         std::filesystem::path path;
@@ -320,21 +323,8 @@ bool StoragePool::put(const ObjectId& id, std::span<const uint8_t> data,
             // the physical age when the content hash already exists, which keeps
             // reachability GC from racing a new write that reuses an old orphan.
             // Do not short-circuit this through has().
-            if (store->put(id, data, durability)) {
-                if (durability == StoreWriteDurability::deferred) {
-                    // Remember the exact LocalStore instance which accepted the
-                    // provisional object. A backend can disappear/reopen before
-                    // publication; node-level "online" state is not sufficient
-                    // evidence that this particular placement crossed a barrier.
-                    std::lock_guard durability_lock(durability_mutex_);
-                    const auto known = std::find_if(
-                        deferred_stores_.begin(), deferred_stores_.end(),
-                        [&](const DeferredStore& item) { return item.store == store; });
-                    if (known == deferred_stores_.end())
-                        deferred_stores_.push_back({backend, store});
-                }
+            if (store->put(id, data, StoreWriteDurability::immediate))
                 return true;
-            }
         } catch (const std::exception& error) {
             Log::debug("storage write failed " + path.string() + ": " + error.what());
             deactivate(backend, store, error.what());
@@ -343,32 +333,120 @@ bool StoragePool::put(const ObjectId& id, std::span<const uint8_t> data,
     return false;
 }
 
-void StoragePool::durability_barrier() {
-    // Serialize the generation cut with deferred-put registration. A put which
-    // finishes its physical write while this barrier is running cannot return
-    // to its caller until it has registered its store for the next generation.
-    std::lock_guard durability_lock(durability_mutex_);
-    if (deferred_stores_.empty())
-        return;
-
-    for (const auto& item : deferred_stores_) {
+std::optional<uint64_t> StoragePool::put_deferred(const ObjectId& id,
+                                                  std::span<const uint8_t> data) {
+    for (const auto& backend : ranked(id)) {
+        std::shared_ptr<LocalStore> store;
         std::filesystem::path path;
         {
-            std::lock_guard lock(item.backend->mutex);
-            path = item.backend->cfg.path;
+            std::lock_guard lock(backend->mutex);
+            if (!backend->online || !backend->store)
+                continue;
+            store = backend->store;
+            path = backend->cfg.path;
         }
         try {
-            item.store->durability_barrier();
+            const auto local_generation = store->put_deferred(id, data);
+            if (!local_generation)
+                continue;
+
+            std::lock_guard durability_lock(durability_mutex_);
+            // A concurrent barrier may have crossed this LocalStore generation
+            // between physical placement and registration. In that case the
+            // placement is already covered by the pool's last acknowledged
+            // generation and needs no new pending generation of its own.
+            if (*local_generation <= store->durable_generation())
+                return durable_generation_;
+
+            const auto generation = ++mutation_generation_;
+            deferred_generations_.push_back(
+                {generation, backend, store, *local_generation});
+            return generation;
+        } catch (const std::exception& error) {
+            Log::debug("storage deferred write failed " + path.string() + ": " + error.what());
+            deactivate(backend, store, error.what());
+        }
+    }
+    return {};
+}
+
+void StoragePool::durability_barrier(uint64_t required_generation) {
+    std::lock_guard durability_lock(durability_mutex_);
+    if (required_generation <= durable_generation_)
+        return;
+    if (required_generation > mutation_generation_)
+        throw std::runtime_error("storage-pool durability generation was never admitted");
+
+    struct Target {
+        std::shared_ptr<Backend> backend;
+        std::shared_ptr<LocalStore> store;
+        uint64_t local_generation{};
+    };
+    std::vector<Target> targets;
+    for (const auto& item : deferred_generations_) {
+        if (item.generation > required_generation)
+            break;
+        auto found = std::find_if(targets.begin(), targets.end(), [&](const Target& target) {
+            return target.store == item.store;
+        });
+        if (found == targets.end()) {
+            targets.push_back({item.backend, item.store, item.local_generation});
+        } else {
+            found->local_generation = std::max(found->local_generation, item.local_generation);
+        }
+    }
+
+    for (const auto& target : targets) {
+        std::filesystem::path path;
+        {
+            std::lock_guard lock(target.backend->mutex);
+            path = target.backend->cfg.path;
+        }
+        try {
+            target.store->durability_barrier(target.local_generation);
         } catch (const std::exception& error) {
             Log::warn("storage durability barrier failed " + path.string() + ": " + error.what());
-            deactivate(item.backend, item.store, error.what());
-            // Keep the complete touched-store set. Retrying the publication is
-            // allowed to establish a later barrier, but this generation must
-            // not be acknowledged after any one placement failed its barrier.
+            deactivate(target.backend, target.store, error.what());
             throw;
         }
     }
-    deferred_stores_.clear();
+
+    // A LocalStore barrier is a physical filesystem cut and can make later
+    // mutations durable as collateral group commit. Advance the node-wide
+    // frontier through every contiguous placement whose exact store generation
+    // is now known durable, not merely through the generation requested by this
+    // caller. This is what prevents queued stale barrier RPCs from repeatedly
+    // flushing unrelated newer recovery traffic.
+    for (const auto& item : deferred_generations_) {
+        if (item.generation <= durable_generation_)
+            continue;
+        if (item.store->durable_generation() < item.local_generation)
+            break;
+        durable_generation_ = item.generation;
+    }
+    deferred_generations_.erase(
+        deferred_generations_.begin(),
+        std::find_if(deferred_generations_.begin(), deferred_generations_.end(),
+                     [&](const DeferredGeneration& item) {
+                         return item.generation > durable_generation_;
+                     }));
+
+    if (required_generation > durable_generation_)
+        throw std::runtime_error("storage-pool durability barrier did not cover requested generation");
+}
+
+void StoragePool::durability_barrier() {
+    uint64_t generation = 0;
+    {
+        std::lock_guard durability_lock(durability_mutex_);
+        generation = mutation_generation_;
+    }
+    durability_barrier(generation);
+}
+
+uint64_t StoragePool::durable_generation() const {
+    std::lock_guard durability_lock(durability_mutex_);
+    return durable_generation_;
 }
 
 void StoragePool::observe_get(size_t bytes, uint64_t elapsed) const {

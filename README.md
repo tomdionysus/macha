@@ -10,6 +10,8 @@ There is no permanent master, cloud service or account system. Nodes share one c
 
 0.14.7 is usable but experimental. It is deliberately a media filesystem/server rather than a complete general-purpose POSIX filesystem. Streaming was introduced in 0.7.0 and links the FFmpeg libraries directly when enabled; no media subprocesses are launched.
 
+**0.15.2 upgrade:** stop or upgrade every cluster node together. Transport v14 adds generation-qualified deferred-object durability acknowledgements/barriers and rejects v13-and-earlier peers rather than allowing those payloads to be misparsed during a rolling mixed-version upgrade. The authoritative object format, metadata format, FUSE operation journal and existing spool data remain compatible with 0.15.1.
+
 **0.11.x upgrade:** stop every node before upgrading from 0.9.x. Transport v13 rejects v12-and-earlier peers; mixed-version operation is not supported. Existing 0.9.x SM7 checkpoints, DLT1 metadata journals, encrypted object files and backend accounting are read in place. New metadata is written as SM8/DLT2. Back up `state_path` first; after 0.10.x or 0.11.x has written new metadata, rollback to 0.9.x is unsupported. 0.11.0 does not change the 0.10.0 wire or storage formats.
 
 ## Documentation

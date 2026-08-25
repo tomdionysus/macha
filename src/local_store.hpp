@@ -54,6 +54,8 @@ class LocalStore {
     uint64_t accounting_sequence_{};
     unsigned accounting_slot_{};
     bool accounting_dirty_{};
+    uint64_t mutation_generation_{};
+    uint64_t durable_generation_{};
 #if !defined(__linux__)
     // Linux can establish one filesystem-wide durability generation with
     // syncfs(). Portable fallback platforms retain the paths touched by a
@@ -68,7 +70,8 @@ class LocalStore {
                             bool durable);
     void mark_accounting_dirty_locked();
     void checkpoint_accounting_locked();
-    void durability_barrier_locked();
+    bool put_impl(const ObjectId&, std::span<const uint8_t>, StoreWriteDurability, uint64_t*);
+    void durability_barrier_locked(uint64_t required_generation);
     void scan(std::stop_token);
     bool remove_locked(const ObjectId&, StoreWriteDurability);
 
@@ -78,10 +81,19 @@ class LocalStore {
     ~LocalStore();
     bool put(const ObjectId&, std::span<const uint8_t>,
              StoreWriteDurability = StoreWriteDurability::immediate);
-    // Establish stable storage for every deferred authoritative mutation which
-    // completed before this call. The caller uses this as the publication
-    // generation barrier immediately before metadata makes those objects live.
+    // Stage one WAL-backed authoritative mutation and return the local mutation
+    // generation which must be durable before that placement can be published.
+    std::optional<uint64_t> put_deferred(const ObjectId&, std::span<const uint8_t>);
+    // Establish stable storage through required_generation. A barrier which has
+    // already covered that generation is a no-op even if newer mutations are
+    // currently dirty; one physical barrier may therefore group-commit many
+    // otherwise independent publication generations.
+    void durability_barrier(uint64_t required_generation);
+    // Flush every deferred authoritative mutation currently admitted. Used by
+    // strict reaffirmation/destruction; publication paths should use the
+    // generation-qualified overload above.
     void durability_barrier();
+    uint64_t durable_generation() const;
     std::optional<Bytes> get(const ObjectId&) const;
     bool has(const ObjectId&) const;
     // Strong presence predicate for durability/repair decisions. Unlike has(),

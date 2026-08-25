@@ -47,12 +47,16 @@ class StoragePool {
     std::array<uint8_t, 32> key_{};
     mutable std::mutex mutex_;
     std::vector<std::shared_ptr<Backend>> backends_;
-    struct DeferredStore {
+    struct DeferredGeneration {
+        uint64_t generation{};
         std::shared_ptr<Backend> backend;
         std::shared_ptr<LocalStore> store;
+        uint64_t local_generation{};
     };
-    std::mutex durability_mutex_;
-    std::vector<DeferredStore> deferred_stores_;
+    mutable std::mutex durability_mutex_;
+    uint64_t mutation_generation_{};
+    uint64_t durable_generation_{};
+    std::vector<DeferredGeneration> deferred_generations_;
     Cursor rebalance_cursor_;
     Cursor scrub_cursor_;
     Cursor gc_cursor_;
@@ -81,7 +85,10 @@ class StoragePool {
 
     bool put(const ObjectId&, std::span<const uint8_t>,
              StoreWriteDurability = StoreWriteDurability::immediate);
+    std::optional<uint64_t> put_deferred(const ObjectId&, std::span<const uint8_t>);
+    void durability_barrier(uint64_t required_generation);
     void durability_barrier();
+    uint64_t durable_generation() const;
     std::optional<Bytes> get(const ObjectId&) const;
     bool has(const ObjectId&) const;
     bool valid(const ObjectId&) const;
