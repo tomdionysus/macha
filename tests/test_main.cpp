@@ -4276,7 +4276,7 @@ void test_fuse_recovery_spool_descriptors_are_bounded() {
     config.metadata_replication = 1;
     config.fuse.commit_workers = 1;
     config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 60s;
+    config.fuse.publication_quiet = 30s;
 
     Service service(config, keys);
     service.start();
@@ -4314,6 +4314,95 @@ void test_fuse_recovery_spool_descriptors_are_bounded() {
     }
     service.stop();
 #endif
+}
+
+void test_fuse_recovery_starts_without_new_fuse_activity() {
+    TempDir t;
+    auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto config = config_for(t.path() / "fuse-recovery-autostart", keyfile, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 4;
+    config.fuse.recovery_commit_workers = 2;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 300ms;
+
+    Service service(config, keys);
+    service.start();
+
+    // Create the paths through FUSE first and let their namespace operations
+    // fully settle. The subsequent journal therefore contains inode descriptors
+    // with historical namespace sequence numbers but no unpublished namespace
+    // work -- the shape seen after a long-running copy is restarted.
+    constexpr size_t files = 4;
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        for (size_t i = 0; i < files; ++i) {
+            auto created = frontend->create("/recover-autostart-" + std::to_string(i) + ".bin",
+                                            0644, getuid(), getgid(), true, true, false);
+            frontend->release(created.inode, true);
+        }
+        REQUIRE(frontend->wait_for_idle(10s));
+
+        // Hold the viewer/foreground gate closed while constructing the durable
+        // backlog. publication_quiet normally reduces live FUSE publication to
+        // foreground_commit_workers rather than disabling it, so merely checking
+        // pending_data here is timing-sensitive: one publisher may already be active.
+        // Refresh foreground activity until the frontend has been stopped so no
+        // distributed data publication can race this fixture.
+        auto payload = pattern(4 * config.extent_size);
+        service.filesystem().store().foreground_activity(1);
+        std::jthread hold_foreground([&](std::stop_token stop) {
+            while (!stop.stop_requested()) {
+                service.filesystem().store().foreground_activity(1);
+                std::this_thread::sleep_for(10ms);
+            }
+        });
+        for (size_t i = 0; i < files; ++i) {
+            auto handle = frontend->open("/recover-autostart-" + std::to_string(i) + ".bin",
+                                         true, true, false, false);
+            REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
+            frontend->release(handle.inode, true);
+        }
+        const auto staged = frontend->status();
+        CHECK(staged.pending_data >= files);
+        CHECK(staged.active_data == 0);
+        frontend->stop();
+        hold_foreground.request_stop();
+        hold_foreground.join();
+    }
+
+    // Let the real playback gate expire, then deliberately keep only the generic
+    // read-ahead/interactive activity clock hot. Recovery must ignore that clock:
+    // its own object writes use the same accounting and would otherwise throttle
+    // themselves. Do not issue any FUSE request after the restarted frontend is
+    // constructed.
+    REQUIRE(wait_until([&] {
+        return service.filesystem().foreground_idle_for() >= config.fuse.publication_quiet;
+    }, 2s));
+    service.filesystem().store().interactive_activity(1);
+
+    // With a recovery budget of two, both slots should become runnable immediately
+    // rather than waiting for a new rsync/getattr to kick the scheduler.
+    size_t max_recovery_active = 0;
+    {
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        const auto deadline = Clock::now() + 3s;
+        while (Clock::now() < deadline) {
+            const auto status = recovered->status();
+            max_recovery_active = std::max(max_recovery_active, status.active_recovery_data);
+            if (max_recovery_active >= config.fuse.recovery_commit_workers)
+                break;
+            std::this_thread::sleep_for(1ms);
+        }
+        REQUIRE(max_recovery_active == config.fuse.recovery_commit_workers);
+        recovered->stop();
+    }
+
+    service.stop();
 }
 
 void test_fuse_recovery_publication_concurrency_is_bounded() {
@@ -9114,6 +9203,7 @@ int main() {
         RUN_TEST(test_fuse_durable_journal_trims_checksum_invalid_complete_tail);
         RUN_TEST(test_fuse_durable_journal_preserves_unreferenced_spool);
         RUN_TEST(test_fuse_recovery_spool_descriptors_are_bounded);
+        RUN_TEST(test_fuse_recovery_starts_without_new_fuse_activity);
         RUN_TEST(test_fuse_recovery_publication_concurrency_is_bounded);
         RUN_TEST(test_fuse_durable_journal_accepts_authoritative_data_done_without_published_prefix);
         RUN_TEST(test_fuse_durable_journal_rejects_unbacked_data_done);

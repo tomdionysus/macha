@@ -421,10 +421,9 @@ struct FuseFrontend::State {
     std::deque<NamespaceOp> namespace_queue;
     std::deque<NamespaceOp> namespace_unconfirmed;
     bool namespace_inflight{};
+    uint64_t namespace_inflight_sequence{};
     std::jthread namespace_worker;
-    std::atomic_uint64_t published_namespace_sequence{};
     std::mutex publication_mutex;
-    std::condition_variable_any publication_cv;
 
     struct DataQueueItem {
         std::shared_ptr<Inode> inode;
@@ -442,6 +441,11 @@ struct FuseFrontend::State {
     // feeding a file, background publication must not fan out merely because
     // there was a short gap between kernel callbacks.
     std::atomic_size_t open_writers{};
+    // Recovery publication writes are ordinary read-ahead activity at the
+    // DistributedStore layer, so the store-wide activity clock cannot be used
+    // to decide whether FUSE itself is busy: recovery would throttle itself.
+    // Track actual kernel/FUSE callbacks separately.
+    std::atomic_int64_t last_mount_activity_ms{};
 
     std::array<BrokerQueue, 6> broker;
     std::atomic_size_t broker_pending{};
@@ -1635,6 +1639,7 @@ struct FuseFrontend::State {
                 op = namespace_queue.front();
                 namespace_queue.pop_front();
                 namespace_inflight = true;
+                namespace_inflight_sequence = op.sequence;
             }
 
             bool published = false;
@@ -1681,7 +1686,6 @@ struct FuseFrontend::State {
             }
 
             if (published) {
-                published_namespace_sequence.store(op.sequence, std::memory_order_release);
                 bool confirmed = false;
                 if (auto available = fs.available_snapshot_view())
                     confirmed = namespace_effect_confirmed(op, *available->snapshot);
@@ -1691,7 +1695,6 @@ struct FuseFrontend::State {
                     std::lock_guard lock(namespace_queue_mutex);
                     namespace_unconfirmed.push_back(op);
                 }
-                publication_cv.notify_all();
             } else if (!stopping.load()) {
                 // Stop-requested workers leave the durable operation pending for
                 // startup replay. It was popped from RAM only for this worker.
@@ -1701,6 +1704,7 @@ struct FuseFrontend::State {
             {
                 std::lock_guard lock(namespace_queue_mutex);
                 namespace_inflight = false;
+                namespace_inflight_sequence = 0;
             }
             namespace_cv.notify_all();
         }
@@ -1763,13 +1767,24 @@ struct FuseFrontend::State {
         if (snapshot.operations.empty())
             return;
 
-        std::unique_lock sequence_lock(data_queue_mutex);
-        publication_cv.wait(sequence_lock, [&] {
-            return stopping.load() ||
-                   published_namespace_sequence.load(std::memory_order_acquire) >=
-                       snapshot.required_namespace_sequence;
-        });
-        sequence_lock.unlock();
+        // Order data only behind namespace mutations which are actually still
+        // unpublished. A recovered inode descriptor can retain an old namespace
+        // sequence after the corresponding journal history has been retired; a
+        // reconstructed scalar watermark is therefore not a reliable reason to
+        // park a recovery worker indefinitely. The namespace queue/in-flight op
+        // is the authoritative set of work which can still change published_path.
+        {
+            std::unique_lock namespace_lock(namespace_queue_mutex);
+            namespace_cv.wait(namespace_lock, [&] {
+                if (stopping.load())
+                    return true;
+                if (namespace_inflight &&
+                    namespace_inflight_sequence <= snapshot.required_namespace_sequence)
+                    return false;
+                return namespace_queue.empty() ||
+                       namespace_queue.front().sequence > snapshot.required_namespace_sequence;
+            });
+        }
         if (stopping.load())
             return;
 
@@ -1871,6 +1886,24 @@ struct FuseFrontend::State {
             (void)confirm_data_from_snapshot(inode, *available->snapshot);
     }
 
+    static int64_t mount_clock_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   Clock::now().time_since_epoch())
+            .count();
+    }
+
+    void note_mount_activity() {
+        last_mount_activity_ms.store(mount_clock_ms(), std::memory_order_relaxed);
+        data_cv.notify_all();
+    }
+
+    std::chrono::milliseconds mount_idle_for() const {
+        const auto last = last_mount_activity_ms.load(std::memory_order_relaxed);
+        if (!last)
+            return std::chrono::hours(24);
+        return std::chrono::milliseconds(std::max<int64_t>(0, mount_clock_ms() - last));
+    }
+
     bool data_global_slot_available() const {
         // Playback is stricter than mounted-filesystem foreground activity.
         // FUSE data has already been admitted to the local spool, so starting a
@@ -1879,7 +1912,7 @@ struct FuseFrontend::State {
         if (!playback_quiet())
             return false;
         const bool recent_mount_activity = config.publication_quiet.count() > 0 &&
-            fs.interactive_idle_for() < config.publication_quiet;
+            mount_idle_for() < config.publication_quiet;
         const bool mount_busy =
             open_writers.load(std::memory_order_relaxed) > 0 || recent_mount_activity;
         const auto limit = mount_busy ? config.foreground_commit_workers : config.commit_workers;
@@ -1942,7 +1975,7 @@ struct FuseFrontend::State {
                         });
                         continue;
                     }
-                    const auto mount_idle = fs.interactive_idle_for();
+                    const auto mount_idle = mount_idle_for();
                     if (open_writers.load(std::memory_order_relaxed) == 0 &&
                         config.publication_quiet.count() > 0 && mount_idle < config.publication_quiet) {
                         data_cv.wait_for(lock, stop, config.publication_quiet - mount_idle, [&] {
@@ -2439,20 +2472,6 @@ struct FuseFrontend::State {
         if (!paths.contains(canonical_path("/")))
             throw std::runtime_error("FUSE frontend cannot initialise without namespace root");
 
-        // Journal compaction intentionally drops completed history, so the
-        // first sequence present after restart need not be 1. Every sequence
-        // before the first unpublished operation is already known published.
-        uint64_t published_prefix = recovery.max_namespace_sequence;
-        for (const auto& [sequence, op] : recovery.namespace_ops) {
-            (void)op;
-            if (!recovery.namespace_published.contains(sequence) &&
-                !recovery.namespace_done.contains(sequence)) {
-                published_prefix = sequence > 0 ? sequence - 1 : 0;
-                break;
-            }
-        }
-        published_namespace_sequence.store(published_prefix, std::memory_order_release);
-
         {
             std::lock_guard queue_lock(namespace_queue_mutex);
             for (const auto& [sequence, op] : recovery.namespace_ops) {
@@ -2745,7 +2764,6 @@ struct FuseFrontend::State {
             return;
         namespace_cv.notify_all();
         data_cv.notify_all();
-        publication_cv.notify_all();
         for (auto& queue : broker)
             queue.cv.notify_all();
         if (namespace_worker.joinable()) namespace_worker.request_stop();
@@ -3702,6 +3720,7 @@ std::pair<uint64_t, uint64_t> FuseFrontend::logical_capacity() const {
 }
 
 void FuseFrontend::note_interactive_activity(uint64_t bytes) {
+    state_->note_mount_activity();
     state_->fs.note_interactive_activity(bytes);
 }
 
