@@ -2563,10 +2563,12 @@ std::optional<ProviderMatch> MusicScanProvider::lookup(const MediaProbe& probe) 
 CatalogueScanner::CatalogueScanner(NodeRuntime& node, FileSystem& fs,
                                    CatalogueManager& catalogue, CatalogueHintQueue& hints,
                                    CatalogueScannerConfig config,
-                                   std::unique_ptr<HttpClient> http)
+                                   std::unique_ptr<HttpClient> http,
+                                   std::chrono::milliseconds diagnostic_interval)
     : node_(node), fs_(fs), catalogue_(catalogue), hints_(hints), config_(std::move(config)),
       http_(http ? std::move(http) : std::make_unique<CurlHttpClient>()),
-      provider_http_(std::make_unique<BudgetHttpClient>(*http_)) {
+      provider_http_(std::make_unique<BudgetHttpClient>(*http_)),
+      diagnostic_interval_(diagnostic_interval) {
     configure_providers();
 }
 CatalogueScanner::~CatalogueScanner() { stop(); }
@@ -2671,9 +2673,8 @@ void CatalogueScanner::reconfigure(CatalogueScannerConfig config) {
     start();
 }
 
-void CatalogueScanner::walk(std::string_view root, const MetadataSnapshot& namespace_snapshot,
-                            std::vector<std::pair<std::string, FsEntry>>& out,
-                            std::stop_token stop) {
+std::vector<std::pair<std::string, FsEntry>> catalogue_snapshot_files(
+    std::string_view root, const MetadataSnapshot& namespace_snapshot, std::stop_token stop) {
     const auto normalized = normalize_path(std::string(root));
     const auto root_entry = namespace_snapshot.entries.find(normalized);
     if (root_entry == namespace_snapshot.entries.end())
@@ -2685,14 +2686,16 @@ void CatalogueScanner::walk(std::string_view root, const MetadataSnapshot& names
     // generation. Enumerating the snapshot directly is both cheaper than a
     // sequence of readdir() calls and prevents a mutation between directories
     // from manufacturing an absence that never existed in any generation.
+    std::vector<std::pair<std::string, FsEntry>> out;
     const auto prefix = normalized == "/" ? std::string("/") : normalized + "/";
     auto it = namespace_snapshot.entries.lower_bound(prefix);
     for (; it != namespace_snapshot.entries.end(); ++it) {
-        if (stop.stop_requested()) return;
+        if (stop.stop_requested()) break;
         if (!it->first.starts_with(prefix)) break;
         if (it->second.type == EntryType::file)
             out.emplace_back(it->first, it->second);
     }
+    return out;
 }
 
 CatalogueScanProvider* CatalogueScanner::provider_for_path(std::string_view path,
@@ -3087,9 +3090,8 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
     size_t roots_unavailable = 0;
     for (auto& provider : providers_) {
         for (const auto& root : provider->roots()) {
-            std::vector<std::pair<std::string, FsEntry>> root_files;
             try {
-                walk(root, namespace_snapshot, root_files, stop);
+                auto root_files = catalogue_snapshot_files(root, namespace_snapshot, stop);
                 if (stop.stop_requested()) return 0;
                 ++roots_scanned;
                 for (auto& [path, entry] : root_files)
@@ -3163,7 +3165,7 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
 }
 
 void CatalogueScanner::loop(std::stop_token stop) {
-    ThreadCpuReporter cpu_reporter("macha-catalogue", std::chrono::seconds(5), true);
+    ThreadCpuReporter cpu_reporter("macha-catalogue", diagnostic_interval_, true);
     CatalogueScannerConfig initial_config;
     { std::lock_guard lock(config_mutex_); initial_config = config_; }
     const auto persisted = load_scanner_state(node_.config().state_path);

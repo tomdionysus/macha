@@ -1,0 +1,1704 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "test_backend_support.hpp"
+
+using namespace macha;
+using namespace std::chrono_literals;
+using namespace macha::test_support;
+
+namespace {
+
+MACHA_TEST("rpc_cluster", test_async_rpc_move_ownership) {
+    std::atomic_int cancelled{};
+
+    // AsyncRpc is an owning cancellation handle. Moving it must transfer that
+    // ownership; destruction of the moved-from object must be inert. This is
+    // particularly important on libc++, where std::function's moved-from state
+    // is permitted to remain non-empty.
+    std::optional<AsyncRpc> moved;
+    {
+        std::promise<RpcReply> promise;
+        AsyncRpc original(promise.get_future(), [&] { ++cancelled; }, {});
+        moved.emplace(std::move(original));
+    }
+    CHECK(cancelled.load() == 0);
+    moved.reset();
+    CHECK(cancelled.load() == 1);
+
+    // Move assignment must also cancel any request already owned by the target,
+    // while leaving the source destructor inert.
+    std::promise<RpcReply> first_promise;
+    std::promise<RpcReply> second_promise;
+    AsyncRpc first(first_promise.get_future(), [&] { ++cancelled; }, {});
+    {
+        AsyncRpc second(second_promise.get_future(), [&] { ++cancelled; }, {});
+        first = std::move(second);
+        CHECK(cancelled.load() == 2);
+    }
+    CHECK(cancelled.load() == 2);
+}
+
+MACHA_TEST("rpc_cluster", test_rpc_v13_frame_priority_and_variable_length) {
+    CHECK(frame_type_priority(FrameType::control) < frame_type_priority(FrameType::foreground));
+    CHECK(frame_type_priority(FrameType::foreground) < frame_type_priority(FrameType::read_ahead));
+    CHECK(frame_type_priority(FrameType::read_ahead) <
+          frame_type_priority(FrameType::speculative));
+    CHECK(default_frame_type(MessageType::ping) == FrameType::control);
+    CHECK(default_frame_type(MessageType::get_object) == FrameType::foreground);
+    CHECK(default_frame_type(MessageType::get_metadata_object) == FrameType::speculative);
+    CHECK(std::string(message_type_name(MessageType::commit_metadata)) == "commit_metadata");
+    CHECK(std::string(message_type_name(MessageType::cas_metadata_delta)) ==
+          "cas_metadata_delta");
+
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto port = free_port();
+
+    NodeInfo server_info;
+    server_info.id = random_node_id();
+    server_info.host = "127.0.0.1";
+    server_info.port = port;
+    server_info.failure_domain = "server-site";
+
+    std::mutex order_mutex;
+    std::vector<uint8_t> order;
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (request.type == MessageType::put_object && !request.payload.empty()) {
+                std::lock_guard lock(order_mutex);
+                order.push_back(request.payload.front());
+            }
+            return RpcMessage{MessageType::ok, request.payload};
+        },
+        [](const NodeInfo&) {}, 4096);
+    server.start();
+
+    NodeInfo client_info;
+    client_info.id = random_node_id();
+    client_info.host = "127.0.0.1";
+    client_info.port = free_port();
+    client_info.failure_domain = "client-site";
+    RpcClient client(keys, [client_info] { return client_info; }, [](const NodeInfo&) {},
+                     [](uint64_t) {}, 500ms, 5s, 30s, 4096);
+    Endpoint endpoint{"127.0.0.1", port};
+
+    // A non-multiple of max_frame_size proves that the final frame is naturally
+    // short rather than padded to a fixed transport block size.
+    auto odd = pattern(12'345);
+    auto odd_reply = client.call(endpoint, MessageType::ping, odd, 1s);
+    CHECK(odd_reply.message.payload == odd);
+
+    auto metadata_reply = client.call(endpoint, MessageType::get_metadata, Bytes{0x4d},
+                                      FrameType::read_ahead, 2s);
+    CHECK(metadata_reply.message.type == MessageType::ok);
+    CHECK(metadata_reply.message.payload == Bytes{0x4d});
+
+    // Content-addressed metadata objects are potentially large and therefore
+    // run at speculative worker priority, but they deliberately stay on the
+    // CONTROL TCP session. Catalogue bootstrap must not require a DATA lane.
+    auto metadata_object_reply =
+        client.call(endpoint, MessageType::put_metadata_object, Bytes{0x43, 0x41, 0x54},
+                    FrameType::speculative, 2s);
+    CHECK(metadata_object_reply.message.type == MessageType::ok);
+    CHECK(client.stats().canonical_connections == 1);
+
+    // Start a large speculative transfer, then introduce foreground work. The
+    // writer reconsiders priority after every <=4 KiB variable-length frame, so
+    // foreground reaches the server before the speculative message completes.
+    Bytes speculative(32 * 1024 * 1024, 0x53);
+    auto background = client.call_async(endpoint, MessageType::put_object, speculative,
+                                        FrameType::speculative);
+    std::this_thread::sleep_for(2ms);
+    auto foreground = client.call_async(endpoint, MessageType::put_object, Bytes{0x46},
+                                        FrameType::foreground);
+    REQUIRE(foreground.wait_for(2s) == std::future_status::ready);
+    CHECK(foreground.get().message.type == MessageType::ok);
+    {
+        std::lock_guard lock(order_mutex);
+        REQUIRE(!order.empty());
+        CHECK(order.front() == 0x46);
+    }
+    REQUIRE(background.wait_for(10s) == std::future_status::ready);
+    CHECK(background.get().message.type == MessageType::ok);
+    CHECK(client.stats().canonical_connections == 2);
+
+    // Cancellation can race with the writer while one frame is outside the
+    // outbound deque. The cancelled transfer must not be requeued after that
+    // frame, otherwise the peer sees continuation frames after cancel_transfer
+    // discarded its assembler state and tears down the canonical connection.
+    Bytes cancelled_payload(32 * 1024 * 1024, 0x43);
+    auto cancelled = client.call_async(endpoint, MessageType::put_object, cancelled_payload,
+                                       FrameType::speculative);
+    std::this_thread::sleep_for(2ms);
+    cancelled.cancel();
+    auto after_cancel = client.call(endpoint, MessageType::ping, Bytes{0x50}, 2s);
+    CHECK(after_cancel.message.type == MessageType::ok);
+    CHECK(client.stats().connections_created == 2);
+
+    client.stop();
+    server.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_rpc_v13_persistence_and_multiplexing) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto port = free_port();
+
+    NodeInfo server_info;
+    server_info.id = random_node_id();
+    server_info.host = "127.0.0.1";
+    server_info.port = port;
+    server_info.failure_domain = "server-site";
+
+    TestGate first_slow_gate;
+    std::atomic_uint slow_calls{};
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (!request.payload.empty() && request.payload.front() == 1) {
+                if (slow_calls.fetch_add(1) == 0)
+                    first_slow_gate.enter_and_wait();
+                else
+                    std::this_thread::sleep_for(80ms);
+            }
+            return RpcMessage{MessageType::ok, request.payload};
+        },
+        [](const NodeInfo&) {});
+    server.start();
+
+    NodeInfo client_info;
+    client_info.id = random_node_id();
+    client_info.host = "127.0.0.1";
+    client_info.port = free_port();
+    client_info.failure_domain = "client-site";
+
+    RpcClient client(keys, [client_info] { return client_info; }, [](const NodeInfo&) {},
+                     [](uint64_t) {}, 500ms);
+    Endpoint endpoint{"127.0.0.1", port};
+
+    Bytes slow_payload{1};
+    Bytes fast_payload{2};
+    auto slow = client.call_async(endpoint, MessageType::ping, slow_payload);
+    REQUIRE(first_slow_gate.wait_for_entries(1));
+    auto fast = client.call_async(endpoint, MessageType::ping, fast_payload);
+
+    REQUIRE(fast.wait_for(150ms) == std::future_status::ready);
+    auto fast_reply = fast.get();
+    CHECK(fast_reply.message.type == MessageType::ok);
+    CHECK(fast_reply.message.payload == fast_payload);
+    first_slow_gate.open();
+    REQUIRE(slow.wait_for(500ms) == std::future_status::ready);
+    CHECK(slow.get().message.payload == slow_payload);
+
+    // Empty request immediately follows prior frames on the same channel. This
+    // would desynchronise the old GCM framing bug.
+    auto empty_reply = client.call(endpoint, MessageType::ping, {}, 1s);
+    CHECK(empty_reply.message.type == MessageType::ok);
+    CHECK(empty_reply.message.payload.empty());
+
+    auto stats = client.stats();
+    CHECK(stats.connections_created == 1);
+    CHECK(stats.connections_reused >= 2);
+
+    // The argument to synchronous call() is now a stall-observation interval,
+    // not a request deadline. A healthy RPC may take arbitrarily longer than
+    // that interval and must still complete without its connection being torn
+    // down merely because wall-clock time elapsed.
+    Bytes very_slow_payload{1};
+    auto started = Clock::now();
+    auto very_slow = client.call(endpoint, MessageType::ping, very_slow_payload, 50ms);
+    CHECK(very_slow.message.type == MessageType::ok);
+    CHECK(very_slow.message.payload == very_slow_payload);
+    CHECK(Clock::now() - started >= 60ms);
+
+    // The same persistent connection remains usable after a slow request; there is no
+    // timeout-induced backoff/reconnect cycle.
+    auto recovered = client.call(endpoint, MessageType::ping, fast_payload, 50ms);
+    CHECK(recovered.message.type == MessageType::ok);
+    CHECK(client.stats().connections_created == 1);
+
+    client.stop();
+    server.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_rpc_v13_bidirectional_and_deduplication) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+
+    struct TestNode {
+        NodeInfo info;
+        RpcClient client;
+        RpcServer server;
+
+        TestNode(ClusterKeys keys, NodeInfo node, RpcServer::Handler handler)
+            : info(std::move(node)),
+              client(keys, [this] { return info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+                     500ms, 10s, 30s),
+              server("127.0.0.1", info.port, keys, info, std::move(handler),
+                     [](const NodeInfo&) {}) {
+            server.attach_client(client);
+            server.start();
+        }
+        ~TestNode() {
+            server.stop();
+            client.stop();
+        }
+    };
+
+    auto node_info = [] {
+        NodeInfo node;
+        node.id = random_node_id();
+        node.host = "127.0.0.1";
+        node.port = free_port();
+        node.failure_domain = "rpc-test";
+        return node;
+    };
+    auto echo = [](const NodeInfo&, FrameType, const RpcMessage& request) {
+        return RpcMessage{MessageType::ok, request.payload};
+    };
+
+    // Once A has called B, B can originate an RPC back over the accepted socket.
+    // It must not create a second B->A TCP connection.
+    {
+        TestNode a(keys, node_info(), echo);
+        TestNode b(keys, node_info(), echo);
+        CHECK(a.client.call(b.info, MessageType::members, Bytes{1}, 1s).message.payload == Bytes{1});
+        CHECK(b.client.stats().connections_created == 0);
+        CHECK(b.client.call(a.info, MessageType::members, Bytes{2}, 1s).message.payload == Bytes{2});
+        CHECK(b.client.stats().connections_created == 0);
+
+        // DATA is a second independently canonical bidirectional lane. A opens
+        // it lazily; B must reuse the accepted data session rather than dial a
+        // third physical connection back to A.
+        CHECK(a.client.call(b.info, MessageType::put_object, Bytes{3},
+                            FrameType::foreground, 1s).message.payload == Bytes{3});
+        CHECK(b.client.call(a.info, MessageType::get_object, Bytes{4},
+                            FrameType::foreground, 1s).message.payload == Bytes{4});
+        CHECK(b.client.stats().connections_created == 0);
+        CHECK(a.client.stats().canonical_connections == 2);
+        CHECK(b.client.stats().canonical_connections == 2);
+    }
+
+    // Simultaneous cross-dial starts with two physical sessions. Both nodes
+    // must select the same winner and all later RPCs must reuse it.
+    {
+        TestNode a(keys, node_info(), echo);
+        TestNode b(keys, node_info(), echo);
+        std::atomic_int ready{};
+        std::exception_ptr a_error;
+        std::exception_ptr b_error;
+        std::jthread a_call([&] {
+            try {
+                ++ready;
+                while (ready.load() < 2)
+                    std::this_thread::yield();
+                auto reply = a.client.call(b.info, MessageType::members, Bytes{3}, 1s);
+                if (reply.message.payload != Bytes{3})
+                    throw std::runtime_error("bad A cross-dial reply");
+            } catch (...) {
+                a_error = std::current_exception();
+            }
+        });
+        std::jthread b_call([&] {
+            try {
+                ++ready;
+                while (ready.load() < 2)
+                    std::this_thread::yield();
+                auto reply = b.client.call(a.info, MessageType::members, Bytes{4}, 1s);
+                if (reply.message.payload != Bytes{4})
+                    throw std::runtime_error("bad B cross-dial reply");
+            } catch (...) {
+                b_error = std::current_exception();
+            }
+        });
+        a_call.join();
+        b_call.join();
+        if (a_error)
+            std::rethrow_exception(a_error);
+        if (b_error)
+            std::rethrow_exception(b_error);
+
+        REQUIRE(wait_until([&] {
+            return a.client.stats().canonical_connections == 1 &&
+                   b.client.stats().canonical_connections == 1;
+        }));
+        auto a_created = a.client.stats().connections_created;
+        auto b_created = b.client.stats().connections_created;
+        CHECK(a.client.call(b.info, MessageType::members, Bytes{5}, 1s).message.payload == Bytes{5});
+        CHECK(b.client.call(a.info, MessageType::members, Bytes{6}, 1s).message.payload == Bytes{6});
+        CHECK(a.client.stats().connections_created == a_created);
+        CHECK(b.client.stats().connections_created == b_created);
+    }
+
+    // Endpoint spelling is not peer identity. A hostname alias can cause a
+    // transient second dial, but authenticated NodeId dedup leaves one route.
+    {
+        TestNode a(keys, node_info(), echo);
+        TestNode b(keys, node_info(), echo);
+        Endpoint numeric{"127.0.0.1", b.info.port};
+        Endpoint alias{"localhost", b.info.port};
+        CHECK(a.client.call(numeric, MessageType::members, Bytes{7}, 1s).message.payload == Bytes{7});
+        CHECK(a.client.call(alias, MessageType::members, Bytes{8}, 1s).message.payload == Bytes{8});
+        REQUIRE(wait_until([&] { return a.client.stats().canonical_connections == 1; }));
+        auto created = a.client.stats().connections_created;
+        CHECK(a.client.call(alias, MessageType::members, Bytes{9}, 1s).message.payload == Bytes{9});
+        CHECK(a.client.stats().connections_created == created);
+    }
+
+    // A failed dial puts the endpoint into retry backoff, but that backoff must
+    // not mask a canonical route which arrives inbound immediately afterwards.
+    // This is the normal recovery shape when a peer reconnects while the other
+    // side is still remembering the failed outbound attempt.
+    {
+        TestNode a(keys, node_info(), echo);
+        TestNode b(keys, node_info(), echo);
+        Endpoint b_endpoint{"127.0.0.1", b.info.port};
+
+        b.server.stop();
+        bool failed = false;
+        try {
+            (void)a.client.call(b_endpoint, MessageType::members, Bytes{10}, 1s);
+        } catch (...) {
+            failed = true;
+        }
+        REQUIRE(failed);
+
+        b.server.attach_client(b.client);
+        b.server.start();
+        CHECK(b.client.call(a.info, MessageType::members, Bytes{11}, 1s).message.payload ==
+              Bytes{11});
+        REQUIRE(wait_until([&] { return a.client.stats().canonical_connections == 1; }));
+
+        // Still inside the failed dial's minimum 250-ms retry-backoff window.
+        // Endpoint lookup must reuse the authenticated inbound route before
+        // consulting dial backoff.
+        CHECK(a.client.call(b_endpoint, MessageType::members, Bytes{12}, 1s).message.payload ==
+              Bytes{12});
+    }
+
+    // Retirement is a drain, not a reset. Force the higher NodeId to have a
+    // slow request outstanding on the connection which cross-dial arbitration
+    // will discard, then create the canonical lower->higher connection.
+    {
+        auto first = node_info();
+        auto second = node_info();
+        auto lower_info = first.id < second.id ? first : second;
+        auto higher_info = first.id < second.id ? second : first;
+        TestGate retired_connection_gate;
+        auto lower_handler = [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (!request.payload.empty() && request.payload.front() == 42)
+                retired_connection_gate.enter_and_wait();
+            return RpcMessage{MessageType::ok, request.payload};
+        };
+        TestNode lower(keys, lower_info, lower_handler);
+        TestNode higher(keys, higher_info, echo);
+
+        auto slow = higher.client.call_async(lower.info, MessageType::members, Bytes{42});
+        REQUIRE(retired_connection_gate.wait_for_entries(1));
+        CHECK(lower.client.call(higher.info, MessageType::members, Bytes{43}, 1s).message.payload ==
+              Bytes{43});
+        retired_connection_gate.open();
+        REQUIRE(slow.wait_for(1s) == std::future_status::ready);
+        CHECK(slow.get().message.payload == Bytes{42});
+        REQUIRE(wait_until([&] {
+            return lower.client.stats().canonical_connections == 1 &&
+                   higher.client.stats().canonical_connections == 1;
+        }));
+        auto created = higher.client.stats().connections_created;
+        CHECK(higher.client.call(lower.info, MessageType::members, Bytes{44}, 1s).message.payload ==
+              Bytes{44});
+        CHECK(higher.client.stats().connections_created == created);
+    }
+}
+
+MACHA_TEST("rpc_cluster", test_mutual_bootstrap_prunes_cross_dial) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+
+    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 1;
+    c1.metadata_replication = c2.metadata_replication = 1;
+    c1.heartbeat = c2.heartbeat = 20ms;
+
+    NodeRuntime n1(c1, keys);
+    NodeRuntime n2(c2, keys);
+    n1.start();
+    n2.start();
+
+    REQUIRE(wait_until([&] {
+        const auto a = n1.rpc_stats();
+        const auto b = n2.rpc_stats();
+        return n1.membership().active().size() >= 2 && n2.membership().active().size() >= 2 &&
+               a.canonical_connections == 1 && b.canonical_connections == 1;
+    }));
+
+    const auto a_before = n1.rpc_stats();
+    const auto b_before = n2.rpc_stats();
+    std::this_thread::sleep_for(120ms); // six configured heartbeats
+    const auto a_after = n1.rpc_stats();
+    const auto b_after = n2.rpc_stats();
+
+    CHECK(a_after.canonical_connections == 1);
+    CHECK(b_after.canonical_connections == 1);
+    CHECK(a_after.connections_created == a_before.connections_created);
+    CHECK(b_after.connections_created == b_before.connections_created);
+
+    n2.stop();
+    n1.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_rpc_v7_handshake_is_rejected) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto port = free_port();
+
+    NodeInfo server_info;
+    server_info.id = random_node_id();
+    server_info.host = "127.0.0.1";
+    server_info.port = port;
+    server_info.failure_domain = "server";
+    RpcServer server("127.0.0.1", port, keys, server_info,
+                     [](const NodeInfo&, FrameType, const RpcMessage&) {
+                         return RpcMessage{MessageType::ok, {}};
+                     },
+                     [](const NodeInfo&) {});
+    server.start();
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(fd >= 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(port);
+    REQUIRE(connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+
+    NodeInfo old_client;
+    old_client.id = random_node_id();
+    old_client.host = "127.0.0.1";
+    old_client.port = free_port();
+    old_client.failure_domain = "old-client";
+    auto ephemeral = x25519_generate();
+    auto nonce_bytes = random_bytes(32);
+    std::array<uint8_t, 32> nonce{};
+    std::copy(nonce_bytes.begin(), nonce_bytes.end(), nonce.begin());
+
+    Writer hello_writer;
+    hello_writer.u16(7);
+    hello_writer.u32(256 * 1024); // v7 had no transport-lane byte.
+    hello_writer.fixed(keys.cluster_id);
+    hello_writer.fixed(old_client.id.bytes);
+    hello_writer.fixed(nonce);
+    hello_writer.fixed(ephemeral.public_key);
+    encode_node_info(hello_writer, old_client);
+    auto hello = hello_writer.take();
+
+    Bytes authenticated(reinterpret_cast<const uint8_t*>("client/v7"),
+                        reinterpret_cast<const uint8_t*>("client/v7") + 9);
+    authenticated.insert(authenticated.end(), hello.begin(), hello.end());
+    Writer envelope;
+    envelope.bytes(hello);
+    envelope.fixed(hmac_sha256(keys.auth, authenticated));
+    Writer framed;
+    framed.u32(static_cast<uint32_t>(envelope.data().size()));
+    framed.raw(envelope.data());
+
+    size_t sent = 0;
+    while (sent < framed.data().size()) {
+        auto count = send(fd, framed.data().data() + sent, framed.data().size() - sent, 0);
+        REQUIRE(count > 0);
+        sent += static_cast<size_t>(count);
+    }
+
+    timeval timeout{1, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    uint8_t byte{};
+    CHECK(recv(fd, &byte, 1, 0) == 0);
+    close(fd);
+    OPENSSL_cleanse(ephemeral.private_key.data(), ephemeral.private_key.size());
+    server.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_rpc_slow_control_does_not_abort_data) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto port = free_port();
+
+    NodeInfo server_info;
+    server_info.id = random_node_id();
+    server_info.host = "127.0.0.1";
+    server_info.port = port;
+    server_info.failure_domain = "server-site";
+
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (request.type == MessageType::put_object) {
+                std::this_thread::sleep_for(120ms);
+                return RpcMessage{MessageType::ok, {}};
+            }
+            if (request.type == MessageType::members) {
+                std::this_thread::sleep_for(120ms);
+                return RpcMessage{MessageType::ok, request.payload};
+            }
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {});
+    server.start();
+
+    NodeInfo client_info;
+    client_info.id = random_node_id();
+    client_info.host = "127.0.0.1";
+    client_info.port = free_port();
+    client_info.failure_domain = "client-site";
+
+    RpcClient client(keys, [client_info] { return client_info; }, [](const NodeInfo&) {},
+                     [](uint64_t) {}, 500ms, 20ms, 80ms);
+    Endpoint endpoint{"127.0.0.1", port};
+
+    // The 20-ms value below is not a deadline: both 120-ms RPCs are healthy and
+    // must complete without the peer transport being destroyed. They also
+    // outlive the 80-ms peer-death window while priority control pings on the independent control
+    // connection prove that the peer itself remains alive.
+    Bytes object_payload(256 * 1024, 0x5a);
+    auto data = client.call_async(endpoint, MessageType::put_object, object_payload);
+    std::this_thread::sleep_for(5ms);
+
+    auto started = Clock::now();
+    auto control = client.call(endpoint, MessageType::members, Bytes{1}, 20ms);
+    CHECK(control.message.type == MessageType::ok);
+    CHECK(Clock::now() - started >= 100ms);
+
+    REQUIRE(data.wait_for(2s) == std::future_status::ready);
+    CHECK(data.get().message.type == MessageType::ok);
+    CHECK(client.stats().connections_created == 2);
+
+    client.stop();
+    server.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_rpc_health_and_control_not_starved_by_data) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto port = free_port();
+
+    NodeInfo server_info;
+    server_info.id = random_node_id();
+    server_info.host = "127.0.0.1";
+    server_info.port = port;
+    server_info.failure_domain = "server-site";
+
+    TestGate data_workers_gate;
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (request.type == MessageType::put_object) {
+                data_workers_gate.enter_and_wait();
+                return RpcMessage{MessageType::ok, {}};
+            }
+            if (request.type == MessageType::members)
+                return RpcMessage{MessageType::ok, {}};
+            if (request.type == MessageType::ping)
+                return RpcMessage{MessageType::ok, {}};
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {});
+    server.start();
+
+    NodeInfo client_info;
+    client_info.id = random_node_id();
+    client_info.host = "127.0.0.1";
+    client_info.port = free_port();
+    client_info.failure_domain = "client-site";
+
+    RpcClient client(keys, [client_info] { return client_info; }, [](const NodeInfo&) {},
+                     [](uint64_t) {}, 500ms, 100ms, 2s);
+    Endpoint endpoint{"127.0.0.1", port};
+
+    // Occupy every data worker. Health and membership use a separate control TCP
+    // stream and must remain prompt regardless of data-lane work.
+    std::vector<AsyncRpc> bulk;
+    for (int i = 0; i < 8; ++i)
+        bulk.push_back(client.call_async(endpoint, MessageType::put_object, Bytes{0x5a},
+                                         FrameType::speculative));
+    REQUIRE(data_workers_gate.wait_for_entries(6));
+
+    auto started = Clock::now();
+    auto health = client.call(endpoint, MessageType::ping, {}, 20ms);
+    CHECK(health.message.type == MessageType::ok);
+    CHECK(Clock::now() - started < 150ms);
+
+    started = Clock::now();
+    auto control = client.call(endpoint, MessageType::members, {}, 20ms);
+    CHECK(control.message.type == MessageType::ok);
+    CHECK(Clock::now() - started < 150ms);
+
+    CHECK(client.stats().canonical_connections == 2);
+
+    data_workers_gate.open();
+    for (auto& rpc : bulk) {
+        REQUIRE(rpc.wait_for(1s) == std::future_status::ready);
+        CHECK(rpc.get().message.type == MessageType::ok);
+    }
+
+    client.stop();
+    server.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_rpc_health_not_starved_by_slow_control_handlers) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto port = free_port();
+
+    NodeInfo server_info;
+    server_info.id = random_node_id();
+    server_info.host = "127.0.0.1";
+    server_info.port = port;
+    server_info.failure_domain = "server-site";
+
+    TestGate slow_control_gate;
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (request.type == MessageType::have_object) {
+                slow_control_gate.enter_and_wait();
+                return RpcMessage{MessageType::bool_reply, Bytes{1}};
+            }
+            if (request.type == MessageType::members)
+                return RpcMessage{MessageType::members_reply, {}};
+            if (request.type == MessageType::ping)
+                return RpcMessage{MessageType::ok, {}};
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {});
+    server.start();
+
+    NodeInfo client_info;
+    client_info.id = random_node_id();
+    client_info.host = "127.0.0.1";
+    client_info.port = free_port();
+    client_info.failure_domain = "client-site";
+
+    RpcClient client(keys, [client_info] { return client_info; }, [](const NodeInfo&) {},
+                     [](uint64_t) {}, 500ms, 100ms, 2s);
+    Endpoint endpoint{"127.0.0.1", port};
+
+    // Occupy both ordinary control handlers with storage-shaped work. Health
+    // and membership must use the reserved fast-control executor rather than
+    // queue behind those handlers.
+    auto slow1 = client.call_async(endpoint, MessageType::have_object, Bytes{1},
+                                   FrameType::control);
+    auto slow2 = client.call_async(endpoint, MessageType::have_object, Bytes{2},
+                                   FrameType::control);
+    REQUIRE(slow_control_gate.wait_for_entries(2));
+
+    auto started = Clock::now();
+    auto health = client.call(endpoint, MessageType::ping, {}, 20ms);
+    CHECK(health.message.type == MessageType::ok);
+    CHECK(Clock::now() - started < 150ms);
+
+    started = Clock::now();
+    auto members = client.call(endpoint, MessageType::members, {}, 20ms);
+    CHECK(members.message.type == MessageType::members_reply);
+    CHECK(Clock::now() - started < 150ms);
+
+    slow_control_gate.open();
+    REQUIRE(slow1.wait_for(1s) == std::future_status::ready);
+    REQUIRE(slow2.wait_for(1s) == std::future_status::ready);
+    CHECK(slow1.get().message.type == MessageType::bool_reply);
+    CHECK(slow2.get().message.type == MessageType::bool_reply);
+
+    client.stop();
+    server.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_rpc_foreground_not_starved_by_busy_data_workers) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto port = free_port();
+
+    NodeInfo server_info;
+    server_info.id = random_node_id();
+    server_info.host = "127.0.0.1";
+    server_info.port = port;
+    server_info.failure_domain = "server-site";
+
+    TestGate lower_priority_gate;
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, FrameType frame_type, const RpcMessage& request) {
+            if (request.type == MessageType::put_object && frame_type != FrameType::foreground)
+                lower_priority_gate.enter_and_wait();
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {});
+    server.start();
+
+    NodeInfo client_info;
+    client_info.id = random_node_id();
+    client_info.host = "127.0.0.1";
+    client_info.port = free_port();
+    client_info.failure_domain = "client-site";
+    RpcClient client(keys, [client_info] { return client_info; }, [](const NodeInfo&) {},
+                     [](uint64_t) {}, 500ms, 100ms, 2s);
+    Endpoint endpoint{"127.0.0.1", port};
+
+    // Lower-priority work may use most of the DATA execution pool, but it must
+    // leave execution capacity for a playback/seek read that arrives later.
+    std::vector<AsyncRpc> bulk;
+    for (int i = 0; i < 8; ++i)
+        bulk.push_back(client.call_async(endpoint, MessageType::put_object, Bytes{0x42},
+                                         FrameType::read_ahead));
+    REQUIRE(lower_priority_gate.wait_for_entries(6));
+
+    auto started = Clock::now();
+    auto foreground = client.call(endpoint, MessageType::get_object, Bytes{0x46},
+                                  FrameType::foreground, 100ms);
+    CHECK(foreground.message.type == MessageType::ok);
+    CHECK(Clock::now() - started < 200ms);
+
+    lower_priority_gate.open();
+    for (auto& rpc : bulk) {
+        REQUIRE(rpc.wait_for(2s) == std::future_status::ready);
+        CHECK(rpc.get().message.type == MessageType::ok);
+    }
+
+    client.stop();
+    server.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_early_replication_quorum) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto p1 = free_port();
+    auto pf = free_port();
+    auto ps = free_port();
+
+    // This test is specifically about object PUT quorum latency. Keep metadata
+    // consensus out of the test and use two deterministic RPC peers rather than
+    // relying on service discovery/background maintenance to make the fast peer
+    // reachable. That removes a platform/timing dependency which made this test
+    // intermittently (and on macOS, consistently) fail before the assertion it
+    // was intended to exercise.
+    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1);
+    c1.dead_after = 3s;
+    c1.metadata_replication = 1;
+    // Keep the node's background membership exchange out of this latency test.
+    // The peers are injected directly below; the test should measure object
+    // quorum completion, not race a 100ms control-plane scheduler.
+    c1.heartbeat = 10s;
+    Service s1(c1, keys);
+    s1.start();
+
+    NodeInfo fast_info;
+    fast_info.id = random_node_id();
+    fast_info.host = "127.0.0.1";
+    fast_info.port = pf;
+    fast_info.failure_domain = "fast-site";
+    fast_info.capacity = 1024ULL * 1024 * 1024;
+    fast_info.seen_unix_ms = unix_ms();
+
+    NodeInfo slow_info;
+    slow_info.id = random_node_id();
+    slow_info.host = "127.0.0.1";
+    slow_info.port = ps;
+    slow_info.failure_domain = "slow-site";
+    slow_info.capacity = 1024ULL * 1024 * 1024;
+    slow_info.seen_unix_ms = unix_ms();
+
+    TestGate slow_replica_gate;
+    auto peer_handler = [&](const NodeInfo& self, bool slow) {
+        return [&, self, slow](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (request.type == MessageType::put_object) {
+                if (slow) slow_replica_gate.enter_and_wait();
+                return RpcMessage{MessageType::ok, {}};
+            }
+            if (request.type == MessageType::members) {
+                Writer writer;
+                writer.u32(1);
+                encode_node_info(writer, self);
+                return RpcMessage{MessageType::members_reply, writer.take()};
+            }
+            return RpcMessage{MessageType::ok, {}};
+        };
+    };
+
+    RpcServer fast_server("127.0.0.1", pf, keys, fast_info,
+                          peer_handler(fast_info, false), [](const NodeInfo&) {});
+    RpcServer slow_server("127.0.0.1", ps, keys, slow_info,
+                          peer_handler(slow_info, true), [](const NodeInfo&) {});
+    fast_server.start();
+    slow_server.start();
+
+    s1.node().membership().observe(fast_info, true);
+    s1.node().membership().observe(slow_info, true);
+    REQUIRE(s1.node().membership().active().size() == 3);
+
+    DistributedStore store(s1.node());
+    auto data = pattern(256 * 1024);
+    auto started = Clock::now();
+    REQUIRE(store.put(data) == object_id(data));
+    auto elapsed = Clock::now() - started;
+    CHECK(elapsed < 500ms);
+
+    slow_replica_gate.open();
+    slow_server.stop();
+    fast_server.stop();
+    s1.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_put_spills_stalled_owners_and_commits_degraded_floor) {
+    TestService fixture("local-degraded");
+    auto& config = fixture.config();
+    const auto& keys = fixture.keys();
+    auto slow1_port = free_port();
+    auto slow2_port = free_port();
+
+    config.replication = 3;
+    config.metadata_replication = 1;
+    config.min_write_replicas = 1;
+    config.write_stall = 100ms;
+    config.heartbeat = 10s;
+    config.dead_after = 5s;
+
+    auto& service = fixture.start();
+
+    auto slow_info = [](uint16_t port, const char* domain) {
+        NodeInfo info;
+        info.id = random_node_id();
+        info.host = "127.0.0.1";
+        info.port = port;
+        info.failure_domain = domain;
+        info.capacity = 1024ULL * 1024 * 1024;
+        info.seen_unix_ms = unix_ms();
+        return info;
+    };
+    auto slow1 = slow_info(slow1_port, "slow-site-1");
+    auto slow2 = slow_info(slow2_port, "slow-site-2");
+
+    TestGate stalled_owner_gate;
+    auto delayed_put = [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+        if (request.type == MessageType::put_object)
+            stalled_owner_gate.enter_and_wait();
+        return RpcMessage{MessageType::ok, {}};
+    };
+    RpcServer slow1_server("127.0.0.1", slow1_port, keys, slow1, delayed_put,
+                           [](const NodeInfo&) {});
+    RpcServer slow2_server("127.0.0.1", slow2_port, keys, slow2, delayed_put,
+                           [](const NodeInfo&) {});
+    slow1_server.start();
+    slow2_server.start();
+
+    service.node().membership().observe(slow1, true);
+    service.node().membership().observe(slow2, true);
+    REQUIRE(service.node().membership().active().size() == 3);
+
+    // The local copy succeeds immediately, but the normal R=3 quorum requires
+    // two replicas. Both remote owners accept their RPCs and then make no
+    // progress. The write must spill/degrade at the explicit floor rather than
+    // wait for the 5s membership expiry (or for the delayed replies).
+    DistributedStore store(service.node());
+    auto data = pattern(128 * 1024);
+    auto id = object_id(data);
+    auto started = Clock::now();
+    CHECK(store.put(id, data));
+    auto elapsed = Clock::now() - started;
+    CHECK(elapsed >= 75ms);
+    CHECK(elapsed < 1s);
+    CHECK(service.node().local_store().has(id));
+
+    stalled_owner_gate.open();
+    slow2_server.stop();
+    slow1_server.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_put_falls_back_after_remote_launch_failure) {
+    TestService fixture("local");
+    auto& config = fixture.config();
+    auto dead_port = free_port();
+
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.connect_timeout = 100ms;
+    config.heartbeat = 30s;
+    config.dead_after = 60s;
+
+    auto& service = fixture.start();
+
+    NodeInfo unreachable;
+    unreachable.id = random_node_id();
+    unreachable.host = "127.0.0.1";
+    unreachable.port = dead_port; // free_port() closes the listener: connect must fail.
+    unreachable.failure_domain = "unreachable-site";
+    unreachable.capacity = config.storage_backends.front().limit;
+    unreachable.seen_unix_ms = unix_ms();
+    service.node().membership().observe(unreachable, true);
+    REQUIRE(service.node().membership().active().size() == 2);
+
+    Bytes data;
+    std::vector<NodeInfo> ranked;
+    for (uint32_t salt = 0; salt < 4096; ++salt) {
+        data = pattern(256 * 1024 + salt);
+        auto id = object_id(data);
+        ranked = capacity_placement_nodes(id.bytes, service.node().membership().active(), 1);
+        if (ranked.size() == 2 && ranked[0].id == unreachable.id &&
+            ranked[1].id == service.node().node_id())
+            break;
+        ranked.clear();
+    }
+    REQUIRE(ranked.size() == 2);
+
+    // Before 0.9.4, a synchronous call_async() failure incremented a dead
+    // "completed" counter but was not treated as a failed replica. With no
+    // pending RPC, the quorum loop then slept forever instead of trying the
+    // deterministic fallback owner. Keep a cancellation watchdog so this
+    // regression fails boundedly rather than hanging the entire test binary.
+    std::atomic_bool cancelled{false};
+    std::jthread watchdog([&](std::stop_token stop) {
+        const auto deadline = Clock::now() + 2s;
+        while (!stop.stop_requested() && Clock::now() < deadline)
+            std::this_thread::sleep_for(10ms);
+        if (!stop.stop_requested())
+            cancelled.store(true, std::memory_order_relaxed);
+    });
+
+    DistributedStore store(service.node());
+    auto id = object_id(data);
+    const bool stored = store.put(id, data, &cancelled);
+    watchdog.request_stop();
+
+    CHECK(stored);
+    CHECK(!cancelled.load(std::memory_order_relaxed));
+    CHECK(service.node().local_store().has(id));
+    service.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_joiner_cannot_form_genesis) {
+    TestService fixture("joiner");
+    auto& config = fixture.config();
+    config.bootstrap = {{"127.0.0.1", config.port}};
+    config.replication = 1;
+    config.metadata_replication = 1;
+
+    auto& service = fixture.start();
+    bool rejected = false;
+    try {
+        (void)service.filesystem().getattr("/");
+    } catch (const std::exception& error) {
+        rejected = std::string(error.what()).find("waiting for bootstrap peer") != std::string::npos;
+    }
+    CHECK(rejected);
+}
+
+MACHA_TEST("rpc_cluster", test_bootstrap_joiner_requires_complete_checkpoint_survey) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto unreachable_port = free_port();
+    auto config = config_for(cluster.path() / "checkpoint-survey", cluster.keyfile(), free_port(),
+                             {{"127.0.0.1", unreachable_port}});
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.dead_after = 10s;
+
+    NodeRuntime node(config, keys);
+    node.start();
+
+    // Keep an unreachable peer in active membership and choose its identity so
+    // metadata HRW would select this fresh node as the sole genesis voter. This
+    // deterministically exercises the dangerous pre-0.14.2 path: both metadata
+    // RPC surveys fail, yet a replication-1 joiner could previously form an
+    // empty generation-2 namespace on itself.
+    static constexpr char label[] = "macha/metadata-placement/v1";
+    const auto placement_key =
+        sha256({reinterpret_cast<const uint8_t*>(label), sizeof(label) - 1});
+    NodeInfo phantom;
+    phantom.host = "127.0.0.1";
+    phantom.failure_domain = "unreachable-bootstrap";
+    phantom.port = unreachable_port;
+    phantom.capacity = 512ULL * 1024 * 1024;
+    phantom.seen_unix_ms = unix_ms();
+
+    const auto self = node.membership().self();
+    bool selected_self = false;
+    for (uint32_t candidate = 1; candidate < 100000 && !selected_self; ++candidate) {
+        phantom.id = {};
+        phantom.id.bytes[0] = static_cast<uint8_t>(candidate >> 24U);
+        phantom.id.bytes[1] = static_cast<uint8_t>(candidate >> 16U);
+        phantom.id.bytes[2] = static_cast<uint8_t>(candidate >> 8U);
+        phantom.id.bytes[3] = static_cast<uint8_t>(candidate);
+        if (phantom.id == self.id)
+            continue;
+        auto ranked = rendezvous_nodes(placement_key.bytes, {self, phantom}, 1);
+        selected_self = !ranked.empty() && ranked.front().id == self.id;
+    }
+    REQUIRE(selected_self);
+    node.membership().observe(phantom, true);
+
+    MetadataManager metadata(node);
+    bool rejected = false;
+    try {
+        (void)metadata.snapshot_view();
+    } catch (const std::exception& error) {
+        rejected = std::string(error.what()).find("bootstrap checkpoint survey") !=
+                   std::string::npos;
+    }
+    CHECK(rejected);
+    CHECK(node.metadata_replica().current().generation <= 1);
+    CHECK(node.metadata_replica().committed().generation <= 1);
+
+    node.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_quorum) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto p1 = free_port();
+    auto p2 = free_port();
+
+    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 2;
+    c1.metadata_replication = c2.metadata_replication = 2;
+
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }));
+
+    // Both peers may attempt genesis simultaneously after symmetric discovery.
+    // Competing generation-2 proposals must converge on one metadata history.
+    std::exception_ptr first_error;
+    std::exception_ptr second_error;
+    std::atomic<unsigned> ready{};
+    std::atomic<bool> go{};
+    std::thread first([&] {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        try {
+            s1.filesystem().mkdir("/from-node-1", 0755, getuid(), getgid());
+        } catch (...) {
+            first_error = std::current_exception();
+        }
+    });
+    std::thread second([&] {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        try {
+            s2.filesystem().mkdir("/from-node-2", 0755, getuid(), getgid());
+        } catch (...) {
+            second_error = std::current_exception();
+        }
+    });
+    while (ready.load(std::memory_order_acquire) != 2)
+        std::this_thread::yield();
+    go.store(true, std::memory_order_release);
+    first.join();
+    second.join();
+    if (first_error)
+        std::rethrow_exception(first_error);
+    if (second_error)
+        std::rethrow_exception(second_error);
+
+    CHECK(s1.filesystem().getattr("/from-node-2").type == EntryType::directory);
+    CHECK(s2.filesystem().getattr("/from-node-1").type == EntryType::directory);
+
+    s1.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    s1.filesystem().create_file("/media/two-replicas.bin", 0644, getuid(), getgid());
+    auto input = pattern(128 * 1024);
+    auto writer = s1.filesystem().open_write("/media/two-replicas.bin", true);
+    REQUIRE(writer->write(0, input) == input.size());
+    writer->commit();
+
+    REQUIRE(wait_until([&] {
+        try {
+            return s2.filesystem().getattr("/media/two-replicas.bin").size == input.size();
+        } catch (...) {
+            return false;
+        }
+    }));
+
+    MetadataManager m1(s1.node());
+    auto snapshot = m1.snapshot();
+    CHECK(snapshot.metadata_voters.size() == 2);
+    CHECK(snapshot.data_replication == 2);
+
+    auto entry = s1.filesystem().getattr("/media/two-replicas.bin");
+    REQUIRE(entry.extents.size() == 1);
+    CHECK(s1.node().local_store().has(entry.extents.front().id));
+    CHECK(s2.node().local_store().has(entry.extents.front().id));
+
+    s2.stop();
+    s1.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto p1 = free_port();
+    auto p2 = free_port();
+
+    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1);
+    auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 1;
+    c1.metadata_replication = c2.metadata_replication = 1;
+
+    ObjectId object;
+    Bytes input = pattern(128 * 1024);
+    {
+        Service s1(c1, keys);
+        Service s2(c2, keys);
+        s1.start();
+        s2.start();
+        REQUIRE(wait_until([&] {
+            return s1.node().membership().active().size() >= 2 &&
+                   s2.node().membership().active().size() >= 2;
+        }));
+
+        s1.filesystem().create_file("/policy.bin", 0644, getuid(), getgid());
+        auto writer = s1.filesystem().open_write("/policy.bin", true);
+        REQUIRE(writer->write(0, input) == input.size());
+        writer->commit();
+        auto entry = s1.filesystem().getattr("/policy.bin");
+        REQUIRE(entry.extents.size() == 1);
+        object = entry.extents.front().id;
+        REQUIRE(wait_until([&] {
+            try {
+                return s2.filesystem().getattr("/policy.bin").size == input.size();
+            } catch (...) {
+                return false;
+            }
+        }));
+        s2.stop();
+        s1.stop();
+    }
+
+    // Replica policy is deliberately changed only while the whole cluster is
+    // stopped. On restart the old metadata quorum commits the new policy and
+    // object repair converges existing content to the new data replica count.
+    c1.replication = c2.replication = 2;
+    c1.metadata_replication = c2.metadata_replication = 2;
+    {
+        Service s1(c1, keys);
+        Service s2(c2, keys);
+        s1.start();
+        s2.start();
+        REQUIRE(wait_until([&] {
+            return s1.node().membership().active().size() >= 2 &&
+                   s2.node().membership().active().size() >= 2;
+        }));
+
+        s1.filesystem().mkdir("/after-grow", 0755, getuid(), getgid());
+        MetadataManager m1(s1.node());
+        auto snapshot = m1.snapshot();
+        CHECK(snapshot.metadata_voters.size() == 2);
+        CHECK(snapshot.data_replication == 2);
+        CHECK(s2.filesystem().getattr("/after-grow").type == EntryType::directory);
+
+        DistributedStore r1(s1.node());
+        DistributedStore r2(s2.node());
+        REQUIRE(wait_until([&] {
+            r1.repair_once(1024 * 1024);
+            r2.repair_once(1024 * 1024);
+            return s1.node().local_store().has(object) && s2.node().local_store().has(object);
+        }));
+
+        s2.stop();
+        s1.stop();
+    }
+
+    c1.replication = c2.replication = 1;
+    c1.metadata_replication = c2.metadata_replication = 1;
+    {
+        Service s1(c1, keys);
+        Service s2(c2, keys);
+        s1.start();
+        s2.start();
+        REQUIRE(wait_until([&] {
+            return s1.node().membership().active().size() >= 2 &&
+                   s2.node().membership().active().size() >= 2;
+        }));
+
+        s2.filesystem().mkdir("/after-shrink", 0755, getuid(), getgid());
+        MetadataManager m2(s2.node());
+        auto snapshot = m2.snapshot();
+        CHECK(snapshot.metadata_voters.size() == 1);
+        CHECK(snapshot.data_replication == 1);
+        CHECK(s1.filesystem().getattr("/after-shrink").type == EntryType::directory);
+
+        auto reader = s2.filesystem().open_read("/policy.bin");
+        Bytes output(input.size());
+        REQUIRE(reader->read(0, output) == output.size());
+        CHECK(output == input);
+
+        s2.stop();
+        s1.stop();
+    }
+}
+
+MACHA_TEST("rpc_cluster", test_full_replica_fallback) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    uint16_t p1 = free_port();
+    uint16_t p2 = free_port();
+    uint16_t p3 = free_port();
+    uint16_t p4 = free_port();
+
+    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1);
+    auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    auto c3 = config_for(cluster.path() / "n3", cluster.keyfile(), p3, {{"127.0.0.1", p1}});
+    auto c4 = config_for(cluster.path() / "n4", cluster.keyfile(), p4, {{"127.0.0.1", p1}});
+    // Equal configured capacities give each node an equal placement share.
+    // Node 1 is then filled locally: current free space must not change its
+    // placement weight, and the missing replica should spill to the fallback.
+    c1.storage_backends.front().limit = 2ULL * 1024 * 1024;
+    c2.storage_backends.front().limit = 2ULL * 1024 * 1024;
+    c3.storage_backends.front().limit = 2ULL * 1024 * 1024;
+    c4.storage_backends.front().limit = 2ULL * 1024 * 1024;
+
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    Service s3(c3, keys);
+    Service s4(c4, keys);
+    s1.start();
+    s2.start();
+    s3.start();
+    s4.start();
+    REQUIRE(wait_until([&] { return s2.node().membership().active().size() >= 4; }));
+
+    auto filler = pattern(1800 * 1024);
+    filler[0] ^= 0xa5;
+    REQUIRE(s1.node().local_store().put(object_id(filler), filler));
+
+    Bytes data;
+    std::vector<NodeInfo> ranked;
+    for (uint32_t salt = 0; salt < 1000; ++salt) {
+        data = pattern(256 * 1024 + salt);
+        auto id = object_id(data);
+        auto active = s2.node().membership().active();
+        ranked = capacity_placement_nodes(id.bytes, active, c2.replication);
+        if (ranked.size() == 4 &&
+            std::find_if(ranked.begin(), ranked.begin() + 3, [&](const NodeInfo& n) {
+                return n.id == s1.node().node_id();
+            }) != ranked.begin() + 3) {
+            break;
+        }
+        ranked.clear();
+    }
+    REQUIRE(ranked.size() == 4);
+
+    auto id = object_id(data);
+    DistributedStore store(s2.node());
+    REQUIRE(store.put(id, data));
+    CHECK(!s1.node().local_store().has(id));
+
+    std::array<Service*, 4> services{&s1, &s2, &s3, &s4};
+    auto fallback = std::find_if(services.begin(), services.end(), [&](Service* service) {
+        return service->node().node_id() == ranked[3].id;
+    });
+    REQUIRE(fallback != services.end());
+
+    // Foreground put() commits at quorum and does not wait for the full third
+    // owner. Placement repair subsequently spills that missing replica to the
+    // next deterministic capacity-aware fallback node.
+    REQUIRE(wait_until([&] {
+        for (auto* service : services) {
+            if (!service->node().local_store().has(id))
+                continue;
+            DistributedStore repair(service->node());
+            repair.repair_once(8ULL * 1024 * 1024);
+        }
+        return (*fallback)->node().local_store().has(id);
+    }));
+
+    size_t copies = 0;
+    for (auto* service : services)
+        copies += service->node().local_store().has(id) ? 1 : 0;
+    CHECK(copies == 3);
+
+    s4.stop();
+    s3.stop();
+    s2.stop();
+    s1.stop();
+}
+
+MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_replication) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    uint16_t p1 = free_port();
+    uint16_t p2 = free_port();
+
+    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1);
+    auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 2;
+    c1.metadata_replication = c2.metadata_replication = 1;
+
+    std::vector<ObjectId> objects;
+    Bytes input = pattern(2 * 1024 * 1024 + 12345);
+    NodeId old_n1;
+
+    auto s1 = std::make_unique<Service>(c1, keys);
+    auto s2 = std::make_unique<Service>(c2, keys);
+    s1->start();
+    s2->start();
+    REQUIRE(wait_until([&] {
+        return s1->node().membership().active().size() >= 2 &&
+               s2->node().membership().active().size() >= 2;
+    }));
+
+    s1->filesystem().mkdir("/media", 0755, getuid(), getgid());
+    s1->filesystem().create_file("/media/recovery.bin", 0644, getuid(), getgid());
+    auto writer = s1->filesystem().open_write("/media/recovery.bin", true);
+    REQUIRE(writer->write(0, input) == input.size());
+    writer->commit();
+    auto entry = s1->filesystem().getattr("/media/recovery.bin");
+    REQUIRE(!entry.extents.empty());
+    for (const auto& extent : entry.extents) {
+        if (!extent.hole)
+            objects.push_back(extent.id);
+    }
+    REQUIRE(!objects.empty());
+
+    REQUIRE(wait_until([&] {
+        try {
+            return s2->filesystem().getattr("/media/recovery.bin").size == input.size();
+        } catch (...) {
+            return false;
+        }
+    }));
+    REQUIRE(wait_until([&] {
+        return std::all_of(objects.begin(), objects.end(),
+                           [&](const auto& id) { return s2->node().local_store().has(id); });
+    }));
+
+    // Force one normal metadata maintenance pass so node 2 is demonstrably a
+    // durable committed-checkpoint witness before the voter is destroyed.
+    MetadataManager witness_repair(s2->node());
+    witness_repair.repair_once();
+    CHECK(s2->node().metadata_replica().committed().generation > 1);
+
+    old_n1 = s1->node().node_id();
+    s1->stop();
+    s1.reset();
+
+    // Simulate complete loss of node 1: identity, namespace state, cache and
+    // every authoritative object are gone. The shared cluster key/config remain.
+    std::error_code ec;
+    std::filesystem::remove_all(c1.state_path, ec);
+    std::filesystem::remove_all(c1.storage_backends.front().path, ec);
+    if (!c1.cache.path.empty())
+        std::filesystem::remove_all(c1.cache.path, ec);
+    std::filesystem::create_directories(c1.storage_backends.front().path);
+
+    // A wiped founder cannot discover the survivor unless it is explicitly
+    // given a bootstrap route. This is the same replacement-node operation a
+    // real deployment performs after losing local state.
+    auto replacement_config = c1;
+    replacement_config.bootstrap = {{"127.0.0.1", p2}};
+    auto replacement = std::make_unique<Service>(replacement_config, keys);
+    replacement->start();
+    CHECK(replacement->node().node_id() != old_n1);
+
+    REQUIRE(wait_until([&] {
+        try {
+            return replacement->filesystem().getattr("/media/recovery.bin").size == input.size();
+        } catch (...) {
+            return false;
+        }
+    }, 10s));
+
+    // Once the committed namespace is recovered, the existing live-object
+    // maintenance walk must automatically repopulate the replacement's DHT
+    // ownership from the surviving node.
+    REQUIRE(wait_until([&] {
+        return std::all_of(objects.begin(), objects.end(), [&](const auto& id) {
+            return replacement->node().local_store().has(id);
+        });
+    }, 10s));
+
+    Bytes output(input.size());
+    auto reader = replacement->filesystem().open_read("/media/recovery.bin");
+    size_t offset = 0;
+    while (offset < output.size()) {
+        auto n = reader->read(offset, {output.data() + offset, output.size() - offset});
+        REQUIRE(n > 0);
+        offset += n;
+    }
+    CHECK(output == input);
+
+    // Recovery also reconstructs a writable metadata voter group; it is not a
+    // read-only salvage mode.
+    replacement->filesystem().mkdir("/after-replacement", 0755, getuid(), getgid());
+    REQUIRE(wait_until(
+        [&] {
+            try {
+                return s2->filesystem().getattr("/after-replacement").type ==
+                       EntryType::directory;
+            } catch (...) {
+                return false;
+            }
+        },
+        200ms));
+
+    replacement->stop();
+    s2->stop();
+}
+
+MACHA_HEAVY_TEST("rpc_cluster", test_three_node_cluster) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    uint16_t p1 = free_port();
+    uint16_t p2 = free_port();
+    uint16_t p3 = free_port();
+    uint16_t p4 = free_port();
+
+    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1);
+    auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    auto c3 = config_for(cluster.path() / "n3", cluster.keyfile(), p3, {{"127.0.0.1", p1}});
+    auto c4 = config_for(cluster.path() / "n4", cluster.keyfile(), p4, {{"127.0.0.1", p1}});
+
+    {
+        Service s1(c1, keys);
+        Service s2(c2, keys);
+        Service s3(c3, keys);
+        s1.start();
+        s2.start();
+        s3.start();
+
+        REQUIRE(wait_until([&] {
+            return s1.node().membership().active().size() >= 3 &&
+                   s2.node().membership().active().size() >= 3 &&
+                   s3.node().membership().active().size() >= 3;
+        }));
+
+        s1.filesystem().mkdir("/media", 0755, getuid(), getgid());
+        s1.filesystem().create_file("/media/movie.mkv", 0644, getuid(), getgid());
+        auto input = pattern(3 * 1024 * 1024 + 12345);
+        auto writer = s1.filesystem().open_write("/media/movie.mkv", true);
+        size_t offset = 0;
+        while (offset < input.size()) {
+            size_t n = std::min<size_t>(77777, input.size() - offset);
+            CHECK(writer->write(offset, {input.data() + offset, n}) == n);
+            offset += n;
+        }
+        writer->commit();
+
+        // Removing a committed file records an explicit retirement. Reachability
+        // GC uses the same live inventory for both tombstone pruning and orphan sweep.
+        s1.filesystem().create_file("/media/delete-me.bin", 0644, getuid(), getgid());
+        auto delete_data = pattern(131072);
+        auto delete_writer = s1.filesystem().open_write("/media/delete-me.bin", true);
+        REQUIRE(delete_writer->write(0, delete_data) == delete_data.size());
+        delete_writer->commit();
+        auto delete_entry = s1.filesystem().getattr("/media/delete-me.bin");
+        REQUIRE(delete_entry.extents.size() == 1);
+        auto deleted_id = delete_entry.extents.front().id;
+        s1.filesystem().unlink("/media/delete-me.bin");
+        auto maintenance = s1.filesystem().maintenance_objects();
+        CHECK(std::find_if(maintenance.garbage.begin(), maintenance.garbage.end(),
+                           [&](const GarbageRef& garbage) { return garbage.id == deleted_id; }) !=
+              maintenance.garbage.end());
+        CHECK(std::find(maintenance.live.begin(), maintenance.live.end(), deleted_id) ==
+              maintenance.live.end());
+        auto inventory1 = s1.filesystem().maintenance_objects_cached();
+        auto inventory2 = s1.filesystem().maintenance_objects_cached();
+        CHECK(inventory1.get() == inventory2.get());
+        CHECK(inventory1->metadata_generation != 0);
+        CHECK(inventory1->entries >= 2);
+        CHECK(inventory1->extents >= 1);
+        CHECK(std::is_sorted(inventory1->live.begin(), inventory1->live.end()));
+        CHECK(std::adjacent_find(inventory1->live.begin(), inventory1->live.end()) ==
+              inventory1->live.end());
+        CHECK(std::is_sorted(inventory1->garbage.begin(), inventory1->garbage.end()));
+        s1.filesystem().mkdir("/inventory-generation-change", 0755, getuid(), getgid());
+        auto inventory3 = s1.filesystem().maintenance_objects_cached();
+        CHECK(inventory3->metadata_generation > inventory1->metadata_generation);
+        CHECK(inventory3.get() != inventory1.get());
+
+        REQUIRE(wait_until([&] {
+            try {
+                return s2.filesystem().getattr("/media/movie.mkv").size == input.size();
+            } catch (...) {
+                return false;
+            }
+        }));
+
+        // Warm node 2's namespace cache, mutate through node 1, then require
+        // visibility before the cache TTL can expire. The local replica update
+        // and generation notice are both valid invalidation paths.
+        (void)s2.filesystem().getattr("/media");
+        s1.filesystem().mkdir("/cache-invalidation", 0755, getuid(), getgid());
+        REQUIRE(wait_until(
+            [&] {
+                try {
+                    return s2.filesystem().getattr("/cache-invalidation").type ==
+                           EntryType::directory;
+                } catch (...) {
+                    return false;
+                }
+            },
+            200ms));
+
+        auto reader = s2.filesystem().open_read("/media/movie.mkv");
+        Bytes output(input.size());
+        size_t got = 0;
+        while (got < output.size()) {
+            size_t n = std::min<size_t>(131072, output.size() - got);
+            auto r = reader->read(got, {output.data() + got, n});
+            REQUIRE(r > 0);
+            got += r;
+        }
+        CHECK(output == input);
+
+        Bytes slice(333333);
+        auto random_reader = s3.filesystem().open_read("/media/movie.mkv");
+        auto n = random_reader->read(987654, slice);
+        REQUIRE(n == slice.size());
+        CHECK(std::equal(slice.begin(), slice.end(), input.begin() + 987654));
+
+        s1.filesystem().mkdir("/media/not-a-file", 0755, getuid(), getgid());
+        bool wrong_type_rejected = false;
+        try {
+            s1.filesystem().rename("/media/movie.mkv", "/media/not-a-file", false);
+        } catch (const FsError& error) {
+            wrong_type_rejected = error.code() == EISDIR;
+        }
+        CHECK(wrong_type_rejected);
+
+        // Loss of any one metadata voter must not stop namespace mutations.
+        auto failed_voter = s3.node().node_id();
+        s3.stop();
+        s2.filesystem().mkdir("/survives-one-node-loss", 0755, getuid(), getgid());
+        CHECK(s1.filesystem().getattr("/survives-one-node-loss").type == EntryType::directory);
+
+        // Remove a local replica from node 2; reads must transparently fall back to node 1.
+        auto entry = s2.filesystem().getattr("/media/movie.mkv");
+        REQUIRE(!entry.extents.empty());
+
+        // A damaged encrypted replica must fail authentication, fall back to a
+        // healthy peer, and be restored by the bounded scrub/repair path.
+        auto damaged = entry.extents.front().id;
+        corrupt_object(c2.storage_backends.front().path, damaged);
+        DistributedStore corruption_repair(s2.node());
+        auto recovered = corruption_repair.get(damaged);
+        REQUIRE(recovered.has_value());
+        CHECK(object_id(*recovered) == damaged);
+        corruption_repair.scrub_once(128ULL * 1024 * 1024);
+        for (size_t attempt = 0; attempt < entry.extents.size() + 2; ++attempt)
+            corruption_repair.repair_once(128ULL * 1024 * 1024);
+        REQUIRE(s2.node().local_store().get(damaged).has_value());
+
+        // Remove a local replica entirely; reads must transparently fall back.
+        s2.node().local_store().remove(damaged);
+        auto failover_reader = s2.filesystem().open_read("/media/movie.mkv");
+        Bytes first(1024 * 1024);
+        REQUIRE(failover_reader->read(0, first) == first.size());
+        CHECK(std::equal(first.begin(), first.end(), input.begin()));
+
+        // Enable a persistent SSD-style cache on node 2 at runtime. A playback
+        // fetch that node 2 should own is retained independently of DHT storage
+        // and also promoted back to authoritative storage without another WAN
+        // fetch.
+        auto cache_config = c2;
+        cache_config.cache.path = cluster.path() / "n2-cache";
+        cache_config.cache.max_blocks = 8;
+        s2.node().reconfigure_local(cache_config);
+        s2.node().local_store().remove(damaged);
+        DistributedStore playback_store(s2.node());
+        auto playback_fetch = playback_store.get(damaged, 0, true);
+        REQUIRE(playback_fetch.has_value());
+        CHECK(object_id(*playback_fetch) == damaged);
+        REQUIRE(wait_until([&] { return s2.node().block_cache().has(damaged); }));
+        REQUIRE(wait_until([&] { return s2.node().local_store().has(damaged); }));
+        // Prove the cache is genuinely independent: discard the DHT copy again;
+        // subsequent reads can still use the persistent cache.
+        s2.node().local_store().remove(damaged);
+        auto cached_fetch = playback_store.get(damaged, 0, true);
+        REQUIRE(cached_fetch.has_value());
+        CHECK(*cached_fetch == *playback_fetch);
+
+        // Add a replacement storage node. Once the failed voter has expired, a
+        // surviving metadata majority can safely replace it with the new node.
+        Service s4(c4, keys);
+        s4.start();
+        REQUIRE(wait_until([&] {
+            auto active = s1.node().membership().active();
+            bool has_failed = false;
+            bool has_new = false;
+            for (const auto& peer : active) {
+                has_failed |= peer.id == failed_voter;
+                has_new |= peer.id == s4.node().node_id();
+            }
+            return !has_failed && has_new && active.size() >= 3;
+        }));
+        // A joining owner pulls its assigned live objects automatically. This
+        // no longer depends on an old owner being manually prodded to scan/push.
+        REQUIRE(wait_until([&] {
+            return s4.node().local_store().has(entry.extents.front().id);
+        }));
+
+        MetadataManager repair(s1.node());
+        repair.repair_once();
+        REQUIRE(wait_until([&] {
+            try {
+                return s4.filesystem().getattr("/media/movie.mkv").size == input.size();
+            } catch (...) {
+                return false;
+            }
+        }));
+
+        // The old voter can now also disappear: node 2 + replacement node 4
+        // are a majority of the new voter group.
+        s1.stop();
+        s2.filesystem().mkdir("/after-voter-replacement", 0755, getuid(), getgid());
+        CHECK(s4.filesystem().getattr("/after-voter-replacement").type == EntryType::directory);
+
+        // A single surviving voter is a minority and must not split-brain metadata.
+        s4.stop();
+        bool refused = false;
+        try {
+            s2.filesystem().mkdir("/must-not-commit", 0755, getuid(), getgid());
+        } catch (...) {
+            refused = true;
+        }
+        CHECK(refused);
+        s2.stop();
+    }
+
+    // Full process-style restart from persisted state.
+    {
+        Service s1(c1, keys);
+        Service s2(c2, keys);
+        Service s3(c3, keys);
+        s1.start();
+        s2.start();
+        s3.start();
+        REQUIRE(wait_until([&] { return s2.node().membership().active().size() >= 3; }));
+        REQUIRE(wait_until([&] {
+            try {
+                return s2.filesystem().getattr("/media/movie.mkv").size > 0;
+            } catch (...) {
+                return false;
+            }
+        }));
+        auto e = s2.filesystem().getattr("/media/movie.mkv");
+        CHECK(e.size == 3 * 1024 * 1024 + 12345);
+        Bytes tail(65536);
+        auto r = s2.filesystem().open_read("/media/movie.mkv");
+        REQUIRE(r->read(e.size - tail.size(), tail) == tail.size());
+        auto expected = pattern(e.size);
+        CHECK(std::equal(tail.begin(), tail.end(), expected.end() - tail.size()));
+        s3.stop();
+        s2.stop();
+        s1.stop();
+    }
+}
+
+} // namespace

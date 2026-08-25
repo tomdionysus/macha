@@ -1,0 +1,2630 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "test_backend_support.hpp"
+
+using namespace macha;
+using namespace std::chrono_literals;
+using namespace macha::test_support;
+
+namespace {
+
+MACHA_TEST("hydration_catalogue", test_hydration_scheduler_and_prediction) {
+    auto make_id = [](uint8_t value) {
+        Bytes bytes(32, value);
+        return object_id(bytes);
+    };
+
+    // Read-ahead and current-file hints reinforce the same ordered run, but
+    // weighted virtual time must still service a lower-priority next-file run.
+    auto a = make_id(1), b = make_id(2), c = make_id(3), d = make_id(4), e = make_id(5),
+         f = make_id(6), n0 = make_id(7), n1 = make_id(8), n2 = make_id(9);
+    std::vector<HydrationHint> hints{
+        {"current", {a, b}, 1000, "read_ahead"},
+        {"current", {a, b, c, d, e, f}, 700, "current_file"},
+        {"next", {n0, n1, n2}, 300, "next_episode"},
+    };
+    HydrationScheduler scheduler;
+    std::set<ObjectId> present;
+    std::vector<HydrationRequest> requests;
+    for (size_t i = 0; i < 7; ++i) {
+        auto request = scheduler.next(hints, [&](const ObjectId& id) { return present.contains(id); });
+        REQUIRE(request.has_value());
+        requests.push_back(*request);
+        present.insert(request->object);
+    }
+    CHECK(requests[0].object == a);
+    CHECK(requests[0].priority == 1700);
+    CHECK(requests[1].object == b);
+    CHECK(requests[2].object == c);
+    CHECK(requests[3].object == n0); // interleaved before the current file completes.
+    auto n0_at = std::find_if(requests.begin(), requests.end(), [&](const auto& r) { return r.object == n0; });
+    auto n1_at = std::find_if(requests.begin(), requests.end(), [&](const auto& r) { return r.object == n1; });
+    REQUIRE(n0_at != requests.end());
+    REQUIRE(n1_at != requests.end());
+    CHECK(n0_at < n1_at); // an ordered speculative run can never start in its middle.
+
+    // A blocked prefix blocks the rest of that run rather than skipping ahead.
+    scheduler.reset();
+    present.clear();
+    auto blocked = [&](const ObjectId& id) { return id == n0; };
+    auto blocked_request = scheduler.next({{"next", {n0, n1, n2}, 300, "next_episode"}},
+                                          [&](const ObjectId& id) { return present.contains(id); },
+                                          blocked);
+    CHECK(!blocked_request.has_value());
+
+    PlaybackTracker tracker;
+    FsEntry synthetic;
+    synthetic.type = EntryType::file;
+    synthetic.size = 6;
+    for (size_t i = 0; i < 6; ++i)
+        synthetic.extents.push_back({i, 1, make_id(static_cast<uint8_t>(20 + i)), false});
+    auto session = tracker.open("/synthetic.mkv", synthetic);
+    tracker.progress(session, 1);
+    HydrationConfig hc;
+    ReadAheadHintProvider ahead(tracker, hc, 2);
+    CurrentFileHintProvider tail(tracker, hc);
+    auto ahead_hints = ahead.hints();
+    auto tail_hints = tail.hints();
+    REQUIRE(ahead_hints.size() == 1);
+    REQUIRE(tail_hints.size() == 1);
+    CHECK(ahead_hints[0].objects.size() == 2);
+    CHECK(ahead_hints[0].objects[0] == synthetic.extents[2].id);
+    CHECK(ahead_hints[0].objects[1] == synthetic.extents[3].id);
+    CHECK(tail_hints[0].objects.size() == 4);
+    CHECK(tail_hints[0].objects.front() == synthetic.extents[2].id);
+    CHECK(tail_hints[0].objects.back() == synthetic.extents[5].id);
+    tracker.close(session);
+
+    std::atomic_uint playback_changes{};
+    tracker.set_change_callback([&] { ++playback_changes; });
+    auto notified_session = tracker.open("/notified.mkv", synthetic);
+    tracker.progress(notified_session, 2);
+    tracker.close(notified_session);
+    CHECK(playback_changes.load() == 3);
+    tracker.set_change_callback({});
+
+    auto renamed = synthetic;
+    renamed.mode = 0600;
+    renamed.uid = 1234;
+    renamed.gid = 5678;
+    renamed.mtime_ns = 999;
+    CHECK(file_media_id(synthetic) == file_media_id(renamed));
+
+    // Catalogue prediction is resolved against actual Macha file manifests. It
+    // advances within a season, crosses into the next season, and advances a
+    // movie collection; every predicted run begins at extent zero.
+    TestService fixture("store");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.hydration.enabled = false;
+    auto& service = fixture.start();
+    service.filesystem().mkdir("/TV", 0755, getuid(), getgid());
+    service.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
+
+    auto make_file = [&](const std::string& path, uint8_t value) {
+        service.filesystem().create_file(path, 0644, getuid(), getgid());
+        auto data = Bytes(2 * 1024 * 1024 + 12345, value);
+        auto writer = service.filesystem().open_write(path, true);
+        REQUIRE(writer->write(0, data) == data.size());
+        writer->commit();
+        auto entry = service.filesystem().getattr(path);
+        REQUIRE(entry.extents.size() >= 3);
+        return entry;
+    };
+
+    auto ep1_file = make_file("/TV/s01e01.mkv", 31);
+    auto ep2_file = make_file("/TV/s01e02.mkv", 32);
+    auto ep3_file = make_file("/TV/s02e01.mkv", 33);
+    auto movie1_file = make_file("/Movies/one.mkv", 41);
+    auto movie2_file = make_file("/Movies/two.mkv", 42);
+
+    CatalogueItem show;
+    show.id = "show:test";
+    show.kind = CatalogueKind::show;
+    show.title = "Test Show";
+    show = service.catalogue().upsert(show);
+
+    CatalogueItem season1;
+    season1.id = "season:test:1";
+    season1.kind = CatalogueKind::season;
+    season1.title = "Season 1";
+    season1.parent_id = show.id;
+    season1.season_number = 1;
+    season1 = service.catalogue().upsert(season1);
+
+    CatalogueItem season2;
+    season2.id = "season:test:2";
+    season2.kind = CatalogueKind::season;
+    season2.title = "Season 2";
+    season2.parent_id = show.id;
+    season2.season_number = 2;
+    season2 = service.catalogue().upsert(season2);
+
+    CatalogueItem ep1;
+    ep1.id = "episode:test:1:1";
+    ep1.kind = CatalogueKind::episode;
+    ep1.title = "One";
+    ep1.parent_id = season1.id;
+    ep1.season_number = 1;
+    ep1.episode_number = 1;
+    ep1.media_ids = {file_media_id(ep1_file)};
+    ep1 = service.catalogue().upsert(ep1);
+
+    CatalogueItem ep2;
+    ep2.id = "episode:test:1:2";
+    ep2.kind = CatalogueKind::episode;
+    ep2.title = "Two";
+    ep2.parent_id = season1.id;
+    ep2.season_number = 1;
+    ep2.episode_number = 2;
+    ep2.media_ids = {file_media_id(ep2_file)};
+    ep2 = service.catalogue().upsert(ep2);
+
+    CatalogueItem ep3;
+    ep3.id = "episode:test:2:1";
+    ep3.kind = CatalogueKind::episode;
+    ep3.title = "Three";
+    ep3.parent_id = season2.id;
+    ep3.season_number = 2;
+    ep3.episode_number = 1;
+    ep3.media_ids = {file_media_id(ep3_file)};
+    ep3 = service.catalogue().upsert(ep3);
+
+    CatalogueItem movie1;
+    movie1.id = "movie:test:1";
+    movie1.kind = CatalogueKind::movie;
+    movie1.title = "First Film";
+    movie1.year = 2001;
+    movie1.external_ids["collection"] = "test-films";
+    movie1.media_ids = {"/Movies/one.mkv"};
+    movie1 = service.catalogue().upsert(movie1);
+
+    CatalogueItem movie2;
+    movie2.id = "movie:test:2";
+    movie2.kind = CatalogueKind::movie;
+    movie2.title = "Second Film";
+    movie2.year = 2003;
+    movie2.external_ids["collection"] = "test-films";
+    movie2.media_ids = {"path:/Movies/two.mkv"};
+    movie2 = service.catalogue().upsert(movie2);
+
+    HydrationConfig prediction_config;
+    prediction_config.catalogue_lookahead = 1;
+    PlaybackTracker prediction_tracker;
+    CatalogueSequenceHintProvider predictor(prediction_tracker, service.filesystem(),
+                                            service.catalogue(), prediction_config);
+
+    auto check_prediction = [&](const std::string& path, const FsEntry& current,
+                                const FsEntry& expected, const char* reason) {
+        auto active = prediction_tracker.open(path, current);
+        prediction_tracker.progress(active, 0);
+        auto predicted = predictor.hints();
+        REQUIRE(predicted.size() == 1);
+        CHECK(predicted[0].reason == reason);
+        REQUIRE(!predicted[0].objects.empty());
+        CHECK(predicted[0].objects.front() == expected.extents.front().id);
+        CHECK(predicted[0].objects.size() == expected.extents.size());
+        prediction_tracker.close(active);
+    };
+    check_prediction("/TV/s01e01.mkv", ep1_file, ep2_file, "next_episode");
+    check_prediction("/TV/s01e02.mkv", ep2_file, ep3_file, "next_episode");
+    check_prediction("/Movies/one.mkv", movie1_file, movie2_file, "next_movie");
+}
+
+MACHA_FAST_TEST("hydration_catalogue", test_replica_selector) {
+    auto node = [](uint8_t value) {
+        NodeInfo n;
+        n.id.bytes[0] = value;
+        n.host = "replica-" + std::to_string(value);
+        n.port = static_cast<uint16_t>(7000 + value);
+        return n;
+    };
+
+    ReplicaSelector selector;
+    std::vector<NodeInfo> nodes{node(1), node(2), node(3)};
+
+    // With no measurements, the extent stripe spreads equivalent speculative
+    // work over the complete replica set instead of pinning it to peer zero.
+    CHECK(selector.order(nodes, 0, ReplicaWorkClass::speculative).front().id == nodes[0].id);
+    CHECK(selector.order(nodes, 1, ReplicaWorkClass::speculative).front().id == nodes[1].id);
+    CHECK(selector.order(nodes, 2, ReplicaWorkClass::speculative).front().id == nodes[2].id);
+
+    // Outstanding speculative work makes an otherwise equal peer less useful
+    // for the next independent extent.
+    selector.started(nodes[0], ReplicaWorkClass::speculative);
+    CHECK(selector.order(nodes, 0, ReplicaWorkClass::speculative).front().id != nodes[0].id);
+    selector.finished(nodes[0], ReplicaWorkClass::speculative, 1024, 100ms, true);
+
+    // Foreground reads optimise latency rather than symmetry.
+    selector.started(nodes[0], ReplicaWorkClass::foreground);
+    selector.finished(nodes[0], ReplicaWorkClass::foreground, 1024, 20ms, true);
+    selector.started(nodes[1], ReplicaWorkClass::foreground);
+    selector.finished(nodes[1], ReplicaWorkClass::foreground, 1024, 200ms, true);
+    CHECK(selector.order(nodes, 0, ReplicaWorkClass::foreground).front().id == nodes[0].id);
+
+    // Speculative work yields to a peer carrying foreground traffic when an
+    // idle replica is available.
+    selector.started(nodes[0], ReplicaWorkClass::foreground);
+    CHECK(selector.order(nodes, 0, ReplicaWorkClass::speculative).front().id != nodes[0].id);
+    selector.finished(nodes[0], ReplicaWorkClass::foreground, 1024, 20ms, true);
+
+    // Promotion moves one active transfer between accounting classes rather
+    // than duplicating it.
+    selector.started(nodes[2], ReplicaWorkClass::speculative);
+    selector.promoted(nodes[2]);
+    auto promoted = selector.stats(nodes[2].id);
+    CHECK(promoted.speculative_in_flight == 0);
+    CHECK(promoted.foreground_in_flight == 1);
+    selector.finished(nodes[2], ReplicaWorkClass::foreground, 1024, 50ms, true);
+    CHECK(selector.stats(nodes[2].id).foreground_in_flight == 0);
+
+    // A failed source is penalised immediately; a later successful transfer
+    // clears the consecutive-failure penalty without erasing history.
+    selector.started(nodes[1], ReplicaWorkClass::foreground);
+    selector.finished(nodes[1], ReplicaWorkClass::foreground, 0, 10ms, false);
+    CHECK(selector.stats(nodes[1].id).failures == 1);
+    CHECK(selector.order(nodes, 0, ReplicaWorkClass::foreground).front().id != nodes[1].id);
+    selector.started(nodes[1], ReplicaWorkClass::foreground);
+    selector.finished(nodes[1], ReplicaWorkClass::foreground, 1024, 25ms, true);
+    CHECK(selector.stats(nodes[1].id).failures == 1);
+}
+
+MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cache) {
+    TempDir temp;
+    auto keyfile = temp.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    auto c1 = config_for(temp.path() / "n1", keyfile, p1);
+    auto c2 = config_for(temp.path() / "n2", keyfile, p2, {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 1;
+    c1.metadata_replication = c2.metadata_replication = 1;
+    c2.cache.path = temp.path() / "cache2";
+    c2.cache.max_blocks = 32;
+
+    NodeRuntime n1(c1, keys);
+    NodeRuntime n2(c2, keys);
+    n1.start();
+    n2.start();
+    REQUIRE(wait_until([&] {
+        return n1.membership().active().size() >= 2 && n2.membership().active().size() >= 2;
+    }));
+
+    DistributedStore source(n1);
+    DistributedStore target(n2);
+    auto make_remote = [&](uint8_t value) {
+        Bytes data(128 * 1024, value);
+        auto id = object_id(data);
+        REQUIRE(source.replicate_all(id, data, false) >= 2);
+        n2.local_store().remove(id);
+        n2.block_cache().remove(id);
+        REQUIRE(!target.locally_available(id));
+        return id;
+    };
+
+    const auto a = make_remote(61);
+    const auto b = make_remote(62);
+    const auto c = make_remote(63);
+    const auto n0 = make_remote(64);
+    const auto nnext = make_remote(65);
+
+    class StaticHints final : public HydrationHintProvider {
+        std::vector<HydrationHint> hints_;
+      public:
+        explicit StaticHints(std::vector<HydrationHint> hints) : hints_(std::move(hints)) {}
+        std::string_view name() const override { return "test"; }
+        std::vector<HydrationHint> hints() override { return hints_; }
+    };
+    auto provider = std::make_shared<StaticHints>(std::vector<HydrationHint>{
+        {"current", {a, b}, 1000, "read_ahead"},
+        {"current", {a, b, c}, 700, "current_file"},
+        {"next", {n0, nnext}, 300, "next_episode"}});
+
+    HydrationConfig config;
+    CacheHydrator hydrator(target, config);
+    hydrator.add_provider(provider);
+    REQUIRE(hydrator.run_once());
+    CHECK(hydrator.status().last_object == a);
+    CHECK(n2.block_cache().has(a));
+    CHECK(!n2.local_store().has(a));
+    REQUIRE(hydrator.run_once());
+    CHECK(hydrator.status().last_object == b);
+    REQUIRE(hydrator.run_once());
+    CHECK(hydrator.status().last_object == c);
+    REQUIRE(hydrator.run_once());
+    CHECK(hydrator.status().last_object == n0);
+    CHECK(n2.block_cache().has(n0));
+    CHECK(!n2.local_store().has(n0));
+    CHECK(!n2.block_cache().has(nnext));
+
+    // The production worker keeps a bounded speculative window in flight so
+    // several replicas can contribute bandwidth. Dispatch is still ordered and
+    // the configured limit is never exceeded.
+    const auto parallel0 = make_remote(66);
+    const auto parallel1 = make_remote(67);
+    const auto parallel2 = make_remote(68);
+    auto concurrent_provider = std::make_shared<StaticHints>(
+        std::vector<HydrationHint>{{"parallel", {parallel0, parallel1, parallel2}, 500, "current_file"}});
+    HydrationConfig concurrent_config;
+    concurrent_config.interval = 10ms;
+    concurrent_config.max_inflight = 2;
+    CacheHydrator concurrent(target, concurrent_config);
+    concurrent.add_provider(concurrent_provider);
+    concurrent.start();
+    REQUIRE(wait_until([&] { return concurrent.status().fetched >= 3; }, 5s));
+    concurrent.stop();
+    auto concurrent_status = concurrent.status();
+    CHECK(concurrent_status.peak_in_flight == 2);
+    CHECK(concurrent_status.in_flight == 0);
+    CHECK(n2.block_cache().has(parallel0));
+    CHECK(n2.block_cache().has(parallel1));
+    CHECK(n2.block_cache().has(parallel2));
+
+    // With no work the production hydrator must block, not sample providers at
+    // hydration.interval. A producer notification wakes it immediately when a
+    // new hint becomes available.
+    const auto event_object = make_remote(69);
+    class NotifyingHints final : public HydrationHintProvider {
+        mutable std::mutex mutex_;
+        std::vector<HydrationHint> hints_;
+        std::function<void()> wake_;
+      public:
+        std::atomic_uint calls{};
+        std::string_view name() const override { return "notifying-test"; }
+        std::vector<HydrationHint> hints() override {
+            ++calls;
+            std::lock_guard lock(mutex_);
+            return hints_;
+        }
+        void set_wake_callback(std::function<void()> callback) override {
+            std::lock_guard lock(mutex_);
+            wake_ = std::move(callback);
+        }
+        void publish(std::vector<HydrationHint> hints) {
+            std::function<void()> wake;
+            {
+                std::lock_guard lock(mutex_);
+                hints_ = std::move(hints);
+                wake = wake_;
+            }
+            if (wake) wake();
+        }
+    };
+    auto notifying_provider = std::make_shared<NotifyingHints>();
+    HydrationConfig event_config;
+    event_config.interval = 5ms;
+    event_config.max_inflight = 1;
+    CacheHydrator event_hydrator(target, event_config);
+    event_hydrator.add_provider(notifying_provider);
+    event_hydrator.start();
+    std::this_thread::sleep_for(25ms);
+    CHECK(notifying_provider->calls.load() <= 2);
+    notifying_provider->publish({{"event", {event_object}, 1000, "event-test"}});
+    REQUIRE(wait_until([&] { return n2.block_cache().has(event_object); }, 3s));
+    event_hydrator.stop();
+
+    n2.stop();
+    n1.stop();
+}
+
+MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_scanner) {
+    // External IDs are part of the durable catalogue format. Read fields in
+    // deterministic order: function-argument evaluation order must not be
+    // allowed to swap provider/id pairs during decoding.
+    CatalogueSnapshot codec_snapshot;
+    CatalogueItem codec_item;
+    codec_item.id = "codec:test";
+    codec_item.kind = CatalogueKind::movie;
+    codec_item.title = "Codec Test";
+    codec_item.external_ids["tmdb"] = "42";
+    codec_item.external_ids["macha_scanner"] = "1";
+    codec_snapshot.items.emplace(codec_item.id, codec_item);
+    auto codec_roundtrip = decode_catalogue(encode_catalogue(codec_snapshot));
+    REQUIRE(codec_roundtrip.items.contains(codec_item.id));
+    CHECK(codec_roundtrip.items.at(codec_item.id).external_ids == codec_item.external_ids);
+
+    FsEntry fake;
+    fake.type = EntryType::file;
+    fake.size = 123456;
+
+    auto episode = probe_media_path(
+        "/TV/The Expanse/Season 02/The.Expanse.S02E05.Home.mkv", fake);
+    REQUIRE(episode.has_value());
+    CHECK(episode->kind == MediaProbeKind::episode);
+    CHECK(episode->series == "The Expanse");
+    CHECK(episode->season == 2);
+    CHECK(episode->episode == 5);
+    CHECK(episode->title == "Home");
+
+    auto movie = probe_media_path(
+        "/Movies/Blade.Runner.2049.2017.1080p.BluRay.mkv", fake);
+    REQUIRE(movie.has_value());
+    CHECK(movie->kind == MediaProbeKind::movie);
+    CHECK(movie->title == "Blade Runner 2049");
+    CHECK(movie->year == 2017);
+
+    struct MovieRegression { const char* path; const char* title; int year; const char* edition{}; };
+    for (const auto& regression : std::array{
+             MovieRegression{"/Movies/01 Men In Black 1 - Will Smith 1997 Eng Ita Multi-Subs 1080p [H264-mp4].mp4", "Men In Black 1", 1997},
+             MovieRegression{"/Movies/02 Men In Black 2 - Will Smith 2002 Eng Ita Multi-Subs 1080p [H264-mp4].mp4", "Men In Black 2", 2002},
+             MovieRegression{"/Movies/03 Men In Black 3 - Will Smith 2012 Eng Ita Multi-Subs 1080p [H264-mp4].mp4", "Men In Black 3", 2012},
+             MovieRegression{"/Movies/12.Monkeys.1995.1080p.BluRay.x264.AAC5.1.mp4", "12 Monkeys", 1995},
+             MovieRegression{"/Movies/1994.Pulp.Fiction.1920x816.BDRip.x264.DTS-HD.MA.mkv", "Pulp Fiction", 1994},
+             MovieRegression{"/Movies/Apollo.13.1995.Remastered.1080p.BluRay.DDP.5.1.H.265-EDGE2020.mkv", "Apollo 13", 1995, "Remastered"},
+             MovieRegression{"/Movies/Bo.Burnham.Inside.2021.1080p.NF.WEBRip.DDP.5.1.H.265-EDGE2020.mkv", "Bo Burnham Inside", 2021},
+             MovieRegression{"/Movies/Corpse.Bride.2005.1080p.BluRay.DDP.5.1.H.265-EDGE2020.mkv", "Corpse Bride", 2005},
+             MovieRegression{"/Movies/Leon.the.Professional.Extended.1994.BrRip.x264.YIFY.mp4", "Leon the Professional", 1994, "Extended"},
+             MovieRegression{"/Movies/Requiem.For.A.Dream.DIRECTORS.CUT.2000.1080p.BrRip.x264.YIFY.mp4", "Requiem For A Dream", 2000, "DIRECTORS CUT"},
+             MovieRegression{"/Movies/Rebel.Moon.Part.One.Directors.Cut.1080p.NF.WEBRip.AAC5.1.10bits.x265-Rapta.mkv", "Rebel Moon Part One", 0, "Directors Cut"},
+             MovieRegression{"/Movies/2003.Kill.Bill-.Volume.1.1920x802.BDRip.x264.DTS-HD.MA.mkv", "Kill Bill Volume 1", 2003},
+             MovieRegression{"/Movies/Soldier - Sci-fi 1998 Eng Rus Comm Multi Subs 720p [H264-mp4].mp4", "Soldier", 1998},
+         }) {
+        auto parsed = probe_media_path(regression.path, fake);
+        REQUIRE(parsed.has_value());
+        CHECK(parsed->kind == MediaProbeKind::movie);
+        CHECK(parsed->title == regression.title);
+        if (regression.year) CHECK(parsed->year == regression.year);
+        else CHECK(!parsed->year.has_value());
+        if (regression.edition) CHECK(parsed->edition == std::optional<std::string>{regression.edition});
+        else CHECK(!parsed->edition.has_value());
+    }
+
+    auto apollo_candidates = probe_media_candidates(
+        "/Movies/Apollo.13.1995.Remastered.1080p.BluRay.DDP.5.1.H.265-EDGE2020.mkv", fake);
+    REQUIRE(apollo_candidates.size() >= 2);
+    CHECK(apollo_candidates.front().generator == "movie-semantic");
+    CHECK(apollo_candidates.front().score > apollo_candidates.back().score);
+    CHECK(!apollo_candidates.front().evidence.empty());
+
+    auto compact_candidates = probe_media_candidates(
+        "/Movies/japhson-romeoandjuliet.mkv", fake);
+    auto compact = std::find_if(compact_candidates.begin(), compact_candidates.end(),
+                                [](const auto& candidate) {
+                                    return candidate.generator == "movie-compact-title";
+                                });
+    REQUIRE(compact != compact_candidates.end());
+    CHECK(compact->probe.title == "romeo and juliet");
+
+    struct EpisodeRegression {
+        const char* path;
+        const char* series;
+        int year;
+        int season;
+        int episode;
+        const char* title;
+    };
+    for (const auto& regression : std::array{
+             EpisodeRegression{"/TV/Big.Mistakes.S01E08.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Big Mistakes", 0, 1, 8, ""},
+             EpisodeRegression{"/TV/Stranger.Things.S05E01.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 1, ""},
+             EpisodeRegression{"/TV/Stranger.Things.S05E03.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 3, ""},
+             EpisodeRegression{"/TV/Stranger.Things.S05E04.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 4, ""},
+             EpisodeRegression{"/TV/Stranger.Things.S05E05.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 5, ""},
+             EpisodeRegression{"/TV/Stranger.Things.S05E06.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 6, ""},
+             EpisodeRegression{"/TV/Stranger.Things.S05E08.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv", "Stranger Things", 0, 5, 8, ""},
+             EpisodeRegression{"/TV/Battlestar Galactica (2003) Season 1-4 S01-S04 (1080p BluRay x265 HEVC 10bit AAC 5.1 RZeroX)/Season 2/Battlestar Galactica (2003) - S02E01 - Scattered (1080p BluRay x265 RZeroX).mkv", "Battlestar Galactica", 2003, 2, 1, "Scattered"},
+             EpisodeRegression{"/TV/Ballykissangel (1996)/Season 2/Ballykissangel - S02E09 - As Happy as a Turkey on Boxing Day.mkv", "Ballykissangel", 1996, 2, 9, "As Happy as a Turkey on Boxing Day"},
+             EpisodeRegression{"/TV/Allo Allo 1984 Season 1 to 3 Complete DVDRip x264 [i_c]/Allo Allo 1984 Season 1/01 - Allo Allo S1e00 - The British Are Coming [Pilot].mkv", "Allo Allo", 0, 1, 0, "The British Are Coming [Pilot]"},
+             EpisodeRegression{"/TV/Test Show S01E01 - Ordinary Episode [rartv].mkv", "Test Show", 0, 1, 1, "Ordinary Episode"},
+             EpisodeRegression{"/TV/Black Books (2000)/Black Books (2000) - S01E01 - Cooking the Books (576p DVD x265 Ghost).mkv", "Black Books", 2000, 1, 1, "Cooking the Books"},
+             EpisodeRegression{"/TV/Black Books (2000)/S01E02.mkv", "Black Books", 2000, 1, 2, ""},
+             EpisodeRegression{"/TV/Blackadder.1982.S01-S04.1080p.BluRay.EAC3.2.0.x265-iVy/S01E01.mkv", "Blackadder", 1982, 1, 1, ""},
+             EpisodeRegression{"/TV/Black.Jesus.S01.1080p.AMZN.WEBRip.DDP5.1.x264-Cinefeel[rartv]/S01E01.mkv", "Black Jesus", 0, 1, 1, ""},
+             EpisodeRegression{"/TV/Black.Jesus.S02.1080p.WEB-DL.DD5.1.H.264-BTN[rartv]/S02E01.mkv", "Black Jesus", 0, 2, 1, ""},
+             EpisodeRegression{"/TV/Black.Jesus.S02.1080p.WEB-DL.DD5.1.H.264-BTN[rartv]/Black.Jesus.S02E05.Tasty.Tudi.s.1080p.WEB-DL.DD5.1.H.264-BTN.mkv", "Black Jesus", 0, 2, 5, "Tasty Tudi's"},
+             EpisodeRegression{"/TV/Black.Jesus.S02.1080p.WEB-DL.DD5.1.H.264-BTN[rartv]/Black.Jesus.S02E07.Thy.Neighbor.s.Strife.1080p.WEB-DL.DD5.1.H.264-BTN.mkv", "Black Jesus", 0, 2, 7, "Thy Neighbor's Strife"},
+         }) {
+        auto parsed = probe_media_path(regression.path, fake);
+        REQUIRE(parsed.has_value());
+        CHECK(parsed->kind == MediaProbeKind::episode);
+        CHECK(parsed->series == regression.series);
+        CHECK(parsed->season == regression.season);
+        CHECK(parsed->episode == regression.episode);
+        CHECK(parsed->title == regression.title);
+        if (regression.year) CHECK(parsed->year == regression.year);
+        else CHECK(!parsed->year.has_value());
+    }
+
+    auto multi_episode = probe_media_path(
+        "/TV/Battlestar Galactica (2003)/Season 4/Battlestar Galactica (2003) - S04E19-E20 - Daybreak (1080p BluRay x265 RZeroX).mkv", fake);
+    REQUIRE(multi_episode.has_value());
+    CHECK(multi_episode->kind == MediaProbeKind::episode);
+    CHECK(multi_episode->series == "Battlestar Galactica");
+    CHECK(multi_episode->year == 2003);
+    CHECK(multi_episode->season == 4);
+    CHECK(multi_episode->episode == 19);
+    CHECK(multi_episode->episode_end == 20);
+    CHECK(multi_episode->title == "Daybreak");
+
+    auto special_directory = probe_media_path(
+        "/TV/Battlestar Galactica (2003)/Specials/Battlestar Galactica (2003) - S00E23 - The Resistance (1) (480p BluRay x265 RZeroX).mkv", fake);
+    REQUIRE(special_directory.has_value());
+    CHECK(special_directory->series == "Battlestar Galactica");
+    CHECK(special_directory->year == 2003);
+    CHECK(special_directory->season == 0);
+    CHECK(special_directory->episode == 23);
+    CHECK(special_directory->title == "The Resistance (1)");
+
+    const auto battlestar_path =
+        "/TV/Battlestar Galactica (2003) Season 1-4 S01-S04 (1080p BluRay x265 HEVC 10bit AAC 5.1 RZeroX)/Season 2/Battlestar Galactica (2003) - S02E01 - Scattered (1080p BluRay x265 RZeroX).mkv";
+    auto battlestar_candidates = probe_media_candidates(battlestar_path, fake, "/TV");
+    auto battlestar_yearless = std::find_if(
+        battlestar_candidates.begin(), battlestar_candidates.end(), [](const auto& candidate) {
+            return candidate.generator == "episode-filename-yearless";
+        });
+    REQUIRE(battlestar_yearless != battlestar_candidates.end());
+    CHECK(battlestar_yearless->probe.series == "Battlestar Galactica");
+    CHECK(!battlestar_yearless->probe.year.has_value());
+    CHECK(battlestar_yearless->probe.season == 2);
+    CHECK(battlestar_yearless->probe.episode == 1);
+
+    auto track = probe_media_path(
+        "/Music/Pink Floyd/The Dark Side of the Moon/01 - Speak to Me.flac", fake);
+    REQUIRE(track.has_value());
+    CHECK(track->kind == MediaProbeKind::track);
+    CHECK(track->artist == "Pink Floyd");
+    CHECK(track->album == "The Dark Side of the Moon");
+    CHECK(track->track == 1);
+    CHECK(track->title == "Speak to Me");
+
+    auto disc_track = probe_media_path(
+        "/Music/Pink Floyd/The Wall/CD 2/03 - Hey You.flac", fake);
+    REQUIRE(disc_track.has_value());
+    CHECK(disc_track->artist == "Pink Floyd");
+    CHECK(disc_track->album == "The Wall");
+    CHECK(disc_track->disc == 2);
+    CHECK(disc_track->track == 3);
+    CHECK(disc_track->title == "Hey You");
+
+    auto discography_track = probe_media_path(
+        "/Music/A Tribe Called Quest Discography @ 320 (8 Albums)(RAP)(by dragan09)/1990 - Peoples Instinctive Travels And The Path/16 Can I Kick It_ (Extended Bollerho.mp3", fake);
+    REQUIRE(discography_track.has_value());
+    CHECK(discography_track->artist == "A Tribe Called Quest");
+    CHECK(discography_track->album == "Peoples Instinctive Travels And The Path");
+    CHECK(discography_track->year == 1990);
+    CHECK(discography_track->track == 16);
+
+    MediaProbe tagged_music;
+    tagged_music.kind = MediaProbeKind::track;
+    tagged_music.path = "/Music/Various Artists/Collected/04 - Teardrop.flac";
+    tagged_music.media_id = "macha:test-tagged-track";
+    tagged_music.title = "Teardrop";
+    tagged_music.album = "Collected";
+    tagged_music.album_artist = "Various Artists";
+    tagged_music.track_artist = "Massive Attack";
+    tagged_music.artist = tagged_music.album_artist;
+    auto tagged_candidates = probe_media_candidates(
+        MediaProbeContext{"/Music", tagged_music.path, fake, &tagged_music});
+    auto embedded_candidate = std::find_if(tagged_candidates.begin(), tagged_candidates.end(),
+                                           [](const auto& candidate) {
+                                               return candidate.generator == "music-embedded-tags";
+                                           });
+    auto recording_candidate = std::find_if(tagged_candidates.begin(), tagged_candidates.end(),
+                                            [](const auto& candidate) {
+                                                return candidate.generator == "music-recording-tags";
+                                            });
+    auto merged_candidate = std::find_if(tagged_candidates.begin(), tagged_candidates.end(),
+                                         [](const auto& candidate) {
+                                             return candidate.generator == "music-tags-plus-path";
+                                         });
+    REQUIRE(embedded_candidate != tagged_candidates.end());
+    REQUIRE(recording_candidate != tagged_candidates.end());
+    REQUIRE(merged_candidate != tagged_candidates.end());
+    CHECK(embedded_candidate->probe.artist == "Various Artists");
+    CHECK(embedded_candidate->probe.lookup_strategy ==
+          MediaProbeLookupStrategy::music_release_first);
+    CHECK(recording_candidate->probe.artist == "Massive Attack");
+    CHECK(recording_candidate->probe.album == "Collected");
+    CHECK(recording_candidate->probe.lookup_strategy ==
+          MediaProbeLookupStrategy::music_recording_first);
+    CHECK(merged_candidate->probe.track == 4);
+
+    auto untagged_music_candidates = probe_media_candidates(
+        "/Music/Pink Floyd/The Dark Side of the Moon/01 - Speak to Me.flac", fake, "/Music");
+    auto structured_recording = std::find_if(
+        untagged_music_candidates.begin(), untagged_music_candidates.end(), [](const auto& candidate) {
+            return candidate.generator == "music-structured-recording";
+        });
+    REQUIRE(structured_recording != untagged_music_candidates.end());
+    CHECK(structured_recording->probe.lookup_strategy ==
+          MediaProbeLookupStrategy::music_recording_first);
+
+    // Provider unit: one season lookup yields the show/season/episode hierarchy
+    // and all useful visual roles without requiring separate image metadata calls.
+    TempDir provider_temp;
+    auto token = provider_temp.path() / "tmdb.token";
+    {
+        std::ofstream out(token);
+        out << "test-token\n";
+    }
+    FakeHttpClient tmdb_http;
+    tmdb_http.add("/search/tv", 200, "application/json",
+                  R"({"results":[{"id":1402,"name":"The Walking Dead","overview":"Show overview","first_air_date":"2010-10-31","poster_path":"/show.jpg","backdrop_path":"/show-bg.jpg"}]})");
+    tmdb_http.add("/tv/1402/season/1", 200, "application/json",
+                  R"({"id":3643,"name":"Season 1","overview":"Season overview","poster_path":"/season.jpg","episodes":[{"id":63056,"episode_number":1,"name":"Days Gone Bye","overview":"Episode overview","still_path":"/episode.jpg"}]})");
+    CatalogueTmdbConfig tmdb_config;
+    tmdb_config.token_file = token;
+    TmdbProvider tmdb(tmdb_http, tmdb_config);
+    MediaProbe tv_probe;
+    tv_probe.kind = MediaProbeKind::episode;
+    tv_probe.series = "The Walking Dead";
+    tv_probe.season = 1;
+    tv_probe.episode = 1;
+    tv_probe.media_id = "macha:test-episode";
+    auto tv_match = tmdb.lookup(tv_probe);
+    REQUIRE(tv_match.has_value());
+    CHECK(tv_match->items.size() == 3);
+    CHECK(tv_match->items[0].kind == CatalogueKind::show);
+    CHECK(tv_match->items[1].kind == CatalogueKind::season);
+    CHECK(tv_match->items[2].kind == CatalogueKind::episode);
+    CHECK(tv_match->items[2].media_ids == std::vector<std::string>{"macha:test-episode"});
+    CHECK(tv_match->artwork.size() == 4);
+
+    // A one-year TV premiere difference is evidence, not a hard rejection.
+    // Release folders frequently use a pilot/miniseries/production year.
+    FakeHttpClient adjacent_year_http;
+    adjacent_year_http.add("query=Adjacent%20Year%20Show&language=en-GB", 200, "application/json",
+                           R"({"results":[{"id":1500,"name":"Adjacent Year Show","first_air_date":"2004-01-01"}]})");
+    adjacent_year_http.add("/tv/1500/season/1", 200, "application/json",
+                           R"({"id":1501,"name":"Season 1","episodes":[{"id":1502,"episode_number":1,"name":"Pilot"}]})");
+    TmdbProvider adjacent_year_tmdb(adjacent_year_http, tmdb_config);
+    MediaProbe adjacent_year_probe;
+    adjacent_year_probe.kind = MediaProbeKind::episode;
+    adjacent_year_probe.series = "Adjacent Year Show";
+    adjacent_year_probe.year = 2003;
+    adjacent_year_probe.season = 1;
+    adjacent_year_probe.episode = 1;
+    adjacent_year_probe.title = "Pilot";
+    adjacent_year_probe.media_id = "macha:adjacent-year";
+    CHECK(adjacent_year_tmdb.lookup(adjacent_year_probe).has_value());
+
+    // Positive show/season results are cached as the actual JSON objects, not
+    // merely as truthy values. A second episode lookup must therefore remain
+    // usable without issuing another provider request.
+    const auto tv_requests = tmdb_http.requests();
+    auto tv_cached = tmdb.lookup(tv_probe);
+    REQUIRE(tv_cached.has_value());
+    CHECK(tv_cached->items.size() == 3);
+    CHECK(tmdb_http.requests() == tv_requests);
+
+    // A year in a release name can identify a miniseries or special rather than
+    // TMDB's canonical ongoing series. A missing season is a semantic mismatch:
+    // cache that negative season result and let the scanner try the yearless
+    // episode candidate without repeatedly spending one request per episode.
+    FakeHttpClient battlestar_http;
+    battlestar_http.add("query=Battlestar%20Galactica&language=en-GB", 200, "application/json",
+                        R"({"results":[{"id":1972,"name":"Battlestar Galactica","first_air_date":"2004-10-18"},{"id":101,"name":"Battlestar Galactica","first_air_date":"2003-12-08"}]})");
+    battlestar_http.add("/tv/101/season/2", 404, "application/json", R"({})");
+    battlestar_http.add("/tv/1972/season/2", 200, "application/json",
+                        R"({"id":202,"name":"Season 2","episodes":[{"id":203,"episode_number":1,"name":"Scattered"},{"id":204,"episode_number":2,"name":"Valley of Darkness"}]})");
+    TmdbProvider battlestar_tmdb(battlestar_http, tmdb_config);
+    MediaProbe battlestar_probe;
+    battlestar_probe.kind = MediaProbeKind::episode;
+    battlestar_probe.series = "Battlestar Galactica";
+    battlestar_probe.year = 2003;
+    battlestar_probe.season = 2;
+    battlestar_probe.episode = 1;
+    battlestar_probe.title = "Scattered";
+    battlestar_probe.media_id = "macha:test-bsg";
+    CHECK(!battlestar_tmdb.lookup(battlestar_probe).has_value());
+    CHECK(battlestar_http.requests() == 2);
+    battlestar_probe.episode = 2;
+    battlestar_probe.title = "Valley of Darkness";
+    CHECK(!battlestar_tmdb.lookup(battlestar_probe).has_value());
+    CHECK(battlestar_http.requests() == 2);
+    battlestar_probe.year.reset();
+    battlestar_probe.episode = 1;
+    battlestar_probe.title = "Scattered";
+    auto battlestar_match = battlestar_tmdb.lookup(battlestar_probe);
+    REQUIRE(battlestar_match.has_value());
+    CHECK(battlestar_match->items.back().title == "Scattered");
+    CHECK(battlestar_http.requests() == 4);
+
+    battlestar_probe.title = "Definitely Not Scattered";
+    CHECK(!battlestar_tmdb.lookup(battlestar_probe).has_value());
+    CHECK(battlestar_http.requests() == 4);
+
+    // Strong series/year/season/episode identity must not be vetoed by small
+    // filename-title differences. TMDB's title is canonical; release titles are
+    // secondary evidence once the numbered identity is strong.
+    FakeHttpClient title_variation_http;
+    title_variation_http.add("query=Blue%20Lights&language=en-GB", 200, "application/json",
+                             R"({"results":[{"id":2000,"name":"Blue Lights","first_air_date":"2023-03-27"}]})");
+    title_variation_http.add("/tv/2000/season/1", 200, "application/json",
+                             R"({"id":2001,"name":"Season 1","episodes":[{"id":2006,"episode_number":6,"name":"Love the One You're With"}]})");
+    TmdbProvider title_variation_tmdb(title_variation_http, tmdb_config);
+    MediaProbe title_variation_probe;
+    title_variation_probe.kind = MediaProbeKind::episode;
+    title_variation_probe.series = "Blue Lights";
+    title_variation_probe.year = 2023;
+    title_variation_probe.season = 1;
+    title_variation_probe.episode = 6;
+    title_variation_probe.title = "Love the One You Are With";
+    title_variation_probe.media_id = "macha:blue-lights-s01e06";
+    auto title_variation_match = title_variation_tmdb.lookup(title_variation_probe);
+    REQUIRE(title_variation_match.has_value());
+    CHECK(title_variation_match->items.back().title == "Love the One You're With");
+
+    // Dots replacing apostrophes in release names are a punctuation artefact,
+    // not evidence that an otherwise matching episode is different.
+    FakeHttpClient possessive_http;
+    possessive_http.add("query=Black%20Jesus&language=en-GB", 200, "application/json",
+                        R"({"results":[{"id":2100,"name":"Black Jesus","first_air_date":"2014-08-07"}]})");
+    possessive_http.add("/tv/2100/season/2", 200, "application/json",
+                        R"({"id":2101,"name":"Season 2","episodes":[{"id":2105,"episode_number":5,"name":"Tasty Tudi's"}]})");
+    TmdbProvider possessive_tmdb(possessive_http, tmdb_config);
+    MediaProbe possessive_probe;
+    possessive_probe.kind = MediaProbeKind::episode;
+    possessive_probe.series = "Black Jesus";
+    possessive_probe.season = 2;
+    possessive_probe.episode = 5;
+    possessive_probe.title = "Tasty Tudi's";
+    possessive_probe.media_id = "macha:black-jesus-s02e05";
+    auto possessive_match = possessive_tmdb.lookup(possessive_probe);
+    REQUIRE(possessive_match.has_value());
+    CHECK(possessive_match->items.back().title == "Tasty Tudi's");
+
+    // Specials are especially prone to numbering differences between metadata
+    // ordering schemes. Keep the already-resolved show/season, but allow a very
+    // strong title to remap the local special number to TMDB's canonical one.
+    FakeHttpClient special_remap_http;
+    special_remap_http.add("query=Battlestar%20Galactica&language=en-GB", 200, "application/json",
+                           R"({"results":[{"id":1972,"name":"Battlestar Galactica","first_air_date":"2004-10-18"}]})");
+    special_remap_http.add("/tv/1972/season/0", 200, "application/json",
+                           R"json({"id":2200,"name":"Specials","episodes":[{"id":2202,"episode_number":2,"name":"The Resistance (1)"},{"id":2223,"episode_number":23,"name":"Unrelated Special"}]})json");
+    TmdbProvider special_remap_tmdb(special_remap_http, tmdb_config);
+    MediaProbe special_remap_probe;
+    special_remap_probe.kind = MediaProbeKind::episode;
+    special_remap_probe.series = "Battlestar Galactica";
+    special_remap_probe.season = 0;
+    special_remap_probe.episode = 23;
+    special_remap_probe.title = "The Resistance (1)";
+    special_remap_probe.media_id = "macha:bsg-resistance-1";
+    auto special_remap_match = special_remap_tmdb.lookup(special_remap_probe);
+    REQUIRE(special_remap_match.has_value());
+    CHECK(special_remap_match->items.back().episode_number == 2);
+    CHECK(special_remap_match->items.back().title == "The Resistance (1)");
+
+    // Some legacy Specials layouts contain a programme that TMDB models as a
+    // separate one-season TV entity. Exact-year identity plus missing season 0
+    // is enough to try the corresponding season-1 episode.
+    FakeHttpClient miniseries_http;
+    miniseries_http.add("query=Battlestar%20Galactica&language=en-GB", 200, "application/json",
+                        R"({"results":[{"id":101,"name":"Battlestar Galactica","first_air_date":"2003-12-08"}]})");
+    miniseries_http.add("/tv/101/season/0", 404, "application/json", R"({})");
+    miniseries_http.add("/tv/101/season/1", 200, "application/json",
+                        R"({"id":2300,"name":"Miniseries","episodes":[{"id":2301,"episode_number":1,"name":"Part 1"},{"id":2302,"episode_number":2,"name":"Part 2"}]})");
+    TmdbProvider miniseries_tmdb(miniseries_http, tmdb_config);
+    MediaProbe miniseries_probe;
+    miniseries_probe.kind = MediaProbeKind::episode;
+    miniseries_probe.series = "Battlestar Galactica";
+    miniseries_probe.year = 2003;
+    miniseries_probe.season = 0;
+    miniseries_probe.episode = 1;
+    miniseries_probe.title = "Battlestar Galactica The Miniseries (1)";
+    miniseries_probe.media_id = "macha:bsg-miniseries-1";
+    auto miniseries_match = miniseries_tmdb.lookup(miniseries_probe);
+    REQUIRE(miniseries_match.has_value());
+    CHECK(miniseries_match->items[1].season_number == 1);
+    CHECK(miniseries_match->items.back().episode_number == 1);
+
+    // If a legacy special is a standalone TMDB movie rather than an episode,
+    // recover it through the movie catalogue path instead of dropping it.
+    FakeHttpClient standalone_special_http;
+    standalone_special_http.add("query=Battlestar%20Galactica&language=en-GB", 200, "application/json",
+                                R"({"results":[{"id":101,"name":"Battlestar Galactica","first_air_date":"2003-12-08"}]})");
+    standalone_special_http.add("/tv/101/season/0", 404, "application/json", R"({})");
+    standalone_special_http.add("/tv/101/season/1", 200, "application/json",
+                                R"({"id":2400,"name":"Miniseries","episodes":[{"id":2401,"episode_number":1,"name":"Part 1"},{"id":2402,"episode_number":2,"name":"Part 2"}]})");
+    standalone_special_http.add("query=Battlestar%20Galactica%20The%20Plan&language=en-GB", 200, "application/json",
+                                R"({"results":[{"id":2403,"title":"Battlestar Galactica: The Plan","release_date":"2009-10-27"}]})");
+    standalone_special_http.add("/movie/2403", 200, "application/json",
+                                R"({"id":2403,"title":"Battlestar Galactica: The Plan","release_date":"2009-10-27"})");
+    TmdbProvider standalone_special_tmdb(standalone_special_http, tmdb_config);
+    MediaProbe standalone_special_probe;
+    standalone_special_probe.kind = MediaProbeKind::episode;
+    standalone_special_probe.series = "Battlestar Galactica";
+    standalone_special_probe.year = 2003;
+    standalone_special_probe.season = 0;
+    standalone_special_probe.episode = 22;
+    standalone_special_probe.title = "The Plan";
+    standalone_special_probe.media_id = "macha:bsg-the-plan";
+    auto standalone_special_match = standalone_special_tmdb.lookup(standalone_special_probe);
+    REQUIRE(standalone_special_match.has_value());
+    REQUIRE(standalone_special_match->items.size() == 1);
+    CHECK(standalone_special_match->items.front().kind == CatalogueKind::movie);
+    CHECK(standalone_special_match->items.front().title == "Battlestar Galactica: The Plan");
+    CHECK(standalone_special_match->items.front().media_ids ==
+          std::vector<std::string>{"macha:bsg-the-plan"});
+
+    // Multi-episode files retain one media object while emitting every TMDB
+    // episode identity covered by the filename range.
+    FakeHttpClient range_http;
+    range_http.add("query=Range%20Show&language=en-GB", 200, "application/json",
+                   R"({"results":[{"id":2500,"name":"Range Show","first_air_date":"2020-01-01"}]})");
+    range_http.add("/tv/2500/season/4", 200, "application/json",
+                   R"({"id":2501,"name":"Season 4","episodes":[{"id":2519,"episode_number":19,"name":"Part One"},{"id":2520,"episode_number":20,"name":"Part Two"}]})");
+    TmdbProvider range_tmdb(range_http, tmdb_config);
+    MediaProbe range_probe;
+    range_probe.kind = MediaProbeKind::episode;
+    range_probe.series = "Range Show";
+    range_probe.year = 2020;
+    range_probe.season = 4;
+    range_probe.episode = 19;
+    range_probe.episode_end = 20;
+    range_probe.title = "Combined Finale";
+    range_probe.media_id = "macha:range-show-finale";
+    auto range_match = range_tmdb.lookup(range_probe);
+    REQUIRE(range_match.has_value());
+    REQUIRE(range_match->items.size() == 4);
+    CHECK(range_match->items[2].episode_number == 19);
+    CHECK(range_match->items[3].episode_number == 20);
+    CHECK(range_match->items[2].media_ids == std::vector<std::string>{"macha:range-show-finale"});
+    CHECK(range_match->items[3].media_ids == std::vector<std::string>{"macha:range-show-finale"});
+
+    // Provider title scoring must tolerate common number spelling differences
+    // between release filenames and canonical provider titles. The year remains
+    // part of the score, so this does not turn matching into a first-result win.
+    FakeHttpClient movie_http;
+    movie_http.add("query=Men%20In%20Black%202&language=en-GB&primary_release_year=2002",
+                   200, "application/json",
+                   R"({"results":[{"id":1001,"title":"Men in Black II","release_date":"2002-07-03"}]})");
+    movie_http.add("/movie/1001", 200, "application/json",
+                   R"({"id":1001,"title":"Men in Black II","release_date":"2002-07-03"})");
+    movie_http.add("query=12%20Monkeys&language=en-GB&primary_release_year=1995",
+                   200, "application/json",
+                   R"({"results":[{"id":1002,"title":"Twelve Monkeys","release_date":"1995-12-29"}]})");
+    movie_http.add("/movie/1002", 200, "application/json",
+                   R"({"id":1002,"title":"Twelve Monkeys","release_date":"1995-12-29"})");
+    movie_http.add("query=A%20Knights%20Tale&language=en-GB&primary_release_year=2001",
+                   200, "application/json",
+                   R"({"results":[{"id":1003,"title":"A Knight's Tale","release_date":"2001-05-11"}]})");
+    movie_http.add("/movie/1003", 200, "application/json",
+                   R"({"id":1003,"title":"A Knight's Tale","release_date":"2001-05-11"})");
+    movie_http.add("query=Kill%20Bill%20Volume%201&language=en-GB&primary_release_year=2003",
+                   200, "application/json",
+                   R"({"results":[{"id":1004,"title":"Kill Bill: Vol. 1","release_date":"2003-10-10"}]})");
+    movie_http.add("/movie/1004", 200, "application/json",
+                   R"({"id":1004,"title":"Kill Bill: Vol. 1","release_date":"2003-10-10"})");
+    movie_http.add("query=Shrek%204&language=en-GB&primary_release_year=2010",
+                   200, "application/json",
+                   R"({"results":[{"id":1005,"title":"Shrek Forever After","release_date":"2010-05-16"}]})");
+    movie_http.add("/movie/1005", 200, "application/json",
+                   R"({"id":1005,"title":"Shrek Forever After","release_date":"2010-05-16"})");
+    movie_http.add("query=Shichinin%20no%20samurai&language=en-GB&primary_release_year=1954",
+                   200, "application/json",
+                   R"({"results":[{"id":1006,"title":"Seven Samurai","release_date":"1954-04-26"}]})");
+    movie_http.add("/movie/1006", 200, "application/json",
+                   R"({"id":1006,"title":"Seven Samurai","release_date":"1954-04-26"})");
+    movie_http.add("query=Rebel%20Moon%20Part%20One&language=en-GB",
+                   200, "application/json",
+                   R"({"results":[{"id":1007,"title":"Rebel Moon - Part One: A Child of Fire","release_date":"2023-12-15"}]})");
+    movie_http.add("/movie/1007", 200, "application/json",
+                   R"({"id":1007,"title":"Rebel Moon - Part One: A Child of Fire","release_date":"2023-12-15"})");
+    TmdbProvider movie_tmdb(movie_http, tmdb_config);
+
+    MediaProbe mib_probe;
+    mib_probe.kind = MediaProbeKind::movie;
+    mib_probe.title = "Men In Black 2";
+    mib_probe.year = 2002;
+    mib_probe.media_id = "macha:test-mib2";
+    auto mib_match = movie_tmdb.lookup(mib_probe);
+    REQUIRE(mib_match.has_value());
+    REQUIRE(mib_match->items.size() == 1);
+    CHECK(mib_match->items.front().title == "Men in Black II");
+    CHECK(mib_match->items.front().media_ids == std::vector<std::string>{"macha:test-mib2"});
+
+    MediaProbe monkeys_probe;
+    monkeys_probe.kind = MediaProbeKind::movie;
+    monkeys_probe.title = "12 Monkeys";
+    monkeys_probe.year = 1995;
+    monkeys_probe.media_id = "macha:test-12-monkeys";
+    auto monkeys_match = movie_tmdb.lookup(monkeys_probe);
+    REQUIRE(monkeys_match.has_value());
+    REQUIRE(monkeys_match->items.size() == 1);
+    CHECK(monkeys_match->items.front().title == "Twelve Monkeys");
+    CHECK(monkeys_match->items.front().media_ids == std::vector<std::string>{"macha:test-12-monkeys"});
+
+    auto punctuation_probe = mib_probe;
+    punctuation_probe.title = "A Knights Tale";
+    punctuation_probe.year = 2001;
+    punctuation_probe.media_id = "macha:test-knights";
+    auto punctuation_match = movie_tmdb.lookup(punctuation_probe);
+    REQUIRE(punctuation_match.has_value());
+    CHECK(punctuation_match->items.front().title == "A Knight's Tale");
+
+    auto volume_probe = mib_probe;
+    volume_probe.title = "Kill Bill Volume 1";
+    volume_probe.year = 2003;
+    volume_probe.media_id = "macha:test-kill-bill";
+    auto volume_match = movie_tmdb.lookup(volume_probe);
+    REQUIRE(volume_match.has_value());
+    CHECK(volume_match->items.front().title == "Kill Bill: Vol. 1");
+
+    auto franchise_probe = mib_probe;
+    franchise_probe.title = "Shrek 4";
+    franchise_probe.year = 2010;
+    franchise_probe.media_id = "macha:test-shrek4";
+    auto franchise_match = movie_tmdb.lookup(franchise_probe);
+    REQUIRE(franchise_match.has_value());
+    CHECK(franchise_match->items.front().title == "Shrek Forever After");
+
+    auto alias_probe = mib_probe;
+    alias_probe.title = "Shichinin no samurai";
+    alias_probe.year = 1954;
+    alias_probe.media_id = "macha:test-seven-samurai";
+    auto alias_match = movie_tmdb.lookup(alias_probe);
+    REQUIRE(alias_match.has_value());
+    CHECK(alias_match->items.front().title == "Seven Samurai");
+
+    auto expanded_title_probe = mib_probe;
+    expanded_title_probe.title = "Rebel Moon Part One";
+    expanded_title_probe.year.reset();
+    expanded_title_probe.media_id = "macha:test-rebel-moon";
+    auto expanded_title_match = movie_tmdb.lookup(expanded_title_probe);
+    REQUIRE(expanded_title_match.has_value());
+    CHECK(expanded_title_match->items.front().title == "Rebel Moon - Part One: A Child of Fire");
+
+    // MusicBrainz resolves one release, then maps the local track onto its
+    // recording; Cover Art Archive provides the front cover URL.
+    FakeHttpClient mb_http;
+    mb_http.add("/ws/2/release?", 200, "application/json",
+                R"({"releases":[{"id":"rel-1","title":"The Dark Side of the Moon","score":100,"artist-credit":[{"name":"Pink Floyd","artist":{"id":"artist-1","name":"Pink Floyd"}}]}]})");
+    mb_http.add("/ws/2/release/rel-1", 200, "application/json",
+                R"({"id":"rel-1","title":"The Dark Side of the Moon","date":"1973-03-01","artist-credit":[{"name":"Pink Floyd","artist":{"id":"artist-1","name":"Pink Floyd"}}],"release-group":{"id":"rg-1"},"media":[{"position":1,"tracks":[{"position":1,"title":"Speak to Me","recording":{"id":"rec-1","title":"Speak to Me"}}]}]})");
+    mb_http.add("coverartarchive.org/release/rel-1", 200, "application/json",
+                R"({"images":[{"front":true,"image":"https://images.example/original.jpg","thumbnails":{"500":"https://images.example/500.jpg"}}]})");
+    CatalogueMusicBrainzConfig mb_config;
+    mb_config.contact = "https://example.test/macha";
+    MusicBrainzProvider mb(mb_http, mb_config);
+    MediaProbe music_probe;
+    music_probe.kind = MediaProbeKind::track;
+    music_probe.artist = "Pink Floyd";
+    music_probe.album = "The Dark Side of the Moon";
+    music_probe.title = "Speak to Me";
+    music_probe.track = 1;
+    music_probe.media_id = "macha:test-track";
+    auto mb_match = mb.lookup(music_probe);
+    REQUIRE(mb_match.has_value());
+    CHECK(mb_match->items.size() == 3);
+    CHECK(mb_match->items[0].kind == CatalogueKind::artist);
+    CHECK(mb_match->items[1].kind == CatalogueKind::album);
+    CHECK(mb_match->items[2].kind == CatalogueKind::track);
+    CHECK(mb_match->items[2].external_ids.at("musicbrainz") == "rec-1");
+    REQUIRE(!mb_match->artwork.empty());
+    CHECK(mb_match->artwork.front().role == "cover");
+    CHECK(mb_match->artwork.front().url == "https://images.example/500.jpg");
+
+    // If tags/filename give artist+title but no trustworthy album, use a
+    // recording search rather than inventing a release from directory names.
+    FakeHttpClient mb_recording_http;
+    mb_recording_http.add("/ws/2/recording?", 200, "application/json",
+        R"JSON({"recordings":[{"id":"rec-2","title":"The First Time (Raven Remix)","score":100,"artist-credit":[{"name":"Scooter","artist":{"id":"artist-2","name":"Scooter"}}]}]})JSON");
+    mb_recording_http.add("/ws/2/recording/rec-2", 200, "application/json",
+        R"JSON({"id":"rec-2","title":"The First Time (Raven Remix)","artist-credit":[{"name":"Scooter","artist":{"id":"artist-2","name":"Scooter"}}],"releases":[{"id":"rel-2","title":"The First Time"}]})JSON");
+    mb_recording_http.add("/ws/2/release/rel-2", 200, "application/json",
+        R"JSON({"id":"rel-2","title":"The First Time","date":"1995-05-01","artist-credit":[{"name":"Scooter","artist":{"id":"artist-2","name":"Scooter"}}],"release-group":{"id":"rg-2"},"media":[{"position":1,"tracks":[{"position":1,"title":"The First Time (Raven Remix)","recording":{"id":"rec-2","title":"The First Time (Raven Remix)"}}]}]})JSON");
+    MusicBrainzProvider mb_recording(mb_recording_http, mb_config);
+    MediaProbe recording_probe;
+    recording_probe.kind = MediaProbeKind::track;
+    recording_probe.artist = "Scooter";
+    recording_probe.title = "The First Time (Raven Remix)";
+    recording_probe.media_id = "macha:test-recording-fallback";
+    auto recording_match = mb_recording.lookup(recording_probe);
+    REQUIRE(recording_match.has_value());
+    CHECK(recording_match->items.size() == 3);
+    CHECK(recording_match->items[1].title == "The First Time");
+    CHECK(recording_match->items[2].external_ids.at("musicbrainz") == "rec-2");
+
+    FakeHttpClient mb_compilation_http;
+    mb_compilation_http.add("/ws/2/recording?", 200, "application/json",
+        R"JSON({"recordings":[{"id":"rec-3","title":"Teardrop","score":100,"artist-credit":[{"name":"Massive Attack","artist":{"id":"artist-3","name":"Massive Attack"}}]}]})JSON");
+    mb_compilation_http.add("/ws/2/recording/rec-3", 200, "application/json",
+        R"JSON({"id":"rec-3","title":"Teardrop","artist-credit":[{"name":"Massive Attack","artist":{"id":"artist-3","name":"Massive Attack"}}],"releases":[{"id":"rel-other","title":"Mezzanine"},{"id":"rel-collected","title":"Collected"}]})JSON");
+    mb_compilation_http.add("/ws/2/release/rel-collected", 200, "application/json",
+        R"JSON({"id":"rel-collected","title":"Collected","date":"2006-03-27","artist-credit":[{"name":"Various Artists","artist":{"id":"artist-va","name":"Various Artists"}}],"release-group":{"id":"rg-collected"},"media":[{"position":1,"tracks":[{"position":4,"title":"Teardrop","recording":{"id":"rec-3","title":"Teardrop"}}]}]})JSON");
+    MusicBrainzProvider mb_compilation(mb_compilation_http, mb_config);
+    MediaProbe compilation_probe;
+    compilation_probe.kind = MediaProbeKind::track;
+    compilation_probe.artist = "Massive Attack";
+    compilation_probe.album = "Collected";
+    compilation_probe.title = "Teardrop";
+    compilation_probe.track = 4;
+    compilation_probe.lookup_strategy = MediaProbeLookupStrategy::music_recording_first;
+    compilation_probe.media_id = "macha:test-compilation";
+    auto compilation_match = mb_compilation.lookup(compilation_probe);
+    REQUIRE(compilation_match.has_value());
+    CHECK(compilation_match->items[0].title == "Various Artists");
+    CHECK(compilation_match->items[1].title == "Collected");
+    CHECK(compilation_match->items[2].title == "Teardrop");
+
+    // Semantic provider misses are process-lifetime negative cache entries.
+    // Only a successful provider response saying "no match" is suppressed on
+    // later tracks/scans; transient failures use the provider circuit instead.
+    FakeHttpClient mb_miss_http;
+    mb_miss_http.add("/ws/2/release?", 200, "application/json", R"({"releases":[]})");
+    MusicBrainzProvider mb_miss(mb_miss_http, mb_config);
+    MediaProbe missing_track = music_probe;
+    missing_track.album = "Definitely Missing Album";
+    missing_track.title = "Track One";
+    CHECK(!mb_miss.lookup(missing_track).has_value());
+    CHECK(mb_miss_http.requests() == 1);
+    for (int track_number = 2; track_number <= 128; ++track_number) {
+        missing_track.title = "Track " + std::to_string(track_number);
+        missing_track.track = track_number;
+        CHECK(!mb_miss.lookup(missing_track).has_value());
+    }
+    CHECK(mb_miss_http.requests() == 1);
+
+    FakeHttpClient mb_error_http;
+    mb_error_http.add("/ws/2/release?", 503, "application/json", R"({})");
+    MusicBrainzProvider mb_error(mb_error_http, mb_config);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool threw = false;
+        try {
+            (void)mb_error.lookup(music_probe);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        CHECK(threw);
+    }
+    CHECK(mb_error_http.requests() == 1);
+
+    // A transient MusicBrainz outage must not burn every music hypothesis.
+    // The circuit opens after one 503 and Discogs receives the same candidate.
+    TempDir discogs_temp;
+    auto discogs_token = discogs_temp.path() / "discogs.token";
+    {
+        std::ofstream out(discogs_token);
+        out << "discogs-test-token\n";
+    }
+    FakeHttpClient fallback_music_http;
+    fallback_music_http.add("musicbrainz.org/ws/2", 503, "application/json", R"({})");
+    fallback_music_http.add("api.discogs.com/database/search", 200, "application/json",
+                            R"({"results":[{"id":500,"type":"release","title":"Clannad - Crann Ull","year":1980}]})");
+    fallback_music_http.add("api.discogs.com/releases/500", 200, "application/json",
+                            R"({"id":500,"title":"Crann Ull","year":1980,"master_id":600,"artists":[{"id":700,"name":"Clannad"}],"tracklist":[{"position":"7","type_":"track","title":"Gathering Mushrooms"}],"images":[{"type":"primary","uri":"https://img.discogs.example/500.jpg"}]})");
+    CatalogueMusicProviderConfig fallback_music_config;
+    fallback_music_config.roots = {"/Music"};
+    fallback_music_config.musicbrainz.enabled = true;
+    fallback_music_config.discogs.enabled = true;
+    fallback_music_config.discogs.token_file = discogs_token;
+    MusicScanProvider fallback_music(fallback_music_http, fallback_music_config);
+    MediaProbe discogs_probe;
+    discogs_probe.kind = MediaProbeKind::track;
+    discogs_probe.path = "/Music/Clannad/1980 - Crann Ull/07.Clannad - Gathering Mushrooms.mp3";
+    discogs_probe.media_id = "macha:discogs-fallback";
+    discogs_probe.artist = "Clannad";
+    discogs_probe.album = "Crann Ull";
+    discogs_probe.title = "Gathering Mushrooms";
+    discogs_probe.year = 1980;
+    discogs_probe.track = 7;
+    discogs_probe.lookup_strategy = MediaProbeLookupStrategy::music_recording_first;
+    auto discogs_match = fallback_music.lookup(discogs_probe);
+    REQUIRE(discogs_match.has_value());
+    CHECK(discogs_match->items.size() == 3);
+    CHECK(discogs_match->items[0].id == "discogs:artist:700");
+    CHECK(discogs_match->items[1].id == "discogs:album:master:600");
+    CHECK(discogs_match->items[2].id == "discogs:track:500:7");
+    CHECK(discogs_match->items[2].title == "Gathering Mushrooms");
+    CHECK(fallback_music_http.requests_containing("musicbrainz.org/ws/2") == 1);
+    CHECK(fallback_music_http.requests_containing("api.discogs.com/database/search") == 1);
+    CHECK(fallback_music_http.requests_containing("api.discogs.com/releases/500") == 1);
+
+    // The MusicBrainz circuit is still open, while Discogs' successful search
+    // and release detail are cached.
+    auto discogs_cached = fallback_music.lookup(discogs_probe);
+    REQUIRE(discogs_cached.has_value());
+    CHECK(fallback_music_http.requests_containing("musicbrainz.org/ws/2") == 1);
+    CHECK(fallback_music_http.requests_containing("api.discogs.com/database/search") == 1);
+    CHECK(fallback_music_http.requests_containing("api.discogs.com/releases/500") == 1);
+
+    FakeHttpClient tmdb_miss_http;
+    tmdb_miss_http.add("/search/movie", 200, "application/json", R"({"results":[]})");
+    TmdbProvider tmdb_miss(tmdb_miss_http, tmdb_config);
+    MediaProbe missing_movie;
+    missing_movie.kind = MediaProbeKind::movie;
+    missing_movie.title = "Definitely Missing Movie";
+    missing_movie.year = 2026;
+    CHECK(!tmdb_miss.lookup(missing_movie).has_value());
+    CHECK(tmdb_miss_http.requests() == 1);
+    CHECK(!tmdb_miss.lookup(missing_movie).has_value());
+    CHECK(tmdb_miss_http.requests() == 1);
+
+    // Transport/provider failures are deliberately not negative-cached: the
+    // next scan gets another chance after a transient outage.
+    FakeHttpClient tmdb_error_http;
+    tmdb_error_http.add("/search/movie", 503, "application/json", R"({})");
+    TmdbProvider tmdb_error(tmdb_error_http, tmdb_config);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool threw = false;
+        try {
+            (void)tmdb_error.lookup(missing_movie);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        CHECK(threw);
+    }
+    CHECK(tmdb_error_http.requests() == 2);
+
+    // End-to-end scanner: resolve a real distributed filesystem entry, fetch
+    // poster/backdrop bytes, commit them with the catalogue, then prove a second
+    // scan is idempotent and deletion removes only the scanner-owned item.
+    TempDir t;
+    auto key = t.path() / "cluster.key";
+    write_key(key);
+    auto config = config_for(t.path() / "disk", key, free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.metadata_cache = 20ms;
+    auto keys = load_cluster_keys(key);
+    Service service(config, keys);
+    service.start();
+
+    // Music scanning is tag-first and provider-root scoped. Deliberately put a
+    // tagged MP3 under misleading collection/grouping directories: embedded
+    // metadata must win, while untagged filename fallback must not manufacture
+    // an artist/album from those same directories.
+    service.filesystem().mkdir("/Music", 0755, getuid(), getgid());
+    const std::string collection = "/Music/Scooter Full Discography (Albums & Singles 1994-2011)";
+    service.filesystem().mkdir(collection, 0755, getuid(), getgid());
+    const std::string singles = collection + "/Singles";
+    service.filesystem().mkdir(singles, 0755, getuid(), getgid());
+    const std::string tagged_album = singles + "/14 - [1996] I'm Raving The Remixes CDM";
+    service.filesystem().mkdir(tagged_album, 0755, getuid(), getgid());
+    const std::string tagged_path = tagged_album + "/01 - Completely Wrong.mp3";
+
+    auto fixture_bytes = [](const char* name) {
+        auto path = std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "tests" / "fixtures" / name;
+        std::ifstream input(path, std::ios::binary);
+        REQUIRE(input.good());
+        std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        return Bytes(bytes.begin(), bytes.end());
+    };
+    auto write_fixture = [&](const std::string& path, const Bytes& bytes) {
+        service.filesystem().create_file(path, 0644, getuid(), getgid());
+        auto writer = service.filesystem().open_write(path, true);
+        REQUIRE(writer->write(0, bytes) == bytes.size());
+        writer->commit();
+    };
+
+    const auto tagged_bytes = fixture_bytes("tagged.mp3");
+    const auto untagged_bytes = fixture_bytes("untagged.mp3");
+    const Bytes embedded_cover{
+        0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a,
+        0x00, 0x00, 0x00, 0x0d, 'I', 'H', 'D', 'R',
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde,
+        0x00, 0x00, 0x00, 0x0c, 'I', 'D', 'A', 'T', 0x78, 0x9c,
+        0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00,
+        0xc9, 0xfe, 0x92, 0xef, 0x00, 0x00, 0x00, 0x00, 'I', 'E',
+        'N', 'D', 0xae, 0x42, 0x60, 0x82};
+    auto with_apic = [](const Bytes& input, const Bytes& cover) {
+        if (input.size() < 10 || std::string_view(reinterpret_cast<const char*>(input.data()), 3) != "ID3")
+            throw std::runtime_error("tagged MP3 fixture has no ID3 header");
+        auto decode_synchsafe = [](const uint8_t* p) -> size_t {
+            return (static_cast<size_t>(p[0] & 0x7f) << 21) |
+                   (static_cast<size_t>(p[1] & 0x7f) << 14) |
+                   (static_cast<size_t>(p[2] & 0x7f) << 7) |
+                   static_cast<size_t>(p[3] & 0x7f);
+        };
+        auto encode_synchsafe = [](size_t n) {
+            return std::array<uint8_t, 4>{
+                static_cast<uint8_t>((n >> 21) & 0x7f),
+                static_cast<uint8_t>((n >> 14) & 0x7f),
+                static_cast<uint8_t>((n >> 7) & 0x7f),
+                static_cast<uint8_t>(n & 0x7f)};
+        };
+        const auto tag_size = decode_synchsafe(input.data() + 6);
+        if (10 + tag_size > input.size()) throw std::runtime_error("invalid ID3 fixture size");
+        Bytes payload{0x03};
+        const std::string mime = "image/png";
+        payload.insert(payload.end(), mime.begin(), mime.end());
+        payload.push_back(0);
+        payload.push_back(0x03); // front cover
+        payload.push_back(0);   // empty UTF-8 description
+        payload.insert(payload.end(), cover.begin(), cover.end());
+        Bytes frame{'A', 'P', 'I', 'C'};
+        auto frame_size = encode_synchsafe(payload.size());
+        frame.insert(frame.end(), frame_size.begin(), frame_size.end());
+        frame.push_back(0);
+        frame.push_back(0);
+        frame.insert(frame.end(), payload.begin(), payload.end());
+
+        Bytes result;
+        result.reserve(input.size() + frame.size());
+        result.insert(result.end(), input.begin(), input.begin() + 6);
+        auto new_tag_size = encode_synchsafe(tag_size + frame.size());
+        result.insert(result.end(), new_tag_size.begin(), new_tag_size.end());
+        result.insert(result.end(), input.begin() + 10, input.begin() + 10 + tag_size);
+        result.insert(result.end(), frame.begin(), frame.end());
+        result.insert(result.end(), input.begin() + 10 + tag_size, input.end());
+        return result;
+    };
+    const auto tagged_with_cover = with_apic(tagged_bytes, embedded_cover);
+    write_fixture(tagged_path, tagged_with_cover);
+
+    FakeHttpClient music_probe_http;
+    CatalogueMusicProviderConfig music_source_config;
+    music_source_config.roots = {"/Music"};
+    music_source_config.musicbrainz.enabled = false;
+    MusicScanProvider music_source(music_probe_http, music_source_config);
+    auto tagged_entry = service.filesystem().getattr(tagged_path);
+    auto tagged_file = music_source.probe_file(service.filesystem(), "/Music", tagged_path, tagged_entry);
+    REQUIRE(!tagged_file.candidates.empty());
+    REQUIRE(tagged_file.artwork.size() == 1);
+    CHECK(tagged_file.artwork.front().role == "cover");
+    CHECK(tagged_file.artwork.front().mime_type == "image/png");
+    CHECK(tagged_file.artwork.front().bytes == embedded_cover);
+    auto tagged_probe = std::optional<MediaProbe>{tagged_file.candidates.front().probe};
+    REQUIRE(tagged_probe.has_value());
+    CHECK(tagged_probe->artist == "Scooter");
+    CHECK(tagged_probe->album == "I'm Raving The Remixes");
+    CHECK(tagged_probe->title == "I'm Raving (Progressive Remix)");
+    CHECK(tagged_probe->track == 1);
+    CHECK(tagged_probe->disc == 1);
+    CHECK(tagged_probe->year == 1996);
+    CHECK(tagged_probe->musicbrainz_recording_id == std::optional<std::string>{"rec-tagged-1"});
+    CHECK(tagged_probe->musicbrainz_release_id == std::optional<std::string>{"rel-tagged-1"});
+    CHECK(tagged_probe->musicbrainz_artist_id == std::optional<std::string>{"artist-tagged-1"});
+
+    // Embedded APIC artwork and provider artwork are independent catalogue
+    // candidates. Neither should suppress or replace the other merely because
+    // both have the semantic role "cover".
+    auto music_art_http = std::make_unique<FakeHttpClient>();
+    music_art_http->add("/ws/2/release/rel-tagged-1", 200, "application/json",
+        R"JSON({"id":"rel-tagged-1","title":"I'm Raving The Remixes","date":"1996-01-01","artist-credit":[{"name":"Scooter","artist":{"id":"artist-tagged-1","name":"Scooter"}}],"release-group":{"id":"rg-tagged-1"},"media":[{"position":1,"tracks":[{"position":1,"title":"I'm Raving (Progressive Remix)","recording":{"id":"rec-tagged-1","title":"I'm Raving (Progressive Remix)"}}]}]})JSON");
+    music_art_http->add("coverartarchive.org/release/rel-tagged-1", 200, "application/json",
+        R"JSON({"images":[{"front":true,"image":"https://provider.example/cover.jpg","thumbnails":{"500":"https://provider.example/cover.jpg"}}]})JSON");
+    const Bytes provider_cover{0xff, 0xd8, 0xff, 0xe0, 0x01, 0x02, 0x03, 0x04};
+    music_art_http->add_bytes("provider.example/cover.jpg", 200, "image/jpeg", provider_cover);
+    CatalogueScannerConfig music_art_config;
+    music_art_config.enabled = true;
+    music_art_config.movies.enabled = false;
+    music_art_config.tv.enabled = false;
+    music_art_config.music.enabled = true;
+    music_art_config.music.roots = {tagged_album};
+    music_art_config.music.musicbrainz.enabled = true;
+    music_art_config.music.musicbrainz.contact = "https://example.test/macha";
+    music_art_config.music.discogs.enabled = false;
+    music_art_config.max_provider_requests_per_scan = 8;
+    CatalogueScanner music_art_scanner(service.node(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
+                                       music_art_config, std::move(music_art_http));
+    CHECK(music_art_scanner.scan_once() == 1);
+    auto music_album = service.catalogue().get("musicbrainz:album:rg-tagged-1");
+    REQUIRE(music_album.has_value());
+    REQUIRE(music_album->artwork.size() == 2);
+    CHECK(std::count_if(music_album->artwork.begin(), music_album->artwork.end(),
+                        [](const auto& art) { return art.role == "cover"; }) == 2);
+    const auto embedded_id = object_id(embedded_cover);
+    const auto provider_id = object_id(provider_cover);
+    CHECK(std::any_of(music_album->artwork.begin(), music_album->artwork.end(),
+                      [&](const auto& art) { return art.id == embedded_id; }));
+    CHECK(std::any_of(music_album->artwork.begin(), music_album->artwork.end(),
+                      [&](const auto& art) { return art.id == provider_id; }));
+    CHECK(service.node().local_store().has(embedded_id));
+    CHECK(service.node().local_store().has(provider_id));
+
+    const std::string loose_path = singles + "/Scooter - The First Time (Raven Remix).mp3";
+    write_fixture(loose_path, untagged_bytes);
+    auto loose_entry = service.filesystem().getattr(loose_path);
+    auto loose_probe = music_source.probe(service.filesystem(), "/Music", loose_path, loose_entry);
+    REQUIRE(loose_probe.has_value());
+    CHECK(loose_probe->artist == "Scooter");
+    CHECK(loose_probe->album.empty());
+    CHECK(loose_probe->title == "The First Time (Raven Remix)");
+
+    const std::string nested_album = singles + "/13 - [1996] I'm Raving CDM";
+    service.filesystem().mkdir(nested_album, 0755, getuid(), getgid());
+    const std::string nested_path = nested_album + "/01 - I'm Raving.mp3";
+    write_fixture(nested_path, untagged_bytes);
+    auto nested_entry = service.filesystem().getattr(nested_path);
+    auto nested_probe = music_source.probe(service.filesystem(), "/Music", nested_path, nested_entry);
+    REQUIRE(nested_probe.has_value());
+    CHECK(nested_probe->artist.empty());
+    CHECK(nested_probe->album.empty());
+    CHECK(nested_probe->track == 1);
+    CHECK(nested_probe->title == "I'm Raving");
+
+    service.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
+    service.filesystem().create_file("/Movies/Blade.Runner.2049.2017.1080p.mkv", 0644,
+                                     getuid(), getgid());
+    auto bytes = pattern(32768);
+    auto writer = service.filesystem().open_write(
+        "/Movies/Blade.Runner.2049.2017.1080p.mkv", true);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto entry = service.filesystem().getattr(
+        "/Movies/Blade.Runner.2049.2017.1080p.mkv");
+    auto media_id = file_media_id(entry);
+
+    auto scanner_token = t.path() / "scanner-tmdb.token";
+    {
+        std::ofstream out(scanner_token);
+        out << "scanner-token\n";
+    }
+    auto fake_http = std::make_unique<FakeHttpClient>();
+    fake_http->add("/search/movie", 200, "application/json",
+                   R"({"results":[{"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04"}]})");
+    fake_http->add("/movie/335984", 200, "application/json",
+                   R"({"id":335984,"title":"Blade Runner 2049","overview":"A blade runner uncovers a long-buried secret.","release_date":"2017-10-04","poster_path":"/poster.jpg","backdrop_path":"/backdrop.jpg","belongs_to_collection":{"id":422837,"name":"Blade Runner Collection"}})");
+    fake_http->add_bytes("/t/p/w500/poster.jpg", 200, "image/jpeg", Bytes{1,2,3,4,5});
+    fake_http->add_bytes("/t/p/w500/backdrop.jpg", 200, "image/jpeg", Bytes{6,7,8,9});
+
+    CatalogueScannerConfig scanner_config;
+    scanner_config.enabled = true;
+    // A missing configured root makes the pass partial: discoveries from
+    // available roots are still ingested, but absence cannot prune existing
+    // scanner-owned bindings until every root is traversable.
+    scanner_config.movies.roots = {"/Movies", "/Missing"};
+    scanner_config.movies.tmdb.token_file = scanner_token;
+    scanner_config.tv.enabled = false;
+    scanner_config.music.enabled = false;
+    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
+                             scanner_config, std::move(fake_http));
+    const auto namespace_before_scan = service.filesystem().namespace_signature();
+    CHECK(scanner.scan_once() == 1);
+    CHECK(service.filesystem().namespace_signature() == namespace_before_scan);
+    auto catalogued = service.catalogue().get("tmdb:movie:335984");
+    REQUIRE(catalogued.has_value());
+    CHECK(catalogued->title == "Blade Runner 2049");
+    CHECK(catalogued->external_ids.at("tmdb_collection") == "422837");
+    CHECK(catalogued->external_ids.at("macha_scanner") == "1");
+    CHECK(catalogued->media_ids == std::vector<std::string>{media_id});
+    CHECK(catalogued->artwork.size() == 2);
+    for (const auto& art : catalogued->artwork)
+        CHECK(service.node().local_store().has(art.id));
+    auto revision = catalogued->revision;
+    CHECK(scanner.scan_once() == 0);
+    REQUIRE(service.catalogue().get("tmdb:movie:335984").has_value());
+    CHECK(service.catalogue().get("tmdb:movie:335984")->revision == revision);
+
+    // Manual metadata editing is authoritative. A later scanner discovery for
+    // another local copy may add media bindings, but must not silently overwrite
+    // the user's descriptive changes.
+    auto manual = *service.catalogue().get("tmdb:movie:335984");
+    manual.title = "Blade Runner Custom";
+    manual.sort_title = manual.title;
+    manual.synopsis = "A manually edited synopsis.";
+    manual.external_ids["macha_metadata_locked"] = "1";
+    auto manually_saved = service.catalogue().upsert(std::move(manual), revision);
+    revision = manually_saved.revision;
+
+    // A second file resolving to the same title adds another binding without
+    // losing the already-bound media identity.
+    const std::string alternate = "/Movies/Blade.Runner.2049.2017.Remux.mkv";
+    service.filesystem().create_file(alternate, 0644, getuid(), getgid());
+    auto alternate_bytes = pattern(32769);
+    auto alternate_writer = service.filesystem().open_write(alternate, true);
+    REQUIRE(alternate_writer->write(0, alternate_bytes) == alternate_bytes.size());
+    alternate_writer->commit();
+    CHECK(service.filesystem().namespace_signature() != namespace_before_scan);
+    auto alternate_id = file_media_id(service.filesystem().getattr(alternate));
+    CHECK(alternate_id != media_id);
+    CHECK(scanner.scan_once() == 1);
+    auto twice = service.catalogue().get("tmdb:movie:335984");
+    REQUIRE(twice.has_value());
+    CHECK(twice->title == "Blade Runner Custom");
+    CHECK(twice->synopsis == "A manually edited synopsis.");
+    CHECK(twice->year == std::optional<int32_t>{2017});
+    CHECK(twice->artwork.size() == 2);
+    CHECK(twice->external_ids.at("tmdb") == "335984");
+    CHECK(twice->external_ids.at("macha_metadata_locked") == "1");
+    CHECK(std::find(twice->media_ids.begin(), twice->media_ids.end(), media_id) != twice->media_ids.end());
+    CHECK(std::find(twice->media_ids.begin(), twice->media_ids.end(), alternate_id) != twice->media_ids.end());
+
+    // Clear Metadata removes the catalogue entity rather than saving an empty
+    // matched item. It also returns the exact immutable media identities that
+    // became unbound, so recovery can enqueue only those files instead of
+    // reopening every terminal/no-match hint in the library.
+    auto cleared = service.catalogue().clear_metadata_with_media(
+        "tmdb:movie:335984", twice->revision);
+    CHECK(cleared.removed_items == 1);
+    CHECK(cleared.media_ids.size() == 2);
+    CHECK(std::find(cleared.media_ids.begin(), cleared.media_ids.end(), media_id) !=
+          cleared.media_ids.end());
+    CHECK(std::find(cleared.media_ids.begin(), cleared.media_ids.end(), alternate_id) !=
+          cleared.media_ids.end());
+    CHECK(!service.catalogue().get("tmdb:movie:335984").has_value());
+    CHECK(scanner.request_media_rescan(cleared.media_ids) == 2);
+    CHECK(service.catalogue_hints().summary().pending == 2);
+    scanner.start();
+    REQUIRE(wait_until([&] {
+        auto item = service.catalogue().get("tmdb:movie:335984");
+        return item && service.catalogue_hints().summary().pending == 0;
+    }, 5s));
+    scanner.stop();
+    CHECK(std::filesystem::exists(service.node().config().state_path /
+                                  "catalogue" / "scanner.state"));
+    auto rematched = service.catalogue().get("tmdb:movie:335984");
+    REQUIRE(rematched.has_value());
+    CHECK(rematched->title == "Blade Runner 2049");
+    CHECK(rematched->synopsis == "A blade runner uncovers a long-buried secret.");
+    CHECK(rematched->external_ids.at("tmdb") == "335984");
+    CHECK(!rematched->external_ids.contains("macha_metadata_locked"));
+    CHECK(rematched->artwork.size() == 2);
+    CHECK(std::find(rematched->media_ids.begin(), rematched->media_ids.end(), media_id) != rematched->media_ids.end());
+    CHECK(std::find(rematched->media_ids.begin(), rematched->media_ids.end(), alternate_id) != rematched->media_ids.end());
+
+    // Deletion reconciles duplicate bindings one at a time and removes the
+    // scanner-owned item only after the final copy goes.
+    service.filesystem().unlink("/Movies/Blade.Runner.2049.2017.1080p.mkv");
+    std::this_thread::sleep_for(config.metadata_cache + 20ms);
+    CHECK(scanner.scan_once() == 0);
+    auto partial = service.catalogue().get("tmdb:movie:335984");
+    REQUIRE(partial.has_value());
+    CHECK(std::find(partial->media_ids.begin(), partial->media_ids.end(), media_id) != partial->media_ids.end());
+    CHECK(std::find(partial->media_ids.begin(), partial->media_ids.end(), alternate_id) != partial->media_ids.end());
+
+    // Once the previously unavailable root exists, the scan is complete and
+    // destructive reconciliation may safely remove the vanished first binding.
+    service.filesystem().mkdir("/Missing", 0755, getuid(), getgid());
+    std::this_thread::sleep_for(config.metadata_cache + 20ms);
+    CHECK(scanner.scan_once() == 0);
+    auto remaining = service.catalogue().get("tmdb:movie:335984");
+    REQUIRE(remaining.has_value());
+    CHECK(remaining->media_ids == std::vector<std::string>{alternate_id});
+
+    service.filesystem().unlink(alternate);
+    std::this_thread::sleep_for(config.metadata_cache + 20ms);
+    CHECK(service.filesystem().readdir("/Movies").empty());
+    CHECK(scanner.scan_once() == 0);
+    CHECK(!service.catalogue().get("tmdb:movie:335984").has_value());
+
+    // Shutdown must not wait for a complete catalogue scan. request_stop()
+    // propagates into the HTTP client so an in-flight provider request is
+    // interrupted, and scan_once(stop) abandons the partial pass without a
+    // reconciliation commit.
+    const std::string shutdown_path = "/Movies/Shutdown.Test.2020.mkv";
+    service.filesystem().create_file(shutdown_path, 0644, getuid(), getgid());
+    auto shutdown_writer = service.filesystem().open_write(shutdown_path, true);
+    auto shutdown_bytes = pattern(32769);
+    REQUIRE(shutdown_writer->write(0, shutdown_bytes) == shutdown_bytes.size());
+    shutdown_writer->commit();
+
+    auto blocking_http = std::make_unique<BlockingHttpClient>();
+    auto* blocking_http_ptr = blocking_http.get();
+    auto cancel_config = scanner_config;
+    cancel_config.movies.roots = {"/Movies"};
+    CatalogueScanner cancel_scanner(service.node(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
+                                    cancel_config, std::move(blocking_http));
+    // Scanner startup is intentionally idle on an already-operated library.
+    // Explicitly request the pass whose in-flight provider request this test
+    // exercises, rather than depending on the old startup-rescan behaviour.
+    cancel_scanner.request_rescan();
+    cancel_scanner.start();
+    REQUIRE(wait_until([&] { return blocking_http_ptr->entered(); }, 1s));
+    const auto stop_started = Clock::now();
+    cancel_scanner.stop();
+    CHECK(blocking_http_ptr->stopped());
+    CHECK(Clock::now() - stop_started < 1s);
+
+    // Online metadata enrichment is bounded by actual provider HTTP requests,
+    // not by the number of files. Completed discoveries commit normally and a
+    // later pass resumes with already-bound media skipped.
+    service.filesystem().mkdir("/Budget", 0755, getuid(), getgid());
+    const std::array<std::pair<const char*, uint8_t>, 3> budget_files{{
+        {"/Budget/Budget.One.2020.mkv", 1},
+        {"/Budget/Budget.Two.2021.mkv", 2},
+        {"/Budget/Budget.Three.2022.mkv", 3},
+    }};
+    std::set<std::string> budget_media_ids;
+    for (const auto& [path, marker] : budget_files) {
+        service.filesystem().create_file(path, 0644, getuid(), getgid());
+        auto w = service.filesystem().open_write(path, true);
+        REQUIRE(w->write(0, Bytes{marker, 2, 3, 4}) == 4);
+        w->commit();
+        budget_media_ids.insert(file_media_id(service.filesystem().getattr(path)));
+    }
+    REQUIRE(budget_media_ids.size() == budget_files.size());
+    auto budget_http = std::make_unique<FakeHttpClient>();
+    auto* budget_http_ptr = budget_http.get();
+    budget_http->add("query=Budget%20One", 200, "application/json",
+                     R"({"results":[{"id":2001,"title":"Budget One","release_date":"2020-01-01"}]})");
+    budget_http->add("/movie/2001", 200, "application/json",
+                     R"({"id":2001,"title":"Budget One","release_date":"2020-01-01"})");
+    budget_http->add("query=Budget%20Two", 200, "application/json",
+                     R"({"results":[{"id":2002,"title":"Budget Two","release_date":"2021-01-01"}]})");
+    budget_http->add("/movie/2002", 200, "application/json",
+                     R"({"id":2002,"title":"Budget Two","release_date":"2021-01-01"})");
+    budget_http->add("query=Budget%20Three", 200, "application/json",
+                     R"({"results":[{"id":2003,"title":"Budget Three","release_date":"2022-01-01"}]})");
+    budget_http->add("/movie/2003", 200, "application/json",
+                     R"({"id":2003,"title":"Budget Three","release_date":"2022-01-01"})");
+
+    auto budget_config = scanner_config;
+    budget_config.movies.roots = {"/Budget"};
+    budget_config.max_provider_requests_per_scan = 4;
+    budget_config.provider_batch_delay = 1000ms;
+    CatalogueScanner budget_scanner(service.node(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
+                                    budget_config, std::move(budget_http));
+    CHECK(budget_scanner.scan_once() == 2);
+    CHECK(budget_http_ptr->requests() == 4);
+    size_t first_batch_items = 0;
+    for (const auto* id : {"tmdb:movie:2001", "tmdb:movie:2002", "tmdb:movie:2003"})
+        if (service.catalogue().get(id).has_value()) ++first_batch_items;
+    CHECK(first_batch_items == 2);
+    CHECK(budget_scanner.scan_once() == 1);
+    CHECK(budget_http_ptr->requests() == 6);
+    CHECK(service.catalogue().get("tmdb:movie:2001").has_value());
+    CHECK(service.catalogue().get("tmdb:movie:2002").has_value());
+    CHECK(service.catalogue().get("tmdb:movie:2003").has_value());
+
+    // Provider request budgeting is fair across media domains. A long run of
+    // movie misses must not consume the whole batch before TV and Music get a
+    // lookup opportunity.
+    service.filesystem().mkdir("/FairMovies", 0755, getuid(), getgid());
+    for (int i = 1; i <= 4; ++i) {
+        const auto path = "/FairMovies/Fair.Movie." + std::to_string(i) + ".mkv";
+        service.filesystem().create_file(path, 0644, getuid(), getgid());
+        auto w = service.filesystem().open_write(path, true);
+        REQUIRE(w->write(0, Bytes{static_cast<uint8_t>(i), 2, 3, 4}) == 4);
+        w->commit();
+    }
+    service.filesystem().mkdir("/FairTV", 0755, getuid(), getgid());
+    const std::string fair_tv = "/FairTV/Fair.Show.S01E01.mkv";
+    service.filesystem().create_file(fair_tv, 0644, getuid(), getgid());
+    auto fair_tv_writer = service.filesystem().open_write(fair_tv, true);
+    REQUIRE(fair_tv_writer->write(0, Bytes{9, 8, 7, 6}) == 4);
+    fair_tv_writer->commit();
+    service.filesystem().mkdir("/FairMusic", 0755, getuid(), getgid());
+    service.filesystem().mkdir("/FairMusic/Fair Artist", 0755, getuid(), getgid());
+    service.filesystem().mkdir("/FairMusic/Fair Artist/Fair Album", 0755, getuid(), getgid());
+    const std::string fair_music = "/FairMusic/Fair Artist/Fair Album/01 - Fair Track.mp3";
+    write_fixture(fair_music, untagged_bytes);
+
+    auto fair_http = std::make_unique<FakeHttpClient>();
+    auto* fair_http_ptr = fair_http.get();
+    fair_http->add("/search/movie", 200, "application/json", R"({"results":[]})");
+    fair_http->add("/search/tv", 200, "application/json", R"({"results":[]})");
+    fair_http->add("/ws/2/release?", 200, "application/json", R"({"releases":[]})");
+    auto fair_config = scanner_config;
+    fair_config.movies.roots = {"/FairMovies"};
+    fair_config.tv.enabled = true;
+    fair_config.tv.roots = {"/FairTV"};
+    fair_config.tv.tmdb.token_file = scanner_token;
+    fair_config.music.enabled = true;
+    fair_config.music.roots = {"/FairMusic"};
+    fair_config.music.musicbrainz.enabled = true;
+    fair_config.max_provider_requests_per_scan = 3;
+    CatalogueScanner fair_scanner(service.node(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
+                                  fair_config, std::move(fair_http));
+    CHECK(fair_scanner.scan_once() == 0);
+    CHECK(fair_http_ptr->requests() == 3);
+    CHECK(fair_http_ptr->requests_containing("/search/movie") == 1);
+    CHECK(fair_http_ptr->requests_containing("/search/tv") == 1);
+    CHECK(fair_http_ptr->requests_containing("/ws/2/release?") == 1);
+
+    service.stop();
+}
+
+MACHA_TEST("hydration_catalogue", test_catalogue_zero_length_files_wait_for_committed_content) {
+    TestService fixture("node");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.catalogue.scanner.enabled = false;
+    auto& service = fixture.start();
+
+    service.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
+    const std::string path = "/Movies/Transient.Movie.2026.mkv";
+    service.filesystem().create_file(path, 0644, getuid(), getgid());
+    const auto empty_entry = service.filesystem().getattr(path);
+    REQUIRE(empty_entry.type == EntryType::file);
+    REQUIRE(empty_entry.size == 0);
+    const auto empty_media_id = file_media_id(empty_entry);
+
+    auto token = fixture.path() / "tmdb.token";
+    {
+        std::ofstream out(token);
+        out << "test-token\n";
+    }
+    auto fake_http = std::make_unique<FakeHttpClient>();
+    auto* fake_http_ptr = fake_http.get();
+    fake_http->add("/search/movie", 200, "application/json",
+                   R"({"results":[{"id":4242,"title":"Transient Movie","release_date":"2026-01-01"}]})");
+    fake_http->add("/movie/4242", 200, "application/json",
+                   R"({"id":4242,"title":"Transient Movie","release_date":"2026-01-01"})");
+
+    CatalogueScannerConfig scanner_config;
+    scanner_config.enabled = true;
+    scanner_config.movies.roots = {"/Movies"};
+    scanner_config.movies.tmdb.token_file = token;
+    scanner_config.tv.enabled = false;
+    scanner_config.music.enabled = false;
+    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(),
+                             service.catalogue_hints(), scanner_config, std::move(fake_http));
+
+    // Discovery must not manufacture one shared immutable identity for every
+    // zero-length namespace shell, queue provider work, or contact TMDB.
+    CHECK(scanner.scan_once() == 0);
+    CHECK(service.catalogue_hints().summary().total == 0);
+    CHECK(fake_http_ptr->requests() == 0);
+
+    // A hint admitted just before the namespace becomes visible can still race
+    // with publication. It must remain pending rather than becoming a durable
+    // semantic no-match for a file whose content has not committed yet.
+    const auto hint_id = service.catalogue_hints().submit(
+        path, "namespace", empty_media_id, CatalogueHintPriority::namespace_mutation);
+    CHECK(scanner.scan_once() == 0);
+    auto waiting = service.catalogue_hints().get(hint_id);
+    REQUIRE(waiting.has_value());
+    CHECK(waiting->state == CatalogueHintState::deferred);
+    CHECK(waiting->result.empty());
+    CHECK(waiting->error == "namespace media file has no committed content yet");
+    CHECK(fake_http_ptr->requests() == 0);
+
+    // Once the real extent manifest commits, the changed media identity reopens
+    // the same path and normal provider matching proceeds immediately.
+    auto writer = service.filesystem().open_write(path, true);
+    auto bytes = pattern(32768);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    const auto committed_entry = service.filesystem().getattr(path);
+    REQUIRE(committed_entry.size == bytes.size());
+    const auto committed_media_id = file_media_id(committed_entry);
+    CHECK(committed_media_id != empty_media_id);
+
+    CHECK(scanner.scan_once() == 1);
+    auto item = service.catalogue().get("tmdb:movie:4242");
+    REQUIRE(item.has_value());
+    CHECK(item->media_ids == std::vector<std::string>{committed_media_id});
+    CHECK(fake_http_ptr->requests() == 2);
+}
+
+MACHA_TEST("hydration_catalogue", test_catalogue_cache_ignores_unrelated_metadata_generation) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto config = config_for(cluster.path() / "node", cluster.keyfile(), free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+
+    NodeRuntime node(config, keys);
+    DistributedStore store(node);
+    MetadataManager metadata(node);
+    CatalogueManager catalogue(node, store, metadata);
+    node.start();
+
+    CatalogueItem item;
+    item.id = "test:movie:1";
+    item.kind = CatalogueKind::movie;
+    item.title = "Cached Movie";
+    auto committed = catalogue.upsert(item);
+    CHECK(committed.title == "Cached Movie");
+
+    auto status = catalogue.status();
+    REQUIRE(status.root.has_value());
+    REQUIRE(node.local_store().remove(*status.root));
+
+    // Advance ordinary filesystem metadata without changing catalogue_root.
+    // The cached immutable catalogue must remain usable even though the backing
+    // root object has deliberately been made unavailable for a reload.
+    metadata.mutate([](MetadataSnapshot& snapshot) {
+        auto root = snapshot.entries.find("/");
+        REQUIRE(root != snapshot.entries.end());
+        ++root->second.version;
+        ++root->second.mtime_ns;
+    });
+
+    auto cached = catalogue.get("test:movie:1");
+    REQUIRE(cached.has_value());
+    CHECK(cached->title == "Cached Movie");
+    // The global metadata generation is newer, but the decoded immutable view
+    // proves that catalogue_root did not change. A missing-item mutation can
+    // therefore return 404 without entering quorum repair.
+    CHECK(catalogue.definitely_absent("test:movie:missing"));
+
+    // Background convergence should also recognise that an unchanged
+    // content-addressed root does not need to be reloaded.
+    catalogue.repair_once();
+    auto after_repair = catalogue.get("test:movie:1");
+    REQUIRE(after_repair.has_value());
+    CHECK(after_repair->title == "Cached Movie");
+
+    node.stop();
+}
+
+MACHA_TEST("hydration_catalogue", test_catalogue_scanner_restart_does_not_rescan_unchanged_namespace) {
+    TestService fixture("store");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.catalogue.scanner.enabled = false; // explicit scanner below
+    auto& service = fixture.start();
+
+    service.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
+    service.filesystem().create_file("/Movies/Unbound.2026.mkv", 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write("/Movies/Unbound.2026.mkv", true);
+    auto bytes = pattern(4096);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+
+    // Simulate an upgrade from the pre-scanner.state queue implementation. The
+    // durable hint-state file remains even when every historical ephemeral hint
+    // has been discarded. Restart/coordinator election must seed scanner.state
+    // from the current immutable namespace and wait for the normal safety
+    // interval; it must not interpret process start as a reason to walk /Movies.
+    std::filesystem::create_directories(config.state_path / "catalogue");
+    {
+        std::ofstream out(config.state_path / "catalogue" / "hints.json");
+        out << R"({"version":2,"hints":[]})";
+    }
+
+    auto token = fixture.path() / "tmdb.token";
+    {
+        std::ofstream out(token);
+        out << "test-token\n";
+    }
+    CatalogueScannerConfig scanner_config;
+    scanner_config.enabled = true;
+    scanner_config.interval = 1h;
+    scanner_config.rescan_debounce = 50ms;
+    scanner_config.rescan_max_delay = 1s;
+    scanner_config.movies.roots = {"/Movies"};
+    scanner_config.movies.tmdb.token_file = token;
+    scanner_config.tv.enabled = false;
+    scanner_config.music.enabled = false;
+
+    auto fake_http = std::make_unique<FakeHttpClient>();
+    auto* fake_http_ptr = fake_http.get();
+    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(),
+                             service.catalogue_hints(), scanner_config, std::move(fake_http));
+    scanner.start();
+    REQUIRE(wait_until([&] {
+        return std::filesystem::exists(config.state_path / "catalogue" / "scanner.state");
+    }, 1s));
+    std::this_thread::sleep_for(80ms);
+    CHECK(service.catalogue_hints().summary().total == 0);
+    CHECK(fake_http_ptr->requests() == 0);
+    scanner.stop();
+}
+
+MACHA_TEST("hydration_catalogue", test_catalogue_non_coordinator_idle_does_not_spin) {
+    TempDir temp;
+    auto keyfile = temp.path() / "cluster.key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+
+    auto c1 = config_for(temp.path() / "catalogue-idle-1", keyfile, free_port());
+    auto c2 = config_for(temp.path() / "catalogue-idle-2", keyfile, free_port(),
+                         {{"127.0.0.1", c1.port}});
+    c1.replication = c2.replication = 1;
+    c1.metadata_replication = c2.metadata_replication = 1;
+    c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = false;
+    c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
+
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }, 5s));
+
+    Service* non_coordinator = s1.node().node_id() > s2.node().node_id() ? &s1 : &s2;
+    CatalogueScannerConfig scanner_config;
+    scanner_config.enabled = true;
+    scanner_config.interval = 1h;
+    scanner_config.movies.enabled = false;
+    scanner_config.tv.enabled = false;
+    scanner_config.music.enabled = false;
+
+    auto capture = std::make_shared<ConcurrentCapturingLogger>(LogLevel::all);
+    Log::set_logger(capture);
+    CatalogueScanner scanner(non_coordinator->node(), non_coordinator->filesystem(),
+                             non_coordinator->catalogue(), non_coordinator->catalogue_hints(),
+                             scanner_config, std::make_unique<FakeHttpClient>(), 1s);
+    scanner.start();
+    std::this_thread::sleep_for(1200ms);
+    scanner.stop();
+    const auto records = capture->records();
+    Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
+
+    uint64_t max_iterations = 0;
+    bool saw_report = false;
+    for (const auto& [level, message] : records) {
+        if (level != LogLevel::all ||
+            message.find("DIAG thread name=macha-catalogue") == std::string::npos)
+            continue;
+        const auto marker = message.find(" iterations=");
+        REQUIRE(marker != std::string::npos);
+        max_iterations = std::max(
+            max_iterations,
+            static_cast<uint64_t>(std::stoull(message.substr(marker + 12))));
+        saw_report = true;
+    }
+    CHECK(saw_report);
+    // The idle non-coordinator has only the one-second membership/coordinator
+    // observation cadence. A stale coordinator-only deadline must never turn
+    // this into a zero-timeout polling loop.
+    CHECK(max_iterations <= 20);
+
+    s2.stop();
+    s1.stop();
+}
+
+MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_persistence_coalescing_and_priority) {
+    TempDir temp;
+    const auto state = temp.path() / "hint-state";
+
+    std::string no_match_id;
+    {
+        CatalogueHintQueue hints(state);
+        no_match_id = hints.submit("/Movies/Unknown.mkv", "scanner", "macha:rev-a",
+                                   CatalogueHintPriority::periodic_scan);
+        CHECK(hints.submit("//Movies//Unknown.mkv", "scanner", "macha:rev-a",
+                           CatalogueHintPriority::periodic_scan) == no_match_id);
+        REQUIRE(hints.list().size() == 1);
+        auto claimed = hints.claim_next();
+        REQUIRE(claimed.has_value());
+        CHECK(claimed->id == no_match_id);
+        auto processing_summary = hints.summary();
+        CHECK(processing_summary.total == 1);
+        CHECK(processing_summary.pending == 1);
+        CHECK(processing_summary.queued == 0);
+        CHECK(processing_summary.processing == 1);
+        CHECK(processing_summary.deferred == 0);
+        hints.mark_no_match(no_match_id, "movies", "macha:rev-a", "no provider match");
+        auto terminal_summary = hints.summary();
+        CHECK(terminal_summary.pending == 0);
+        CHECK(terminal_summary.no_match == 1);
+
+        // An unchanged namespace observation must reuse the terminal negative
+        // result rather than reopening provider work merely because its source
+        // or scan pass is different.
+        CHECK(hints.submit("/Movies/Unknown.mkv", "namespace", "macha:rev-a",
+                           CatalogueHintPriority::namespace_mutation) == no_match_id);
+        auto unchanged = hints.get(no_match_id);
+        REQUIRE(unchanged.has_value());
+        CHECK(unchanged->state == CatalogueHintState::no_match);
+
+        // Replacing bytes at the same path changes the stable media id and
+        // therefore reopens the coalesced work item at the stronger priority.
+        hints.submit("/Movies/Unknown.mkv", "namespace", "macha:rev-b",
+                     CatalogueHintPriority::namespace_mutation);
+        auto changed = hints.get(no_match_id);
+        REQUIRE(changed.has_value());
+        CHECK(changed->state == CatalogueHintState::queued);
+        CHECK(changed->priority == CatalogueHintPriority::namespace_mutation);
+        auto replacement = hints.claim_next();
+        REQUIRE(replacement.has_value());
+        hints.mark_no_match(replacement->id, "movies", "macha:rev-b", "still unmatched");
+
+        // Manual work always reopens terminal state; an ingest occurrence then
+        // raises the same canonical-path item to the highest current priority.
+        hints.submit("/Movies/Unknown.mkv", "manual", "manual:1",
+                     CatalogueHintPriority::manual_rescan);
+        hints.submit("/Movies/Unknown.mkv", "ingest", "job-1",
+                     CatalogueHintPriority::ingest);
+        auto coalesced = hints.get(no_match_id);
+        REQUIRE(coalesced.has_value());
+        CHECK(coalesced->state == CatalogueHintState::queued);
+        CHECK(coalesced->priority == CatalogueHintPriority::ingest);
+        CHECK(hints.summary("ingest", "job-1").pending == 1);
+        CHECK(hints.erase_origin("ingest", "job-1") == 1);
+        auto lowered = hints.get(no_match_id);
+        REQUIRE(lowered.has_value());
+        CHECK(lowered->priority == CatalogueHintPriority::manual_rescan);
+        hints.submit("/Movies/Unknown.mkv", "ingest", "job-1", CatalogueHintPriority::ingest);
+        auto in_flight = hints.claim_next();
+        REQUIRE(in_flight.has_value());
+        CHECK(in_flight->id == no_match_id);
+    }
+
+    // Claim ownership is deliberately not persisted: if the daemon exits while
+    // a hint is in flight, the durable queued/deferred state provides at-least-once
+    // replay without a full hints.json rewrite merely to record `processing`.
+    {
+        CatalogueHintQueue hints(state);
+        auto recovered = hints.get(no_match_id);
+        REQUIRE(recovered.has_value());
+        CHECK(recovered->state == CatalogueHintState::queued);
+    }
+
+    // Terminal worker progress is intentionally coalesced rather than forcing a
+    // complete hints.json rewrite per item. Destruction is a durability boundary:
+    // the final dirty terminal state must still survive a clean shutdown.
+    const auto terminal_state = temp.path() / "terminal-state";
+    std::string terminal_id;
+    {
+        CatalogueHintQueue terminal_queue(terminal_state);
+        terminal_id = terminal_queue.submit("/Movies/Terminal.mkv", "scanner", "macha:terminal",
+                                            CatalogueHintPriority::periodic_scan);
+        REQUIRE(terminal_queue.claim_next().has_value());
+        terminal_queue.mark_no_match(terminal_id, "movies", "macha:terminal", "no match");
+        CHECK(terminal_queue.summary().pending == 0);
+    }
+    {
+        CatalogueHintQueue terminal_queue(terminal_state);
+        auto recovered = terminal_queue.get(terminal_id);
+        REQUIRE(recovered.has_value());
+        CHECK(recovered->state == CatalogueHintState::no_match);
+    }
+
+    // Candidate fallback progress is queue state, not provider-process state.
+    // Persist it so a restart cannot repeatedly retry the first hypothesis and
+    // defeat fair scheduling.
+    const auto cursor_state = temp.path() / "cursor-state";
+    std::string cursor_id;
+    {
+        CatalogueHintQueue cursor(cursor_state);
+        cursor_id = cursor.submit("/Music/Artist/Album/01 - Track.mp3", "scanner",
+                                  "macha:cursor", CatalogueHintPriority::periodic_scan);
+        auto claimed = cursor.claim_next();
+        REQUIRE(claimed.has_value());
+        cursor.advance_candidate(cursor_id, 2);
+        auto advanced = cursor.get(cursor_id);
+        REQUIRE(advanced.has_value());
+        CHECK(advanced->candidate_cursor == 2);
+    }
+    {
+        CatalogueHintQueue cursor(cursor_state);
+        auto recovered = cursor.get(cursor_id);
+        REQUIRE(recovered.has_value());
+        CHECK(recovered->state == CatalogueHintState::queued);
+        CHECK(recovered->candidate_cursor == 2);
+    }
+
+    // Repeated per-item failures become a persisted terminal dead letter rather
+    // than remaining runnable forever. The failure counter is distinct from
+    // scheduling attempts and survives restart for API/operator inspection.
+    const auto failure_state = temp.path() / "failure-state";
+    std::string failure_id;
+    {
+        CatalogueHintQueue failure_queue(failure_state);
+        failure_id = failure_queue.submit("/Movies/Broken.mkv", "scanner", "macha:broken",
+                                          CatalogueHintPriority::periodic_scan);
+        REQUIRE(failure_queue.claim_next().has_value());
+        CHECK(!failure_queue.record_failure(failure_id, "first failure", 0, 2));
+        auto once = failure_queue.get(failure_id);
+        REQUIRE(once.has_value());
+        CHECK(once->state == CatalogueHintState::deferred);
+        CHECK(once->failures == 1);
+        REQUIRE(failure_queue.claim_next().has_value());
+        CHECK(failure_queue.record_failure(failure_id, "second failure", 0, 2));
+        auto dead = failure_queue.get(failure_id);
+        REQUIRE(dead.has_value());
+        CHECK(dead->state == CatalogueHintState::failed);
+        CHECK(dead->failures == 2);
+        CHECK(dead->error == "second failure");
+        CHECK(!failure_queue.claim_next().has_value());
+    }
+    {
+        CatalogueHintQueue failure_queue(failure_state);
+        auto dead = failure_queue.get(failure_id);
+        REQUIRE(dead.has_value());
+        CHECK(dead->state == CatalogueHintState::failed);
+        CHECK(dead->failures == 2);
+        CHECK(!failure_queue.claim_next().has_value());
+    }
+
+    // Equal-priority work is fair across top-level catalogue roots rather than
+    // allowing a large Movies backlog to starve TV or Music indefinitely.
+    const auto fairness_state = temp.path() / "fairness-state";
+    CatalogueHintQueue fair(fairness_state);
+    fair.submit("/Movies/A.mkv", "scanner", "macha:a", 10);
+    fair.submit("/Movies/B.mkv", "scanner", "macha:b", 10);
+    fair.submit("/TV/Show/S01E01.mkv", "scanner", "macha:c", 10);
+    auto first = fair.claim_next();
+    auto second = fair.claim_next();
+    REQUIRE(first.has_value());
+    REQUIRE(second.has_value());
+    CHECK(first->path.starts_with("/Movies/"));
+    CHECK(second->path.starts_with("/TV/"));
+
+    // An idle consumer blocks on the queue revision instead of polling the
+    // complete persisted hint map. A new submission wakes it immediately.
+    const auto wake_state = temp.path() / "wake-state";
+    CatalogueHintQueue wake(wake_state);
+    const auto revision = wake.revision();
+    CHECK(!wake.wait_for_change({}, revision, 5ms));
+    std::jthread producer([&] {
+        std::this_thread::sleep_for(20ms);
+        wake.submit("/Movies/Wake.mkv", "ingest", "wake-job",
+                    CatalogueHintPriority::ingest);
+    });
+    CHECK(wake.wait_for_change({}, revision, 500ms));
+    auto ready_delay = wake.next_ready_delay();
+    REQUIRE(ready_delay.has_value());
+    CHECK(*ready_delay == 0ms);
+}
+
+MACHA_TEST("hydration_catalogue", test_ingest_catalogue_feedback_and_external_clear_cleanup) {
+    TestService fixture("node");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.catalogue.scanner.enabled = false;
+    config.catalogue.scanner.movies.enabled = true;
+    config.catalogue.scanner.movies.roots = {"/Movies"};
+    config.catalogue.scanner.tv.enabled = false;
+    config.catalogue.scanner.music.enabled = false;
+    config.ingest.enabled = false; // use the explicit manager below
+
+    auto& service = fixture.start();
+
+    const auto source_root = fixture.path() / "external-import";
+    std::filesystem::create_directories(source_root);
+    const auto media = source_root / "Queue Test Movie 2024.mkv";
+    const auto unrelated = source_root / "do-not-delete.txt";
+    {
+        std::ofstream out(media, std::ios::binary);
+        auto bytes = pattern(512 * 1024);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+    }
+    {
+        std::ofstream out(unrelated);
+        out << "external source material not selected for ingest\n";
+    }
+
+    IngestConfig ingest_config;
+    ingest_config.enabled = true;
+    ingest_config.staging_path = fixture.path() / "staging";
+    ingest_config.source_roots = {source_root};
+    ingest_config.copy_chunk_bytes = 64 * 1024;
+    ingest_config.checkpoint_bytes = 256 * 1024;
+    ingest_config.delete_external_source_on_clear = true;
+    IngestManager ingest(service.node(), service.filesystem(), service.catalogue_hints(),
+                         ingest_config);
+    ingest.start();
+    const auto job_id = ingest.submit_path(source_root);
+
+    REQUIRE(wait_until([&] {
+        auto job = ingest.job(job_id);
+        return job && job->state == IngestJobState::cataloguing;
+    }, 10s));
+    auto summary = service.catalogue_hints().summary("ingest", job_id);
+    REQUIRE(summary.total == 1);
+    REQUIRE(summary.pending == 1);
+    auto hint = service.catalogue_hints().claim_next();
+    REQUIRE(hint.has_value());
+    CHECK(hint->origins.size() == 1);
+    service.catalogue_hints().mark_catalogued(
+        hint->id, "movies", "macha:test-ingest-media", {"test:movie:queue"}, "synthetic match");
+
+    REQUIRE(wait_until([&] {
+        auto job = ingest.job(job_id);
+        return job && job->state == IngestJobState::completed;
+    }, 5s));
+    auto completed = ingest.job(job_id);
+    REQUIRE(completed.has_value());
+    CHECK(completed->catalogue_total == 1);
+    CHECK(completed->catalogue_pending == 0);
+    CHECK(completed->catalogue_catalogued == 1);
+    CHECK(completed->catalogue_no_match == 0);
+    CHECK(completed->catalogue_failed == 0);
+
+    REQUIRE(ingest.clear(job_id));
+    CHECK(!ingest.job(job_id).has_value());
+    CHECK(!std::filesystem::exists(media));
+    CHECK(std::filesystem::exists(unrelated));
+    CHECK(std::filesystem::exists(source_root));
+    CHECK(service.catalogue_hints().summary("ingest", job_id).total == 0);
+
+    ingest.stop();
+}
+
+MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto c1 = config_for(cluster.path() / "catalogue-live-1", cluster.keyfile(), free_port());
+    auto c2 = config_for(cluster.path() / "catalogue-live-2", cluster.keyfile(), free_port(),
+                         {{"127.0.0.1", c1.port}});
+    c1.replication = c2.replication = 1;
+    c1.metadata_replication = c2.metadata_replication = 1;
+    c1.metadata_cache = c2.metadata_cache = 30ms;
+
+    NodeRuntime n1(c1, keys);
+    DistributedStore store1(n1);
+    MetadataManager metadata1(n1);
+    CatalogueManager catalogue1(n1, store1, metadata1);
+
+    NodeRuntime n2(c2, keys);
+    DistributedStore store2(n2);
+    MetadataManager metadata2(n2);
+    CatalogueManager catalogue2(n2, store2, metadata2);
+
+    // Form the initial namespace on the bootstrap-less founder before starting
+    // the joiner. A configured joiner is intentionally forbidden from inventing
+    // genesis while its bootstrap peer has not yet entered active membership.
+    n1.start();
+
+    CatalogueItem first;
+    first.id = "test:movie:remote-first";
+    first.kind = CatalogueKind::movie;
+    first.title = "Remote First";
+    first = catalogue1.upsert(first);
+
+    n2.start();
+
+    // Cold-load node two from node one's committed catalogue. There is no Service
+    // here, so no catalogue maintenance thread can refresh it behind the test.
+    REQUIRE(wait_until([&] {
+        try {
+            auto item = catalogue2.get(first.id);
+            return item && item->title == first.title;
+        } catch (...) {
+            return false;
+        }
+    }, 5s));
+    const auto before = catalogue2.status();
+    REQUIRE(before.ready);
+
+    CatalogueItem second;
+    second.id = "test:movie:remote-second";
+    second.kind = CatalogueKind::movie;
+    second.title = "Remote Second";
+    second = catalogue1.upsert(second);
+    const auto writer_status = catalogue1.status();
+
+    // Membership/metadata propagation tells node two that a newer generation
+    // exists. The catalogue itself is deliberately still the old cached root.
+    REQUIRE(wait_until([&] {
+        return n2.known_metadata_generation() >= writer_status.metadata_generation;
+    }, 5s));
+    const auto stale = catalogue2.status();
+    CHECK(stale.metadata_generation == before.metadata_generation);
+    CHECK(stale.known_metadata_generation >= writer_status.metadata_generation);
+    CHECK(stale.known_metadata_generation > stale.metadata_generation);
+
+    // A remote generation notice must not turn ordinary kernel metadata traffic
+    // into quorum reads. FUSE may adopt a newer snapshot only after some control-
+    // plane owner has already decoded it locally. Repeated getattr therefore
+    // leaves MetadataManager's available generation unchanged.
+    FileSystem fs2(n2, store2, metadata2);
+    FuseConfig fuse_config;
+    fuse_config.commit_workers = 1;
+    auto frontend = std::make_shared<FuseFrontend>(fs2, fuse_config);
+    const auto available_before_fuse = metadata2.available_snapshot_view();
+    REQUIRE(available_before_fuse.has_value());
+    const auto namespace_revision_before = metadata2.available_namespace_revision();
+    for (int i = 0; i < 64; ++i) CHECK(frontend->getattr("/").type == EntryType::directory);
+    const auto available_after_fuse = metadata2.available_snapshot_view();
+    REQUIRE(available_after_fuse.has_value());
+    CHECK(available_after_fuse->generation == available_before_fuse->generation);
+
+    // Warm reads must remain memory-only even when a newer generation is known.
+    // The serving API may briefly return the previous coherent snapshot while its
+    // background/control-plane worker converges; it must not perform quorum I/O
+    // on the request thread. refresh_needed() is the hand-off to that worker.
+    CHECK(catalogue2.refresh_needed());
+    auto still_cached = catalogue2.get(first.id);
+    REQUIRE(still_cached.has_value());
+    CHECK(still_cached->title == first.title);
+    CHECK(!catalogue2.get(second.id).has_value());
+    const auto after_read = catalogue2.status();
+    CHECK(after_read.metadata_generation == stale.metadata_generation);
+    CHECK(after_read.known_metadata_generation >= writer_status.metadata_generation);
+
+    // Simulate the Service control-plane pass. It must converge the immutable root
+    // and atomically publish the replacement snapshot for subsequent API reads.
+    catalogue2.repair_once();
+    auto refreshed = catalogue2.get(second.id);
+    REQUIRE(refreshed.has_value());
+    CHECK(refreshed->title == second.title);
+    const auto after = catalogue2.status();
+    CHECK(after.metadata_generation >= writer_status.metadata_generation);
+    CHECK(after.metadata_generation == after.known_metadata_generation);
+    CHECK(!catalogue2.refresh_needed());
+    CHECK(frontend->getattr("/").type == EntryType::directory);
+    auto available_after_repair = metadata2.available_snapshot_view();
+    REQUIRE(available_after_repair.has_value());
+    CHECK(available_after_repair->generation >= writer_status.metadata_generation);
+    // This metadata change only moved the catalogue root, so it must not force
+    // FUSE to rebuild its namespace graph.
+    CHECK(metadata2.available_namespace_revision() == namespace_revision_before);
+    frontend->stop();
+
+    CatalogueHintQueue catalogue2_hints(cluster.path() / "catalogue2-hints");
+    CatalogueApi api(catalogue2, catalogue2_hints);
+    auto status_response = api.handle({.method = "GET",
+                                       .path = "/api/v1/catalogue/status",
+                                       .query = {},
+                                       .headers = {},
+                                       .body = {}});
+    REQUIRE(status_response.status == 200);
+    auto status_json = Json::parse(std::string(status_response.body.begin(),
+                                               status_response.body.end()));
+    REQUIRE(status_json.find("metadata_generation") != nullptr);
+    REQUIRE(status_json.find("known_metadata_generation") != nullptr);
+    CHECK(status_json.find("metadata_generation")->asInt64() ==
+          status_json.find("known_metadata_generation")->asInt64());
+
+    n2.stop();
+    n1.stop();
+}
+
+MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_missed_notice) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto c1 = config_for(cluster.path() / "metadata-ttl-1", cluster.keyfile(), free_port());
+    auto c2 = config_for(cluster.path() / "metadata-ttl-2", cluster.keyfile(), free_port(),
+                         {{"127.0.0.1", c1.port}});
+    c1.replication = c2.replication = 1;
+    c1.metadata_replication = c2.metadata_replication = 1;
+    c1.metadata_cache = c2.metadata_cache = 30ms;
+    // Keep ordinary heartbeat propagation outside this test window. We install a
+    // valid newer voter record directly to simulate a generation notice that was
+    // missed by node two; TTL validation must still discover it from quorum.
+    c1.heartbeat = c2.heartbeat = 5s;
+    c1.dead_after = c2.dead_after = 20s;
+
+    NodeRuntime n1(c1, keys);
+    NodeRuntime n2(c2, keys);
+    MetadataManager metadata1(n1);
+    MetadataManager metadata2(n2);
+
+    // Establish genesis on the founder first. The joiner may legitimately reject
+    // metadata reads with "waiting for bootstrap peer" during the brief interval
+    // between start() and membership convergence, so retry its initial read rather
+    // than turning that expected bootstrap state into an unhandled test failure.
+    n1.start();
+    const auto initial1 = metadata1.snapshot_view();
+    n2.start();
+
+    std::optional<MetadataSnapshotView> initial2;
+    REQUIRE(wait_until([&] {
+        try {
+            auto view = metadata2.snapshot_view();
+            if (view.generation != initial1.generation)
+                return false;
+            initial2 = std::move(view);
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+    }, 5s));
+    REQUIRE(initial2.has_value());
+
+    auto base = n1.metadata_replica().current();
+    auto changed = decode_snapshot(base.payload);
+    auto root = changed.entries.find("/");
+    REQUIRE(root != changed.entries.end());
+    ++root->second.version;
+
+    MetadataRecord next;
+    next.generation = base.generation + 1;
+    next.previous = base.hash;
+    next.payload = encode_snapshot(changed);
+    next.hash = metadata_hash(next.generation, next.previous, next.payload);
+    REQUIRE(n1.metadata_replica().seed(next));
+
+    // With no generation notice, the decoded view is legitimately reused until
+    // the configured metadata TTL expires.
+    CHECK(n2.known_metadata_generation() < next.generation);
+    CHECK(metadata2.snapshot_view().generation == initial2->generation);
+    std::this_thread::sleep_for(c2.metadata_cache + 20ms);
+    REQUIRE(n2.known_metadata_generation() < next.generation);
+
+    // Expiry must force a real metadata read, discover the newer voter record and
+    // replace the decoded snapshot. Before 0.10.4 cached_snapshot_view() ignored
+    // cache_until_ and this remained stale indefinitely without a notice.
+    auto refreshed = metadata2.snapshot_view();
+    CHECK(refreshed.generation == next.generation);
+    CHECK(n2.known_metadata_generation() >= next.generation);
+
+    n2.stop();
+    n1.stop();
+}
+
+MACHA_TEST("hydration_catalogue", test_catalogue_root_ready_without_local_artwork) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto config = config_for(cluster.path() / "node", cluster.keyfile(), free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+
+    NodeRuntime node(config, keys);
+    DistributedStore store(node);
+    MetadataManager metadata(node);
+    CatalogueManager catalogue(node, store, metadata);
+    node.start();
+
+    CatalogueSnapshot snapshot;
+    CatalogueItem item;
+    item.id = "test:movie:artwork-missing";
+    item.kind = CatalogueKind::movie;
+    item.title = "Catalogue Still Loads";
+    item.revision = 1;
+    item.updated_ns = wall_time_ns();
+    CatalogueArtwork artwork;
+    artwork.role = "poster";
+    artwork.mime_type = "image/jpeg";
+    artwork.id = object_id(Bytes{0x01, 0x02, 0x03, 0x04});
+    item.artwork.push_back(artwork);
+    snapshot.items.emplace(item.id, item);
+
+    auto encoded = encode_catalogue(snapshot);
+    auto root = object_id(encoded);
+    REQUIRE(node.local_store().put(root, encoded));
+    REQUIRE(!node.local_store().has(artwork.id));
+
+    metadata.mutate([&](MetadataSnapshot& state) { state.catalogue_root = root; });
+    catalogue.repair_once();
+
+    auto status = catalogue.status();
+    CHECK(status.ready);
+    CHECK(status.items == 1);
+    CHECK(status.artwork_objects == 1);
+    CHECK(status.local_artwork_objects == 0);
+    auto loaded = catalogue.get(item.id);
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->title == item.title);
+
+    node.stop();
+}
+
+MACHA_FAST_TEST("hydration_catalogue", test_macos_unicode_namespace_aliases) {
+#if defined(__APPLE__)
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto config = config_for(cluster.path() / "node", cluster.keyfile(), free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+
+    NodeRuntime node(config, keys);
+    DistributedStore store(node);
+    MetadataManager metadata(node);
+    FileSystem filesystem(node, store, metadata);
+    node.start();
+
+    filesystem.mkdir("/Music", 0755, getuid(), getgid());
+
+    // Simulate namespace keys written by a previous version/client in D form.
+    // The runtime alias index must resolve NFC callbacks to the exact persisted
+    // spelling instead of rewriting the metadata representation.
+    const std::string nfd_dir = "/Music/Cafe\xcc\x81 del Mar";
+    const std::string nfd_file =
+        nfd_dir + "/01.Clannad - Na Buachailli\xcc\x81 lainn.mp3";
+    const std::string nfc_dir = "/Music/Caf\xc3\xa9 del Mar";
+    const std::string nfc_file =
+        nfc_dir + "/01.Clannad - Na Buachaill\xc3\xad lainn.mp3";
+
+    metadata.mutate([&](MetadataSnapshot& snapshot) {
+        FsEntry dir;
+        dir.type = EntryType::directory;
+        dir.mode = 0755;
+        dir.uid = getuid();
+        dir.gid = getgid();
+        dir.ctime_ns = dir.mtime_ns = wall_time_ns();
+        snapshot.entries[nfd_dir] = dir;
+
+        FsEntry file;
+        file.type = EntryType::file;
+        file.mode = 0644;
+        file.uid = getuid();
+        file.gid = getgid();
+        file.ctime_ns = file.mtime_ns = wall_time_ns();
+        snapshot.entries[nfd_file] = file;
+    });
+
+    CHECK(filesystem.getattr(nfc_dir).type == EntryType::directory);
+    CHECK(filesystem.getattr(nfc_file).type == EntryType::file);
+    auto listed = filesystem.readdir(nfc_dir);
+    REQUIRE(listed.size() == 1);
+    CHECK(listed.front().first == "01.Clannad - Na Buachailli\xcc\x81 lainn.mp3");
+
+    // A new NFC leaf under an old NFD parent must retain the exact stored parent
+    // spelling so require_parent() sees a real namespace key.
+    const std::string new_nfc = nfc_dir + "/Macha Caf\xc3\xa9 Test.mp3";
+    filesystem.create_file(new_nfc, 0644, getuid(), getgid());
+    const auto persisted = metadata.snapshot();
+    CHECK(persisted.entries.contains(nfd_dir + "/Macha Caf\xc3\xa9 Test.mp3"));
+    CHECK(filesystem.getattr(new_nfc).type == EntryType::file);
+
+    node.stop();
+#endif
+}
+
+MACHA_TEST("hydration_catalogue", test_media_index_cache_survives_namespace_churn) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto config = config_for(cluster.path() / "node", cluster.keyfile(), free_port());
+    config.replication = 1;
+    config.metadata_replication = 1;
+
+    NodeRuntime node(config, keys);
+    DistributedStore store(node);
+    MetadataManager metadata(node);
+    FileSystem filesystem(node, store, metadata);
+    node.start();
+
+    filesystem.mkdir("/media", 0755, getuid(), getgid());
+    filesystem.create_file("/media/a.mkv", 0644, getuid(), getgid());
+    auto a_bytes = pattern(32 * 1024 + 17);
+    auto a_writer = filesystem.open_write("/media/a.mkv", true);
+    REQUIRE(a_writer->write(0, a_bytes) == a_bytes.size());
+    a_writer->commit();
+    auto a_entry = filesystem.getattr("/media/a.mkv");
+    auto a_id = file_media_id(a_entry);
+
+    auto first = filesystem.find_media(a_id);
+    REQUIRE(first.has_value());
+    CHECK(first->first == "/media/a.mkv");
+
+    // Unrelated namespace churn must not invalidate an already resolved,
+    // content-addressed media id.
+    filesystem.mkdir("/noise", 0755, getuid(), getgid());
+    auto cached = filesystem.find_media(a_id);
+    REQUIRE(cached.has_value());
+    CHECK(cached->first == "/media/a.mkv");
+    CHECK(file_media_id(cached->second) == a_id);
+
+    // A genuinely new id is a cache miss and must rebuild against current
+    // metadata, after which both the new and old ids remain resolvable.
+    filesystem.create_file("/media/b.mkv", 0644, getuid(), getgid());
+    auto b_bytes = pattern(48 * 1024 + 29);
+    auto b_writer = filesystem.open_write("/media/b.mkv", true);
+    REQUIRE(b_writer->write(0, b_bytes) == b_bytes.size());
+    b_writer->commit();
+    auto b_id = file_media_id(filesystem.getattr("/media/b.mkv"));
+    CHECK(b_id != a_id);
+
+    auto second = filesystem.find_media(b_id);
+    REQUIRE(second.has_value());
+    CHECK(second->first == "/media/b.mkv");
+    REQUIRE(filesystem.find_media(a_id).has_value());
+
+    node.stop();
+}
+
+MACHA_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_gc) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    uint16_t p1 = free_port();
+    uint16_t p2 = free_port();
+    uint16_t p3 = free_port();
+
+    auto c1 = config_for(cluster.path() / "cat1", cluster.keyfile(), p1);
+    auto c2 = config_for(cluster.path() / "cat2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    auto c3 = config_for(cluster.path() / "cat3", cluster.keyfile(), p3, {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = c3.replication = 1;
+    c1.metadata_replication = c2.metadata_replication = c3.metadata_replication = 1;
+    c1.maintenance.garbage_grace = 0ms;
+    c2.maintenance.garbage_grace = 0ms;
+    c3.maintenance.garbage_grace = 0ms;
+    // Production defaults back settled maintenance off for 30 seconds. This
+    // fixture deliberately exercises cluster GC at the scheduler's 5-second
+    // minimum so its 10-second convergence assertion does not depend on the
+    // production no-progress interval.
+    c1.maintenance.no_progress_backoff = 1000ms;
+    c2.maintenance.no_progress_backoff = 1000ms;
+    c3.maintenance.no_progress_backoff = 1000ms;
+    CHECK(maintenance_background_interval(c1.maintenance) == 5000ms);
+
+    Service s1(c1, keys);
+    s1.start();
+    REQUIRE(wait_until([&] {
+        try {
+            s1.catalogue().repair_once();
+            return s1.catalogue().status().ready;
+        } catch (...) {
+            return false;
+        }
+    }));
+
+    CatalogueItem show;
+    show.id = "show:test";
+    show.kind = CatalogueKind::show;
+    show.title = "Test Programme";
+    show.synopsis = "A deliberately small distributed catalogue test.";
+    show.external_ids["tmdb"] = "1234";
+    show = s1.catalogue().upsert(show);
+
+    CatalogueItem episode;
+    episode.id = "episode:test:1:1";
+    episode.kind = CatalogueKind::episode;
+    episode.title = "The Pilot";
+    episode.parent_id = show.id;
+    episode.season_number = 1;
+    episode.episode_number = 1;
+    episode = s1.catalogue().upsert(episode);
+
+    auto first_art_bytes = pattern(64 * 1024 + 17);
+    auto first_art = s1.catalogue().put_artwork(show.id, "poster", "image/jpeg",
+                                                first_art_bytes, show.revision);
+    show = *s1.catalogue().get(show.id);
+    CHECK(s1.catalogue().search("pilot").front().id == episode.id);
+
+    // A node joining after the catalogue already exists must become locally
+    // browse/search capable, including artwork, without provider access.
+    Service s2(c2, keys);
+    s2.start();
+    REQUIRE(wait_until([&] {
+        auto status = s2.catalogue().status();
+        return status.ready && status.items == 2 && status.artwork_objects == 1 &&
+               status.local_artwork_objects == 1;
+    }, 10s));
+    REQUIRE(s2.catalogue().get(episode.id).has_value());
+    CHECK(s2.catalogue().search("test programme").front().id == show.id);
+    CHECK(s2.node().local_store().has(first_art.id));
+
+    Service s3(c3, keys);
+    s3.start();
+    REQUIRE(wait_until([&] {
+        auto status = s3.catalogue().status();
+        return status.ready && status.items == 2 && status.local_artwork_objects == 1;
+    }, 10s));
+    CHECK(s3.catalogue().list(CatalogueKind::episode).size() == 1);
+    CHECK(s3.node().local_store().has(first_art.id));
+
+    // Replacing the poster retires the old object in committed metadata. With
+    // a zero grace period in this test, reachability GC must prune that retirement
+    // and delete the unreachable physical object on every connected node while
+    // preserving the replacement.
+    auto second_art_bytes = pattern(96 * 1024 + 3);
+    second_art_bytes[0] ^= 0xa5;
+    auto second_art = s2.catalogue().put_artwork(show.id, "poster", "image/jpeg",
+                                                 second_art_bytes, show.revision);
+    REQUIRE(wait_until([&] {
+        return s1.catalogue().status().ready && s2.catalogue().status().ready &&
+               s3.catalogue().status().ready && s1.node().local_store().has(second_art.id) &&
+               s2.node().local_store().has(second_art.id) &&
+               s3.node().local_store().has(second_art.id);
+    }, 10s));
+    REQUIRE(wait_until([&] {
+        return !s1.node().local_store().has(first_art.id) &&
+               !s2.node().local_store().has(first_art.id) &&
+               !s3.node().local_store().has(first_art.id);
+    }, 10s));
+
+    CatalogueApi api(s3.catalogue(), s3.catalogue_hints());
+    CHECK(!s3.catalogue().definitely_absent(show.id));
+    CHECK(s3.catalogue().definitely_absent("show:does-not-exist"));
+    auto missing_clear = api.handle({.method = "DELETE",
+                                     .path = "/api/v1/catalogue/items/show%3Adoes-not-exist/metadata",
+                                     .query = {},
+                                     .headers = {},
+                                     .body = {}});
+    CHECK(missing_clear.status == 404);
+    auto status_response = api.handle({.method = "GET",
+                                       .path = "/api/v1/catalogue/status",
+                                       .query = {},
+                                       .headers = {},
+                                       .body = {}});
+    CHECK(status_response.status == 200);
+    std::string status_body(status_response.body.begin(), status_response.body.end());
+    CHECK(status_body.find("\"ready\":true") != std::string::npos);
+    auto status_json = Json::parse(status_body);
+    REQUIRE(status_json.find("server_version") != nullptr);
+    CHECK(status_json.find("server_version")->asString() == kServerVersion);
+    auto search_response = api.handle({.method = "GET",
+                                       .path = "/api/v1/catalogue/search",
+                                       .query = {{"q", "pilot"}},
+                                       .headers = {},
+                                       .body = {}});
+    CHECK(search_response.status == 200);
+    std::string search_body(search_response.body.begin(), search_response.body.end());
+    CHECK(search_body.find("episode:test:1:1") != std::string::npos);
+
+    // Clear Metadata is an atomic catalogue reset. Clearing a hierarchy parent
+    // also removes descendants so leaf media bindings cannot keep the old match
+    // alive and block a fresh scanner/provider lookup.
+    auto clear_response = api.handle({.method = "DELETE",
+                                      .path = "/api/v1/catalogue/items/show%3Atest/metadata",
+                                      .query = {},
+                                      .headers = {{"if-match", "\"rev-" + std::to_string(show.revision + 1) + "\""}},
+                                      .body = {}});
+    // The poster replacement did not mutate the copy of `show`; use the current
+    // revision if the optimistic request raced a catalogue refresh.
+    if (clear_response.status == 409) {
+        auto current_show = s3.catalogue().get(show.id);
+        REQUIRE(current_show.has_value());
+        clear_response = api.handle({.method = "DELETE",
+                                     .path = "/api/v1/catalogue/items/show%3Atest/metadata",
+                                     .query = {},
+                                     .headers = {{"if-match", "\"rev-" + std::to_string(current_show->revision) + "\""}},
+                                     .body = {}});
+    }
+    CHECK(clear_response.status == 204);
+    CHECK(!s3.catalogue().get(show.id).has_value());
+    CHECK(!s3.catalogue().get(episode.id).has_value());
+
+    s3.stop();
+    s2.stop();
+    s1.stop();
+}
+
+} // namespace
