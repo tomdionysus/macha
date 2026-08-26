@@ -95,6 +95,8 @@ Bytes encode_catalogue(const CatalogueSnapshot&);
 CatalogueSnapshot decode_catalogue(std::span<const uint8_t>);
 std::string catalogue_kind_name(CatalogueKind);
 std::optional<CatalogueKind> parse_catalogue_kind(std::string_view);
+std::vector<CatalogueArtwork> effective_catalogue_artwork(const CatalogueSnapshot&,
+                                                           const CatalogueItem&);
 
 class CatalogueConflict : public std::runtime_error {
   public:
@@ -145,6 +147,7 @@ class CatalogueManager {
     bool refresh_needed() const;
     CatalogueStatus status() const;
     CatalogueSnapshot snapshot();
+    std::shared_ptr<const CatalogueSnapshot> snapshot_view();
     std::optional<CatalogueItem> get(std::string_view id);
     std::vector<CatalogueItem> list(std::optional<CatalogueKind> kind = {},
                                     std::optional<std::string_view> parent = {});

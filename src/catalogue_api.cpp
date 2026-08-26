@@ -62,7 +62,20 @@ std::string optional_number(const std::optional<int32_t>& value) {
     return value ? std::to_string(*value) : "null";
 }
 
-std::string item_json(const CatalogueItem& item) {
+std::string artwork_json(const std::vector<CatalogueArtwork>& artwork) {
+    std::string out = "[";
+    for (size_t i = 0; i < artwork.size(); ++i) {
+        if (i) out += ',';
+        const auto& art = artwork[i];
+        out += "{\"role\":" + json_escape(art.role) + ",\"id\":" +
+               json_escape(to_string(art.id)) + ",\"mime_type\":" +
+               json_escape(art.mime_type) + "}";
+    }
+    out += ']';
+    return out;
+}
+
+std::string item_json(const CatalogueItem& item, const CatalogueSnapshot& snapshot) {
     std::string out = "{";
     out += "\"id\":" + json_escape(item.id);
     out += ",\"kind\":" + json_escape(catalogue_kind_name(item.kind));
@@ -92,24 +105,19 @@ std::string item_json(const CatalogueItem& item) {
         if (i) out += ',';
         out += json_escape(item.media_ids[i]);
     }
-    out += "],\"artwork\":[";
-    for (size_t i = 0; i < item.artwork.size(); ++i) {
-        if (i) out += ',';
-        const auto& art = item.artwork[i];
-        out += "{\"role\":" + json_escape(art.role) + ",\"id\":" +
-               json_escape(to_string(art.id)) + ",\"mime_type\":" +
-               json_escape(art.mime_type) + "}";
-    }
-    out += "],\"revision\":" + std::to_string(item.revision);
+    out += "],\"artwork\":" + artwork_json(item.artwork);
+    out += ",\"effective_artwork\":" + artwork_json(effective_catalogue_artwork(snapshot, item));
+    out += ",\"revision\":" + std::to_string(item.revision);
     out += ",\"updated_ns\":" + std::to_string(item.updated_ns) + "}";
     return out;
 }
 
-std::string items_json(const std::vector<CatalogueItem>& items) {
+std::string items_json(const std::vector<CatalogueItem>& items,
+                       const CatalogueSnapshot& snapshot) {
     std::string out = "{\"items\":[";
     for (size_t i = 0; i < items.size(); ++i) {
         if (i) out += ',';
-        out += item_json(items[i]);
+        out += item_json(items[i], snapshot);
     }
     out += "]}";
     return out;
@@ -282,7 +290,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             }
             std::optional<std::string_view> parent;
             if (auto it = request.query.find("parent"); it != request.query.end()) parent = it->second;
-            return json(200, items_json(catalogue_.list(kind, parent)));
+            auto snapshot = catalogue_.snapshot_view();
+            return json(200, items_json(catalogue_.list(kind, parent), *snapshot));
         }
 
         if (request.method == "GET" && request.path == "/api/v1/catalogue/search") {
@@ -294,7 +303,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 if (ec != std::errc{} || end != it->second.data() + it->second.size() || limit > 1000)
                     return error(400, "bad_limit", "limit must be 0..1000");
             }
-            return json(200, items_json(catalogue_.search(q->second, limit)));
+            auto snapshot = catalogue_.snapshot_view();
+            return json(200, items_json(catalogue_.search(q->second, limit), *snapshot));
         }
 
         constexpr std::string_view item_prefix = "/api/v1/catalogue/items/";
@@ -352,7 +362,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             if (request.method == "GET") {
                 auto item = catalogue_.get(id);
                 if (!item) return error(404, "not_found", "catalogue item not found");
-                auto response = json(200, item_json(*item));
+                auto snapshot = catalogue_.snapshot_view();
+                auto response = json(200, item_json(*item, *snapshot));
                 response.headers["ETag"] = "\"rev-" + std::to_string(item->revision) + "\"";
                 return response;
             }
@@ -360,7 +371,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 auto existing = catalogue_.get(id);
                 auto item = parse_item(id, request.body);
                 auto saved = catalogue_.upsert(std::move(item), expected_revision(request));
-                auto response = json(existing ? 200 : 201, item_json(saved));
+                auto snapshot = catalogue_.snapshot_view();
+                auto response = json(existing ? 200 : 201, item_json(saved, *snapshot));
                 response.headers["ETag"] = "\"rev-" + std::to_string(saved.revision) + "\"";
                 return response;
             }
