@@ -315,8 +315,9 @@ class CatalogueScanner {
         size_t catalogued{};
     };
 
-    std::optional<PreparedHintMatch> prepare_hint(const CatalogueHint&, std::stop_token,
-                                                   const MetadataSnapshot& namespace_snapshot);
+    std::optional<PreparedHintMatch> prepare_hint(
+        const CatalogueHint&, std::stop_token, const MetadataSnapshot& namespace_snapshot,
+        DistributedStore::DurabilityBatch& artwork_batch);
     HintBatchResult process_hint_batch(std::stop_token, size_t max_hints);
     CatalogueScanProvider* provider_for_path(std::string_view path, std::string& root) const;
 
