@@ -2339,6 +2339,210 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
     n1.stop();
 }
 
+MACHA_TEST("hydration_catalogue", test_catalogue_effective_music_artwork_resolution) {
+    auto art = [](std::string_view seed) {
+        return CatalogueArtwork{"cover", object_id(Bytes(seed.begin(), seed.end())), "image/jpeg"};
+    };
+
+    const auto old_art = art("old");
+    const auto newest_a_art = art("newest-a");
+    const auto newest_b_art = art("newest-b");
+    const auto unknown_art = art("unknown");
+    const auto track_art = art("track");
+    const auto compilation_art = art("compilation");
+    const auto explicit_artist_art = art("artist");
+
+    CatalogueSnapshot snapshot;
+
+    CatalogueItem artist;
+    artist.id = "artist:test";
+    artist.kind = CatalogueKind::artist;
+    artist.title = "Test Artist";
+    snapshot.items.emplace(artist.id, artist);
+
+    CatalogueItem various;
+    various.id = "artist:various";
+    various.kind = CatalogueKind::artist;
+    various.title = "Various Artists";
+    snapshot.items.emplace(various.id, various);
+
+    CatalogueItem old_album;
+    old_album.id = "album:old";
+    old_album.kind = CatalogueKind::album;
+    old_album.title = "Old";
+    old_album.parent_id = artist.id;
+    old_album.year = 2020;
+    old_album.artwork = {old_art};
+    snapshot.items.emplace(old_album.id, old_album);
+
+    CatalogueItem newest_b;
+    newest_b.id = "album:2024-b";
+    newest_b.kind = CatalogueKind::album;
+    newest_b.title = "Newest B";
+    newest_b.parent_id = artist.id;
+    newest_b.year = 2024;
+    newest_b.artwork = {newest_b_art};
+    snapshot.items.emplace(newest_b.id, newest_b);
+
+    CatalogueItem newest_a;
+    newest_a.id = "album:2024-a";
+    newest_a.kind = CatalogueKind::album;
+    newest_a.title = "Newest A";
+    newest_a.parent_id = artist.id;
+    newest_a.year = 2024;
+    newest_a.artwork = {newest_a_art};
+    snapshot.items.emplace(newest_a.id, newest_a);
+
+    CatalogueItem newer_bare;
+    newer_bare.id = "album:2025-bare";
+    newer_bare.kind = CatalogueKind::album;
+    newer_bare.title = "Newer But Bare";
+    newer_bare.parent_id = artist.id;
+    newer_bare.year = 2025;
+    snapshot.items.emplace(newer_bare.id, newer_bare);
+
+    CatalogueItem unknown_album;
+    unknown_album.id = "album:000-unknown";
+    unknown_album.kind = CatalogueKind::album;
+    unknown_album.title = "Unknown Date";
+    unknown_album.parent_id = artist.id;
+    unknown_album.artwork = {unknown_art};
+    snapshot.items.emplace(unknown_album.id, unknown_album);
+
+    CatalogueItem track;
+    track.id = "track:old:1";
+    track.kind = CatalogueKind::track;
+    track.title = "Inherited Track";
+    track.parent_id = old_album.id;
+    snapshot.items.emplace(track.id, track);
+
+    CatalogueItem explicit_track = track;
+    explicit_track.id = "track:old:2";
+    explicit_track.title = "Explicit Track";
+    explicit_track.artwork = {track_art};
+    snapshot.items.emplace(explicit_track.id, explicit_track);
+
+    CatalogueItem bare_track = track;
+    bare_track.id = "track:bare:1";
+    bare_track.title = "Bare Track";
+    bare_track.parent_id = newer_bare.id;
+    snapshot.items.emplace(bare_track.id, bare_track);
+
+    CatalogueItem compilation;
+    compilation.id = "album:compilation";
+    compilation.kind = CatalogueKind::album;
+    compilation.title = "Compilation";
+    compilation.parent_id = various.id;
+    compilation.year = 2026;
+    compilation.artwork = {compilation_art};
+    snapshot.items.emplace(compilation.id, compilation);
+
+    CHECK(effective_catalogue_artwork(snapshot, artist) ==
+          std::vector<CatalogueArtwork>{newest_a_art});
+    CHECK(effective_catalogue_artwork(snapshot, track) == std::vector<CatalogueArtwork>{old_art});
+    CHECK(effective_catalogue_artwork(snapshot, explicit_track) ==
+          std::vector<CatalogueArtwork>{track_art});
+    CHECK(effective_catalogue_artwork(snapshot, bare_track).empty());
+    CHECK(effective_catalogue_artwork(snapshot, newer_bare).empty());
+
+    CatalogueItem explicit_artist = artist;
+    explicit_artist.artwork = {explicit_artist_art};
+    CHECK(effective_catalogue_artwork(snapshot, explicit_artist) ==
+          std::vector<CatalogueArtwork>{explicit_artist_art});
+
+    // Compilation artwork does not leak across track-artist relationships: only
+    // albums whose release/album artist is this direct catalogue parent qualify.
+    CHECK(effective_catalogue_artwork(snapshot, artist) !=
+          std::vector<CatalogueArtwork>{compilation_art});
+    CHECK(artist.artwork.empty());
+    CHECK(track.artwork.empty());
+}
+
+MACHA_TEST("hydration_catalogue", test_catalogue_api_effective_artwork_is_display_only) {
+    TestService fixture("catalogue-effective-artwork-api");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.hydration.enabled = false;
+    auto& service = fixture.start();
+
+    CatalogueItem artist;
+    artist.id = "artist:api-test";
+    artist.kind = CatalogueKind::artist;
+    artist.title = "API Artist";
+    artist = service.catalogue().upsert(artist);
+
+    CatalogueItem album;
+    album.id = "album:api-test";
+    album.kind = CatalogueKind::album;
+    album.title = "API Album";
+    album.parent_id = artist.id;
+    album.year = 2024;
+    album = service.catalogue().upsert(album);
+
+    CatalogueItem track;
+    track.id = "track:api-test";
+    track.kind = CatalogueKind::track;
+    track.title = "API Track";
+    track.parent_id = album.id;
+    track = service.catalogue().upsert(track);
+
+    const Bytes cover_bytes{0x10, 0x20, 0x30, 0x40};
+    const auto cover = service.catalogue().put_artwork(album.id, "cover", "image/jpeg",
+                                                       cover_bytes, album.revision);
+
+    CatalogueApi api(service.catalogue(), service.catalogue_hints());
+    const auto track_response = api.handle({.method = "GET",
+                                            .path = "/api/v1/catalogue/items/track%3Aapi-test",
+                                            .query = {},
+                                            .headers = {},
+                                            .body = {}});
+    REQUIRE(track_response.status == 200);
+    const auto track_json =
+        Json::parse(std::string(track_response.body.begin(), track_response.body.end()));
+    const auto* canonical = track_json.find("artwork");
+    const auto* effective = track_json.find("effective_artwork");
+    REQUIRE(canonical && canonical->isArray());
+    REQUIRE(effective && effective->isArray());
+    CHECK(canonical->asArray().empty());
+    REQUIRE(effective->asArray().size() == 1);
+    CHECK(effective->asArray().front().find("id")->asString() == to_string(cover.id));
+
+    const auto artist_response = api.handle({.method = "GET",
+                                             .path = "/api/v1/catalogue/items/artist%3Aapi-test",
+                                             .query = {},
+                                             .headers = {},
+                                             .body = {}});
+    REQUIRE(artist_response.status == 200);
+    const auto artist_json =
+        Json::parse(std::string(artist_response.body.begin(), artist_response.body.end()));
+    const auto* artist_effective = artist_json.find("effective_artwork");
+    REQUIRE(artist_effective && artist_effective->isArray());
+    REQUIRE(artist_effective->asArray().size() == 1);
+    CHECK(artist_effective->asArray().front().find("id")->asString() == to_string(cover.id));
+
+    auto artwork_response = api.handle({.method = "GET",
+                                        .path = "/api/v1/catalogue/artwork/" + to_string(cover.id),
+                                        .query = {},
+                                        .headers = {},
+                                        .body = {}});
+    REQUIRE(artwork_response.status == 200);
+    CHECK(artwork_response.body == cover_bytes);
+
+    // Round-trip the GET representation. `effective_artwork` is intentionally
+    // ignored by the mutation parser and must never become canonical metadata.
+    auto put_response = api.handle({.method = "PUT",
+                                    .path = "/api/v1/catalogue/items/track%3Aapi-test",
+                                    .query = {},
+                                    .headers = {{"if-match", "\"rev-" +
+                                                              std::to_string(track.revision) + "\""}},
+                                    .body = track_response.body});
+    REQUIRE(put_response.status == 200);
+    auto stored = service.catalogue().get(track.id);
+    REQUIRE(stored.has_value());
+    CHECK(stored->artwork.empty());
+}
+
 MACHA_TEST("hydration_catalogue", test_catalogue_root_ready_without_local_artwork) {
     TestCluster cluster;
     const auto& keys = cluster.keys();

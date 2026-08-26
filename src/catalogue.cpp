@@ -294,6 +294,53 @@ std::optional<CatalogueKind> parse_catalogue_kind(std::string_view value) {
     return {};
 }
 
+std::vector<CatalogueArtwork> effective_catalogue_artwork(const CatalogueSnapshot& snapshot,
+                                                           const CatalogueItem& item) {
+    if (!item.artwork.empty())
+        return item.artwork;
+
+    if (item.kind == CatalogueKind::track) {
+        if (!item.parent_id)
+            return {};
+        auto parent = snapshot.items.find(*item.parent_id);
+        if (parent == snapshot.items.end() || parent->second.kind != CatalogueKind::album)
+            return {};
+        return parent->second.artwork;
+    }
+
+    if (item.kind != CatalogueKind::artist)
+        return {};
+
+    const CatalogueItem* newest = nullptr;
+    for (const auto& [_, candidate] : snapshot.items) {
+        if (candidate.kind != CatalogueKind::album || !candidate.parent_id ||
+            *candidate.parent_id != item.id || candidate.artwork.empty())
+            continue;
+
+        if (!newest) {
+            newest = &candidate;
+            continue;
+        }
+
+        const bool candidate_has_year = candidate.year.has_value();
+        const bool newest_has_year = newest->year.has_value();
+        if (candidate_has_year != newest_has_year) {
+            if (candidate_has_year)
+                newest = &candidate;
+            continue;
+        }
+        if (candidate_has_year && candidate.year != newest->year) {
+            if (*candidate.year > *newest->year)
+                newest = &candidate;
+            continue;
+        }
+        if (candidate.id < newest->id)
+            newest = &candidate;
+    }
+
+    return newest ? newest->artwork : std::vector<CatalogueArtwork>{};
+}
+
 CatalogueManager::CatalogueManager(NodeRuntime& node, DistributedStore& store,
                                    MetadataManager& metadata)
     : node_(node), store_(store), metadata_(metadata) {}
@@ -554,6 +601,10 @@ CatalogueStatus CatalogueManager::status() const {
 
 CatalogueSnapshot CatalogueManager::snapshot() {
     return *current_snapshot();
+}
+
+std::shared_ptr<const CatalogueSnapshot> CatalogueManager::snapshot_view() {
+    return current_snapshot();
 }
 
 std::optional<CatalogueItem> CatalogueManager::get(std::string_view id) {
