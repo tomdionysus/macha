@@ -522,7 +522,7 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     CHECK(encode_snapshot(apply_metadata_delta(delta_target, garbage_delta_roundtrip)) ==
           encode_snapshot(garbage_compacted));
 
-    // 0.9.4 SM7 snapshots remain valid on disk. Their tombstones intentionally
+    // Legacy SM7 snapshots remain valid on disk. Their tombstones intentionally
     // decode as legacy (no retirement time/id) and are stamped by 0.10.x GC.
     Writer old_v7;
     const std::array<uint8_t, 8> old_v7_magic{'D', 'H', 'T', 'M', 'E', 'T', 'A', '7'};
@@ -603,7 +603,7 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
         CHECK(replayed_snapshot.garbage.back().retired_at_ns == 0);
     }
 
-    // 0.4.0 metadata snapshots had no catalogue-root field. 0.5.0 must read
+    // Legacy metadata snapshots had no catalogue-root field. Current code must read
     // them directly so an existing namespace upgrades to an empty catalogue
     // rather than requiring destructive state migration.
     Writer old;

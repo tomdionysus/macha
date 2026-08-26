@@ -44,7 +44,7 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_frame_priority_and_variable_length) {
           frame_type_priority(FrameType::speculative));
     CHECK(default_frame_type(MessageType::ping) == FrameType::control);
     CHECK(default_frame_type(MessageType::get_object) == FrameType::foreground);
-    CHECK(default_frame_type(MessageType::get_metadata_object) == FrameType::speculative);
+    CHECK(default_frame_type(MessageType::get_control_object) == FrameType::speculative);
     CHECK(std::string(message_type_name(MessageType::commit_metadata)) == "commit_metadata");
     CHECK(std::string(message_type_name(MessageType::cas_metadata_delta)) ==
           "cas_metadata_delta");
@@ -96,10 +96,10 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_frame_priority_and_variable_length) {
     // Content-addressed metadata objects are potentially large and therefore
     // run at speculative worker priority, but they deliberately stay on the
     // CONTROL TCP session. Catalogue bootstrap must not require a DATA lane.
-    auto metadata_object_reply =
-        client.call(endpoint, MessageType::put_metadata_object, Bytes{0x43, 0x41, 0x54},
+    auto control_object_reply =
+        client.call(endpoint, MessageType::put_control_object, Bytes{0x43, 0x41, 0x54},
                     FrameType::speculative, 2s);
-    CHECK(metadata_object_reply.message.type == MessageType::ok);
+    CHECK(control_object_reply.message.type == MessageType::ok);
     CHECK(client.stats().canonical_connections == 1);
 
     // Start a large speculative transfer, then introduce foreground work. The
@@ -849,8 +849,8 @@ MACHA_TEST("rpc_cluster", test_early_replication_quorum) {
     s1.stop();
 }
 
-MACHA_TEST("rpc_cluster", test_put_spills_stalled_owners_and_commits_degraded_floor) {
-    TestService fixture("local-degraded");
+MACHA_TEST("rpc_cluster", test_put_commits_at_floor_without_waiting_for_desired_replicas) {
+    TestNode fixture("local-degraded", ConfigProfile::functional);
     auto& config = fixture.config();
     const auto& keys = fixture.keys();
     auto slow1_port = free_port();
@@ -863,7 +863,7 @@ MACHA_TEST("rpc_cluster", test_put_spills_stalled_owners_and_commits_degraded_fl
     config.heartbeat = 10s;
     config.dead_after = 5s;
 
-    auto& service = fixture.start();
+    auto& node = fixture.start();
 
     auto slow_info = [](uint16_t port, const char* domain) {
         NodeInfo info;
@@ -891,23 +891,22 @@ MACHA_TEST("rpc_cluster", test_put_spills_stalled_owners_and_commits_degraded_fl
     slow1_server.start();
     slow2_server.start();
 
-    service.node().membership().observe(slow1, true);
-    service.node().membership().observe(slow2, true);
-    REQUIRE(service.node().membership().active().size() == 3);
+    node.membership().observe(slow1, true);
+    node.membership().observe(slow2, true);
+    REQUIRE(node.membership().active().size() == 3);
 
-    // The local copy succeeds immediately, but the normal R=3 quorum requires
-    // two replicas. Both remote owners accept their RPCs and then make no
-    // progress. The write must spill/degrade at the explicit floor rather than
-    // wait for the 5s membership expiry (or for the delayed replies).
-    DistributedStore store(service.node());
+    // R=3 is a convergence target, not a foreground quorum. With W=1 the
+    // durable local placement satisfies publication immediately; slow desired
+    // replicas must not even be placed on the foreground critical path.
+    DistributedStore store(node);
     auto data = pattern(128 * 1024);
     auto id = object_id(data);
     auto started = Clock::now();
     CHECK(store.put(id, data));
     auto elapsed = Clock::now() - started;
-    CHECK(elapsed >= 75ms);
-    CHECK(elapsed < 1s);
-    CHECK(service.node().local_store().has(id));
+    CHECK(elapsed < 500ms);
+    CHECK(stalled_owner_gate.entered() == 0);
+    CHECK(node.local_store().has(id));
 
     stalled_owner_gate.open();
     slow2_server.stop();
@@ -950,7 +949,7 @@ MACHA_TEST("rpc_cluster", test_put_falls_back_after_remote_launch_failure) {
     }
     REQUIRE(ranked.size() == 2);
 
-    // Before 0.9.4, a synchronous call_async() failure incremented a dead
+    // A synchronous call_async() failure must not increment a dead
     // "completed" counter but was not treated as a failed replica. With no
     // pending RPC, the quorum loop then slept forever instead of trying the
     // deterministic fallback owner. Keep a cancellation watchdog so this
@@ -1007,7 +1006,7 @@ MACHA_TEST("rpc_cluster", test_bootstrap_joiner_requires_complete_checkpoint_sur
 
     // Keep an unreachable peer in active membership and choose its identity so
     // metadata HRW would select this fresh node as the sole genesis voter. This
-    // deterministically exercises the dangerous pre-0.14.2 path: both metadata
+    // deterministically exercises the dangerous path: both metadata
     // RPC surveys fail, yet a replication-1 joiner could previously form an
     // empty generation-2 namespace on itself.
     static constexpr char label[] = "macha/metadata-placement/v1";
@@ -1060,6 +1059,7 @@ MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_quorum) {
     auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
     auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 2;
+    c1.min_write_replicas = c2.min_write_replicas = 2;
     c1.metadata_replication = c2.metadata_replication = 2;
 
     Service s1(c1, keys);
@@ -1373,7 +1373,12 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
             return false;
         }
     }));
+    // R=2 is convergence, while the write floor remains W=1. Drive the repair
+    // primitive explicitly so this lifecycle test verifies convergence itself
+    // rather than depending on the production maintenance scheduler's backoff.
+    DistributedStore initial_convergence(s2->node());
     REQUIRE(wait_until([&] {
+        initial_convergence.repair_once(16ULL * 1024 * 1024, &objects);
         return std::all_of(objects.begin(), objects.end(),
                            [&](const auto& id) { return s2->node().local_store().has(id); });
     }));
@@ -1406,6 +1411,21 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
     replacement->start();
     CHECK(replacement->node().node_id() != old_n1);
 
+    // Wait until the destroyed node has expired from placement membership.
+    // Repair before that point may correctly retain the old owner in the R=2
+    // preferred set and therefore has no reason to pull every object to the
+    // replacement yet.
+    REQUIRE(wait_until([&] {
+        const auto active = replacement->node().membership().active();
+        const bool old_present = std::any_of(active.begin(), active.end(), [&](const auto& node) {
+            return node.id == old_n1;
+        });
+        const bool survivor_present = std::any_of(active.begin(), active.end(), [&](const auto& node) {
+            return node.id == s2->node().node_id();
+        });
+        return !old_present && survivor_present;
+    }, 5s));
+
     REQUIRE(wait_until([&] {
         try {
             return replacement->filesystem().getattr("/media/recovery.bin").size == input.size();
@@ -1414,10 +1434,12 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
         }
     }, 10s));
 
-    // Once the committed namespace is recovered, the existing live-object
-    // maintenance walk must automatically repopulate the replacement's DHT
-    // ownership from the surviving node.
+    // Once the committed namespace is recovered, prove the same bounded repair
+    // primitive used by maintenance repopulates the replacement's R=2 ownership
+    // from the survivor.
+    DistributedStore replacement_convergence(replacement->node());
     REQUIRE(wait_until([&] {
+        replacement_convergence.repair_once(16ULL * 1024 * 1024, &objects);
         return std::all_of(objects.begin(), objects.end(), [&](const auto& id) {
             return replacement->node().local_store().has(id);
         });
@@ -1463,6 +1485,14 @@ MACHA_HEAVY_TEST("rpc_cluster", test_three_node_cluster) {
     auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     auto c3 = config_for(cluster.path() / "n3", cluster.keyfile(), p3, {{"127.0.0.1", p1}});
     auto c4 = config_for(cluster.path() / "n4", cluster.keyfile(), p4, {{"127.0.0.1", p1}});
+    c1.storage_packing = c2.storage_packing = c3.storage_packing = c4.storage_packing =
+        StoragePackingConfig{0, 0};
+    // This lifecycle test deliberately corrupts one replica and immediately
+    // requires a healthy peer copy.  Make that synchronous durability
+    // requirement explicit; replicas=3 alone is only the convergence target in
+    // the 0.18 storage contract.
+    c1.min_write_replicas = c2.min_write_replicas = c3.min_write_replicas =
+        c4.min_write_replicas = 3;
 
     {
         Service s1(c1, keys);

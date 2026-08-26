@@ -64,7 +64,7 @@ FsEntry entry(Reader& r) {
     return e;
 }
 Bytes encode_snapshot_v7(const MetadataSnapshot& s) {
-    // Exact pre-0.10.0 snapshot representation. This is used only while
+    // Exact legacy snapshot representation. This is used only while
     // replaying DLT1 records from an existing metadata journal: the journal
     // stores the successor hash, so reconstructing the historical SM7 bytes
     // is part of on-disk compatibility. New snapshots are always SM8.
@@ -372,7 +372,7 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
 
     if (v1) {
         // DLT1 is retained only for replaying metadata journals written by
-        // pre-0.10.0 nodes. New network mutations are always DLT2.
+        // legacy nodes. New network mutations are always DLT2.
         auto garbage = r.u32();
         if (garbage > 10000000)
             throw DecodeError("too much metadata delta garbage");

@@ -40,7 +40,7 @@ Protocol v7 is intentionally incompatible with v6 and earlier. Mixed versions fa
 
 Losing the cluster key makes encrypted cluster data unrecoverable. Back it up separately.
 
-Compromise lets an attacker join the trusted cluster from that point onward. 0.7.0 has no online key rotation or per-node revocation.
+Compromise lets an attacker join the trusted cluster from that point onward. Macha currently has no online cluster-key rotation or per-node cryptographic revocation.
 
 Forward secrecy protects old transport captures; it does not protect stored encrypted data from someone who later obtains both that data and the cluster key-derived storage key.
 

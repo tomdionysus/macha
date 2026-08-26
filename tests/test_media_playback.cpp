@@ -122,7 +122,7 @@ MACHA_FAST_TEST("media_playback", test_media_vod_index_planning_rejects_partial_
     CHECK(full->segment_durations.size() == 30);
     for (const auto duration : full->segment_durations) CHECK(duration <= 4.001);
 
-    // Regression for 0.8.0: avformat_find_stream_info() can leave a Matroska
+    // Regression: avformat_find_stream_info() can leave a Matroska
     // AVStream index containing only keyframes encountered during probing. The
     // old planner accepted that as complete and advertised the entire
     // unindexed tail as one fragment, e.g. segments=1 for a full movie.
@@ -611,7 +611,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     CHECK(plans.back().seek == 23s);
 
     // A transformed seek-only PATCH must reuse the already prepared VOD plan.
-    // Re-probing/re-planning here is the 0.8.1 behaviour that made cached
+    // Re-probing/re-planning here makes cached
     // seeks take several seconds on Matroska media.
     const auto probes_before_seek = fake_engine_ptr->probes();
     const auto prepares_before_seek = fake_engine_ptr->vod_prepares();

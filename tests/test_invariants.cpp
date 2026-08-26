@@ -304,7 +304,9 @@ MACHA_TEST("invariants", test_replica_repair_does_not_count_corrupt_remote_as_he
     auto c1 = config_for(t.path() / "n1", keyfile, p1);
     auto c2 = config_for(t.path() / "n2", keyfile, p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 2;
+    c1.min_write_replicas = c2.min_write_replicas = 2;
     c1.metadata_replication = c2.metadata_replication = 1;
+    c1.storage_packing = c2.storage_packing = StoragePackingConfig{0, 0};
 
     NodeRuntime n1(c1, keys);
     NodeRuntime n2(c2, keys);
@@ -351,7 +353,19 @@ MACHA_TEST("invariants", test_rebalance_never_deletes_last_valid_copy_for_corrup
     const auto bytes = pattern(96 * 1024, 10);
     const auto id = object_id(bytes);
 
-    // Seed a valid copy on both physical stores before handing them to the pool.
+    const auto pool_state = t.path() / "pool-state";
+    const auto pool_node = random_node_id();
+    const std::vector<StorageBackendConfig> backends{
+        {a, 64ULL * 1024 * 1024}, {b, 64ULL * 1024 * 1024}};
+
+    // Establish the 0.18 backend identity/format boundary while the stores are
+    // empty, then seed the corruption scenario through loose LocalStore objects.
+    // Reopening the pool must therefore exercise valid 0.18 media, not bypass
+    // genesis protection with an unversioned pre-populated directory.
+    {
+        StoragePool initialise(pool_state, pool_node, backends, keys.storage);
+        REQUIRE(wait_until([&] { return initialise.online_backends() == 2; }));
+    }
     {
         LocalStore sa(a, 64ULL * 1024 * 1024, keys.storage);
         LocalStore sb(b, 64ULL * 1024 * 1024, keys.storage);
@@ -360,8 +374,7 @@ MACHA_TEST("invariants", test_rebalance_never_deletes_last_valid_copy_for_corrup
         REQUIRE(sb.put(id, bytes));
     }
 
-    StoragePool pool(t.path() / "pool-state", random_node_id(),
-                     {{a, 64ULL * 1024 * 1024}, {b, 64ULL * 1024 * 1024}}, keys.storage);
+    StoragePool pool(pool_state, pool_node, backends, keys.storage);
     REQUIRE(wait_until([&] { return pool.online_backends() == 2; }));
 
     // pool.put() reaffirms/touches only the deterministic preferred backend.
@@ -1204,7 +1217,7 @@ MACHA_TEST("invariants", test_catalogue_gc_liveness_fails_closed_when_current_ro
     const auto maintenance = catalogue.maintenance_objects();
     // Even when the current immutable catalogue cannot yet be fetched/decoded,
     // its metadata-referenced root is unconditionally live and GC must fail closed.
-    CHECK(maintenance.live.contains(missing_root));
+    CHECK(maintenance.control_live.contains(missing_root));
     CHECK(!maintenance.complete);
 
 }

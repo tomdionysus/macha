@@ -2,35 +2,46 @@
 
 # Macha
 
-*Macha — <span lang="ga">Macha</span> /ˈmˠaxə/ — approximately 'MAKH-uh'*
+*Macha — <span lang="ga">Macha</span> /ˈmˠaxə/ — approximately “MAKH-uh”*
 
-Macha is a C++20 distributed filesystem and media server for large, mostly immutable video and music files. It stores files as encrypted content-addressed extents across ordinary machines, mounts the namespace with FUSE, keeps a distributed media catalogue, and can serve media directly or as fragmented-MP4 HLS with negotiated remuxing/transcoding.
+Macha is a C++20 distributed filesystem and media server for large, mostly immutable video and music libraries. Files are split into encrypted content-addressed extents, placed across ordinary machines, exposed through FUSE, indexed in a distributed catalogue, and served directly or through in-process FFmpeg remux/transcode pipelines.
 
-There is no permanent master, cloud service or account system. Nodes share one cluster key, discover membership through bootstrap peers, and converge placement and replicas in the background.
+There is no permanent master, cloud service or account system. Nodes share a cluster key, discover peers through bootstrap endpoints, and converge data placement and replicas in the background.
 
-0.14.7 is usable but experimental. It is deliberately a media filesystem/server rather than a complete general-purpose POSIX filesystem. Streaming was introduced in 0.7.0 and links the FFmpeg libraries directly when enabled; no media subprocesses are launched.
+## 0.18 storage contract
 
-**0.16.0 upgrade:** stop or upgrade every cluster node together. Transport v15 carries filesystem-domain durability tickets `(process epoch, domain, generation, backend incarnation)` and rejects v14-and-earlier peers rather than allowing mixed durability semantics. Existing authoritative objects, metadata, FUSE operation journals, spools and backend accounting remain readable in place.
+0.18 starts from a fresh namespace and storage layout. It deliberately refuses non-empty unversioned state/data stores rather than guessing how older state should be interpreted.
 
-**0.11.x upgrade:** stop every node before upgrading from 0.9.x. Transport v13 rejects v12-and-earlier peers; mixed-version operation is not supported. Existing 0.9.x SM7 checkpoints, DLT1 metadata journals, encrypted object files and backend accounting are read in place. New metadata is written as SM8/DLT2. Back up `state_path` first; after 0.10.x or 0.11.x has written new metadata, rollback to 0.9.x is unsupported. 0.11.0 does not change the 0.10.0 wire or storage formats.
+The storage model has three explicit classes:
+
+- **DATA** — media extents, artwork, subtitles and other immutable payload objects. DATA is placed by the DHT across eligible node/backend capacity. A full preferred owner falls through to the next deterministic candidate.
+- **CONTROL/METADATA** — namespace metadata plus catalogue manifests/shards. These use dedicated priority storage and metadata-voter quorum semantics; ordinary DATA quota cannot block them.
+- **CACHE** — opportunistic non-authoritative copies. Cache contents never satisfy DATA or metadata durability.
+
+`dht.min_write_replicas` is the foreground DATA publication floor. `dht.replicas` is the desired converged replica count; repair fills missing replicas after publication when policy permits degraded writes.
+
+Small immutable objects are packed below `LocalStore`. Packing does not change `ObjectId`, DHT placement, catalogue references, replication, repair or GC.
+
+See [Storage](docs/storage.md) and [Durability](docs/durability.md) for the precise contract.
 
 ## Documentation
 
-- [Quick start and two-node demo](docs/quickstart.md)
-- [Installation and configuration](docs/configuration.md)
-- [Storage, disks and filesystem behaviour](docs/storage.md)
-- [Durability architecture](docs/durability.md)
-- [Cluster, recovery and transport](docs/cluster.md)
-- [Catalogue and scanner](docs/catalogue.md)
-- [Streaming and playback API](docs/streaming.md)
-- [Maintenance, cache, tests and service files](docs/operations.md)
+- [Quick start](docs/quickstart.md)
+- [Configuration](docs/configuration.md)
+- [Storage](docs/storage.md)
+- [Durability](docs/durability.md)
+- [Cluster and recovery](docs/cluster.md)
+- [Catalogue](docs/catalogue.md)
+- [Streaming](docs/streaming.md)
+- [Operations](docs/operations.md)
 - [Architecture](ARCHITECTURE.md)
 - [Security](SECURITY.md)
 - [Roadmap](ROADMAP.md)
-- [Changelog](CHANGELOG.md)
+- [Current release notes](CHANGELOG.md)
+- [Validation](VALIDATION.md)
 
 The complete configuration example is [`macha.yaml.example`](macha.yaml.example).
 
-Developed with substantial use of AI-assisted implementation
+Developed with substantial use of AI-assisted implementation.
 
 GPL-3.0-or-later. See [`LICENSE`](LICENSE).

@@ -2,11 +2,15 @@
 #include "local_store.hpp"
 #include "codec.hpp"
 #include "log.hpp"
+#include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -15,12 +19,17 @@ namespace macha {
 namespace {
 constexpr std::array<uint8_t, 8> M{'D', 'H', 'T', 'O', 'B', 'J', '0', '1'};
 constexpr std::array<uint8_t, 8> A{'M', 'A', 'C', 'H', 'A', 'A', 'C', '1'};
+constexpr std::array<uint8_t, 8> P{'M', 'A', 'C', 'H', 'P', 'K', '0', '1'};
 constexpr size_t accounting_slot_size = 128;
 constexpr size_t accounting_body_size = accounting_slot_size - 32;
 constexpr uint8_t accounting_none = 0;
-constexpr uint8_t accounting_put = 1;
-constexpr uint8_t accounting_remove = 2;
 constexpr uint8_t accounting_dirty = 3;
+constexpr uint8_t pack_put = 1;
+constexpr uint8_t pack_remove = 2;
+constexpr uint8_t pack_touch = 3;
+constexpr size_t pack_header_prefix_size = 93;
+constexpr size_t pack_header_size = pack_header_prefix_size + 32;
+constexpr uint64_t pack_payload_safety_limit = 128ULL * 1024 * 1024;
 
 struct AccountingRecord {
     uint64_t sequence{};
@@ -30,15 +39,24 @@ struct AccountingRecord {
     uint64_t size{};
 };
 
+struct PackHeader {
+    uint8_t type{};
+    uint64_t touched_ms{};
+    ObjectId id{};
+    uint64_t plain_size{};
+    uint64_t payload_size{};
+    std::array<uint8_t, 12> nonce{};
+    std::array<uint8_t, 16> tag{};
+};
+
 void pwa_exact(int fd, std::span<const uint8_t> data, uint64_t offset) {
     size_t done = 0;
     while (done < data.size()) {
         auto n = ::pwrite(fd, data.data() + done, data.size() - done,
                           static_cast<off_t>(offset + done));
         if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            throw std::runtime_error("cannot write accounting state: " + std::string(strerror(errno)));
+            if (errno == EINTR) continue;
+            throw std::runtime_error("cannot write storage state: " + std::string(strerror(errno)));
         }
         done += static_cast<size_t>(n);
     }
@@ -51,12 +69,10 @@ std::optional<Bytes> pra_exact(int fd, size_t size, uint64_t offset) {
         auto n = ::pread(fd, out.data() + done, out.size() - done,
                          static_cast<off_t>(offset + done));
         if (n < 0) {
-            if (errno == EINTR)
-                continue;
+            if (errno == EINTR) continue;
             return {};
         }
-        if (n == 0)
-            return {};
+        if (n == 0) return {};
         done += static_cast<size_t>(n);
     }
     return out;
@@ -70,8 +86,7 @@ Bytes encode_accounting(const AccountingRecord& record) {
     body.u8(record.operation);
     body.u64(record.size);
     body.fixed(record.id.bytes);
-    while (body.data().size() < accounting_body_size)
-        body.u8(0);
+    while (body.data().size() < accounting_body_size) body.u8(0);
     if (body.data().size() != accounting_body_size)
         throw std::runtime_error("internal accounting record size error");
     auto hash = sha256(body.data());
@@ -82,8 +97,7 @@ Bytes encode_accounting(const AccountingRecord& record) {
 }
 
 std::optional<AccountingRecord> decode_accounting(std::span<const uint8_t> bytes) {
-    if (bytes.size() != accounting_slot_size)
-        return {};
+    if (bytes.size() != accounting_slot_size) return {};
     auto body = bytes.first(accounting_body_size);
     auto expected = sha256(body);
     if (!std::equal(expected.bytes.begin(), expected.bytes.end(),
@@ -92,53 +106,103 @@ std::optional<AccountingRecord> decode_accounting(std::span<const uint8_t> bytes
     try {
         Reader reader(body);
         auto magic = reader.raw(A.size());
-        if (!std::equal(magic.begin(), magic.end(), A.begin()))
-            return {};
+        if (!std::equal(magic.begin(), magic.end(), A.begin())) return {};
         AccountingRecord record;
         record.sequence = reader.u64();
         record.used = reader.u64();
         record.operation = reader.u8();
         record.size = reader.u64();
         record.id.bytes = reader.fixed<32>();
-        if (record.operation > accounting_dirty)
+        if (record.operation != accounting_none && record.operation != accounting_dirty)
             return {};
         return record;
     } catch (...) {
         return {};
     }
 }
-void wa(int f, std::span<const uint8_t> b) {
-    size_t p = 0;
-    while (p < b.size()) {
-        auto n = ::write(f, b.data() + p, b.size() - p);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            throw std::runtime_error(strerror(errno));
+
+Bytes encode_pack_header(const PackHeader& header) {
+    Writer prefix;
+    prefix.raw(P);
+    prefix.u8(header.type);
+    prefix.u64(header.touched_ms);
+    prefix.fixed(header.id.bytes);
+    prefix.u64(header.plain_size);
+    prefix.u64(header.payload_size);
+    prefix.fixed(header.nonce);
+    prefix.fixed(header.tag);
+    if (prefix.data().size() != pack_header_prefix_size)
+        throw std::runtime_error("internal pack header size error");
+    auto checksum = sha256(prefix.data());
+    Writer out;
+    out.raw(prefix.data());
+    out.fixed(checksum.bytes);
+    return out.take();
+}
+
+std::optional<PackHeader> decode_pack_header(std::span<const uint8_t> bytes) {
+    if (bytes.size() != pack_header_size) return {};
+    const auto prefix = bytes.first(pack_header_prefix_size);
+    const auto checksum = sha256(prefix);
+    if (!std::equal(checksum.bytes.begin(), checksum.bytes.end(),
+                    bytes.begin() + pack_header_prefix_size))
+        return {};
+    try {
+        Reader r(prefix);
+        auto magic = r.raw(P.size());
+        if (!std::equal(magic.begin(), magic.end(), P.begin())) return {};
+        PackHeader h;
+        h.type = r.u8();
+        h.touched_ms = r.u64();
+        h.id.bytes = r.fixed<32>();
+        h.plain_size = r.u64();
+        h.payload_size = r.u64();
+        h.nonce = r.fixed<12>();
+        h.tag = r.fixed<16>();
+        r.finish();
+        if (h.type < pack_put || h.type > pack_touch) return {};
+        if (h.type == pack_put) {
+            if (!h.payload_size || h.payload_size > pack_payload_safety_limit ||
+                h.plain_size != h.payload_size)
+                return {};
+        } else if (h.payload_size || h.plain_size) {
+            return {};
         }
-        p += n;
+        return h;
+    } catch (...) {
+        return {};
     }
 }
+
+void wa(int fd, std::span<const uint8_t> bytes) {
+    size_t done = 0;
+    while (done < bytes.size()) {
+        auto n = ::write(fd, bytes.data() + done, bytes.size() - done);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            throw std::runtime_error(strerror(errno));
+        }
+        done += static_cast<size_t>(n);
+    }
+}
+
 Bytes rf(const std::filesystem::path& p) {
     int fd = ::open(p.c_str(), O_RDONLY);
     if (fd < 0)
         throw std::runtime_error("cannot open object: " + std::string(strerror(errno)));
-
-    struct stat st {};
+    struct stat st{};
     if (fstat(fd, &st) != 0 || st.st_size < 0) {
-        auto error = std::string(strerror(errno));
+        const auto error = std::string(strerror(errno));
         close(fd);
         throw std::runtime_error("cannot stat object: " + error);
     }
-
     Bytes out(static_cast<size_t>(st.st_size));
     size_t done = 0;
     while (done < out.size()) {
         auto n = ::read(fd, out.data() + done, out.size() - done);
         if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            auto error = std::string(strerror(errno));
+            if (errno == EINTR) continue;
+            const auto error = std::string(strerror(errno));
             close(fd);
             throw std::runtime_error("cannot read object: " + error);
         }
@@ -152,12 +216,39 @@ Bytes rf(const std::filesystem::path& p) {
         throw std::runtime_error("cannot close object: " + std::string(strerror(errno)));
     return out;
 }
+
 void syncdir(const std::filesystem::path& p) {
-    int f = ::open(p.c_str(), O_RDONLY | O_DIRECTORY);
-    if (f >= 0) {
-        (void)fsync(f);
-        close(f);
+    int fd = ::open(p.c_str(), O_RDONLY | O_DIRECTORY);
+    if (fd >= 0) {
+        int rc;
+        do { rc = ::fsync(fd); } while (rc != 0 && errno == EINTR);
+        ::close(fd);
     }
+}
+
+std::string pack_name(uint64_t sequence) {
+    std::ostringstream out;
+    out << "pack-" << std::setw(20) << std::setfill('0') << sequence << ".pack";
+    return out.str();
+}
+
+std::optional<uint64_t> pack_sequence(std::string_view name) {
+    if (name.size() != 30 || !name.starts_with("pack-") || !name.ends_with(".pack"))
+        return {};
+    try {
+        size_t used = 0;
+        auto value = std::stoull(std::string(name.substr(5, 20)), &used, 10);
+        if (used != 20 || !value) return {};
+        return value;
+    } catch (...) {
+        return {};
+    }
+}
+
+std::filesystem::file_time_type file_time_from_unix_ms(uint64_t value) {
+    using namespace std::chrono;
+    const auto target = system_clock::time_point(milliseconds(value));
+    return std::filesystem::file_time_type::clock::now() + (target - system_clock::now());
 }
 
 } // namespace
@@ -183,20 +274,32 @@ StorageLock::~StorageLock() {
     }
 }
 
-LocalStore::LocalStore(std::filesystem::path r, uint64_t l, std::array<uint8_t, 32> k,
-                       LocalStoreMode mode, std::shared_ptr<DurabilityDomain> durability_domain)
-    : root_(std::move(r)), objects_(root_ / "objects"),
-      accounting_path_(root_ / ".macha.accounting"), limit_(l), key_(k), mode_(mode),
+LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
+                       std::array<uint8_t, 32> key, LocalStoreMode mode,
+                       std::shared_ptr<DurabilityDomain> durability_domain)
+    : root_(std::move(root)), objects_(root_ / "objects"), packs_(root_ / "packs"),
+      accounting_path_(root_ / ".macha.accounting"), limit_(options.limit),
+      reserve_free_(options.reserve_free), pack_threshold_(options.pack_threshold),
+      pack_target_size_(options.pack_target_size), key_(key), mode_(mode),
       durability_domain_(std::move(durability_domain)) {
+    if (!limit_) throw std::runtime_error("local store limit must be non-zero");
+    if ((pack_threshold_ == 0) != (pack_target_size_ == 0))
+        throw std::runtime_error("pack threshold and target size must both be zero or non-zero");
+    if (pack_threshold_ && pack_target_size_ < pack_threshold_)
+        throw std::runtime_error("pack target size must be >= pack threshold");
+
     std::filesystem::create_directories(objects_);
+    std::filesystem::create_directories(packs_);
+    {
+        std::lock_guard lock(m_);
+        rebuild_pack_index_locked(true);
+    }
+
     if (mode_ == LocalStoreMode::ephemeral) {
-        // Cache contents are explicitly disposable. Reconcile their byte count
-        // from the directory tree and never create a false durability contract.
         durability_domain_.reset();
         scan_thread_ = std::jthread([this](std::stop_token stop) {
-            try {
-                scan(stop);
-            } catch (const std::exception& error) {
+            try { scan(stop); }
+            catch (const std::exception& error) {
                 scan_failed_.store(true, std::memory_order_release);
                 Log::warn("storage accounting scan failed path=" + root_.string() +
                           " error=" + error.what());
@@ -207,20 +310,24 @@ LocalStore::LocalStore(std::filesystem::path r, uint64_t l, std::array<uint8_t, 
 
     if (!durability_domain_)
         durability_domain_ = std::make_shared<DurabilityDomain>(1, root_);
-
     accounting_fd_ = ::open(accounting_path_.c_str(), O_RDWR | O_CREAT, 0600);
     if (accounting_fd_ < 0)
         throw std::runtime_error("cannot open accounting state: " + std::string(strerror(errno)));
-    if (restore_accounting()) {
+
+    // Packed indexes are deliberately derived from the authoritative append-only
+    // records at every start. If packs exist, reconcile physical accounting too;
+    // this prevents a stale clean accounting checkpoint from hiding a torn tail.
+    const bool have_packs = std::filesystem::directory_iterator(packs_) !=
+                            std::filesystem::directory_iterator();
+    if (!have_packs && restore_accounting()) {
         accounting_trusted_.store(true, std::memory_order_release);
         scan_complete_.store(true, std::memory_order_release);
         Log::debug("storage accounting restored path=" + root_.string() +
                    " used=" + std::to_string(used_.load(std::memory_order_relaxed)));
     } else {
         scan_thread_ = std::jthread([this](std::stop_token stop) {
-            try {
-                scan(stop);
-            } catch (const std::exception& error) {
+            try { scan(stop); }
+            catch (const std::exception& error) {
                 scan_failed_.store(true, std::memory_order_release);
                 Log::warn("storage accounting scan failed path=" + root_.string() +
                           " error=" + error.what());
@@ -229,50 +336,41 @@ LocalStore::LocalStore(std::filesystem::path r, uint64_t l, std::array<uint8_t, 
     }
 }
 
+LocalStore::LocalStore(std::filesystem::path root, uint64_t limit,
+                       std::array<uint8_t, 32> key, LocalStoreMode mode,
+                       std::shared_ptr<DurabilityDomain> durability_domain)
+    : LocalStore(std::move(root), LocalStoreOptions{limit, 0, 0, 0}, key, mode,
+                 std::move(durability_domain)) {}
+
 LocalStore::~LocalStore() {
     if (scan_thread_.joinable()) {
         scan_thread_.request_stop();
         scan_thread_.join();
     }
     if (accounting_fd_ >= 0) {
-        // Accounting is derived state. During a process lifetime it is marked
-        // DIRTY once before the first authoritative mutation and remains dirty.
-        // A clean checkpoint is written only after the store's complete mutation
-        // frontier has crossed the physical durability domain on clean teardown.
         bool can_checkpoint = accounting_trusted_.load(std::memory_order_acquire);
         if (can_checkpoint && durability_domain_ && last_mutation_generation_) {
             try {
                 durability_domain_->await_durable(last_mutation_generation_,
                                                   DurabilityUrgency::immediate);
-            } catch (...) {
-                can_checkpoint = false;
-            }
+            } catch (...) { can_checkpoint = false; }
         }
         if (can_checkpoint) {
-            try {
-                checkpoint_accounting_locked();
-            } catch (...) {
-                // A durable DIRTY marker remains, forcing exact reconciliation
-                // instead of trusting stale accounting after an unclean stop.
-            }
+            try { checkpoint_accounting_locked(); } catch (...) {}
         }
         close(accounting_fd_);
         accounting_fd_ = -1;
     }
 }
-std::filesystem::path LocalStore::path(const ObjectId& i) const {
-    auto s = to_string(i);
+
+std::filesystem::path LocalStore::path(const ObjectId& id) const {
+    auto s = to_string(id);
     return objects_ / s.substr(0, 2) / s.substr(2, 2) / (s + ".obj");
 }
 
 void LocalStore::persist_accounting(uint64_t used, uint8_t operation, const ObjectId& id,
                                     uint64_t size, bool durable) {
-    AccountingRecord record;
-    record.sequence = ++accounting_sequence_;
-    record.used = used;
-    record.operation = operation;
-    record.id = id;
-    record.size = size;
+    AccountingRecord record{++accounting_sequence_, used, operation, id, size};
     accounting_slot_ ^= 1U;
     auto encoded = encode_accounting(record);
     pwa_exact(accounting_fd_, encoded, accounting_slot_ * accounting_slot_size);
@@ -284,63 +382,31 @@ bool LocalStore::restore_accounting() {
     std::optional<AccountingRecord> best;
     unsigned best_slot = 0;
     for (unsigned slot = 0; slot < 2; ++slot) {
-        auto bytes = pra_exact(accounting_fd_, accounting_slot_size,
-                               slot * accounting_slot_size);
-        if (!bytes)
-            continue;
+        auto bytes = pra_exact(accounting_fd_, accounting_slot_size, slot * accounting_slot_size);
+        if (!bytes) continue;
         auto decoded = decode_accounting(*bytes);
-        if (!decoded)
-            continue;
+        if (!decoded) continue;
         if (!best || decoded->sequence > best->sequence) {
             best = *decoded;
             best_slot = slot;
         }
     }
-    if (!best)
-        return false;
-
+    if (!best || best->operation == accounting_dirty) return false;
     accounting_sequence_ = best->sequence;
     accounting_slot_ = best_slot;
-    if (best->operation == accounting_dirty) {
-        // A deferred publication generation began but never installed a clean
-        // accounting checkpoint. Object data may be wholly durable, partially
-        // durable, or absent; the object tree is authoritative and is rebuilt
-        // in the background before new capacity mutations are admitted.
-        return false;
-    }
-    uint64_t restored = best->used;
-    if (best->operation == accounting_put) {
-        if (std::filesystem::exists(path(best->id))) {
-            if (std::numeric_limits<uint64_t>::max() - restored < best->size)
-                return false;
-            restored += best->size;
-        }
-    } else if (best->operation == accounting_remove) {
-        if (!std::filesystem::exists(path(best->id))) {
-            if (best->size > restored)
-                return false;
-            restored -= best->size;
-        }
-    }
-    used_.store(restored, std::memory_order_relaxed);
-    if (best->operation != accounting_none) {
-        ObjectId none{};
-        persist_accounting(restored, accounting_none, none, 0, true);
-    }
+    used_.store(best->used, std::memory_order_relaxed);
     return true;
 }
 
 void LocalStore::mark_accounting_dirty_locked() {
-    if (mode_ == LocalStoreMode::ephemeral || accounting_dirty_)
-        return;
+    if (mode_ == LocalStoreMode::ephemeral || accounting_dirty_) return;
     ObjectId none{};
     persist_accounting(used_.load(std::memory_order_relaxed), accounting_dirty, none, 0, true);
     accounting_dirty_ = true;
 }
 
 void LocalStore::checkpoint_accounting_locked() {
-    if (mode_ == LocalStoreMode::ephemeral || !accounting_dirty_)
-        return;
+    if (mode_ == LocalStoreMode::ephemeral || !accounting_dirty_) return;
     ObjectId none{};
     persist_accounting(used_.load(std::memory_order_relaxed), accounting_none, none, 0, true);
     accounting_dirty_ = false;
@@ -363,175 +429,433 @@ void LocalStore::reap_durable_generations_locked() {
     }
 }
 
-bool LocalStore::put_impl(const ObjectId& i, std::span<const uint8_t> d,
-                          StoreWriteDurability durability, uint64_t* deferred_generation) {
-    if (object_id(d) != i)
-        throw std::runtime_error("object hash mismatch");
-    auto p = path(i);
-    std::unique_lock g(m_);
+bool LocalStore::physical_space_available_locked(uint64_t need) const {
+    const auto before = used_.load(std::memory_order_relaxed);
+    if (need > limit_ || before > limit_ - need) return false;
+    std::error_code error;
+    const auto space = std::filesystem::space(root_, error);
+    if (error) return false;
+    if (need > space.available) return false;
+    return reserve_free_ <= space.available - need;
+}
 
-    auto reaffirm_existing = [&]() -> std::optional<uint64_t> {
-        if (!std::filesystem::exists(p))
-            return {};
-        std::optional<Bytes> existing;
-        try {
-            existing = get(i);
-        } catch (...) {
-            return {};
-        }
-        if (!existing || existing->size() != d.size() ||
-            !std::equal(existing->begin(), existing->end(), d.begin()))
-            return {};
-        touch(i);
-        reap_durable_generations_locked();
-        if (const auto found = provisional_generations_.find(i);
-            found != provisional_generations_.end())
-            return found->second;
-        // Generation zero means this exact backend incarnation already had a
-        // validated object before any current-process provisional mutation.
-        // Startup reconciliation establishes a physical baseline before such
-        // state is admitted for mutation, so zero requires no new barrier.
-        return uint64_t{0};
-    };
-
-    auto finish_reaffirmation = [&](uint64_t generation) {
-        if (deferred_generation)
-            *deferred_generation = generation;
-        if (mode_ == LocalStoreMode::authoritative &&
-            durability == StoreWriteDurability::immediate && durability_domain_ &&
-            generation > durability_domain_->durable_generation()) {
-            // Do not hold the store mutation lock while physical durability is
-            // established. Other writers can complete and join the same cut.
-            g.unlock();
-            durability_domain_->await_durable(generation, DurabilityUrgency::immediate);
-        }
-        return true;
-    };
-
-    // Mutations and reaffirmations wait until capacity reconciliation has made
-    // the backend's pre-process state exact and, after an unclean restart,
-    // physically stable. Reads remain available while that scan runs.
-    wait_for_accounting(g);
-    if (auto generation = reaffirm_existing())
-        return finish_reaffirmation(*generation);
-    if (std::filesystem::exists(p)) {
-        if (!remove_locked(i) && std::filesystem::exists(p))
-            throw std::runtime_error("cannot replace corrupt local object");
+void LocalStore::select_active_pack_locked(uint64_t next_record_size) {
+    if (!pack_threshold_) throw std::runtime_error("packing is disabled");
+    if (active_pack_.empty() ||
+        (active_pack_size_ && active_pack_size_ + next_record_size > pack_target_size_)) {
+        active_pack_ = packs_ / pack_name(next_pack_sequence_++);
+        active_pack_size_ = 0;
     }
+}
 
-    auto sealed = aes_gcm_seal(key_, d, i.bytes);
+bool LocalStore::append_pack_record_locked(uint8_t type, const ObjectId& id,
+                                           std::span<const uint8_t> data, uint64_t touched_ms,
+                                           PackEntry* entry, uint64_t* record_size) {
+    PackHeader h;
+    h.type = type;
+    h.touched_ms = touched_ms;
+    h.id = id;
+    Bytes payload;
+    if (type == pack_put) {
+        auto sealed = aes_gcm_seal(key_, data, id.bytes);
+        payload = std::move(sealed.ciphertext);
+        h.plain_size = data.size();
+        h.payload_size = payload.size();
+        h.nonce = sealed.nonce;
+        h.tag = sealed.tag;
+    }
+    auto header = encode_pack_header(h);
+    const uint64_t total = header.size() + payload.size();
+    select_active_pack_locked(total);
+
+    int fd = ::open(active_pack_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0)
+        throw std::runtime_error("cannot open pack: " + std::string(strerror(errno)));
+    const uint64_t start = active_pack_size_;
+    try {
+        wa(fd, header);
+        if (!payload.empty()) wa(fd, payload);
+        if (::close(fd) != 0)
+            throw std::runtime_error("cannot close pack: " + std::string(strerror(errno)));
+        fd = -1;
+    } catch (...) {
+        if (fd >= 0) ::close(fd);
+        // A failed append (ENOSPC, EIO, short write) must not poison the live
+        // process with a torn record. Restore the previous durable boundary when
+        // possible; if rollback itself fails, abandon this pack so later writes
+        // never append behind the torn bytes. Restart recovery will truncate it.
+        int rollback = ::open(active_pack_.c_str(), O_WRONLY);
+        if (rollback >= 0) {
+            if (::ftruncate(rollback, static_cast<off_t>(start)) == 0)
+                active_pack_size_ = start;
+            else {
+                active_pack_.clear();
+                active_pack_size_ = 0;
+            }
+            ::close(rollback);
+        } else {
+            active_pack_.clear();
+            active_pack_size_ = 0;
+        }
+        throw;
+    }
+    active_pack_size_ += total;
+    if (entry) {
+        entry->file = active_pack_;
+        entry->payload_offset = start + header.size();
+        entry->payload_size = h.payload_size;
+        entry->plain_size = h.plain_size;
+        entry->record_size = total;
+        entry->touched_unix_ms = touched_ms;
+        entry->nonce = h.nonce;
+        entry->tag = h.tag;
+    }
+    if (record_size) *record_size = total;
+    return true;
+}
+
+std::optional<Bytes> LocalStore::get_packed_locked(const ObjectId& id) const {
+    auto found = packed_.find(id);
+    if (found == packed_.end()) return {};
+    const auto& entry = found->second;
+    int fd = ::open(entry.file.c_str(), O_RDONLY);
+    if (fd < 0)
+        throw std::runtime_error("cannot open pack: " + std::string(strerror(errno)));
+    auto payload = pra_exact(fd, static_cast<size_t>(entry.payload_size), entry.payload_offset);
+    const int close_rc = ::close(fd);
+    if (!payload)
+        throw std::runtime_error("short packed object read");
+    if (close_rc != 0)
+        throw std::runtime_error("cannot close pack: " + std::string(strerror(errno)));
+    auto plain = aes_gcm_open(key_, entry.nonce, entry.tag, *payload, id.bytes);
+    if (plain.size() != entry.plain_size || object_id(plain) != id)
+        throw std::runtime_error("packed object integrity failure");
+    return plain;
+}
+
+void LocalStore::rebuild_pack_index_locked(bool truncate_incomplete_tail) {
+    packed_.clear();
+    pack_dead_bytes_ = 0;
+    next_pack_sequence_ = 1;
+    active_pack_.clear();
+    active_pack_size_ = 0;
+
+    std::vector<std::pair<uint64_t, std::filesystem::path>> files;
+    std::error_code error;
+    for (const auto& entry : std::filesystem::directory_iterator(packs_, error)) {
+        if (error) break;
+        if (!entry.is_regular_file()) continue;
+        const auto name = entry.path().filename().string();
+        if (name.find(".tmp") != std::string::npos || name.starts_with(".compact-")) {
+            std::error_code remove_error;
+            std::filesystem::remove(entry.path(), remove_error);
+            continue;
+        }
+        if (auto seq = pack_sequence(name))
+            files.push_back({*seq, entry.path()});
+    }
+    if (error) throw std::runtime_error("cannot enumerate packs: " + error.message());
+    std::sort(files.begin(), files.end());
+
+    for (const auto& [sequence, file] : files) {
+        next_pack_sequence_ = std::max(next_pack_sequence_, sequence + 1);
+        int fd = ::open(file.c_str(), truncate_incomplete_tail ? O_RDWR : O_RDONLY);
+        if (fd < 0)
+            throw std::runtime_error("cannot open pack during recovery: " +
+                                     std::string(strerror(errno)));
+        struct stat st{};
+        if (::fstat(fd, &st) != 0 || st.st_size < 0) {
+            const auto saved = errno;
+            ::close(fd);
+            throw std::runtime_error("cannot stat pack during recovery: " +
+                                     std::string(strerror(saved)));
+        }
+        const uint64_t file_size = static_cast<uint64_t>(st.st_size);
+        uint64_t offset = 0;
+        while (offset < file_size) {
+            if (file_size - offset < pack_header_size) {
+                if (truncate_incomplete_tail && ::ftruncate(fd, static_cast<off_t>(offset)) == 0)
+                    Log::warn("truncated incomplete pack tail path=" + file.string());
+                break;
+            }
+            auto bytes = pra_exact(fd, pack_header_size, offset);
+            if (!bytes) {
+                ::close(fd);
+                throw std::runtime_error("cannot read pack header during recovery");
+            }
+            auto header = decode_pack_header(*bytes);
+            if (!header) {
+                ::close(fd);
+                throw std::runtime_error("corrupt pack header at " + file.string() +
+                                         " offset=" + std::to_string(offset));
+            }
+            const uint64_t total = pack_header_size + header->payload_size;
+            if (total > file_size - offset) {
+                if (truncate_incomplete_tail && ::ftruncate(fd, static_cast<off_t>(offset)) == 0)
+                    Log::warn("truncated incomplete packed object path=" + file.string());
+                break;
+            }
+            if (header->type == pack_put) {
+                if (auto old = packed_.find(header->id); old != packed_.end())
+                    pack_dead_bytes_ += old->second.record_size;
+                PackEntry entry;
+                entry.file = file;
+                entry.payload_offset = offset + pack_header_size;
+                entry.payload_size = header->payload_size;
+                entry.plain_size = header->plain_size;
+                entry.record_size = total;
+                entry.touched_unix_ms = header->touched_ms;
+                entry.nonce = header->nonce;
+                entry.tag = header->tag;
+                packed_[header->id] = entry;
+            } else if (header->type == pack_remove) {
+                if (auto old = packed_.find(header->id); old != packed_.end()) {
+                    pack_dead_bytes_ += old->second.record_size;
+                    packed_.erase(old);
+                }
+                pack_dead_bytes_ += total;
+            } else {
+                if (auto old = packed_.find(header->id); old != packed_.end())
+                    old->second.touched_unix_ms = header->touched_ms;
+                pack_dead_bytes_ += total;
+            }
+            offset += total;
+        }
+        ::close(fd);
+        std::error_code size_error;
+        const auto actual = std::filesystem::file_size(file, size_error);
+        if (!size_error) {
+            active_pack_ = file;
+            active_pack_size_ = actual;
+        }
+    }
+    if (active_pack_size_ >= pack_target_size_) {
+        active_pack_.clear();
+        active_pack_size_ = 0;
+    }
+}
+
+bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> data,
+                                  StoreWriteDurability durability, uint64_t* deferred_generation,
+                                  std::unique_lock<std::mutex>& lock) {
+    auto sealed = aes_gcm_seal(key_, data, id.bytes);
     Writer header;
     header.raw(M);
-    header.u64(d.size());
+    header.u64(data.size());
     header.fixed(sealed.nonce);
     header.fixed(sealed.tag);
     const uint64_t need = header.data().size() + sealed.ciphertext.size();
+    if (!physical_space_available_locked(need)) return false;
     const auto before = used_.load(std::memory_order_relaxed);
-    if (need > limit_ || before > limit_ - need)
-        return false;
-
     const bool ephemeral = mode_ == LocalStoreMode::ephemeral;
-    if (!ephemeral) {
-        // The accounting record is a process/session validity checkpoint, not a
-        // transaction log. Once DIRTY is durable, any crash causes exact tree
-        // reconciliation; publication durability is owned solely by the domain.
-        mark_accounting_dirty_locked();
-    }
+    if (!ephemeral) mark_accounting_dirty_locked();
 
+    auto p = path(id);
     std::filesystem::create_directories(p.parent_path());
     auto temp = p.string() + ".tmp." + std::to_string(getpid()) + "." + std::to_string(unix_ms());
     int fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (fd < 0)
-        throw std::runtime_error(strerror(errno));
+    if (fd < 0) throw std::runtime_error(strerror(errno));
     try {
         wa(fd, header.data());
         wa(fd, sealed.ciphertext);
-        if (close(fd))
-            throw std::runtime_error(strerror(errno));
+        if (::close(fd) != 0) throw std::runtime_error(strerror(errno));
         fd = -1;
-        if (rename(temp.c_str(), p.c_str()))
-            throw std::runtime_error(strerror(errno));
+        if (::rename(temp.c_str(), p.c_str()) != 0) throw std::runtime_error(strerror(errno));
         used_.store(before + need, std::memory_order_relaxed);
-
         uint64_t generation = 0;
         if (!ephemeral && durability_domain_) {
             generation = durability_domain_->complete_mutation(p, p.parent_path());
             last_mutation_generation_ = std::max(last_mutation_generation_, generation);
-            provisional_generations_[i] = generation;
-            provisional_order_.push_back({generation, i});
+            provisional_generations_[id] = generation;
+            provisional_order_.push_back({generation, id});
             reap_durable_generations_locked();
         }
-        if (deferred_generation)
-            *deferred_generation = generation;
-
+        if (deferred_generation) *deferred_generation = generation;
         if (!ephemeral && durability == StoreWriteDurability::immediate && generation) {
-            // The strict caller waits, but physical durability still belongs to
-            // the domain coordinator. Releasing m_ lets concurrent writes join
-            // the same immediate cut instead of serializing one barrier per PUT.
-            g.unlock();
+            lock.unlock();
             durability_domain_->await_durable(generation, DurabilityUrgency::immediate);
         }
         return true;
     } catch (...) {
-        if (fd >= 0)
-            close(fd);
-        std::error_code error;
-        std::filesystem::remove(temp, error);
+        if (fd >= 0) ::close(fd);
+        std::error_code remove_error;
+        std::filesystem::remove(temp, remove_error);
         throw;
     }
 }
-std::optional<Bytes> LocalStore::get(const ObjectId& i) const {
-    auto p = path(i);
-    if (!std::filesystem::exists(p))
-        return {};
-    auto e = rf(p);
-    Reader r(e);
-    auto m = r.raw(8);
-    if (!std::equal(m.begin(), m.end(), M.begin()))
-        throw std::runtime_error("bad object header");
-    auto sz = r.u64();
-    auto n = r.fixed<12>();
-    auto t = r.fixed<16>();
-    auto c = r.raw(r.remaining());
-    auto d = aes_gcm_open(key_, n, t, c, i.bytes);
-    if (d.size() != sz || object_id(d) != i)
-        throw std::runtime_error("object integrity failure");
-    return d;
-}
-bool LocalStore::has(const ObjectId& i) const {
-    return std::filesystem::exists(path(i));
-}
-bool LocalStore::valid(const ObjectId& i) const noexcept {
-    try {
-        return get(i).has_value();
-    } catch (...) {
-        return false;
+
+bool LocalStore::put_packed_locked(const ObjectId& id, std::span<const uint8_t> data,
+                                   StoreWriteDurability durability, uint64_t* deferred_generation,
+                                   std::unique_lock<std::mutex>& lock) {
+    const uint64_t need = pack_header_size + data.size();
+    if (!physical_space_available_locked(need)) return false;
+    const auto before = used_.load(std::memory_order_relaxed);
+    const bool ephemeral = mode_ == LocalStoreMode::ephemeral;
+    if (!ephemeral) mark_accounting_dirty_locked();
+    PackEntry entry;
+    uint64_t record_size = 0;
+    append_pack_record_locked(pack_put, id, data, unix_ms(), &entry, &record_size);
+    if (auto old = packed_.find(id); old != packed_.end())
+        pack_dead_bytes_ += old->second.record_size;
+    packed_[id] = entry;
+    used_.store(before + record_size, std::memory_order_relaxed);
+
+    uint64_t generation = 0;
+    if (!ephemeral && durability_domain_) {
+        generation = durability_domain_->complete_mutation(entry.file, packs_);
+        last_mutation_generation_ = std::max(last_mutation_generation_, generation);
+        provisional_generations_[id] = generation;
+        provisional_order_.push_back({generation, id});
+        reap_durable_generations_locked();
     }
+    if (deferred_generation) *deferred_generation = generation;
+    if (!ephemeral && durability == StoreWriteDurability::immediate && generation) {
+        lock.unlock();
+        durability_domain_->await_durable(generation, DurabilityUrgency::immediate);
+    }
+    return true;
 }
-bool LocalStore::remove_locked(const ObjectId& i) {
-    auto p = path(i);
+
+bool LocalStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
+                          StoreWriteDurability durability, uint64_t* deferred_generation) {
+    if (object_id(data) != id) throw std::runtime_error("object hash mismatch");
+    std::unique_lock lock(m_);
+    wait_for_accounting(lock);
+
+    std::optional<Bytes> existing;
+    try {
+        if (packed_.contains(id)) existing = get_packed_locked(id);
+        else if (std::filesystem::exists(path(id))) {
+            auto encoded = rf(path(id));
+            Reader r(encoded);
+            auto magic = r.raw(M.size());
+            if (!std::equal(magic.begin(), magic.end(), M.begin()))
+                throw std::runtime_error("bad object header");
+            auto size = r.u64();
+            auto nonce = r.fixed<12>();
+            auto tag = r.fixed<16>();
+            auto cipher = r.raw(r.remaining());
+            auto plain = aes_gcm_open(key_, nonce, tag, cipher, id.bytes);
+            if (plain.size() != size || object_id(plain) != id)
+                throw std::runtime_error("object integrity failure");
+            existing = std::move(plain);
+        }
+    } catch (...) {
+        existing.reset();
+    }
+    if (existing && existing->size() == data.size() &&
+        std::equal(existing->begin(), existing->end(), data.begin())) {
+        const auto packed = packed_.find(id);
+        if (packed != packed_.end()) {
+            // A compact touch record makes the re-affirmation age crash-recoverable.
+            const auto before = used_.load(std::memory_order_relaxed);
+            uint64_t record_size = 0;
+            if (mode_ != LocalStoreMode::ephemeral) mark_accounting_dirty_locked();
+            const auto touched = unix_ms();
+            append_pack_record_locked(pack_touch, id, {}, touched, nullptr, &record_size);
+            packed->second.touched_unix_ms = touched;
+            pack_dead_bytes_ += record_size;
+            used_.store(before + record_size, std::memory_order_relaxed);
+            uint64_t generation = 0;
+            if (mode_ != LocalStoreMode::ephemeral && durability_domain_) {
+                generation = durability_domain_->complete_mutation(active_pack_, packs_);
+                last_mutation_generation_ = std::max(last_mutation_generation_, generation);
+                provisional_generations_[id] = generation;
+                provisional_order_.push_back({generation, id});
+            }
+            if (deferred_generation) *deferred_generation = generation;
+            if (durability == StoreWriteDurability::immediate && generation) {
+                lock.unlock();
+                durability_domain_->await_durable(generation, DurabilityUrgency::immediate);
+            }
+            return true;
+        }
+        std::error_code touch_error;
+        std::filesystem::last_write_time(path(id), std::filesystem::file_time_type::clock::now(),
+                                         touch_error);
+        reap_durable_generations_locked();
+        uint64_t generation = 0;
+        if (auto found = provisional_generations_.find(id); found != provisional_generations_.end())
+            generation = found->second;
+        if (deferred_generation) *deferred_generation = generation;
+        if (durability == StoreWriteDurability::immediate && durability_domain_ &&
+            generation > durability_domain_->durable_generation()) {
+            lock.unlock();
+            durability_domain_->await_durable(generation, DurabilityUrgency::immediate);
+        }
+        return true;
+    }
+
+    if (packed_.contains(id)) {
+        // A corrupt packed record is superseded by the new record. The old bytes
+        // remain dead until compaction; no in-place rewrite can damage neighbours.
+    } else if (std::filesystem::exists(path(id))) {
+        if (!remove_locked(id) && std::filesystem::exists(path(id)))
+            throw std::runtime_error("cannot replace corrupt local object");
+    }
+
+    if (pack_threshold_ && data.size() <= pack_threshold_)
+        return put_packed_locked(id, data, durability, deferred_generation, lock);
+    return put_loose_locked(id, data, durability, deferred_generation, lock);
+}
+
+std::optional<Bytes> LocalStore::get(const ObjectId& id) const {
+    std::lock_guard lock(m_);
+    if (auto data = get_packed_locked(id)) return data;
+    auto p = path(id);
+    if (!std::filesystem::exists(p)) return {};
+    auto encoded = rf(p);
+    Reader r(encoded);
+    auto magic = r.raw(M.size());
+    if (!std::equal(magic.begin(), magic.end(), M.begin()))
+        throw std::runtime_error("bad object header");
+    auto size = r.u64();
+    auto nonce = r.fixed<12>();
+    auto tag = r.fixed<16>();
+    auto cipher = r.raw(r.remaining());
+    auto plain = aes_gcm_open(key_, nonce, tag, cipher, id.bytes);
+    if (plain.size() != size || object_id(plain) != id)
+        throw std::runtime_error("object integrity failure");
+    return plain;
+}
+
+bool LocalStore::has(const ObjectId& id) const {
+    std::lock_guard lock(m_);
+    return packed_.contains(id) || std::filesystem::exists(path(id));
+}
+
+bool LocalStore::valid(const ObjectId& id) const noexcept {
+    try { return get(id).has_value(); } catch (...) { return false; }
+}
+
+bool LocalStore::remove_locked(const ObjectId& id) {
+    if (auto found = packed_.find(id); found != packed_.end()) {
+        const auto before = used_.load(std::memory_order_relaxed);
+        if (mode_ != LocalStoreMode::ephemeral) mark_accounting_dirty_locked();
+        uint64_t tomb_size = 0;
+        append_pack_record_locked(pack_remove, id, {}, unix_ms(), nullptr, &tomb_size);
+        pack_dead_bytes_ += found->second.record_size + tomb_size;
+        packed_.erase(found);
+        used_.store(before + tomb_size, std::memory_order_relaxed);
+        provisional_generations_.erase(id);
+        if (mode_ != LocalStoreMode::ephemeral && durability_domain_) {
+            const auto generation = durability_domain_->complete_mutation(active_pack_, packs_);
+            last_mutation_generation_ = std::max(last_mutation_generation_, generation);
+        }
+        return true;
+    }
+
+    auto p = path(id);
     std::error_code error;
     const auto size = std::filesystem::file_size(p, error);
-    if (error)
-        return false;
+    if (error) return false;
     const auto before = used_.load(std::memory_order_relaxed);
-    if (size > before)
-        throw std::runtime_error("local accounting underflow");
-
-    const bool ephemeral = mode_ == LocalStoreMode::ephemeral;
-    if (!ephemeral)
-        mark_accounting_dirty_locked();
-
-    if (!std::filesystem::remove(p, error))
-        return false;
+    if (size > before) throw std::runtime_error("local accounting underflow");
+    if (mode_ != LocalStoreMode::ephemeral) mark_accounting_dirty_locked();
+    if (!std::filesystem::remove(p, error)) return false;
     used_.store(before - size, std::memory_order_relaxed);
-    provisional_generations_.erase(i);
-
-    // Deletion durability is intentionally lazy. If an unlink is lost in a
-    // crash, the only consequence is an unreachable object surviving for a
-    // later GC pass. Still register the mutation so a clean accounting
-    // checkpoint on shutdown cannot get ahead of the directory state.
-    if (!ephemeral && durability_domain_) {
+    provisional_generations_.erase(id);
+    if (mode_ != LocalStoreMode::ephemeral && durability_domain_) {
         const auto generation = durability_domain_->complete_mutation({}, p.parent_path());
         last_mutation_generation_ = std::max(last_mutation_generation_, generation);
     }
@@ -545,23 +869,20 @@ bool LocalStore::put(const ObjectId& id, std::span<const uint8_t> data) {
 std::optional<uint64_t> LocalStore::put_deferred(const ObjectId& id,
                                                  std::span<const uint8_t> data) {
     uint64_t generation = 0;
-    if (!put_impl(id, data, StoreWriteDurability::deferred, &generation))
-        return {};
+    if (!put_impl(id, data, StoreWriteDurability::deferred, &generation)) return {};
     return generation;
 }
 
 void LocalStore::durability_barrier(uint64_t required_generation, DurabilityUrgency urgency) {
-    if (mode_ == LocalStoreMode::ephemeral || !durability_domain_ || !required_generation)
-        return;
+    if (mode_ == LocalStoreMode::ephemeral || !durability_domain_ || !required_generation) return;
     durability_domain_->await_durable(required_generation, urgency);
 }
 
 void LocalStore::durability_barrier() {
-    if (mode_ == LocalStoreMode::ephemeral || !durability_domain_)
-        return;
+    if (mode_ == LocalStoreMode::ephemeral || !durability_domain_) return;
     uint64_t generation = 0;
     {
-        std::lock_guard g(m_);
+        std::lock_guard lock(m_);
         generation = last_mutation_generation_;
     }
     if (generation)
@@ -576,105 +897,338 @@ uint64_t LocalStore::durability_domain_id() const noexcept {
     return durability_domain_ ? durability_domain_->id() : 0;
 }
 
-bool LocalStore::remove(const ObjectId& i) {
-    std::unique_lock g(m_);
-    wait_for_accounting(g);
-    return remove_locked(i);
+bool LocalStore::remove(const ObjectId& id) {
+    std::unique_lock lock(m_);
+    wait_for_accounting(lock);
+    return remove_locked(id);
 }
 
-bool LocalStore::remove_if_older_than(const ObjectId& i, std::chrono::milliseconds age) {
-    std::unique_lock g(m_);
-    wait_for_accounting(g);
+bool LocalStore::remove_if_older_than(const ObjectId& id, std::chrono::milliseconds age) {
+    std::unique_lock lock(m_);
+    wait_for_accounting(lock);
+    if (auto found = packed_.find(id); found != packed_.end()) {
+        const auto now = unix_ms();
+        if (now < found->second.touched_unix_ms ||
+            now - found->second.touched_unix_ms < static_cast<uint64_t>(age.count()))
+            return false;
+        return remove_locked(id);
+    }
     std::error_code error;
-    const auto modified = std::filesystem::last_write_time(path(i), error);
-    if (error || std::filesystem::file_time_type::clock::now() - modified < age)
-        return false;
-    return remove_locked(i);
+    const auto modified = std::filesystem::last_write_time(path(id), error);
+    if (error || std::filesystem::file_time_type::clock::now() - modified < age) return false;
+    return remove_locked(id);
 }
+
 std::vector<ObjectId> LocalStore::list() const {
     std::vector<ObjectId> out;
     Cursor cursor;
     bool exhausted = false;
     while (!exhausted) {
-        if (auto id = next_object(cursor, exhausted))
-            out.push_back(*id);
+        if (auto id = next_object(cursor, exhausted)) out.push_back(*id);
     }
     return out;
 }
 
 std::optional<ObjectId> LocalStore::next_object(Cursor& cursor, bool& exhausted) const {
     exhausted = false;
+    if (!cursor.packed_done) {
+        std::lock_guard lock(m_);
+        auto it = cursor.packed_after ? packed_.upper_bound(*cursor.packed_after) : packed_.begin();
+        if (it != packed_.end()) {
+            cursor.packed_after = it->first;
+            return it->first;
+        }
+        cursor.packed_done = true;
+    }
+
     std::error_code error;
-    if (!cursor.initialized) {
+    if (!cursor.loose_initialized) {
         cursor.iterator = std::filesystem::recursive_directory_iterator(
             objects_, std::filesystem::directory_options::skip_permission_denied, error);
-        cursor.initialized = true;
+        cursor.loose_initialized = true;
         if (error) {
             cursor = {};
             exhausted = true;
             return {};
         }
     }
-
     const std::filesystem::recursive_directory_iterator end;
     while (cursor.iterator != end) {
         const auto entry = *cursor.iterator;
         cursor.iterator.increment(error);
         if (error) {
-            // A disk disappearing or a directory being removed while maintenance
-            // is walking it ends this pass. refresh() will independently update
-            // backend state; the next pass starts from the root again.
             cursor = {};
             exhausted = true;
             return {};
         }
         std::error_code type_error;
-        if (!entry.is_regular_file(type_error) || type_error)
-            continue;
+        if (!entry.is_regular_file(type_error) || type_error) continue;
         auto name = entry.path().filename().string();
-        if (name.size() != 68 || name.compare(64, 4, ".obj") != 0)
-            continue;
+        if (name.size() != 68 || name.compare(64, 4, ".obj") != 0) continue;
         auto bytes = unhex(name.substr(0, 64));
-        if (!bytes || bytes->size() != 32)
-            continue;
+        if (!bytes || bytes->size() != 32) continue;
         ObjectId id;
         std::copy(bytes->begin(), bytes->end(), id.bytes.begin());
         return id;
     }
-
     cursor = {};
     exhausted = true;
     return {};
 }
-std::filesystem::path LocalStore::object_path(const ObjectId& i) const {
-    return path(i);
+
+std::filesystem::path LocalStore::object_path(const ObjectId& id) const {
+    std::lock_guard lock(m_);
+    if (auto found = packed_.find(id); found != packed_.end()) return found->second.file;
+    return path(id);
 }
-uint64_t LocalStore::stored_size(const ObjectId& i) const {
-    std::error_code e;
-    auto n = std::filesystem::file_size(path(i), e);
-    return e ? 0 : n;
+
+uint64_t LocalStore::stored_size(const ObjectId& id) const {
+    std::lock_guard lock(m_);
+    if (auto found = packed_.find(id); found != packed_.end()) return found->second.record_size;
+    std::error_code error;
+    auto size = std::filesystem::file_size(path(id), error);
+    return error ? 0 : size;
 }
-std::filesystem::file_time_type LocalStore::last_write(const ObjectId& i) const {
-    std::error_code e;
-    auto t = std::filesystem::last_write_time(path(i), e);
-    return e ? std::filesystem::file_time_type::min() : t;
+
+std::filesystem::file_time_type LocalStore::last_write(const ObjectId& id) const {
+    std::lock_guard lock(m_);
+    if (auto found = packed_.find(id); found != packed_.end())
+        return file_time_from_unix_ms(found->second.touched_unix_ms);
+    std::error_code error;
+    auto time = std::filesystem::last_write_time(path(id), error);
+    return error ? std::filesystem::file_time_type::min() : time;
 }
-void LocalStore::touch(const ObjectId& i) {
-    std::error_code e;
-    std::filesystem::last_write_time(path(i), std::filesystem::file_time_type::clock::now(), e);
+
+void LocalStore::touch(const ObjectId& id) {
+    std::lock_guard lock(m_);
+    if (auto found = packed_.find(id); found != packed_.end()) {
+        const auto before = used_.load(std::memory_order_relaxed);
+        uint64_t record_size = 0;
+        const auto touched = unix_ms();
+        if (mode_ != LocalStoreMode::ephemeral) mark_accounting_dirty_locked();
+        append_pack_record_locked(pack_touch, id, {}, touched, nullptr, &record_size);
+        found->second.touched_unix_ms = touched;
+        pack_dead_bytes_ += record_size;
+        used_.store(before + record_size, std::memory_order_relaxed);
+        if (mode_ != LocalStoreMode::ephemeral && durability_domain_) {
+            const auto generation = durability_domain_->complete_mutation(active_pack_, packs_);
+            last_mutation_generation_ = std::max(last_mutation_generation_, generation);
+        }
+        return;
+    }
+    std::error_code error;
+    std::filesystem::last_write_time(path(id), std::filesystem::file_time_type::clock::now(), error);
 }
-bool LocalStore::older_than(const ObjectId& i, std::chrono::milliseconds age) const {
-    std::error_code e;
-    auto t = std::filesystem::last_write_time(path(i), e);
-    if (e)
+
+bool LocalStore::older_than(const ObjectId& id, std::chrono::milliseconds age) const {
+    std::lock_guard lock(m_);
+    if (auto found = packed_.find(id); found != packed_.end()) {
+        const auto now = unix_ms();
+        return now >= found->second.touched_unix_ms &&
+               now - found->second.touched_unix_ms > static_cast<uint64_t>(age.count());
+    }
+    std::error_code error;
+    auto time = std::filesystem::last_write_time(path(id), error);
+    if (error) return false;
+    return std::filesystem::file_time_type::clock::now() - time > age;
+}
+
+bool LocalStore::is_packed(const ObjectId& id) const {
+    std::lock_guard lock(m_);
+    return packed_.contains(id);
+}
+
+bool LocalStore::compact_packs_locked() {
+    if (!pack_threshold_) return true;
+    if (pack_dead_bytes_ == 0) return true;
+
+    struct OldPack {
+        std::filesystem::path file;
+        uint64_t size{};
+    };
+    std::vector<OldPack> old_packs;
+    uint64_t old_total = 0;
+    {
+        std::error_code error;
+        for (const auto& entry : std::filesystem::directory_iterator(packs_, error)) {
+            if (error) break;
+            if (!entry.is_regular_file()) continue;
+            if (!pack_sequence(entry.path().filename().string())) continue;
+            std::error_code size_error;
+            const auto size = entry.file_size(size_error);
+            if (size_error)
+                throw std::runtime_error("cannot size source pack: " + size_error.message());
+            old_packs.push_back({entry.path(), size});
+            if (size > std::numeric_limits<uint64_t>::max() - old_total)
+                throw std::runtime_error("pack compaction size overflow");
+            old_total += size;
+        }
+        if (error)
+            throw std::runtime_error("cannot enumerate source packs: " + error.message());
+    }
+
+    // Compaction is copy-on-write. It may temporarily exceed the configured DATA
+    // admission limit because the old durable representation cannot be removed
+    // before the replacement is fsynced and installed. It must, however, preserve
+    // the physical filesystem reserve. Record sizes are stable under re-encryption
+    // because AES-GCM ciphertext length equals plaintext length.
+    uint64_t live_total = 0;
+    for (const auto& [_, entry] : packed_) {
+        if (entry.record_size > std::numeric_limits<uint64_t>::max() - live_total)
+            throw std::runtime_error("pack compaction live-size overflow");
+        live_total += entry.record_size;
+    }
+    std::error_code space_error;
+    const auto space = std::filesystem::space(root_, space_error);
+    if (space_error)
+        throw std::runtime_error("cannot inspect free space for pack compaction: " +
+                                 space_error.message());
+    if (live_total > space.available || reserve_free_ > space.available - live_total)
         return false;
-    return std::filesystem::file_time_type::clock::now() - t > age;
+
+    struct NewPack {
+        std::filesystem::path temp;
+        std::filesystem::path final;
+        int fd{-1};
+        uint64_t size{};
+    };
+    std::vector<NewPack> new_packs;
+    std::map<ObjectId, PackEntry> rebuilt;
+    uint64_t new_total = 0;
+
+    auto open_pack = [&]() -> NewPack& {
+        const auto sequence = next_pack_sequence_++;
+        NewPack item;
+        item.final = packs_ / pack_name(sequence);
+        item.temp = packs_ / (".compact-" + std::to_string(getpid()) + "-" +
+                              std::to_string(sequence) + ".tmp");
+        item.fd = ::open(item.temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (item.fd < 0)
+            throw std::runtime_error("cannot create compacted pack: " +
+                                     std::string(strerror(errno)));
+        new_packs.push_back(std::move(item));
+        return new_packs.back();
+    };
+
+    auto cleanup_temps = [&] {
+        for (auto& pack : new_packs) {
+            if (pack.fd >= 0) {
+                ::close(pack.fd);
+                pack.fd = -1;
+            }
+            std::error_code error;
+            std::filesystem::remove(pack.temp, error);
+        }
+    };
+
+    try {
+        NewPack* current = nullptr;
+        for (const auto& [id, old_entry] : packed_) {
+            auto plain = get_packed_locked(id);
+            if (!plain) throw std::runtime_error("packed object disappeared during compaction");
+            auto sealed = aes_gcm_seal(key_, *plain, id.bytes);
+            PackHeader h;
+            h.type = pack_put;
+            h.touched_ms = old_entry.touched_unix_ms;
+            h.id = id;
+            h.plain_size = plain->size();
+            h.payload_size = sealed.ciphertext.size();
+            h.nonce = sealed.nonce;
+            h.tag = sealed.tag;
+            auto header = encode_pack_header(h);
+            const uint64_t record_size = header.size() + sealed.ciphertext.size();
+            if (!current || (current->size && current->size + record_size > pack_target_size_))
+                current = &open_pack();
+            const uint64_t record_start = current->size;
+            wa(current->fd, header);
+            wa(current->fd, sealed.ciphertext);
+            current->size += record_size;
+            PackEntry entry;
+            entry.file = current->final;
+            entry.payload_offset = record_start + header.size();
+            entry.payload_size = sealed.ciphertext.size();
+            entry.plain_size = plain->size();
+            entry.record_size = record_size;
+            entry.touched_unix_ms = old_entry.touched_unix_ms;
+            entry.nonce = sealed.nonce;
+            entry.tag = sealed.tag;
+            rebuilt[id] = entry;
+            new_total += record_size;
+        }
+
+        for (auto& pack : new_packs) {
+            if (::fsync(pack.fd) != 0)
+                throw std::runtime_error("cannot sync compacted pack: " +
+                                         std::string(strerror(errno)));
+            if (::close(pack.fd) != 0)
+                throw std::runtime_error("cannot close compacted pack: " +
+                                         std::string(strerror(errno)));
+            pack.fd = -1;
+            if (::rename(pack.temp.c_str(), pack.final.c_str()) != 0)
+                throw std::runtime_error("cannot install compacted pack: " +
+                                         std::string(strerror(errno)));
+        }
+        syncdir(packs_);
+
+        // From this point onward the running process must read the new durable
+        // representation before any old source pack is removed. If deletion is
+        // interrupted, the remaining old packs are merely dead duplicate bytes;
+        // the next compaction/restart can reclaim them without losing a live object.
+        const auto before = used_.load(std::memory_order_relaxed);
+        if (new_total > std::numeric_limits<uint64_t>::max() - before)
+            throw std::runtime_error("pack compaction accounting overflow");
+        packed_ = std::move(rebuilt);
+        used_.store(before + new_total, std::memory_order_relaxed);
+        pack_dead_bytes_ = old_total;
+        if (new_packs.empty()) {
+            active_pack_.clear();
+            active_pack_size_ = 0;
+        } else {
+            active_pack_ = new_packs.back().final;
+            active_pack_size_ = new_packs.back().size;
+            if (active_pack_size_ >= pack_target_size_) {
+                active_pack_.clear();
+                active_pack_size_ = 0;
+            }
+        }
+
+        bool all_removed = true;
+        for (const auto& old : old_packs) {
+            std::error_code remove_error;
+            const bool removed = std::filesystem::remove(old.file, remove_error);
+            if (remove_error || !removed) {
+                all_removed = false;
+                Log::warn("cannot remove compacted source pack path=" + old.file.string() +
+                          (remove_error ? " error=" + remove_error.message() : ""));
+                continue;
+            }
+            const auto current_used = used_.load(std::memory_order_relaxed);
+            if (old.size > current_used)
+                throw std::runtime_error("pack compaction accounting underflow");
+            used_.store(current_used - old.size, std::memory_order_relaxed);
+            pack_dead_bytes_ = old.size > pack_dead_bytes_ ? 0 : pack_dead_bytes_ - old.size;
+        }
+        syncdir(packs_);
+
+        if (mode_ != LocalStoreMode::ephemeral) mark_accounting_dirty_locked();
+        if (mode_ != LocalStoreMode::ephemeral && durability_domain_) {
+            const auto generation = durability_domain_->complete_mutation({}, packs_);
+            last_mutation_generation_ = std::max(last_mutation_generation_, generation);
+        }
+        return all_removed;
+    } catch (...) {
+        cleanup_temps();
+        throw;
+    }
 }
+
+bool LocalStore::compact_packs() {
+    std::unique_lock lock(m_);
+    wait_for_accounting(lock);
+    return compact_packs_locked();
+}
+
 void LocalStore::wait_for_accounting(std::unique_lock<std::mutex>& lock) const {
-    // Only mutations need exact quota accounting. Reads, health and maintenance
-    // enumeration never wait for the startup reconciliation. Avoid a condition
-    // variable tied to object lifetime: the scan owns no caller lock and this
-    // path is used only during the short first-start reconciliation window.
     while (!scan_complete_.load(std::memory_order_acquire)) {
         if (scan_failed_.load(std::memory_order_acquire))
             throw std::runtime_error("storage accounting reconciliation failed");
@@ -685,109 +1239,85 @@ void LocalStore::wait_for_accounting(std::unique_lock<std::mutex>& lock) const {
 }
 
 void LocalStore::scan(std::stop_token stop) {
-    // Capacity accounting is intentionally reconciled in the background. The
-    // old constructor walked the entire object tree before the backend could be
-    // declared online, which made startup proportional to store size. Mutating
-    // operations wait for this one initial reconciliation; reads remain
-    // available immediately.
     Log::debug("storage accounting scan begin path=" + root_.string());
-    uint64_t n = 0;
-    std::error_code e;
-    for (auto it = std::filesystem::recursive_directory_iterator(objects_, e);
-         !e && it != std::filesystem::recursive_directory_iterator(); it.increment(e)) {
-        if (stop.stop_requested())
-            break;
-        const auto& x = *it;
-        if (!x.is_regular_file())
-            continue;
-        auto name = x.path().filename().string();
-        if (name.find(".tmp.") != std::string::npos) {
-            std::error_code r;
-            std::filesystem::remove(x.path(), r);
-            continue;
+    uint64_t total = 0;
+    std::error_code error;
+    for (const auto& root : {objects_, packs_}) {
+        for (auto it = std::filesystem::recursive_directory_iterator(root, error);
+             !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
+            if (stop.stop_requested()) return;
+            if (!it->is_regular_file()) continue;
+            auto name = it->path().filename().string();
+            if (name.find(".tmp") != std::string::npos || name.starts_with(".compact-")) {
+                std::error_code remove_error;
+                std::filesystem::remove(it->path(), remove_error);
+                continue;
+            }
+            std::error_code size_error;
+            const auto size = it->file_size(size_error);
+            if (!size_error) total += size;
         }
-        std::error_code size_error;
-        auto size = x.file_size(size_error);
-        if (!size_error)
-            n += size;
+        if (error) break;
     }
-    if (stop.stop_requested())
-        return;
-    if (e) {
+    if (error) {
         scan_failed_.store(true, std::memory_order_release);
         Log::warn("storage accounting scan failed path=" + root_.string() +
-                  " error=" + e.message());
+                  " error=" + error.message());
         return;
     }
-
-    // Missing/DIRTY accounting can follow an unclean *process* restart while
-    // Linux still holds the old process's object writes in page cache. Before
-    // treating reconstructed objects as generation-zero durable, establish one
-    // physical filesystem baseline. Mutations remain blocked until this ends.
     if (mode_ == LocalStoreMode::authoritative && durability_domain_) {
         try {
             const auto baseline = durability_domain_->complete_mutation();
             durability_domain_->await_durable(baseline, DurabilityUrgency::immediate);
             last_mutation_generation_ = std::max(last_mutation_generation_, baseline);
-        } catch (const std::exception& error) {
+        } catch (const std::exception& ex) {
             scan_failed_.store(true, std::memory_order_release);
             Log::warn("storage accounting baseline durability failed path=" + root_.string() +
-                      " error=" + error.what());
+                      " error=" + ex.what());
             return;
         }
     }
-
     {
-        std::lock_guard guard(m_);
-        used_.store(n, std::memory_order_relaxed);
-        if (mode_ == LocalStoreMode::authoritative) {
-            ObjectId none{};
-            persist_accounting(n, accounting_none, none, 0, true);
-            accounting_trusted_.store(true, std::memory_order_release);
-            accounting_dirty_ = false;
+        std::lock_guard lock(m_);
+        used_.store(total, std::memory_order_relaxed);
+        accounting_trusted_.store(true, std::memory_order_release);
+        if (mode_ != LocalStoreMode::ephemeral) {
+            accounting_dirty_ = true;
+            checkpoint_accounting_locked();
         }
-        scan_complete_.store(true, std::memory_order_release);
     }
+    scan_complete_.store(true, std::memory_order_release);
     Log::debug("storage accounting scan complete path=" + root_.string() +
-               " used=" + std::to_string(n));
+               " used=" + std::to_string(total));
 }
-NodeId load_or_create_node_id(const std::filesystem::path& r) {
-    std::filesystem::create_directories(r);
-    auto p = r / "node.id";
-    if (std::filesystem::exists(p)) {
-        std::ifstream f(p);
-        std::string s;
-        f >> s;
-        auto b = unhex(s);
-        if (!b || b->size() != 16)
-            throw std::runtime_error("invalid node.id");
-        NodeId i;
-        std::copy(b->begin(), b->end(), i.bytes.begin());
-        return i;
+
+NodeId load_or_create_node_id(const std::filesystem::path& state) {
+    std::filesystem::create_directories(state);
+    auto file = state / "node-id";
+    if (std::filesystem::exists(file)) {
+        std::ifstream in(file);
+        std::string text;
+        in >> text;
+        auto bytes = unhex(text);
+        if (!bytes || bytes->size() != 16)
+            throw std::runtime_error("invalid node id");
+        NodeId id;
+        std::copy(bytes->begin(), bytes->end(), id.bytes.begin());
+        return id;
     }
-    auto i = random_node_id();
-    auto t = p.string() + ".tmp." + std::to_string(getpid());
-    auto encoded = to_string(i) + "\n";
-    int fd = ::open(t.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0)
-        throw std::runtime_error("cannot create node.id: " + std::string(strerror(errno)));
-    try {
-        wa(fd, {reinterpret_cast<const uint8_t*>(encoded.data()), encoded.size()});
-        if (fsync(fd))
-            throw std::runtime_error("cannot sync node.id: " + std::string(strerror(errno)));
-        if (close(fd))
-            throw std::runtime_error("cannot close node.id: " + std::string(strerror(errno)));
-        fd = -1;
-        if (::rename(t.c_str(), p.c_str()))
-            throw std::runtime_error("cannot install node.id: " + std::string(strerror(errno)));
-        syncdir(p.parent_path());
-    } catch (...) {
-        if (fd >= 0)
-            close(fd);
-        std::error_code error;
-        std::filesystem::remove(t, error);
-        throw;
+    auto id = random_node_id();
+    auto tmp = file.string() + ".tmp";
+    {
+        int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) throw std::runtime_error(strerror(errno));
+        auto text = to_string(id) + "\n";
+        wa(fd, {reinterpret_cast<const uint8_t*>(text.data()), text.size()});
+        (void)fsync(fd);
+        close(fd);
     }
-    return i;
+    if (::rename(tmp.c_str(), file.c_str()) != 0)
+        throw std::runtime_error(strerror(errno));
+    syncdir(state);
+    return id;
 }
 } // namespace macha

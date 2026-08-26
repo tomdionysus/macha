@@ -69,8 +69,13 @@ struct CatalogueStatus {
 };
 
 struct CatalogueMaintenance {
+    // DATA objects referenced by the catalogue. These participate in ordinary
+    // DHT placement/repair and global reachability GC.
     std::set<ObjectId> live;
-    std::set<ObjectId> universal;
+    // Catalogue manifest/shards are control-plane objects. They are protected
+    // and swept in the dedicated control store, never by DATA placement.
+    std::set<ObjectId> control_live;
+    std::set<ObjectId> universal; // intentionally empty in the 0.18 storage model
     // False means current catalogue metadata could not be fully converged, so
     // the live set is conservative but incomplete and physical GC must not run.
     bool complete{true};
@@ -96,6 +101,14 @@ class CatalogueConflict : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// The catalogue content/provider result is not at fault; the cluster cannot
+// currently satisfy the control/DATA durability contract. Scanner work catches
+// this separately and defers without consuming semantic failure attempts.
+class CatalogueUnavailable : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
+
 class CatalogueManager {
     NodeRuntime& node_;
     DistributedStore& store_;
@@ -110,10 +123,15 @@ class CatalogueManager {
     uint64_t last_sync_unix_ms_{};
     bool ready_{};
     std::string error_;
+    LocalStore::Cursor control_gc_cursor_;
+    std::optional<ObjectId> control_converged_root_;
+    std::vector<NodeId> control_converged_voters_;
+    Clock::time_point control_convergence_retry_{};
 
     static std::set<ObjectId> artwork_ids(const CatalogueSnapshot&);
-    static size_t durability_required(const MetadataSnapshot&, size_t active);
+    static size_t durability_required(const MetadataSnapshot&);
     CatalogueSnapshot load_root(const std::optional<ObjectId>&);
+    bool converge_control_replicas(const MetadataSnapshot&);
     void cache(uint64_t metadata_generation, const MetadataSnapshot&, CatalogueSnapshot);
     std::shared_ptr<const CatalogueSnapshot> current_snapshot();
     void commit(const std::optional<ObjectId>& expected_root, const CatalogueSnapshot& next,
@@ -148,6 +166,8 @@ class CatalogueManager {
                            std::optional<Hash256> expected_namespace = std::nullopt);
     std::optional<CatalogueArtworkContent> artwork(const ObjectId&);
     CatalogueMaintenance maintenance_objects();
+    size_t control_gc_step(const std::vector<ObjectId>& live,
+                           std::chrono::milliseconds grace, size_t operation_budget = 32);
 };
 
 } // namespace macha

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "config.hpp"
+#include "fuse_mountpoint.hpp"
 #include "filesystem.hpp"
 #include "hydration.hpp"
 #include <filesystem>

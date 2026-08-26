@@ -33,6 +33,9 @@
 #include <string_view>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#if defined(__linux__)
+#include <sys/mount.h>
+#endif
 #include <thread>
 #include <unistd.h>
 #if defined(__APPLE__)
@@ -441,83 +444,6 @@ fuse_operations operations() {
     return o;
 }
 
-enum class MountTableState : uint8_t {
-    mounted,
-    missing,
-    probe_error,
-};
-
-struct MountTableProbe {
-    MountTableState state{MountTableState::probe_error};
-    int error{EIO};
-};
-
-MountTableProbe probe_mount_table(const std::string& mount) {
-#if defined(__linux__)
-    const auto unescape_mount_field = [](std::string value) {
-        for (const auto& [escaped, plain] :
-             std::array<std::pair<std::string_view, char>, 4>{{{"\\040", ' '}, {"\\011", '\t'},
-                                                               {"\\012", '\n'}, {"\\134", '\\'}}}) {
-            size_t pos = 0;
-            while ((pos = value.find(escaped, pos)) != std::string::npos) {
-                value.replace(pos, escaped.size(), 1, plain);
-                ++pos;
-            }
-        }
-        return value;
-    };
-
-    errno = 0;
-    std::ifstream input("/proc/self/mountinfo");
-    if (!input.is_open())
-        return {MountTableState::probe_error, errno ? errno : EIO};
-
-    std::string line;
-    while (std::getline(input, line)) {
-        std::istringstream fields(line);
-        std::string id, parent, device, root, mounted;
-        if (!(fields >> id >> parent >> device >> root >> mounted)) continue;
-        if (unescape_mount_field(mounted) != mount) continue;
-        auto separator = line.find(" - ");
-        if (separator == std::string::npos)
-            return {MountTableState::mounted, 0};
-        auto tail = line.substr(separator + 3);
-        std::istringstream type_fields(tail);
-        std::string type, source;
-        type_fields >> type >> source;
-        return {source == "macha" || type.starts_with("fuse")
-                    ? MountTableState::mounted
-                    : MountTableState::missing,
-                0};
-    }
-    if (input.bad())
-        return {MountTableState::probe_error, errno ? errno : EIO};
-    return {MountTableState::missing, 0};
-#elif defined(__APPLE__)
-    errno = 0;
-    struct statfs* mounts = nullptr;
-    const int count = getmntinfo(&mounts, MNT_NOWAIT);
-    if (count <= 0)
-        return {MountTableState::probe_error, errno ? errno : EIO};
-    for (int i = 0; i < count; ++i) {
-        if (mount == mounts[i].f_mntonname) {
-            std::string source = mounts[i].f_mntfromname;
-            std::string type = mounts[i].f_fstypename;
-            return {source.find("macha") != std::string::npos ||
-                            type.find("fuse") != std::string::npos ||
-                            type.find("macfuse") != std::string::npos
-                        ? MountTableState::mounted
-                        : MountTableState::missing,
-                    0};
-        }
-    }
-    return {MountTableState::missing, 0};
-#else
-    (void)mount;
-    return {MountTableState::mounted, 0};
-#endif
-}
-
 class CoveredMountpointGuard {
     int fd_{-1};
     mode_t original_mode_{};
@@ -620,8 +546,8 @@ int run_fuse(FileSystem& filesystem, CacheHydrator& hydrator,
             std::this_thread::sleep_for(config.watchdog_interval);
             if (stop.stop_requested()) break;
 
-            const auto probe = probe_mount_table(mount);
-            if (probe.state == MountTableState::mounted) {
+            const auto probe = probe_macha_mountpoint(mount);
+            if (probe.state == MountTableState::macha_fuse) {
                 mount_seen.store(true);
                 consecutive_misses = 0;
                 consecutive_probe_errors = 0;

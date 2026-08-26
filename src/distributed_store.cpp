@@ -11,10 +11,6 @@
 
 namespace macha {
 namespace {
-size_t quorum(size_t n) {
-    return n / 2 + 1;
-}
-
 bool read_aborted(Clock::time_point deadline, const std::atomic_bool* cancelled,
                   const std::function<bool()>& abort = {}) {
     return (cancelled && cancelled->load(std::memory_order_relaxed)) ||
@@ -108,7 +104,10 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
         return false;
     const size_t target = std::min(n_.config().replication, nodes.size());
     const size_t floor = n_.config().min_write_replicas;
-    const size_t need = std::max(quorum(target), floor);
+    // 0.18 makes foreground durability explicit: min_write_replicas is the
+    // publication contract. Desired replication is convergence work performed
+    // by repair, not a latency/quorum rule that changes with current membership.
+    const size_t need = floor;
     if (nodes.size() < floor)
         return false;
 
@@ -130,7 +129,8 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
     size_t success = 0;
     std::vector<DurableReplica> successful_replicas;
     size_t replacement_needed = 0;
-    size_t next_fallback = target;
+    const size_t initial = std::min(floor, nodes.size());
+    size_t next_fallback = initial;
     std::chrono::milliseconds local_store_time{};
     std::chrono::milliseconds remote_max_time{};
 
@@ -213,7 +213,7 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
         }
     };
 
-    for (size_t i = 0; i < target; ++i)
+    for (size_t i = 0; i < initial; ++i)
         launch(nodes[i]);
 
     if (success >= need)
@@ -294,22 +294,9 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
                 return finish(true, need);
         }
 
-        size_t responsive_unfinished = 0;
         size_t unfinished = 0;
-        for (const auto& item : pending) {
-            if (item.done)
-                continue;
-            ++unfinished;
-            if (!item.spilled)
-                ++responsive_unfinished;
-        }
-
-        // Preserve the normal replica quorum while responsive candidates can
-        // still satisfy it. Once every remaining path to that quorum is a
-        // stalled PUT that has already been hedged, allow the explicit durable
-        // floor to commit and let repair restore desired placement later.
-        if (success >= floor && success + responsive_unfinished < need)
-            return finish(true, floor);
+        for (const auto& item : pending)
+            if (!item.done) ++unfinished;
 
         if (success + unfinished + (nodes.size() - next_fallback) < floor)
             break;
@@ -837,31 +824,35 @@ size_t DistributedStore::replicate_all(const ObjectId& id, std::span<const uint8
     return success;
 }
 
-size_t DistributedStore::replicate_metadata_all(const ObjectId& id,
-                                                std::span<const uint8_t> data) {
+size_t DistributedStore::replicate_control(const ObjectId& id,
+                                             std::span<const uint8_t> data,
+                                             const std::vector<NodeId>& metadata_voters) {
     size_t success = 0;
     Writer writer;
     writer.fixed(id.bytes);
     writer.bytes(data);
     const auto payload = writer.take();
 
+    const std::set<NodeId> voters(metadata_voters.begin(), metadata_voters.end());
     for (const auto& target : n_.membership().active()) {
+        if (!voters.contains(target.id))
+            continue;
         try {
             if (target.id == n_.node_id()) {
-                if (n_.local_store().put(id, data))
+                if (n_.control_store().put(id, data))
                     ++success;
                 continue;
             }
 
             auto started = Clock::now();
-            auto reply = n_.call(target, MessageType::put_metadata_object, payload,
+            auto reply = n_.call(target, MessageType::put_control_object, payload,
                                  FrameType::speculative);
             if (reply.message.type == MessageType::ok) {
                 ++success;
                 note_network(data.size(), Clock::now() - started);
             }
         } catch (const std::exception& e) {
-            Log::debug("metadata object write " + target.host + ": " + e.what());
+            Log::debug("control object write " + target.host + ": " + e.what());
         }
     }
     return success;
@@ -908,19 +899,15 @@ bool DistributedStore::ensure_local(const ObjectId& id, bool foreground) {
     return data && n_.local_store().put(id, *data);
 }
 
-bool DistributedStore::ensure_metadata_local(const ObjectId& id) {
-    if (n_.local_store().valid(id))
+bool DistributedStore::ensure_control_local(const ObjectId& id) {
+    if (n_.control_store().valid(id))
         return true;
-    if (auto cached = n_.block_cache().get(id)) {
-        if (n_.local_store().put(id, *cached))
-            return true;
-    }
 
     Writer writer;
     writer.fixed(id.bytes);
     const auto payload = writer.take();
 
-    // Catalogue roots are universal metadata objects rather than DHT data
+    // Control objects are metadata-voter data rather than DHT DATA
     // replicas. Search every currently active peer and keep the transfer on the
     // CONTROL transport while using speculative worker priority so it cannot
     // block health/quorum traffic or require a DATA session to exist.
@@ -929,9 +916,9 @@ bool DistributedStore::ensure_metadata_local(const ObjectId& id) {
             continue;
         try {
             auto started = Clock::now();
-            auto reply = n_.call(target, MessageType::get_metadata_object, payload,
+            auto reply = n_.call(target, MessageType::get_control_object, payload,
                                  FrameType::speculative);
-            if (reply.message.type != MessageType::metadata_object_reply)
+            if (reply.message.type != MessageType::control_object_reply)
                 continue;
 
             Reader reader(reply.message.payload);
@@ -939,14 +926,14 @@ bool DistributedStore::ensure_metadata_local(const ObjectId& id) {
             auto data = reader.bytes(128 * 1024 * 1024);
             reader.finish();
             if (returned != id || object_id(data) != id) {
-                Log::debug("metadata object read " + target.host + ": integrity failure");
+                Log::debug("control object read " + target.host + ": integrity failure");
                 continue;
             }
             note_network(data.size(), Clock::now() - started);
-            if (n_.local_store().put(id, data))
+            if (n_.control_store().put(id, data))
                 return true;
         } catch (const std::exception& e) {
-            Log::debug("metadata object read " + target.host + ": " + e.what());
+            Log::debug("control object read " + target.host + ": " + e.what());
         }
     }
     return false;

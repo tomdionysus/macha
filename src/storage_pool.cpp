@@ -19,6 +19,7 @@
 namespace macha {
 namespace {
 constexpr const char* marker_name = ".macha.backend";
+constexpr std::string_view backend_marker_version = "macha-backend-v18";
 
 std::string read_text(const std::filesystem::path& path) {
     std::ifstream in(path);
@@ -31,15 +32,18 @@ std::string read_text(const std::filesystem::path& path) {
 }
 
 std::string marker_text(const NodeId& node, const NodeId& token) {
-    return to_string(node) + " " + to_string(token);
+    return std::string(backend_marker_version) + " " + to_string(node) + " " + to_string(token);
 }
 
 bool parse_marker(const std::string& text, NodeId& node, NodeId& token) {
-    auto space = text.find(' ');
-    if (space == std::string::npos)
+    const auto first = text.find(' ');
+    if (first == std::string::npos || text.substr(0, first) != backend_marker_version)
         return false;
-    auto n = unhex(text.substr(0, space));
-    auto t = unhex(text.substr(space + 1));
+    const auto second = text.find(' ', first + 1);
+    if (second == std::string::npos)
+        return false;
+    auto n = unhex(text.substr(first + 1, second - first - 1));
+    auto t = unhex(text.substr(second + 1));
     if (!n || !t || n->size() != 16 || t->size() != 16)
         return false;
     std::copy(n->begin(), n->end(), node.bytes.begin());
@@ -67,9 +71,10 @@ struct StoragePool::Backend {
 StoragePool::StoragePool(std::filesystem::path state_path, NodeId node_id,
                          std::vector<StorageBackendConfig> configs,
                          std::array<uint8_t, 32> key,
-                         std::chrono::milliseconds durability_batch_window)
+                         std::chrono::milliseconds durability_batch_window,
+                         StoragePackingConfig packing)
     : state_path_(std::move(state_path)), node_id_(node_id), key_(key),
-      durability_batch_window_(durability_batch_window) {
+      durability_batch_window_(durability_batch_window), packing_(packing) {
     reconfigure(configs);
     refresh();
 }
@@ -192,6 +197,16 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
             deactivate(backend, existing, "known backend marker is absent", generation);
             return false;
         } else {
+            // 0.18 is an explicit fresh-backend format boundary. A directory
+            // without a versioned backend marker is adoptable only when empty;
+            // otherwise old loose objects/pack layouts could be silently
+            // reinterpreted as current authoritative DATA.
+            auto first = std::filesystem::directory_iterator(cfg.path, ec);
+            if (ec)
+                throw std::runtime_error("cannot inspect unversioned backend: " + ec.message());
+            if (first != std::filesystem::directory_iterator())
+                throw std::runtime_error(
+                    "non-empty unversioned storage backend; 0.18 requires an empty backend");
             token = random_node_id();
             token_known = true;
             durable_replace_file(marker, marker_text(node_id_, token) + "\n");
@@ -212,7 +227,12 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
                 std::lock_guard lock(domain_mutex_);
                 instance_id = next_backend_instance_++;
             }
-            store = std::make_shared<LocalStore>(cfg.path, cfg.limit, key_,
+            LocalStoreOptions options;
+            options.limit = cfg.limit;
+            options.reserve_free = cfg.reserve_free;
+            options.pack_threshold = packing_.threshold;
+            options.pack_target_size = packing_.target_size;
+            store = std::make_shared<LocalStore>(cfg.path, options, key_,
                                                  LocalStoreMode::authoritative,
                                                  durability_domain);
         } else {
@@ -225,7 +245,8 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
         {
             std::lock_guard lock(backend->mutex);
             if (backend->generation == generation && backend->configured &&
-                backend->cfg.path == cfg.path && backend->cfg.limit == cfg.limit) {
+                backend->cfg.path == cfg.path && backend->cfg.limit == cfg.limit &&
+                backend->cfg.reserve_free == cfg.reserve_free) {
                 backend->token = token;
                 backend->token_known = token_known;
                 backend->store = store;
@@ -273,8 +294,10 @@ void StoragePool::reconfigure(const std::vector<StorageBackendConfig>& configs) 
             } else {
                 std::lock_guard backend_lock((*existing)->mutex);
                 (*existing)->configured = true;
-                if ((*existing)->cfg.limit != cfg.limit) {
+                if ((*existing)->cfg.limit != cfg.limit ||
+                    (*existing)->cfg.reserve_free != cfg.reserve_free) {
                     (*existing)->cfg.limit = cfg.limit;
+                    (*existing)->cfg.reserve_free = cfg.reserve_free;
                     ++(*existing)->generation;
                     (*existing)->online = false;
                     retired.push_back(std::move((*existing)->store));

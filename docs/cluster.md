@@ -1,48 +1,48 @@
-# Cluster, recovery and transport
+# Cluster and recovery
 
-## Node replacement and recovery
+## Membership
 
-`state_path` contains identity and control-plane state. Deleting it means **this is a new node**, even if it starts on the same machine and storage paths.
+Each node has a persistent random node ID, advertised endpoint, configured failure domain and DATA capacity. Bootstrap endpoints are discovery seeds, not masters. Once connected, peers exchange membership and maintain separate CONTROL and DATA transport lanes.
 
-Committed namespace checkpoints are therefore retained on every active node, not only metadata voters. If an old voter is permanently lost and a fresh replacement joins, the surviving nodes can reconstruct the voter set from an agreed committed checkpoint. The replacement then walks the recovered live-object set and pulls the extents it should own.
+Cluster protocol 18 is deliberately incompatible with earlier storage semantics. Mixed-version operation is rejected.
 
-This is intentionally not a partition escape hatch. Recovery waits until apparently-active peers are either reachable or age out under `dead_after_ms`, requires the surviving committed checkpoints to agree, and requires fresh replacement node(s) for the missing voter seats. If an old voter quorum still exists, normal quorum recovery wins.
-A node configured with bootstrap peers also fails closed before genesis: every active member must complete the committed-checkpoint survey, and any durable post-genesis checkpoint suppresses fresh namespace formation. A transient bootstrap metadata RPC therefore delays formation rather than creating a second empty namespace.
+## Metadata voters
 
-Losing only `storage` is simpler: namespace and node identity survive, and normal object repair restores missing replicas. Losing `state_path` is replacement, not disk failure.
+The configured `dht.metadata_replicas` determines the metadata-voter group. Namespace reads and CAS mutations require majority evidence from that group.
 
-## Metadata and split brain
+A metadata voter is not required to hold every DATA object. Metadata/control authority and bulk DATA ownership are separate responsibilities.
 
-Namespace metadata is a versioned encrypted CAS history held by a configured voter set. The canonical state is a complete snapshot, but ordinary 0.9.0 mutations are transmitted and durably appended as deterministic deltas against an expected generation/hash. Full records are reserved for repair, recovery and policy changes. Reads and mutations still require the same majority evidence from the voter set.
+Catalogue control objects must reach a voter majority before the namespace can reference them and are subsequently converged to all current voters.
 
-For three voters:
+## DATA membership and placement
 
-```text
-3 healthy       quorum 2; read/write
-2 healthy       quorum 2; read/write
-1 healthy       no mutation quorum
-```
+Active nodes advertise currently eligible aggregate DATA capacity. Deterministic capacity-aware placement derives preferred replica owners and fallback candidates for each `ObjectId`.
 
-A metadata minority fails rather than inventing a second history. Read-only access may fall back to the last valid local snapshot when quorum is unavailable; mutations do not.
+Cluster size does not implicitly redefine `min_write_replicas`. If policy allows a degraded floor below `replicas`, publication can proceed at the floor and repair converges later.
 
-The current metadata voter set and data replica count are persisted in the namespace. Replica counts may be changed on a coordinated whole-cluster restart; the old voter majority commits the new policy, then ordinary repair converges existing objects to the new data replica count. `extent_size` remains fixed for the lifetime of the namespace.
+When a node or backend cannot admit a preferred object, writers can use the next deterministic candidate. This is required for heterogeneous capacities.
 
-## Transport
+## Failure domains
 
-A peer pair uses up to two persistent authenticated bidirectional TCP lanes. `CONTROL` carries heartbeat/health, membership and other small protocol operations. `DATA` carries object payloads only. Prioritised metadata remains on CONTROL, and DATA is lazy: ordinary cluster formation establishes CONTROL while the second lane appears only when a node needs object traffic.
+`network.failure_domain` identifies nodes that share a physical/site failure boundary. Placement prefers distinct domains when enough are available. Capacity calculations and replica placement use that topology instead of pretending two stores in the same failure domain are equivalent to two independent sites.
 
-Each lane is canonical independently by authenticated `(NodeId, lane)`, not endpoint text. Simultaneous cross-dial deterministically leaves at most one connection for each lane and drains duplicates before closing them.
+## Recovery
 
-Protocol v15 transfers logical RPCs as variable-length AES-256-GCM frames. The authenticated handshake includes the lane and negotiates `network.max_frame_size` to the lower peer limit. The default is 256 KiB and the allowed range is 4 KiB..4 MiB. Frames are not padded to that size and storage extent size is independent of transport frame size. v14-and-earlier peers are intentionally incompatible.
+Recovery is layered rather than global:
 
-For data-class requests, frame priority is `foreground` > `read_ahead` > `speculative`; scheduling is reconsidered after every frame. Transfer-local promotion and cancellation notifications remain on DATA because object-transfer request IDs are scoped to that lane. Health and membership never share a TCP byte stream with object payloads, so bulk retransmission/head-of-line blocking cannot directly delay liveness traffic.
+1. **state identity** — reject non-empty state that does not carry the fresh storage-layout marker;
+2. **mount preflight** — before services start, verify the configured mountpoint; optionally remove only a stale Macha/FUSE mount;
+3. **DATA backends** — validate backend identity, rebuild accounting after unclean shutdown, reconstruct pack indexes;
+4. **namespace metadata** — recover committed checkpoint/journal state and form voter quorum;
+5. **FUSE journal** — reconstruct accepted local mutations and resume publication;
+6. **catalogue control** — fetch missing manifest/shards from metadata peers and converge them;
+7. **DATA repair** — restore desired placement/replica count from the committed live set;
+8. **cache** — rebuild/discard opportunistically.
 
-The v15 handshake uses ephemeral X25519 authenticated with HMAC from the shared cluster key. Directional keys are derived with HKDF-SHA256. Server dispatch separately services control and data work, with foreground chosen before read-ahead before speculative queued data. User-originated metadata mutations use read-ahead frame priority and background metadata repair uses speculative frame priority, but both remain on the CONTROL transport so foreground object traffic keeps the DATA connection to itself. Health and membership use control-priority frames on CONTROL and therefore pre-empt fragmented metadata there.
+No external catalogue provider is required for correctness recovery.
 
+## Joining and rejoining nodes
 
-### Distributed object durability
+A joining node starts with its own empty DATA/control stores and learns current membership/metadata. DATA objects are pulled only according to placement/repair policy. Catalogue control objects are converged if the node is a metadata voter. Artwork remains ordinary DATA and is not pulled merely because a node votes on metadata.
 
-Transport v15 also carries physical durability tickets for provisional object placement. A deferred PUT acknowledgement names the accepting node process epoch, filesystem durability-domain ID, mutation generation and backend incarnation. Publication asks the remote node to make that exact generation durable; an RPC data worker only waits on the node's `DurabilityDomain` coordinator and never performs `syncfs()` itself. Concurrent publications therefore group-commit on each physical filesystem. Process restart or backend reopen invalidates old tickets. See [Durability architecture](durability.md).
-
-
-Nodes must be mutually reachable at their advertised addresses. There is no STUN, TURN, UPnP or NAT hole punching.
+A returning node's immutable objects are reusable after validation. Placement/repair decides which remain useful; reachability GC eventually removes objects no longer referenced or placed there.

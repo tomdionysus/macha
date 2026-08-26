@@ -1,108 +1,89 @@
-# Catalogue and scanner
+# Catalogue
 
-The catalogue is cluster metadata. Every node converges the complete catalogue snapshot and every referenced artwork object, independently of `dht.replicas`. Catalogue synchronisation runs ahead of ordinary media repair, and catalogue reads synchronise on demand. A node reports `ready: true` only when it has the current catalogue and all referenced artwork locally.
+## Authority
 
-The optional scanner is composed from catalogue providers. Each provider owns the distributed-filesystem roots it is allowed to inspect and applies only its own media parser there. Movies and TV use separate TMDB-backed providers. Music can use multiple metadata providers in priority order: MusicBrainz first, then optional Discogs fallback; album covers come from Cover Art Archive or the matched Discogs release. The scanner itself only schedules traversal, provider work and reconciliation.
+The catalogue is distributed cluster metadata. Scanner/provider processes produce candidate media descriptions, but the committed catalogue is represented by content-addressed CONTROL objects referenced from namespace metadata.
 
-Only the lowest active node ID runs a scan, so a normally configured cluster does not make the same provider requests from every node. Enable the scanner consistently on all nodes if you want automatic failover of that role. Already-bound files are identified by their stable `macha:<sha256>` media identity and are not looked up or downloaded again on every pass. Scanner-owned entries are removed when their final media binding disappears; manually-created catalogue records are not garbage-collected by the scanner.
+External providers are enrichment inputs, not recovery authorities.
 
-Remote metadata work is scheduled round-robin across enabled media providers rather than exhausting Movies before TV or Music. The request budget is a hard HTTP ceiling. If a pass stops at that ceiling, each provider resumes after its last attempted path on the continuation pass, so a persistent miss in one domain cannot repeatedly starve the others. TMDB show/season misses and successful MusicBrainz/Discogs semantic misses are cached for the provider lifetime. MusicBrainz and Discogs transient HTTP/transport failures open a short circuit instead of being retried for every candidate; if every configured music metadata provider is unavailable, that media-domain pass is deferred to the next continuation batch.
+## Structure
 
-Movie and TV filename recognition uses scored candidate inference rather than a single destructive parse. Candidate generators implement `MediaProbeCandidateGenerator` and receive a `MediaProbeContext`, then emit a `MediaProbe`, score and human-readable evidence. The default pipeline currently includes filename-semantic, yearless-TV, directory-structural, compact-title and legacy fallbacks. Strong evidence such as `S02E04`, an adjacent `(2003)` year, agreement with a `Season 2` directory, or a technical boundary such as `1080p`/`BluRay` outweighs weak release-name evidence. The scanner retains the best few distinct candidates and may try up to five provider interpretations within the existing provider request budget. Adding another naming convention is therefore a new generator, not another global regex that can damage unrelated filenames.
-
-Movie editions such as `Extended`, `Remastered` and `Director's Cut` are classified separately from the provider lookup title. TMDB comparison is intentionally more forgiving than display parsing: apostrophes, `&`/`and`, roman/word sequel numbers and `Volume`/`Vol.` are canonicalised for comparison, while exact-year agreement and provider result rank can resolve aliases such as franchise-number filenames without rewriting the local title.
-
-Music is tag-first but no longer single-hypothesis. Embedded container metadata is read once through libavformat over Macha's distributed read path and supplied to the same candidate interface as path evidence. Embedded APIC/attached-picture artwork is captured during that same read and stored as a `cover` artwork candidate alongside provider artwork; different immutable images are retained rather than collapsed merely because they share the same role. The default music candidates include authoritative embedded tags, a recording-first interpretation using the track artist, embedded tags supplemented by structured path fields, and a pure structured-path fallback. Album artist and track artist are kept separately, so compilation albums can retain `Various Artists` album context while recording-first provider lookup still searches by the performing artist. Each candidate is offered to configured music metadata providers in priority order; Discogs uses authenticated database search and release detail as a fallback rather than replacing MusicBrainz identity when MusicBrainz succeeds. `Artist - Title.ext` is recognised, and exact root-relative `Artist/Album/File` (plus `CD 2`/`Disc 2`) layouts remain useful, but arbitrary nested collection/grouping directories are not promoted to artists merely because of their depth. Missing configured provider roots make a scan partial: available roots are still ingested, but destructive reconciliation is suppressed until every configured root can be traversed. Other filesystem errors abort the pass.
-
-The coordinator also reacts to committed namespace mutations. A metadata-generation change starts/restarts `rescan_debounce_ms` (10 seconds by default). Continuous mutation cannot postpone the pending scan beyond `rescan_max_delay_ms` (10 minutes by default), measured from the first unscanned mutation. Before scanning, the coordinator compares a deterministic namespace-content signature and runs only if files/directories actually changed. Catalogue-only metadata commits are excluded from that signature, so a scan cannot trigger itself. The last successfully reconciled namespace signature and next safety-check deadline are persisted under `state_path/catalogue/scanner.state`; daemon restart or coordinator election therefore does not itself launch a library traversal. On the one-time upgrade from releases without `scanner.state`, existing hint state suppresses an immediate restart scan but leaves the seeded identity unverified, so one full reconciliation still occurs at the ordinary safety deadline. Thereafter, at each periodic `interval_ms` deadline Macha first verifies the authoritative namespace signature and only traverses provider roots when that identity changed.
-
-TMDB needs an API Read Access Token. Put the token alone in a file readable by Macha. MusicBrainz does not need an API key, but requires a meaningful contact string and is rate-limited by the provider; Macha spaces its MusicBrainz API requests accordingly. Discogs database search requires authentication; create a personal token and place only the token in a file readable by Macha. Configure only curated media roots:
-
-```yaml
-catalogue:
-  scanner:
-    enabled: true
-    interval_ms: 21600000
-    rescan_debounce_ms: 10000
-    rescan_max_delay_ms: 600000
-    max_artwork_bytes: 16M
-    providers:
-      movies:
-        roots: [/Movies]
-        tmdb:
-          enabled: true
-          token_file: /etc/macha-tmdb.token
-          language: en-GB
-          image_size: w500
-      tv:
-        roots: [/TV]
-        tmdb:
-          enabled: true
-          token_file: /etc/macha-tmdb.token
-          language: en-GB
-          image_size: w500
-      music:
-        roots: [/Music]
-        musicbrainz:
-          enabled: true
-          contact: https://github.com/tomdionysus/macha
-          cover_size: "500"
-        discogs:
-          enabled: false
-          # token_file: /etc/macha-discogs.token
-```
-
-Movies download poster and backdrop artwork. TV downloads show poster/backdrop, season poster and episode stills. Music retains embedded cover art and provider front-cover artwork as separate candidates. Images are stored as immutable Macha objects and committed with the catalogue, so every active node receives the actual image bytes rather than depending on provider URLs at display time.
-
-Enable the API locally:
-
-```yaml
-catalogue:
-  api:
-    enabled: true
-    listen: 127.0.0.1
-    port: 7438
-    # token_file: /etc/macha-api.token
-    max_request_bytes: 8M
-```
-
-Useful endpoints are:
+The catalogue is split into 64 deterministic shards. Item ID determines its shard. A small manifest contains the optional `ObjectId` for each shard.
 
 ```text
-GET    /api/v1/catalogue/status
-GET    /api/v1/catalogue/items?type=show&parent=...
-GET    /api/v1/catalogue/search?q=expanse
-GET    /api/v1/catalogue/items/{id}
-PUT    /api/v1/catalogue/items/{id}
-DELETE /api/v1/catalogue/items/{id}
-DELETE /api/v1/catalogue/items/{id}/metadata
-POST   /api/v1/catalogue/items/{id}/artwork?role=poster&mime=image/jpeg
-GET    /api/v1/catalogue/artwork/{sha256}
+namespace metadata
+      |
+      v
+catalogue manifest (CONTROL)
+      |
+      +--> shard 00 (CONTROL)
+      +--> shard 01 (CONTROL)
+      ...
+      +--> shard 63 (CONTROL)
+
+catalogue item
+      |
+      +--> media IDs / metadata
+      `--> artwork ObjectIds (DATA)
 ```
 
-Item mutations support `If-Match: "rev-N"` and return an `ETag`. `PUT` can mark an item with the internal `macha_metadata_locked=1` external ID so scanner reconciliation preserves manual descriptive changes while still reconciling live media bindings. `DELETE .../metadata` is the destructive rematch operation: it removes the selected catalogue entity and any descendants needed to release leaf media bindings, while leaving the underlying namespace media untouched. The clear operation preserves the released immutable media IDs and queues only their paths for re-enrichment; it does not force a full-library scan or reopen unrelated terminal/no-match hints. A known-current missing item returns 404 from the in-memory catalogue without first performing distributed metadata repair. If `token_file` is configured, clients must send that file's contents as a Bearer token. Keep a remotely exposed API authenticated and firewall-restricted.
+A mutation rewrites only affected shards plus the manifest rather than serializing the complete catalogue for every item.
 
-Replacing or deleting the last reference to artwork records a committed retirement tombstone. The current catalogue root and all artwork referenced by it are part of the same live-object mark set as filesystem extents, so a still-live reference always wins. After `maintenance.garbage_grace_ms` (24 hours by default) the retirement is pruned and each node's bounded reachability sweep removes any old unreachable authoritative copy. A disconnected node does not need to retain or replay the tombstone forever: after rejoining, current catalogue reachability is sufficient to converge deletion.
+## Commit protocol
 
+A catalogue mutation reads the current metadata root and uses optimistic concurrency.
 
-Playback is deliberately separate from catalogue mutation. A playback session may be created from a catalogue `item_id`, in which case Macha evaluates every bound `media_id` and chooses the cheapest compatible representation, or directly from a `media_id`. See [Streaming](streaming.md).
+Before publishing a successor root:
 
-## Cache freshness
+- newly introduced artwork references are verified through ordinary DATA reads;
+- changed shard objects are content-addressed and stored on a metadata-voter majority;
+- the successor manifest is stored on a metadata-voter majority;
+- namespace metadata is CAS-updated from the expected old root to the new root.
 
-Catalogue API reads use a shared decoded in-memory snapshot. Once warm, GET/list/search
-never perform distributed metadata validation or reload a catalogue root on the request
-thread. Metadata generation announcements and `metadata_cache_ms` expiry instead make
-the service control plane converge the catalogue asynchronously. Validation only loads
-a new catalogue object when `catalogue_root` changes; an unchanged content-addressed
-root keeps the same decoded snapshot, and publication of a replacement is atomic.
+A conflicting namespace/catalogue generation retries as a conflict. A metadata/control durability outage is infrastructure unavailability and causes scanner work to defer without consuming semantic/provider attempts.
 
-If metadata validation temporarily fails after a catalogue has already been loaded,
-Macha continues serving that last coherent immutable snapshot and records the refresh error.
-`/api/v1/catalogue/status` exposes both `metadata_generation` (the cached catalogue's
-validated metadata generation) and `known_metadata_generation` (the newest generation
-the node knows exists).
+## Control convergence
 
+Majority durability is enough to commit. Maintenance separately converges the current manifest and all referenced shards to every current metadata voter.
 
-## Persistent catalogue hint queue
+If voter membership changes or a voter loses a control object, the missing immutable object is fetched from another active voter. The committed root remains valid as long as quorum metadata/control authority remains available.
 
-0.14.0 schedules catalogue work through persisted coalescing path hints. Ingest completion, explicit rescans, namespace-mutation discovery and periodic discovery are independent producers with priorities 100, 80, 50 and 10. Duplicate paths coalesce while retaining origin provenance. Provider matches are accumulated for a bounded worker batch and committed together, preserving the previous scanner's efficient one-catalogue-mutation-per-batch behaviour. Complete namespace traversal remains the only source allowed to prune vanished media bindings. See `ARCHITECTURE.md` for the full scheduling model.
+Control garbage collection uses its own live set and grace period. It does not interact with DATA placement.
+
+## Artwork
+
+Artwork is DATA, not CONTROL.
+
+`stage_artwork()` content-addresses the downloaded bytes and writes them through the normal distributed DATA store. It therefore obeys the same rules as media extents:
+
+- capacity-aware preferred owner;
+- deterministic fallback when an owner/backend is full or unavailable;
+- `min_write_replicas` publication floor;
+- repair toward `replicas`;
+- ordinary DATA reachability GC;
+- optional local small-object packing.
+
+A full node can read artwork remotely without first promoting it into its own full authoritative DATA store.
+
+The catalogue item records role, MIME type and `ObjectId`; it never records a pack filename/offset.
+
+## Scanner hints
+
+Namespace discovery produces persisted/coalescing path hints. Provider work is bounded and processed in batches. Prepared matches are reconciled together rather than committing one complete catalogue per media file.
+
+Failures are classified:
+
+- provider/content/parsing failures consume the hint's bounded semantic attempts;
+- catalogue CAS conflicts defer briefly;
+- metadata/control quorum or DATA availability failures defer without incrementing semantic failure count.
+
+This prevents a temporary cluster outage from permanently marking otherwise valid media as failed.
+
+## Maintenance liveness
+
+Catalogue maintenance exports two different live sets:
+
+- artwork `ObjectId`s join the ordinary DATA live set;
+- manifest/shard `ObjectId`s join the CONTROL live set.
+
+Physical GC runs only when the catalogue/metadata view is sufficiently current to make those sets safe.

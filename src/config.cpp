@@ -73,8 +73,21 @@ void validate(Config& config) {
         throw std::runtime_error("at least one storage backend is required");
     for (const auto& backend : config.storage_backends) {
         if (backend.path.empty() || !backend.limit)
-            throw std::runtime_error("each storage backend requires path and nonzero limit");
+            throw std::runtime_error("each storage.data backend requires path and nonzero limit");
     }
+    if (!config.metadata_store.limit)
+        throw std::runtime_error("storage.metadata.limit must be nonzero");
+    const auto validate_packing = [](const StoragePackingConfig& packing, const char* what) {
+        if (!packing.threshold) {
+            if (packing.target_size)
+                throw std::runtime_error(std::string(what) + ".target_size requires a nonzero threshold");
+            return;
+        }
+        if (!packing.target_size || packing.target_size < packing.threshold)
+            throw std::runtime_error(std::string(what) + ".target_size must be >= threshold");
+    };
+    validate_packing(config.storage_packing, "storage.data.packing");
+    validate_packing(config.metadata_store.packing, "storage.metadata.packing");
     if (!config.replication || !config.metadata_replication || !config.min_write_replicas)
         throw std::runtime_error("replication must be nonzero");
     if (config.min_write_replicas > config.replication)
@@ -428,6 +441,7 @@ void parse_fuse(const YAML::Node& root, Config& c) {
     if (f["hint_lifetime_ms"]) c.fuse.hint_lifetime = milliseconds(f["hint_lifetime_ms"], "fuse.hint_lifetime_ms");
     if (f["write_through_cache"]) c.fuse.write_through_cache = f["write_through_cache"].as<bool>();
     if (f["fail_closed_mountpoint"]) c.fuse.fail_closed_mountpoint = f["fail_closed_mountpoint"].as<bool>();
+    if (f["unmount_if_mounted"]) c.fuse.unmount_if_mounted = f["unmount_if_mounted"].as<bool>();
     if (f["watchdog_interval_ms"]) c.fuse.watchdog_interval = milliseconds(f["watchdog_interval_ms"], "fuse.watchdog_interval_ms");
     if (auto t = f["timeouts"]) {
         if (t["lookup_ms"]) c.fuse.timeouts.lookup = milliseconds(t["lookup_ms"], "fuse.timeouts.lookup_ms");
@@ -602,9 +616,8 @@ void parse_streaming(const YAML::Node& root, Config& c) {
         return;
     if (streaming["enabled"])
         c.streaming.enabled = streaming["enabled"].as<bool>();
-    // 0.7.0 originally exposed ffmpeg/ffprobe executable paths. The libav
-    // backend no longer uses them, but silently tolerate those keys so an
-    // existing 0.7.0 configuration keeps starting after this replacement.
+    // Legacy executable-path keys are accepted but ignored; media execution is
+    // in-process through libav.
     if (streaming["temp_path"])
         c.streaming.temp_path = std::filesystem::path(streaming["temp_path"].as<std::string>());
     if (streaming["max_sessions"])
@@ -741,6 +754,8 @@ Endpoint parse_endpoint(const std::string& value, uint16_t default_port) {
 }
 
 Config normalize_config(Config c) {
+    if (c.metadata_store.path.empty() && !c.state_path.empty())
+        c.metadata_store.path = c.state_path / "metadata-objects";
     validate(c);
     return c;
 }
@@ -773,13 +788,43 @@ Config load_yaml_config(const std::filesystem::path& path) {
         c.ffmpeg_log_level = parse_ffmpeg_log_level(root["ffmpeg_log_level"].as<std::string>());
 
     auto storage = root["storage"];
-    if (!storage || !storage.IsSequence())
-        throw std::runtime_error("storage must be a sequence of backends");
-    for (const auto& item : storage) {
+    if (!storage || !storage.IsMap())
+        throw std::runtime_error("storage must be a mapping with data and metadata sections");
+    auto data_storage = storage["data"];
+    if (!data_storage || !data_storage.IsMap())
+        throw std::runtime_error("storage.data must be a mapping");
+    auto backends = data_storage["backends"];
+    if (!backends || !backends.IsSequence())
+        throw std::runtime_error("storage.data.backends must be a sequence");
+    for (const auto& item : backends) {
         StorageBackendConfig backend;
+        if (!item["path"] || !item["limit"])
+            throw std::runtime_error("storage.data backend requires path and limit");
         backend.path = item["path"].as<std::string>();
         backend.limit = yaml_size(item["limit"]);
+        if (item["reserve_free"])
+            backend.reserve_free = yaml_size(item["reserve_free"]);
         c.storage_backends.push_back(std::move(backend));
+    }
+    if (auto packing = data_storage["packing"]) {
+        if (packing["threshold"])
+            c.storage_packing.threshold = static_cast<size_t>(yaml_size(packing["threshold"]));
+        if (packing["target_size"])
+            c.storage_packing.target_size = static_cast<size_t>(yaml_size(packing["target_size"]));
+    }
+    if (auto metadata = storage["metadata"]) {
+        if (!metadata.IsMap())
+            throw std::runtime_error("storage.metadata must be a mapping");
+        if (metadata["path"])
+            c.metadata_store.path = metadata["path"].as<std::string>();
+        if (metadata["limit"])
+            c.metadata_store.limit = yaml_size(metadata["limit"]);
+        if (auto packing = metadata["packing"]) {
+            if (packing["threshold"])
+                c.metadata_store.packing.threshold = static_cast<size_t>(yaml_size(packing["threshold"]));
+            if (packing["target_size"])
+                c.metadata_store.packing.target_size = static_cast<size_t>(yaml_size(packing["target_size"]));
+        }
     }
 
     auto cache = root["cache"];

@@ -49,40 +49,11 @@ observable production state or a `TestGate` so the test proves the competing ope
 entered the state being tested. Deliberate time-policy tests may scale the policy interval while
 keeping the same ordering/ratio invariant.
 
-## 0.15.0 coverage-preservation contract
+## Regression ownership
 
-The pre-0.15 suite contained 83 functional cases in `test_main.cpp` and 14 separate architecture
-regressions: 97 named scenarios in total. All were inventoried before the old sources were removed.
+The suite is organized by current invariants rather than by historical release migrations. When a test is consolidated or moved, preserve the underlying failure situation in the owning subsystem and retain process-shaped restart/network coverage wherever a pure state test cannot reproduce the lifecycle.
 
-95 legacy scenario names remain directly represented in the unified suite. The only two removed
-architecture implementations are exact duplicates of stronger owning tests:
-
-| Removed architecture case | Owning replacement |
-| --- | --- |
-| `test_unreferenced_fuse_spool_is_preserved_without_killing_frontend` | `test_fuse_durable_journal_preserves_unreferenced_spool` exercises startup, quarantine and continued frontend operation |
-| `test_local_store_put_repairs_corrupt_existing_object_before_ack` | `test_local_store` performs corrupt-existing -> verified re-put -> verified read as part of the LocalStore contract |
-
-The two historical FUSE torn-tail lifecycle tests are deliberately retained. They still prove real
-file truncation/restart wiring. Additional exhaustive coverage is cheap: the runtime journal-frame
-scanner is a production component and `test_fuse_journal_frame_scanner_exhaustive_tail_model`
-exercises every possible cut inside the next valid frame, full-length invalid-checksum EOF recovery,
-mid-journal corruption rejection, and fully valid framing without repeating a frontend restart.
-
-The unified suite additionally adds state/property coverage for:
-
-- metadata delta encode/decode/apply across 96 successive namespace/catalogue/garbage/idempotency
-  transitions, with full-snapshot round-trip agreement at every state;
-- hydration scheduler ordering, reinforcement, fairness and blocked-prefix semantics;
-- deterministic capacity placement across 256 keys, every replica count, failure-domain diversity,
-  and the R=1 monotonic-addition property over 1024 keys;
-- durable atomic replacement with empty, binary and large payloads;
-- torrent fetch URL safety and magnet sanitisation; and
-- every `TorrentJobState`, `IngestJobState` and `CatalogueHintState` name/parse round trip.
-
-This is a coverage-preserving migration by *situation*, not by test-file shape or raw assertion count.
-Expensive process-shaped tests prove real wiring; combinatorial state-space coverage calls the actual
-production state machine/policy directly instead of replaying the complete server lifecycle for every
-row.
+State/property coverage complements integration tests for metadata deltas, placement, hydration scheduling, durable replacement, ingest safety and enum/state round trips. The purpose is to prove production algorithms over broad state spaces without replacing the crash, restart and network tests that validate real wiring.
 
 ## Quantitative coverage
 
