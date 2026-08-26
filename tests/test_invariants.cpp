@@ -957,20 +957,23 @@ MACHA_TEST("invariants", test_control_plane_hint_admission_is_storage_durable) {
 
 MACHA_TEST("invariants", test_deferred_object_barrier_rejects_stale_process_epoch) {
     TestCluster cluster(ConfigProfile::isolated);
-    auto config = cluster.node_config("durability-epoch");
-    config.replication = 1;
-    config.metadata_replication = 1;
-    NodeRuntime node(config, cluster.keys());
-    node.start();
+    auto server_config = cluster.node_config("durability-epoch-server");
+    auto client_config = cluster.node_config("durability-epoch-client");
+    server_config.replication = client_config.replication = 1;
+    server_config.metadata_replication = client_config.metadata_replication = 1;
+    NodeRuntime server(server_config, cluster.keys());
+    NodeRuntime client(client_config, cluster.keys());
+    server.start();
+    client.start();
 
     const auto bytes = pattern(64 * 1024, 46);
     const auto id = object_id(bytes);
     Writer request;
     request.fixed(id.bytes);
     request.bytes(bytes);
-    const Endpoint endpoint{"127.0.0.1", config.port};
-    auto placed = node.call(endpoint, MessageType::put_object_deferred, request.data(),
-                            FrameType::read_ahead);
+    const Endpoint endpoint{"127.0.0.1", server_config.port};
+    auto placed = client.call(endpoint, MessageType::put_object_deferred, request.data(),
+                              FrameType::read_ahead);
     REQUIRE(placed.message.type == MessageType::ok);
     Reader placed_reply(placed.message.payload);
     NodeId acknowledged_epoch{placed_reply.fixed<16>()};
@@ -978,7 +981,7 @@ MACHA_TEST("invariants", test_deferred_object_barrier_rejects_stale_process_epoc
     const auto generation = placed_reply.u64();
     const auto backend_instance = placed_reply.u64();
     placed_reply.finish();
-    CHECK(acknowledged_epoch == node.durability_epoch());
+    CHECK(acknowledged_epoch == server.durability_epoch());
 
     auto barrier_payload = [&](const NodeId& epoch) {
         Writer writer;
@@ -993,26 +996,30 @@ MACHA_TEST("invariants", test_deferred_object_barrier_rejects_stale_process_epoc
     while (wrong_epoch == acknowledged_epoch)
         wrong_epoch = random_node_id();
     auto stale = barrier_payload(wrong_epoch);
-    auto rejected = node.call(endpoint, MessageType::object_durability_barrier, stale,
-                              FrameType::read_ahead);
+    auto rejected = client.call(endpoint, MessageType::object_durability_barrier, stale,
+                                FrameType::read_ahead);
     CHECK(rejected.message.type == MessageType::error);
 
     auto current = barrier_payload(acknowledged_epoch);
-    auto durable = node.call(endpoint, MessageType::object_durability_barrier, current,
-                             FrameType::read_ahead);
+    auto durable = client.call(endpoint, MessageType::object_durability_barrier, current,
+                               FrameType::read_ahead);
     CHECK(durable.message.type == MessageType::ok);
-    node.stop();
+    client.stop();
+    server.stop();
 }
 
 MACHA_TEST("invariants", test_rpc_durability_barrier_group_commits_independent_publications) {
 #if defined(__linux__)
     TestCluster cluster(ConfigProfile::isolated);
-    auto config = cluster.node_config("durability-group-rpc");
-    config.replication = 1;
-    config.metadata_replication = 1;
-    NodeRuntime node(config, cluster.keys());
-    node.start();
-    const Endpoint endpoint{"127.0.0.1", config.port};
+    auto server_config = cluster.node_config("durability-group-rpc-server");
+    auto client_config = cluster.node_config("durability-group-rpc-client");
+    server_config.replication = client_config.replication = 1;
+    server_config.metadata_replication = client_config.metadata_replication = 1;
+    NodeRuntime server(server_config, cluster.keys());
+    NodeRuntime client(client_config, cluster.keys());
+    server.start();
+    client.start();
+    const Endpoint endpoint{"127.0.0.1", server_config.port};
 
     struct RemoteToken {
         NodeId epoch{};
@@ -1025,7 +1032,7 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_group_commits_independent_p
         Writer request;
         request.fixed(object_id(bytes).bytes);
         request.bytes(bytes);
-        auto reply = node.call(endpoint, MessageType::put_object_deferred, request.data(),
+        auto reply = client.call(endpoint, MessageType::put_object_deferred, request.data(),
                                FrameType::read_ahead);
         REQUIRE(reply.message.type == MessageType::ok);
         Reader reader(reply.message.payload);
@@ -1043,7 +1050,7 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_group_commits_independent_p
         request.u64(token.domain);
         request.u64(token.generation);
         request.u64(token.backend_instance);
-        return node.call(endpoint, MessageType::object_durability_barrier, request.data(),
+        return client.call(endpoint, MessageType::object_durability_barrier, request.data(),
                          FrameType::read_ahead);
     };
 
@@ -1070,7 +1077,8 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_group_commits_independent_p
     CHECK(a.backend_instance == b.backend_instance);
     CHECK(b.backend_instance == c.backend_instance);
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
-    node.stop();
+    client.stop();
+    server.stop();
 #else
     std::cout << "[ARCH-REGRESSION] RPC group-commit check is Linux-only; skipped\n";
 #endif
@@ -1079,12 +1087,15 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_group_commits_independent_p
 MACHA_TEST("invariants", test_rpc_durability_barrier_reuses_already_covered_generation) {
 #if defined(__linux__)
     TestCluster cluster(ConfigProfile::isolated);
-    auto config = cluster.node_config("durability-generation-rpc");
-    config.replication = 1;
-    config.metadata_replication = 1;
-    NodeRuntime node(config, cluster.keys());
-    node.start();
-    const Endpoint endpoint{"127.0.0.1", config.port};
+    auto server_config = cluster.node_config("durability-generation-rpc-server");
+    auto client_config = cluster.node_config("durability-generation-rpc-client");
+    server_config.replication = client_config.replication = 1;
+    server_config.metadata_replication = client_config.metadata_replication = 1;
+    NodeRuntime server(server_config, cluster.keys());
+    NodeRuntime client(client_config, cluster.keys());
+    server.start();
+    client.start();
+    const Endpoint endpoint{"127.0.0.1", server_config.port};
 
     struct RemoteToken {
         NodeId epoch{};
@@ -1097,7 +1108,7 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_reuses_already_covered_gene
         Writer request;
         request.fixed(object_id(bytes).bytes);
         request.bytes(bytes);
-        auto reply = node.call(endpoint, MessageType::put_object_deferred, request.data(),
+        auto reply = client.call(endpoint, MessageType::put_object_deferred, request.data(),
                                FrameType::read_ahead);
         REQUIRE(reply.message.type == MessageType::ok);
         Reader reader(reply.message.payload);
@@ -1115,7 +1126,7 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_reuses_already_covered_gene
         request.u64(token.domain);
         request.u64(token.generation);
         request.u64(token.backend_instance);
-        return node.call(endpoint, MessageType::object_durability_barrier, request.data(),
+        return client.call(endpoint, MessageType::object_durability_barrier, request.data(),
                          FrameType::read_ahead);
     };
 
@@ -1154,7 +1165,8 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_reuses_already_covered_gene
     track_fsync = false;
     REQUIRE(latest.message.type == MessageType::ok);
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 1);
-    node.stop();
+    client.stop();
+    server.stop();
 #else
     std::cout << "[ARCH-REGRESSION] RPC generation reuse check is Linux-only; skipped\n";
 #endif
