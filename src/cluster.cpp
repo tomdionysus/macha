@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster.hpp"
 #include "diagnostics.hpp"
+#include "durable_file.hpp"
 
 #include "codec.hpp"
 #include "log.hpp"
 
 #include <algorithm>
+#include <fstream>
 #include <set>
 #include <thread>
 #include <unistd.h>
@@ -68,13 +70,45 @@ int64_t activity_now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch())
         .count();
 }
+
+NodeId load_v18_node_id(const std::filesystem::path& state) {
+    static constexpr std::string_view expected = "macha-state-layout-v18";
+    const auto marker = state / "storage-layout";
+    if (std::filesystem::exists(marker)) {
+        std::ifstream input(marker);
+        std::string value;
+        std::getline(input, value);
+        if (!input && value.empty())
+            throw std::runtime_error("cannot read storage layout marker");
+        if (value != expected)
+            throw std::runtime_error("incompatible Macha storage layout; 0.18 requires a fresh namespace");
+    } else {
+        // 0.18 intentionally has no live migration path. Refuse to reinterpret an
+        // older namespace/backend layout as the new storage contract. StorageLock
+        // has already created .macha.lock, which is the only allowed pre-existing
+        // entry for a fresh state directory.
+        for (const auto& entry : std::filesystem::directory_iterator(state)) {
+            if (entry.path().filename() == ".macha.lock") continue;
+            throw std::runtime_error(
+                "existing unversioned Macha state detected; 0.18 requires a fresh namespace");
+        }
+        durable_replace_file(marker, std::string(expected) + "\n");
+    }
+    return load_or_create_node_id(state);
+}
 } // namespace
 
 NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
     : cfg_(normalize_config(std::move(config))), keys_(keys), state_lock_(cfg_.state_path),
-      id_(load_or_create_node_id(cfg_.state_path)),
+      id_(load_v18_node_id(cfg_.state_path)),
       durability_epoch_(random_node_id()),
-      local_(cfg_.state_path, id_, cfg_.storage_backends, keys_.storage),
+      local_(cfg_.state_path, id_, cfg_.storage_backends, keys_.storage,
+             std::chrono::milliseconds(500), cfg_.storage_packing),
+      control_(cfg_.metadata_store.path,
+               LocalStoreOptions{cfg_.metadata_store.limit, 0,
+                                 cfg_.metadata_store.packing.threshold,
+                                 cfg_.metadata_store.packing.target_size},
+               keys_.storage),
       cache_(cfg_.cache, keys_.storage),
       meta_(cfg_.state_path, keys_.storage, cache_.metadata()),
       members_(self_info(cfg_, id_, local_.used(), local_.limit(), meta_.committed().generation),
@@ -181,9 +215,7 @@ void NodeRuntime::request_stop() {
 std::chrono::milliseconds NodeRuntime::stall_notice_for(MessageType type) const {
     if (type == MessageType::get_object || type == MessageType::put_object ||
         type == MessageType::put_object_deferred ||
-        type == MessageType::object_durability_barrier ||
-        type == MessageType::get_metadata_object ||
-        type == MessageType::put_metadata_object)
+        type == MessageType::object_durability_barrier)
         return cfg_.data_stall_notice;
     return cfg_.control_stall_notice;
 }
@@ -358,8 +390,7 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             writer.u8(local_.valid(id));
             return {MessageType::bool_reply, writer.take()};
         }
-        case MessageType::get_object:
-        case MessageType::get_metadata_object: {
+        case MessageType::get_object: {
             Reader reader(request.payload);
             ObjectId id{reader.fixed<32>()};
             reader.finish();
@@ -370,14 +401,22 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             Writer writer;
             writer.fixed(id.bytes);
             writer.bytes(*data);
-            const auto reply = request.type == MessageType::get_metadata_object
-                                   ? MessageType::metadata_object_reply
-                                   : MessageType::object_reply;
-            return {reply, writer.take()};
+            return {MessageType::object_reply, writer.take()};
+        }
+        case MessageType::get_control_object: {
+            Reader reader(request.payload);
+            ObjectId id{reader.fixed<32>()};
+            reader.finish();
+            auto data = control_.get(id);
+            if (!data)
+                return error_reply("control object not found");
+            Writer writer;
+            writer.fixed(id.bytes);
+            writer.bytes(*data);
+            return {MessageType::control_object_reply, writer.take()};
         }
         case MessageType::put_object:
-        case MessageType::put_object_deferred:
-        case MessageType::put_metadata_object: {
+        case MessageType::put_object_deferred: {
             Reader reader(request.payload);
             ObjectId id{reader.fixed<32>()};
             auto data = reader.bytes(128 * 1024 * 1024);
@@ -402,6 +441,15 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             if (!local_.put(id, data))
                 return error_reply("storage limit reached");
             members_.storage(local_.used(), local_.limit());
+            return {MessageType::ok, {}};
+        }
+        case MessageType::put_control_object: {
+            Reader reader(request.payload);
+            ObjectId id{reader.fixed<32>()};
+            auto data = reader.bytes(128 * 1024 * 1024);
+            reader.finish();
+            if (!control_.put(id, data))
+                return error_reply("control storage limit reached");
             return {MessageType::ok, {}};
         }
         case MessageType::object_durability_barrier: {

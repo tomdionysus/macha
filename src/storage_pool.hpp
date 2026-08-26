@@ -55,6 +55,7 @@ class StoragePool {
     NodeId node_id_;
     std::array<uint8_t, 32> key_{};
     std::chrono::milliseconds durability_batch_window_{500};
+    StoragePackingConfig packing_{};
     mutable std::mutex mutex_;
     std::vector<std::shared_ptr<Backend>> backends_;
     mutable std::mutex domain_mutex_;
@@ -85,7 +86,8 @@ class StoragePool {
   public:
     StoragePool(std::filesystem::path state_path, NodeId, std::vector<StorageBackendConfig>,
                 std::array<uint8_t, 32> key,
-                std::chrono::milliseconds durability_batch_window = std::chrono::milliseconds(500));
+                std::chrono::milliseconds durability_batch_window = std::chrono::milliseconds(500),
+                StoragePackingConfig packing = StoragePackingConfig{0, 0});
     void reconfigure(const std::vector<StorageBackendConfig>&);
     void refresh();
 

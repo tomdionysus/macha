@@ -37,8 +37,8 @@ enum class MessageType : uint16_t {
     cancel_transfer = 16,
     commit_metadata = 17,
     cas_metadata_delta = 18,
-    get_metadata_object = 19,
-    put_metadata_object = 20,
+    get_control_object = 19,
+    put_control_object = 20,
     get_metadata_identity = 21,
     put_object_deferred = 22,
     object_durability_barrier = 23,
@@ -49,7 +49,7 @@ enum class MessageType : uint16_t {
     object_reply = 104,
     metadata_reply = 105,
     cas_reply = 106,
-    metadata_object_reply = 107,
+    control_object_reply = 107,
     metadata_identity_reply = 108
 };
 

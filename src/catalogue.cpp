@@ -13,7 +13,9 @@
 
 namespace macha {
 namespace {
-constexpr std::array<uint8_t, 8> magic{'M', 'C', 'A', 'T', '0', '0', '0', '1'};
+constexpr std::array<uint8_t, 8> magic{'M', 'C', 'A', 'T', '0', '0', '1', '8'};
+constexpr std::array<uint8_t, 8> manifest_magic{'M', 'C', 'R', 'O', 'O', 'T', '1', '8'};
+constexpr size_t catalogue_shard_count = 64;
 
 void optional_i32(Writer& w, const std::optional<int32_t>& value) {
     w.u8(value.has_value());
@@ -117,6 +119,53 @@ void record_garbage_upsert(MetadataDelta& delta, const GarbageRef& garbage) {
         delta.upsert_garbage.push_back(garbage);
     else
         *existing = garbage;
+}
+
+
+struct CatalogueManifest {
+    std::array<std::optional<ObjectId>, catalogue_shard_count> shards;
+};
+
+size_t catalogue_shard(std::string_view id) {
+    const auto hash = sha256({reinterpret_cast<const uint8_t*>(id.data()), id.size()});
+    uint64_t value = 0;
+    for (size_t i = 0; i < sizeof(value); ++i)
+        value = (value << 8) | hash.bytes[i];
+    return value % catalogue_shard_count;
+}
+
+Bytes encode_catalogue_manifest(const CatalogueManifest& manifest) {
+    Writer writer;
+    writer.raw(manifest_magic);
+    writer.u32(catalogue_shard_count);
+    for (const auto& shard : manifest.shards) {
+        writer.u8(shard.has_value());
+        if (shard) writer.fixed(shard->bytes);
+    }
+    return writer.take();
+}
+
+CatalogueManifest decode_catalogue_manifest(std::span<const uint8_t> bytes) {
+    Reader reader(bytes);
+    const auto magic_bytes = reader.raw(manifest_magic.size());
+    if (!std::equal(magic_bytes.begin(), magic_bytes.end(), manifest_magic.begin()))
+        throw DecodeError("bad catalogue manifest");
+    if (reader.u32() != catalogue_shard_count)
+        throw DecodeError("unsupported catalogue shard count");
+    CatalogueManifest manifest;
+    for (auto& shard : manifest.shards) {
+        if (reader.u8()) shard = ObjectId{reader.fixed<32>()};
+    }
+    reader.finish();
+    return manifest;
+}
+
+std::array<CatalogueSnapshot, catalogue_shard_count>
+shard_catalogue(const CatalogueSnapshot& snapshot) {
+    std::array<CatalogueSnapshot, catalogue_shard_count> shards;
+    for (const auto& [id, item] : snapshot.items)
+        shards[catalogue_shard(id)].items.emplace(id, item);
+    return shards;
 }
 
 bool valid_kind(uint8_t value) {
@@ -257,20 +306,108 @@ std::set<ObjectId> CatalogueManager::artwork_ids(const CatalogueSnapshot& snapsh
     return ids;
 }
 
-size_t CatalogueManager::durability_required(const MetadataSnapshot& metadata, size_t active) {
-    const size_t voters = std::max<size_t>(1, metadata.metadata_voters.size());
-    return std::min(active, voters / 2 + 1);
+size_t CatalogueManager::durability_required(const MetadataSnapshot& metadata) {
+    if (metadata.metadata_voters.empty())
+        throw std::runtime_error("catalogue metadata voter set is empty");
+    return metadata.metadata_voters.size() / 2 + 1;
 }
 
 CatalogueSnapshot CatalogueManager::load_root(const std::optional<ObjectId>& root) {
     if (!root)
         return {};
-    if (!store_.ensure_metadata_local(*root))
-        throw std::runtime_error("catalogue root object unavailable");
-    auto data = node_.local_store().get(*root);
-    if (!data)
-        throw std::runtime_error("catalogue root object unavailable locally");
-    return decode_catalogue(*data);
+    if (!store_.ensure_control_local(*root))
+        throw CatalogueUnavailable("catalogue manifest unavailable");
+    auto encoded_manifest = node_.control_store().get(*root);
+    if (!encoded_manifest)
+        throw CatalogueUnavailable("catalogue manifest unavailable locally");
+    const auto manifest = decode_catalogue_manifest(*encoded_manifest);
+    CatalogueSnapshot snapshot;
+    for (const auto& shard_id : manifest.shards) {
+        if (!shard_id) continue;
+        if (!store_.ensure_control_local(*shard_id))
+            throw CatalogueUnavailable("catalogue shard unavailable: " + to_string(*shard_id));
+        auto encoded_shard = node_.control_store().get(*shard_id);
+        if (!encoded_shard)
+            throw CatalogueUnavailable("catalogue shard unavailable locally: " + to_string(*shard_id));
+        auto shard = decode_catalogue(*encoded_shard);
+        for (auto& [id, item] : shard.items) {
+            if (!snapshot.items.emplace(id, std::move(item)).second)
+                throw std::runtime_error("catalogue item appears in multiple shards");
+        }
+    }
+    return snapshot;
+}
+
+bool CatalogueManager::converge_control_replicas(const MetadataSnapshot& metadata) {
+    const auto root = metadata.catalogue_root;
+    if (!root) {
+        std::lock_guard lock(mutex_);
+        control_converged_root_.reset();
+        control_converged_voters_ = metadata.metadata_voters;
+        control_convergence_retry_ = {};
+        return true;
+    }
+
+    {
+        std::lock_guard lock(mutex_);
+        if (control_converged_root_ == root &&
+            control_converged_voters_ == metadata.metadata_voters)
+            return true;
+        if (Clock::now() < control_convergence_retry_)
+            return false;
+    }
+
+    try {
+        if (!store_.ensure_control_local(*root))
+            throw CatalogueUnavailable("catalogue manifest unavailable for control repair");
+        auto encoded_manifest = node_.control_store().get(*root);
+        if (!encoded_manifest)
+            throw CatalogueUnavailable("catalogue manifest unavailable locally for control repair");
+        const auto manifest = decode_catalogue_manifest(*encoded_manifest);
+
+        std::vector<std::pair<ObjectId, Bytes>> objects;
+        objects.reserve(catalogue_shard_count + 1);
+        objects.push_back({*root, std::move(*encoded_manifest)});
+        for (const auto& shard_id : manifest.shards) {
+            if (!shard_id) continue;
+            if (!store_.ensure_control_local(*shard_id))
+                throw CatalogueUnavailable("catalogue shard unavailable for control repair: " +
+                                           to_string(*shard_id));
+            auto encoded = node_.control_store().get(*shard_id);
+            if (!encoded)
+                throw CatalogueUnavailable("catalogue shard unavailable locally for control repair: " +
+                                           to_string(*shard_id));
+            objects.push_back({*shard_id, std::move(*encoded)});
+        }
+
+        bool complete = true;
+        for (const auto& [id, encoded] : objects) {
+            if (store_.replicate_control(id, encoded, metadata.metadata_voters) <
+                metadata.metadata_voters.size())
+                complete = false;
+        }
+
+        std::lock_guard lock(mutex_);
+        if (complete) {
+            control_converged_root_ = root;
+            control_converged_voters_ = metadata.metadata_voters;
+            control_convergence_retry_ = {};
+        } else {
+            // Publication only needs a metadata-voter majority. Missing/offline
+            // voters are convergence debt and must not invalidate a readable
+            // committed catalogue. Retry at a bounded cadence.
+            control_converged_root_.reset();
+            control_converged_voters_.clear();
+            control_convergence_retry_ = Clock::now() + std::chrono::seconds(5);
+        }
+        return complete;
+    } catch (...) {
+        std::lock_guard lock(mutex_);
+        control_converged_root_.reset();
+        control_converged_voters_.clear();
+        control_convergence_retry_ = Clock::now() + std::chrono::seconds(5);
+        throw;
+    }
 }
 
 void CatalogueManager::cache(uint64_t metadata_generation, const MetadataSnapshot& metadata,
@@ -296,8 +433,11 @@ void CatalogueManager::repair_once() {
             std::lock_guard lock(mutex_);
             const auto now = Clock::now();
             if (ready_ && cached_metadata_generation_ >= node_.known_metadata_generation() &&
-                now < cache_until_)
-                return;
+                now < cache_until_ && control_converged_root_ == cached_root_) {
+                auto view = metadata_.available_snapshot_view();
+                if (view && control_converged_voters_ == view->snapshot->metadata_voters)
+                    return;
+            }
         }
 
         // MetadataManager is the owner of authoritative/quorum metadata reads.
@@ -324,6 +464,7 @@ void CatalogueManager::repair_once() {
 
         const auto generation = view->generation;
         const auto& metadata = *view->snapshot;
+        const bool control_converged = converge_control_replicas(metadata);
         {
             std::lock_guard lock(mutex_);
             if (ready_ && cached_root_ == metadata.catalogue_root) {
@@ -335,7 +476,10 @@ void CatalogueManager::repair_once() {
                 cached_metadata_generation_ = generation;
                 cache_until_ = Clock::now() + node_.config().metadata_cache;
                 last_sync_unix_ms_ = unix_ms();
-                error_.clear();
+                if (control_converged)
+                    error_.clear();
+                else
+                    error_ = "catalogue control replicas are converging";
                 return;
             }
         }
@@ -403,7 +547,7 @@ CatalogueStatus CatalogueManager::status() const {
     status.artwork_objects = art.size();
     for (const auto& id : art)
         status.local_artwork_objects += node_.local_store().has(id) ? 1 : 0;
-    const bool root_local = !status.root || node_.local_store().has(*status.root);
+    const bool root_local = !status.root || node_.control_store().has(*status.root);
     status.ready = status.ready && root_local;
     return status;
 }
@@ -462,9 +606,12 @@ void CatalogueManager::commit(const std::optional<ObjectId>& expected_root,
                               const CatalogueSnapshot& next,
                               const std::set<ObjectId>& old_artwork,
                               std::optional<Hash256> expected_namespace) {
-    auto encoded = encode_catalogue(next);
-    auto root = object_id(encoded);
-    auto metadata_record = metadata_.read_record();
+    MetadataRecord metadata_record;
+    try {
+        metadata_record = metadata_.read_record();
+    } catch (const std::exception& e) {
+        throw CatalogueUnavailable(std::string("catalogue metadata unavailable: ") + e.what());
+    }
     auto metadata_snapshot = decode_snapshot(metadata_record.payload);
     if (metadata_snapshot.catalogue_root != expected_root)
         throw CatalogueConflict("catalogue changed concurrently");
@@ -472,33 +619,57 @@ void CatalogueManager::commit(const std::optional<ObjectId>& expected_root,
         metadata_namespace_signature(metadata_snapshot) != *expected_namespace)
         throw CatalogueConflict("namespace changed during catalogue reconciliation");
 
-    const auto active = node_.membership().active();
-    const auto required = durability_required(metadata_snapshot, active.size());
-    auto new_artwork = artwork_ids(next);
+    const auto required = durability_required(metadata_snapshot);
+    const auto new_artwork = artwork_ids(next);
 
-    const auto root_copies = store_.replicate_metadata_all(root, encoded);
-    if (root_copies < required) {
-        // Never synchronously erase staged content here. Catalogue staging is
-        // content-addressed and can race another successful commit which makes
-        // the same hash live after any reachability check we could perform.
-        // Unreferenced staging is an ordinary orphan and is reclaimed safely by
-        // the grace-period reachability collector.
-        throw std::runtime_error("catalogue root could not reach metadata durability quorum");
-    }
-
+    // Artwork is ordinary immutable DATA. Validate only newly introduced references;
+    // unchanged artwork was already proven by the committed catalogue. DHT placement,
+    // fallback, replication and repair are exactly the same as for media objects.
     for (const auto& id : new_artwork) {
-        auto data = node_.local_store().get(id);
-        if (!data) {
-            if (!store_.ensure_local(id, false)) {
-                throw std::runtime_error("referenced artwork object is unavailable: " +
-                                         to_string(id));
-            }
-            data = node_.local_store().get(id);
-        }
-        if (!data || store_.replicate_all(id, *data, false) < required) {
-            throw std::runtime_error("artwork could not reach metadata durability quorum");
-        }
+        if (old_artwork.contains(id)) continue;
+        if (!store_.get(id, 0, FrameType::speculative))
+            throw CatalogueUnavailable("referenced artwork object is unavailable: " + to_string(id));
     }
+
+    CatalogueManifest old_manifest;
+    if (expected_root) {
+        if (!store_.ensure_control_local(*expected_root))
+            throw CatalogueUnavailable("current catalogue manifest unavailable");
+        auto encoded = node_.control_store().get(*expected_root);
+        if (!encoded)
+            throw CatalogueUnavailable("current catalogue manifest unavailable locally");
+        old_manifest = decode_catalogue_manifest(*encoded);
+    }
+
+    CatalogueManifest manifest;
+    const auto shards = shard_catalogue(next);
+    std::vector<std::pair<ObjectId, Bytes>> changed_control;
+    changed_control.reserve(catalogue_shard_count + 1);
+    for (size_t i = 0; i < catalogue_shard_count; ++i) {
+        if (shards[i].items.empty()) continue;
+        auto encoded = encode_catalogue(shards[i]);
+        const auto id = object_id(encoded);
+        manifest.shards[i] = id;
+        if (old_manifest.shards[i] != id)
+            changed_control.push_back({id, std::move(encoded)});
+    }
+
+    auto encoded_manifest = encode_catalogue_manifest(manifest);
+    const auto root = object_id(encoded_manifest);
+    if (expected_root && *expected_root == root) {
+        cache(metadata_record.generation, metadata_snapshot, next);
+        return;
+    }
+
+    // A catalogue metadata commit may reference a control object only after a
+    // majority of the configured metadata voters has durably stored it. Missing
+    // voters make the mutation fail; DATA capacity is irrelevant to this path.
+    for (const auto& [id, encoded] : changed_control) {
+        if (store_.replicate_control(id, encoded, metadata_snapshot.metadata_voters) < required)
+            throw CatalogueUnavailable("catalogue shard could not reach metadata durability quorum");
+    }
+    if (store_.replicate_control(root, encoded_manifest, metadata_snapshot.metadata_voters) < required)
+        throw CatalogueUnavailable("catalogue manifest could not reach metadata durability quorum");
 
     try {
         metadata_.mutate_delta([&](MetadataSnapshot& metadata, MetadataDelta& delta) {
@@ -507,25 +678,31 @@ void CatalogueManager::commit(const std::optional<ObjectId>& expected_root,
             if (expected_namespace &&
                 metadata_namespace_signature(metadata) != *expected_namespace)
                 throw CatalogueConflict("namespace changed during catalogue reconciliation");
-            if (metadata.catalogue_root && *metadata.catalogue_root != root)
-                record_garbage_upsert(delta, append_garbage(metadata, *metadata.catalogue_root));
             metadata.catalogue_root = root;
             delta.catalogue = CatalogueDelta::set;
             delta.catalogue_root = root;
+            // Obsolete manifest/shard objects are reclaimed by the dedicated control
+            // store reachability sweep after the same grace period as DATA orphans.
             for (const auto& id : old_artwork) {
                 if (!new_artwork.contains(id))
                     record_garbage_upsert(delta, append_garbage(metadata, id));
             }
         });
-    } catch (...) {
-        // As above, failed/stale staged objects are deliberately left for the
-        // reachability collector. Immediate distributed deletion is not safe
-        // against a concurrent commit of the same content hash.
+    } catch (const CatalogueConflict&) {
         throw;
+    } catch (const std::exception& e) {
+        throw CatalogueUnavailable(std::string("catalogue metadata durability unavailable: ") +
+                                   e.what());
     }
 
     auto committed_record = metadata_.read_record();
     auto committed_metadata = decode_snapshot(committed_record.payload);
+    {
+        std::lock_guard lock(mutex_);
+        control_converged_root_.reset();
+        control_converged_voters_.clear();
+        control_convergence_retry_ = {};
+    }
     cache(committed_record.generation, committed_metadata, next);
 }
 
@@ -673,8 +850,8 @@ CatalogueArtwork CatalogueManager::stage_artwork(std::string role, std::string m
     if (bytes.empty())
         throw std::runtime_error("artwork body is empty");
     CatalogueArtwork art{std::move(role), object_id(bytes), std::move(mime_type)};
-    if (!node_.local_store().put(art.id, bytes))
-        throw std::runtime_error("cannot stage artwork locally");
+    if (!store_.put(art.id, bytes))
+        throw std::runtime_error("cannot store artwork in distributed DATA storage");
     return art;
 }
 
@@ -868,9 +1045,11 @@ std::optional<CatalogueArtworkContent> CatalogueManager::artwork(const ObjectId&
     }
     if (!mime_type)
         return {};
-    if (!store_.ensure_local(id, true))
-        return {};
-    auto bytes = node_.local_store().get(id);
+    // Reading DATA must never require the reader to become an authoritative
+    // owner. A full/small node can serve artwork directly from its DHT owner,
+    // exactly as it can read a remotely placed media extent. The normal get()
+    // path may use cache opportunistically without consuming DATA replica quota.
+    auto bytes = store_.get(id, 0, FrameType::foreground);
     if (!bytes)
         return {};
     return CatalogueArtworkContent{std::move(*mime_type), std::move(*bytes)};
@@ -898,8 +1077,7 @@ CatalogueMaintenance CatalogueManager::maintenance_objects() {
             if (metadata_root) {
                 // The metadata reference itself is unconditionally live even if
                 // the immutable root cannot currently be fetched or decoded.
-                out.live.insert(*metadata_root);
-                out.universal.insert(*metadata_root);
+                out.control_live.insert(*metadata_root);
             }
         }
     } catch (...) {
@@ -921,8 +1099,18 @@ CatalogueMaintenance CatalogueManager::maintenance_objects() {
     }
 
     if (root) {
-        out.live.insert(*root);
-        out.universal.insert(*root);
+        out.control_live.insert(*root);
+        try {
+            if (store_.ensure_control_local(*root)) {
+                if (auto encoded = node_.control_store().get(*root)) {
+                    const auto manifest = decode_catalogue_manifest(*encoded);
+                    for (const auto& shard : manifest.shards)
+                        if (shard) out.control_live.insert(*shard);
+                }
+            }
+        } catch (...) {
+            repair_ok = false;
+        }
     }
     {
         std::lock_guard lock(mutex_);
@@ -932,11 +1120,27 @@ CatalogueMaintenance CatalogueManager::maintenance_objects() {
     }
     if (!cached)
         return out;
-    for (const auto& id : artwork_ids(*cached)) {
+    for (const auto& id : artwork_ids(*cached))
         out.live.insert(id);
-        out.universal.insert(id);
-    }
     return out;
+}
+
+size_t CatalogueManager::control_gc_step(const std::vector<ObjectId>& live,
+                                         std::chrono::milliseconds grace,
+                                         size_t operation_budget) {
+    if (!operation_budget) return 0;
+    size_t removed = 0;
+    bool exhausted = false;
+    for (size_t operations = 0; operations < operation_budget && !exhausted; ++operations) {
+        auto id = node_.control_store().next_object(control_gc_cursor_, exhausted);
+        if (!id) continue;
+        if (std::binary_search(live.begin(), live.end(), *id)) continue;
+        if (node_.control_store().remove_if_older_than(*id, grace))
+            ++removed;
+    }
+    if (exhausted && removed)
+        (void)node_.control_store().compact_packs();
+    return removed;
 }
 
 } // namespace macha

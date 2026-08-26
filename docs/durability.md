@@ -1,182 +1,132 @@
-# Durability architecture
+# Durability
 
-Macha 0.16.0 has one owner for authoritative object durability: a **DurabilityDomain** for each physical filesystem. Storage, FUSE publication, repair and RPC code express durability requirements; they do not issue authoritative object barriers themselves.
+## Rule
 
-This design separates three kinds of state which have different failure semantics:
+Macha may publish a logical reference only after the storage class responsible for that reference has satisfied its durability contract.
 
-| State | Authority | Required crash behaviour |
-| --- | --- | --- |
-| Accepted but unpublished file data | FUSE spool + operation journal | replay or abandon that inode generation; never invent bytes |
-| Published media | immutable authoritative objects + committed metadata | every object referenced by the new manifest is durable on the required replica set before metadata publication |
-| Persistent cache | no authority | may be discarded completely after a crash |
+For DATA, the foreground contract is `dht.min_write_replicas` durable authoritative copies. For namespace/control metadata, the contract is metadata-voter majority durability.
 
-Capacity accounting, LRU state and garbage collection are derived/cleanup state. They must recover correctly, but they do not define whether media bytes are published.
+Cache never counts.
 
-## Core invariants
+## DATA durability domains
 
-1. Existing published media remain intact and indexable until metadata explicitly replaces or deletes them.
-2. A metadata commit must never reference a new authoritative object generation until the configured durable replica requirement for every referenced new extent has been satisfied.
-3. The FUSE spool and operation journal are the WAL for accepted writes. They remain available until publication is confirmed and `data_done` is durable.
-4. Missing, truncated or checksum-invalid spool data invalidates only the affected inode's dirty generation. A previously published manifest remains authoritative.
-5. Cache contents are disposable. Cache loss or corruption is a cache miss, not media loss.
-6. A durability acknowledgement is valid only for the exact node process, physical durability domain and backend incarnation which accepted the object.
+Authoritative DATA backends on the same physical filesystem share a `DurabilityDomain`. The domain tracks monotonically increasing mutation generations and a durable frontier. A DATA placement is represented by a ticket containing the current process epoch, physical durability domain, mutation generation and backend incarnation.
 
-## Durability domains
+Those fences prevent a ticket from an old process or a removed/reopened backend from satisfying a current publication.
 
-`StoragePool` identifies mounted authoritative filesystems by `st_dev`. Configured backend paths on the same filesystem share one `DurabilityDomain`; paths on different filesystems do not.
+A mutation generation is issued only after the object write/rename operations for that mutation have completed. The physical barrier can cover several generations at once.
 
-A domain owns:
+On Linux the domain barrier uses `syncfs()` on a representative backend path. Platforms without `syncfs()` use the supported conservative fsync fallback.
 
-- a process-local domain ID;
-- a monotonically increasing mutation generation;
-- the highest generation known durable;
-- a group-commit coordinator thread (`macha-durable`);
-- one or more current backend paths which can be opened when a physical barrier is required.
+## Strict and deferred writes
 
-The domain deliberately does **not** keep a permanent directory file descriptor. A configured media backend is allowed to disappear and return. The coordinator opens a representative backend directory only for the duration of a physical barrier.
+`LocalStore::put()` is strict: it returns success only after the local durability requirement has been met.
 
-A mutation receives generation `N` only **after** all of that mutation's write/rename/unlink syscalls have completed. The coordinator captures its cut under the domain mutex and releases that mutex before performing stable-storage I/O. Writers therefore continue admitting generations `N+1...` while the barrier is in progress. The completed barrier advances the durable frontier only through the captured cut, even if the operating system happened to flush later writes as well.
-
-On Linux the physical primitive is `syncfs()` on a representative path for the domain. On platforms without `syncfs`, the same coordinator owns the conservative file/directory `fsync()` fallback. No `LocalStore`, FUSE worker or RPC worker owns authoritative object barriers.
-
-### Tickets
-
-A provisional placement is represented by a ticket:
+Distributed publication uses the deferred path where appropriate:
 
 ```text
-node process epoch
-physical durability domain
-mutation generation
-backend incarnation
+write immutable object
+      |
+      v
+provisional durability ticket
+      |
+      v
+coalesce required tickets by physical domain
+      |
+      v
+physical durability barrier
+      |
+      v
+publication may reference object
 ```
 
-Generation zero is reserved for a validated object which was already part of the backend's durable baseline before the current provisional mutation. It therefore needs no new physical barrier, but the domain and backend-incarnation fields are still required.
+Immediate versus batchable urgency changes scheduling, not correctness. Both use the same generation/ticket mechanism.
 
-The process epoch changes on every node process start. The backend incarnation changes every time a configured backend is reopened. A stale ticket from either an old process or an old backend incarnation cannot satisfy a current publication.
+## Distributed DATA publication
 
-## Group commit
+The writer ranks preferred owners and deterministic fallbacks. It obtains placements until at least `min_write_replicas` have accepted and become durably covered. Only then may filesystem metadata reference the new extents.
 
-A caller does not execute `syncfs()`. It asks the domain to make generation `N` durable and waits for the ticket.
+`replicas` can be larger than the publication floor. Missing desired copies remain repair debt and are converged by maintenance.
 
-Batchable requests use a short group window (500 ms by default in 0.16.0):
+A full or offline preferred owner does not weaken the floor; it changes which eligible candidate supplies the required durable copy.
+
+## Namespace metadata
+
+Namespace metadata is an encrypted CAS history over an explicit metadata-voter set. A successor record is committed only with voter-majority evidence for the expected predecessor/generation. Ordinary mutation uses deterministic deltas; checkpoints/full records are recovery material.
+
+Metadata mutations therefore have a different quorum from DATA publication. `dht.replicas` does not define metadata quorum.
+
+## Catalogue control durability
+
+Catalogue manifest/shard objects are CONTROL. Before namespace metadata can point at a new catalogue manifest:
+
+1. newly referenced artwork DATA must be readable through the normal DATA store;
+2. changed catalogue shards must be durable on a metadata-voter majority;
+3. the successor manifest must be durable on a metadata-voter majority;
+4. namespace metadata CAS publishes the new manifest root.
+
+After publication, maintenance converges the current manifest/shards to all current metadata voters. A voter joining or returning with missing control objects fetches them from another voter. This convergence does not make artwork universal.
+
+Transient metadata/control unavailability causes catalogue scanner work to defer. It does not consume the hint's provider/content failure attempts.
+
+## FUSE durability
+
+FUSE success is separated into local admission durability and later distributed publication.
+
+For an accepted file write:
 
 ```text
-publication A needs generation 100 --+
-publication B needs generation 117 --+--> DurabilityDomain --> one syncfs()
-publication C needs generation 123 --+                         durable >= 123
+write bytes to inode spool
+      |
+fsync local spool state
+      |
+append + fsync ordered operation descriptor
+      |
+return local success to kernel
+      |
+asynchronous publication builds DATA extents
+      |
+wait for DATA durability floor
+      |
+commit namespace metadata
+      |
+record operation completion / retire spool
 ```
 
-If the cut is generation 140, all waiters through 140 complete together. A later request for generation 117 returns immediately even if generations 141+ are already dirty.
+Namespace mutations similarly journal their local intent before exposing the optimistic local result.
 
-Strict writes use the same mutation/ticket path but request **immediate** scheduling. Immediate means "do not deliberately wait for the batch window"; it does not create a second durability implementation and can still share a cut with work already admitted.
+This allows an unclean process restart to replay acknowledged local operations without inventing state from partially written files.
 
-The public storage API enforces this distinction: `put()` is strict and durable-before-return; `put_deferred()` is the only provisional path and returns the ticket which the caller must retain.
+## Accounting
 
-## Spool-backed publication
+Authoritative DATA byte accounting is derived state. Clean stores carry an exact checkpoint. If accounting is missing/dirty after an unclean stop, the backend reconciles physical objects before mutation admission becomes authoritative again.
 
-For FUSE publication, the spool/journal is already durable before distributed object publication starts. The publication sequence is therefore:
+Accounting does not replace physical durability tickets; it only controls capacity admission.
 
-```text
-durable spool + operation journal
-        |
-        v
-build immutable extents
-        |
-        v
-provisional local/remote placement
-        |
-        v
-collect exact durability tickets
-        |
-        v
-await required replica tickets (group committed)
-        |
-        v
-commit metadata manifest
-        |
-        v
-observe committed metadata / durable data_done
-        |
-        v
-unlink spool
-```
+## Deletion
 
-The object writes themselves contain no per-extent `fsync()` or directory `fsync()`. A crash before the durability tickets complete simply replays from the still-durable spool. A crash after the object barrier but before metadata commit leaves harmless unreferenced content-addressed objects. A crash after metadata commit but before journal completion is recovered idempotently from metadata plus the journal.
+Deleting an unreachable object is less safety-critical than publishing a new reference. A lost deletion after a crash merely leaves garbage. Reachability remains authoritative and later GC retries removal.
 
-Spool retirement is a best-effort unlink after the durable completion marker. The unlink itself is not synchronously forced: if a crash loses it, startup sees an already-completed stale spool pathname and removes it. Successful operation therefore does not accumulate zero-byte spool files during long uptimes.
+For packed objects, deletion is a logical tombstone and dead physical bytes are reclaimed by compaction.
 
-## Distributed durability
+## Crash matrix
 
-Deferred object PUT replies carry the accepting node's `(process epoch, domain, generation, backend incarnation)` ticket. The publisher coalesces requirements for the same exact placement to the highest generation it needs.
-
-A durability-barrier RPC is an **await request**, not a request for an RPC worker to execute storage I/O. The receiver submits the generation to its `DurabilityDomain`; the RPC worker waits while `macha-durable` performs any required group commit. Concurrent RPC requests on the same filesystem naturally share one physical barrier.
-
-Remote requests are launched before the publisher blocks on its local domain, aligning group-commit windows across replicas rather than serialising one physical cut per node.
-
-Transport v15 carries these physical-domain tickets. Mixed v14/v15 operation is intentionally rejected; all cluster nodes must be upgraded together. On-disk object, metadata, FUSE journal and spool formats are unchanged from 0.15.x.
-
-## Accounting is derived state
-
-`.macha.accounting` is not a per-publication transaction log in 0.16.0.
-
-On the first authoritative mutation of a clean process/store session, Macha writes and fsyncs one `DIRTY` accounting record. All subsequent puts, removals and publications update the in-memory byte count without toggling accounting CLEAN/DIRTY around each durability generation.
-
-On clean store shutdown:
-
-1. the store waits for its final mutation generation to become durable;
-2. it writes the exact byte count as a CLEAN accounting checkpoint;
-3. it fsyncs that small checkpoint.
-
-On an unclean process restart, a DIRTY/missing/corrupt accounting record triggers the existing object-tree reconciliation. Reads remain available while mutations wait for exact capacity accounting. Before the reconstructed tree is declared trustworthy, the domain establishes one physical durability baseline. This matters when only the process crashed: Linux may still have writes from the dead process in page cache even though the machine never rebooted.
-
-Thus clean restart remains O(1), while a crash pays one reconciliation scan instead of every normal publication paying synchronous accounting I/O.
-
-Historical `put`/`remove` accounting records remain readable for upgrade compatibility.
-
-## Deletion and garbage collection
-
-Creating a newly published object is safety-critical; deleting an already-unreachable object is not.
-
-Authoritative deletion therefore performs the unlink and registers a domain mutation, but does not force a barrier immediately. If a crash loses the unlink, unreachable garbage survives and a later GC pass removes it again. Metadata/reachability remains the authority, so lazy deletion durability cannot remove published media.
-
-A clean accounting checkpoint still waits through the store's final mutation generation, preventing a clean byte-count checkpoint from getting ahead of its directory state.
-
-## Cache
-
-`PersistentBlockCache` uses the shared encrypted object codec but an explicitly ephemeral `LocalStore` mode. It has no durability domain, no object/directory fsync, and no authoritative accounting WAL. Startup rebuilds useful cache state from the directory tree; malformed or missing entries are discarded. Recovery publication bypasses cache admission so a large crash replay does not evict the established working set merely because it traverses many extents.
-
-## Crash-state matrix
-
-| Crash point | Recovery result |
+| Crash point | Required recovery result |
 | --- | --- |
-| Before spool/journal admission is durable | write was not acknowledged |
-| Spool durable, no object yet | replay from spool |
-| Some provisional objects visible, no domain ticket durable | replay; valid objects may deduplicate |
-| Domain barrier in progress | metadata not yet publishable; replay remains authoritative |
-| Tickets durable, metadata not committed | durable unreferenced objects; replay/deduplicate |
-| Metadata committed, `data_done` not durable | journal replay observes already-published generation and completes idempotently |
-| `data_done` durable, spool unlink lost | stale completed spool removed later |
-| Accounting DIRTY | reconcile object tree, establish durable baseline, checkpoint exact usage |
+| Before local FUSE admission is durable | operation was not acknowledged |
+| Durable FUSE spool/journal, no DATA placement | replay from local durable intent |
+| Some provisional DATA placements, no required barriers | replay/deduplicate; metadata must not reference them |
+| DATA barriers complete, metadata CAS not committed | durable unreferenced DATA; replay can reuse it |
+| Metadata committed, local FUSE completion not recorded | replay observes committed state and completes idempotently |
+| Pack tail torn | truncate to last valid committed pack record |
+| Pack compaction after replacement install but before old deletion | replacement is live; old packs are duplicate reclaimable bytes |
+| DATA accounting dirty | reconcile physical store and establish a new trusted baseline |
+| Catalogue control object missing from one voter | fetch/converge from another voter without invalidating committed root |
 | Cache missing/corrupt | discard/rebuild cache |
-| Deletion unlink lost | unreachable garbage survives until later GC |
+| GC unlink lost | unreachable garbage remains for a later sweep |
 
-## Observability and regression requirements
+## Memory is part of stability
 
-During sustained spool recovery on Linux, `strace` should show authoritative `syncfs()` calls from `macha-durable`, not from FUSE or RPC data workers. After the first mutation-session accounting marker, `.macha.accounting` must not be fsynced around every publication.
+Metadata mutation must not scale by retaining several complete namespace representations. `MetadataRecord` payloads share immutable backing, record hashes are streamed, compact deltas are applied in place, and ordinary mutation paths avoid building full duplicate garbage indexes.
 
-Regression tests cover:
-
-- no per-object/directory fsync for authoritative object data;
-- accounting DIRTY once per process/store mutation session;
-- crash accounting reconciliation plus physical baseline establishment;
-- exact generation cuts and already-covered tickets;
-- independent publication group commit;
-- physical-domain sharing across multiple backend paths;
-- backend-incarnation and process-epoch fencing;
-- pre-existing durable object reaffirmation without a new barrier;
-- publication barrier before metadata commit;
-- lazy deletion durability;
-- zero authoritative durability operations for cache contents;
-- immediate successful spool unlink after durable publication completion.
-
-The scheduling window is performance policy. These invariants are correctness policy; changing batching policy must not weaken them.
+Regression coverage deliberately retains many large `MetadataRecord` copies and enforces a loose RSS ceiling on Linux so a return to payload-deep-copy behavior fails testing rather than reaching the OOM killer in production.

@@ -28,6 +28,7 @@ class NodeRuntime {
     NodeId id_;
     NodeId durability_epoch_;
     StoragePool local_;
+    LocalStore control_;
     PersistentBlockCache cache_;
     MetadataReplica meta_;
     Membership members_;
@@ -79,6 +80,12 @@ class NodeRuntime {
     }
     const StoragePool& local_store() const {
         return local_;
+    }
+    LocalStore& control_store() {
+        return control_;
+    }
+    const LocalStore& control_store() const {
+        return control_;
     }
     PersistentBlockCache& block_cache() {
         return cache_;

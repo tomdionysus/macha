@@ -3006,7 +3006,10 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
             if (auto match = prepare_hint(*hint, stop, *namespace_view->snapshot))
                 prepared.push_back(std::move(*match));
         } catch (const CatalogueConflict& e) {
-            hints_.record_failure(hint->id, e.what(), unix_ms() + 500, 120);
+            hints_.defer(hint->id, e.what(), unix_ms() + 500);
+        } catch (const CatalogueUnavailable& e) {
+            hints_.defer(hint->id, e.what(),
+                         unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
         } catch (const std::exception& e) {
             hints_.record_failure(hint->id, e.what(),
                                   unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()),
@@ -3032,7 +3035,14 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
             catalogue_.reconcile_scanner(discovered, active_media_ids, false);
     } catch (const CatalogueConflict& e) {
         for (const auto& match : prepared)
-            hints_.record_failure(match.hint_id, e.what(), unix_ms() + 500, 120);
+            hints_.defer(match.hint_id, e.what(), unix_ms() + 500);
+        return out;
+    } catch (const CatalogueUnavailable& e) {
+        const auto retry = unix_ms() +
+            static_cast<uint64_t>(config.provider_batch_delay.count());
+        for (const auto& match : prepared)
+            hints_.defer(match.hint_id, e.what(), retry);
+        Log::debug("catalogue hint batch deferred: " + std::string(e.what()));
         return out;
     } catch (const std::exception& e) {
         for (const auto& match : prepared)
@@ -3273,7 +3283,8 @@ void CatalogueScanner::loop(std::stop_token stop) {
             // time already counts as quiet time and therefore is not penalised.
             const auto work_started = Clock::now();
             const auto cpu_started = thread_cpu_time_ns();
-            const auto batch = process_hint_batch(stop, 1);
+            constexpr size_t background_hint_batch = 32;
+            const auto batch = process_hint_batch(stop, background_hint_batch);
             const auto completed = Clock::now();
             auto cooldown = std::chrono::milliseconds(25);
             const auto cpu_completed = thread_cpu_time_ns();

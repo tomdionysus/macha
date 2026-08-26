@@ -223,7 +223,7 @@ std::vector<GarbageRef> Service::collect_garbage(const std::vector<GarbageRef>& 
     matured.reserve(garbage.size());
 
     for (const auto& candidate : garbage) {
-        // A zero retirement time is a pre-0.10.0 tombstone. It is deliberately
+        // A zero retirement time denotes a legacy tombstone. It is deliberately
         // ineligible until maintain_garbage_metadata() stamps it into the new
         // lifecycle, giving existing stores a fresh full grace period on upgrade.
         if (candidate.retired_at_ns <= 0 || now_ns < candidate.retired_at_ns ||
@@ -407,17 +407,23 @@ void Service::loop(std::stop_token stop) {
                     maintenance_inventory_generation_ != objects->metadata_generation) {
                     auto live = std::make_shared<std::vector<ObjectId>>(objects->live);
                     auto universal = std::make_shared<std::vector<ObjectId>>();
+                    auto control_live = std::make_shared<std::vector<ObjectId>>();
                     auto catalogue_objects = catalogue_.maintenance_objects();
                     maintenance_catalogue_complete_ = catalogue_objects.complete;
                     live->insert(live->end(), catalogue_objects.live.begin(),
                                  catalogue_objects.live.end());
                     universal->insert(universal->end(), catalogue_objects.universal.begin(),
                                       catalogue_objects.universal.end());
+                    control_live->insert(control_live->end(), catalogue_objects.control_live.begin(),
+                                         catalogue_objects.control_live.end());
                     std::sort(live->begin(), live->end());
                     live->erase(std::unique(live->begin(), live->end()), live->end());
                     std::sort(universal->begin(), universal->end());
                     universal->erase(std::unique(universal->begin(), universal->end()),
                                      universal->end());
+                    std::sort(control_live->begin(), control_live->end());
+                    control_live->erase(std::unique(control_live->begin(), control_live->end()),
+                                        control_live->end());
 
                     maintenance_garbage_.clear();
                     maintenance_stale_garbage_.clear();
@@ -433,6 +439,7 @@ void Service::loop(std::stop_token stop) {
                     maintenance_inventory_generation_ = objects->metadata_generation;
                     maintenance_live_ = std::move(live);
                     maintenance_universal_ = std::move(universal);
+                    maintenance_control_live_ = std::move(control_live);
                     rebuilt_inventory = true;
                 }
                 if (rebuilt_inventory && Log::enabled(LogLevel::all)) {
@@ -505,6 +512,13 @@ void Service::loop(std::stop_token stop) {
                         garbage_metadata_changed = true;
                     }
                     last_garbage_inventory = now;
+                }
+
+                if (gc_due && maintenance_catalogue_complete_ && maintenance_control_live_) {
+                    const auto removed = catalogue_.control_gc_step(
+                        *maintenance_control_live_, policy.garbage_grace, 32);
+                    if (removed)
+                        Log::debug("catalogue control GC removed=" + std::to_string(removed));
                 }
 
                 // Physical mark/sweep also catches objects that never acquired a

@@ -19,7 +19,7 @@
 
 namespace macha {
 namespace {
-constexpr uint16_t protocol_version = 15;
+constexpr uint16_t protocol_version = 18;
 constexpr uint32_t frame_magic = 0x4d433133; // "MC13"
 constexpr size_t protocol_min_frame_size = 4 * 1024;
 constexpr size_t protocol_max_frame_size = 4 * 1024 * 1024;
@@ -304,13 +304,13 @@ bool is_priority_data_message(MessageType type) {
     case MessageType::seed_metadata:
     case MessageType::checkpoint_metadata:
     case MessageType::commit_metadata:
-    case MessageType::get_metadata_object:
-    case MessageType::put_metadata_object:
+    case MessageType::get_control_object:
+    case MessageType::put_control_object:
     case MessageType::get_metadata_identity:
     case MessageType::bool_reply:
     case MessageType::metadata_reply:
     case MessageType::cas_reply:
-    case MessageType::metadata_object_reply:
+    case MessageType::control_object_reply:
     case MessageType::metadata_identity_reply:
         return true;
     default:
@@ -470,8 +470,8 @@ const char* message_type_name(MessageType type) noexcept {
     case MessageType::promote_foreground: return "promote_foreground";
     case MessageType::cancel_transfer: return "cancel_transfer";
     case MessageType::commit_metadata: return "commit_metadata";
-    case MessageType::get_metadata_object: return "get_metadata_object";
-    case MessageType::put_metadata_object: return "put_metadata_object";
+    case MessageType::get_control_object: return "get_control_object";
+    case MessageType::put_control_object: return "put_control_object";
     case MessageType::get_metadata_identity: return "get_metadata_identity";
     case MessageType::ok: return "ok";
     case MessageType::error: return "error";
@@ -480,7 +480,7 @@ const char* message_type_name(MessageType type) noexcept {
     case MessageType::object_reply: return "object_reply";
     case MessageType::metadata_reply: return "metadata_reply";
     case MessageType::cas_reply: return "cas_reply";
-    case MessageType::metadata_object_reply: return "metadata_object_reply";
+    case MessageType::control_object_reply: return "control_object_reply";
     case MessageType::metadata_identity_reply: return "metadata_identity_reply";
     }
     return "unknown";
@@ -495,7 +495,7 @@ FrameType default_frame_type(MessageType type) noexcept {
         type == MessageType::put_object_deferred ||
         type == MessageType::object_durability_barrier)
         return FrameType::foreground;
-    if (type == MessageType::get_metadata_object || type == MessageType::put_metadata_object)
+    if (type == MessageType::get_control_object || type == MessageType::put_control_object)
         return FrameType::speculative;
     return FrameType::control;
 }

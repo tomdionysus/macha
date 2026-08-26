@@ -25,12 +25,12 @@ struct FsEntry {
 struct GarbageRef {
     ObjectId id{};
     // Wall-clock retirement time written into committed metadata. Zero denotes
-    // a tombstone written by metadata formats before 0.10.0; maintenance
+    // a tombstone written by legacy metadata formats; maintenance
     // conservatively stamps those before making them eligible for collection.
     int64_t retired_at_ns{};
     // Unique retirement identity prevents an old maintenance decision from
     // pruning a later retirement of the same content-addressed object. Empty
-    // means the tombstone came from a pre-0.10.0 snapshot/journal.
+    // means the tombstone came from a legacy snapshot/journal.
     NodeId retirement_id{};
     auto operator<=>(const GarbageRef&) const = default;
 };

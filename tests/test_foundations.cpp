@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
+#include "fuse_mountpoint.hpp"
 
 using namespace macha;
 using namespace std::chrono_literals;
@@ -330,10 +331,23 @@ MACHA_FAST_TEST("foundations", test_config) {
             << "log_level: WARN\n"
             << "ffmpeg_log_level: DEBUG\n"
             << "storage:\n"
-            << "  - path: " << disk1.string() << "\n"
-            << "    limit: 10T\n"
-            << "  - path: " << disk2.string() << "\n"
-            << "    limit: 10T\n"
+            << "  data:\n"
+            << "    backends:\n"
+            << "      - path: " << disk1.string() << "\n"
+            << "        limit: 10T\n"
+            << "        reserve_free: 2G\n"
+            << "      - path: " << disk2.string() << "\n"
+            << "        limit: 10T\n"
+            << "        reserve_free: 2G\n"
+            << "    packing:\n"
+            << "      threshold: 512K\n"
+            << "      target_size: 32M\n"
+            << "  metadata:\n"
+            << "    path: " << (state / "control").string() << "\n"
+            << "    limit: 2G\n"
+            << "    packing:\n"
+            << "      threshold: 256K\n"
+            << "      target_size: 16M\n"
             << "cache:\n"
             << "  path: " << cache_dir.string() << "\n"
             << "  max_blocks: 4096\n"
@@ -344,6 +358,7 @@ MACHA_FAST_TEST("foundations", test_config) {
             << "  root_mode: '0750'\n"
             << "fuse:\n"
             << "  allow_other: true\n"
+            << "  unmount_if_mounted: true\n"
             << "  spool_path: " << fuse_spool.string() << "\n"
             << "  operation_journal_path: " << fuse_journal.string() << "\n"
             << "  entry_timeout_ms: 375\n"
@@ -361,7 +376,7 @@ MACHA_FAST_TEST("foundations", test_config) {
             << "  read_ahead_extents: 4\n"
             << "  hint_lifetime_ms: 4500\n"
             << "  write_through_cache: false\n"
-            << "  refresh_interval_ms: 750\n" // legacy 0.14.4 key: accepted and ignored
+            << "  refresh_interval_ms: 750\n" // legacy key: accepted and ignored
             << "  fail_closed_mountpoint: true\n"
             << "  watchdog_interval_ms: 650\n"
             << "  timeouts:\n"
@@ -491,11 +506,19 @@ MACHA_FAST_TEST("foundations", test_config) {
     CHECK(yc.state_path == state);
     CHECK(yc.storage_backends.size() == 2);
     CHECK(yc.storage_backends[0].limit == 10ULL * 1024 * 1024 * 1024 * 1024);
+    CHECK(yc.storage_backends[0].reserve_free == 2ULL * 1024 * 1024 * 1024);
+    CHECK(yc.storage_packing.threshold == 512ULL * 1024);
+    CHECK(yc.storage_packing.target_size == 32ULL * 1024 * 1024);
+    CHECK(yc.metadata_store.path == state / "control");
+    CHECK(yc.metadata_store.limit == 2ULL * 1024 * 1024 * 1024);
+    CHECK(yc.metadata_store.packing.threshold == 256ULL * 1024);
+    CHECK(yc.metadata_store.packing.target_size == 16ULL * 1024 * 1024);
     CHECK(yc.cache.path == cache_dir);
     CHECK(yc.cache.max_blocks == 4096);
     CHECK(yc.log_level == LogLevel::warn);
     CHECK(yc.ffmpeg_log_level == FfmpegLogLevel::debug);
     CHECK(yc.fuse.allow_other);
+    CHECK(yc.fuse.unmount_if_mounted);
     REQUIRE(yc.fuse.spool_path.has_value());
     CHECK(*yc.fuse.spool_path == fuse_spool);
     REQUIRE(yc.fuse.operation_journal_path.has_value());
@@ -650,7 +673,7 @@ MACHA_FAST_TEST("foundations", test_config) {
         CHECK(rejected);
     }
 
-    for (size_t i = 0; i < 3; ++i) {
+    for (size_t i = 0; i < 4; ++i) {
         auto legacy_yaml = t.path() / ("legacy-" + std::to_string(i) + ".yaml");
         std::ofstream out(legacy_yaml);
         out << "state_path: " << state.string() << "\n"
@@ -662,8 +685,11 @@ MACHA_FAST_TEST("foundations", test_config) {
             out << "verbose: true\n";
         else if (i == 1)
             out << "network:\n  control_timeout_ms: 1000\n";
-        else
+        else if (i == 2)
             out << "network:\n  data_timeout_ms: 1000\n";
+        // i == 3 is deliberately only the pre-0.18 storage sequence. The
+        // fresh storage contract rejects it without relying on another
+        // obsolete key to trigger the failure.
         out.close();
 
         std::vector<std::string> old_args{"macha", "--config", legacy_yaml.string()};
@@ -840,3 +866,23 @@ MACHA_FAST_TEST("foundations", test_capacity_placement) {
 }
 
 } // namespace
+
+MACHA_TEST("foundations", test_fuse_mountpoint_preflight_refuses_unrelated_filesystem) {
+#if defined(__linux__) || defined(__APPLE__)
+    TempDir temp;
+    FuseConfig config;
+    config.unmount_if_mounted = true;
+
+    CHECK(probe_macha_mountpoint(temp.path().string()).state == MountTableState::missing);
+    prepare_fuse_mountpoint(temp.path(), config);
+
+    CHECK(probe_macha_mountpoint("/").state == MountTableState::other);
+    bool refused = false;
+    try {
+        prepare_fuse_mountpoint("/", config);
+    } catch (const std::exception& e) {
+        refused = std::string(e.what()).find("non-Macha") != std::string::npos;
+    }
+    CHECK(refused);
+#endif
+}

@@ -35,11 +35,15 @@ int main(int argc, char** argv) {
             std::make_shared<macha::ConsoleLogger>(config.log_level));
         macha::configure_ffmpeg_logging(config.ffmpeg_log_level);
         auto keys = macha::load_cluster_keys(config.key_file);
+        if (config.mount_path) {
+            std::filesystem::create_directories(*config.mount_path);
+            macha::prepare_fuse_mountpoint(*config.mount_path, config.fuse);
+        }
+
         macha::Service service(config, keys);
         service.start();
 
         if (config.mount_path) {
-            std::filesystem::create_directories(*config.mount_path);
             int rc = macha::run_fuse(service.filesystem(), service.hydration().hydrator(),
                                         *config.mount_path, config.fuse,
                                         [&service] { service.request_stop(); });

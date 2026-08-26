@@ -1,4 +1,4 @@
-# Macha 0.14.7
+# Macha 0.18.0
 #
 # Copy this file per node. Paths, advertise address and failure_domain are
 # node-local. The cluster key contents and dht policy must match every node.
@@ -21,12 +21,31 @@ log_level: INFO
 # QUIET, PANIC, FATAL, ERROR, WARN, INFO, VERBOSE, DEBUG or TRACE. Default: ERROR.
 ffmpeg_log_level: ERROR
 
-# Authoritative local DHT storage. Add as many independent backends as required.
+# Authoritative storage is split by correctness class. DATA holds media extents,
+# artwork and other immutable payloads. CONTROL/METADATA has an independent
+# priority quota and cannot be blocked by a full DATA backend.
 storage:
-  - path: /mnt/media-a/dht
-    limit: 10T
-  - path: /mnt/media-b/dht
-    limit: 10T
+  data:
+    backends:
+      - path: /mnt/media-a/macha-data
+        limit: 10T
+        reserve_free: 4G
+      - path: /mnt/media-b/macha-data
+        limit: 10T
+        reserve_free: 4G
+    # Objects at or below threshold are packed locally. Packing never changes
+    # ObjectId, DHT ownership, replication, repair or GC. Set both to 0 to disable.
+    packing:
+      threshold: 1M
+      target_size: 64M
+
+  metadata:
+    # Omit path to use <state_path>/metadata-objects.
+    path: /var/lib/macha/metadata-objects
+    limit: 4G
+    packing:
+      threshold: 1M
+      target_size: 64M
 
 # Independent best-effort read cache. It does not count as a DHT replica.
 # SSD is a good fit. max_blocks is a block count, not a byte limit.
@@ -53,9 +72,8 @@ fuse:
   # Durable FUSE admission state can be placed independently of state_path.
   # spool_path may hold the full unpublished byte backlog. The operation
   # journal is small descriptor/control state and may live on another device.
-  # If omitted, compatibility defaults are:
-  #   spool_path: <state_path>/fuse-spool
-  #   operation_journal_path: <spool_path>/operations.log
+  # If omitted, spool_path defaults below state_path and the operation journal
+  # defaults inside the resolved spool directory.
   spool_path: /var/spool/macha/fuse
   operation_journal_path: /var/lib/macha/fuse-operations.log
 
@@ -80,6 +98,11 @@ fuse:
   read_ahead_extents: 2
   hint_lifetime_ms: 5000
   write_through_cache: true
+
+  # Before starting cluster/storage services, detect an already-mounted Macha
+  # FUSE filesystem at mount_path. If true, remove that stale Macha mount and
+  # verify it disappeared. Unrelated filesystems are always refused.
+  unmount_if_mounted: true
   fail_closed_mountpoint: true
   watchdog_interval_ms: 1000
 
@@ -104,24 +127,21 @@ network:
   control_stall_notice_ms: 5000
   data_stall_notice_ms: 120000
 
-# Cluster policy. Keep replica counts identical everywhere. They may be changed
-# by stopping the whole cluster, editing every node, then restarting it.
-# 3/3 is a sensible three-node production starting point.
-# For a two-node cluster use replicas: 2, metadata_replicas: 2; both nodes are
-# then required for metadata writes.
+# Cluster policy. Keep replica counts identical everywhere and change them as a
+# coordinated cluster operation. DATA replicas and metadata voters are separate.
+# `min_write_replicas` is the foreground DATA durability floor; `replicas` is
+# the convergence target restored by repair.
 #
-# extent_size is fixed once a namespace exists. The compiled default is 16M.
-# 4M is the current recommended media
-# setting because it gives finer-grained reads, retries and rebalance.
+# extent_size is fixed once a namespace exists. It is a logical file-chunk
+# ceiling and is unrelated to the physical small-object packing threshold.
 dht:
   replicas: 3
   metadata_replicas: 3
 
-  # Healthy immutable extent writes still commit at replica quorum. Degraded
-  # writes may commit at min_write_replicas and are repaired in the background.
-  # A stalled preferred owner spills to the next
-  # deterministic placement candidate after write_stall_ms without waiting for
-  # membership expiry. Metadata writes retain their separate voter quorum.
+  # DATA may publish after min_write_replicas durable authoritative copies.
+  # Repair converges missing copies toward replicas. A full/offline/stalled
+  # preferred owner falls through to the next deterministic capacity-aware
+  # candidate. Metadata/control writes retain their separate voter quorum.
   min_write_replicas: 1
   write_stall_ms: 2500
   extent_size: 4M
@@ -177,8 +197,10 @@ maintenance:
   # Retirement tombstones are pruned after the same grace period.
   garbage_grace_ms: 86400000
 
-# The catalogue itself is cluster metadata and is always present on every node.
-# The scanner and HTTP/JSON API are optional. Each scan provider owns the roots
+# Catalogue structure is CONTROL metadata: sharded content-addressed objects are
+# majority-durable on metadata voters and then converged to current voters.
+# Artwork is ordinary DATA. The scanner and HTTP/JSON API are optional.
+# Each scan provider owns the roots
 # it is allowed to classify. Every enabled provider root must be readable for
 # deletion reconciliation to run.
 catalogue:

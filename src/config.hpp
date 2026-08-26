@@ -13,7 +13,29 @@ namespace macha {
 
 struct StorageBackendConfig {
     std::filesystem::path path;
+    // Maximum authoritative DATA bytes admitted to this backend. Metadata/control
+    // objects never consume this quota.
     uint64_t limit{};
+    // Minimum physical filesystem free space preserved for the operating system,
+    // Macha control state and crash recovery. Data admission stops before crossing it.
+    uint64_t reserve_free{};
+};
+
+struct StoragePackingConfig {
+    // Immutable DATA objects at or below this size are packed into append-only
+    // containers. Packing is purely a local physical representation.
+    size_t threshold{1024 * 1024};
+    // Rotate packs at approximately this physical size. A single record may make
+    // the final pack slightly larger.
+    size_t target_size{64 * 1024 * 1024};
+};
+
+struct MetadataObjectStoreConfig {
+    // Empty means <state_path>/metadata-objects.
+    std::filesystem::path path;
+    // Safety ceiling for content-addressed control objects such as catalogue shards.
+    uint64_t limit{4ULL * 1024 * 1024 * 1024};
+    StoragePackingConfig packing{};
 };
 
 struct CacheConfig {
@@ -61,7 +83,7 @@ struct FuseConfig {
 
     // Durable local admission state. By default the spool remains at
     // state_path/fuse-spool and the operation journal lives inside it as
-    // operations.log for compatibility with 0.13/0.14.x. Either location may
+    // operations.log. Either location may
     // be moved independently. The spool can contain the full unpublished byte
     // backlog; the journal contains only the descriptors which make those bytes
     // and optimistic namespace mutations recoverable after restart.
@@ -102,6 +124,8 @@ struct FuseConfig {
 
     // Local metadata refresh and external mount-loss containment.
     bool fail_closed_mountpoint{true};
+    // Recover a stale Macha/FUSE mount left by an unclean daemon exit before startup.
+    bool unmount_if_mounted{false};
     std::chrono::milliseconds watchdog_interval{1000};
 };
 
@@ -264,6 +288,8 @@ struct HydrationConfig {
 struct Config {
     std::filesystem::path state_path;
     std::vector<StorageBackendConfig> storage_backends;
+    StoragePackingConfig storage_packing;
+    MetadataObjectStoreConfig metadata_store;
     CacheConfig cache;
     MaintenanceConfig maintenance;
     FilesystemConfig filesystem;

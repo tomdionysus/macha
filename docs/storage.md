@@ -1,96 +1,176 @@
-# Storage, disks and filesystem behaviour
+# Storage
 
-## How files are stored
+## Storage classes
 
-A file is namespace metadata plus an ordered list of immutable extents.
+Macha has three storage classes with different correctness rules.
+
+### DATA
+
+DATA contains immutable payload objects: media extents, catalogue artwork, subtitles and similar blobs. A DATA object is addressed by SHA-256 of its plaintext. DATA is distributed by capacity-aware deterministic placement and governed by `dht.replicas` / `dht.min_write_replicas`.
+
+### CONTROL / metadata
+
+Namespace metadata and content-addressed catalogue control objects are control-plane authority. Namespace records use metadata-voter quorum. Catalogue manifests/shards use a dedicated local control object store and must be durable on a metadata-voter majority before namespace metadata can reference a new root.
+
+CONTROL storage does not consume DATA quota.
+
+### Cache
+
+Cache is opportunistic and non-authoritative. A cache copy can accelerate a read but never satisfies DATA replication or metadata durability.
+
+## DATA backends
+
+A node may configure several authoritative DATA backends:
+
+```yaml
+storage:
+  data:
+    backends:
+      - path: /mnt/disk-a/macha-data
+        limit: 8T
+        reserve_free: 4G
+      - path: /mnt/disk-b/macha-data
+        limit: 16T
+        reserve_free: 4G
+    packing:
+      threshold: 1M
+      target_size: 64M
+```
+
+`limit` is the maximum physical authoritative DATA admitted to that backend. `reserve_free` is a second gate against the actual filesystem: a DATA write is refused if it would cross the configured physical free-space reserve even when `limit` has room.
+
+Backend paths are not treated as interchangeable directories. Each carries a node/backend identity marker. A non-empty unversioned backend is refused by the fresh 0.18 storage contract.
+
+## Placement across nodes
+
+Every active node advertises eligible DATA capacity. Macha derives a stable capacity-aware order for each `ObjectId`:
 
 ```text
-pathname
+ObjectId
    |
    v
-metadata manifest
+preferred owner 1
+preferred owner 2
+...
    |
-   +--> extent A --+
-   +--> extent B --+--> deterministic DHT owners
-   +--> extent C --+          |
-                              +--> node A / local disk
-                              +--> node B / local disk
-                              +--> node C / local disk
+   +--> deterministic fallback 1
+   +--> deterministic fallback 2
 ```
 
-Extents are addressed by SHA-256. Sequential writes publish completed extents as they are filled; the whole file is not held in memory. Reopening an existing file for append/resume preserves every complete committed extent by reference. If EOF is inside the final extent, only that one tail extent is fetched lazily to seed the append buffer; aligned appends fetch no old extent data. Repeated flush/fsync on an open append handle re-arms only the committed partial tail, so later writes remain extent-native. Random writes use a temporary file under `state_path/tmp`; commit rebuilds the extent manifest from staged bytes, but unchanged extents are matched by offset/length/content hash and their existing `ExtentRef` is reused instead of retransmitted.
+Configured capacity, not momentary free space, determines the stable placement weight. This prevents object ownership from churning continuously as disks fill.
 
-Reads try, in order:
+If a preferred node is full, offline or cannot complete the write inside the placement stall policy, the writer tries the next deterministic candidate. A small node therefore does not cap an R=1 cluster.
 
-1. authoritative local storage;
-2. persistent local cache;
-3. another DHT node.
-
-Sequential readers retain the current decrypted extent. Speculative reads are scheduled through the cache hydrator rather than by per-handle futures. Read-ahead, the remaining extents of the current file, and catalogue-predicted next media all submit ordered hints with independent priorities.
-
-Remote extent retrieval is replica-aware. Independent foreground reads choose among the configured replica set using current load, recent transfer latency and failures. Speculative hydration uses the same measurements but prefers idle replicas and yields to foreground work. Concurrent requests for the same object are coalesced; if playback needs an extent already being hydrated, that transfer is promoted rather than duplicated. A successful remote foreground fetch is still persisted asynchronously, and if this node should own the extent the same bytes can become the authoritative replica.
-
-## Nodes and disks
-
-A DHT node may have several local storage backends. The cluster sees one node whose placement weight is the aggregate configured capacity of its adopted backends. A second capacity-weighted shard layer chooses the local authoritative disk.
-
-Each adopted backend has a `.macha.backend` marker and a matching identity under `state_path/backend-identities`.
-
-If an adopted disk disappears temporarily, it goes offline but keeps its placement weight. Reads and writes fall through to surviving disks without making a transient unmount redefine the whole placement map. If the disk returns with the expected marker, local rebalance converges objects back to their intended proportional placement.
-
-Adding or removing a backend in YAML and sending `SIGHUP` changes capacity without changing node identity. A newly adopted backend gains a proportional share of local placement; removing it from configuration removes that share. Current free space is never used as a placement weight.
-
-Each authoritative backend keeps a small two-slot checksummed `.macha.accounting` journal, but accounting is derived state rather than part of each publication transaction. The first mutation of a clean process/store session durably marks accounting DIRTY once; normal puts, removals and publication generations then update the in-memory byte count without per-publication accounting fsyncs. Clean shutdown waits for the store's final durability generation and writes one exact CLEAN checkpoint. DIRTY/missing/corrupt accounting after an unclean restart falls back to object-tree reconciliation and establishes a physical durability baseline before the reconstructed state is trusted.
-
-Authoritative object durability is owned by one `DurabilityDomain` per physical filesystem (`st_dev`), shared by every configured backend path on that filesystem. Object writes/renames receive monotonically increasing generations only after their filesystem syscalls complete. Callers retain generation-qualified tickets; a coordinator thread group-commits batchable publication requirements with `syncfs()` on Linux, while strict `put()` uses the same path with immediate scheduling. RPC/FUSE workers wait on tickets rather than executing physical barriers. Backend incarnation and node process epoch fence stale acknowledgements across hotplug/restart. See [Durability architecture](durability.md) for the invariants, crash matrix and distributed ticket format.
-
-The persistent block cache is explicitly ephemeral and has no durability domain. Recovery does not admit replayed extents into the cache, so a large spool replay cannot churn the established cache working set. Authoritative deletion is also lazily durable: losing an unlink in a crash can only retain unreachable garbage for a later GC pass.
-
-The first 0.8.4 startup of an older backend, or a missing/corrupt accounting journal, falls back to the former background object-tree reconciliation once and writes a trusted checkpoint when the scan completes. Reads remain available while this migration/recovery scan runs and mutations wait for exact capacity accounting. If that reconciliation is interrupted, its partial byte count is discarded rather than made authoritative. Placement weight remains configured capacity and never depends on the transient scan result.
-
-Backend state locks never cover filesystem I/O. `StoragePool` snapshots the backend state and takes a `shared_ptr<LocalStore>`, releases the backend mutex, then performs the disk operation. A backend can therefore be refreshed, removed or marked offline without a long `get`, directory walk or accounting-thread shutdown blocking health/control RPCs. An in-flight operation may finish against the old `LocalStore`; the shared pointer keeps it alive safely until that operation returns.
-
-Scrub, local rebalance, reachability garbage collection and distributed push repair use independent persistent filesystem cursors. They advance a bounded number of physical objects per scheduler slice instead of rebuilding a complete object list for every small maintenance budget. Distributed pull repair advances the cached ordered live-object index directly rather than copying it into a complete vector for each slice. Rebalance/repair declare quiescence only after a complete pass finds no work. A completed GC pass pauses for `maintenance.no_progress_backoff_ms`; the default settled backoff is five minutes. Control-plane metadata/catalogue verification remains at most 30 seconds apart.
-
-Proactive physical integrity scrub is not part of the ordinary idle loop. Every normal `LocalStore::get()` already authenticates AES-GCM and verifies the plaintext `ObjectId` SHA-256. Scrub adds cold-data coverage and therefore runs as a low-frequency campaign: `maintenance.scrub_interval_ms` defaults to 30 days, its next due time is stored in `state_path/maintenance/scrub.next`, and `scrub_fraction` controls the campaign rate once due. A new schedule file is anchored one interval into the future, so upgrading or restarting a healthy large node does not immediately launch a complete-store read/hash pass.
-
-## Filesystem limits
-
-The implemented filesystem operations cover ordinary media-library use: files and directories, create/open/read/write/truncate/unlink, mkdir/rmdir, rename, chmod/chown, timestamps, stat/statfs, directory enumeration, flush and fsync.
-
-From 0.13.0 those operations enter an inode-based `FuseFrontend` first. Path resolution happens once and open handles retain stable frontend inode identity across rename. Namespace changes commit to the local overlay in kernel order and are then published FIFO; file writes are appended to a local operation spool and overlapping/adjacent dirty ranges are coalesced for scheduling. `flush` and writable-handle `release` request publication rather than performing quorum work, while read-only `release` never publishes another handle's dirty data and `fsync` durably flushes the local spool before queueing publication. Per-inode data publication preserves truncate/write order and waits for the inode's accepted namespace sequence, so rsync-style create/write/rename/close sequences cannot publish data through stale paths. The durable spool+journal remains authoritative until the required replica generations cross their storage barriers and metadata commits; completed/abandoned spools are then unlinked immediately without a directory durability barrier, because a crash can at worst resurrect an already-completed pathname which startup cleanup safely removes. Publication concurrency is reduced while mounted-filesystem traffic is active, keeping local spool acceptance ahead of asynchronous extent and metadata convergence under sustained bulk writes. FUSE namespace synchronisation is demand-driven rather than timer-driven and is strictly local: kernel metadata requests compare a process-local namespace revision and may adopt only a snapshot already decoded by `MetadataManager`; they never perform quorum I/O. The namespace revision advances only when filesystem entries change, so catalogue/GC/control metadata churn does not rebuild the FUSE graph. Kernel `getattr`/`readdir` also use compact attribute records and never copy file extent vectors merely to answer stat information.
-
-Foreground FUSE reads never force a dirty writer to commit. They overlay pending local write/truncate operations on the immutable committed manifest and enforce a hard read deadline for any required remote extent. The same demand becomes an ordered high-priority hint in the existing hydration/cache scheduler; it is not a second cache hierarchy.
-
-0.9.0 does **not** implement symlinks, hard links, extended attributes, distributed advisory locks, full sparse-file semantics, or stable POSIX inode identity across every rename case. Access time is not tracked. Concurrent appenders use file-version CAS rather than a globally serialized append stream.
-
-A failed or interrupted upload may leave immutable extents whose data put completed but whose metadata commit did not. 0.10.0 collects these as ordinary unreachable objects: each node compares its physical authoritative objects with the combined committed filesystem+catalogue live set and removes an unreferenced object only after its local file has remained untouched for `maintenance.garbage_grace_ms` (24 hours by default). The sweep is bounded and yields to playback/mounted-filesystem work. Reaffirming an existing content hash refreshes that age, and the final age-check/remove is atomic with respect to `LocalStore::put()`.
-
-Committed deletions still create retirement tombstones so recently dropped objects remain protected while metadata converges. Tombstones are no longer permanent: after their grace expires they are pruned from metadata, and a node which was offline long enough to miss one still discovers the dead object by reachability when it rejoins. Pre-0.10 tombstones are retained and stamped with a new retirement time on first 0.10.0 maintenance, giving an upgraded store a full grace period.
-
-## On-disk layout
+For example:
 
 ```text
-<state_path>/
-    .macha.lock
-    node.id
-    backend-identities/
-    metadata/
-        checkpoint.meta
-        journal.log
-        # after first 0.9 migration from 0.8.x:
-        current.meta.v10
-        committed.meta.v10
-    tmp/
-
-<storage backend>/
-    .macha.backend
-    .macha.accounting
-    objects/ab/cd/<sha256>.obj
-
-<cache path>/
-    objects/ab/cd/<sha256>.obj
-    metadata/current.meta
+node A DATA limit:   1 GiB
+node B DATA limit:   2 TiB
+replicas:            1
+min_write_replicas:  1
 ```
 
-Object writes use unique temporary names, `fsync`, and atomic rename. Metadata journal records are individually encrypted/authenticated and fsynced before a CAS vote is acknowledged; commit markers are fsynced before the generation becomes a recovery witness. Idle maintenance periodically replaces the journal prefix with one durable full checkpoint. The state path is exclusively locked so two processes cannot use one node identity at once.
+The logical DATA capacity is approximately the aggregate eligible capacity, subject to reserves/overhead. Once A cannot admit an object, placement can fall through to B. No rule requires every object to fit on A.
+
+## Publication floor and convergence target
+
+Two settings intentionally mean different things:
+
+```yaml
+dht:
+  replicas: 3
+  min_write_replicas: 1
+```
+
+`min_write_replicas` is the number of durable authoritative DATA copies required before foreground publication. `replicas` is the desired converged replica count.
+
+Thus an R=3/W=1 write may publish after one durable copy during a degraded topology. That object is under-replicated, not falsely considered converged. Maintenance repair creates the missing preferred replicas when eligible nodes/capacity return.
+
+If `min_write_replicas: 2`, publication requires two durable placements; a two-copy policy can legitimately reduce writable capacity when only two suitable stores exist. That is explicit policy rather than an accidental consequence of cluster size.
+
+## Local backend selection
+
+Within a node, `StoragePool` ranks configured backends by the same stable capacity-aware principle. A full/offline preferred backend falls through to another local backend. The node advertises the aggregate eligible configured DATA capacity, not the smallest backend.
+
+## Physical representation
+
+Logical object identity is independent of local representation.
+
+### Loose objects
+
+Objects above `storage.data.packing.threshold` are stored as individual encrypted object files.
+
+### Packed objects
+
+Objects at or below the threshold are appended to encrypted pack containers. The default is 1 MiB threshold and approximately 64 MiB target pack size.
+
+Packing is purely local:
+
+```text
+ObjectId A --+
+ObjectId B --+--> pack file
+ObjectId C --+
+
+ObjectId D ------> loose object file
+```
+
+No distributed metadata records pack coordinates. Reads still ask `LocalStore` for an `ObjectId`; `LocalStore` chooses the physical representation.
+
+Each packed PUT record is independently authenticated and contains enough identity/size information to rebuild the index. A logical removal appends a tombstone. Touch/age state used by GC is likewise represented without changing the logical object.
+
+On restart, the pack index is reconstructed by scanning durable records. A torn final record is truncated to the last valid record boundary. A corrupt committed record is an integrity error rather than being guessed around.
+
+Compaction is copy-on-write:
+
+1. calculate live records and required temporary physical space;
+2. preserve `reserve_free`;
+3. write replacement packs;
+4. make replacements durable;
+5. atomically install replacements and switch the live index;
+6. delete obsolete packs.
+
+If a crash leaves old packs behind after the replacement is installed, restart sees the later live records and the old bytes are reclaimable duplicates.
+
+## CONTROL object storage
+
+Control objects are configured separately:
+
+```yaml
+storage:
+  metadata:
+    path: /var/lib/macha/metadata-objects
+    limit: 4G
+    packing:
+      threshold: 1M
+      target_size: 64M
+```
+
+If `path` is omitted, it resolves below `state_path`. The store is content-addressed and may use the same physical packing implementation, but its quota is independent from bulk DATA.
+
+The control-store `limit` is a safety ceiling, not a DATA budget. Operators should size and monitor the underlying filesystem so state/control growth has real headroom. DATA `reserve_free` is especially important when DATA and state paths reside on the same physical filesystem.
+
+## Catalogue storage
+
+Catalogue structure consists of 64 content-addressed shards plus a small manifest root. Those objects are CONTROL. Artwork bytes are DATA.
+
+A catalogue commit cannot reference a new manifest/shard until that control object is durable on a majority of the current metadata voters. After commit, maintenance converges current control objects onto every current metadata voter. Missing non-majority copies are repair debt, not grounds for copying artwork everywhere.
+
+## Reads
+
+A DATA read checks authoritative local storage, then cache, then remote candidates. Fetching an object from a remote authoritative owner does not require the reading node to become an owner. If the local DATA store is full, the node can still serve/read remote artwork or media.
+
+The cache may retain a useful fetched copy independently, but that cache copy does not count toward the authoritative replica target.
+
+## Garbage collection
+
+Committed metadata is reachability authority. Filesystem extents and catalogue artwork contribute to the DATA live set. Catalogue manifests/shards contribute to a separate CONTROL live set.
+
+Objects that become unreachable are protected for `maintenance.garbage_grace_ms` before physical reclamation. This protects failed publications, convergence lag and recently retired references. DATA and CONTROL are swept separately.
+
+Packed logical deletion does not rewrite neighboring live objects immediately; dead bytes are reclaimed later by pack compaction.
+
+## Fresh-storage boundary
+
+The storage implementation is intentionally not a live migration layer. A fresh state namespace is marked `macha-state-layout-v18`; DATA backends are marked `macha-backend-v18`. Non-empty unversioned state or DATA is refused.
+
+This prevents an older physical representation from being silently accepted under new durability/placement semantics.

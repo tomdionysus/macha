@@ -1,6 +1,6 @@
 # Streaming
 
-0.7.0 introduced negotiated media streaming to the existing HTTP API. 0.8.0 changes finite movie/episode transformed playback to immutable HLS VOD manifests; the earlier growing EVENT form is retained as a future live/event design in `ROADMAP.md`. The public API deals in media capabilities, playback plans and sessions. Media probing, remuxing and transcoding run in-process through the FFmpeg libraries behind `MediaEngine`; no `ffmpeg` or `ffprobe` subprocess is launched.
+The public playback API deals in media capabilities, playback plans and sessions. Finite transformed media uses immutable HLS VOD manifests with lazy fragment generation. Media probing, remuxing and transcoding run in-process through the FFmpeg libraries behind `MediaEngine`; no `ffmpeg` or `ffprobe` subprocess is launched.
 
 ## Modes
 
@@ -67,7 +67,7 @@ If the API has a permanent Bearer token, session creation and control still requ
 GET /api/v1/playback/status
 ```
 
-Reports enablement, current session/transcode counts, media-engine backend/version and encoder availability. The old `ffmpeg_available`, `ffprobe_available` and `ffmpeg_version` fields are retained as false/empty for one compatibility release only.
+Reports enablement, current session/transcode counts, media-engine backend/version and encoder availability. Legacy executable-discovery status fields are reported as false/empty; the active backend/version and encoder capabilities are the authoritative status fields.
 
 ## Create a session
 

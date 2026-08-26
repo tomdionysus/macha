@@ -1694,11 +1694,11 @@ MACHA_TEST("hydration_catalogue", test_catalogue_cache_ignores_unrelated_metadat
 
     auto status = catalogue.status();
     REQUIRE(status.root.has_value());
-    REQUIRE(node.local_store().remove(*status.root));
+    REQUIRE(node.control_store().remove(*status.root));
 
     // Advance ordinary filesystem metadata without changing catalogue_root.
-    // The cached immutable catalogue must remain usable even though the backing
-    // root object has deliberately been made unavailable for a reload.
+    // The warm immutable catalogue must remain usable even though its local
+    // CONTROL manifest has deliberately been made unavailable.
     metadata.mutate([](MetadataSnapshot& snapshot) {
         auto root = snapshot.entries.find("/");
         REQUIRE(root != snapshot.entries.end());
@@ -1714,9 +1714,16 @@ MACHA_TEST("hydration_catalogue", test_catalogue_cache_ignores_unrelated_metadat
     // therefore return 404 without entering quorum repair.
     CHECK(catalogue.definitely_absent("test:movie:missing"));
 
-    // Background convergence should also recognise that an unchanged
-    // content-addressed root does not need to be reloaded.
-    catalogue.repair_once();
+    // CONTROL durability is stronger than API-cache availability. Background
+    // convergence must notice that the authoritative manifest is missing and
+    // fail closed, while the already-loaded immutable snapshot remains usable.
+    bool repair_failed = false;
+    try {
+        catalogue.repair_once();
+    } catch (const CatalogueUnavailable&) {
+        repair_failed = true;
+    }
+    CHECK(repair_failed);
     auto after_repair = catalogue.get("test:movie:1");
     REQUIRE(after_repair.has_value());
     CHECK(after_repair->title == "Cached Movie");
@@ -1997,6 +2004,29 @@ MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_persistence_coa
         CHECK(dead->state == CatalogueHintState::failed);
         CHECK(dead->failures == 2);
         CHECK(!failure_queue.claim_next().has_value());
+    }
+
+    // Infrastructure unavailability is scheduling state, not evidence that the
+    // media/provider match is bad. Deferring work must therefore preserve the
+    // semantic failure count exactly, even when the hint already has one real
+    // failure recorded.
+    const auto infrastructure_state = temp.path() / "infrastructure-state";
+    {
+        CatalogueHintQueue queue(infrastructure_state);
+        const auto id = queue.submit("/Movies/Retry.mkv", "scanner", "macha:retry",
+                                     CatalogueHintPriority::periodic_scan);
+        REQUIRE(queue.claim_next().has_value());
+        CHECK(!queue.record_failure(id, "provider parse failure", 0, 5));
+        auto failed_once = queue.get(id);
+        REQUIRE(failed_once.has_value());
+        CHECK(failed_once->failures == 1);
+        REQUIRE(queue.claim_next().has_value());
+        queue.defer(id, "metadata durability temporarily unavailable", unix_ms() + 1000);
+        auto deferred = queue.get(id);
+        REQUIRE(deferred.has_value());
+        CHECK(deferred->state == CatalogueHintState::deferred);
+        CHECK(deferred->failures == 1);
+        CHECK(deferred->error == "metadata durability temporarily unavailable");
     }
 
     // Equal-priority work is fair across top-level catalogue roots rather than
@@ -2299,7 +2329,7 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
     REQUIRE(n2.known_metadata_generation() < next.generation);
 
     // Expiry must force a real metadata read, discover the newer voter record and
-    // replace the decoded snapshot. Before 0.10.4 cached_snapshot_view() ignored
+    // replace the decoded snapshot. cached_snapshot_view() must not ignore
     // cache_until_ and this remained stale indefinitely without a notice.
     auto refreshed = metadata2.snapshot_view();
     CHECK(refreshed.generation == next.generation);
@@ -2322,34 +2352,30 @@ MACHA_TEST("hydration_catalogue", test_catalogue_root_ready_without_local_artwor
     CatalogueManager catalogue(node, store, metadata);
     node.start();
 
-    CatalogueSnapshot snapshot;
     CatalogueItem item;
     item.id = "test:movie:artwork-missing";
     item.kind = CatalogueKind::movie;
     item.title = "Catalogue Still Loads";
-    item.revision = 1;
-    item.updated_ns = wall_time_ns();
-    CatalogueArtwork artwork;
-    artwork.role = "poster";
-    artwork.mime_type = "image/jpeg";
-    artwork.id = object_id(Bytes{0x01, 0x02, 0x03, 0x04});
-    item.artwork.push_back(artwork);
-    snapshot.items.emplace(item.id, item);
+    item = catalogue.upsert(item);
 
-    auto encoded = encode_catalogue(snapshot);
-    auto root = object_id(encoded);
-    REQUIRE(node.local_store().put(root, encoded));
+    const Bytes artwork_bytes{0x01, 0x02, 0x03, 0x04};
+    const auto artwork = catalogue.put_artwork(item.id, "poster", "image/jpeg",
+                                               artwork_bytes, item.revision);
+    REQUIRE(node.local_store().remove(artwork.id));
     REQUIRE(!node.local_store().has(artwork.id));
 
-    metadata.mutate([&](MetadataSnapshot& state) { state.catalogue_root = root; });
-    catalogue.repair_once();
+    // Force a cold catalogue load from the sharded CONTROL representation. The
+    // referenced artwork DATA is deliberately absent locally and must not be a
+    // prerequisite for catalogue readiness.
+    CatalogueManager reloaded(node, store, metadata);
+    reloaded.repair_once();
 
-    auto status = catalogue.status();
+    auto status = reloaded.status();
     CHECK(status.ready);
     CHECK(status.items == 1);
     CHECK(status.artwork_objects == 1);
     CHECK(status.local_artwork_objects == 0);
-    auto loaded = catalogue.get(item.id);
+    auto loaded = reloaded.get(item.id);
     REQUIRE(loaded.has_value());
     CHECK(loaded->title == item.title);
 
@@ -2528,42 +2554,74 @@ MACHA_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_gc) {
     show = *s1.catalogue().get(show.id);
     CHECK(s1.catalogue().search("pilot").front().id == episode.id);
 
-    // A node joining after the catalogue already exists must become locally
-    // browse/search capable, including artwork, without provider access.
+    // A node joining after the catalogue already exists must become
+    // browse/search capable without provider access. Artwork is ordinary DATA:
+    // with R=1 it is not copied to every joining node, but every node must still
+    // be able to read it from the elected/fallback owner.
     Service s2(c2, keys);
     s2.start();
     REQUIRE(wait_until([&] {
         auto status = s2.catalogue().status();
-        return status.ready && status.items == 2 && status.artwork_objects == 1 &&
-               status.local_artwork_objects == 1;
+        return status.ready && status.items == 2 && status.artwork_objects == 1;
     }, 10s));
     REQUIRE(s2.catalogue().get(episode.id).has_value());
     CHECK(s2.catalogue().search("test programme").front().id == show.id);
-    CHECK(s2.node().local_store().has(first_art.id));
+    auto s2_first_art = s2.catalogue().artwork(first_art.id);
+    REQUIRE(s2_first_art.has_value());
+    CHECK(s2_first_art->bytes == first_art_bytes);
 
     Service s3(c3, keys);
     s3.start();
     REQUIRE(wait_until([&] {
         auto status = s3.catalogue().status();
-        return status.ready && status.items == 2 && status.local_artwork_objects == 1;
+        return status.ready && status.items == 2 && status.artwork_objects == 1;
     }, 10s));
     CHECK(s3.catalogue().list(CatalogueKind::episode).size() == 1);
-    CHECK(s3.node().local_store().has(first_art.id));
+    auto s3_first_art = s3.catalogue().artwork(first_art.id);
+    REQUIRE(s3_first_art.has_value());
+    CHECK(s3_first_art->bytes == first_art_bytes);
 
-    // Replacing the poster retires the old object in committed metadata. With
-    // a zero grace period in this test, reachability GC must prune that retirement
-    // and delete the unreachable physical object on every connected node while
-    // preserving the replacement.
+    // Replacing the poster retires the old DATA object in committed metadata.
+    // With a zero grace period, reachability GC must delete the old authoritative
+    // copy while preserving exactly the normal R=1 placement semantics for the
+    // replacement.
     auto second_art_bytes = pattern(96 * 1024 + 3);
     second_art_bytes[0] ^= 0xa5;
     auto second_art = s2.catalogue().put_artwork(show.id, "poster", "image/jpeg",
                                                  second_art_bytes, show.revision);
+    auto has_second_artwork_reference = [&](Service& service) {
+        try {
+            // Namespace and catalogue share Service's MetadataManager. Force the
+            // known metadata generation into that manager, then run catalogue
+            // convergence explicitly instead of waiting for background cadence.
+            (void)service.filesystem().getattr("/");
+            service.catalogue().repair_once();
+            auto item = service.catalogue().get(show.id);
+            return item && std::any_of(item->artwork.begin(), item->artwork.end(),
+                                       [&](const CatalogueArtwork& art) {
+                                           return art.id == second_art.id;
+                                       });
+        } catch (...) {
+            return false;
+        }
+    };
+    // `ready` means the node has a usable catalogue, not that it has observed
+    // the just-committed generation.  Wait for the replacement reference to
+    // converge before testing distributed DATA reads for that ObjectId.
     REQUIRE(wait_until([&] {
-        return s1.catalogue().status().ready && s2.catalogue().status().ready &&
-               s3.catalogue().status().ready && s1.node().local_store().has(second_art.id) &&
-               s2.node().local_store().has(second_art.id) &&
-               s3.node().local_store().has(second_art.id);
+        return has_second_artwork_reference(s1) &&
+               has_second_artwork_reference(s2) &&
+               has_second_artwork_reference(s3);
     }, 10s));
+    auto s1_second_art = s1.catalogue().artwork(second_art.id);
+    auto s2_second_art = s2.catalogue().artwork(second_art.id);
+    auto s3_second_art = s3.catalogue().artwork(second_art.id);
+    REQUIRE(s1_second_art.has_value());
+    REQUIRE(s2_second_art.has_value());
+    REQUIRE(s3_second_art.has_value());
+    CHECK(s1_second_art->bytes == second_art_bytes);
+    CHECK(s2_second_art->bytes == second_art_bytes);
+    CHECK(s3_second_art->bytes == second_art_bytes);
     REQUIRE(wait_until([&] {
         return !s1.node().local_store().has(first_art.id) &&
                !s2.node().local_store().has(first_art.id) &&

@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.17.0 LANGUAGES CXX)
+project(macha VERSION 0.18.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -137,6 +137,7 @@ set(MACHA_CORE_SOURCES
     src/filesystem.cpp
     src/fuse_journal.cpp
     src/fuse_frontend.cpp
+    src/fuse_mountpoint.cpp
     src/service.cpp
 )
 
@@ -226,6 +227,7 @@ if(MACHA_BUILD_TESTS)
         tests/test_framework.cpp
         tests/test_foundations.cpp
         tests/test_storage_metadata.cpp
+        tests/test_storage_v18.cpp
         tests/test_rpc_cluster.cpp
         tests/test_filesystem_fuse.cpp
         tests/test_hydration_catalogue.cpp
