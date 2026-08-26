@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.17.0 - 2026-08-26
+
+- make immutable metadata-record payloads share backing storage so copying a record no longer duplicates a namespace-sized byte vector, and hash canonical metadata records incrementally instead of materialising a second full encoded buffer;
+- add an exact-delta mutation path for ordinary filesystem, catalogue and garbage-maintenance changes, apply metadata deltas in place, and cache the already-mutated decoded snapshot so a single mutation no longer holds multiple deep copies of the complete namespace;
+- replace full garbage-index tree copies with compact sorted pointer indexes, batch extent retirement into one scan of the garbage set, and remove per-extent linear scans from large file publication;
+- bound full metadata checkpoint/seed fan-out to one remote payload in flight at a time and remove an additional outbound RPC payload copy, preventing recovery/repair from multiplying full-snapshot memory by peer count;
+- add regression coverage for shared metadata-record backing, canonical streaming hashes, in-place delta storage stability and repeated large-record copies with a Linux RSS bound, guarding against reintroduction of namespace-scale transient memory amplification.
+
 ## 0.16.0 - 2026-08-25
 
 - replace layered store/RPC/FUSE ownership of authoritative object barriers with one filesystem-scoped `DurabilityDomain` per `st_dev`; completed filesystem mutations receive process-local generations, publication waits on generation tickets, and only the domain coordinator performs authoritative object `syncfs()`/portable fallback barriers;

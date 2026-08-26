@@ -3,6 +3,7 @@
 #include "crypto.hpp"
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <mutex>
 namespace macha {
 enum class EntryType : uint8_t { directory = 1, file = 2 };
@@ -46,10 +47,45 @@ struct MetadataSnapshot {
     std::map<std::string, FsEntry> entries;
     std::vector<GarbageRef> garbage;
 };
+// Metadata records are immutable once constructed. Their canonical snapshot payload can
+// be hundreds of megabytes on large media namespaces, so copying a MetadataRecord must
+// not duplicate the complete byte vector. SharedBytes retains value semantics while
+// making record copies share immutable backing storage. Any assignment/assign creates a
+// new backing vector, so aliases can never observe mutation.
+class SharedBytes {
+    std::shared_ptr<const Bytes> bytes_{std::make_shared<const Bytes>()};
+
+  public:
+    SharedBytes() = default;
+    SharedBytes(Bytes value) : bytes_(std::make_shared<const Bytes>(std::move(value))) {}
+
+    SharedBytes& operator=(Bytes value) {
+        bytes_ = std::make_shared<const Bytes>(std::move(value));
+        return *this;
+    }
+
+    template <class Iterator> void assign(Iterator first, Iterator last) {
+        bytes_ = std::make_shared<const Bytes>(first, last);
+    }
+
+    size_t size() const noexcept { return bytes_->size(); }
+    bool empty() const noexcept { return bytes_->empty(); }
+    const uint8_t* data() const noexcept { return bytes_->data(); }
+    Bytes::const_iterator begin() const noexcept { return bytes_->begin(); }
+    Bytes::const_iterator end() const noexcept { return bytes_->end(); }
+    operator std::span<const uint8_t>() const noexcept { return *bytes_; }
+
+    friend bool operator==(const SharedBytes& a, const SharedBytes& b) {
+        return a.bytes_ == b.bytes_ || *a.bytes_ == *b.bytes_;
+    }
+    friend bool operator==(const SharedBytes& a, const Bytes& b) { return *a.bytes_ == b; }
+    friend bool operator==(const Bytes& a, const SharedBytes& b) { return a == *b.bytes_; }
+};
+
 struct MetadataRecord {
     uint64_t generation{};
     Hash256 previous{}, hash{};
-    Bytes payload;
+    SharedBytes payload;
 };
 
 struct MetadataIdentity {
@@ -79,6 +115,7 @@ Bytes encode_metadata_record(const MetadataRecord&);
 Bytes encode_metadata_delta(const MetadataDelta&);
 MetadataDelta decode_metadata_delta(std::span<const uint8_t>);
 std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot&, const MetadataSnapshot&);
+void apply_metadata_delta_in_place(MetadataSnapshot&, const MetadataDelta&);
 MetadataSnapshot apply_metadata_delta(const MetadataSnapshot&, const MetadataDelta&);
 MetadataRecord decode_metadata_record(std::span<const uint8_t>);
 Hash256 metadata_hash(uint64_t, const Hash256&, std::span<const uint8_t>);

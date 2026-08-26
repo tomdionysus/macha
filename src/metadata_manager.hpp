@@ -65,6 +65,7 @@ class MetadataManager {
     MetadataRecord maybe_reconfigure(const MetadataRecord&);
     MetadataRecord read_record_uncached();
     MetadataRecord cache_record(const MetadataRecord&);
+    MetadataRecord cache_record(const MetadataRecord&, std::shared_ptr<MetadataSnapshot> decoded);
     std::optional<MetadataRecord> cached_record();
     std::optional<MetadataSnapshotView> cached_snapshot_view();
 
@@ -83,9 +84,11 @@ class MetadataManager {
                          std::span<const uint8_t>, size_t required,
                          FrameType frame_type = FrameType::control);
     CasResult cas_delta_quorum(const std::vector<NodeInfo>&, const MetadataRecord&,
-                               std::span<const uint8_t> delta,
-                               std::span<const uint8_t> proposed_payload, size_t required,
-                               FrameType frame_type = FrameType::control);
+                               std::span<const uint8_t> delta, Bytes proposed_payload,
+                               size_t required, FrameType frame_type = FrameType::control);
+    MetadataRecord mutate_impl(
+        const std::function<void(MetadataSnapshot&, MetadataDelta*)>&, bool exact_delta,
+        size_t retries);
 
   public:
     explicit MetadataManager(NodeRuntime&);
@@ -100,6 +103,10 @@ class MetadataManager {
         return available_namespace_revision_.load(std::memory_order_acquire);
     }
     MetadataRecord mutate(const std::function<void(MetadataSnapshot&)>&, size_t retries = 8);
+    // Fast path for callers that can describe the exact delta as they mutate the
+    // decoded snapshot. Avoids retaining a second deep copy of the namespace.
+    MetadataRecord mutate_delta(
+        const std::function<void(MetadataSnapshot&, MetadataDelta&)>&, size_t retries = 8);
     void repair_once();
 };
 } // namespace macha

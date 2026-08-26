@@ -99,6 +99,35 @@ bool metadata_delta_v1(std::span<const uint8_t> data) {
     return data.size() >= magic.size() && std::equal(magic.begin(), magic.end(), data.begin());
 }
 
+void hash_u8(Sha256Hasher& hash, uint8_t value) {
+    hash.update(std::span<const uint8_t>(&value, 1));
+}
+
+void hash_u32(Sha256Hasher& hash, uint32_t value) {
+    std::array<uint8_t, 4> encoded{};
+    for (int shift = 24, i = 0; shift >= 0; shift -= 8, ++i)
+        encoded[static_cast<size_t>(i)] = static_cast<uint8_t>(value >> shift);
+    hash.update(encoded);
+}
+
+void hash_u64(Sha256Hasher& hash, uint64_t value) {
+    std::array<uint8_t, 8> encoded{};
+    for (int shift = 56, i = 0; shift >= 0; shift -= 8, ++i)
+        encoded[static_cast<size_t>(i)] = static_cast<uint8_t>(value >> shift);
+    hash.update(encoded);
+}
+
+void hash_bytes(Sha256Hasher& hash, std::span<const uint8_t> bytes) {
+    if (bytes.size() > UINT32_MAX)
+        throw std::runtime_error("encoded blob too large");
+    hash_u32(hash, static_cast<uint32_t>(bytes.size()));
+    hash.update(bytes);
+}
+
+void hash_string(Sha256Hasher& hash, const std::string& value) {
+    hash_bytes(hash, {reinterpret_cast<const uint8_t*>(value.data()), value.size()});
+}
+
 void writefile(const std::filesystem::path& p, std::span<const uint8_t> d) {
     durable_replace_file(
         p, std::string_view(reinterpret_cast<const char*>(d.data()), d.size()));
@@ -424,31 +453,49 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
         }
     }
 
-    std::map<ObjectId, GarbageRef> before_garbage;
-    std::map<ObjectId, GarbageRef> after_garbage;
-    for (const auto& garbage : before.garbage) {
-        if (!before_garbage.emplace(garbage.id, garbage).second)
+    // Garbage can contain millions of tombstones on a long-lived media node.
+    // Do not materialise two std::map copies merely to diff them: tree-node
+    // overhead alone can consume gigabytes. Sort compact pointer indexes and
+    // merge them instead. The snapshots remain immutable throughout the diff.
+    std::vector<const GarbageRef*> before_garbage;
+    std::vector<const GarbageRef*> after_garbage;
+    before_garbage.reserve(before.garbage.size());
+    after_garbage.reserve(after.garbage.size());
+    for (const auto& garbage : before.garbage)
+        before_garbage.push_back(&garbage);
+    for (const auto& garbage : after.garbage)
+        after_garbage.push_back(&garbage);
+    const auto by_id = [](const GarbageRef* a, const GarbageRef* b) { return a->id < b->id; };
+    std::sort(before_garbage.begin(), before_garbage.end(), by_id);
+    std::sort(after_garbage.begin(), after_garbage.end(), by_id);
+    for (size_t i = 1; i < before_garbage.size(); ++i)
+        if (before_garbage[i - 1]->id == before_garbage[i]->id)
             return {};
-    }
-    for (const auto& garbage : after.garbage) {
-        if (!after_garbage.emplace(garbage.id, garbage).second)
+    for (size_t i = 1; i < after_garbage.size(); ++i)
+        if (after_garbage[i - 1]->id == after_garbage[i]->id)
             return {};
-    }
-    for (const auto& garbage : before.garbage) {
-        if (!after_garbage.contains(garbage.id))
-            delta.erase_garbage.push_back(garbage.id);
-    }
-    for (const auto& garbage : after.garbage) {
-        auto it = before_garbage.find(garbage.id);
-        if (it == before_garbage.end() || it->second != garbage)
-            delta.upsert_garbage.push_back(garbage);
+
+    size_t bi = 0, ai = 0;
+    while (bi < before_garbage.size() || ai < after_garbage.size()) {
+        if (ai == after_garbage.size() ||
+            (bi < before_garbage.size() && before_garbage[bi]->id < after_garbage[ai]->id)) {
+            delta.erase_garbage.push_back(before_garbage[bi++]->id);
+            continue;
+        }
+        if (bi == before_garbage.size() || after_garbage[ai]->id < before_garbage[bi]->id) {
+            delta.upsert_garbage.push_back(*after_garbage[ai++]);
+            continue;
+        }
+        if (*before_garbage[bi] != *after_garbage[ai])
+            delta.upsert_garbage.push_back(*after_garbage[ai]);
+        ++bi;
+        ++ai;
     }
 
     return delta;
 }
 
-MetadataSnapshot apply_metadata_delta(const MetadataSnapshot& before, const MetadataDelta& delta) {
-    MetadataSnapshot out = before;
+void apply_metadata_delta_in_place(MetadataSnapshot& out, const MetadataDelta& delta) {
     for (const auto& [node, sequence] : delta.mutation_sequences) {
         auto it = out.mutation_sequences.find(node);
         if (it != out.mutation_sequences.end() && sequence < it->second)
@@ -489,15 +536,22 @@ MetadataSnapshot apply_metadata_delta(const MetadataSnapshot& before, const Meta
     auto root = out.entries.find("/");
     if (root == out.entries.end() || root->second.type != EntryType::directory)
         throw DecodeError("metadata delta lost root");
+}
+
+MetadataSnapshot apply_metadata_delta(const MetadataSnapshot& before, const MetadataDelta& delta) {
+    MetadataSnapshot out = before;
+    apply_metadata_delta_in_place(out, delta);
     return out;
 }
 
 Hash256 metadata_hash(uint64_t g, const Hash256& p, std::span<const uint8_t> d) {
-    Writer w;
-    w.u64(g);
-    w.fixed(p.bytes);
-    w.bytes(d);
-    return sha256(w.data());
+    // Preserve the exact canonical encoding without allocating a second copy of
+    // the (potentially hundreds-of-megabytes) snapshot payload merely to hash it.
+    Sha256Hasher hash;
+    hash_u64(hash, g);
+    hash.update(p.bytes);
+    hash_bytes(hash, d);
+    return hash.finish();
 }
 Bytes encode_metadata_record(const MetadataRecord& m) {
     Writer w;
@@ -874,9 +928,9 @@ void MetadataReplica::load_journal() {
             case JOURNAL_PREPARE_DELTA: {
                 if (record.generation != cur_.generation + 1 || record.previous != cur_.hash)
                     throw std::runtime_error("delta CAS chain broken");
-                auto snapshot = decode_snapshot(cur_.payload);
+                auto replayed = decode_snapshot(cur_.payload);
                 auto delta = decode_metadata_delta(body);
-                auto replayed = apply_metadata_delta(snapshot, delta);
+                apply_metadata_delta_in_place(replayed, delta);
                 record.payload = metadata_delta_v1(body) ? encode_snapshot_v7(replayed)
                                                          : encode_snapshot(replayed);
                 if (!valid_metadata_record(record))
@@ -986,9 +1040,9 @@ bool MetadataReplica::cas_delta(uint64_t generation, const Hash256& hash,
             *out = cur_;
         return false;
     }
-    auto before = decode_snapshot(cur_.payload);
+    auto after = decode_snapshot(cur_.payload);
     auto delta = decode_metadata_delta(encoded_delta);
-    auto after = apply_metadata_delta(before, delta);
+    apply_metadata_delta_in_place(after, delta);
 
     MetadataRecord next;
     next.generation = generation + 1;
@@ -1020,12 +1074,12 @@ bool MetadataReplica::install_committed_delta(uint64_t generation, const Hash256
     if (cur_.generation != generation || cur_.hash != hash)
         return false;
 
-    auto before = decode_snapshot(cur_.payload);
+    auto after = decode_snapshot(cur_.payload);
     auto delta = decode_metadata_delta(encoded_delta);
+    apply_metadata_delta_in_place(after, delta);
     MetadataRecord next;
     next.generation = generation + 1;
     next.previous = hash;
-    auto after = apply_metadata_delta(before, delta);
     next.payload = metadata_delta_v1(encoded_delta) ? encode_snapshot_v7(after)
                                                      : encode_snapshot(after);
     next.hash = metadata_hash(next.generation, next.previous, next.payload);
@@ -1138,24 +1192,29 @@ std::optional<MetadataRecord> MetadataReplica::load(const std::filesystem::path&
 }
 
 Hash256 metadata_namespace_signature(const MetadataSnapshot& snapshot) {
-    Writer writer;
-    writer.u64(snapshot.entries.size());
+    // This signature is consulted by catalogue/maintenance paths. Stream the
+    // canonical representation into SHA-256 so a namespace containing millions
+    // of extents never requires a second namespace-sized byte buffer.
+    Sha256Hasher hash;
+    hash_u64(hash, snapshot.entries.size());
     for (const auto& [path, entry] : snapshot.entries) {
-        writer.string(path);
-        writer.u8(static_cast<uint8_t>(entry.type));
+        hash_string(hash, path);
+        hash_u8(hash, static_cast<uint8_t>(entry.type));
         if (entry.type != EntryType::file)
             continue;
-        writer.u64(entry.size);
-        writer.u32(entry.extents.size());
+        hash_u64(hash, entry.size);
+        if (entry.extents.size() > UINT32_MAX)
+            throw std::runtime_error("too many extents for namespace signature");
+        hash_u32(hash, static_cast<uint32_t>(entry.extents.size()));
         for (const auto& extent : entry.extents) {
-            writer.u64(extent.offset);
-            writer.u64(extent.length);
-            writer.u8(extent.hole);
+            hash_u64(hash, extent.offset);
+            hash_u64(hash, extent.length);
+            hash_u8(hash, extent.hole);
             if (!extent.hole)
-                writer.fixed(extent.id.bytes);
+                hash.update(extent.id.bytes);
         }
     }
-    return sha256(writer.data());
+    return hash.finish();
 }
 
 std::string normalize_path(const std::string& p) {

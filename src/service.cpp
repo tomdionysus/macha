@@ -253,10 +253,13 @@ void Service::maintain_garbage_metadata(const std::vector<GarbageRef>& erase,
     for (const auto& candidate : stamp)
         stamp_expected[candidate.id] = candidate;
 
-    metadata_.mutate([&](MetadataSnapshot& snapshot) {
+    metadata_.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
         std::erase_if(snapshot.garbage, [&](const GarbageRef& current) {
             auto expected = erase_expected.find(current.id);
-            return expected != erase_expected.end() && expected->second == current;
+            const bool remove = expected != erase_expected.end() && expected->second == current;
+            if (remove)
+                delta.erase_garbage.push_back(current.id);
+            return remove;
         });
 
         const auto retired = wall_time_ns();
@@ -269,7 +272,12 @@ void Service::maintain_garbage_metadata(const std::vector<GarbageRef>& erase,
             // storage safely while allowing them to leave metadata after grace.
             current.retired_at_ns = retired;
             current.retirement_id = random_node_id();
+            delta.upsert_garbage.push_back(current);
         }
+        std::sort(delta.erase_garbage.begin(), delta.erase_garbage.end());
+        delta.erase_garbage.erase(
+            std::unique(delta.erase_garbage.begin(), delta.erase_garbage.end()),
+            delta.erase_garbage.end());
     });
 }
 

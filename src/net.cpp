@@ -962,7 +962,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         outbound_.push_back({0, FrameType::control, {MessageType::session_retire, {}}, 0, false, {}});
     }
 
-    bool queue_message(uint64_t request_id, FrameType frame_type, const RpcMessage& message,
+    bool queue_message(uint64_t request_id, FrameType frame_type, RpcMessage message,
                        bool reply, std::shared_ptr<std::promise<void>> sent = {}) {
         validate_frame_semantics(message.type, frame_type);
         {
@@ -983,7 +983,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                 outbound_classes_[request_id] = frame_type;
             outbound_.push_back({request_id,
                                  frame_type,
-                                 {message.type, Bytes(message.payload.begin(), message.payload.end())},
+                                 std::move(message),
                                  0,
                                  reply,
                                  std::move(sent)});
@@ -2211,7 +2211,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
         outbound.push_back({0, FrameType::control, {MessageType::session_retire, {}}, 0, false, {}});
     }
 
-    bool queue_message(uint64_t request_id, FrameType frame_type, const RpcMessage& message,
+    bool queue_message(uint64_t request_id, FrameType frame_type, RpcMessage message,
                        bool reply, std::shared_ptr<std::promise<void>> sent = {}) {
         validate_frame_semantics(message.type, frame_type);
         {
@@ -2232,7 +2232,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                 outbound_classes[request_id] = frame_type;
             outbound.push_back({request_id,
                                 frame_type,
-                                {message.type, Bytes(message.payload.begin(), message.payload.end())},
+                                std::move(message),
                                 0,
                                 reply,
                                 std::move(sent)});
