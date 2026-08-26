@@ -152,6 +152,7 @@ class TorrentManager {
     std::optional<TorrentJob> job(std::string_view id) const;
     bool pause(std::string_view id);
     bool resume(std::string_view id);
+    bool retry(std::string_view id);
     bool cancel(std::string_view id);
     bool clear(std::string_view id);
 };

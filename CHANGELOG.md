@@ -1,5 +1,10 @@
 # Current release
 
+## 0.18.1 — acquisition recovery
+
+- Add an explicit torrent retry action for completed downloads whose linked ingest job failed, reusing the existing persisted ingest job and staging payload without redownloading.
+- Keep an operator-paused torrent paused until explicit resume instead of allowing a stale libtorrent status sample to overwrite the Macha job state.
+
 ## 0.18.0 — storage correctness reset
 
 0.18.0 defines a fresh on-disk/storage contract and intentionally does not migrate an existing Macha namespace.
