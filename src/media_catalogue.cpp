@@ -2721,7 +2721,8 @@ CatalogueScanProvider* CatalogueScanner::provider_for_path(std::string_view path
 
 std::optional<CatalogueScanner::PreparedHintMatch>
 CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
-                               const MetadataSnapshot& namespace_snapshot) {
+                               const MetadataSnapshot& namespace_snapshot,
+                               DistributedStore::DurabilityBatch& artwork_batch) {
     if (stop.stop_requested()) return {};
     CatalogueScannerConfig config;
     {
@@ -2812,7 +2813,8 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
         if (artwork_target) {
             bool changed = false;
             for (const auto& art : probed.artwork) {
-                auto staged = catalogue_.stage_artwork(art.role, art.mime_type, art.bytes);
+                auto staged = catalogue_.stage_artwork_deferred(
+                    art.role, art.mime_type, art.bytes, artwork_batch);
                 const bool duplicate = std::any_of(
                     artwork_target->artwork.begin(), artwork_target->artwork.end(),
                     [&](const auto& current) {
@@ -2923,7 +2925,8 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
         if (target != match.items.end()) {
             for (const auto& art : probed.artwork) {
                 try {
-                    auto staged = catalogue_.stage_artwork(art.role, art.mime_type, art.bytes);
+                    auto staged = catalogue_.stage_artwork_deferred(
+                    art.role, art.mime_type, art.bytes, artwork_batch);
                     const bool duplicate = std::any_of(
                         target->artwork.begin(), target->artwork.end(), [&](const auto& current) {
                             return current.role == staged.role && current.id == staged.id;
@@ -2954,7 +2957,8 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
             auto mime = response.content_type;
             if (auto semi = mime.find(';'); semi != std::string::npos) mime.resize(semi);
             if (!mime.starts_with("image/")) continue;
-            auto staged = catalogue_.stage_artwork(art.role, mime, response.body);
+            auto staged = catalogue_.stage_artwork_deferred(
+                art.role, mime, response.body, artwork_batch);
             const bool duplicate = std::any_of(
                 target->artwork.begin(), target->artwork.end(), [&](const auto& current) {
                     return current.role == staged.role && current.id == staged.id;
@@ -2987,6 +2991,7 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
     HintBatchResult out;
     std::vector<PreparedHintMatch> prepared;
     prepared.reserve(max_hints);
+    DistributedStore::DurabilityBatch artwork_batch;
 
     // Acquire one coherent decoded namespace view lazily for the complete
     // batch. An empty queue therefore causes no metadata work at all. Normally
@@ -3003,7 +3008,7 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
                 if (!namespace_view)
                     namespace_view = fs_.local_snapshot_view();
             }
-            if (auto match = prepare_hint(*hint, stop, *namespace_view->snapshot))
+            if (auto match = prepare_hint(*hint, stop, *namespace_view->snapshot, artwork_batch))
                 prepared.push_back(std::move(*match));
         } catch (const CatalogueConflict& e) {
             hints_.defer(hint->id, e.what(), unix_ms() + 500);
@@ -3022,6 +3027,15 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
         return out;
     }
     if (prepared.empty()) return out;
+
+    if (!catalogue_.artwork_durability_barrier(artwork_batch)) {
+        const auto retry = unix_ms() +
+            static_cast<uint64_t>(config.provider_batch_delay.count());
+        for (const auto& match : prepared)
+            hints_.defer(match.hint_id, "catalogue artwork durability quorum unavailable", retry);
+        Log::debug("catalogue hint batch deferred: artwork durability quorum unavailable");
+        return out;
+    }
 
     std::vector<CatalogueItem> discovered;
     std::set<std::string> active_media_ids;

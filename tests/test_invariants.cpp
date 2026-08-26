@@ -498,6 +498,40 @@ MACHA_TEST("invariants", test_authoritative_deferred_generation_batches_stable_s
 #endif
 }
 
+MACHA_TEST("invariants", test_catalogue_artwork_batch_defers_durability_until_barrier) {
+    TestNode fixture("catalogue-artwork-batch");
+    fixture.config().maintenance.interval = std::chrono::hours(1);
+    fixture.start();
+    REQUIRE(wait_until([&] { return fixture.node().local_store().online_backends() == 1; }));
+
+    CatalogueManager catalogue(fixture.node(), fixture.store(), fixture.metadata());
+    DistributedStore::DurabilityBatch batch;
+    const auto a = pattern(64 * 1024, 201);
+    const auto b = pattern(64 * 1024, 202);
+    const auto art_a = catalogue.stage_artwork_deferred("poster", "image/jpeg", a, batch);
+    const auto art_b = catalogue.stage_artwork_deferred("backdrop", "image/jpeg", b, batch);
+
+    REQUIRE(batch.requirements.size() == 2);
+    for (const auto& requirement : batch.requirements) {
+        REQUIRE(requirement.replicas.size() == 1);
+        const auto& replica = requirement.replicas.front();
+        REQUIRE(replica.id == fixture.node().node_id());
+        const StoragePool::DurabilityToken token{
+            replica.domain, replica.generation, replica.backend_instance};
+        CHECK(!fixture.node().local_store().durability_covered(token));
+    }
+
+    REQUIRE(catalogue.artwork_durability_barrier(batch));
+    for (const auto& requirement : batch.requirements) {
+        const auto& replica = requirement.replicas.front();
+        const StoragePool::DurabilityToken token{
+            replica.domain, replica.generation, replica.backend_instance};
+        CHECK(fixture.node().local_store().durability_covered(token));
+    }
+    CHECK(fixture.node().local_store().has(art_a.id));
+    CHECK(fixture.node().local_store().has(art_b.id));
+}
+
 MACHA_TEST("invariants", test_accounting_dirty_marker_is_process_session_scoped) {
 #if defined(__linux__)
     TempDir t;
