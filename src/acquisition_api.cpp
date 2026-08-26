@@ -313,6 +313,7 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
                 bool changed = false;
                 if (target->second == "pause") changed = torrents_.pause(target->first);
                 else if (target->second == "resume") changed = torrents_.resume(target->first);
+                else if (target->second == "retry") changed = torrents_.retry(target->first);
                 else if (target->second == "cancel") changed = torrents_.cancel(target->first);
                 else if (target->second == "clear") changed = torrents_.clear(target->first);
                 else return http_error(404, "not_found", "unknown torrent action");

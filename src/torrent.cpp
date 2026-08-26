@@ -733,6 +733,49 @@ bool TorrentManager::resume(std::string_view id) {
     return true;
 }
 
+bool TorrentManager::retry(std::string_view id) {
+    std::lock_guard lock(mutex_);
+    auto it = jobs_.find(std::string(id));
+    if (it == jobs_.end()) return false;
+    auto& job = it->second;
+    if (job.state != TorrentJobState::failed || !job.ingest_job_id) return false;
+
+    const auto linked = ingest_.job(*job.ingest_job_id);
+    if (!linked || linked->state != IngestJobState::failed) return false;
+
+    const auto previous = job;
+    job.state = TorrentJobState::importing;
+    job.download_rate = 0;
+    job.upload_rate = 0;
+    job.eta_seconds.reset();
+    job.error.clear();
+    job.updated_unix_ms = unix_ms();
+    try {
+        // Persist the wrapper first. If the daemon exits before ingest.resume(),
+        // update_jobs() will observe the still-failed linked ingest after restart
+        // and converge this wrapper back to failed without touching the payload.
+        save_state_locked();
+    } catch (...) {
+        job = previous;
+        throw;
+    }
+
+    try {
+        if (!ingest_.resume(*job.ingest_job_id)) {
+            job = previous;
+            save_state_locked();
+            return false;
+        }
+    } catch (...) {
+        job = previous;
+        save_state_locked();
+        throw;
+    }
+
+    cv_.notify_all();
+    return true;
+}
+
 bool TorrentManager::cancel(std::string_view id) {
     std::lock_guard lock(mutex_);
     auto it = jobs_.find(std::string(id));
@@ -834,6 +877,14 @@ void TorrentManager::update_jobs() {
     for (auto& [id, job] : jobs_) {
         if (job.state == TorrentJobState::cancelled || job.state == TorrentJobState::completed ||
             job.state == TorrentJobState::failed)
+            continue;
+
+        // Macha's explicit pause is operator intent. libtorrent applies
+        // pause asynchronously and status() may briefly report the pre-pause
+        // download state; never let that stale observation resume the job in
+        // Macha. Linked ingest jobs are still sampled because their own state
+        // is authoritative once the torrent payload has been handed over.
+        if (job.state == TorrentJobState::paused && !job.ingest_job_id)
             continue;
 
         if (job.ingest_job_id) {

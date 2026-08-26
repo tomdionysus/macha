@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
+#include "acquisition_api.hpp"
 
 using namespace macha;
 using namespace std::chrono_literals;
@@ -2058,6 +2059,142 @@ MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_persistence_coa
     auto ready_delay = wake.next_ready_delay();
     REQUIRE(ready_delay.has_value());
     CHECK(*ready_delay == 0ms);
+}
+
+MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_intent) {
+    TestNode fixture("torrent-recovery");
+    fixture.prepare();
+
+    const auto state_path = fixture.config().state_path;
+    const auto staging_path = fixture.path() / "staging";
+    const auto retry_payload = staging_path / "torrents" / "torrent-retry";
+    const auto pause_payload = staging_path / "torrents" / "torrent-pause";
+    std::filesystem::create_directories(retry_payload);
+    std::filesystem::create_directories(pause_payload);
+    std::filesystem::create_directories(state_path / "ingest");
+    std::filesystem::create_directories(state_path / "torrent");
+
+    {
+        Json::Object job;
+        job["id"] = "ingest-retry";
+        job["source_type"] = "torrent";
+        job["source_ref"] = "torrent-retry";
+        job["display_name"] = "Retry Movie";
+        job["source_path"] = retry_payload.string();
+        job["source_owned"] = true;
+        job["delete_source_on_clear"] = true;
+        job["state"] = "failed";
+        job["bytes_total"] = static_cast<uint64_t>(1234);
+        job["bytes_completed"] = static_cast<uint64_t>(1234);
+        job["files_total"] = static_cast<uint64_t>(1);
+        job["files_completed"] = static_cast<uint64_t>(1);
+        job["created_unix_ms"] = static_cast<uint64_t>(1);
+        job["updated_unix_ms"] = static_cast<uint64_t>(2);
+        job["error"] = "metadata quorum unavailable";
+        job["files"] = Json::Array{};
+        Json::Array jobs;
+        jobs.emplace_back(std::move(job));
+        Json::Object root;
+        root["version"] = static_cast<uint64_t>(2);
+        root["jobs"] = std::move(jobs);
+        std::ofstream out(state_path / "ingest" / "jobs.json", std::ios::binary | std::ios::trunc);
+        REQUIRE(out.good());
+        out << Json(std::move(root)).dump();
+        REQUIRE(out.good());
+    }
+
+    {
+        Json::Array jobs;
+        Json::Object retry;
+        retry["id"] = "torrent-retry";
+        retry["name"] = "Retry Movie";
+        retry["source_uri"] = "magnet:?xt=urn:btih:1111111111111111111111111111111111111111";
+        retry["info_hash"] = "1111111111111111111111111111111111111111";
+        retry["save_path"] = retry_payload.string();
+        retry["state"] = "failed";
+        retry["bytes_total"] = static_cast<uint64_t>(1234);
+        retry["bytes_completed"] = static_cast<uint64_t>(1234);
+        retry["ingest_job_id"] = "ingest-retry";
+        retry["created_unix_ms"] = static_cast<uint64_t>(1);
+        retry["updated_unix_ms"] = static_cast<uint64_t>(2);
+        retry["error"] = "ingest failed: metadata quorum unavailable";
+        jobs.emplace_back(std::move(retry));
+
+        Json::Object pause;
+        pause["id"] = "torrent-pause";
+        pause["name"] = "Pause Movie";
+        pause["source_uri"] = "magnet:?xt=urn:btih:2222222222222222222222222222222222222222";
+        pause["info_hash"] = "2222222222222222222222222222222222222222";
+        pause["save_path"] = pause_payload.string();
+        pause["state"] = "queued";
+        pause["created_unix_ms"] = static_cast<uint64_t>(1);
+        pause["updated_unix_ms"] = static_cast<uint64_t>(2);
+        pause["error"] = "";
+        jobs.emplace_back(std::move(pause));
+
+        Json::Object root;
+        root["version"] = static_cast<uint64_t>(1);
+        root["jobs"] = std::move(jobs);
+        std::ofstream out(state_path / "torrent" / "jobs.json", std::ios::binary | std::ios::trunc);
+        REQUIRE(out.good());
+        out << Json(std::move(root)).dump();
+        REQUIRE(out.good());
+    }
+
+    CatalogueHintQueue hints(state_path / "catalogue-hints");
+    IngestConfig ingest_config;
+    ingest_config.enabled = true;
+    ingest_config.staging_path = staging_path;
+    IngestManager ingest(fixture.node(), fixture.filesystem(), hints, ingest_config);
+
+    TorrentConfig torrent_config;
+    torrent_config.enabled = true;
+    torrent_config.dht = false;
+    torrent_config.pex = false;
+    torrent_config.lsd = false;
+    TorrentManager torrents(ingest, torrent_config, state_path);
+
+    auto failed_ingest = ingest.job("ingest-retry");
+    REQUIRE(failed_ingest.has_value());
+    CHECK(failed_ingest->state == IngestJobState::failed);
+
+    TorrentSearchManager search(torrent_config);
+    AcquisitionApi acquisition(ingest, torrents, search);
+    HttpRequest retry_request;
+    retry_request.method = "POST";
+    retry_request.path = "/api/v1/torrents/jobs/torrent-retry/retry";
+    const auto retry_response = acquisition.handle(retry_request);
+    REQUIRE(retry_response.status == 200);
+    const auto retry_body = Json::parse(
+        std::string(retry_response.body.begin(), retry_response.body.end()));
+    CHECK(retry_body.find("state")->asString() == "importing");
+    CHECK(!torrents.retry("torrent-retry"));
+
+    const auto retried_ingest = ingest.job("ingest-retry");
+    const auto retried_torrent = torrents.job("torrent-retry");
+    REQUIRE(retried_ingest.has_value());
+    REQUIRE(retried_torrent.has_value());
+    CHECK(retried_ingest->state == IngestJobState::queued);
+    CHECK(retried_ingest->error.empty());
+    CHECK(retried_torrent->state == TorrentJobState::importing);
+    CHECK(retried_torrent->error.empty());
+    REQUIRE(retried_torrent->ingest_job_id.has_value());
+    CHECK(*retried_torrent->ingest_job_id == "ingest-retry");
+
+    REQUIRE(torrents.pause("torrent-pause"));
+    auto paused = torrents.job("torrent-pause");
+    REQUIRE(paused.has_value());
+    CHECK(paused->state == TorrentJobState::paused);
+
+    // When libtorrent is present, start() restores a live paused handle and the
+    // worker immediately samples it. The explicit Macha pause must remain
+    // authoritative even if libtorrent still reports its pre-pause state.
+    torrents.start();
+    std::this_thread::sleep_for(750ms);
+    paused = torrents.job("torrent-pause");
+    REQUIRE(paused.has_value());
+    CHECK(paused->state == TorrentJobState::paused);
+    torrents.stop();
 }
 
 MACHA_TEST("hydration_catalogue", test_ingest_catalogue_feedback_and_external_clear_cleanup) {
