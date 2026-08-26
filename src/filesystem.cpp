@@ -75,32 +75,54 @@ uint64_t fd_size(int fd) {
     return static_cast<uint64_t>(st.st_size);
 }
 
-void queue_garbage(MetadataSnapshot& snapshot, const ObjectId& id) {
-    auto existing = std::find_if(snapshot.garbage.begin(), snapshot.garbage.end(),
-                                 [&](const GarbageRef& garbage) { return garbage.id == id; });
-    auto retired = wall_time_ns();
-    if (existing != snapshot.garbage.end()) {
-        // Re-retiring the same content-addressed object is a new retirement.
-        // Force the token forwards even if the wall clock has moved backwards so
-        // maintenance cannot confuse an old prune decision with this one.
-        if (retired <= existing->retired_at_ns &&
-            existing->retired_at_ns < std::numeric_limits<int64_t>::max())
-            retired = existing->retired_at_ns + 1;
-        existing->retired_at_ns = retired;
-        existing->retirement_id = random_node_id();
-    } else {
-        snapshot.garbage.push_back({id, retired, random_node_id()});
+void record_garbage_upsert(MetadataDelta& delta, const GarbageRef& garbage) {
+    auto existing = std::find_if(delta.upsert_garbage.begin(), delta.upsert_garbage.end(),
+                                 [&](const GarbageRef& value) { return value.id == garbage.id; });
+    if (existing == delta.upsert_garbage.end())
+        delta.upsert_garbage.push_back(garbage);
+    else
+        *existing = garbage;
+}
+
+void queue_garbage_batch(MetadataSnapshot& snapshot, std::vector<ObjectId> ids,
+                         MetadataDelta& delta) {
+    if (ids.empty())
+        return;
+
+    // File publication can retire hundreds of extents at once.  Do not perform
+    // one linear scan of the (potentially very large) garbage vector per extent.
+    // Keep the transient index bounded by this file's extent count and scan the
+    // committed garbage set once.
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    std::vector<bool> found(ids.size(), false);
+
+    for (auto& garbage : snapshot.garbage) {
+        auto target = std::lower_bound(ids.begin(), ids.end(), garbage.id);
+        if (target == ids.end() || *target != garbage.id)
+            continue;
+        const auto index = static_cast<size_t>(target - ids.begin());
+        if (found[index])
+            continue;
+
+        auto retired = wall_time_ns();
+        if (retired <= garbage.retired_at_ns &&
+            garbage.retired_at_ns < std::numeric_limits<int64_t>::max())
+            retired = garbage.retired_at_ns + 1;
+        garbage.retired_at_ns = retired;
+        garbage.retirement_id = random_node_id();
+        record_garbage_upsert(delta, garbage);
+        found[index] = true;
+    }
+
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (found[i])
+            continue;
+        snapshot.garbage.push_back({ids[i], wall_time_ns(), random_node_id()});
+        record_garbage_upsert(delta, snapshot.garbage.back());
     }
 }
 
-void queue_garbage(MetadataSnapshot& snapshot, const FsEntry& entry) {
-    if (entry.type != EntryType::file)
-        return;
-    for (const auto& extent : entry.extents) {
-        if (!extent.hole)
-            queue_garbage(snapshot, extent.id);
-    }
-}
 } // namespace
 ReadHandle::ReadHandle(DistributedStore& s, FsEntry e, PlaybackTracker* playback,
                        std::string path, FrameType frame_type)
@@ -1038,7 +1060,7 @@ std::vector<std::pair<std::string, FsEntry>> FileSystem::readdir(const std::stri
 }
 void FileSystem::mkdir(const std::string& p, uint32_t mode, uint32_t uid, uint32_t gid) {
     auto q = resolve_new_path(p);
-    m_.mutate([&](MetadataSnapshot& s) {
+    m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
         require_parent(s, q);
         if (s.entries.contains(q))
             fail(EEXIST, "exists");
@@ -1049,6 +1071,7 @@ void FileSystem::mkdir(const std::string& p, uint32_t mode, uint32_t uid, uint32
         e.gid = gid;
         e.ctime_ns = e.mtime_ns = wall_time_ns();
         s.entries[q] = e;
+        delta.upsert_entries[q] = e;
     });
 }
 void FileSystem::rmdir(const std::string& p) {
@@ -1058,7 +1081,7 @@ void FileSystem::rmdir(const std::string& p) {
     auto q = *resolved;
     if (q == "/")
         fail(EBUSY, "root");
-    m_.mutate([&](MetadataSnapshot& s) {
+    m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
         auto i = s.entries.find(q);
         if (i == s.entries.end())
             fail(ENOENT, "missing");
@@ -1068,6 +1091,7 @@ void FileSystem::rmdir(const std::string& p) {
             if (x != q && under(x, q))
                 fail(ENOTEMPTY, "not empty");
         s.entries.erase(i);
+        delta.erase_entries.push_back(q);
     });
 }
 FsEntry FileSystem::create_file(const std::string& p, uint32_t mode, uint32_t uid, uint32_t gid) {
@@ -1078,11 +1102,12 @@ FsEntry FileSystem::create_file(const std::string& p, uint32_t mode, uint32_t ui
     e.uid = uid;
     e.gid = gid;
     e.ctime_ns = e.mtime_ns = wall_time_ns();
-    m_.mutate([&](MetadataSnapshot& s) {
+    m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
         require_parent(s, q);
         if (s.entries.contains(q))
             fail(EEXIST, "exists");
         s.entries[q] = e;
+        delta.upsert_entries[q] = e;
     });
     return e;
 }
@@ -1091,14 +1116,20 @@ void FileSystem::unlink(const std::string& p) {
     if (!resolved)
         fail(ENOENT, "missing");
     auto q = *resolved;
-    m_.mutate([&](MetadataSnapshot& s) {
+    m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
         auto i = s.entries.find(q);
         if (i == s.entries.end())
             fail(ENOENT, "missing");
         if (i->second.type != EntryType::file)
             fail(EISDIR, "directory");
-        queue_garbage(s, i->second);
+        std::vector<ObjectId> retiring;
+        retiring.reserve(i->second.extents.size());
+        for (const auto& extent : i->second.extents)
+            if (!extent.hole)
+                retiring.push_back(extent.id);
+        queue_garbage_batch(s, std::move(retiring), delta);
         s.entries.erase(i);
+        delta.erase_entries.push_back(q);
     });
 }
 void FileSystem::rename(const std::string& a, const std::string& b, bool nr) {
@@ -1118,7 +1149,7 @@ void FileSystem::rename(const std::string& a, const std::string& b, bool nr) {
     // namespace rename and handle-path migration serialized with write commit so
     // a close/flush cannot observe the source path after it has moved.
     std::lock_guard handles(open_writes_mutex_);
-    m_.mutate([&](MetadataSnapshot& s) {
+    m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
         auto src = s.entries.find(x);
         if (src == s.entries.end())
             fail(ENOENT, "source missing");
@@ -1139,19 +1170,34 @@ void FileSystem::rename(const std::string& a, const std::string& b, bool nr) {
                         fail(ENOTEMPTY, "target not empty");
                 }
             } else {
-                queue_garbage(s, dst->second);
+                std::vector<ObjectId> retiring;
+                retiring.reserve(dst->second.extents.size());
+                for (const auto& extent : dst->second.extents)
+                    if (!extent.hole)
+                        retiring.push_back(extent.id);
+                queue_garbage_batch(s, std::move(retiring), delta);
             }
             s.entries.erase(dst);
+            delta.erase_entries.push_back(y);
         }
         std::vector<std::pair<std::string, FsEntry>> mv;
-        for (auto i = s.entries.begin(); i != s.entries.end();)
+        for (auto i = s.entries.begin(); i != s.entries.end();) {
             if (under(i->first, x)) {
-                mv.push_back({y + i->first.substr(x.size()), i->second});
+                const auto target = y + i->first.substr(x.size());
+                delta.erase_entries.push_back(i->first);
+                delta.upsert_entries[target] = i->second;
+                mv.push_back({target, i->second});
                 i = s.entries.erase(i);
-            } else
+            } else {
                 ++i;
+            }
+        }
         for (auto& v : mv)
             s.entries.emplace(std::move(v));
+        std::sort(delta.erase_entries.begin(), delta.erase_entries.end());
+        delta.erase_entries.erase(
+            std::unique(delta.erase_entries.begin(), delta.erase_entries.end()),
+            delta.erase_entries.end());
     });
 
     for (auto i = open_writes_.begin(); i != open_writes_.end();) {
@@ -1175,7 +1221,7 @@ void FileSystem::chmod(const std::string& p, uint32_t mode) {
     if (!resolved)
         fail(ENOENT, "missing");
     auto q = *resolved;
-    m_.mutate([&](MetadataSnapshot& s) {
+    m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
         auto j = s.entries.find(q);
         if (j == s.entries.end())
             fail(ENOENT, "missing");
@@ -1183,6 +1229,7 @@ void FileSystem::chmod(const std::string& p, uint32_t mode) {
         i.mode = mode & 07777;
         ++i.version;
         i.ctime_ns = wall_time_ns();
+        delta.upsert_entries[q] = i;
     });
 }
 void FileSystem::chown(const std::string& p, uint32_t u, uint32_t g, bool su, bool sg) {
@@ -1190,7 +1237,7 @@ void FileSystem::chown(const std::string& p, uint32_t u, uint32_t g, bool su, bo
     if (!resolved)
         fail(ENOENT, "missing");
     auto q = *resolved;
-    m_.mutate([&](MetadataSnapshot& s) {
+    m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
         auto i = s.entries.find(q);
         if (i == s.entries.end())
             fail(ENOENT, "missing");
@@ -1200,6 +1247,7 @@ void FileSystem::chown(const std::string& p, uint32_t u, uint32_t g, bool su, bo
             i->second.gid = g;
         ++i->second.version;
         i->second.ctime_ns = wall_time_ns();
+        delta.upsert_entries[q] = i->second;
     });
 }
 void FileSystem::utimens(const std::string& p, int64_t mt) {
@@ -1207,13 +1255,14 @@ void FileSystem::utimens(const std::string& p, int64_t mt) {
     if (!resolved)
         fail(ENOENT, "missing");
     auto q = *resolved;
-    m_.mutate([&](MetadataSnapshot& s) {
+    m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
         auto i = s.entries.find(q);
         if (i == s.entries.end())
             fail(ENOENT, "missing");
         i->second.mtime_ns = mt;
         i->second.ctime_ns = wall_time_ns();
         ++i->second.version;
+        delta.upsert_entries[q] = i->second;
     });
 }
 void FileSystem::truncate_file(const std::string& p, uint64_t z) {
@@ -1479,7 +1528,7 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
                              const std::vector<ExtentRef>& xs, FsEntry* out) {
     auto q = normalize_path(p);
     FsEntry committed;
-    m_.mutate([&](MetadataSnapshot& s) {
+    m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
         auto i = s.entries.find(q);
         if (i == s.entries.end())
             fail(ENOENT, "removed while open");
@@ -1504,10 +1553,13 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
             if (!extent.hole)
                 retained.insert(extent.id);
         }
+        std::vector<ObjectId> retiring;
+        retiring.reserve(i->second.extents.size());
         for (const auto& extent : i->second.extents) {
             if (!extent.hole && !retained.contains(extent.id))
-                queue_garbage(s, extent.id);
+                retiring.push_back(extent.id);
         }
+        queue_garbage_batch(s, std::move(retiring), delta);
 
         i->second.size = z;
         i->second.extents = xs;
@@ -1517,6 +1569,7 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
         i->second.ctime_ns = now;
         ++i->second.version;
         committed = i->second;
+        delta.upsert_entries[q] = committed;
     });
     if (out)
         *out = std::move(committed);

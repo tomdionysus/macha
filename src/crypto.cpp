@@ -19,15 +19,45 @@ std::array<uint8_t, 32> derive(std::span<const uint8_t, 32> k, const char* l) {
     return hkdf_sha256(k, {}, std::span<const uint8_t>((const uint8_t*)l, strlen(l)));
 }
 } // namespace
+
+struct Sha256Hasher::State {
+    M context{EVP_MD_CTX_new(), EVP_MD_CTX_free};
+    bool finished{};
+
+    State() {
+        if (!context || EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1)
+            throw std::runtime_error("SHA256 init failed");
+    }
+};
+
+Sha256Hasher::Sha256Hasher() : state_(std::make_unique<State>()) {}
+Sha256Hasher::~Sha256Hasher() = default;
+Sha256Hasher::Sha256Hasher(Sha256Hasher&&) noexcept = default;
+Sha256Hasher& Sha256Hasher::operator=(Sha256Hasher&&) noexcept = default;
+
+void Sha256Hasher::update(std::span<const uint8_t> data) {
+    if (!state_ || state_->finished)
+        throw std::runtime_error("SHA256 context already finished");
+    if (!data.empty() &&
+        EVP_DigestUpdate(state_->context.get(), data.data(), data.size()) != 1)
+        throw std::runtime_error("SHA256 update failed");
+}
+
+Hash256 Sha256Hasher::finish() {
+    if (!state_ || state_->finished)
+        throw std::runtime_error("SHA256 context already finished");
+    Hash256 out;
+    unsigned size = 0;
+    if (EVP_DigestFinal_ex(state_->context.get(), out.bytes.data(), &size) != 1 || size != 32)
+        throw std::runtime_error("SHA256 final failed");
+    state_->finished = true;
+    return out;
+}
+
 Hash256 sha256(std::span<const uint8_t> d) {
-    Hash256 o;
-    M c(EVP_MD_CTX_new(), EVP_MD_CTX_free);
-    unsigned n = 0;
-    if (!c || EVP_DigestInit_ex(c.get(), EVP_sha256(), nullptr) != 1 ||
-        EVP_DigestUpdate(c.get(), d.data(), d.size()) != 1 ||
-        EVP_DigestFinal_ex(c.get(), o.bytes.data(), &n) != 1 || n != 32)
-        throw std::runtime_error("SHA256 failed");
-    return o;
+    Sha256Hasher hasher;
+    hasher.update(d);
+    return hasher.finish();
 }
 ObjectId object_id(std::span<const uint8_t> d) {
     ObjectId o;

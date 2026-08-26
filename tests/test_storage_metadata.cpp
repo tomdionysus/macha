@@ -1,11 +1,119 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
 
+#include <optional>
+#include <string_view>
+
 using namespace macha;
 using namespace std::chrono_literals;
 using namespace macha::test_support;
 
 namespace {
+
+std::optional<uint64_t> process_rss_kib() {
+#if defined(__linux__)
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        constexpr std::string_view prefix = "VmRSS:";
+        if (!line.starts_with(prefix))
+            continue;
+        const auto first = line.find_first_of("0123456789", prefix.size());
+        if (first == std::string::npos)
+            return {};
+        return std::stoull(line.substr(first));
+    }
+#endif
+    return {};
+}
+
+MACHA_FAST_TEST("storage_metadata", test_metadata_record_payload_copy_is_shared) {
+    MetadataRecord record;
+    record.payload = Bytes(4 * 1024 * 1024, 0x5a);
+    const auto* backing = record.payload.data();
+
+    MetadataRecord copy = record;
+    MetadataRecord second_copy = copy;
+    CHECK(copy.payload.data() == backing);
+    CHECK(second_copy.payload.data() == backing);
+
+    copy.payload = Bytes(16, 0x11);
+    CHECK(copy.payload.data() != backing);
+    CHECK(record.payload.data() == second_copy.payload.data());
+
+    // Regression for the Raspberry Pi OOM: retaining many MetadataRecord values
+    // must retain one immutable namespace payload, not one payload allocation per
+    // record. The pointer identity check is portable; Linux additionally guards
+    // the process-level resident-memory consequence.
+    record.payload = Bytes(8 * 1024 * 1024, 0xa5);
+    const auto large_backing = record.payload.data();
+    const auto rss_before = process_rss_kib();
+    std::vector<MetadataRecord> copies(64, record);
+    for (const auto& retained : copies)
+        CHECK(retained.payload.data() == large_backing);
+    if (rss_before) {
+        const auto rss_after = process_rss_kib();
+        REQUIRE(rss_after.has_value());
+        // A deep-copy regression would add roughly 512 MiB here. Leave ample
+        // allocator/test-runner headroom while still failing that failure mode.
+        CHECK(*rss_after <= *rss_before + 64 * 1024);
+    }
+}
+
+MACHA_FAST_TEST("storage_metadata", test_metadata_hash_streaming_matches_canonical_encoding) {
+    const uint64_t generation = 0x1122334455667788ULL;
+    Hash256 previous{};
+    for (size_t i = 0; i < previous.bytes.size(); ++i)
+        previous.bytes[i] = static_cast<uint8_t>(i * 7 + 3);
+    auto payload = pattern(2 * 1024 * 1024 + 137);
+
+    Writer canonical;
+    canonical.u64(generation);
+    canonical.fixed(previous.bytes);
+    canonical.bytes(payload);
+    CHECK(metadata_hash(generation, previous, payload) == sha256(canonical.data()));
+}
+
+MACHA_FAST_TEST("storage_metadata", test_metadata_delta_in_place_preserves_namespace_storage) {
+    auto snapshot = decode_snapshot(genesis_metadata().payload);
+    for (size_t i = 0; i < 4096; ++i) {
+        FsEntry entry;
+        entry.type = EntryType::file;
+        entry.size = i;
+        entry.version = i + 1;
+        snapshot.entries["/file-" + std::to_string(i)] = entry;
+    }
+
+    const auto stable_path = std::string("/file-2048");
+    const auto* stable_entry = &snapshot.entries.at(stable_path);
+    const auto origin = random_node_id();
+
+    MetadataDelta delta;
+    delta.mutation_sequences[origin] = 9;
+    auto changed = snapshot.entries.at("/file-7");
+    changed.size = 0x12345678;
+    ++changed.version;
+    delta.upsert_entries["/file-7"] = changed;
+
+    apply_metadata_delta_in_place(snapshot, delta);
+    CHECK(&snapshot.entries.at(stable_path) == stable_entry);
+    CHECK(snapshot.entries.at("/file-7") == changed);
+    CHECK(snapshot.mutation_sequences.at(origin) == 9);
+
+    // Repeated small deltas must operate on the same decoded namespace rather
+    // than retaining successive deep copies of it.
+    for (uint64_t sequence = 10; sequence < 1010; ++sequence) {
+        MetadataDelta update;
+        update.mutation_sequences[origin] = sequence;
+        auto current = snapshot.entries.at("/file-7");
+        ++current.version;
+        current.size = sequence;
+        update.upsert_entries["/file-7"] = current;
+        apply_metadata_delta_in_place(snapshot, update);
+        CHECK(&snapshot.entries.at(stable_path) == stable_entry);
+    }
+    CHECK(snapshot.mutation_sequences.at(origin) == 1009);
+}
 
 MACHA_TEST("storage_metadata", test_local_store) {
     TempDir t;

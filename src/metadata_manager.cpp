@@ -129,12 +129,32 @@ MetadataRecord MetadataManager::latest(const std::vector<MetadataRecord>& record
     return result;
 }
 
+MetadataRecord MetadataManager::cache_record(
+    const MetadataRecord& record, std::shared_ptr<MetadataSnapshot> decoded) {
+    std::lock_guard lock(cache_mutex_);
+    // Concurrent quorum/local reads can complete out of order. Never let an
+    // older completion move the process cache backwards after a newer immutable
+    // record has already been observed.
+    if (cache_ && newer_than(*cache_, record))
+        return *cache_;
+    cache_ = record;
+    cache_until_ = Clock::now() + node_.config().metadata_cache;
+    if (!decoded_cache_ || decoded_generation_ != record.generation || decoded_hash_ != record.hash) {
+        const bool namespace_changed = !decoded_cache_ || decoded_cache_->entries != decoded->entries;
+        decoded_cache_ = std::move(decoded);
+        decoded_generation_ = record.generation;
+        decoded_hash_ = record.hash;
+        if (namespace_changed)
+            ++decoded_namespace_revision_;
+        available_generation_.store(decoded_generation_, std::memory_order_release);
+        available_namespace_revision_.store(decoded_namespace_revision_, std::memory_order_release);
+    }
+    return record;
+}
+
 MetadataRecord MetadataManager::cache_record(const MetadataRecord& record) {
     {
         std::lock_guard lock(cache_mutex_);
-        // Concurrent quorum/local reads can complete out of order.  Never let
-        // an older completion move the process cache backwards after a newer
-        // immutable record has already been observed.
         if (cache_ && newer_than(*cache_, record))
             return *cache_;
         cache_ = record;
@@ -147,24 +167,7 @@ MetadataRecord MetadataManager::cache_record(const MetadataRecord& record) {
     // refresh their short quorum cache frequently; rebuilding tens of thousands
     // of FsEntry/extent objects on every getattr was the dominant namespace cost.
     auto decoded = std::make_shared<MetadataSnapshot>(decode_snapshot(record.payload));
-    {
-        std::lock_guard lock(cache_mutex_);
-        if (cache_ && newer_than(*cache_, record))
-            return *cache_;
-        cache_ = record;
-        cache_until_ = Clock::now() + node_.config().metadata_cache;
-        if (!decoded_cache_ || decoded_generation_ != record.generation || decoded_hash_ != record.hash) {
-            const bool namespace_changed =
-                !decoded_cache_ || decoded_cache_->entries != decoded->entries;
-            decoded_cache_ = std::move(decoded);
-            decoded_generation_ = record.generation;
-            decoded_hash_ = record.hash;
-            if (namespace_changed) ++decoded_namespace_revision_;
-            available_generation_.store(decoded_generation_, std::memory_order_release);
-            available_namespace_revision_.store(decoded_namespace_revision_, std::memory_order_release);
-        }
-    }
-    return record;
+    return cache_record(record, std::move(decoded));
 }
 
 std::optional<MetadataRecord> MetadataManager::cached_record() {
@@ -199,61 +202,36 @@ bool MetadataManager::seed_quorum(const std::vector<NodeInfo>& nodes,
     if (!required)
         return true;
 
+    // Full records can be very large.  A fan-out of N asynchronous RPCs creates
+    // N queued payload copies at once, which is unsafe on memory-bounded nodes.
+    // Seeding is a recovery/policy slow path, so bound full-record fan-out to one
+    // remote transfer at a time.
+    const auto encoded = encode_metadata_record(record);
     size_t success = 0;
     size_t completed = 0;
-    std::vector<PendingBool> pending;
-    pending.reserve(nodes.size());
-    const auto encoded = encode_metadata_record(record);
-
     for (const auto& owner : nodes) {
+        bool ok = false;
         if (owner.id == node_.node_id()) {
-            ++completed;
-            if (node_.seed_metadata(record))
-                ++success;
-            continue;
-        }
-        try {
-            PendingBool item;
-            item.owner = owner;
-            item.rpc.emplace(node_.call_async(owner, MessageType::seed_metadata, encoded, frame_type));
-            pending.push_back(std::move(item));
-        } catch (...) {
-            ++completed;
-        }
-    }
-
-    if (success >= required)
-        return true;
-    if (success + (nodes.size() - completed) < required)
-        return false;
-
-    while (completed < nodes.size()) {
-        bool progressed = false;
-        for (auto& item : pending) {
-            if (item.done || !item.rpc)
-                continue;
-            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
-                continue;
-            item.done = true;
-            ++completed;
-            progressed = true;
+            ok = node_.seed_metadata(record);
+        } else {
             try {
-                if (bool_reply(item.rpc->get()))
-                    ++success;
+                auto rpc = node_.call_async(owner, MessageType::seed_metadata, encoded, frame_type);
+                while (rpc.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                ok = bool_reply(rpc.get());
             } catch (...) {
             }
-            if (success >= required)
-                return true;
-            if (success + (nodes.size() - completed) < required)
-                return false;
         }
-        if (!progressed)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        ++completed;
+        if (ok)
+            ++success;
+        if (success >= required)
+            return true;
+        if (success + (nodes.size() - completed) < required)
+            return false;
     }
-
     return success >= required;
 }
-
 
 bool MetadataManager::checkpoint_quorum(const std::vector<NodeInfo>& nodes,
                                         const MetadataRecord& record, size_t required,
@@ -261,59 +239,33 @@ bool MetadataManager::checkpoint_quorum(const std::vector<NodeInfo>& nodes,
     if (!required)
         return true;
 
+    // As with seeding, serialize full checkpoints so memory use is independent
+    // of cluster width. Compact commit/delta RPCs remain concurrent.
+    const auto encoded = encode_metadata_record(record);
     size_t success = 0;
     size_t completed = 0;
-    std::vector<PendingBool> pending;
-    pending.reserve(nodes.size());
-    const auto encoded = encode_metadata_record(record);
-
     for (const auto& owner : nodes) {
+        bool ok = false;
         if (owner.id == node_.node_id()) {
-            ++completed;
-            if (node_.checkpoint_metadata(record))
-                ++success;
-            continue;
-        }
-        try {
-            PendingBool item;
-            item.owner = owner;
-            item.rpc.emplace(
-                node_.call_async(owner, MessageType::checkpoint_metadata, encoded, frame_type));
-            pending.push_back(std::move(item));
-        } catch (...) {
-            ++completed;
-        }
-    }
-
-    if (success >= required)
-        return true;
-    if (success + (nodes.size() - completed) < required)
-        return false;
-
-    while (completed < nodes.size()) {
-        bool progressed = false;
-        for (auto& item : pending) {
-            if (item.done || !item.rpc)
-                continue;
-            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
-                continue;
-            item.done = true;
-            ++completed;
-            progressed = true;
+            ok = node_.checkpoint_metadata(record);
+        } else {
             try {
-                if (bool_reply(item.rpc->get()))
-                    ++success;
+                auto rpc =
+                    node_.call_async(owner, MessageType::checkpoint_metadata, encoded, frame_type);
+                while (rpc.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                ok = bool_reply(rpc.get());
             } catch (...) {
             }
-            if (success >= required)
-                return true;
-            if (success + (nodes.size() - completed) < required)
-                return false;
         }
-        if (!progressed)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        ++completed;
+        if (ok)
+            ++success;
+        if (success >= required)
+            return true;
+        if (success + (nodes.size() - completed) < required)
+            return false;
     }
-
     return success >= required;
 }
 
@@ -443,48 +395,25 @@ void MetadataManager::refresh_cache_identity(const MetadataIdentity& identity) {
 void MetadataManager::seed_all_best_effort(const std::vector<NodeInfo>& nodes,
                                            const MetadataRecord& record,
                                            FrameType frame_type) {
-    std::vector<PendingBool> pending;
-    pending.reserve(nodes.size());
+    // This is explicitly a full-snapshot slow path. Keep at most one remote
+    // checkpoint payload queued at once; otherwise memory grows as
+    // metadata_size * peer_count exactly when the node is already recovering.
     const auto encoded = encode_metadata_record(record);
-
     for (const auto& owner : nodes) {
         if (owner.id == node_.node_id()) {
             (void)node_.checkpoint_metadata(record);
             continue;
         }
         try {
-            PendingBool item;
-            item.owner = owner;
-            item.rpc.emplace(
-                node_.call_async(owner, MessageType::checkpoint_metadata, encoded, frame_type));
-            pending.push_back(std::move(item));
+            auto rpc =
+                node_.call_async(owner, MessageType::checkpoint_metadata, encoded, frame_type);
+            while (rpc.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (!bool_reply(rpc.get()))
+                Log::debug("metadata checkpoint rejected by " + owner.host);
         } catch (const std::exception& error) {
             Log::debug("metadata checkpoint " + owner.host + ": " + error.what());
         }
-    }
-
-    for (;;) {
-        bool pending_work = false;
-        bool progressed = false;
-        for (auto& item : pending) {
-            if (item.done || !item.rpc)
-                continue;
-            pending_work = true;
-            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
-                continue;
-            item.done = true;
-            progressed = true;
-            try {
-                if (!bool_reply(item.rpc->get()))
-                    Log::debug("metadata checkpoint rejected by " + item.owner.host);
-            } catch (const std::exception& error) {
-                Log::debug("metadata checkpoint " + item.owner.host + ": " + error.what());
-            }
-        }
-        if (!pending_work)
-            return;
-        if (!progressed)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 
@@ -579,8 +508,8 @@ MetadataManager::CasResult MetadataManager::cas_quorum(const std::vector<NodeInf
 
 MetadataManager::CasResult MetadataManager::cas_delta_quorum(
     const std::vector<NodeInfo>& nodes, const MetadataRecord& expected,
-    std::span<const uint8_t> delta, std::span<const uint8_t> proposed_payload,
-    size_t required, FrameType frame_type) {
+    std::span<const uint8_t> delta, Bytes proposed_payload, size_t required,
+    FrameType frame_type) {
     CasResult result;
     if (!required)
         return result;
@@ -594,7 +523,7 @@ MetadataManager::CasResult MetadataManager::cas_delta_quorum(
     MetadataRecord proposed;
     proposed.generation = expected.generation + 1;
     proposed.previous = expected.hash;
-    proposed.payload.assign(proposed_payload.begin(), proposed_payload.end());
+    proposed.payload = std::move(proposed_payload);
     proposed.hash = metadata_hash(proposed.generation, proposed.previous, proposed.payload);
 
     size_t completed = 0;
@@ -1377,8 +1306,9 @@ MetadataSnapshot MetadataManager::snapshot() {
     return *view.snapshot;
 }
 
-MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot&)>& mutate,
-                                       size_t retries) {
+MetadataRecord MetadataManager::mutate_impl(
+    const std::function<void(MetadataSnapshot&, MetadataDelta*)>& mutate, bool exact_delta,
+    size_t retries) {
     std::unique_lock lock(mutation_mutex_);
     const auto origin = node_.node_id();
     std::optional<uint64_t> sequence;
@@ -1425,7 +1355,7 @@ MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot
                                 FrameType::read_ahead);
             (void)node_.checkpoint_metadata(current);
             const auto commit_ms = elapsed_ms(commit_started);
-            cache_record(current);
+            cache_record(current, std::make_shared<MetadataSnapshot>(std::move(snapshot)));
             const auto total_ms = elapsed_ms(total_started);
             if (total_ms >= 100 && Log::enabled(LogLevel::debug)) {
                 Log::debug("metadata mutate recovered total_ms=" + std::to_string(total_ms) +
@@ -1445,22 +1375,28 @@ MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot
             sequence = previous + 1;
         }
 
-        auto before = snapshot;
+        std::optional<MetadataSnapshot> before;
+        if (!exact_delta)
+            before.emplace(snapshot);
+        MetadataDelta supplied_delta;
         auto voters = snapshot.metadata_voters;
         auto data_replication = snapshot.data_replication;
         auto extent_size = snapshot.extent_size;
-        mutate(snapshot);
+        mutate(snapshot, exact_delta ? &supplied_delta : nullptr);
         if (!same_voters(snapshot.metadata_voters, voters))
             throw std::runtime_error("filesystem mutation attempted to change metadata voters");
         if (snapshot.data_replication != data_replication || snapshot.extent_size != extent_size)
             throw std::runtime_error("filesystem mutation attempted to change cluster policy");
         snapshot.mutation_sequences[origin] = *sequence;
+        if (exact_delta)
+            supplied_delta.mutation_sequences[origin] = *sequence;
 
         const auto encode_started = Clock::now();
         auto payload = encode_snapshot(snapshot);
+        const auto snapshot_bytes = payload.size();
         const auto encode_ms = elapsed_ms(encode_started);
         if (payload == current.payload)
-            return cache_record(current);
+            return cache_record(current, std::make_shared<MetadataSnapshot>(std::move(snapshot)));
 
         auto nodes = voter_nodes(voters);
         const auto need = quorum(voters.size());
@@ -1468,10 +1404,15 @@ MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot
         Bytes delta_payload;
         bool used_delta = false;
         CasResult result;
-        if (auto delta = metadata_delta(before, snapshot)) {
+        std::optional<MetadataDelta> delta;
+        if (exact_delta)
+            delta = std::move(supplied_delta);
+        else
+            delta = metadata_delta(*before, snapshot);
+        if (delta) {
             delta_payload = encode_metadata_delta(*delta);
             if (delta_payload.size() < payload.size()) {
-                result = cas_delta_quorum(nodes, current, delta_payload, payload, need,
+                result = cas_delta_quorum(nodes, current, delta_payload, std::move(payload), need,
                                           FrameType::read_ahead);
                 used_delta = true;
             } else {
@@ -1500,7 +1441,8 @@ MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot
                 (void)node_.checkpoint_metadata(*result.committed);
             }
             const auto commit_ms = elapsed_ms(commit_started);
-            cache_record(*result.committed);
+            cache_record(*result.committed,
+                         std::make_shared<MetadataSnapshot>(std::move(snapshot)));
             const auto total_ms = elapsed_ms(total_started);
             if (total_ms >= 100 && Log::enabled(LogLevel::debug)) {
                 Log::debug("metadata mutate total_ms=" + std::to_string(total_ms) +
@@ -1511,7 +1453,7 @@ MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot
                            " commit_ms=" + std::to_string(commit_ms) +
                            " mode=" + std::string(used_delta ? "delta" : "snapshot") +
                            " delta_bytes=" + std::to_string(delta_payload.size()) +
-                           " snapshot_bytes=" + std::to_string(payload.size()) +
+                           " snapshot_bytes=" + std::to_string(snapshot_bytes) +
                            " attempt=" + std::to_string(attempt + 1));
             }
             return *result.committed;
@@ -1523,6 +1465,19 @@ MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot
     }
 
     throw std::runtime_error("metadata mutation conflict");
+}
+
+MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot&)>& mutate,
+                                       size_t retries) {
+    return mutate_impl(
+        [&](MetadataSnapshot& snapshot, MetadataDelta*) { mutate(snapshot); }, false, retries);
+}
+
+MetadataRecord MetadataManager::mutate_delta(
+    const std::function<void(MetadataSnapshot&, MetadataDelta&)>& mutate, size_t retries) {
+    return mutate_impl(
+        [&](MetadataSnapshot& snapshot, MetadataDelta* delta) { mutate(snapshot, *delta); }, true,
+        retries);
 }
 
 void MetadataManager::repair_once() {

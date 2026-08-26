@@ -93,7 +93,7 @@ double score(std::string_view query, const CatalogueItem& item) {
     return 0.0;
 }
 
-void append_garbage(MetadataSnapshot& snapshot, const ObjectId& id) {
+GarbageRef append_garbage(MetadataSnapshot& snapshot, const ObjectId& id) {
     auto existing = std::find_if(snapshot.garbage.begin(), snapshot.garbage.end(),
                                  [&](const GarbageRef& candidate) { return candidate.id == id; });
     auto retired = wall_time_ns();
@@ -105,7 +105,18 @@ void append_garbage(MetadataSnapshot& snapshot, const ObjectId& id) {
         existing->retirement_id = random_node_id();
     } else {
         snapshot.garbage.push_back({id, retired, random_node_id()});
+        existing = std::prev(snapshot.garbage.end());
     }
+    return *existing;
+}
+
+void record_garbage_upsert(MetadataDelta& delta, const GarbageRef& garbage) {
+    auto existing = std::find_if(delta.upsert_garbage.begin(), delta.upsert_garbage.end(),
+                                 [&](const GarbageRef& value) { return value.id == garbage.id; });
+    if (existing == delta.upsert_garbage.end())
+        delta.upsert_garbage.push_back(garbage);
+    else
+        *existing = garbage;
 }
 
 bool valid_kind(uint8_t value) {
@@ -490,18 +501,20 @@ void CatalogueManager::commit(const std::optional<ObjectId>& expected_root,
     }
 
     try {
-        metadata_.mutate([&](MetadataSnapshot& metadata) {
+        metadata_.mutate_delta([&](MetadataSnapshot& metadata, MetadataDelta& delta) {
             if (metadata.catalogue_root != expected_root)
                 throw CatalogueConflict("catalogue changed concurrently");
             if (expected_namespace &&
                 metadata_namespace_signature(metadata) != *expected_namespace)
                 throw CatalogueConflict("namespace changed during catalogue reconciliation");
             if (metadata.catalogue_root && *metadata.catalogue_root != root)
-                append_garbage(metadata, *metadata.catalogue_root);
+                record_garbage_upsert(delta, append_garbage(metadata, *metadata.catalogue_root));
             metadata.catalogue_root = root;
+            delta.catalogue = CatalogueDelta::set;
+            delta.catalogue_root = root;
             for (const auto& id : old_artwork) {
                 if (!new_artwork.contains(id))
-                    append_garbage(metadata, id);
+                    record_garbage_upsert(delta, append_garbage(metadata, id));
             }
         });
     } catch (...) {
