@@ -93,3 +93,16 @@ Repeated recovery/catalogue mutation should not produce monotonic namespace-size
 `DEBUG` logs show placement, quorum, catalogue and maintenance state without the per-object volume of `ALL`. `ALL` is intended for targeted tracing and can be expensive on active systems.
 
 A DATA failure should be diagnosed as placement/admission/durability; a metadata failure as voter/control durability. Keeping those failure domains distinct is intentional and should be preserved in logs and tooling.
+
+## Cluster status and telemetry
+
+`GET /api/v1/status` merges two deliberately different telemetry planes:
+
+- ephemeral authenticated peer telemetry for the current operational view;
+- one coalesced last-known observation per node persisted through cluster metadata.
+
+Ephemeral telemetry is gossiped with boot-incarnation and sequence ordering and is not journalled as a metrics history. Persisted status is periodically replaced rather than replayed after quorum loss. The API marks observations as live, stale, or last-known so an offline node's old runtime counters are never presented as current.
+
+Cluster capacity distinguishes known durable/cache capacity from the portion currently online. Per-node status reports endpoint, version, failure domain, storage/cache use, metadata generation, runtime/load, peer counts and RPC connection statistics. Metadata quorum state is derived from the committed voter set and current node liveness.
+
+`POST /api/v1/status/connectivity/check` and the node-specific equivalent perform diagnostic connectivity checks without changing cluster configuration. State-changing administrative operations belong under `/api/v1/manage`.

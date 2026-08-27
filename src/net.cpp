@@ -42,6 +42,17 @@ constexpr size_t frame_header_size = 28;
 constexpr uint8_t frame_first = 0x01;
 constexpr uint8_t frame_last = 0x02;
 
+bool reset_invalidates_node_reference(
+    const std::map<std::string, IdentityAssociationReset>& resets, const NodeInfo& node) {
+    for (const auto& [_, reset] : resets) {
+        if (identity_reset_matches_endpoint(reset, node.host, node.port) &&
+            identity_reset_matches_node(reset, node.id) &&
+            node.seen_unix_ms <= reset.reset_unix_ms)
+            return true;
+    }
+    return false;
+}
+
 void validate_frame_limit(size_t size) {
     if (size < protocol_min_frame_size || size > protocol_max_frame_size)
         throw std::runtime_error("max frame size must be 4K..4M");
@@ -312,6 +323,8 @@ bool is_priority_data_message(MessageType type) {
     case MessageType::cas_reply:
     case MessageType::control_object_reply:
     case MessageType::metadata_identity_reply:
+    case MessageType::telemetry:
+    case MessageType::telemetry_reply:
         return true;
     default:
         return false;
@@ -473,6 +486,8 @@ const char* message_type_name(MessageType type) noexcept {
     case MessageType::get_control_object: return "get_control_object";
     case MessageType::put_control_object: return "put_control_object";
     case MessageType::get_metadata_identity: return "get_metadata_identity";
+    case MessageType::telemetry: return "telemetry";
+    case MessageType::identity_resets: return "identity_resets";
     case MessageType::ok: return "ok";
     case MessageType::error: return "error";
     case MessageType::members_reply: return "members_reply";
@@ -482,6 +497,8 @@ const char* message_type_name(MessageType type) noexcept {
     case MessageType::cas_reply: return "cas_reply";
     case MessageType::control_object_reply: return "control_object_reply";
     case MessageType::metadata_identity_reply: return "metadata_identity_reply";
+    case MessageType::telemetry_reply: return "telemetry_reply";
+    case MessageType::identity_resets_reply: return "identity_resets_reply";
     }
     return "unknown";
 }
@@ -495,7 +512,8 @@ FrameType default_frame_type(MessageType type) noexcept {
         type == MessageType::put_object_deferred ||
         type == MessageType::object_durability_barrier)
         return FrameType::foreground;
-    if (type == MessageType::get_control_object || type == MessageType::put_control_object)
+    if (type == MessageType::get_control_object || type == MessageType::put_control_object ||
+        type == MessageType::telemetry)
         return FrameType::speculative;
     return FrameType::control;
 }
@@ -1407,6 +1425,21 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             future.get();
     }
 
+    bool try_notify(const RpcMessage& message, FrameType frame_type) {
+        validate_frame_semantics(message.type, frame_type);
+        if (!usable())
+            return false;
+        std::unique_lock lock(outbound_mutex_, std::try_to_lock);
+        // Best-effort traffic is admitted only onto an otherwise idle writer.
+        // It must never add queueing delay in front of operational RPC.
+        if (!lock.owns_lock() || broken_.load() || !outbound_.empty())
+            return false;
+        outbound_.push_back({0, frame_type, message, 0, false, {}});
+        lock.unlock();
+        outbound_cv_.notify_one();
+        return true;
+    }
+
     void retire() {
         {
             std::lock_guard admission(admission_mutex_);
@@ -1632,9 +1665,9 @@ RpcClient::connection(const Endpoint& endpoint, const NodeId* expected, NodeId* 
     std::optional<NodeId> known;
     {
         std::lock_guard lock(mutex_);
-        if (expected)
+        if (expected) {
             known = *expected;
-        else if (auto p = endpoint_peers_.find(endpoint_key(endpoint)); p != endpoint_peers_.end())
+        } else if (auto p = endpoint_peers_.find(endpoint_key(endpoint)); p != endpoint_peers_.end())
             known = p->second;
 
         // Retry backoff applies to creating a new TCP connection, not to an
@@ -1681,8 +1714,12 @@ RpcClient::connection(const Endpoint& endpoint, const NodeId* expected, NodeId* 
         ++connections_created_;
 
         if (expected && fresh->peer().id != *expected) {
+            const auto actual_id = fresh->peer().id;
             fresh->close();
-            throw std::runtime_error("RPC endpoint authenticated as the wrong node");
+            throw std::runtime_error("RPC endpoint " + endpoint_key(endpoint) +
+                                     " authenticated as the wrong node: expected NodeId " +
+                                     to_string(*expected) + ", actual authenticated NodeId " +
+                                     to_string(actual_id));
         }
         if (actual)
             *actual = fresh->peer().id;
@@ -1810,6 +1847,13 @@ AsyncRpc RpcClient::call_async(const Endpoint& endpoint, MessageType type,
 AsyncRpc RpcClient::call_async(const NodeInfo& node, MessageType type,
                                std::span<const uint8_t> payload) {
     Endpoint endpoint{node.host, node.port};
+    {
+        std::lock_guard lock(mutex_);
+        if (reset_invalidates_node_reference(identity_resets_, node))
+            throw std::runtime_error("RPC endpoint " + endpoint_key(endpoint) +
+                                     " identity association for NodeId " + to_string(node.id) +
+                                     " was reset; re-resolve the node before retrying");
+    }
     return call_async_known(endpoint, &node.id, type, payload, default_frame_type(type));
 }
 
@@ -1821,6 +1865,13 @@ AsyncRpc RpcClient::call_async(const Endpoint& endpoint, MessageType type,
 AsyncRpc RpcClient::call_async(const NodeInfo& node, MessageType type,
                                std::span<const uint8_t> payload, FrameType frame_type) {
     Endpoint endpoint{node.host, node.port};
+    {
+        std::lock_guard lock(mutex_);
+        if (reset_invalidates_node_reference(identity_resets_, node))
+            throw std::runtime_error("RPC endpoint " + endpoint_key(endpoint) +
+                                     " identity association for NodeId " + to_string(node.id) +
+                                     " was reset; re-resolve the node before retrying");
+    }
     return call_async_known(endpoint, &node.id, type, payload, frame_type);
 }
 
@@ -2095,6 +2146,123 @@ void RpcClient::broadcast(const RpcMessage& message) {
         } catch (...) {
         }
     }
+}
+
+size_t RpcClient::broadcast_best_effort(const RpcMessage& message, FrameType frame_type) {
+    std::vector<std::shared_ptr<PeerConnection>> outbound;
+    std::vector<std::function<bool(const RpcMessage&, FrameType)>> inbound;
+    {
+        std::unique_lock lock(mutex_, std::try_to_lock);
+        if (!lock.owns_lock())
+            return 0;
+        for (const auto& [_, connection] : connections_)
+            if (connection && connection->usable() &&
+                connection->lane() == TransportLane::control)
+                outbound.push_back(connection);
+        for (const auto& [_, route] : inbound_routes_)
+            if (route.lane == TransportLane::control && route.usable && route.usable() &&
+                route.try_notify)
+                inbound.push_back(route.try_notify);
+    }
+
+    size_t queued = 0;
+    for (auto& connection : outbound)
+        try {
+            if (connection->try_notify(message, frame_type))
+                ++queued;
+        } catch (...) {
+        }
+    for (auto& notify : inbound)
+        try {
+            if (notify(message, frame_type))
+                ++queued;
+        } catch (...) {
+        }
+    return queued;
+}
+
+void RpcClient::invalidate_identity_association(const IdentityAssociationReset& reset) {
+    if (reset.host.empty() || !reset.epoch)
+        return;
+    std::vector<std::shared_ptr<PeerConnection>> outbound;
+    std::vector<std::function<void()>> inbound;
+    {
+        std::lock_guard lock(mutex_);
+        const auto reset_key = identity_reset_key(reset.host, reset.port);
+        auto existing = identity_resets_.find(reset_key);
+        if (existing != identity_resets_.end() && existing->second.epoch >= reset.epoch)
+            return;
+        identity_resets_[reset_key] = reset;
+
+        auto endpoint_in_scope = [&](const Endpoint& endpoint) {
+            return identity_reset_matches_endpoint(reset, endpoint.host, endpoint.port);
+        };
+        auto node_in_scope = [&](const NodeId& node) {
+            return identity_reset_matches_node(reset, node);
+        };
+
+        // Remove all cached endpoint -> peer associations in scope. For an IP
+        // reset (port == 0), this intentionally covers every advertised port
+        // on that address.
+        for (auto it = endpoints_.begin(); it != endpoints_.end();) {
+            if (!endpoint_in_scope(it->second)) {
+                ++it;
+                continue;
+            }
+            auto mapped = endpoint_peers_.find(it->first);
+            if (mapped != endpoint_peers_.end() && node_in_scope(mapped->second))
+                endpoint_peers_.erase(mapped);
+            health_.erase(dial_key(it->second, TransportLane::control));
+            health_.erase(dial_key(it->second, TransportLane::data));
+            it = endpoints_.erase(it);
+        }
+        if (reset.port) {
+            const Endpoint endpoint{reset.host, reset.port};
+            const auto endpoint_k = endpoint_key(endpoint);
+            auto mapped = endpoint_peers_.find(endpoint_k);
+            if (mapped != endpoint_peers_.end() && node_in_scope(mapped->second))
+                endpoint_peers_.erase(mapped);
+            health_.erase(dial_key(endpoint, TransportLane::control));
+            health_.erase(dial_key(endpoint, TransportLane::data));
+        }
+
+        for (auto it = connections_.begin(); it != connections_.end();) {
+            const auto& connection = it->second;
+            if (connection && endpoint_in_scope(Endpoint{connection->peer().host,
+                                                         connection->peer().port}) &&
+                node_in_scope(connection->peer().id)) {
+                outbound.push_back(std::move(it->second));
+                it = connections_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = inbound_routes_.begin(); it != inbound_routes_.end();) {
+            if (endpoint_in_scope(Endpoint{it->second.peer.host, it->second.peer.port}) &&
+                node_in_scope(it->second.peer.id)) {
+                if (it->second.close)
+                    inbound.push_back(it->second.close);
+                it = inbound_routes_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = retired_connections_.begin(); it != retired_connections_.end();) {
+            if (*it && endpoint_in_scope(Endpoint{(*it)->peer().host, (*it)->peer().port}) &&
+                node_in_scope((*it)->peer().id)) {
+                outbound.push_back(std::move(*it));
+                it = retired_connections_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    // Never close sessions while holding the routing mutex: session teardown
+    // can invoke unregister callbacks which need the same mutex.
+    for (auto& close : inbound)
+        close();
+    for (auto& connection : outbound)
+        connection->close();
 }
 
 void RpcClient::stop() {
@@ -2457,6 +2625,21 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
         auto future = sent->get_future();
         if (queue_message(0, FrameType::control, message, false, sent))
             future.get();
+    }
+
+    bool try_notify(const RpcMessage& message, FrameType frame_type) {
+        validate_frame_semantics(message.type, frame_type);
+        if (!usable())
+            return false;
+        std::unique_lock lock(outbound_mutex, std::try_to_lock);
+        // Best-effort traffic is admitted only onto an otherwise idle writer.
+        // It must never add queueing delay in front of operational RPC.
+        if (!lock.owns_lock() || !ready.load() || done.load() || !outbound.empty())
+            return false;
+        outbound.push_back({0, frame_type, message, 0, false, {}});
+        lock.unlock();
+        outbound_cv.notify_one();
+        return true;
     }
 
     void retire() {
@@ -2924,6 +3107,11 @@ void RpcServer::session_loop(Session* session) {
                 route.notify = [weak](const RpcMessage& message) {
                     if (auto s = weak.lock())
                         s->notify(message);
+                };
+                route.try_notify = [weak](const RpcMessage& message, FrameType frame_type) {
+                    if (auto s = weak.lock())
+                        return s->try_notify(message, frame_type);
+                    return false;
                 };
                 route.retire = [weak] {
                     if (auto s = weak.lock())

@@ -1,5 +1,13 @@
 # Current release
 
+## 0.18.2 — cluster status telemetry
+
+- Add live node telemetry on the authenticated peer protocol, gossiped across the cluster with boot-incarnation sequencing, freshness expiry and rolling-upgrade compatibility.
+- Persist one coalesced last-known status record per node through metadata quorum using SM9/DLT3 while preserving SM7/DLT1 and SM8/DLT2 journal replay compatibility.
+- Add durable SM10/DLT4 cluster-wide endpoint→NodeId reset tombstones under `/api/v1/manage`, including endpoint-, NodeId-, and IP-only scopes, live membership/telemetry/RPC eviction, stale-gossip suppression, propagation, confirmation metadata, and audit logging.
+- Improve wrong-node RPC diagnostics with endpoint, expected NodeId, and the actually authenticated NodeId.
+- Add `/api/v1/status` cluster/node status surfaces with known-versus-online storage/cache totals, metadata quorum health, runtime/load/peer/RPC observations and explicit connectivity re-check actions.
+
 ## 0.18.1 — acquisition recovery
 
 - Add an explicit torrent retry action for completed downloads whose linked ingest job failed, reusing the existing persisted ingest job and staging payload without redownloading.

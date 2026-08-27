@@ -5,6 +5,7 @@
 #include "catalogue_hints.hpp"
 #include "filesystem.hpp"
 #include "http.hpp"
+#include "metadata_manager.hpp"
 #include "media_catalogue.hpp"
 
 #include <mutex>
@@ -15,6 +16,8 @@ namespace macha {
 // deliberately orchestrates the existing namespace/catalogue primitives rather
 // than maintaining a second management database.
 class ManageApi {
+    NodeRuntime& node_;
+    MetadataManager& metadata_;
     FileSystem& fs_;
     CatalogueManager& catalogue_;
     CatalogueHintQueue& hints_;
@@ -22,9 +25,10 @@ class ManageApi {
     std::mutex mutation_mutex_;
 
   public:
-    ManageApi(FileSystem& fs, CatalogueManager& catalogue, CatalogueHintQueue& hints,
-              CatalogueScanner& scanner)
-        : fs_(fs), catalogue_(catalogue), hints_(hints), scanner_(scanner) {}
+    ManageApi(NodeRuntime& node, MetadataManager& metadata, FileSystem& fs,
+              CatalogueManager& catalogue, CatalogueHintQueue& hints, CatalogueScanner& scanner)
+        : node_(node), metadata_(metadata), fs_(fs), catalogue_(catalogue), hints_(hints),
+          scanner_(scanner) {}
 
     HttpResponse handle(const HttpRequest&);
 };
