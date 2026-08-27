@@ -45,6 +45,61 @@ Json bytes_pair(uint64_t used, uint64_t capacity) {
                         {"free_bytes", capacity > used ? capacity - used : 0}};
 }
 
+Json endpoint_json(const Endpoint& endpoint, std::string_view source = {}) {
+    Json::Object out{{"host", endpoint.host}, {"port", static_cast<uint64_t>(endpoint.port)}};
+    if (!source.empty())
+        out["source"] = std::string(source);
+    return Json(std::move(out));
+}
+
+Json public_connectivity_json(const PublicConnectivityStatus& status) {
+    Json::Object upnp;
+    upnp["enabled"] = status.upnp.enabled;
+    upnp["support_built"] = status.upnp.support_built;
+    upnp["gateway_found"] = status.upnp.gateway_found;
+    upnp["mapping_active"] = status.upnp.mapping_active;
+    upnp["mapping_created"] = status.upnp.mapping_created;
+    upnp["mapping_owned"] = status.upnp.mapping_owned;
+    upnp["private_wan"] = status.upnp.private_wan;
+    upnp["lan_address"] = status.upnp.lan_address.empty() ? Json(nullptr) : Json(status.upnp.lan_address);
+    upnp["external_address"] = status.upnp.external_address.empty()
+                                    ? Json(nullptr)
+                                    : Json(status.upnp.external_address);
+    upnp["internal_port"] = static_cast<uint64_t>(status.upnp.internal_port);
+    upnp["external_port"] = static_cast<uint64_t>(status.upnp.external_port);
+    upnp["lease_seconds"] = static_cast<uint64_t>(status.upnp.lease_seconds);
+    upnp["igd_status"] = static_cast<int64_t>(status.upnp.igd_status);
+    upnp["error"] = status.upnp.error.empty() ? Json(nullptr) : Json(status.upnp.error);
+
+    Json::Object external_ip;
+    external_ip["enabled"] = status.external_ip.enabled;
+    external_ip["attempted"] = status.external_ip.attempted;
+    external_ip["address"] = status.external_ip.address.empty()
+                                 ? Json(nullptr)
+                                 : Json(status.external_ip.address);
+    external_ip["error"] = status.external_ip.error.empty()
+                               ? Json(nullptr)
+                               : Json(status.external_ip.error);
+
+    Json::Object check;
+    check["enabled"] = status.check_enabled;
+    check["self_probe"] = status.self_probe;
+    check["error"] = status.self_probe_error.empty() ? Json(nullptr) : Json(status.self_probe_error);
+    check["checked_at_unix_ms"] = status.checked_unix_ms;
+    // A same-node TCP connect is a NAT loopback diagnostic, not proof that an
+    // arbitrary Internet host can reach the advertised endpoint. A future peer
+    // probe can promote this field without changing the status shape.
+    check["externally_verified"] = false;
+
+    Json::Object out;
+    out["configured"] = endpoint_json(status.configured);
+    out["advertised"] = endpoint_json(status.advertised, status.advertised_source);
+    out["upnp"] = std::move(upnp);
+    out["external_ip"] = std::move(external_ip);
+    out["check"] = std::move(check);
+    return Json(std::move(out));
+}
+
 Json identity_reset_json(const IdentityAssociationReset& reset) {
     Json::Object out;
     out["scope"] = identity_reset_key(reset.host, reset.port);
@@ -365,11 +420,19 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     Json::Object root;
     root["cluster"] = std::move(cluster);
     root["nodes"] = std::move(nodes);
+    root["connectivity"] = public_connectivity_json(node_.public_connectivity_status());
     root["generated_at_unix_ms"] = unix_ms();
     return http_json(200, Json(std::move(root)).dump());
 }
 
 HttpResponse ClusterStatusService::connectivity_check(const std::optional<NodeId>& only) {
+    // The cluster-wide diagnostic action also refreshes this node's public
+    // endpoint discovery and explicitly runs the self/NAT-loopback probe. The
+    // node-specific action remains the existing peer RPC reachability check.
+    std::optional<PublicConnectivityStatus> public_status;
+    if (!only)
+        public_status = node_.refresh_public_connectivity(true, true);
+
     Json::Array results;
     bool found_requested = !only.has_value();
     for (const auto& member : node_.membership().all()) {
@@ -393,6 +456,8 @@ HttpResponse ClusterStatusService::connectivity_check(const std::optional<NodeId
     if (!found_requested)
         return http_error(404, "node_not_found", "unknown cluster node");
     Json::Object root{{"results", std::move(results)}, {"checked_at_unix_ms", unix_ms()}};
+    if (public_status)
+        root["connectivity"] = public_connectivity_json(*public_status);
     return http_json(200, Json(std::move(root)).dump());
 }
 

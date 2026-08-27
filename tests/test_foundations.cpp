@@ -471,6 +471,11 @@ MACHA_FAST_TEST("foundations", test_config) {
     CHECK(Log::enabled(LogLevel::warn));
     CHECK(Log::enabled(LogLevel::error));
     Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
+    CHECK(!Config{}.upnp.enabled);
+    CHECK(Config{}.upnp.external_port == 0);
+    CHECK(Config{}.upnp.discovery_timeout == 2000ms);
+    CHECK(!Config{}.external_ip.enabled);
+    CHECK(!Config{}.connectivity_check.enabled);
     MaintenanceConfig maintenance_policy;
     CHECK(maintenance_policy.interval == 1000ms);
     CHECK(maintenance_policy.idle_bandwidth_fraction == 0.10);
@@ -571,6 +576,17 @@ MACHA_FAST_TEST("foundations", test_config) {
             << "  max_frame_size: 192K\n"
             << "  control_stall_notice_ms: 4100\n"
             << "  data_stall_notice_ms: 88000\n"
+            << "  upnp:\n"
+            << "    enabled: true\n"
+            << "    external_port: 17440\n"
+            << "    discovery_timeout_ms: 1800\n"
+            << "    lease_seconds: 3600\n"
+            << "  external_ip:\n"
+            << "    enabled: true\n"
+            << "    timeout_ms: 2400\n"
+            << "  connectivity_check:\n"
+            << "    enabled: true\n"
+            << "    timeout_ms: 2600\n"
             << "dht:\n"
             << "  replicas: 3\n"
             << "  metadata_replicas: 3\n"
@@ -731,6 +747,14 @@ MACHA_FAST_TEST("foundations", test_config) {
     CHECK(yc.max_frame_size == 192ULL * 1024);
     CHECK(yc.control_stall_notice == 4100ms);
     CHECK(yc.data_stall_notice == 88000ms);
+    CHECK(yc.upnp.enabled);
+    CHECK(yc.upnp.external_port == 17440);
+    CHECK(yc.upnp.discovery_timeout == 1800ms);
+    CHECK(yc.upnp.lease_seconds == 3600);
+    CHECK(yc.external_ip.enabled);
+    CHECK(yc.external_ip.timeout == 2400ms);
+    CHECK(yc.connectivity_check.enabled);
+    CHECK(yc.connectivity_check.timeout == 2600ms);
     CHECK(yc.min_write_replicas == 2);
     CHECK(yc.write_stall == 1750ms);
     CHECK(yc.maintenance.interval == 250ms);

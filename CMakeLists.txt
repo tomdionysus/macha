@@ -67,6 +67,11 @@ endif()
 pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET
     libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7 libswresample>=4)
 
+# UPnP IGD discovery/port mapping is optional at build time. Nodes with the
+# feature disabled do not require miniupnpc; enabling it without build support
+# is reported in Status and falls through to the configured external-IP path.
+pkg_check_modules(MINIUPNPC QUIET IMPORTED_TARGET miniupnpc)
+
 # BitTorrent acquisition is optional at build time. Prefer libtorrent's native
 # CMake package: it carries the exact compile definitions and transitive Boost,
 # OpenSSL and platform-framework requirements used to build the installed
@@ -106,6 +111,7 @@ set(MACHA_CORE_SOURCES
     src/diagnostics.cpp
     src/telemetry.cpp
     src/status_api.cpp
+    src/public_connectivity.cpp
     src/durable_file.cpp
     src/durability_domain.cpp
     src/placement.cpp
@@ -150,6 +156,13 @@ target_include_directories(macha_core PUBLIC
     ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(macha_core PUBLIC
     OpenSSL::Crypto Threads::Threads CURL::libcurl ${MACHA_YAML_TARGET} PkgConfig::LIBAV)
+if(TARGET PkgConfig::MINIUPNPC)
+    target_link_libraries(macha_core PUBLIC PkgConfig::MINIUPNPC)
+    target_compile_definitions(macha_core PUBLIC MACHA_HAVE_MINIUPNPC=1)
+    message(STATUS "UPnP port mapping enabled (miniupnpc)")
+else()
+    message(STATUS "miniupnpc not found; UPnP port mapping unavailable at runtime")
+endif()
 if(MACHA_LIBTORRENT_TARGET)
     target_link_libraries(macha_core PUBLIC ${MACHA_LIBTORRENT_TARGET})
     target_compile_definitions(macha_core PUBLIC MACHA_HAVE_LIBTORRENT=1)

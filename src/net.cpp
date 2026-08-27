@@ -2776,6 +2776,11 @@ RpcServer::~RpcServer() {
     stop();
 }
 
+void RpcServer::set_local(NodeInfo local) {
+    std::lock_guard lock(local_mutex_);
+    local_ = std::move(local);
+}
+
 RpcServer::RequestClass RpcServer::request_class(FrameType type) {
     switch (type) {
     case FrameType::control:
@@ -3041,8 +3046,13 @@ void RpcServer::accept_loop(std::stop_token stop) {
         try {
             session = std::make_shared<Session>();
             session->remote_host = numeric_host(address, size);
+            NodeInfo local;
+            {
+                std::lock_guard lock(local_mutex_);
+                local = local_;
+            }
             session->channel =
-                std::make_unique<SecureChannel>(client, keys_, local_, max_frame_size_);
+                std::make_unique<SecureChannel>(client, keys_, std::move(local), max_frame_size_);
             channel_owns_client = true;
             session->channel->set_io_timeout(rpc_handshake_timeout);
             {

@@ -100,6 +100,15 @@ void validate(Config& config) {
         throw std::runtime_error("read-ahead must be <= 64");
     if (config.connect_timeout.count() < 100 || config.metadata_cache.count() < 0)
         throw std::runtime_error("invalid network/cache timeout");
+    if (config.upnp.discovery_timeout < std::chrono::milliseconds(100) ||
+        config.upnp.discovery_timeout > std::chrono::seconds(30))
+        throw std::runtime_error("network.upnp.discovery_timeout_ms must be 100..30000");
+    if (config.external_ip.timeout < std::chrono::milliseconds(100) ||
+        config.external_ip.timeout > std::chrono::seconds(30))
+        throw std::runtime_error("network.external_ip.timeout_ms must be 100..30000");
+    if (config.connectivity_check.timeout < std::chrono::milliseconds(100) ||
+        config.connectivity_check.timeout > std::chrono::seconds(30))
+        throw std::runtime_error("network.connectivity_check.timeout_ms must be 100..30000");
     if (config.max_frame_size < 4 * 1024 || config.max_frame_size > 4ULL * 1024 * 1024)
         throw std::runtime_error("network.max_frame_size must be 4K..4M");
     if (config.heartbeat.count() <= 0 || config.dead_after.count() <= 0)
@@ -342,6 +351,32 @@ void parse_network(const YAML::Node& root, Config& c) {
     if (n["data_stall_notice_ms"])
         c.data_stall_notice =
             milliseconds(n["data_stall_notice_ms"], "data_stall_notice_ms");
+
+    if (auto u = n["upnp"]) {
+        if (u["enabled"])
+            c.upnp.enabled = u["enabled"].as<bool>();
+        if (u["external_port"])
+            c.upnp.external_port = u["external_port"].as<uint16_t>();
+        if (u["discovery_timeout_ms"])
+            c.upnp.discovery_timeout =
+                milliseconds(u["discovery_timeout_ms"], "network.upnp.discovery_timeout_ms");
+        if (u["lease_seconds"])
+            c.upnp.lease_seconds = u["lease_seconds"].as<uint32_t>();
+    }
+    if (auto e = n["external_ip"]) {
+        if (e["enabled"])
+            c.external_ip.enabled = e["enabled"].as<bool>();
+        if (e["timeout_ms"])
+            c.external_ip.timeout =
+                milliseconds(e["timeout_ms"], "network.external_ip.timeout_ms");
+    }
+    if (auto check = n["connectivity_check"]) {
+        if (check["enabled"])
+            c.connectivity_check.enabled = check["enabled"].as<bool>();
+        if (check["timeout_ms"])
+            c.connectivity_check.timeout = milliseconds(
+                check["timeout_ms"], "network.connectivity_check.timeout_ms");
+    }
 }
 
 void parse_dht(const YAML::Node& root, Config& c) {

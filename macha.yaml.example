@@ -127,6 +127,28 @@ network:
   control_stall_notice_ms: 5000
   data_stall_notice_ms: 120000
 
+  # Optional public ingress discovery. When a UPnP IGD mapping succeeds, Macha
+  # advertises the gateway's external address and mapped port to cluster peers.
+  # external_port: 0 requests the same external port as network.port.
+  upnp:
+    enabled: false
+    external_port: 0
+    discovery_timeout_ms: 2000
+    lease_seconds: 0
+
+  # Optional fallback when UPnP cannot supply a public address. This uses
+  # https://checkip.amazonaws.com and assumes any required port forwarding is
+  # already configured outside Macha.
+  external_ip:
+    enabled: false
+    timeout_ms: 3000
+
+  # Probe the effective advertised endpoint from this node after startup. A
+  # failure can mean the port is closed OR that the gateway lacks NAT hairpin.
+  connectivity_check:
+    enabled: false
+    timeout_ms: 3000
+
 # Cluster policy. Keep replica counts identical everywhere and change them as a
 # coordinated cluster operation. DATA replicas and metadata voters are separate.
 # `min_write_replicas` is the foreground DATA durability floor; `replicas` is

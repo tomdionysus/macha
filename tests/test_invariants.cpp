@@ -312,6 +312,19 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     CHECK(cluster->find("metadata_read_available")->asBool());
     CHECK(!cluster->find("metadata_write_available")->asBool());
 
+    const auto* connectivity = root.find("connectivity");
+    REQUIRE(connectivity != nullptr);
+    const auto* upnp = connectivity->find("upnp");
+    REQUIRE(upnp != nullptr);
+    CHECK(!upnp->find("enabled")->asBool());
+    CHECK(!upnp->find("mapping_active")->asBool());
+    const auto* advertised = connectivity->find("advertised");
+    REQUIRE(advertised != nullptr);
+    const auto self = node.membership().self();
+    CHECK(advertised->find("host")->asString() == self.host);
+    CHECK(advertised->find("port")->asUInt64() == self.port);
+    CHECK(advertised->find("source")->asString() == "configured");
+
     const auto* nodes = root.find("nodes");
     REQUIRE(nodes != nullptr);
     bool found = false;
