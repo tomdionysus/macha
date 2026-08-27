@@ -1176,8 +1176,19 @@ void MetadataReplica::load_journal() {
                 (void)decode_snapshot(record.payload);
                 if (record.generation < cur_.generation)
                     throw std::runtime_error("seed moved backwards");
-                if (record.generation == cur_.generation && record.hash != cur_.hash)
-                    throw std::runtime_error("seed generation conflict");
+                if (record.generation == cur_.generation && record.hash != cur_.hash) {
+                    // MetadataReplica::seed() permits a deterministic sibling
+                    // replacement at the same generation when both proposals
+                    // share the same predecessor and the incoming hash wins the
+                    // ordering tie-break. The authenticated journal records only
+                    // seeds that passed that admission rule, so replay must
+                    // reproduce the same transition rather than rejecting state
+                    // that was valid and live before restart.
+                    if (record.previous != cur_.previous)
+                        throw std::runtime_error("seed generation conflict");
+                    if (record.hash < cur_.hash)
+                        throw std::runtime_error("seed ordering conflict");
+                }
                 cur_ = std::move(record);
                 break;
             }

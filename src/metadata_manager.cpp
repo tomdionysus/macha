@@ -100,6 +100,108 @@ MetadataManager::MetadataManager(NodeRuntime& node) : node_(node) {
     placement_key_ = sha256({reinterpret_cast<const uint8_t*>(label), sizeof(label) - 1});
 }
 
+const char* metadata_availability_name(MetadataAvailability availability) noexcept {
+    switch (availability) {
+    case MetadataAvailability::unavailable:
+        return "unavailable";
+    case MetadataAvailability::read_only:
+        return "read-only";
+    case MetadataAvailability::writable:
+        return "writable";
+    }
+    return "unavailable";
+}
+
+MetadataClusterStatus MetadataManager::cluster_status() const noexcept {
+    MetadataClusterStatus out;
+    out.generation = quorum_generation_.load(std::memory_order_acquire);
+    out.observed_unix_ms = quorum_observed_unix_ms_.load(std::memory_order_acquire);
+    out.voters = quorum_voters_.load(std::memory_order_acquire);
+    out.voters_online = quorum_voters_online_.load(std::memory_order_acquire);
+    out.quorum_required = quorum_required_.load(std::memory_order_acquire);
+    out.availability = metadata_availability_.load(std::memory_order_acquire);
+    out.stable = quorum_stable_.load(std::memory_order_acquire);
+    out.write_available = quorum_write_available_.load(std::memory_order_acquire);
+    return out;
+}
+
+void MetadataManager::publish_quorum_state(bool validated, std::string_view reason) {
+    // The metadata subsystem owns this state.  Telemetry is deliberately not an
+    // input.  This method is called by the existing background metadata owner
+    // after a validation attempt and performs no RPC or disk I/O itself.  The
+    // published fields are atomics so Status polling cannot cause metadata work.
+    auto view = available_snapshot_view();
+    size_t online = 0;
+    size_t required = 0;
+    size_t voter_count = 0;
+    uint64_t generation = 0;
+
+    MetadataAvailability next = MetadataAvailability::unavailable;
+    if (view && !view->snapshot->metadata_voters.empty()) {
+        const auto& voters = view->snapshot->metadata_voters;
+        const auto active = node_.membership().active();
+        for (const auto& voter : voters) {
+            if (std::any_of(active.begin(), active.end(), [&](const NodeInfo& node) {
+                    return node.id == voter;
+                }))
+                ++online;
+        }
+        voter_count = voters.size();
+        required = quorum(voter_count);
+        generation = view->generation;
+        next = validated && online >= required ? MetadataAvailability::writable
+                                               : MetadataAvailability::read_only;
+    }
+
+    quorum_generation_.store(generation, std::memory_order_release);
+    quorum_voters_.store(static_cast<uint32_t>(voter_count), std::memory_order_release);
+    quorum_voters_online_.store(static_cast<uint32_t>(online), std::memory_order_release);
+    quorum_required_.store(static_cast<uint32_t>(required), std::memory_order_release);
+    quorum_observed_unix_ms_.store(unix_ms(), std::memory_order_release);
+    quorum_write_available_.store(next == MetadataAvailability::writable,
+                                  std::memory_order_release);
+    quorum_stable_.store(next == MetadataAvailability::writable, std::memory_order_release);
+
+    const auto previous = metadata_availability_.exchange(next, std::memory_order_acq_rel);
+    if (previous == next)
+        return;
+
+    std::string transition_reason;
+    if (next == MetadataAvailability::writable) {
+        transition_reason = "metadata write quorum available";
+    } else if (next == MetadataAvailability::read_only) {
+        if (previous == MetadataAvailability::writable)
+            transition_reason = "metadata write quorum lost";
+        else if (!reason.empty())
+            transition_reason.assign(reason);
+        else
+            transition_reason = "local metadata state ready; metadata write quorum unavailable";
+    } else if (!reason.empty()) {
+        transition_reason.assign(reason);
+    } else {
+        transition_reason = "coherent metadata unavailable";
+    }
+
+    std::string message =
+        "metadata availability changed state=" + std::string(metadata_availability_name(next)) +
+        " previous=" + metadata_availability_name(previous) +
+        " reason=\"" + transition_reason + "\"";
+    if (generation) {
+        message += " generation=" + std::to_string(generation) +
+                   " voters=" + std::to_string(online) + "/" +
+                   std::to_string(voter_count) +
+                   " quorum=" + std::to_string(required);
+    }
+
+    if (next == MetadataAvailability::writable ||
+        (previous == MetadataAvailability::unavailable &&
+         next == MetadataAvailability::read_only)) {
+        Log::info(message);
+    } else {
+        Log::warn(message);
+    }
+}
+
 std::optional<NodeInfo> MetadataManager::node_info(const NodeId& id) const {
     for (const auto& node : node_.membership().all()) {
         if (node.id == id)
@@ -414,8 +516,10 @@ void MetadataManager::seed_all_best_effort(const std::vector<NodeInfo>& nodes,
                 node_.call_async(owner, MessageType::checkpoint_metadata, encoded, frame_type);
             while (rpc.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            if (!bool_reply(rpc.get()))
-                Log::debug("metadata checkpoint rejected by " + owner.host);
+            // A negative checkpoint acknowledgement is an ordinary convergence
+            // decision (for example, the receiver is already current).  Do not
+            // turn routine state-machine chatter into a fault-looking log line.
+            (void)bool_reply(rpc.get());
         } catch (const std::exception& error) {
             Log::debug("metadata checkpoint " + owner.host + ": " + error.what());
         }
@@ -1256,8 +1360,10 @@ MetadataRecord MetadataManager::read_record() {
         auto voters = voters_of(local);
         if (!node_.metadata_replica().recovery_required() && local.generation > 1 &&
             !voters.empty()) {
-            Log::debug("metadata quorum unavailable; using persisted read-only snapshot: " +
-                       std::string(error.what()));
+            // Availability is logged centrally, on state transition, by the
+            // metadata maintenance owner. Read fallback itself is intentionally
+            // silent so repeated foreground reads cannot create quorum-log noise.
+            (void)error;
             return cache_record(local);
         }
         throw;

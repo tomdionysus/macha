@@ -4,6 +4,12 @@
 #include <mutex>
 #include <unordered_map>
 namespace macha {
+
+struct MembershipSnapshot {
+    std::vector<NodeInfo> all;
+    std::vector<NodeInfo> active;
+};
+
 class Membership {
     struct R {
         NodeInfo info;
@@ -24,6 +30,7 @@ class Membership {
     void observe(NodeInfo, bool direct = false);
     bool apply_identity_reset(const IdentityAssociationReset&);
     std::vector<IdentityAssociationReset> identity_resets() const;
+    MembershipSnapshot snapshot() const;
     std::vector<NodeInfo> all() const;
     std::vector<NodeInfo> active() const;
 };

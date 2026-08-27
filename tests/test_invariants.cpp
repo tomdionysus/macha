@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
 #include "manage_api.hpp"
+#include "status_api.hpp"
 #include "json.hpp"
 
 #if defined(__linux__)
@@ -126,6 +127,10 @@ MACHA_TEST("invariants", test_manage_node_identity_association_reset) {
     config.hydration.enabled = false;
     config.catalogue.scanner.enabled = false;
     auto& service = fixture.start();
+    REQUIRE(wait_until([&] {
+        return service.metadata_manager().cluster_status().availability ==
+               MetadataAvailability::writable;
+    }));
 
     auto& fs = service.filesystem();
     auto& hints = service.catalogue_hints();
@@ -259,6 +264,125 @@ MACHA_TEST("invariants", test_manage_node_identity_association_reset) {
     REQUIRE(metadata_after_ip.identity_resets.contains(ip_key));
     CHECK(metadata_after_ip.identity_resets.at(ip_key).stale_node_id == NodeId{});
     CHECK(metadata_after_ip.identity_resets.at(ip_key).reason == "clear by ip");
+}
+
+MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
+    TestNode fixture("status-membership");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.hydration.enabled = false;
+    config.catalogue.scanner.enabled = false;
+    auto& node = fixture.start();
+    auto& metadata = fixture.metadata();
+
+    // Establish the coherent local metadata view without a Service maintenance
+    // thread. This keeps the availability state deterministic for this test.
+    const auto local_snapshot = metadata.snapshot();
+    REQUIRE(local_snapshot.metadata_voters.size() == 1);
+
+    NodeInfo peer;
+    peer.id = random_node_id();
+    peer.host = "10.44.1.200";
+    peer.port = 7437;
+    peer.failure_domain = "test-lab";
+    peer.capacity = 4ULL * 1024 * 1024 * 1024;
+    peer.used = 1024ULL * 1024 * 1024;
+    peer.metadata_generation = node.metadata_replica().generation();
+    peer.seen_unix_ms = unix_ms();
+    node.membership().observe(peer, true);
+
+    // Deliberately do not create a telemetry observation for the peer. Cluster
+    // membership alone must make it visible and online in Status. Metadata
+    // write capability is independently published by MetadataManager.
+    metadata.note_quorum_validation(false, "test write quorum unavailable");
+    ClusterStatusService status(node, metadata);
+    HttpRequest request;
+    request.method = "GET";
+    request.path = "/api/v1/status";
+    auto response = status.handle(request);
+    REQUIRE(response.status == 200);
+    auto root = Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
+                                        response.body.size()));
+    const auto* cluster = root.find("cluster");
+    REQUIRE(cluster != nullptr);
+    CHECK(cluster->find("nodes_known")->asUInt64() == 2);
+    CHECK(cluster->find("nodes_online")->asUInt64() == 2);
+    CHECK(cluster->find("metadata_availability")->asString() == "read-only");
+    CHECK(cluster->find("metadata_read_available")->asBool());
+    CHECK(!cluster->find("metadata_write_available")->asBool());
+
+    const auto* nodes = root.find("nodes");
+    REQUIRE(nodes != nullptr);
+    bool found = false;
+    for (const auto& value : nodes->asArray()) {
+        if (value.find("id")->asString() != to_string(peer.id))
+            continue;
+        found = true;
+        CHECK(value.find("state")->asString() == "online");
+        CHECK(value.find("telemetry_freshness")->asString() == "unavailable");
+        CHECK(value.find("host")->asString() == peer.host);
+        CHECK(value.find("port")->asUInt64() == peer.port);
+        CHECK(value.find("storage")->find("capacity_bytes")->asUInt64() == peer.capacity);
+    }
+    CHECK(found);
+
+    metadata.note_quorum_validation(true);
+    response = status.handle(request);
+    REQUIRE(response.status == 200);
+    root = Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
+                                   response.body.size()));
+    cluster = root.find("cluster");
+    REQUIRE(cluster != nullptr);
+    CHECK(cluster->find("metadata_availability")->asString() == "writable");
+    CHECK(cluster->find("metadata_write_available")->asBool());
+}
+
+MACHA_TEST("invariants", test_metadata_availability_logs_only_transitions) {
+    TestNode fixture("metadata-availability-log");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_replication = 1;
+    auto& node = fixture.start();
+    (void)node;
+    auto& metadata = fixture.metadata();
+    REQUIRE(metadata.snapshot().metadata_voters.size() == 1);
+
+    auto capture = std::make_shared<ConcurrentCapturingLogger>(LogLevel::all);
+    Log::set_logger(capture);
+
+    metadata.note_quorum_validation(false, "metadata write quorum unavailable");
+    metadata.note_quorum_validation(false, "metadata write quorum unavailable");
+    metadata.note_quorum_validation(true);
+    metadata.note_quorum_validation(false, "metadata write quorum unavailable");
+
+    const auto records = capture->records();
+    Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
+
+    size_t availability_logs = 0;
+    bool saw_initial_read_only = false;
+    bool saw_writable = false;
+    bool saw_lost_write = false;
+    for (const auto& [level, message] : records) {
+        if (message.find("metadata availability changed") == std::string::npos)
+            continue;
+        ++availability_logs;
+        if (level == LogLevel::info &&
+            message.find("state=read-only previous=unavailable") != std::string::npos)
+            saw_initial_read_only = true;
+        if (level == LogLevel::info &&
+            message.find("state=writable previous=read-only") != std::string::npos &&
+            message.find("reason=\"metadata write quorum available\"") != std::string::npos)
+            saw_writable = true;
+        if (level == LogLevel::warn &&
+            message.find("state=read-only previous=writable") != std::string::npos &&
+            message.find("reason=\"metadata write quorum lost\"") != std::string::npos)
+            saw_lost_write = true;
+    }
+    CHECK(availability_logs == 3);
+    CHECK(saw_initial_read_only);
+    CHECK(saw_writable);
+    CHECK(saw_lost_write);
 }
 
 MACHA_TEST("invariants", test_fuse_open_inode_identity_survives_external_replace_and_unlink) {

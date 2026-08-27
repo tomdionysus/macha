@@ -461,11 +461,17 @@ void CatalogueManager::cache(uint64_t metadata_generation, const MetadataSnapsho
                              CatalogueSnapshot snapshot) {
     auto cached = std::make_shared<const CatalogueSnapshot>(std::move(snapshot));
     std::lock_guard lock(mutex_);
+    const bool root_changed = !control_gc_root_epoch_initialized_ ||
+                              cached_root_ != metadata.catalogue_root;
     cached_ = std::move(cached);
     cached_root_ = metadata.catalogue_root;
     cached_metadata_generation_ = metadata_generation;
     cache_until_ = Clock::now() + node_.config().metadata_cache;
     last_sync_unix_ms_ = unix_ms();
+    if (root_changed) {
+        control_gc_root_epoch_ = Clock::now();
+        control_gc_root_epoch_initialized_ = true;
+    }
     ready_ = true;
     error_.clear();
 }
@@ -1220,13 +1226,38 @@ size_t CatalogueManager::control_gc_step(const std::vector<ObjectId>& live,
                                          std::chrono::milliseconds grace,
                                          size_t operation_budget) {
     if (!operation_budget) return 0;
+
+    // Catalogue publication is intentionally data-before-metadata: immutable
+    // manifest/shard objects must already be durable on the metadata voters
+    // before the catalogue-root CAS may reference them.  Consequently a future
+    // root's CONTROL objects are temporarily unreachable from the *current*
+    // metadata root.  Protect every object written since this process first
+    // observed the current root.  Once a successor root is observed, its objects
+    // are in `live` and the previous epoch's failed/orphan staging can be swept.
+    // This works identically on remote voters receiving put_control_object RPCs
+    // and requires no publication RPC, lock, or foreground-path coordination.
+    Clock::time_point root_epoch;
+    {
+        std::lock_guard lock(mutex_);
+        if (!control_gc_root_epoch_initialized_)
+            return 0;
+        root_epoch = control_gc_root_epoch_;
+    }
+    const auto since_root = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - root_epoch);
+    // +1ms makes equality safe for packed objects whose durable touch timestamp
+    // is millisecond-granular: an object staged in the same millisecond as the
+    // root observation is still considered newer than that root.
+    const auto publication_grace = since_root + std::chrono::milliseconds(1);
+    const auto effective_grace = std::max(grace, publication_grace);
+
     size_t removed = 0;
     bool exhausted = false;
     for (size_t operations = 0; operations < operation_budget && !exhausted; ++operations) {
         auto id = node_.control_store().next_object(control_gc_cursor_, exhausted);
         if (!id) continue;
         if (std::binary_search(live.begin(), live.end(), *id)) continue;
-        if (node_.control_store().remove_if_older_than(*id, grace))
+        if (node_.control_store().remove_if_older_than(*id, effective_grace))
             ++removed;
     }
     if (exhausted && removed)
