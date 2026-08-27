@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
+#include "manage_api.hpp"
+#include "json.hpp"
 
 #if defined(__linux__)
 #include <sys/syscall.h>
@@ -22,6 +24,99 @@ std::atomic_bool track_fsync{false};
 std::atomic_uint64_t fsync_calls{0};
 std::atomic_uint64_t syncfs_calls{0};
 #endif
+
+
+MACHA_TEST("invariants", test_manage_unmatched_rename_manual_catalogue_and_filesystem_binding) {
+    TestService fixture("manage");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.hydration.enabled = false;
+    config.catalogue.scanner.enabled = false;
+    auto& service = fixture.start();
+
+    auto& fs = service.filesystem();
+    fs.mkdir("/Movies", 0755, getuid(), getgid());
+    write_file(fs, "/Movies/unknown.mkv", pattern(4096, 91));
+    const auto before = fs.getattr("/Movies/unknown.mkv");
+    const auto media_id = file_media_id(before);
+
+    auto& hints = service.catalogue_hints();
+    const auto hint_id = hints.submit("/Movies/unknown.mkv", "scanner", media_id,
+                                      CatalogueHintPriority::periodic_scan);
+    auto claimed = hints.claim_next();
+    REQUIRE(claimed.has_value());
+    REQUIRE(claimed->id == hint_id);
+    hints.mark_no_match(hint_id, "movies", media_id, "no metadata provider match");
+
+    CatalogueScanner scanner(service.node(), fs, service.catalogue(), hints,
+                             config.catalogue.scanner);
+    ManageApi manage(fs, service.catalogue(), hints, scanner);
+
+    HttpRequest list;
+    list.method = "GET";
+    list.path = "/api/v1/manage/unmatched";
+    auto listed = manage.handle(list);
+    REQUIRE(listed.status == 200);
+    auto listed_json = Json::parse(std::string(reinterpret_cast<const char*>(listed.body.data()), listed.body.size()));
+    REQUIRE(listed_json.find("count") != nullptr);
+    CHECK(listed_json.find("count")->asUInt64() == 1);
+
+    HttpRequest rename;
+    rename.method = "POST";
+    rename.path = "/api/v1/manage/filesystem/rename";
+    const std::string rename_body = R"({"path":"/Movies/unknown.mkv","destination":"/Movies/renamed.mkv"})";
+    rename.body.assign(rename_body.begin(), rename_body.end());
+    REQUIRE(manage.handle(rename).status == 200);
+    CHECK(file_media_id(fs.getattr("/Movies/renamed.mkv")) == media_id);
+
+    auto moved_hints = hints.list();
+    REQUIRE(moved_hints.size() == 1);
+    CHECK(moved_hints.front().path == "/Movies/renamed.mkv");
+    CHECK(moved_hints.front().media_id == media_id);
+    const auto moved_hint_id = moved_hints.front().id;
+
+    HttpRequest manual;
+    manual.method = "POST";
+    manual.path = "/api/v1/manage/unmatched/" + moved_hint_id + "/manual";
+    const std::string manual_body = R"({"kind":"movie","title":"Manually Identified","year":2026})";
+    manual.body.assign(manual_body.begin(), manual_body.end());
+    auto created = manage.handle(manual);
+    REQUIRE(created.status == 201);
+    auto created_json = Json::parse(std::string(reinterpret_cast<const char*>(created.body.data()), created.body.size()));
+    const auto leaf_id = created_json.find("leaf_item_id")->asString();
+    auto item = service.catalogue().get(leaf_id);
+    REQUIRE(item.has_value());
+    CHECK(item->title == "Manually Identified");
+    CHECK(item->media_ids == std::vector<std::string>{media_id});
+    CHECK(!hints.get(moved_hint_id).has_value());
+
+    HttpRequest browse;
+    browse.method = "GET";
+    browse.path = "/api/v1/manage/filesystem";
+    browse.query["path"] = "/Movies";
+    auto browsed = manage.handle(browse);
+    REQUIRE(browsed.status == 200);
+    auto browsed_json = Json::parse(std::string(reinterpret_cast<const char*>(browsed.body.data()), browsed.body.size()));
+    const auto& entries = browsed_json.find("entries")->asArray();
+    REQUIRE(entries.size() == 1);
+    CHECK(entries.front().find("path")->asString() == "/Movies/renamed.mkv");
+    CHECK(entries.front().find("media_id")->asString() == media_id);
+    REQUIRE(entries.front().find("catalogue_item_ids")->asArray().size() == 1);
+    CHECK(entries.front().find("catalogue_item_ids")->asArray().front().asString() == leaf_id);
+
+    // Generic Files-tab deletion also clears any durable match state for the path.
+    const auto delete_hint = hints.submit("/Movies/renamed.mkv", "scanner", media_id,
+                                          CatalogueHintPriority::periodic_scan);
+    REQUIRE(hints.claim_next().has_value());
+    hints.mark_no_match(delete_hint, "movies", media_id, "synthetic stale exception");
+    HttpRequest remove;
+    remove.method = "DELETE";
+    remove.path = "/api/v1/manage/filesystem";
+    remove.query["path"] = "/Movies/renamed.mkv";
+    REQUIRE(manage.handle(remove).status == 204);
+    CHECK(hints.list().empty());
+}
 
 MACHA_TEST("invariants", test_fuse_open_inode_identity_survives_external_replace_and_unlink) {
     TestNode fixture("node");

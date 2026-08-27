@@ -515,7 +515,7 @@ void CatalogueManager::repair_once() {
         {
             std::lock_guard lock(mutex_);
             if (ready_ && cached_root_ == metadata.catalogue_root) {
-                // Filesystem namespace mutations advance the global metadata
+                // MachaDFS namespace mutations advance the global metadata
                 // generation far more often than the catalogue root changes.
                 // The catalogue object itself is immutable/content-addressed,
                 // so an unchanged root means the cached snapshot is still
@@ -784,6 +784,30 @@ CatalogueItem CatalogueManager::upsert(CatalogueItem item,
     current.items[item.id] = item;
     commit(expected_root, current, old_art);
     return item;
+}
+
+std::vector<CatalogueItem> CatalogueManager::upsert_many(std::vector<CatalogueItem> items) {
+    if (items.empty()) return {};
+    DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
+    repair_once();
+    auto current = *current_snapshot();
+    std::optional<ObjectId> expected_root;
+    {
+        std::lock_guard lock(mutex_);
+        expected_root = cached_root_;
+    }
+    auto old_art = artwork_ids(current);
+    const auto updated_ns = wall_time_ns();
+    for (auto& item : items) {
+        if (item.id.empty())
+            throw std::runtime_error("catalogue item id is required");
+        auto it = current.items.find(item.id);
+        item.revision = it == current.items.end() ? 1 : it->second.revision + 1;
+        item.updated_ns = updated_ns;
+        current.items[item.id] = item;
+    }
+    commit(expected_root, current, old_art);
+    return items;
 }
 
 bool CatalogueManager::erase(std::string_view id, std::optional<uint64_t> expected_revision) {

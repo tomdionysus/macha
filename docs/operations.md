@@ -39,7 +39,7 @@ Maintenance is bounded and low priority. It performs:
 - catalogue control-object convergence and CONTROL GC;
 - scheduled physical integrity scrub.
 
-A complete no-progress pass backs off instead of repeatedly scanning a settled store. Foreground playback and mounted-filesystem activity suppress speculative work according to policy.
+A complete no-progress pass backs off instead of repeatedly scanning a settled store. Foreground playback and mounted MachaDFS activity suppress speculative work according to policy.
 
 ## Garbage collection
 

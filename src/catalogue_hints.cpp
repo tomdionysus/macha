@@ -706,4 +706,82 @@ size_t CatalogueHintQueue::erase_origin(std::string_view source, std::string_vie
     return removed;
 }
 
+bool CatalogueHintQueue::erase(std::string_view id) {
+    std::lock_guard lock(mutex_);
+    auto it = std::find_if(hints_.begin(), hints_.end(),
+                           [&](const auto& pair) { return pair.second.id == id; });
+    if (it == hints_.end()) return false;
+    hints_.erase(it);
+    mark_state_dirty_locked();
+    persist_dirty_state_locked(true);
+    changed_locked();
+    return true;
+}
+
+size_t CatalogueHintQueue::erase_prefix(std::string_view path_value) {
+    const auto path = normalize_path(std::string(path_value));
+    const auto prefix = path == "/" ? std::string("/") : path + "/";
+    std::lock_guard lock(mutex_);
+    size_t removed = 0;
+    for (auto it = hints_.begin(); it != hints_.end();) {
+        if (it->first == path || it->first.starts_with(prefix)) {
+            it = hints_.erase(it);
+            ++removed;
+        } else {
+            ++it;
+        }
+    }
+    if (removed) {
+        mark_state_dirty_locked();
+        persist_dirty_state_locked(true);
+        changed_locked();
+    }
+    return removed;
+}
+
+size_t CatalogueHintQueue::rename_prefix(std::string_view source_value,
+                                         std::string_view destination_value) {
+    const auto source = normalize_path(std::string(source_value));
+    const auto destination = normalize_path(std::string(destination_value));
+    if (source == destination) return 0;
+    const auto prefix = source == "/" ? std::string("/") : source + "/";
+
+    std::lock_guard lock(mutex_);
+    std::vector<std::pair<std::string, CatalogueHint>> moved;
+    for (auto it = hints_.begin(); it != hints_.end();) {
+        if (it->first != source && !it->first.starts_with(prefix)) {
+            ++it;
+            continue;
+        }
+        auto hint = std::move(it->second);
+        const auto suffix = it->first == source ? std::string{} : it->first.substr(source.size());
+        auto new_path = normalize_path(destination + suffix);
+        hint.path = new_path;
+        hint.id = hint_id_for_path(new_path);
+        // A worker may still hold the old id/path. Requeue the renamed work so
+        // completion against that stale claim cannot strand a durable `processing`
+        // record or resolve a replacement file.
+        if (hint.state == CatalogueHintState::processing) {
+            hint.state = CatalogueHintState::queued;
+            hint.ready_after_unix_ms = 0;
+        }
+        hint.updated_unix_ms = now_ms();
+        moved.emplace_back(std::move(new_path), std::move(hint));
+        it = hints_.erase(it);
+    }
+    if (moved.empty()) return 0;
+
+    for (auto& [path, hint] : moved) {
+        // Namespace truth wins over a stale hint that happened to occupy the new
+        // path. `FileSystem::rename(..., no_replace=true)` has already guaranteed
+        // that no live destination entry was overwritten.
+        hints_.erase(path);
+        hints_.emplace(std::move(path), std::move(hint));
+    }
+    mark_state_dirty_locked();
+    persist_dirty_state_locked(true);
+    changed_locked();
+    return moved.size();
+}
+
 } // namespace macha

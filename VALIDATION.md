@@ -1,6 +1,6 @@
 # Validation
 
-The storage backend is specified by invariants in `ARCHITECTURE.md`, `docs/storage.md` and `docs/durability.md`. The normal regression suite includes dedicated storage-contract cases in `tests/test_storage_v18.cpp` plus related placement, metadata, catalogue and FUSE cases in the owning test files.
+MachaDFS storage is specified by invariants in `ARCHITECTURE.md`, `docs/storage.md` and `docs/durability.md`. The normal regression suite includes dedicated storage-contract cases in `tests/test_storage_v18.cpp` plus related placement, metadata, catalogue and FUSE cases in the owning test files.
 
 ## Storage contract cases
 

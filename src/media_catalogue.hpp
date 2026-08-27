@@ -332,6 +332,7 @@ class CatalogueScanner {
     void reconfigure(CatalogueScannerConfig);
     void request_rescan();
     size_t request_media_rescan(const std::vector<std::string>& media_ids);
+    std::vector<MediaProbeCandidate> probe_unmatched(std::string_view hint_id);
     size_t scan_once();
 };
 

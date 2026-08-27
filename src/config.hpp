@@ -109,7 +109,7 @@ struct FuseConfig {
     // publication so restart recovery cannot make the node unresponsive.
     // The effective limit is min(recovery_commit_workers, commit_workers).
     size_t recovery_commit_workers{2};
-    // While mounted filesystem activity is recent, cap asynchronous data
+    // While mounted MachaDFS activity is recent, cap asynchronous data
     // publication so local spool acceptance remains responsive. Once the
     // frontend is quiet, all commit_workers may drain the live backlog.
     size_t foreground_commit_workers{1};
@@ -130,7 +130,7 @@ struct FuseConfig {
 };
 
 struct FilesystemConfig {
-    // These values become the ownership/mode of the distributed filesystem
+    // These values become the ownership/mode of the MachaDFS namespace
     // root when a brand-new metadata group is formed. They are stored in DHT
     // metadata thereafter; changing the config does not rewrite an existing
     // filesystem root.

@@ -10,7 +10,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-Changes to cluster, metadata, storage, crypto, transport or filesystem semantics need a regression or fault-injection test. Do not weaken quorum safety, object integrity, crash durability or foreground I/O behaviour to simplify an error path.
+Changes to cluster, metadata, storage, crypto, transport or MachaDFS semantics need a regression or fault-injection test. Do not weaken quorum safety, object integrity, crash durability or foreground I/O behaviour to simplify an error path.
 
 ## Style
 

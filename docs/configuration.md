@@ -143,7 +143,7 @@ maintenance:
   garbage_grace_ms: 86400000
 ```
 
-Maintenance performs DATA repair/rebalance/GC/scrub and catalogue control convergence/GC. Foreground media and mounted-filesystem activity take priority.
+Maintenance performs DATA repair/rebalance/GC/scrub and catalogue control convergence/GC. Foreground media and mounted MachaDFS activity take priority.
 
 ## Catalogue
 

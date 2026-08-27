@@ -128,6 +128,7 @@ set(MACHA_CORE_SOURCES
     src/catalogue.cpp
     src/catalogue_hints.cpp
     src/catalogue_api.cpp
+    src/manage_api.cpp
     src/acquisition_api.cpp
     src/media_catalogue.cpp
     src/ingest.cpp

@@ -163,7 +163,7 @@ The cache may retain a useful fetched copy independently, but that cache copy do
 
 ## Garbage collection
 
-Committed metadata is reachability authority. Filesystem extents and catalogue artwork contribute to the DATA live set. Catalogue manifests/shards contribute to a separate CONTROL live set.
+Committed metadata is reachability authority. MachaDFS file extents and catalogue artwork contribute to the DATA live set. Catalogue manifests/shards contribute to a separate CONTROL live set.
 
 Objects that become unreachable are protected for `maintenance.garbage_grace_ms` before physical reclamation. This protects failed publications, convergence lag and recently retired references. DATA and CONTROL are swept separately.
 

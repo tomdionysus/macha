@@ -2,7 +2,7 @@
 
 ## Design boundary
 
-Macha is a distributed media filesystem, not a general-purpose distributed POSIX filesystem. The authoritative model is immutable content-addressed objects plus quorum-managed namespace/control metadata. Local FUSE state makes accepted filesystem mutations crash-recoverable while distributed publication proceeds asynchronously.
+MachaDFS (Macha Distributed File System) is a distributed media filesystem, not a general-purpose distributed POSIX filesystem. The authoritative model is immutable content-addressed objects plus quorum-managed namespace/control metadata. Local FUSE state makes accepted filesystem mutations crash-recoverable while distributed publication proceeds asynchronously.
 
 The storage contract deliberately separates three classes:
 
@@ -120,7 +120,7 @@ External metadata providers are enrichment inputs, not recovery dependencies.
 
 ## Maintenance
 
-Maintenance is low priority and bounded. It performs replica repair, local backend rebalance, reachability GC, catalogue control convergence/GC and scheduled integrity scrub. Foreground playback and mounted-filesystem traffic suppress speculative work.
+Maintenance is low priority and bounded. It performs replica repair, local backend rebalance, reachability GC, catalogue control convergence/GC and scheduled integrity scrub. Foreground playback and mounted MachaDFS traffic suppress speculative work.
 
 GC authority is reachability from committed metadata. DATA and CONTROL have separate physical sweeps. Newly orphaned/unreferenced objects remain protected by the configured grace period so failed publication and metadata convergence cannot race reclamation.
 

@@ -1148,7 +1148,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     }
     CHECK(tmdb_error_http.requests() == 2);
 
-    // End-to-end scanner: resolve a real distributed filesystem entry, fetch
+    // End-to-end scanner: resolve a real MachaDFS entry, fetch
     // poster/backdrop bytes, commit them with the catalogue, then prove a second
     // scan is idempotent and deletion removes only the scanner-owned item.
     TempDir t;
@@ -1850,6 +1850,46 @@ MACHA_TEST("hydration_catalogue", test_catalogue_non_coordinator_idle_does_not_s
 
     s2.stop();
     s1.stop();
+}
+
+
+MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_follows_machadfs_rename_and_delete) {
+    TempDir temp;
+    const auto state = temp.path() / "manage-hints";
+
+    CatalogueHintQueue hints(state);
+    const auto original_id = hints.submit("/Movies/A/unknown.mkv", "scanner", "macha:stable",
+                                          CatalogueHintPriority::periodic_scan);
+    REQUIRE(hints.claim_next().has_value());
+    hints.mark_no_match(original_id, "movies", "macha:stable", "no provider match");
+
+    CHECK(hints.rename_prefix("/Movies/A", "/Movies/B") == 1);
+    auto moved = hints.list();
+    REQUIRE(moved.size() == 1);
+    CHECK(moved.front().path == "/Movies/B/unknown.mkv");
+    CHECK(moved.front().media_id == "macha:stable");
+    CHECK(moved.front().state == CatalogueHintState::no_match);
+    CHECK(moved.front().id != original_id);
+
+    const auto processing_id = hints.submit("/Movies/B/in-flight.mkv", "scanner", "macha:flight",
+                                            CatalogueHintPriority::periodic_scan);
+    auto claimed = hints.claim_next();
+    REQUIRE(claimed.has_value());
+    CHECK(claimed->id == processing_id);
+    CHECK(hints.rename_prefix("/Movies/B/in-flight.mkv", "/Movies/C/in-flight.mkv") == 1);
+    CHECK(!hints.get(processing_id).has_value());
+    auto after_processing_move = hints.list();
+    auto requeued = std::find_if(after_processing_move.begin(), after_processing_move.end(), [](const auto& hint) {
+        return hint.path == "/Movies/C/in-flight.mkv";
+    });
+    REQUIRE(requeued != after_processing_move.end());
+    CHECK(requeued->state == CatalogueHintState::queued);
+
+    CHECK(hints.erase_prefix("/Movies/B") == 1);
+    auto after_erase = hints.list();
+    CHECK(std::none_of(after_erase.begin(), after_erase.end(), [](const auto& hint) {
+        return hint.path == "/Movies/B/unknown.mkv";
+    }));
 }
 
 MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_persistence_coalescing_and_priority) {
