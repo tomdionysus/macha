@@ -285,6 +285,23 @@ struct HydrationConfig {
     size_t catalogue_lookahead{1};
 };
 
+struct UpnpConfig {
+    bool enabled{};
+    uint16_t external_port{}; // 0 = use network.port
+    std::chrono::milliseconds discovery_timeout{2000};
+    uint32_t lease_seconds{}; // 0 = request a permanent mapping
+};
+
+struct ExternalIpConfig {
+    bool enabled{};
+    std::chrono::milliseconds timeout{3000};
+};
+
+struct ConnectivityCheckConfig {
+    bool enabled{};
+    std::chrono::milliseconds timeout{3000};
+};
+
 struct Config {
     std::filesystem::path state_path;
     std::vector<StorageBackendConfig> storage_backends;
@@ -307,6 +324,9 @@ struct Config {
     std::string advertise_host;
     std::string failure_domain;
     uint16_t port{7437};
+    UpnpConfig upnp;
+    ExternalIpConfig external_ip;
+    ConnectivityCheckConfig connectivity_check;
     size_t replication{3};
     size_t metadata_replication{3};
     size_t min_write_replicas{1};

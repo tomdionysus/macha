@@ -7,6 +7,7 @@
 #include "metadata.hpp"
 #include "net.hpp"
 #include "persistent_cache.hpp"
+#include "public_connectivity.hpp"
 #include "storage_pool.hpp"
 #include "telemetry.hpp"
 
@@ -33,11 +34,8 @@ class NodeRuntime {
     PersistentBlockCache cache_;
     MetadataReplica meta_;
     Membership members_;
+    PublicConnectivity public_connectivity_;
     TelemetryStore telemetry_;
-    // Immutable network identity copied once during construction.  The
-    // telemetry worker must not contend on Membership's mutex merely to report
-    // our own host/failure-domain/port every few seconds.
-    NodeInfo telemetry_identity_;
     std::atomic_uint64_t remote_metadata_generation_{};
     std::atomic_uint64_t telemetry_storage_used_{};
     std::atomic_uint64_t telemetry_storage_capacity_{};
@@ -153,6 +151,8 @@ class NodeRuntime {
     bool apply_identity_reset(const IdentityAssociationReset&);
     void propagate_identity_reset(const IdentityAssociationReset&);
     std::vector<IdentityAssociationReset> identity_resets() const { return members_.identity_resets(); }
+    PublicConnectivityStatus public_connectivity_status() const;
+    PublicConnectivityStatus refresh_public_connectivity(bool probe, bool force_probe = false);
     RpcStats rpc_stats() const {
         return client_.stats();
     }

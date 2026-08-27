@@ -163,6 +163,8 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
       meta_(cfg_.state_path, keys_.storage, cache_.metadata()),
       members_(self_info(cfg_, id_, local_.used(), local_.limit(), meta_.committed().generation),
                cfg_.dead_after),
+      public_connectivity_(cfg_, id_,
+                           Endpoint{members_.self().host, members_.self().port}),
       telemetry_(id_, cfg_.state_path / "telemetry" / "last-known.bin"),
       client_(
           keys_, [this] { return members_.self(); },
@@ -192,6 +194,11 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
           cfg_.max_frame_size) {
     server_.attach_client(client_);
 
+    // Resolve the effective public endpoint before any peer exchange. UPnP and
+    // the optional AWS external-IP fallback only change how this node is
+    // advertised; the local listener remains cfg_.listen_host:cfg_.port.
+    (void)refresh_public_connectivity(false);
+
     // Identity-reset tombstones must be active before the first peer exchange.
     // This prevents stale membership from being reintroduced during startup.
     try {
@@ -220,7 +227,6 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
     telemetry_storage_used_.store(storage_used, std::memory_order_relaxed);
     telemetry_storage_capacity_.store(storage_capacity, std::memory_order_relaxed);
     telemetry_metadata_generation_.store(meta_.committed().generation, std::memory_order_relaxed);
-    telemetry_identity_ = members_.self();
     refresh_telemetry();
 }
 
@@ -233,6 +239,8 @@ void NodeRuntime::start() {
         return;
     local_writer_ = std::jthread([this](std::stop_token stop) { local_writer_loop(stop); });
     server_.start();
+    if (cfg_.connectivity_check.enabled)
+        (void)public_connectivity_.probe(false);
     telemetry_worker_ = std::jthread([this](std::stop_token stop) { telemetry_loop(stop); });
     maintenance_ = std::jthread([this](std::stop_token stop) { loop(stop); });
     Log::info("node " + to_string(id_).substr(0, 12) + " listening on " +
@@ -695,8 +703,30 @@ void NodeRuntime::merge(std::span<const uint8_t> payload) {
     remote_metadata_generation_.store(newest_metadata);
 }
 
+PublicConnectivityStatus NodeRuntime::public_connectivity_status() const {
+    return public_connectivity_.status();
+}
+
+PublicConnectivityStatus NodeRuntime::refresh_public_connectivity(bool probe, bool force_probe) {
+    const auto before = members_.self();
+    const auto status = public_connectivity_.refresh(probe, force_probe);
+    if (!status.advertised.host.empty() && status.advertised.port &&
+        (status.advertised.host != before.host || status.advertised.port != before.port)) {
+        members_.endpoint(status.advertised.host, status.advertised.port);
+        server_.set_local(members_.self());
+        Log::info("node advertised endpoint changed from=" + before.host + ":" +
+                  std::to_string(before.port) + " to=" + status.advertised.host + ":" +
+                  std::to_string(status.advertised.port) + " source=" +
+                  status.advertised_source);
+    }
+    return status;
+}
+
 void NodeRuntime::refresh_telemetry() {
-    auto info = telemetry_identity_;
+    // Public reachability may change the advertised host/port at runtime. Use
+    // the authoritative current self identity instead of a stale construction
+    // snapshot; this lock is taken only once per telemetry refresh interval.
+    auto info = members_.self();
     info.used = telemetry_storage_used_.load(std::memory_order_relaxed);
     info.capacity = telemetry_storage_capacity_.load(std::memory_order_relaxed);
     info.metadata_generation = telemetry_metadata_generation_.load(std::memory_order_relaxed);
