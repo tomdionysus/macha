@@ -44,7 +44,7 @@ Immediate versus batchable urgency changes scheduling, not correctness. Both use
 
 ## Distributed DATA publication
 
-The writer ranks preferred owners and deterministic fallbacks. It obtains placements until at least `min_write_replicas` have accepted and become durably covered. Only then may filesystem metadata reference the new extents.
+The writer ranks preferred owners and deterministic fallbacks. It obtains placements until at least `min_write_replicas` have accepted and become durably covered. Only then may MachaDFS namespace metadata reference the new extents.
 
 `replicas` can be larger than the publication floor. Missing desired copies remain repair debt and are converged by maintenance.
 

@@ -153,6 +153,7 @@ class CatalogueManager {
                                     std::optional<std::string_view> parent = {});
     std::vector<CatalogueItem> search(std::string_view query, size_t limit = 50);
     CatalogueItem upsert(CatalogueItem, std::optional<uint64_t> expected_revision = {});
+    std::vector<CatalogueItem> upsert_many(std::vector<CatalogueItem>);
     bool erase(std::string_view id, std::optional<uint64_t> expected_revision = {});
     bool definitely_absent(std::string_view id) const;
     CatalogueClearResult clear_metadata_with_media(

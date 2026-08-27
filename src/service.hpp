@@ -3,6 +3,7 @@
 #include "catalogue.hpp"
 #include "catalogue_hints.hpp"
 #include "catalogue_api.hpp"
+#include "manage_api.hpp"
 #include "acquisition_api.hpp"
 #include "ingest.hpp"
 #include "torrent.hpp"
@@ -35,6 +36,7 @@ class Service {
     TorrentSearchManager torrent_search_;
     AcquisitionApi acquisition_api_;
     CatalogueApi catalogue_api_;
+    ManageApi manage_api_;
     PlaybackManager streaming_;
     std::unique_ptr<HttpServer> catalogue_http_;
     std::jthread maintenance_;

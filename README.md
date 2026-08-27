@@ -4,7 +4,7 @@
 
 *Macha — <span lang="ga">Macha</span> /ˈmˠaxə/ — approximately “MAKH-uh”*
 
-Macha is a C++20 distributed filesystem and media server for large, mostly immutable video and music libraries. Files are split into encrypted content-addressed extents, placed across ordinary machines, exposed through FUSE, indexed in a distributed catalogue, and served directly or through in-process FFmpeg remux/transcode pipelines.
+Macha is a C++20 MachaDFS (Macha Distributed File System) and media server for large, mostly immutable video and music libraries. Files are split into encrypted content-addressed extents, placed across ordinary machines, exposed through FUSE, indexed in a distributed catalogue, and served directly or through in-process FFmpeg remux/transcode pipelines.
 
 There is no permanent master, cloud service or account system. Nodes share a cluster key, discover peers through bootstrap endpoints, and converge data placement and replicas in the background.
 

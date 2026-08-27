@@ -2663,6 +2663,23 @@ size_t CatalogueScanner::request_media_rescan(const std::vector<std::string>& me
     return queued;
 }
 
+
+std::vector<MediaProbeCandidate> CatalogueScanner::probe_unmatched(std::string_view hint_id) {
+    auto hint = hints_.get(hint_id);
+    if (!hint || hint->state != CatalogueHintState::no_match || hint->media_id.empty())
+        return {};
+
+    std::lock_guard lock(config_mutex_);
+    std::string root;
+    auto* provider = provider_for_path(hint->path, root);
+    if (!provider || !provider->accepts_path(hint->path)) return {};
+
+    auto entry = fs_.getattr(hint->path);
+    if (entry.type != EntryType::file || entry.size == 0 || file_media_id(entry) != hint->media_id)
+        return {};
+    return provider->probe_file(fs_, root, hint->path, entry).candidates;
+}
+
 void CatalogueScanner::reconfigure(CatalogueScannerConfig config) {
     stop();
     {
@@ -2788,7 +2805,7 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
     auto probed = provider->probe_file(fs_, root, hint.path, entry);
     if (stop.stop_requested()) return {};
     if (probed.candidates.empty()) {
-        hints_.mark_no_match(hint.id, std::string(provider->name()), {},
+        hints_.mark_no_match(hint.id, std::string(provider->name()), media_id,
                              "no supported media candidate");
         return {};
     }

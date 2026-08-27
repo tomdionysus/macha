@@ -101,6 +101,7 @@ Service::Service(Config config, ClusterKeys keys)
                      [this](const std::vector<std::string>& media_ids) {
                          scanner_.request_media_rescan(media_ids);
                      }),
+      manage_api_(fs_, catalogue_, catalogue_hints_, scanner_),
       streaming_(fs_, catalogue_, node_.config().catalogue.api, node_.config().streaming) {
     if (node_.config().catalogue.api.enabled) {
         catalogue_http_ = std::make_unique<HttpServer>(
@@ -111,6 +112,8 @@ Service::Service(Config config, ClusterKeys keys)
                 if (request.path.starts_with("/api/v1/ingest/") ||
                     request.path.starts_with("/api/v1/torrents/"))
                     return acquisition_api_.handle(request);
+                if (request.path.starts_with("/api/v1/manage"))
+                    return manage_api_.handle(request);
                 return catalogue_api_.handle(request);
             },
             [this](const HttpRequest& request) { return streaming_.capability_request(request); });
@@ -138,7 +141,7 @@ void Service::start() {
 
 void Service::request_stop() {
     // Phase one of shutdown is deliberately non-blocking. Signal anything
-    // that can be waiting on mounted-filesystem or catalogue work before any
+    // that can be waiting on mounted MachaDFS or catalogue work before any
     // component is joined, so teardown cannot deadlock behind the first
     // long-running subsystem in Service::stop().
     fs_.request_io_cancellation();
@@ -316,7 +319,7 @@ void Service::loop(std::stop_token stop) {
             store_.foreground_idle_for() < policy.foreground_quiet;
         const bool interactive_busy = interactive_bytes > 0 ||
             store_.interactive_idle_for() < policy.foreground_quiet;
-        // Priority law: playback/seek > mounted filesystem/useful prefetch >
+        // Priority law: playback/seek > mounted MachaDFS/useful prefetch >
         // repair/rebalance/scrub. Both foreground classes suppress background
         // work, while the transport queues themselves keep playback above mount I/O.
         bool busy = playback_busy || interactive_busy;

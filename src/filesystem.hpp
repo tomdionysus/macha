@@ -143,7 +143,7 @@ class FileSystem {
     PlaybackTracker* playback_{};
     std::mutex open_writes_mutex_;
     std::vector<std::weak_ptr<WriteHandle>> open_writes_;
-    // Cooperative cancellation for mounted-filesystem reads/writes during
+    // Cooperative cancellation for mounted MachaDFS reads/writes during
     // daemon shutdown. Namespace-only operations are short metadata calls;
     // extent transfers carry this token into DistributedStore.
     std::atomic_bool io_cancelled_{};

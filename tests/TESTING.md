@@ -12,7 +12,7 @@ The test implementation is split only by the subsystem that owns the invariant:
 - `test_foundations.cpp` — codecs, configuration, diagnostics, placement and small pure policies;
 - `test_storage_metadata.cpp` — local/pool storage, persistent cache and metadata durability;
 - `test_rpc_cluster.cpp` — transport, admission, quorum, membership and distributed repair;
-- `test_filesystem_fuse.cpp` — filesystem semantics, FUSE ordering, durability and recovery;
+- `test_filesystem_fuse.cpp` — MachaDFS semantics, FUSE ordering, durability and recovery;
 - `test_hydration_catalogue.cpp` — hydration, replica selection, media recognition and catalogue state;
 - `test_media_playback.cpp` — HTTP streaming, VOD planning, timestamps and playback negotiation;
 - `test_invariants.cpp` — cross-component regressions whose failure requires a real topology/lifecycle;

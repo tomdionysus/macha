@@ -135,6 +135,9 @@ class CatalogueHintQueue {
     CatalogueHintSummary summary() const;
     CatalogueHintSummary summary(std::string_view source, std::string_view source_ref) const;
     size_t erase_origin(std::string_view source, std::string_view source_ref);
+    bool erase(std::string_view id);
+    size_t erase_prefix(std::string_view path);
+    size_t rename_prefix(std::string_view source, std::string_view destination);
 };
 
 } // namespace macha

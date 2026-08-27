@@ -290,7 +290,7 @@ struct FuseFrontend::State {
         // Recovery-local validation failure. The durable journal remains the
         // authority for which generation is pending, but a missing/truncated
         // spool invalidates only this inode's dirty generation rather than the
-        // complete mounted filesystem.
+        // complete mounted MachaDFS namespace.
         std::optional<std::string> recovery_spool_error;
         // Writes admitted to the local spool can wait together for one durable
         // payload+journal barrier. admitted_size reserves O_APPEND offsets while
