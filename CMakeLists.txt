@@ -60,6 +60,18 @@ if(APPLE)
             set(PKG_CONFIG_USE_CMAKE_PREFIX_PATH TRUE)
             message(STATUS "Using Homebrew libtorrent from ${MACHA_LIBTORRENT_PREFIX}")
         endif()
+
+        execute_process(
+            COMMAND ${MACHA_BREW_EXECUTABLE} --prefix miniupnpc
+            RESULT_VARIABLE MACHA_BREW_MINIUPNPC_RESULT
+            OUTPUT_VARIABLE MACHA_MINIUPNPC_PREFIX
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        if(MACHA_BREW_MINIUPNPC_RESULT EQUAL 0)
+            list(PREPEND CMAKE_PREFIX_PATH "${MACHA_MINIUPNPC_PREFIX}")
+            set(PKG_CONFIG_USE_CMAKE_PREFIX_PATH TRUE)
+            message(STATUS "Using Homebrew miniupnpc from ${MACHA_MINIUPNPC_PREFIX}")
+        endif()
     endif()
 endif()
 
@@ -67,10 +79,19 @@ endif()
 pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET
     libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7 libswresample>=4)
 
-# UPnP IGD discovery/port mapping is optional at build time. Nodes with the
-# feature disabled do not require miniupnpc; enabling it without build support
-# is reported in Status and falls through to the configured external-IP path.
-pkg_check_modules(MINIUPNPC QUIET IMPORTED_TARGET miniupnpc)
+# UPnP IGD discovery/port mapping is optional at build time. Prefer the
+# library's native CMake package when available (including Homebrew), with
+# pkg-config as a fallback for distributions that only ship miniupnpc.pc.
+set(MACHA_MINIUPNPC_TARGET "")
+find_package(miniupnpc CONFIG QUIET)
+if(TARGET miniupnpc::miniupnpc)
+    set(MACHA_MINIUPNPC_TARGET miniupnpc::miniupnpc)
+else()
+    pkg_check_modules(MINIUPNPC QUIET IMPORTED_TARGET miniupnpc)
+    if(TARGET PkgConfig::MINIUPNPC)
+        set(MACHA_MINIUPNPC_TARGET PkgConfig::MINIUPNPC)
+    endif()
+endif()
 
 # BitTorrent acquisition is optional at build time. Prefer libtorrent's native
 # CMake package: it carries the exact compile definitions and transitive Boost,
@@ -156,10 +177,10 @@ target_include_directories(macha_core PUBLIC
     ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(macha_core PUBLIC
     OpenSSL::Crypto Threads::Threads CURL::libcurl ${MACHA_YAML_TARGET} PkgConfig::LIBAV)
-if(TARGET PkgConfig::MINIUPNPC)
-    target_link_libraries(macha_core PUBLIC PkgConfig::MINIUPNPC)
+if(MACHA_MINIUPNPC_TARGET)
+    target_link_libraries(macha_core PUBLIC ${MACHA_MINIUPNPC_TARGET})
     target_compile_definitions(macha_core PUBLIC MACHA_HAVE_MINIUPNPC=1)
-    message(STATUS "UPnP port mapping enabled (miniupnpc)")
+    message(STATUS "UPnP port mapping enabled (${MACHA_MINIUPNPC_TARGET})")
 else()
     message(STATUS "miniupnpc not found; UPnP port mapping unavailable at runtime")
 endif()
