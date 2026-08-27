@@ -292,6 +292,7 @@ class RpcServer {
     uint16_t port_;
     ClusterKeys keys_;
     NodeInfo local_;
+    mutable std::mutex local_mutex_;
     Handler handler_;
     Observer observer_;
     size_t max_frame_size_{};
@@ -338,6 +339,7 @@ class RpcServer {
     void start();
     void stop();
     void attach_client(RpcClient&);
+    void set_local(NodeInfo);
     void broadcast(const RpcMessage&);
     uint16_t bound_port() const { return bound_port_; }
 };

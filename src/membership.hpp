@@ -26,6 +26,7 @@ class Membership {
     NodeInfo self() const;
     void usage(uint64_t);
     void storage(uint64_t used, uint64_t capacity);
+    void endpoint(std::string host, uint16_t port);
     void metadata_generation(uint64_t);
     void observe(NodeInfo, bool direct = false);
     bool apply_identity_reset(const IdentityAssociationReset&);

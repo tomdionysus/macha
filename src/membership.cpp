@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "membership.hpp"
 #include <algorithm>
+#include <stdexcept>
+#include <utility>
 namespace macha {
 Membership::Membership(NodeInfo s, std::chrono::milliseconds d) : self_(std::move(s)), dead_(d) {}
 NodeInfo Membership::self() const {
@@ -18,6 +20,14 @@ void Membership::storage(uint64_t used, uint64_t capacity) {
     std::lock_guard g(m_);
     self_.used = used;
     self_.capacity = capacity;
+    self_.seen_unix_ms = unix_ms();
+}
+void Membership::endpoint(std::string host, uint16_t port) {
+    std::lock_guard g(m_);
+    if (host.empty() || !port)
+        throw std::runtime_error("membership endpoint must be complete");
+    self_.host = std::move(host);
+    self_.port = port;
     self_.seen_unix_ms = unix_ms();
 }
 void Membership::metadata_generation(uint64_t generation) {
