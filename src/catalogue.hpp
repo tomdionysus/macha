@@ -123,6 +123,13 @@ class CatalogueManager {
     uint64_t cached_metadata_generation_{};
     Clock::time_point cache_until_{};
     uint64_t last_sync_unix_ms_{};
+    // CONTROL objects for a successor catalogue are staged on metadata voters
+    // before the metadata CAS can reference them.  Remember when this process
+    // first observed the current root so GC can never remove objects written
+    // after that point; a later root observation makes failed/stale staging
+    // eligible again without a distributed publication lock.
+    Clock::time_point control_gc_root_epoch_{};
+    bool control_gc_root_epoch_initialized_{};
     bool ready_{};
     std::string error_;
     LocalStore::Cursor control_gc_cursor_;

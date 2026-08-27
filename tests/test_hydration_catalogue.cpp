@@ -2877,6 +2877,55 @@ MACHA_TEST("hydration_catalogue", test_media_index_cache_survives_namespace_chur
     node.stop();
 }
 
+MACHA_TEST("hydration_catalogue", test_catalogue_control_gc_protects_future_root_staging) {
+    TestService fixture("catalogue-control-publication", ConfigProfile::isolated);
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_replication = 1;
+    auto& service = fixture.start();
+
+    REQUIRE(wait_until([&] {
+        try {
+            service.catalogue().repair_once();
+            return service.catalogue().status().ready;
+        } catch (...) {
+            return false;
+        }
+    }));
+
+    // CONTROL publication is data-before-metadata. Simulate a future root/shard
+    // arriving on this voter before the root CAS references it. Even with zero
+    // configured grace, GC must retain anything written after the currently
+    // observed catalogue root.
+    Bytes staged = pattern(4096 + 37);
+    staged[0] ^= 0x6d;
+    const auto staged_id = object_id(staged);
+    REQUIRE(service.node().control_store().put(staged_id, staged));
+    std::this_thread::sleep_for(5ms);
+
+    const std::vector<ObjectId> no_live;
+    for (int i = 0; i < 4; ++i)
+        (void)service.catalogue().control_gc_step(no_live, 0ms, 64);
+    CHECK(service.node().control_store().has(staged_id));
+
+    // Once a successor catalogue root is committed/observed, an unreferenced
+    // object from the previous publication epoch becomes an ordinary orphan.
+    CatalogueItem item;
+    item.id = "movie:control-publication-fence";
+    item.kind = CatalogueKind::movie;
+    item.title = "Control Publication Fence";
+    (void)service.catalogue().upsert(item);
+    std::this_thread::sleep_for(5ms);
+
+    auto maintenance = service.catalogue().maintenance_objects();
+    REQUIRE(maintenance.complete);
+    std::vector<ObjectId> live(maintenance.control_live.begin(),
+                               maintenance.control_live.end());
+    for (int i = 0; i < 4 && service.node().control_store().has(staged_id); ++i)
+        (void)service.catalogue().control_gc_step(live, 0ms, 64);
+    CHECK(!service.node().control_store().has(staged_id));
+}
+
 MACHA_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_gc) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
