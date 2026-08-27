@@ -60,6 +60,54 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_record_payload_copy_is_shared)
     }
 }
 
+MACHA_FAST_TEST("storage_metadata", test_metadata_seed_sibling_replays_after_restart) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto replica_path = t.path() / "seed-sibling";
+
+    const auto genesis = genesis_metadata();
+    auto make_sibling = [&](std::string path) {
+        auto snapshot = decode_snapshot(genesis.payload);
+        FsEntry entry;
+        entry.type = EntryType::directory;
+        entry.mode = 0755;
+        snapshot.entries.emplace(std::move(path), entry);
+
+        MetadataRecord record;
+        record.generation = genesis.generation + 1;
+        record.previous = genesis.hash;
+        record.payload = encode_snapshot(snapshot);
+        record.hash = metadata_hash(record.generation, record.previous, record.payload);
+        return record;
+    };
+
+    auto first = make_sibling("/first");
+    auto second = make_sibling("/second");
+    if (second.hash < first.hash)
+        std::swap(first, second);
+    REQUIRE(first.hash != second.hash);
+
+    {
+        MetadataReplica replica(replica_path, keys.storage);
+        REQUIRE(replica.seed(first));
+        // Same-generation sibling replacement is an intentional deterministic
+        // convergence rule: the greater hash wins when the predecessor agrees.
+        REQUIRE(replica.seed(second));
+        REQUIRE(replica.remember_current_committed(second.generation, second.hash));
+        CHECK(replica.current().hash == second.hash);
+        CHECK(replica.committed().hash == second.hash);
+    }
+
+    // Journal replay must reproduce every state transition that seed() accepted
+    // while the process was live. This specifically guards the replacement-node
+    // restart path exercised by test_three_node_cluster.
+    MetadataReplica replayed(replica_path, keys.storage);
+    CHECK(replayed.current().hash == second.hash);
+    CHECK(replayed.committed().hash == second.hash);
+}
+
 MACHA_FAST_TEST("storage_metadata", test_metadata_hash_streaming_matches_canonical_encoding) {
     const uint64_t generation = 0x1122334455667788ULL;
     Hash256 previous{};

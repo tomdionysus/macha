@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 
 namespace macha {
 
@@ -28,6 +29,26 @@ struct MetadataSnapshotView {
     std::shared_ptr<const MetadataSnapshot> snapshot;
 };
 
+
+enum class MetadataAvailability : uint8_t {
+    unavailable = 0,
+    read_only = 1,
+    writable = 2,
+};
+
+const char* metadata_availability_name(MetadataAvailability) noexcept;
+
+struct MetadataClusterStatus {
+    uint64_t generation{};
+    uint64_t observed_unix_ms{};
+    uint32_t voters{};
+    uint32_t voters_online{};
+    uint32_t quorum_required{};
+    MetadataAvailability availability{MetadataAvailability::unavailable};
+    bool stable{};
+    bool write_available{};
+};
+
 class MetadataManager {
     NodeRuntime& node_;
     Hash256 placement_key_;
@@ -41,6 +62,18 @@ class MetadataManager {
     uint64_t decoded_namespace_revision_{};
     std::atomic_uint64_t available_namespace_revision_{};
     Hash256 decoded_hash_{};
+
+    // Published operational metadata-quorum state. This is observational only:
+    // reads are lock-free and never initiate quorum/network I/O. The state is
+    // refreshed by the existing background metadata repair owner.
+    std::atomic_uint64_t quorum_generation_{};
+    std::atomic_uint64_t quorum_observed_unix_ms_{};
+    std::atomic_uint32_t quorum_voters_{};
+    std::atomic_uint32_t quorum_voters_online_{};
+    std::atomic_uint32_t quorum_required_{};
+    std::atomic_bool quorum_stable_{};
+    std::atomic_bool quorum_write_available_{};
+    std::atomic<MetadataAvailability> metadata_availability_{MetadataAvailability::unavailable};
 
     struct CasResult {
         size_t success{};
@@ -89,6 +122,7 @@ class MetadataManager {
     MetadataRecord mutate_impl(
         const std::function<void(MetadataSnapshot&, MetadataDelta*)>&, bool exact_delta,
         size_t retries);
+    void publish_quorum_state(bool validated, std::string_view reason = {});
 
   public:
     explicit MetadataManager(NodeRuntime&);
@@ -96,6 +130,10 @@ class MetadataManager {
     MetadataSnapshot snapshot();
     MetadataSnapshotView snapshot_view();
     std::optional<MetadataSnapshotView> available_snapshot_view() const;
+    MetadataClusterStatus cluster_status() const noexcept;
+    void note_quorum_validation(bool available, std::string_view reason = {}) {
+        publish_quorum_state(available, reason);
+    }
     uint64_t available_snapshot_generation() const noexcept {
         return available_generation_.load(std::memory_order_acquire);
     }

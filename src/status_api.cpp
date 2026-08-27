@@ -27,6 +27,19 @@ PersistedNodeStatus persisted(const NodeTelemetry& telemetry) {
     return out;
 }
 
+void merge_membership(PersistedNodeStatus& out, const NodeInfo& member) {
+    // Membership is the authoritative live cluster view. Telemetry may enrich
+    // it, but absence of telemetry must never make a connected node disappear
+    // from Status or make a voter look offline.
+    out.observed_unix_ms = std::max(out.observed_unix_ms, member.seen_unix_ms);
+    out.host = member.host;
+    out.failure_domain = member.failure_domain;
+    out.port = member.port;
+    out.storage_capacity = member.capacity;
+    out.storage_used = member.used;
+    out.metadata_generation = std::max(out.metadata_generation, member.metadata_generation);
+}
+
 Json bytes_pair(uint64_t used, uint64_t capacity) {
     return Json::Object{{"capacity_bytes", capacity}, {"used_bytes", used},
                         {"free_bytes", capacity > used ? capacity - used : 0}};
@@ -47,23 +60,30 @@ Json identity_reset_json(const IdentityAssociationReset& reset) {
     return Json(std::move(out));
 }
 
-Json node_json(const NodeId& id, const PersistedNodeStatus& durable,
+Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeInfo* member,
                const NodeTelemetry* live, uint64_t live_age_ms, bool online, bool stale,
                bool metadata_voter, const IdentityAssociationReset* identity_reset) {
     Json::Object node;
     node["id"] = to_string(id);
     node["state"] = online ? "online" : "offline";
-    node["telemetry_freshness"] = online ? (stale ? "stale" : "live") : "last_known";
-    node["observed_at_unix_ms"] = live ? live->observed_unix_ms : durable.observed_unix_ms;
+    node["telemetry_freshness"] =
+        online ? (live ? (stale ? "stale" : "live") : "unavailable") : "last_known";
+    node["observed_at_unix_ms"] =
+        live ? live->observed_unix_ms : (member ? member->seen_unix_ms : durable.observed_unix_ms);
     node["live_age_ms"] = live ? Json(live_age_ms) : Json(nullptr);
     node["version"] = live ? live->version : durable.version;
-    node["host"] = live ? live->host : durable.host;
-    node["port"] = static_cast<uint64_t>(live ? live->port : durable.port);
-    node["failure_domain"] = live ? live->failure_domain : durable.failure_domain;
-    node["metadata_generation"] = live ? live->metadata_generation : durable.metadata_generation;
+    node["host"] = member ? member->host : (live ? live->host : durable.host);
+    node["port"] = static_cast<uint64_t>(
+        member ? member->port : (live ? live->port : durable.port));
+    node["failure_domain"] =
+        member ? member->failure_domain : (live ? live->failure_domain : durable.failure_domain);
+    node["metadata_generation"] = member ? member->metadata_generation
+                                           : (live ? live->metadata_generation
+                                                   : durable.metadata_generation);
 
-    const auto storage_capacity = live ? live->storage_capacity : durable.storage_capacity;
-    const auto storage_used = live ? live->storage_used : durable.storage_used;
+    const auto storage_capacity =
+        member ? member->capacity : (live ? live->storage_capacity : durable.storage_capacity);
+    const auto storage_used = member ? member->used : (live ? live->storage_used : durable.storage_used);
     const auto cache_capacity = live ? live->cache_capacity : durable.cache_capacity;
     const auto cache_used = live ? live->cache_used : durable.cache_used;
     node["storage"] = bytes_pair(storage_used, storage_capacity);
@@ -180,8 +200,21 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         Log::debug("status metadata unavailable: " + std::string(error.what()));
     }
 
+    // Current cluster membership is independent of telemetry. These are small,
+    // in-memory snapshots under Membership's short mutex; they do no network or
+    // disk I/O. Telemetry only decorates members after this authoritative view
+    // has been established.
+    const auto membership = node_.membership().snapshot();
+    const auto& membership_all = membership.all;
+    const auto& membership_active = membership.active;
+    std::set<NodeId> active_members;
+    std::map<NodeId, NodeInfo> members_by_id;
+    for (const auto& member : membership_all)
+        members_by_id.emplace(member.id, member);
+    for (const auto& member : membership_active)
+        active_members.insert(member.id);
+
     const auto fresh_for = std::max(node_.config().heartbeat * 3, std::chrono::milliseconds(5000));
-    const auto online_for = std::max(node_.config().dead_after, fresh_for);
     auto views = node_.telemetry().views(fresh_for);
     std::map<NodeId, TelemetryView> live;
     for (auto& view : views)
@@ -194,6 +227,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         known[telemetry.node_id] = persisted(telemetry);
     for (const auto& [id, view] : live)
         known[id] = persisted(view.telemetry);
+    for (const auto& member : membership_all)
+        merge_membership(known[member.id], member);
 
     std::set<NodeId> voters;
     if (metadata)
@@ -209,13 +244,18 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
             continue;
         const auto found = live.find(id);
         const NodeTelemetry* current = found == live.end() ? nullptr : &found->second.telemetry;
+        const auto member_found = members_by_id.find(id);
+        const NodeInfo* member = member_found == members_by_id.end() ? nullptr : &member_found->second;
         const uint64_t age = found == live.end() ? 0 : static_cast<uint64_t>(found->second.age.count());
-        const bool online = current && found->second.age <= online_for;
+        const bool online = active_members.contains(id);
         const bool stale = current && found->second.age > fresh_for;
         const bool voter = voters.contains(id);
 
-        const auto storage_capacity = current ? current->storage_capacity : durable.storage_capacity;
-        const auto storage_used = current ? current->storage_used : durable.storage_used;
+        const auto storage_capacity = member ? member->capacity
+                                             : (current ? current->storage_capacity
+                                                        : durable.storage_capacity);
+        const auto storage_used =
+            member ? member->used : (current ? current->storage_used : durable.storage_used);
         const auto cache_capacity = current ? current->cache_capacity : durable.cache_capacity;
         const auto cache_used = current ? current->cache_used : durable.cache_used;
         known_capacity += storage_capacity;
@@ -233,8 +273,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         }
         const IdentityAssociationReset* identity_reset = nullptr;
         if (metadata) {
-            const auto& host = current ? current->host : durable.host;
-            const auto port = current ? current->port : durable.port;
+            const auto& host = member ? member->host : (current ? current->host : durable.host);
+            const auto port = member ? member->port : (current ? current->port : durable.port);
             if (!host.empty() && port) {
                 for (const auto& [_, reset] : metadata->identity_resets) {
                     if (!identity_reset_matches_endpoint(reset, host, port) ||
@@ -245,7 +285,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                 }
             }
         }
-        nodes.push_back(node_json(id, durable, current, age, online, stale, voter, identity_reset));
+        nodes.push_back(
+            node_json(id, durable, member, current, age, online, stale, voter, identity_reset));
     }
 
     if (only) {
@@ -254,18 +295,40 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         return http_json(200, nodes.front().dump());
     }
 
-    const size_t voter_count = voters.size();
-    const size_t quorum = voter_count ? voter_count / 2 + 1 : 0;
-    const bool metadata_available = static_cast<bool>(metadata);
-    const bool quorum_available = metadata_available && (!voter_count || active_voters >= quorum);
+    const auto published_metadata = metadata_.cluster_status();
+    const size_t voter_count = !voters.empty() ? voters.size() : published_metadata.voters;
+    const size_t quorum = voter_count ? voter_count / 2 + 1 : published_metadata.quorum_required;
+    if (voters.empty())
+        active_voters = published_metadata.voters_online;
+
+    // Read availability comes from the already-decoded coherent snapshot; write
+    // availability comes only from the metadata subsystem's last successful
+    // validation.  Current membership may demote a previously writable state
+    // immediately, but Status never promotes read-only -> writable merely because
+    // enough peers happen to be connected.
+    MetadataAvailability metadata_availability = published_metadata.availability;
+    if (metadata) {
+        if (metadata_availability == MetadataAvailability::unavailable)
+            metadata_availability = MetadataAvailability::read_only;
+        if (metadata_availability == MetadataAvailability::writable &&
+            voter_count && active_voters < quorum)
+            metadata_availability = MetadataAvailability::read_only;
+    } else {
+        metadata_availability = MetadataAvailability::unavailable;
+    }
+    const bool metadata_read_available =
+        metadata_availability != MetadataAvailability::unavailable;
+    const bool metadata_write_available =
+        metadata_availability == MetadataAvailability::writable;
+
     std::string health = "healthy";
     Json::Array conditions;
-    if (!metadata_available) {
+    if (!metadata_read_available) {
         health = "critical";
-        conditions.emplace_back("metadata status unavailable");
-    } else if (!quorum_available) {
-        health = "critical";
-        conditions.emplace_back("metadata quorum unavailable");
+        conditions.emplace_back("metadata unavailable");
+    } else if (!metadata_write_available) {
+        health = "degraded";
+        conditions.emplace_back("metadata read-only");
     }
     if (online_nodes < known.size()) {
         if (health == "healthy")
@@ -283,11 +346,17 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     cluster["conditions"] = std::move(conditions);
     cluster["nodes_known"] = static_cast<uint64_t>(known.size());
     cluster["nodes_online"] = static_cast<uint64_t>(online_nodes);
-    cluster["metadata_generation"] = metadata_generation;
+    cluster["metadata_generation"] = metadata_generation ? metadata_generation
+                                                        : published_metadata.generation;
     cluster["metadata_voters"] = static_cast<uint64_t>(voter_count);
     cluster["metadata_voters_online"] = static_cast<uint64_t>(active_voters);
     cluster["metadata_quorum_required"] = static_cast<uint64_t>(quorum);
-    cluster["metadata_quorum_available"] = quorum_available;
+    cluster["metadata_availability"] = metadata_availability_name(metadata_availability);
+    cluster["metadata_read_available"] = metadata_read_available;
+    cluster["metadata_quorum_available"] = metadata_write_available;
+    cluster["metadata_write_available"] = metadata_write_available;
+    cluster["metadata_quorum_validated"] = published_metadata.stable;
+    cluster["metadata_quorum_validated_at_unix_ms"] = published_metadata.observed_unix_ms;
     cluster["storage_known"] = bytes_pair(known_used, known_capacity);
     cluster["storage_online"] = bytes_pair(online_used, online_capacity);
     cluster["cache_known"] = bytes_pair(known_cache_used, known_cache_capacity);

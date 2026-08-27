@@ -98,11 +98,14 @@ A DATA failure should be diagnosed as placement/admission/durability; a metadata
 
 `GET /api/v1/status` merges two deliberately different telemetry planes:
 
-- ephemeral authenticated peer telemetry for the current operational view;
-- one coalesced last-known observation per node persisted through cluster metadata.
+- authoritative in-memory cluster membership for node identity, liveness, endpoint and durable storage state;
+- optional ephemeral authenticated peer telemetry for runtime/load/cache detail;
+- a bounded coalesced last-known telemetry cache persisted independently on each node.
 
-Ephemeral telemetry is gossiped with boot-incarnation and sequence ordering and is not journalled as a metrics history. Persisted status is periodically replaced rather than replayed after quorum loss. The API marks observations as live, stale, or last-known so an offline node's old runtime counters are never presented as current.
+Telemetry never defines cluster membership or metadata quorum. Ephemeral telemetry is gossiped with boot-incarnation and sequence ordering and is not journalled as a metrics history. Gossip is best-effort and may be dropped under useful load. The last-known cache is periodically replaced only after a long interactive-idle interval and never mutates the MachaDFS namespace or enters metadata quorum/CAS. The API marks observations as live, stale, unavailable, or last-known so an online node cannot disappear merely because optional telemetry was dropped.
 
-Cluster capacity distinguishes known durable/cache capacity from the portion currently online. Per-node status reports endpoint, version, failure domain, storage/cache use, metadata generation, runtime/load, peer counts and RPC connection statistics. Metadata quorum state is derived from the committed voter set and current node liveness.
+Cluster capacity distinguishes known durable/cache capacity from the portion currently online. Per-node status reports authoritative membership endpoint/storage fields and enriches them with telemetry when available. Metadata availability is owned and published by `MetadataManager` as exactly `unavailable`, `read-only`, or `writable`; Status consumes that state and may demote a previously writable view immediately if current membership has lost the required voters, but never promotes to writable merely from peer connectivity.
+
+Metadata availability logging is transition-only and canonical, for example `metadata availability changed state=writable previous=read-only reason="metadata write quorum available"`. Routine negative checkpoint acknowledgements are silent because they are normal convergence decisions; transport/checkpoint exceptions remain diagnostic.
 
 `POST /api/v1/status/connectivity/check` and the node-specific equivalent perform diagnostic connectivity checks without changing cluster configuration. State-changing administrative operations belong under `/api/v1/manage`.

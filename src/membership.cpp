@@ -74,22 +74,44 @@ std::vector<IdentityAssociationReset> Membership::identity_resets() const {
         out.push_back(reset);
     return out;
 }
+MembershipSnapshot Membership::snapshot() const {
+    std::lock_guard g(m_);
+    const auto now = Clock::now();
+    const auto seen = unix_ms();
+    MembershipSnapshot out;
+    out.all.reserve(nodes_.size() + 1);
+    out.active.reserve(nodes_.size() + 1);
+    auto self = self_;
+    self.seen_unix_ms = seen;
+    out.all.push_back(self);
+    out.active.push_back(std::move(self));
+    for (const auto& [_, record] : nodes_) {
+        out.all.push_back(record.info);
+        if (now - record.seen <= dead_)
+            out.active.push_back(record.info);
+    }
+    return out;
+}
+
 std::vector<NodeInfo> Membership::all() const {
     std::lock_guard g(m_);
-    std::vector<NodeInfo> o{self_};
-    o[0].seen_unix_ms = unix_ms();
-    for (auto& [_, r] : nodes_)
-        o.push_back(r.info);
-    return o;
+    std::vector<NodeInfo> out{self_};
+    out[0].seen_unix_ms = unix_ms();
+    out.reserve(nodes_.size() + 1);
+    for (const auto& [_, record] : nodes_)
+        out.push_back(record.info);
+    return out;
 }
+
 std::vector<NodeInfo> Membership::active() const {
     std::lock_guard g(m_);
-    auto now = Clock::now();
-    std::vector<NodeInfo> o{self_};
-    o[0].seen_unix_ms = unix_ms();
-    for (auto& [_, r] : nodes_)
-        if (now - r.seen <= dead_)
-            o.push_back(r.info);
-    return o;
+    const auto now = Clock::now();
+    std::vector<NodeInfo> out{self_};
+    out[0].seen_unix_ms = unix_ms();
+    out.reserve(nodes_.size() + 1);
+    for (const auto& [_, record] : nodes_)
+        if (now - record.seen <= dead_)
+            out.push_back(record.info);
+    return out;
 }
 } // namespace macha

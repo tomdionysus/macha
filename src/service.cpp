@@ -370,7 +370,22 @@ void Service::loop(std::stop_token stop) {
                 last_metadata == Clock::time_point{} || now - last_metadata >= background_interval;
             if (metadata_refresh_needed || (!busy && metadata_periodic)) {
                 const auto stage = Clock::now();
-                metadata_.repair_once();
+                try {
+                    metadata_.repair_once();
+                    metadata_.note_quorum_validation(true);
+                } catch (const std::exception& error) {
+                    // Preserve the original maintenance ordering invariant: a
+                    // failed metadata repair aborts this maintenance pass.  The
+                    // catalogue/GC/repair stages below must not run after the
+                    // metadata owner has just failed to establish a coherent
+                    // writable view. Availability itself is still published and
+                    // logged exactly once on transition.
+                    metadata_.note_quorum_validation(false, error.what());
+                    throw;
+                } catch (...) {
+                    metadata_.note_quorum_validation(false, "metadata validation failed");
+                    throw;
+                }
                 log_slow_stage("metadata-repair", stage);
                 last_metadata = now;
             }
@@ -522,7 +537,14 @@ void Service::loop(std::stop_token stop) {
                     last_garbage_inventory = now;
                 }
 
-                if (gc_due && maintenance_catalogue_complete_ && maintenance_control_live_) {
+                // The catalogue control live-set is derived from the same immutable
+                // metadata inventory as DATA reachability.  A foreground catalogue
+                // mutation may advance metadata after that inventory was built.  Never
+                // sweep the control store using such a stale set: with a zero/short
+                // grace period it could delete a newly-published manifest or shard
+                // before the next maintenance pass observes the successor generation.
+                if (gc_due && maintenance_catalogue_complete_ && maintenance_control_live_ &&
+                    maintenance_inventory_generation_ >= node_.known_metadata_generation()) {
                     const auto removed = catalogue_.control_gc_step(
                         *maintenance_control_live_, policy.garbage_grace, 32);
                     if (removed)
@@ -646,8 +668,15 @@ void Service::loop(std::stop_token stop) {
                 }
             }
 
+        } catch (const MetadataNotReady&) {
+            // Normal startup/recovery state. MetadataManager has already
+            // published any availability transition; do not duplicate it on
+            // every maintenance pass.
         } catch (const std::exception& e) {
-            Log::debug("maintenance: " + std::string(e.what()));
+            const std::string_view message(e.what());
+            if (message != "metadata read quorum unavailable" &&
+                message != "metadata write quorum unavailable")
+                Log::debug("maintenance: " + std::string(message));
         }
 
         cpu_reporter.tick();
