@@ -29,6 +29,17 @@ void Membership::observe(NodeInfo n, bool direct) {
     if (n.id == self_.id || n.host.empty() || !n.port)
         return;
     std::lock_guard g(m_);
+    for (const auto& [_, reset] : identity_resets_) {
+        if (!identity_reset_matches_endpoint(reset, n.host, n.port) ||
+            !identity_reset_matches_node(reset, n.id))
+            continue;
+        // A reset is a freshness boundary, not a permanent blacklist. Stale
+        // gossip cannot recreate the invalidated association, while a directly
+        // authenticated peer may establish it again. Once that fresh observation
+        // propagates with a post-reset seen time, ordinary gossip is valid too.
+        if (!direct && n.seen_unix_ms <= reset.reset_unix_ms)
+            return;
+    }
     auto now = Clock::now();
     auto i = nodes_.find(n.id);
     if (i == nodes_.end())
@@ -36,6 +47,32 @@ void Membership::observe(NodeInfo n, bool direct) {
     else if (direct || n.seen_unix_ms > i->second.info.seen_unix_ms) {
         i->second = {std::move(n), now};
     }
+}
+
+bool Membership::apply_identity_reset(const IdentityAssociationReset& reset) {
+    if (reset.host.empty() || !reset.epoch)
+        return false;
+    std::lock_guard g(m_);
+    const auto key = identity_reset_key(reset.host, reset.port);
+    auto found = identity_resets_.find(key);
+    if (found != identity_resets_.end() && found->second.epoch >= reset.epoch)
+        return false;
+    identity_resets_[key] = reset;
+    std::erase_if(nodes_, [&](const auto& item) {
+        const auto& info = item.second.info;
+        return identity_reset_matches_endpoint(reset, info.host, info.port) &&
+               identity_reset_matches_node(reset, info.id);
+    });
+    return true;
+}
+
+std::vector<IdentityAssociationReset> Membership::identity_resets() const {
+    std::lock_guard g(m_);
+    std::vector<IdentityAssociationReset> out;
+    out.reserve(identity_resets_.size());
+    for (const auto& [_, reset] : identity_resets_)
+        out.push_back(reset);
+    return out;
 }
 std::vector<NodeInfo> Membership::all() const {
     std::lock_guard g(m_);

@@ -42,6 +42,8 @@ enum class MessageType : uint16_t {
     get_metadata_identity = 21,
     put_object_deferred = 22,
     object_durability_barrier = 23,
+    telemetry = 24,
+    identity_resets = 25,
     ok = 100,
     error = 101,
     members_reply = 102,
@@ -50,7 +52,9 @@ enum class MessageType : uint16_t {
     metadata_reply = 105,
     cas_reply = 106,
     control_object_reply = 107,
-    metadata_identity_reply = 108
+    metadata_identity_reply = 108,
+    telemetry_reply = 109,
+    identity_resets_reply = 110
 };
 
 // Transport priority is a property of the frame type itself. There is no
@@ -182,6 +186,7 @@ class RpcClient {
         std::array<uint8_t, 32> session_id{};
         std::function<AsyncRpc(MessageType, std::span<const uint8_t>, FrameType)> call;
         std::function<void(const RpcMessage&)> notify;
+        std::function<bool(const RpcMessage&, FrameType)> try_notify;
         std::function<void()> retire;
         std::function<void()> close;
         std::function<bool()> usable;
@@ -207,6 +212,7 @@ class RpcClient {
     std::map<std::string, NodeId> endpoint_peers_;
     std::map<std::string, PeerHealth> health_;
     std::map<std::string, Endpoint> endpoints_;
+    std::map<std::string, IdentityAssociationReset> identity_resets_;
     std::atomic_uint64_t connections_created_{};
     std::atomic_uint64_t connections_reused_{};
     std::jthread health_thread_;
@@ -262,6 +268,8 @@ class RpcClient {
                   std::chrono::milliseconds stall_notice);
     RpcStats stats() const;
     void broadcast(const RpcMessage&);
+    size_t broadcast_best_effort(const RpcMessage&, FrameType);
+    void invalidate_identity_association(const IdentityAssociationReset&);
     void stop();
 };
 

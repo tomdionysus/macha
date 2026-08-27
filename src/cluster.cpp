@@ -5,6 +5,7 @@
 
 #include "codec.hpp"
 #include "log.hpp"
+#include "macha_version.hpp"
 
 #include <algorithm>
 #include <fstream>
@@ -40,14 +41,63 @@ NodeInfo self_info(const Config& config, const NodeId& id, uint64_t used, uint64
 }
 
 bool current_metadata_delta(std::span<const uint8_t> data) {
-    static constexpr std::array<uint8_t, 8> magic{'D', 'H', 'T', 'M', 'D', 'L', 'T', '2'};
-    return data.size() >= magic.size() && std::equal(magic.begin(), magic.end(), data.begin());
+    static constexpr std::array<uint8_t, 7> prefix{'D', 'H', 'T', 'M', 'D', 'L', 'T'};
+    return data.size() >= 8 && std::equal(prefix.begin(), prefix.end(), data.begin()) &&
+           (data[7] == '2' || data[7] == '3' || data[7] == '4');
 }
 
 RpcMessage error_reply(const std::string& text) {
     Writer writer;
     writer.string(text);
     return {MessageType::error, writer.take()};
+}
+
+constexpr std::array<uint8_t, 8> identity_reset_magic{'M', 'A', 'C', 'H', 'I', 'D', 'R', '1'};
+
+void encode_identity_reset(Writer& writer, const IdentityAssociationReset& reset) {
+    writer.string(reset.host);
+    writer.u16(reset.port);
+    writer.fixed(reset.stale_node_id.bytes);
+    writer.u64(reset.epoch);
+    writer.u64(reset.reset_unix_ms);
+    writer.fixed(reset.reset_by.bytes);
+    writer.string(reset.reason);
+}
+
+Bytes encode_identity_resets(const std::vector<IdentityAssociationReset>& resets) {
+    Writer writer;
+    writer.raw(identity_reset_magic);
+    writer.u32(static_cast<uint32_t>(resets.size()));
+    for (const auto& reset : resets)
+        encode_identity_reset(writer, reset);
+    return writer.take();
+}
+
+std::vector<IdentityAssociationReset> decode_identity_resets(std::span<const uint8_t> payload) {
+    Reader reader(payload);
+    const auto magic = reader.raw(identity_reset_magic.size());
+    if (!std::equal(magic.begin(), magic.end(), identity_reset_magic.begin()))
+        throw DecodeError("bad identity reset payload");
+    const auto count = reader.u32();
+    if (count > 65536)
+        throw DecodeError("too many identity reset records");
+    std::vector<IdentityAssociationReset> out;
+    out.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        IdentityAssociationReset reset;
+        reset.host = reader.string(4096);
+        reset.port = reader.u16();
+        reset.stale_node_id.bytes = reader.fixed<16>();
+        reset.epoch = reader.u64();
+        reset.reset_unix_ms = reader.u64();
+        reset.reset_by.bytes = reader.fixed<16>();
+        reset.reason = reader.string(4096);
+        if (reset.host.empty() || !reset.epoch)
+            throw DecodeError("bad identity reset record");
+        out.push_back(std::move(reset));
+    }
+    reader.finish();
+    return out;
 }
 
 MetadataIdentity encoded_metadata_identity(std::span<const uint8_t> data) {
@@ -113,6 +163,7 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
       meta_(cfg_.state_path, keys_.storage, cache_.metadata()),
       members_(self_info(cfg_, id_, local_.used(), local_.limit(), meta_.committed().generation),
                cfg_.dead_after),
+      telemetry_(id_, cfg_.state_path / "telemetry" / "last-known.bin"),
       client_(
           keys_, [this] { return members_.self(); },
           [this](const NodeInfo& peer) {
@@ -141,6 +192,16 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
           cfg_.max_frame_size) {
     server_.attach_client(client_);
 
+    // Identity-reset tombstones must be active before the first peer exchange.
+    // This prevents stale membership from being reintroduced during startup.
+    try {
+        const auto committed_snapshot = decode_snapshot(meta_.committed().payload);
+        for (const auto& [_, reset] : committed_snapshot.identity_resets)
+            apply_identity_reset(reset);
+    } catch (const std::exception& error) {
+        Log::debug("cannot preload identity reset tombstones: " + std::string(error.what()));
+    }
+
     // The metadata cache is deliberately independent of node state. If node
     // state was restored from an older backup but the SSD cache survived, a
     // newer valid snapshot can improve read-only/offline startup. Mutations use
@@ -152,8 +213,15 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
         }
     }
     cache_.remember_metadata(meta_.committed());
-    members_.storage(local_.used(), local_.limit());
+    const auto storage_used = local_.used();
+    const auto storage_capacity = local_.limit();
+    members_.storage(storage_used, storage_capacity);
     members_.metadata_generation(meta_.committed().generation);
+    telemetry_storage_used_.store(storage_used, std::memory_order_relaxed);
+    telemetry_storage_capacity_.store(storage_capacity, std::memory_order_relaxed);
+    telemetry_metadata_generation_.store(meta_.committed().generation, std::memory_order_relaxed);
+    telemetry_identity_ = members_.self();
+    refresh_telemetry();
 }
 
 NodeRuntime::~NodeRuntime() {
@@ -165,6 +233,7 @@ void NodeRuntime::start() {
         return;
     local_writer_ = std::jthread([this](std::stop_token stop) { local_writer_loop(stop); });
     server_.start();
+    telemetry_worker_ = std::jthread([this](std::stop_token stop) { telemetry_loop(stop); });
     maintenance_ = std::jthread([this](std::stop_token stop) { loop(stop); });
     Log::info("node " + to_string(id_).substr(0, 12) + " listening on " +
               std::to_string(server_.bound_port()) + " domain=" + members_.self().failure_domain);
@@ -177,6 +246,13 @@ void NodeRuntime::stop() {
     }
     Log::debug("shutdown: NodeRuntime::stop begin");
     request_stop();
+    // Telemetry never waits on transport, so retire it before closing shared
+    // RPC state. This also proves shutdown cannot be held behind telemetry.
+    if (telemetry_worker_.joinable()) {
+        Log::debug("shutdown: telemetry joining");
+        telemetry_worker_.join();
+        Log::debug("shutdown: telemetry joined");
+    }
     // Close transport before joining maintenance. A maintenance iteration may
     // already be waiting on an RPC; closing the client/server first makes that
     // wait fail promptly instead of holding shutdown behind network timeouts.
@@ -200,6 +276,10 @@ void NodeRuntime::stop() {
 }
 
 void NodeRuntime::request_stop() {
+    if (telemetry_worker_.joinable()) {
+        telemetry_worker_.request_stop();
+        telemetry_wait_cv_.notify_all();
+    }
     if (maintenance_.joinable()) {
         Log::debug("shutdown: node maintenance request_stop");
         maintenance_.request_stop();
@@ -378,6 +458,27 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             for (const auto& node : nodes)
                 encode_node_info(writer, node);
             return {MessageType::members_reply, writer.take()};
+        }
+        case MessageType::telemetry: {
+            if (!request.payload.empty()) {
+                try {
+                    for (auto& value : decode_telemetry_set(request.payload))
+                        telemetry_.observe(std::move(value));
+                } catch (const DecodeError&) {
+                    // Accept the short-lived request/reply form emitted by the
+                    // first 0.18.2 build during a rolling patch update.
+                    telemetry_.observe(decode_node_telemetry(request.payload), true);
+                }
+            }
+            const auto gossip_ttl = std::max(cfg_.dead_after * 2, std::chrono::milliseconds(60000));
+            return {MessageType::telemetry_reply,
+                    encode_telemetry_set(telemetry_.recent(gossip_ttl, 64))};
+        }
+        case MessageType::identity_resets: {
+            if (!request.payload.empty())
+                for (const auto& reset : decode_identity_resets(request.payload))
+                    apply_identity_reset(reset);
+            return {MessageType::identity_resets_reply, encode_identity_resets(identity_resets())};
         }
         case MessageType::have_object: {
             Reader reader(request.payload);
@@ -594,6 +695,91 @@ void NodeRuntime::merge(std::span<const uint8_t> payload) {
     remote_metadata_generation_.store(newest_metadata);
 }
 
+void NodeRuntime::refresh_telemetry() {
+    auto info = telemetry_identity_;
+    info.used = telemetry_storage_used_.load(std::memory_order_relaxed);
+    info.capacity = telemetry_storage_capacity_.load(std::memory_order_relaxed);
+    info.metadata_generation = telemetry_metadata_generation_.load(std::memory_order_relaxed);
+    const uint64_t cache_capacity = static_cast<uint64_t>(cfg_.cache.max_blocks) * cfg_.extent_size;
+    const uint64_t cache_used = static_cast<uint64_t>(cache_.blocks()) * cfg_.extent_size;
+    const auto peers_known = telemetry_peers_known_.load(std::memory_order_relaxed);
+    const auto peers_active = telemetry_peers_active_.load(std::memory_order_relaxed);
+    telemetry_.refresh_local(
+        info, std::string(kServerVersion), cache_capacity, cache_used,
+        static_cast<uint32_t>(local_.online_backends()), peers_known, peers_active,
+        0, 0, peers_active > 0 ? peers_active - 1 : 0);
+}
+
+void NodeRuntime::telemetry_loop(std::stop_token stop) {
+    ThreadCpuReporter cpu_reporter("macha-telemetry", std::chrono::seconds(5), true);
+    const auto interval = std::chrono::seconds(5);
+    const auto idle_before_gossip = std::chrono::seconds(2);
+    const auto gossip_ttl = std::max(cfg_.dead_after * 2, std::chrono::milliseconds(60000));
+    while (!stop.stop_requested()) {
+        try {
+            refresh_telemetry();
+            // Sampling is always local. Network gossip is suppressed while the
+            // node has recent foreground/read-ahead work, then additionally
+            // uses no-wait/idle-writer admission in RpcClient. Telemetry is the
+            // first thing dropped when the node is doing useful work.
+            const bool operationally_idle =
+                activity_idle_for(FrameType::foreground) >= idle_before_gossip &&
+                activity_idle_for(FrameType::read_ahead) >= idle_before_gossip;
+            if (operationally_idle) {
+                auto values = telemetry_.recent(gossip_ttl, 64);
+                if (!values.empty()) {
+                    // This is a no-dial, no-wait notification. It is admitted only
+                    // if the RPC routing and per-peer outbound locks are immediately
+                    // available, and speculative priority keeps it behind all
+                    // operational control/foreground/read-ahead traffic.
+                    (void)client_.broadcast_best_effort(
+                        {MessageType::telemetry, encode_telemetry_set(values)},
+                        FrameType::speculative);
+                }
+            }
+        } catch (const std::exception& error) {
+            Log::debug("telemetry refresh skipped: " + std::string(error.what()));
+        }
+        cpu_reporter.tick();
+        std::unique_lock lock(telemetry_wait_mutex_);
+        telemetry_wait_cv_.wait_for(lock, stop, interval, [] { return false; });
+    }
+}
+
+bool NodeRuntime::apply_identity_reset(const IdentityAssociationReset& reset) {
+    const bool changed = members_.apply_identity_reset(reset);
+    // Keep all consumers idempotently aligned even if one of them learned the
+    // tombstone first through a different path.
+    telemetry_.apply_identity_reset(reset);
+    client_.invalidate_identity_association(reset);
+    if (changed) {
+        Log::info("node identity association reset scope=" +
+                  identity_reset_key(reset.host, reset.port) + " stale_node_id=" +
+                  (reset.stale_node_id == NodeId{} ? std::string("<any>") : to_string(reset.stale_node_id)) +
+                  " epoch=" + std::to_string(reset.epoch) +
+                  " reset_by=" + to_string(reset.reset_by) +
+                  (reset.reason.empty() ? std::string{} : " reason=" + reset.reason));
+    }
+    return changed;
+}
+
+void NodeRuntime::propagate_identity_reset(const IdentityAssociationReset& reset) {
+    (void)apply_identity_reset(reset);
+    const auto payload = encode_identity_resets({reset});
+    for (const auto& peer : members_.active()) {
+        if (peer.id == id_)
+            continue;
+        try {
+            auto reply = call(peer, MessageType::identity_resets, payload);
+            if (reply.message.type == MessageType::identity_resets_reply)
+                for (const auto& learned : decode_identity_resets(reply.message.payload))
+                    apply_identity_reset(learned);
+        } catch (const std::exception& error) {
+            Log::debug("identity reset propagation to " + peer.host + ": " + error.what());
+        }
+    }
+}
+
 void NodeRuntime::exchange(const Endpoint& endpoint) {
     auto reply = call(endpoint, MessageType::members);
     if (reply.message.type != MessageType::members_reply)
@@ -620,10 +806,19 @@ void NodeRuntime::loop(std::stop_token stop) {
         if (refresh_ms >= 100 && Log::enabled(LogLevel::all))
             Log::trace("DIAG node-stage stage=storage-refresh elapsed_ms=" +
                        std::to_string(refresh_ms));
-        members_.storage(local_.used(), local_.limit());
-        members_.metadata_generation(meta_.generation());
+        const auto storage_used = local_.used();
+        const auto storage_capacity = local_.limit();
+        const auto metadata_generation = meta_.generation();
+        members_.storage(storage_used, storage_capacity);
+        members_.metadata_generation(metadata_generation);
+        telemetry_storage_used_.store(storage_used, std::memory_order_relaxed);
+        telemetry_storage_capacity_.store(storage_capacity, std::memory_order_relaxed);
+        telemetry_metadata_generation_.store(metadata_generation, std::memory_order_relaxed);
         std::set<std::pair<std::string, uint16_t>> exchanged;
         const auto known_nodes = members_.all();
+        telemetry_peers_known_.store(static_cast<uint32_t>(known_nodes.size()),
+                                     std::memory_order_relaxed);
+        uint32_t active_peers = 1;
         for (const auto& endpoint : cfg_.bootstrap) {
             exchanged.emplace(endpoint.host, endpoint.port);
             try {
@@ -641,6 +836,7 @@ void NodeRuntime::loop(std::stop_token stop) {
                     exchange(*known);
                 else
                     exchange(endpoint);
+                ++active_peers;
             } catch (const std::exception& error) {
                 Log::debug("bootstrap: " + std::string(error.what()));
             }
@@ -652,10 +848,12 @@ void NodeRuntime::loop(std::stop_token stop) {
                 continue;
             try {
                 exchange(node);
+                ++active_peers;
             } catch (const std::exception& error) {
                 Log::debug("peer " + node.host + ": " + error.what());
             }
         }
+        telemetry_peers_active_.store(active_peers, std::memory_order_relaxed);
         cpu_reporter.tick();
         std::unique_lock wait_lock(maintenance_wait_mutex_);
         maintenance_wait_cv_.wait_for(wait_lock, stop, cfg_.heartbeat, [] { return false; });

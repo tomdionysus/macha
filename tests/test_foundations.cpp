@@ -42,6 +42,33 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     CHECK(decoded_node.failure_domain == advertised.failure_domain);
     CHECK(decoded_node.metadata_generation == 42);
 
+    NodeTelemetry telemetry;
+    telemetry.node_id = advertised.id;
+    telemetry.boot_id = random_node_id();
+    telemetry.sequence = 9;
+    telemetry.observed_unix_ms = 123456789;
+    telemetry.version = "0.18.2";
+    telemetry.host = advertised.host;
+    telemetry.failure_domain = advertised.failure_domain;
+    telemetry.port = advertised.port;
+    telemetry.storage_capacity = advertised.capacity;
+    telemetry.storage_used = advertised.used;
+    telemetry.cache_capacity = 1024;
+    telemetry.cache_used = 256;
+    telemetry.metadata_generation = advertised.metadata_generation;
+    telemetry.uptime_ms = 60000;
+    telemetry.rss_bytes = 4096;
+    telemetry.process_cpu_milli_percent = 1250;
+    telemetry.load1_milli = 375;
+    telemetry.storage_backends_online = 2;
+    telemetry.peers_known = 3;
+    telemetry.peers_active = 2;
+    telemetry.rpc_connections_reused = 7;
+    CHECK(decode_node_telemetry(encode_node_telemetry(telemetry)) == telemetry);
+    auto telemetry_set = decode_telemetry_set(encode_telemetry_set({telemetry}));
+    REQUIRE(telemetry_set.size() == 1);
+    CHECK(telemetry_set.front() == telemetry);
+
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -77,6 +104,156 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
         rejected = true;
     }
     CHECK(rejected);
+}
+
+MACHA_FAST_TEST("foundations", test_membership_identity_reset_tombstone) {
+    NodeInfo self;
+    self.id = random_node_id();
+    self.host = "self.example";
+    self.port = 57401;
+    Membership membership(self, 30s);
+
+    NodeInfo stale;
+    stale.id = random_node_id();
+    stale.host = "10.44.1.50";
+    stale.port = 57401;
+    stale.seen_unix_ms = unix_ms();
+    membership.observe(stale, true);
+    CHECK(membership.all().size() == 2);
+
+    IdentityAssociationReset reset;
+    reset.host = stale.host;
+    reset.port = stale.port;
+    reset.stale_node_id = stale.id;
+    reset.epoch = 1;
+    reset.reset_unix_ms = unix_ms();
+    reset.reset_by = self.id;
+    REQUIRE(membership.apply_identity_reset(reset));
+    CHECK(membership.all().size() == 1);
+
+    // Gossip cannot resurrect the pre-reset endpoint->NodeId association.
+    membership.observe(stale, false);
+    CHECK(membership.all().size() == 1);
+
+    // A tombstone is a freshness boundary, not a permanent NodeId ban. A
+    // directly authenticated post-reset observation can establish the same
+    // association again when that really is the node at the endpoint.
+    stale.seen_unix_ms = reset.reset_unix_ms + 1;
+    membership.observe(stale, true);
+    REQUIRE(membership.all().size() == 2);
+
+    // A newer reset clears that fresh association again.
+    auto reset2 = reset;
+    reset2.epoch = 2;
+    reset2.reset_unix_ms += 2;
+    REQUIRE(membership.apply_identity_reset(reset2));
+    CHECK(membership.all().size() == 1);
+
+    // The endpoint itself is not blacklisted: a freshly authenticated
+    // replacement NodeId is valid.
+    auto replacement = stale;
+    replacement.id = random_node_id();
+    replacement.seen_unix_ms = reset2.reset_unix_ms + 1;
+    membership.observe(replacement, true);
+    REQUIRE(membership.all().size() == 2);
+    CHECK(membership.all().back().id == replacement.id);
+
+    // Older/equal reset epochs cannot roll the tombstone backwards.
+    CHECK(!membership.apply_identity_reset(reset));
+    CHECK(!membership.apply_identity_reset(reset2));
+}
+
+MACHA_FAST_TEST("foundations", test_telemetry_identity_reset_freshness_boundary) {
+    const auto self = random_node_id();
+    TelemetryStore store(self);
+
+    NodeTelemetry peer;
+    peer.node_id = random_node_id();
+    peer.boot_id = random_node_id();
+    peer.sequence = 1;
+    peer.observed_unix_ms = unix_ms();
+    peer.host = "10.44.1.50";
+    peer.port = 57401;
+    store.observe(peer, true);
+    REQUIRE(store.all().size() == 1);
+
+    IdentityAssociationReset reset;
+    reset.host = peer.host;
+    reset.port = peer.port;
+    reset.stale_node_id = peer.node_id;
+    reset.epoch = 1;
+    reset.reset_unix_ms = peer.observed_unix_ms + 1;
+    reset.reset_by = self;
+    store.apply_identity_reset(reset);
+    CHECK(store.all().empty());
+
+    // Pre-reset gossip remains suppressed.
+    peer.sequence = 2;
+    store.observe(peer, false);
+    CHECK(store.all().empty());
+
+    // Fresh direct telemetry can establish the association again.
+    peer.sequence = 3;
+    peer.observed_unix_ms = reset.reset_unix_ms + 1;
+    store.observe(peer, true);
+    REQUIRE(store.all().size() == 1);
+    CHECK(store.all().front().sequence == 3);
+}
+
+MACHA_FAST_TEST("foundations", test_membership_ip_identity_reset_without_node_id) {
+    NodeInfo self;
+    self.id = random_node_id();
+    self.host = "self.example";
+    self.port = 57401;
+    Membership membership(self, 30s);
+
+    const auto before_reset = unix_ms();
+    NodeInfo first;
+    first.id = random_node_id();
+    first.host = "10.44.1.50";
+    first.port = 57401;
+    first.seen_unix_ms = before_reset;
+    NodeInfo second = first;
+    second.id = random_node_id();
+    second.port = 57402;
+    NodeInfo other = first;
+    other.id = random_node_id();
+    other.host = "10.44.1.51";
+    membership.observe(first, true);
+    membership.observe(second, true);
+    membership.observe(other, true);
+    REQUIRE(membership.all().size() == 4);
+
+    IdentityAssociationReset reset;
+    reset.host = "10.44.1.50";
+    reset.port = 0; // every endpoint on this IP
+    reset.stale_node_id = {}; // NodeId unknown
+    reset.epoch = 1;
+    reset.reset_unix_ms = before_reset + 1;
+    reset.reset_by = self.id;
+    REQUIRE(membership.apply_identity_reset(reset));
+
+    auto after = membership.all();
+    CHECK(after.size() == 2);
+    CHECK(std::any_of(after.begin(), after.end(), [&](const NodeInfo& node) {
+        return node.id == other.id;
+    }));
+
+    // Gossip containing a pre-reset observation cannot reintroduce either old
+    // association, even when the administrator did not know their NodeIds.
+    membership.observe(first, false);
+    membership.observe(second, false);
+    CHECK(membership.all().size() == 2);
+
+    // The IP is not blacklisted. Fresh authentication may establish a new
+    // identity, and subsequent gossip carrying a post-reset observation is valid.
+    auto replacement = first;
+    replacement.id = random_node_id();
+    replacement.seen_unix_ms = reset.reset_unix_ms + 1;
+    membership.observe(replacement, true);
+    REQUIRE(membership.all().size() == 3);
+    membership.observe(replacement, false);
+    CHECK(membership.all().size() == 3);
 }
 
 MACHA_FAST_TEST("foundations", test_durable_replace_file_matrix) {

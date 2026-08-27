@@ -51,7 +51,7 @@ MACHA_TEST("invariants", test_manage_unmatched_rename_manual_catalogue_and_files
 
     CatalogueScanner scanner(service.node(), fs, service.catalogue(), hints,
                              config.catalogue.scanner);
-    ManageApi manage(fs, service.catalogue(), hints, scanner);
+    ManageApi manage(service.node(), service.metadata_manager(), fs, service.catalogue(), hints, scanner);
 
     HttpRequest list;
     list.method = "GET";
@@ -116,6 +116,149 @@ MACHA_TEST("invariants", test_manage_unmatched_rename_manual_catalogue_and_files
     remove.query["path"] = "/Movies/renamed.mkv";
     REQUIRE(manage.handle(remove).status == 204);
     CHECK(hints.list().empty());
+}
+
+MACHA_TEST("invariants", test_manage_node_identity_association_reset) {
+    TestService fixture("manage-identity-reset");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_replication = 1;
+    config.hydration.enabled = false;
+    config.catalogue.scanner.enabled = false;
+    auto& service = fixture.start();
+
+    auto& fs = service.filesystem();
+    auto& hints = service.catalogue_hints();
+    CatalogueScanner scanner(service.node(), fs, service.catalogue(), hints,
+                             config.catalogue.scanner);
+    ManageApi manage(service.node(), service.metadata_manager(), fs, service.catalogue(), hints,
+                     scanner);
+
+    HttpRequest root;
+    root.method = "GET";
+    root.path = "/api/v1/manage";
+    auto root_response = manage.handle(root);
+    REQUIRE(root_response.status == 200);
+    auto root_json = Json::parse(std::string(reinterpret_cast<const char*>(root_response.body.data()),
+                                             root_response.body.size()));
+    CHECK(root_json.find("api")->asString() == "manage");
+    CHECK(root_json.find("actions")->find("identity_association_reset") != nullptr);
+    CHECK(root_json.find("actions")->find("node_identity_association_reset") != nullptr);
+
+    NodeInfo stale;
+    stale.id = random_node_id();
+    stale.host = "10.44.1.50";
+    stale.port = 57401;
+    stale.failure_domain = "test";
+    stale.seen_unix_ms = unix_ms();
+    service.node().membership().observe(stale, true);
+
+    PersistedNodeStatus durable;
+    durable.observed_unix_ms = unix_ms();
+    durable.host = stale.host;
+    durable.port = stale.port;
+    durable.failure_domain = stale.failure_domain;
+    service.metadata_manager().mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+        snapshot.node_status[stale.id] = durable;
+        delta.upsert_node_status[stale.id] = durable;
+    });
+
+    HttpRequest reset;
+    reset.method = "POST";
+    reset.path = "/api/v1/manage/nodes/" + to_string(stale.id) +
+                 "/identity-association/reset";
+    const std::string reset_body =
+        R"({"host":"10.44.1.50","port":57401,"reason":"test endpoint reassignment"})";
+    reset.body.assign(reset_body.begin(), reset_body.end());
+    auto reset_response = manage.handle(reset);
+    REQUIRE(reset_response.status == 200);
+    auto reset_json = Json::parse(std::string(reinterpret_cast<const char*>(reset_response.body.data()),
+                                              reset_response.body.size()));
+    const auto& reset_value = *reset_json.find("reset");
+    CHECK(reset_value.find("stale_node_id")->asString() == to_string(stale.id));
+    CHECK(reset_value.find("epoch")->asUInt64() == 1);
+    CHECK(reset_value.find("scope")->asString() == "[10.44.1.50]:57401");
+
+    const auto membership_after = service.node().membership().all();
+    CHECK(std::none_of(membership_after.begin(), membership_after.end(),
+                       [&](const NodeInfo& node) { return node.id == stale.id; }));
+
+    // Re-gossiping the pre-reset stale association cannot resurrect it.
+    service.node().membership().observe(stale, false);
+    const auto membership_regossip = service.node().membership().all();
+    CHECK(std::none_of(membership_regossip.begin(), membership_regossip.end(),
+                       [&](const NodeInfo& node) { return node.id == stale.id; }));
+
+    // A different authenticated NodeId may immediately own the same endpoint.
+    auto replacement = stale;
+    replacement.id = random_node_id();
+    service.node().membership().observe(replacement, true);
+    const auto membership_replacement = service.node().membership().all();
+    CHECK(std::any_of(membership_replacement.begin(), membership_replacement.end(),
+                      [&](const NodeInfo& node) { return node.id == replacement.id; }));
+
+    const auto metadata = service.metadata_manager().snapshot();
+    CHECK(metadata.node_status.contains(stale.id));
+    const auto key = identity_reset_key(stale.host, stale.port);
+    REQUIRE(metadata.identity_resets.contains(key));
+    CHECK(metadata.identity_resets.at(key).stale_node_id == stale.id);
+    CHECK(metadata.identity_resets.at(key).reason == "test endpoint reassignment");
+
+    // The generic management action also supports clearing by IP alone when
+    // the stale NodeId is no longer known. Port 0 is the durable wildcard for
+    // every advertised endpoint on the host.
+    auto second_port = replacement;
+    second_port.id = random_node_id();
+    second_port.port = 57402;
+    service.node().membership().observe(second_port, true);
+    auto unrelated = replacement;
+    unrelated.id = random_node_id();
+    unrelated.host = "10.44.1.51";
+    service.node().membership().observe(unrelated, true);
+
+    HttpRequest reset_ip;
+    reset_ip.method = "POST";
+    reset_ip.path = "/api/v1/manage/identity-associations/reset";
+    const std::string reset_ip_body = R"({"host":"10.44.1.50","reason":"clear by ip"})";
+    reset_ip.body.assign(reset_ip_body.begin(), reset_ip_body.end());
+    auto reset_ip_response = manage.handle(reset_ip);
+    REQUIRE(reset_ip_response.status == 200);
+    auto reset_ip_json = Json::parse(std::string(
+        reinterpret_cast<const char*>(reset_ip_response.body.data()), reset_ip_response.body.size()));
+    const auto& reset_ip_value = *reset_ip_json.find("reset");
+    CHECK(reset_ip_value.find("scope")->asString() == "[10.44.1.50]:*");
+    CHECK(reset_ip_value.find("port")->isNull());
+    CHECK(reset_ip_value.find("stale_node_id")->isNull());
+    const auto reset_ip_at = reset_ip_value.find("reset_at_unix_ms")->asUInt64();
+
+    const auto after_ip_reset = service.node().membership().all();
+    CHECK(std::none_of(after_ip_reset.begin(), after_ip_reset.end(), [&](const NodeInfo& node) {
+        return node.host == "10.44.1.50";
+    }));
+    CHECK(std::any_of(after_ip_reset.begin(), after_ip_reset.end(), [&](const NodeInfo& node) {
+        return node.id == unrelated.id;
+    }));
+
+    // Pre-reset gossip cannot recreate an association for that IP, but direct
+    // post-reset authentication can establish a replacement identity.
+    replacement.seen_unix_ms = reset_ip_at ? reset_ip_at - 1 : 0;
+    service.node().membership().observe(replacement, false);
+    const auto after_stale_regossip = service.node().membership().all();
+    CHECK(std::none_of(after_stale_regossip.begin(), after_stale_regossip.end(),
+                       [&](const NodeInfo& node) { return node.id == replacement.id; }));
+    auto fresh = replacement;
+    fresh.id = random_node_id();
+    fresh.seen_unix_ms = reset_ip_at + 1;
+    service.node().membership().observe(fresh, true);
+    const auto after_fresh_auth = service.node().membership().all();
+    CHECK(std::any_of(after_fresh_auth.begin(), after_fresh_auth.end(),
+                      [&](const NodeInfo& node) { return node.id == fresh.id; }));
+
+    const auto metadata_after_ip = service.metadata_manager().snapshot();
+    const auto ip_key = identity_reset_key("10.44.1.50", 0);
+    REQUIRE(metadata_after_ip.identity_resets.contains(ip_key));
+    CHECK(metadata_after_ip.identity_resets.at(ip_key).stale_node_id == NodeId{});
+    CHECK(metadata_after_ip.identity_resets.at(ip_key).reason == "clear by ip");
 }
 
 MACHA_TEST("invariants", test_fuse_open_inode_identity_survives_external_replace_and_unlink) {

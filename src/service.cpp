@@ -88,7 +88,7 @@ void log_slow_stage(std::string_view stage, Clock::time_point started,
 
 Service::Service(Config config, ClusterKeys keys)
     : node_(std::move(config), keys), store_(node_), metadata_(node_),
-      catalogue_(node_, store_, metadata_), fs_(node_, store_, metadata_, &playback_),
+      cluster_status_(node_, metadata_), catalogue_(node_, store_, metadata_), fs_(node_, store_, metadata_, &playback_),
       catalogue_hints_(node_.config().state_path),
       scanner_(node_, fs_, catalogue_, catalogue_hints_, node_.config().catalogue.scanner),
       hydration_(store_, playback_, fs_, catalogue_, node_.config().hydration,
@@ -101,12 +101,14 @@ Service::Service(Config config, ClusterKeys keys)
                      [this](const std::vector<std::string>& media_ids) {
                          scanner_.request_media_rescan(media_ids);
                      }),
-      manage_api_(fs_, catalogue_, catalogue_hints_, scanner_),
+      manage_api_(node_, metadata_, fs_, catalogue_, catalogue_hints_, scanner_),
       streaming_(fs_, catalogue_, node_.config().catalogue.api, node_.config().streaming) {
     if (node_.config().catalogue.api.enabled) {
         catalogue_http_ = std::make_unique<HttpServer>(
             node_.config().catalogue.api,
             [this](const HttpRequest& request) {
+                if (request.path == "/api/v1/status" || request.path.starts_with("/api/v1/status/"))
+                    return cluster_status_.handle(request);
                 if (request.path.starts_with("/api/v1/playback/"))
                     return streaming_.handle(request);
                 if (request.path.starts_with("/api/v1/ingest/") ||
@@ -126,6 +128,7 @@ Service::~Service() {
 
 void Service::start() {
     node_.start();
+    cluster_status_.start();
     ingest_.start();
     torrents_.start();
     streaming_.start();
@@ -149,6 +152,7 @@ void Service::request_stop() {
     ingest_.request_stop();
     scanner_.request_stop();
     hydration_.request_stop();
+    cluster_status_.request_stop();
     if (catalogue_http_)
         catalogue_http_->request_stop();
     streaming_.request_stop();
@@ -166,6 +170,7 @@ void Service::stop() {
     ingest_.stop();
     scanner_.stop();
     hydration_.stop();
+    cluster_status_.stop();
     if (catalogue_http_)
         catalogue_http_->stop();
     streaming_.stop();

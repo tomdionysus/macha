@@ -35,6 +35,22 @@ struct GarbageRef {
     auto operator<=>(const GarbageRef&) const = default;
 };
 
+struct PersistedNodeStatus {
+    NodeId boot_id{};
+    uint64_t observed_unix_ms{};
+    std::string version;
+    std::string host;
+    std::string failure_domain;
+    uint16_t port{};
+    uint64_t storage_capacity{};
+    uint64_t storage_used{};
+    uint64_t cache_capacity{};
+    uint64_t cache_used{};
+    uint64_t metadata_generation{};
+    uint32_t storage_backends_online{};
+    auto operator<=>(const PersistedNodeStatus&) const = default;
+};
+
 struct MetadataSnapshot {
     std::vector<NodeId> metadata_voters;
     uint32_t data_replication{};
@@ -46,6 +62,14 @@ struct MetadataSnapshot {
     std::optional<ObjectId> catalogue_root;
     std::map<std::string, FsEntry> entries;
     std::vector<GarbageRef> garbage;
+    // Low-frequency, cluster-persisted last-known node observations. This is
+    // deliberately not a metrics history: each node coalesces its current
+    // status into one record and ephemeral telemetry remains off-quorum.
+    std::map<NodeId, PersistedNodeStatus> node_status;
+    // Durable endpoint->NodeId invalidations. These are tombstones, not node
+    // deletion: they suppress a stale association while allowing the endpoint
+    // to authenticate later as a different NodeId.
+    std::map<std::string, IdentityAssociationReset, std::less<>> identity_resets;
 };
 // Metadata records are immutable once constructed. Their canonical snapshot payload can
 // be hundreds of megabytes on large media namespaces, so copying a MetadataRecord must
@@ -106,6 +130,8 @@ struct MetadataDelta {
     std::vector<std::string> erase_entries;
     std::vector<ObjectId> erase_garbage;
     std::vector<GarbageRef> upsert_garbage;
+    std::map<NodeId, PersistedNodeStatus> upsert_node_status;
+    std::map<std::string, IdentityAssociationReset, std::less<>> upsert_identity_resets;
     CatalogueDelta catalogue{CatalogueDelta::unchanged};
     std::optional<ObjectId> catalogue_root;
 };

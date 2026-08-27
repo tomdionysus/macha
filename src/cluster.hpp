@@ -8,6 +8,7 @@
 #include "net.hpp"
 #include "persistent_cache.hpp"
 #include "storage_pool.hpp"
+#include "telemetry.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -32,10 +33,23 @@ class NodeRuntime {
     PersistentBlockCache cache_;
     MetadataReplica meta_;
     Membership members_;
+    TelemetryStore telemetry_;
+    // Immutable network identity copied once during construction.  The
+    // telemetry worker must not contend on Membership's mutex merely to report
+    // our own host/failure-domain/port every few seconds.
+    NodeInfo telemetry_identity_;
     std::atomic_uint64_t remote_metadata_generation_{};
+    std::atomic_uint64_t telemetry_storage_used_{};
+    std::atomic_uint64_t telemetry_storage_capacity_{};
+    std::atomic_uint64_t telemetry_metadata_generation_{};
+    std::atomic_uint32_t telemetry_peers_known_{1};
+    std::atomic_uint32_t telemetry_peers_active_{1};
     RpcClient client_;
     RpcServer server_;
     std::jthread maintenance_;
+    std::jthread telemetry_worker_;
+    std::mutex telemetry_wait_mutex_;
+    std::condition_variable_any telemetry_wait_cv_;
     std::mutex maintenance_wait_mutex_;
     std::condition_variable_any maintenance_wait_cv_;
     std::jthread local_writer_;
@@ -55,6 +69,8 @@ class NodeRuntime {
     void exchange(const Endpoint&);
     void exchange(const NodeInfo&);
     void merge(std::span<const uint8_t>);
+    void refresh_telemetry();
+    void telemetry_loop(std::stop_token);
     std::chrono::milliseconds stall_notice_for(MessageType) const;
 
   public:
@@ -99,6 +115,12 @@ class NodeRuntime {
     const Membership& membership() const {
         return members_;
     }
+    TelemetryStore& telemetry() {
+        return telemetry_;
+    }
+    const TelemetryStore& telemetry() const {
+        return telemetry_;
+    }
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
     RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType);
@@ -128,6 +150,9 @@ class NodeRuntime {
         const auto remote = remote_metadata_generation_.load();
         return local > remote ? local : remote;
     }
+    bool apply_identity_reset(const IdentityAssociationReset&);
+    void propagate_identity_reset(const IdentityAssociationReset&);
+    std::vector<IdentityAssociationReset> identity_resets() const { return members_.identity_resets(); }
     RpcStats rpc_stats() const {
         return client_.stats();
     }

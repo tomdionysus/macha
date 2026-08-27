@@ -362,6 +362,29 @@ std::string route_id(std::string_view path, std::string_view prefix, std::string
     return std::string(rest);
 }
 
+std::optional<NodeId> parse_node_id(std::string_view text) {
+    auto raw = unhex(std::string(text));
+    if (!raw || raw->size() != 16) return {};
+    NodeId id;
+    std::copy(raw->begin(), raw->end(), id.bytes.begin());
+    return id;
+}
+
+Json identity_reset_json(const IdentityAssociationReset& reset) {
+    Json::Object out;
+    out["scope"] = identity_reset_key(reset.host, reset.port);
+    out["host"] = reset.host;
+    out["port"] = reset.port ? Json(static_cast<uint64_t>(reset.port)) : Json(nullptr);
+    out["stale_node_id"] = reset.stale_node_id == NodeId{}
+                               ? Json(nullptr)
+                               : Json(to_string(reset.stale_node_id));
+    out["epoch"] = reset.epoch;
+    out["reset_at_unix_ms"] = reset.reset_unix_ms;
+    out["reset_by_node_id"] = to_string(reset.reset_by);
+    out["reason"] = reset.reason.empty() ? Json(nullptr) : Json(reset.reason);
+    return Json(std::move(out));
+}
+
 } // namespace
 
 HttpResponse ManageApi::handle(const HttpRequest& request) {
@@ -371,6 +394,144 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
     std::unique_lock mutation_lock(mutation_mutex_, std::defer_lock);
     if (request.method != "GET") mutation_lock.lock();
     try {
+        if (request.method == "GET" && request.path == "/api/v1/manage") {
+            Json::Object resources;
+            resources["unmatched"] = "/api/v1/manage/unmatched";
+            resources["filesystem"] = "/api/v1/manage/filesystem";
+            Json::Object actions;
+            actions["identity_association_reset"] =
+                "/api/v1/manage/identity-associations/reset";
+            actions["node_identity_association_reset"] =
+                "/api/v1/manage/nodes/{node_id}/identity-association/reset";
+            Json::Object out;
+            out["api"] = "manage";
+            out["version"] = static_cast<uint64_t>(1);
+            out["privileged"] = false;
+            out["resources"] = std::move(resources);
+            out["actions"] = std::move(actions);
+            return http_json(200, Json(std::move(out)).dump());
+        }
+
+        auto commit_identity_reset = [&](std::string host, uint16_t port, NodeId stale_id,
+                                         std::string reason) -> HttpResponse {
+            if (host.empty())
+                return http_error(400, "host_required", "host/IP is required");
+
+            IdentityAssociationReset reset;
+            reset.host = std::move(host);
+            reset.port = port; // 0 deliberately means every port on this host.
+            reset.stale_node_id = stale_id; // zero deliberately means unknown/any stale identity.
+            reset.reset_by = node_.node_id();
+            reset.reset_unix_ms = unix_ms();
+            reset.reason = std::move(reason);
+            const auto key = identity_reset_key(reset.host, reset.port);
+
+            const auto committed = metadata_.mutate_delta(
+                [&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+                    uint64_t epoch = 1;
+                    if (auto found = snapshot.identity_resets.find(key);
+                        found != snapshot.identity_resets.end())
+                        epoch = found->second.epoch + 1;
+                    reset.epoch = epoch;
+                    snapshot.identity_resets[key] = reset;
+                    delta.upsert_identity_resets[key] = reset;
+                });
+
+            Log::info("management identity reset committed scope=" + key +
+                      " stale_node_id=" +
+                      (stale_id == NodeId{} ? std::string("<any>") : to_string(stale_id)) +
+                      " epoch=" + std::to_string(reset.epoch) +
+                      " metadata_generation=" + std::to_string(committed.generation) +
+                      (reset.reason.empty() ? std::string{} : " reason=" + reset.reason));
+            node_.propagate_identity_reset(reset);
+
+            Json::Object out;
+            out["reset"] = identity_reset_json(reset);
+            out["metadata_generation"] = committed.generation;
+            return http_json(200, Json(std::move(out)).dump());
+        };
+
+        // General cluster management action. This does not require a NodeId:
+        //   host + port + node_id => one known endpoint->NodeId association
+        //   host + port           => whatever stale identity occupied that endpoint
+        //   host                  => all stale endpoint associations on that IP/host
+        // The wildcard forms suppress pre-reset gossip but allow a fresh,
+        // directly authenticated peer to establish a replacement association.
+        if (request.method == "POST" &&
+            request.path == "/api/v1/manage/identity-associations/reset") {
+            const auto body = parse_body(request);
+            auto host = string_value(body, "host");
+            uint16_t port = 0;
+            if (const auto* value = body.find("port"); value && !value->isNull()) {
+                const auto raw = value->asUInt64();
+                if (!raw || raw > 65535)
+                    return http_error(400, "bad_port", "port must be 1..65535 when supplied");
+                port = static_cast<uint16_t>(raw);
+            }
+            NodeId stale_id{};
+            if (const auto id_text = string_value(body, "node_id"); !id_text.empty()) {
+                const auto parsed = parse_node_id(id_text);
+                if (!parsed)
+                    return http_error(400, "bad_node_id",
+                                      "node_id must be a 32-character hexadecimal id");
+                stale_id = *parsed;
+            }
+            return commit_identity_reset(std::move(host), port, stale_id,
+                                         string_value(body, "reason"));
+        }
+
+        // Node-scoped convenience route retained for Status node detail and
+        // future node management actions under /api/v1/manage/nodes/....
+        constexpr std::string_view node_manage_prefix = "/api/v1/manage/nodes/";
+        if (request.method == "POST" && request.path.starts_with(node_manage_prefix)) {
+            const auto id_text = route_id(request.path, node_manage_prefix,
+                                          "/identity-association/reset");
+            if (!id_text.empty()) {
+                const auto stale_id = parse_node_id(id_text);
+                if (!stale_id)
+                    return http_error(400, "bad_node_id",
+                                      "node id must be a 32-character hexadecimal id");
+
+                const auto body = parse_body(request);
+                std::string host = string_value(body, "host");
+                uint16_t port = 0;
+                if (const auto* value = body.find("port"); value && !value->isNull()) {
+                    const auto raw = value->asUInt64();
+                    if (!raw || raw > 65535)
+                        return http_error(400, "bad_port", "port must be 1..65535 when supplied");
+                    port = static_cast<uint16_t>(raw);
+                }
+
+                // When no endpoint is supplied, resolve the node's most recent
+                // endpoint from live membership and then durable status. If the
+                // caller supplies only a host, port=0 is intentionally retained
+                // as a host-wide reset for this NodeId.
+                if (host.empty()) {
+                    for (const auto& member : node_.membership().all()) {
+                        if (member.id == *stale_id) {
+                            host = member.host;
+                            port = member.port;
+                            break;
+                        }
+                    }
+                    if (host.empty()) {
+                        auto view = metadata_.snapshot_view();
+                        if (auto found = view.snapshot->node_status.find(*stale_id);
+                            found != view.snapshot->node_status.end()) {
+                            host = found->second.host;
+                            port = found->second.port;
+                        }
+                    }
+                }
+                if (host.empty())
+                    return http_error(404, "node_endpoint_unknown",
+                                      "no known endpoint for this node; supply host/IP");
+
+                return commit_identity_reset(std::move(host), port, *stale_id,
+                                             string_value(body, "reason"));
+            }
+        }
+
         if (request.method == "GET" && request.path == "/api/v1/manage/unmatched") {
             Json::Array items;
             for (const auto& hint : hints_.list()) {

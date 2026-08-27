@@ -5,6 +5,7 @@
 #include "local_store.hpp"
 #include "metadata.hpp"
 
+#include <atomic>
 #include <list>
 #include <map>
 #include <memory>
@@ -30,6 +31,7 @@ class PersistentBlockCache {
     std::shared_ptr<LocalStore> store_;
     std::list<ObjectId> lru_;
     std::map<ObjectId, std::list<ObjectId>::iterator> lru_index_;
+    std::atomic_size_t block_count_{};
 
     void open_locked();
     void rebuild_lru_locked();
