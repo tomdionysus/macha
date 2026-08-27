@@ -5,6 +5,7 @@
 #include "catalogue_api.hpp"
 #include "manage_api.hpp"
 #include "acquisition_api.hpp"
+#include "status_api.hpp"
 #include "ingest.hpp"
 #include "torrent.hpp"
 #include "filesystem.hpp"
@@ -25,6 +26,7 @@ class Service {
     NodeRuntime node_;
     DistributedStore store_;
     MetadataManager metadata_;
+    ClusterStatusService cluster_status_;
     CatalogueManager catalogue_;
     PlaybackTracker playback_;
     FileSystem fs_;
@@ -66,6 +68,9 @@ class Service {
     }
     NodeRuntime& node() {
         return node_;
+    }
+    MetadataManager& metadata_manager() {
+        return metadata_;
     }
     CatalogueManager& catalogue() {
         return catalogue_;

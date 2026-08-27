@@ -1,0 +1,357 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "status_api.hpp"
+
+#include "json.hpp"
+#include "log.hpp"
+
+#include <algorithm>
+#include <map>
+
+namespace macha {
+namespace {
+
+PersistedNodeStatus persisted(const NodeTelemetry& telemetry) {
+    PersistedNodeStatus out;
+    out.boot_id = telemetry.boot_id;
+    out.observed_unix_ms = telemetry.observed_unix_ms;
+    out.version = telemetry.version;
+    out.host = telemetry.host;
+    out.failure_domain = telemetry.failure_domain;
+    out.port = telemetry.port;
+    out.storage_capacity = telemetry.storage_capacity;
+    out.storage_used = telemetry.storage_used;
+    out.cache_capacity = telemetry.cache_capacity;
+    out.cache_used = telemetry.cache_used;
+    out.metadata_generation = telemetry.metadata_generation;
+    out.storage_backends_online = telemetry.storage_backends_online;
+    return out;
+}
+
+Json bytes_pair(uint64_t used, uint64_t capacity) {
+    return Json::Object{{"capacity_bytes", capacity}, {"used_bytes", used},
+                        {"free_bytes", capacity > used ? capacity - used : 0}};
+}
+
+Json identity_reset_json(const IdentityAssociationReset& reset) {
+    Json::Object out;
+    out["scope"] = identity_reset_key(reset.host, reset.port);
+    out["host"] = reset.host;
+    out["port"] = reset.port ? Json(static_cast<uint64_t>(reset.port)) : Json(nullptr);
+    out["stale_node_id"] = reset.stale_node_id == NodeId{}
+                               ? Json(nullptr)
+                               : Json(to_string(reset.stale_node_id));
+    out["epoch"] = reset.epoch;
+    out["reset_at_unix_ms"] = reset.reset_unix_ms;
+    out["reset_by_node_id"] = to_string(reset.reset_by);
+    out["reason"] = reset.reason.empty() ? Json(nullptr) : Json(reset.reason);
+    return Json(std::move(out));
+}
+
+Json node_json(const NodeId& id, const PersistedNodeStatus& durable,
+               const NodeTelemetry* live, uint64_t live_age_ms, bool online, bool stale,
+               bool metadata_voter, const IdentityAssociationReset* identity_reset) {
+    Json::Object node;
+    node["id"] = to_string(id);
+    node["state"] = online ? "online" : "offline";
+    node["telemetry_freshness"] = online ? (stale ? "stale" : "live") : "last_known";
+    node["observed_at_unix_ms"] = live ? live->observed_unix_ms : durable.observed_unix_ms;
+    node["live_age_ms"] = live ? Json(live_age_ms) : Json(nullptr);
+    node["version"] = live ? live->version : durable.version;
+    node["host"] = live ? live->host : durable.host;
+    node["port"] = static_cast<uint64_t>(live ? live->port : durable.port);
+    node["failure_domain"] = live ? live->failure_domain : durable.failure_domain;
+    node["metadata_generation"] = live ? live->metadata_generation : durable.metadata_generation;
+
+    const auto storage_capacity = live ? live->storage_capacity : durable.storage_capacity;
+    const auto storage_used = live ? live->storage_used : durable.storage_used;
+    const auto cache_capacity = live ? live->cache_capacity : durable.cache_capacity;
+    const auto cache_used = live ? live->cache_used : durable.cache_used;
+    node["storage"] = bytes_pair(storage_used, storage_capacity);
+    node["cache"] = bytes_pair(cache_used, cache_capacity);
+    node["storage_backends_online"] = static_cast<uint64_t>(
+        live ? live->storage_backends_online : durable.storage_backends_online);
+
+    Json::Array roles;
+    if (storage_capacity) roles.emplace_back("storage");
+    if (cache_capacity) roles.emplace_back("cache");
+    if (metadata_voter) roles.emplace_back("metadata-voter");
+    node["roles"] = std::move(roles);
+
+    Json::Object runtime;
+    if (live && online) {
+        runtime["uptime_ms"] = live->uptime_ms;
+        runtime["rss_bytes"] = live->rss_bytes;
+        runtime["process_cpu_percent"] = static_cast<double>(live->process_cpu_milli_percent) / 1000.0;
+        runtime["load1"] = static_cast<double>(live->load1_milli) / 1000.0;
+        runtime["peers_known"] = static_cast<uint64_t>(live->peers_known);
+        runtime["peers_active"] = static_cast<uint64_t>(live->peers_active);
+        runtime["rpc_connections_created"] = live->rpc_connections_created;
+        runtime["rpc_connections_reused"] = live->rpc_connections_reused;
+        runtime["rpc_connections_canonical"] = live->rpc_connections_canonical;
+    }
+    node["runtime"] = std::move(runtime);
+    node["identity_association_reset"] =
+        identity_reset ? identity_reset_json(*identity_reset) : Json(nullptr);
+    return node;
+}
+
+std::optional<NodeId> parse_node_id(std::string_view text) {
+    auto raw = unhex(std::string(text));
+    if (!raw || raw->size() != 16)
+        return {};
+    NodeId id;
+    std::copy(raw->begin(), raw->end(), id.bytes.begin());
+    return id;
+}
+
+} // namespace
+
+ClusterStatusService::ClusterStatusService(NodeRuntime& node, MetadataManager& metadata)
+    : node_(node), metadata_(metadata) {}
+
+ClusterStatusService::~ClusterStatusService() {
+    stop();
+}
+
+void ClusterStatusService::start() {
+    if (persistence_.joinable())
+        return;
+    persistence_ = std::jthread([this](std::stop_token stop) { persistence_loop(stop); });
+}
+
+void ClusterStatusService::request_stop() {
+    if (!persistence_.joinable())
+        return;
+    persistence_.request_stop();
+    wait_cv_.notify_all();
+}
+
+void ClusterStatusService::stop() {
+    request_stop();
+    if (persistence_.joinable())
+        persistence_.join();
+}
+
+void ClusterStatusService::persist_local_status() {
+    // Status persistence is deliberately outside namespace metadata. Even a
+    // five-minute observational checkpoint must never serialize a large
+    // namespace, acquire the metadata mutation lock, or enter quorum CAS.
+    // Defer the tiny local durable write while viewer-critical work is active.
+    // durable_replace_file() includes the durability barrier we want for the
+    // last-known cache. Keep that I/O well clear of interactive traffic rather
+    // than allowing observational state to introduce an fsync into a busy node.
+    constexpr auto idle_before_persist = std::chrono::seconds(30);
+    if (node_.activity_idle_for(FrameType::foreground) < idle_before_persist ||
+        node_.activity_idle_for(FrameType::read_ahead) < idle_before_persist)
+        return;
+    node_.telemetry().persist();
+}
+
+void ClusterStatusService::persistence_loop(std::stop_token stop) {
+    // Give startup membership/quorum formation a short head start, then keep one
+    // coalesced durable observation per node. A failed checkpoint is retried; no
+    // historical telemetry backlog is ever replayed into metadata.
+    auto delay = std::chrono::seconds(10);
+    while (!stop.stop_requested()) {
+        std::unique_lock lock(wait_mutex_);
+        wait_cv_.wait_for(lock, stop, delay, [] { return false; });
+        lock.unlock();
+        if (stop.stop_requested())
+            break;
+        try {
+            persist_local_status();
+            delay = std::chrono::minutes(5);
+        } catch (const std::exception& error) {
+            Log::debug("status checkpoint unavailable: " + std::string(error.what()));
+            delay = std::chrono::seconds(30);
+        }
+    }
+}
+
+HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& only) {
+    std::shared_ptr<const MetadataSnapshot> metadata;
+    uint64_t metadata_generation = 0;
+    try {
+        if (auto available = metadata_.available_snapshot_view()) {
+            metadata = available->snapshot;
+            metadata_generation = available->generation;
+        }
+    } catch (const std::exception& error) {
+        Log::debug("status metadata unavailable: " + std::string(error.what()));
+    }
+
+    const auto fresh_for = std::max(node_.config().heartbeat * 3, std::chrono::milliseconds(5000));
+    const auto online_for = std::max(node_.config().dead_after, fresh_for);
+    auto views = node_.telemetry().views(fresh_for);
+    std::map<NodeId, TelemetryView> live;
+    for (auto& view : views)
+        live.emplace(view.telemetry.node_id, std::move(view));
+
+    std::map<NodeId, PersistedNodeStatus> known;
+    if (metadata)
+        known = metadata->node_status; // Read-only compatibility with early SM9 checkpoints.
+    for (const auto& telemetry : node_.telemetry().persisted())
+        known[telemetry.node_id] = persisted(telemetry);
+    for (const auto& [id, view] : live)
+        known[id] = persisted(view.telemetry);
+
+    std::set<NodeId> voters;
+    if (metadata)
+        voters.insert(metadata->metadata_voters.begin(), metadata->metadata_voters.end());
+
+    uint64_t known_capacity = 0, known_used = 0, online_capacity = 0, online_used = 0;
+    uint64_t known_cache_capacity = 0, known_cache_used = 0, online_cache_capacity = 0,
+             online_cache_used = 0;
+    size_t online_nodes = 0, active_voters = 0;
+    Json::Array nodes;
+    for (const auto& [id, durable] : known) {
+        if (only && id != *only)
+            continue;
+        const auto found = live.find(id);
+        const NodeTelemetry* current = found == live.end() ? nullptr : &found->second.telemetry;
+        const uint64_t age = found == live.end() ? 0 : static_cast<uint64_t>(found->second.age.count());
+        const bool online = current && found->second.age <= online_for;
+        const bool stale = current && found->second.age > fresh_for;
+        const bool voter = voters.contains(id);
+
+        const auto storage_capacity = current ? current->storage_capacity : durable.storage_capacity;
+        const auto storage_used = current ? current->storage_used : durable.storage_used;
+        const auto cache_capacity = current ? current->cache_capacity : durable.cache_capacity;
+        const auto cache_used = current ? current->cache_used : durable.cache_used;
+        known_capacity += storage_capacity;
+        known_used += storage_used;
+        known_cache_capacity += cache_capacity;
+        known_cache_used += cache_used;
+        if (online) {
+            ++online_nodes;
+            online_capacity += storage_capacity;
+            online_used += storage_used;
+            online_cache_capacity += cache_capacity;
+            online_cache_used += cache_used;
+            if (voter)
+                ++active_voters;
+        }
+        const IdentityAssociationReset* identity_reset = nullptr;
+        if (metadata) {
+            const auto& host = current ? current->host : durable.host;
+            const auto port = current ? current->port : durable.port;
+            if (!host.empty() && port) {
+                for (const auto& [_, reset] : metadata->identity_resets) {
+                    if (!identity_reset_matches_endpoint(reset, host, port) ||
+                        !identity_reset_matches_node(reset, id))
+                        continue;
+                    if (!identity_reset || reset.reset_unix_ms > identity_reset->reset_unix_ms)
+                        identity_reset = &reset;
+                }
+            }
+        }
+        nodes.push_back(node_json(id, durable, current, age, online, stale, voter, identity_reset));
+    }
+
+    if (only) {
+        if (nodes.empty())
+            return http_error(404, "node_not_found", "unknown cluster node");
+        return http_json(200, nodes.front().dump());
+    }
+
+    const size_t voter_count = voters.size();
+    const size_t quorum = voter_count ? voter_count / 2 + 1 : 0;
+    const bool metadata_available = static_cast<bool>(metadata);
+    const bool quorum_available = metadata_available && (!voter_count || active_voters >= quorum);
+    std::string health = "healthy";
+    Json::Array conditions;
+    if (!metadata_available) {
+        health = "critical";
+        conditions.emplace_back("metadata status unavailable");
+    } else if (!quorum_available) {
+        health = "critical";
+        conditions.emplace_back("metadata quorum unavailable");
+    }
+    if (online_nodes < known.size()) {
+        if (health == "healthy")
+            health = "degraded";
+        conditions.emplace_back("one or more known nodes are offline");
+    }
+    if (online_capacity < known_capacity) {
+        if (health == "healthy")
+            health = "degraded";
+        conditions.emplace_back("some known durable capacity is unavailable");
+    }
+
+    Json::Object cluster;
+    cluster["health"] = health;
+    cluster["conditions"] = std::move(conditions);
+    cluster["nodes_known"] = static_cast<uint64_t>(known.size());
+    cluster["nodes_online"] = static_cast<uint64_t>(online_nodes);
+    cluster["metadata_generation"] = metadata_generation;
+    cluster["metadata_voters"] = static_cast<uint64_t>(voter_count);
+    cluster["metadata_voters_online"] = static_cast<uint64_t>(active_voters);
+    cluster["metadata_quorum_required"] = static_cast<uint64_t>(quorum);
+    cluster["metadata_quorum_available"] = quorum_available;
+    cluster["storage_known"] = bytes_pair(known_used, known_capacity);
+    cluster["storage_online"] = bytes_pair(online_used, online_capacity);
+    cluster["cache_known"] = bytes_pair(known_cache_used, known_cache_capacity);
+    cluster["cache_online"] = bytes_pair(online_cache_used, online_cache_capacity);
+
+    Json::Object root;
+    root["cluster"] = std::move(cluster);
+    root["nodes"] = std::move(nodes);
+    root["generated_at_unix_ms"] = unix_ms();
+    return http_json(200, Json(std::move(root)).dump());
+}
+
+HttpResponse ClusterStatusService::connectivity_check(const std::optional<NodeId>& only) {
+    Json::Array results;
+    bool found_requested = !only.has_value();
+    for (const auto& member : node_.membership().all()) {
+        if (only && member.id != *only)
+            continue;
+        found_requested = true;
+        bool reachable = member.id == node_.node_id();
+        std::string error;
+        if (!reachable) {
+            try {
+                reachable = node_.call(member, MessageType::ping).message.type == MessageType::ok;
+            } catch (const std::exception& e) {
+                error = e.what();
+            }
+        }
+        Json::Object item{{"node_id", to_string(member.id)}, {"reachable", reachable}};
+        if (!error.empty())
+            item["error"] = error;
+        results.emplace_back(std::move(item));
+    }
+    if (!found_requested)
+        return http_error(404, "node_not_found", "unknown cluster node");
+    Json::Object root{{"results", std::move(results)}, {"checked_at_unix_ms", unix_ms()}};
+    return http_json(200, Json(std::move(root)).dump());
+}
+
+HttpResponse ClusterStatusService::handle(const HttpRequest& request) {
+    if (request.method == "GET" &&
+        (request.path == "/api/v1/status" || request.path == "/api/v1/status/nodes"))
+        return status_response();
+    if (request.method == "POST" && request.path == "/api/v1/status/connectivity/check")
+        return connectivity_check({});
+
+    constexpr std::string_view prefix = "/api/v1/status/nodes/";
+    if (request.path.starts_with(prefix)) {
+        auto tail = std::string_view(request.path).substr(prefix.size());
+        constexpr std::string_view check = "/connectivity/check";
+        bool connectivity = false;
+        if (tail.ends_with(check)) {
+            connectivity = true;
+            tail.remove_suffix(check.size());
+        }
+        auto id = parse_node_id(tail);
+        if (!id)
+            return http_error(400, "bad_node_id", "node id must be a 32-character hexadecimal id");
+        if (request.method == "GET" && !connectivity)
+            return status_response(*id);
+        if (request.method == "POST" && connectivity)
+            return connectivity_check(*id);
+    }
+    return http_error(404, "not_found", "status route not found");
+}
+
+} // namespace macha

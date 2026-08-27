@@ -131,6 +131,11 @@ MetadataRecord MetadataManager::latest(const std::vector<MetadataRecord>& record
 
 MetadataRecord MetadataManager::cache_record(
     const MetadataRecord& record, std::shared_ptr<MetadataSnapshot> decoded) {
+    // Durable management tombstones are operational constraints as soon as a
+    // committed metadata generation is decoded, not merely data for the UI.
+    for (const auto& [_, reset] : decoded->identity_resets)
+        node_.apply_identity_reset(reset);
+
     std::lock_guard lock(cache_mutex_);
     // Concurrent quorum/local reads can complete out of order. Never let an
     // older completion move the process cache backwards after a newer immutable
@@ -1383,6 +1388,11 @@ MetadataRecord MetadataManager::mutate_impl(
         auto data_replication = snapshot.data_replication;
         auto extent_size = snapshot.extent_size;
         mutate(snapshot, exact_delta ? &supplied_delta : nullptr);
+        // Exact-delta callers do not know the enclosing snapshot wire version.
+        // Once durable node status has activated SM9, carry one idempotent status
+        // witness so encode_metadata_delta emits DLT3 and reconstructs SM9.
+        if (exact_delta && !snapshot.node_status.empty() && supplied_delta.upsert_node_status.empty())
+            supplied_delta.upsert_node_status.emplace(*snapshot.node_status.begin());
         if (!same_voters(snapshot.metadata_voters, voters))
             throw std::runtime_error("filesystem mutation attempted to change metadata voters");
         if (snapshot.data_replication != data_replication || snapshot.extent_size != extent_size)

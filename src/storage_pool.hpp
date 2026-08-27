@@ -71,6 +71,7 @@ class StoragePool {
     mutable std::atomic_uint64_t diag_get_max_ms_{};
     mutable std::atomic_int64_t diag_get_report_ns_{};
     mutable std::atomic_uint64_t full_list_scans_{};
+    std::atomic_size_t online_backends_cached_{};
 
     void observe_get(size_t, uint64_t) const;
 

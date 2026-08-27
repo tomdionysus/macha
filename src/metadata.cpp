@@ -16,6 +16,8 @@ constexpr std::array<uint8_t, 8> SM5{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'},
     SM6{'D', 'H', 'T', 'M', 'E', 'T', 'A', '6'},
     SM7{'D', 'H', 'T', 'M', 'E', 'T', 'A', '7'},
     SM8{'D', 'H', 'T', 'M', 'E', 'T', 'A', '8'},
+    SM9{'D', 'H', 'T', 'M', 'E', 'T', 'A', '9'},
+    SM10{'D', 'H', 'T', 'M', 'E', 'T', 'B', '0'},
     DM{'D', 'H', 'T', 'M', 'D', 'B', '0', '1'},
     MJ{'D', 'H', 'T', 'M', 'J', 'N', 'L', '1'};
 constexpr uint8_t JOURNAL_PREPARE_FULL = 1, JOURNAL_PREPARE_DELTA = 2,
@@ -63,11 +65,68 @@ FsEntry entry(Reader& r) {
     }
     return e;
 }
+
+void encode_node_status(Writer& w, const PersistedNodeStatus& status) {
+    w.fixed(status.boot_id.bytes);
+    w.u64(status.observed_unix_ms);
+    w.string(status.version);
+    w.string(status.host);
+    w.string(status.failure_domain);
+    w.u16(status.port);
+    w.u64(status.storage_capacity);
+    w.u64(status.storage_used);
+    w.u64(status.cache_capacity);
+    w.u64(status.cache_used);
+    w.u64(status.metadata_generation);
+    w.u32(status.storage_backends_online);
+}
+
+PersistedNodeStatus decode_node_status(Reader& r) {
+    PersistedNodeStatus status;
+    status.boot_id.bytes = r.fixed<16>();
+    status.observed_unix_ms = r.u64();
+    status.version = r.string(256);
+    status.host = r.string(4096);
+    status.failure_domain = r.string(4096);
+    status.port = r.u16();
+    status.storage_capacity = r.u64();
+    status.storage_used = r.u64();
+    status.cache_capacity = r.u64();
+    status.cache_used = r.u64();
+    status.metadata_generation = r.u64();
+    status.storage_backends_online = r.u32();
+    return status;
+}
+
+void encode_identity_reset(Writer& w, const IdentityAssociationReset& reset) {
+    w.string(reset.host);
+    w.u16(reset.port);
+    w.fixed(reset.stale_node_id.bytes);
+    w.u64(reset.epoch);
+    w.u64(reset.reset_unix_ms);
+    w.fixed(reset.reset_by.bytes);
+    w.string(reset.reason);
+}
+
+IdentityAssociationReset decode_identity_reset(Reader& r) {
+    IdentityAssociationReset reset;
+    reset.host = r.string(4096);
+    reset.port = r.u16();
+    reset.stale_node_id.bytes = r.fixed<16>();
+    reset.epoch = r.u64();
+    reset.reset_unix_ms = r.u64();
+    reset.reset_by.bytes = r.fixed<16>();
+    reset.reason = r.string(4096);
+    if (reset.host.empty() || !reset.epoch)
+        throw DecodeError("bad identity reset");
+    return reset;
+}
+
 Bytes encode_snapshot_v7(const MetadataSnapshot& s) {
     // Exact legacy snapshot representation. This is used only while
     // replaying DLT1 records from an existing metadata journal: the journal
     // stores the successor hash, so reconstructing the historical SM7 bytes
-    // is part of on-disk compatibility. New snapshots are always SM8.
+    // is part of on-disk compatibility. Ordinary new snapshots remain SM8.
     Writer w;
     w.raw(SM7);
     w.u32(s.metadata_voters.size());
@@ -94,9 +153,64 @@ Bytes encode_snapshot_v7(const MetadataSnapshot& s) {
     return w.take();
 }
 
-bool metadata_delta_v1(std::span<const uint8_t> data) {
-    static constexpr std::array<uint8_t, 8> magic{'D', 'H', 'T', 'M', 'D', 'L', 'T', '1'};
-    return data.size() >= magic.size() && std::equal(magic.begin(), magic.end(), data.begin());
+Bytes encode_snapshot_v8(const MetadataSnapshot& s) {
+    // Exact pre-telemetry representation. DLT2 journal successor hashes were
+    // computed over SM8 bytes, so rolling forward an existing journal must
+    // reproduce that encoding rather than silently upgrading it to SM9.
+    Writer w;
+    w.raw(SM8);
+    w.u32(s.metadata_voters.size());
+    for (const auto& v : s.metadata_voters)
+        w.fixed(v.bytes);
+    w.u32(s.data_replication);
+    w.u64(s.extent_size);
+    w.u32(s.mutation_sequences.size());
+    for (const auto& [node, sequence] : s.mutation_sequences) {
+        w.fixed(node.bytes);
+        w.u64(sequence);
+    }
+    w.u32(s.entries.size());
+    for (const auto& [path, value] : s.entries) {
+        w.string(path);
+        entry(w, value);
+    }
+    w.u8(s.catalogue_root.has_value());
+    if (s.catalogue_root)
+        w.fixed(s.catalogue_root->bytes);
+    w.u32(s.garbage.size());
+    for (const auto& garbage : s.garbage) {
+        w.fixed(garbage.id.bytes);
+        w.i64(garbage.retired_at_ns);
+        w.fixed(garbage.retirement_id.bytes);
+    }
+    return w.take();
+}
+
+int metadata_delta_version(std::span<const uint8_t> data) {
+    static constexpr std::array<uint8_t, 7> prefix{'D', 'H', 'T', 'M', 'D', 'L', 'T'};
+    if (data.size() < 8 || !std::equal(prefix.begin(), prefix.end(), data.begin()))
+        return 0;
+    if (data[7] < '1' || data[7] > '4')
+        return 0;
+    return static_cast<int>(data[7] - '0');
+}
+
+Bytes encode_snapshot_for_delta(std::span<const uint8_t> delta, const MetadataSnapshot& snapshot) {
+    switch (metadata_delta_version(delta)) {
+    case 1:
+        return encode_snapshot_v7(snapshot);
+    case 2:
+        return encode_snapshot_v8(snapshot);
+    case 3:
+        // Preserve SM9 for historical DLT3 journal successors.
+        if (!snapshot.identity_resets.empty())
+            throw DecodeError("DLT3 cannot contain identity resets");
+        return encode_snapshot(snapshot);
+    case 4:
+        return encode_snapshot(snapshot);
+    default:
+        throw DecodeError("bad metadata delta");
+    }
 }
 
 void hash_u8(Sha256Hasher& hash, uint8_t value) {
@@ -196,7 +310,14 @@ std::optional<std::filesystem::path> quarantine_metadata_file(
 } // namespace
 Bytes encode_snapshot(const MetadataSnapshot& s) {
     Writer w;
-    w.raw(SM8);
+    // Keep ordinary namespace snapshots exactly SM8. Legacy SM9 node-status
+    // records remain readable/writable for compatibility, while identity-reset
+    // tombstones are the only normal 0.18.2 feature that crosses into SM10.
+    const bool include_node_status = !s.node_status.empty() || !s.identity_resets.empty();
+    if (!s.identity_resets.empty())
+        w.raw(SM10);
+    else
+        w.raw(s.node_status.empty() ? SM8 : SM9);
     w.u32(s.metadata_voters.size());
     for (auto& v : s.metadata_voters)
         w.fixed(v.bytes);
@@ -221,6 +342,20 @@ Bytes encode_snapshot(const MetadataSnapshot& s) {
         w.i64(garbage.retired_at_ns);
         w.fixed(garbage.retirement_id.bytes);
     }
+    if (include_node_status) {
+        w.u32(static_cast<uint32_t>(s.node_status.size()));
+        for (const auto& [node, status] : s.node_status) {
+            w.fixed(node.bytes);
+            encode_node_status(w, status);
+        }
+    }
+    if (!s.identity_resets.empty()) {
+        w.u32(static_cast<uint32_t>(s.identity_resets.size()));
+        for (const auto& [key, reset] : s.identity_resets) {
+            w.string(key);
+            encode_identity_reset(w, reset);
+        }
+    }
     return w.take();
 }
 MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
@@ -230,7 +365,9 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
     const bool v6 = std::equal(m.begin(), m.end(), SM6.begin());
     const bool v7 = std::equal(m.begin(), m.end(), SM7.begin());
     const bool v8 = std::equal(m.begin(), m.end(), SM8.begin());
-    if (!v5 && !v6 && !v7 && !v8)
+    const bool v9 = std::equal(m.begin(), m.end(), SM9.begin());
+    const bool v10 = std::equal(m.begin(), m.end(), SM10.begin());
+    if (!v5 && !v6 && !v7 && !v8 && !v9 && !v10)
         throw DecodeError("bad snapshot");
     auto nv = r.u32();
     if (nv > 1024)
@@ -242,7 +379,7 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
     }
     s.data_replication = r.u32();
     s.extent_size = r.u64();
-    if (v7 || v8) {
+    if (v7 || v8 || v9 || v10) {
         auto mutations = r.u32();
         if (mutations > 65536)
             throw DecodeError("too many metadata mutation origins");
@@ -261,7 +398,7 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
         if (!s.entries.emplace(p, entry(r)).second)
             throw DecodeError("duplicate path");
     }
-    if ((v6 || v7 || v8) && r.u8()) {
+    if ((v6 || v7 || v8 || v9 || v10) && r.u8()) {
         ObjectId root;
         root.bytes = r.fixed<32>();
         s.catalogue_root = root;
@@ -273,13 +410,35 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
     for (uint32_t i = 0; i < garbage_count; ++i) {
         GarbageRef garbage;
         garbage.id.bytes = r.fixed<32>();
-        if (v8) {
+        if (v8 || v9 || v10) {
             garbage.retired_at_ns = r.i64();
             if (garbage.retired_at_ns < 0)
                 throw DecodeError("bad garbage retirement time");
             garbage.retirement_id.bytes = r.fixed<16>();
         }
         s.garbage.push_back(garbage);
+    }
+    if (v9 || v10) {
+        const auto count = r.u32();
+        if (count > 65536)
+            throw DecodeError("too many persisted node status records");
+        for (uint32_t i = 0; i < count; ++i) {
+            NodeId node{r.fixed<16>()};
+            if (!s.node_status.emplace(node, decode_node_status(r)).second)
+                throw DecodeError("duplicate persisted node status");
+        }
+    }
+    if (v10) {
+        const auto count = r.u32();
+        if (count > 65536)
+            throw DecodeError("too many identity reset tombstones");
+        for (uint32_t i = 0; i < count; ++i) {
+            auto key = r.string(8192);
+            auto reset = decode_identity_reset(r);
+            if (key != identity_reset_key(reset.host, reset.port) ||
+                !s.identity_resets.emplace(std::move(key), std::move(reset)).second)
+                throw DecodeError("bad identity reset tombstone key");
+        }
     }
     r.finish();
     auto x = s.entries.find("/");
@@ -289,9 +448,13 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
 }
 
 Bytes encode_metadata_delta(const MetadataDelta& delta) {
-    static constexpr std::array<uint8_t, 8> magic{'D', 'H', 'T', 'M', 'D', 'L', 'T', '2'};
+    static constexpr std::array<uint8_t, 8> magic_v2{'D', 'H', 'T', 'M', 'D', 'L', 'T', '2'};
+    static constexpr std::array<uint8_t, 8> magic_v3{'D', 'H', 'T', 'M', 'D', 'L', 'T', '3'};
+    static constexpr std::array<uint8_t, 8> magic_v4{'D', 'H', 'T', 'M', 'D', 'L', 'T', '4'};
+    const bool v4 = !delta.upsert_identity_resets.empty();
+    const bool v3 = v4 || !delta.upsert_node_status.empty();
     Writer w;
-    w.raw(magic);
+    w.raw(v4 ? magic_v4 : (v3 ? magic_v3 : magic_v2));
     w.u32(delta.mutation_sequences.size());
     for (const auto& [node, sequence] : delta.mutation_sequences) {
         w.fixed(node.bytes);
@@ -320,17 +483,35 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
         w.i64(garbage.retired_at_ns);
         w.fixed(garbage.retirement_id.bytes);
     }
+    if (v3) {
+        w.u32(static_cast<uint32_t>(delta.upsert_node_status.size()));
+        for (const auto& [node, status] : delta.upsert_node_status) {
+            w.fixed(node.bytes);
+            encode_node_status(w, status);
+        }
+    }
+    if (v4) {
+        w.u32(static_cast<uint32_t>(delta.upsert_identity_resets.size()));
+        for (const auto& [key, reset] : delta.upsert_identity_resets) {
+            w.string(key);
+            encode_identity_reset(w, reset);
+        }
+    }
     return w.take();
 }
 
 MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
     static constexpr std::array<uint8_t, 8> magic_v1{'D', 'H', 'T', 'M', 'D', 'L', 'T', '1'};
     static constexpr std::array<uint8_t, 8> magic_v2{'D', 'H', 'T', 'M', 'D', 'L', 'T', '2'};
+    static constexpr std::array<uint8_t, 8> magic_v3{'D', 'H', 'T', 'M', 'D', 'L', 'T', '3'};
+    static constexpr std::array<uint8_t, 8> magic_v4{'D', 'H', 'T', 'M', 'D', 'L', 'T', '4'};
     Reader r(data);
     auto got = r.raw(magic_v1.size());
     const bool v1 = std::equal(got.begin(), got.end(), magic_v1.begin());
     const bool v2 = std::equal(got.begin(), got.end(), magic_v2.begin());
-    if (!v1 && !v2)
+    const bool v3 = std::equal(got.begin(), got.end(), magic_v3.begin());
+    const bool v4 = std::equal(got.begin(), got.end(), magic_v4.begin());
+    if (!v1 && !v2 && !v3 && !v4)
         throw DecodeError("bad metadata delta");
     MetadataDelta delta;
     auto sequences = r.u32();
@@ -372,7 +553,7 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
 
     if (v1) {
         // DLT1 is retained only for replaying metadata journals written by
-        // legacy nodes. New network mutations are always DLT2.
+        // legacy nodes. New network mutations are always DLT3.
         auto garbage = r.u32();
         if (garbage > 10000000)
             throw DecodeError("too much metadata delta garbage");
@@ -408,6 +589,28 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
             if (value.retired_at_ns < 0 || !upsert_ids.insert(value.id).second)
                 throw DecodeError("bad metadata delta garbage upsert");
             delta.upsert_garbage.push_back(value);
+        }
+    }
+    if (v3 || v4) {
+        const auto count = r.u32();
+        if (count > 65536)
+            throw DecodeError("too many metadata delta node status records");
+        for (uint32_t i = 0; i < count; ++i) {
+            NodeId node{r.fixed<16>()};
+            if (!delta.upsert_node_status.emplace(node, decode_node_status(r)).second)
+                throw DecodeError("duplicate metadata delta node status");
+        }
+    }
+    if (v4) {
+        const auto count = r.u32();
+        if (count > 65536)
+            throw DecodeError("too many metadata delta identity resets");
+        for (uint32_t i = 0; i < count; ++i) {
+            auto key = r.string(8192);
+            auto reset = decode_identity_reset(r);
+            if (key != identity_reset_key(reset.host, reset.port) ||
+                !delta.upsert_identity_resets.emplace(std::move(key), std::move(reset)).second)
+                throw DecodeError("bad metadata delta identity reset key");
         }
     }
     r.finish();
@@ -492,6 +695,28 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
         ++ai;
     }
 
+    for (const auto& [node, status] : after.node_status) {
+        auto it = before.node_status.find(node);
+        if (it == before.node_status.end() || it->second != status)
+            delta.upsert_node_status.emplace(node, status);
+    }
+    // Once a snapshot has crossed into SM9, every delta successor must remain
+    // SM9. An unchanged witness makes the wire version explicit without adding
+    // another format flag to MetadataDelta.
+    if (!after.node_status.empty() && delta.upsert_node_status.empty())
+        delta.upsert_node_status.emplace(*after.node_status.begin());
+
+    for (const auto& [key, reset] : after.identity_resets) {
+        auto it = before.identity_resets.find(key);
+        if (it == before.identity_resets.end() || it->second != reset)
+            delta.upsert_identity_resets.emplace(key, reset);
+    }
+    for (const auto& [key, _] : before.identity_resets)
+        if (!after.identity_resets.contains(key))
+            return {}; // reset tombstones are monotonic; never erase via a delta
+    if (!after.identity_resets.empty() && delta.upsert_identity_resets.empty())
+        delta.upsert_identity_resets.emplace(*after.identity_resets.begin());
+
     return delta;
 }
 
@@ -532,6 +757,13 @@ void apply_metadata_delta_in_place(MetadataSnapshot& out, const MetadataDelta& d
             out.garbage.push_back(garbage);
         else
             *it = garbage;
+    }
+    for (const auto& [node, status] : delta.upsert_node_status)
+        out.node_status[node] = status;
+    for (const auto& [key, reset] : delta.upsert_identity_resets) {
+        auto found = out.identity_resets.find(key);
+        if (found == out.identity_resets.end() || found->second.epoch < reset.epoch)
+            out.identity_resets[key] = reset;
     }
     auto root = out.entries.find("/");
     if (root == out.entries.end() || root->second.type != EntryType::directory)
@@ -931,8 +1163,7 @@ void MetadataReplica::load_journal() {
                 auto replayed = decode_snapshot(cur_.payload);
                 auto delta = decode_metadata_delta(body);
                 apply_metadata_delta_in_place(replayed, delta);
-                record.payload = metadata_delta_v1(body) ? encode_snapshot_v7(replayed)
-                                                         : encode_snapshot(replayed);
+                record.payload = encode_snapshot_for_delta(body, replayed);
                 if (!valid_metadata_record(record))
                     throw std::runtime_error("delta CAS hash invalid");
                 cur_ = std::move(record);
@@ -1047,8 +1278,7 @@ bool MetadataReplica::cas_delta(uint64_t generation, const Hash256& hash,
     MetadataRecord next;
     next.generation = generation + 1;
     next.previous = hash;
-    next.payload = metadata_delta_v1(encoded_delta) ? encode_snapshot_v7(after)
-                                                     : encode_snapshot(after);
+    next.payload = encode_snapshot_for_delta(encoded_delta, after);
     next.hash = metadata_hash(next.generation, next.previous, next.payload);
     append_journal(JOURNAL_PREPARE_DELTA, next, encoded_delta);
     cur_ = next;
@@ -1080,8 +1310,7 @@ bool MetadataReplica::install_committed_delta(uint64_t generation, const Hash256
     MetadataRecord next;
     next.generation = generation + 1;
     next.previous = hash;
-    next.payload = metadata_delta_v1(encoded_delta) ? encode_snapshot_v7(after)
-                                                     : encode_snapshot(after);
+    next.payload = encode_snapshot_for_delta(encoded_delta, after);
     next.hash = metadata_hash(next.generation, next.previous, next.payload);
     if (next.generation != committed.generation || next.previous != committed.previous ||
         next.hash != committed.hash || next.payload != committed.payload)

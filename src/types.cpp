@@ -47,6 +47,28 @@ std::string to_string(const ObjectId& id) {
     return hex(id.bytes);
 }
 
+
+std::string endpoint_identity_key(std::string_view host, uint16_t port) {
+    // Brackets keep IPv6 endpoints unambiguous while preserving the familiar
+    // host:port representation used in diagnostics and management responses.
+    return "[" + std::string(host) + "]:" + std::to_string(port);
+}
+
+std::string identity_reset_key(std::string_view host, uint16_t port) {
+    if (port)
+        return endpoint_identity_key(host, port);
+    return "[" + std::string(host) + "]:*";
+}
+
+bool identity_reset_matches_endpoint(const IdentityAssociationReset& reset, std::string_view host,
+                                     uint16_t port) {
+    return reset.host == host && (!reset.port || reset.port == port);
+}
+
+bool identity_reset_matches_node(const IdentityAssociationReset& reset, const NodeId& node) {
+    return reset.stale_node_id == NodeId{} || reset.stale_node_id == node;
+}
+
 uint64_t unix_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())

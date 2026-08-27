@@ -320,15 +320,17 @@ void StoragePool::reconfigure(const std::vector<StorageBackendConfig>& configs) 
 }
 
 void StoragePool::refresh() {
+    size_t online = 0;
     for (const auto& backend : snapshot()) {
         bool configured = false;
         {
             std::lock_guard lock(backend->mutex);
             configured = backend->configured;
         }
-        if (configured)
-            (void)activate(backend);
+        if (configured && activate(backend))
+            ++online;
     }
+    online_backends_cached_.store(online, std::memory_order_relaxed);
 }
 
 std::vector<std::shared_ptr<StoragePool::Backend>> StoragePool::ranked(const ObjectId& id) const {
@@ -934,12 +936,6 @@ uint64_t StoragePool::limit() const {
 }
 
 size_t StoragePool::online_backends() const {
-    size_t count = 0;
-    for (const auto& backend : snapshot()) {
-        std::lock_guard lock(backend->mutex);
-        if (backend->online && backend->store)
-            ++count;
-    }
-    return count;
+    return online_backends_cached_.load(std::memory_order_relaxed);
 }
 } // namespace macha

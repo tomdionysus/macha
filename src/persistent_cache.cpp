@@ -65,6 +65,7 @@ void PersistentBlockCache::open_locked() {
     store_.reset();
     lru_.clear();
     lru_index_.clear();
+    block_count_.store(0, std::memory_order_relaxed);
     if (config_.path.empty() || !config_.max_blocks)
         return;
     try {
@@ -76,6 +77,7 @@ void PersistentBlockCache::open_locked() {
         store_.reset();
         lru_.clear();
         lru_index_.clear();
+        block_count_.store(0, std::memory_order_relaxed);
         Log::warn("persistent cache disabled: " + std::string(error.what()));
     }
 }
@@ -95,6 +97,7 @@ void PersistentBlockCache::reconfigure(CacheConfig config) {
             store_.reset();
             lru_.clear();
             lru_index_.clear();
+            block_count_.store(0, std::memory_order_relaxed);
             return;
         }
         if (reopen || !store_)
@@ -124,6 +127,7 @@ void PersistentBlockCache::rebuild_lru_locked() {
         lru_.push_back(id);
         lru_index_[id] = std::prev(lru_.end());
     }
+    block_count_.store(lru_.size(), std::memory_order_relaxed);
 }
 
 void PersistentBlockCache::mark_used(const std::shared_ptr<LocalStore>& store,
@@ -152,6 +156,7 @@ void PersistentBlockCache::trim_to_limit(const std::shared_ptr<LocalStore>& stor
             victim = lru_.front();
             lru_index_.erase(*victim);
             lru_.pop_front();
+            block_count_.store(lru_.size(), std::memory_order_relaxed);
         }
 
         // LocalStore serialises physical mutations internally. Cache mode is
@@ -200,6 +205,7 @@ bool PersistentBlockCache::put(const ObjectId& id, std::span<const uint8_t> data
                 victim = lru_.front();
                 lru_index_.erase(*victim);
                 lru_.pop_front();
+                block_count_.store(lru_.size(), std::memory_order_relaxed);
             }
             (void)store->remove(*victim);
         }
@@ -219,6 +225,7 @@ bool PersistentBlockCache::put(const ObjectId& id, std::span<const uint8_t> data
                 lru_.push_back(id);
                 lru_index_[id] = std::prev(lru_.end());
             }
+            block_count_.store(lru_.size(), std::memory_order_relaxed);
         }
         return true;
     } catch (const std::exception& error) {
@@ -260,6 +267,7 @@ std::optional<Bytes> PersistentBlockCache::get(const ObjectId& id) {
                 if (found != lru_index_.end()) {
                     lru_.erase(found->second);
                     lru_index_.erase(found);
+                    block_count_.store(lru_.size(), std::memory_order_relaxed);
                 }
             }
         }
@@ -294,6 +302,7 @@ bool PersistentBlockCache::remove(const ObjectId& id) {
             if (found != lru_index_.end()) {
                 lru_.erase(found->second);
                 lru_index_.erase(found);
+                block_count_.store(lru_.size(), std::memory_order_relaxed);
             }
         }
     }
@@ -301,8 +310,7 @@ bool PersistentBlockCache::remove(const ObjectId& id) {
 }
 
 size_t PersistentBlockCache::blocks() const {
-    std::lock_guard lock(state_mutex_);
-    return lru_.size();
+    return block_count_.load(std::memory_order_relaxed);
 }
 
 std::filesystem::path PersistentBlockCache::metadata_path(const CacheConfig& config) {
