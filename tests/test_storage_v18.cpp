@@ -223,6 +223,7 @@ MACHA_TEST("storage_v18", test_metadata_control_store_is_independent_of_data_quo
     config.metadata_store.limit = 8ULL * 1024 * 1024;
     std::filesystem::create_directories(config.storage_backends.front().path);
     fixture.prepare();
+    fixture.start();
 
     // Exhaust ordinary DATA admission.
     size_t stored = 0;
@@ -318,14 +319,15 @@ class StorageClusterNode {
         if (!config_.metadata_store.path.empty())
             std::filesystem::create_directories(config_.metadata_store.path);
         node_ = std::make_unique<NodeRuntime>(config_, keys_);
-        store_ = std::make_unique<DistributedStore>(*node_);
-        metadata_ = std::make_unique<MetadataManager>(*node_);
-        catalogue_ = std::make_unique<CatalogueManager>(*node_, *store_, *metadata_);
     }
     void start() {
         if (!node_) prepare();
         node_->start();
         started_ = true;
+        REQUIRE(node_->wait_local_state_ready(10s));
+        store_ = std::make_unique<DistributedStore>(*node_);
+        metadata_ = std::make_unique<MetadataManager>(*node_);
+        catalogue_ = std::make_unique<CatalogueManager>(*node_, *store_, *metadata_);
     }
     NodeRuntime& node() { REQUIRE(node_); return *node_; }
     DistributedStore& store() { REQUIRE(store_); return *store_; }
@@ -415,7 +417,13 @@ MACHA_TEST("storage_v18", test_unversioned_nonempty_data_backend_is_refused) {
     }
 
     NodeRuntime node(config, cluster.keys());
+    node.start();
+    REQUIRE(node.wait_local_state_ready(10s));
+    CHECK(node.readiness().control_plane_online);
+    CHECK(node.readiness().data_storage_ready);
     CHECK(node.local_store().online_backends() == 0);
+    CHECK(node.local_store().limit() == 0);
+    node.stop();
 }
 
 MACHA_TEST("storage_v18", test_r1_logical_capacity_is_aggregate_not_smallest_node) {

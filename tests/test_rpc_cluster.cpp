@@ -1089,6 +1089,7 @@ MACHA_TEST("rpc_cluster", test_bootstrap_joiner_requires_complete_checkpoint_sur
     }
     REQUIRE(selected_self);
     node.membership().observe(phantom, true);
+    REQUIRE(node.wait_local_state_ready(10s));
 
     MetadataManager metadata(node);
     bool rejected = false;
@@ -1161,6 +1162,11 @@ MACHA_TEST("rpc_cluster", test_established_metadata_floor_ignores_misconfigured_
         return s1.node().membership().active().size() >= 2 &&
                s2.node().membership().active().size() >= 2;
     }));
+    // Reachability deliberately precedes local metadata recovery. This test is
+    // about an already-established write floor, so make both metadata planes
+    // ready before creating that established history.
+    (void)s1.filesystem();
+    (void)s2.filesystem();
     s1.filesystem().mkdir("/established", 0755, getuid(), getgid());
     REQUIRE(wait_until([&] {
         try { return s2.filesystem().getattr("/established").type == EntryType::directory; }
@@ -2319,6 +2325,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_three_node_cluster) {
         // A joining owner pulls its assigned live objects automatically. This
         // no longer depends on an old owner being manually prodded to scan/push.
         REQUIRE(wait_until([&] {
+            if (!s4.node().readiness().data_storage_ready)
+                return false;
             return s4.node().local_store().has(entry.extents.front().id);
         }));
 

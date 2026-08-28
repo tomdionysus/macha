@@ -7,6 +7,7 @@
 namespace macha {
 
 void Service::reload_config() {
+    wait_services_ready();
     if (!node_.config().config_file) {
         Log::warn("configuration reload requested but this node was not started with --config");
         return;
@@ -33,13 +34,13 @@ void Service::reload_config() {
     Log::set_logger(std::make_shared<ConsoleLogger>(updated.log_level));
     configure_ffmpeg_logging(updated.ffmpeg_log_level);
     node_.reconfigure_local(updated);
-    scanner_.reconfigure(updated.catalogue.scanner);
-    hydration_.reconfigure(updated.hydration, updated.read_ahead_extents);
-    ingest_.reconfigure(updated.ingest);
-    torrents_.reconfigure(updated.torrent);
+    scanner_->reconfigure(updated.catalogue.scanner);
+    hydration_->reconfigure(updated.hydration, updated.read_ahead_extents);
+    ingest_->reconfigure(updated.ingest);
+    torrents_->reconfigure(updated.torrent);
     if (streaming_restart_required)
         Log::warn("streaming enable/buffer/probe/path changes require restart; live limits were reloaded");
-    streaming_.reconfigure(updated.streaming);
+    streaming_->reconfigure(updated.streaming);
     Log::info("reloaded storage backends, persistent cache, catalogue scanner, ingest, torrent, hydration and streaming limits");
 }
 

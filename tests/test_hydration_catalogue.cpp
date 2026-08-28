@@ -343,6 +343,11 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
     REQUIRE(wait_until([&] {
         return n1.membership().active().size() >= 2 && n2.membership().active().size() >= 2;
     }));
+    // Membership reachability is intentionally orthogonal to local backend
+    // readiness. This test exercises cache hydration, not early lifecycle, so
+    // wait for the DATA/cache planes before publishing test objects.
+    REQUIRE(n1.wait_local_state_ready(10s));
+    REQUIRE(n2.wait_local_state_ready(10s));
 
     DistributedStore source(n1);
     DistributedStore target(n2);
@@ -1620,10 +1625,11 @@ MACHA_TEST("hydration_catalogue", test_catalogue_cache_ignores_unrelated_metadat
     config.metadata_min_write_replicas = 1;
 
     NodeRuntime node(config, keys);
+    node.start();
+    REQUIRE(node.wait_local_state_ready(10s));
     DistributedStore store(node);
     MetadataManager metadata(node);
     CatalogueManager catalogue(node, store, metadata);
-    node.start();
 
     CatalogueItem item;
     item.id = "test:movie:1";
@@ -2120,6 +2126,8 @@ MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_int
         REQUIRE(out.good());
     }
 
+    fixture.start();
+
     CatalogueHintQueue hints(state_path / "catalogue-hints");
     IngestConfig ingest_config;
     ingest_config.enabled = true;
@@ -2263,19 +2271,16 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     c1.metadata_cache = c2.metadata_cache = 30ms;
 
     NodeRuntime n1(c1, keys);
-    DistributedStore store1(n1);
-    MetadataManager metadata1(n1);
-    CatalogueManager catalogue1(n1, store1, metadata1);
-
     NodeRuntime n2(c2, keys);
-    DistributedStore store2(n2);
-    MetadataManager metadata2(n2);
-    CatalogueManager catalogue2(n2, store2, metadata2);
 
     // Form the initial namespace on the bootstrap-less founder before starting
     // the joiner. A configured joiner is intentionally forbidden from inventing
     // genesis while its bootstrap peer has not yet entered active membership.
     n1.start();
+    REQUIRE(n1.wait_local_state_ready(10s));
+    DistributedStore store1(n1);
+    MetadataManager metadata1(n1);
+    CatalogueManager catalogue1(n1, store1, metadata1);
 
     CatalogueItem first;
     first.id = "test:movie:remote-first";
@@ -2284,6 +2289,10 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     first = catalogue1.upsert(first);
 
     n2.start();
+    REQUIRE(n2.wait_local_state_ready(10s));
+    DistributedStore store2(n2);
+    MetadataManager metadata2(n2);
+    CatalogueManager catalogue2(n2, store2, metadata2);
 
     // Cold-load node two from node one's committed catalogue. There is no Service
     // here, so no catalogue maintenance thread can refresh it behind the test.
@@ -2399,16 +2408,18 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
 
     NodeRuntime n1(c1, keys);
     NodeRuntime n2(c2, keys);
-    MetadataManager metadata1(n1);
-    MetadataManager metadata2(n2);
 
     // Establish genesis on the founder first. The joiner may legitimately reject
     // metadata reads with "waiting for bootstrap peer" during the brief interval
     // between start() and membership convergence, so retry its initial read rather
     // than turning that expected bootstrap state into an unhandled test failure.
     n1.start();
+    REQUIRE(n1.wait_local_state_ready(10s));
+    MetadataManager metadata1(n1);
     const auto initial1 = metadata1.snapshot_view();
     n2.start();
+    REQUIRE(n2.wait_local_state_ready(10s));
+    MetadataManager metadata2(n2);
 
     std::optional<MetadataSnapshotView> initial2;
     REQUIRE(wait_until([&] {
@@ -2669,10 +2680,11 @@ MACHA_TEST("hydration_catalogue", test_catalogue_root_ready_without_local_artwor
     config.metadata_min_write_replicas = 1;
 
     NodeRuntime node(config, keys);
+    node.start();
+    REQUIRE(node.wait_local_state_ready(10s));
     DistributedStore store(node);
     MetadataManager metadata(node);
     CatalogueManager catalogue(node, store, metadata);
-    node.start();
 
     CatalogueItem item;
     item.id = "test:movie:artwork-missing";
@@ -2713,10 +2725,11 @@ MACHA_FAST_TEST("hydration_catalogue", test_macos_unicode_namespace_aliases) {
     config.metadata_min_write_replicas = 1;
 
     NodeRuntime node(config, keys);
+    node.start();
+    REQUIRE(node.wait_local_state_ready(10s));
     DistributedStore store(node);
     MetadataManager metadata(node);
     FileSystem filesystem(node, store, metadata);
-    node.start();
 
     filesystem.mkdir("/Music", 0755, getuid(), getgid());
 
@@ -2774,10 +2787,11 @@ MACHA_TEST("hydration_catalogue", test_media_index_cache_survives_namespace_chur
     config.metadata_min_write_replicas = 1;
 
     NodeRuntime node(config, keys);
+    node.start();
+    REQUIRE(node.wait_local_state_ready(10s));
     DistributedStore store(node);
     MetadataManager metadata(node);
     FileSystem filesystem(node, store, metadata);
-    node.start();
 
     filesystem.mkdir("/media", 0755, getuid(), getgid());
     filesystem.create_file("/media/a.mkv", 0644, getuid(), getgid());

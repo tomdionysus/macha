@@ -1788,6 +1788,8 @@ MACHA_TEST("storage_metadata", test_metadata_identity_rpc) {
     NodeRuntime n2(c2, keys);
     n1.start();
     n2.start();
+    REQUIRE(n1.wait_local_state_ready(10s));
+    REQUIRE(n2.wait_local_state_ready(10s));
     REQUIRE(wait_until([&] { return n1.membership().active().size() >= 2; }, 5s));
 
     auto peers = n1.membership().active();
@@ -1830,6 +1832,11 @@ MACHA_TEST("storage_metadata", test_repair_step_is_bounded_and_yields) {
         return s1.node().membership().active().size() >= 2 &&
                s2.node().membership().active().size() >= 2;
     }));
+    // Cluster reachability deliberately precedes DATA readiness now. Repair is
+    // a storage-plane operation, so this test must wait for that plane rather
+    // than treating membership activity as an implicit backend-ready signal.
+    REQUIRE(s1.node().wait_local_state_ready(std::chrono::seconds{10}));
+    REQUIRE(s2.node().wait_local_state_ready(std::chrono::seconds{10}));
 
     auto bytes = pattern(512 * 1024);
     auto id = object_id(bytes);

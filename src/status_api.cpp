@@ -181,8 +181,7 @@ std::optional<NodeId> parse_node_id(std::string_view text) {
 
 } // namespace
 
-ClusterStatusService::ClusterStatusService(NodeRuntime& node, MetadataManager& metadata)
-    : node_(node), metadata_(metadata) {}
+ClusterStatusService::ClusterStatusService(NodeRuntime& node) : node_(node) {}
 
 ClusterStatusService::~ClusterStatusService() {
     stop();
@@ -244,15 +243,18 @@ void ClusterStatusService::persistence_loop(std::stop_token stop) {
 }
 
 HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& only) {
+    auto* metadata_manager = metadata_.load(std::memory_order_acquire);
     std::shared_ptr<const MetadataSnapshot> metadata;
     uint64_t metadata_generation = 0;
-    try {
-        if (auto available = metadata_.available_snapshot_view()) {
-            metadata = available->snapshot;
-            metadata_generation = available->generation;
+    if (metadata_manager) {
+        try {
+            if (auto available = metadata_manager->available_snapshot_view()) {
+                metadata = available->snapshot;
+                metadata_generation = available->generation;
+            }
+        } catch (const std::exception& error) {
+            Log::debug("status metadata unavailable: " + std::string(error.what()));
         }
-    } catch (const std::exception& error) {
-        Log::debug("status metadata unavailable: " + std::string(error.what()));
     }
 
     // Current cluster membership is independent of telemetry. These are small,
@@ -344,7 +346,7 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         return http_json(200, nodes.front().dump());
     }
 
-    const auto published_metadata = metadata_.cluster_status();
+    const auto published_metadata = metadata_manager ? metadata_manager->cluster_status() : MetadataClusterStatus{};
     const size_t metadata_replicas = known.empty() ? published_metadata.replicas : known.size();
     const size_t active_metadata_replicas = online_nodes;
     const size_t metadata_min_write_replicas = node_.config().metadata_min_write_replicas;
@@ -368,9 +370,18 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     const bool metadata_write_available =
         metadata_availability == MetadataAvailability::writable;
 
+    const auto readiness = node_.readiness();
     std::string health = "healthy";
     Json::Array conditions;
-    if (!metadata_read_available) {
+    if (readiness.failed) {
+        health = "critical";
+        conditions.emplace_back("local startup recovery failed");
+    } else if (!readiness.local_state_ready || !metadata_manager) {
+        health = "recovering";
+        conditions.emplace_back(readiness.local_state_ready
+                                    ? "local services are starting"
+                                    : "local state is recovering");
+    } else if (!metadata_read_available) {
         health = "critical";
         conditions.emplace_back("metadata unavailable");
     } else if (!metadata_write_available) {
@@ -416,8 +427,25 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     cluster["cache_known"] = bytes_pair(known_cache_used, known_cache_capacity);
     cluster["cache_online"] = bytes_pair(online_cache_used, online_cache_capacity);
 
+    Json::Object startup;
+    startup["phase"] = readiness.failed ? "failed" :
+                           (readiness.local_state_ready && metadata_manager ? "ready" :
+                            (readiness.control_plane_online ? "recovering" : "starting"));
+    startup["control_plane"] = readiness.control_plane_online ? "ready" : "starting";
+    startup["api"] = "ready";
+    startup["data_storage"] = readiness.data_storage_ready ? "ready" : "recovering";
+    startup["control_storage"] = readiness.control_storage_ready ? "ready" : "recovering";
+    startup["cache"] = readiness.cache_ready ? "ready" : "recovering";
+    startup["retention"] = readiness.retention_ready ? "ready" : "recovering";
+    startup["metadata"] = readiness.metadata_ready ? "ready" : "recovering";
+    startup["services"] = metadata_manager ? "ready" : "recovering";
+    startup["started_at_unix_ms"] = readiness.started_unix_ms;
+    startup["ready_at_unix_ms"] = readiness.ready_unix_ms ? Json(readiness.ready_unix_ms) : Json(nullptr);
+    startup["error"] = readiness.error.empty() ? Json(nullptr) : Json(readiness.error);
+
     Json::Object root;
     root["cluster"] = std::move(cluster);
+    root["startup"] = std::move(startup);
     root["nodes"] = std::move(nodes);
     root["connectivity"] = public_connectivity_json(node_.public_connectivity_status());
     root["generated_at_unix_ms"] = unix_ms();

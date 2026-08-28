@@ -135,24 +135,12 @@ NodeId load_v18_node_id(const std::filesystem::path& state) {
 }
 } // namespace
 
-NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
+NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook startup_stage_hook)
     : cfg_(normalize_config(std::move(config))), keys_(keys), state_lock_(cfg_.state_path),
-      id_(load_v18_node_id(cfg_.state_path)),
-      durability_epoch_(random_node_id()),
-      local_(cfg_.state_path, id_, cfg_.storage_backends, keys_.storage,
-             std::chrono::milliseconds(500), cfg_.storage_packing),
-      control_(cfg_.metadata_store.path,
-               LocalStoreOptions{cfg_.metadata_store.limit, 0,
-                                 cfg_.metadata_store.packing.threshold,
-                                 cfg_.metadata_store.packing.target_size},
-               keys_.storage),
-      cache_(cfg_.cache, keys_.storage),
-      retention_(cfg_.state_path, keys_.storage),
-      meta_(cfg_.state_path, keys_.storage, cache_.metadata()),
-      members_(self_info(cfg_, id_, local_.used(), local_.limit(), meta_.committed().generation),
-               cfg_.dead_after, cfg_.state_path / "membership" / "known-nodes.bin"),
-      public_connectivity_(cfg_, id_,
-                           Endpoint{members_.self().host, members_.self().port}),
+      id_(load_v18_node_id(cfg_.state_path)), durability_epoch_(random_node_id()),
+      members_(self_info(cfg_, id_, 0, 0, 0), cfg_.dead_after,
+               cfg_.state_path / "membership" / "known-nodes.bin"),
+      public_connectivity_(cfg_, id_, Endpoint{members_.self().host, members_.self().port}),
       telemetry_(id_, cfg_.state_path / "telemetry" / "last-known.bin"),
       client_(
           keys_, [this] { return members_.self(); },
@@ -171,7 +159,9 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
           cfg_.connect_timeout, cfg_.heartbeat, cfg_.dead_after, cfg_.max_frame_size),
       server_(
           cfg_.listen_host, cfg_.port, keys_, members_.self(),
-          [this](const NodeInfo& peer, FrameType frame_type, const RpcMessage& request) { return handle(peer, frame_type, request); },
+          [this](const NodeInfo& peer, FrameType frame_type, const RpcMessage& request) {
+              return handle(peer, frame_type, request);
+          },
           [this](const NodeInfo& peer) {
               members_.observe(peer, true);
               auto current = remote_metadata_generation_.load();
@@ -180,95 +170,237 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
                          current, peer.metadata_generation)) {
               }
           },
-          cfg_.max_frame_size) {
+          cfg_.max_frame_size),
+      startup_stage_hook_(std::move(startup_stage_hook)), startup_unix_ms_(unix_ms()) {
     server_.attach_client(client_);
-
-    // Resolve the effective public endpoint before any peer exchange. UPnP and
-    // the optional AWS external-IP fallback only change how this node is
-    // advertised; the local listener remains cfg_.listen_host:cfg_.port.
-    (void)refresh_public_connectivity(false);
-
-    // Identity-reset tombstones must be active before the first peer exchange.
-    // This prevents stale membership from being reintroduced during startup.
-    try {
-        const auto committed_snapshot = decode_snapshot(meta_.committed().payload);
-        for (const auto& [_, reset] : committed_snapshot.identity_resets)
-            apply_identity_reset(reset);
-    } catch (const std::exception& error) {
-        Log::debug("cannot preload identity reset tombstones: " + std::string(error.what()));
-    }
-
-    // The persistent metadata cache is a read/recovery aid only. It must never
-    // become metadata authority merely because it is newer than the primary
-    // state directory: only a durable acceptance certificate may make a 0.19+
-    // commit authoritative. MetadataReplica may use this cache as a quarantined
-    // recovery seed, but recovery remains explicitly unaccepted until peers
-    // supply accepted-head evidence.
-    cache_.remember_metadata(meta_.committed());
-    const auto storage_used = local_.used();
-    const auto storage_capacity = local_.limit();
-    members_.storage(storage_used, storage_capacity);
-    members_.metadata_generation(meta_.committed().generation);
-    telemetry_storage_used_.store(storage_used, std::memory_order_relaxed);
-    telemetry_storage_capacity_.store(storage_capacity, std::memory_order_relaxed);
-    telemetry_metadata_generation_.store(meta_.committed().generation, std::memory_order_relaxed);
-    refresh_telemetry();
 }
 
 NodeRuntime::~NodeRuntime() {
     stop();
 }
 
+void NodeRuntime::mark_ready(ReadyBit bit) {
+    ready_bits_.fetch_or(static_cast<uint32_t>(bit), std::memory_order_release);
+    if (all_local_state_ready() && !ready_unix_ms_.load(std::memory_order_relaxed))
+        ready_unix_ms_.store(unix_ms(), std::memory_order_release);
+    readiness_cv_.notify_all();
+}
+
+void NodeRuntime::mark_recovery_failed(std::string error) {
+    {
+        std::lock_guard lock(readiness_mutex_);
+        if (recovery_error_.empty())
+            recovery_error_ = std::move(error);
+    }
+    ready_bits_.fetch_or(static_cast<uint32_t>(ready_failed), std::memory_order_release);
+    readiness_cv_.notify_all();
+}
+
+bool NodeRuntime::all_local_state_ready() const noexcept {
+    constexpr uint32_t required = ready_data_storage | ready_control_storage | ready_cache |
+                                  ready_retention | ready_metadata;
+    const auto bits = ready_bits_.load(std::memory_order_acquire);
+    return (bits & required) == required && !(bits & ready_failed);
+}
+
+NodeReadiness NodeRuntime::readiness() const {
+    const auto bits = ready_bits_.load(std::memory_order_acquire);
+    NodeReadiness out;
+    out.control_plane_online = (bits & ready_control_plane) != 0;
+    out.data_storage_ready = (bits & ready_data_storage) != 0;
+    out.control_storage_ready = (bits & ready_control_storage) != 0;
+    out.cache_ready = (bits & ready_cache) != 0;
+    out.retention_ready = (bits & ready_retention) != 0;
+    out.metadata_ready = (bits & ready_metadata) != 0;
+    out.local_state_ready = all_local_state_ready();
+    out.failed = (bits & ready_failed) != 0;
+    out.started_unix_ms = startup_unix_ms_;
+    out.ready_unix_ms = ready_unix_ms_.load(std::memory_order_acquire);
+    {
+        std::lock_guard lock(readiness_mutex_);
+        out.error = recovery_error_;
+    }
+    return out;
+}
+
+bool NodeRuntime::wait_local_state_ready(std::chrono::milliseconds timeout) {
+    if (all_local_state_ready())
+        return true;
+    std::unique_lock lock(readiness_mutex_);
+    readiness_cv_.wait_for(lock, timeout, [this] {
+        const auto bits = ready_bits_.load(std::memory_order_acquire);
+        return all_local_state_ready() || (bits & ready_failed) != 0 || !started_.load();
+    });
+    return all_local_state_ready();
+}
+
+StoragePool& NodeRuntime::local_store() {
+    if (!ready(ready_data_storage) || !local_)
+        throw std::runtime_error("data storage is still recovering");
+    return *local_;
+}
+const StoragePool& NodeRuntime::local_store() const {
+    if (!ready(ready_data_storage) || !local_)
+        throw std::runtime_error("data storage is still recovering");
+    return *local_;
+}
+LocalStore& NodeRuntime::control_store() {
+    if (!ready(ready_control_storage) || !control_)
+        throw std::runtime_error("control storage is still recovering");
+    return *control_;
+}
+const LocalStore& NodeRuntime::control_store() const {
+    if (!ready(ready_control_storage) || !control_)
+        throw std::runtime_error("control storage is still recovering");
+    return *control_;
+}
+PersistentBlockCache& NodeRuntime::block_cache() {
+    if (!ready(ready_cache) || !cache_)
+        throw std::runtime_error("persistent cache is still recovering");
+    return *cache_;
+}
+RetentionStore& NodeRuntime::retention_store() {
+    if (!ready(ready_retention) || !retention_)
+        throw std::runtime_error("retention state is still recovering");
+    return *retention_;
+}
+const RetentionStore& NodeRuntime::retention_store() const {
+    if (!ready(ready_retention) || !retention_)
+        throw std::runtime_error("retention state is still recovering");
+    return *retention_;
+}
+MetadataReplica& NodeRuntime::metadata_replica() {
+    if (!ready(ready_metadata) || !meta_)
+        throw std::runtime_error("metadata replica is still recovering");
+    return *meta_;
+}
+const MetadataReplica& NodeRuntime::metadata_replica() const {
+    if (!ready(ready_metadata) || !meta_)
+        throw std::runtime_error("metadata replica is still recovering");
+    return *meta_;
+}
+
+void NodeRuntime::recover_storage(std::stop_token stop) {
+    try {
+        if (startup_stage_hook_)
+            startup_stage_hook_("data-storage");
+        if (stop.stop_requested())
+            return;
+        auto local = std::make_unique<StoragePool>(
+            cfg_.state_path, id_, cfg_.storage_backends, keys_.storage,
+            std::chrono::milliseconds(500), cfg_.storage_packing);
+        if (stop.stop_requested())
+            return;
+        const auto used = local->used();
+        const auto capacity = local->limit();
+        local_ = std::move(local);
+        members_.storage(used, capacity);
+        server_.set_local(members_.self());
+        telemetry_storage_used_.store(used, std::memory_order_relaxed);
+        telemetry_storage_capacity_.store(capacity, std::memory_order_relaxed);
+        mark_ready(ready_data_storage);
+        Log::info("node data storage ready used=" + std::to_string(used) +
+                  " capacity=" + std::to_string(capacity));
+    } catch (const std::exception& error) {
+        Log::error("node data storage recovery failed: " + std::string(error.what()));
+        mark_recovery_failed("data storage: " + std::string(error.what()));
+    }
+}
+
+void NodeRuntime::recover_state(std::stop_token stop) {
+    try {
+        if (startup_stage_hook_)
+            startup_stage_hook_("control-storage");
+        if (stop.stop_requested())
+            return;
+        control_ = std::make_unique<LocalStore>(
+            cfg_.metadata_store.path,
+            LocalStoreOptions{cfg_.metadata_store.limit, 0,
+                              cfg_.metadata_store.packing.threshold,
+                              cfg_.metadata_store.packing.target_size},
+            keys_.storage);
+        mark_ready(ready_control_storage);
+
+        if (startup_stage_hook_)
+            startup_stage_hook_("cache");
+        if (stop.stop_requested())
+            return;
+        cache_ = std::make_unique<PersistentBlockCache>(cfg_.cache, keys_.storage);
+        mark_ready(ready_cache);
+
+        if (startup_stage_hook_)
+            startup_stage_hook_("retention");
+        if (stop.stop_requested())
+            return;
+        retention_ = std::make_unique<RetentionStore>(cfg_.state_path, keys_.storage);
+        mark_ready(ready_retention);
+
+        if (startup_stage_hook_)
+            startup_stage_hook_("metadata");
+        if (stop.stop_requested())
+            return;
+        meta_ = std::make_unique<MetadataReplica>(cfg_.state_path, keys_.storage, cache_->metadata());
+
+        // Identity-reset tombstones must be active before metadata exchange.
+        try {
+            const auto committed_snapshot = decode_snapshot(meta_->committed().payload);
+            for (const auto& [_, reset] : committed_snapshot.identity_resets)
+                apply_identity_reset(reset);
+        } catch (const std::exception& error) {
+            Log::debug("cannot preload identity reset tombstones: " + std::string(error.what()));
+        }
+
+        cache_->remember_metadata(meta_->committed());
+        const auto generation = meta_->committed().generation;
+        members_.metadata_generation(generation);
+        server_.set_local(members_.self());
+        telemetry_metadata_generation_.store(generation, std::memory_order_relaxed);
+        mark_ready(ready_metadata);
+        Log::info("node metadata ready generation=" + std::to_string(generation));
+    } catch (const std::exception& error) {
+        Log::error("node local state recovery failed: " + std::string(error.what()));
+        mark_recovery_failed("local state: " + std::string(error.what()));
+    }
+}
+
 void NodeRuntime::start() {
     if (started_.exchange(true))
         return;
-    local_writer_ = std::jthread([this](std::stop_token stop) { local_writer_loop(stop); });
-    server_.start();
-    if (cfg_.connectivity_check.enabled)
-        (void)public_connectivity_.probe(false);
-    telemetry_worker_ = std::jthread([this](std::stop_token stop) { telemetry_loop(stop); });
-    maintenance_ = std::jthread([this](std::stop_token stop) { loop(stop); });
-    Log::info("node " + to_string(id_).substr(0, 12) + " listening on " +
-              std::to_string(server_.bound_port()) + " domain=" + members_.self().failure_domain);
-}
 
-void NodeRuntime::stop() {
-    if (!started_.exchange(false)) {
-        Log::debug("shutdown: NodeRuntime::stop already stopped");
-        return;
-    }
-    Log::debug("shutdown: NodeRuntime::stop begin");
-    request_stop();
-    // Telemetry never waits on transport, so retire it before closing shared
-    // RPC state. This also proves shutdown cannot be held behind telemetry.
-    if (telemetry_worker_.joinable()) {
-        Log::debug("shutdown: telemetry joining");
-        telemetry_worker_.join();
-        Log::debug("shutdown: telemetry joined");
-    }
-    // Close transport before joining maintenance. A maintenance iteration may
-    // already be waiting on an RPC; closing the client/server first makes that
-    // wait fail promptly instead of holding shutdown behind network timeouts.
-    Log::debug("shutdown: RpcServer::stop calling");
-    server_.stop();
-    Log::debug("shutdown: RpcServer::stop returned");
-    Log::debug("shutdown: RpcClient::stop calling");
-    client_.stop();
-    Log::debug("shutdown: RpcClient::stop returned");
-    if (maintenance_.joinable()) {
-        Log::debug("shutdown: node maintenance joining");
-        maintenance_.join();
-        Log::debug("shutdown: node maintenance joined");
-    }
-    if (local_writer_.joinable()) {
-        Log::debug("shutdown: local writer joining");
-        local_writer_.join();
-        Log::debug("shutdown: local writer joined");
-    }
-    Log::debug("shutdown: NodeRuntime::stop complete");
+    if (startup_stage_hook_)
+        startup_stage_hook_("control-plane");
+
+    // Bring the control plane online before any potentially expensive local
+    // backend recovery. Peers can authenticate this node immediately and Status
+    // can distinguish reachability from readiness.
+    server_.start();
+    mark_ready(ready_control_plane);
+    Log::info("node " + to_string(id_).substr(0, 12) + " listening on " +
+              std::to_string(server_.bound_port()) + " domain=" + members_.self().failure_domain +
+              " state=recovering");
+
+    telemetry_worker_ = std::jthread([this](std::stop_token stop) { telemetry_loop(stop); });
+    local_writer_ = std::jthread([this](std::stop_token stop) { local_writer_loop(stop); });
+    maintenance_ = std::jthread([this](std::stop_token stop) { loop(stop); });
+    storage_recovery_ = std::jthread([this](std::stop_token stop) { recover_storage(stop); });
+    state_recovery_ = std::jthread([this](std::stop_token stop) { recover_state(stop); });
+    connectivity_worker_ = std::jthread([this](std::stop_token stop) {
+        if (stop.stop_requested())
+            return;
+        try {
+            (void)refresh_public_connectivity(false);
+            if (cfg_.connectivity_check.enabled && !stop.stop_requested())
+                (void)public_connectivity_.probe(false);
+        } catch (const std::exception& error) {
+            Log::debug("startup connectivity refresh unavailable: " + std::string(error.what()));
+        }
+    });
 }
 
 void NodeRuntime::request_stop() {
+    if (storage_recovery_.joinable()) storage_recovery_.request_stop();
+    if (state_recovery_.joinable()) state_recovery_.request_stop();
+    if (connectivity_worker_.joinable()) connectivity_worker_.request_stop();
     if (telemetry_worker_.joinable()) {
         telemetry_worker_.request_stop();
         telemetry_wait_cv_.notify_all();
@@ -283,6 +415,31 @@ void NodeRuntime::request_stop() {
         local_writer_.request_stop();
         local_copy_cv_.notify_all();
     }
+    readiness_cv_.notify_all();
+}
+
+void NodeRuntime::stop() {
+    if (!started_.exchange(false)) {
+        Log::debug("shutdown: NodeRuntime::stop already stopped");
+        return;
+    }
+    Log::debug("shutdown: NodeRuntime::stop begin");
+    request_stop();
+
+    // Close transport promptly; recovery never owns transport state.
+    Log::debug("shutdown: RpcServer::stop calling");
+    server_.stop();
+    Log::debug("shutdown: RpcServer::stop returned");
+    Log::debug("shutdown: RpcClient::stop calling");
+    client_.stop();
+    Log::debug("shutdown: RpcClient::stop returned");
+
+    for (auto* worker : {&connectivity_worker_, &storage_recovery_, &state_recovery_,
+                         &telemetry_worker_, &maintenance_, &local_writer_}) {
+        if (worker->joinable())
+            worker->join();
+    }
+    Log::debug("shutdown: NodeRuntime::stop complete");
 }
 
 std::chrono::milliseconds NodeRuntime::stall_notice_for(MessageType type) const {
@@ -373,13 +530,14 @@ void NodeRuntime::announce_metadata_generation(uint64_t generation) {
     // accepted locally.
     remote_metadata_epoch_.fetch_add(1, std::memory_order_acq_rel);
     members_.metadata_generation(generation);
+    server_.set_local(members_.self());
     Writer writer;
     writer.u64(generation);
     client_.broadcast({MessageType::metadata_notice, writer.take()});
 }
 
 bool NodeRuntime::store_metadata_commit(const MetadataHistoryEntry& entry) {
-    return meta_.import_history(entry);
+    return metadata_replica().import_history(entry);
 }
 
 bool NodeRuntime::accept_metadata_commit(const MetadataAcceptance& acceptance) {
@@ -390,7 +548,7 @@ bool NodeRuntime::accept_metadata_commit(const MetadataAcceptance& acceptance) {
     // reject the transition. MetadataReplica validates the certificate against
     // the commit and its parent policies.
     if (acceptance.required) {
-        auto record = meta_.historical(acceptance.hash);
+        auto record = metadata_replica().historical(acceptance.hash);
         if (!record)
             return false;
         const auto snapshot = decode_snapshot(record->payload);
@@ -398,17 +556,17 @@ bool NodeRuntime::accept_metadata_commit(const MetadataAcceptance& acceptance) {
             cfg_.metadata_min_write_replicas)
             return false;
     }
-    const auto heads_before = meta_.accepted_head_certificates();
-    const auto before = meta_.committed();
-    if (!meta_.accept_commit(acceptance))
+    const auto heads_before = metadata_replica().accepted_head_certificates();
+    const auto before = metadata_replica().committed();
+    if (!metadata_replica().accept_commit(acceptance))
         return false;
-    const auto heads_after = meta_.accepted_head_certificates();
-    const auto after = meta_.committed();
+    const auto heads_after = metadata_replica().accepted_head_certificates();
+    const auto after = metadata_replica().committed();
     members_.metadata_generation(std::max(after.generation, acceptance.generation));
     if (heads_after == heads_before)
         return true;
     if (after.hash != before.hash)
-        cache_.remember_metadata(after);
+        block_cache().remember_metadata(after);
     // A same-generation sibling may not change the materialised preferred head,
     // but peers still need an ordinary metadata wake-up so foreground cache
     // validation and background reconciliation notice the changed head set.
@@ -417,7 +575,7 @@ bool NodeRuntime::accept_metadata_commit(const MetadataAcceptance& acceptance) {
 }
 
 std::vector<MetadataAcceptance> NodeRuntime::metadata_heads() const {
-    return meta_.accepted_head_certificates();
+    return metadata_replica().accepted_head_certificates();
 }
 
 RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcMessage& request) {
@@ -464,14 +622,14 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             // Replica-presence RPCs are durability decisions, not directory
             // existence probes. Authenticate/decrypt/hash the object before
             // allowing repair or write-floor logic to count this replica.
-            writer.u8(local_.valid(id));
+            writer.u8(local_store().valid(id));
             return {MessageType::bool_reply, writer.take()};
         }
         case MessageType::get_object: {
             Reader reader(request.payload);
             ObjectId id{reader.fixed<32>()};
             reader.finish();
-            auto data = local_.get(id);
+            auto data = local_store().get(id);
             if (!data)
                 return error_reply("object not found");
             note_activity(frame_type, data->size());
@@ -484,7 +642,7 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             Reader reader(request.payload);
             ObjectId id{reader.fixed<32>()};
             reader.finish();
-            auto data = control_.get(id);
+            auto data = control_store().get(id);
             if (!data)
                 return error_reply("control object not found");
             Writer writer;
@@ -500,10 +658,10 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             reader.finish();
             note_activity(frame_type, data.size());
             if (request.type == MessageType::put_object_deferred) {
-                const auto generation = local_.put_deferred(id, data);
+                const auto generation = local_store().put_deferred(id, data);
                 if (!generation)
                     return error_reply("storage limit reached");
-                members_.storage(local_.used(), local_.limit());
+                members_.storage(local_store().used(), local_store().limit());
                 // Bind provisional placement to this exact process lifetime and
                 // exact node-wide mutation generation. A later barrier for an
                 // already-covered generation is a no-op even when unrelated
@@ -515,9 +673,9 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
                 reply.u64(generation->backend_instance);
                 return {MessageType::ok, reply.take()};
             }
-            if (!local_.put(id, data))
+            if (!local_store().put(id, data))
                 return error_reply("storage limit reached");
-            members_.storage(local_.used(), local_.limit());
+            members_.storage(local_store().used(), local_store().limit());
             return {MessageType::ok, {}};
         }
         case MessageType::put_control_object: {
@@ -525,7 +683,7 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             ObjectId id{reader.fixed<32>()};
             auto data = reader.bytes(128 * 1024 * 1024);
             reader.finish();
-            if (!control_.put(id, data))
+            if (!control_store().put(id, data))
                 return error_reply("control storage limit reached");
             return {MessageType::ok, {}};
         }
@@ -539,9 +697,9 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             if (expected_epoch != durability_epoch_)
                 return error_reply("storage durability epoch changed");
             try {
-                local_.durability_barrier({domain, required_generation, backend_instance},
+                local_store().durability_barrier({domain, required_generation, backend_instance},
                                           DurabilityUrgency::batchable);
-                members_.storage(local_.used(), local_.limit());
+                members_.storage(local_store().used(), local_store().limit());
                 return {MessageType::ok, {}};
             } catch (const std::exception& error) {
                 return error_reply(std::string("storage durability barrier failed: ") + error.what());
@@ -570,37 +728,37 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             reader.finish();
             for (const auto& id : ids) {
                 const bool present = object_class == RetentionClass::data
-                                         ? local_.valid(id)
-                                         : control_.valid(id);
+                                         ? local_store().valid(id)
+                                         : control_store().valid(id);
                 if (!present)
                     return error_reply("retention object is not durably present");
             }
-            retention_.retain_batch(object_class, ids, dot);
+            retention_store().retain_batch(object_class, ids, dot);
             return {MessageType::ok, {}};
         }
         case MessageType::delete_object: {
             Reader reader(request.payload);
             ObjectId id{reader.fixed<32>()};
             reader.finish();
-            if (retention_.retained(RetentionClass::data, id))
+            if (retention_store().retained(RetentionClass::data, id))
                 return error_reply("object has an active retention claim");
-            (void)local_.remove(id);
-            (void)cache_.remove(id);
-            members_.storage(local_.used(), local_.limit());
+            (void)local_store().remove(id);
+            if (ready(ready_cache)) (void)block_cache().remove(id);
+            members_.storage(local_store().used(), local_store().limit());
             return {MessageType::ok, {}};
         }
         case MessageType::get_metadata:
-            return {MessageType::metadata_reply, encode_metadata_record(meta_.current())};
+            return {MessageType::metadata_reply, encode_metadata_record(metadata_replica().current())};
         case MessageType::get_committed_metadata:
-            return {MessageType::metadata_reply, encode_metadata_record(meta_.committed())};
+            return {MessageType::metadata_reply, encode_metadata_record(metadata_replica().committed())};
         case MessageType::get_metadata_identity:
-            return metadata_identity_reply(meta_.committed_identity());
+            return metadata_identity_reply(metadata_replica().committed_identity());
         case MessageType::get_metadata_history_entry: {
             Reader reader(request.payload);
             Hash256 hash;
             hash.bytes = reader.fixed<32>();
             reader.finish();
-            auto entry = meta_.history_entry(hash);
+            auto entry = metadata_replica().history_entry(hash);
             if (!entry)
                 return error_reply("metadata history entry unavailable");
             return {MessageType::metadata_history_entry_reply,
@@ -612,13 +770,13 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             hash.bytes = reader.fixed<32>();
             reader.finish();
             Writer writer;
-            writer.u8(meta_.history_contains(hash));
+            writer.u8(metadata_replica().history_contains(hash));
             return {MessageType::bool_reply, writer.take()};
         }
         case MessageType::put_metadata_history_entry: {
             auto entry = decode_metadata_history_entry(request.payload);
             Writer writer;
-            writer.u8(meta_.import_history(entry));
+            writer.u8(metadata_replica().import_history(entry));
             return {MessageType::bool_reply, writer.take()};
         }
         case MessageType::get_metadata_heads:
@@ -688,21 +846,27 @@ PublicConnectivityStatus NodeRuntime::refresh_public_connectivity(bool probe, bo
 }
 
 void NodeRuntime::refresh_telemetry() {
-    // Public reachability may change the advertised host/port at runtime. Use
-    // the authoritative current self identity instead of a stale construction
-    // snapshot; this lock is taken only once per telemetry refresh interval.
+    // Telemetry is valid during recovery. Unready local planes report zero
+    // online capacity/usage rather than making the node disappear from the
+    // cluster while recovery is in progress.
     auto info = members_.self();
     info.used = telemetry_storage_used_.load(std::memory_order_relaxed);
     info.capacity = telemetry_storage_capacity_.load(std::memory_order_relaxed);
     info.metadata_generation = telemetry_metadata_generation_.load(std::memory_order_relaxed);
-    const uint64_t cache_capacity = static_cast<uint64_t>(cfg_.cache.max_blocks) * cfg_.extent_size;
-    const uint64_t cache_used = static_cast<uint64_t>(cache_.blocks()) * cfg_.extent_size;
+    uint64_t cache_capacity = 0;
+    uint64_t cache_used = 0;
+    uint32_t storage_backends_online = 0;
+    if (ready(ready_cache) && cache_) {
+        cache_capacity = static_cast<uint64_t>(cfg_.cache.max_blocks) * cfg_.extent_size;
+        cache_used = static_cast<uint64_t>(cache_->blocks()) * cfg_.extent_size;
+    }
+    if (ready(ready_data_storage) && local_)
+        storage_backends_online = static_cast<uint32_t>(local_->online_backends());
     const auto peers_known = telemetry_peers_known_.load(std::memory_order_relaxed);
     const auto peers_active = telemetry_peers_active_.load(std::memory_order_relaxed);
-    telemetry_.refresh_local(
-        info, std::string(kServerVersion), cache_capacity, cache_used,
-        static_cast<uint32_t>(local_.online_backends()), peers_known, peers_active,
-        0, 0, peers_active > 0 ? peers_active - 1 : 0);
+    telemetry_.refresh_local(info, std::string(kServerVersion), cache_capacity, cache_used,
+                             storage_backends_online, peers_known, peers_active,
+                             0, 0, peers_active > 0 ? peers_active - 1 : 0);
 }
 
 void NodeRuntime::telemetry_loop(std::stop_token stop) {
@@ -795,20 +959,27 @@ void NodeRuntime::exchange(const NodeInfo& node) {
 void NodeRuntime::loop(std::stop_token stop) {
     ThreadCpuReporter cpu_reporter("macha-node", std::chrono::seconds(5), true);
     while (!stop.stop_requested()) {
-        const auto refresh_started = Clock::now();
-        local_.refresh();
-        const auto refresh_ms = elapsed_ms(refresh_started);
-        if (refresh_ms >= 100 && Log::enabled(LogLevel::all))
-            Log::trace("DIAG node-stage stage=storage-refresh elapsed_ms=" +
-                       std::to_string(refresh_ms));
-        const auto storage_used = local_.used();
-        const auto storage_capacity = local_.limit();
-        const auto metadata_generation = meta_.generation();
-        members_.storage(storage_used, storage_capacity);
-        members_.metadata_generation(metadata_generation);
-        telemetry_storage_used_.store(storage_used, std::memory_order_relaxed);
-        telemetry_storage_capacity_.store(storage_capacity, std::memory_order_relaxed);
-        telemetry_metadata_generation_.store(metadata_generation, std::memory_order_relaxed);
+        // Local readiness is orthogonal to membership. Refresh whichever local
+        // planes are available, then perform membership exchange regardless.
+        if (ready(ready_data_storage) && local_) {
+            const auto refresh_started = Clock::now();
+            local_->refresh();
+            const auto refresh_ms = elapsed_ms(refresh_started);
+            if (refresh_ms >= 100 && Log::enabled(LogLevel::all))
+                Log::trace("DIAG node-stage stage=storage-refresh elapsed_ms=" +
+                           std::to_string(refresh_ms));
+            const auto storage_used = local_->used();
+            const auto storage_capacity = local_->limit();
+            members_.storage(storage_used, storage_capacity);
+            telemetry_storage_used_.store(storage_used, std::memory_order_relaxed);
+            telemetry_storage_capacity_.store(storage_capacity, std::memory_order_relaxed);
+        }
+        if (ready(ready_metadata) && meta_) {
+            const auto metadata_generation = meta_->generation();
+            members_.metadata_generation(metadata_generation);
+            telemetry_metadata_generation_.store(metadata_generation, std::memory_order_relaxed);
+        }
+
         std::set<std::pair<std::string, uint16_t>> exchanged;
         const auto known_nodes = members_.all();
         telemetry_peers_known_.store(static_cast<uint32_t>(known_nodes.size()),
@@ -817,10 +988,6 @@ void NodeRuntime::loop(std::stop_token stop) {
         for (const auto& endpoint : cfg_.bootstrap) {
             exchanged.emplace(endpoint.host, endpoint.port);
             try {
-                // Bootstrap is only identity-less before first authentication.
-                // Once the advertised endpoint belongs to a known NodeId, use
-                // the identity-aware route so a reconnect/backoff state cannot
-                // force us back into endpoint-dial behaviour.
                 auto known = std::find_if(known_nodes.begin(), known_nodes.end(),
                                           [&](const NodeInfo& node) {
                                               return node.id != id_ &&
@@ -856,7 +1023,9 @@ void NodeRuntime::loop(std::stop_token stop) {
 }
 
 void NodeRuntime::enqueue_fetched(const ObjectId& id, std::span<const uint8_t> data, bool promote) {
-    const bool cache = cache_.enabled();
+    const bool cache = ready(ready_cache) && cache_ && cache_->enabled();
+    if (promote && (!ready(ready_data_storage) || !local_))
+        promote = false;
     if (!cache && !promote)
         return;
 
@@ -893,16 +1062,16 @@ void NodeRuntime::local_writer_loop(std::stop_token stop) {
             local_copy_bytes_ -= job.data.size();
         }
         bool cached = false;
-        if (job.cache)
-            cached = cache_.put(job.id, job.data);
+        if (job.cache && ready(ready_cache) && cache_)
+            cached = cache_->put(job.id, job.data);
         // With a persistent cache, foreground fetches are made durable on the
         // cache device first and authoritative HDD promotion is left to idle
         // maintenance. If the cache write fails (or cache is disabled), retain
         // the already-fetched bytes by promoting here rather than forcing a
         // second network transfer later.
-        if (job.promote && (!job.cache || !cached)) {
-            (void)local_.put(job.id, job.data);
-            members_.storage(local_.used(), local_.limit());
+        if (job.promote && (!job.cache || !cached) && ready(ready_data_storage) && local_) {
+            (void)local_->put(job.id, job.data);
+            members_.storage(local_->used(), local_->limit());
         }
         cpu_reporter.tick();
     }
@@ -910,9 +1079,11 @@ void NodeRuntime::local_writer_loop(std::stop_token stop) {
 
 void NodeRuntime::reconfigure_local(const Config& config) {
     auto updated = normalize_config(config);
-    local_.reconfigure(updated.storage_backends);
-    local_.refresh();
-    cache_.reconfigure(updated.cache);
+    if (!all_local_state_ready())
+        throw std::runtime_error("node local state is still recovering");
+    local_->reconfigure(updated.storage_backends);
+    local_->refresh();
+    cache_->reconfigure(updated.cache);
     // These fields are node-local policy only and are not consumed by the
     // long-lived networking/metadata threads, so keep the public snapshot in
     // sync with a successful live reload without changing cluster policy.
@@ -920,6 +1091,6 @@ void NodeRuntime::reconfigure_local(const Config& config) {
     cfg_.cache = updated.cache;
     cfg_.hydration = updated.hydration;
     cfg_.read_ahead_extents = updated.read_ahead_extents;
-    members_.storage(local_.used(), local_.limit());
+    members_.storage(local_store().used(), local_store().limit());
 }
 } // namespace macha

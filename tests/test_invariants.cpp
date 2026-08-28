@@ -266,6 +266,133 @@ MACHA_TEST("invariants", test_manage_node_identity_association_reset) {
     CHECK(metadata_after_ip.identity_resets.at(ip_key).reason == "clear by ip");
 }
 
+
+
+MACHA_TEST("invariants", test_status_api_precedes_control_plane_startup) {
+    TestCluster cluster(ConfigProfile::isolated);
+    auto config = cluster.node_config("status-first");
+    config.catalogue.api.enabled = true;
+    config.catalogue.api.listen = "127.0.0.1";
+    config.catalogue.api.port = free_port();
+
+    TestGate control_gate;
+    Service service(config, cluster.keys(), [&](std::string_view stage) {
+        if (stage == "control-plane")
+            control_gate.enter_and_wait();
+    });
+    struct ReleaseGate {
+        TestGate& gate;
+        ~ReleaseGate() { gate.open(); }
+    } release{control_gate};
+
+    std::jthread starter([&] { service.start(); });
+    REQUIRE(control_gate.wait_for_entries(1));
+
+    const auto response = raw_http_get(config.catalogue.api.port, "/api/v1/status");
+    CHECK(response.find("HTTP/1.1 200") != std::string::npos);
+    const auto body_at = response.find("\r\n\r\n");
+    REQUIRE(body_at != std::string::npos);
+    auto status = Json::parse(response.substr(body_at + 4));
+    const auto* startup = status.find("startup");
+    REQUIRE(startup != nullptr);
+    CHECK(startup->find("phase")->asString() == "starting");
+    CHECK(startup->find("api")->asString() == "ready");
+    CHECK(startup->find("control_plane")->asString() == "starting");
+
+    control_gate.open();
+    starter.join();
+    REQUIRE(wait_until([&] { return service.ready(); }, 10s));
+}
+
+MACHA_TEST("invariants", test_control_plane_and_status_api_are_online_while_backends_recover) {
+    TestCluster cluster(ConfigProfile::isolated);
+    auto config = cluster.node_config("recovering-service");
+    config.catalogue.api.enabled = true;
+    config.catalogue.api.listen = "127.0.0.1";
+    config.catalogue.api.port = free_port();
+
+    TestGate recovery_gate;
+    Service service(config, cluster.keys(), [&](std::string_view stage) {
+        if (stage == "data-storage" || stage == "control-storage")
+            recovery_gate.enter_and_wait();
+    });
+    struct ReleaseGate {
+        TestGate& gate;
+        ~ReleaseGate() { gate.open(); }
+    } release{recovery_gate};
+
+    service.start();
+    REQUIRE(recovery_gate.wait_for_entries(2));
+
+    const auto status_response = raw_http_get(config.catalogue.api.port, "/api/v1/status");
+    CHECK(status_response.find("HTTP/1.1 200") != std::string::npos);
+    const auto body_at = status_response.find("\r\n\r\n");
+    REQUIRE(body_at != std::string::npos);
+    auto status = Json::parse(status_response.substr(body_at + 4));
+    const auto* startup = status.find("startup");
+    REQUIRE(startup != nullptr);
+    CHECK(startup->find("phase")->asString() == "recovering");
+    CHECK(startup->find("api")->asString() == "ready");
+    CHECK(startup->find("control_plane")->asString() == "ready");
+    CHECK(startup->find("data_storage")->asString() == "recovering");
+    CHECK(startup->find("control_storage")->asString() == "recovering");
+    CHECK(!service.ready());
+
+    const auto ordinary = raw_http_get(config.catalogue.api.port, "/api/v1/catalogue/status");
+    CHECK(ordinary.find("HTTP/1.1 503") != std::string::npos);
+    CHECK(ordinary.find("service_recovering") != std::string::npos);
+
+    recovery_gate.open();
+    REQUIRE(wait_until([&] { return service.ready(); }, 10s));
+    const auto ready_response = raw_http_get(config.catalogue.api.port, "/api/v1/status");
+    const auto ready_body_at = ready_response.find("\r\n\r\n");
+    REQUIRE(ready_body_at != std::string::npos);
+    auto ready_status = Json::parse(ready_response.substr(ready_body_at + 4));
+    CHECK(ready_status.find("startup")->find("phase")->asString() == "ready");
+}
+
+MACHA_TEST("invariants", test_rpc_membership_is_online_while_local_state_recovers) {
+    TestCluster cluster(ConfigProfile::isolated);
+    auto recovering_config = cluster.node_config("recovering-node");
+    auto peer_config = cluster.node_config("peer-node");
+
+    TestGate recovery_gate;
+    NodeRuntime recovering(recovering_config, cluster.keys(), [&](std::string_view stage) {
+        if (stage == "data-storage" || stage == "control-storage")
+            recovery_gate.enter_and_wait();
+    });
+    struct ReleaseGate {
+        TestGate& gate;
+        ~ReleaseGate() { gate.open(); }
+    } release{recovery_gate};
+
+    recovering.start();
+    REQUIRE(recovery_gate.wait_for_entries(2));
+    CHECK(recovering.readiness().control_plane_online);
+    CHECK(!recovering.readiness().local_state_ready);
+
+    NodeRuntime peer(peer_config, cluster.keys());
+    peer.start();
+    REQUIRE(peer.wait_local_state_ready(10s));
+
+    const Endpoint recovering_endpoint{"127.0.0.1", recovering_config.port};
+    const auto ping = peer.call(recovering_endpoint, MessageType::ping);
+    CHECK(ping.message.type == MessageType::ok);
+    const auto members = peer.call(recovering_endpoint, MessageType::members);
+    CHECK(members.message.type == MessageType::members_reply);
+    REQUIRE(wait_until([&] {
+        const auto all = recovering.membership().all();
+        return std::any_of(all.begin(), all.end(), [&](const NodeInfo& node) {
+            return node.id == peer.node_id();
+        });
+    }));
+
+    recovery_gate.open();
+    REQUIRE(recovering.wait_local_state_ready(10s));
+    peer.stop();
+    recovering.stop();
+}
+
 MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     TestNode fixture("status-membership");
     auto& config = fixture.config();
@@ -297,7 +424,8 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     // validation is convergence telemetry in 0.19; it must not demote write
     // capability while the configured durability floor is reachable.
     metadata.note_replica_validation(false, "test metadata reconciliation pending");
-    ClusterStatusService status(node, metadata);
+    ClusterStatusService status(node);
+    status.attach_metadata(metadata);
     HttpRequest request;
     request.method = "GET";
     request.path = "/api/v1/status";
@@ -472,12 +600,11 @@ MACHA_TEST("invariants", test_dirty_open_inode_never_writes_remote_replacement) 
 MACHA_TEST("invariants", test_failed_catalogue_commit_never_deletes_live_filesystem_object) {
     TestNode fixture("node");
     fixture.prepare();
-    auto& node = fixture.node();
+    auto& node = fixture.start();
     auto& store = fixture.store();
     auto& metadata = fixture.metadata();
     auto& fs = fixture.filesystem();
     CatalogueManager catalogue(node, store, metadata);
-    fixture.start();
 
     const auto live_bytes = pattern(8192, 5);
     write_file(fs, "/live.bin", live_bytes);
@@ -520,12 +647,11 @@ MACHA_TEST("invariants", test_failed_catalogue_commit_never_deletes_live_filesys
 MACHA_TEST("invariants", test_scanner_prune_is_fenced_to_scanned_namespace) {
     TestNode fixture("node");
     fixture.prepare();
-    auto& node = fixture.node();
+    auto& node = fixture.start();
     auto& store = fixture.store();
     auto& metadata = fixture.metadata();
     auto& fs = fixture.filesystem();
     CatalogueManager catalogue(node, store, metadata);
-    fixture.start();
 
     const auto old_bytes = pattern(4096, 31);
     const auto new_bytes = pattern(4096, 32);
@@ -565,12 +691,11 @@ MACHA_TEST("invariants", test_scanner_prune_is_fenced_to_scanned_namespace) {
 MACHA_FAST_TEST("invariants", test_scanner_does_not_prune_from_mixed_namespace_generations) {
     TestNode fixture("node");
     fixture.prepare();
-    auto& node = fixture.node();
+    auto& node = fixture.start();
     auto& store = fixture.store();
     auto& metadata = fixture.metadata();
     auto& fs = fixture.filesystem();
     CatalogueManager catalogue(node, store, metadata);
-    fixture.start();
 
     FsEntry dir;
     dir.type = EntryType::directory;
@@ -1337,6 +1462,8 @@ MACHA_TEST("invariants", test_deferred_object_barrier_rejects_stale_process_epoc
     NodeRuntime client(client_config, cluster.keys());
     server.start();
     client.start();
+    REQUIRE(server.wait_local_state_ready(10s));
+    REQUIRE(client.wait_local_state_ready(10s));
 
     const auto bytes = pattern(64 * 1024, 46);
     const auto id = object_id(bytes);
@@ -1391,6 +1518,8 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_group_commits_independent_p
     NodeRuntime client(client_config, cluster.keys());
     server.start();
     client.start();
+    REQUIRE(server.wait_local_state_ready(10s));
+    REQUIRE(client.wait_local_state_ready(10s));
     const Endpoint endpoint{"127.0.0.1", server_config.port};
 
     struct RemoteToken {
@@ -1467,6 +1596,8 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_reuses_already_covered_gene
     NodeRuntime client(client_config, cluster.keys());
     server.start();
     client.start();
+    REQUIRE(server.wait_local_state_ready(10s));
+    REQUIRE(client.wait_local_state_ready(10s));
     const Endpoint endpoint{"127.0.0.1", server_config.port};
 
     struct RemoteToken {
@@ -1621,11 +1752,10 @@ MACHA_TEST("invariants", test_http_slow_client_cannot_pin_worker_indefinitely) {
 MACHA_TEST("invariants", test_catalogue_gc_liveness_fails_closed_when_current_root_unavailable) {
     TestNode fixture("node");
     fixture.prepare();
-    auto& node = fixture.node();
+    auto& node = fixture.start();
     auto& store = fixture.store();
     auto& metadata = fixture.metadata();
     CatalogueManager catalogue(node, store, metadata);
-    fixture.start();
     catalogue.repair_once(); // establish a coherent empty cached catalogue
 
     const auto missing_root = object_id(pattern(32123, 11));

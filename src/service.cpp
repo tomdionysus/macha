@@ -85,43 +85,13 @@ void log_slow_stage(std::string_view stage, Clock::time_point started,
 }
 } // namespace
 
-Service::Service(Config config, ClusterKeys keys)
-    : node_(std::move(config), keys), store_(node_), metadata_(node_),
-      cluster_status_(node_, metadata_), catalogue_(node_, store_, metadata_), fs_(node_, store_, metadata_, &playback_),
-      catalogue_hints_(node_.config().state_path),
-      scanner_(node_, fs_, catalogue_, catalogue_hints_, node_.config().catalogue.scanner),
-      hydration_(store_, playback_, fs_, catalogue_, node_.config().hydration,
-                 node_.config().read_ahead_extents),
-      ingest_(node_, fs_, catalogue_hints_, node_.config().ingest),
-      torrents_(ingest_, node_.config().torrent, node_.config().state_path),
-      torrent_search_(node_.config().torrent),
-      acquisition_api_(ingest_, torrents_, torrent_search_),
-      catalogue_api_(catalogue_, catalogue_hints_,
-                     [this](const std::vector<std::string>& media_ids) {
-                         scanner_.request_media_rescan(media_ids);
-                     }),
-      manage_api_(node_, metadata_, fs_, catalogue_, catalogue_hints_, scanner_),
-      streaming_(fs_, catalogue_, node_.config().catalogue.api, node_.config().streaming) {
-    metadata_.set_publication_retention(
-        [this](const MetadataPublicationContext& context) {
-            retain_metadata_publication(context);
-        });
+Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook startup_stage_hook)
+    : node_(std::move(config), keys, std::move(startup_stage_hook)), cluster_status_(node_) {
     if (node_.config().catalogue.api.enabled) {
         catalogue_http_ = std::make_unique<HttpServer>(
             node_.config().catalogue.api,
-            [this](const HttpRequest& request) {
-                if (request.path == "/api/v1/status" || request.path.starts_with("/api/v1/status/"))
-                    return cluster_status_.handle(request);
-                if (request.path.starts_with("/api/v1/playback/"))
-                    return streaming_.handle(request);
-                if (request.path.starts_with("/api/v1/ingest/") ||
-                    request.path.starts_with("/api/v1/torrents/"))
-                    return acquisition_api_.handle(request);
-                if (request.path.starts_with("/api/v1/manage"))
-                    return manage_api_.handle(request);
-                return catalogue_api_.handle(request);
-            },
-            [this](const HttpRequest& request) { return streaming_.capability_request(request); });
+            [this](const HttpRequest& request) { return handle_http(request); },
+            [this](const HttpRequest& request) { return capability_request(request); });
     }
 }
 
@@ -129,54 +99,183 @@ Service::~Service() {
     stop();
 }
 
+HttpResponse Service::handle_http(const HttpRequest& request) {
+    if (request.path == "/api/v1/status" || request.path.starts_with("/api/v1/status/"))
+        return cluster_status_.handle(request);
+
+    if (!services_ready_.load(std::memory_order_acquire)) {
+        if (startup_failed_.load(std::memory_order_acquire)) {
+            std::lock_guard lock(startup_mutex_);
+            return http_error(503, "startup_failed",
+                              startup_error_.empty() ? "server startup failed" : startup_error_);
+        }
+        return http_error(503, "service_recovering",
+                          "server control plane is online; local services are still recovering");
+    }
+
+    if (request.path.starts_with("/api/v1/playback/"))
+        return streaming_->handle(request);
+    if (request.path.starts_with("/api/v1/ingest/") ||
+        request.path.starts_with("/api/v1/torrents/"))
+        return acquisition_api_->handle(request);
+    if (request.path.starts_with("/api/v1/manage"))
+        return manage_api_->handle(request);
+    return catalogue_api_->handle(request);
+}
+
+bool Service::capability_request(const HttpRequest& request) {
+    if (!services_ready_.load(std::memory_order_acquire) || !streaming_)
+        return false;
+    return streaming_->capability_request(request);
+}
+
+void Service::wait_services_ready() {
+    if (services_ready_.load(std::memory_order_acquire))
+        return;
+    std::unique_lock lock(startup_mutex_);
+    startup_cv_.wait(lock, [this] {
+        return services_ready_.load(std::memory_order_acquire) ||
+               startup_failed_.load(std::memory_order_acquire);
+    });
+    if (!services_ready_.load(std::memory_order_acquire))
+        throw std::runtime_error(startup_error_.empty() ? "server startup failed" : startup_error_);
+}
+
+void Service::initialise_services(std::stop_token stop) {
+    try {
+        while (!stop.stop_requested()) {
+            if (node_.wait_local_state_ready(std::chrono::milliseconds(100)))
+                break;
+            const auto readiness = node_.readiness();
+            if (readiness.failed)
+                throw std::runtime_error(readiness.error.empty()
+                                             ? "node local-state recovery failed"
+                                             : readiness.error);
+        }
+        if (stop.stop_requested())
+            return;
+
+        auto store = std::make_unique<DistributedStore>(node_);
+        auto metadata = std::make_unique<MetadataManager>(node_);
+        auto catalogue = std::make_unique<CatalogueManager>(node_, *store, *metadata);
+        auto fs = std::make_unique<FileSystem>(node_, *store, *metadata, &playback_);
+        auto catalogue_hints = std::make_unique<CatalogueHintQueue>(node_.config().state_path);
+        auto scanner = std::make_unique<CatalogueScanner>(
+            node_, *fs, *catalogue, *catalogue_hints, node_.config().catalogue.scanner);
+        auto hydration = std::make_unique<HydrationManager>(
+            *store, playback_, *fs, *catalogue, node_.config().hydration,
+            node_.config().read_ahead_extents);
+        auto ingest = std::make_unique<IngestManager>(
+            node_, *fs, *catalogue_hints, node_.config().ingest);
+        auto torrents = std::make_unique<TorrentManager>(
+            *ingest, node_.config().torrent, node_.config().state_path);
+        auto torrent_search = std::make_unique<TorrentSearchManager>(node_.config().torrent);
+        auto acquisition_api = std::make_unique<AcquisitionApi>(
+            *ingest, *torrents, *torrent_search);
+        auto catalogue_api = std::make_unique<CatalogueApi>(
+            *catalogue, *catalogue_hints,
+            [scanner_ptr = scanner.get()](const std::vector<std::string>& media_ids) {
+                scanner_ptr->request_media_rescan(media_ids);
+            });
+        auto manage_api = std::make_unique<ManageApi>(
+            node_, *metadata, *fs, *catalogue, *catalogue_hints, *scanner);
+        auto streaming = std::make_unique<PlaybackManager>(
+            *fs, *catalogue, node_.config().catalogue.api, node_.config().streaming);
+
+        metadata->set_publication_retention(
+            [this](const MetadataPublicationContext& context) {
+                retain_metadata_publication(context);
+            });
+
+        store_ = std::move(store);
+        metadata_ = std::move(metadata);
+        catalogue_ = std::move(catalogue);
+        fs_ = std::move(fs);
+        catalogue_hints_ = std::move(catalogue_hints);
+        scanner_ = std::move(scanner);
+        hydration_ = std::move(hydration);
+        ingest_ = std::move(ingest);
+        torrents_ = std::move(torrents);
+        torrent_search_ = std::move(torrent_search);
+        acquisition_api_ = std::move(acquisition_api);
+        catalogue_api_ = std::move(catalogue_api);
+        manage_api_ = std::move(manage_api);
+        streaming_ = std::move(streaming);
+
+        if (stop.stop_requested())
+            return;
+
+        ingest_->start();
+        torrents_->start();
+        streaming_->start();
+        scanner_->start();
+        hydration_->start();
+        cluster_status_.attach_metadata(*metadata_);
+        maintenance_ = std::jthread([this](std::stop_token maintenance_stop) {
+            loop(maintenance_stop);
+        });
+
+        services_ready_.store(true, std::memory_order_release);
+        startup_cv_.notify_all();
+        Log::info("server local services ready");
+    } catch (const std::exception& error) {
+        {
+            std::lock_guard lock(startup_mutex_);
+            startup_error_ = error.what();
+        }
+        startup_failed_.store(true, std::memory_order_release);
+        startup_cv_.notify_all();
+        Log::error("server service initialization failed: " + std::string(error.what()));
+    }
+}
+
 void Service::start() {
-    node_.start();
+    // Status is the first externally visible service. It depends only on the
+    // lightweight node identity/membership state constructed from config, so
+    // operators can observe startup even before the cluster listener or any
+    // durable backend begins recovery.
     cluster_status_.start();
-    ingest_.start();
-    torrents_.start();
-    streaming_.start();
     if (catalogue_http_)
         catalogue_http_->start();
-    scanner_.start();
-    hydration_.start();
-    // The maintenance loop attempts catalogue synchronisation before ordinary
-    // data repair on its first iteration. Catalogue API reads also synchronise
-    // on demand; /status remains available while a joiner is converging.
-    maintenance_ = std::jthread([this](std::stop_token stop) { loop(stop); });
+
+    node_.start();
+    startup_ = std::jthread([this](std::stop_token stop) { initialise_services(stop); });
 }
 
 void Service::request_stop() {
-    // Phase one of shutdown is deliberately non-blocking. Signal anything
-    // that can be waiting on mounted MachaDFS or catalogue work before any
-    // component is joined, so teardown cannot deadlock behind the first
-    // long-running subsystem in Service::stop().
-    fs_.request_io_cancellation();
-    torrents_.request_stop();
-    ingest_.request_stop();
-    scanner_.request_stop();
-    hydration_.request_stop();
+    if (startup_.joinable())
+        startup_.request_stop();
+    if (fs_) fs_->request_io_cancellation();
+    if (torrents_) torrents_->request_stop();
+    if (ingest_) ingest_->request_stop();
+    if (scanner_) scanner_->request_stop();
+    if (hydration_) hydration_->request_stop();
     cluster_status_.request_stop();
     if (catalogue_http_)
         catalogue_http_->request_stop();
-    streaming_.request_stop();
+    if (streaming_) streaming_->request_stop();
     if (maintenance_.joinable()) {
         maintenance_.request_stop();
         maintenance_wait_cv_.notify_all();
     }
     node_.request_stop();
+    startup_cv_.notify_all();
 }
 
 void Service::stop() {
     Log::debug("shutdown: Service::stop begin");
     request_stop();
-    torrents_.stop();
-    ingest_.stop();
-    scanner_.stop();
-    hydration_.stop();
+    if (startup_.joinable())
+        startup_.join();
+    if (torrents_) torrents_->stop();
+    if (ingest_) ingest_->stop();
+    if (scanner_) scanner_->stop();
+    if (hydration_) hydration_->stop();
+    cluster_status_.detach_metadata();
     cluster_status_.stop();
     if (catalogue_http_)
         catalogue_http_->stop();
-    streaming_.stop();
+    if (streaming_) streaming_->stop();
     if (maintenance_.joinable()) {
         Log::debug("shutdown: service maintenance request_stop");
         maintenance_.request_stop();
@@ -188,7 +287,6 @@ void Service::stop() {
     node_.stop();
     Log::debug("shutdown: Service::stop complete");
 }
-
 
 
 void Service::retain_metadata_publication(const MetadataPublicationContext& context) {
@@ -218,7 +316,7 @@ void Service::retain_metadata_publication(const MetadataPublicationContext& cont
         const auto conflict_extents = metadata_conflict_extent_roots(context.proposed);
         data.insert(data.end(), conflict_extents.begin(), conflict_extents.end());
         for (const auto& root : metadata_catalogue_root_set(context.proposed)) {
-            auto objects = catalogue_.retention_objects(std::nullopt, root);
+            auto objects = catalogue_->retention_objects(std::nullopt, root);
             data.insert(data.end(), objects.data.begin(), objects.data.end());
             control.insert(control.end(), objects.control.begin(), objects.control.end());
         }
@@ -238,7 +336,7 @@ void Service::retain_metadata_publication(const MetadataPublicationContext& cont
             ? context.delta->catalogue != CatalogueDelta::unchanged
             : before.catalogue_root != context.proposed.catalogue_root;
         if (catalogue_changed && context.proposed.catalogue_root) {
-            auto objects = catalogue_.retention_objects(before.catalogue_root,
+            auto objects = catalogue_->retention_objects(before.catalogue_root,
                                                         context.proposed.catalogue_root);
             data.insert(data.end(), objects.data.begin(), objects.data.end());
             control.insert(control.end(), objects.control.begin(), objects.control.end());
@@ -252,7 +350,7 @@ void Service::retain_metadata_publication(const MetadataPublicationContext& cont
             for (const auto& root : after_roots) {
                 if (before_roots.contains(root))
                     continue;
-                auto objects = catalogue_.retention_objects(std::nullopt, root);
+                auto objects = catalogue_->retention_objects(std::nullopt, root);
                 data.insert(data.end(), objects.data.begin(), objects.data.end());
                 control.insert(control.end(), objects.control.begin(), objects.control.end());
             }
@@ -264,10 +362,10 @@ void Service::retain_metadata_publication(const MetadataPublicationContext& cont
     std::sort(control.begin(), control.end());
     control.erase(std::unique(control.begin(), control.end()), control.end());
 
-    if (!data.empty() && !store_.retain_data(data, dot))
+    if (!data.empty() && !store_->retain_data(data, dot))
         throw MetadataNotReady("DATA retention floor unavailable before metadata publication");
     if (!control.empty() &&
-        !store_.retain_control(control, dot,
+        !store_->retain_control(control, dot,
                                context.proposed.metadata_write_replicas_required))
         throw MetadataNotReady("CONTROL retention floor unavailable before metadata publication");
 }
@@ -310,7 +408,7 @@ void Service::maintain_garbage_metadata(const std::vector<GarbageRef>& erase,
     for (const auto& candidate : stamp)
         stamp_expected[candidate.id] = candidate;
 
-    metadata_.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+    metadata_->mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
         std::erase_if(snapshot.garbage, [&](const GarbageRef& current) {
             auto expected = erase_expected.find(current.id);
             const bool remove = expected != erase_expected.end() && expected->second == current;
@@ -370,19 +468,19 @@ void Service::loop(std::stop_token stop) {
         last_wall = now;
         last_cpu = cpu_now;
 
-        auto playback_bytes = store_.take_foreground_bytes();
-        auto interactive_bytes = store_.take_interactive_bytes();
+        auto playback_bytes = store_->take_foreground_bytes();
+        auto interactive_bytes = store_->take_interactive_bytes();
         const bool playback_busy = playback_bytes > 0 ||
-            store_.foreground_idle_for() < policy.foreground_quiet;
+            store_->foreground_idle_for() < policy.foreground_quiet;
         const bool interactive_busy = interactive_bytes > 0 ||
-            store_.interactive_idle_for() < policy.foreground_quiet;
+            store_->interactive_idle_for() < policy.foreground_quiet;
         // Priority law: playback/seek > mounted MachaDFS/useful prefetch >
         // repair/rebalance/scrub. Both foreground classes suppress background
         // work, while the transport queues themselves keep playback above mount I/O.
         bool busy = playback_busy || interactive_busy;
         double fraction = busy ? policy.busy_bandwidth_fraction : policy.idle_bandwidth_fraction;
 
-        double bandwidth = store_.estimated_network_bps();
+        double bandwidth = store_->estimated_network_bps();
         if (bandwidth <= 0.0)
             bandwidth = static_cast<double>(policy.initial_bandwidth);
         if (policy.max_bandwidth)
@@ -424,10 +522,10 @@ void Service::loop(std::stop_token stop) {
             if (metadata_refresh_needed || (!busy && metadata_periodic)) {
                 const auto stage = Clock::now();
                 try {
-                    metadata_.repair_once();
-                    metadata_.note_replica_validation(true);
+                    metadata_->repair_once();
+                    metadata_->note_replica_validation(true);
                 } catch (const std::exception& error) {
-                    metadata_.note_replica_validation(false, error.what());
+                    metadata_->note_replica_validation(false, error.what());
                     // In 0.19, inability to validate/reconcile every active
                     // metadata head must not stall non-destructive DATA repair.
                     // A locally committed branch remains a valid source of live
@@ -440,7 +538,7 @@ void Service::loop(std::stop_token stop) {
                     Log::debug("metadata repair deferred; continuing non-destructive maintenance: " +
                                std::string(error.what()));
                 } catch (...) {
-                    metadata_.note_replica_validation(false, "metadata validation failed");
+                    metadata_->note_replica_validation(false, "metadata validation failed");
                     const auto local = node_.metadata_replica().committed();
                     if (node_.metadata_replica().recovery_required() || local.generation <= 1)
                         throw;
@@ -456,14 +554,14 @@ void Service::loop(std::stop_token stop) {
             // independently of foreground activity, while the normal settled-state
             // verification remains an idle/background operation. This keeps remote
             // catalogue changes live without ever putting metadata-replica I/O on an API thread.
-            const bool catalogue_refresh_needed = catalogue_.refresh_needed();
+            const bool catalogue_refresh_needed = catalogue_->refresh_needed();
             const bool catalogue_periodic =
                 last_catalogue == Clock::time_point{} ||
                 now - last_catalogue >= background_interval;
             if (catalogue_refresh_needed || (!busy && catalogue_periodic)) {
                 const auto stage = Clock::now();
                 try {
-                    catalogue_.repair_once();
+                    catalogue_->repair_once();
                 } catch (const std::exception& e) {
                     Log::debug("catalogue sync: " + std::string(e.what()));
                 }
@@ -490,14 +588,14 @@ void Service::loop(std::stop_token stop) {
             // those consumers can make progress or metadata has advanced.
             if (network_due || garbage_due || gc_due) {
                 const auto inventory_stage = Clock::now();
-                auto objects = fs_.maintenance_objects_cached();
+                auto objects = fs_->maintenance_objects_cached();
                 bool rebuilt_inventory = false;
                 if (!maintenance_live_ || !maintenance_catalogue_complete_ ||
                     maintenance_inventory_generation_ != objects->metadata_generation) {
                     auto live = std::make_shared<std::vector<ObjectId>>(objects->live);
                     auto universal = std::make_shared<std::vector<ObjectId>>();
                     auto control_live = std::make_shared<std::vector<ObjectId>>();
-                    auto catalogue_objects = catalogue_.maintenance_objects();
+                    auto catalogue_objects = catalogue_->maintenance_objects();
                     maintenance_catalogue_complete_ = catalogue_objects.complete;
                     live->insert(live->end(), catalogue_objects.live.begin(),
                                  catalogue_objects.live.end());
@@ -566,8 +664,8 @@ void Service::loop(std::stop_token stop) {
                             if (present)
                                 continue;
                             const bool restored = type == RetentionClass::data
-                                                      ? store_.ensure_local(*id, false)
-                                                      : store_.ensure_control_local(*id);
+                                                      ? store_->ensure_local(*id, false)
+                                                      : store_->ensure_control_local(*id);
                             if (restored) {
                                 ++retained_repairs;
                                 network_credit = std::max(0.0, network_credit -
@@ -586,7 +684,7 @@ void Service::loop(std::stop_token stop) {
                     const size_t operation_budget = static_cast<size_t>(std::clamp<uint64_t>(
                         (byte_budget / extent), 4, 16));
                     const auto repair_stage = Clock::now();
-                    auto repair = store_.repair_step(
+                    auto repair = store_->repair_step(
                         byte_budget, operation_budget, maintenance_live_.get(),
                         maintenance_universal_.get(),
                         [this] {
@@ -594,8 +692,8 @@ void Service::loop(std::stop_token stop) {
                             // foreground I/O appears. The next scheduler pass
                             // will re-evaluate busy_bandwidth_fraction normally.
                             const auto quiet = node_.config().maintenance.foreground_quiet;
-                            return store_.foreground_idle_for() < quiet ||
-                                   store_.interactive_idle_for() < quiet;
+                            return store_->foreground_idle_for() < quiet ||
+                                   store_->interactive_idle_for() < quiet;
                         },
                         maintenance_inventory_generation_);
                     log_slow_stage("network-repair", repair_stage,
@@ -621,7 +719,7 @@ void Service::loop(std::stop_token stop) {
 
                 const bool cluster_gc_healthy = node_.membership().all_known_reachable();
                 const bool cluster_gc_stable =
-                    cluster_gc_healthy && metadata_.cluster_status().stable;
+                    cluster_gc_healthy && metadata_->cluster_status().stable;
 
                 bool garbage_metadata_changed = false;
                 if (garbage_due && cluster_gc_stable && maintenance_catalogue_complete_) {
@@ -647,7 +745,7 @@ void Service::loop(std::stop_token stop) {
                 // sweep the control store using such a stale set: with a zero/short
                 // grace period it could delete a newly-published manifest or shard
                 // before the next maintenance pass observes the successor generation.
-                const auto current_metadata_view = metadata_.available_snapshot_view();
+                const auto current_metadata_view = metadata_->available_snapshot_view();
                 const bool destructive_gc_enabled =
                     cluster_gc_stable && current_metadata_view &&
                     current_metadata_view->snapshot->retention_baseline_complete;
@@ -656,7 +754,7 @@ void Service::loop(std::stop_token stop) {
                 // provides a complete live-object set plus the mutation clock of
                 // claim dots it has actually observed. Claims from unseen concurrent
                 // branches are not dominated by that clock and therefore survive.
-                if (auto floor = metadata_.retention_release_view();
+                if (auto floor = metadata_->retention_release_view();
                     floor && floor->hash != retention_release_floor_hash_) {
                     auto data_live = std::make_shared<std::vector<ObjectId>>();
                     auto control_live = std::make_shared<std::vector<ObjectId>>();
@@ -673,7 +771,7 @@ void Service::loop(std::stop_token stop) {
 
                     for (const auto& root : metadata_catalogue_root_set(*floor->snapshot)) {
                         try {
-                            auto retained = catalogue_.retention_objects(std::nullopt, root);
+                            auto retained = catalogue_->retention_objects(std::nullopt, root);
                             data_live->insert(data_live->end(), retained.data.begin(), retained.data.end());
                             control_live->insert(control_live->end(), retained.control.begin(), retained.control.end());
                         } catch (const std::exception& error) {
@@ -706,7 +804,7 @@ void Service::loop(std::stop_token stop) {
                             RetentionClass::control, *retention_release_control_live_,
                             retention_release_clock_, 64);
                     }
-                    const auto removed = catalogue_.control_gc_step(
+                    const auto removed = catalogue_->control_gc_step(
                         *maintenance_control_live_, policy.garbage_grace, 32);
                     (void)node_.retention_store().prune_unclaimed(
                         RetentionClass::control,
@@ -750,8 +848,8 @@ void Service::loop(std::stop_token stop) {
                         *maintenance_live_, protected_ids, policy.garbage_grace, 64,
                         [this] {
                             const auto quiet = node_.config().maintenance.foreground_quiet;
-                            return store_.foreground_idle_for() < quiet ||
-                                   store_.interactive_idle_for() < quiet;
+                            return store_->foreground_idle_for() < quiet ||
+                                   store_->interactive_idle_for() < quiet;
                         },
                         [this](const ObjectId& id) {
                             return node_.retention_store().retained(RetentionClass::data, id);
@@ -785,8 +883,8 @@ void Service::loop(std::stop_token stop) {
                     static_cast<uint64_t>(local_credit), 64,
                     [this] {
                         const auto quiet = node_.config().maintenance.foreground_quiet;
-                        return store_.foreground_idle_for() < quiet ||
-                               store_.interactive_idle_for() < quiet;
+                        return store_->foreground_idle_for() < quiet ||
+                               store_->interactive_idle_for() < quiet;
                     });
                 log_slow_stage("local-rebalance", rebalance_stage,
                                "bytes=" + std::to_string(rebalance.bytes) +
@@ -815,7 +913,7 @@ void Service::loop(std::stop_token stop) {
             // reachable and repair reports convergence, re-root that history so
             // lifetime metadata mutation count does not become lifetime disk/RSS.
             if (!busy && node_.membership().all_known_reachable() &&
-                metadata_.cluster_status().stable)
+                metadata_->cluster_status().stable)
                 (void)node_.metadata_replica().compact_history_if_safe();
 
             // Packed DATA tombstones are physical dead space. Compact one
@@ -832,8 +930,8 @@ void Service::loop(std::stop_token stop) {
                     static_cast<uint64_t>(scrub_credit), 64,
                     [this] {
                         const auto quiet = node_.config().maintenance.foreground_quiet;
-                        return store_.foreground_idle_for() < quiet ||
-                               store_.interactive_idle_for() < quiet;
+                        return store_->foreground_idle_for() < quiet ||
+                               store_->interactive_idle_for() < quiet;
                     });
                 log_slow_stage("scrub", scrub_stage,
                                "bytes=" + std::to_string(scrub.bytes) +

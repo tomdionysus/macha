@@ -1179,7 +1179,15 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_recovery_starts_without_new_fuse_a
     // work -- the shape seen after a long-running copy is restarted.
     constexpr size_t files = 4;
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        // Use a deliberately long quiet window while staging the crash backlog.
+        // A short wall-clock quiet window plus a helper refresh thread is
+        // scheduler-sensitive under a parallel test run: if that helper misses
+        // its timeslice for >publication_quiet, a publisher can legitimately
+        // start before the fixture is stopped. The production behaviour is the
+        // thing under test here, not host scheduler latency.
+        auto staging_fuse = config.fuse;
+        staging_fuse.publication_quiet = 5s;
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), staging_fuse);
         for (size_t i = 0; i < files; ++i) {
             auto created = frontend->create("/recover-autostart-" + std::to_string(i) + ".bin",
                                             0644, getuid(), getgid(), true, true, false);
@@ -1188,19 +1196,11 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_recovery_starts_without_new_fuse_a
         REQUIRE(frontend->wait_for_idle(10s));
 
         // Hold the viewer/foreground gate closed while constructing the durable
-        // backlog. publication_quiet normally reduces live FUSE publication to
-        // foreground_commit_workers rather than disabling it, so merely checking
-        // pending_data here is timing-sensitive: one publisher may already be active.
-        // Refresh foreground activity until the frontend has been stopped so no
-        // distributed data publication can race this fixture.
+        // backlog. The five-second staging quiet window above is comfortably
+        // larger than this bounded fixture, so a single activity sample is a
+        // deterministic gate even under a heavily loaded test runner.
         auto payload = pattern(4 * config.extent_size);
         service.filesystem().store().foreground_activity(1);
-        std::jthread hold_foreground([&](std::stop_token stop) {
-            while (!stop.stop_requested()) {
-                service.filesystem().store().foreground_activity(1);
-                std::this_thread::sleep_for(10ms);
-            }
-        });
         for (size_t i = 0; i < files; ++i) {
             auto handle = frontend->open("/recover-autostart-" + std::to_string(i) + ".bin",
                                          true, true, false, false);
@@ -1211,8 +1211,6 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_recovery_starts_without_new_fuse_a
         CHECK(staged.pending_data >= files);
         CHECK(staged.active_data == 0);
         frontend->stop();
-        hold_foreground.request_stop();
-        hold_foreground.join();
     }
 
     // Let the real playback gate expire, then deliberately keep only the generic

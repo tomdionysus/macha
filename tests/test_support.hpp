@@ -207,6 +207,10 @@ class TestService {
         REQUIRE(!service_);
         service_ = std::make_unique<Service>(config_, keys_);
         service_->start();
+        // Ordinary service fixtures preserve the historical fully-ready contract.
+        // Lifecycle tests instantiate Service directly so they can intentionally
+        // observe the early status/control-plane phases.
+        (void)service_->filesystem();
         return *service_;
     }
 
@@ -252,17 +256,31 @@ class TestNode {
     void prepare() {
         REQUIRE(!node_);
         node_ = std::make_unique<NodeRuntime>(config_, keys_);
-        store_ = std::make_unique<DistributedStore>(*node_);
-        metadata_ = std::make_unique<MetadataManager>(*node_);
-        filesystem_ = std::make_unique<FileSystem>(*node_, *store_, *metadata_);
     }
 
-    NodeRuntime& start() {
+    NodeRuntime& start_control_plane() {
         if (!node_) prepare();
         REQUIRE(!started_);
         node_->start();
         started_ = true;
         return *node_;
+    }
+
+    NodeRuntime& wait_ready() {
+        REQUIRE(node_);
+        REQUIRE(started_);
+        REQUIRE(node_->wait_local_state_ready(std::chrono::seconds{10}));
+        if (!store_) {
+            store_ = std::make_unique<DistributedStore>(*node_);
+            metadata_ = std::make_unique<MetadataManager>(*node_);
+            filesystem_ = std::make_unique<FileSystem>(*node_, *store_, *metadata_);
+        }
+        return *node_;
+    }
+
+    NodeRuntime& start() {
+        start_control_plane();
+        return wait_ready();
     }
 
     NodeRuntime& node() { REQUIRE(node_); return *node_; }

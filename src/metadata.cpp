@@ -2071,13 +2071,36 @@ void MetadataReplica::load_history() {
             envelope.finish();
             auto plaintext = aes_gcm_open(key_, nonce, tag, ciphertext, MH);
             auto entry_value = decode_metadata_history_entry(plaintext);
-            auto [it, inserted] = history_.emplace(entry_value.hash, std::move(entry_value));
-            if (!inserted)
-                throw DecodeError("duplicate metadata history record");
-            if (!historical_locked(it->first)) {
-                history_.erase(it);
-                throw DecodeError("metadata history record cannot be reconstructed");
+
+            // Cold-start history loading must be O(history bytes), not O(history^2).
+            // Validate each frame locally here; full reconstruction is deferred to
+            // accepted/current heads which can actually become authority.
+            if (!entry_value.generation || entry_value.hash == Hash256{})
+                throw DecodeError("invalid metadata history identity");
+            if (entry_value.body == MetadataHistoryEntry::Body::full) {
+                MetadataRecord record;
+                record.generation = entry_value.generation;
+                record.previous = entry_value.previous;
+                record.hash = entry_value.hash;
+                record.payload = entry_value.payload;
+                if (!valid_metadata_record(record))
+                    throw DecodeError("invalid full metadata history record");
+                auto snapshot = decode_snapshot(record.payload);
+                if (snapshot.merge_parents != entry_value.merge_parents)
+                    throw DecodeError("metadata history merge parents mismatch");
+            } else if (entry_value.body == MetadataHistoryEntry::Body::delta) {
+                if (!entry_value.previous_known || entry_value.generation <= 1)
+                    throw DecodeError("metadata delta history has no predecessor");
+                auto parent = history_.find(entry_value.previous);
+                if (parent == history_.end() || parent->second.generation + 1 != entry_value.generation)
+                    throw DecodeError("metadata delta history predecessor missing or non-adjacent");
+                (void)decode_metadata_delta(entry_value.payload);
+            } else {
+                throw DecodeError("unknown metadata history body");
             }
+
+            if (!history_.emplace(entry_value.hash, std::move(entry_value)).second)
+                throw DecodeError("duplicate metadata history record");
         } catch (const std::exception& error) {
             if (final_frame && std::string_view(error.what()) == "AES-GCM authentication failed") {
                 trailing_problem = "final frame failed AES-GCM authentication";
@@ -2135,10 +2158,14 @@ void MetadataReplica::load_heads() {
         reader.finish();
         auto values = decode_metadata_acceptance_set(aes_gcm_open(key_, nonce, tag, ciphertext, MA));
         for (auto& value : values) {
-            auto record = historical_locked(value.hash);
-            if (!record || record->generation != value.generation)
+            std::optional<MetadataRecord> reconstructed;
+            if (value.hash == committed_.hash && value.generation == committed_.generation)
+                reconstructed = committed_;
+            else
+                reconstructed = historical_locked(value.hash);
+            if (!reconstructed || reconstructed->generation != value.generation)
                 throw std::runtime_error("accepted metadata head is not reconstructible");
-            if (!acceptance_matches_record_policy_locked(value, *record))
+            if (!acceptance_matches_record_policy_locked(value, *reconstructed))
                 throw std::runtime_error("accepted metadata head policy does not match commit");
             accepted_heads_.emplace(value.hash, std::move(value));
         }
@@ -2351,7 +2378,8 @@ MetadataHistoryEntry MetadataReplica::history_for_current(std::span<const uint8_
     entry_value.hash = cur_.hash;
     entry_value.previous_known = cur_.generation > 1 && cur_.previous != Hash256{};
     entry_value.merge_parents = decode_snapshot(cur_.payload).merge_parents;
-    if (!delta.empty()) {
+    constexpr uint64_t full_anchor_interval = 256;
+    if (!delta.empty() && cur_.generation % full_anchor_interval != 0) {
         entry_value.body = MetadataHistoryEntry::Body::delta;
         entry_value.payload.assign(delta.begin(), delta.end());
     } else {
