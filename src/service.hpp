@@ -12,11 +12,14 @@
 #include "hydration.hpp"
 #include "media_catalogue.hpp"
 #include "playback.hpp"
+#include <atomic>
 #include <condition_variable>
 #include <ctime>
 #include <mutex>
 #include <memory>
 #include <optional>
+#include <string>
+#include <thread>
 #include <vector>
 
 namespace macha {
@@ -25,23 +28,32 @@ std::chrono::milliseconds maintenance_background_interval(const MaintenanceConfi
 
 class Service {
     NodeRuntime node_;
-    DistributedStore store_;
-    MetadataManager metadata_;
     ClusterStatusService cluster_status_;
-    CatalogueManager catalogue_;
-    PlaybackTracker playback_;
-    FileSystem fs_;
-    CatalogueHintQueue catalogue_hints_;
-    CatalogueScanner scanner_;
-    HydrationManager hydration_;
-    IngestManager ingest_;
-    TorrentManager torrents_;
-    TorrentSearchManager torrent_search_;
-    AcquisitionApi acquisition_api_;
-    CatalogueApi catalogue_api_;
-    ManageApi manage_api_;
-    PlaybackManager streaming_;
     std::unique_ptr<HttpServer> catalogue_http_;
+
+    std::unique_ptr<DistributedStore> store_;
+    std::unique_ptr<MetadataManager> metadata_;
+    std::unique_ptr<CatalogueManager> catalogue_;
+    PlaybackTracker playback_;
+    std::unique_ptr<FileSystem> fs_;
+    std::unique_ptr<CatalogueHintQueue> catalogue_hints_;
+    std::unique_ptr<CatalogueScanner> scanner_;
+    std::unique_ptr<HydrationManager> hydration_;
+    std::unique_ptr<IngestManager> ingest_;
+    std::unique_ptr<TorrentManager> torrents_;
+    std::unique_ptr<TorrentSearchManager> torrent_search_;
+    std::unique_ptr<AcquisitionApi> acquisition_api_;
+    std::unique_ptr<CatalogueApi> catalogue_api_;
+    std::unique_ptr<ManageApi> manage_api_;
+    std::unique_ptr<PlaybackManager> streaming_;
+
+    std::jthread startup_;
+    std::atomic_bool services_ready_{};
+    std::atomic_bool startup_failed_{};
+    mutable std::mutex startup_mutex_;
+    std::condition_variable startup_cv_;
+    std::string startup_error_;
+
     std::jthread maintenance_;
     std::mutex maintenance_wait_mutex_;
     std::condition_variable_any maintenance_wait_cv_;
@@ -49,10 +61,6 @@ class Service {
     std::shared_ptr<const std::vector<ObjectId>> maintenance_live_;
     std::shared_ptr<const std::vector<ObjectId>> maintenance_universal_;
     std::shared_ptr<const std::vector<ObjectId>> maintenance_control_live_;
-    // Live sets reconstructed from the sole accepted local metadata head.
-    // Retention claims may be released against these sets even if the cluster
-    // partitions again later; newer deletions remain claimed until a newer
-    // stability horizon is established.
     Hash256 retention_release_floor_hash_{};
     std::shared_ptr<const std::vector<ObjectId>> retention_release_data_live_;
     std::shared_ptr<const std::vector<ObjectId>> retention_release_control_live_;
@@ -63,6 +71,11 @@ class Service {
     std::vector<GarbageRef> maintenance_stale_garbage_;
     std::optional<ObjectId> retention_data_repair_cursor_;
     std::optional<ObjectId> retention_control_repair_cursor_;
+
+    void initialise_services(std::stop_token);
+    void wait_services_ready();
+    HttpResponse handle_http(const HttpRequest&);
+    bool capability_request(const HttpRequest&);
     void loop(std::stop_token);
     std::vector<GarbageRef> collect_garbage(const std::vector<GarbageRef>&);
     void maintain_garbage_metadata(const std::vector<GarbageRef>& erase,
@@ -70,29 +83,18 @@ class Service {
     void retain_metadata_publication(const MetadataPublicationContext&);
 
   public:
-    Service(Config, ClusterKeys);
+    Service(Config, ClusterKeys, NodeRuntime::StartupStageHook startup_stage_hook = {});
     ~Service();
     void start();
     void request_stop();
     void stop();
     void reload_config();
-    FileSystem& filesystem() {
-        return fs_;
-    }
-    NodeRuntime& node() {
-        return node_;
-    }
-    MetadataManager& metadata_manager() {
-        return metadata_;
-    }
-    CatalogueManager& catalogue() {
-        return catalogue_;
-    }
-    CatalogueHintQueue& catalogue_hints() {
-        return catalogue_hints_;
-    }
-    HydrationManager& hydration() {
-        return hydration_;
-    }
+    bool ready() const noexcept { return services_ready_.load(std::memory_order_acquire); }
+    FileSystem& filesystem() { wait_services_ready(); return *fs_; }
+    NodeRuntime& node() { return node_; }
+    MetadataManager& metadata_manager() { wait_services_ready(); return *metadata_; }
+    CatalogueManager& catalogue() { wait_services_ready(); return *catalogue_; }
+    CatalogueHintQueue& catalogue_hints() { wait_services_ready(); return *catalogue_hints_; }
+    HydrationManager& hydration() { wait_services_ready(); return *hydration_; }
 };
 } // namespace macha
