@@ -15,6 +15,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 configure_file(src/version.hpp.in ${CMAKE_CURRENT_BINARY_DIR}/generated/macha_version.hpp @ONLY)
 
+option(MACHA_BUILD_SERVER "Build the macha server executable" ON)
 option(MACHA_ENABLE_FUSE "Build the FUSE mount adapter when available" ON)
 option(MACHA_BUILD_TESTS "Build tests" ON)
 option(MACHA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
@@ -22,9 +23,18 @@ option(MACHA_TEST_COVERAGE "Instrument the backend test build for source/branch 
 
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(Threads REQUIRED)
-find_package(CURL REQUIRED)
-find_package(yaml-cpp REQUIRED)
 find_package(PkgConfig REQUIRED)
+find_package(CURL REQUIRED)
+find_package(yaml-cpp QUIET)
+
+# Some environments expose a static CURL::libcurl without its transitive link
+# dependencies. Prefer pkg-config's complete imported target when available.
+pkg_check_modules(LIBCURL QUIET IMPORTED_TARGET libcurl)
+if(TARGET PkgConfig::LIBCURL)
+    set(MACHA_CURL_TARGET PkgConfig::LIBCURL)
+else()
+    set(MACHA_CURL_TARGET CURL::libcurl)
+endif()
 
 # Homebrew versioned FFmpeg is keg-only and libtorrent's native CMake package
 # lives beneath its formula prefix. Discover both prefixes up front on macOS so
@@ -76,7 +86,7 @@ if(APPLE)
 endif()
 
 # The in-process media engine uses public APIs present in FFmpeg 6 and later.
-pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET
+pkg_check_modules(LIBAV QUIET IMPORTED_TARGET
     libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7 libswresample>=4)
 
 # UPnP IGD discovery/port mapping is optional at build time. Prefer the
@@ -114,21 +124,27 @@ if(NOT MACHA_LIBTORRENT_TARGET)
     endif()
 endif()
 
+set(MACHA_YAML_TARGET "")
 if(TARGET yaml-cpp::yaml-cpp)
     set(MACHA_YAML_TARGET yaml-cpp::yaml-cpp)
 elseif(TARGET yaml-cpp)
     set(MACHA_YAML_TARGET yaml-cpp)
-else()
-    message(FATAL_ERROR "yaml-cpp package found but no CMake target is available")
+endif()
+
+if(MACHA_BUILD_SERVER AND NOT MACHA_YAML_TARGET)
+    message(FATAL_ERROR "yaml-cpp is required to build the macha server (set MACHA_BUILD_SERVER=OFF for dependency-light tests)")
+endif()
+if(MACHA_BUILD_SERVER AND NOT TARGET PkgConfig::LIBAV)
+    message(FATAL_ERROR "FFmpeg development libraries are required to build the macha server (set MACHA_BUILD_SERVER=OFF for dependency-light tests)")
 endif()
 
 set(MACHA_CORE_SOURCES
     src/types.cpp
     src/codec.cpp
     src/crypto.cpp
-    src/config.cpp
+    src/config_base.cpp
     src/log.cpp
-    src/ffmpeg_log.cpp
+    src/ffmpeg_log_base.cpp
     src/diagnostics.cpp
     src/telemetry.cpp
     src/status_api.cpp
@@ -153,7 +169,7 @@ set(MACHA_CORE_SOURCES
     src/media_timestamps.cpp
     src/media_vod.cpp
     src/subtitle_text.cpp
-    src/media_engine.cpp
+    src/media_engine_common.cpp
     src/playback.cpp
     src/catalogue.cpp
     src/catalogue_hints.cpp
@@ -177,7 +193,7 @@ target_include_directories(macha_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(macha_core PUBLIC
-    OpenSSL::Crypto Threads::Threads CURL::libcurl ${MACHA_YAML_TARGET} PkgConfig::LIBAV)
+    OpenSSL::Crypto Threads::Threads ${MACHA_CURL_TARGET})
 if(MACHA_MINIUPNPC_TARGET)
     target_link_libraries(macha_core PUBLIC ${MACHA_MINIUPNPC_TARGET})
     target_compile_definitions(macha_core PUBLIC MACHA_HAVE_MINIUPNPC=1)
@@ -204,65 +220,76 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     endif()
 endif()
 
-add_executable(macha src/main.cpp)
-target_link_libraries(macha PRIVATE macha_core)
+if(MACHA_BUILD_SERVER)
+    add_executable(macha
+        src/main.cpp
+        src/config.cpp
+        src/ffmpeg_log.cpp
+        src/media_engine.cpp
+        src/media_metadata_ffmpeg.cpp
+        src/service_config.cpp)
+    target_link_libraries(macha PRIVATE macha_core ${MACHA_YAML_TARGET} PkgConfig::LIBAV)
 
-set(MACHA_FUSE_FOUND OFF)
-if(MACHA_ENABLE_FUSE)
-    pkg_check_modules(FUSE3 QUIET IMPORTED_TARGET fuse3)
-    if(TARGET PkgConfig::FUSE3)
-        set(MACHA_FUSE_FOUND ON)
-        target_sources(macha PRIVATE src/fuse_adapter.cpp)
-        target_link_libraries(macha PRIVATE PkgConfig::FUSE3)
-    endif()
-
-    if(APPLE AND NOT MACHA_FUSE_FOUND)
-        find_path(FUSE3_INCLUDE_DIR fuse.h
-            HINTS
-                /usr/local/include/fuse3
-                /opt/homebrew/include/fuse3
-                /Library/Filesystems/macfuse.fs/Contents/Resources/include/fuse3
-        )
-        find_library(FUSE3_LIBRARY
-            NAMES fuse3 fuse
-            HINTS
-                /usr/local/lib
-                /opt/homebrew/lib
-                /Library/Filesystems/macfuse.fs/Contents/Resources/lib
-        )
-        if(FUSE3_INCLUDE_DIR AND FUSE3_LIBRARY)
+    set(MACHA_FUSE_FOUND OFF)
+    if(MACHA_ENABLE_FUSE)
+        pkg_check_modules(FUSE3 QUIET IMPORTED_TARGET fuse3)
+        if(TARGET PkgConfig::FUSE3)
             set(MACHA_FUSE_FOUND ON)
             target_sources(macha PRIVATE src/fuse_adapter.cpp)
-            target_include_directories(macha PRIVATE ${FUSE3_INCLUDE_DIR})
-            target_link_libraries(macha PRIVATE ${FUSE3_LIBRARY})
+            target_link_libraries(macha PRIVATE PkgConfig::FUSE3)
+        endif()
+
+        if(APPLE AND NOT MACHA_FUSE_FOUND)
+            find_path(FUSE3_INCLUDE_DIR fuse.h
+                HINTS
+                    /usr/local/include/fuse3
+                    /opt/homebrew/include/fuse3
+                    /Library/Filesystems/macfuse.fs/Contents/Resources/include/fuse3
+            )
+            find_library(FUSE3_LIBRARY
+                NAMES fuse3 fuse
+                HINTS
+                    /usr/local/lib
+                    /opt/homebrew/lib
+                    /Library/Filesystems/macfuse.fs/Contents/Resources/lib
+            )
+            if(FUSE3_INCLUDE_DIR AND FUSE3_LIBRARY)
+                set(MACHA_FUSE_FOUND ON)
+                target_sources(macha PRIVATE src/fuse_adapter.cpp)
+                target_include_directories(macha PRIVATE ${FUSE3_INCLUDE_DIR})
+                target_link_libraries(macha PRIVATE ${FUSE3_LIBRARY})
+            endif()
         endif()
     endif()
-endif()
 
-if(NOT MACHA_FUSE_FOUND)
-    target_sources(macha PRIVATE src/fuse_stub.cpp)
-    if(MACHA_ENABLE_FUSE)
-        message(STATUS "FUSE3/macFUSE development files not found; building service without mount support")
+    if(NOT MACHA_FUSE_FOUND)
+        target_sources(macha PRIVATE src/fuse_stub.cpp)
+        if(MACHA_ENABLE_FUSE)
+            message(STATUS "FUSE3/macFUSE development files not found; building service without mount support")
+        endif()
     endif()
-endif()
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-    target_compile_options(macha PRIVATE -Wall -Wextra -Wpedantic)
-    if(MACHA_WARNINGS_AS_ERRORS)
-        target_compile_options(macha PRIVATE -Werror)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(macha PRIVATE -Wall -Wextra -Wpedantic)
+        if(MACHA_WARNINGS_AS_ERRORS)
+            target_compile_options(macha PRIVATE -Werror)
+        endif()
     endif()
+
 endif()
 
 if(MACHA_BUILD_TESTS)
     include(CTest)
     enable_testing()
 
-    # One process-isolated, self-registering test executable. The runner itself
-    # parallelises cases, so `ctest` does not need to know about internal test
-    # partitioning and architecture regressions cannot drift into a second suite.
+    # The portable suite owns all dependency-free behavioural tests. Concrete
+    # yaml-cpp/libav adapter tests are registered separately below only when
+    # those development dependencies are available. Both use the same runner.
     add_executable(macha-tests
         tests/main.cpp
         tests/test_framework.cpp
+        src/media_engine_stub.cpp
+        src/media_metadata_stub.cpp
         tests/test_foundations.cpp
         tests/test_storage_metadata.cpp
         tests/test_storage_v18.cpp
@@ -274,7 +301,6 @@ if(MACHA_BUILD_TESTS)
         tests/test_models.cpp)
     target_link_libraries(macha-tests PRIVATE macha_core)
     target_compile_definitions(macha-tests PRIVATE
-        MACHA_HAVE_YAML_CPP=1
         MACHA_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(macha-tests PRIVATE -Wall -Wextra -Wpedantic)
@@ -300,10 +326,50 @@ if(MACHA_BUILD_TESTS)
     # Individual cases have stricter child-process deadlines. This is only a
     # suite-level deadman for CI infrastructure failures.
     set_tests_properties(macha-tests PROPERTIES TIMEOUT 300)
+
+    # Runtime-adapter tests are intentionally separate. A development machine
+    # without yaml-cpp/FFmpeg can still compile and execute the large portable
+    # suite above; when both dependencies exist this executable exercises the
+    # concrete configuration/media adapters as well.
+    if(MACHA_YAML_TARGET AND TARGET PkgConfig::LIBAV)
+        add_executable(macha-tests-runtime
+            tests/main.cpp
+            tests/test_framework.cpp
+            tests/test_runtime_dependencies.cpp
+            src/config.cpp
+            src/ffmpeg_log.cpp
+            src/media_engine.cpp
+            src/media_metadata_ffmpeg.cpp)
+        target_link_libraries(macha-tests-runtime PRIVATE
+            macha_core ${MACHA_YAML_TARGET} PkgConfig::LIBAV)
+        target_compile_definitions(macha-tests-runtime PRIVATE
+            MACHA_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(macha-tests-runtime PRIVATE -Wall -Wextra -Wpedantic)
+            if(MACHA_WARNINGS_AS_ERRORS)
+                target_compile_options(macha-tests-runtime PRIVATE -Werror)
+            endif()
+        endif()
+        if(MACHA_TEST_COVERAGE)
+            if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+                target_compile_options(macha-tests-runtime PRIVATE --coverage)
+                target_link_options(macha-tests-runtime PRIVATE --coverage)
+            elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
+                target_compile_options(macha-tests-runtime PRIVATE -fprofile-instr-generate -fcoverage-mapping)
+                target_link_options(macha-tests-runtime PRIVATE -fprofile-instr-generate)
+            endif()
+        endif()
+        add_test(NAME macha-tests-runtime COMMAND macha-tests-runtime)
+        set_tests_properties(macha-tests-runtime PROPERTIES TIMEOUT 300)
+    else()
+        message(STATUS "yaml-cpp and/or FFmpeg development files not found; runtime-adapter tests will not be built")
+    endif()
 endif()
 
 include(GNUInstallDirs)
-install(TARGETS macha RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(TARGET macha)
+    install(TARGETS macha RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 install(FILES systemd/macha.service DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system OPTIONAL)
 install(FILES README.md ARCHITECTURE.md SECURITY.md CHANGELOG.md CONTRIBUTING.md LICENSE
         DESTINATION ${CMAKE_INSTALL_DOCDIR})

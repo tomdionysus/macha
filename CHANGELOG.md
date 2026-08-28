@@ -21,6 +21,7 @@
 - Keep the 0.18 on-disk storage layout readable; bump the peer protocol to 20 because the metadata publication contract is intentionally incompatible with protocol 18/19.
 - Fix protocol-20 compact metadata deltas so ordinary mutations retain SM12/SM13 write-floor and retention-governance state, persist completed retention baselines even with an empty migration roster, and preserve mutation-sequence counters across restart.
 - Keep legacy accepted-head certificates readable during upgrade while preventing a protocol-20 branch from downgrading to legacy authority, and route background maintenance through the same virgin-cluster policy fencing as foreground discovery.
+- Split dependency-free backend tests from concrete yaml-cpp/FFmpeg runtime-adapter tests so storage, cluster, filesystem, catalogue and playback policy coverage can build and run on constrained development hosts; add `run-tests.sh` to execute every test binary present in a build tree.
 
 ## 0.18.2 — cluster status telemetry
 
