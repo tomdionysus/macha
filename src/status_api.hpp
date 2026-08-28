@@ -4,6 +4,7 @@
 #include "http.hpp"
 #include "metadata_manager.hpp"
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <optional>
@@ -13,7 +14,7 @@ namespace macha {
 
 class ClusterStatusService {
     NodeRuntime& node_;
-    MetadataManager& metadata_;
+    std::atomic<MetadataManager*> metadata_{nullptr};
     std::jthread persistence_;
     std::mutex wait_mutex_;
     std::condition_variable_any wait_cv_;
@@ -24,7 +25,9 @@ class ClusterStatusService {
     HttpResponse connectivity_check(const std::optional<NodeId>& only);
 
   public:
-    ClusterStatusService(NodeRuntime&, MetadataManager&);
+    explicit ClusterStatusService(NodeRuntime&);
+    void attach_metadata(MetadataManager& metadata) { metadata_.store(&metadata, std::memory_order_release); }
+    void detach_metadata() { metadata_.store(nullptr, std::memory_order_release); }
     ~ClusterStatusService();
     void start();
     void request_stop();

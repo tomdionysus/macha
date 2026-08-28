@@ -15,9 +15,29 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
+#include <string_view>
 
 namespace macha {
+struct NodeReadiness {
+    bool control_plane_online{};
+    bool data_storage_ready{};
+    bool control_storage_ready{};
+    bool cache_ready{};
+    bool retention_ready{};
+    bool metadata_ready{};
+    bool local_state_ready{};
+    bool failed{};
+    uint64_t started_unix_ms{};
+    uint64_t ready_unix_ms{};
+    std::string error;
+};
+
 class NodeRuntime {
+  public:
+    using StartupStageHook = std::function<void(std::string_view)>;
+
+  private:
     struct LocalCopyJob {
         ObjectId id;
         Bytes data;
@@ -25,19 +45,47 @@ class NodeRuntime {
         bool cache{};
     };
 
+    enum ReadyBit : uint32_t {
+        ready_control_plane = 1U << 0,
+        ready_data_storage = 1U << 1,
+        ready_control_storage = 1U << 2,
+        ready_cache = 1U << 3,
+        ready_retention = 1U << 4,
+        ready_metadata = 1U << 5,
+        ready_failed = 1U << 31,
+    };
+
     Config cfg_;
     ClusterKeys keys_;
     StorageLock state_lock_;
     NodeId id_;
     NodeId durability_epoch_;
-    StoragePool local_;
-    LocalStore control_;
-    PersistentBlockCache cache_;
-    RetentionStore retention_;
-    MetadataReplica meta_;
+
+    // The control plane is intentionally constructed before any storage or
+    // metadata backend. A node is therefore reachable/authenticated while its
+    // local durable state is still recovering.
     Membership members_;
     PublicConnectivity public_connectivity_;
     TelemetryStore telemetry_;
+    RpcClient client_;
+    RpcServer server_;
+
+    std::unique_ptr<StoragePool> local_;
+    std::unique_ptr<LocalStore> control_;
+    std::unique_ptr<PersistentBlockCache> cache_;
+    std::unique_ptr<RetentionStore> retention_;
+    std::unique_ptr<MetadataReplica> meta_;
+    StartupStageHook startup_stage_hook_;
+    std::atomic_uint32_t ready_bits_{};
+    uint64_t startup_unix_ms_{};
+    std::atomic_uint64_t ready_unix_ms_{};
+    mutable std::mutex readiness_mutex_;
+    std::condition_variable readiness_cv_;
+    std::string recovery_error_;
+    std::jthread storage_recovery_;
+    std::jthread state_recovery_;
+    std::jthread connectivity_worker_;
+
     std::atomic_uint64_t remote_metadata_generation_{};
     std::atomic_uint64_t remote_metadata_epoch_{};
     std::atomic_uint64_t telemetry_storage_used_{};
@@ -45,8 +93,6 @@ class NodeRuntime {
     std::atomic_uint64_t telemetry_metadata_generation_{};
     std::atomic_uint32_t telemetry_peers_known_{1};
     std::atomic_uint32_t telemetry_peers_active_{1};
-    RpcClient client_;
-    RpcServer server_;
     std::jthread maintenance_;
     std::jthread telemetry_worker_;
     std::mutex telemetry_wait_mutex_;
@@ -64,6 +110,15 @@ class NodeRuntime {
     std::atomic_int64_t last_playback_activity_ms_{};
     std::atomic_int64_t last_interactive_activity_ms_{};
 
+    bool ready(ReadyBit bit) const noexcept {
+        return (ready_bits_.load(std::memory_order_acquire) & static_cast<uint32_t>(bit)) != 0;
+    }
+    void mark_ready(ReadyBit bit);
+    void mark_recovery_failed(std::string);
+    void recover_storage(std::stop_token);
+    void recover_state(std::stop_token);
+    bool all_local_state_ready() const noexcept;
+
     RpcMessage handle(const NodeInfo&, FrameType, const RpcMessage&);
     void loop(std::stop_token);
     void local_writer_loop(std::stop_token);
@@ -75,59 +130,30 @@ class NodeRuntime {
     std::chrono::milliseconds stall_notice_for(MessageType) const;
 
   public:
-    NodeRuntime(Config, ClusterKeys);
+    NodeRuntime(Config, ClusterKeys, StartupStageHook startup_stage_hook = {});
     ~NodeRuntime();
     void start();
     void request_stop();
     void stop();
-    const Config& config() const {
-        return cfg_;
-    }
-    const ClusterKeys& keys() const {
-        return keys_;
-    }
-    NodeId node_id() const {
-        return id_;
-    }
-    NodeId durability_epoch() const {
-        return durability_epoch_;
-    }
-    StoragePool& local_store() {
-        return local_;
-    }
-    const StoragePool& local_store() const {
-        return local_;
-    }
-    LocalStore& control_store() {
-        return control_;
-    }
-    const LocalStore& control_store() const {
-        return control_;
-    }
-    PersistentBlockCache& block_cache() {
-        return cache_;
-    }
-    RetentionStore& retention_store() {
-        return retention_;
-    }
-    const RetentionStore& retention_store() const {
-        return retention_;
-    }
-    MetadataReplica& metadata_replica() {
-        return meta_;
-    }
-    Membership& membership() {
-        return members_;
-    }
-    const Membership& membership() const {
-        return members_;
-    }
-    TelemetryStore& telemetry() {
-        return telemetry_;
-    }
-    const TelemetryStore& telemetry() const {
-        return telemetry_;
-    }
+    bool wait_local_state_ready(std::chrono::milliseconds timeout);
+    NodeReadiness readiness() const;
+    const Config& config() const { return cfg_; }
+    const ClusterKeys& keys() const { return keys_; }
+    NodeId node_id() const { return id_; }
+    NodeId durability_epoch() const { return durability_epoch_; }
+    StoragePool& local_store();
+    const StoragePool& local_store() const;
+    LocalStore& control_store();
+    const LocalStore& control_store() const;
+    PersistentBlockCache& block_cache();
+    RetentionStore& retention_store();
+    const RetentionStore& retention_store() const;
+    MetadataReplica& metadata_replica();
+    const MetadataReplica& metadata_replica() const;
+    Membership& membership() { return members_; }
+    const Membership& membership() const { return members_; }
+    TelemetryStore& telemetry() { return telemetry_; }
+    const TelemetryStore& telemetry() const { return telemetry_; }
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
     RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType);
@@ -145,14 +171,10 @@ class NodeRuntime {
     void note_activity(FrameType, uint64_t bytes = 0);
     uint64_t take_activity_bytes(FrameType);
     std::chrono::milliseconds activity_idle_for(FrameType) const;
-    uint64_t remote_metadata_generation() const {
-        return remote_metadata_generation_.load();
-    }
-    uint64_t remote_metadata_epoch() const {
-        return remote_metadata_epoch_.load(std::memory_order_acquire);
-    }
+    uint64_t remote_metadata_generation() const { return remote_metadata_generation_.load(); }
+    uint64_t remote_metadata_epoch() const { return remote_metadata_epoch_.load(std::memory_order_acquire); }
     uint64_t known_metadata_generation() const {
-        const auto local = meta_.generation();
+        const auto local = ready(ready_metadata) ? metadata_replica().generation() : 0;
         const auto remote = remote_metadata_generation_.load();
         return local > remote ? local : remote;
     }
@@ -161,8 +183,6 @@ class NodeRuntime {
     std::vector<IdentityAssociationReset> identity_resets() const { return members_.identity_resets(); }
     PublicConnectivityStatus public_connectivity_status() const;
     PublicConnectivityStatus refresh_public_connectivity(bool probe, bool force_probe = false);
-    RpcStats rpc_stats() const {
-        return client_.stats();
-    }
+    RpcStats rpc_stats() const { return client_.stats(); }
 };
 } // namespace macha

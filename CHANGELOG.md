@@ -1,6 +1,12 @@
 # Current release
 
-## 0.19.0 — metadata replica availability (development)
+## 0.20.0 — asynchronous node startup (development)
+
+- Bring the RPC control plane and status API online before local backend recovery.
+- Report startup/readiness independently from cluster reachability and storage availability.
+- Make metadata-history cold-start linear and add periodic full-history anchors.
+
+## 0.19.0 — metadata replica availability
 
 - Replace fixed metadata-voter placement with all-node metadata replication. Every active node is eligible to durably store namespace and catalogue-control metadata.
 - Add `dht.metadata_min_write_replicas`: the literal number of distinct active metadata replicas which must durably store an immutable commit before it may be accepted. Legacy `dht.metadata_replicas` remains a migration-only alias and maps its old voter count to the equivalent former majority write floor.
