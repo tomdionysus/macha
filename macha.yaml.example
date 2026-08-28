@@ -94,6 +94,15 @@ fuse:
   foreground_commit_workers: 1
   publication_quiet_ms: 5000
   max_pending_operations: 4096
+
+  # Aggregate local write-back and recovery bounds. New operation-journal
+  # admissions stop at the WAL ceiling while already-durable work drains; the
+  # journal is reset when the pending set reaches zero.
+  max_spool_bytes: 16G
+  spool_reserve_free: 2G
+  max_orphan_bytes: 1G
+  max_operation_journal_bytes: 256M
+
   hydration_priority: 2000
   read_ahead_extents: 2
   hint_lifetime_ms: 5000

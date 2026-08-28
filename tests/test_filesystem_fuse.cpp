@@ -481,6 +481,143 @@ MACHA_TEST("filesystem_fuse", test_fuse_completed_publication_unlinks_retired_sp
     frontend->stop();
 }
 
+MACHA_TEST("filesystem_fuse", test_fuse_spool_byte_limit_applies_before_unbounded_backlog) {
+    TestService fixture("fuse-spool-byte-limit");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 30s;
+    config.fuse.max_spool_bytes = 384 * 1024;
+    config.fuse.spool_reserve_free = 0;
+
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto handle = frontend->create("/bounded-spool.bin", 0600, getuid(), getgid(),
+                                   true, true, false);
+    const auto first = pattern(256 * 1024, 41);
+    REQUIRE(frontend->write(handle.inode, 0, first) == first.size());
+
+    bool refused = false;
+    try {
+        const auto second = pattern(256 * 1024, 42);
+        (void)frontend->write(handle.inode, first.size(), second);
+    } catch (const FsError& error) {
+        refused = error.code() == ENOSPC;
+    }
+    CHECK(refused);
+
+    const auto spool_dir =
+        config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
+    const auto spool = spool_dir / ("inode-" + std::to_string(handle.inode) + ".spool");
+    REQUIRE(std::filesystem::exists(spool));
+    CHECK(std::filesystem::file_size(spool) == first.size());
+    frontend->stop();
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_operation_journal_admission_is_bounded_while_busy) {
+    TestService fixture("fuse-journal-budget");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 30s;
+    config.fuse.max_operation_journal_bytes = 12 * 1024;
+
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+
+    // Keep one durable DATA operation outstanding so unrelated namespace work
+    // cannot take the normal "pending == 0" journal reset fast path.
+    auto hold = frontend->create("/journal-hold.bin", 0600, getuid(), getgid(),
+                                 true, true, false);
+    const auto payload = pattern(64 * 1024, 91);
+    REQUIRE(frontend->write(hold.inode, 0, payload) == payload.size());
+    frontend->release(hold.inode, true); // local durability only; publication remains quiet
+
+    const auto journal = config.fuse.operation_journal_path.value_or(
+        config.state_path / "fuse-spool" / "operations.log");
+    REQUIRE(std::filesystem::exists(journal));
+
+    bool refused = false;
+    for (size_t i = 0; i < 256 && !refused; ++i) {
+        try {
+            frontend->mkdir("/journal-budget-" + std::to_string(i), 0700, getuid(), getgid());
+        } catch (const FsError& error) {
+            if (error.code() == ENOSPC)
+                refused = true;
+            else
+                throw;
+        }
+    }
+    REQUIRE(refused);
+
+    // Completion records for work admitted just before the ceiling are allowed
+    // to drain beyond the admission threshold. Rejected *new* work must not keep
+    // extending the WAL indefinitely.
+    const auto bounded_size = std::filesystem::file_size(journal);
+    for (size_t i = 0; i < 8; ++i) {
+        bool rejected_again = false;
+        try {
+            frontend->mkdir("/journal-refused-" + std::to_string(i), 0700, getuid(), getgid());
+        } catch (const FsError& error) {
+            rejected_again = error.code() == ENOSPC;
+        }
+        CHECK(rejected_again);
+    }
+    CHECK(std::filesystem::file_size(journal) == bounded_size);
+    frontend->stop();
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_orphan_quarantine_is_byte_bounded_on_recovery) {
+    TestService fixture("fuse-orphan-budget");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.fuse.max_orphan_bytes = 1024;
+
+    // Establish/version the service state before introducing deliberately
+    // unreferenced recovery artifacts.  Pre-populating state_path before
+    // Service startup correctly trips the legacy/unversioned-state guard.
+    auto& service = fixture.start();
+    const auto spool_dir = config.state_path / "fuse-spool";
+    std::filesystem::create_directories(spool_dir);
+    const auto older = spool_dir / "inode-900.spool.orphan.1";
+    const auto newer = spool_dir / "inode-901.spool.orphan.2";
+    {
+        std::ofstream out(older, std::ios::binary | std::ios::trunc);
+        out << std::string(800, 'a');
+    }
+    {
+        std::ofstream out(newer, std::ios::binary | std::ios::trunc);
+        out << std::string(800, 'b');
+    }
+    const auto now = std::filesystem::file_time_type::clock::now();
+    std::filesystem::last_write_time(older, now - 2h);
+    std::filesystem::last_write_time(newer, now - 1h);
+
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+
+    uint64_t orphan_bytes = 0;
+    size_t orphan_files = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(spool_dir)) {
+        if (!entry.is_regular_file() ||
+            entry.path().filename().string().find(".orphan.") == std::string::npos)
+            continue;
+        orphan_bytes += entry.file_size();
+        ++orphan_files;
+    }
+    CHECK(orphan_bytes <= config.fuse.max_orphan_bytes);
+    CHECK(orphan_files == 1);
+    CHECK(!std::filesystem::exists(older));
+    CHECK(std::filesystem::exists(newer));
+    frontend->stop();
+}
+
 MACHA_TEST("filesystem_fuse", test_fuse_publication_yields_to_playback) {
     TestService fixture("fuse-playback-yield");
     auto& config = fixture.config();

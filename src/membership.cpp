@@ -1,10 +1,85 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "membership.hpp"
+#include "codec.hpp"
+#include "durable_file.hpp"
 #include <algorithm>
+#include <array>
+#include <fstream>
 #include <stdexcept>
 #include <utility>
 namespace macha {
-Membership::Membership(NodeInfo s, std::chrono::milliseconds d) : self_(std::move(s)), dead_(d) {}
+namespace {
+constexpr std::array<uint8_t, 8> known_magic{'M', 'A', 'C', 'H', 'M', 'E', 'M', '1'};
+constexpr uint32_t max_known_nodes = 65536;
+constexpr uint64_t max_known_bytes = 16ULL * 1024 * 1024;
+}
+
+Membership::Membership(NodeInfo s, std::chrono::milliseconds d, std::filesystem::path known_path)
+    : self_(std::move(s)), dead_(d), known_path_(std::move(known_path)) {
+    load_known();
+}
+
+void Membership::load_known() {
+    if (known_path_.empty() || !std::filesystem::exists(known_path_))
+        return;
+    const auto size = std::filesystem::file_size(known_path_);
+    if (size > max_known_bytes)
+        throw std::runtime_error("known-node roster is too large");
+    std::ifstream input(known_path_, std::ios::binary);
+    if (!input)
+        throw std::runtime_error("cannot read known-node roster " + known_path_.string());
+    Bytes bytes(static_cast<size_t>(size));
+    if (size && !input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size)))
+        throw std::runtime_error("cannot read known-node roster " + known_path_.string());
+    Reader reader(bytes);
+    if (reader.fixed<8>() != known_magic)
+        throw DecodeError("bad known-node roster magic");
+    const auto count = reader.u32();
+    if (count > max_known_nodes)
+        throw DecodeError("too many known nodes");
+    const auto stale = Clock::now() - dead_ - std::chrono::milliseconds(1);
+    for (uint32_t i = 0; i < count; ++i) {
+        NodeInfo node;
+        node.id.bytes = reader.fixed<16>();
+        node.host = reader.string(4096);
+        node.failure_domain = reader.string(4096);
+        node.port = reader.u16();
+        if (node.id == NodeId{} || node.id == self_.id || node.host.empty() || !node.port)
+            throw DecodeError("bad known-node roster entry");
+        if (!nodes_.emplace(node.id, R{std::move(node), stale, std::nullopt}).second)
+            throw DecodeError("duplicate known-node roster entry");
+    }
+    reader.finish();
+}
+
+void Membership::persist_known_locked() const {
+    if (known_path_.empty())
+        return;
+    if (nodes_.size() > max_known_nodes)
+        throw std::runtime_error("too many known nodes");
+    std::vector<NodeInfo> ordered;
+    ordered.reserve(nodes_.size());
+    for (const auto& [_, record] : nodes_)
+        ordered.push_back(record.info);
+    std::sort(ordered.begin(), ordered.end(), [](const NodeInfo& a, const NodeInfo& b) {
+        return a.id < b.id;
+    });
+    Writer writer;
+    writer.fixed(known_magic);
+    writer.u32(static_cast<uint32_t>(ordered.size()));
+    for (const auto& node : ordered) {
+        writer.fixed(node.id.bytes);
+        writer.string(node.host);
+        writer.string(node.failure_domain);
+        writer.u16(node.port);
+    }
+    const auto& bytes = writer.data();
+    if (bytes.size() > max_known_bytes)
+        throw std::runtime_error("known-node roster is too large");
+    durable_replace_file(
+        known_path_, std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+}
+
 NodeInfo Membership::self() const {
     std::lock_guard g(m_);
     auto s = self_;
@@ -52,11 +127,25 @@ void Membership::observe(NodeInfo n, bool direct) {
     }
     auto now = Clock::now();
     auto i = nodes_.find(n.id);
-    if (i == nodes_.end())
-        nodes_.emplace(n.id, R{std::move(n), now});
-    else if (direct || n.seen_unix_ms > i->second.info.seen_unix_ms) {
-        i->second = {std::move(n), now};
+    bool durable_roster_changed = false;
+    if (i == nodes_.end()) {
+        R record{std::move(n), now, direct ? std::optional<Clock::time_point>(now) : std::nullopt};
+        nodes_.emplace(record.info.id, std::move(record));
+        durable_roster_changed = true;
+    } else {
+        const bool association_changed = i->second.info.host != n.host ||
+                                         i->second.info.port != n.port ||
+                                         i->second.info.failure_domain != n.failure_domain;
+        if (direct || n.seen_unix_ms > i->second.info.seen_unix_ms) {
+            i->second.info = std::move(n);
+            i->second.seen = now;
+        }
+        if (direct)
+            i->second.direct_seen = now;
+        durable_roster_changed = association_changed;
     }
+    if (durable_roster_changed)
+        persist_known_locked();
 }
 
 bool Membership::apply_identity_reset(const IdentityAssociationReset& reset) {
@@ -68,11 +157,14 @@ bool Membership::apply_identity_reset(const IdentityAssociationReset& reset) {
     if (found != identity_resets_.end() && found->second.epoch >= reset.epoch)
         return false;
     identity_resets_[key] = reset;
+    const auto before = nodes_.size();
     std::erase_if(nodes_, [&](const auto& item) {
         const auto& info = item.second.info;
         return identity_reset_matches_endpoint(reset, info.host, info.port) &&
                identity_reset_matches_node(reset, info.id);
     });
+    if (nodes_.size() != before)
+        persist_known_locked();
     return true;
 }
 
@@ -123,5 +215,13 @@ std::vector<NodeInfo> Membership::active() const {
         if (now - record.seen <= dead_)
             out.push_back(record.info);
     return out;
+}
+
+bool Membership::all_known_reachable() const {
+    std::lock_guard g(m_);
+    const auto now = Clock::now();
+    return std::all_of(nodes_.begin(), nodes_.end(), [&](const auto& item) {
+        return item.second.direct_seen && now - *item.second.direct_seen <= dead_;
+    });
 }
 } // namespace macha

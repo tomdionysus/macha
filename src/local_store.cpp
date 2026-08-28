@@ -1039,185 +1039,194 @@ bool LocalStore::is_packed(const ObjectId& id) const {
 }
 
 bool LocalStore::compact_packs_locked() {
-    if (!pack_threshold_) return true;
-    if (pack_dead_bytes_ == 0) return true;
+    if (!pack_threshold_ || pack_dead_bytes_ == 0)
+        return true;
 
-    struct OldPack {
+    struct PackUsage {
         std::filesystem::path file;
         uint64_t size{};
+        uint64_t live{};
+        uint64_t dead{};
     };
-    std::vector<OldPack> old_packs;
-    uint64_t old_total = 0;
-    {
-        std::error_code error;
-        for (const auto& entry : std::filesystem::directory_iterator(packs_, error)) {
-            if (error) break;
-            if (!entry.is_regular_file()) continue;
-            if (!pack_sequence(entry.path().filename().string())) continue;
-            std::error_code size_error;
-            const auto size = entry.file_size(size_error);
-            if (size_error)
-                throw std::runtime_error("cannot size source pack: " + size_error.message());
-            old_packs.push_back({entry.path(), size});
-            if (size > std::numeric_limits<uint64_t>::max() - old_total)
-                throw std::runtime_error("pack compaction size overflow");
-            old_total += size;
-        }
-        if (error)
-            throw std::runtime_error("cannot enumerate source packs: " + error.message());
+
+    std::map<std::filesystem::path, uint64_t> live_by_pack;
+    for (const auto& [_, entry] : packed_) {
+        auto& live = live_by_pack[entry.file];
+        if (entry.record_size > std::numeric_limits<uint64_t>::max() - live)
+            throw std::runtime_error("pack compaction live-size overflow");
+        live += entry.record_size;
     }
 
-    // Compaction is copy-on-write. It may temporarily exceed the configured DATA
-    // admission limit because the old durable representation cannot be removed
-    // before the replacement is fsynced and installed. It must, however, preserve
-    // the physical filesystem reserve. Record sizes are stable under re-encryption
-    // because AES-GCM ciphertext length equals plaintext length.
-    uint64_t live_total = 0;
-    for (const auto& [_, entry] : packed_) {
-        if (entry.record_size > std::numeric_limits<uint64_t>::max() - live_total)
-            throw std::runtime_error("pack compaction live-size overflow");
-        live_total += entry.record_size;
+    std::vector<PackUsage> packs;
+    uint64_t total_dead = 0;
+    std::error_code enumerate_error;
+    for (const auto& entry : std::filesystem::directory_iterator(packs_, enumerate_error)) {
+        if (enumerate_error)
+            break;
+        if (!entry.is_regular_file() || !pack_sequence(entry.path().filename().string()))
+            continue;
+        std::error_code size_error;
+        const auto size = entry.file_size(size_error);
+        if (size_error)
+            throw std::runtime_error("cannot size source pack: " + size_error.message());
+        const auto found = live_by_pack.find(entry.path());
+        const uint64_t live = found == live_by_pack.end() ? 0 : found->second;
+        if (live > size)
+            throw std::runtime_error("pack live accounting exceeds physical pack size");
+        const uint64_t dead = size - live;
+        if (dead > std::numeric_limits<uint64_t>::max() - total_dead)
+            throw std::runtime_error("pack dead-size overflow");
+        total_dead += dead;
+        packs.push_back({entry.path(), size, live, dead});
     }
+    if (enumerate_error)
+        throw std::runtime_error("cannot enumerate source packs: " + enumerate_error.message());
+
+    // The cached counter is only an admission hint. Derive the authoritative
+    // value from the current index/files before selecting a victim so recovery
+    // from an interrupted previous compaction cannot leave dead bytes hidden.
+    pack_dead_bytes_ = total_dead;
+    auto victim = std::max_element(packs.begin(), packs.end(), [](const PackUsage& a,
+                                                                  const PackUsage& b) {
+        if (a.dead != b.dead)
+            return a.dead < b.dead;
+        return a.size < b.size;
+    });
+    if (victim == packs.end() || victim->dead == 0) {
+        pack_dead_bytes_ = 0;
+        return true;
+    }
+
+    // One maintenance invocation rewrites at most one source pack. Temporary
+    // space is therefore bounded by that pack's live bytes rather than the live
+    // size of the entire DATA store.
     std::error_code space_error;
     const auto space = std::filesystem::space(root_, space_error);
     if (space_error)
         throw std::runtime_error("cannot inspect free space for pack compaction: " +
                                  space_error.message());
-    if (live_total > space.available || reserve_free_ > space.available - live_total)
+    if (victim->live > space.available || reserve_free_ > space.available - victim->live)
         return false;
 
-    struct NewPack {
-        std::filesystem::path temp;
-        std::filesystem::path final;
-        int fd{-1};
-        uint64_t size{};
-    };
-    std::vector<NewPack> new_packs;
+    std::vector<std::pair<ObjectId, PackEntry>> victim_entries;
+    for (const auto& [id, entry] : packed_)
+        if (entry.file == victim->file)
+            victim_entries.push_back({id, entry});
+
+    std::filesystem::path replacement;
+    std::filesystem::path temp;
+    int fd = -1;
+    uint64_t replacement_size = 0;
     std::map<ObjectId, PackEntry> rebuilt;
-    uint64_t new_total = 0;
 
-    auto open_pack = [&]() -> NewPack& {
-        const auto sequence = next_pack_sequence_++;
-        NewPack item;
-        item.final = packs_ / pack_name(sequence);
-        item.temp = packs_ / (".compact-" + std::to_string(getpid()) + "-" +
-                              std::to_string(sequence) + ".tmp");
-        item.fd = ::open(item.temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
-        if (item.fd < 0)
-            throw std::runtime_error("cannot create compacted pack: " +
-                                     std::string(strerror(errno)));
-        new_packs.push_back(std::move(item));
-        return new_packs.back();
-    };
-
-    auto cleanup_temps = [&] {
-        for (auto& pack : new_packs) {
-            if (pack.fd >= 0) {
-                ::close(pack.fd);
-                pack.fd = -1;
-            }
+    auto cleanup_temp = [&] {
+        if (fd >= 0) {
+            ::close(fd);
+            fd = -1;
+        }
+        if (!temp.empty()) {
             std::error_code error;
-            std::filesystem::remove(pack.temp, error);
+            std::filesystem::remove(temp, error);
         }
     };
 
     try {
-        NewPack* current = nullptr;
-        for (const auto& [id, old_entry] : packed_) {
-            auto plain = get_packed_locked(id);
-            if (!plain) throw std::runtime_error("packed object disappeared during compaction");
-            auto sealed = aes_gcm_seal(key_, *plain, id.bytes);
-            PackHeader h;
-            h.type = pack_put;
-            h.touched_ms = old_entry.touched_unix_ms;
-            h.id = id;
-            h.plain_size = plain->size();
-            h.payload_size = sealed.ciphertext.size();
-            h.nonce = sealed.nonce;
-            h.tag = sealed.tag;
-            auto header = encode_pack_header(h);
-            const uint64_t record_size = header.size() + sealed.ciphertext.size();
-            if (!current || (current->size && current->size + record_size > pack_target_size_))
-                current = &open_pack();
-            const uint64_t record_start = current->size;
-            wa(current->fd, header);
-            wa(current->fd, sealed.ciphertext);
-            current->size += record_size;
-            PackEntry entry;
-            entry.file = current->final;
-            entry.payload_offset = record_start + header.size();
-            entry.payload_size = sealed.ciphertext.size();
-            entry.plain_size = plain->size();
-            entry.record_size = record_size;
-            entry.touched_unix_ms = old_entry.touched_unix_ms;
-            entry.nonce = sealed.nonce;
-            entry.tag = sealed.tag;
-            rebuilt[id] = entry;
-            new_total += record_size;
-        }
+        if (!victim_entries.empty()) {
+            const auto sequence = next_pack_sequence_++;
+            replacement = packs_ / pack_name(sequence);
+            temp = packs_ / (".compact-" + std::to_string(getpid()) + "-" +
+                             std::to_string(sequence) + ".tmp");
+            fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+            if (fd < 0)
+                throw std::runtime_error("cannot create compacted pack: " +
+                                         std::string(strerror(errno)));
 
-        for (auto& pack : new_packs) {
-            if (::fsync(pack.fd) != 0)
+            for (const auto& [id, old_entry] : victim_entries) {
+                if (old_entry.payload_offset < pack_header_size)
+                    throw std::runtime_error("invalid packed object offset during compaction");
+                const auto record_offset = old_entry.payload_offset - pack_header_size;
+                int source = ::open(victim->file.c_str(), O_RDONLY);
+                if (source < 0)
+                    throw std::runtime_error("cannot open source pack during compaction: " +
+                                             std::string(strerror(errno)));
+                auto bytes = pra_exact(source, old_entry.record_size, record_offset);
+                const auto saved = errno;
+                ::close(source);
+                if (!bytes)
+                    throw std::runtime_error("cannot read live pack record during compaction: " +
+                                             std::string(strerror(saved)));
+                wa(fd, *bytes);
+
+                auto next = old_entry;
+                next.file = replacement;
+                next.payload_offset = replacement_size + pack_header_size;
+                rebuilt.emplace(id, std::move(next));
+                replacement_size += old_entry.record_size;
+            }
+
+            if (::fsync(fd) != 0)
                 throw std::runtime_error("cannot sync compacted pack: " +
                                          std::string(strerror(errno)));
-            if (::close(pack.fd) != 0)
+            if (::close(fd) != 0) {
+                fd = -1;
                 throw std::runtime_error("cannot close compacted pack: " +
                                          std::string(strerror(errno)));
-            pack.fd = -1;
-            if (::rename(pack.temp.c_str(), pack.final.c_str()) != 0)
+            }
+            fd = -1;
+            if (::rename(temp.c_str(), replacement.c_str()) != 0)
                 throw std::runtime_error("cannot install compacted pack: " +
                                          std::string(strerror(errno)));
+            temp.clear();
+            syncdir(packs_);
         }
-        syncdir(packs_);
 
-        // From this point onward the running process must read the new durable
-        // representation before any old source pack is removed. If deletion is
-        // interrupted, the remaining old packs are merely dead duplicate bytes;
-        // the next compaction/restart can reclaim them without losing a live object.
+        if (mode_ != LocalStoreMode::ephemeral)
+            mark_accounting_dirty_locked();
+
         const auto before = used_.load(std::memory_order_relaxed);
-        if (new_total > std::numeric_limits<uint64_t>::max() - before)
+        if (replacement_size > std::numeric_limits<uint64_t>::max() - before)
             throw std::runtime_error("pack compaction accounting overflow");
-        packed_ = std::move(rebuilt);
-        used_.store(before + new_total, std::memory_order_relaxed);
-        pack_dead_bytes_ = old_total;
-        if (new_packs.empty()) {
+        used_.store(before + replacement_size, std::memory_order_relaxed);
+
+        // The installed replacement has a strictly newer sequence than every
+        // existing pack. Point the live index at it before removing the victim;
+        // a failed unlink then leaves only harmless dead duplicate bytes.
+        for (auto& [id, entry] : rebuilt)
+            packed_[id] = std::move(entry);
+
+        if (!replacement.empty() && replacement_size < pack_target_size_) {
+            active_pack_ = replacement;
+            active_pack_size_ = replacement_size;
+        } else {
             active_pack_.clear();
             active_pack_size_ = 0;
-        } else {
-            active_pack_ = new_packs.back().final;
-            active_pack_size_ = new_packs.back().size;
-            if (active_pack_size_ >= pack_target_size_) {
-                active_pack_.clear();
-                active_pack_size_ = 0;
-            }
         }
 
-        bool all_removed = true;
-        for (const auto& old : old_packs) {
-            std::error_code remove_error;
-            const bool removed = std::filesystem::remove(old.file, remove_error);
-            if (remove_error || !removed) {
-                all_removed = false;
-                Log::warn("cannot remove compacted source pack path=" + old.file.string() +
-                          (remove_error ? " error=" + remove_error.message() : ""));
-                continue;
-            }
+        std::error_code remove_error;
+        const bool removed = std::filesystem::remove(victim->file, remove_error);
+        if (remove_error || !removed) {
+            // All records in the old victim are now superseded by the newer
+            // representation (or were already dead), so the entire old pack is
+            // dead and can be retried by a later bounded compaction pass.
+            pack_dead_bytes_ = total_dead - victim->dead + victim->size;
+            Log::warn("cannot remove compacted source pack path=" + victim->file.string() +
+                      (remove_error ? " error=" + remove_error.message() : ""));
+        } else {
             const auto current_used = used_.load(std::memory_order_relaxed);
-            if (old.size > current_used)
+            if (victim->size > current_used)
                 throw std::runtime_error("pack compaction accounting underflow");
-            used_.store(current_used - old.size, std::memory_order_relaxed);
-            pack_dead_bytes_ = old.size > pack_dead_bytes_ ? 0 : pack_dead_bytes_ - old.size;
+            used_.store(current_used - victim->size, std::memory_order_relaxed);
+            pack_dead_bytes_ = total_dead - victim->dead;
         }
         syncdir(packs_);
 
-        if (mode_ != LocalStoreMode::ephemeral) mark_accounting_dirty_locked();
         if (mode_ != LocalStoreMode::ephemeral && durability_domain_) {
             const auto generation = durability_domain_->complete_mutation({}, packs_);
             last_mutation_generation_ = std::max(last_mutation_generation_, generation);
         }
-        return all_removed;
+        return !remove_error && removed;
     } catch (...) {
-        cleanup_temps();
+        cleanup_temp();
         throw;
     }
 }

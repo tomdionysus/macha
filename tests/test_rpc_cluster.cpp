@@ -7,6 +7,57 @@ using namespace macha::test_support;
 
 namespace {
 
+MACHA_FAST_TEST("rpc_cluster", test_rpc_reassembly_has_count_byte_and_message_bounds) {
+    MessageAssembler assembler(2, 8, 16);
+    auto fragment = [](uint64_t request, bool first, bool last, size_t bytes) {
+        return WireFragment{request, FrameType::foreground, MessageType::put_object,
+                            first, last, Bytes(bytes, 0x5a)};
+    };
+
+    CHECK(!assembler.push(fragment(1, true, false, 3)).has_value());
+    CHECK(!assembler.push(fragment(2, true, false, 3)).has_value());
+    CHECK(assembler.incomplete_messages() == 2);
+    CHECK(assembler.incomplete_bytes() == 6);
+
+    bool count_rejected = false;
+    try {
+        (void)assembler.push(fragment(3, true, false, 1));
+    } catch (...) {
+        count_rejected = true;
+    }
+    CHECK(count_rejected);
+    CHECK(assembler.incomplete_messages() == 2);
+
+    bool aggregate_rejected = false;
+    try {
+        (void)assembler.push(fragment(1, false, false, 3));
+    } catch (...) {
+        aggregate_rejected = true;
+    }
+    CHECK(aggregate_rejected);
+    CHECK(assembler.incomplete_bytes() == 6);
+
+    assembler.discard(2);
+    CHECK(assembler.incomplete_messages() == 1);
+    CHECK(assembler.incomplete_bytes() == 3);
+    auto complete = assembler.push(fragment(1, false, true, 0));
+    REQUIRE(complete.has_value());
+    CHECK(complete->message.payload.size() == 3);
+    CHECK(assembler.incomplete_messages() == 0);
+    CHECK(assembler.incomplete_bytes() == 0);
+
+    MessageAssembler message_bound(4, 64, 4);
+    CHECK(!message_bound.push(fragment(9, true, false, 3)).has_value());
+    bool message_rejected = false;
+    try {
+        (void)message_bound.push(fragment(9, false, true, 2));
+    } catch (...) {
+        message_rejected = true;
+    }
+    CHECK(message_rejected);
+    CHECK(message_bound.incomplete_bytes() == 3);
+}
+
 MACHA_TEST("rpc_cluster", test_async_rpc_move_ownership) {
     std::atomic_int cancelled{};
 
@@ -1335,7 +1386,7 @@ MACHA_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_before_acc
     s1.stop();
 }
 
-MACHA_TEST("rpc_cluster", test_partition_delete_allows_causal_gc_without_global_convergence) {
+MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_cluster_healthy) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
@@ -1366,15 +1417,18 @@ MACHA_TEST("rpc_cluster", test_partition_delete_allows_causal_gc_without_global_
 
     Service s1(c1, keys);
     Service s2(c2, keys);
-    Service s3(c3, keys);
+    auto s3 = std::make_unique<Service>(c3, keys);
     s1.start();
     s2.start();
-    s3.start();
+    s3->start();
     REQUIRE(wait_until([&] {
-        return s1.node().membership().active().size() == 3 &&
-               s2.node().membership().active().size() == 3 &&
-               s3.node().membership().active().size() == 3;
-    }));
+        return s1.node().membership().all_known_reachable() &&
+               s2.node().membership().all_known_reachable() &&
+               s3->node().membership().all_known_reachable() &&
+               s1.metadata_manager().cluster_status().stable &&
+               s2.metadata_manager().cluster_status().stable &&
+               s3->metadata_manager().cluster_status().stable;
+    }, 10s));
 
     s1.filesystem().create_file("/partition-retain.bin", 0644, getuid(), getgid());
     const auto bytes = pattern(128 * 1024 + 7);
@@ -1387,20 +1441,37 @@ MACHA_TEST("rpc_cluster", test_partition_delete_allows_causal_gc_without_global_
     REQUIRE(wait_until([&] {
         try {
             return s2.filesystem().getattr("/partition-retain.bin").size == bytes.size() &&
-                   s3.filesystem().getattr("/partition-retain.bin").size == bytes.size();
+                   s3->filesystem().getattr("/partition-retain.bin").size == bytes.size();
         } catch (...) {
             return false;
         }
     }));
 
-    // Node 3 now carries a legitimate accepted ancestor branch but becomes
-    // unreachable before the delete. Nodes 1+2 are still a legal W=2 metadata
-    // cohort and must be allowed to advance.
-    s3.stop();
+    // Placement is intentionally free to choose either active replica. Record
+    // the concrete claims/copies present on the cohort that will remain online;
+    // the invariant is that destructive maintenance must not remove any of
+    // those pre-existing resources while a durably-known node is unreachable.
+    const bool n1_claim_before =
+        s1.node().retention_store().retained(RetentionClass::data, extent);
+    const bool n2_claim_before =
+        s2.node().retention_store().retained(RetentionClass::data, extent);
+    const bool n1_copy_before = s1.node().local_store().valid(extent);
+    const bool n2_copy_before = s2.node().local_store().valid(extent);
+    REQUIRE(n1_claim_before || n2_claim_before);
+    REQUIRE(n1_copy_before || n2_copy_before);
+
+    // The remaining W=2 cohort may continue accepting metadata while node 3 is
+    // offline, but the persisted roster must make that degraded state a hard
+    // fence for claim release and physical reclamation.
+    s3->stop();
+    s3.reset();
     REQUIRE(wait_until([&] {
         return s1.node().membership().active().size() == 2 &&
-               s2.node().membership().active().size() == 2;
+               s2.node().membership().active().size() == 2 &&
+               !s1.node().membership().all_known_reachable() &&
+               !s2.node().membership().all_known_reachable();
     }));
+
     s1.filesystem().unlink("/partition-retain.bin");
     REQUIRE(wait_until([&] {
         try {
@@ -1411,19 +1482,46 @@ MACHA_TEST("rpc_cluster", test_partition_delete_allows_causal_gc_without_global_
         }
     }));
 
-    // An offline *unchanged ancestor* is not a competing semantic reference:
-    // if it later makes only unrelated changes, three-way merge still preserves
-    // this accepted delete. The running pair may therefore causally release the
-    // claims it observed and reclaim its copies without waiting for node 3. A
-    // genuinely concurrent touch would have installed a newer claim dot, which
-    // this delete's mutation clock could not remove.
+    // Give maintenance several complete zero-grace passes. If partition GC is
+    // accidentally re-enabled, this fails by observing either the causal claim
+    // or the local bytes disappear while the known third node remains offline.
+    std::this_thread::sleep_for(800ms);
+    if (n1_claim_before)
+        CHECK(s1.node().retention_store().retained(RetentionClass::data, extent));
+    if (n2_claim_before)
+        CHECK(s2.node().retention_store().retained(RetentionClass::data, extent));
+    if (n1_copy_before) CHECK(s1.node().local_store().valid(extent));
+    if (n2_copy_before) CHECK(s2.node().local_store().valid(extent));
+
+    // Recreate the third process from its original persistent state. All three
+    // sides must directly rediscover one another and metadata must converge
+    // before the healthy-cluster GC epoch is allowed to reclaim the delete.
+    s3 = std::make_unique<Service>(c3, keys);
+    s3->start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().all_known_reachable() &&
+               s2.node().membership().all_known_reachable() &&
+               s3->node().membership().all_known_reachable() &&
+               s1.metadata_manager().cluster_status().stable &&
+               s2.metadata_manager().cluster_status().stable &&
+               s3->metadata_manager().cluster_status().stable;
+    }, 10s));
+    REQUIRE(wait_until([&] {
+        try {
+            (void)s3->filesystem().getattr("/partition-retain.bin");
+            return false;
+        } catch (...) {
+            return true;
+        }
+    }, 10s));
     REQUIRE(wait_until([&] {
         return !s1.node().retention_store().retained(RetentionClass::data, extent) &&
                !s2.node().retention_store().retained(RetentionClass::data, extent) &&
                !s1.node().local_store().valid(extent) &&
                !s2.node().local_store().valid(extent);
-    }, 5s));
+    }, 10s));
 
+    s3->stop();
     s2.stop();
     s1.stop();
 }
