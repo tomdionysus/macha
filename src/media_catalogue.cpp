@@ -2632,7 +2632,7 @@ size_t CatalogueScanner::request_media_rescan(const std::vector<std::string>& me
     if (available) {
         snapshot = available->snapshot.get();
     } else {
-        // This is host-local durable metadata only, not a quorum read. It is a
+        // This is host-local durable metadata only, not a replica-validating read. It is a
         // best-effort rematch accelerator; the ordinary namespace/safety scan
         // remains the correctness fallback if the local replica is stale.
         try {
@@ -3049,8 +3049,8 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
         const auto retry = unix_ms() +
             static_cast<uint64_t>(config.provider_batch_delay.count());
         for (const auto& match : prepared)
-            hints_.defer(match.hint_id, "catalogue artwork durability quorum unavailable", retry);
-        Log::debug("catalogue hint batch deferred: artwork durability quorum unavailable");
+            hints_.defer(match.hint_id, "catalogue artwork durability floor unavailable", retry);
+        Log::debug("catalogue hint batch deferred: artwork durability floor unavailable");
         return out;
     }
 

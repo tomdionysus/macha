@@ -27,6 +27,113 @@ std::optional<uint64_t> process_rss_kib() {
     return {};
 }
 
+MACHA_FAST_TEST("storage_metadata", test_retention_claims_are_causal_durable_and_observed_remove) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto state = t.path() / "retention-state";
+
+    const auto origin_a = random_node_id();
+    const auto origin_b = random_node_id();
+    const auto object = object_id(pattern(4097));
+    const auto second = object_id(pattern(8193));
+
+    {
+        RetentionStore retention(state, keys.storage);
+        retention.retain(RetentionClass::data, object, {origin_a, 1});
+        CHECK(retention.retained(RetentionClass::data, object));
+
+        // A removal may clear only claims which are causally visible in its
+        // metadata mutation clock. A concurrent branch claim from B therefore
+        // survives an A-only delete context.
+        retention.retain(RetentionClass::data, object, {origin_b, 1});
+        std::vector<ObjectId> no_live;
+        CHECK(retention.release_unreferenced(
+                  RetentionClass::data, no_live, RetentionClock{{origin_a, 1}}, 16) == 1);
+        CHECK(retention.retained(RetentionClass::data, object));
+
+        // Once a reconciled metadata view has observed both branch dots the
+        // now-unreferenced object may lose both claims.
+        CHECK(retention.release_unreferenced(
+                  RetentionClass::data, no_live,
+                  RetentionClock{{origin_a, 1}, {origin_b, 1}}, 16) == 1);
+        CHECK(!retention.retained(RetentionClass::data, object));
+
+        // Removed clocks suppress delayed/replayed old ADDs but do not suppress
+        // a genuinely later mutation from the same origin.
+        retention.retain(RetentionClass::data, object, {origin_a, 1});
+        CHECK(!retention.retained(RetentionClass::data, object));
+        retention.retain(RetentionClass::data, object, {origin_a, 2});
+        CHECK(retention.retained(RetentionClass::data, object));
+
+        retention.retain(RetentionClass::control, second, {origin_b, 7});
+        CHECK(retention.retained(RetentionClass::control, second));
+        // Compaction must preserve exactly the same causal state while bounding
+        // the append-only foreground journal.
+        CHECK(retention.compact_if_needed(1));
+        CHECK(!retention.compact_if_needed(1));
+    }
+
+    // Claim and remove contexts are crash/restart state, not process-local GC
+    // hints. Reopening must preserve both the live later DATA claim and CONTROL
+    // claim, as well as the tombstone which suppresses a delayed A:1 replay.
+    {
+        RetentionStore reopened(state, keys.storage);
+        CHECK(reopened.retained(RetentionClass::data, object));
+        CHECK(reopened.retained(RetentionClass::control, second));
+        reopened.retain(RetentionClass::data, object, {origin_a, 1});
+        CHECK(reopened.retained(RetentionClass::data, object));
+        CHECK(reopened.release_unreferenced(
+                  RetentionClass::data, {}, RetentionClock{{origin_a, 2}}, 16) == 1);
+        CHECK(!reopened.retained(RetentionClass::data, object));
+    }
+}
+
+MACHA_FAST_TEST("storage_metadata", test_retention_claim_is_physical_gc_barrier) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto state = t.path() / "state";
+    const auto disk = t.path() / "disk";
+    std::filesystem::create_directories(disk);
+    const auto node = random_node_id();
+    StoragePool pool(state, node, {{disk, 64ULL * 1024 * 1024}}, keys.storage);
+    pool.refresh();
+    RetentionStore retention(state, keys.storage);
+
+    auto bytes = pattern(128 * 1024 + 17);
+    const auto id = object_id(bytes);
+    REQUIRE(pool.put(id, bytes));
+    auto physical = object_path(disk, id);
+    REQUIRE(std::filesystem::exists(physical));
+    std::filesystem::last_write_time(
+        physical, std::filesystem::file_time_type::clock::now() - 48h);
+
+    const auto origin = random_node_id();
+    retention.retain(RetentionClass::data, id, {origin, 1});
+    std::vector<ObjectId> none;
+    auto protected_pass = pool.gc_step(
+        none, none, 0ms, 128, {}, [&](const ObjectId& candidate) {
+            return retention.retained(RetentionClass::data, candidate);
+        });
+    CHECK(protected_pass.complete);
+    CHECK(pool.has(id));
+
+    // Metadata has now causally observed and removed the only reference. The
+    // claim can disappear first; only then may ordinary physical GC reclaim it.
+    CHECK(retention.release_unreferenced(
+              RetentionClass::data, none, RetentionClock{{origin, 1}}, 16) == 1);
+    CHECK(!retention.retained(RetentionClass::data, id));
+    auto reclaim_pass = pool.gc_step(
+        none, none, 0ms, 128, {}, [&](const ObjectId& candidate) {
+            return retention.retained(RetentionClass::data, candidate);
+        });
+    CHECK(reclaim_pass.complete);
+    CHECK(!pool.has(id));
+}
+
 MACHA_FAST_TEST("storage_metadata", test_metadata_record_payload_copy_is_shared) {
     MetadataRecord record;
     record.payload = Bytes(4 * 1024 * 1024, 0x5a);
@@ -161,6 +268,611 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_in_place_preserves_names
         CHECK(&snapshot.entries.at(stable_path) == stable_entry);
     }
     CHECK(snapshot.mutation_sequences.at(origin) == 1009);
+}
+
+MACHA_FAST_TEST("storage_metadata", test_metadata_branch_merge_history_roundtrip) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+
+    const auto genesis = genesis_metadata();
+    const auto base = decode_snapshot(genesis.payload);
+
+    FsEntry directory;
+    directory.type = EntryType::directory;
+    directory.mode = 0755;
+
+    auto left_snapshot = base;
+    left_snapshot.entries["/left"] = directory;
+    FsEntry left_conflict;
+    left_conflict.type = EntryType::file;
+    left_conflict.mode = 0644;
+    left_conflict.size = 11;
+    left_conflict.version = 1;
+    left_snapshot.entries["/same"] = left_conflict;
+    left_snapshot.catalogue_root = object_id(pattern(111));
+
+    auto right_snapshot = base;
+    right_snapshot.entries["/right"] = directory;
+    auto right_conflict = left_conflict;
+    right_conflict.size = 22;
+    right_conflict.version = 2;
+    right_snapshot.entries["/same"] = right_conflict;
+    right_snapshot.catalogue_root = object_id(pattern(222));
+
+    auto make_child = [&](const MetadataSnapshot& snapshot) {
+        MetadataRecord record;
+        record.generation = genesis.generation + 1;
+        record.previous = genesis.hash;
+        record.payload = encode_snapshot(snapshot);
+        record.hash = metadata_hash(record.generation, record.previous, record.payload);
+        return record;
+    };
+    const auto left = make_child(left_snapshot);
+    const auto right = make_child(right_snapshot);
+    REQUIRE(left.hash != right.hash);
+
+    const auto merged =
+        merge_metadata_snapshots(base, left_snapshot, right_snapshot, left.hash, right.hash);
+    CHECK(merged.snapshot.entries.contains("/left"));
+    CHECK(merged.snapshot.entries.contains("/right"));
+    CHECK(!merged.snapshot.entries.contains("/same"));
+    CHECK(!merged.snapshot.catalogue_root.has_value());
+    CHECK(merged.conflicts_created == 2);
+    CHECK(merged.snapshot.conflicts.size() == 2);
+
+    auto branch_snapshot = merged.snapshot;
+    branch_snapshot.merge_parents = {right.hash};
+    const auto branch_encoded = encode_snapshot(branch_snapshot);
+    const auto branch_decoded = decode_snapshot(branch_encoded);
+    CHECK(branch_decoded.merge_parents == branch_snapshot.merge_parents);
+    CHECK(branch_decoded.conflicts == branch_snapshot.conflicts);
+
+    const auto left_path = t.path() / "branch-left";
+    const auto right_path = t.path() / "branch-right";
+    {
+        MetadataReplica left_replica(left_path, keys.storage);
+        MetadataReplica right_replica(right_path, keys.storage);
+        REQUIRE(left_replica.seed(left));
+        REQUIRE(left_replica.remember_current_committed(left.generation, left.hash));
+        REQUIRE(right_replica.seed(right));
+        REQUIRE(right_replica.remember_current_committed(right.generation, right.hash));
+
+        auto right_history = right_replica.history_entry(right.hash);
+        REQUIRE(right_history.has_value());
+        REQUIRE(left_replica.import_history(*right_history));
+        auto common = left_replica.history_common_ancestor(left.hash, right.hash);
+        REQUIRE(common.has_value());
+        CHECK(*common == genesis.hash);
+
+        MetadataRecord reconciliation;
+        reconciliation.generation = std::max(left.generation, right.generation) + 1;
+        reconciliation.previous = left.hash;
+        reconciliation.payload = branch_encoded;
+        reconciliation.hash = metadata_hash(reconciliation.generation, reconciliation.previous,
+                                            reconciliation.payload);
+
+        REQUIRE(left_replica.seed(reconciliation));
+        REQUIRE(left_replica.remember_current_committed(reconciliation.generation,
+                                                        reconciliation.hash));
+        // The right branch can accept the same merge because its committed head
+        // is an explicit secondary parent, even though the primary parent is left.
+        REQUIRE(right_replica.seed(reconciliation));
+        REQUIRE(right_replica.remember_current_committed(reconciliation.generation,
+                                                         reconciliation.hash));
+        CHECK(left_replica.history_is_ancestor(left.hash, reconciliation.hash));
+        CHECK(left_replica.history_is_ancestor(right.hash, reconciliation.hash));
+    }
+
+    MetadataReplica reopened_left(left_path, keys.storage);
+    MetadataReplica reopened_right(right_path, keys.storage);
+    CHECK(reopened_left.committed().hash == reopened_right.committed().hash);
+    CHECK(reopened_left.history_is_ancestor(left.hash, reopened_left.committed().hash));
+    CHECK(reopened_left.history_is_ancestor(right.hash, reopened_left.committed().hash));
+    auto historical_merge = reopened_left.historical(reopened_left.committed().hash);
+    REQUIRE(historical_merge.has_value());
+    const auto reopened_snapshot = decode_snapshot(historical_merge->payload);
+    CHECK(reopened_snapshot.conflicts == branch_snapshot.conflicts);
+    CHECK(reopened_snapshot.merge_parents == branch_snapshot.merge_parents);
+}
+
+MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_roundtrip) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "accepted-heads";
+
+    const auto genesis = genesis_metadata();
+    FsEntry directory;
+    directory.type = EntryType::directory;
+    directory.mode = 0755;
+
+    auto make_child = [&](std::string name) {
+        auto snapshot = decode_snapshot(genesis.payload);
+        snapshot.metadata_write_replicas_required = 2;
+        snapshot.entries[std::move(name)] = directory;
+        MetadataRecord record;
+        record.generation = genesis.generation + 1;
+        record.previous = genesis.hash;
+        record.payload = encode_snapshot(snapshot);
+        record.hash = metadata_hash(record.generation, record.previous, record.payload);
+        return record;
+    };
+    const auto left = make_child("/left");
+    const auto right = make_child("/right");
+    REQUIRE(left.hash != right.hash);
+    CHECK(decode_snapshot(left.payload).metadata_write_replicas_required == 2);
+
+    NodeId a{}, b{}, c{};
+    a.bytes[15] = 1;
+    b.bytes[15] = 2;
+    c.bytes[15] = 3;
+    MetadataAcceptance left_accept{left.generation, left.hash, 2, {a, b}};
+    MetadataAcceptance right_accept{right.generation, right.hash, 2, {b, c}};
+
+    // The transitional SM13 `metadata_participants` roster is migration
+    // bookkeeping, not an eligibility/voter set. A certificate may therefore
+    // name any real metadata replica even when an old snapshot's roster does not.
+    {
+        auto rostered_snapshot = decode_snapshot(genesis.payload);
+        rostered_snapshot.metadata_write_replicas_required = 2;
+        rostered_snapshot.metadata_participants = {a, b};
+        rostered_snapshot.entries["/roster-is-not-authority"] = directory;
+        MetadataRecord rostered;
+        rostered.generation = genesis.generation + 1;
+        rostered.previous = genesis.hash;
+        rostered.payload = encode_snapshot(rostered_snapshot);
+        rostered.hash = metadata_hash(rostered.generation, rostered.previous, rostered.payload);
+        MetadataReplica replica(t.path() / "roster-not-authority", keys.storage);
+        REQUIRE(replica.store_commit(rostered));
+        CHECK(replica.accept_commit(
+            MetadataAcceptance{rostered.generation, rostered.hash, 2, {a, c}}));
+    }
+
+    {
+        MetadataReplica replica(path, keys.storage);
+        REQUIRE(replica.store_commit(left));
+        MetadataAcceptance understrength{left.generation, left.hash, 1, {a}};
+        CHECK(!replica.accept_commit(understrength));
+        REQUIRE(replica.accept_commit(left_accept));
+        REQUIRE(replica.store_commit(right));
+        REQUIRE(replica.accept_commit(right_accept));
+        auto heads = replica.accepted_heads();
+        REQUIRE(heads.size() == 2);
+        CHECK(replica.history_is_ancestor(genesis.hash, left.hash));
+        CHECK(replica.history_is_ancestor(genesis.hash, right.hash));
+    }
+
+    MetadataRecord reconciliation;
+    MetadataAcceptance merge_accept;
+    {
+        MetadataReplica replica(path, keys.storage);
+        auto heads = replica.accepted_heads();
+        REQUIRE(heads.size() == 2);
+        auto common = replica.history_common_ancestor(left.hash, right.hash);
+        REQUIRE(common.has_value());
+        CHECK(*common == genesis.hash);
+
+        auto merged = merge_metadata_snapshots(
+            decode_snapshot(genesis.payload), decode_snapshot(left.payload),
+            decode_snapshot(right.payload), left.hash, right.hash);
+        auto primary = left;
+        auto secondary = right;
+        if (secondary.hash < primary.hash)
+            std::swap(primary, secondary);
+        merged.snapshot.merge_parents = {secondary.hash};
+        reconciliation.generation = std::max(left.generation, right.generation) + 1;
+        reconciliation.previous = primary.hash;
+        reconciliation.payload = encode_snapshot(merged.snapshot);
+        reconciliation.hash = metadata_hash(reconciliation.generation,
+                                            reconciliation.previous,
+                                            reconciliation.payload);
+        merge_accept = {reconciliation.generation, reconciliation.hash, 2, {a, c}};
+        REQUIRE(replica.store_commit(reconciliation));
+        REQUIRE(replica.accept_commit(merge_accept));
+        heads = replica.accepted_heads();
+        REQUIRE(heads.size() == 1);
+        CHECK(heads.front().hash == reconciliation.hash);
+        CHECK(replica.history_is_ancestor(left.hash, reconciliation.hash));
+        CHECK(replica.history_is_ancestor(right.hash, reconciliation.hash));
+    }
+
+    MetadataReplica reopened(path, keys.storage);
+    auto heads = reopened.accepted_heads();
+    REQUIRE(heads.size() == 1);
+    CHECK(heads.front().hash == reconciliation.hash);
+    auto certificate = reopened.acceptance(reconciliation.hash);
+    REQUIRE(certificate.has_value());
+    CHECK(*certificate == merge_accept);
+}
+
+MACHA_FAST_TEST("storage_metadata", test_metadata_recovery_cache_seed_is_not_accepted_authority) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "cache-recovery";
+
+    auto base = genesis_metadata();
+    auto snapshot = decode_snapshot(base.payload);
+    FsEntry cached_entry;
+    cached_entry.type = EntryType::directory;
+    cached_entry.mode = 0755;
+    snapshot.entries["/cached-only"] = cached_entry;
+    MetadataRecord cached;
+    cached.generation = base.generation + 1;
+    cached.previous = base.hash;
+    cached.payload = encode_snapshot(snapshot);
+    cached.hash = metadata_hash(cached.generation, cached.previous, cached.payload);
+
+    // Force primary-state recovery while providing a valid persistent-cache seed.
+    // The seed may materialise a read/recovery snapshot, but it must not acquire
+    // accepted-head authority without a certificate from another replica.
+    std::filesystem::create_directories(path / "metadata");
+    {
+        std::ofstream corrupt(path / "metadata" / "checkpoint.meta", std::ios::binary);
+        corrupt << "not encrypted metadata";
+    }
+    {
+        MetadataReplica recovered(path, keys.storage, cached);
+        CHECK(recovered.recovery_required());
+        CHECK(recovered.committed().hash == cached.hash);
+        CHECK(recovered.accepted_heads().empty());
+        CHECK(!recovered.acceptance(cached.hash).has_value());
+    }
+
+    // The durable recovery marker must preserve the same fail-closed state on
+    // another restart; merely being able to decrypt the fallback checkpoint does
+    // not turn it into historical acceptance evidence.
+    MetadataReplica reopened(path, keys.storage, cached);
+    CHECK(reopened.recovery_required());
+    CHECK(reopened.committed().hash == cached.hash);
+    CHECK(reopened.accepted_heads().empty());
+    CHECK(!reopened.acceptance(cached.hash).has_value());
+}
+
+MACHA_FAST_TEST("storage_metadata", test_metadata_conflict_alternatives_are_gc_roots) {
+    MetadataSnapshot snapshot;
+    const auto effective_root = object_id(pattern(101));
+    const auto base_root = object_id(pattern(102));
+    const auto left_root = object_id(pattern(103));
+    const auto right_root = object_id(pattern(104));
+    snapshot.catalogue_root = effective_root;
+
+    const auto base_extent = object_id(pattern(201));
+    const auto left_extent = object_id(pattern(202));
+    const auto right_extent = object_id(pattern(203));
+    FsEntry base_entry;
+    base_entry.type = EntryType::file;
+    base_entry.size = 1;
+    base_entry.extents.push_back({0, 1, base_extent, false});
+    auto left_entry = base_entry;
+    left_entry.extents.front().id = left_extent;
+    auto right_entry = base_entry;
+    right_entry.extents.front().id = right_extent;
+
+    MetadataConflict namespace_conflict;
+    namespace_conflict.kind = MetadataConflictKind::namespace_entry;
+    namespace_conflict.key = "/conflicted.bin";
+    namespace_conflict.base_entry = base_entry;
+    namespace_conflict.left_entry = left_entry;
+    namespace_conflict.right_entry = right_entry;
+    snapshot.conflicts.emplace("namespace", namespace_conflict);
+
+    MetadataConflict catalogue_conflict;
+    catalogue_conflict.kind = MetadataConflictKind::catalogue_root;
+    catalogue_conflict.key = "catalogue_root";
+    catalogue_conflict.base_catalogue_root = base_root;
+    catalogue_conflict.left_catalogue_root = left_root;
+    catalogue_conflict.right_catalogue_root = right_root;
+    snapshot.conflicts.emplace("catalogue", catalogue_conflict);
+
+    const auto extent_roots = metadata_conflict_extent_roots(snapshot);
+    CHECK(extent_roots == std::set<ObjectId>({base_extent, left_extent, right_extent}));
+    const auto catalogue_roots = metadata_catalogue_root_set(snapshot);
+    CHECK(catalogue_roots ==
+          std::set<ObjectId>({effective_root, base_root, left_root, right_root}));
+}
+
+MACHA_FAST_TEST("storage_metadata", test_metadata_legacy_prepare_journal_replays_deterministically) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto genesis = genesis_metadata();
+
+    auto first_snapshot = decode_snapshot(genesis.payload);
+    FsEntry first;
+    first.type = EntryType::directory;
+    first.mode = 0755;
+    first_snapshot.entries["/first"] = first;
+
+    auto second_snapshot = decode_snapshot(genesis.payload);
+    FsEntry second = first;
+    second_snapshot.entries["/second"] = second;
+
+    auto child = [&](const MetadataSnapshot& snapshot) {
+        MetadataRecord record;
+        record.generation = genesis.generation + 1;
+        record.previous = genesis.hash;
+        record.payload = encode_snapshot(snapshot);
+        record.hash = metadata_hash(record.generation, record.previous, record.payload);
+        return record;
+    };
+    auto a = child(first_snapshot);
+    auto b = child(second_snapshot);
+    REQUIRE(a.hash != b.hash);
+    const auto& low = a.hash < b.hash ? a : b;
+    const auto& high = a.hash < b.hash ? b : a;
+
+    const auto path = t.path() / "prepare-race";
+    {
+        MetadataReplica replica(path, keys.storage);
+        MetadataRecord observed;
+        REQUIRE(replica.cas(genesis.generation, genesis.hash, high.payload, &observed));
+        CHECK(observed.hash == high.hash);
+
+        // Legacy pre-0.19 PREPARE journal state remains readable deterministically.
+        // This is storage/restart compatibility only; protocol 20 never uses
+        // MetadataReplica::cas() for live distributed publication.
+        REQUIRE(replica.cas(genesis.generation, genesis.hash, low.payload, &observed));
+        CHECK(observed.hash == low.hash);
+        CHECK(!replica.cas(genesis.generation, genesis.hash, high.payload, &observed));
+        CHECK(observed.hash == low.hash);
+        CHECK(replica.committed().hash == genesis.hash);
+    }
+
+    // The old PREPARE replacement sequence must still replay after upgrade so an
+    // interrupted pre-0.19 journal can be recovered/migrated without data loss.
+    MetadataReplica reopened(path, keys.storage);
+    CHECK(reopened.current().hash == low.hash);
+    CHECK(reopened.committed().hash == genesis.hash);
+    MetadataRecord observed;
+    REQUIRE(reopened.cas(genesis.generation, genesis.hash, low.payload, &observed));
+    CHECK(observed.hash == low.hash);
+    REQUIRE(reopened.remember_current_committed(low.generation, low.hash));
+    CHECK(reopened.committed().hash == low.hash);
+}
+
+MACHA_FAST_TEST("storage_metadata", test_protocol20_checkpoint_without_acceptance_never_self_promotes) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "missing-head-certificate";
+
+    const auto genesis = genesis_metadata();
+    auto snapshot = decode_snapshot(genesis.payload);
+    snapshot.metadata_write_replicas_required = 2;
+    FsEntry directory;
+    directory.type = EntryType::directory;
+    directory.mode = 0755;
+    snapshot.entries["/accepted"] = directory;
+    MetadataRecord record;
+    record.generation = genesis.generation + 1;
+    record.previous = genesis.hash;
+    record.payload = encode_snapshot(snapshot);
+    record.hash = metadata_hash(record.generation, record.previous, record.payload);
+
+    NodeId a{}, b{};
+    a.bytes[15] = 1;
+    b.bytes[15] = 2;
+    {
+        MetadataReplica replica(path, keys.storage);
+        REQUIRE(replica.store_commit(record));
+        REQUIRE(replica.accept_commit({record.generation, record.hash, 2, {a, b}}));
+        CHECK(replica.committed().hash == record.hash);
+    }
+
+    // Simulate loss of the independent acceptance-proof file while retaining a
+    // perfectly readable SM12 checkpoint/history. The checkpoint is recovery
+    // material only; protocol 20 must never manufacture authority from it.
+    REQUIRE(std::filesystem::remove(path / "metadata" / "heads.meta"));
+    MetadataReplica reopened(path, keys.storage);
+    CHECK(reopened.committed().hash == record.hash);
+    CHECK(reopened.recovery_required());
+    CHECK(reopened.accepted_heads().empty());
+    CHECK(!reopened.acceptance(record.hash).has_value());
+}
+
+MACHA_FAST_TEST("storage_metadata", test_metadata_local_mutation_sequence_never_regresses_with_branch_state) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "mutation-sequence";
+    {
+        MetadataReplica replica(path, keys.storage);
+        CHECK(replica.reserve_mutation_sequence(5) == 6);
+        CHECK(replica.reserve_mutation_sequence(2) == 7);
+    }
+    MetadataReplica reopened(path, keys.storage);
+    CHECK(reopened.reserve_mutation_sequence(1) == 8);
+    CHECK(reopened.reserve_mutation_sequence(100) == 101);
+}
+
+MACHA_FAST_TEST("storage_metadata", test_protocol20_delta_preserves_governance_snapshot_encoding) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto replica_id = random_node_id();
+
+    auto parent_snapshot = decode_snapshot(genesis_metadata().payload);
+    parent_snapshot.metadata_voters.clear();
+    parent_snapshot.metadata_write_replicas_required = 1;
+    parent_snapshot.retention_baseline_complete = true;
+
+    const auto genesis = genesis_metadata();
+    MetadataRecord parent;
+    parent.generation = 2;
+    parent.previous = genesis.hash;
+    parent.payload = encode_snapshot(parent_snapshot);
+    parent.hash = metadata_hash(parent.generation, parent.previous, parent.payload);
+
+    MetadataReplica replica(t.path() / "protocol20-delta", keys.storage);
+    REQUIRE(replica.store_commit(parent));
+    REQUIRE(replica.accept_commit({parent.generation, parent.hash, 1, {replica_id}}));
+
+    auto child_snapshot = parent_snapshot;
+    child_snapshot.mutation_sequences[replica_id] = 1;
+    FsEntry file;
+    file.type = EntryType::file;
+    file.mode = 0644;
+    file.version = 1;
+    child_snapshot.entries["/delta.bin"] = file;
+
+    auto delta = metadata_delta(parent_snapshot, child_snapshot);
+    REQUIRE(delta.has_value());
+    auto encoded_delta = encode_metadata_delta(*delta);
+    REQUIRE(encoded_delta.size() >= 8);
+    CHECK(encoded_delta[7] == '5');
+    CHECK(encode_snapshot(apply_metadata_delta(parent_snapshot,
+                                                decode_metadata_delta(encoded_delta))) ==
+          encode_snapshot(child_snapshot));
+
+    MetadataRecord child;
+    child.generation = parent.generation + 1;
+    child.previous = parent.hash;
+    child.payload = encode_snapshot(child_snapshot);
+    child.hash = metadata_hash(child.generation, child.previous, child.payload);
+    REQUIRE(replica.store_commit(child, encoded_delta));
+    REQUIRE(replica.accept_commit({child.generation, child.hash, 1, {replica_id}}));
+    REQUIRE(replica.historical(child.hash).has_value());
+    CHECK(replica.historical(child.hash)->payload == child.payload);
+
+    MetadataReplica reopened(t.path() / "protocol20-delta", keys.storage);
+    REQUIRE(reopened.historical(child.hash).has_value());
+    CHECK(reopened.historical(child.hash)->payload == child.payload);
+    REQUIRE(reopened.acceptance(child.hash).has_value());
+}
+
+MACHA_FAST_TEST("storage_metadata", test_metadata_conflict_resolution_is_not_resurrected_by_merge) {
+    const auto genesis = genesis_metadata();
+    auto base = decode_snapshot(genesis.payload);
+    MetadataConflict conflict;
+    conflict.kind = MetadataConflictKind::namespace_entry;
+    conflict.key = "/old-conflict";
+    conflict.left_head = sha256(pattern(31));
+    conflict.right_head = sha256(pattern(32));
+    const auto conflict_id = metadata_conflict_id(conflict);
+    base.conflicts.emplace(conflict_id, conflict);
+
+    auto left = base;
+    left.conflicts.erase(conflict_id); // explicit resolution
+    auto right = base;
+    FsEntry directory;
+    directory.type = EntryType::directory;
+    directory.mode = 0755;
+    right.entries["/unrelated"] = directory;
+
+    const auto merged = merge_metadata_snapshots(base, left, right,
+                                                  sha256(pattern(41)), sha256(pattern(42)));
+    CHECK(!merged.snapshot.conflicts.contains(conflict_id));
+    CHECK(merged.snapshot.entries.contains("/unrelated"));
+}
+
+MACHA_FAST_TEST("storage_metadata", test_metadata_divergent_renames_become_conflicts) {
+    const auto genesis = genesis_metadata();
+    auto base = decode_snapshot(genesis.payload);
+    FsEntry file;
+    file.type = EntryType::file;
+    file.mode = 0644;
+    file.size = 123;
+    file.version = 7;
+    base.entries["/a"] = file;
+
+    auto left = base;
+    left.entries.erase("/a");
+    left.entries["/b"] = file;
+    auto right = base;
+    right.entries.erase("/a");
+    right.entries["/c"] = file;
+
+    auto merged = merge_metadata_snapshots(base, left, right,
+                                            sha256(pattern(51)), sha256(pattern(52)));
+    REQUIRE(merged.snapshot.entries.contains("/a"));
+    CHECK(merged.snapshot.entries.at("/a") == file);
+    CHECK(!merged.snapshot.entries.contains("/b"));
+    CHECK(!merged.snapshot.entries.contains("/c"));
+    std::set<std::string> conflict_paths;
+    for (const auto& [_, value] : merged.snapshot.conflicts)
+        if (value.kind == MetadataConflictKind::namespace_entry)
+            conflict_paths.insert(value.key);
+    CHECK(conflict_paths.contains("/a"));
+    CHECK(conflict_paths.contains("/b"));
+    CHECK(conflict_paths.contains("/c"));
+
+    // The same rename on both branches is not a conflict.
+    right = base;
+    right.entries.erase("/a");
+    right.entries["/b"] = file;
+    merged = merge_metadata_snapshots(base, left, right,
+                                      sha256(pattern(61)), sha256(pattern(62)));
+    CHECK(!merged.snapshot.entries.contains("/a"));
+    REQUIRE(merged.snapshot.entries.contains("/b"));
+    CHECK(merged.snapshot.entries.at("/b") == file);
+    CHECK(merged.snapshot.conflicts.empty());
+
+    // Move-vs-modify also preserves the ancestor and both alternatives.
+    right = base;
+    right.entries["/a"].size = 456;
+    right.entries["/a"].version = 8;
+    merged = merge_metadata_snapshots(base, left, right,
+                                      sha256(pattern(71)), sha256(pattern(72)));
+    REQUIRE(merged.snapshot.entries.contains("/a"));
+    CHECK(merged.snapshot.entries.at("/a") == file);
+    CHECK(!merged.snapshot.entries.contains("/b"));
+    conflict_paths.clear();
+    for (const auto& [_, value] : merged.snapshot.conflicts)
+        if (value.kind == MetadataConflictKind::namespace_entry)
+            conflict_paths.insert(value.key);
+    CHECK(conflict_paths.contains("/a"));
+    CHECK(conflict_paths.contains("/b"));
+}
+
+MACHA_FAST_TEST("storage_metadata", test_protocol20_state_rejects_legacy_authority_mutators) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    MetadataReplica replica(t.path() / "legacy-backdoor", keys.storage);
+    const auto genesis = genesis_metadata();
+    auto snapshot = decode_snapshot(genesis.payload);
+    snapshot.metadata_write_replicas_required = 2;
+    MetadataRecord established;
+    established.generation = genesis.generation + 1;
+    established.previous = genesis.hash;
+    established.payload = encode_snapshot(snapshot);
+    established.hash = metadata_hash(established.generation, established.previous,
+                                     established.payload);
+    NodeId a{}, b{};
+    a.bytes[15] = 1;
+    b.bytes[15] = 2;
+    REQUIRE(replica.store_commit(established));
+    REQUIRE(replica.accept_commit({established.generation, established.hash, 2, {a, b}}));
+
+    auto child_snapshot = snapshot;
+    FsEntry directory;
+    directory.type = EntryType::directory;
+    directory.mode = 0755;
+    child_snapshot.entries["/must-not-seed"] = directory;
+    MetadataRecord child;
+    child.generation = established.generation + 1;
+    child.previous = established.hash;
+    child.payload = encode_snapshot(child_snapshot);
+    child.hash = metadata_hash(child.generation, child.previous, child.payload);
+
+    CHECK(!replica.seed(child));
+    CHECK(!replica.remember_committed(child));
+    MetadataRecord observed;
+    CHECK(!replica.cas(established.generation, established.hash, child.payload, &observed));
+    CHECK(replica.committed().hash == established.hash);
+    auto heads = replica.accepted_heads();
+    REQUIRE(heads.size() == 1);
+    CHECK(heads.front().hash == established.hash);
 }
 
 MACHA_TEST("storage_metadata", test_local_store) {
@@ -590,8 +1302,8 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     CHECK(encode_snapshot(reconstructed) == encode_snapshot(delta_target));
     CHECK(encoded_delta.size() < encode_snapshot(delta_target).size());
 
-    // DLT2 represents tombstone replacement and pruning directly. This is the
-    // ordinary 0.10.x path used to stamp legacy records and bound garbage metadata.
+    // The current compact-delta format represents tombstone replacement and
+    // pruning directly while preserving the parent's canonical snapshot family.
     auto garbage_compacted = delta_target;
     garbage_compacted.garbage.erase(garbage_compacted.garbage.begin());
     garbage_compacted.garbage.front().retired_at_ns += 1;
@@ -637,7 +1349,7 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     CHECK(upgraded_v7.garbage.front().retirement_id == NodeId{});
 
     // DLT1 is accepted only as a persisted-journal format compatibility path.
-    // New encoders always emit DLT2; old 0.9.x journal records still replay.
+    // New encoders emit DLT5; old journal records still replay byte-for-byte.
     Writer old_delta;
     const std::array<uint8_t, 8> old_delta_magic{'D', 'H', 'T', 'M', 'D', 'L', 'T', '1'};
     old_delta.raw(old_delta_magic);
@@ -722,8 +1434,8 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     REQUIRE(replica.cas(current.generation, current.hash, encoded, &next));
     CHECK(next.generation == current.generation + 1);
     CHECK(decode_snapshot(next.payload).metadata_voters.size() == 3);
-    // A successful vote is not yet a committed cluster checkpoint. Recovery
-    // witnesses advance only after MetadataManager has observed quorum.
+    // A successful replica CAS is not yet a committed cluster checkpoint. The
+    // committed head advances only after MetadataManager has observed the write floor.
     CHECK(replica.committed().hash == current.hash);
     REQUIRE(replica.remember_current_committed(next.generation, next.hash));
     CHECK(replica.committed().hash == next.hash);
@@ -735,7 +1447,7 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     CHECK(std::filesystem::exists(replica_path / "metadata" / "checkpoint.meta"));
     CHECK(std::filesystem::exists(replica_path / "metadata" / "journal.log"));
 
-    // Ordinary 0.9 mutation is a compact delta proposal. It survives restart
+    // Ordinary mutation is a compact delta proposal. It survives restart
     // through the encrypted journal and does not require a full snapshot file
     // rewrite for either prepare or commit.
     auto before_delta = decode_snapshot(reopened.current().payload);
@@ -836,9 +1548,35 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
         CHECK(preserved);
     }
 
+    // A prepared proposal which never reached the write floor has no authority.
+    // A later proposal based on the last committed head must be able to pre-empt
+    // it, and that rollback/replacement must survive another restart.
+    MetadataRecord replacement;
+    {
+        MetadataReplica recovered(uncommitted_path, keys.storage);
+        const auto base = recovered.committed();
+        auto before = decode_snapshot(base.payload);
+        auto after = before;
+        after.entries["/replacement"] = extra;
+        auto d = metadata_delta(before, after);
+        REQUIRE(d.has_value());
+        const auto dbytes = encode_metadata_delta(*d);
+        REQUIRE(recovered.cas_delta(base.generation, base.hash, dbytes, &replacement));
+        CHECK(recovered.current().hash == replacement.hash);
+        CHECK(recovered.committed().hash == base.hash);
+        REQUIRE(recovered.remember_current_committed(replacement.generation, replacement.hash));
+    }
+    {
+        MetadataReplica recovered(uncommitted_path, keys.storage);
+        CHECK(recovered.current().hash == replacement.hash);
+        CHECK(recovered.committed().hash == replacement.hash);
+        CHECK(decode_snapshot(recovered.committed().payload).entries.contains("/replacement"));
+        CHECK(!decode_snapshot(recovered.committed().payload).entries.contains("/pending"));
+    }
+
     // The persistent metadata cache is an independently encrypted committed
     // snapshot. If the primary checkpoint is damaged, it may seed startup but
-    // is explicitly marked non-authoritative until quorum checkpointing clears
+    // is explicitly marked non-authoritative until replica checkpointing clears
     // the recovery marker. The damaged primary files remain quarantined.
     auto damaged_checkpoint_path = t.path() / "damaged-checkpoint-node";
     MetadataRecord recovery_seed;
@@ -944,7 +1682,7 @@ MACHA_TEST("storage_metadata", test_metadata_identity_rpc) {
     auto c2 = config_for(cluster.path() / "identity-2", cluster.keyfile(), free_port(),
                          {{"127.0.0.1", c1.port}});
     c1.replication = c2.replication = 1;
-    c1.metadata_replication = c2.metadata_replication = 1;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
 
     NodeRuntime n1(c1, keys);
     NodeRuntime n2(c2, keys);
@@ -980,7 +1718,7 @@ MACHA_TEST("storage_metadata", test_repair_step_is_bounded_and_yields) {
     auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1);
     auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 1;
-    c1.metadata_replication = c2.metadata_replication = 1;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
     c1.maintenance.idle_bandwidth_fraction = 0.0;
     c2.maintenance.idle_bandwidth_fraction = 0.0;
 
@@ -1042,7 +1780,7 @@ MACHA_TEST("storage_metadata", test_genesis_root_configuration) {
     TestService fixture("single");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.filesystem.root_uid = 501;
     config.filesystem.root_gid = 20;
     config.filesystem.root_mode = 0750;

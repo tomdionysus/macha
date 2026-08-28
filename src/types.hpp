@@ -52,6 +52,10 @@ struct NodeInfo {
     uint64_t used{};
     uint64_t seen_unix_ms{};
     uint64_t metadata_generation{};
+    // Protocol 20 metadata safety policy. Every metadata-capable node in a
+    // cluster must advertise the same floor; mismatches fail closed rather than
+    // allowing a weaker node to mint an acceptance certificate.
+    uint32_t metadata_write_replicas_required{};
 };
 
 struct NodeIdHash {

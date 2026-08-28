@@ -14,15 +14,7 @@
 
 namespace macha {
 namespace {
-size_t quorum(size_t n) {
-    return n / 2 + 1;
-}
-
-std::vector<NodeId> voters_of(const MetadataRecord& record) {
-    return decode_snapshot(record.payload).metadata_voters;
-}
-
-bool same_voters(std::vector<NodeId> a, std::vector<NodeId> b) {
+bool same_legacy_metadata_voters(std::vector<NodeId> a, std::vector<NodeId> b) {
     std::sort(a.begin(), a.end());
     std::sort(b.begin(), b.end());
     return a == b;
@@ -45,18 +37,6 @@ struct PendingBool {
     bool done{};
 };
 
-struct PendingIdentity {
-    NodeInfo owner;
-    std::optional<AsyncRpc> rpc;
-    bool done{};
-};
-
-struct PendingCas {
-    NodeInfo owner;
-    std::optional<AsyncRpc> rpc;
-    bool done{};
-};
-
 bool bool_reply(const RpcReply& reply) {
     if (reply.message.type != MessageType::bool_reply)
         return false;
@@ -66,39 +46,9 @@ bool bool_reply(const RpcReply& reply) {
     return ok;
 }
 
-std::optional<MetadataIdentity> identity_reply(const RpcReply& reply) {
-    if (reply.message.type != MessageType::metadata_identity_reply)
-        return {};
-    Reader reader(reply.message.payload);
-    MetadataIdentity identity;
-    identity.generation = reader.u64();
-    identity.hash.bytes = reader.fixed<32>();
-    reader.finish();
-    return identity;
-}
-
-std::pair<bool, MetadataRecord> cas_reply(const RpcReply& reply) {
-    if (reply.message.type != MessageType::cas_reply)
-        return {};
-    Reader reader(reply.message.payload);
-    bool ok = reader.u8() != 0;
-    MetadataRecord record;
-    if (ok) {
-        record.generation = reader.u64();
-        record.previous.bytes = reader.fixed<32>();
-        record.hash.bytes = reader.fixed<32>();
-    } else {
-        record = decode_metadata_record(reader.bytes());
-    }
-    reader.finish();
-    return {ok, record};
-}
 } // namespace
 
-MetadataManager::MetadataManager(NodeRuntime& node) : node_(node) {
-    static constexpr char label[] = "macha/metadata-placement/v1";
-    placement_key_ = sha256({reinterpret_cast<const uint8_t*>(label), sizeof(label) - 1});
-}
+MetadataManager::MetadataManager(NodeRuntime& node) : node_(node) {}
 
 const char* metadata_availability_name(MetadataAvailability availability) noexcept {
     switch (availability) {
@@ -114,53 +64,59 @@ const char* metadata_availability_name(MetadataAvailability availability) noexce
 
 MetadataClusterStatus MetadataManager::cluster_status() const noexcept {
     MetadataClusterStatus out;
-    out.generation = quorum_generation_.load(std::memory_order_acquire);
-    out.observed_unix_ms = quorum_observed_unix_ms_.load(std::memory_order_acquire);
-    out.voters = quorum_voters_.load(std::memory_order_acquire);
-    out.voters_online = quorum_voters_online_.load(std::memory_order_acquire);
-    out.quorum_required = quorum_required_.load(std::memory_order_acquire);
+    out.generation = replica_generation_.load(std::memory_order_acquire);
+    out.observed_unix_ms = replica_observed_unix_ms_.load(std::memory_order_acquire);
+    out.replicas = metadata_replicas_.load(std::memory_order_acquire);
+    out.replicas_online = metadata_replicas_online_.load(std::memory_order_acquire);
+    out.write_replicas_required = metadata_write_replicas_required_.load(std::memory_order_acquire);
     out.availability = metadata_availability_.load(std::memory_order_acquire);
-    out.stable = quorum_stable_.load(std::memory_order_acquire);
-    out.write_available = quorum_write_available_.load(std::memory_order_acquire);
+    out.stable = metadata_replica_set_stable_.load(std::memory_order_acquire);
+    out.write_available = metadata_write_available_.load(std::memory_order_acquire);
     return out;
 }
 
-void MetadataManager::publish_quorum_state(bool validated, std::string_view reason) {
-    // The metadata subsystem owns this state.  Telemetry is deliberately not an
-    // input.  This method is called by the existing background metadata owner
-    // after a validation attempt and performs no RPC or disk I/O itself.  The
-    // published fields are atomics so Status polling cannot cause metadata work.
+void MetadataManager::publish_replica_state(bool validated, std::string_view reason) {
+    // Every known node is metadata-capable. The write policy is a durability
+    // floor, not a fixed voter set: any metadata_min_write_replicas currently
+    // reachable replicas may accept a mutation.
     auto view = available_snapshot_view();
-    size_t online = 0;
-    size_t required = 0;
-    size_t voter_count = 0;
-    uint64_t generation = 0;
+    const auto membership = node_.membership().snapshot();
+    const size_t required = node_.config().metadata_min_write_replicas;
+    const auto expected_policy = static_cast<uint32_t>(required);
+    const size_t known = membership.all.size();
+    const bool peer_policy_mismatch = std::any_of(
+        membership.active.begin(), membership.active.end(), [&](const NodeInfo& peer) {
+            return peer.metadata_write_replicas_required != expected_policy;
+        });
+    const bool local_policy_mismatch =
+        view && view->snapshot->metadata_write_replicas_required &&
+        view->snapshot->metadata_write_replicas_required != expected_policy;
+    const size_t online = static_cast<size_t>(std::count_if(
+        membership.active.begin(), membership.active.end(), [&](const NodeInfo& peer) {
+            return peer.metadata_write_replicas_required == expected_policy;
+        }));
+    const uint64_t generation = view ? view->generation : 0;
 
     MetadataAvailability next = MetadataAvailability::unavailable;
-    if (view && !view->snapshot->metadata_voters.empty()) {
-        const auto& voters = view->snapshot->metadata_voters;
-        const auto active = node_.membership().active();
-        for (const auto& voter : voters) {
-            if (std::any_of(active.begin(), active.end(), [&](const NodeInfo& node) {
-                    return node.id == voter;
-                }))
-                ++online;
-        }
-        voter_count = voters.size();
-        required = quorum(voter_count);
-        generation = view->generation;
-        next = validated && online >= required ? MetadataAvailability::writable
-                                               : MetadataAvailability::read_only;
+    if (view) {
+        // Replica-set validation describes convergence/stability, not write
+        // authority.  A locally committed branch plus the configured number of
+        // reachable metadata replicas is enough to attempt a mutation; any
+        // divergent peer is reconciled by the mutation/read path itself.
+        next = !local_policy_mismatch && online >= required ? MetadataAvailability::writable
+                                                            : MetadataAvailability::read_only;
     }
 
-    quorum_generation_.store(generation, std::memory_order_release);
-    quorum_voters_.store(static_cast<uint32_t>(voter_count), std::memory_order_release);
-    quorum_voters_online_.store(static_cast<uint32_t>(online), std::memory_order_release);
-    quorum_required_.store(static_cast<uint32_t>(required), std::memory_order_release);
-    quorum_observed_unix_ms_.store(unix_ms(), std::memory_order_release);
-    quorum_write_available_.store(next == MetadataAvailability::writable,
-                                  std::memory_order_release);
-    quorum_stable_.store(next == MetadataAvailability::writable, std::memory_order_release);
+    replica_generation_.store(generation, std::memory_order_release);
+    metadata_replicas_.store(static_cast<uint32_t>(known), std::memory_order_release);
+    metadata_replicas_online_.store(static_cast<uint32_t>(online), std::memory_order_release);
+    metadata_write_replicas_required_.store(static_cast<uint32_t>(required),
+                                            std::memory_order_release);
+    replica_observed_unix_ms_.store(unix_ms(), std::memory_order_release);
+    metadata_write_available_.store(next == MetadataAvailability::writable,
+                                    std::memory_order_release);
+    metadata_replica_set_stable_.store(validated && !peer_policy_mismatch && !local_policy_mismatch,
+                                       std::memory_order_release);
 
     const auto previous = metadata_availability_.exchange(next, std::memory_order_acq_rel);
     if (previous == next)
@@ -168,14 +124,19 @@ void MetadataManager::publish_quorum_state(bool validated, std::string_view reas
 
     std::string transition_reason;
     if (next == MetadataAvailability::writable) {
-        transition_reason = "metadata write quorum available";
+        transition_reason = validated ? "metadata write durability floor available"
+                                      : "metadata write durability floor available; reconciliation pending";
     } else if (next == MetadataAvailability::read_only) {
-        if (previous == MetadataAvailability::writable)
-            transition_reason = "metadata write quorum lost";
+        if (local_policy_mismatch)
+            transition_reason = "local metadata write-floor policy mismatch";
+        else if (peer_policy_mismatch && online < required)
+            transition_reason = "metadata write-floor policy mismatch leaves too few compatible replicas";
+        else if (previous == MetadataAvailability::writable)
+            transition_reason = "metadata write durability floor lost";
         else if (!reason.empty())
             transition_reason.assign(reason);
         else
-            transition_reason = "local metadata state ready; metadata write quorum unavailable";
+            transition_reason = "local metadata state ready; metadata write durability floor unavailable";
     } else if (!reason.empty()) {
         transition_reason.assign(reason);
     } else {
@@ -188,9 +149,9 @@ void MetadataManager::publish_quorum_state(bool validated, std::string_view reas
         " reason=\"" + transition_reason + "\"";
     if (generation) {
         message += " generation=" + std::to_string(generation) +
-                   " voters=" + std::to_string(online) + "/" +
-                   std::to_string(voter_count) +
-                   " quorum=" + std::to_string(required);
+                   " replicas=" + std::to_string(online) + "/" +
+                   std::to_string(known) +
+                   " required=" + std::to_string(required);
     }
 
     if (next == MetadataAvailability::writable ||
@@ -210,7 +171,7 @@ std::optional<NodeInfo> MetadataManager::node_info(const NodeId& id) const {
     return {};
 }
 
-std::vector<NodeInfo> MetadataManager::voter_nodes(const std::vector<NodeId>& ids) const {
+std::vector<NodeInfo> MetadataManager::replica_nodes(const std::vector<NodeId>& ids) const {
     std::vector<NodeInfo> out;
     out.reserve(ids.size());
     for (const auto& id : ids) {
@@ -220,15 +181,28 @@ std::vector<NodeInfo> MetadataManager::voter_nodes(const std::vector<NodeId>& id
     return out;
 }
 
-MetadataRecord MetadataManager::latest(const std::vector<MetadataRecord>& records) const {
-    if (records.empty())
-        throw std::runtime_error("metadata unavailable");
-    auto result = records.front();
-    for (const auto& record : records) {
-        if (newer_than(record, result))
-            result = record;
+std::vector<NodeInfo> MetadataManager::compatible_replicas(
+    const std::vector<NodeInfo>& nodes) const {
+    const auto required = static_cast<uint32_t>(node_.config().metadata_min_write_replicas);
+    std::vector<NodeInfo> out;
+    out.reserve(nodes.size());
+    for (const auto& peer : nodes) {
+        if (peer.metadata_write_replicas_required == required)
+            out.push_back(peer);
     }
-    return result;
+    return out;
+}
+
+void MetadataManager::require_metadata_policy_match(const std::vector<NodeInfo>& nodes) const {
+    const auto required = static_cast<uint32_t>(node_.config().metadata_min_write_replicas);
+    for (const auto& peer : nodes) {
+        if (peer.metadata_write_replicas_required == required)
+            continue;
+        throw MetadataNotReady(
+            "metadata write-floor policy mismatch peer=" + to_string(peer.id) +
+            " local=" + std::to_string(required) +
+            " peer_required=" + std::to_string(peer.metadata_write_replicas_required));
+    }
 }
 
 MetadataRecord MetadataManager::cache_record(
@@ -239,13 +213,14 @@ MetadataRecord MetadataManager::cache_record(
         node_.apply_identity_reset(reset);
 
     std::lock_guard lock(cache_mutex_);
-    // Concurrent quorum/local reads can complete out of order. Never let an
+    // Concurrent replica/local reads can complete out of order. Never let an
     // older completion move the process cache backwards after a newer immutable
     // record has already been observed.
     if (cache_ && newer_than(*cache_, record))
         return *cache_;
     cache_ = record;
     cache_until_ = Clock::now() + node_.config().metadata_cache;
+    cache_remote_epoch_ = node_.remote_metadata_epoch();
     if (!decoded_cache_ || decoded_generation_ != record.generation || decoded_hash_ != record.hash) {
         const bool namespace_changed = !decoded_cache_ || decoded_cache_->entries != decoded->entries;
         decoded_cache_ = std::move(decoded);
@@ -266,12 +241,13 @@ MetadataRecord MetadataManager::cache_record(const MetadataRecord& record) {
             return *cache_;
         cache_ = record;
         cache_until_ = Clock::now() + node_.config().metadata_cache;
+        cache_remote_epoch_ = node_.remote_metadata_epoch();
         if (decoded_cache_ && decoded_generation_ == record.generation && decoded_hash_ == record.hash)
             return record;
     }
 
     // Decode only when the canonical record actually changes. Metadata reads can
-    // refresh their short quorum cache frequently; rebuilding tens of thousands
+    // refresh their short metadata cache frequently; rebuilding tens of thousands
     // of FsEntry/extent objects on every getattr was the dominant namespace cost.
     auto decoded = std::make_shared<MetadataSnapshot>(decode_snapshot(record.payload));
     return cache_record(record, std::move(decoded));
@@ -279,9 +255,10 @@ MetadataRecord MetadataManager::cache_record(const MetadataRecord& record) {
 
 std::optional<MetadataRecord> MetadataManager::cached_record() {
     std::lock_guard lock(cache_mutex_);
-    if (!cache_ || Clock::now() >= cache_until_)
+    if (!cache_ || Clock::now() >= cache_until_ ||
+        cache_remote_epoch_ != node_.remote_metadata_epoch())
         return {};
-    if (node_.metadata_replica().generation() > cache_->generation ||
+    if (node_.metadata_replica().committed_generation() > cache_->generation ||
         node_.remote_metadata_generation() > cache_->generation)
         return {};
     return cache_;
@@ -292,736 +269,700 @@ std::optional<MetadataSnapshotView> MetadataManager::cached_snapshot_view() {
     // The decoded snapshot is reusable indefinitely for a specific immutable
     // metadata record, but it is not evidence that the record is still current.
     // Honour the same short TTL as cached_record() so missed generation notices
-    // eventually force a quorum validation instead of making metadata stale forever.
-    if (!cache_ || !decoded_cache_ || Clock::now() >= cache_until_)
+    // eventually force a replica validation instead of making metadata stale forever.
+    if (!cache_ || !decoded_cache_ || Clock::now() >= cache_until_ ||
+        cache_remote_epoch_ != node_.remote_metadata_epoch())
         return {};
     if (cache_->generation != decoded_generation_ || cache_->hash != decoded_hash_)
         return {};
-    if (node_.metadata_replica().generation() > decoded_generation_ ||
+    if (node_.metadata_replica().committed_generation() > decoded_generation_ ||
         node_.remote_metadata_generation() > decoded_generation_)
         return {};
     return MetadataSnapshotView{decoded_generation_, decoded_namespace_revision_, decoded_hash_, decoded_cache_};
 }
 
-bool MetadataManager::seed_quorum(const std::vector<NodeInfo>& nodes,
-                                  const MetadataRecord& record, size_t required,
-                                  FrameType frame_type) {
-    if (!required)
-        return true;
-
-    // Full records can be very large.  A fan-out of N asynchronous RPCs creates
-    // N queued payload copies at once, which is unsafe on memory-bounded nodes.
-    // Seeding is a recovery/policy slow path, so bound full-record fan-out to one
-    // remote transfer at a time.
-    const auto encoded = encode_metadata_record(record);
-    size_t success = 0;
-    size_t completed = 0;
-    for (const auto& owner : nodes) {
-        bool ok = false;
-        if (owner.id == node_.node_id()) {
-            ok = node_.seed_metadata(record);
-        } else {
-            try {
-                auto rpc = node_.call_async(owner, MessageType::seed_metadata, encoded, frame_type);
-                while (rpc.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                ok = bool_reply(rpc.get());
-            } catch (...) {
+bool MetadataManager::import_history_from_peer(const NodeInfo& owner, const Hash256& target,
+                                               FrameType frame_type) {
+    auto& local = node_.metadata_replica();
+    if (local.history_contains(target)) {
+        // A prior peer may have supplied the head as a full commit while lacking
+        // some optional ancestry. Use every later source to fill those holes;
+        // common-ancestor discovery must not depend on which certificate holder
+        // happened to answer first.
+        if (auto entry = local.history_entry(target)) {
+            if (entry->previous_known && !local.history_contains(entry->previous))
+                (void)import_history_from_peer(owner, entry->previous, frame_type);
+            for (const auto& parent : entry->merge_parents) {
+                if (!local.history_contains(parent))
+                    (void)import_history_from_peer(owner, parent, frame_type);
             }
         }
-        ++completed;
-        if (ok)
-            ++success;
-        if (success >= required)
-            return true;
-        if (success + (nodes.size() - completed) < required)
-            return false;
-    }
-    return success >= required;
-}
-
-bool MetadataManager::checkpoint_quorum(const std::vector<NodeInfo>& nodes,
-                                        const MetadataRecord& record, size_t required,
-                                        FrameType frame_type) {
-    if (!required)
         return true;
-
-    // As with seeding, serialize full checkpoints so memory use is independent
-    // of cluster width. Compact commit/delta RPCs remain concurrent.
-    const auto encoded = encode_metadata_record(record);
-    size_t success = 0;
-    size_t completed = 0;
-    for (const auto& owner : nodes) {
-        bool ok = false;
-        if (owner.id == node_.node_id()) {
-            ok = node_.checkpoint_metadata(record);
-        } else {
-            try {
-                auto rpc =
-                    node_.call_async(owner, MessageType::checkpoint_metadata, encoded, frame_type);
-                while (rpc.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                ok = bool_reply(rpc.get());
-            } catch (...) {
-            }
-        }
-        ++completed;
-        if (ok)
-            ++success;
-        if (success >= required)
-            return true;
-        if (success + (nodes.size() - completed) < required)
-            return false;
     }
-    return success >= required;
-}
-
-bool MetadataManager::commit_quorum(const std::vector<NodeInfo>& nodes,
-                                    uint64_t generation, const Hash256& hash,
-                                    size_t required, FrameType frame_type) {
-    if (!required)
-        return true;
-
-    Writer writer;
-    writer.u64(generation);
-    writer.fixed(hash.bytes);
-    const auto encoded = writer.take();
-
-    size_t success = 0;
-    size_t completed = 0;
-    std::vector<PendingBool> pending;
-    pending.reserve(nodes.size());
-
-    for (const auto& owner : nodes) {
-        if (owner.id == node_.node_id()) {
-            ++completed;
-            if (node_.commit_metadata(generation, hash))
-                ++success;
-            continue;
-        }
-        try {
-            PendingBool item;
-            item.owner = owner;
-            item.rpc.emplace(
-                node_.call_async(owner, MessageType::commit_metadata, encoded, frame_type));
-            pending.push_back(std::move(item));
-        } catch (...) {
-            ++completed;
-        }
-    }
-
-    if (success >= required)
-        return true;
-    if (success + (nodes.size() - completed) < required)
+    if (owner.id == node_.node_id())
         return false;
 
-    while (completed < nodes.size()) {
-        bool progressed = false;
-        for (auto& item : pending) {
-            if (item.done || !item.rpc)
-                continue;
-            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
-                continue;
-            item.done = true;
-            ++completed;
-            progressed = true;
+    struct Task {
+        Hash256 hash{};
+        bool required{};
+        bool loaded{};
+        MetadataHistoryEntry entry;
+    };
+
+    std::vector<Task> stack;
+    std::set<Hash256> active;
+    stack.push_back({target, true, false, {}});
+    active.insert(target);
+
+    while (!stack.empty()) {
+        auto& task = stack.back();
+        if (local.history_contains(task.hash)) {
+            active.erase(task.hash);
+            stack.pop_back();
+            continue;
+        }
+
+        if (!task.loaded) {
             try {
-                if (bool_reply(item.rpc->get()))
-                    ++success;
+                Writer request;
+                request.fixed(task.hash.bytes);
+                auto reply = node_.call(owner, MessageType::get_metadata_history_entry,
+                                        request.take(), frame_type);
+                if (reply.message.type != MessageType::metadata_history_entry_reply)
+                    throw std::runtime_error("metadata history entry unavailable");
+                task.entry = decode_metadata_history_entry(reply.message.payload);
+                if (task.entry.hash != task.hash)
+                    throw std::runtime_error("metadata history reply identity mismatch");
+                task.loaded = true;
             } catch (...) {
+                const bool required = task.required;
+                active.erase(task.hash);
+                stack.pop_back();
+                if (required)
+                    return false;
+                continue;
             }
-            if (success >= required)
-                return true;
-            if (success + (nodes.size() - completed) < required)
-                return false;
+
+            std::vector<std::pair<Hash256, bool>> dependencies;
+            if (task.entry.previous_known) {
+                dependencies.emplace_back(
+                    task.entry.previous,
+                    task.entry.body == MetadataHistoryEntry::Body::delta);
+            }
+            for (const auto& parent : task.entry.merge_parents)
+                dependencies.emplace_back(parent, false);
+
+            bool pushed = false;
+            for (auto it = dependencies.rbegin(); it != dependencies.rend(); ++it) {
+                if (local.history_contains(it->first))
+                    continue;
+                if (!active.insert(it->first).second) {
+                    if (it->second)
+                        return false;
+                    continue;
+                }
+                stack.push_back({it->first, it->second, false, {}});
+                pushed = true;
+            }
+            if (pushed)
+                continue;
         }
-        if (!progressed)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+        const bool required = task.required;
+        const auto hash = task.hash;
+        const auto entry = task.entry;
+        active.erase(hash);
+        stack.pop_back();
+        if (!local.import_history(entry) && required)
+            return false;
     }
 
-    return success >= required;
+    return local.history_contains(target);
 }
 
-void MetadataManager::commit_all_best_effort(const std::vector<NodeInfo>& nodes,
-                                             uint64_t generation, const Hash256& hash,
-                                             FrameType frame_type) {
-    Writer writer;
-    writer.u64(generation);
-    writer.fixed(hash.bytes);
-    const auto encoded = writer.take();
+bool MetadataManager::push_history_to_peer(const NodeInfo& owner, const Hash256& target,
+                                            FrameType frame_type) {
+    auto& local = node_.metadata_replica();
+    if (owner.id == node_.node_id())
+        return local.history_contains(target);
+    if (!local.history_contains(target))
+        return false;
 
-    std::vector<PendingBool> pending;
-    pending.reserve(nodes.size());
-    for (const auto& owner : nodes) {
-        if (owner.id == node_.node_id()) {
-            (void)node_.commit_metadata(generation, hash);
+    auto remote_has = [&](const Hash256& hash) {
+        try {
+            Writer request;
+            request.fixed(hash.bytes);
+            auto reply = node_.call(owner, MessageType::has_metadata_history_entry,
+                                    request.take(), frame_type);
+            return bool_reply(reply);
+        } catch (...) {
+            return false;
+        }
+    };
+
+    struct Task {
+        Hash256 hash{};
+        bool required{};
+        bool expanded{};
+        MetadataHistoryEntry entry;
+    };
+
+    std::vector<Task> stack;
+    std::set<Hash256> active;
+    stack.push_back({target, true, false, {}});
+    active.insert(target);
+
+    while (!stack.empty()) {
+        auto& task = stack.back();
+        if (remote_has(task.hash)) {
+            active.erase(task.hash);
+            stack.pop_back();
             continue;
         }
-        try {
-            PendingBool item;
-            item.owner = owner;
-            item.rpc.emplace(
-                node_.call_async(owner, MessageType::commit_metadata, encoded, frame_type));
-            pending.push_back(std::move(item));
-        } catch (const std::exception& error) {
-            Log::debug("metadata compact commit " + owner.host + ": " + error.what());
-        }
-    }
 
-    for (;;) {
-        bool pending_work = false;
-        bool progressed = false;
-        for (auto& item : pending) {
-            if (item.done || !item.rpc)
+        if (!task.expanded) {
+            auto entry = local.history_entry(task.hash);
+            if (!entry) {
+                const bool required = task.required;
+                active.erase(task.hash);
+                stack.pop_back();
+                if (required)
+                    return false;
                 continue;
-            pending_work = true;
-            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
-                continue;
-            item.done = true;
-            progressed = true;
-            try {
-                if (!bool_reply(item.rpc->get()))
-                    Log::debug("metadata compact commit rejected by " + item.owner.host);
-            } catch (const std::exception& error) {
-                Log::debug("metadata compact commit " + item.owner.host + ": " + error.what());
             }
-        }
-        if (!pending_work)
-            return;
-        if (!progressed)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-}
+            task.entry = *entry;
+            task.expanded = true;
 
-void MetadataManager::refresh_cache_identity(const MetadataIdentity& identity) {
-    std::lock_guard lock(cache_mutex_);
-    if (cache_ && cache_->generation == identity.generation && cache_->hash == identity.hash)
-        cache_until_ = Clock::now() + node_.config().metadata_cache;
-}
+            std::vector<std::pair<Hash256, bool>> dependencies;
+            if (entry->previous_known) {
+                dependencies.emplace_back(
+                    entry->previous,
+                    entry->body == MetadataHistoryEntry::Body::delta);
+            }
+            for (const auto& parent : entry->merge_parents)
+                dependencies.emplace_back(parent, false);
 
-void MetadataManager::seed_all_best_effort(const std::vector<NodeInfo>& nodes,
-                                           const MetadataRecord& record,
-                                           FrameType frame_type) {
-    // This is explicitly a full-snapshot slow path. Keep at most one remote
-    // checkpoint payload queued at once; otherwise memory grows as
-    // metadata_size * peer_count exactly when the node is already recovering.
-    const auto encoded = encode_metadata_record(record);
-    for (const auto& owner : nodes) {
-        if (owner.id == node_.node_id()) {
-            (void)node_.checkpoint_metadata(record);
-            continue;
+            bool pushed = false;
+            for (auto it = dependencies.rbegin(); it != dependencies.rend(); ++it) {
+                if (remote_has(it->first))
+                    continue;
+                if (!active.insert(it->first).second) {
+                    if (it->second)
+                        return false;
+                    continue;
+                }
+                stack.push_back({it->first, it->second, false, {}});
+                pushed = true;
+            }
+            if (pushed)
+                continue;
         }
+
+        bool ok = false;
         try {
-            auto rpc =
-                node_.call_async(owner, MessageType::checkpoint_metadata, encoded, frame_type);
-            while (rpc.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            // A negative checkpoint acknowledgement is an ordinary convergence
-            // decision (for example, the receiver is already current).  Do not
-            // turn routine state-machine chatter into a fault-looking log line.
-            (void)bool_reply(rpc.get());
-        } catch (const std::exception& error) {
-            Log::debug("metadata checkpoint " + owner.host + ": " + error.what());
+            auto encoded = encode_metadata_history_entry(task.entry);
+            ok = bool_reply(node_.call(owner, MessageType::put_metadata_history_entry,
+                                       encoded, frame_type));
+        } catch (...) {
         }
+        const bool required = task.required;
+        const auto hash = task.hash;
+        active.erase(hash);
+        stack.pop_back();
+        if (!ok && required)
+            return false;
+    }
+    return true;
+}
+
+MetadataHistoryEntry MetadataManager::commit_history_entry(
+    const MetadataRecord& record, std::span<const uint8_t> delta) const {
+    if (!valid_metadata_record(record))
+        throw std::runtime_error("cannot publish invalid metadata commit");
+    MetadataHistoryEntry entry;
+    entry.generation = record.generation;
+    entry.previous = record.previous;
+    entry.hash = record.hash;
+    entry.previous_known = record.generation > 1 && record.previous != Hash256{};
+    entry.merge_parents = decode_snapshot(record.payload).merge_parents;
+    if (!delta.empty()) {
+        entry.body = MetadataHistoryEntry::Body::delta;
+        entry.payload.assign(delta.begin(), delta.end());
+    } else {
+        entry.body = MetadataHistoryEntry::Body::full;
+        entry.payload.assign(record.payload.begin(), record.payload.end());
+    }
+    return entry;
+}
+
+bool MetadataManager::store_commit_on(const NodeInfo& owner,
+                                      const MetadataHistoryEntry& compact,
+                                      const MetadataRecord& record,
+                                      FrameType frame_type) {
+    if (owner.id == node_.node_id()) {
+        return node_.metadata_replica().store_commit(
+            record, compact.body == MetadataHistoryEntry::Body::delta
+                        ? std::span<const uint8_t>(compact.payload)
+                        : std::span<const uint8_t>{});
+    }
+
+    try {
+        auto encoded = encode_metadata_history_entry(compact);
+        auto reply = node_.call(owner, MessageType::put_metadata_commit, encoded, frame_type);
+        if (bool_reply(reply))
+            return true;
+
+        // A compact delta may arrive at a perfectly valid replica which simply
+        // has not imported its parent yet. Commit storage is not a CAS: fall back
+        // to the immutable full commit rather than rejecting the branch because
+        // of that replica's current/effective head.
+        if (compact.body == MetadataHistoryEntry::Body::delta) {
+            auto full = commit_history_entry(record);
+            encoded = encode_metadata_history_entry(full);
+            return bool_reply(
+                node_.call(owner, MessageType::put_metadata_commit, encoded, frame_type));
+        }
+    } catch (const std::exception& error) {
+        Log::debug("metadata commit store " + owner.host + ": " + error.what());
+    }
+    return false;
+}
+
+bool MetadataManager::accept_commit_on(const NodeInfo& owner,
+                                       const MetadataAcceptance& acceptance,
+                                       FrameType frame_type) {
+    if (owner.id == node_.node_id())
+        return node_.accept_metadata_commit(acceptance);
+    try {
+        const auto encoded = encode_metadata_acceptance(acceptance);
+        return bool_reply(
+            node_.call(owner, MessageType::accept_metadata_commit, encoded, frame_type));
+    } catch (const std::exception& error) {
+        Log::debug("metadata acceptance " + owner.host + ": " + error.what());
+        return false;
     }
 }
 
-MetadataManager::CasResult MetadataManager::cas_quorum(const std::vector<NodeInfo>& nodes,
-                                                       const MetadataRecord& expected,
-                                                       std::span<const uint8_t> payload,
-                                                       size_t required,
-                                                       FrameType frame_type) {
-    CasResult result;
+size_t MetadataManager::acceptance_floor_for(const MetadataRecord& record) const {
+    const auto snapshot_floor = [](const MetadataSnapshot& snapshot) -> size_t {
+        if (snapshot.metadata_write_replicas_required)
+            return snapshot.metadata_write_replicas_required;
+        if (!snapshot.metadata_voters.empty())
+            return snapshot.metadata_voters.size() / 2 + 1;
+        return 0;
+    };
+
+    const auto current = decode_snapshot(record.payload);
+    size_t required = snapshot_floor(current);
     if (!required)
-        return result;
+        throw std::runtime_error("protocol-20 metadata commit has no write-floor policy");
 
-    Writer writer;
-    writer.u64(expected.generation);
-    writer.fixed(expected.hash.bytes);
-    writer.bytes(payload);
-    const auto encoded = writer.take();
-
-    MetadataRecord proposed;
-    proposed.generation = expected.generation + 1;
-    proposed.previous = expected.hash;
-    proposed.payload.assign(payload.begin(), payload.end());
-    proposed.hash = metadata_hash(proposed.generation, proposed.previous, proposed.payload);
-
-    size_t completed = 0;
-    std::vector<PendingCas> pending;
-    pending.reserve(nodes.size());
-
-    auto observe = [&](bool ok, const MetadataRecord& record) {
-        if (ok) {
-            if (record.generation != proposed.generation ||
-                record.previous != proposed.previous || record.hash != proposed.hash)
-                throw std::runtime_error("metadata CAS voter acknowledged unexpected successor");
-            ++result.success;
-            if (!result.committed)
-                result.committed = proposed;
-        } else if (record.generation > expected.generation ||
-                   (record.generation == expected.generation && record.hash != expected.hash)) {
-            result.conflict = true;
-        }
-    };
-
-    for (const auto& owner : nodes) {
-        if (owner.id == node_.node_id()) {
-            ++completed;
-            MetadataRecord record;
-            bool ok = node_.cas_metadata(expected.generation, expected.hash, payload, &record);
-            observe(ok, record);
-            continue;
-        }
-        try {
-            PendingCas item;
-            item.owner = owner;
-            item.rpc.emplace(node_.call_async(owner, MessageType::cas_metadata, encoded, frame_type));
-            pending.push_back(std::move(item));
-        } catch (...) {
-            ++completed;
-        }
+    // Policy transitions are certified at the strongest policy visible on any
+    // parent edge. This matters for lowering the floor and for merge commits
+    // which reconcile a policy-transition branch with an older sibling.
+    for (const auto& parent_hash : metadata_record_parents(record)) {
+        auto parent = node_.metadata_replica().historical(parent_hash);
+        if (!parent)
+            throw MetadataNotReady("metadata commit parent unavailable for policy validation");
+        required = std::max(required, snapshot_floor(decode_snapshot(parent->payload)));
     }
-
-    if (result.success >= required)
-        return result;
-    if (result.success + (nodes.size() - completed) < required)
-        return result;
-
-    while (completed < nodes.size()) {
-        bool progressed = false;
-        for (auto& item : pending) {
-            if (item.done || !item.rpc)
-                continue;
-            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
-                continue;
-            item.done = true;
-            ++completed;
-            progressed = true;
-            try {
-                auto [ok, record] = cas_reply(item.rpc->get());
-                observe(ok, record);
-            } catch (...) {
-            }
-            if (result.success >= required)
-                return result;
-            if (result.success + (nodes.size() - completed) < required)
-                return result;
-        }
-        if (!progressed)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    return result;
+    return required;
 }
 
-MetadataManager::CasResult MetadataManager::cas_delta_quorum(
-    const std::vector<NodeInfo>& nodes, const MetadataRecord& expected,
-    std::span<const uint8_t> delta, Bytes proposed_payload, size_t required,
-    FrameType frame_type) {
-    CasResult result;
-    if (!required)
-        return result;
+MetadataManager::PublishedCommit MetadataManager::publish_commit(
+    const std::vector<NodeInfo>& nodes, const MetadataRecord& record,
+    std::span<const uint8_t> delta, FrameType frame_type) {
+    const size_t required = acceptance_floor_for(record);
+    auto compatible = compatible_replicas(nodes);
+    if (compatible.size() < required)
+        throw MetadataNotReady("metadata write durability floor unavailable: too few policy-compatible replicas");
 
-    Writer writer;
-    writer.u64(expected.generation);
-    writer.fixed(expected.hash.bytes);
-    writer.bytes(delta);
-    const auto encoded = writer.take();
+    const auto compact = commit_history_entry(record, delta);
+    PublishedCommit out;
+    out.record = record;
 
-    MetadataRecord proposed;
-    proposed.generation = expected.generation + 1;
-    proposed.previous = expected.hash;
-    proposed.payload = std::move(proposed_payload);
-    proposed.hash = metadata_hash(proposed.generation, proposed.previous, proposed.payload);
+    auto ordered = compatible;
+    std::stable_sort(ordered.begin(), ordered.end(), [&](const NodeInfo& a, const NodeInfo& b) {
+        return a.id == node_.node_id() && b.id != node_.node_id();
+    });
 
-    size_t completed = 0;
-    std::vector<PendingCas> pending;
-    pending.reserve(nodes.size());
-
-    auto observe = [&](bool ok, const MetadataRecord& record) {
-        if (ok) {
-            if (record.generation != proposed.generation ||
-                record.previous != proposed.previous || record.hash != proposed.hash)
-                throw std::runtime_error(
-                    "metadata delta CAS voter acknowledged unexpected successor");
-            ++result.success;
-            if (!result.committed)
-                result.committed = proposed;
-        } else if (record.generation > expected.generation ||
-                   (record.generation == expected.generation && record.hash != expected.hash)) {
-            result.conflict = true;
-        }
-    };
-
-    for (const auto& owner : nodes) {
-        if (owner.id == node_.node_id()) {
-            ++completed;
-            MetadataRecord record;
-            bool ok = node_.cas_metadata_delta(expected.generation, expected.hash, delta, &record);
-            observe(ok, record);
-            continue;
-        }
-        try {
-            PendingCas item;
-            item.owner = owner;
-            item.rpc.emplace(
-                node_.call_async(owner, MessageType::cas_metadata_delta, encoded, frame_type));
-            pending.push_back(std::move(item));
-        } catch (...) {
-            ++completed;
-        }
-    }
-
-    if (result.success >= required)
-        return result;
-    if (result.success + (nodes.size() - completed) < required)
-        return result;
-
-    while (completed < nodes.size()) {
-        bool progressed = false;
-        for (auto& item : pending) {
-            if (item.done || !item.rpc)
-                continue;
-            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
-                continue;
-            item.done = true;
-            ++completed;
-            progressed = true;
-            try {
-                auto [ok, record] = cas_reply(item.rpc->get());
-                observe(ok, record);
-            } catch (...) {
-            }
-            if (result.success >= required)
-                return result;
-            if (result.success + (nodes.size() - completed) < required)
-                return result;
-        }
-        if (!progressed)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    return result;
-}
-
-MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& voters, FrameType frame_type) {
-    if (voters.empty())
-        throw std::runtime_error("metadata voter set is empty");
-    const size_t need = quorum(voters.size());
-    auto nodes = voter_nodes(voters);
-    if (nodes.size() < need)
-        throw std::runtime_error("metadata read quorum unavailable");
-
-    std::vector<MetadataRecord> matching;
-    std::vector<MetadataRecord> transitioned;
-    size_t responded = 0;
-    size_t completed = 0;
-    std::vector<PendingRead> pending;
-    pending.reserve(nodes.size());
-
-    auto observe = [&](const MetadataRecord& record) {
-        ++responded;
-        auto record_voters = voters_of(record);
-        if (record_voters.empty() || same_voters(record_voters, voters))
-            matching.push_back(record);
-        else
-            transitioned.push_back(record);
-    };
-
-    for (const auto& owner : nodes) {
-        if (owner.id == node_.node_id()) {
-            ++completed;
-            observe(node_.metadata_replica().current());
-            continue;
-        }
-        try {
-            PendingRead item;
-            item.owner = owner;
-            item.rpc.emplace(node_.call_async(owner, MessageType::get_metadata, {}, frame_type));
-            pending.push_back(std::move(item));
-        } catch (...) {
-            ++completed;
-        }
-    }
-
-    auto decide = [&]() -> std::optional<MetadataRecord> {
-        struct TransitionGroup {
-            std::vector<NodeId> voters;
-            std::vector<MetadataRecord> records;
-        };
-        std::vector<TransitionGroup> groups;
-        for (const auto& record : transitioned) {
-            auto next = voters_of(record);
-            std::sort(next.begin(), next.end());
-            auto found = std::find_if(groups.begin(), groups.end(), [&](const auto& group) {
-                return group.voters == next;
-            });
-            if (found == groups.end())
-                groups.push_back({std::move(next), {record}});
-            else
-                found->records.push_back(record);
-        }
-        for (const auto& group : groups) {
-            if (group.records.size() >= need) {
-                auto successor = latest(group.records);
-                node_.seed_metadata(successor);
-                node_.checkpoint_metadata(successor);
-
-                // An old-group majority has committed the voter transition.
-                // Repair the successor onto a new-group quorum before following
-                // it. This also completes a transition interrupted after the
-                // old quorum committed but before every new voter was seeded.
-                auto next_nodes = voter_nodes(group.voters);
-                const size_t next_need = quorum(group.voters.size());
-                if (next_nodes.size() < next_need ||
-                    !seed_quorum(next_nodes, successor, next_need, frame_type))
-                    throw std::runtime_error("metadata voter transition target quorum unavailable");
-                checkpoint_quorum(next_nodes, successor, next_need, frame_type);
-                return read_group(group.voters, frame_type);
-            }
-        }
-
-        if (responded < need || matching.empty())
-            return {};
-
-        auto current = latest(matching);
-        size_t identical = 0;
-        for (const auto& record : matching) {
-            if (record.hash == current.hash)
-                ++identical;
-        }
-
-        // Do not read-repair a voter transition from a minority. A transition
-        // is followed only when an old-group majority reports the same next
-        // group above. Ordinary same-group generations may be safely repaired.
-        if (identical < need) {
-            auto current_voters = voters_of(current);
-            if (!same_voters(current_voters, voters))
-                return {};
-            if (!seed_quorum(nodes, current, need, frame_type))
-                return {};
-        }
-
-        auto policy = decode_snapshot(current.payload);
-        if (policy.metadata_voters.empty())
-            throw std::runtime_error("metadata voter group lost its configuration");
-        if (policy.extent_size != node_.config().extent_size) {
-            throw std::runtime_error("cluster extent size does not match local configuration");
-        }
-        node_.seed_metadata(current);
-        node_.checkpoint_metadata(current);
-        return current;
-    };
-
-    if (auto result = decide())
-        return *result;
-
-    while (completed < nodes.size()) {
-        bool progressed = false;
-        for (auto& item : pending) {
-            if (item.done || !item.rpc)
-                continue;
-            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
-                continue;
-            item.done = true;
-            ++completed;
-            progressed = true;
-            try {
-                auto reply = item.rpc->get();
-                if (reply.message.type == MessageType::metadata_reply)
-                    observe(decode_metadata_record(reply.message.payload));
-            } catch (...) {
-            }
-            if (auto result = decide())
-                return *result;
-        }
-        if (responded + (nodes.size() - completed) < need)
+    // Store the immutable commit independently on the fastest available
+    // registered replicas until the configured durability floor is reached. A
+    // receiver never compares it with its current head; it validates the commit
+    // and durably appends it to the DAG. The caller's local replica is required
+    // to participate so the operation can immediately continue from the commit.
+    for (const auto& owner : ordered) {
+        if (store_commit_on(owner, compact, record, frame_type))
+            out.stored_on.push_back(owner);
+        if (out.stored_on.size() >= required)
             break;
-        if (!progressed)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (out.stored_on.size() < required)
+        throw MetadataNotReady("metadata commit durability floor unavailable");
+    if (std::none_of(out.stored_on.begin(), out.stored_on.end(), [&](const NodeInfo& owner) {
+            return owner.id == node_.node_id();
+        }))
+        throw std::runtime_error("local metadata commit store failed");
+
+    out.acceptance.generation = record.generation;
+    out.acceptance.hash = record.hash;
+    out.acceptance.required = static_cast<uint32_t>(required);
+    out.acceptance.replicas.reserve(out.stored_on.size());
+    for (const auto& owner : out.stored_on)
+        out.acceptance.replicas.push_back(owner.id);
+    std::sort(out.acceptance.replicas.begin(), out.acceptance.replicas.end());
+    out.acceptance.replicas.erase(
+        std::unique(out.acceptance.replicas.begin(), out.acceptance.replicas.end()),
+        out.acceptance.replicas.end());
+
+    // Acceptance is evidence about the already-completed immutable stores, not
+    // a second consensus decision. Before installing the certificate, make the
+    // commit's parent policy/history available on each holder. This is required
+    // to validate a lowering transition and means every certificate holder can
+    // later reconstruct the branch rather than possessing an opaque head only.
+    const auto parents = metadata_record_parents(record);
+    size_t accepted = 0;
+    bool local_accepted = false;
+    for (const auto& owner : out.stored_on) {
+        bool ancestry_ready = true;
+        if (owner.id != node_.node_id()) {
+            for (const auto& parent : parents) {
+                if (!push_history_to_peer(owner, parent, frame_type)) {
+                    ancestry_ready = false;
+                    break;
+                }
+            }
+        }
+        if (ancestry_ready && accept_commit_on(owner, out.acceptance, frame_type)) {
+            ++accepted;
+            local_accepted = local_accepted || owner.id == node_.node_id();
+        }
+    }
+    if (!local_accepted)
+        throw std::runtime_error("local metadata acceptance persistence failed");
+    if (accepted < required)
+        throw MetadataNotReady("metadata acceptance certificate durability floor unavailable");
+
+    return out;
+}
+
+std::vector<std::pair<NodeInfo, MetadataAcceptance>> MetadataManager::discover_accepted_heads(
+    const std::vector<NodeInfo>& nodes, FrameType frame_type) {
+    std::vector<std::pair<NodeInfo, MetadataAcceptance>> out;
+    for (const auto& owner : nodes) {
+        try {
+            std::vector<MetadataAcceptance> heads;
+            if (owner.id == node_.node_id()) {
+                heads = node_.metadata_heads();
+            } else {
+                auto reply = node_.call(owner, MessageType::get_metadata_heads, {}, frame_type);
+                if (reply.message.type != MessageType::metadata_heads_reply)
+                    continue;
+                heads = decode_metadata_acceptance_set(reply.message.payload);
+            }
+            for (auto& head : heads)
+                out.emplace_back(owner, std::move(head));
+        } catch (const std::exception& error) {
+            Log::debug("metadata head survey " + owner.host + ": " + error.what());
+        }
+    }
+    return out;
+}
+
+bool MetadataManager::replicate_accepted_head(const NodeInfo& owner,
+                                              const MetadataRecord& record,
+                                              const MetadataAcceptance& acceptance,
+                                              FrameType frame_type) {
+    if (owner.id == node_.node_id()) {
+        if (!node_.metadata_replica().store_commit(record))
+            return false;
+        return node_.accept_metadata_commit(acceptance);
+    }
+    if (!push_history_to_peer(owner, record.hash, frame_type)) {
+        // The local history may have been compactly rooted at this accepted
+        // record. A full immutable commit is sufficient for an arbitrary fresh
+        // replica even when earlier ancestry is not locally materialised.
+        if (!store_commit_on(owner, commit_history_entry(record), record, frame_type))
+            return false;
+    }
+    return accept_commit_on(owner, acceptance, frame_type);
+}
+
+void MetadataManager::ensure_accepted_head_durable(
+    const std::vector<NodeInfo>& nodes, const MetadataRecord& record, size_t required,
+    FrameType frame_type) {
+    auto acceptance = node_.metadata_replica().acceptance(record.hash);
+    if (!acceptance)
+        throw MetadataNotReady("metadata mutation is visible locally without acceptance certificate");
+    if (acceptance->required != acceptance_floor_for(record))
+        throw MetadataNotReady("metadata acceptance certificate policy mismatch");
+
+    const auto compatible = compatible_replicas(nodes);
+    if (compatible.size() < required)
+        throw MetadataNotReady("metadata acceptance certificate durability floor unavailable");
+
+    size_t durable = 0;
+    for (const auto& owner : compatible) {
+        if (replicate_accepted_head(owner, record, *acceptance, frame_type))
+            ++durable;
+        if (durable >= required)
+            break;
+    }
+    if (durable < required)
+        throw MetadataNotReady("metadata acceptance certificate durability floor unavailable");
+}
+
+MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
+                                           FrameType frame_type) {
+    auto nodes = compatible_replicas(replica_nodes(replicas));
+    if (nodes.empty())
+        throw MetadataNotReady("metadata replicas unavailable");
+
+    struct ObservedHead {
+        std::vector<MetadataAcceptance> certificates;
+        std::vector<NodeInfo> owners;
+    };
+    std::map<Hash256, ObservedHead> observed;
+    for (auto& [owner, acceptance] : discover_accepted_heads(nodes, frame_type)) {
+        auto& head = observed[acceptance.hash];
+        if (std::none_of(head.owners.begin(), head.owners.end(),
+                         [&](const NodeInfo& value) { return value.id == owner.id; }))
+            head.owners.push_back(owner);
+        if (std::find(head.certificates.begin(), head.certificates.end(), acceptance) ==
+            head.certificates.end())
+            head.certificates.push_back(std::move(acceptance));
+    }
+    if (observed.empty())
+        throw MetadataNotReady("no accepted metadata heads available");
+
+    // Import every accepted head independently. A receiver is not asked to
+    // replace its current head; it merely stores the immutable DAG material and
+    // the acceptance certificate. This is the central 0.19 semantic boundary.
+    for (const auto& [hash, head] : observed) {
+        auto& local = node_.metadata_replica();
+        std::vector<NodeInfo> history_sources = head.owners;
+        for (const auto& certificate : head.certificates) {
+            for (const auto& witness : certificate.replicas) {
+                auto found = std::find_if(nodes.begin(), nodes.end(), [&](const NodeInfo& peer) {
+                    return peer.id == witness;
+                });
+                if (found != nodes.end() &&
+                    std::none_of(history_sources.begin(), history_sources.end(),
+                                 [&](const NodeInfo& peer) { return peer.id == found->id; }))
+                    history_sources.push_back(*found);
+            }
+        }
+
+        bool imported = local.history_contains(hash);
+        for (const auto& owner : history_sources) {
+            if (owner.id == node_.node_id())
+                continue;
+            imported = import_history_from_peer(owner, hash, frame_type) || imported;
+        }
+        if (!imported)
+            continue;
+        bool accepted = false;
+        for (const auto& certificate : head.certificates)
+            accepted = node_.accept_metadata_commit(certificate) || accepted;
+        if (!accepted)
+            Log::warn("ignoring metadata head without a valid acceptance certificate hash=" +
+                      to_string(hash));
     }
 
-    if (responded < need)
-        throw std::runtime_error("metadata read quorum unavailable");
-    if (matching.empty())
-        throw std::runtime_error("metadata voter configuration conflict");
-    throw std::runtime_error("metadata repair quorum unavailable");
+    const size_t need = node_.config().metadata_min_write_replicas;
+    for (;;) {
+        auto heads = node_.metadata_replica().accepted_heads();
+        if (heads.empty())
+            throw MetadataNotReady("metadata accepted-head set is empty");
+        std::sort(heads.begin(), heads.end(), [](const MetadataRecord& a,
+                                                 const MetadataRecord& b) {
+            if (a.hash != b.hash)
+                return a.hash < b.hash;
+            return a.generation < b.generation;
+        });
+
+        if (heads.size() == 1) {
+            auto selected = heads.front();
+            auto policy = decode_snapshot(selected.payload);
+            if (policy.extent_size && policy.extent_size != node_.config().extent_size)
+                throw std::runtime_error("cluster extent size does not match local configuration");
+            // A whole-cluster configuration change may legitimately leave the
+            // accepted branch carrying the previous write floor. Return the
+            // accepted head here; maybe_reconfigure() performs the explicit
+            // transition commit at max(old_floor, new_floor) before any write.
+            return cache_record(selected,
+                                std::make_shared<MetadataSnapshot>(std::move(policy)));
+        }
+
+        if (compatible_replicas(nodes).size() < need)
+            throw MetadataNotReady(
+                "divergent metadata heads await reconciliation; write durability floor unavailable");
+
+        // Deterministically fold the maximal accepted-head set two branches at a
+        // time. Each merge commit explicitly names both parents and applies
+        // three-way conflict-presence semantics so explicit resolutions survive.
+        // Three or more partitions therefore
+        // converge as a sequence of immutable two-parent merges rather than by
+        // inventing a winner or blocking on an N-way special case.
+        auto left = heads[0];
+        auto right = heads[1];
+        const auto common =
+            node_.metadata_replica().history_common_ancestor(left.hash, right.hash);
+        if (!common)
+            throw MetadataNotReady("divergent metadata heads have no known common ancestor");
+        auto base_record = node_.metadata_replica().historical(*common);
+        if (!base_record)
+            throw MetadataNotReady("metadata common ancestor cannot be reconstructed");
+
+        auto base = decode_snapshot(base_record->payload);
+        auto left_snapshot = decode_snapshot(left.payload);
+        auto right_snapshot = decode_snapshot(right.payload);
+        auto merged = merge_metadata_snapshots(base, left_snapshot, right_snapshot,
+                                               left.hash, right.hash);
+        if (merged.snapshot.extent_size &&
+            merged.snapshot.extent_size != node_.config().extent_size)
+            throw std::runtime_error("cluster extent size does not match local configuration");
+
+        // Use the lower hash as the primary parent so every reconciler which
+        // observes the same maximal head pair produces the same immutable merge
+        // commit. Reconciliation is a pure join of already-authored histories,
+        // not a new user mutation: the merged vector clock already causally
+        // covers both parents and every live object in the result was retained
+        // by one of those authored parent mutations. Adding a fresh local
+        // origin/sequence here makes simultaneous reconcilers manufacture
+        // equivalent sibling merges forever (A+B -> M1/M2 -> M3/M4 ...).
+        if (right.hash < left.hash) {
+            std::swap(left, right);
+            std::swap(left_snapshot, right_snapshot);
+        }
+        merged.snapshot.metadata_voters.clear();
+        merged.snapshot.merge_parents = {right.hash};
+
+        MetadataRecord reconciliation;
+        reconciliation.generation = std::max(left.generation, right.generation) + 1;
+        reconciliation.previous = left.hash;
+        reconciliation.payload = encode_snapshot(merged.snapshot);
+        reconciliation.hash = metadata_hash(reconciliation.generation,
+                                            reconciliation.previous,
+                                            reconciliation.payload);
+
+        (void)publish_commit(nodes, reconciliation, {}, frame_type);
+        Log::info("metadata histories reconciled generation=" +
+                  std::to_string(reconciliation.generation) +
+                  " conflicts=" + std::to_string(merged.conflicts_created) +
+                  " remaining_heads=" + std::to_string(heads.size() - 1));
+        // accept_commit() removes accepted ancestors from the local head set. The
+        // loop therefore naturally folds any remaining divergent heads into the
+        // newly accepted reconciliation commit.
+    }
 }
 
 MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial) {
-    MetadataRecord current = initial;
+    auto snapshot = decode_snapshot(initial.payload);
+    if (snapshot.extent_size && snapshot.extent_size != node_.config().extent_size)
+        throw std::runtime_error("cluster extent size does not match local configuration");
 
-    for (size_t attempt = 0; attempt < 8; ++attempt) {
-        auto snapshot = decode_snapshot(current.payload);
-        const auto old_voters = snapshot.metadata_voters;
-        if (old_voters.empty())
-            throw std::runtime_error("metadata voter group lost its configuration");
-        if (snapshot.extent_size != node_.config().extent_size)
-            throw std::runtime_error("cluster extent size does not match local configuration");
+    const size_t configured = node_.config().metadata_min_write_replicas;
+    const size_t persisted = snapshot.metadata_write_replicas_required
+                                 ? snapshot.metadata_write_replicas_required
+                                 : (!snapshot.metadata_voters.empty()
+                                        ? snapshot.metadata_voters.size() / 2 + 1
+                                        : 0);
+    const bool policy_transition = persisted != configured;
+    const bool clear_legacy_metadata_voters = !snapshot.metadata_voters.empty();
+    const bool data_policy_change = snapshot.data_replication != node_.config().replication;
 
-        // Replica-policy changes are an offline coordinated operation: every
-        // node must be restarted with the same desired values. Transport v15
-        // does not advertise desired policy, so mixed rolling configurations
-        // cannot be safely reconciled here.
-        const size_t old_need = quorum(old_voters.size());
-        const size_t target = node_.config().metadata_replication;
-        const uint32_t old_data_replication = snapshot.data_replication;
-        auto active = node_.membership().active();
+    const auto active = node_.membership().active();
+    // Before a durable protocol-20 policy exists, every active peer must agree
+    // on the configured write floor. Filtering mismatched peers first can let
+    // two incompatible cohorts independently establish authority from the same
+    // legacy/genesis state. Established protocol-20 clusters continue to ignore
+    // mismatched peers while the persisted floor remains satisfiable.
+    if (!snapshot.metadata_write_replicas_required)
+        require_metadata_policy_match(active);
+    const auto compatible = compatible_replicas(active);
 
-        std::set<NodeId> active_ids;
+    // `metadata_participants` was introduced during the protocol-20 bring-up as
+    // a migration roster. It is not authority: every authenticated, policy-
+    // compatible node is metadata-capable. Preserve/reconstruct the roster only
+    // long enough to establish the one-time legacy retention baseline, then
+    // clear it permanently.
+    auto participants = snapshot.metadata_participants;
+    bool migration_roster_change = false;
+    if (!snapshot.retention_baseline_complete && participants.empty()) {
+        for (const auto& legacy : snapshot.metadata_voters)
+            if (legacy != NodeId{})
+                participants.insert(legacy);
+        for (const auto& [id, _] : snapshot.node_status)
+            if (id != NodeId{})
+                participants.insert(id);
+        for (const auto& [id, _] : snapshot.mutation_sequences)
+            if (id != NodeId{})
+                participants.insert(id);
         for (const auto& peer : active)
-            active_ids.insert(peer.id);
-
-        std::vector<NodeId> surviving;
-        std::vector<NodeInfo> surviving_nodes;
-        for (const auto& id : old_voters) {
-            if (!active_ids.contains(id))
-                continue;
-            surviving.push_back(id);
-            if (auto owner = node_info(id))
-                surviving_nodes.push_back(*owner);
-        }
-        if (surviving.size() < old_need)
-            return current;
-
-        std::vector<NodeId> next;
-        if (target == old_voters.size() && surviving.size() == old_voters.size()) {
-            next = old_voters;
-        } else {
-            if (active.size() < target) {
-                // Ordinary degraded operation is still allowed while the old
-                // voter group has quorum. Reconfiguration waits for enough
-                // nodes to restore the configured group size. A deliberate
-                // size increase, however, cannot take effect until its target
-                // nodes are present.
-                if (target == old_voters.size())
-                    return current;
-                throw std::runtime_error("metadata policy change: need " +
-                                         std::to_string(target) + " active nodes, have " +
-                                         std::to_string(active.size()));
-            }
-
-            if (surviving_nodes.size() > target) {
-                auto ranked = rendezvous_nodes(placement_key_.bytes, surviving_nodes, target);
-                for (const auto& peer : ranked)
-                    next.push_back(peer.id);
-            } else {
-                next = surviving;
-                std::set<NodeId> chosen(next.begin(), next.end());
-                std::vector<NodeInfo> candidates;
-                for (const auto& peer : active) {
-                    if (!chosen.contains(peer.id))
-                        candidates.push_back(peer);
-                }
-                auto ranked = rendezvous_nodes(placement_key_.bytes, candidates,
-                                               target - next.size());
-                for (const auto& peer : ranked)
-                    next.push_back(peer.id);
-            }
-            std::sort(next.begin(), next.end());
-            if (next.size() != target)
-                throw std::runtime_error("metadata policy change target voter set unavailable");
-        }
-
-        const bool voters_changed = !same_voters(next, old_voters);
-        const bool data_changed = snapshot.data_replication != node_.config().replication;
-        if (!voters_changed && !data_changed)
-            return current;
-
-        auto old_nodes = voter_nodes(old_voters);
-        if (old_nodes.size() < old_need)
-            return current;
-
-        std::vector<NodeInfo> next_nodes;
-        size_t next_need = 0;
-        if (voters_changed) {
-            next_nodes = voter_nodes(next);
-            next_need = quorum(next.size());
-            if (next_nodes.size() < next_need)
-                throw std::runtime_error("metadata policy change target quorum unavailable");
-
-            // Put the last committed old-group record on enough future voters
-            // before changing the configuration. Newly-added voters can then
-            // accept/repair the successor immediately after the old quorum CAS.
-            if (!seed_quorum(next_nodes, current, next_need))
-                throw std::runtime_error("metadata policy change target quorum unavailable");
-        }
-
-        snapshot.metadata_voters = next;
-        snapshot.data_replication = static_cast<uint32_t>(node_.config().replication);
-        auto payload = encode_snapshot(snapshot);
-
-        // The old voter majority serialises the configuration change. This is
-        // the authority for both resizing/replacing the metadata group and for
-        // changing the stored data-replication policy.
-        auto result = cas_quorum(old_nodes, current, payload, old_need);
-        if (result.success >= old_need && result.committed) {
-            auto committed = *result.committed;
-            if (voters_changed) {
-                if (!seed_quorum(next_nodes, committed, next_need)) {
-                    // The old quorum has already committed this transition. Do
-                    // not attempt to roll it back; read_group() will finish
-                    // seeding the new quorum when connectivity returns.
-                    node_.checkpoint_metadata(committed);
-                    throw std::runtime_error(
-                        "metadata voter transition committed; target quorum unavailable");
-                }
-                checkpoint_quorum(next_nodes, committed, next_need);
-            } else {
-                checkpoint_quorum(old_nodes, committed, old_need);
-            }
-            node_.checkpoint_metadata(committed);
-            seed_all_best_effort(active, committed);
-            cache_record(committed);
-            if (old_data_replication != node_.config().replication ||
-                old_voters.size() != next.size()) {
-                Log::info("cluster replication policy changed: data " +
-                          std::to_string(old_data_replication) + " metadata " +
-                          std::to_string(old_voters.size()) + " -> data " +
-                          std::to_string(node_.config().replication) + " metadata " +
-                          std::to_string(next.size()));
-            } else {
-                Log::info("metadata voter group replaced unavailable node(s)");
-            }
-            return committed;
-        }
-        if (!result.conflict)
-            throw std::runtime_error("metadata policy change quorum unavailable");
-
-        current = read_record_base();
+            if (peer.id != NodeId{})
+                participants.insert(peer.id);
+        migration_roster_change = participants != snapshot.metadata_participants;
     }
 
-    throw std::runtime_error("metadata policy change conflict");
+    const bool clear_migration_roster =
+        snapshot.retention_baseline_complete && !snapshot.metadata_participants.empty();
+    if (!policy_transition && !clear_legacy_metadata_voters && !data_policy_change &&
+        !migration_roster_change && !clear_migration_roster)
+        return initial;
+
+    // Policy transitions are ordinary immutable commits certified at the
+    // stronger of old/new floors. No node-seat roster participates.
+    const size_t transition_floor = std::max(configured, persisted);
+    if (compatible.size() < transition_floor)
+        return initial;
+
+    snapshot.metadata_voters.clear();
+    snapshot.metadata_write_replicas_required = static_cast<uint32_t>(configured);
+    snapshot.metadata_participants = snapshot.retention_baseline_complete
+                                         ? std::set<NodeId>{}
+                                         : std::move(participants);
+    snapshot.merge_parents.clear();
+    snapshot.data_replication = static_cast<uint32_t>(node_.config().replication);
+    MetadataRecord proposed;
+    proposed.generation = initial.generation + 1;
+    proposed.previous = initial.hash;
+    proposed.payload = encode_snapshot(snapshot);
+    proposed.hash = metadata_hash(proposed.generation, proposed.previous, proposed.payload);
+    (void)publish_commit(compatible, proposed, {}, FrameType::control);
+    Log::info("metadata policy/migration transition committed generation=" +
+              std::to_string(proposed.generation) +
+              " old_write_floor=" + std::to_string(persisted) +
+              " new_write_floor=" + std::to_string(configured) +
+              " acceptance_floor=" + std::to_string(transition_floor) +
+              " participants=" + std::to_string(snapshot.metadata_participants.size()));
+    return cache_record(proposed,
+                        std::make_shared<MetadataSnapshot>(std::move(snapshot)));
 }
 
 MetadataManager::RecoverySurvey MetadataManager::recover_from_committed_checkpoints(
     const std::vector<NodeInfo>& active) {
     RecoverySurvey survey;
-    if (active.size() < 2)
+    if (active.empty())
         return survey;
 
-    struct Checkpoint {
-        NodeInfo owner;
-        MetadataRecord record;
-    };
-
-    std::vector<Checkpoint> checkpoints;
     std::vector<PendingRead> pending;
-    pending.reserve(active.size());
     size_t completed = 0;
     size_t failed = 0;
+    bool durable_history = false;
 
     for (const auto& owner : active) {
         if (owner.id == node_.node_id()) {
             ++completed;
-            checkpoints.push_back({owner, node_.metadata_replica().committed()});
+            durable_history = durable_history ||
+                              node_.metadata_replica().committed().generation > 1;
             continue;
         }
         try {
             PendingRead item;
             item.owner = owner;
-            item.rpc.emplace(node_.call_async(owner, MessageType::get_committed_metadata));
+            item.rpc.emplace(node_.call_async(owner, MessageType::get_committed_metadata,
+                                              {}, FrameType::control));
             pending.push_back(std::move(item));
         } catch (...) {
             ++completed;
@@ -1045,8 +986,8 @@ MetadataManager::RecoverySurvey MetadataManager::recover_from_committed_checkpoi
                     ++failed;
                     continue;
                 }
-                checkpoints.push_back(
-                    {item.owner, decode_metadata_record(reply.message.payload)});
+                durable_history = durable_history ||
+                                  decode_metadata_record(reply.message.payload).generation > 1;
             } catch (...) {
                 ++failed;
             }
@@ -1055,288 +996,109 @@ MetadataManager::RecoverySurvey MetadataManager::recover_from_committed_checkpoi
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    // Recovery is a deliberate replacement operation, not a partition escape
-    // hatch. Every member still considered active must participate in the
-    // checkpoint survey. Stale member records simply delay recovery until
-    // dead_after expires instead of allowing a partitioned cohort to promote
-    // itself around an apparently-live peer.
-    if (failed || checkpoints.size() != active.size()) {
-        Log::debug("metadata recovery waiting for active checkpoint witnesses");
-        return survey;
-    }
-    survey.complete = true;
-
-    std::vector<Checkpoint> durable;
-    std::vector<NodeInfo> fresh;
-    for (const auto& checkpoint : checkpoints) {
-        if (checkpoint.record.generation <= 1)
-            fresh.push_back(checkpoint.owner);
-        else
-            durable.push_back(checkpoint);
-    }
-    survey.durable_history = !durable.empty();
-    if (durable.empty() || fresh.empty())
-        return survey;
-
-    uint64_t highest_generation = 0;
-    for (const auto& checkpoint : durable)
-        highest_generation = std::max(highest_generation, checkpoint.record.generation);
-
-    std::optional<MetadataRecord> base;
-    for (const auto& checkpoint : durable) {
-        if (checkpoint.record.generation != highest_generation)
-            continue;
-        if (!base) {
-            base = checkpoint.record;
-            continue;
-        }
-        if (checkpoint.record.hash != base->hash) {
-            throw std::runtime_error(
-                "metadata recovery conflict: committed checkpoints diverge");
-        }
-    }
-    if (!base)
-        return survey;
-
-    auto snapshot = decode_snapshot(base->payload);
-    const size_t target = snapshot.metadata_voters.size();
-    if (!target)
-        throw std::runtime_error("metadata recovery checkpoint has no voter group");
-    if (active.size() < target)
-        return survey;
-    if (snapshot.extent_size != node_.config().extent_size)
-        throw std::runtime_error(
-            "metadata recovery checkpoint extent size does not match configuration");
-
-    std::set<NodeId> active_ids;
-    for (const auto& owner : active)
-        active_ids.insert(owner.id);
-
-    std::vector<NodeId> surviving_voters;
-    for (const auto& voter : snapshot.metadata_voters) {
-        if (active_ids.contains(voter))
-            surviving_voters.push_back(voter);
-    }
-
-    const size_t old_need = quorum(snapshot.metadata_voters.size());
-    if (surviving_voters.size() >= old_need)
-        return survey; // Normal quorum recovery/reconfiguration must win when possible.
-
-    const size_t missing = target - surviving_voters.size();
-    std::set<NodeId> old_voter_ids(snapshot.metadata_voters.begin(), snapshot.metadata_voters.end());
-    std::vector<NodeInfo> replacements;
-    for (const auto& owner : fresh) {
-        if (!old_voter_ids.contains(owner.id))
-            replacements.push_back(owner);
-    }
-    if (replacements.size() < missing) {
-        Log::debug("metadata recovery waiting for " + std::to_string(missing) +
-                   " fresh replacement node(s)");
-        return survey;
-    }
-
-    auto ranked = rendezvous_nodes(placement_key_.bytes, replacements, missing);
-    if (ranked.size() != missing)
-        return survey;
-
-    std::vector<NodeId> next_voters = surviving_voters;
-    for (const auto& owner : ranked)
-        next_voters.push_back(owner.id);
-    std::sort(next_voters.begin(), next_voters.end());
-
-    snapshot.metadata_voters = next_voters;
-    auto payload = encode_snapshot(snapshot);
-    MetadataRecord recovery;
-    recovery.generation = base->generation + 1;
-    recovery.previous = base->hash;
-    recovery.payload = std::move(payload);
-    recovery.hash = metadata_hash(recovery.generation, recovery.previous, recovery.payload);
-
-    std::vector<NodeInfo> next_nodes;
-    next_nodes.reserve(next_voters.size());
-    for (const auto& id : next_voters) {
-        auto found = std::find_if(active.begin(), active.end(),
-                                  [&](const auto& owner) { return owner.id == id; });
-        if (found == active.end())
-            return survey;
-        next_nodes.push_back(*found);
-    }
-
-    // First install the deterministic successor on a new-group quorum without
-    // marking it as a committed recovery checkpoint. Only after that quorum is
-    // present do we checkpoint the successor. This keeps an interrupted
-    // recovery attempt out of the durable witness set used by the next retry.
-    if (!seed_quorum(next_nodes, recovery, quorum(next_nodes.size())))
-        return survey;
-    if (!checkpoint_quorum(next_nodes, recovery, quorum(next_nodes.size())))
-        return survey;
-
-    (void)node_.checkpoint_metadata(recovery);
-    seed_all_best_effort(active, recovery);
-    Log::info("metadata voter group recovered from committed checkpoint generation " +
-              std::to_string(base->generation) + " using " + std::to_string(missing) +
-              " fresh replacement node(s)");
-    survey.recovered = std::move(recovery);
+    // This survey has one job in 0.19: a configured joiner may form a virgin
+    // namespace only after every currently-active bootstrap peer has positively
+    // demonstrated that no durable post-genesis history exists. It does not
+    // elect/replace authorities.
+    survey.complete = failed == 0;
+    survey.durable_history = durable_history;
     return survey;
 }
 
 MetadataRecord MetadataManager::discover_or_form() {
-    auto active = node_.membership().active();
-
-    // Discovery is parallel: a slow/dead peer cannot hold startup behind its
-    // socket timeout when another reachable voter already knows the cluster.
-    std::vector<MetadataRecord> discovered;
-    std::vector<PendingRead> pending;
-    size_t completed = 0;
-    for (const auto& peer : active) {
-        if (peer.id == node_.node_id()) {
-            ++completed;
-            auto record = node_.metadata_replica().current();
-            if (record.generation > 1)
-                discovered.push_back(std::move(record));
-            continue;
-        }
-        try {
-            PendingRead item;
-            item.owner = peer;
-            item.rpc.emplace(node_.call_async(peer, MessageType::get_metadata));
-            pending.push_back(std::move(item));
-        } catch (...) {
-            ++completed;
-        }
+    const auto active = node_.membership().active();
+    const size_t need = node_.config().metadata_min_write_replicas;
+    const auto local_snapshot = decode_snapshot(node_.metadata_replica().committed().payload);
+    if (local_snapshot.metadata_write_replicas_required &&
+        local_snapshot.metadata_write_replicas_required != need)
+        throw MetadataNotReady("local metadata write-floor policy does not match configuration");
+    const bool established_policy = local_snapshot.metadata_write_replicas_required != 0;
+    if (!established_policy)
+        require_metadata_policy_match(active);
+    const auto write_active = compatible_replicas(active);
+    if (write_active.size() < need) {
+        throw MetadataNotReady("metadata replica set forming: need " + std::to_string(need) +
+                               " policy-compatible active nodes, have " +
+                               std::to_string(write_active.size()));
     }
+    if (!node_.config().bootstrap.empty() && active.size() == 1)
+        throw MetadataNotReady("metadata replica set forming: waiting for bootstrap peer");
 
-    while (completed < active.size()) {
-        bool progressed = false;
-        for (auto& item : pending) {
-            if (item.done || !item.rpc)
-                continue;
-            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
-                continue;
-            item.done = true;
-            ++completed;
-            progressed = true;
-            try {
-                auto reply = item.rpc->get();
-                if (reply.message.type == MessageType::metadata_reply) {
-                    auto record = decode_metadata_record(reply.message.payload);
-                    if (record.generation > 1)
-                        discovered.push_back(std::move(record));
-                }
-            } catch (...) {
-            }
-        }
-        if (!discovered.empty())
+    std::vector<NodeId> ids;
+    ids.reserve(active.size());
+    for (const auto& peer : active)
+        ids.push_back(peer.id);
+
+    // First discover accepted heads. Unlike the old protocol there is no
+    // genesis-election race: if any post-genesis accepted commit exists, import
+    // it (and any siblings) through the ordinary branch path.
+    bool any_post_genesis = false;
+    for (const auto& [_, acceptance] : discover_accepted_heads(active, FrameType::control)) {
+        if (acceptance.generation > 1) {
+            any_post_genesis = true;
             break;
-        if (!progressed)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    if (!discovered.empty()) {
-        std::sort(discovered.begin(), discovered.end(), [](const auto& a, const auto& b) {
-            return newer_than(a, b);
-        });
-        std::reverse(discovered.begin(), discovered.end());
-
-        std::set<std::vector<NodeId>> tried;
-        for (const auto& candidate : discovered) {
-            auto voters = voters_of(candidate);
-            auto sorted = voters;
-            std::sort(sorted.begin(), sorted.end());
-            if (!tried.insert(sorted).second)
-                continue;
-            try {
-                return cache_record(read_group(voters));
-            } catch (const std::exception& error) {
-                Log::debug("metadata discovery candidate: " + std::string(error.what()));
-            }
         }
-        auto recovery = recover_from_committed_checkpoints(active);
-        if (recovery.recovered)
-            return cache_record(*recovery.recovered);
-        throw MetadataNotReady(
-            "no discovered metadata voter group has quorum; waiting for replacement recovery");
     }
+    if (any_post_genesis)
+        return read_group(ids, FrameType::control);
 
-    auto recovery = recover_from_committed_checkpoints(active);
-    if (recovery.recovered)
-        return cache_record(*recovery.recovered);
-
-    const size_t target = node_.config().metadata_replication;
-    if (active.size() < target) {
-        throw MetadataNotReady("metadata group forming: need " + std::to_string(target) +
-                               " active nodes, have " + std::to_string(active.size()));
-    }
-    // A configured joiner must not invent a namespace until active bootstrap
-    // peers have positively proved that no committed post-genesis history
-    // exists. Symmetric virgin peers may still form genesis once that survey is
-    // complete; an inconclusive survey always fails closed.
     if (!node_.config().bootstrap.empty()) {
-        if (active.size() == 1)
-            throw MetadataNotReady("metadata group forming: waiting for bootstrap peer");
-        // A configured joiner may only create genesis after every currently
-        // active member has positively answered the committed-checkpoint survey
-        // and that survey proves there is no durable post-genesis history. A
-        // transient RPC failure must fail closed here: with metadata replication
-        // one, rendezvous could otherwise select the fresh node itself and let it
-        // create an empty namespace while a survivor still holds the real cluster.
-        if (!recovery.complete)
+        auto survey = recover_from_committed_checkpoints(active);
+        if (!survey.complete)
             throw MetadataNotReady(
-                "metadata group forming: waiting for bootstrap checkpoint survey");
-        if (recovery.durable_history)
+                "metadata replica set forming: waiting for bootstrap checkpoint survey");
+        if (survey.durable_history)
             throw MetadataNotReady(
-                "metadata group forming: durable bootstrap metadata requires recovery");
+                "metadata replica set forming: bootstrap peer has durable history");
     }
 
-    auto selected = rendezvous_nodes(placement_key_.bytes, active, target);
-    std::vector<NodeId> voter_ids;
-    voter_ids.reserve(selected.size());
-    for (const auto& peer : selected)
-        voter_ids.push_back(peer.id);
-    std::sort(voter_ids.begin(), voter_ids.end());
-
-    auto genesis = genesis_metadata();
-    auto snapshot = decode_snapshot(genesis.payload);
+    auto base = genesis_metadata();
+    auto snapshot = decode_snapshot(base.payload);
     auto root = snapshot.entries.find("/");
     if (root == snapshot.entries.end())
         throw std::runtime_error("genesis metadata has no filesystem root");
     root->second.uid = node_.config().filesystem.root_uid;
     root->second.gid = node_.config().filesystem.root_gid;
     root->second.mode = node_.config().filesystem.root_mode;
-    root->second.ctime_ns = root->second.mtime_ns = wall_time_ns();
-    snapshot.metadata_voters = voter_ids;
+
+    // Virgin founders must construct byte-identical generation 2 without a
+    // coordinator. Root timestamps therefore use a deterministic non-zero
+    // protocol sentinel; subsequent filesystem timestamps are ordinary wall
+    // time. This removes startup leadership from the metadata model entirely.
+    root->second.ctime_ns = root->second.mtime_ns = 1;
+    snapshot.metadata_voters.clear();
     snapshot.data_replication = static_cast<uint32_t>(node_.config().replication);
     snapshot.extent_size = node_.config().extent_size;
-    auto payload = encode_snapshot(snapshot);
+    snapshot.metadata_write_replicas_required = static_cast<uint32_t>(need);
+    snapshot.metadata_participants.clear();
+    // Genesis itself is the first accepted branch point; there is no older
+    // protocol-20 causal horizon yet. Background convergence advances this to
+    // generation 2 once every founding participant has durably accepted it.
+    snapshot.metadata_branch_floor = {};
+    snapshot.retention_baseline_complete = true; // virgin namespace has no inherited objects
 
-    auto result = cas_quorum(selected, genesis, payload, quorum(target));
-    if (result.success >= quorum(target) && result.committed) {
-        seed_quorum(selected, *result.committed, quorum(target));
-        checkpoint_quorum(selected, *result.committed, quorum(target));
-        node_.checkpoint_metadata(*result.committed);
-        Log::info("metadata voter group formed with " + std::to_string(target) + " nodes");
-        return cache_record(*result.committed);
-    }
+    MetadataRecord formed;
+    formed.generation = base.generation + 1;
+    formed.previous = base.hash;
+    formed.payload = encode_snapshot(snapshot);
+    formed.hash = metadata_hash(formed.generation, formed.previous, formed.payload);
+    (void)publish_commit(write_active, formed, {}, FrameType::control);
 
-    if (result.conflict) {
-        for (int attempt = 0; attempt < 5; ++attempt) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            auto local = node_.metadata_replica().current();
-            auto voters = voters_of(local);
-            if (voters.size() == target)
-                return cache_record(read_group(voters));
-        }
-    }
-
-    throw MetadataNotReady("metadata voter group formation quorum unavailable");
+    Log::info("metadata replica set formed active=" + std::to_string(write_active.size()) +
+              " required=" + std::to_string(need));
+    return cache_record(formed,
+                        std::make_shared<MetadataSnapshot>(std::move(snapshot)));
 }
 
 MetadataRecord MetadataManager::read_record_base() {
-    auto local = node_.metadata_replica().current();
-    auto voters = voters_of(local);
-    if (voters.empty())
+    auto active = node_.membership().active();
+    std::vector<NodeId> ids;
+    ids.reserve(active.size());
+    for (const auto& peer : active)
+        ids.push_back(peer.id);
+    if (node_.metadata_replica().committed().generation <= 1)
         return discover_or_form();
-    return read_group(voters);
+    return read_group(ids, FrameType::control);
 }
 
 MetadataRecord MetadataManager::read_record_uncached() {
@@ -1352,17 +1114,13 @@ MetadataRecord MetadataManager::read_record() {
     try {
         return cache_record(read_record_uncached());
     } catch (const std::exception& error) {
-        // Reads may continue from the last durably persisted snapshot when the
-        // node is completely isolated. Mutations deliberately do not use this
-        // fallback: mutate() still requires quorum CAS, preserving split-brain
-        // safety even when its optimistic base came from the durable local replica.
-        auto local = node_.metadata_replica().current();
-        auto voters = voters_of(local);
-        if (!node_.metadata_replica().recovery_required() && local.generation > 1 &&
-            !voters.empty()) {
-            // Availability is logged centrally, on state transition, by the
-            // metadata maintenance owner. Read fallback itself is intentionally
-            // silent so repeated foreground reads cannot create quorum-log noise.
+        // Reads may continue from the last durably persisted local snapshot
+        // while the metadata write floor is unavailable. Mutations never use
+        // this fallback as proof of publication durability.
+        auto local = node_.metadata_replica().committed();
+        const auto heads = node_.metadata_replica().accepted_heads();
+        if (!node_.metadata_replica().recovery_required() && heads.size() == 1 &&
+            heads.front().hash == local.hash && local.generation > 1) {
             (void)error;
             return cache_record(local);
         }
@@ -1405,7 +1163,7 @@ MetadataSnapshotView MetadataManager::snapshot_view() {
 std::optional<MetadataSnapshotView> MetadataManager::available_snapshot_view() const {
     // This is deliberately a no-I/O view.  Consumers such as FUSE use it to
     // adopt a newer snapshot which MetadataManager has already obtained and
-    // decoded, but never to turn an OS metadata lookup into quorum traffic.
+    // decoded, but never to turn an OS metadata lookup into metadata traffic.
     std::lock_guard lock(cache_mutex_);
     if (!decoded_cache_)
         return {};
@@ -1417,170 +1175,204 @@ MetadataSnapshot MetadataManager::snapshot() {
     return *view.snapshot;
 }
 
+std::optional<MetadataSnapshotView> MetadataManager::retention_release_view() const {
+    if (node_.metadata_replica().recovery_required())
+        return {};
+    const auto heads = node_.metadata_replica().accepted_heads();
+    if (heads.size() != 1)
+        return {};
+
+    // Claim release is local and causal, not a global-stability decision. The
+    // sole accepted head's complete live set determines which local claims are
+    // still needed, while its mutation clock can remove only claim dots that
+    // this branch actually observed. Concurrent/unseen branch claims therefore
+    // survive without requiring every participant to be online.
+    auto current = available_snapshot_view();
+    if (current && current->hash == heads.front().hash)
+        return current;
+    try {
+        auto decoded = std::make_shared<MetadataSnapshot>(decode_snapshot(heads.front().payload));
+        return MetadataSnapshotView{heads.front().generation, 0, heads.front().hash,
+                                    std::move(decoded)};
+    } catch (...) {
+        return {};
+    }
+}
+
 MetadataRecord MetadataManager::mutate_impl(
     const std::function<void(MetadataSnapshot&, MetadataDelta*)>& mutate, bool exact_delta,
     size_t retries) {
     std::unique_lock lock(mutation_mutex_);
     const auto origin = node_.node_id();
     std::optional<uint64_t> sequence;
-    bool force_quorum_read = false;
 
     for (size_t attempt = 0; attempt < retries; ++attempt) {
         const auto total_started = Clock::now();
-        auto base_started = total_started;
+        const auto all_active = node_.membership().active();
+        const auto active = compatible_replicas(all_active);
+        const size_t need = node_.config().metadata_min_write_replicas;
+        if (active.size() < need)
+            throw MetadataNotReady("metadata write durability floor unavailable: too few policy-compatible replicas");
 
-        // Local mutations are serialised and quorum CAS is the conflict
-        // detector, so the common path can start from our durable current
-        // replica rather than downloading the entire namespace from a quorum
-        // before every create/chmod/commit. A metadata notice or CAS conflict
-        // forces a quorum refresh before retrying.
         MetadataRecord current;
-        auto local = node_.metadata_replica().current();
-        auto local_voters = voters_of(local);
+        auto local_heads = node_.metadata_replica().accepted_heads();
         const bool recovering = node_.metadata_replica().recovery_required();
-        if (force_quorum_read || recovering || local_voters.empty() || local.generation <= 1 ||
-            node_.remote_metadata_generation() > local.generation) {
-            if (local_voters.empty() || local.generation <= 1) {
-                current = read_record_uncached();
-            } else {
-                current = maybe_reconfigure(read_group(local_voters, FrameType::read_ahead));
-                if (recovering)
-                    node_.metadata_replica().mark_recovered();
+        if (recovering || local_heads.empty() ||
+            (local_heads.size() == 1 && local_heads.front().generation <= 1)) {
+            current = read_record_uncached();
+            if (recovering)
+                node_.metadata_replica().mark_recovered();
+        } else if (local_heads.size() > 1 ||
+                   node_.remote_metadata_generation() >
+                       node_.metadata_replica().committed_generation()) {
+            // Reconciliation is useful when already known, but it is not a
+            // prerequisite for accepting another branch mutation. If the survey
+            // cannot complete, fall back to the locally materialised accepted
+            // head and preserve availability.
+            try {
+                std::vector<NodeId> ids;
+                ids.reserve(all_active.size());
+                for (const auto& peer : all_active)
+                    ids.push_back(peer.id);
+                current = maybe_reconfigure(read_group(ids, FrameType::read_ahead));
+            } catch (const MetadataNotReady&) {
+                if (local_heads.size() > 1)
+                    throw;
+                current = maybe_reconfigure(node_.metadata_replica().committed());
             }
         } else {
-            current = maybe_reconfigure(local);
+            current = maybe_reconfigure(node_.metadata_replica().committed());
         }
-        const auto base_ms = elapsed_ms(base_started);
 
-        const auto decode_started = Clock::now();
         auto snapshot = decode_snapshot(current.payload);
-        const auto decode_ms = elapsed_ms(decode_started);
-
+        if (snapshot.metadata_write_replicas_required != need)
+            throw MetadataNotReady("metadata write-floor transition is not durably accepted");
+        const bool clear_merge_parent_topology = !snapshot.merge_parents.empty();
         auto seen = snapshot.mutation_sequences.find(origin);
         if (sequence && seen != snapshot.mutation_sequences.end() && seen->second >= *sequence) {
-            auto current_voters = voters_of(current);
-            auto current_nodes = voter_nodes(current_voters);
-            const auto current_need = quorum(current_voters.size());
-            const auto commit_started = Clock::now();
-            (void)commit_quorum(current_nodes, current.generation, current.hash, current_need,
-                                FrameType::read_ahead);
-            (void)node_.checkpoint_metadata(current);
-            const auto commit_ms = elapsed_ms(commit_started);
+            ensure_accepted_head_durable(active, current, need, FrameType::read_ahead);
             cache_record(current, std::make_shared<MetadataSnapshot>(std::move(snapshot)));
-            const auto total_ms = elapsed_ms(total_started);
-            if (total_ms >= 100 && Log::enabled(LogLevel::debug)) {
-                Log::debug("metadata mutate recovered total_ms=" + std::to_string(total_ms) +
-                           " base_ms=" + std::to_string(base_ms) +
-                           " decode_ms=" + std::to_string(decode_ms) +
-                           " commit_ms=" + std::to_string(commit_ms) +
-                           " generation=" + std::to_string(current.generation));
-            }
             return current;
         }
-
         if (!sequence) {
             const uint64_t previous =
                 seen == snapshot.mutation_sequences.end() ? 0 : seen->second;
             if (previous == std::numeric_limits<uint64_t>::max())
                 throw std::runtime_error("metadata mutation sequence exhausted");
-            sequence = previous + 1;
+            sequence = node_.metadata_replica().reserve_mutation_sequence(previous);
         }
 
         std::optional<MetadataSnapshot> before;
         if (!exact_delta)
             before.emplace(snapshot);
+        snapshot.merge_parents.clear();
         MetadataDelta supplied_delta;
-        auto voters = snapshot.metadata_voters;
-        auto data_replication = snapshot.data_replication;
-        auto extent_size = snapshot.extent_size;
+        const auto legacy_metadata_voters = snapshot.metadata_voters;
+        const auto data_replication = snapshot.data_replication;
+        const auto extent_size = snapshot.extent_size;
+        const auto metadata_write_replicas_required =
+            snapshot.metadata_write_replicas_required;
+        const auto metadata_participants = snapshot.metadata_participants;
+        const auto metadata_branch_floor = snapshot.metadata_branch_floor;
+        const auto retention_baseline_complete = snapshot.retention_baseline_complete;
         mutate(snapshot, exact_delta ? &supplied_delta : nullptr);
-        // Exact-delta callers do not know the enclosing snapshot wire version.
-        // Once durable node status has activated SM9, carry one idempotent status
-        // witness so encode_metadata_delta emits DLT3 and reconstructs SM9.
         if (exact_delta && !snapshot.node_status.empty() && supplied_delta.upsert_node_status.empty())
             supplied_delta.upsert_node_status.emplace(*snapshot.node_status.begin());
-        if (!same_voters(snapshot.metadata_voters, voters))
-            throw std::runtime_error("filesystem mutation attempted to change metadata voters");
-        if (snapshot.data_replication != data_replication || snapshot.extent_size != extent_size)
+        if (!same_legacy_metadata_voters(snapshot.metadata_voters, legacy_metadata_voters))
+            throw std::runtime_error(
+                "filesystem mutation attempted to change legacy metadata replica state");
+        if (snapshot.data_replication != data_replication || snapshot.extent_size != extent_size ||
+            snapshot.metadata_write_replicas_required != metadata_write_replicas_required ||
+            snapshot.metadata_participants != metadata_participants ||
+            snapshot.metadata_branch_floor != metadata_branch_floor ||
+            snapshot.retention_baseline_complete != retention_baseline_complete)
             throw std::runtime_error("filesystem mutation attempted to change cluster policy");
         snapshot.mutation_sequences[origin] = *sequence;
         if (exact_delta)
             supplied_delta.mutation_sequences[origin] = *sequence;
 
-        const auto encode_started = Clock::now();
         auto payload = encode_snapshot(snapshot);
-        const auto snapshot_bytes = payload.size();
-        const auto encode_ms = elapsed_ms(encode_started);
         if (payload == current.payload)
-            return cache_record(current, std::make_shared<MetadataSnapshot>(std::move(snapshot)));
+            return cache_record(current,
+                                std::make_shared<MetadataSnapshot>(std::move(snapshot)));
 
-        auto nodes = voter_nodes(voters);
-        const auto need = quorum(voters.size());
-        const auto cas_started = Clock::now();
+        MetadataRecord proposed;
+        proposed.generation = current.generation + 1;
+        proposed.previous = current.hash;
+        proposed.payload = std::move(payload);
+        proposed.hash = metadata_hash(proposed.generation, proposed.previous, proposed.payload);
+
         Bytes delta_payload;
-        bool used_delta = false;
-        CasResult result;
         std::optional<MetadataDelta> delta;
-        if (exact_delta)
-            delta = std::move(supplied_delta);
-        else
-            delta = metadata_delta(*before, snapshot);
-        if (delta) {
-            delta_payload = encode_metadata_delta(*delta);
-            if (delta_payload.size() < payload.size()) {
-                result = cas_delta_quorum(nodes, current, delta_payload, std::move(payload), need,
-                                          FrameType::read_ahead);
-                used_delta = true;
-            } else {
-                delta_payload.clear();
-                result = cas_quorum(nodes, current, payload, need, FrameType::read_ahead);
-            }
-        } else {
-            // Rare policy/shape changes retain the full-snapshot CAS primitive.
-            // Ordinary filesystem and catalogue mutations are representable as
-            // MetadataDelta and therefore never take this branch.
-            result = cas_quorum(nodes, current, payload, need, FrameType::read_ahead);
+        if (!clear_merge_parent_topology) {
+            if (exact_delta)
+                delta = std::move(supplied_delta);
+            else
+                delta = metadata_delta(*before, snapshot);
         }
-        const auto cas_ms = elapsed_ms(cas_started);
-        if (result.success >= need && result.committed) {
-            // The delta/full CAS has durably appended the successor proposal on
-            // a quorum. Mark those already-installed records committed with a
-            // compact generation+hash RPC; checkpoint compaction is local and
-            // periodic, while non-quorum replicas converge through repair.
-            const auto commit_started = Clock::now();
-            (void)commit_quorum(nodes, result.committed->generation, result.committed->hash, need,
-                                FrameType::read_ahead);
-            if (used_delta) {
-                if (!node_.checkpoint_metadata_delta(current, delta_payload, *result.committed))
-                    (void)node_.checkpoint_metadata(*result.committed);
-            } else {
-                (void)node_.checkpoint_metadata(*result.committed);
+        if (delta) {
+            auto encoded = encode_metadata_delta(*delta);
+            if (encoded.size() < proposed.payload.size())
+                delta_payload = std::move(encoded);
+        }
+
+        if (publication_retention_) {
+            publication_retention_(MetadataPublicationContext{
+                origin, *sequence, current, snapshot, delta ? &*delta : nullptr});
+        }
+
+        try {
+            (void)publish_commit(active, proposed, delta_payload, FrameType::read_ahead);
+
+            // A concurrent writer can durably accept a sibling of `proposed`
+            // while this publication is in flight.  In that case the mutation
+            // must not bless its branch-specific decoded snapshot as current
+            // after the acceptance notice has already invalidated the cache.
+            // With W>=2, at least the later of two mutually-published writers
+            // observes both accepted heads locally before returning.  Reconcile
+            // that local divergence synchronously so both completed mutations
+            // are visible once the writers have returned.
+            auto post_publish_heads = node_.metadata_replica().accepted_heads();
+            if (post_publish_heads.size() > 1) {
+                std::vector<NodeId> ids;
+                ids.reserve(all_active.size());
+                for (const auto& peer : all_active)
+                    ids.push_back(peer.id);
+                try {
+                    return read_group(ids, FrameType::read_ahead);
+                } catch (const MetadataNotReady&) {
+                    // The authored commit is already durably accepted.  Do not
+                    // overwrite the invalidated cache with one sibling merely
+                    // because reconciliation could not complete immediately; a
+                    // subsequent read will retry the accepted-head survey.
+                    return proposed;
+                }
             }
-            const auto commit_ms = elapsed_ms(commit_started);
-            cache_record(*result.committed,
+
+            cache_record(proposed,
                          std::make_shared<MetadataSnapshot>(std::move(snapshot)));
             const auto total_ms = elapsed_ms(total_started);
             if (total_ms >= 100 && Log::enabled(LogLevel::debug)) {
                 Log::debug("metadata mutate total_ms=" + std::to_string(total_ms) +
-                           " base_ms=" + std::to_string(base_ms) +
-                           " decode_ms=" + std::to_string(decode_ms) +
-                           " encode_ms=" + std::to_string(encode_ms) +
-                           " cas_ms=" + std::to_string(cas_ms) +
-                           " commit_ms=" + std::to_string(commit_ms) +
-                           " mode=" + std::string(used_delta ? "delta" : "snapshot") +
+                           " mode=" + std::string(delta_payload.empty() ? "snapshot" : "delta") +
                            " delta_bytes=" + std::to_string(delta_payload.size()) +
-                           " snapshot_bytes=" + std::to_string(snapshot_bytes) +
+                           " snapshot_bytes=" + std::to_string(proposed.payload.size()) +
                            " attempt=" + std::to_string(attempt + 1));
             }
-            return *result.committed;
+            return proposed;
+        } catch (const MetadataNotReady&) {
+            // If the commit crossed the store floor but certificate fan-out was
+            // interrupted, the local accepted-head set may already contain this
+            // exact mutation. Preserve the sequence across retries so the next
+            // iteration recognises and returns it instead of generating a second
+            // logical mutation.
+            if (attempt + 1 == retries)
+                throw;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        if (!result.conflict)
-            throw std::runtime_error("metadata write quorum unavailable");
-
-        force_quorum_read = true;
     }
 
-    throw std::runtime_error("metadata mutation conflict");
+    throw MetadataNotReady("metadata mutation could not reach durable acceptance floor");
 }
 
 MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot&)>& mutate,
@@ -1597,158 +1389,123 @@ MetadataRecord MetadataManager::mutate_delta(
 }
 
 void MetadataManager::repair_once() {
-    // Full metadata records are intentionally large: the namespace may contain
-    // tens of thousands of immutable extent references. Repair must therefore
-    // compare cheap immutable identities before transferring a complete record.
-    // A settled cluster should exchange only generation+hash probes; full
-    // snapshots are reserved for an actual divergence, stale replica, voter
-    // transition or mixed-version peer.
-    auto full_repair = [this] {
-        auto local = node_.metadata_replica().current();
-        auto voters = voters_of(local);
-        auto record = voters.empty()
-            ? read_record_uncached()
-            : maybe_reconfigure(read_group(voters, FrameType::speculative));
-        voters = voters_of(record);
-        auto voter_replicas = voter_nodes(voters);
-        seed_quorum(voter_replicas, record, quorum(voters.size()), FrameType::speculative);
-        checkpoint_quorum(voter_replicas, record, quorum(voters.size()),
-                          FrameType::speculative);
+    const auto all_active = node_.membership().active();
+    const auto active = compatible_replicas(all_active);
+    if (active.empty())
+        throw MetadataNotReady("metadata replicas unavailable");
 
-        // Namespace checkpoints are recovery witnesses on every active node.
-        // Only the slow path broadcasts a complete snapshot.
-        seed_all_best_effort(node_.membership().active(), record, FrameType::speculative);
-        node_.metadata_replica().compact();
-        cache_record(record);
-    };
-
-    const auto local_identity = node_.metadata_replica().current_identity();
-    const auto view = available_snapshot_view();
-    const auto active = node_.membership().active();
-
-    // If we do not already have the exact decoded local record, or cluster
-    // policy itself needs attention, retain the authoritative full repair path.
-    if (!view || view->generation != local_identity.generation ||
-        view->hash != local_identity.hash || view->snapshot->metadata_voters.empty() ||
-        view->snapshot->metadata_voters.size() != node_.config().metadata_replication ||
-        view->snapshot->data_replication != node_.config().replication) {
-        full_repair();
-        return;
+    MetadataRecord record;
+    if (node_.metadata_replica().committed().generation <= 1) {
+        // Maintenance must not bypass virgin-cluster discovery/policy fencing.
+        // read_group() can otherwise filter incompatible peers before any
+        // protocol-20 policy exists and allow a mismatched cohort to form.
+        record = discover_or_form();
+    } else {
+        std::vector<NodeId> ids;
+        ids.reserve(all_active.size());
+        for (const auto& peer : all_active)
+            ids.push_back(peer.id);
+        record = maybe_reconfigure(read_group(ids, FrameType::speculative));
     }
+    auto acceptance = node_.metadata_replica().acceptance(record.hash);
+    if (!acceptance)
+        throw MetadataNotReady("selected metadata head has no acceptance certificate");
 
-    const auto& voters = view->snapshot->metadata_voters;
-    std::map<NodeId, NodeInfo> active_by_id;
-    for (const auto& owner : active)
-        active_by_id.emplace(owner.id, owner);
-    for (const auto& voter : voters) {
-        if (!active_by_id.contains(voter)) {
-            full_repair();
-            return;
-        }
-    }
-
-    std::map<NodeId, MetadataIdentity> identities;
-    identities.emplace(node_.node_id(), local_identity);
-    std::vector<PendingIdentity> pending;
-    pending.reserve(active.size());
+    // Convergence is replication, not head replacement. Every active node is
+    // offered the accepted immutable head plus its proof. A node holding a
+    // different accepted branch keeps that branch as another head; read_group()
+    // will reconcile the maximal set rather than overwriting it.
+    size_t converged = 0;
     for (const auto& owner : active) {
-        if (owner.id == node_.node_id())
-            continue;
-        try {
-            PendingIdentity item;
-            item.owner = owner;
-            item.rpc.emplace(node_.call_async(owner, MessageType::get_metadata_identity, {},
-                                              FrameType::speculative));
-            pending.push_back(std::move(item));
-        } catch (...) {
-            // Missing identities are handled below: a missing voter forces the
-            // old authoritative path; a non-voter receives a normal full repair.
+        if (replicate_accepted_head(owner, record, *acceptance, FrameType::speculative))
+            ++converged;
+    }
+    if (converged < active.size())
+        throw MetadataNotReady("metadata accepted-head replication incomplete");
+
+    auto snapshot = decode_snapshot(record.payload);
+    std::vector<NodeInfo> participants;
+    participants.reserve(snapshot.metadata_participants.size());
+    bool all_participants_online = !snapshot.metadata_participants.empty();
+    for (const auto& participant : snapshot.metadata_participants) {
+        auto found = std::find_if(active.begin(), active.end(), [&](const NodeInfo& peer) {
+            return peer.id == participant;
+        });
+        if (found == active.end()) {
+            all_participants_online = false;
+            break;
         }
+        participants.push_back(*found);
     }
 
-    for (;;) {
-        bool pending_work = false;
-        bool progressed = false;
-        for (auto& item : pending) {
-            if (item.done || !item.rpc)
-                continue;
-            pending_work = true;
-            if (item.rpc->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
-                continue;
-            item.done = true;
-            progressed = true;
-            try {
-                if (auto identity = identity_reply(item.rpc->get()))
-                    identities[item.owner.id] = *identity;
-            } catch (...) {
+    bool all_participants_at_head = all_participants_online;
+    if (all_participants_at_head) {
+        for (const auto& participant : participants) {
+            if (!replicate_accepted_head(participant, record, *acceptance,
+                                         FrameType::speculative)) {
+                all_participants_at_head = false;
+                break;
             }
         }
-        if (!pending_work)
-            break;
-        if (!progressed)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    // Every voter must report the exact same current immutable record before
-    // the no-payload path is allowed. Any minority proposal, same-generation
-    // hash conflict, unreachable voter, or old peer falls back to read_group(),
-    // preserving the existing recovery/reconfiguration semantics.
-    for (const auto& voter : voters) {
-        auto found = identities.find(voter);
-        if (found == identities.end() || found->second != local_identity) {
-            full_repair();
-            return;
+    // A migrated SM12 cluster has no physical retention baseline. Establish it
+    // only after *every durable branch-capable participant* has converged onto
+    // this reconciled head. The publication guard then places/claims every
+    // reachable DATA/CONTROL object before the baseline commit itself can be
+    // accepted. Until this succeeds destructive mark/sweep is fenced in Service.
+    if (all_participants_at_head && !snapshot.retention_baseline_complete) {
+        const auto origin = node_.node_id();
+        const auto found = snapshot.mutation_sequences.find(origin);
+        const uint64_t previous_sequence =
+            found == snapshot.mutation_sequences.end() ? 0 : found->second;
+        const auto sequence = node_.metadata_replica().reserve_mutation_sequence(previous_sequence);
+
+        auto baseline = snapshot;
+        baseline.retention_baseline_complete = true;
+        baseline.metadata_participants.clear();
+        baseline.metadata_branch_floor = {};
+        baseline.merge_parents.clear();
+        baseline.mutation_sequences[origin] = sequence;
+
+        MetadataRecord baseline_record;
+        baseline_record.generation = record.generation + 1;
+        baseline_record.previous = record.hash;
+        baseline_record.payload = encode_snapshot(baseline);
+        baseline_record.hash = metadata_hash(baseline_record.generation,
+                                             baseline_record.previous,
+                                             baseline_record.payload);
+        if (publication_retention_) {
+            publication_retention_(MetadataPublicationContext{
+                origin, sequence, record, baseline, nullptr});
         }
-    }
+        auto published = publish_commit(active, baseline_record, {}, FrameType::speculative);
+        record = baseline_record;
+        acceptance = published.acceptance;
+        snapshot = std::move(baseline);
 
-    auto voter_replicas = voter_nodes(voters);
-    const auto need = quorum(voters.size());
-    bool voter_commit_needed =
-        node_.metadata_replica().committed_identity() != local_identity;
-    for (const auto& voter : voters) {
-        auto found = active_by_id.find(voter);
-        if (found != active_by_id.end() &&
-            found->second.metadata_generation < local_identity.generation)
-            voter_commit_needed = true;
-    }
-    if (voter_commit_needed &&
-        !commit_quorum(voter_replicas, local_identity.generation, local_identity.hash, need,
-                       FrameType::speculative)) {
-        full_repair();
-        return;
-    }
-
-    std::vector<NodeInfo> compact_commit;
-    std::vector<NodeInfo> full_checkpoint;
-    for (const auto& owner : active) {
-        auto found = identities.find(owner.id);
-        if (found != identities.end() && found->second == local_identity) {
-            if (owner.metadata_generation < local_identity.generation)
-                compact_commit.push_back(owner);
-        } else if (std::find(voters.begin(), voters.end(), owner.id) == voters.end()) {
-            full_checkpoint.push_back(owner);
+        all_participants_at_head = true;
+        for (const auto& participant : participants) {
+            if (!replicate_accepted_head(participant, record, *acceptance,
+                                         FrameType::speculative)) {
+                all_participants_at_head = false;
+                break;
+            }
         }
+        if (all_participants_at_head)
+            Log::info("metadata retention baseline established generation=" +
+                      std::to_string(record.generation) +
+                      " migration_participants=" + std::to_string(participants.size()));
     }
 
-    if (!compact_commit.empty())
-        commit_all_best_effort(compact_commit, local_identity.generation, local_identity.hash,
-                               FrameType::speculative);
-
-    if (!full_checkpoint.empty()) {
-        // Voter consensus above proves the local current record before it is
-        // copied. Re-check the identity after taking the large copy so a
-        // concurrent mutation cannot make us push an obsolete snapshot.
-        auto record = node_.metadata_replica().current();
-        if (record.generation != local_identity.generation || record.hash != local_identity.hash) {
-            full_repair();
-            return;
-        }
-        seed_all_best_effort(full_checkpoint, record, FrameType::speculative);
-        cache_record(record);
-    } else {
-        refresh_cache_identity(local_identity);
-    }
+    // Retention release is driven independently by each node's sole accepted
+    // head and causal mutation clock. No globally advanced branch floor is
+    // needed for physical GC; unknown concurrent claim dots simply survive.
 
     node_.metadata_replica().compact();
+    cache_record(record, std::make_shared<MetadataSnapshot>(std::move(snapshot)));
 }
+
+
+
 } // namespace macha

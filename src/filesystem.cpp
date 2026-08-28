@@ -1636,13 +1636,30 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
     const auto& snapshot = *view.snapshot;
     std::vector<ObjectId> live;
     size_t extents = 0;
-    for (const auto& [_, entry] : snapshot.entries) {
+    auto add_entry_extents = [&](const FsEntry& entry) {
         extents += entry.extents.size();
         for (const auto& extent : entry.extents) {
             if (!extent.hole)
                 live.push_back(extent.id);
         }
+    };
+    for (const auto& [_, entry] : snapshot.entries)
+        add_entry_extents(entry);
+
+    // Unresolved conflict alternatives are reachability roots just as surely as
+    // the effective namespace. Count their physical extents for diagnostics and
+    // protect their immutable objects from GC until explicit resolution.
+    for (const auto& [_, conflict] : snapshot.conflicts) {
+        if (conflict.kind != MetadataConflictKind::namespace_entry)
+            continue;
+        for (const auto* candidate : {&conflict.base_entry, &conflict.left_entry,
+                                      &conflict.right_entry}) {
+            if (*candidate)
+                extents += (**candidate).extents.size();
+        }
     }
+    const auto conflict_live = metadata_conflict_extent_roots(snapshot);
+    live.insert(live.end(), conflict_live.begin(), conflict_live.end());
     std::sort(live.begin(), live.end());
     live.erase(std::unique(live.begin(), live.end()), live.end());
 
@@ -1665,6 +1682,7 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
     built->live = std::move(live);
     built->garbage = std::move(garbage);
     built->metadata_generation = view.generation;
+    built->observed_mutations = snapshot.mutation_sequences;
     built->entries = snapshot.entries.size();
     built->extents = extents;
 

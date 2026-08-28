@@ -125,14 +125,14 @@ inline Config config_for(const std::filesystem::path& path, const std::filesyste
 
     if (profile == ConfigProfile::functional) {
         c.replication = 3;
-        c.metadata_replication = 3;
+        c.metadata_min_write_replicas = 2;
         c.read_ahead_extents = 2;
         c.heartbeat = 100ms;
         c.control_stall_notice = 2s;
         c.data_stall_notice = 5s;
     } else {
         c.replication = 1;
-        c.metadata_replication = 1;
+        c.metadata_min_write_replicas = 1;
         c.catalogue.scanner.enabled = false;
         c.catalogue.api.enabled = false;
         c.ingest.enabled = false;

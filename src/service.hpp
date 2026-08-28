@@ -16,6 +16,7 @@
 #include <ctime>
 #include <mutex>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace macha {
@@ -48,13 +49,25 @@ class Service {
     std::shared_ptr<const std::vector<ObjectId>> maintenance_live_;
     std::shared_ptr<const std::vector<ObjectId>> maintenance_universal_;
     std::shared_ptr<const std::vector<ObjectId>> maintenance_control_live_;
+    // Live sets reconstructed from the sole accepted local metadata head.
+    // Retention claims may be released against these sets even if the cluster
+    // partitions again later; newer deletions remain claimed until a newer
+    // stability horizon is established.
+    Hash256 retention_release_floor_hash_{};
+    std::shared_ptr<const std::vector<ObjectId>> retention_release_data_live_;
+    std::shared_ptr<const std::vector<ObjectId>> retention_release_control_live_;
+    RetentionClock retention_release_clock_;
+    bool retention_release_complete_{};
     bool maintenance_catalogue_complete_{true};
     std::vector<GarbageRef> maintenance_garbage_;
     std::vector<GarbageRef> maintenance_stale_garbage_;
+    std::optional<ObjectId> retention_data_repair_cursor_;
+    std::optional<ObjectId> retention_control_repair_cursor_;
     void loop(std::stop_token);
     std::vector<GarbageRef> collect_garbage(const std::vector<GarbageRef>&);
     void maintain_garbage_metadata(const std::vector<GarbageRef>& erase,
                                    const std::vector<GarbageRef>& stamp);
+    void retain_metadata_publication(const MetadataPublicationContext&);
 
   public:
     Service(Config, ClusterKeys);

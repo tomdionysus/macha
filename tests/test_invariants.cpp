@@ -31,7 +31,7 @@ MACHA_TEST("invariants", test_manage_unmatched_rename_manual_catalogue_and_files
     TestService fixture("manage");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.hydration.enabled = false;
     config.catalogue.scanner.enabled = false;
     auto& service = fixture.start();
@@ -123,7 +123,7 @@ MACHA_TEST("invariants", test_manage_node_identity_association_reset) {
     TestService fixture("manage-identity-reset");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.hydration.enabled = false;
     config.catalogue.scanner.enabled = false;
     auto& service = fixture.start();
@@ -270,7 +270,7 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     TestNode fixture("status-membership");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.hydration.enabled = false;
     config.catalogue.scanner.enabled = false;
     auto& node = fixture.start();
@@ -279,7 +279,7 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     // Establish the coherent local metadata view without a Service maintenance
     // thread. This keeps the availability state deterministic for this test.
     const auto local_snapshot = metadata.snapshot();
-    REQUIRE(local_snapshot.metadata_voters.size() == 1);
+    REQUIRE(local_snapshot.metadata_voters.empty());
 
     NodeInfo peer;
     peer.id = random_node_id();
@@ -293,9 +293,10 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     node.membership().observe(peer, true);
 
     // Deliberately do not create a telemetry observation for the peer. Cluster
-    // membership alone must make it visible and online in Status. Metadata
-    // write capability is independently published by MetadataManager.
-    metadata.note_quorum_validation(false, "test write quorum unavailable");
+    // membership alone must make it visible and online in Status. Replica-set
+    // validation is convergence telemetry in 0.19; it must not demote write
+    // capability while the configured durability floor is reachable.
+    metadata.note_replica_validation(false, "test metadata reconciliation pending");
     ClusterStatusService status(node, metadata);
     HttpRequest request;
     request.method = "GET";
@@ -308,9 +309,10 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     REQUIRE(cluster != nullptr);
     CHECK(cluster->find("nodes_known")->asUInt64() == 2);
     CHECK(cluster->find("nodes_online")->asUInt64() == 2);
-    CHECK(cluster->find("metadata_availability")->asString() == "read-only");
+    CHECK(cluster->find("metadata_availability")->asString() == "writable");
     CHECK(cluster->find("metadata_read_available")->asBool());
-    CHECK(!cluster->find("metadata_write_available")->asBool());
+    CHECK(cluster->find("metadata_write_available")->asBool());
+    CHECK(!cluster->find("metadata_replica_set_validated")->asBool());
 
     const auto* connectivity = root.find("connectivity");
     REQUIRE(connectivity != nullptr);
@@ -340,7 +342,7 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     }
     CHECK(found);
 
-    metadata.note_quorum_validation(true);
+    metadata.note_replica_validation(true);
     response = status.handle(request);
     REQUIRE(response.status == 200);
     root = Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
@@ -355,47 +357,42 @@ MACHA_TEST("invariants", test_metadata_availability_logs_only_transitions) {
     TestNode fixture("metadata-availability-log");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     auto& node = fixture.start();
     (void)node;
     auto& metadata = fixture.metadata();
-    REQUIRE(metadata.snapshot().metadata_voters.size() == 1);
+    REQUIRE(metadata.snapshot().metadata_voters.empty());
 
     auto capture = std::make_shared<ConcurrentCapturingLogger>(LogLevel::all);
     Log::set_logger(capture);
 
-    metadata.note_quorum_validation(false, "metadata write quorum unavailable");
-    metadata.note_quorum_validation(false, "metadata write quorum unavailable");
-    metadata.note_quorum_validation(true);
-    metadata.note_quorum_validation(false, "metadata write quorum unavailable");
+    metadata.note_replica_validation(false, "metadata reconciliation pending");
+    CHECK(metadata.cluster_status().write_available);
+    CHECK(!metadata.cluster_status().stable);
+    metadata.note_replica_validation(false, "metadata reconciliation pending");
+    metadata.note_replica_validation(true);
+    CHECK(metadata.cluster_status().write_available);
+    CHECK(metadata.cluster_status().stable);
+    metadata.note_replica_validation(false, "metadata reconciliation pending");
+    CHECK(metadata.cluster_status().write_available);
+    CHECK(!metadata.cluster_status().stable);
 
     const auto records = capture->records();
     Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
 
     size_t availability_logs = 0;
-    bool saw_initial_read_only = false;
-    bool saw_writable = false;
-    bool saw_lost_write = false;
+    bool saw_initial_writable = false;
     for (const auto& [level, message] : records) {
         if (message.find("metadata availability changed") == std::string::npos)
             continue;
         ++availability_logs;
         if (level == LogLevel::info &&
-            message.find("state=read-only previous=unavailable") != std::string::npos)
-            saw_initial_read_only = true;
-        if (level == LogLevel::info &&
-            message.find("state=writable previous=read-only") != std::string::npos &&
-            message.find("reason=\"metadata write quorum available\"") != std::string::npos)
-            saw_writable = true;
-        if (level == LogLevel::warn &&
-            message.find("state=read-only previous=writable") != std::string::npos &&
-            message.find("reason=\"metadata write quorum lost\"") != std::string::npos)
-            saw_lost_write = true;
+            message.find("state=writable previous=unavailable") != std::string::npos &&
+            message.find("reconciliation pending") != std::string::npos)
+            saw_initial_writable = true;
     }
-    CHECK(availability_logs == 3);
-    CHECK(saw_initial_read_only);
-    CHECK(saw_writable);
-    CHECK(saw_lost_write);
+    CHECK(availability_logs == 1);
+    CHECK(saw_initial_writable);
 }
 
 MACHA_TEST("invariants", test_fuse_open_inode_identity_survives_external_replace_and_unlink) {
@@ -680,7 +677,7 @@ MACHA_TEST("invariants", test_replica_repair_does_not_count_corrupt_remote_as_he
     auto c2 = config_for(t.path() / "n2", keyfile, p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 2;
     c1.min_write_replicas = c2.min_write_replicas = 2;
-    c1.metadata_replication = c2.metadata_replication = 1;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
     c1.storage_packing = c2.storage_packing = StoragePackingConfig{0, 0};
 
     NodeRuntime n1(c1, keys);
@@ -1256,7 +1253,7 @@ MACHA_TEST("invariants", test_publication_generation_barrier_precedes_metadata_c
     TestNode fixture("publication-generation");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.extent_size = 1024 * 1024;
     fixture.start();
     auto& fs = fixture.filesystem();
@@ -1335,7 +1332,7 @@ MACHA_TEST("invariants", test_deferred_object_barrier_rejects_stale_process_epoc
     auto server_config = cluster.node_config("durability-epoch-server");
     auto client_config = cluster.node_config("durability-epoch-client");
     server_config.replication = client_config.replication = 1;
-    server_config.metadata_replication = client_config.metadata_replication = 1;
+    server_config.metadata_min_write_replicas = client_config.metadata_min_write_replicas = 1;
     NodeRuntime server(server_config, cluster.keys());
     NodeRuntime client(client_config, cluster.keys());
     server.start();
@@ -1389,7 +1386,7 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_group_commits_independent_p
     auto server_config = cluster.node_config("durability-group-rpc-server");
     auto client_config = cluster.node_config("durability-group-rpc-client");
     server_config.replication = client_config.replication = 1;
-    server_config.metadata_replication = client_config.metadata_replication = 1;
+    server_config.metadata_min_write_replicas = client_config.metadata_min_write_replicas = 1;
     NodeRuntime server(server_config, cluster.keys());
     NodeRuntime client(client_config, cluster.keys());
     server.start();
@@ -1465,7 +1462,7 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_reuses_already_covered_gene
     auto server_config = cluster.node_config("durability-generation-rpc-server");
     auto client_config = cluster.node_config("durability-generation-rpc-client");
     server_config.replication = client_config.replication = 1;
-    server_config.metadata_replication = client_config.metadata_replication = 1;
+    server_config.metadata_min_write_replicas = client_config.metadata_min_write_replicas = 1;
     NodeRuntime server(server_config, cluster.keys());
     NodeRuntime client(client_config, cluster.keys());
     server.start();

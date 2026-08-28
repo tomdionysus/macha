@@ -120,7 +120,8 @@ class StoragePool {
                               const std::vector<ObjectId>& protected_ids,
                               std::chrono::milliseconds orphan_grace,
                               size_t operation_budget,
-                              const std::function<bool()>& should_yield = {});
+                              const std::function<bool()>& should_yield = {},
+                              const std::function<bool(const ObjectId&)>& is_retained = {});
 
     // Compatibility helper for callers/tests that explicitly request a complete
     // pass. Service maintenance uses rebalance_step() so a settled large store
