@@ -37,13 +37,9 @@ NodeInfo self_info(const Config& config, const NodeId& id, uint64_t used, uint64
     node.used = used;
     node.seen_unix_ms = unix_ms();
     node.metadata_generation = metadata_generation;
+    node.metadata_write_replicas_required =
+        static_cast<uint32_t>(config.metadata_min_write_replicas);
     return node;
-}
-
-bool current_metadata_delta(std::span<const uint8_t> data) {
-    static constexpr std::array<uint8_t, 7> prefix{'D', 'H', 'T', 'M', 'D', 'L', 'T'};
-    return data.size() >= 8 && std::equal(prefix.begin(), prefix.end(), data.begin()) &&
-           (data[7] == '2' || data[7] == '3' || data[7] == '4');
 }
 
 RpcMessage error_reply(const std::string& text) {
@@ -100,15 +96,6 @@ std::vector<IdentityAssociationReset> decode_identity_resets(std::span<const uin
     return out;
 }
 
-MetadataIdentity encoded_metadata_identity(std::span<const uint8_t> data) {
-    Reader reader(data);
-    MetadataIdentity identity;
-    identity.generation = reader.u64();
-    (void)reader.fixed<32>(); // previous hash
-    identity.hash.bytes = reader.fixed<32>();
-    return identity;
-}
-
 RpcMessage metadata_identity_reply(const MetadataIdentity& identity) {
     Writer writer;
     writer.u64(identity.generation);
@@ -160,6 +147,7 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
                                  cfg_.metadata_store.packing.target_size},
                keys_.storage),
       cache_(cfg_.cache, keys_.storage),
+      retention_(cfg_.state_path, keys_.storage),
       meta_(cfg_.state_path, keys_.storage, cache_.metadata()),
       members_(self_info(cfg_, id_, local_.used(), local_.limit(), meta_.committed().generation),
                cfg_.dead_after),
@@ -174,6 +162,7 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
                   std::max(remote_metadata_generation_.load(), peer.metadata_generation));
           },
           [this](uint64_t generation) {
+              remote_metadata_epoch_.fetch_add(1, std::memory_order_acq_rel);
               auto current = remote_metadata_generation_.load();
               while (current < generation && !remote_metadata_generation_.compare_exchange_weak(
                                                  current, generation)) {
@@ -209,16 +198,12 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
         Log::debug("cannot preload identity reset tombstones: " + std::string(error.what()));
     }
 
-    // The metadata cache is deliberately independent of node state. If node
-    // state was restored from an older backup but the SSD cache survived, a
-    // newer valid snapshot can improve read-only/offline startup. Mutations use
-    // quorum CAS as the authority; a stale local base is rejected and refreshed.
-    if (auto cached = cache_.metadata()) {
-        if (cached->generation > meta_.committed().generation) {
-            (void)meta_.seed(*cached);
-            (void)meta_.remember_committed(*cached);
-        }
-    }
+    // The persistent metadata cache is a read/recovery aid only. It must never
+    // become metadata authority merely because it is newer than the primary
+    // state directory: only a durable acceptance certificate may make a 0.19+
+    // commit authoritative. MetadataReplica may use this cache as a quarantined
+    // recovery seed, but recovery remains explicitly unaccepted until peers
+    // supply accepted-head evidence.
     cache_.remember_metadata(meta_.committed());
     const auto storage_used = local_.used();
     const auto storage_capacity = local_.limit();
@@ -379,77 +364,60 @@ std::chrono::milliseconds NodeRuntime::activity_idle_for(FrameType type) const {
 }
 
 void NodeRuntime::announce_metadata_generation(uint64_t generation) {
+    // Accepted-head topology can change without increasing the maximum metadata
+    // generation (for example, a concurrent same-generation sibling arriving
+    // over RPC).  MetadataManager caches key off this epoch as well as the
+    // generation, so advance it for local acceptance changes before broadcasting
+    // the notice.  Otherwise a node can keep serving its pre-sibling snapshot
+    // until the cache TTL expires even though the sibling is already durably
+    // accepted locally.
+    remote_metadata_epoch_.fetch_add(1, std::memory_order_acq_rel);
     members_.metadata_generation(generation);
     Writer writer;
     writer.u64(generation);
     client_.broadcast({MessageType::metadata_notice, writer.take()});
 }
 
-bool NodeRuntime::seed_metadata(const MetadataRecord& record) {
-    // Seeding repairs/stages a replica but does not make the record a durable
-    // recovery witness. Only checkpoint_metadata() is called after a quorum is
-    // known to have committed the record.
-    return meta_.seed(record);
+bool NodeRuntime::store_metadata_commit(const MetadataHistoryEntry& entry) {
+    return meta_.import_history(entry);
 }
 
-bool NodeRuntime::checkpoint_metadata(const MetadataRecord& record) {
-    auto before = meta_.committed();
-    (void)meta_.seed(record);
-    bool checkpointed = meta_.remember_committed(record);
-    auto committed = meta_.committed();
-    members_.metadata_generation(committed.generation);
-    if (checkpointed)
-        cache_.remember_metadata(committed);
-    if (checkpointed && committed.hash != before.hash)
-        announce_metadata_generation(committed.generation);
-    return checkpointed;
-}
-
-bool NodeRuntime::checkpoint_metadata_delta(const MetadataRecord& base,
-                                            std::span<const uint8_t> delta,
-                                            const MetadataRecord& record) {
-    auto before = meta_.committed();
-    const bool checkpointed =
-        meta_.install_committed_delta(base.generation, base.hash, delta, record);
-    if (!checkpointed)
+bool NodeRuntime::accept_metadata_commit(const MetadataAcceptance& acceptance) {
+    // A protocol-20 node accepts only branches whose *resulting* cluster policy
+    // matches its configured policy. The certificate's own `required` value may
+    // be stronger during a safe policy transition (for example W=3 -> W=2), so
+    // comparing it directly with the local configuration would incorrectly
+    // reject the transition. MetadataReplica validates the certificate against
+    // the commit and its parent policies.
+    if (acceptance.required) {
+        auto record = meta_.historical(acceptance.hash);
+        if (!record)
+            return false;
+        const auto snapshot = decode_snapshot(record->payload);
+        if (snapshot.metadata_write_replicas_required !=
+            cfg_.metadata_min_write_replicas)
+            return false;
+    }
+    const auto heads_before = meta_.accepted_head_certificates();
+    const auto before = meta_.committed();
+    if (!meta_.accept_commit(acceptance))
         return false;
-    auto committed = meta_.committed();
-    members_.metadata_generation(committed.generation);
-    cache_.remember_metadata(committed);
-    if (committed.hash != before.hash)
-        announce_metadata_generation(committed.generation);
+    const auto heads_after = meta_.accepted_head_certificates();
+    const auto after = meta_.committed();
+    members_.metadata_generation(std::max(after.generation, acceptance.generation));
+    if (heads_after == heads_before)
+        return true;
+    if (after.hash != before.hash)
+        cache_.remember_metadata(after);
+    // A same-generation sibling may not change the materialised preferred head,
+    // but peers still need an ordinary metadata wake-up so foreground cache
+    // validation and background reconciliation notice the changed head set.
+    announce_metadata_generation(std::max(after.generation, acceptance.generation));
     return true;
 }
 
-bool NodeRuntime::commit_metadata(uint64_t generation, const Hash256& hash) {
-    auto before = meta_.committed();
-    const bool checkpointed = meta_.remember_current_committed(generation, hash);
-    if (!checkpointed)
-        return false;
-    auto committed = meta_.committed();
-    members_.metadata_generation(committed.generation);
-    cache_.remember_metadata(committed);
-    if (committed.hash != before.hash)
-        announce_metadata_generation(committed.generation);
-    return true;
-}
-
-bool NodeRuntime::cas_metadata(uint64_t generation, const Hash256& hash,
-                               std::span<const uint8_t> payload, MetadataRecord* out) {
-    // A successful per-voter CAS is only a proposal until MetadataManager has
-    // observed a quorum. It must not advance the advertised generation or the
-    // durable committed checkpoint on its own.
-    return meta_.cas(generation, hash, payload, out);
-}
-
-bool NodeRuntime::cas_metadata_delta(uint64_t generation, const Hash256& hash,
-                                     std::span<const uint8_t> delta, MetadataRecord* out) {
-    // The v15 wire protocol has exactly one delta representation. MetadataReplica
-    // still understands DLT1 solely so an existing pre-0.10 journal can replay
-    // locally; accepting it here would turn storage migration into wire fallback.
-    if (!current_metadata_delta(delta))
-        throw std::runtime_error("unsupported metadata delta version");
-    return meta_.cas_delta(generation, hash, delta, out);
+std::vector<MetadataAcceptance> NodeRuntime::metadata_heads() const {
+    return meta_.accepted_head_certificates();
 }
 
 RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcMessage& request) {
@@ -495,7 +463,7 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             Writer writer;
             // Replica-presence RPCs are durability decisions, not directory
             // existence probes. Authenticate/decrypt/hash the object before
-            // allowing repair or write quorum logic to count this replica.
+            // allowing repair or write-floor logic to count this replica.
             writer.u8(local_.valid(id));
             return {MessageType::bool_reply, writer.take()};
         }
@@ -579,10 +547,43 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
                 return error_reply(std::string("storage durability barrier failed: ") + error.what());
             }
         }
+        case MessageType::retain_objects: {
+            Reader reader(request.payload);
+            const auto raw_class = reader.u8();
+            if (raw_class < static_cast<uint8_t>(RetentionClass::data) ||
+                raw_class > static_cast<uint8_t>(RetentionClass::control))
+                return error_reply("invalid retention object class");
+            const auto object_class = static_cast<RetentionClass>(raw_class);
+            RetentionDot dot;
+            dot.origin.bytes = reader.fixed<16>();
+            dot.sequence = reader.u64();
+            const auto count = reader.u32();
+            if (!count || count > 1000000)
+                return error_reply("invalid retention object count");
+            std::vector<ObjectId> ids;
+            ids.reserve(count);
+            for (uint32_t i = 0; i < count; ++i) {
+                ObjectId id;
+                id.bytes = reader.fixed<32>();
+                ids.push_back(id);
+            }
+            reader.finish();
+            for (const auto& id : ids) {
+                const bool present = object_class == RetentionClass::data
+                                         ? local_.valid(id)
+                                         : control_.valid(id);
+                if (!present)
+                    return error_reply("retention object is not durably present");
+            }
+            retention_.retain_batch(object_class, ids, dot);
+            return {MessageType::ok, {}};
+        }
         case MessageType::delete_object: {
             Reader reader(request.payload);
             ObjectId id{reader.fixed<32>()};
             reader.finish();
+            if (retention_.retained(RetentionClass::data, id))
+                return error_reply("object has an active retention claim");
             (void)local_.remove(id);
             (void)cache_.remove(id);
             members_.storage(local_.used(), local_.limit());
@@ -593,91 +594,55 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
         case MessageType::get_committed_metadata:
             return {MessageType::metadata_reply, encode_metadata_record(meta_.committed())};
         case MessageType::get_metadata_identity:
-            return metadata_identity_reply(meta_.current_identity());
-        case MessageType::seed_metadata: {
-            // Full repair records are large. If the sender is redundantly
-            // offering the exact immutable record we already hold, the header
-            // identity is sufficient to acknowledge it; do not copy/hash/decode
-            // the 20+ MiB payload again.
-            const auto identity = encoded_metadata_identity(request.payload);
-            bool ok = identity == meta_.current_identity();
-            if (!ok) {
-                auto metadata = decode_metadata_record(request.payload);
-                ok = seed_metadata(metadata);
-            }
-            Writer writer;
-            writer.u8(ok);
-            return {MessageType::bool_reply, writer.take()};
-        }
-        case MessageType::checkpoint_metadata: {
-            // Same optimisation for durable checkpoints. If the record is
-            // already current but not yet committed, the compact generation+
-            // hash commit is enough; only an actually different record needs
-            // the full validation/decode path.
-            const auto identity = encoded_metadata_identity(request.payload);
-            bool ok = identity == meta_.committed_identity();
-            if (!ok && identity == meta_.current_identity())
-                ok = commit_metadata(identity.generation, identity.hash);
-            if (!ok) {
-                auto metadata = decode_metadata_record(request.payload);
-                ok = checkpoint_metadata(metadata);
-            }
-            Writer writer;
-            writer.u8(ok);
-            return {MessageType::bool_reply, writer.take()};
-        }
-        case MessageType::commit_metadata: {
+            return metadata_identity_reply(meta_.committed_identity());
+        case MessageType::get_metadata_history_entry: {
             Reader reader(request.payload);
-            const auto generation = reader.u64();
-            Hash256 hash{reader.fixed<32>()};
+            Hash256 hash;
+            hash.bytes = reader.fixed<32>();
+            reader.finish();
+            auto entry = meta_.history_entry(hash);
+            if (!entry)
+                return error_reply("metadata history entry unavailable");
+            return {MessageType::metadata_history_entry_reply,
+                    encode_metadata_history_entry(*entry)};
+        }
+        case MessageType::has_metadata_history_entry: {
+            Reader reader(request.payload);
+            Hash256 hash;
+            hash.bytes = reader.fixed<32>();
             reader.finish();
             Writer writer;
-            writer.u8(commit_metadata(generation, hash));
+            writer.u8(meta_.history_contains(hash));
             return {MessageType::bool_reply, writer.take()};
         }
-        case MessageType::cas_metadata: {
-            Reader reader(request.payload);
-            auto generation = reader.u64();
-            Hash256 hash{reader.fixed<32>()};
-            auto payload = reader.bytes();
-            reader.finish();
-            MetadataRecord out;
-            bool ok = cas_metadata(generation, hash, payload, &out);
+        case MessageType::put_metadata_history_entry: {
+            auto entry = decode_metadata_history_entry(request.payload);
             Writer writer;
-            writer.u8(ok);
-            if (ok) {
-                // The proposer already owns the exact payload accepted by this
-                // voter. Returning it again doubles the wire cost of every
-                // successful namespace mutation. A success acknowledgement only
-                // needs enough identity to prove which successor was installed;
-                // conflicts still return the complete current record below.
-                writer.u64(out.generation);
-                writer.fixed(out.previous.bytes);
-                writer.fixed(out.hash.bytes);
-            } else {
-                writer.bytes(encode_metadata_record(out));
-            }
-            return {MessageType::cas_reply, writer.take()};
+            writer.u8(meta_.import_history(entry));
+            return {MessageType::bool_reply, writer.take()};
         }
-        case MessageType::cas_metadata_delta: {
-            Reader reader(request.payload);
-            auto generation = reader.u64();
-            Hash256 hash{reader.fixed<32>()};
-            auto delta = reader.bytes();
-            reader.finish();
-            MetadataRecord out;
-            bool ok = cas_metadata_delta(generation, hash, delta, &out);
+        case MessageType::get_metadata_heads:
+            return {MessageType::metadata_heads_reply,
+                    encode_metadata_acceptance_set(metadata_heads())};
+        case MessageType::put_metadata_commit: {
+            auto entry = decode_metadata_history_entry(request.payload);
             Writer writer;
-            writer.u8(ok);
-            if (ok) {
-                writer.u64(out.generation);
-                writer.fixed(out.previous.bytes);
-                writer.fixed(out.hash.bytes);
-            } else {
-                writer.bytes(encode_metadata_record(out));
-            }
-            return {MessageType::cas_reply, writer.take()};
+            writer.u8(store_metadata_commit(entry));
+            return {MessageType::bool_reply, writer.take()};
         }
+        case MessageType::accept_metadata_commit: {
+            auto acceptance = decode_metadata_acceptance(request.payload);
+            Writer writer;
+            writer.u8(accept_metadata_commit(acceptance));
+            return {MessageType::bool_reply, writer.take()};
+        }
+        case MessageType::seed_metadata:
+        case MessageType::checkpoint_metadata:
+        case MessageType::commit_metadata:
+        case MessageType::cas_metadata:
+        case MessageType::cas_metadata_delta:
+            return error_reply(
+                "legacy metadata CAS/PREPARE/COMMIT RPC is unavailable in protocol 20");
         case MessageType::metadata_notice:
             return error_reply("metadata notice is server-originated");
         default:

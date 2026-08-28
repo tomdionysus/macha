@@ -117,7 +117,7 @@ Json identity_reset_json(const IdentityAssociationReset& reset) {
 
 Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeInfo* member,
                const NodeTelemetry* live, uint64_t live_age_ms, bool online, bool stale,
-               bool metadata_voter, const IdentityAssociationReset* identity_reset) {
+               bool metadata_replica, const IdentityAssociationReset* identity_reset) {
     Json::Object node;
     node["id"] = to_string(id);
     node["state"] = online ? "online" : "offline";
@@ -149,7 +149,7 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
     Json::Array roles;
     if (storage_capacity) roles.emplace_back("storage");
     if (cache_capacity) roles.emplace_back("cache");
-    if (metadata_voter) roles.emplace_back("metadata-voter");
+    if (metadata_replica) roles.emplace_back("metadata-replica");
     node["roles"] = std::move(roles);
 
     Json::Object runtime;
@@ -210,7 +210,7 @@ void ClusterStatusService::stop() {
 void ClusterStatusService::persist_local_status() {
     // Status persistence is deliberately outside namespace metadata. Even a
     // five-minute observational checkpoint must never serialize a large
-    // namespace, acquire the metadata mutation lock, or enter quorum CAS.
+    // namespace, acquire the metadata mutation lock, or enter metadata publication CAS.
     // Defer the tiny local durable write while viewer-critical work is active.
     // durable_replace_file() includes the durability barrier we want for the
     // last-known cache. Keep that I/O well clear of interactive traffic rather
@@ -223,7 +223,7 @@ void ClusterStatusService::persist_local_status() {
 }
 
 void ClusterStatusService::persistence_loop(std::stop_token stop) {
-    // Give startup membership/quorum formation a short head start, then keep one
+    // Give startup membership/metadata formation a short head start, then keep one
     // coalesced durable observation per node. A failed checkpoint is retried; no
     // historical telemetry backlog is ever replayed into metadata.
     auto delay = std::chrono::seconds(10);
@@ -285,14 +285,10 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     for (const auto& member : membership_all)
         merge_membership(known[member.id], member);
 
-    std::set<NodeId> voters;
-    if (metadata)
-        voters.insert(metadata->metadata_voters.begin(), metadata->metadata_voters.end());
-
     uint64_t known_capacity = 0, known_used = 0, online_capacity = 0, online_used = 0;
     uint64_t known_cache_capacity = 0, known_cache_used = 0, online_cache_capacity = 0,
              online_cache_used = 0;
-    size_t online_nodes = 0, active_voters = 0;
+    size_t online_nodes = 0;
     Json::Array nodes;
     for (const auto& [id, durable] : known) {
         if (only && id != *only)
@@ -304,7 +300,7 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         const uint64_t age = found == live.end() ? 0 : static_cast<uint64_t>(found->second.age.count());
         const bool online = active_members.contains(id);
         const bool stale = current && found->second.age > fresh_for;
-        const bool voter = voters.contains(id);
+        const bool metadata_replica = true;
 
         const auto storage_capacity = member ? member->capacity
                                              : (current ? current->storage_capacity
@@ -323,8 +319,6 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
             online_used += storage_used;
             online_cache_capacity += cache_capacity;
             online_cache_used += cache_used;
-            if (voter)
-                ++active_voters;
         }
         const IdentityAssociationReset* identity_reset = nullptr;
         if (metadata) {
@@ -341,7 +335,7 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
             }
         }
         nodes.push_back(
-            node_json(id, durable, member, current, age, online, stale, voter, identity_reset));
+            node_json(id, durable, member, current, age, online, stale, metadata_replica, identity_reset));
     }
 
     if (only) {
@@ -351,22 +345,20 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     }
 
     const auto published_metadata = metadata_.cluster_status();
-    const size_t voter_count = !voters.empty() ? voters.size() : published_metadata.voters;
-    const size_t quorum = voter_count ? voter_count / 2 + 1 : published_metadata.quorum_required;
-    if (voters.empty())
-        active_voters = published_metadata.voters_online;
+    const size_t metadata_replicas = known.empty() ? published_metadata.replicas : known.size();
+    const size_t active_metadata_replicas = online_nodes;
+    const size_t metadata_min_write_replicas = node_.config().metadata_min_write_replicas;
 
-    // Read availability comes from the already-decoded coherent snapshot; write
-    // availability comes only from the metadata subsystem's last successful
-    // validation.  Current membership may demote a previously writable state
-    // immediately, but Status never promotes read-only -> writable merely because
-    // enough peers happen to be connected.
+    // Read availability comes from the already-decoded committed snapshot.
+    // Write availability is the durability floor: validation/stability is
+    // reported separately because reconciliation debt does not revoke the right
+    // of any reachable floor-sized cohort to attempt a metadata mutation.
     MetadataAvailability metadata_availability = published_metadata.availability;
     if (metadata) {
         if (metadata_availability == MetadataAvailability::unavailable)
             metadata_availability = MetadataAvailability::read_only;
         if (metadata_availability == MetadataAvailability::writable &&
-            voter_count && active_voters < quorum)
+            active_metadata_replicas < metadata_min_write_replicas)
             metadata_availability = MetadataAvailability::read_only;
     } else {
         metadata_availability = MetadataAvailability::unavailable;
@@ -403,15 +395,22 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     cluster["nodes_online"] = static_cast<uint64_t>(online_nodes);
     cluster["metadata_generation"] = metadata_generation ? metadata_generation
                                                         : published_metadata.generation;
-    cluster["metadata_voters"] = static_cast<uint64_t>(voter_count);
-    cluster["metadata_voters_online"] = static_cast<uint64_t>(active_voters);
-    cluster["metadata_quorum_required"] = static_cast<uint64_t>(quorum);
+    cluster["metadata_replicas"] = static_cast<uint64_t>(metadata_replicas);
+    cluster["metadata_replicas_online"] = static_cast<uint64_t>(active_metadata_replicas);
+    cluster["metadata_min_write_replicas"] = static_cast<uint64_t>(metadata_min_write_replicas);
+    // Transitional API aliases for 0.18 clients. They carry the new values and
+    // should not be interpreted as a fixed voter set or majority quorum.
+    cluster["metadata_voters"] = static_cast<uint64_t>(metadata_replicas);
+    cluster["metadata_voters_online"] = static_cast<uint64_t>(active_metadata_replicas);
+    cluster["metadata_quorum_required"] = static_cast<uint64_t>(metadata_min_write_replicas);
     cluster["metadata_availability"] = metadata_availability_name(metadata_availability);
     cluster["metadata_read_available"] = metadata_read_available;
-    cluster["metadata_quorum_available"] = metadata_write_available;
+    cluster["metadata_quorum_available"] = metadata_write_available; // deprecated alias
     cluster["metadata_write_available"] = metadata_write_available;
-    cluster["metadata_quorum_validated"] = published_metadata.stable;
-    cluster["metadata_quorum_validated_at_unix_ms"] = published_metadata.observed_unix_ms;
+    cluster["metadata_replica_set_validated"] = published_metadata.stable;
+    cluster["metadata_quorum_validated"] = published_metadata.stable; // deprecated alias
+    cluster["metadata_replica_set_validated_at_unix_ms"] = published_metadata.observed_unix_ms;
+    cluster["metadata_quorum_validated_at_unix_ms"] = published_metadata.observed_unix_ms; // deprecated alias
     cluster["storage_known"] = bytes_pair(known_used, known_capacity);
     cluster["storage_online"] = bytes_pair(online_used, online_capacity);
     cluster["cache_known"] = bytes_pair(known_cache_used, known_cache_capacity);

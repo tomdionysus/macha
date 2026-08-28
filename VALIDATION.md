@@ -20,7 +20,7 @@ The suite explicitly exercises:
 - W=1 publication can later converge to R=2 through repair;
 - catalogue CONTROL objects remain writable when ordinary DATA is full;
 - artwork uses ordinary DATA placement/fallback and can be read remotely by a full node;
-- catalogue manifest/shard CONTROL objects recover onto a metadata voter from another voter;
+- catalogue manifest/shard CONTROL objects recover onto a metadata replica from another replica;
 - metadata-record copying shares immutable payload backing and does not reintroduce namespace-sized heap amplification;
 - mountpoint preflight accepts an ordinary directory and refuses an unrelated mounted filesystem.
 
@@ -68,6 +68,6 @@ The full suite must pass there before deployment.
 
 ### 0.18.2 catalogue CONTROL publication fence
 
-The final catalogue-GC correction was audited separately from telemetry/status. Catalogue CONTROL publication is data-before-metadata, so a future root's immutable manifest/shards are temporarily absent from the current metadata live set. CONTROL GC now derives an additional age floor from the current catalogue-root observation epoch on each voter. This adds no RPC, distributed lock, metadata read, or foreground-path wait; it only makes the background local CONTROL sweep conservatively retain objects written after the currently observed root.
+The final catalogue-GC correction was audited separately from telemetry/status. Catalogue CONTROL publication is data-before-metadata, so a future root's immutable manifest/shards are temporarily absent from the current metadata live set. CONTROL GC now derives an additional age floor from the current catalogue-root observation epoch on each metadata replica. This adds no RPC, distributed lock, metadata read, or foreground-path wait; it only makes the background local CONTROL sweep conservatively retain objects written after the currently observed root.
 
 `src/catalogue.cpp` and the focused `test_catalogue_control_gc_protects_future_root_staging` source compile cleanly with `-std=c++20 -Wall -Wextra -Wpedantic -Werror` in the release container (using the existing test-only FFmpeg header stub). Full-suite execution remains a development-host gate because this container lacks yaml-cpp/FFmpeg/FUSE development packages.

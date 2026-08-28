@@ -270,6 +270,48 @@ CatalogueSnapshot decode_catalogue(std::span<const uint8_t> data) {
     return snapshot;
 }
 
+std::optional<CatalogueSnapshot> merge_catalogue_snapshots(
+    const CatalogueSnapshot& base, const CatalogueSnapshot& left,
+    const CatalogueSnapshot& right) {
+    std::set<std::string> ids;
+    for (const auto* source : {&base.items, &left.items, &right.items})
+        for (const auto& [id, _] : *source)
+            ids.insert(id);
+
+    auto find_item = [](const auto& items, const std::string& id)
+        -> std::optional<CatalogueItem> {
+        auto found = items.find(id);
+        if (found == items.end())
+            return {};
+        return found->second;
+    };
+
+    CatalogueSnapshot merged;
+    for (const auto& id : ids) {
+        const auto b = find_item(base.items, id);
+        const auto l = find_item(left.items, id);
+        const auto r = find_item(right.items, id);
+        std::optional<CatalogueItem> selected;
+        if (l == r)
+            selected = l;
+        else if (l == b)
+            selected = r;
+        else if (r == b)
+            selected = l;
+        else
+            return {};
+        if (selected)
+            merged.items.emplace(id, std::move(*selected));
+    }
+
+    // Avoid combining a parent deletion on one branch with a child creation or
+    // change on another branch. Keep the root conflict durable in that case.
+    for (const auto& [_, item] : merged.items)
+        if (item.parent_id && !merged.items.contains(*item.parent_id))
+            return {};
+    return merged;
+}
+
 std::string catalogue_kind_name(CatalogueKind kind) {
     switch (kind) {
     case CatalogueKind::movie: return "movie";
@@ -353,10 +395,8 @@ std::set<ObjectId> CatalogueManager::artwork_ids(const CatalogueSnapshot& snapsh
     return ids;
 }
 
-size_t CatalogueManager::durability_required(const MetadataSnapshot& metadata) {
-    if (metadata.metadata_voters.empty())
-        throw std::runtime_error("catalogue metadata voter set is empty");
-    return metadata.metadata_voters.size() / 2 + 1;
+size_t CatalogueManager::durability_required() const {
+    return node_.config().metadata_min_write_replicas;
 }
 
 CatalogueSnapshot CatalogueManager::load_root(const std::optional<ObjectId>& root) {
@@ -387,18 +427,22 @@ CatalogueSnapshot CatalogueManager::load_root(const std::optional<ObjectId>& roo
 
 bool CatalogueManager::converge_control_replicas(const MetadataSnapshot& metadata) {
     const auto root = metadata.catalogue_root;
+    std::vector<NodeId> active_nodes;
+    for (const auto& node : node_.membership().active())
+        active_nodes.push_back(node.id);
+    std::sort(active_nodes.begin(), active_nodes.end());
+
     if (!root) {
         std::lock_guard lock(mutex_);
         control_converged_root_.reset();
-        control_converged_voters_ = metadata.metadata_voters;
+        control_converged_nodes_ = std::move(active_nodes);
         control_convergence_retry_ = {};
         return true;
     }
 
     {
         std::lock_guard lock(mutex_);
-        if (control_converged_root_ == root &&
-            control_converged_voters_ == metadata.metadata_voters)
+        if (control_converged_root_ == root && control_converged_nodes_ == active_nodes)
             return true;
         if (Clock::now() < control_convergence_retry_)
             return false;
@@ -429,34 +473,32 @@ bool CatalogueManager::converge_control_replicas(const MetadataSnapshot& metadat
 
         bool complete = true;
         for (const auto& [id, encoded] : objects) {
-            if (store_.replicate_control(id, encoded, metadata.metadata_voters) <
-                metadata.metadata_voters.size())
+            if (store_.replicate_control(id, encoded) < active_nodes.size())
                 complete = false;
         }
 
         std::lock_guard lock(mutex_);
         if (complete) {
             control_converged_root_ = root;
-            control_converged_voters_ = metadata.metadata_voters;
+            control_converged_nodes_ = std::move(active_nodes);
             control_convergence_retry_ = {};
         } else {
-            // Publication only needs a metadata-voter majority. Missing/offline
-            // voters are convergence debt and must not invalidate a readable
-            // committed catalogue. Retry at a bounded cadence.
+            // Publication requires only metadata_min_write_replicas durable
+            // copies. Missing/offline replicas are convergence debt and do not
+            // invalidate an already-published catalogue root.
             control_converged_root_.reset();
-            control_converged_voters_.clear();
+            control_converged_nodes_.clear();
             control_convergence_retry_ = Clock::now() + std::chrono::seconds(5);
         }
         return complete;
     } catch (...) {
         std::lock_guard lock(mutex_);
         control_converged_root_.reset();
-        control_converged_voters_.clear();
+        control_converged_nodes_.clear();
         control_convergence_retry_ = Clock::now() + std::chrono::seconds(5);
         throw;
     }
 }
-
 void CatalogueManager::cache(uint64_t metadata_generation, const MetadataSnapshot& metadata,
                              CatalogueSnapshot snapshot) {
     auto cached = std::make_shared<const CatalogueSnapshot>(std::move(snapshot));
@@ -470,16 +512,38 @@ void CatalogueManager::cache(uint64_t metadata_generation, const MetadataSnapsho
     last_sync_unix_ms_ = unix_ms();
     if (root_changed) {
         control_gc_root_epoch_ = Clock::now();
+        ++control_gc_root_epoch_sequence_;
         control_gc_root_epoch_initialized_ = true;
     }
     ready_ = true;
     error_.clear();
 }
 
+bool CatalogueManager::reconcile_catalogue_conflict(const MetadataSnapshotView& view) {
+    for (const auto& [id, conflict] : view.snapshot->conflicts) {
+        if (conflict.kind != MetadataConflictKind::catalogue_root)
+            continue;
+
+        const auto base = load_root(conflict.base_catalogue_root);
+        const auto left = load_root(conflict.left_catalogue_root);
+        const auto right = load_root(conflict.right_catalogue_root);
+        auto merged = merge_catalogue_snapshots(base, left, right);
+        if (!merged)
+            return false;
+
+        commit(view.snapshot->catalogue_root, *merged, artwork_ids(base), {},
+               std::make_pair(id, conflict));
+        Log::info("catalogue branch conflict reconciled id=" + id +
+                  " items=" + std::to_string(merged->items.size()));
+        return true;
+    }
+    return false;
+}
+
 void CatalogueManager::repair_once() {
     // Catalogue refresh is single-flight. API workers can all observe the same
     // generation notice or TTL expiry at once; only one of them should perform
-    // metadata quorum I/O and fetch/decode a replacement immutable root.
+    // metadata replica I/O and fetch/decode a replacement immutable root.
     std::lock_guard refresh_lock(refresh_mutex_);
     try {
         {
@@ -487,15 +551,18 @@ void CatalogueManager::repair_once() {
             const auto now = Clock::now();
             if (ready_ && cached_metadata_generation_ >= node_.known_metadata_generation() &&
                 now < cache_until_ && control_converged_root_ == cached_root_) {
-                auto view = metadata_.available_snapshot_view();
-                if (view && control_converged_voters_ == view->snapshot->metadata_voters)
+                std::vector<NodeId> active_nodes;
+                for (const auto& node : node_.membership().active())
+                    active_nodes.push_back(node.id);
+                std::sort(active_nodes.begin(), active_nodes.end());
+                if (control_converged_nodes_ == active_nodes)
                     return;
             }
         }
 
-        // MetadataManager is the owner of authoritative/quorum metadata reads.
+        // MetadataManager is the owner of authoritative replicated metadata reads.
         // Catalogue convergence consumes the decoded immutable view it has
-        // already established instead of independently repeating the same quorum
+        // already established instead of independently repeating the same replica validation
         // read whenever the catalogue TTL expires or a generation notice arrives.
         // A genuinely cold CatalogueManager may bootstrap MetadataManager once;
         // after that this path is strictly memory-only.
@@ -509,11 +576,20 @@ void CatalogueManager::repair_once() {
 
         // If a newer generation is merely known but has not yet been acquired,
         // leave convergence to MetadataManager::repair_once(). Do not create a
-        // second quorum reader from CatalogueManager. refresh_needed() remains
+        // second replica-validating reader from CatalogueManager. refresh_needed() remains
         // true, so the catalogue will adopt the view immediately after metadata
         // maintenance publishes it.
         if (view->generation < node_.known_metadata_generation())
             return;
+
+        // Resolve at most one catalogue-root conflict per maintenance pass. A
+        // disjoint three-way item merge is automatic; any genuine same-item or
+        // parent/child collision remains a durable first-class conflict.
+        if (reconcile_catalogue_conflict(*view)) {
+            view = metadata_.available_snapshot_view();
+            if (!view)
+                return;
+        }
 
         const auto generation = view->generation;
         const auto& metadata = *view->snapshot;
@@ -553,7 +629,7 @@ std::shared_ptr<const CatalogueSnapshot> CatalogueManager::current_snapshot() {
         std::lock_guard lock(mutex_);
         // Warm reads are deliberately memory-only. Catalogue convergence is a
         // control-plane/background responsibility; an API GET must never block
-        // on metadata quorum I/O merely because a short validation TTL expired.
+        // on metadata replica I/O merely because a short validation TTL expired.
         if (ready_ && cached_)
             return cached_;
     }
@@ -659,10 +735,10 @@ std::vector<CatalogueItem> CatalogueManager::search(std::string_view query, size
     return out;
 }
 
-void CatalogueManager::commit(const std::optional<ObjectId>& expected_root,
-                              const CatalogueSnapshot& next,
-                              const std::set<ObjectId>& old_artwork,
-                              std::optional<Hash256> expected_namespace) {
+void CatalogueManager::commit(
+    const std::optional<ObjectId>& expected_root, const CatalogueSnapshot& next,
+    const std::set<ObjectId>& old_artwork, std::optional<Hash256> expected_namespace,
+    std::optional<std::pair<std::string, MetadataConflict>> resolved_conflict) {
     MetadataRecord metadata_record;
     try {
         metadata_record = metadata_.read_record();
@@ -676,7 +752,7 @@ void CatalogueManager::commit(const std::optional<ObjectId>& expected_root,
         metadata_namespace_signature(metadata_snapshot) != *expected_namespace)
         throw CatalogueConflict("namespace changed during catalogue reconciliation");
 
-    const auto required = durability_required(metadata_snapshot);
+    const auto required = durability_required();
     const auto new_artwork = artwork_ids(next);
 
     // Artwork is ordinary immutable DATA. Validate only newly introduced references;
@@ -718,33 +794,49 @@ void CatalogueManager::commit(const std::optional<ObjectId>& expected_root,
         return;
     }
 
-    // A catalogue metadata commit may reference a control object only after a
-    // majority of the configured metadata voters has durably stored it. Missing
-    // voters make the mutation fail; DATA capacity is irrelevant to this path.
+    // A catalogue metadata commit may reference a control object only after the
+    // configured metadata write floor has durably stored it. Every active node
+    // is eligible; DATA capacity is irrelevant to this control path.
     for (const auto& [id, encoded] : changed_control) {
-        if (store_.replicate_control(id, encoded, metadata_snapshot.metadata_voters) < required)
-            throw CatalogueUnavailable("catalogue shard could not reach metadata durability quorum");
+        if (store_.replicate_control(id, encoded) < required)
+            throw CatalogueUnavailable("catalogue shard could not reach metadata durability floor");
     }
-    if (store_.replicate_control(root, encoded_manifest, metadata_snapshot.metadata_voters) < required)
-        throw CatalogueUnavailable("catalogue manifest could not reach metadata durability quorum");
+    if (store_.replicate_control(root, encoded_manifest) < required)
+        throw CatalogueUnavailable("catalogue manifest could not reach metadata durability floor");
 
     try {
-        metadata_.mutate_delta([&](MetadataSnapshot& metadata, MetadataDelta& delta) {
-            if (metadata.catalogue_root != expected_root)
-                throw CatalogueConflict("catalogue changed concurrently");
-            if (expected_namespace &&
-                metadata_namespace_signature(metadata) != *expected_namespace)
-                throw CatalogueConflict("namespace changed during catalogue reconciliation");
-            metadata.catalogue_root = root;
-            delta.catalogue = CatalogueDelta::set;
-            delta.catalogue_root = root;
-            // Obsolete manifest/shard objects are reclaimed by the dedicated control
-            // store reachability sweep after the same grace period as DATA orphans.
-            for (const auto& id : old_artwork) {
-                if (!new_artwork.contains(id))
-                    record_garbage_upsert(delta, append_garbage(metadata, id));
-            }
-        });
+        if (resolved_conflict) {
+            metadata_.mutate([&](MetadataSnapshot& metadata) {
+                if (metadata.catalogue_root != expected_root)
+                    throw CatalogueConflict("catalogue changed concurrently");
+                if (expected_namespace &&
+                    metadata_namespace_signature(metadata) != *expected_namespace)
+                    throw CatalogueConflict("namespace changed during catalogue reconciliation");
+                auto found = metadata.conflicts.find(resolved_conflict->first);
+                if (found == metadata.conflicts.end() || found->second != resolved_conflict->second)
+                    throw CatalogueConflict("catalogue conflict changed concurrently");
+                metadata.catalogue_root = root;
+                metadata.conflicts.erase(found);
+                for (const auto& id : old_artwork)
+                    if (!new_artwork.contains(id))
+                        (void)append_garbage(metadata, id);
+            });
+        } else {
+            metadata_.mutate_delta([&](MetadataSnapshot& metadata, MetadataDelta& delta) {
+                if (metadata.catalogue_root != expected_root)
+                    throw CatalogueConflict("catalogue changed concurrently");
+                if (expected_namespace &&
+                    metadata_namespace_signature(metadata) != *expected_namespace)
+                    throw CatalogueConflict("namespace changed during catalogue reconciliation");
+                metadata.catalogue_root = root;
+                delta.catalogue = CatalogueDelta::set;
+                delta.catalogue_root = root;
+                for (const auto& id : old_artwork) {
+                    if (!new_artwork.contains(id))
+                        record_garbage_upsert(delta, append_garbage(metadata, id));
+                }
+            });
+        }
     } catch (const CatalogueConflict&) {
         throw;
     } catch (const std::exception& e) {
@@ -757,7 +849,7 @@ void CatalogueManager::commit(const std::optional<ObjectId>& expected_root,
     {
         std::lock_guard lock(mutex_);
         control_converged_root_.reset();
-        control_converged_voters_.clear();
+        control_converged_nodes_.clear();
         control_convergence_retry_ = {};
     }
     cache(committed_record.generation, committed_metadata, next);
@@ -859,7 +951,7 @@ bool CatalogueManager::definitely_absent(std::string_view id) const {
     // changes. If MetadataManager has already decoded the known generation and
     // its immutable catalogue root is unchanged, the cached catalogue is still
     // exactly current even though its bookkeeping generation is older. This is
-    // a memory-only proof and avoids a quorum repair for a definite 404.
+    // a memory-only proof and avoids a replica repair for a definite 404.
     if (auto available = metadata_.available_snapshot_view();
         available && available->generation >= known_generation &&
         available->snapshot->catalogue_root == cached_root)
@@ -1152,6 +1244,45 @@ std::optional<CatalogueArtworkContent> CatalogueManager::artwork(const ObjectId&
     return CatalogueArtworkContent{std::move(*mime_type), std::move(*bytes)};
 }
 
+
+CatalogueRetentionObjects CatalogueManager::retention_objects(
+    const std::optional<ObjectId>& old_root, const std::optional<ObjectId>& new_root) {
+    CatalogueRetentionObjects out;
+    if (!new_root)
+        return out;
+
+    if (!store_.ensure_control_local(*new_root))
+        throw CatalogueUnavailable("catalogue manifest unavailable for retention publication");
+    auto encoded_manifest = node_.control_store().get(*new_root);
+    if (!encoded_manifest)
+        throw CatalogueUnavailable("catalogue manifest unavailable locally for retention publication");
+    const auto manifest = decode_catalogue_manifest(*encoded_manifest);
+    out.control.push_back(*new_root);
+    for (const auto& shard : manifest.shards) {
+        if (!shard)
+            continue;
+        if (!store_.ensure_control_local(*shard))
+            throw CatalogueUnavailable("catalogue shard unavailable for retention publication: " +
+                                       to_string(*shard));
+        out.control.push_back(*shard);
+    }
+
+    const auto before = load_root(old_root);
+    const auto after = load_root(new_root);
+    for (const auto& [id, item] : after.items) {
+        const auto found = before.items.find(id);
+        if (found != before.items.end() && found->second == item)
+            continue;
+        for (const auto& artwork : item.artwork)
+            out.data.push_back(artwork.id);
+    }
+    std::sort(out.data.begin(), out.data.end());
+    out.data.erase(std::unique(out.data.begin(), out.data.end()), out.data.end());
+    std::sort(out.control.begin(), out.control.end());
+    out.control.erase(std::unique(out.control.begin(), out.control.end()), out.control.end());
+    return out;
+}
+
 CatalogueMaintenance CatalogueManager::maintenance_objects() {
     // Maintenance liveness must be based on converged catalogue metadata, not
     // the deliberately stale-tolerant API cache returned by current_snapshot().
@@ -1159,6 +1290,7 @@ CatalogueMaintenance CatalogueManager::maintenance_objects() {
     // live indefinitely after a remote catalogue mutation, preventing GC.
     CatalogueMaintenance out;
     std::optional<ObjectId> metadata_root;
+    std::set<ObjectId> metadata_roots;
     uint64_t metadata_generation = 0;
     bool metadata_current = false;
     try {
@@ -1171,11 +1303,12 @@ CatalogueMaintenance CatalogueManager::maintenance_objects() {
             metadata_generation = view->generation;
             metadata_current = view->generation >= node_.known_metadata_generation();
             metadata_root = view->snapshot->catalogue_root;
-            if (metadata_root) {
-                // The metadata reference itself is unconditionally live even if
-                // the immutable root cannot currently be fetched or decoded.
-                out.control_live.insert(*metadata_root);
-            }
+            metadata_roots = metadata_catalogue_root_set(*view->snapshot);
+            // A catalogue-root conflict keeps the effective catalogue at the
+            // common-ancestor value, but every alternative remains durable state
+            // until explicit resolution. Protect all immutable alternative roots
+            // (and, below, their manifests/shards/artwork) from reachability GC.
+            out.control_live.insert(metadata_roots.begin(), metadata_roots.end());
         }
     } catch (...) {
         metadata_current = false;
@@ -1209,16 +1342,52 @@ CatalogueMaintenance CatalogueManager::maintenance_objects() {
             repair_ok = false;
         }
     }
+    bool protected_roots_complete = true;
+    for (const auto& protected_root : metadata_roots) {
+        try {
+            if (!store_.ensure_control_local(protected_root)) {
+                protected_roots_complete = false;
+                continue;
+            }
+            auto encoded_manifest = node_.control_store().get(protected_root);
+            if (!encoded_manifest) {
+                protected_roots_complete = false;
+                continue;
+            }
+            const auto manifest = decode_catalogue_manifest(*encoded_manifest);
+            for (const auto& shard_id : manifest.shards) {
+                if (!shard_id)
+                    continue;
+                out.control_live.insert(*shard_id);
+                if (!store_.ensure_control_local(*shard_id)) {
+                    protected_roots_complete = false;
+                    continue;
+                }
+                auto encoded_shard = node_.control_store().get(*shard_id);
+                if (!encoded_shard) {
+                    protected_roots_complete = false;
+                    continue;
+                }
+                const auto shard = decode_catalogue(*encoded_shard);
+                for (const auto& id : artwork_ids(shard))
+                    out.live.insert(id);
+            }
+        } catch (...) {
+            protected_roots_complete = false;
+        }
+    }
+
     {
         std::lock_guard lock(mutex_);
         const bool root_converged = cached_root_ == metadata_root &&
                                     cached_metadata_generation_ >= metadata_generation;
-        out.complete = metadata_current && repair_ok && root_converged;
+        out.complete = metadata_current && repair_ok && root_converged &&
+                       protected_roots_complete;
     }
-    if (!cached)
-        return out;
-    for (const auto& id : artwork_ids(*cached))
-        out.live.insert(id);
+    if (cached) {
+        for (const auto& id : artwork_ids(*cached))
+            out.live.insert(id);
+    }
     return out;
 }
 
@@ -1228,37 +1397,70 @@ size_t CatalogueManager::control_gc_step(const std::vector<ObjectId>& live,
     if (!operation_budget) return 0;
 
     // Catalogue publication is intentionally data-before-metadata: immutable
-    // manifest/shard objects must already be durable on the metadata voters
-    // before the catalogue-root CAS may reference them.  Consequently a future
+    // manifest/shard objects must already satisfy the metadata write floor
+    // before an accepted metadata commit may reference them. Consequently a future
     // root's CONTROL objects are temporarily unreachable from the *current*
-    // metadata root.  Protect every object written since this process first
-    // observed the current root.  Once a successor root is observed, its objects
-    // are in `live` and the previous epoch's failed/orphan staging can be swept.
-    // This works identically on remote voters receiving put_control_object RPCs
-    // and requires no publication RPC, lock, or foreground-path coordination.
+    // metadata root. Time alone is not a sufficient fence: the root may advance
+    // between staging and a maintenance pass whose live set still reflects the
+    // previous root. Give every unreferenced object an explicit catalogue-root
+    // epoch. It must survive the epoch in which GC first observes it (or in which
+    // it is re-affirmed); only a later root epoch can make it an ordinary orphan.
     Clock::time_point root_epoch;
+    uint64_t root_epoch_sequence = 0;
     {
         std::lock_guard lock(mutex_);
         if (!control_gc_root_epoch_initialized_)
             return 0;
         root_epoch = control_gc_root_epoch_;
+        root_epoch_sequence = control_gc_root_epoch_sequence_;
     }
     const auto since_root = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - root_epoch);
-    // +1ms makes equality safe for packed objects whose durable touch timestamp
-    // is millisecond-granular: an object staged in the same millisecond as the
-    // root observation is still considered newer than that root.
-    const auto publication_grace = since_root + std::chrono::milliseconds(1);
-    const auto effective_grace = std::max(grace, publication_grace);
+    const auto staged_since_root = since_root + std::chrono::milliseconds(1);
 
     size_t removed = 0;
     bool exhausted = false;
     for (size_t operations = 0; operations < operation_budget && !exhausted; ++operations) {
         auto id = node_.control_store().next_object(control_gc_cursor_, exhausted);
         if (!id) continue;
-        if (std::binary_search(live.begin(), live.end(), *id)) continue;
-        if (node_.control_store().remove_if_older_than(*id, effective_grace))
-            ++removed;
+
+        if (std::binary_search(live.begin(), live.end(), *id)) {
+            std::lock_guard lock(mutex_);
+            control_gc_unreferenced_epoch_.erase(*id);
+            continue;
+        }
+
+        // A content-addressed object may have existed for several catalogue
+        // generations and then been re-used by the current publication. LocalStore
+        // touches an existing object on put(), so preserve any object whose durable
+        // age shows that it was staged/re-affirmed after this root was observed.
+        if (!node_.control_store().older_than(*id, staged_since_root)) {
+            std::lock_guard lock(mutex_);
+            if (control_gc_root_epoch_sequence_ != root_epoch_sequence)
+                continue;
+            control_gc_unreferenced_epoch_[*id] = root_epoch_sequence;
+            continue;
+        }
+
+        {
+            std::lock_guard lock(mutex_);
+            if (control_gc_root_epoch_sequence_ != root_epoch_sequence)
+                continue;
+            auto [seen, inserted] =
+                control_gc_unreferenced_epoch_.emplace(*id, root_epoch_sequence);
+            if (inserted || seen->second == root_epoch_sequence)
+                continue;
+
+            // Keep the root epoch stable across the local removal. cache() takes
+            // the same mutex when publishing a newly observed root, so stale-live
+            // GC can never race a root transition and delete that root's staging.
+            if (node_.retention_store().retained(RetentionClass::control, *id))
+                continue;
+            if (node_.control_store().remove_if_older_than(*id, grace)) {
+                control_gc_unreferenced_epoch_.erase(seen);
+                ++removed;
+            }
+        }
     }
     if (exhausted && removed)
         (void)node_.control_store().compact_packs();

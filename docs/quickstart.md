@@ -57,7 +57,7 @@ network:
 
 dht:
   replicas: 1
-  metadata_replicas: 2
+  metadata_min_write_replicas: 2
   min_write_replicas: 1
   extent_size: 4M
 
@@ -110,7 +110,7 @@ network:
 
 dht:
   replicas: 1
-  metadata_replicas: 2
+  metadata_min_write_replicas: 2
   min_write_replicas: 1
   extent_size: 4M
 
@@ -142,6 +142,6 @@ sudo ./build/macha --config demo/node1.yaml
 sudo ./build/macha --config demo/node2.yaml
 ```
 
-With `replicas: 1`, the 2 GiB node does not cap the 8 GiB node. DATA objects have one desired authoritative owner and may fall through to the other node when their preferred owner cannot admit them. Metadata has two voters, so both nodes are required for metadata majority in this two-node demonstration.
+With `replicas: 1`, the 2 GiB node does not cap the 8 GiB node. DATA objects have one desired authoritative owner and may fall through to the other node when their preferred owner cannot admit them. With `metadata_min_write_replicas: 2`, both nodes are required for metadata publication in this two-node demonstration; in a larger cluster any two active replicas can satisfy the same floor.
 
 For a production cluster, choose replica/failure-domain policy according to the failures you intend to survive; do not infer production durability from this R=1 example.

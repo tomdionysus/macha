@@ -4,7 +4,7 @@
 
 Macha may publish a logical reference only after the storage class responsible for that reference has satisfied its durability contract.
 
-For DATA, the foreground contract is `dht.min_write_replicas` durable authoritative copies. For namespace/control metadata, the contract is metadata-voter majority durability.
+For DATA, the foreground contract is `dht.min_write_replicas` durable authoritative copies. For namespace/control metadata, the contract is `dht.metadata_min_write_replicas` distinct durable metadata copies on active nodes.
 
 Cache never counts.
 
@@ -52,20 +52,22 @@ A full or offline preferred owner does not weaken the floor; it changes which el
 
 ## Namespace metadata
 
-Namespace metadata is an encrypted CAS history over an explicit metadata-voter set. A successor record is committed only with voter-majority evidence for the expected predecessor/generation. Ordinary mutation uses deterministic deltas; checkpoints/full records are recovery material.
+Every node is metadata-capable. A metadata commit is publishable after the exact immutable commit has been durably stored on at least `dht.metadata_min_write_replicas` distinct active nodes and its acceptance certificate has been durably retained. A receiver stores the commit independently of its current head; disconnected cohorts may therefore preserve different accepted successors of the same ancestor. Ordinary linear commits may use compact deterministic deltas in the history store, while full records remain valid recovery material.
 
-Metadata mutations therefore have a different quorum from DATA publication. `dht.replicas` does not define metadata quorum.
+This is a durability floor rather than majority consensus. It deliberately allows arbitrary surviving cohorts of the configured floor size to continue. Consequently disconnected cohorts can produce divergent valid histories. 0.19 preserves those histories and refuses destructive convergence; automatic DAG reconciliation and first-class conflict records are the follow-on layer.
+
+Metadata durability is independent of DATA `dht.replicas` and `dht.min_write_replicas`.
 
 ## Catalogue control durability
 
 Catalogue manifest/shard objects are CONTROL. Before namespace metadata can point at a new catalogue manifest:
 
 1. newly referenced artwork DATA must be readable through the normal DATA store;
-2. changed catalogue shards must be durable on a metadata-voter majority;
-3. the successor manifest must be durable on a metadata-voter majority;
-4. namespace metadata CAS publishes the new manifest root.
+2. changed catalogue shards must be durable on at least `metadata_min_write_replicas` active nodes;
+3. the successor manifest must be durable on at least `metadata_min_write_replicas` active nodes;
+4. namespace metadata acceptance publishes the new manifest root.
 
-After publication, maintenance converges the current manifest/shards to all current metadata voters. A voter joining or returning with missing control objects fetches them from another voter. This convergence does not make artwork universal.
+After publication, maintenance converges the current manifest/shards to all active metadata replicas. A joining or returning node with missing control objects fetches them from another replica. This convergence does not make artwork universal.
 
 Transient metadata/control unavailability causes catalogue scanner work to defer. It does not consume the hint's provider/content failure attempts.
 
@@ -116,12 +118,12 @@ For packed objects, deletion is a logical tombstone and dead physical bytes are 
 | Before local FUSE admission is durable | operation was not acknowledged |
 | Durable FUSE spool/journal, no DATA placement | replay from local durable intent |
 | Some provisional DATA placements, no required barriers | replay/deduplicate; metadata must not reference them |
-| DATA barriers complete, metadata CAS not committed | durable unreferenced DATA; replay can reuse it |
+| DATA barriers complete, metadata commit not accepted | durable unreferenced DATA; replay can reuse it |
 | Metadata committed, local FUSE completion not recorded | replay observes committed state and completes idempotently |
 | Pack tail torn | truncate to last valid committed pack record |
 | Pack compaction after replacement install but before old deletion | replacement is live; old packs are duplicate reclaimable bytes |
 | DATA accounting dirty | reconcile physical store and establish a new trusted baseline |
-| Catalogue control object missing from one voter | fetch/converge from another voter without invalidating committed root |
+| Catalogue control object missing from one replica | fetch/converge from another replica without invalidating committed root |
 | Cache missing/corrupt | discard/rebuild cache |
 | GC unlink lost | unreachable garbage remains for a later sweep |
 

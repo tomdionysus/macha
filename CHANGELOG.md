@@ -1,5 +1,27 @@
 # Current release
 
+## 0.19.0 — metadata replica availability (development)
+
+- Replace fixed metadata-voter placement with all-node metadata replication. Every active node is eligible to durably store namespace and catalogue-control metadata.
+- Add `dht.metadata_min_write_replicas`: the literal number of distinct active metadata replicas which must durably store an immutable commit before it may be accepted. Legacy `dht.metadata_replicas` remains a migration-only alias and maps its old voter count to the equivalent former majority write floor.
+- Replace the live metadata CAS/PREPARE/COMMIT state machine with immutable commit storage plus durable acceptance certificates. A replica stores a valid commit without comparing it to its current head; acceptance records the distinct durable store witnesses and survives their later absence.
+- Persist a maximal accepted-head set on each replica. Independent partition branches coexist instead of competing for a single current slot; accepted ancestors fall out of the head set only when a descendant/merge commit supersedes them.
+- Add protocol-20 `put_metadata_commit`, `accept_metadata_commit`, and accepted-head discovery RPCs; reject the legacy network CAS/PREPARE/COMMIT RPC family so live code cannot accidentally re-enter the old consensus model.
+- Add encrypted compact metadata ancestry/history, exchange it between arbitrary replicas, collapse stale ancestor heads, and reconcile divergent accepted heads through deterministic two-parent merge commits. N simultaneous heads converge by repeated deterministic DAG merges rather than winner selection.
+- Merge non-conflicting namespace changes automatically and preserve incompatible namespace/catalogue-root alternatives as durable first-class conflict records instead of silently choosing a winner.
+- Invalidate metadata caches on an independent peer-observation epoch so same-generation sibling heads are discovered promptly; numeric generation alone is no longer a complete freshness signal.
+- Let any active replica initiate virgin-cluster genesis. All virgin founders construct the same deterministic generation-2 root and publish it through the ordinary commit-store/acceptance path; there is no genesis coordinator, voter or PREPARE arbitration. Bootstrap-configured joiners remain fenced until their peer survey completes.
+- Publish catalogue CONTROL objects against the same any-node metadata write floor and converge them opportunistically to active replicas.
+- Fence catalogue CONTROL GC by catalogue-root epoch as well as object age: data-before-metadata staging survives the root epoch in which it is first observed/re-affirmed and cannot be reclaimed by a stale maintenance live-set during root publication.
+- Replace metadata voter/quorum status with replica/write-floor fields while retaining deprecated 0.18 JSON aliases for client compatibility.
+- Keep non-destructive DATA repair running from an accepted local branch while metadata reconciliation/validation is pending.
+- Separate write availability from convergence validation: a reachable `metadata_min_write_replicas` cohort remains writable while reconciliation is pending, with validation reported independently as stability telemetry.
+- Add durable causal DATA/CONTROL retention claims on physical copies. Metadata publication re-affirms referenced immutable objects before acceptance; local/remote deletion, placement eviction and GC refuse to remove a claimed copy. Missing claimed copies are repaired in bounded background slices even when the claiming branch is absent from the node's current namespace view.
+- Keep GC useful during partitions: unclaimed staging/extra copies remain reclaimable, while inherited claims are released only after every currently known metadata replica is online and the accepted-head set is validated coherent. This prevents one partition from erasing an ancestor object still required by another accepted branch.
+- Keep the 0.18 on-disk storage layout readable; bump the peer protocol to 20 because the metadata publication contract is intentionally incompatible with protocol 18/19.
+- Fix protocol-20 compact metadata deltas so ordinary mutations retain SM12/SM13 write-floor and retention-governance state, persist completed retention baselines even with an empty migration roster, and preserve mutation-sequence counters across restart.
+- Keep legacy accepted-head certificates readable during upgrade while preventing a protocol-20 branch from downgrading to legacy authority, and route background maintenance through the same virgin-cluster policy fencing as foreground discovery.
+
 ## 0.18.2 — cluster status telemetry
 
 - Add optional UPnP IGD public port mapping, AWS external-IP fallback, boot/manual public endpoint self-probing, runtime advertised endpoint updates, and Status API diagnostics.

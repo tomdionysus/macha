@@ -19,7 +19,7 @@
 
 namespace macha {
 namespace {
-constexpr uint16_t protocol_version = 18;
+constexpr uint16_t protocol_version = 20;
 constexpr uint32_t frame_magic = 0x4d433133; // "MC13"
 constexpr size_t protocol_min_frame_size = 4 * 1024;
 constexpr size_t protocol_max_frame_size = 4 * 1024 * 1024;
@@ -318,11 +318,19 @@ bool is_priority_data_message(MessageType type) {
     case MessageType::get_control_object:
     case MessageType::put_control_object:
     case MessageType::get_metadata_identity:
+    case MessageType::get_metadata_history_entry:
+    case MessageType::has_metadata_history_entry:
+    case MessageType::put_metadata_history_entry:
+    case MessageType::get_metadata_heads:
+    case MessageType::put_metadata_commit:
+    case MessageType::accept_metadata_commit:
     case MessageType::bool_reply:
     case MessageType::metadata_reply:
     case MessageType::cas_reply:
     case MessageType::control_object_reply:
     case MessageType::metadata_identity_reply:
+    case MessageType::metadata_history_entry_reply:
+    case MessageType::metadata_heads_reply:
     case MessageType::telemetry:
     case MessageType::telemetry_reply:
         return true;
@@ -488,6 +496,13 @@ const char* message_type_name(MessageType type) noexcept {
     case MessageType::get_metadata_identity: return "get_metadata_identity";
     case MessageType::telemetry: return "telemetry";
     case MessageType::identity_resets: return "identity_resets";
+    case MessageType::get_metadata_history_entry: return "get_metadata_history_entry";
+    case MessageType::has_metadata_history_entry: return "has_metadata_history_entry";
+    case MessageType::put_metadata_history_entry: return "put_metadata_history_entry";
+    case MessageType::get_metadata_heads: return "get_metadata_heads";
+    case MessageType::put_metadata_commit: return "put_metadata_commit";
+    case MessageType::accept_metadata_commit: return "accept_metadata_commit";
+    case MessageType::retain_objects: return "retain_objects";
     case MessageType::ok: return "ok";
     case MessageType::error: return "error";
     case MessageType::members_reply: return "members_reply";
@@ -499,6 +514,8 @@ const char* message_type_name(MessageType type) noexcept {
     case MessageType::metadata_identity_reply: return "metadata_identity_reply";
     case MessageType::telemetry_reply: return "telemetry_reply";
     case MessageType::identity_resets_reply: return "identity_resets_reply";
+    case MessageType::metadata_history_entry_reply: return "metadata_history_entry_reply";
+    case MessageType::metadata_heads_reply: return "metadata_heads_reply";
     }
     return "unknown";
 }
