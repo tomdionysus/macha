@@ -40,7 +40,13 @@ class RetentionStore {
 
     using StateMap = std::map<ObjectId, ObjectState>;
 
-    std::filesystem::path checkpoint_path_;
+    // claims.meta is the protocol-20 legacy monolithic checkpoint. New
+    // checkpoints are generation directories selected by claims.current and
+    // split by the first SHA-256 byte, so no checkpoint read/write is O(total
+    // retained objects) in temporary buffer size.
+    std::filesystem::path legacy_checkpoint_path_;
+    std::filesystem::path checkpoint_root_;
+    std::filesystem::path checkpoint_manifest_path_;
     std::filesystem::path journal_path_;
     std::array<uint8_t, 32> key_{};
     mutable std::mutex mutex_;
@@ -48,17 +54,25 @@ class RetentionStore {
     StateMap control_;
     std::optional<ObjectId> data_release_after_;
     std::optional<ObjectId> control_release_after_;
+    std::optional<ObjectId> data_prune_after_;
+    std::optional<ObjectId> control_prune_after_;
     size_t journal_records_{};
+    uint64_t journal_bytes_{};
 
     StateMap& state_for(RetentionClass);
     const StateMap& state_for(RetentionClass) const;
     std::optional<ObjectId>& cursor_for(RetentionClass);
+    std::optional<ObjectId>& prune_cursor_for(RetentionClass);
     void apply_add_locked(RetentionClass, const RetentionDot&, const std::vector<ObjectId>&);
     size_t apply_release_locked(RetentionClass, const RetentionClock&,
                                 const std::vector<ObjectId>&);
     void append_frame_locked(std::span<const uint8_t>);
-    Bytes encode_checkpoint_locked() const;
-    void decode_checkpoint_locked(std::span<const uint8_t>);
+    Bytes encode_checkpoint_shard_locked(uint8_t shard) const;
+    void decode_checkpoint_shard_locked(uint8_t shard, std::span<const uint8_t>);
+    void decode_legacy_checkpoint_locked(std::span<const uint8_t>);
+    void load_checkpoint_generation_locked();
+    void load_journal_locked();
+    void cleanup_checkpoint_generations_locked(std::string_view keep) const;
     void load();
 
   public:
@@ -79,16 +93,14 @@ class RetentionStore {
 
     size_t claim_objects(RetentionClass) const;
 
-    // Compact the append journal into one encrypted durable snapshot. This is
-    // intended for background maintenance, never the foreground publication
-    // critical path. Replaying an old journal after a crash between snapshot
-    // replacement and truncation is idempotent.
+    // Compact the append journal into an atomically-selected generation of 256
+    // bounded encrypted shards. The journal is also compacted on a byte ceiling,
+    // not only by record count, so recovery never has to absorb an unbounded WAL.
     bool compact_if_needed(size_t record_threshold = 4096);
 
     // Forget causality tombstones only when no claim remains and the physical
-    // object is absent. A delayed ADD RPC is then rejected by the object-presence
-    // check; if the same content is genuinely introduced later it receives a
-    // new mutation dot. Returns the number of state entries pruned.
+    // object is absent. Traversal is cursor-based so a small operation budget
+    // cannot starve entries later in the ordered map indefinitely.
     size_t prune_unclaimed(RetentionClass, const std::function<bool(const ObjectId&)>& exists,
                            size_t operation_budget);
 };

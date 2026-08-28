@@ -116,6 +116,20 @@ struct FuseConfig {
     std::chrono::milliseconds publication_quiet{5000};
     size_t max_pending_operations{4096};
 
+    // Aggregate local write-back admission. Queue counts alone do not bound a
+    // hot inode: one pending publication can otherwise accumulate arbitrary
+    // spool bytes. Preserve a physical free-space floor independently of the
+    // logical byte ceiling.
+    uint64_t max_spool_bytes{16ULL * 1024 * 1024 * 1024};
+    uint64_t spool_reserve_free{2ULL * 1024 * 1024 * 1024};
+    // Crash-recovery forensic tails are useful, but never authoritative. Keep
+    // their aggregate disk usage bounded and discard oldest evidence first.
+    uint64_t max_orphan_bytes{1024ULL * 1024 * 1024};
+    // New durable operation admissions stop at this WAL size. Already-admitted
+    // operations may append their completion records so the queue can drain to
+    // zero and trigger the existing atomic journal reset.
+    uint64_t max_operation_journal_bytes{256ULL * 1024 * 1024};
+
     // FUSE demand is emitted into the existing hydration scheduler.
     uint32_t hydration_priority{2000};
     size_t read_ahead_extents{2};

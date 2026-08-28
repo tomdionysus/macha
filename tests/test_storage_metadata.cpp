@@ -90,6 +90,89 @@ MACHA_FAST_TEST("storage_metadata", test_retention_claims_are_causal_durable_and
     }
 }
 
+MACHA_FAST_TEST("storage_metadata", test_retention_prune_cursor_cannot_starve_later_tombstones) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    RetentionStore retention(t.path() / "state", keys.storage);
+    const auto origin = random_node_id();
+
+    std::array<ObjectId, 5> objects{};
+    for (size_t i = 0; i < objects.size(); ++i)
+        objects[i].bytes.back() = static_cast<uint8_t>(i + 1);
+
+    for (const auto& id : objects)
+        retention.retain(RetentionClass::data, id, {origin, 1});
+    CHECK(retention.release_unreferenced(
+              RetentionClass::data, {}, RetentionClock{{origin, 1}}, 32) == objects.size());
+
+    // The first two tombstones are still backed by physical objects. A fixed
+    // budget must nevertheless make forward progress to the later dead rows,
+    // rather than restarting at map.begin() forever.
+    auto exists = [&](const ObjectId& id) {
+        return id == objects[0] || id == objects[1];
+    };
+    CHECK(retention.prune_unclaimed(RetentionClass::data, exists, 2) == 0);
+    CHECK(retention.prune_unclaimed(RetentionClass::data, exists, 2) == 2);
+
+    // A pruned causal tombstone no longer suppresses an ancient replay. This is
+    // a useful externally visible probe that the later row was actually erased.
+    retention.retain(RetentionClass::data, objects[2], {origin, 1});
+    CHECK(retention.retained(RetentionClass::data, objects[2]));
+
+    // The protected leading row was examined but retained, so its remove clock
+    // must still suppress the same old dot.
+    retention.retain(RetentionClass::data, objects[0], {origin, 1});
+    CHECK(!retention.retained(RetentionClass::data, objects[0]));
+}
+
+MACHA_FAST_TEST("storage_metadata", test_retention_checkpoint_is_hash_sharded_and_restartable) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto state = t.path() / "state";
+    const auto origin = random_node_id();
+    std::vector<ObjectId> objects;
+    objects.reserve(512);
+    for (uint16_t shard = 0; shard < 256; ++shard) {
+        for (uint16_t suffix = 0; suffix < 2; ++suffix) {
+            ObjectId id{};
+            id.bytes[0] = static_cast<uint8_t>(shard);
+            id.bytes[30] = static_cast<uint8_t>(suffix);
+            id.bytes[31] = static_cast<uint8_t>(255 - shard);
+            objects.push_back(id);
+        }
+    }
+
+    {
+        RetentionStore retention(state, keys.storage);
+        retention.retain_batch(RetentionClass::data, objects, {origin, 7});
+        REQUIRE(retention.compact_if_needed(1));
+    }
+
+    const auto manifest = state / "retention" / "claims.current";
+    REQUIRE(std::filesystem::exists(manifest));
+    CHECK(!std::filesystem::exists(state / "retention" / "claims.meta"));
+    CHECK(std::filesystem::file_size(state / "retention" / "claims.log") == 0);
+
+    std::ifstream in(manifest);
+    std::string generation;
+    std::getline(in, generation);
+    REQUIRE(!generation.empty());
+    const auto generation_path = state / "retention" / "checkpoints" / generation;
+    size_t shards = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(generation_path))
+        if (entry.is_regular_file())
+            ++shards;
+    CHECK(shards == 256);
+
+    RetentionStore reopened(state, keys.storage);
+    for (const auto& id : objects)
+        CHECK(reopened.retained(RetentionClass::data, id));
+}
+
 MACHA_FAST_TEST("storage_metadata", test_retention_claim_is_physical_gc_barrier) {
     TempDir t;
     auto keyfile = t.path() / "key";
@@ -486,6 +569,23 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
     auto certificate = reopened.acceptance(reconciliation.hash);
     REQUIRE(certificate.has_value());
     CHECK(*certificate == merge_accept);
+
+    // A globally-converged owner may establish a new local ancestry floor. The
+    // sole accepted committed head remains fully reconstructable, while obsolete
+    // branch history no longer consumes disk or restart RSS indefinitely.
+    const auto history_path = path / "metadata" / "history.log";
+    const auto history_before = std::filesystem::file_size(history_path);
+    REQUIRE(reopened.compact_history_if_safe(1, 1));
+    const auto history_after = std::filesystem::file_size(history_path);
+    CHECK(history_after < history_before);
+    CHECK(!reopened.historical(left.hash).has_value());
+    CHECK(!reopened.historical(right.hash).has_value());
+    REQUIRE(reopened.historical(reconciliation.hash).has_value());
+
+    MetadataReplica rerooted(path, keys.storage);
+    CHECK(!rerooted.historical(left.hash).has_value());
+    REQUIRE(rerooted.historical(reconciliation.hash).has_value());
+    CHECK(rerooted.historical(reconciliation.hash)->payload == reconciliation.payload);
 }
 
 MACHA_FAST_TEST("storage_metadata", test_metadata_recovery_cache_seed_is_not_accepted_authority) {

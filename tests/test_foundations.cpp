@@ -165,6 +165,52 @@ MACHA_FAST_TEST("foundations", test_membership_identity_reset_tombstone) {
     CHECK(!membership.apply_identity_reset(reset2));
 }
 
+MACHA_FAST_TEST("foundations", test_membership_persists_gc_fence_and_requires_direct_reachability) {
+    TempDir t;
+    const auto roster = t.path() / "membership" / "known-nodes.bin";
+
+    NodeInfo self;
+    self.id = random_node_id();
+    self.host = "127.0.0.1";
+    self.port = 57401;
+
+    NodeInfo peer;
+    peer.id = random_node_id();
+    peer.host = "127.0.0.2";
+    peer.port = 57402;
+    peer.seen_unix_ms = unix_ms();
+
+    {
+        Membership membership(self, 40ms, roster);
+        CHECK(membership.all_known_reachable());
+
+        // Gossip may teach us that a node exists, but it is deliberately not
+        // proof that the node is reachable for destructive GC.
+        membership.observe(peer, false);
+        REQUIRE(membership.all().size() == 2);
+        CHECK(!membership.all_known_reachable());
+
+        membership.observe(peer, true);
+        CHECK(membership.all_known_reachable());
+        REQUIRE(std::filesystem::exists(roster));
+    }
+
+    // A recovering isolated node must remember the peer before it has had a
+    // chance to rediscover the cluster. Persisted members therefore restart as
+    // GC fences until this process directly authenticates them again.
+    {
+        Membership recovered(self, 40ms, roster);
+        REQUIRE(recovered.all().size() == 2);
+        CHECK(!recovered.all_known_reachable());
+
+        peer.seen_unix_ms = unix_ms();
+        recovered.observe(peer, true);
+        CHECK(recovered.all_known_reachable());
+        std::this_thread::sleep_for(60ms);
+        CHECK(!recovered.all_known_reachable());
+    }
+}
+
 MACHA_FAST_TEST("foundations", test_telemetry_identity_reset_freshness_boundary) {
     const auto self = random_node_id();
     TelemetryStore store(self);
@@ -409,14 +455,22 @@ MACHA_TEST("foundations", test_thread_cpu_reporter_debug_escalation) {
     });
     CHECK(high != records.end());
 
-    std::this_thread::sleep_for(50ms);
-    reporter.tick();
-    records = capture->records();
-    const auto recovered = std::find_if(records.begin(), records.end(), [](const auto& record) {
-        return record.first == LogLevel::debug &&
-               record.second.find("DIAG thread CPU recovered name=macha-test-hot") != std::string::npos;
-    });
-    CHECK(recovered != records.end());
+    // The final high-CPU reporting interval can contain a short unreported
+    // busy tail before the sleep starts. Give the reporter more than one idle
+    // interval so the assertion does not depend on exactly where that final
+    // sampling boundary landed.
+    bool recovered = false;
+    for (int attempt = 0; attempt < 4 && !recovered; ++attempt) {
+        std::this_thread::sleep_for(35ms);
+        reporter.tick();
+        records = capture->records();
+        recovered = std::any_of(records.begin(), records.end(), [](const auto& record) {
+            return record.first == LogLevel::debug &&
+                   record.second.find("DIAG thread CPU recovered name=macha-test-hot") !=
+                       std::string::npos;
+        });
+    }
+    CHECK(recovered);
 
     Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
 }
