@@ -45,9 +45,6 @@
 #include <mutex>
 #include <netinet/in.h>
 #include <openssl/crypto.h>
-extern "C" {
-#include <libavutil/log.h>
-}
 #include <random>
 #include <set>
 #include <sstream>

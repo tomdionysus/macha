@@ -7,7 +7,7 @@ Macha is intentionally small. Prefer a direct fix over another layer.
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMACHA_WARNINGS_AS_ERRORS=ON
 cmake --build build -j
-ctest --test-dir build --output-on-failure
+./run-tests.sh build
 ```
 
 Changes to cluster, metadata, storage, crypto, transport or MachaDFS semantics need a regression or fault-injection test. Do not weaken quorum safety, object integrity, crash durability or foreground I/O behaviour to simplify an error path.
@@ -24,7 +24,7 @@ Changes to cluster, metadata, storage, crypto, transport or MachaDFS semantics n
 
 ## Dependencies
 
-The core dependency set is C++20, OpenSSL, yaml-cpp, libcurl and the FFmpeg/libavformat, libavcodec, libavutil, libswscale and libswresample development libraries. FUSE3/macFUSE is the mount dependency. libtorrent-rasterbar >= 2.0 enables the optional integrated BitTorrent acquisition component; generic filesystem ingest remains available without it. The FFmpeg command-line tools are not invoked by Macha. Boost is not otherwise required by Macha.
+The dependency-light core/test set is C++20, OpenSSL and libcurl. Building the server and runtime-adapter tests additionally requires yaml-cpp and the FFmpeg/libavformat, libavcodec, libavutil, libswscale and libswresample development libraries. FUSE3/macFUSE is the mount dependency. libtorrent-rasterbar >= 2.0 enables the optional integrated BitTorrent acquisition component; generic filesystem ingest remains available without it. The FFmpeg command-line tools are not invoked by Macha. Boost is not otherwise required by Macha.
 
 ## Security
 

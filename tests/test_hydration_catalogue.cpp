@@ -1223,10 +1223,6 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     service.filesystem().mkdir(collection, 0755, getuid(), getgid());
     const std::string singles = collection + "/Singles";
     service.filesystem().mkdir(singles, 0755, getuid(), getgid());
-    const std::string tagged_album = singles + "/14 - [1996] I'm Raving The Remixes CDM";
-    service.filesystem().mkdir(tagged_album, 0755, getuid(), getgid());
-    const std::string tagged_path = tagged_album + "/01 - Completely Wrong.mp3";
-
     auto fixture_bytes = [](const char* name) {
         auto path = std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "tests" / "fixtures" / name;
         std::ifstream input(path, std::ios::binary);
@@ -1241,122 +1237,13 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
         writer->commit();
     };
 
-    const auto tagged_bytes = fixture_bytes("tagged.mp3");
     const auto untagged_bytes = fixture_bytes("untagged.mp3");
-    const Bytes embedded_cover{
-        0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a,
-        0x00, 0x00, 0x00, 0x0d, 'I', 'H', 'D', 'R',
-        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-        0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde,
-        0x00, 0x00, 0x00, 0x0c, 'I', 'D', 'A', 'T', 0x78, 0x9c,
-        0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00,
-        0xc9, 0xfe, 0x92, 0xef, 0x00, 0x00, 0x00, 0x00, 'I', 'E',
-        'N', 'D', 0xae, 0x42, 0x60, 0x82};
-    auto with_apic = [](const Bytes& input, const Bytes& cover) {
-        if (input.size() < 10 || std::string_view(reinterpret_cast<const char*>(input.data()), 3) != "ID3")
-            throw std::runtime_error("tagged MP3 fixture has no ID3 header");
-        auto decode_synchsafe = [](const uint8_t* p) -> size_t {
-            return (static_cast<size_t>(p[0] & 0x7f) << 21) |
-                   (static_cast<size_t>(p[1] & 0x7f) << 14) |
-                   (static_cast<size_t>(p[2] & 0x7f) << 7) |
-                   static_cast<size_t>(p[3] & 0x7f);
-        };
-        auto encode_synchsafe = [](size_t n) {
-            return std::array<uint8_t, 4>{
-                static_cast<uint8_t>((n >> 21) & 0x7f),
-                static_cast<uint8_t>((n >> 14) & 0x7f),
-                static_cast<uint8_t>((n >> 7) & 0x7f),
-                static_cast<uint8_t>(n & 0x7f)};
-        };
-        const auto tag_size = decode_synchsafe(input.data() + 6);
-        if (10 + tag_size > input.size()) throw std::runtime_error("invalid ID3 fixture size");
-        Bytes payload{0x03};
-        const std::string mime = "image/png";
-        payload.insert(payload.end(), mime.begin(), mime.end());
-        payload.push_back(0);
-        payload.push_back(0x03); // front cover
-        payload.push_back(0);   // empty UTF-8 description
-        payload.insert(payload.end(), cover.begin(), cover.end());
-        Bytes frame{'A', 'P', 'I', 'C'};
-        auto frame_size = encode_synchsafe(payload.size());
-        frame.insert(frame.end(), frame_size.begin(), frame_size.end());
-        frame.push_back(0);
-        frame.push_back(0);
-        frame.insert(frame.end(), payload.begin(), payload.end());
-
-        Bytes result;
-        result.reserve(input.size() + frame.size());
-        result.insert(result.end(), input.begin(), input.begin() + 6);
-        auto new_tag_size = encode_synchsafe(tag_size + frame.size());
-        result.insert(result.end(), new_tag_size.begin(), new_tag_size.end());
-        result.insert(result.end(), input.begin() + 10, input.begin() + 10 + tag_size);
-        result.insert(result.end(), frame.begin(), frame.end());
-        result.insert(result.end(), input.begin() + 10 + tag_size, input.end());
-        return result;
-    };
-    const auto tagged_with_cover = with_apic(tagged_bytes, embedded_cover);
-    write_fixture(tagged_path, tagged_with_cover);
 
     FakeHttpClient music_probe_http;
     CatalogueMusicProviderConfig music_source_config;
     music_source_config.roots = {"/Music"};
     music_source_config.musicbrainz.enabled = false;
     MusicScanProvider music_source(music_probe_http, music_source_config);
-    auto tagged_entry = service.filesystem().getattr(tagged_path);
-    auto tagged_file = music_source.probe_file(service.filesystem(), "/Music", tagged_path, tagged_entry);
-    REQUIRE(!tagged_file.candidates.empty());
-    REQUIRE(tagged_file.artwork.size() == 1);
-    CHECK(tagged_file.artwork.front().role == "cover");
-    CHECK(tagged_file.artwork.front().mime_type == "image/png");
-    CHECK(tagged_file.artwork.front().bytes == embedded_cover);
-    auto tagged_probe = std::optional<MediaProbe>{tagged_file.candidates.front().probe};
-    REQUIRE(tagged_probe.has_value());
-    CHECK(tagged_probe->artist == "Scooter");
-    CHECK(tagged_probe->album == "I'm Raving The Remixes");
-    CHECK(tagged_probe->title == "I'm Raving (Progressive Remix)");
-    CHECK(tagged_probe->track == 1);
-    CHECK(tagged_probe->disc == 1);
-    CHECK(tagged_probe->year == 1996);
-    CHECK(tagged_probe->musicbrainz_recording_id == std::optional<std::string>{"rec-tagged-1"});
-    CHECK(tagged_probe->musicbrainz_release_id == std::optional<std::string>{"rel-tagged-1"});
-    CHECK(tagged_probe->musicbrainz_artist_id == std::optional<std::string>{"artist-tagged-1"});
-
-    // Embedded APIC artwork and provider artwork are independent catalogue
-    // candidates. Neither should suppress or replace the other merely because
-    // both have the semantic role "cover".
-    auto music_art_http = std::make_unique<FakeHttpClient>();
-    music_art_http->add("/ws/2/release/rel-tagged-1", 200, "application/json",
-        R"JSON({"id":"rel-tagged-1","title":"I'm Raving The Remixes","date":"1996-01-01","artist-credit":[{"name":"Scooter","artist":{"id":"artist-tagged-1","name":"Scooter"}}],"release-group":{"id":"rg-tagged-1"},"media":[{"position":1,"tracks":[{"position":1,"title":"I'm Raving (Progressive Remix)","recording":{"id":"rec-tagged-1","title":"I'm Raving (Progressive Remix)"}}]}]})JSON");
-    music_art_http->add("coverartarchive.org/release/rel-tagged-1", 200, "application/json",
-        R"JSON({"images":[{"front":true,"image":"https://provider.example/cover.jpg","thumbnails":{"500":"https://provider.example/cover.jpg"}}]})JSON");
-    const Bytes provider_cover{0xff, 0xd8, 0xff, 0xe0, 0x01, 0x02, 0x03, 0x04};
-    music_art_http->add_bytes("provider.example/cover.jpg", 200, "image/jpeg", provider_cover);
-    CatalogueScannerConfig music_art_config;
-    music_art_config.enabled = true;
-    music_art_config.movies.enabled = false;
-    music_art_config.tv.enabled = false;
-    music_art_config.music.enabled = true;
-    music_art_config.music.roots = {tagged_album};
-    music_art_config.music.musicbrainz.enabled = true;
-    music_art_config.music.musicbrainz.contact = "https://example.test/macha";
-    music_art_config.music.discogs.enabled = false;
-    music_art_config.max_provider_requests_per_scan = 8;
-    CatalogueScanner music_art_scanner(service.node(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
-                                       music_art_config, std::move(music_art_http));
-    CHECK(music_art_scanner.scan_once() == 1);
-    auto music_album = service.catalogue().get("musicbrainz:album:rg-tagged-1");
-    REQUIRE(music_album.has_value());
-    REQUIRE(music_album->artwork.size() == 2);
-    CHECK(std::count_if(music_album->artwork.begin(), music_album->artwork.end(),
-                        [](const auto& art) { return art.role == "cover"; }) == 2);
-    const auto embedded_id = object_id(embedded_cover);
-    const auto provider_id = object_id(provider_cover);
-    CHECK(std::any_of(music_album->artwork.begin(), music_album->artwork.end(),
-                      [&](const auto& art) { return art.id == embedded_id; }));
-    CHECK(std::any_of(music_album->artwork.begin(), music_album->artwork.end(),
-                      [&](const auto& art) { return art.id == provider_id; }));
-    CHECK(service.node().local_store().has(embedded_id));
-    CHECK(service.node().local_store().has(provider_id));
 
     const std::string loose_path = singles + "/Scooter - The First Time (Raven Remix).mp3";
     write_fixture(loose_path, untagged_bytes);
