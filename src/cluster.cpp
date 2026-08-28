@@ -150,7 +150,7 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys)
       retention_(cfg_.state_path, keys_.storage),
       meta_(cfg_.state_path, keys_.storage, cache_.metadata()),
       members_(self_info(cfg_, id_, local_.used(), local_.limit(), meta_.committed().generation),
-               cfg_.dead_after),
+               cfg_.dead_after, cfg_.state_path / "membership" / "known-nodes.bin"),
       public_connectivity_(cfg_, id_,
                            Endpoint{members_.self().host, members_.self().port}),
       telemetry_(id_, cfg_.state_path / "telemetry" / "last-known.bin"),

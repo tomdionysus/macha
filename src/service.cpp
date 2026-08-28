@@ -480,11 +480,10 @@ void Service::loop(std::stop_token stop) {
                           now - last_garbage_inventory >= background_interval);
             const bool gc_due = !busy && now >= gc_quiescent_until;
 
-            // Physical GC is safe during partitions because object liveness is
-            // carried by durable causal retention claims on the physical nodes
-            // which hold the objects. Reachability remains useful for deciding
-            // which observed claims can be released, but global branch discovery
-            // is no longer a prerequisite for local reclamation.
+            // Destructive maintenance is deliberately opportunistic: degraded
+            // clusters retain garbage. Reclamation is enabled only after every
+            // durably-known node has been directly reached by this process and
+            // metadata repair has validated/converged that complete replica set.
 
             // Reachability GC, repair and explicit tombstone accounting share
             // one immutable namespace inventory. Rebuild it only when one of
@@ -620,8 +619,12 @@ void Service::loop(std::stop_token stop) {
                     }
                 }
 
+                const bool cluster_gc_healthy = node_.membership().all_known_reachable();
+                const bool cluster_gc_stable =
+                    cluster_gc_healthy && metadata_.cluster_status().stable;
+
                 bool garbage_metadata_changed = false;
-                if (garbage_due && maintenance_catalogue_complete_) {
+                if (garbage_due && cluster_gc_stable && maintenance_catalogue_complete_) {
                     auto matured = collect_garbage(maintenance_garbage_);
                     std::vector<GarbageRef> legacy;
                     for (const auto& candidate : maintenance_garbage_) {
@@ -646,7 +649,8 @@ void Service::loop(std::stop_token stop) {
                 // before the next maintenance pass observes the successor generation.
                 const auto current_metadata_view = metadata_.available_snapshot_view();
                 const bool destructive_gc_enabled =
-                    current_metadata_view && current_metadata_view->snapshot->retention_baseline_complete;
+                    cluster_gc_stable && current_metadata_view &&
+                    current_metadata_view->snapshot->retention_baseline_complete;
 
                 // Retention release is local and causal. A sole accepted head
                 // provides a complete live-object set plus the mutation clock of
@@ -694,8 +698,9 @@ void Service::loop(std::stop_token stop) {
                 if (gc_due && destructive_gc_enabled && maintenance_catalogue_complete_ &&
                     maintenance_control_live_ &&
                     maintenance_inventory_generation_ >= node_.known_metadata_generation()) {
-                    // Release locally-observed dead claims even during a partition.
-                    // Concurrent/unseen claims survive observed-remove causality.
+                    // Destructive retention release is fenced by direct reachability of
+                    // every durably-known node. A partition may continue to accumulate
+                    // causal tombstones/claims, but it cannot reclaim authoritative bytes.
                     if (retention_release_complete_ && retention_release_control_live_) {
                         (void)node_.retention_store().release_unreferenced(
                             RetentionClass::control, *retention_release_control_live_,
@@ -804,6 +809,21 @@ void Service::loop(std::stop_token stop) {
             // cost. Snapshot-before-truncate makes interruption idempotent.
             if (!busy)
                 (void)node_.retention_store().compact_if_needed(4096);
+
+            // Metadata ancestry is required while a known node may still return
+            // with an unseen branch. Once the complete durable roster is directly
+            // reachable and repair reports convergence, re-root that history so
+            // lifetime metadata mutation count does not become lifetime disk/RSS.
+            if (!busy && node_.membership().all_known_reachable() &&
+                metadata_.cluster_status().stable)
+                (void)node_.metadata_replica().compact_history_if_safe();
+
+            // Packed DATA tombstones are physical dead space. Compact one
+            // victim pack per backend at a time; unlike the old whole-store
+            // rewrite this has a fixed temporary-space envelope and therefore
+            // remains viable on multi-terabyte backends.
+            if (!busy)
+                (void)node_.local_store().compact_packs();
 
             if (!busy && scrub_due &&
                 scrub_credit >= node_.config().extent_size) {

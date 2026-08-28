@@ -215,6 +215,10 @@ void parse_fuse(const YAML::Node& root, Config& c) {
     if (f["foreground_commit_workers"]) c.fuse.foreground_commit_workers = f["foreground_commit_workers"].as<size_t>();
     if (f["publication_quiet_ms"]) c.fuse.publication_quiet = milliseconds(f["publication_quiet_ms"], "fuse.publication_quiet_ms");
     if (f["max_pending_operations"]) c.fuse.max_pending_operations = f["max_pending_operations"].as<size_t>();
+    if (f["max_spool_bytes"]) c.fuse.max_spool_bytes = yaml_size(f["max_spool_bytes"]);
+    if (f["spool_reserve_free"]) c.fuse.spool_reserve_free = yaml_size(f["spool_reserve_free"]);
+    if (f["max_orphan_bytes"]) c.fuse.max_orphan_bytes = yaml_size(f["max_orphan_bytes"]);
+    if (f["max_operation_journal_bytes"]) c.fuse.max_operation_journal_bytes = yaml_size(f["max_operation_journal_bytes"]);
     if (f["hydration_priority"]) c.fuse.hydration_priority = f["hydration_priority"].as<uint32_t>();
     if (f["read_ahead_extents"]) c.fuse.read_ahead_extents = f["read_ahead_extents"].as<size_t>();
     if (f["hint_lifetime_ms"]) c.fuse.hint_lifetime = milliseconds(f["hint_lifetime_ms"], "fuse.hint_lifetime_ms");

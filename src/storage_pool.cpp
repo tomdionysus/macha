@@ -908,6 +908,32 @@ uint64_t StoragePool::rebalance_once(uint64_t budget_bytes) {
     }
 }
 
+size_t StoragePool::compact_packs() {
+    size_t visited = 0;
+    for (const auto& backend : snapshot()) {
+        std::shared_ptr<LocalStore> store;
+        std::filesystem::path path;
+        {
+            std::lock_guard lock(backend->mutex);
+            if (!backend->online || !backend->store)
+                continue;
+            store = backend->store;
+            path = backend->cfg.path;
+        }
+        try {
+            (void)store->compact_packs();
+            ++visited;
+        } catch (const std::exception& error) {
+            // Compaction failure must not make authoritative bytes disappear.
+            // Keep the backend online and retry later; reads still use the old
+            // durable representation unless a replacement was already installed.
+            Log::warn("DATA pack compaction deferred path=" + path.string() +
+                      " error=" + error.what());
+        }
+    }
+    return visited;
+}
+
 uint64_t StoragePool::used() const {
     uint64_t total = 0;
     for (const auto& backend : snapshot()) {

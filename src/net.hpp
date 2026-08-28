@@ -118,6 +118,33 @@ struct WireFragment {
     Bytes payload;
 };
 
+// Stateful fragment reassembly has aggregate limits in addition to the wire's
+// per-message limit. Keeping this as a small transport primitive also makes the
+// adversarial accounting invariant directly testable without opening sockets.
+class MessageAssembler {
+    struct Partial {
+        FrameType frame_type{FrameType::control};
+        MessageType message_type{MessageType::error};
+        Bytes payload;
+    };
+
+    std::map<uint64_t, Partial> partial_;
+    size_t partial_bytes_{};
+    size_t max_partial_messages_;
+    size_t max_partial_bytes_;
+    size_t max_message_bytes_;
+
+  public:
+    explicit MessageAssembler(size_t max_partial_messages = 64,
+                              size_t max_partial_bytes = 256ULL * 1024 * 1024,
+                              size_t max_message_bytes = 128ULL * 1024 * 1024);
+    void promote(uint64_t request_id, FrameType);
+    void discard(uint64_t request_id);
+    std::optional<RpcFrame> push(WireFragment);
+    size_t incomplete_messages() const noexcept { return partial_.size(); }
+    size_t incomplete_bytes() const noexcept { return partial_bytes_; }
+};
+
 class SecureChannel {
     int fd_{-1};
     ClusterKeys keys_;

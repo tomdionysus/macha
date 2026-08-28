@@ -267,11 +267,14 @@ class MetadataReplica {
     uint64_t mutation_sequence_{};
     size_t journal_records_{};
     uint64_t journal_bytes_{};
+    size_t history_records_{};
+    uint64_t history_bytes_{};
     bool recovery_required_{};
     void persist(const std::filesystem::path&, const MetadataRecord&);
     std::optional<MetadataRecord> load(const std::filesystem::path&) const;
     void append_journal(uint8_t, const MetadataRecord&, std::span<const uint8_t> = {});
     void load_journal();
+    Bytes encode_history_frame(const MetadataHistoryEntry&) const;
     void append_history(const MetadataHistoryEntry&);
     void load_history();
     void load_heads();
@@ -323,6 +326,12 @@ class MetadataReplica {
     std::optional<Hash256> history_common_ancestor(const Hash256&, const Hash256&) const;
     std::optional<MetadataRecord> historical(const Hash256&) const;
     void compact();
+    // Once every durably-known node is directly reachable and metadata repair
+    // has converged the cluster, old ancestry is no longer needed to reconcile
+    // an unseen branch. Re-root history at the sole committed accepted head so
+    // disk and startup RSS do not grow with lifetime mutation count.
+    bool compact_history_if_safe(size_t record_threshold = 256,
+                                 uint64_t byte_threshold = 64ULL * 1024 * 1024);
 };
 std::string normalize_path(const std::string&);
 std::string parent_path(const std::string&);

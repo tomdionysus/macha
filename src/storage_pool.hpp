@@ -128,6 +128,11 @@ class StoragePool {
     // is never enumerated in one scheduler tick.
     uint64_t rebalance_once(uint64_t budget_bytes = 0);
 
+    // Reclaim dead records from packed authoritative DATA incrementally. Each
+    // LocalStore invocation rewrites at most one pack, so temporary disk demand
+    // is bounded by a pack rather than by the backend's complete live corpus.
+    size_t compact_packs();
+
     uint64_t used() const;
     uint64_t limit() const;
     size_t online_backends() const;

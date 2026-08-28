@@ -1965,10 +1965,7 @@ void MetadataReplica::load_journal() {
     }
 }
 
-void MetadataReplica::append_history(const MetadataHistoryEntry& entry_value) {
-    if (history_.contains(entry_value.hash))
-        return;
-
+Bytes MetadataReplica::encode_history_frame(const MetadataHistoryEntry& entry_value) const {
     auto plaintext = encode_metadata_history_entry(entry_value);
     auto sealed = aes_gcm_seal(key_, plaintext, MH);
     Writer envelope;
@@ -1982,8 +1979,14 @@ void MetadataReplica::append_history(const MetadataHistoryEntry& entry_value) {
     Writer frame;
     frame.u32(static_cast<uint32_t>(payload.size()));
     frame.raw(payload);
-    auto bytes = frame.take();
+    return frame.take();
+}
 
+void MetadataReplica::append_history(const MetadataHistoryEntry& entry_value) {
+    if (history_.contains(entry_value.hash))
+        return;
+
+    auto bytes = encode_history_frame(entry_value);
     int fd = open(history_p_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (fd < 0)
         throw std::runtime_error("cannot open metadata history " + history_p_.string() + ": " +
@@ -2011,36 +2014,55 @@ void MetadataReplica::append_history(const MetadataHistoryEntry& entry_value) {
         throw std::runtime_error("cannot close metadata history " + history_p_.string() + ": " +
                                  strerror(errno));
     history_.emplace(entry_value.hash, entry_value);
+    ++history_records_;
+    history_bytes_ += bytes.size();
 }
 
 void MetadataReplica::load_history() {
+    constexpr uint64_t max_record = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+    constexpr uint64_t max_quarantine_tail = 16ULL * 1024ULL * 1024ULL;
     history_.clear();
+    history_records_ = 0;
+    history_bytes_ = 0;
     if (!std::filesystem::exists(history_p_))
         return;
 
+    const uint64_t file_size = std::filesystem::file_size(history_p_);
     std::ifstream stream(history_p_, std::ios::binary);
     if (!stream)
         throw std::runtime_error("cannot open metadata history " + history_p_.string());
-    Bytes bytes(std::istreambuf_iterator<char>(stream), {});
-    auto input = std::span<const uint8_t>(bytes);
-    size_t offset = 0;
-    size_t valid = 0;
+    uint64_t offset = 0;
+    uint64_t valid = 0;
     std::string trailing_problem;
 
-    while (offset + 4 <= bytes.size()) {
-        Reader header(input.subspan(offset, 4));
-        const auto length = header.u32();
+    // Recovery is deliberately streaming: history can span many namespace
+    // generations, so startup RSS is bounded by one history frame rather than
+    // the lifetime size of history.log.
+    while (offset + 4 <= file_size) {
+        std::array<uint8_t, 4> header_bytes{};
+        if (!stream.read(reinterpret_cast<char*>(header_bytes.data()), header_bytes.size())) {
+            trailing_problem = "incomplete trailing frame header";
+            break;
+        }
+        Reader header(header_bytes);
+        const auto length = static_cast<uint64_t>(header.u32());
         header.finish();
-        if (length > 2U * 1024U * 1024U * 1024U)
+        if (length > max_record)
             throw std::runtime_error("metadata history " + history_p_.string() +
                                      " offset=" + std::to_string(offset) + ": record too large");
-        if (offset + 4ULL + length > bytes.size()) {
+        if (offset > std::numeric_limits<uint64_t>::max() - 4 - length ||
+            offset + 4 + length > file_size) {
             trailing_problem = "incomplete trailing frame";
             break;
         }
 
-        const bool final_frame = offset + 4ULL + length == bytes.size();
-        auto frame = input.subspan(offset + 4, length);
+        Bytes frame(static_cast<size_t>(length));
+        if (length && !stream.read(reinterpret_cast<char*>(frame.data()),
+                                   static_cast<std::streamsize>(length))) {
+            trailing_problem = "incomplete trailing frame";
+            break;
+        }
+        const bool final_frame = offset + 4 + length == file_size;
         try {
             Reader envelope(frame);
             auto nonce = envelope.fixed<12>();
@@ -2067,19 +2089,31 @@ void MetadataReplica::load_history() {
 
         offset += 4 + length;
         valid = offset;
+        ++history_records_;
     }
 
-    if (valid != bytes.size()) {
+    if (valid != file_size) {
         if (trailing_problem.empty())
             trailing_problem = "trailing bytes after last complete frame";
-        auto tail = input.subspan(valid);
-        const auto quarantine = quarantine_journal_tail(history_p_, tail);
-        truncate_durable(history_p_, valid);
+        const uint64_t tail_size = file_size - valid;
+        std::string quarantine = "<discarded: over quarantine limit>";
+        if (tail_size <= max_quarantine_tail) {
+            stream.clear();
+            stream.seekg(static_cast<std::streamoff>(valid), std::ios::beg);
+            Bytes tail(static_cast<size_t>(tail_size));
+            if (tail_size && !stream.read(reinterpret_cast<char*>(tail.data()),
+                                          static_cast<std::streamsize>(tail_size)))
+                throw std::runtime_error("cannot read corrupt metadata history tail");
+            quarantine = quarantine_journal_tail(history_p_, tail).string();
+        }
+        stream.close();
+        truncate_durable(history_p_, static_cast<size_t>(valid));
         Log::warn("metadata history recovered path=" + history_p_.string() +
                   " offset=" + std::to_string(valid) +
-                  " discarded_bytes=" + std::to_string(tail.size()) +
-                  " quarantine=" + quarantine.string() + " reason=" + trailing_problem);
+                  " discarded_bytes=" + std::to_string(tail_size) +
+                  " quarantine=" + quarantine + " reason=" + trailing_problem);
     }
+    history_bytes_ = valid;
 }
 
 void MetadataReplica::load_heads() {
@@ -2990,6 +3024,41 @@ bool MetadataReplica::remember_current_committed(uint64_t generation, const Hash
 void MetadataReplica::compact() {
     std::lock_guard lock(m_);
     compact_if_needed();
+}
+
+bool MetadataReplica::compact_history_if_safe(size_t record_threshold,
+                                              uint64_t byte_threshold) {
+    std::lock_guard lock(m_);
+    if ((history_records_ < record_threshold && history_bytes_ < byte_threshold) ||
+        cur_.generation != committed_.generation || cur_.hash != committed_.hash ||
+        pending_history_ || accepted_heads_.size() != 1 ||
+        !accepted_heads_.contains(committed_.hash))
+        return false;
+
+    // Re-root the sole converged accepted head as a full entry. Its predecessor
+    // and merge-parent hashes remain part of the immutable record/snapshot, but
+    // previous_known=false establishes a deliberate local ancestry floor: an old
+    // branch is no longer reconstructable from this node after the cluster has
+    // proven that every known participant has converged beyond it.
+    MetadataHistoryEntry root;
+    root.generation = committed_.generation;
+    root.previous = committed_.previous;
+    root.hash = committed_.hash;
+    root.previous_known = false;
+    root.merge_parents = decode_snapshot(committed_.payload).merge_parents;
+    root.body = MetadataHistoryEntry::Body::full;
+    root.payload.assign(committed_.payload.begin(), committed_.payload.end());
+
+    auto frame = encode_history_frame(root);
+    durable_replace_file(
+        history_p_,
+        std::string_view(reinterpret_cast<const char*>(frame.data()), frame.size()));
+
+    history_.clear();
+    history_.emplace(root.hash, std::move(root));
+    history_records_ = 1;
+    history_bytes_ = frame.size();
+    return true;
 }
 
 void MetadataReplica::persist(const std::filesystem::path& path, const MetadataRecord& record) {

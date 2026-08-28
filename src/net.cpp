@@ -23,7 +23,6 @@ constexpr uint16_t protocol_version = 20;
 constexpr uint32_t frame_magic = 0x4d433133; // "MC13"
 constexpr size_t protocol_min_frame_size = 4 * 1024;
 constexpr size_t protocol_max_frame_size = 4 * 1024 * 1024;
-constexpr size_t max_message_size = 128 * 1024 * 1024;
 // Fast health/membership RPCs must never queue behind storage-backed control
 // handlers such as metadata checkpointing.
 constexpr size_t fast_control_worker_count = 2;
@@ -381,69 +380,81 @@ uint64_t transfer_target(const RpcMessage& message) {
     return id;
 }
 
-struct MessageAssembler {
-    struct Partial {
-        FrameType frame_type{FrameType::control};
-        MessageType message_type{MessageType::error};
-        Bytes payload;
-    };
 
-    std::map<uint64_t, Partial> partial;
-
-    void promote(uint64_t request_id, FrameType type) {
-        auto found = partial.find(request_id);
-        if (found != partial.end())
-            found->second.frame_type = more_urgent(type, found->second.frame_type);
-    }
-
-    void discard(uint64_t request_id) {
-        partial.erase(request_id);
-    }
-
-    std::optional<RpcFrame> push(WireFragment fragment) {
-        if (fragment.request_id == 0) {
-            if (!fragment.first || !fragment.last)
-                throw std::runtime_error("notification must fit one frame");
-            return RpcFrame{0, fragment.frame_type,
-                            {fragment.message_type, std::move(fragment.payload)}};
-        }
-
-        auto found = partial.find(fragment.request_id);
-        if (fragment.first) {
-            if (found != partial.end())
-                throw std::runtime_error("duplicate first fragment");
-            Partial item;
-            item.frame_type = fragment.frame_type;
-            item.message_type = fragment.message_type;
-            found = partial.emplace(fragment.request_id, std::move(item)).first;
-        } else if (found == partial.end()) {
-            throw std::runtime_error("continuation without first fragment");
-        }
-
-        if (found->second.message_type != fragment.message_type)
-            throw std::runtime_error("message type changed during transfer");
-        if (frame_type_priority(fragment.frame_type) >
-            frame_type_priority(found->second.frame_type)) {
-            throw std::runtime_error("frame type was demoted during transfer");
-        }
-        found->second.frame_type = more_urgent(fragment.frame_type, found->second.frame_type);
-        if (found->second.payload.size() + fragment.payload.size() > max_message_size)
-            throw std::runtime_error("RPC message too large");
-        found->second.payload.insert(found->second.payload.end(), fragment.payload.begin(),
-                                     fragment.payload.end());
-
-        if (!fragment.last)
-            return {};
-
-        RpcFrame complete{fragment.request_id,
-                          found->second.frame_type,
-                          {found->second.message_type, std::move(found->second.payload)}};
-        partial.erase(found);
-        return complete;
-    }
-};
 
 } // namespace
+
+MessageAssembler::MessageAssembler(size_t max_partial_messages, size_t max_partial_bytes,
+                                   size_t max_message_bytes)
+    : max_partial_messages_(max_partial_messages), max_partial_bytes_(max_partial_bytes),
+      max_message_bytes_(max_message_bytes) {
+    if (!max_partial_messages_ || !max_partial_bytes_ || !max_message_bytes_)
+        throw std::invalid_argument("RPC reassembly limits must be non-zero");
+}
+
+void MessageAssembler::promote(uint64_t request_id, FrameType type) {
+    auto found = partial_.find(request_id);
+    if (found != partial_.end())
+        found->second.frame_type = more_urgent(type, found->second.frame_type);
+}
+
+void MessageAssembler::discard(uint64_t request_id) {
+    auto found = partial_.find(request_id);
+    if (found == partial_.end())
+        return;
+    partial_bytes_ -= found->second.payload.size();
+    partial_.erase(found);
+}
+
+std::optional<RpcFrame> MessageAssembler::push(WireFragment fragment) {
+    if (fragment.request_id == 0) {
+        if (!fragment.first || !fragment.last)
+            throw std::runtime_error("notification must fit one frame");
+        return RpcFrame{0, fragment.frame_type,
+                        {fragment.message_type, std::move(fragment.payload)}};
+    }
+
+    auto found = partial_.find(fragment.request_id);
+    if (fragment.first) {
+        if (found != partial_.end())
+            throw std::runtime_error("duplicate first fragment");
+        if (partial_.size() >= max_partial_messages_)
+            throw std::runtime_error("too many incomplete RPC messages");
+        Partial item;
+        item.frame_type = fragment.frame_type;
+        item.message_type = fragment.message_type;
+        found = partial_.emplace(fragment.request_id, std::move(item)).first;
+    } else if (found == partial_.end()) {
+        throw std::runtime_error("continuation without first fragment");
+    }
+
+    if (found->second.message_type != fragment.message_type)
+        throw std::runtime_error("message type changed during transfer");
+    if (frame_type_priority(fragment.frame_type) >
+        frame_type_priority(found->second.frame_type)) {
+        throw std::runtime_error("frame type was demoted during transfer");
+    }
+    found->second.frame_type = more_urgent(fragment.frame_type, found->second.frame_type);
+    if (found->second.payload.size() > max_message_bytes_ ||
+        fragment.payload.size() > max_message_bytes_ - found->second.payload.size())
+        throw std::runtime_error("RPC message too large");
+    if (partial_bytes_ > max_partial_bytes_ ||
+        fragment.payload.size() > max_partial_bytes_ - partial_bytes_)
+        throw std::runtime_error("incomplete RPC reassembly budget exceeded");
+    found->second.payload.insert(found->second.payload.end(), fragment.payload.begin(),
+                                 fragment.payload.end());
+    partial_bytes_ += fragment.payload.size();
+
+    if (!fragment.last)
+        return {};
+
+    partial_bytes_ -= found->second.payload.size();
+    RpcFrame complete{fragment.request_id,
+                      found->second.frame_type,
+                      {found->second.message_type, std::move(found->second.payload)}};
+    partial_.erase(found);
+    return complete;
+}
 
 const char* transport_lane_name(TransportLane lane) noexcept {
     switch (lane) {
@@ -1054,6 +1065,11 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
 
     void cancel_inbound(uint64_t request_id) {
         DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
+        // Unknown cancellation IDs are untrusted wire input, not state. Only a
+        // request which is actually registered inbound may create a cancellation
+        // tombstone; this bounds the set by real in-flight work.
+        if (!inbound_classes_.contains(request_id))
+            return;
         cancelled_inbound_.insert(request_id);
         inbound_classes_.erase(request_id);
         std::erase_if(outbound_, [&](const Outbound& item) {

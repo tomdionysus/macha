@@ -420,6 +420,10 @@ struct FuseFrontend::State {
     std::exception_ptr durability_error;
     std::atomic_uint64_t durability_batches{};
     std::atomic_uint64_t durability_writes{};
+    // Aggregate authoritative bytes currently held in inode-*.spool files.
+    // This is reserved before pwrite and released only after successful spool
+    // retirement, so concurrent hot inodes cannot bypass the configured cap.
+    std::atomic_uint64_t spool_bytes{};
 
     mutable std::mutex namespace_mutex;
     std::map<std::string, std::shared_ptr<Inode>, std::less<>> paths;
@@ -484,6 +488,92 @@ struct FuseFrontend::State {
     ~State() {
         if (journal_fd >= 0)
             ::close(journal_fd);
+    }
+
+    void reserve_spool_bytes(uint64_t bytes) {
+        if (!bytes)
+            return;
+        std::filesystem::create_directories(spool_dir);
+        std::error_code space_error;
+        const auto space = std::filesystem::space(spool_dir, space_error);
+        if (space_error)
+            throw FsError(EIO, "cannot inspect FUSE spool free space");
+        if (bytes > space.available ||
+            config.spool_reserve_free > space.available - bytes)
+            throw FsError(ENOSPC, "FUSE spool physical reserve reached");
+
+        auto current = spool_bytes.load(std::memory_order_relaxed);
+        for (;;) {
+            if (current > config.max_spool_bytes ||
+                bytes > config.max_spool_bytes - current)
+                throw FsError(ENOSPC, "FUSE spool byte limit reached");
+            if (spool_bytes.compare_exchange_weak(current, current + bytes,
+                                                  std::memory_order_acq_rel,
+                                                  std::memory_order_relaxed))
+                return;
+        }
+    }
+
+    void release_spool_bytes(uint64_t bytes) {
+        if (!bytes)
+            return;
+        const auto before = spool_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
+        if (before < bytes) {
+            spool_bytes.store(0, std::memory_order_release);
+            Log::error("FUSE spool accounting underflow");
+        }
+    }
+
+    struct OrphanFile {
+        std::filesystem::path path;
+        uint64_t size{};
+        std::filesystem::file_time_type time{};
+    };
+
+    uint64_t make_orphan_room(uint64_t incoming) {
+        std::filesystem::create_directories(spool_dir);
+        std::vector<OrphanFile> orphans;
+        uint64_t total = 0;
+        std::error_code error;
+        for (const auto& entry : std::filesystem::directory_iterator(spool_dir, error)) {
+            if (error)
+                throw FsError(EIO, "cannot enumerate FUSE orphan spool files");
+            if (!entry.is_regular_file())
+                continue;
+            const auto name = entry.path().filename().string();
+            if (name.find(".orphan.") == std::string::npos)
+                continue;
+            std::error_code size_error;
+            const auto size = entry.file_size(size_error);
+            if (size_error)
+                continue;
+            std::error_code time_error;
+            const auto time = entry.last_write_time(time_error);
+            const auto safe_time = time_error ? std::filesystem::file_time_type::min() : time;
+            orphans.push_back({entry.path(), size, safe_time});
+            total = size > std::numeric_limits<uint64_t>::max() - total
+                        ? std::numeric_limits<uint64_t>::max()
+                        : total + size;
+        }
+        std::sort(orphans.begin(), orphans.end(), [](const OrphanFile& a, const OrphanFile& b) {
+            if (a.time != b.time)
+                return a.time < b.time;
+            return a.path.string() < b.path.string();
+        });
+        bool changed = false;
+        for (const auto& orphan : orphans) {
+            if (incoming <= config.max_orphan_bytes &&
+                total <= config.max_orphan_bytes - incoming)
+                break;
+            std::error_code remove_error;
+            if (std::filesystem::remove(orphan.path, remove_error) && !remove_error) {
+                total = orphan.size > total ? 0 : total - orphan.size;
+                changed = true;
+            }
+        }
+        if (changed)
+            sync_directory(spool_dir);
+        return total;
     }
 
     static constexpr std::array<uint8_t, 8> journal_magic{
@@ -638,7 +728,8 @@ struct FuseFrontend::State {
         journal_poisoned = false;
     }
 
-    void append_journal_records_locked(const std::vector<Bytes>& payloads) {
+    void append_journal_records_locked(const std::vector<Bytes>& payloads,
+                                       bool new_admission = false) {
         if (journal_poisoned)
             throw FsError(EIO, "FUSE operation journal is unavailable after a previous write failure");
         if (payloads.empty())
@@ -646,10 +737,25 @@ struct FuseFrontend::State {
         const auto start = ::lseek(journal_fd, 0, SEEK_END);
         if (start < 0)
             throw FsError(errno, "cannot seek FUSE operation journal");
+
+        uint64_t appended_bytes = 0;
+        for (const auto& payload : payloads) {
+            if (payload.size() > fuse_journal_max_record)
+                throw FsError(EFBIG, "FUSE operation journal record too large");
+            const uint64_t frame_size = 4ULL + payload.size() + 32ULL;
+            if (frame_size > std::numeric_limits<uint64_t>::max() - appended_bytes)
+                throw FsError(EFBIG, "FUSE operation journal batch size overflow");
+            appended_bytes += frame_size;
+        }
+        if (new_admission &&
+            (static_cast<uint64_t>(start) > config.max_operation_journal_bytes ||
+             appended_bytes > config.max_operation_journal_bytes -
+                                  std::min<uint64_t>(static_cast<uint64_t>(start),
+                                                     config.max_operation_journal_bytes)))
+            throw FsError(ENOSPC, "FUSE operation journal admission limit reached");
+
         try {
             for (const auto& payload : payloads) {
-                if (payload.size() > fuse_journal_max_record)
-                    throw FsError(EFBIG, "FUSE operation journal record too large");
                 auto frame = fuse_journal_frame(payload);
                 write_exact(journal_fd, frame);
             }
@@ -672,10 +778,11 @@ struct FuseFrontend::State {
         }
     }
 
-    void append_journal_record_locked(std::span<const uint8_t> payload) {
+    void append_journal_record_locked(std::span<const uint8_t> payload,
+                                      bool new_admission = false) {
         std::vector<Bytes> payloads;
         payloads.emplace_back(payload.begin(), payload.end());
-        append_journal_records_locked(payloads);
+        append_journal_records_locked(payloads, new_admission);
     }
 
     void reset_journal_locked() {
@@ -713,7 +820,7 @@ struct FuseFrontend::State {
         payload.u64(inode->namespace_sequence);
         payload.u64(inode->next_data_sequence);
         std::lock_guard journal_lock(journal_mutex);
-        append_journal_record_locked(payload.data());
+        append_journal_record_locked(payload.data(), true);
         inode->journal_epoch = epoch;
     }
 
@@ -722,7 +829,7 @@ struct FuseFrontend::State {
         payload.u8(static_cast<uint8_t>(JournalRecord::namespace_op));
         encode_namespace_op(payload, op);
         std::lock_guard lock(journal_mutex);
-        append_journal_record_locked(payload.data());
+        append_journal_record_locked(payload.data(), true);
         durable_pending_operations.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -731,7 +838,7 @@ struct FuseFrontend::State {
         payload.u8(static_cast<uint8_t>(JournalRecord::data_op));
         encode_data_op(payload, inode, op);
         std::lock_guard lock(journal_mutex);
-        append_journal_record_locked(payload.data());
+        append_journal_record_locked(payload.data(), true);
         durable_pending_operations.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -748,7 +855,7 @@ struct FuseFrontend::State {
         std::lock_guard admission_lock(journal_admission_mutex);
         {
             std::lock_guard journal_lock(journal_mutex);
-            append_journal_records_locked(payloads);
+            append_journal_records_locked(payloads, true);
         }
         durable_pending_operations.fetch_add(batch.size(), std::memory_order_relaxed);
         const auto previous =
@@ -994,25 +1101,67 @@ struct FuseFrontend::State {
                 throw FsError(errno, "cannot stat FUSE operation journal");
             if (statbuf.st_size < static_cast<off_t>(journal_magic.size()))
                 throw std::runtime_error("FUSE operation journal header is missing");
-            Bytes bytes(static_cast<size_t>(statbuf.st_size));
-            if (read_fd_all(fd, bytes) != bytes.size())
-                throw std::runtime_error("short FUSE operation journal read");
-            if (!std::equal(journal_magic.begin(), journal_magic.end(), bytes.begin()))
+            const uint64_t file_size = static_cast<uint64_t>(statbuf.st_size);
+            auto pread_exact = [&](std::span<uint8_t> out, uint64_t offset) {
+                size_t done = 0;
+                while (done < out.size()) {
+                    const auto n = ::pread(fd, out.data() + done, out.size() - done,
+                                           static_cast<off_t>(offset + done));
+                    if (n < 0 && errno == EINTR)
+                        continue;
+                    if (n <= 0)
+                        return false;
+                    done += static_cast<size_t>(n);
+                }
+                return true;
+            };
+
+            std::array<uint8_t, journal_magic.size()> magic{};
+            if (!pread_exact(magic, 0) ||
+                !std::equal(journal_magic.begin(), journal_magic.end(), magic.begin()))
                 throw std::runtime_error("unsupported or corrupt FUSE operation journal header");
 
             JournalRecovery recovery;
-            const auto scan = scan_fuse_journal_frames(
-                bytes, journal_magic.size(),
-                [&](std::span<const uint8_t> payload, size_t frame_offset) {
-                    parse_journal_record(recovery, payload, frame_offset);
-                });
-            const auto last_good = scan.last_good;
-            if (last_good != bytes.size()) {
+            uint64_t position = journal_magic.size();
+            uint64_t last_good = position;
+            while (position < file_size) {
+                if (file_size - position < 4)
+                    break;
+                std::array<uint8_t, 4> length_bytes{};
+                if (!pread_exact(length_bytes, position))
+                    break;
+                Reader length_reader(length_bytes);
+                const auto length = static_cast<uint64_t>(length_reader.u32());
+                length_reader.finish();
+                if (length > fuse_journal_max_record)
+                    throw std::runtime_error("FUSE operation journal record length is corrupt");
+                const uint64_t frame_size = 4ULL + length + 32ULL;
+                if (file_size - position < frame_size)
+                    break;
+
+                Bytes payload(static_cast<size_t>(length));
+                std::array<uint8_t, 32> checksum{};
+                if ((length && !pread_exact(payload, position + 4)) ||
+                    !pread_exact(checksum, position + 4 + length))
+                    break;
+                Hash256 expected;
+                expected.bytes = checksum;
+                if (sha256(payload) != expected) {
+                    if (position + frame_size == file_size)
+                        break;
+                    throw std::runtime_error("FUSE operation journal checksum mismatch");
+                }
+
+                parse_journal_record(recovery, payload, static_cast<size_t>(position));
+                position += frame_size;
+                last_good = position;
+            }
+            if (last_good != file_size) {
                 if (::ftruncate(fd, static_cast<off_t>(last_good)) != 0)
                     throw FsError(errno, "cannot trim torn FUSE operation journal tail");
                 fsync_fd(fd, "cannot sync trimmed FUSE operation journal");
                 Log::warn("trimmed incomplete FUSE operation journal tail bytes=" +
-                          std::to_string(bytes.size() - last_good));
+                          std::to_string(file_size - last_good));
             }
             if (::close(fd) != 0)
                 throw FsError(errno, "cannot close FUSE operation journal after recovery");
@@ -1441,7 +1590,9 @@ struct FuseFrontend::State {
                 ::close(inode.spool_fd);
                 inode.spool_fd = -1;
             }
+            const auto retired_bytes = inode.spool_end;
             inode.spool_end = 0;
+            release_spool_bytes(retired_bytes);
             return true;
         }
 
@@ -1458,6 +1609,7 @@ struct FuseFrontend::State {
         }
 
         const auto retired_path = inode.spool_path;
+        const auto retired_bytes = inode.spool_end;
         if (::unlink(retired_path.c_str()) != 0 && errno != ENOENT) {
             Log::warn("cannot unlink retired FUSE spool inode=" +
                       std::to_string(inode.id) + " error=" + std::strerror(errno));
@@ -1465,6 +1617,7 @@ struct FuseFrontend::State {
         }
         inode.spool_end = 0;
         inode.spool_path.clear();
+        release_spool_bytes(retired_bytes);
         return true;
     }
 
@@ -2291,6 +2444,25 @@ struct FuseFrontend::State {
     void quarantine_spool_tail(const std::filesystem::path& path, uint64_t keep, uint64_t size) {
         if (size <= keep)
             return;
+        const auto orphan_bytes = size - keep;
+        const auto existing_orphans = make_orphan_room(orphan_bytes);
+        if (orphan_bytes > config.max_orphan_bytes ||
+            existing_orphans > config.max_orphan_bytes - orphan_bytes) {
+            int original = ::open(path.c_str(), O_RDWR);
+            if (original < 0)
+                throw FsError(errno, "cannot trim over-budget FUSE orphan tail");
+            if (::ftruncate(original, static_cast<off_t>(keep)) != 0) {
+                const int saved = errno;
+                ::close(original);
+                throw FsError(saved, "cannot trim over-budget FUSE orphan tail");
+            }
+            fsync_fd(original, "cannot sync trimmed over-budget FUSE spool");
+            ::close(original);
+            sync_directory(spool_dir);
+            Log::warn("discarded over-budget orphaned FUSE spool tail path=" + path.string() +
+                      " bytes=" + std::to_string(orphan_bytes));
+            return;
+        }
         const auto orphan = path.string() + ".orphan." + std::to_string(unix_ms());
         int source = ::open(path.c_str(), O_RDONLY);
         if (source < 0)
@@ -2369,6 +2541,7 @@ struct FuseFrontend::State {
         const auto size = static_cast<uint64_t>(statbuf.st_size);
         if (size < required) {
             ::close(fd);
+            reserve_spool_bytes(size);
             inode->recovery_spool_error =
                 "spool is shorter than its durable operation journal";
             inode->spool_end = size;
@@ -2377,6 +2550,7 @@ struct FuseFrontend::State {
         ::close(fd);
         if (size > required)
             quarantine_spool_tail(inode->spool_path, required, size);
+        reserve_spool_bytes(required);
         // Recovery validates durable spool state but does not retain one file
         // descriptor per dirty inode. Replay/read paths open the spool lazily.
         inode->spool_fd = -1;
@@ -2385,6 +2559,16 @@ struct FuseFrontend::State {
 
     void preserve_unreferenced_spool(const std::filesystem::path& path, uint64_t size,
                                     std::string_view reason) {
+        const auto existing_orphans = make_orphan_room(size);
+        if (size > config.max_orphan_bytes ||
+            existing_orphans > config.max_orphan_bytes - size) {
+            if (::unlink(path.c_str()) != 0 && errno != ENOENT)
+                throw FsError(errno, "cannot discard over-budget unreferenced FUSE spool");
+            sync_directory(spool_dir);
+            Log::warn("discarded over-budget unreferenced FUSE spool path=" + path.string() +
+                      " bytes=" + std::to_string(size) + " reason=" + std::string(reason));
+            return;
+        }
         const auto preserved = path.string() + ".orphan." + std::to_string(unix_ms()) + "." +
                                std::to_string(getpid());
         if (::rename(path.c_str(), preserved.c_str()) != 0)
@@ -2397,6 +2581,7 @@ struct FuseFrontend::State {
     }
 
     void validate_recovery_spools(const JournalRecovery& recovery) {
+        (void)make_orphan_room(0);
         std::error_code ec;
         bool directory_changed = false;
         for (const auto& entry : std::filesystem::directory_iterator(spool_dir, ec)) {
@@ -3653,7 +3838,6 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
                 inode->admitted_size = inode->visible.size;
 
             const auto target = append ? inode->admitted_size : offset;
-            fd = state_->ensure_spool_locked(inode);
             spool_offset = inode->spool_end;
             const auto seq = inode->next_data_sequence;
             const auto now = wall_time_ns();
@@ -3673,61 +3857,79 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
                                                     checksum_size}));
             }
 
-            // Keep the inode descriptor alive across the asynchronous gap between
-            // payload admission and the group-committed data-op frame. The
-            // admission count prevents journal compaction in that gap.
-            {
-                std::lock_guard journal_admission(state_->journal_admission_mutex);
-                state_->journal_inode_locked(inode);
-                state_->journal_inflight_admissions.fetch_add(1, std::memory_order_relaxed);
-            }
-
+            // Do all potentially-allocating overlay preparation before reserving
+            // disk bytes. Once the reservation exists, every failure path below
+            // can roll back the tail exactly while this inode lock excludes later
+            // reservations.
+            State::DataOp overlay_op = ticket->op;
+            inode->data_ops.reserve(inode->data_ops.size() + 1);
+            state_->reserve_spool_bytes(static_cast<uint64_t>(owned.size()));
+            bool admission_active = false;
+            bool queued = false;
             try {
+                fd = state_->ensure_spool_locked(inode);
+
+                // Keep the inode descriptor alive across the asynchronous gap between
+                // payload admission and the group-committed data-op frame. The
+                // admission count prevents journal compaction in that gap.
+                {
+                    std::lock_guard journal_admission(state_->journal_admission_mutex);
+                    state_->journal_inode_locked(inode);
+                    state_->journal_inflight_admissions.fetch_add(1, std::memory_order_relaxed);
+                    admission_active = true;
+                }
+
                 if (pwrite_exact(fd, owned, spool_offset) != owned.size())
                     throw FsError(errno ? errno : EIO, "short FUSE spool write");
+
+                // Queue first. The durability worker cannot observe this ticket until
+                // the inode mutex is released, and every remaining mutation is
+                // non-throwing after the reservations above.
+                state_->enqueue_durability(ticket);
+                queued = true;
+
+                inode->spool_end += owned.size();
+                inode->admitted_size =
+                    std::max<uint64_t>(inode->admitted_size, target + owned.size());
+                inode->next_data_sequence = seq + 1;
+
+                // POSIX write() makes accepted bytes immediately visible to this
+                // node, but does not imply stable storage. Keep the operation in the
+                // local overlay now; the durability worker advances
+                // durable_data_sequence only after spool fsync -> journal append ->
+                // journal fsync. Distributed publication is clamped to that durable
+                // prefix, so relaxing write acknowledgement cannot expose an
+                // unstable generation to other nodes or the metadata write floor.
+                inode->data_ops.push_back(std::move(overlay_op));
+                inode->visible.size =
+                    std::max<uint64_t>(inode->visible.size, target + owned.size());
+                inode->visible.mtime_ns = now;
+                inode->visible.ctime_ns = now;
+                ++inode->durability_pending;
             } catch (...) {
-                {
+                if (!queued && admission_active) {
                     std::lock_guard journal_admission(state_->journal_admission_mutex);
                     const auto previous = state_->journal_inflight_admissions.fetch_sub(
                         1, std::memory_order_relaxed);
                     if (!previous)
                         state_->journal_inflight_admissions.store(0, std::memory_order_relaxed);
                 }
-                // No later reservation can exist while this inode lock is held,
-                // so the failed, unacknowledged tail can be removed exactly.
-                if (::ftruncate(fd, static_cast<off_t>(spool_offset)) == 0) {
-                    try {
-                        fsync_fd(fd, "cannot sync rolled-back FUSE spool");
-                    } catch (const std::exception& e) {
-                        Log::error("cannot sync rolled-back FUSE spool inode=" +
-                                   std::to_string(inode->id) + " error=" + e.what());
+                if (!queued && fd >= 0) {
+                    // No later reservation can exist while this inode lock is held,
+                    // so the failed, unacknowledged tail can be removed exactly.
+                    if (::ftruncate(fd, static_cast<off_t>(spool_offset)) == 0) {
+                        try {
+                            fsync_fd(fd, "cannot sync rolled-back FUSE spool");
+                        } catch (const std::exception& e) {
+                            Log::error("cannot sync rolled-back FUSE spool inode=" +
+                                       std::to_string(inode->id) + " error=" + e.what());
+                        }
                     }
                 }
+                if (!queued)
+                    state_->release_spool_bytes(static_cast<uint64_t>(owned.size()));
                 throw;
             }
-
-            inode->spool_end += owned.size();
-            inode->admitted_size =
-                std::max<uint64_t>(inode->admitted_size, target + owned.size());
-            inode->next_data_sequence = seq + 1;
-
-            // POSIX write() makes accepted bytes immediately visible to this
-            // node, but does not imply stable storage. Keep the operation in the
-            // local overlay now; the durability worker advances
-            // durable_data_sequence only after spool fsync -> journal append ->
-            // journal fsync. Distributed publication is clamped to that durable
-            // prefix, so relaxing write acknowledgement cannot expose an
-            // unstable generation to other nodes or the metadata write floor.
-            inode->data_ops.push_back(ticket->op);
-            inode->visible.size =
-                std::max<uint64_t>(inode->visible.size, target + owned.size());
-            inode->visible.mtime_ns = now;
-            inode->visible.ctime_ns = now;
-            ++inode->durability_pending;
-
-            // Queue while still holding the inode lock so per-inode journal
-            // sequence order exactly follows spool reservation order.
-            state_->enqueue_durability(ticket);
         }
 
         // Normal POSIX semantics: successful write() means the bytes have been

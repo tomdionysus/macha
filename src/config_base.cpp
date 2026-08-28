@@ -112,6 +112,10 @@ void validate(Config& config) {
     if (!config.fuse.max_pending_requests || config.fuse.max_pending_requests > 65536 ||
         !config.fuse.max_pending_operations || config.fuse.max_pending_operations > 65536)
         throw std::runtime_error("fuse pending queue limits must be 1..65536");
+    if (!config.fuse.max_spool_bytes)
+        throw std::runtime_error("fuse.max_spool_bytes must be nonzero");
+    if (config.fuse.max_operation_journal_bytes < 4096)
+        throw std::runtime_error("fuse.max_operation_journal_bytes must be at least 4096");
     if (config.fuse.read_ahead_extents > 64)
         throw std::runtime_error("fuse.read_ahead_extents must be <= 64");
     if (config.fuse.watchdog_interval < std::chrono::milliseconds(50))

@@ -117,6 +117,48 @@ MACHA_TEST("storage_v18", test_pack_tombstones_and_compaction_preserve_live_obje
     }
 }
 
+MACHA_TEST("storage_v18", test_pack_compaction_reclaims_dead_space_incrementally) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+
+    LocalStoreOptions options;
+    options.limit = 128ULL * 1024 * 1024;
+    options.pack_threshold = 256 * 1024;
+    options.pack_target_size = 512 * 1024;
+
+    LocalStore store(t.path() / "store", options, keys.storage);
+    std::vector<ObjectId> ids;
+    for (size_t i = 0; i < 40; ++i) {
+        auto data = pattern(96 * 1024 + i, static_cast<uint8_t>(17 + i));
+        auto id = object_id(data);
+        REQUIRE(store.put(id, data));
+        ids.push_back(id);
+    }
+    for (size_t i = 0; i < ids.size(); i += 2)
+        REQUIRE(store.remove(ids[i]));
+
+    const auto before = store.used();
+    REQUIRE(store.compact_packs());
+    const auto after_one = store.used();
+    CHECK(after_one < before);
+
+    // More dead packs remain after one bounded victim rewrite. A second
+    // maintenance slice therefore makes additional progress instead of the
+    // first call requiring temporary space for the complete packed corpus.
+    REQUIRE(store.compact_packs());
+    const auto after_two = store.used();
+    CHECK(after_two < after_one);
+
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (i % 2 == 0)
+            CHECK(!store.has(ids[i]));
+        else
+            CHECK(store.valid(ids[i]));
+    }
+}
+
 MACHA_TEST("storage_v18", test_local_backend_capacity_falls_through_to_larger_backend) {
     TempDir t;
     auto keyfile = t.path() / "key";
