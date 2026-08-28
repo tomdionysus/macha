@@ -54,7 +54,7 @@ The metadata store has an independent limit and never consumes DATA quota.
 ```yaml
 dht:
   replicas: 1
-  metadata_replicas: 2
+  metadata_min_write_replicas: 2
   min_write_replicas: 1
   write_stall_ms: 2500
   extent_size: 4M
@@ -64,11 +64,11 @@ dht:
 
 - `replicas`: desired converged authoritative DATA copies.
 - `min_write_replicas`: durable DATA copies required before foreground publication; must be `<= replicas`.
-- `metadata_replicas`: metadata voter count. Namespace/control commits use voter majority, not DATA replica policy.
+- `metadata_min_write_replicas`: minimum distinct active nodes that must durably accept a namespace/control mutation before publication. Every node is metadata-capable; this is a write durability floor, not a voter count or convergence target. The legacy `metadata_replicas` key is accepted only for 0.18 migration and is translated to its former majority write floor.
 - `write_stall_ms`: how long a stalled preferred DATA placement may block before deterministic fallback is attempted.
 - `extent_size`: maximum ordinary file extent size. It is unrelated to small-object pack allocation.
 
-Replica policy should be identical across the cluster and changed as a coordinated cluster operation.
+Replica policy should be identical across the cluster and changed as a coordinated cluster operation. `metadata_min_write_replicas: 2` means any two active nodes, not two preselected nodes.
 
 ## Network
 

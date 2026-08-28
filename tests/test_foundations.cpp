@@ -32,6 +32,7 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     advertised.used = 4567;
     advertised.seen_unix_ms = 9999;
     advertised.metadata_generation = 42;
+    advertised.metadata_write_replicas_required = 2;
     Writer node_writer;
     encode_node_info(node_writer, advertised);
     Reader node_reader(node_writer.data());
@@ -41,6 +42,7 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     CHECK(decoded_node.host == advertised.host);
     CHECK(decoded_node.failure_domain == advertised.failure_domain);
     CHECK(decoded_node.metadata_generation == 42);
+    CHECK(decoded_node.metadata_write_replicas_required == 2);
 
     NodeTelemetry telemetry;
     telemetry.node_id = advertised.id;
@@ -755,6 +757,7 @@ MACHA_FAST_TEST("foundations", test_config) {
     CHECK(yc.external_ip.timeout == 2400ms);
     CHECK(yc.connectivity_check.enabled);
     CHECK(yc.connectivity_check.timeout == 2600ms);
+    CHECK(yc.metadata_min_write_replicas == 2); // legacy metadata_replicas: 3 -> old 2-vote floor
     CHECK(yc.min_write_replicas == 2);
     CHECK(yc.write_stall == 1750ms);
     CHECK(yc.maintenance.interval == 250ms);

@@ -252,7 +252,7 @@ MACHA_TEST("media_playback", test_playback_probe_failure_is_stage_specific) {
     auto keys = load_cluster_keys(keyfile);
     auto c = config_for(t.path() / "node", keyfile, free_port());
     c.replication = 1;
-    c.metadata_replication = 1;
+    c.metadata_min_write_replicas = 1;
     c.catalogue.api.enabled = false;
     Service service(c, keys);
     service.start();
@@ -302,7 +302,7 @@ MACHA_TEST("media_playback", test_attached_picture_audio_direct_play) {
     auto keys = load_cluster_keys(keyfile);
     auto c = config_for(t.path() / "node", keyfile, free_port());
     c.replication = 1;
-    c.metadata_replication = 1;
+    c.metadata_min_write_replicas = 1;
     c.catalogue.api.enabled = false;
     Service service(c, keys);
     service.start();
@@ -356,7 +356,7 @@ MACHA_TEST("media_playback", test_forced_direct_bypasses_client_capabilities) {
     auto keys = load_cluster_keys(keyfile);
     auto c = config_for(t.path() / "node", keyfile, free_port());
     c.replication = 1;
-    c.metadata_replication = 1;
+    c.metadata_min_write_replicas = 1;
     c.catalogue.api.enabled = false;
     Service service(c, keys);
     service.start();
@@ -483,7 +483,7 @@ MACHA_TEST("media_playback", test_concurrent_transcode_admission_is_reserved) {
     auto keys = load_cluster_keys(keyfile);
     auto c = config_for(t.path() / "node", keyfile, free_port());
     c.replication = 1;
-    c.metadata_replication = 1;
+    c.metadata_min_write_replicas = 1;
     c.catalogue.api.enabled = false;
     Service service(c, keys);
     service.start();
@@ -550,7 +550,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     auto port = free_port();
     auto c = config_for(t.path() / "node", keyfile, port);
     c.replication = 1;
-    c.metadata_replication = 1;
+    c.metadata_min_write_replicas = 1;
     c.catalogue.api.enabled = false;
     Service service(c, keys);
     service.start();

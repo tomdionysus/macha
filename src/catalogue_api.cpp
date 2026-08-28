@@ -316,7 +316,7 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 auto id = url_decode(rest.substr(0, metadata_suffix));
                 const auto revision = expected_revision(request);
                 // A known-current negative is a routing/result decision, not a
-                // distributed metadata operation. Avoid a quorum repair merely
+                // distributed metadata operation. Avoid a replica repair merely
                 // to discover that this DELETE is a 404. If the local catalogue
                 // cannot prove the negative from current immutable state, fall
                 // through to the existing strong mutation path.

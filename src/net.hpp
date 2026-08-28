@@ -44,6 +44,13 @@ enum class MessageType : uint16_t {
     object_durability_barrier = 23,
     telemetry = 24,
     identity_resets = 25,
+    get_metadata_history_entry = 26,
+    has_metadata_history_entry = 27,
+    put_metadata_history_entry = 28,
+    get_metadata_heads = 29,
+    put_metadata_commit = 30,
+    accept_metadata_commit = 31,
+    retain_objects = 32,
     ok = 100,
     error = 101,
     members_reply = 102,
@@ -54,7 +61,9 @@ enum class MessageType : uint16_t {
     control_object_reply = 107,
     metadata_identity_reply = 108,
     telemetry_reply = 109,
-    identity_resets_reply = 110
+    identity_resets_reply = 110,
+    metadata_history_entry_reply = 111,
+    metadata_heads_reply = 112
 };
 
 // Transport priority is a property of the frame type itself. There is no

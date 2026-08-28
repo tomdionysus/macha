@@ -10,7 +10,7 @@ DATA contains immutable payload objects: media extents, catalogue artwork, subti
 
 ### CONTROL / metadata
 
-Namespace metadata and content-addressed catalogue control objects are control-plane authority. Namespace records use metadata-voter quorum. Catalogue manifests/shards use a dedicated local control object store and must be durable on a metadata-voter majority before namespace metadata can reference a new root.
+Namespace metadata and content-addressed catalogue control objects are control-plane authority. Every node stores metadata/control authority. Namespace mutations and catalogue manifests/shards must satisfy `dht.metadata_min_write_replicas` distinct active durable copies before publication. There is no permanent metadata voter subset.
 
 CONTROL storage does not consume DATA quota.
 
@@ -153,7 +153,7 @@ The control-store `limit` is a safety ceiling, not a DATA budget. Operators shou
 
 Catalogue structure consists of 64 content-addressed shards plus a small manifest root. Those objects are CONTROL. Artwork bytes are DATA.
 
-A catalogue commit cannot reference a new manifest/shard until that control object is durable on a majority of the current metadata voters. After commit, maintenance converges current control objects onto every current metadata voter. Missing non-majority copies are repair debt, not grounds for copying artwork everywhere.
+A catalogue commit cannot reference a new manifest/shard until that control object is durable on `metadata_min_write_replicas` active nodes. After commit, maintenance converges current control objects onto every active node. Missing extra copies are convergence debt, not grounds for copying artwork everywhere.
 
 ## Reads
 

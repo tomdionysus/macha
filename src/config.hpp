@@ -328,7 +328,7 @@ struct Config {
     ExternalIpConfig external_ip;
     ConnectivityCheckConfig connectivity_check;
     size_t replication{3};
-    size_t metadata_replication{3};
+    size_t metadata_min_write_replicas{2};
     size_t min_write_replicas{1};
     std::chrono::milliseconds write_stall{2500};
     size_t extent_size{16 * 1024 * 1024};

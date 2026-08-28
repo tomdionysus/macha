@@ -4,7 +4,7 @@
 
 Create the configured state, DATA backend, cache and FUSE spool parent directories on the intended filesystems. Do not point Macha at a populated unversioned state/backend: the storage contract deliberately refuses it.
 
-Copy the same cluster key to every node. Configure reachable advertised addresses and consistent DHT policy. Start at least enough metadata voters to form a majority before expecting namespace/catalogue mutations to commit.
+Copy the same cluster key to every node. Configure reachable advertised addresses and consistent DHT policy. Start at least `dht.metadata_min_write_replicas` nodes before expecting namespace/catalogue mutations to commit.
 
 ## Capacity
 
@@ -23,11 +23,11 @@ A full backend stops admitting new DATA. Local `StoragePool` tries another ranke
 
 Do not increase metadata/control quota merely to work around a full DATA disk; those are intentionally different resources.
 
-## Metadata quorum loss
+## Metadata write-floor loss
 
-Without a metadata-voter majority, namespace/catalogue mutations cannot commit. Nodes may continue serving a persisted/readable snapshot where the operation supports it.
+With fewer than `metadata_min_write_replicas` active nodes, namespace/catalogue mutations cannot publish. Nodes may continue serving a persisted/readable snapshot where the operation supports it.
 
-Catalogue scanner infrastructure failures are deferred rather than counted as semantic provider failures. Once quorum returns, work resumes.
+Catalogue scanner infrastructure failures are deferred rather than counted as semantic provider failures. Once the write floor is available, work resumes.
 
 ## Maintenance
 
@@ -90,9 +90,9 @@ Repeated recovery/catalogue mutation should not produce monotonic namespace-size
 
 ## Diagnostics
 
-`DEBUG` logs show placement, quorum, catalogue and maintenance state without the per-object volume of `ALL`. `ALL` is intended for targeted tracing and can be expensive on active systems.
+`DEBUG` logs show placement, metadata write-floor, catalogue and maintenance state without the per-object volume of `ALL`. `ALL` is intended for targeted tracing and can be expensive on active systems.
 
-A DATA failure should be diagnosed as placement/admission/durability; a metadata failure as voter/control durability. Keeping those failure domains distinct is intentional and should be preserved in logs and tooling.
+A DATA failure should be diagnosed as placement/admission/durability; a metadata failure as metadata/control write-floor durability. Keeping those failure domains distinct is intentional and should be preserved in logs and tooling.
 
 ## Cluster status and telemetry
 
@@ -102,10 +102,10 @@ A DATA failure should be diagnosed as placement/admission/durability; a metadata
 - optional ephemeral authenticated peer telemetry for runtime/load/cache detail;
 - a bounded coalesced last-known telemetry cache persisted independently on each node.
 
-Telemetry never defines cluster membership or metadata quorum. Ephemeral telemetry is gossiped with boot-incarnation and sequence ordering and is not journalled as a metrics history. Gossip is best-effort and may be dropped under useful load. The last-known cache is periodically replaced only after a long interactive-idle interval and never mutates the MachaDFS namespace or enters metadata quorum/CAS. The API marks observations as live, stale, unavailable, or last-known so an online node cannot disappear merely because optional telemetry was dropped.
+Telemetry never defines cluster membership or metadata durability. Ephemeral telemetry is gossiped with boot-incarnation and sequence ordering and is not journalled as a metrics history. Gossip is best-effort and may be dropped under useful load. The last-known cache is periodically replaced only after a long interactive-idle interval and never mutates the MachaDFS namespace or enters metadata publication. The API marks observations as live, stale, unavailable, or last-known so an online node cannot disappear merely because optional telemetry was dropped.
 
-Cluster capacity distinguishes known durable/cache capacity from the portion currently online. Per-node status reports authoritative membership endpoint/storage fields and enriches them with telemetry when available. Metadata availability is owned and published by `MetadataManager` as exactly `unavailable`, `read-only`, or `writable`; Status consumes that state and may demote a previously writable view immediately if current membership has lost the required voters, but never promotes to writable merely from peer connectivity.
+Cluster capacity distinguishes known durable/cache capacity from the portion currently online. Per-node status reports authoritative membership endpoint/storage fields and enriches them with telemetry when available. Metadata availability is owned and published by `MetadataManager` as exactly `unavailable`, `read-only`, or `writable`; Status consumes that state and may demote a previously writable view immediately if fewer than `metadata_min_write_replicas` active replicas remain, but never promotes to writable merely from peer connectivity.
 
-Metadata availability logging is transition-only and canonical, for example `metadata availability changed state=writable previous=read-only reason="metadata write quorum available"`. Routine negative checkpoint acknowledgements are silent because they are normal convergence decisions; transport/checkpoint exceptions remain diagnostic.
+Metadata availability logging is transition-only and canonical, for example `metadata availability changed state=writable previous=read-only reason="metadata write durability floor available"`. Routine negative checkpoint acknowledgements are silent because they are normal convergence decisions; transport/checkpoint exceptions remain diagnostic.
 
 `POST /api/v1/status/connectivity/check` and the node-specific equivalent perform diagnostic connectivity checks without changing cluster configuration. State-changing administrative operations belong under `/api/v1/manage`.

@@ -12,7 +12,7 @@ MACHA_TEST("filesystem_fuse", test_open_write_metadata_merge) {
     TestService fixture("single-write");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.extent_size = 1024 * 1024;
 
     auto& service = fixture.start();
@@ -75,7 +75,7 @@ MACHA_TEST("filesystem_fuse", test_fresh_and_resumed_write_exactness) {
     TestService fixture("write-exactness");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.extent_size = 1024 * 1024;
 
     auto& service = fixture.start();
@@ -219,7 +219,7 @@ MACHA_TEST("filesystem_fuse", test_active_write_size_visibility) {
     TestService fixture("active-size");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.extent_size = 1024 * 1024;
 
     auto& service = fixture.start();
@@ -259,7 +259,7 @@ MACHA_TEST("filesystem_fuse", test_open_write_survives_rename) {
     TestService fixture("single-rename");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.extent_size = 1024 * 1024;
 
     auto& service = fixture.start();
@@ -310,7 +310,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_accepts_metadata_after_genesis_
     auto c1 = config_for(cluster.path() / "genesis-n1", cluster.keyfile(), p1);
     auto c2 = config_for(cluster.path() / "genesis-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 1;
-    c1.metadata_replication = c2.metadata_replication = 2;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 2;
 
     Service s1(c1, keys);
     Service s2(c2, keys);
@@ -364,7 +364,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_ordering_merging_and_cache) {
     TestService fixture("fuse-ordering");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.extent_size = 1024 * 1024;
     config.cache.path = fixture.path() / "cache";
     config.cache.max_blocks = 64;
@@ -459,7 +459,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_completed_publication_unlinks_retired_sp
     TestService fixture("fuse-spool-retire-unlink");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.extent_size = 1024 * 1024;
     config.fuse.commit_workers = 1;
     config.fuse.foreground_commit_workers = 1;
@@ -485,7 +485,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_yields_to_playback) {
     TestService fixture("fuse-playback-yield");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.extent_size = 1024 * 1024;
     config.fuse.commit_workers = 1;
     config.fuse.foreground_commit_workers = 1;
@@ -521,7 +521,7 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_durable_journal_recovers_namespace
     TestService fixture("fuse-journal-recovery");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.extent_size = 1024 * 1024;
     config.fuse.commit_workers = 1;
     config.fuse.foreground_commit_workers = 1;
@@ -597,7 +597,7 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_durable_journal_recovers_ordered_m
     TestService fixture("fuse-journal-ordering");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.extent_size = 1024 * 1024;
     config.fuse.commit_workers = 1;
     config.fuse.foreground_commit_workers = 1;
@@ -703,7 +703,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_trims_torn_tail) {
     TestService fixture("fuse-journal-torn-tail");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.fuse.commit_workers = 1;
     config.fuse.foreground_commit_workers = 1;
     config.fuse.publication_quiet = 30s;
@@ -741,7 +741,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_trims_checksum_invalid_c
     TestService fixture("fuse-journal-checksum-tail");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.fuse.commit_workers = 1;
     config.fuse.foreground_commit_workers = 1;
     // This test needs publication deferred long enough to leave a durable
@@ -860,7 +860,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_preserves_unreferenced_s
     TestService fixture("fuse-journal-orphan");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
 
     auto& service = fixture.start();
     const auto spool_dir = config.state_path / "fuse-spool";
@@ -910,7 +910,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_spool_descriptors_are_bounded) 
     TestService fixture("fuse-recovery-fd-bound");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.fuse.commit_workers = 1;
     config.fuse.foreground_commit_workers = 1;
     config.fuse.publication_quiet = 30s;
@@ -961,7 +961,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_idle_spool_descriptor_reopens_for_append
     TestService fixture("fuse-idle-spool-reopen");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.fuse.commit_workers = 1;
     config.fuse.foreground_commit_workers = 1;
     config.fuse.publication_quiet = 30s;
@@ -1027,7 +1027,7 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_recovery_starts_without_new_fuse_a
     TestService fixture("fuse-recovery-autostart");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.extent_size = 1024 * 1024;
     config.fuse.commit_workers = 4;
     config.fuse.recovery_commit_workers = 2;
@@ -1110,7 +1110,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_publication_concurrency_is_boun
     TestService fixture("fuse-recovery-concurrency");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.extent_size = 1024 * 1024;
     config.fuse.commit_workers = 4;
     config.fuse.recovery_commit_workers = 1;
@@ -1207,7 +1207,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_accepts_authoritative_da
     TestService fixture("fuse-journal-done-recovery");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.fuse.commit_workers = 1;
     config.fuse.foreground_commit_workers = 1;
     config.fuse.publication_quiet = 1s;
@@ -1264,7 +1264,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_rejects_unbacked_data_do
     TestService fixture("fuse-journal-unbacked-done");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
 
     auto& service = fixture.start();
     {
@@ -1297,7 +1297,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_drops_only_inode_with_mi
     TestService fixture("fuse-journal-missing-spool");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.fuse.commit_workers = 1;
     config.fuse.foreground_commit_workers = 1;
     config.fuse.publication_quiet = 30s;
@@ -1335,7 +1335,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_checksum_drops_corrupt_generati
     TestService fixture("fuse-journal-corrupt-spool");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.fuse.commit_workers = 1;
     config.fuse.foreground_commit_workers = 1;
     config.fuse.publication_quiet = 30s;
@@ -1396,7 +1396,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_read_only_release_does_not_publish_write
     TestService fixture("fuse-read-release");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.fuse.commit_workers = 1;
 
     auto& service = fixture.start();
@@ -1439,7 +1439,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_unlink_and_rename_over_open_ino
     TestService fixture("fuse-replace");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.fuse.commit_workers = 2;
 
     auto& service = fixture.start();
@@ -1504,7 +1504,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_read_overlay_truncate_and_hydra
     TestService fixture("fuse-read");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.extent_size = 1024 * 1024;
     config.fuse.read_ahead_extents = 2;
     config.fuse.hydration_priority = 2718;
@@ -1592,7 +1592,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_buffered_writes_batch_until_close_durabi
     TestService fixture("fuse-group-commit");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.fuse.publication_quiet = 30s;
     config.fuse.request_workers = 24;
 
@@ -1637,7 +1637,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_fsync_waits_for_distributed_publication)
     TestService fixture("fuse-fsync-publication");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.fuse.publication_quiet = 0ms;
     config.fuse.timeouts.sync = 10s;
 
@@ -1671,7 +1671,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_open_read_reuses_extent_until_manifest_c
     TestService fixture("fuse-open-read-cache");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.extent_size = 1024 * 1024;
 
     auto& service = fixture.start();
@@ -1697,7 +1697,12 @@ MACHA_TEST("filesystem_fuse", test_fuse_open_read_reuses_extent_until_manifest_c
         // through the same open FUSE handle must still be served from that
         // retained extent, whereas constructing a new ReadHandle per callback
         // would immediately fail here.
-        service.filesystem().store().erase_all(entry.extents.front().id);
+        // erase_all() is a policy-level delete and correctly refuses to remove
+        // a still-retained live object.  This test needs a simulated physical
+        // loss beneath the manifest, so remove the local copy directly and also
+        // clear any opportunistic block-cache copy.
+        REQUIRE(service.node().local_store().remove(entry.extents.front().id));
+        (void)service.node().block_cache().remove(entry.extents.front().id);
         Bytes second(4096);
         REQUIRE(frontend->read(handle, 8192, second) == second.size());
         CHECK(std::equal(second.begin(), second.end(), bytes.begin() + 8192));
@@ -1720,7 +1725,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_namespace_refresh_is_demand_dri
     TestService fixture("fuse-demand-refresh");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.fuse.commit_workers = 1;
 
     auto& service = fixture.start();

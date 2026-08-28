@@ -96,7 +96,7 @@ MACHA_TEST("hydration_catalogue", test_hydration_scheduler_and_prediction) {
     TestService fixture("store");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.hydration.enabled = false;
     auto& service = fixture.start();
     service.filesystem().mkdir("/TV", 0755, getuid(), getgid());
@@ -212,6 +212,58 @@ MACHA_TEST("hydration_catalogue", test_hydration_scheduler_and_prediction) {
     check_prediction("/Movies/one.mkv", movie1_file, movie2_file, "next_movie");
 }
 
+MACHA_FAST_TEST("hydration_catalogue", test_catalogue_three_way_merge) {
+    CatalogueSnapshot base;
+    CatalogueItem a;
+    a.id = "movie:a";
+    a.kind = CatalogueKind::movie;
+    a.title = "A";
+    base.items.emplace(a.id, a);
+
+    auto left = base;
+    CatalogueItem b;
+    b.id = "movie:b";
+    b.kind = CatalogueKind::movie;
+    b.title = "B";
+    left.items.emplace(b.id, b);
+
+    auto right = base;
+    CatalogueItem c;
+    c.id = "movie:c";
+    c.kind = CatalogueKind::movie;
+    c.title = "C";
+    right.items.emplace(c.id, c);
+
+    auto merged = merge_catalogue_snapshots(base, left, right);
+    REQUIRE(merged.has_value());
+    CHECK(merged->items.size() == 3);
+    CHECK(merged->items.contains("movie:b"));
+    CHECK(merged->items.contains("movie:c"));
+
+    auto conflicting_left = base;
+    auto conflicting_right = base;
+    conflicting_left.items.at("movie:a").title = "Left";
+    conflicting_right.items.at("movie:a").title = "Right";
+    CHECK(!merge_catalogue_snapshots(base, conflicting_left, conflicting_right).has_value());
+
+    CatalogueSnapshot structural_base;
+    CatalogueItem parent;
+    parent.id = "show:p";
+    parent.kind = CatalogueKind::show;
+    parent.title = "Parent";
+    structural_base.items.emplace(parent.id, parent);
+    auto delete_parent = structural_base;
+    delete_parent.items.erase(parent.id);
+    auto add_child = structural_base;
+    CatalogueItem child;
+    child.id = "episode:p:1";
+    child.kind = CatalogueKind::episode;
+    child.title = "Child";
+    child.parent_id = parent.id;
+    add_child.items.emplace(child.id, child);
+    CHECK(!merge_catalogue_snapshots(structural_base, delete_parent, add_child).has_value());
+}
+
 MACHA_FAST_TEST("hydration_catalogue", test_replica_selector) {
     auto node = [](uint8_t value) {
         NodeInfo n;
@@ -280,7 +332,7 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
     auto c1 = config_for(temp.path() / "n1", keyfile, p1);
     auto c2 = config_for(temp.path() / "n2", keyfile, p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 1;
-    c1.metadata_replication = c2.metadata_replication = 1;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
     c2.cache.path = temp.path() / "cache2";
     c2.cache.max_blocks = 32;
 
@@ -1156,7 +1208,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     write_key(key);
     auto config = config_for(t.path() / "disk", key, free_port());
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.metadata_cache = 20ms;
     auto keys = load_cluster_keys(key);
     Service service(config, keys);
@@ -1603,7 +1655,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_zero_length_files_wait_for_comm
     TestService fixture("node");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.catalogue.scanner.enabled = false;
     auto& service = fixture.start();
 
@@ -1678,7 +1730,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_cache_ignores_unrelated_metadat
     const auto& keys = cluster.keys();
     auto config = config_for(cluster.path() / "node", cluster.keyfile(), free_port());
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
 
     NodeRuntime node(config, keys);
     DistributedStore store(node);
@@ -1736,7 +1788,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_restart_does_not_rescan
     TestService fixture("store");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.catalogue.scanner.enabled = false; // explicit scanner below
     auto& service = fixture.start();
 
@@ -1797,7 +1849,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_non_coordinator_idle_does_not_s
     auto c2 = config_for(temp.path() / "catalogue-idle-2", keyfile, free_port(),
                          {{"127.0.0.1", c1.port}});
     c1.replication = c2.replication = 1;
-    c1.metadata_replication = c2.metadata_replication = 1;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
     c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = false;
     c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
 
@@ -2241,7 +2293,7 @@ MACHA_TEST("hydration_catalogue", test_ingest_catalogue_feedback_and_external_cl
     TestService fixture("node");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.catalogue.scanner.enabled = false;
     config.catalogue.scanner.movies.enabled = true;
     config.catalogue.scanner.movies.roots = {"/Movies"};
@@ -2320,7 +2372,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     auto c2 = config_for(cluster.path() / "catalogue-live-2", cluster.keyfile(), free_port(),
                          {{"127.0.0.1", c1.port}});
     c1.replication = c2.replication = 1;
-    c1.metadata_replication = c2.metadata_replication = 1;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
     c1.metadata_cache = c2.metadata_cache = 30ms;
 
     NodeRuntime n1(c1, keys);
@@ -2450,11 +2502,11 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
     auto c2 = config_for(cluster.path() / "metadata-ttl-2", cluster.keyfile(), free_port(),
                          {{"127.0.0.1", c1.port}});
     c1.replication = c2.replication = 1;
-    c1.metadata_replication = c2.metadata_replication = 1;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
     c1.metadata_cache = c2.metadata_cache = 30ms;
     // Keep ordinary heartbeat propagation outside this test window. We install a
-    // valid newer voter record directly to simulate a generation notice that was
-    // missed by node two; TTL validation must still discover it from quorum.
+    // valid newer committed metadata head directly to simulate a generation notice
+    // that was missed by node two; TTL validation must still discover it from replicas.
     c1.heartbeat = c2.heartbeat = 5s;
     c1.dead_after = c2.dead_after = 20s;
 
@@ -2496,7 +2548,9 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
     next.previous = base.hash;
     next.payload = encode_snapshot(changed);
     next.hash = metadata_hash(next.generation, next.previous, next.payload);
-    REQUIRE(n1.metadata_replica().seed(next));
+    REQUIRE(n1.metadata_replica().store_commit(next));
+    REQUIRE(n1.metadata_replica().accept_commit(
+        {next.generation, next.hash, 1, {n1.node_id()}}));
 
     // With no generation notice, the decoded view is legitimately reused until
     // the configured metadata TTL expires.
@@ -2505,7 +2559,7 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
     std::this_thread::sleep_for(c2.metadata_cache + 20ms);
     REQUIRE(n2.known_metadata_generation() < next.generation);
 
-    // Expiry must force a real metadata read, discover the newer voter record and
+    // Expiry must force a real metadata read, discover the newer committed head and
     // replace the decoded snapshot. cached_snapshot_view() must not ignore
     // cache_until_ and this remained stale indefinitely without a notice.
     auto refreshed = metadata2.snapshot_view();
@@ -2639,7 +2693,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_effective_artwork_is_displa
     TestService fixture("catalogue-effective-artwork-api");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.hydration.enabled = false;
     auto& service = fixture.start();
 
@@ -2725,7 +2779,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_root_ready_without_local_artwor
     const auto& keys = cluster.keys();
     auto config = config_for(cluster.path() / "node", cluster.keyfile(), free_port());
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
 
     NodeRuntime node(config, keys);
     DistributedStore store(node);
@@ -2769,7 +2823,7 @@ MACHA_FAST_TEST("hydration_catalogue", test_macos_unicode_namespace_aliases) {
     const auto& keys = cluster.keys();
     auto config = config_for(cluster.path() / "node", cluster.keyfile(), free_port());
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
 
     NodeRuntime node(config, keys);
     DistributedStore store(node);
@@ -2830,7 +2884,7 @@ MACHA_TEST("hydration_catalogue", test_media_index_cache_survives_namespace_chur
     const auto& keys = cluster.keys();
     auto config = config_for(cluster.path() / "node", cluster.keyfile(), free_port());
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
 
     NodeRuntime node(config, keys);
     DistributedStore store(node);
@@ -2881,7 +2935,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_control_gc_protects_future_root
     TestService fixture("catalogue-control-publication", ConfigProfile::isolated);
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     auto& service = fixture.start();
 
     REQUIRE(wait_until([&] {
@@ -2894,7 +2948,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_control_gc_protects_future_root
     }));
 
     // CONTROL publication is data-before-metadata. Simulate a future root/shard
-    // arriving on this voter before the root CAS references it. Even with zero
+    // arriving on this replica before the root CAS references it. Even with zero
     // configured grace, GC must retain anything written after the currently
     // observed catalogue root.
     Bytes staged = pattern(4096 + 37);
@@ -2937,7 +2991,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_gc) {
     auto c2 = config_for(cluster.path() / "cat2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     auto c3 = config_for(cluster.path() / "cat3", cluster.keyfile(), p3, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = c3.replication = 1;
-    c1.metadata_replication = c2.metadata_replication = c3.metadata_replication = 1;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = c3.metadata_min_write_replicas = 1;
     c1.maintenance.garbage_grace = 0ms;
     c2.maintenance.garbage_grace = 0ms;
     c3.maintenance.garbage_grace = 0ms;
@@ -3052,6 +3106,11 @@ MACHA_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_gc) {
     CHECK(s1_second_art->bytes == second_art_bytes);
     CHECK(s2_second_art->bytes == second_art_bytes);
     CHECK(s3_second_art->bytes == second_art_bytes);
+    // All known metadata replicas are online and have converged past the
+    // replacement, so the inherited retention claim may now be causally released
+    // and ordinary DATA GC must reclaim the old artwork. If a replica were
+    // offline, that claim would remain as the physical safety barrier for a
+    // potentially unseen accepted branch.
     REQUIRE(wait_until([&] {
         return !s1.node().local_store().has(first_art.id) &&
                !s2.node().local_store().has(first_art.id) &&

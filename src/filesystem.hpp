@@ -31,6 +31,7 @@ struct MaintenanceObjects {
     std::vector<ObjectId> live;
     std::vector<GarbageRef> garbage;
     uint64_t metadata_generation{};
+    RetentionClock observed_mutations;
     size_t entries{};
     size_t extents{};
 };

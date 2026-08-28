@@ -36,17 +36,17 @@ A catalogue mutation reads the current metadata root and uses optimistic concurr
 Before publishing a successor root:
 
 - newly introduced artwork references are verified through ordinary DATA reads;
-- changed shard objects are content-addressed and stored on a metadata-voter majority;
-- the successor manifest is stored on a metadata-voter majority;
+- changed shard objects are content-addressed and stored on at least `metadata_min_write_replicas` active nodes;
+- the successor manifest is stored on at least `metadata_min_write_replicas` active nodes;
 - namespace metadata is CAS-updated from the expected old root to the new root.
 
 A conflicting namespace/catalogue generation retries as a conflict. A metadata/control durability outage is infrastructure unavailability and causes scanner work to defer without consuming semantic/provider attempts.
 
 ## Control convergence
 
-Majority durability is enough to commit. Maintenance separately converges the current manifest and all referenced shards to every current metadata voter.
+The configured metadata write floor is enough to commit. Maintenance separately converges the current manifest and all referenced shards to every active metadata replica.
 
-If voter membership changes or a voter loses a control object, the missing immutable object is fetched from another active voter. The committed root remains valid as long as quorum metadata/control authority remains available.
+If an active metadata replica loses a control object, the missing immutable object is fetched from another active replica. The committed root remains valid while enough reachable replicas satisfy the configured metadata write floor; maintenance subsequently converges control objects to all active replicas.
 
 Control garbage collection uses its own live set and grace period. It does not interact with DATA placement.
 
@@ -75,7 +75,7 @@ Failures are classified:
 
 - provider/content/parsing failures consume the hint's bounded semantic attempts;
 - catalogue CAS conflicts defer briefly;
-- metadata/control quorum or DATA availability failures defer without incrementing semantic failure count.
+- metadata/control write-floor or DATA availability failures defer without incrementing semantic failure count.
 
 This prevents a temporary cluster outage from permanently marking otherwise valid media as failed.
 

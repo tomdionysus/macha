@@ -2733,7 +2733,7 @@ struct FuseFrontend::State {
 
         // A metadata-generation notice is only evidence that a newer snapshot
         // exists somewhere in the cluster. It is not permission for a kernel
-        // getattr/readdir to perform quorum I/O. Adopt only an immutable snapshot
+        // getattr/readdir to perform metadata-replica I/O. Adopt only an immutable snapshot
         // which MetadataManager has already obtained and decoded; metadata repair
         // is responsible for making newer generations locally available.
         std::lock_guard refresh_lock(refresh_mutex);
@@ -3717,7 +3717,7 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
             // durable_data_sequence only after spool fsync -> journal append ->
             // journal fsync. Distributed publication is clamped to that durable
             // prefix, so relaxing write acknowledgement cannot expose an
-            // unstable generation to other nodes or metadata quorum.
+            // unstable generation to other nodes or the metadata write floor.
             inode->data_ops.push_back(ticket->op);
             inode->visible.size =
                 std::max<uint64_t>(inode->visible.size, target + owned.size());
@@ -3807,7 +3807,7 @@ void FuseFrontend::fsync(uint64_t inode_id) {
         // Macha's fsync is deliberately stronger than merely syncing the local
         // staging file: require the durable prefix to finish its normal
         // DistributedStore + metadata commit before returning. This does not
-        // weaken or bypass quorum policy; it waits for the existing publication
+        // weaken or bypass metadata publication policy; it waits for the existing publication
         // machinery to satisfy it.
         state_->request_data_publication(inode);
         state_->wait_for_inode_publication(inode, target, deadline, cancelled);

@@ -88,14 +88,17 @@ void validate(Config& config) {
     };
     validate_packing(config.storage_packing, "storage.data.packing");
     validate_packing(config.metadata_store.packing, "storage.metadata.packing");
-    if (!config.replication || !config.metadata_replication || !config.min_write_replicas)
+    if (!config.replication || !config.metadata_min_write_replicas || !config.min_write_replicas)
         throw std::runtime_error("replication must be nonzero");
     if (config.min_write_replicas > config.replication)
         throw std::runtime_error("dht.min_write_replicas must be <= dht.replicas");
     if (config.write_stall.count() <= 0)
         throw std::runtime_error("dht.write_stall_ms must be > 0");
-    if (config.replication > 31 || config.metadata_replication > 31)
-        throw std::runtime_error("replica count must be <= 31");
+    // DATA placement uses a compact bounded owner set. Metadata publication is
+    // an any-node durability floor and must not inherit that historical voter
+    // count limit; large clusters may legitimately require more than 31 copies.
+    if (config.replication > 31)
+        throw std::runtime_error("dht.replicas must be <= 31");
     if (config.read_ahead_extents > 64)
         throw std::runtime_error("read-ahead must be <= 64");
     if (config.connect_timeout.count() < 100 || config.metadata_cache.count() < 0)
@@ -385,8 +388,17 @@ void parse_dht(const YAML::Node& root, Config& c) {
         return;
     if (d["replicas"])
         c.replication = d["replicas"].as<size_t>();
-    if (d["metadata_replicas"])
-        c.metadata_replication = d["metadata_replicas"].as<size_t>();
+    if (d["metadata_min_write_replicas"] && d["metadata_replicas"])
+        throw std::runtime_error(
+            "dht.metadata_min_write_replicas and legacy dht.metadata_replicas are mutually exclusive");
+    if (d["metadata_min_write_replicas"])
+        c.metadata_min_write_replicas = d["metadata_min_write_replicas"].as<size_t>();
+    else if (d["metadata_replicas"]) {
+        // 0.18 metadata_replicas was a fixed voter count whose write floor was
+        // majority. Preserve that durability when reading an old config.
+        const auto legacy = d["metadata_replicas"].as<size_t>();
+        c.metadata_min_write_replicas = legacy ? legacy / 2 + 1 : 0;
+    }
     if (d["min_write_replicas"])
         c.min_write_replicas = d["min_write_replicas"].as<size_t>();
     if (d["write_stall_ms"])
@@ -898,7 +910,7 @@ void print_usage(const char* executable) {
         << "--bootstrap HOST[:PORT] (repeatable)  --listen ADDR  --advertise HOST  --port PORT\n"
         << "--failure-domain NAME  --connect-timeout MS  --max-frame-size SIZE\n"
         << "--control-stall-notice MS  --data-stall-notice MS\n"
-        << "--metadata-cache MS  --replicas N  --metadata-replicas N  --min-write-replicas N\n"
+        << "--metadata-cache MS  --replicas N  --metadata-min-write-replicas N  --min-write-replicas N\n"
         << "--write-stall MS  --extent-size SIZE\n"
         << "--read-ahead N  --mount PATH  --state-path PATH  --cache-path PATH --cache-blocks N\n"
         << "--log-level LEVEL  (ALL|DEBUG|INFO|WARN|ERROR; default INFO)\n"
@@ -960,9 +972,12 @@ Config parse_config(int argc, char** argv) {
             config.port = static_cast<uint16_t>(port);
         } else if (option == "--replicas") {
             config.replication = parse_unsigned(need(i, "--replicas"), "replica count");
+        } else if (option == "--metadata-min-write-replicas") {
+            config.metadata_min_write_replicas = parse_unsigned(
+                need(i, option.c_str()), "minimum metadata write replica count");
         } else if (option == "--metadata-replicas") {
-            config.metadata_replication =
-                parse_unsigned(need(i, "--metadata-replicas"), "metadata replica count");
+            const auto legacy = parse_unsigned(need(i, option.c_str()), "legacy metadata replica count");
+            config.metadata_min_write_replicas = legacy ? legacy / 2 + 1 : 0;
         } else if (option == "--min-write-replicas") {
             config.min_write_replicas =
                 parse_unsigned(need(i, "--min-write-replicas"), "minimum write replica count");

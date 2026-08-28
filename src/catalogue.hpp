@@ -49,6 +49,7 @@ struct CatalogueItem {
     std::vector<CatalogueArtwork> artwork;
     uint64_t revision{1};
     int64_t updated_ns{};
+    auto operator<=>(const CatalogueItem&) const = default;
 };
 
 struct CatalogueSnapshot {
@@ -81,6 +82,11 @@ struct CatalogueMaintenance {
     bool complete{true};
 };
 
+struct CatalogueRetentionObjects {
+    std::vector<ObjectId> data;
+    std::vector<ObjectId> control;
+};
+
 struct CatalogueArtworkContent {
     std::string mime_type;
     Bytes bytes;
@@ -93,6 +99,9 @@ struct CatalogueClearResult {
 
 Bytes encode_catalogue(const CatalogueSnapshot&);
 CatalogueSnapshot decode_catalogue(std::span<const uint8_t>);
+std::optional<CatalogueSnapshot> merge_catalogue_snapshots(
+    const CatalogueSnapshot& base, const CatalogueSnapshot& left,
+    const CatalogueSnapshot& right);
 std::string catalogue_kind_name(CatalogueKind);
 std::optional<CatalogueKind> parse_catalogue_kind(std::string_view);
 std::vector<CatalogueArtwork> effective_catalogue_artwork(const CatalogueSnapshot&,
@@ -123,29 +132,35 @@ class CatalogueManager {
     uint64_t cached_metadata_generation_{};
     Clock::time_point cache_until_{};
     uint64_t last_sync_unix_ms_{};
-    // CONTROL objects for a successor catalogue are staged on metadata voters
-    // before the metadata CAS can reference them.  Remember when this process
-    // first observed the current root so GC can never remove objects written
-    // after that point; a later root observation makes failed/stale staging
-    // eligible again without a distributed publication lock.
+    // CONTROL objects for a successor catalogue are staged on metadata replicas
+    // before metadata publication can reference them. Track both the current
+    // catalogue-root epoch and the epoch in which each unreferenced object was
+    // first observed by GC. An object cannot be reclaimed in that same epoch:
+    // only observing a later catalogue root proves that it was not merely
+    // data-before-metadata staging for the current root. The time point also
+    // detects content-addressed objects re-affirmed after the current root.
     Clock::time_point control_gc_root_epoch_{};
+    uint64_t control_gc_root_epoch_sequence_{};
     bool control_gc_root_epoch_initialized_{};
+    std::map<ObjectId, uint64_t> control_gc_unreferenced_epoch_;
     bool ready_{};
     std::string error_;
     LocalStore::Cursor control_gc_cursor_;
     std::optional<ObjectId> control_converged_root_;
-    std::vector<NodeId> control_converged_voters_;
+    std::vector<NodeId> control_converged_nodes_;
     Clock::time_point control_convergence_retry_{};
 
     static std::set<ObjectId> artwork_ids(const CatalogueSnapshot&);
-    static size_t durability_required(const MetadataSnapshot&);
+    size_t durability_required() const;
     CatalogueSnapshot load_root(const std::optional<ObjectId>&);
     bool converge_control_replicas(const MetadataSnapshot&);
+    bool reconcile_catalogue_conflict(const MetadataSnapshotView&);
     void cache(uint64_t metadata_generation, const MetadataSnapshot&, CatalogueSnapshot);
     std::shared_ptr<const CatalogueSnapshot> current_snapshot();
     void commit(const std::optional<ObjectId>& expected_root, const CatalogueSnapshot& next,
                 const std::set<ObjectId>& old_artwork,
-                std::optional<Hash256> expected_namespace = std::nullopt);
+                std::optional<Hash256> expected_namespace = std::nullopt,
+                std::optional<std::pair<std::string, MetadataConflict>> resolved_conflict = {});
 
   public:
     CatalogueManager(NodeRuntime&, DistributedStore&, MetadataManager&);
@@ -181,6 +196,8 @@ class CatalogueManager {
                            std::optional<Hash256> expected_namespace = std::nullopt);
     std::optional<CatalogueArtworkContent> artwork(const ObjectId&);
     CatalogueMaintenance maintenance_objects();
+    CatalogueRetentionObjects retention_objects(const std::optional<ObjectId>& old_root,
+                                                 const std::optional<ObjectId>& new_root);
     size_t control_gc_step(const std::vector<ObjectId>& live,
                            std::chrono::milliseconds grace, size_t operation_budget = 32);
 };

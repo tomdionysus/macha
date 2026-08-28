@@ -8,6 +8,7 @@
 #include "net.hpp"
 #include "persistent_cache.hpp"
 #include "public_connectivity.hpp"
+#include "retention.hpp"
 #include "storage_pool.hpp"
 #include "telemetry.hpp"
 
@@ -32,11 +33,13 @@ class NodeRuntime {
     StoragePool local_;
     LocalStore control_;
     PersistentBlockCache cache_;
+    RetentionStore retention_;
     MetadataReplica meta_;
     Membership members_;
     PublicConnectivity public_connectivity_;
     TelemetryStore telemetry_;
     std::atomic_uint64_t remote_metadata_generation_{};
+    std::atomic_uint64_t remote_metadata_epoch_{};
     std::atomic_uint64_t telemetry_storage_used_{};
     std::atomic_uint64_t telemetry_storage_capacity_{};
     std::atomic_uint64_t telemetry_metadata_generation_{};
@@ -104,6 +107,12 @@ class NodeRuntime {
     PersistentBlockCache& block_cache() {
         return cache_;
     }
+    RetentionStore& retention_store() {
+        return retention_;
+    }
+    const RetentionStore& retention_store() const {
+        return retention_;
+    }
     MetadataReplica& metadata_replica() {
         return meta_;
     }
@@ -127,13 +136,9 @@ class NodeRuntime {
     AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
     AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType);
     AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType);
-    bool seed_metadata(const MetadataRecord&);
-    bool checkpoint_metadata(const MetadataRecord&);
-    bool checkpoint_metadata_delta(const MetadataRecord& base, std::span<const uint8_t>,
-                                   const MetadataRecord& committed);
-    bool commit_metadata(uint64_t, const Hash256&);
-    bool cas_metadata(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
-    bool cas_metadata_delta(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
+    bool store_metadata_commit(const MetadataHistoryEntry&);
+    bool accept_metadata_commit(const MetadataAcceptance&);
+    std::vector<MetadataAcceptance> metadata_heads() const;
     void announce_metadata_generation(uint64_t);
     void enqueue_fetched(const ObjectId&, std::span<const uint8_t>, bool promote);
     void reconfigure_local(const Config&);
@@ -142,6 +147,9 @@ class NodeRuntime {
     std::chrono::milliseconds activity_idle_for(FrameType) const;
     uint64_t remote_metadata_generation() const {
         return remote_metadata_generation_.load();
+    }
+    uint64_t remote_metadata_epoch() const {
+        return remote_metadata_epoch_.load(std::memory_order_acquire);
     }
     uint64_t known_metadata_generation() const {
         const auto local = meta_.generation();

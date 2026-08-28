@@ -297,7 +297,7 @@ Config storage_node_config(const TestCluster& cluster, std::string_view name, ui
     auto config = cluster.node_config(name, port, std::move(bootstrap));
     config.replication = replicas;
     config.min_write_replicas = min_write_replicas;
-    config.metadata_replication = metadata_replicas;
+    config.metadata_min_write_replicas = metadata_replicas;
     // Loopback test nodes are independent storage failure domains even though
     // they share 127.0.0.1 as their transport host.
     config.failure_domain = std::string(name);
@@ -510,7 +510,7 @@ MACHA_TEST("storage_v18", test_catalogue_metadata_ignores_full_data_quota_and_ar
 
     REQUIRE(wait_until([&] {
         try {
-            return large.metadata().snapshot().metadata_voters.size() == 2;
+            return large.metadata().snapshot().metadata_voters.empty();
         } catch (...) {
             return false;
         }
@@ -543,7 +543,7 @@ MACHA_TEST("storage_v18", test_catalogue_metadata_ignores_full_data_quota_and_ar
     CHECK(fetched->bytes == art_bytes);
 }
 
-MACHA_TEST("storage_v18", test_catalogue_control_objects_recover_on_metadata_voter) {
+MACHA_TEST("storage_v18", test_catalogue_control_objects_recover_on_metadata_replica) {
     TestCluster cluster(ConfigProfile::isolated);
     const auto a_port = free_port();
     const auto b_port = free_port();
@@ -560,7 +560,7 @@ MACHA_TEST("storage_v18", test_catalogue_control_objects_recover_on_metadata_vot
                b.node().membership().active().size() == 2;
     }, 5s));
     REQUIRE(wait_until([&] {
-        try { return b.metadata().snapshot().metadata_voters.size() == 2; }
+        try { return b.metadata().snapshot().metadata_voters.empty(); }
         catch (...) { return false; }
     }, 5s));
 
@@ -585,7 +585,7 @@ MACHA_TEST("storage_v18", test_catalogue_control_objects_recover_on_metadata_vot
 
     // A fresh catalogue manager has no in-memory snapshot to hide the missing
     // physical control objects. Repair must fetch the manifest/shards from the
-    // other metadata voter and leave them durable locally again.
+    // other metadata replica and leave them durable locally again.
     CatalogueManager fresh(a.node(), a.store(), a.metadata());
     fresh.repair_once();
     REQUIRE(fresh.get(item.id).has_value());

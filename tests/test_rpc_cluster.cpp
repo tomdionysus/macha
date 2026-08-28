@@ -45,9 +45,12 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_frame_priority_and_variable_length) {
     CHECK(default_frame_type(MessageType::ping) == FrameType::control);
     CHECK(default_frame_type(MessageType::get_object) == FrameType::foreground);
     CHECK(default_frame_type(MessageType::get_control_object) == FrameType::speculative);
-    CHECK(std::string(message_type_name(MessageType::commit_metadata)) == "commit_metadata");
-    CHECK(std::string(message_type_name(MessageType::cas_metadata_delta)) ==
-          "cas_metadata_delta");
+    CHECK(std::string(message_type_name(MessageType::put_metadata_commit)) ==
+          "put_metadata_commit");
+    CHECK(std::string(message_type_name(MessageType::accept_metadata_commit)) ==
+          "accept_metadata_commit");
+    CHECK(std::string(message_type_name(MessageType::get_metadata_heads)) ==
+          "get_metadata_heads");
 
     TestCluster cluster;
     const auto& keys = cluster.keys();
@@ -420,7 +423,7 @@ MACHA_TEST("rpc_cluster", test_mutual_bootstrap_prunes_cross_dial) {
     auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
     auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 1;
-    c1.metadata_replication = c2.metadata_replication = 1;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
     c1.heartbeat = c2.heartbeat = 20ms;
 
     NodeRuntime n1(c1, keys);
@@ -784,7 +787,7 @@ MACHA_TEST("rpc_cluster", test_early_replication_quorum) {
     // was intended to exercise.
     auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1);
     c1.dead_after = 3s;
-    c1.metadata_replication = 1;
+    c1.metadata_min_write_replicas = 1;
     // Keep the node's background membership exchange out of this latency test.
     // The peers are injected directly below; the test should measure object
     // quorum completion, not race a 100ms control-plane scheduler.
@@ -857,7 +860,7 @@ MACHA_TEST("rpc_cluster", test_put_commits_at_floor_without_waiting_for_desired_
     auto slow2_port = free_port();
 
     config.replication = 3;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.min_write_replicas = 1;
     config.write_stall = 100ms;
     config.heartbeat = 10s;
@@ -919,7 +922,7 @@ MACHA_TEST("rpc_cluster", test_put_falls_back_after_remote_launch_failure) {
     auto dead_port = free_port();
 
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.connect_timeout = 100ms;
     config.heartbeat = 30s;
     config.dead_after = 60s;
@@ -979,7 +982,7 @@ MACHA_TEST("rpc_cluster", test_joiner_cannot_form_genesis) {
     auto& config = fixture.config();
     config.bootstrap = {{"127.0.0.1", config.port}};
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
 
     auto& service = fixture.start();
     bool rejected = false;
@@ -998,15 +1001,15 @@ MACHA_TEST("rpc_cluster", test_bootstrap_joiner_requires_complete_checkpoint_sur
     auto config = config_for(cluster.path() / "checkpoint-survey", cluster.keyfile(), free_port(),
                              {{"127.0.0.1", unreachable_port}});
     config.replication = 1;
-    config.metadata_replication = 1;
+    config.metadata_min_write_replicas = 1;
     config.dead_after = 10s;
 
     NodeRuntime node(config, keys);
     node.start();
 
     // Keep an unreachable peer in active membership and choose its identity so
-    // metadata HRW would select this fresh node as the sole genesis voter. This
-    // deterministically exercises the dangerous path: both metadata
+    // the old placement scheme would have selected this fresh node as a genesis
+    // authority. This deterministically exercises the dangerous path: both metadata
     // RPC surveys fail, yet a replication-1 joiner could previously form an
     // empty generation-2 namespace on itself.
     static constexpr char label[] = "macha/metadata-placement/v1";
@@ -1018,6 +1021,7 @@ MACHA_TEST("rpc_cluster", test_bootstrap_joiner_requires_complete_checkpoint_sur
     phantom.port = unreachable_port;
     phantom.capacity = 512ULL * 1024 * 1024;
     phantom.seen_unix_ms = unix_ms();
+    phantom.metadata_write_replicas_required = 1;
 
     const auto self = node.membership().self();
     bool selected_self = false;
@@ -1050,7 +1054,103 @@ MACHA_TEST("rpc_cluster", test_bootstrap_joiner_requires_complete_checkpoint_sur
     node.stop();
 }
 
-MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_quorum) {
+MACHA_TEST("rpc_cluster", test_metadata_write_floor_policy_mismatch_fails_closed) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto p1 = free_port();
+    auto p2 = free_port();
+
+    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    c1.metadata_min_write_replicas = 1;
+    c2.metadata_min_write_replicas = 2;
+
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }));
+
+    auto rejected_for_policy = [](Service& service) {
+        try {
+            service.filesystem().mkdir("/must-not-form", 0755, getuid(), getgid());
+        } catch (const std::exception& error) {
+            return std::string(error.what()).find("write-floor policy mismatch") !=
+                   std::string::npos;
+        }
+        return false;
+    };
+    CHECK(rejected_for_policy(s1));
+    CHECK(rejected_for_policy(s2));
+    CHECK(s1.node().metadata_replica().committed().generation <= 1);
+    CHECK(s2.node().metadata_replica().committed().generation <= 1);
+
+    s2.stop();
+    s1.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_established_metadata_floor_ignores_misconfigured_peer) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    const auto p3 = free_port();
+
+    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 2;
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }));
+    s1.filesystem().mkdir("/established", 0755, getuid(), getgid());
+    REQUIRE(wait_until([&] {
+        try { return s2.filesystem().getattr("/established").type == EntryType::directory; }
+        catch (...) { return false; }
+    }));
+
+    auto c3 = config_for(cluster.path() / "n3", cluster.keyfile(), p3,
+                         {{"127.0.0.1", p1}, {"127.0.0.1", p2}});
+    c3.metadata_min_write_replicas = 1; // deliberately wrong
+    Service s3(c3, keys);
+    s3.start();
+    REQUIRE(wait_until([&] { return s1.node().membership().active().size() >= 3; }));
+
+    // The bad peer is quarantined from metadata writes; it cannot reduce the
+    // availability of the two policy-compatible replicas which already satisfy W=2.
+    s1.filesystem().mkdir("/still-writable", 0755, getuid(), getgid());
+    REQUIRE(wait_until([&] {
+        try { return s2.filesystem().getattr("/still-writable").type == EntryType::directory; }
+        catch (...) { return false; }
+    }));
+    auto& m1 = s1.metadata_manager();
+    m1.note_replica_validation(false, "policy mismatch test");
+    const auto status = m1.cluster_status();
+    CHECK(status.availability == MetadataAvailability::writable);
+    CHECK(status.replicas_online == 2);
+    CHECK(!status.stable);
+
+    bool bad_peer_rejected = false;
+    try {
+        s3.filesystem().mkdir("/must-not-weaken-policy", 0755, getuid(), getgid());
+    } catch (...) {
+        bad_peer_rejected = true;
+    }
+    CHECK(bad_peer_rejected);
+
+    s3.stop();
+    s2.stop();
+    s1.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_write_floor) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
     auto p1 = free_port();
@@ -1060,7 +1160,7 @@ MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_quorum) {
     auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 2;
     c1.min_write_replicas = c2.min_write_replicas = 2;
-    c1.metadata_replication = c2.metadata_replication = 2;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 2;
 
     Service s1(c1, keys);
     Service s2(c2, keys);
@@ -1127,7 +1227,7 @@ MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_quorum) {
 
     MetadataManager m1(s1.node());
     auto snapshot = m1.snapshot();
-    CHECK(snapshot.metadata_voters.size() == 2);
+    CHECK(snapshot.metadata_voters.empty());
     CHECK(snapshot.data_replication == 2);
 
     auto entry = s1.filesystem().getattr("/media/two-replicas.bin");
@@ -1139,6 +1239,437 @@ MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_quorum) {
     s1.stop();
 }
 
+MACHA_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_before_acceptance) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    const auto p3 = free_port();
+
+    auto peers = [&](uint16_t self) {
+        std::vector<Endpoint> out;
+        for (auto port : {p1, p2, p3})
+            if (port != self)
+                out.push_back({"127.0.0.1", port});
+        return out;
+    };
+    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1, peers(p1));
+    auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, peers(p2));
+    auto c3 = config_for(cluster.path() / "n3", cluster.keyfile(), p3, peers(p3));
+    for (auto* config : {&c1, &c2, &c3}) {
+        config->replication = 3;
+        config->min_write_replicas = 3;
+        config->metadata_min_write_replicas = 2;
+        config->heartbeat = 50ms;
+        config->dead_after = 200ms;
+    }
+
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    auto s3 = std::make_unique<Service>(c3, keys);
+    s1.start();
+    s2.start();
+    s3->start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() == 3 &&
+               s2.node().membership().active().size() == 3 &&
+               s3->node().membership().active().size() == 3;
+    }));
+
+    s1.filesystem().create_file("/retained.bin", 0644, getuid(), getgid());
+    auto input = pattern(128 * 1024);
+    auto writer = s1.filesystem().open_write("/retained.bin", true);
+    REQUIRE(writer->write(0, input) == input.size());
+    writer->commit();
+    const auto entry = s1.filesystem().getattr("/retained.bin");
+    REQUIRE(entry.extents.size() == 1);
+    const auto extent = entry.extents.front().id;
+    REQUIRE(wait_until([&] {
+        return s1.node().local_store().valid(extent) &&
+               s2.node().local_store().valid(extent) &&
+               s3->node().local_store().valid(extent);
+    }));
+    // The accepted file reference itself must already have installed physical
+    // liveness evidence on the DATA durability floor.
+    CHECK(s1.node().retention_store().retained(RetentionClass::data, extent));
+    CHECK(s2.node().retention_store().retained(RetentionClass::data, extent));
+    CHECK(s3->node().retention_store().retained(RetentionClass::data, extent));
+
+    const auto before = s1.node().metadata_replica().committed();
+    s3->stop();
+    s3.reset();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() == 2 &&
+               s2.node().membership().active().size() == 2;
+    }));
+
+    // Metadata W=2 is still available, but this semantic file touch needs a
+    // fresh causal retention dot on DATA W=3 so that a concurrent delete cannot
+    // erase the inherited liveness claim. The metadata head must not advance
+    // when that pre-publication retention barrier cannot be satisfied.
+    bool refused = false;
+    try {
+        s1.filesystem().chmod("/retained.bin", 0600);
+    } catch (const MetadataNotReady&) {
+        refused = true;
+    } catch (...) {
+        refused = true;
+    }
+    CHECK(refused);
+    CHECK(s1.node().metadata_replica().committed().hash == before.hash);
+    CHECK((s1.filesystem().getattr("/retained.bin").mode & 0777U) == 0644U);
+
+    s3 = std::make_unique<Service>(c3, keys);
+    s3->start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() == 3 &&
+               s2.node().membership().active().size() == 3 &&
+               s3->node().membership().active().size() == 3;
+    }));
+    s1.filesystem().chmod("/retained.bin", 0600);
+    CHECK((s1.filesystem().getattr("/retained.bin").mode & 0777U) == 0600U);
+    CHECK(s1.node().metadata_replica().committed().hash != before.hash);
+
+    s3->stop();
+    s2.stop();
+    s1.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_partition_delete_allows_causal_gc_without_global_convergence) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    const auto p3 = free_port();
+
+    auto peers = [&](uint16_t self) {
+        std::vector<Endpoint> out;
+        for (auto port : {p1, p2, p3})
+            if (port != self)
+                out.push_back({"127.0.0.1", port});
+        return out;
+    };
+    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1, peers(p1));
+    auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, peers(p2));
+    auto c3 = config_for(cluster.path() / "n3", cluster.keyfile(), p3, peers(p3));
+    for (auto* config : {&c1, &c2, &c3}) {
+        config->replication = 2;
+        config->min_write_replicas = 2;
+        config->metadata_min_write_replicas = 2;
+        config->heartbeat = 50ms;
+        config->dead_after = 200ms;
+        config->maintenance.interval = 50ms;
+        config->maintenance.foreground_quiet = 10ms;
+        config->maintenance.no_progress_backoff = 500ms;
+        config->maintenance.garbage_grace = 0ms;
+    }
+
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    Service s3(c3, keys);
+    s1.start();
+    s2.start();
+    s3.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() == 3 &&
+               s2.node().membership().active().size() == 3 &&
+               s3.node().membership().active().size() == 3;
+    }));
+
+    s1.filesystem().create_file("/partition-retain.bin", 0644, getuid(), getgid());
+    const auto bytes = pattern(128 * 1024 + 7);
+    auto writer = s1.filesystem().open_write("/partition-retain.bin", true);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    const auto entry = s1.filesystem().getattr("/partition-retain.bin");
+    REQUIRE(entry.extents.size() == 1);
+    const auto extent = entry.extents.front().id;
+    REQUIRE(wait_until([&] {
+        try {
+            return s2.filesystem().getattr("/partition-retain.bin").size == bytes.size() &&
+                   s3.filesystem().getattr("/partition-retain.bin").size == bytes.size();
+        } catch (...) {
+            return false;
+        }
+    }));
+
+    // Node 3 now carries a legitimate accepted ancestor branch but becomes
+    // unreachable before the delete. Nodes 1+2 are still a legal W=2 metadata
+    // cohort and must be allowed to advance.
+    s3.stop();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() == 2 &&
+               s2.node().membership().active().size() == 2;
+    }));
+    s1.filesystem().unlink("/partition-retain.bin");
+    REQUIRE(wait_until([&] {
+        try {
+            (void)s2.filesystem().getattr("/partition-retain.bin");
+            return false;
+        } catch (...) {
+            return true;
+        }
+    }));
+
+    // An offline *unchanged ancestor* is not a competing semantic reference:
+    // if it later makes only unrelated changes, three-way merge still preserves
+    // this accepted delete. The running pair may therefore causally release the
+    // claims it observed and reclaim its copies without waiting for node 3. A
+    // genuinely concurrent touch would have installed a newer claim dot, which
+    // this delete's mutation clock could not remove.
+    REQUIRE(wait_until([&] {
+        return !s1.node().retention_store().retained(RetentionClass::data, extent) &&
+               !s2.node().retention_store().retained(RetentionClass::data, extent) &&
+               !s1.node().local_store().valid(extent) &&
+               !s2.node().local_store().valid(extent);
+    }, 5s));
+
+    s2.stop();
+    s1.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_retained_missing_copy_repairs_without_namespace_reachability) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    const auto p3 = free_port();
+
+    auto peers = [&](uint16_t self) {
+        std::vector<Endpoint> out;
+        for (auto port : {p1, p2, p3})
+            if (port != self)
+                out.push_back({"127.0.0.1", port});
+        return out;
+    };
+    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1, peers(p1));
+    auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, peers(p2));
+    auto c3 = config_for(cluster.path() / "n3", cluster.keyfile(), p3, peers(p3));
+    for (auto* config : {&c1, &c2, &c3}) {
+        config->replication = 1;
+        config->min_write_replicas = 1;
+        config->metadata_min_write_replicas = 2;
+        config->heartbeat = 50ms;
+        config->dead_after = 200ms;
+        config->maintenance.interval = 50ms;
+        config->maintenance.foreground_quiet = 10ms;
+        config->maintenance.no_progress_backoff = 500ms;
+    }
+
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    auto s3 = std::make_unique<Service>(c3, keys);
+    s1.start();
+    s2.start();
+    s3->start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() == 3 &&
+               s2.node().membership().active().size() == 3 &&
+               s3->node().membership().active().size() == 3;
+    }));
+    // Establish normal metadata state so maintenance is running against a valid
+    // accepted branch before we create the deliberately unreachable object.
+    s1.filesystem().mkdir("/base", 0755, getuid(), getgid());
+    REQUIRE(wait_until([&] {
+        try {
+            return s2.filesystem().getattr("/base").type == EntryType::directory;
+        } catch (...) {
+            return false;
+        }
+    }));
+
+    const auto bytes = pattern(96 * 1024 + 13);
+    const auto id = object_id(bytes);
+    REQUIRE(s1.node().local_store().put(id, bytes));
+    REQUIRE(s2.node().local_store().put(id, bytes));
+    const RetentionDot claim{s1.node().node_id(), 0xf00d};
+    s1.node().retention_store().retain(RetentionClass::data, id, claim);
+    s2.node().retention_store().retain(RetentionClass::data, id, claim);
+
+    // Keep another replica offline while installing a deliberately future/
+    // concurrent claim dot which the current branch clock does not dominate.
+    // Namespace reachability is absent, but causal GC must not erase this claim.
+    s3->stop();
+    s3.reset();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() == 2 &&
+               s2.node().membership().active().size() == 2;
+    }));
+
+    REQUIRE(s2.node().local_store().remove(id));
+    CHECK(s2.node().retention_store().retained(RetentionClass::data, id));
+    CHECK(!s2.node().local_store().valid(id));
+
+    // `id` is deliberately absent from namespace/catalogue reachability. The
+    // only reason maintenance can know it must restore this physical copy is the
+    // durable local retention claim itself.
+    REQUIRE(wait_until([&] { return s2.node().local_store().valid(id); }, 5s));
+    auto restored = s2.node().local_store().get(id);
+    REQUIRE(restored.has_value());
+    CHECK(*restored == bytes);
+    CHECK(s2.node().retention_store().retained(RetentionClass::data, id));
+
+    s2.stop();
+    s1.stop();
+}
+
+MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcile) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    const auto p3 = free_port();
+    const auto p4 = free_port();
+
+    auto all_except = [&](uint16_t self) {
+        std::vector<Endpoint> peers;
+        for (auto port : {p1, p2, p3, p4}) {
+            if (port != self)
+                peers.push_back({"127.0.0.1", port});
+        }
+        return peers;
+    };
+
+    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1, all_except(p1));
+    auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, all_except(p2));
+    auto c3 = config_for(cluster.path() / "n3", cluster.keyfile(), p3, all_except(p3));
+    auto c4 = config_for(cluster.path() / "n4", cluster.keyfile(), p4, all_except(p4));
+    for (auto* config : {&c1, &c2, &c3, &c4}) {
+        config->replication = 1;
+        config->min_write_replicas = 1;
+        config->metadata_min_write_replicas = 2;
+        config->heartbeat = 50ms;
+        config->dead_after = 200ms;
+    }
+
+    Hash256 left_head{};
+    NodeId node2_id{};
+    {
+        Service s1(c1, keys);
+        Service s2(c2, keys);
+        Service s3(c3, keys);
+        Service s4(c4, keys);
+        s1.start();
+        s2.start();
+        s3.start();
+        s4.start();
+        REQUIRE(wait_until([&] {
+            return s1.node().membership().active().size() >= 4 &&
+                   s2.node().membership().active().size() >= 4 &&
+                   s3.node().membership().active().size() >= 4 &&
+                   s4.node().membership().active().size() >= 4;
+        }));
+
+        // Establish one accepted base on every replica before deliberately
+        // partitioning the cluster into two disjoint write-capable pairs.
+        s1.filesystem().mkdir("/base", 0755, getuid(), getgid());
+        MetadataManager initial_repair(s1.node());
+        initial_repair.repair_once();
+        REQUIRE(wait_until([&] {
+            try {
+                return s2.filesystem().getattr("/base").type == EntryType::directory &&
+                       s3.filesystem().getattr("/base").type == EntryType::directory &&
+                       s4.filesystem().getattr("/base").type == EntryType::directory;
+            } catch (...) {
+                return false;
+            }
+        }));
+
+        s3.stop();
+        s4.stop();
+        REQUIRE(wait_until([&] {
+            return s1.node().membership().active().size() == 2 &&
+                   s2.node().membership().active().size() == 2;
+        }));
+
+        s1.filesystem().mkdir("/left", 0755, getuid(), getgid());
+        REQUIRE(wait_until([&] {
+            try {
+                return s2.filesystem().getattr("/left").type == EntryType::directory;
+            } catch (...) {
+                return false;
+            }
+        }));
+        left_head = s2.node().metadata_replica().committed().hash;
+        node2_id = s2.node().node_id();
+        CHECK(s2.node().metadata_replica().acceptance(left_head).has_value());
+
+        s2.stop();
+        s1.stop();
+    }
+
+    Hash256 right_head{};
+    {
+        // Nodes 3+4 never observed /left. They must nevertheless remain
+        // writable because they are an arbitrary surviving pair satisfying the
+        // configured metadata durability floor.
+        Service s3(c3, keys);
+        Service s4(c4, keys);
+        s3.start();
+        s4.start();
+        REQUIRE(wait_until([&] {
+            return s3.node().membership().active().size() == 2 &&
+                   s4.node().membership().active().size() == 2;
+        }));
+
+        bool left_absent = false;
+        try {
+            (void)s3.filesystem().getattr("/left");
+        } catch (...) {
+            left_absent = true;
+        }
+        CHECK(left_absent);
+        s3.filesystem().mkdir("/right", 0755, getuid(), getgid());
+        REQUIRE(wait_until([&] {
+            try {
+                return s4.filesystem().getattr("/right").type == EntryType::directory;
+            } catch (...) {
+                return false;
+            }
+        }));
+        right_head = s3.node().metadata_replica().committed().hash;
+        REQUIRE(right_head != left_head);
+        CHECK(s3.node().metadata_replica().acceptance(right_head).has_value());
+
+        // Bring back one member of the other pair. The active pair now carries
+        // two previously accepted sibling histories. Neither may be discarded:
+        // reconciliation must create an accepted descendant of both.
+        s4.stop();
+        Service s2(c2, keys);
+        s2.start();
+        REQUIRE(s2.node().node_id() == node2_id);
+        REQUIRE(wait_until([&] {
+            auto active2 = s2.node().membership().active();
+            auto active3 = s3.node().membership().active();
+            return active2.size() == 2 && active3.size() == 2;
+        }));
+
+        MetadataManager reconcile(s2.node());
+        REQUIRE(wait_until([&] {
+            try {
+                reconcile.repair_once();
+                return s2.filesystem().getattr("/left").type == EntryType::directory &&
+                       s2.filesystem().getattr("/right").type == EntryType::directory &&
+                       s3.filesystem().getattr("/left").type == EntryType::directory &&
+                       s3.filesystem().getattr("/right").type == EntryType::directory;
+            } catch (...) {
+                return false;
+            }
+        }, 3s));
+
+        REQUIRE(wait_until([&] {
+            return s2.node().metadata_replica().accepted_heads().size() == 1 &&
+                   s3.node().metadata_replica().accepted_heads().size() == 1;
+        }));
+        const auto merged = s2.node().metadata_replica().accepted_heads().front();
+        CHECK(s2.node().metadata_replica().history_is_ancestor(left_head, merged.hash));
+        CHECK(s2.node().metadata_replica().history_is_ancestor(right_head, merged.hash));
+
+        s2.stop();
+        s3.stop();
+    }
+}
+
 MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
@@ -1148,7 +1679,7 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
     auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1);
     auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 1;
-    c1.metadata_replication = c2.metadata_replication = 1;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
 
     ObjectId object;
     Bytes input = pattern(128 * 1024);
@@ -1181,10 +1712,10 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
     }
 
     // Replica policy is deliberately changed only while the whole cluster is
-    // stopped. On restart the old metadata quorum commits the new policy and
+    // stopped. On restart the the available metadata replicas commit the new DATA policy and
     // object repair converges existing content to the new data replica count.
     c1.replication = c2.replication = 2;
-    c1.metadata_replication = c2.metadata_replication = 2;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 2;
     {
         Service s1(c1, keys);
         Service s2(c2, keys);
@@ -1198,8 +1729,9 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
         s1.filesystem().mkdir("/after-grow", 0755, getuid(), getgid());
         MetadataManager m1(s1.node());
         auto snapshot = m1.snapshot();
-        CHECK(snapshot.metadata_voters.size() == 2);
+        CHECK(snapshot.metadata_voters.empty());
         CHECK(snapshot.data_replication == 2);
+        CHECK(snapshot.metadata_write_replicas_required == 2);
         CHECK(s2.filesystem().getattr("/after-grow").type == EntryType::directory);
 
         DistributedStore r1(s1.node());
@@ -1215,7 +1747,7 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
     }
 
     c1.replication = c2.replication = 1;
-    c1.metadata_replication = c2.metadata_replication = 1;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
     {
         Service s1(c1, keys);
         Service s2(c2, keys);
@@ -1229,8 +1761,9 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
         s2.filesystem().mkdir("/after-shrink", 0755, getuid(), getgid());
         MetadataManager m2(s2.node());
         auto snapshot = m2.snapshot();
-        CHECK(snapshot.metadata_voters.size() == 1);
+        CHECK(snapshot.metadata_voters.empty());
         CHECK(snapshot.data_replication == 1);
+        CHECK(snapshot.metadata_write_replicas_required == 1);
         CHECK(s1.filesystem().getattr("/after-shrink").type == EntryType::directory);
 
         auto reader = s2.filesystem().open_read("/policy.bin");
@@ -1338,7 +1871,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
     auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1);
     auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 2;
-    c1.metadata_replication = c2.metadata_replication = 1;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
 
     std::vector<ObjectId> objects;
     Bytes input = pattern(2 * 1024 * 1024 + 12345);
@@ -1455,7 +1988,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
     }
     CHECK(output == input);
 
-    // Recovery also reconstructs a writable metadata voter group; it is not a
+    // Recovery also reconstructs a writable metadata replica view; it is not a
     // read-only salvage mode.
     replacement->filesystem().mkdir("/after-replacement", 0755, getuid(), getgid());
     REQUIRE(wait_until(
@@ -1508,7 +2041,23 @@ MACHA_HEAVY_TEST("rpc_cluster", test_three_node_cluster) {
                    s3.node().membership().active().size() >= 3;
         }));
 
-        s1.filesystem().mkdir("/media", 0755, getuid(), getgid());
+        // Genesis has no privileged coordinator in 0.19. Deliberately initiate
+        // the virgin namespace from the highest NodeId, which cannot be the
+        // historical min-NodeId coordinator, and require the resulting root to
+        // become visible on node 1 before continuing the lifecycle test.
+        Service* genesis_writer = &s1;
+        if (s2.node().node_id() > genesis_writer->node().node_id())
+            genesis_writer = &s2;
+        if (s3.node().node_id() > genesis_writer->node().node_id())
+            genesis_writer = &s3;
+        genesis_writer->filesystem().mkdir("/media", 0755, getuid(), getgid());
+        REQUIRE(wait_until([&] {
+            try {
+                return s1.filesystem().getattr("/media").type == EntryType::directory;
+            } catch (...) {
+                return false;
+            }
+        }));
         s1.filesystem().create_file("/media/movie.mkv", 0644, getuid(), getgid());
         auto input = pattern(3 * 1024 * 1024 + 12345);
         auto writer = s1.filesystem().open_write("/media/movie.mkv", true);
@@ -1602,8 +2151,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_three_node_cluster) {
         }
         CHECK(wrong_type_rejected);
 
-        // Loss of any one metadata voter must not stop namespace mutations.
-        auto failed_voter = s3.node().node_id();
+        // Loss of any one metadata replica must not stop namespace mutations.
+        auto failed_replica = s3.node().node_id();
         s3.stop();
         s2.filesystem().mkdir("/survives-one-node-loss", 0755, getuid(), getgid());
         CHECK(s1.filesystem().getattr("/survives-one-node-loss").type == EntryType::directory);
@@ -1654,8 +2203,9 @@ MACHA_HEAVY_TEST("rpc_cluster", test_three_node_cluster) {
         REQUIRE(cached_fetch.has_value());
         CHECK(*cached_fetch == *playback_fetch);
 
-        // Add a replacement storage node. Once the failed voter has expired, a
-        // surviving metadata majority can safely replace it with the new node.
+        // Add a replacement storage node. Once the failed node has expired, the
+        // replacement is immediately an eligible metadata replica; no voter-seat
+        // reconfiguration is required.
         Service s4(c4, keys);
         s4.start();
         REQUIRE(wait_until([&] {
@@ -1663,7 +2213,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_three_node_cluster) {
             bool has_failed = false;
             bool has_new = false;
             for (const auto& peer : active) {
-                has_failed |= peer.id == failed_voter;
+                has_failed |= peer.id == failed_replica;
                 has_new |= peer.id == s4.node().node_id();
             }
             return !has_failed && has_new && active.size() >= 3;
@@ -1684,13 +2234,13 @@ MACHA_HEAVY_TEST("rpc_cluster", test_three_node_cluster) {
             }
         }));
 
-        // The old voter can now also disappear: node 2 + replacement node 4
-        // are a majority of the new voter group.
+        // Node 1 can now also disappear: node 2 + replacement node 4 satisfy
+        // metadata_min_write_replicas=2 regardless of which nodes they are.
         s1.stop();
-        s2.filesystem().mkdir("/after-voter-replacement", 0755, getuid(), getgid());
-        CHECK(s4.filesystem().getattr("/after-voter-replacement").type == EntryType::directory);
+        s2.filesystem().mkdir("/after-arbitrary-replica-failover", 0755, getuid(), getgid());
+        CHECK(s4.filesystem().getattr("/after-arbitrary-replica-failover").type == EntryType::directory);
 
-        // A single surviving voter is a minority and must not split-brain metadata.
+        // One surviving node is below metadata_min_write_replicas=2 and cannot publish.
         s4.stop();
         bool refused = false;
         try {

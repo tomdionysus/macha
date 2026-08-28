@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.18.2 LANGUAGES CXX)
+project(macha VERSION 0.19.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -139,6 +139,7 @@ set(MACHA_CORE_SOURCES
     src/membership.cpp
     src/local_store.cpp
     src/storage_pool.cpp
+    src/retention.cpp
     src/persistent_cache.cpp
     src/metadata.cpp
     src/net.cpp

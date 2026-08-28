@@ -62,7 +62,7 @@ filesystem:
   root_mode: "0755"
 
 # The mounted filesystem is a bounded local frontend. Kernel callbacks never
-# wait synchronously for metadata quorum, remote placement, repair or catalogue
+# wait synchronously for metadata publication, remote placement, repair or catalogue
 # work. Accepted namespace/data state is journalled locally and published by
 # asynchronous workers. Timeouts deliberately remain well below macFUSE's own
 # daemon timeout; a request fails to the kernel rather than hanging the mount.
@@ -150,20 +150,21 @@ network:
     timeout_ms: 3000
 
 # Cluster policy. Keep replica counts identical everywhere and change them as a
-# coordinated cluster operation. DATA replicas and metadata voters are separate.
+# coordinated cluster operation. Every node is metadata-capable.
 # `min_write_replicas` is the foreground DATA durability floor; `replicas` is
-# the convergence target restored by repair.
+# the DATA convergence target restored by repair. `metadata_min_write_replicas`
+# is the number of distinct active nodes required to publish metadata/control.
 #
 # extent_size is fixed once a namespace exists. It is a logical file-chunk
 # ceiling and is unrelated to the physical small-object packing threshold.
 dht:
   replicas: 3
-  metadata_replicas: 3
+  metadata_min_write_replicas: 2
 
   # DATA may publish after min_write_replicas durable authoritative copies.
   # Repair converges missing copies toward replicas. A full/offline/stalled
   # preferred owner falls through to the next deterministic capacity-aware
-  # candidate. Metadata/control writes retain their separate voter quorum.
+  # candidate. Metadata/control writes use their separate any-node write floor.
   min_write_replicas: 1
   write_stall_ms: 2500
   extent_size: 4M
@@ -220,7 +221,7 @@ maintenance:
   garbage_grace_ms: 86400000
 
 # Catalogue structure is CONTROL metadata: sharded content-addressed objects are
-# majority-durable on metadata voters and then converged to current voters.
+# durable on the metadata write floor and then converged to all active nodes.
 # Artwork is ordinary DATA. The scanner and HTTP/JSON API are optional.
 # Each scan provider owns the roots
 # it is allowed to classify. Every enabled provider root must be readable for

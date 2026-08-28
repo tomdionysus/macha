@@ -103,6 +103,10 @@ Service::Service(Config config, ClusterKeys keys)
                      }),
       manage_api_(node_, metadata_, fs_, catalogue_, catalogue_hints_, scanner_),
       streaming_(fs_, catalogue_, node_.config().catalogue.api, node_.config().streaming) {
+    metadata_.set_publication_retention(
+        [this](const MetadataPublicationContext& context) {
+            retain_metadata_publication(context);
+        });
     if (node_.config().catalogue.api.enabled) {
         catalogue_http_ = std::make_unique<HttpServer>(
             node_.config().catalogue.api,
@@ -200,7 +204,7 @@ void Service::reload_config() {
     if (updated.extent_size != node_.config().extent_size)
         throw std::runtime_error("extent_size cannot be changed for an existing namespace");
     if (updated.replication != node_.config().replication ||
-        updated.metadata_replication != node_.config().metadata_replication)
+        updated.metadata_min_write_replicas != node_.config().metadata_min_write_replicas)
         throw std::runtime_error("replica policy changes require a coordinated cluster restart");
     const auto& current_streaming = node_.config().streaming;
     const bool streaming_restart_required =
@@ -221,6 +225,88 @@ void Service::reload_config() {
         Log::warn("streaming enable/buffer/probe/path changes require restart; live limits were reloaded");
     streaming_.reconfigure(updated.streaming);
     Log::info("reloaded storage backends, persistent cache, catalogue scanner, ingest, torrent, hydration and streaming limits");
+}
+
+
+void Service::retain_metadata_publication(const MetadataPublicationContext& context) {
+    const RetentionDot dot{context.origin, context.sequence};
+    std::vector<ObjectId> data;
+    std::vector<ObjectId> control;
+
+    auto add_entry = [&](const FsEntry& entry) {
+        if (entry.type != EntryType::file)
+            return;
+        for (const auto& extent : entry.extents)
+            if (!extent.hole)
+                data.push_back(extent.id);
+    };
+
+    auto before = decode_snapshot(context.parent.payload);
+    const bool establish_baseline = !before.retention_baseline_complete &&
+                                    context.proposed.retention_baseline_complete;
+    if (establish_baseline) {
+        // Migration safety: before protocol-20 retention-aware GC is enabled for
+        // an upgraded namespace, every object reachable from the reconciled
+        // migration view must acquire physical liveness evidence. This is a
+        // one-time potentially-large publication; normal partition-time GC does
+        // not require global convergence after the baseline exists.
+        for (const auto& [_, entry] : context.proposed.entries)
+            add_entry(entry);
+        const auto conflict_extents = metadata_conflict_extent_roots(context.proposed);
+        data.insert(data.end(), conflict_extents.begin(), conflict_extents.end());
+        for (const auto& root : metadata_catalogue_root_set(context.proposed)) {
+            auto objects = catalogue_.retention_objects(std::nullopt, root);
+            data.insert(data.end(), objects.data.begin(), objects.data.end());
+            control.insert(control.end(), objects.control.begin(), objects.control.end());
+        }
+    } else {
+        if (context.delta) {
+            for (const auto& [_, entry] : context.delta->upsert_entries)
+                add_entry(entry);
+        } else {
+            for (const auto& [path, entry] : context.proposed.entries) {
+                const auto found = before.entries.find(path);
+                if (found == before.entries.end() || found->second != entry)
+                    add_entry(entry);
+            }
+        }
+
+        const bool catalogue_changed = context.delta
+            ? context.delta->catalogue != CatalogueDelta::unchanged
+            : before.catalogue_root != context.proposed.catalogue_root;
+        if (catalogue_changed && context.proposed.catalogue_root) {
+            auto objects = catalogue_.retention_objects(before.catalogue_root,
+                                                        context.proposed.catalogue_root);
+            data.insert(data.end(), objects.data.begin(), objects.data.end());
+            control.insert(control.end(), objects.control.begin(), objects.control.end());
+        }
+        // A reconciliation may preserve catalogue conflict alternatives which
+        // are not the effective root. New alternatives must be retained before
+        // the merge commit can become accepted.
+        if (!context.delta) {
+            auto before_roots = metadata_catalogue_root_set(before);
+            auto after_roots = metadata_catalogue_root_set(context.proposed);
+            for (const auto& root : after_roots) {
+                if (before_roots.contains(root))
+                    continue;
+                auto objects = catalogue_.retention_objects(std::nullopt, root);
+                data.insert(data.end(), objects.data.begin(), objects.data.end());
+                control.insert(control.end(), objects.control.begin(), objects.control.end());
+            }
+        }
+    }
+
+    std::sort(data.begin(), data.end());
+    data.erase(std::unique(data.begin(), data.end()), data.end());
+    std::sort(control.begin(), control.end());
+    control.erase(std::unique(control.begin(), control.end()), control.end());
+
+    if (!data.empty() && !store_.retain_data(data, dot))
+        throw MetadataNotReady("DATA retention floor unavailable before metadata publication");
+    if (!control.empty() &&
+        !store_.retain_control(control, dot,
+                               context.proposed.metadata_write_replicas_required))
+        throw MetadataNotReady("CONTROL retention floor unavailable before metadata publication");
 }
 
 std::vector<GarbageRef> Service::collect_garbage(const std::vector<GarbageRef>& garbage) {
@@ -296,6 +382,7 @@ void Service::loop(std::stop_token stop) {
     auto last_wall = Clock::now();
     auto last_cpu = std::clock();
     auto last_metadata = Clock::time_point{};
+    uint64_t last_metadata_remote_epoch = node_.remote_metadata_epoch();
     auto last_catalogue = Clock::time_point{};
     auto last_garbage_inventory = Clock::time_point{};
     auto network_quiescent_until = Clock::time_point{};
@@ -306,6 +393,8 @@ void Service::loop(std::stop_token stop) {
     double network_credit = 0.0;
     double local_credit = 0.0;
     double scrub_credit = 0.0;
+    std::optional<ObjectId> retained_data_repair_after;
+    std::optional<ObjectId> retained_control_repair_after;
 
     while (!stop.stop_requested()) {
         auto now = Clock::now();
@@ -361,40 +450,49 @@ void Service::loop(std::stop_token stop) {
 
         try {
             // Remote generation notices wake no kernel/FUSE path and perform no
-            // quorum I/O themselves. The maintenance owner advances the coherent
+            // metadata-replica I/O themselves. The maintenance owner advances the coherent
             // local metadata snapshot promptly, while settled verification remains
             // a bounded periodic control-plane task.
             const bool metadata_refresh_needed =
-                node_.known_metadata_generation() > node_.metadata_replica().committed_generation();
+                node_.known_metadata_generation() > node_.metadata_replica().committed_generation() ||
+                node_.remote_metadata_epoch() != last_metadata_remote_epoch;
             const bool metadata_periodic =
                 last_metadata == Clock::time_point{} || now - last_metadata >= background_interval;
             if (metadata_refresh_needed || (!busy && metadata_periodic)) {
                 const auto stage = Clock::now();
                 try {
                     metadata_.repair_once();
-                    metadata_.note_quorum_validation(true);
+                    metadata_.note_replica_validation(true);
                 } catch (const std::exception& error) {
-                    // Preserve the original maintenance ordering invariant: a
-                    // failed metadata repair aborts this maintenance pass.  The
-                    // catalogue/GC/repair stages below must not run after the
-                    // metadata owner has just failed to establish a coherent
-                    // writable view. Availability itself is still published and
-                    // logged exactly once on transition.
-                    metadata_.note_quorum_validation(false, error.what());
-                    throw;
+                    metadata_.note_replica_validation(false, error.what());
+                    // In 0.19, inability to validate/reconcile every active
+                    // metadata head must not stall non-destructive DATA repair.
+                    // A locally committed branch remains a valid source of live
+                    // object reachability while reconciliation is pending.
+                    // Destructive GC below is independently fenced on `stable`,
+                    // so continuing here can only add/repair replicas.
+                    const auto local = node_.metadata_replica().committed();
+                    if (node_.metadata_replica().recovery_required() || local.generation <= 1)
+                        throw;
+                    Log::debug("metadata repair deferred; continuing non-destructive maintenance: " +
+                               std::string(error.what()));
                 } catch (...) {
-                    metadata_.note_quorum_validation(false, "metadata validation failed");
-                    throw;
+                    metadata_.note_replica_validation(false, "metadata validation failed");
+                    const auto local = node_.metadata_replica().committed();
+                    if (node_.metadata_replica().recovery_required() || local.generation <= 1)
+                        throw;
+                    Log::debug("metadata repair deferred; continuing non-destructive maintenance");
                 }
                 log_slow_stage("metadata-repair", stage);
                 last_metadata = now;
+                last_metadata_remote_epoch = node_.remote_metadata_epoch();
             }
 
             // Catalogue GETs are memory-only. Convergence therefore belongs here:
             // generation notices (or the short validation TTL) trigger a refresh
             // independently of foreground activity, while the normal settled-state
             // verification remains an idle/background operation. This keeps remote
-            // catalogue changes live without ever putting quorum I/O on an API thread.
+            // catalogue changes live without ever putting metadata-replica I/O on an API thread.
             const bool catalogue_refresh_needed = catalogue_.refresh_needed();
             const bool catalogue_periodic =
                 last_catalogue == Clock::time_point{} ||
@@ -418,6 +516,12 @@ void Service::loop(std::stop_token stop) {
                 !busy && (last_garbage_inventory == Clock::time_point{} ||
                           now - last_garbage_inventory >= background_interval);
             const bool gc_due = !busy && now >= gc_quiescent_until;
+
+            // Physical GC is safe during partitions because object liveness is
+            // carried by durable causal retention claims on the physical nodes
+            // which hold the objects. Reachability remains useful for deciding
+            // which observed claims can be released, but global branch discovery
+            // is no longer a prerequisite for local reclamation.
 
             // Reachability GC, repair and explicit tombstone accounting share
             // one immutable namespace inventory. Rebuild it only when one of
@@ -478,8 +582,41 @@ void Service::loop(std::stop_token stop) {
                 }
 
                 if (network_due) {
-                    const auto byte_budget = static_cast<uint64_t>(network_credit);
                     const auto extent = std::max<uint64_t>(1, node_.config().extent_size);
+
+                    // A durable retention claim is a promise about this physical
+                    // node, not merely an annotation on the node's current
+                    // namespace view. If scrub/corruption removes a claimed copy
+                    // belonging only to an unseen branch, ordinary live-set repair
+                    // cannot discover it. Walk a tiny bounded claim slice first and
+                    // actively restore missing claimed DATA/CONTROL objects.
+                    size_t retained_repairs = 0;
+                    auto repair_retained = [&](RetentionClass type,
+                                               std::optional<ObjectId>& cursor) {
+                        for (size_t examined = 0; examined < 2 && network_credit >= extent; ++examined) {
+                            bool complete = false;
+                            auto id = node_.retention_store().next_retained(type, cursor, complete);
+                            if (!id)
+                                break;
+                            const bool present = type == RetentionClass::data
+                                                     ? node_.local_store().valid(*id)
+                                                     : node_.control_store().valid(*id);
+                            if (present)
+                                continue;
+                            const bool restored = type == RetentionClass::data
+                                                      ? store_.ensure_local(*id, false)
+                                                      : store_.ensure_control_local(*id);
+                            if (restored) {
+                                ++retained_repairs;
+                                network_credit = std::max(0.0, network_credit -
+                                                                   static_cast<double>(extent));
+                            }
+                        }
+                    };
+                    repair_retained(RetentionClass::data, retained_data_repair_after);
+                    repair_retained(RetentionClass::control, retained_control_repair_after);
+
+                    const auto byte_budget = static_cast<uint64_t>(network_credit);
                     // The byte budget alone does not constrain have-object
                     // probes: a settled or mostly-settled namespace could issue
                     // thousands of synchronous control RPCs while consuming no
@@ -501,6 +638,7 @@ void Service::loop(std::stop_token stop) {
                         maintenance_inventory_generation_);
                     log_slow_stage("network-repair", repair_stage,
                                    "bytes=" + std::to_string(repair.bytes_transferred) +
+                                   " retained_repairs=" + std::to_string(retained_repairs) +
                                    " push_examined=" + std::to_string(repair.push_examined) +
                                    " pull_examined=" + std::to_string(repair.pull_examined) +
                                    " remote_ops=" + std::to_string(repair.remote_operations) +
@@ -512,7 +650,7 @@ void Service::loop(std::stop_token stop) {
                     }
                     if (repair.yielded) {
                         Log::trace("maintenance: repair yielded to foreground I/O");
-                    } else if (!repair.bytes_transferred && repair.complete) {
+                    } else if (!retained_repairs && !repair.bytes_transferred && repair.complete) {
                         network_credit = 0.0;
                         network_quiescent_until = Clock::now() + policy.no_progress_backoff;
                         Log::trace("maintenance: repair quiescent; backing off no-progress scan");
@@ -543,22 +681,85 @@ void Service::loop(std::stop_token stop) {
                 // sweep the control store using such a stale set: with a zero/short
                 // grace period it could delete a newly-published manifest or shard
                 // before the next maintenance pass observes the successor generation.
-                if (gc_due && maintenance_catalogue_complete_ && maintenance_control_live_ &&
+                const auto current_metadata_view = metadata_.available_snapshot_view();
+                const bool destructive_gc_enabled =
+                    current_metadata_view && current_metadata_view->snapshot->retention_baseline_complete;
+
+                // Retention release is local and causal. A sole accepted head
+                // provides a complete live-object set plus the mutation clock of
+                // claim dots it has actually observed. Claims from unseen concurrent
+                // branches are not dominated by that clock and therefore survive.
+                if (auto floor = metadata_.retention_release_view();
+                    floor && floor->hash != retention_release_floor_hash_) {
+                    auto data_live = std::make_shared<std::vector<ObjectId>>();
+                    auto control_live = std::make_shared<std::vector<ObjectId>>();
+                    bool complete = true;
+                    for (const auto& [_, entry] : floor->snapshot->entries) {
+                        if (entry.type != EntryType::file)
+                            continue;
+                        for (const auto& extent_ref : entry.extents)
+                            if (!extent_ref.hole)
+                                data_live->push_back(extent_ref.id);
+                    }
+                    const auto conflict_extents = metadata_conflict_extent_roots(*floor->snapshot);
+                    data_live->insert(data_live->end(), conflict_extents.begin(), conflict_extents.end());
+
+                    for (const auto& root : metadata_catalogue_root_set(*floor->snapshot)) {
+                        try {
+                            auto retained = catalogue_.retention_objects(std::nullopt, root);
+                            data_live->insert(data_live->end(), retained.data.begin(), retained.data.end());
+                            control_live->insert(control_live->end(), retained.control.begin(), retained.control.end());
+                        } catch (const std::exception& error) {
+                            complete = false;
+                            Log::debug("retention release horizon catalogue unavailable root=" +
+                                       to_string(root) + " error=" + error.what());
+                        }
+                    }
+                    std::sort(data_live->begin(), data_live->end());
+                    data_live->erase(std::unique(data_live->begin(), data_live->end()), data_live->end());
+                    std::sort(control_live->begin(), control_live->end());
+                    control_live->erase(std::unique(control_live->begin(), control_live->end()), control_live->end());
+                    if (complete) {
+                        retention_release_floor_hash_ = floor->hash;
+                        retention_release_data_live_ = std::move(data_live);
+                        retention_release_control_live_ = std::move(control_live);
+                        retention_release_clock_ = floor->snapshot->mutation_sequences;
+                        retention_release_complete_ = true;
+                    }
+                }
+
+                if (gc_due && destructive_gc_enabled && maintenance_catalogue_complete_ &&
+                    maintenance_control_live_ &&
                     maintenance_inventory_generation_ >= node_.known_metadata_generation()) {
+                    // Release locally-observed dead claims even during a partition.
+                    // Concurrent/unseen claims survive observed-remove causality.
+                    if (retention_release_complete_ && retention_release_control_live_) {
+                        (void)node_.retention_store().release_unreferenced(
+                            RetentionClass::control, *retention_release_control_live_,
+                            retention_release_clock_, 64);
+                    }
                     const auto removed = catalogue_.control_gc_step(
                         *maintenance_control_live_, policy.garbage_grace, 32);
+                    (void)node_.retention_store().prune_unclaimed(
+                        RetentionClass::control,
+                        [this](const ObjectId& id) { return node_.control_store().has(id); }, 64);
                     if (removed)
                         Log::debug("catalogue control GC removed=" + std::to_string(removed));
                 }
 
                 // Physical mark/sweep also catches objects that never acquired a
-                // tombstone at all (for example, a data put followed by process
-                // death before metadata CAS). Recent tombstones are protected for
+                // tombstone at all (for example, a DATA put followed by process
+                // death before metadata commit acceptance). Recent tombstones are protected for
                 // the same grace interval, and legacy tombstones remain protected
                 // until their first 0.10.x maintenance stamp has committed.
-                if (gc_due && maintenance_catalogue_complete_ && !garbage_metadata_changed &&
-                    maintenance_live_ &&
+                if (gc_due && destructive_gc_enabled && maintenance_catalogue_complete_ &&
+                    !garbage_metadata_changed && maintenance_live_ &&
                     maintenance_inventory_generation_ >= node_.known_metadata_generation()) {
+                    if (retention_release_complete_ && retention_release_data_live_) {
+                        (void)node_.retention_store().release_unreferenced(
+                            RetentionClass::data, *retention_release_data_live_,
+                            retention_release_clock_, 64);
+                    }
                     std::vector<ObjectId> protected_ids;
                     protected_ids.reserve(maintenance_garbage_.size());
                     const auto now_ns = wall_time_ns();
@@ -583,10 +784,16 @@ void Service::loop(std::stop_token stop) {
                             const auto quiet = node_.config().maintenance.foreground_quiet;
                             return store_.foreground_idle_for() < quiet ||
                                    store_.interactive_idle_for() < quiet;
+                        },
+                        [this](const ObjectId& id) {
+                            return node_.retention_store().retained(RetentionClass::data, id);
                         });
                     log_slow_stage("garbage-collect", gc_stage,
                                    "reclaimed_bytes=" + std::to_string(gc.bytes) +
                                    " objects=" + std::to_string(gc.objects));
+                    (void)node_.retention_store().prune_unclaimed(
+                        RetentionClass::data,
+                        [this](const ObjectId& id) { return node_.local_store().has(id); }, 64);
                     if (gc.bytes && Log::enabled(LogLevel::debug))
                         Log::debug("garbage collection reclaimed " + std::to_string(gc.bytes) +
                                    " local bytes");
@@ -627,6 +834,13 @@ void Service::loop(std::stop_token stop) {
                     Log::trace("maintenance: local rebalance quiescent; backing off no-progress scan");
                 }
             }
+
+            // Retention publication appends are deliberately batched but still
+            // safety-critical durable records. Compact them only on the background
+            // owner so foreground metadata latency never pays checkpoint rewrite
+            // cost. Snapshot-before-truncate makes interruption idempotent.
+            if (!busy)
+                (void)node_.retention_store().compact_if_needed(4096);
 
             if (!busy && scrub_due &&
                 scrub_credit >= node_.config().extent_size) {
@@ -674,8 +888,8 @@ void Service::loop(std::stop_token stop) {
             // every maintenance pass.
         } catch (const std::exception& e) {
             const std::string_view message(e.what());
-            if (message != "metadata read quorum unavailable" &&
-                message != "metadata write quorum unavailable")
+            if (message != "metadata durable replica set unavailable; reconciliation may be required" &&
+                message != "metadata write durability floor unavailable")
                 Log::debug("maintenance: " + std::string(message));
         }
 

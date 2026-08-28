@@ -80,6 +80,8 @@ class DistributedStore {
     std::vector<NodeInfo> ranked(const ObjectId&) const;
     std::vector<NodeInfo> owners(const ObjectId&) const;
     bool put_on(const NodeInfo&, const ObjectId&, std::span<const uint8_t>, bool foreground);
+    bool retain_on(const NodeInfo&, RetentionClass, const std::vector<ObjectId>&,
+                   const RetentionDot&);
     std::optional<Bytes> get_from(const NodeInfo&, const ObjectId&, FrameType,
                                   const std::shared_ptr<SharedFetch>&,
                                   Clock::time_point deadline, std::atomic_bool* cancelled,
@@ -100,6 +102,12 @@ class DistributedStore {
     bool put_deferred(const ObjectId&, std::span<const uint8_t>, DurabilityBatch&,
                       std::atomic_bool* cancelled = nullptr);
     bool durability_barrier(const DurabilityBatch&);
+    // Publication liveness barrier. Every referenced object touched by a metadata
+    // mutation acquires a causal retention claim before that metadata commit may
+    // be accepted. DATA uses dht.min_write_replicas; CONTROL uses the supplied
+    // metadata write floor.
+    bool retain_data(const std::vector<ObjectId>&, const RetentionDot&);
+    bool retain_control(const std::vector<ObjectId>&, const RetentionDot&, size_t required);
     std::optional<Bytes> get(const ObjectId&, size_t stripe = 0, bool foreground = true,
                              Clock::time_point deadline = {}, std::atomic_bool* cancelled = nullptr);
     std::optional<Bytes> get(const ObjectId&, size_t stripe, FrameType,
@@ -107,8 +115,7 @@ class DistributedStore {
     bool has_on(const NodeInfo&, const ObjectId&);
     bool should_own(const ObjectId&) const;
     size_t replicate_all(const ObjectId&, std::span<const uint8_t>, bool foreground = false);
-    size_t replicate_control(const ObjectId&, std::span<const uint8_t>,
-                             const std::vector<NodeId>& metadata_voters);
+    size_t replicate_control(const ObjectId&, std::span<const uint8_t>);
     bool ensure_local(const ObjectId&, bool foreground = false);
     bool ensure_control_local(const ObjectId&);
     bool locally_available(const ObjectId&) const;

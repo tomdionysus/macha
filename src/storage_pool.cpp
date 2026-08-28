@@ -856,7 +856,8 @@ StoragePool::MaintenanceResult
 StoragePool::gc_step(const std::vector<ObjectId>& live,
                      const std::vector<ObjectId>& protected_ids,
                      std::chrono::milliseconds orphan_grace, size_t operation_budget,
-                     const std::function<bool()>& should_yield) {
+                     const std::function<bool()>& should_yield,
+                     const std::function<bool(const ObjectId&)>& is_retained) {
     MaintenanceResult result;
     while (!operation_budget || result.objects < operation_budget) {
         if (should_yield && should_yield()) {
@@ -872,10 +873,16 @@ StoragePool::gc_step(const std::vector<ObjectId>& live,
         ++result.objects;
         const auto& id = item->id;
         if (std::binary_search(live.begin(), live.end(), id) ||
-            std::binary_search(protected_ids.begin(), protected_ids.end(), id))
+            std::binary_search(protected_ids.begin(), protected_ids.end(), id) ||
+            (is_retained && is_retained(id)))
             continue;
 
         try {
+            // Re-check immediately before irreversible deletion. A foreground
+            // metadata publication may install a retention claim after this GC
+            // slice acquired its inventory but before it reaches this object.
+            if (is_retained && is_retained(id))
+                continue;
             // Object age is the orphan grace for data that never reached a
             // committed metadata reference. LocalStore::put() refreshes this
             // timestamp when an existing content hash is reaffirmed, preventing

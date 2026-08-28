@@ -33,6 +33,10 @@ void check_snapshot_equal(const MetadataSnapshot& actual, const MetadataSnapshot
     CHECK(actual.catalogue_root == expected.catalogue_root);
     CHECK(actual.entries == expected.entries);
     CHECK(actual.garbage == expected.garbage);
+    CHECK(actual.node_status == expected.node_status);
+    CHECK(actual.identity_resets == expected.identity_resets);
+    CHECK(actual.merge_parents == expected.merge_parents);
+    CHECK(actual.conflicts == expected.conflicts);
 }
 
 MACHA_FAST_TEST("models", test_metadata_delta_state_model) {
