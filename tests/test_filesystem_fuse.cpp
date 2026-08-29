@@ -301,7 +301,7 @@ MACHA_TEST("filesystem_fuse", test_open_write_survives_rename) {
     CHECK(output == input);
 }
 
-MACHA_TEST("filesystem_fuse", test_fuse_frontend_accepts_metadata_after_genesis_wait) {
+MACHA_TEST("filesystem_fuse", test_local_snapshot_view_is_local_before_cluster_forms) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
@@ -315,14 +315,21 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_accepts_metadata_after_genesis_
     Service s1(c1, keys);
     Service s2(c2, keys);
     s1.start();
+    REQUIRE(s1.node().wait_local_state_ready(5s));
 
-    bool waiting = false;
-    try {
-        (void)s1.filesystem().local_snapshot_view();
-    } catch (const MetadataNotReady&) {
-        waiting = true;
-    }
-    REQUIRE(waiting);
+    // This is deliberately available before the configured metadata write
+    // floor can form. It reflects only the local replica and must not enter the
+    // authoritative MetadataManager path (which would throw MetadataNotReady
+    // and perform discovery/history work).
+    CHECK(!s1.metadata_manager().available_snapshot_view().has_value());
+    const auto local_record = s1.node().metadata_replica().current();
+    const auto first_local = s1.filesystem().local_snapshot_view();
+    CHECK(first_local.generation == local_record.generation);
+    CHECK(first_local.hash == local_record.hash);
+    CHECK(first_local.snapshot->entries.contains("/"));
+    const auto second_local = s1.filesystem().local_snapshot_view();
+    CHECK(second_local.snapshot == first_local.snapshot);
+    CHECK(!s1.metadata_manager().available_snapshot_view().has_value());
 
     s2.start();
     REQUIRE(wait_until([&] {
@@ -331,20 +338,10 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_accepts_metadata_after_genesis_
     }));
 
     REQUIRE(wait_until([&] {
-        try {
-            (void)s1.filesystem().local_snapshot_view();
-            return true;
-        } catch (const MetadataNotReady&) {
-            return false;
-        }
+        return s1.filesystem().local_snapshot_view().generation > local_record.generation;
     }));
     REQUIRE(wait_until([&] {
-        try {
-            (void)s2.filesystem().local_snapshot_view();
-            return true;
-        } catch (const MetadataNotReady&) {
-            return false;
-        }
+        return s2.filesystem().local_snapshot_view().generation > local_record.generation;
     }));
 
     auto f1 = std::make_shared<FuseFrontend>(s1.filesystem(), c1.fuse);

@@ -2355,6 +2355,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
 
     // Simulate the Service control-plane pass. It must converge the immutable root
     // and atomically publish the replacement snapshot for subsequent API reads.
+    metadata2.repair_once();
     catalogue2.repair_once();
     auto refreshed = catalogue2.get(second.id);
     REQUIRE(refreshed.has_value());

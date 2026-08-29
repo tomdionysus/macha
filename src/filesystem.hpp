@@ -183,6 +183,13 @@ class FileSystem {
     std::mutex maintenance_index_mutex_;
     uint64_t maintenance_index_generation_{};
     std::shared_ptr<const MaintenanceObjects> maintenance_index_;
+    // A local snapshot view must never enter MetadataManager's authoritative
+    // read/discovery path. Cache the decoded content-addressed replica record
+    // independently so repeated local consumers only share immutable state.
+    std::mutex local_snapshot_mutex_;
+    uint64_t local_snapshot_generation_{};
+    Hash256 local_snapshot_hash_{};
+    std::shared_ptr<const MetadataSnapshot> local_snapshot_cache_;
     MetadataSnapshot snap();
     void commit_write(WriteHandle&, const FsEntry&, uint64_t,
                       const std::vector<ExtentRef>&, FsEntry*);

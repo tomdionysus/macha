@@ -1582,7 +1582,19 @@ MetadataSnapshot FileSystem::local_snapshot() const {
 }
 
 MetadataSnapshotView FileSystem::local_snapshot_view() {
-    return m_.snapshot_view();
+    const auto record = n_.metadata_replica().current();
+    if (!valid_metadata_record(record))
+        throw std::runtime_error("local metadata replica unavailable");
+
+    std::lock_guard lock(local_snapshot_mutex_);
+    if (!local_snapshot_cache_ || local_snapshot_generation_ != record.generation ||
+        local_snapshot_hash_ != record.hash) {
+        local_snapshot_generation_ = record.generation;
+        local_snapshot_hash_ = record.hash;
+        local_snapshot_cache_ =
+            std::make_shared<const MetadataSnapshot>(decode_snapshot(record.payload));
+    }
+    return MetadataSnapshotView{record.generation, 0, record.hash, local_snapshot_cache_};
 }
 
 std::optional<MetadataSnapshotView> FileSystem::available_snapshot_view() const {
