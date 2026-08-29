@@ -70,6 +70,10 @@ class HttpServer {
     std::atomic_bool running_{};
     std::atomic<uint16_t> bound_port_{};
     std::atomic_int listen_fd_{-1};
+    std::mutex startup_mutex_;
+    std::condition_variable startup_cv_;
+    bool startup_complete_{};
+    std::string startup_error_;
 
     std::mutex queue_mutex_;
     std::condition_variable_any queue_cv_;

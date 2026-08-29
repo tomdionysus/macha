@@ -280,12 +280,11 @@ MACHA_TEST("invariants", test_status_api_precedes_control_plane_startup) {
         if (stage == "control-plane")
             control_gate.enter_and_wait();
     });
+    std::jthread starter([&] { service.start(); });
     struct ReleaseGate {
         TestGate& gate;
         ~ReleaseGate() { gate.open(); }
     } release{control_gate};
-
-    std::jthread starter([&] { service.start(); });
     REQUIRE(control_gate.wait_for_entries(1));
 
     const auto response = raw_http_get(config.catalogue.api.port, "/api/v1/status");

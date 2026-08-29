@@ -3,6 +3,7 @@
 #include "crypto.hpp"
 #include "durability_domain.hpp"
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -70,6 +71,7 @@ class LocalStore {
     LocalStoreMode mode_{LocalStoreMode::authoritative};
     std::atomic<uint64_t> used_{};
     mutable std::mutex m_;
+    mutable std::condition_variable accounting_cv_;
     std::jthread scan_thread_;
     std::atomic_bool scan_complete_{};
     std::atomic_bool scan_failed_{};

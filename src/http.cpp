@@ -171,11 +171,24 @@ HttpServer::~HttpServer() { stop(); }
 
 void HttpServer::start() {
     if (running_.exchange(true)) return;
+    {
+        std::lock_guard lock(startup_mutex_);
+        startup_complete_ = false;
+        startup_error_.clear();
+    }
     const auto worker_count = std::max<size_t>(1, config_.workers);
     workers_.reserve(worker_count);
     for (size_t i = 0; i < worker_count; ++i)
         workers_.emplace_back([this](std::stop_token stop) { worker(stop); });
     accept_thread_ = std::jthread([this](std::stop_token stop) { run(stop); });
+    std::unique_lock lock(startup_mutex_);
+    startup_cv_.wait(lock, [this] { return startup_complete_; });
+    if (!startup_error_.empty()) {
+        const auto error = startup_error_;
+        lock.unlock();
+        stop();
+        throw std::runtime_error(error);
+    }
 }
 
 void HttpServer::close_queued_clients() {
@@ -272,6 +285,12 @@ void HttpServer::run(std::stop_token stop) {
             bound_port_ = config_.port;
         }
 
+        {
+            std::lock_guard lock(startup_mutex_);
+            startup_complete_ = true;
+        }
+        startup_cv_.notify_all();
+
         Log::info("HTTP API listening on " + config_.listen + ":" + std::to_string(bound_port()));
         while (!stop.stop_requested()) {
             int fd = accept(listen_fd, nullptr, nullptr);
@@ -292,6 +311,14 @@ void HttpServer::run(std::stop_token stop) {
             queue_cv_.notify_one();
         }
     } catch (const std::exception& e) {
+        {
+            std::lock_guard lock(startup_mutex_);
+            if (!startup_complete_) {
+                startup_error_ = e.what();
+                startup_complete_ = true;
+            }
+        }
+        startup_cv_.notify_all();
         if (running_) Log::error("HTTP API: " + std::string(e.what()));
     }
 

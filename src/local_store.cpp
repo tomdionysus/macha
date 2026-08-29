@@ -301,6 +301,7 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
             try { scan(stop); }
             catch (const std::exception& error) {
                 scan_failed_.store(true, std::memory_order_release);
+                accounting_cv_.notify_all();
                 Log::warn("storage accounting scan failed path=" + root_.string() +
                           " error=" + error.what());
             }
@@ -329,6 +330,7 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
             try { scan(stop); }
             catch (const std::exception& error) {
                 scan_failed_.store(true, std::memory_order_release);
+                accounting_cv_.notify_all();
                 Log::warn("storage accounting scan failed path=" + root_.string() +
                           " error=" + error.what());
             }
@@ -1238,13 +1240,12 @@ bool LocalStore::compact_packs() {
 }
 
 void LocalStore::wait_for_accounting(std::unique_lock<std::mutex>& lock) const {
-    while (!scan_complete_.load(std::memory_order_acquire)) {
-        if (scan_failed_.load(std::memory_order_acquire))
-            throw std::runtime_error("storage accounting reconciliation failed");
-        lock.unlock();
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        lock.lock();
-    }
+    accounting_cv_.wait(lock, [this] {
+        return scan_complete_.load(std::memory_order_acquire) ||
+               scan_failed_.load(std::memory_order_acquire);
+    });
+    if (scan_failed_.load(std::memory_order_acquire))
+        throw std::runtime_error("storage accounting reconciliation failed");
 }
 
 void LocalStore::scan(std::stop_token stop) {
@@ -1270,6 +1271,7 @@ void LocalStore::scan(std::stop_token stop) {
     }
     if (error) {
         scan_failed_.store(true, std::memory_order_release);
+        accounting_cv_.notify_all();
         Log::warn("storage accounting scan failed path=" + root_.string() +
                   " error=" + error.message());
         return;
@@ -1281,6 +1283,7 @@ void LocalStore::scan(std::stop_token stop) {
             last_mutation_generation_ = std::max(last_mutation_generation_, baseline);
         } catch (const std::exception& ex) {
             scan_failed_.store(true, std::memory_order_release);
+            accounting_cv_.notify_all();
             Log::warn("storage accounting baseline durability failed path=" + root_.string() +
                       " error=" + ex.what());
             return;
@@ -1296,6 +1299,7 @@ void LocalStore::scan(std::stop_token stop) {
         }
     }
     scan_complete_.store(true, std::memory_order_release);
+    accounting_cv_.notify_all();
     Log::debug("storage accounting scan complete path=" + root_.string() +
                " used=" + std::to_string(total));
 }

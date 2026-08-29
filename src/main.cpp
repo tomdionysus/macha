@@ -5,28 +5,14 @@
 #include "ffmpeg_log.hpp"
 #include "log.hpp"
 #include "service.hpp"
-#include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <memory>
 #include <thread>
 #include <unistd.h>
-
-namespace {
-std::atomic_bool stopping{false};
-std::atomic_bool reload_requested{false};
-void signal_handler(int signal) {
-#ifdef SIGHUP
-    if (signal == SIGHUP) {
-        reload_requested = true;
-        return;
-    }
-#endif
-    stopping = true;
-}
-} // namespace
 
 int main(int argc, char** argv) {
     try {
@@ -38,6 +24,20 @@ int main(int argc, char** argv) {
         if (config.mount_path) {
             std::filesystem::create_directories(*config.mount_path);
             macha::prepare_fuse_mountpoint(*config.mount_path, config.fuse);
+        }
+
+        sigset_t service_signals;
+        sigemptyset(&service_signals);
+        sigaddset(&service_signals, SIGINT);
+        sigaddset(&service_signals, SIGTERM);
+#ifdef SIGHUP
+        sigaddset(&service_signals, SIGHUP);
+#endif
+        if (!config.mount_path) {
+            const int blocked = pthread_sigmask(SIG_BLOCK, &service_signals, nullptr);
+            if (blocked != 0)
+                throw std::runtime_error("cannot block service signals: " +
+                                         std::string(std::strerror(blocked)));
         }
 
         macha::Service service(config, keys);
@@ -53,20 +53,23 @@ int main(int argc, char** argv) {
             return rc;
         }
 
-        std::signal(SIGINT, signal_handler);
-        std::signal(SIGTERM, signal_handler);
+        while (true) {
+            int signal = 0;
+            const int waited = sigwait(&service_signals, &signal);
+            if (waited != 0)
+                throw std::runtime_error("cannot wait for service signal: " +
+                                         std::string(std::strerror(waited)));
 #ifdef SIGHUP
-        std::signal(SIGHUP, signal_handler);
-#endif
-        while (!stopping) {
-            if (reload_requested.exchange(false)) {
+            if (signal == SIGHUP) {
                 try {
                     service.reload_config();
                 } catch (const std::exception& e) {
                     macha::Log::error(std::string("configuration reload failed: ") + e.what());
                 }
+                continue;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+#endif
+            break;
         }
         service.stop();
         return 0;
