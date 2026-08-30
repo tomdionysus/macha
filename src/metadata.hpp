@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "crypto.hpp"
+#include <atomic>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -246,7 +247,28 @@ std::set<ObjectId> metadata_catalogue_root_set(const MetadataSnapshot&);
 // Deterministic identity of namespace paths and immutable file content. Deliberately
 // excludes catalogue/garbage/voter state and non-content stat metadata.
 Hash256 metadata_namespace_signature(const MetadataSnapshot&);
+
+struct MetadataReplicaDiagnostics {
+    uint64_t historical_requests{};
+    uint64_t historical_reconstructions{};
+    uint64_t historical_deltas_applied{};
+    uint64_t materialization_cache_hits{};
+    uint64_t materialization_cache_misses{};
+    uint64_t materialization_cache_evictions{};
+    size_t materialization_cache_entries{};
+};
+
+struct MetadataMaterialization {
+    MetadataRecord record;
+    std::shared_ptr<const MetadataSnapshot> snapshot;
+};
+
 class MetadataReplica {
+    struct MaterializedHistoryEntry {
+        std::shared_ptr<const MetadataMaterialization> value;
+        uint64_t last_used{};
+    };
+
     std::filesystem::path p_;
     std::filesystem::path committed_p_;
     std::filesystem::path checkpoint_p_;
@@ -270,6 +292,14 @@ class MetadataReplica {
     size_t history_records_{};
     uint64_t history_bytes_{};
     bool recovery_required_{};
+    mutable std::map<Hash256, MaterializedHistoryEntry> materialized_history_;
+    mutable uint64_t materialized_history_clock_{};
+    mutable std::atomic_uint64_t historical_requests_{};
+    mutable std::atomic_uint64_t historical_reconstructions_{};
+    mutable std::atomic_uint64_t historical_deltas_applied_{};
+    mutable std::atomic_uint64_t materialization_cache_hits_{};
+    mutable std::atomic_uint64_t materialization_cache_misses_{};
+    mutable std::atomic_uint64_t materialization_cache_evictions_{};
     void persist(const std::filesystem::path&, const MetadataRecord&);
     std::optional<MetadataRecord> load(const std::filesystem::path&) const;
     void append_journal(uint8_t, const MetadataRecord&, std::span<const uint8_t> = {});
@@ -283,11 +313,14 @@ class MetadataReplica {
     void migrate_legacy_head_locked();
     bool prune_accepted_heads_locked();
     bool acceptance_matches_record_policy_locked(const MetadataAcceptance&,
-                                                 const MetadataRecord&) const;
+                                                 const MetadataMaterialization&) const;
     bool legacy_write_api_allowed_locked() const;
     void set_legacy_committed_head_locked(const MetadataRecord&);
     void refresh_materialized_head_locked();
     MetadataHistoryEntry history_for_current(std::span<const uint8_t> delta = {});
+    std::shared_ptr<const MetadataMaterialization> cache_materialization_locked(
+        const MetadataRecord&, std::shared_ptr<const MetadataSnapshot> = {}) const;
+    std::shared_ptr<const MetadataMaterialization> materialized_locked(const Hash256&) const;
     std::optional<MetadataRecord> historical_locked(const Hash256&) const;
     bool history_is_ancestor_locked(const Hash256&, const Hash256&) const;
     std::optional<Hash256> history_common_ancestor_locked(const Hash256&, const Hash256&) const;
@@ -325,6 +358,8 @@ class MetadataReplica {
     bool history_is_ancestor(const Hash256&, const Hash256&) const;
     std::optional<Hash256> history_common_ancestor(const Hash256&, const Hash256&) const;
     std::optional<MetadataRecord> historical(const Hash256&) const;
+    std::shared_ptr<const MetadataMaterialization> materialized(const Hash256&) const;
+    MetadataReplicaDiagnostics diagnostics() const;
     void compact();
     // Once every durably-known node is directly reachable and metadata repair
     // has converged the cluster, old ancestry is no longer needed to reconcile

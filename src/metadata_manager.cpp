@@ -206,7 +206,7 @@ void MetadataManager::require_metadata_policy_match(const std::vector<NodeInfo>&
 }
 
 MetadataRecord MetadataManager::cache_record(
-    const MetadataRecord& record, std::shared_ptr<MetadataSnapshot> decoded) {
+    const MetadataRecord& record, std::shared_ptr<const MetadataSnapshot> decoded) {
     // Durable management tombstones are operational constraints as soon as a
     // committed metadata generation is decoded, not merely data for the UI.
     for (const auto& [_, reset] : decoded->identity_resets)
@@ -249,7 +249,11 @@ MetadataRecord MetadataManager::cache_record(const MetadataRecord& record) {
     // Decode only when the canonical record actually changes. Metadata reads can
     // refresh their short metadata cache frequently; rebuilding tens of thousands
     // of FsEntry/extent objects on every getattr was the dominant namespace cost.
-    auto decoded = std::make_shared<MetadataSnapshot>(decode_snapshot(record.payload));
+    if (auto materialized = node_.metadata_replica().materialized(record.hash);
+        materialized && materialized->record.generation == record.generation &&
+        materialized->record.payload == record.payload)
+        return cache_record(record, materialized->snapshot);
+    auto decoded = std::make_shared<const MetadataSnapshot>(decode_snapshot(record.payload));
     return cache_record(record, std::move(decoded));
 }
 
@@ -561,10 +565,10 @@ size_t MetadataManager::acceptance_floor_for(const MetadataRecord& record) const
     // parent edge. This matters for lowering the floor and for merge commits
     // which reconcile a policy-transition branch with an older sibling.
     for (const auto& parent_hash : metadata_record_parents(record)) {
-        auto parent = node_.metadata_replica().historical(parent_hash);
+        auto parent = node_.metadata_replica().materialized(parent_hash);
         if (!parent)
             throw MetadataNotReady("metadata commit parent unavailable for policy validation");
-        required = std::max(required, snapshot_floor(decode_snapshot(parent->payload)));
+        required = std::max(required, snapshot_floor(*parent->snapshot));
     }
     return required;
 }
@@ -789,15 +793,17 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
 
         if (heads.size() == 1) {
             auto selected = heads.front();
-            auto policy = decode_snapshot(selected.payload);
-            if (policy.extent_size && policy.extent_size != node_.config().extent_size)
+            auto materialized = node_.metadata_replica().materialized(selected.hash);
+            if (!materialized)
+                throw MetadataNotReady("selected metadata head cannot be materialized");
+            if (materialized->snapshot->extent_size &&
+                materialized->snapshot->extent_size != node_.config().extent_size)
                 throw std::runtime_error("cluster extent size does not match local configuration");
             // A whole-cluster configuration change may legitimately leave the
             // accepted branch carrying the previous write floor. Return the
             // accepted head here; maybe_reconfigure() performs the explicit
             // transition commit at max(old_floor, new_floor) before any write.
-            return cache_record(selected,
-                                std::make_shared<MetadataSnapshot>(std::move(policy)));
+            return cache_record(selected, materialized->snapshot);
         }
 
         if (compatible_replicas(nodes).size() < need)
@@ -816,15 +822,16 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             node_.metadata_replica().history_common_ancestor(left.hash, right.hash);
         if (!common)
             throw MetadataNotReady("divergent metadata heads have no known common ancestor");
-        auto base_record = node_.metadata_replica().historical(*common);
-        if (!base_record)
+        auto base_materialized = node_.metadata_replica().materialized(*common);
+        if (!base_materialized)
             throw MetadataNotReady("metadata common ancestor cannot be reconstructed");
-
-        auto base = decode_snapshot(base_record->payload);
-        auto left_snapshot = decode_snapshot(left.payload);
-        auto right_snapshot = decode_snapshot(right.payload);
-        auto merged = merge_metadata_snapshots(base, left_snapshot, right_snapshot,
-                                               left.hash, right.hash);
+        auto left_materialized = node_.metadata_replica().materialized(left.hash);
+        auto right_materialized = node_.metadata_replica().materialized(right.hash);
+        if (!left_materialized || !right_materialized)
+            throw MetadataNotReady("metadata merge head cannot be materialized");
+        auto merged = merge_metadata_snapshots(
+            *base_materialized->snapshot, *left_materialized->snapshot,
+            *right_materialized->snapshot, left.hash, right.hash);
         if (merged.snapshot.extent_size &&
             merged.snapshot.extent_size != node_.config().extent_size)
             throw std::runtime_error("cluster extent size does not match local configuration");
@@ -839,7 +846,6 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         // equivalent sibling merges forever (A+B -> M1/M2 -> M3/M4 ...).
         if (right.hash < left.hash) {
             std::swap(left, right);
-            std::swap(left_snapshot, right_snapshot);
         }
         merged.snapshot.metadata_voters.clear();
         merged.snapshot.merge_parents = {right.hash};
@@ -1196,9 +1202,11 @@ std::optional<MetadataSnapshotView> MetadataManager::retention_release_view() co
     if (current && current->hash == heads.front().hash)
         return current;
     try {
-        auto decoded = std::make_shared<MetadataSnapshot>(decode_snapshot(heads.front().payload));
+        auto materialized = node_.metadata_replica().materialized(heads.front().hash);
+        if (!materialized)
+            return {};
         return MetadataSnapshotView{heads.front().generation, 0, heads.front().hash,
-                                    std::move(decoded)};
+                                    materialized->snapshot};
     } catch (...) {
         return {};
     }
@@ -1431,7 +1439,10 @@ void MetadataManager::repair_once() {
     if (converged < active.size())
         throw MetadataNotReady("metadata accepted-head replication incomplete");
 
-    auto snapshot = decode_snapshot(record.payload);
+    auto materialized = node_.metadata_replica().materialized(record.hash);
+    if (!materialized)
+        throw MetadataNotReady("metadata repair head cannot be materialized");
+    auto snapshot = *materialized->snapshot;
     std::vector<NodeInfo> participants;
     participants.reserve(snapshot.metadata_participants.size());
     bool all_participants_online = !snapshot.metadata_participants.empty();
