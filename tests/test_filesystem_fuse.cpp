@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
 #include "fuse_journal.hpp"
+#include <fcntl.h>
 
 using namespace macha;
 using namespace std::chrono_literals;
@@ -1617,20 +1618,47 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_publication_concurrency_is_boun
     }
 }
 
+void append_fuse_journal_test_records(const std::filesystem::path& journal,
+                                      std::span<const Bytes> payloads) {
+    Bytes bytes;
+    for (const auto& payload : payloads) {
+        auto frame = fuse_journal_frame(payload);
+        bytes.insert(bytes.end(), frame.begin(), frame.end());
+    }
+
+    const int fd = ::open(journal.c_str(), O_WRONLY | O_APPEND);
+    REQUIRE(fd >= 0);
+    size_t offset = 0;
+    while (offset < bytes.size()) {
+        const auto written = ::write(fd, bytes.data() + offset, bytes.size() - offset);
+        if (written < 0 && errno == EINTR) continue;
+        REQUIRE(written > 0);
+        offset += static_cast<size_t>(written);
+    }
+    REQUIRE(::fsync(fd) == 0);
+    REQUIRE(::close(fd) == 0);
+}
+
 void append_fuse_journal_test_record(const std::filesystem::path& journal,
                                      std::span<const uint8_t> payload) {
-    Writer frame;
-    frame.u32(static_cast<uint32_t>(payload.size()));
-    frame.raw(payload);
-    frame.fixed(sha256(payload).bytes);
-    auto bytes = frame.take();
+    const std::array<Bytes, 1> records{Bytes(payload.begin(), payload.end())};
+    append_fuse_journal_test_records(journal, records);
+}
 
-    std::ofstream out(journal, std::ios::binary | std::ios::app);
-    REQUIRE(out.good());
-    out.write(reinterpret_cast<const char*>(bytes.data()),
-              static_cast<std::streamsize>(bytes.size()));
-    out.flush();
-    REQUIRE(out.good());
+Bytes fuse_namespace_marker(uint8_t type, uint64_t sequence) {
+    Writer payload;
+    payload.u8(type);
+    payload.u64(sequence);
+    return payload.take();
+}
+
+std::vector<Bytes> fuse_namespace_markers(uint8_t type, uint64_t first,
+                                          uint64_t last_exclusive) {
+    std::vector<Bytes> records;
+    records.reserve(static_cast<size_t>(last_exclusive - first));
+    for (uint64_t sequence = first; sequence < last_exclusive; ++sequence)
+        records.push_back(fuse_namespace_marker(type, sequence));
+    return records;
 }
 
 std::vector<uint8_t> fuse_journal_record_types(const std::filesystem::path& journal) {
@@ -1649,6 +1677,197 @@ std::vector<uint8_t> fuse_journal_record_types(const std::filesystem::path& jour
         });
     REQUIRE(scan.discarded_tail == 0);
     return types;
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_namespace_recovery_survives_partial_published_marker_group) {
+    TestService fixture("fuse-namespace-partial-published-group");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.fuse.publication_quiet = 30s;
+    auto& service = fixture.start();
+    constexpr uint64_t operations = 6;
+    constexpr uint64_t published_prefix = 3;
+
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        service.filesystem().store().foreground_activity(1);
+        for (uint64_t i = 0; i < operations; ++i)
+            frontend->mkdir("/published-crash-" + std::to_string(i), 0755,
+                            getuid(), getgid());
+        frontend->stop();
+    }
+
+    std::vector<FilesystemNamespaceMutation> committed;
+    committed.reserve(operations);
+    for (uint64_t i = 0; i < operations; ++i) {
+        FilesystemNamespaceMutation mutation;
+        mutation.kind = FilesystemNamespaceMutation::Kind::mkdir;
+        mutation.from = "/published-crash-" + std::to_string(i);
+        mutation.mode = 0755;
+        mutation.uid = getuid();
+        mutation.gid = getgid();
+        committed.push_back(std::move(mutation));
+    }
+    CHECK(service.filesystem().apply_namespace_batch(committed).applied == operations);
+    const auto generation_after_commit =
+        service.filesystem().local_committed_metadata_generation();
+
+    const auto spool_dir =
+        config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
+    const auto journal = config.fuse.operation_journal_path.value_or(
+        spool_dir / "operations.log");
+    // A crash can expose any prefix of a grouped append. Sequence zero is
+    // reserved; this fresh journal's namespace operations are 1..operations.
+    const auto published = fuse_namespace_markers(4, 1, 1 + published_prefix);
+    append_fuse_journal_test_records(journal, published);
+
+    auto replay = config.fuse;
+    replay.publication_quiet = 0ms;
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    REQUIRE(recovered->wait_for_idle(20s));
+    const auto status = recovered->status();
+
+    CHECK(status.namespace_operations_recovered == operations - published_prefix);
+    CHECK(status.namespace_publication_attempts == 0);
+    CHECK(status.namespace_operations_published == operations - published_prefix);
+    CHECK(status.namespace_operations_confirmed == operations - published_prefix);
+    CHECK(service.filesystem().local_committed_metadata_generation() == generation_after_commit);
+    CHECK(std::filesystem::file_size(journal) == 8);
+    for (uint64_t i = 0; i < operations; ++i)
+        CHECK(service.filesystem().getattr("/published-crash-" + std::to_string(i)).type ==
+              EntryType::directory);
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_namespace_recovery_survives_partial_done_marker_group) {
+    TestService fixture("fuse-namespace-partial-done-group");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.fuse.publication_quiet = 30s;
+    auto& service = fixture.start();
+    constexpr uint64_t operations = 6;
+    constexpr uint64_t done_prefix = 2;
+
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        service.filesystem().store().foreground_activity(1);
+        for (uint64_t i = 0; i < operations; ++i)
+            frontend->mkdir("/done-crash-" + std::to_string(i), 0755,
+                            getuid(), getgid());
+        frontend->stop();
+    }
+
+    std::vector<FilesystemNamespaceMutation> committed;
+    committed.reserve(operations);
+    for (uint64_t i = 0; i < operations; ++i) {
+        FilesystemNamespaceMutation mutation;
+        mutation.kind = FilesystemNamespaceMutation::Kind::mkdir;
+        mutation.from = "/done-crash-" + std::to_string(i);
+        mutation.mode = 0755;
+        mutation.uid = getuid();
+        mutation.gid = getgid();
+        committed.push_back(std::move(mutation));
+    }
+    CHECK(service.filesystem().apply_namespace_batch(committed).applied == operations);
+    const auto generation_after_commit =
+        service.filesystem().local_committed_metadata_generation();
+
+    const auto spool_dir =
+        config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
+    const auto journal = config.fuse.operation_journal_path.value_or(
+        spool_dir / "operations.log");
+    const auto published = fuse_namespace_markers(4, 1, 1 + operations);
+    append_fuse_journal_test_records(journal, published);
+    const auto done = fuse_namespace_markers(5, 1, 1 + done_prefix);
+    append_fuse_journal_test_records(journal, done);
+
+    auto replay = config.fuse;
+    replay.publication_quiet = 0ms;
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    REQUIRE(recovered->wait_for_idle(20s));
+    const auto status = recovered->status();
+
+    // Constructor reconciliation confirms the surviving published suffix and
+    // retires it in one done-marker append; no publication worker is needed.
+    CHECK(status.namespace_operations_recovered == 0);
+    CHECK(status.namespace_publication_attempts == 0);
+    CHECK(status.namespace_operations_published == 0);
+    CHECK(status.namespace_operations_confirmed == 0);
+    CHECK(status.journal_append_batches == 1);
+    CHECK(status.journal_records_appended == operations - done_prefix);
+    CHECK(service.filesystem().local_committed_metadata_generation() == generation_after_commit);
+    CHECK(std::filesystem::file_size(journal) == 8);
+    for (uint64_t i = 0; i < operations; ++i)
+        CHECK(service.filesystem().getattr("/done-crash-" + std::to_string(i)).type ==
+              EntryType::directory);
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_live_admission_during_recovery_publication_is_not_blocked) {
+    TestGate publication_gate;
+    TestNode fixture("fuse-live-admission-during-recovery");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.fuse.publication_quiet = 30s;
+    fixture.start();
+    // TestNode deliberately omits Service's background metadata owner. A
+    // synchronous seed mutation forms the one-node replica set before the
+    // generation baseline below, removing that unrelated startup race.
+    fixture.filesystem().mkdir("/fixture-ready", 0755, getuid(), getgid());
+    constexpr size_t recovered_operations = 4;
+
+    {
+        auto frontend = std::make_shared<FuseFrontend>(fixture.filesystem(), config.fuse);
+        fixture.store().foreground_activity(1);
+        for (size_t i = 0; i < recovered_operations; ++i)
+            frontend->mkdir("/recovery-live-" + std::to_string(i), 0755,
+                            getuid(), getgid());
+        frontend->stop();
+    }
+
+    std::atomic_bool gate_once{};
+    fixture.metadata().set_publication_retention(
+        [&](const MetadataPublicationContext&) {
+            if (!gate_once.exchange(true)) publication_gate.enter_and_wait();
+        });
+
+    auto replay = config.fuse;
+    replay.publication_quiet = 0ms;
+    replay.namespace_batch_operations = recovered_operations;
+    const auto generation_before =
+        fixture.filesystem().local_committed_metadata_generation();
+    auto recovered = std::make_shared<FuseFrontend>(fixture.filesystem(), replay);
+    const bool publication_entered = publication_gate.wait_for_entries(1, 5s);
+    CHECK(publication_entered);
+
+    bool live_admitted = false;
+    if (publication_entered) {
+        try {
+            recovered->mkdir("/live-during-recovery", 0755, getuid(), getgid());
+            live_admitted = recovered->inode_for_path("/live-during-recovery").has_value();
+        } catch (...) {
+            publication_gate.open();
+            throw;
+        }
+    }
+    publication_gate.open();
+    REQUIRE(publication_entered);
+    CHECK(live_admitted);
+    REQUIRE(recovered->wait_for_idle(20s));
+    const auto status = recovered->status();
+
+    CHECK(status.namespace_operations_recovered == recovered_operations);
+    CHECK(status.namespace_operations_admitted == 1);
+    CHECK(status.namespace_publication_batches == 2);
+    CHECK(status.namespace_operations_batched == recovered_operations + 1);
+    CHECK(status.namespace_operations_published == recovered_operations + 1);
+    CHECK(status.namespace_operations_confirmed == recovered_operations + 1);
+    CHECK(fixture.filesystem().local_committed_metadata_generation() == generation_before + 2);
+    for (size_t i = 0; i < recovered_operations; ++i)
+        CHECK(fixture.filesystem().getattr("/recovery-live-" + std::to_string(i)).type ==
+              EntryType::directory);
+    CHECK(fixture.filesystem().getattr("/live-during-recovery").type == EntryType::directory);
 }
 
 
