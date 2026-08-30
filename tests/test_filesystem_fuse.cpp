@@ -55,6 +55,17 @@ MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_cou
     REQUIRE(filesystem->find("spool_publish_rate_bytes_per_second") != nullptr);
     REQUIRE(filesystem->find("spool_throttle_waits") != nullptr);
     REQUIRE(filesystem->find("spool_throttle_wait_ms") != nullptr);
+    REQUIRE(filesystem->find("data_publication_requests") != nullptr);
+    REQUIRE(filesystem->find("data_publication_coalesced_queued") != nullptr);
+    REQUIRE(filesystem->find("data_publication_coalesced_running") != nullptr);
+    REQUIRE(filesystem->find("data_publication_coalesced_unconfirmed") != nullptr);
+    REQUIRE(filesystem->find("data_publications_started") != nullptr);
+    REQUIRE(filesystem->find("data_publications_completed") != nullptr);
+    REQUIRE(filesystem->find("data_publication_peak_active") != nullptr);
+    REQUIRE(filesystem->find("data_closed_priority_selections") != nullptr);
+    REQUIRE(filesystem->find("data_publication_bytes_read") != nullptr);
+    REQUIRE(filesystem->find("data_publication_bytes_committed") != nullptr);
+    REQUIRE(filesystem->find("data_publication_bytes_confirmed") != nullptr);
 
     const auto* convergence = diagnostics->find("convergence");
     REQUIRE(convergence != nullptr);
@@ -949,6 +960,95 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_yields_to_playback) {
         REQUIRE(frontend->wait_for_idle(5s));
         CHECK(service.filesystem().getattr("/playback-yield.bin").size == payload.size());
     }
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_open_loaders_use_available_publication_workers) {
+    TestService fixture("fuse-open-loader-concurrency");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 4;
+    // This legacy setting previously collapsed every continuously open loader
+    // workload to one publisher. It must no longer classify writers as viewers.
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 500ms;
+
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    constexpr size_t files = 4;
+    std::vector<FuseOpenHandle> handles;
+    handles.reserve(files);
+    for (size_t i = 0; i < files; ++i)
+        handles.push_back(frontend->create("/loader-" + std::to_string(i) + ".bin", 0644,
+                                           getuid(), getgid(), false, true, false));
+    REQUIRE(frontend->wait_for_idle(10s));
+
+    const auto payload = pattern(8 * config.extent_size, 37);
+    for (const auto& handle : handles)
+        REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
+    REQUIRE(wait_until([&] { return frontend->status().durability_writes == files; }, 10s));
+
+    // Hold the real viewer gate while all four durable inodes are queued. This
+    // makes the runnable set deterministic without adding a scheduler test hook.
+    service.filesystem().store().foreground_activity(1);
+    for (const auto& handle : handles) {
+        frontend->flush(handle.inode);
+        frontend->flush(handle.inode); // repeated demand must coalesce
+    }
+    REQUIRE(frontend->status().pending_data >= files);
+    REQUIRE(frontend->wait_for_idle(30s));
+
+    const auto status = frontend->status();
+    CHECK(status.data_publications_started == files);
+    CHECK(status.data_publications_completed == files);
+    CHECK(status.data_publication_peak_active >= 2);
+    CHECK(status.data_publication_peak_active <= config.fuse.commit_workers);
+    CHECK(status.data_publication_coalesced_queued >= files);
+    CHECK(status.data_publication_bytes_read == files * payload.size());
+    CHECK(status.data_publication_bytes_committed == files * payload.size());
+    CHECK(status.data_publication_bytes_confirmed == files * payload.size());
+
+    for (const auto& handle : handles)
+        frontend->release(handle.inode, true);
+    frontend->stop();
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_closed_file_is_selected_ahead_of_open_loader) {
+    TestService fixture("fuse-closed-file-priority");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 500ms;
+
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto open_large = frontend->create("/open-large.bin", 0644, getuid(), getgid(), false, true,
+                                       false);
+    auto closed_small = frontend->create("/closed-small.bin", 0644, getuid(), getgid(), false,
+                                         true, false);
+    REQUIRE(frontend->wait_for_idle(10s));
+
+    const auto large = pattern(8 * config.extent_size, 51);
+    const auto small = pattern(64 * 1024, 52);
+    REQUIRE(frontend->write(open_large.inode, 0, large) == large.size());
+    REQUIRE(frontend->write(closed_small.inode, 0, small) == small.size());
+    REQUIRE(wait_until([&] { return frontend->status().durability_writes == 2; }, 10s));
+
+    service.filesystem().store().foreground_activity(1);
+    frontend->flush(open_large.inode); // queued first, but remains open
+    frontend->release(closed_small.inode, true); // queued second and closed
+    REQUIRE(frontend->wait_for_idle(30s));
+
+    const auto status = frontend->status();
+    CHECK(status.data_closed_priority_selections >= 1);
+    CHECK(service.filesystem().getattr("/closed-small.bin").size == small.size());
+    CHECK(service.filesystem().getattr("/open-large.bin").size == large.size());
+    frontend->release(open_large.inode, true);
+    frontend->stop();
 }
 
 MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_durable_journal_recovers_namespace_and_data) {

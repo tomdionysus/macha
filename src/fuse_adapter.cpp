@@ -105,9 +105,10 @@ struct FuseLatency {
     bool enabled{Log::enabled(LogLevel::debug)};
     Clock::time_point started{};
 
-    FuseLatency(const char* operation, const char* pathname)
+    FuseLatency(const char* operation, const char* pathname, bool viewer_critical = false)
         : op(operation), path(pathname), started(enabled ? Clock::now() : Clock::time_point{}) {
-        frontend().note_interactive_activity();
+        if (viewer_critical)
+            frontend().note_interactive_activity();
     }
 
     ~FuseLatency() noexcept {
@@ -283,9 +284,12 @@ void set_file_flags(fuse_file_info* fi) {
 
 int op_open(const char* path, fuse_file_info* fi) {
     trace_request("open", path, fi);
-    FuseLatency latency{"open", path};
+    const int access = fi->flags & O_ACCMODE;
+    // A read-only open is the earliest reliable indication that a viewer may
+    // imminently need content. Loader creates and writable opens must not
+    // manufacture a foreground quiet window.
+    FuseLatency latency{"open", path, access == O_RDONLY};
     return guarded("open", [&] {
-        const int access = fi->flags & O_ACCMODE;
         auto h = std::make_unique<Handle>();
         h->file = frontend().open(path, access == O_RDONLY || access == O_RDWR,
                                   access == O_WRONLY || access == O_RDWR,
@@ -314,7 +318,7 @@ int op_create(const char* path, mode_t mode, fuse_file_info* fi) {
 
 int op_read(const char* path, char* buf, size_t size, off_t off, fuse_file_info* fi) {
     trace_request("read", path, fi);
-    FuseLatency latency{"read", path};
+    FuseLatency latency{"read", path, true};
     return guarded("read", [&] {
         if (off < 0)
             return -EINVAL;

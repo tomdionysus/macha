@@ -305,12 +305,14 @@ struct FuseFrontend::State {
         size_t durability_pending{};
         std::condition_variable_any durability_cv;
         size_t open_handles{};
+        size_t writable_handles{};
         bool data_queued{};
         bool data_running{};
         bool data_deferred{};
         std::optional<int> backend_error;
         uint64_t journal_epoch{};
         uint64_t unconfirmed_data_sequence{};
+        uint64_t unconfirmed_publication_bytes{};
         std::optional<FsEntry> unconfirmed_data_entry;
 
         ~Inode() {
@@ -473,16 +475,10 @@ struct FuseFrontend::State {
     std::vector<std::jthread> data_workers;
     std::atomic_size_t active_data{};
     std::atomic_size_t active_recovery_data{};
-    // Number of writable FUSE handles currently open. A writable handle is a
-    // stronger foreground signal than a recent-operation timer: while rsync is
-    // feeding a file, background publication must not fan out merely because
-    // there was a short gap between kernel callbacks.
+    // Number of writable FUSE handles currently open. This is operational state,
+    // not a viewer signal: bulk loaders may keep writers open continuously and
+    // must not thereby collapse publication to a single worker.
     std::atomic_size_t open_writers{};
-    // Recovery publication writes are ordinary read-ahead activity at the
-    // DistributedStore layer, so the store-wide activity clock cannot be used
-    // to decide whether FUSE itself is busy: recovery would throttle itself.
-    // Track actual kernel/FUSE callbacks separately.
-    std::atomic_int64_t last_mount_activity_ms{};
 
     std::array<BrokerQueue, 6> broker;
     std::atomic_size_t broker_pending{};
@@ -497,6 +493,17 @@ struct FuseFrontend::State {
 
     std::atomic_uint64_t timed_out_requests{};
     std::atomic_uint64_t merged_publications{};
+    std::atomic_uint64_t data_publication_requests{};
+    std::atomic_uint64_t data_publication_coalesced_queued{};
+    std::atomic_uint64_t data_publication_coalesced_running{};
+    std::atomic_uint64_t data_publication_coalesced_unconfirmed{};
+    std::atomic_uint64_t data_publications_started{};
+    std::atomic_uint64_t data_publications_completed{};
+    std::atomic_uint64_t data_publication_peak_active{};
+    std::atomic_uint64_t data_closed_priority_selections{};
+    std::atomic_uint64_t data_publication_bytes_read{};
+    std::atomic_uint64_t data_publication_bytes_committed{};
+    std::atomic_uint64_t data_publication_bytes_confirmed{};
     std::atomic_uint64_t backend_failures{};
     // Monotonic diagnostic counters. They deliberately count durable frontend
     // work rather than infer it from queue depth, so batching and crash-replay
@@ -1895,6 +1902,7 @@ struct FuseFrontend::State {
             if (inode->data_ops.empty() ||
                 inode->durable_data_sequence <= inode->published_data_sequence)
                 return;
+            data_publication_requests.fetch_add(1, std::memory_order_relaxed);
             // Never expose acknowledged-but-not-yet-durable local writes to the
             // distributed publication path. They remain a node-local overlay
             // until the durability worker advances this watermark.
@@ -1906,10 +1914,18 @@ struct FuseFrontend::State {
             if (inode->unconfirmed_data_entry) {
                 inode->data_deferred = true;
                 ++merged_publications;
+                data_publication_coalesced_unconfirmed.fetch_add(1,
+                                                                 std::memory_order_relaxed);
                 return;
             }
-            if (inode->data_queued || inode->data_running) {
+            if (inode->data_queued) {
                 ++merged_publications;
+                data_publication_coalesced_queued.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            if (inode->data_running) {
+                ++merged_publications;
+                data_publication_coalesced_running.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
             enqueue = true;
@@ -2095,6 +2111,11 @@ struct FuseFrontend::State {
                         FilesystemNamespaceBatchResult result;
                         try {
                             std::lock_guard backend(publication_mutex);
+                            // Viewer demand may arrive after the outer gate but
+                            // while another publication owns this boundary.
+                            // Re-check after acquiring it so queued background
+                            // commits cannot form a train in front of playback.
+                            wait_for_playback_quiet();
                             result = apply_namespace_backend(
                                 std::span<const NamespaceOp>(batch).subspan(published_prefix));
                         } catch (const FsError& error) {
@@ -2385,6 +2406,7 @@ struct FuseFrontend::State {
                     : publication_bytes + op.length;
         }
         const auto publication_started = Clock::now();
+        data_publications_started.fetch_add(1, std::memory_order_relaxed);
         std::shared_ptr<WriteHandle> writer;
         ScopedFd replay_spool;
         try {
@@ -2430,6 +2452,7 @@ struct FuseFrontend::State {
                         }
                         throw FsError(EIO, "short read from FUSE write spool");
                     }
+                    data_publication_bytes_read.fetch_add(chunk, std::memory_order_relaxed);
                     if (!op.spool_hashes.empty()) {
                         const auto checksum_index =
                             static_cast<size_t>(done / State::spool_checksum_chunk_size);
@@ -2446,10 +2469,17 @@ struct FuseFrontend::State {
                 }
             }
             {
-                wait_for_playback_quiet();
                 std::lock_guard backend(publication_mutex);
+                // Multiple data workers may have passed the chunk gate before
+                // a viewer arrived and then queued here. Re-check while owning
+                // the serial commit boundary so at most the already-running
+                // bounded operation can precede new viewer demand.
+                wait_for_playback_quiet();
                 writer->commit();
             }
+            data_publications_completed.fetch_add(1, std::memory_order_relaxed);
+            data_publication_bytes_committed.fetch_add(publication_bytes,
+                                                       std::memory_order_relaxed);
             note_spool_publication(publication_bytes, Clock::now() - publication_started);
         } catch (const FsError& e) {
             if (e.code() == ENOENT || e.code() == EAGAIN) {
@@ -2472,6 +2502,7 @@ struct FuseFrontend::State {
             inode->published_data_sequence =
                 std::max(inode->published_data_sequence, snapshot.target_sequence);
             inode->unconfirmed_data_sequence = snapshot.target_sequence;
+            inode->unconfirmed_publication_bytes = publication_bytes;
             inode->unconfirmed_data_entry = committed;
         }
 
@@ -2482,37 +2513,14 @@ struct FuseFrontend::State {
             (void)confirm_data_from_snapshot(inode, *available->snapshot);
     }
 
-    static int64_t mount_clock_ms() {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(
-                   Clock::now().time_since_epoch())
-            .count();
-    }
-
-    void note_mount_activity() {
-        last_mount_activity_ms.store(mount_clock_ms(), std::memory_order_relaxed);
-        data_cv.notify_all();
-    }
-
-    std::chrono::milliseconds mount_idle_for() const {
-        const auto last = last_mount_activity_ms.load(std::memory_order_relaxed);
-        if (!last)
-            return std::chrono::hours(24);
-        return std::chrono::milliseconds(std::max<int64_t>(0, mount_clock_ms() - last));
-    }
-
     bool data_global_slot_available() const {
-        // Playback is stricter than mounted-filesystem foreground activity.
-        // FUSE data has already been admitted to the local spool, so starting a
-        // distributed publication while a viewer is waiting serves no latency
-        // purpose and only creates storage/network contention.
+        // Viewer demand is the only foreground gate. Loader writes are already
+        // durable in the local spool and are useful queued work, not a reason to
+        // collapse publication concurrency. A viewer blocks new publication
+        // quanta; publishers also re-check the same gate between replay chunks.
         if (!playback_quiet())
             return false;
-        const bool recent_mount_activity =
-            config.publication_quiet.count() > 0 && mount_idle_for() < config.publication_quiet;
-        const bool mount_busy =
-            open_writers.load(std::memory_order_relaxed) > 0 || recent_mount_activity;
-        const auto limit = mount_busy ? config.foreground_commit_workers : config.commit_workers;
-        return active_data.load(std::memory_order_relaxed) < limit;
+        return active_data.load(std::memory_order_relaxed) < config.commit_workers;
     }
 
     size_t effective_recovery_commit_workers() const {
@@ -2523,11 +2531,24 @@ struct FuseFrontend::State {
         if (!data_global_slot_available())
             return data_queue.end();
 
-        // Live publication always wins over crash-recovery convergence. A large
-        // recovered backlog must never leave a newly closed/fsynced file queued
-        // behind hundreds of old inodes.
-        auto live = std::find_if(data_queue.begin(), data_queue.end(),
-                                 [](const DataQueueItem& item) { return !item.recovery; });
+        // Closed live files win first so a multi-gigabyte open import cannot
+        // hide complete files from the authoritative namespace and catalogue.
+        // Inspect the current handle state rather than freezing it at enqueue:
+        // release() can close an inode while it is already waiting here.
+        auto live = std::find_if(data_queue.begin(), data_queue.end(), [](const DataQueueItem& item) {
+            if (item.recovery)
+                return false;
+            std::lock_guard inode_lock(item.inode->mutex);
+            return item.inode->writable_handles == 0;
+        });
+        if (live != data_queue.end())
+            return live;
+
+        // Open live files still use otherwise idle capacity. This is essential
+        // under spool pressure and obeys the loader law without weakening the
+        // viewer gate above.
+        live = std::find_if(data_queue.begin(), data_queue.end(),
+                            [](const DataQueueItem& item) { return !item.recovery; });
         if (live != data_queue.end())
             return live;
 
@@ -2557,10 +2578,9 @@ struct FuseFrontend::State {
                     if (runnable_data_available_locked())
                         break;
 
-                    // Active publications and writer close both notify data_cv.
-                    // The only transition without a producer event is expiry of
-                    // publication_quiet, so sleep directly to that deadline rather
-                    // than waking every 50 ms while the queue is throttled.
+                    // Active publications and viewer activity transitions notify
+                    // data_cv. Quiet-window expiry is the only transition without
+                    // a producer event, so sleep directly to that deadline.
                     const auto playback_idle = fs.foreground_idle_for();
                     if (config.publication_quiet.count() > 0 &&
                         playback_idle < config.publication_quiet) {
@@ -2570,30 +2590,41 @@ struct FuseFrontend::State {
                         });
                         continue;
                     }
-                    const auto mount_idle = mount_idle_for();
-                    if (open_writers.load(std::memory_order_relaxed) == 0 &&
-                        config.publication_quiet.count() > 0 &&
-                        mount_idle < config.publication_quiet) {
-                        data_cv.wait_for(lock, stop, config.publication_quiet - mount_idle, [&] {
-                            return stopping.load() || data_queue.empty() ||
-                                   runnable_data_available_locked();
-                        });
-                    } else {
-                        data_cv.wait(lock, stop, [&] {
-                            return stopping.load() || data_queue.empty() ||
-                                   runnable_data_available_locked();
-                        });
-                    }
+                    data_cv.wait(lock, stop, [&] {
+                        return stopping.load() || data_queue.empty() ||
+                               runnable_data_available_locked();
+                    });
                 }
                 if (stop.stop_requested() || stopping.load())
                     break;
                 auto selected = runnable_data_locked();
                 if (selected == data_queue.end())
                     continue;
+                bool selected_closed_ahead_of_open = false;
+                {
+                    std::lock_guard selected_inode_lock(selected->inode->mutex);
+                    if (!selected->recovery && selected->inode->writable_handles == 0) {
+                        selected_closed_ahead_of_open =
+                            std::any_of(data_queue.begin(), selected,
+                                        [](const DataQueueItem& item) {
+                                            if (item.recovery)
+                                                return false;
+                                            std::lock_guard inode_lock(item.inode->mutex);
+                                            return item.inode->writable_handles > 0;
+                                        });
+                    }
+                }
+                if (selected_closed_ahead_of_open)
+                    data_closed_priority_selections.fetch_add(1, std::memory_order_relaxed);
                 inode = selected->inode;
                 recovery = selected->recovery;
                 data_queue.erase(selected);
-                ++active_data;
+                const auto active_now = active_data.fetch_add(1, std::memory_order_relaxed) + 1;
+                auto peak = data_publication_peak_active.load(std::memory_order_relaxed);
+                while (peak < active_now &&
+                       !data_publication_peak_active.compare_exchange_weak(
+                           peak, active_now, std::memory_order_relaxed)) {
+                }
                 if (recovery)
                     ++active_recovery_data;
             }
@@ -3230,6 +3261,9 @@ struct FuseFrontend::State {
                 std::remove_if(inode->data_ops.begin(), inode->data_ops.end(),
                                [&](const DataOp& op) { return op.sequence <= target; }),
                 inode->data_ops.end());
+            data_publication_bytes_confirmed.fetch_add(inode->unconfirmed_publication_bytes,
+                                                       std::memory_order_relaxed);
+            inode->unconfirmed_publication_bytes = 0;
             inode->unconfirmed_data_entry.reset();
             inode->unconfirmed_data_sequence = 0;
             if (inode->data_ops.empty() && !inode->durability_pending)
@@ -3989,8 +4023,10 @@ FuseOpenHandle FuseFrontend::open(std::string_view path, bool readable, bool wri
             inode->admitted_size = 0;
         }
         ++inode->open_handles;
-        if (writable)
+        if (writable) {
+            ++inode->writable_handles;
             state_->open_writers.fetch_add(1, std::memory_order_relaxed);
+        }
         std::shared_ptr<FuseReadSession> read_session;
         if (readable) {
             read_session = std::make_shared<FuseReadSession>();
@@ -4032,6 +4068,7 @@ FuseOpenHandle FuseFrontend::create(std::string_view path, uint32_t mode, uint32
                             inode->current_path = requested;
                             inode->namespace_sequence = state_->next_namespace_sequence++;
                             inode->open_handles = 1;
+                            inode->writable_handles = writable ? 1 : 0;
 
                             op.kind = State::NamespaceOp::Kind::create;
                             op.sequence = inode->namespace_sequence;
@@ -4433,6 +4470,8 @@ void FuseFrontend::release(uint64_t inode_id, bool writable) {
                          --inode->open_handles;
                          closed = true;
                      }
+                     if (writable && inode->writable_handles)
+                         --inode->writable_handles;
                  }
                  if (writable && closed) {
                      state_->open_writers.fetch_sub(1, std::memory_order_relaxed);
@@ -4446,8 +4485,8 @@ std::pair<uint64_t, uint64_t> FuseFrontend::logical_capacity() const {
 }
 
 void FuseFrontend::note_interactive_activity(uint64_t bytes) {
-    state_->note_mount_activity();
     state_->fs.note_interactive_activity(bytes);
+    state_->data_cv.notify_all();
 }
 
 std::string FuseFrontend::path_for_inode(uint64_t id) const {
@@ -4515,6 +4554,18 @@ FuseFrontendStatus FuseFrontend::status() const {
     const auto diagnostics = this->diagnostics();
     out.timed_out_requests = diagnostics.timed_out_requests;
     out.merged_publications = diagnostics.merged_publications;
+    out.data_publication_requests = diagnostics.data_publication_requests;
+    out.data_publication_coalesced_queued = diagnostics.data_publication_coalesced_queued;
+    out.data_publication_coalesced_running = diagnostics.data_publication_coalesced_running;
+    out.data_publication_coalesced_unconfirmed =
+        diagnostics.data_publication_coalesced_unconfirmed;
+    out.data_publications_started = diagnostics.data_publications_started;
+    out.data_publications_completed = diagnostics.data_publications_completed;
+    out.data_publication_peak_active = diagnostics.data_publication_peak_active;
+    out.data_closed_priority_selections = diagnostics.data_closed_priority_selections;
+    out.data_publication_bytes_read = diagnostics.data_publication_bytes_read;
+    out.data_publication_bytes_committed = diagnostics.data_publication_bytes_committed;
+    out.data_publication_bytes_confirmed = diagnostics.data_publication_bytes_confirmed;
     out.backend_failures = diagnostics.backend_failures;
     out.durability_batches = diagnostics.durability_batches;
     out.durability_writes = diagnostics.durability_writes;
@@ -4541,6 +4592,17 @@ FuseFrontendDiagnostics FuseFrontend::diagnostics() const noexcept {
     return {
         state_->timed_out_requests.load(std::memory_order_relaxed),
         state_->merged_publications.load(std::memory_order_relaxed),
+        state_->data_publication_requests.load(std::memory_order_relaxed),
+        state_->data_publication_coalesced_queued.load(std::memory_order_relaxed),
+        state_->data_publication_coalesced_running.load(std::memory_order_relaxed),
+        state_->data_publication_coalesced_unconfirmed.load(std::memory_order_relaxed),
+        state_->data_publications_started.load(std::memory_order_relaxed),
+        state_->data_publications_completed.load(std::memory_order_relaxed),
+        state_->data_publication_peak_active.load(std::memory_order_relaxed),
+        state_->data_closed_priority_selections.load(std::memory_order_relaxed),
+        state_->data_publication_bytes_read.load(std::memory_order_relaxed),
+        state_->data_publication_bytes_committed.load(std::memory_order_relaxed),
+        state_->data_publication_bytes_confirmed.load(std::memory_order_relaxed),
         state_->backend_failures.load(std::memory_order_relaxed),
         state_->durability_batches.load(std::memory_order_relaxed),
         state_->durability_writes.load(std::memory_order_relaxed),

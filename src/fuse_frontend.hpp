@@ -64,6 +64,17 @@ struct FuseFrontendStatus {
     size_t active_recovery_data{};
     uint64_t timed_out_requests{};
     uint64_t merged_publications{};
+    uint64_t data_publication_requests{};
+    uint64_t data_publication_coalesced_queued{};
+    uint64_t data_publication_coalesced_running{};
+    uint64_t data_publication_coalesced_unconfirmed{};
+    uint64_t data_publications_started{};
+    uint64_t data_publications_completed{};
+    uint64_t data_publication_peak_active{};
+    uint64_t data_closed_priority_selections{};
+    uint64_t data_publication_bytes_read{};
+    uint64_t data_publication_bytes_committed{};
+    uint64_t data_publication_bytes_confirmed{};
     uint64_t backend_failures{};
     uint64_t durability_batches{};
     uint64_t durability_writes{};
@@ -90,6 +101,17 @@ struct FuseFrontendStatus {
 struct FuseFrontendDiagnostics {
     uint64_t timed_out_requests{};
     uint64_t merged_publications{};
+    uint64_t data_publication_requests{};
+    uint64_t data_publication_coalesced_queued{};
+    uint64_t data_publication_coalesced_running{};
+    uint64_t data_publication_coalesced_unconfirmed{};
+    uint64_t data_publications_started{};
+    uint64_t data_publications_completed{};
+    uint64_t data_publication_peak_active{};
+    uint64_t data_closed_priority_selections{};
+    uint64_t data_publication_bytes_read{};
+    uint64_t data_publication_bytes_committed{};
+    uint64_t data_publication_bytes_confirmed{};
     uint64_t backend_failures{};
     uint64_t durability_batches{};
     uint64_t durability_writes{};

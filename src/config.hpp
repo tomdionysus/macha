@@ -109,9 +109,10 @@ struct FuseConfig {
     // publication so restart recovery cannot make the node unresponsive.
     // The effective limit is min(recovery_commit_workers, commit_workers).
     size_t recovery_commit_workers{2};
-    // While mounted MachaDFS activity is recent, cap asynchronous data
-    // publication so local spool acceptance remains responsive. Once the
-    // frontend is quiet, all commit_workers may drain the live backlog.
+    // Retained for configuration compatibility. Viewer demand now gates new
+    // publication work directly, while loader activity is work-conserving up to
+    // commit_workers; treating every mounted write as foreground caused bulk
+    // imports to remain permanently single-threaded.
     size_t foreground_commit_workers{1};
     std::chrono::milliseconds publication_quiet{5000};
     size_t max_pending_operations{4096};
