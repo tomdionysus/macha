@@ -211,7 +211,12 @@ void Service::initialise_services(std::stop_token stop) {
         scanner_->start();
         hydration_->start();
         cluster_status_.attach_metadata(*metadata_);
-        node_.set_service_event_callback([this] { signal_maintenance(); });
+        // Seed one initial validation pass. Later metadata/topology events use
+        // the edge-triggered high-water object; storage-only events still wake
+        // ordinary maintenance without scheduling redundant metadata work.
+        metadata_convergence_.request(node_.known_metadata_generation());
+        node_.set_service_event_callback(
+            [this](ServiceEvent event) { signal_maintenance(event); });
         maintenance_ = std::jthread([this](std::stop_token maintenance_stop) {
             loop(maintenance_stop);
         });
@@ -290,9 +295,17 @@ void Service::stop() {
     Log::debug("shutdown: Service::stop complete");
 }
 
-void Service::signal_maintenance() {
+void Service::signal_maintenance(ServiceEvent event) {
+    bool wake = true;
+    if (event == ServiceEvent::metadata || event == ServiceEvent::topology)
+        wake = metadata_convergence_.request(node_.known_metadata_generation());
     maintenance_event_.fetch_add(1, std::memory_order_release);
-    maintenance_wait_cv_.notify_all();
+    // A burst received while its convergence pass is already queued/running
+    // only advances the high-water epoch. The active owner observes that epoch
+    // and schedules one follow-up; waking the same owner for every notice adds
+    // no information and recreates the notification storm this state replaces.
+    if (wake)
+        maintenance_wait_cv_.notify_all();
 }
 
 
@@ -375,7 +388,7 @@ void Service::retain_metadata_publication(const MetadataPublicationContext& cont
         !store_->retain_control(control, dot,
                                context.proposed.metadata_write_replicas_required))
         throw MetadataNotReady("CONTROL retention floor unavailable before metadata publication");
-    signal_maintenance();
+    signal_maintenance(ServiceEvent::storage);
 }
 
 std::vector<GarbageRef> Service::collect_garbage(const std::vector<GarbageRef>& garbage) {
@@ -450,8 +463,9 @@ void Service::loop(std::stop_token stop) {
     auto last_wall = Clock::now();
     auto last_cpu = std::clock();
     uint64_t last_metadata_remote_epoch = node_.remote_metadata_epoch();
+    uint64_t last_metadata_demand_epoch{};
     std::vector<NodeId> last_active_nodes;
-    bool metadata_dirty = true;
+    bool metadata_dirty = metadata_convergence_.pending();
     bool catalogue_dirty = true;
     auto metadata_retry_due = Clock::time_point{};
     auto metadata_retry_backoff = maintenance_background_interval(policy);
@@ -474,13 +488,18 @@ void Service::loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
         maintenance_wakeups_.fetch_add(1, std::memory_order_relaxed);
         auto now = Clock::now();
+        metadata_dirty = metadata_convergence_.pending();
+        const auto metadata_demand = metadata_convergence_.diagnostics().requested_epoch;
+        if (metadata_demand != last_metadata_demand_epoch) {
+            metadata_retry_due = Clock::time_point{};
+            last_metadata_demand_epoch = metadata_demand;
+        }
         const auto current_event = maintenance_event_.load(std::memory_order_acquire);
         const bool event_changed = current_event != observed_event;
         observed_event = current_event;
         const auto local_metadata_generation =
             node_.metadata_replica().committed_generation();
         if (local_metadata_generation != last_local_metadata_generation) {
-            metadata_dirty = true;
             catalogue_dirty = true;
             metadata_retry_due = Clock::time_point{};
             last_local_metadata_generation = local_metadata_generation;
@@ -501,7 +520,6 @@ void Service::loop(std::stop_token stop) {
         const auto remote_epoch = node_.remote_metadata_epoch();
         const bool topology_changed = active_nodes != last_active_nodes;
         if (remote_epoch != last_metadata_remote_epoch || topology_changed) {
-            metadata_dirty = true;
             metadata_retry_due = Clock::time_point{};
             if (topology_changed)
                 formation_settle_due = now + node_.config().dead_after;
@@ -585,12 +603,17 @@ void Service::loop(std::stop_token stop) {
                     metadata_ready_for_dependants = false;
                     metadata_retry_due = Clock::now() + metadata_retry_backoff;
                     } else {
+                        const auto convergence_run = metadata_convergence_.begin();
+                        if (!convergence_run) {
+                            metadata_dirty = false;
+                            metadata_ready_for_dependants = true;
+                        } else {
                         const auto stage = Clock::now();
                         try {
                     metadata_->repair_once();
                     metadata_->note_replica_validation(true);
-                    metadata_dirty = false;
-                    metadata_ready_for_dependants = true;
+                    metadata_dirty = metadata_convergence_.complete(*convergence_run);
+                    metadata_ready_for_dependants = !metadata_dirty;
                     catalogue_dirty = true;
                     metadata_retry_due = Clock::time_point{};
                     metadata_retry_backoff = maintenance_background_interval(policy);
@@ -627,6 +650,7 @@ void Service::loop(std::stop_token stop) {
                     Log::debug("metadata repair deferred; continuing non-destructive maintenance");
                         }
                         log_slow_stage("metadata-repair", stage);
+                        }
                     }
                 }
             }

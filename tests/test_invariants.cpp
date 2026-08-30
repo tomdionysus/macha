@@ -14,6 +14,49 @@ using namespace std::chrono_literals;
 using namespace macha::test_support;
 
 namespace {
+
+MACHA_TEST("invariants", test_convergence_demand_coalesces_burst_and_keeps_same_generation_event) {
+    ConvergenceDemand demand;
+    CHECK(!demand.pending());
+
+    demand.request(10);
+    auto first = demand.begin();
+    REQUIRE(first.has_value());
+    CHECK(first->generation == 10);
+
+    // Model notices arriving while the convergence owner is gated in its
+    // current run. They advance the high-water state without scheduling one
+    // maintenance run per intermediate generation.
+    for (uint64_t generation = 11; generation <= 210; ++generation)
+        demand.request(generation);
+    demand.request(210); // same-generation sibling/topology change
+
+    auto during = demand.diagnostics();
+    CHECK(during.events_received == 202);
+    CHECK(during.runs_scheduled == 1);
+    CHECK(during.latest_generation == 210);
+    CHECK(demand.complete(*first));
+
+    auto second = demand.begin();
+    REQUIRE(second.has_value());
+    CHECK(second->generation == 210);
+    CHECK(!demand.complete(*second));
+
+    auto settled = demand.diagnostics();
+    CHECK(settled.runs_scheduled == 2);
+    CHECK(settled.runs_completed == 2);
+    CHECK(settled.completed_epoch == settled.requested_epoch);
+    CHECK(!settled.scheduled);
+
+    // Generation alone is not the identity: a sibling notice at the already
+    // processed generation must still create a new edge.
+    demand.request(210);
+    auto sibling = demand.begin();
+    REQUIRE(sibling.has_value());
+    CHECK(sibling->epoch > second->epoch);
+    CHECK(!demand.complete(*sibling));
+    CHECK(demand.diagnostics().runs_scheduled == 3);
+}
 Config config_for(const std::filesystem::path& path, const std::filesystem::path& key,
                   uint16_t port, std::vector<Endpoint> bootstrap = {}) {
     return macha::test_support::config_for(path, key, port, std::move(bootstrap),

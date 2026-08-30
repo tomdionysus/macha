@@ -9,6 +9,7 @@
 #include "ingest.hpp"
 #include "torrent.hpp"
 #include "filesystem.hpp"
+#include "convergence_demand.hpp"
 #include "hydration.hpp"
 #include "media_catalogue.hpp"
 #include "playback.hpp"
@@ -59,6 +60,7 @@ class Service {
     std::condition_variable_any maintenance_wait_cv_;
     std::atomic_uint64_t maintenance_event_{1};
     std::atomic_uint64_t maintenance_wakeups_{};
+    ConvergenceDemand metadata_convergence_;
     uint64_t maintenance_inventory_generation_{};
     std::shared_ptr<const std::vector<ObjectId>> maintenance_live_;
     std::shared_ptr<const std::vector<ObjectId>> maintenance_universal_;
@@ -79,7 +81,7 @@ class Service {
     HttpResponse handle_http(const HttpRequest&);
     bool capability_request(const HttpRequest&);
     void loop(std::stop_token);
-    void signal_maintenance();
+    void signal_maintenance(ServiceEvent);
     std::vector<GarbageRef> collect_garbage(const std::vector<GarbageRef>&);
     void maintain_garbage_metadata(const std::vector<GarbageRef>& erase,
                                    const std::vector<GarbageRef>& stamp);
@@ -101,6 +103,9 @@ class Service {
     HydrationManager& hydration() { wait_services_ready(); return *hydration_; }
     uint64_t maintenance_wakeups() const noexcept {
         return maintenance_wakeups_.load(std::memory_order_acquire);
+    }
+    ConvergenceDemandDiagnostics metadata_convergence_diagnostics() const noexcept {
+        return metadata_convergence_.diagnostics();
     }
 };
 } // namespace macha

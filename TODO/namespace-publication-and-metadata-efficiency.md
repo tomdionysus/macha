@@ -1,6 +1,7 @@
 # Namespace publication and metadata efficiency
 
-Status: Phase 2 in progress; bounded deletion/backlog publication batches implemented
+Status: Phase 2 deletion/backlog batching and durability validation complete;
+Phase 3 convergence coalescing is in progress
 
 Last updated: 2026-08-30
 
@@ -71,7 +72,7 @@ Goal: make duplicated work and batching behaviour observable before changing it.
 - [x] Add counters for namespace publication batches and operations per batch
   when the batch abstraction is introduced.
 - [ ] Add accepted-head persistence counters.
-- [ ] Add generation notices received and convergence runs scheduled/completed.
+- [x] Add generation/topology events received and convergence runs scheduled/completed.
 - [ ] Add RPC queue time and handler time summaries by message and frame class.
 - [x] Ensure implemented counters do not add production polling or
   high-cardinality logging.
@@ -187,10 +188,12 @@ Goal: retain per-operation journal durability while publishing an ordered group 
 - [x] Test unlink children followed by parent `rmdir` in one batch.
 - [ ] Test create/rename/unlink dependencies in one batch and across batch boundaries.
 - [x] Inject a deterministic failure at operation N and verify largest-valid-prefix publication.
-- [ ] Restart after every durability boundary: admission, distributed commit, published-marker group, confirmation, and done-marker group.
-- [ ] Verify no acknowledged operation is lost, reordered, or reported done without its effect.
+- [x] Restart across admission, distributed commit, partial published-marker,
+  confirmation, and partial done-marker boundaries. Confirmation has no durable
+  record of its own, so its crash image is the published-without-done case.
+- [x] Verify no acknowledged operation is lost, reordered, or reported done without its effect.
 - [x] Test an all-idempotent recovery batch and a partially idempotent batch.
-- [ ] Test concurrent new FUSE admissions while a recovery batch is publishing.
+- [x] Test concurrent new FUSE admissions while a recovery batch is publishing.
 - [x] Verify the encoded-size limit is a hard batching boundary while allowing one oversized operation to make progress.
 
 Exit criteria:
@@ -204,21 +207,29 @@ Goal: process the newest required state without repeating obsolete intermediate 
 
 ### Design
 
-- [ ] Represent metadata convergence demand as an atomic/latest generation or epoch high-water mark plus an edge-triggered scheduled flag.
-- [ ] Receiving a notice advances the high-water mark and signals the worker only when no run is already scheduled.
-- [ ] A convergence run reads the latest accepted-head topology, performs necessary work, and checks the high-water mark again before becoming idle.
-- [ ] Multiple notices received during one run must result in at most one additional pass over the latest state.
-- [ ] Catalogue, retention, and GC consumers should consume a stable immutable snapshot of the latest relevant head, not every intermediate linear generation.
-- [ ] Preserve same-generation sibling notifications by including the existing metadata epoch/topology signal, not generation alone.
-- [ ] Do not coalesce away a branch-topology change, policy transition, retention deadline, or explicit catalogue rescan request.
+- [x] Represent metadata convergence demand as an atomic latest-generation
+  diagnostic high-water mark plus a semantic epoch and edge-triggered scheduled flag.
+- [x] Receiving a metadata/topology event advances the epoch and signals the worker only when no run is already scheduled.
+- [x] A convergence run reads the latest accepted-head topology, performs necessary work, and checks the epoch again before becoming idle.
+- [x] Multiple notices received during one run result in at most one additional pass over the latest state.
+- [x] Catalogue convergence is deferred when a newer metadata epoch arrives
+  during repair, so it consumes the final stable immutable view rather than an
+  obsolete intermediate view. Retention/GC fencing remains unchanged.
+- [x] Preserve same-generation sibling notifications by using the semantic epoch, not generation alone.
+- [x] Do not coalesce away a branch-topology change or policy transition;
+  typed topology and metadata events both advance the semantic epoch, while
+  retention deadlines and explicit catalogue work retain their independent scheduler paths.
 - [ ] Prevent acceptance rebroadcast storms: installing already-known acceptance evidence must not announce again, and followers should not make every intermediate linear head a service-wide event when catching up to a newer head.
 - [ ] Allow a lagging third replica to import required history and accept the newest valid linear head without running full service convergence for every ancestor.
 
 ### Tests
 
-- [ ] Deliver hundreds of increasing generation notices while a convergence run is gated; assert bounded run count and final high-water processing.
-- [ ] Deliver a same-generation sibling notice and verify reconciliation still occurs.
-- [ ] Verify catalogue search/artwork/GC sees the final state after a coalesced burst.
+- [x] Deliver hundreds of increasing generation notices while a convergence run is gated; assert two runs and final high-water processing.
+- [ ] Deliver a real same-generation sibling notice and verify reconciliation
+  occurs. The scheduler-level test already proves the event creates a new epoch.
+- [ ] Verify catalogue search/artwork/GC sees the final state after a coalesced
+  burst. The existing `test_catalogue_sync_search_and_artwork_gc` regression
+  passes after the scheduler change, but does not itself inject a gated burst.
 - [ ] Verify retention deadlines and garbage grace are calculated from the correct accepted state.
 - [ ] Verify no busy loop appears when notices stop or peers disconnect.
 
@@ -421,3 +432,20 @@ Each future session should:
   regression test passed within the full run.
 - Detailed implementation, continuation, and UAT notes:
   `TODO/2026-08-30-phase-2-namespace-batching.md`.
+
+### 2026-08-30 — Phase 2 three-node deletion UAT
+
+- Created 1,000 empty files in a uniquely named disposable directory through
+  the live FUSE mount, then deleted the exact directory with `rm -rf`.
+- The 1,001-operation delete completed in 0.77 seconds and advanced metadata
+  only five generations, from 1301 to 1306, rather than one generation per
+  syscall.
+- All three nodes stayed healthy and writable. Final direct status latency was
+  1.0–17.3 ms, and generation remained at 1306 through the settled window.
+- Both Linux nodes ended with all 89 Macha threads sleeping; local CPU returned
+  below 1%. The original sustained three-core spin did not reproduce.
+- RSS rose by 28–60 MB across nodes after the create/delete burst and then was
+  stable during the short observation. Retained bounded materializations are a
+  plausible but unproven cause; a repeated/larger UAT can establish its ceiling.
+- Detailed measurements and observer-tooling caveats:
+  `TODO/2026-08-30-phase-2-three-node-deletion-uat.md`.
