@@ -2460,11 +2460,13 @@ bool MetadataReplica::history_is_ancestor_locked(const Hash256& ancestor,
         if (found == history_.end())
             continue;
         const auto& entry_value = found->second;
-        if (entry_value.previous_known) {
-            if (entry_value.previous == ancestor)
-                return true;
+        // A compacted full root retains its authenticated direct-parent hash,
+        // even though previous_known=false prevents reconstruction or traversal
+        // beyond that boundary.  The direct edge is still valid ancestry.
+        if (entry_value.previous != Hash256{} && entry_value.previous == ancestor)
+            return true;
+        if (entry_value.previous_known)
             pending.push_back(entry_value.previous);
-        }
         for (const auto& parent : entry_value.merge_parents) {
             if (parent == ancestor)
                 return true;
@@ -2488,8 +2490,17 @@ std::optional<Hash256> MetadataReplica::history_common_ancestor_locked(
         left_ancestors[current] = generation;
         if (found == history_.end())
             continue;
-        if (found->second.previous_known)
+        if (found->second.previous_known) {
             pending.push_back(found->second.previous);
+        } else if (found->second.previous != Hash256{}) {
+            // Record the authenticated boundary parent as a possible common
+            // ancestor, but do not walk into history deliberately discarded by
+            // compaction.
+            const auto parent = history_.find(found->second.previous);
+            const uint64_t parent_generation =
+                parent == history_.end() ? 0 : parent->second.generation;
+            left_ancestors.emplace(found->second.previous, parent_generation);
+        }
         for (const auto& parent : found->second.merge_parents)
             pending.push_back(parent);
     }
@@ -2503,20 +2514,30 @@ std::optional<Hash256> MetadataReplica::history_common_ancestor_locked(
         pending.pop_back();
         if (!seen.insert(current).second)
             continue;
-        auto intersection = left_ancestors.find(current);
-        if (intersection != left_ancestors.end()) {
-            const uint64_t generation = intersection->second;
+        auto consider = [&](const Hash256& candidate, uint64_t generation) {
+            auto intersection = left_ancestors.find(candidate);
+            if (intersection == left_ancestors.end())
+                return;
+            generation = std::max(generation, intersection->second);
             if (!best || generation > best_generation ||
-                (generation == best_generation && *best < current)) {
-                best = current;
+                (generation == best_generation && *best < candidate)) {
+                best = candidate;
                 best_generation = generation;
             }
-        }
+        };
         auto found = history_.find(current);
+        consider(current, found == history_.end() ? 0 : found->second.generation);
         if (found == history_.end())
             continue;
-        if (found->second.previous_known)
+        if (found->second.previous_known) {
             pending.push_back(found->second.previous);
+        } else if (found->second.previous != Hash256{}) {
+            // As above, the boundary parent participates in ancestry matching
+            // without becoming a traversal edge.
+            const auto parent = history_.find(found->second.previous);
+            consider(found->second.previous,
+                     parent == history_.end() ? 0 : parent->second.generation);
+        }
         for (const auto& parent : found->second.merge_parents)
             pending.push_back(parent);
     }
