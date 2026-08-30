@@ -87,6 +87,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "  max_pending_operations: 1024\n"
             << "  namespace_batch_operations: 128\n"
             << "  namespace_batch_bytes: 192K\n"
+            << "  max_spool_bytes: 7G\n"
+            << "  spool_reserve_free: 768M\n"
             << "  hydration_priority: 2500\n"
             << "  read_ahead_extents: 4\n"
             << "  hint_lifetime_ms: 4500\n"
@@ -262,6 +264,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(yc.fuse.max_pending_operations == 1024);
     CHECK(yc.fuse.namespace_batch_operations == 128);
     CHECK(yc.fuse.namespace_batch_bytes == 192 * 1024);
+    CHECK(yc.fuse.max_spool_bytes == 7ULL * 1024 * 1024 * 1024);
+    CHECK(yc.fuse.spool_reserve_free == 768ULL * 1024 * 1024);
     CHECK(yc.fuse.hydration_priority == 2500);
     CHECK(yc.fuse.read_ahead_extents == 4);
     CHECK(yc.fuse.hint_lifetime == 4500ms);

@@ -430,6 +430,20 @@ struct FuseFrontend::State {
     // This is reserved before pwrite and released only after successful spool
     // retirement, so concurrent hot inodes cannot bypass the configured cap.
     std::atomic_uint64_t spool_bytes{};
+    // Spool admission is event-driven backpressure. Below half capacity writes
+    // burst at local disk speed. Above it, completed distributed publications
+    // establish the sustainable rate and admission is paced progressively down
+    // to that rate by 90% occupancy. At the hard bound writers sleep until a
+    // real publication/retirement event creates room; saturation is not ENOSPC.
+    std::mutex spool_admission_mutex;
+    std::condition_variable_any spool_admission_cv;
+    Clock::time_point next_spool_admission{};
+    double spool_publish_rate_bytes_per_second{};
+    uint64_t spool_admission_revision{};
+    std::atomic_bool spool_drain_requested{};
+    std::atomic_uint64_t spool_publish_rate_diagnostic{};
+    std::atomic_uint64_t spool_throttle_waits{};
+    std::atomic_uint64_t spool_throttle_wait_ns{};
 
     mutable std::mutex namespace_mutex;
     std::map<std::string, std::shared_ptr<Inode>, std::less<>> paths;
@@ -510,7 +524,15 @@ struct FuseFrontend::State {
             ::close(journal_fd);
     }
 
-    void reserve_spool_bytes(uint64_t bytes) {
+    uint64_t spool_throttle_start() const {
+        return std::max<uint64_t>(1, config.max_spool_bytes / 2);
+    }
+
+    bool spool_under_pressure() const {
+        return spool_bytes.load(std::memory_order_acquire) >= spool_throttle_start();
+    }
+
+    void check_spool_physical_space(uint64_t bytes) {
         if (!bytes)
             return;
         std::filesystem::create_directories(spool_dir);
@@ -520,25 +542,149 @@ struct FuseFrontend::State {
             throw FsError(EIO, "cannot inspect FUSE spool free space");
         if (bytes > space.available || config.spool_reserve_free > space.available - bytes)
             throw FsError(ENOSPC, "FUSE spool physical reserve reached");
+    }
 
-        auto current = spool_bytes.load(std::memory_order_relaxed);
+    void reserve_spool_bytes(uint64_t bytes) {
+        if (!bytes)
+            return;
+        if (bytes > config.max_spool_bytes)
+            throw FsError(EFBIG, "single FUSE write exceeds the spool byte limit");
+
+        const auto wait_started = Clock::now();
+        bool waited = false;
+        uint64_t drain_requested_at_revision = std::numeric_limits<uint64_t>::max();
+        std::unique_lock lock(spool_admission_mutex);
         for (;;) {
-            if (current > config.max_spool_bytes || bytes > config.max_spool_bytes - current)
-                throw FsError(ENOSPC, "FUSE spool byte limit reached");
-            if (spool_bytes.compare_exchange_weak(
-                    current, current + bytes, std::memory_order_acq_rel, std::memory_order_relaxed))
+            if (stopping.load(std::memory_order_acquire))
+                throw FsError(EINTR, "FUSE spool admission stopping");
+
+            const auto current = spool_bytes.load(std::memory_order_relaxed);
+            const bool capacity_available =
+                current <= config.max_spool_bytes && bytes <= config.max_spool_bytes - current;
+            const auto throttle_start = spool_throttle_start();
+            const auto now = Clock::now();
+
+            bool rate_admitted = current < throttle_start;
+            Clock::time_point wake_at = Clock::time_point::max();
+            if (capacity_available && !rate_admitted &&
+                spool_publish_rate_bytes_per_second > 0.0) {
+                const auto full_rate_at = std::max<uint64_t>(
+                    throttle_start + 1,
+                    config.max_spool_bytes - config.max_spool_bytes / 10);
+                const auto pressure_span = full_rate_at - throttle_start;
+                const auto pressure_bytes =
+                    std::min(current - throttle_start, pressure_span);
+                // Begin at up to 8x measured drain speed, then converge smoothly
+                // to 1x as occupancy approaches 90%. This lets a fresh copy burst
+                // while ensuring a saturated spool cannot grow faster than drain.
+                const double pressure = std::max(
+                    0.125, static_cast<double>(pressure_bytes) /
+                               static_cast<double>(std::max<uint64_t>(1, pressure_span)));
+                const double admission_rate = spool_publish_rate_bytes_per_second / pressure;
+                if (next_spool_admission <= now) {
+                    rate_admitted = true;
+                    const auto seconds = static_cast<double>(bytes) / admission_rate;
+                    const auto delay = std::chrono::duration_cast<Clock::duration>(
+                        std::chrono::duration<double>(seconds));
+                    next_spool_admission = now + std::max(delay, Clock::duration{1});
+                } else {
+                    wake_at = next_spool_admission;
+                }
+            }
+
+            if (capacity_available && rate_admitted) {
+                // The logical reservation is made under the admission mutex;
+                // physical free-space validation is immediately adjacent so a
+                // failed check cannot leave invisible reserved capacity.
+                check_spool_physical_space(bytes);
+                spool_bytes.store(current + bytes, std::memory_order_release);
+                if (waited) {
+                    spool_throttle_wait_ns.fetch_add(
+                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  Clock::now() - wait_started)
+                                                  .count()),
+                        std::memory_order_relaxed);
+                }
                 return;
+            }
+
+            if (!waited) {
+                waited = true;
+                spool_throttle_waits.fetch_add(1, std::memory_order_relaxed);
+            }
+            const auto revision = spool_admission_revision;
+            spool_drain_requested.store(true, std::memory_order_release);
+            if (drain_requested_at_revision != revision) {
+                drain_requested_at_revision = revision;
+                lock.unlock();
+                request_spool_pressure_publications();
+                lock.lock();
+                // The publication request itself may have raced a release or
+                // rate sample. Re-evaluate before sleeping.
+                if (spool_admission_revision != revision)
+                    continue;
+            }
+            if (wake_at == Clock::time_point::max()) {
+                spool_admission_cv.wait(lock, [&] {
+                    return stopping.load(std::memory_order_acquire) ||
+                           spool_admission_revision != revision;
+                });
+            } else {
+                spool_admission_cv.wait_until(lock, wake_at, [&] {
+                    return stopping.load(std::memory_order_acquire) ||
+                           spool_admission_revision != revision;
+                });
+            }
         }
+    }
+
+    void recover_spool_bytes(uint64_t bytes) {
+        if (!bytes)
+            return;
+        check_spool_physical_space(0);
+        std::lock_guard lock(spool_admission_mutex);
+        const auto current = spool_bytes.load(std::memory_order_relaxed);
+        if (current > config.max_spool_bytes || bytes > config.max_spool_bytes - current)
+            throw FsError(ENOSPC, "recovered FUSE spool exceeds configured byte limit");
+        spool_bytes.store(current + bytes, std::memory_order_release);
+    }
+
+    void note_spool_publication(uint64_t bytes, Clock::duration elapsed) {
+        if (!bytes || elapsed <= Clock::duration::zero())
+            return;
+        const auto seconds = std::chrono::duration<double>(elapsed).count();
+        if (seconds <= 0.0)
+            return;
+        const auto sample = static_cast<double>(bytes) / seconds;
+        std::lock_guard lock(spool_admission_mutex);
+        spool_publish_rate_bytes_per_second =
+            spool_publish_rate_bytes_per_second > 0.0
+                ? spool_publish_rate_bytes_per_second * 0.75 + sample * 0.25
+                : sample;
+        spool_publish_rate_diagnostic.store(
+            static_cast<uint64_t>(spool_publish_rate_bytes_per_second),
+            std::memory_order_relaxed);
+        ++spool_admission_revision;
+        spool_admission_cv.notify_all();
     }
 
     void release_spool_bytes(uint64_t bytes) {
         if (!bytes)
             return;
-        const auto before = spool_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
+        std::lock_guard lock(spool_admission_mutex);
+        const auto before = spool_bytes.load(std::memory_order_relaxed);
         if (before < bytes) {
             spool_bytes.store(0, std::memory_order_release);
             Log::error("FUSE spool accounting underflow");
+        } else {
+            spool_bytes.store(before - bytes, std::memory_order_release);
         }
+        if (spool_bytes.load(std::memory_order_relaxed) < spool_throttle_start()) {
+            next_spool_admission = {};
+            spool_drain_requested.store(false, std::memory_order_release);
+        }
+        ++spool_admission_revision;
+        spool_admission_cv.notify_all();
     }
 
     struct OrphanFile {
@@ -1490,6 +1636,14 @@ struct FuseFrontend::State {
                 // descriptor whose spool bytes were not made durable first.
                 journal_data_batch(batch);
                 finish_durability_batch(batch);
+                if (spool_under_pressure() ||
+                    spool_drain_requested.load(std::memory_order_acquire)) {
+                    std::set<std::shared_ptr<Inode>> pressure_inodes;
+                    for (const auto& ticket : batch)
+                        pressure_inodes.insert(ticket->inode);
+                    for (const auto& inode : pressure_inodes)
+                        request_data_publication(inode);
+                }
                 durability_batches.fetch_add(1, std::memory_order_relaxed);
                 durability_writes.fetch_add(batch.size(), std::memory_order_relaxed);
 
@@ -1776,6 +1930,22 @@ struct FuseFrontend::State {
         const bool recovery = inode->published_data_sequence < inode->recovery_data_sequence;
         data_queue.push_back({inode, recovery});
         data_cv.notify_one();
+    }
+
+    void request_spool_pressure_publications() {
+        std::vector<std::shared_ptr<Inode>> candidates;
+        {
+            std::lock_guard lock(namespace_mutex);
+            candidates.reserve(inodes.size());
+            for (const auto& [_, inode] : inodes) {
+                std::lock_guard inode_lock(inode->mutex);
+                if (!inode->data_ops.empty() &&
+                    inode->durable_data_sequence > inode->published_data_sequence)
+                    candidates.push_back(inode);
+            }
+        }
+        for (const auto& inode : candidates)
+            request_data_publication(inode);
     }
 
     void admit_deferred() {
@@ -2205,6 +2375,16 @@ struct FuseFrontend::State {
             return;
         }
 
+        uint64_t publication_bytes = 0;
+        for (const auto& op : snapshot.operations) {
+            if (op.kind != DataOp::Kind::write)
+                continue;
+            publication_bytes =
+                op.length > std::numeric_limits<uint64_t>::max() - publication_bytes
+                    ? std::numeric_limits<uint64_t>::max()
+                    : publication_bytes + op.length;
+        }
+        const auto publication_started = Clock::now();
         std::shared_ptr<WriteHandle> writer;
         ScopedFd replay_spool;
         try {
@@ -2270,6 +2450,7 @@ struct FuseFrontend::State {
                 std::lock_guard backend(publication_mutex);
                 writer->commit();
             }
+            note_spool_publication(publication_bytes, Clock::now() - publication_started);
         } catch (const FsError& e) {
             if (e.code() == ENOENT || e.code() == EAGAIN) {
                 std::lock_guard lock(inode->mutex);
@@ -2707,7 +2888,7 @@ struct FuseFrontend::State {
         const auto size = static_cast<uint64_t>(statbuf.st_size);
         if (size < required) {
             ::close(fd);
-            reserve_spool_bytes(size);
+            recover_spool_bytes(size);
             inode->recovery_spool_error = "spool is shorter than its durable operation journal";
             inode->spool_end = size;
             return;
@@ -2715,7 +2896,7 @@ struct FuseFrontend::State {
         ::close(fd);
         if (size > required)
             quarantine_spool_tail(inode->spool_path, required, size);
-        reserve_spool_bytes(required);
+        recover_spool_bytes(required);
         // Recovery validates durable spool state but does not retain one file
         // descriptor per dirty inode. Replay/read paths open the spool lazily.
         inode->spool_fd = -1;
@@ -3243,6 +3424,7 @@ struct FuseFrontend::State {
             return;
         namespace_cv.notify_all();
         data_cv.notify_all();
+        spool_admission_cv.notify_all();
         for (auto& queue : broker)
             queue.cv.notify_all();
         if (namespace_worker.joinable())
@@ -4033,11 +4215,17 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
             state_->throw_if_durability_poisoned();
             check_deadline(deadline, cancelled);
 
+            // Admission may wait for distributed publication to create spool
+            // capacity. Never hold an inode mutex across that wait: durability
+            // and publication both need the inode in order to make progress.
+            state_->reserve_spool_bytes(static_cast<uint64_t>(owned.size()));
+            bool reservation_transferred = false;
+
             auto ticket = std::make_shared<State::DurabilityTicket>();
             ticket->inode = inode;
             uint64_t spool_offset = 0;
             int fd = -1;
-            {
+            try {
                 std::lock_guard lock(inode->mutex);
                 if (inode->visible.type != EntryType::file)
                     throw FsError(EISDIR, "directory");
@@ -4071,7 +4259,6 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
                 // reservations.
                 State::DataOp overlay_op = ticket->op;
                 inode->data_ops.reserve(inode->data_ops.size() + 1);
-                state_->reserve_spool_bytes(static_cast<uint64_t>(owned.size()));
                 bool admission_active = false;
                 bool queued = false;
                 try {
@@ -4095,6 +4282,7 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
                     // non-throwing after the reservations above.
                     state_->enqueue_durability(ticket);
                     queued = true;
+                    reservation_transferred = true;
 
                     inode->spool_end += owned.size();
                     inode->admitted_size =
@@ -4134,10 +4322,12 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
                             }
                         }
                     }
-                    if (!queued)
-                        state_->release_spool_bytes(static_cast<uint64_t>(owned.size()));
                     throw;
                 }
+            } catch (...) {
+                if (!reservation_transferred)
+                    state_->release_spool_bytes(static_cast<uint64_t>(owned.size()));
+                throw;
             }
 
             // Normal POSIX semantics: successful write() means the bytes have been
@@ -4338,6 +4528,12 @@ FuseFrontendStatus FuseFrontend::status() const {
     out.journal_append_batches = diagnostics.journal_append_batches;
     out.journal_records_appended = diagnostics.journal_records_appended;
     out.journal_durability_barriers = diagnostics.journal_durability_barriers;
+    out.spool_bytes = diagnostics.spool_bytes;
+    out.spool_limit_bytes = diagnostics.spool_limit_bytes;
+    out.spool_publish_rate_bytes_per_second =
+        diagnostics.spool_publish_rate_bytes_per_second;
+    out.spool_throttle_waits = diagnostics.spool_throttle_waits;
+    out.spool_throttle_wait_ms = diagnostics.spool_throttle_wait_ms;
     return out;
 }
 
@@ -4358,6 +4554,11 @@ FuseFrontendDiagnostics FuseFrontend::diagnostics() const noexcept {
         state_->journal_append_batches.load(std::memory_order_relaxed),
         state_->journal_records_appended.load(std::memory_order_relaxed),
         state_->journal_durability_barriers.load(std::memory_order_relaxed),
+        state_->spool_bytes.load(std::memory_order_relaxed),
+        state_->config.max_spool_bytes,
+        state_->spool_publish_rate_diagnostic.load(std::memory_order_relaxed),
+        state_->spool_throttle_waits.load(std::memory_order_relaxed),
+        state_->spool_throttle_wait_ns.load(std::memory_order_relaxed) / 1000000,
     };
 }
 

@@ -77,6 +77,11 @@ struct FuseFrontendStatus {
     uint64_t journal_append_batches{};
     uint64_t journal_records_appended{};
     uint64_t journal_durability_barriers{};
+    uint64_t spool_bytes{};
+    uint64_t spool_limit_bytes{};
+    uint64_t spool_publish_rate_bytes_per_second{};
+    uint64_t spool_throttle_waits{};
+    uint64_t spool_throttle_wait_ms{};
 };
 
 // Lock-free, process-lifetime operational totals suitable for Status. This is
@@ -98,6 +103,11 @@ struct FuseFrontendDiagnostics {
     uint64_t journal_append_batches{};
     uint64_t journal_records_appended{};
     uint64_t journal_durability_barriers{};
+    uint64_t spool_bytes{};
+    uint64_t spool_limit_bytes{};
+    uint64_t spool_publish_rate_bytes_per_second{};
+    uint64_t spool_throttle_waits{};
+    uint64_t spool_throttle_wait_ms{};
 };
 
 struct FuseDirtyRange {

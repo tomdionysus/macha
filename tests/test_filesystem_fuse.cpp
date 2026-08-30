@@ -49,6 +49,12 @@ MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_cou
     CHECK(filesystem->find("journal_append_batches")->asUInt64() == 4);
     CHECK(filesystem->find("journal_records_appended")->asUInt64() == 4);
     CHECK(filesystem->find("journal_durability_barriers")->asUInt64() == 4);
+    CHECK(filesystem->find("spool_bytes")->asUInt64() == 0);
+    CHECK(filesystem->find("spool_limit_bytes")->asUInt64() ==
+          config.fuse.max_spool_bytes);
+    REQUIRE(filesystem->find("spool_publish_rate_bytes_per_second") != nullptr);
+    REQUIRE(filesystem->find("spool_throttle_waits") != nullptr);
+    REQUIRE(filesystem->find("spool_throttle_wait_ms") != nullptr);
 
     const auto* convergence = diagnostics->find("convergence");
     REQUIRE(convergence != nullptr);
@@ -721,8 +727,53 @@ MACHA_TEST("filesystem_fuse", test_fuse_completed_publication_unlinks_retired_sp
     frontend->stop();
 }
 
-MACHA_TEST("filesystem_fuse", test_fuse_spool_byte_limit_applies_before_unbounded_backlog) {
-    TestService fixture("fuse-spool-byte-limit");
+MACHA_TEST("filesystem_fuse", test_fuse_spool_capacity_backpressures_until_publication) {
+    TestService fixture("fuse-spool-backpressure");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 0ms;
+    config.fuse.max_spool_bytes = 384 * 1024;
+    config.fuse.spool_reserve_free = 0;
+
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto handle =
+        frontend->create("/bounded-spool.bin", 0600, getuid(), getgid(), true, true, false);
+    const auto first = pattern(128 * 1024, 41);
+    REQUIRE(frontend->write(handle.inode, 0, first) == first.size());
+
+    auto second_write = std::async(std::launch::async, [&] {
+        const auto second = pattern(300 * 1024, 42);
+        return frontend->write(handle.inode, first.size(), second);
+    });
+    // The second write cannot fit, but saturation is backpressure rather than
+    // ENOSPC. Pressure starts publication of the already-durable prefix and the
+    // writer wakes only after that progress creates capacity.
+    CHECK(second_write.wait_for(10ms) == std::future_status::timeout);
+    REQUIRE(second_write.wait_for(10s) == std::future_status::ready);
+    CHECK(second_write.get() == 300 * 1024);
+
+    const auto pressure = frontend->status();
+    CHECK(pressure.spool_limit_bytes == config.fuse.max_spool_bytes);
+    CHECK(pressure.spool_bytes <= pressure.spool_limit_bytes);
+    CHECK(pressure.spool_throttle_waits >= 1);
+    CHECK(pressure.spool_publish_rate_bytes_per_second > 0);
+
+    const auto spool_dir = config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
+    const auto spool = spool_dir / ("inode-" + std::to_string(handle.inode) + ".spool");
+    REQUIRE(std::filesystem::exists(spool));
+    CHECK(std::filesystem::file_size(spool) <= config.fuse.max_spool_bytes);
+    frontend->release(handle.inode, true);
+    REQUIRE(frontend->wait_for_idle(10s));
+    frontend->stop();
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_spool_stalled_publisher_blocks_without_enospc) {
+    TestService fixture("fuse-spool-stalled-backpressure");
     auto& config = fixture.config();
     config.replication = 1;
     config.metadata_min_write_replicas = 1;
@@ -735,25 +786,32 @@ MACHA_TEST("filesystem_fuse", test_fuse_spool_byte_limit_applies_before_unbounde
 
     auto& service = fixture.start();
     auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
-    auto handle =
-        frontend->create("/bounded-spool.bin", 0600, getuid(), getgid(), true, true, false);
-    const auto first = pattern(256 * 1024, 41);
+    auto handle = frontend->create("/stalled-spool.bin", 0600, getuid(), getgid(), true, true,
+                                   false);
+    frontend->note_interactive_activity();
+    const auto first = pattern(256 * 1024, 51);
     REQUIRE(frontend->write(handle.inode, 0, first) == first.size());
 
-    bool refused = false;
-    try {
-        const auto second = pattern(256 * 1024, 42);
-        (void)frontend->write(handle.inode, first.size(), second);
-    } catch (const FsError& error) {
-        refused = error.code() == ENOSPC;
-    }
-    CHECK(refused);
+    auto blocked = std::async(std::launch::async, [&] {
+        const auto second = pattern(256 * 1024, 52);
+        try {
+            (void)frontend->write(handle.inode, first.size(), second);
+            return 0;
+        } catch (const FsError& error) {
+            return error.code();
+        }
+    });
+    CHECK(blocked.wait_for(150ms) == std::future_status::timeout);
+    const auto pressure = frontend->status();
+    CHECK(pressure.spool_bytes <= pressure.spool_limit_bytes);
+    CHECK(pressure.spool_throttle_waits >= 1);
 
-    const auto spool_dir = config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
-    const auto spool = spool_dir / ("inode-" + std::to_string(handle.inode) + ".spool");
-    REQUIRE(std::filesystem::exists(spool));
-    CHECK(std::filesystem::file_size(spool) == first.size());
+    // Shutdown is a real wake event for blocked admissions. A permanently
+    // stalled publisher does not busy-poll and does not manufacture ENOSPC;
+    // stopping the mount cancels the waiting request explicitly.
     frontend->stop();
+    REQUIRE(blocked.wait_for(2s) == std::future_status::ready);
+    CHECK(blocked.get() == EINTR);
 }
 
 MACHA_TEST("filesystem_fuse", test_fuse_operation_journal_admission_is_bounded_while_busy) {
