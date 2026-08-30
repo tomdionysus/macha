@@ -26,6 +26,8 @@ See [Storage](docs/storage.md) and [Durability](docs/durability.md) for the prec
 
 ## Documentation
 
+- [Linux installation](docs/install-linux.md)
+- [macOS installation](docs/install-macos.md)
 - [Quick start](docs/quickstart.md)
 - [Configuration](docs/configuration.md)
 - [Storage](docs/storage.md)
@@ -44,6 +46,10 @@ See [Storage](docs/storage.md) and [Durability](docs/durability.md) for the prec
 The complete configuration example is [`macha.yaml.example`](macha.yaml.example).
 
 ## Linux installation
+
+See the [complete Linux installation guide](docs/install-linux.md) for
+distribution-specific dependencies, supported FFmpeg versions, systemd setup,
+upgrades and removal.
 
 Configure a system-wide build with an explicit prefix, then use the generated
 Make targets:
