@@ -9,8 +9,10 @@
 #include <utility>
 namespace macha {
 namespace {
-constexpr std::array<uint8_t, 8> known_magic{'M', 'A', 'C', 'H', 'M', 'E', 'M', '1'};
+constexpr std::array<uint8_t, 8> known_magic_v1{'M', 'A', 'C', 'H', 'M', 'E', 'M', '1'};
+constexpr std::array<uint8_t, 8> known_magic_v2{'M', 'A', 'C', 'H', 'M', 'E', 'M', '2'};
 constexpr uint32_t max_known_nodes = 65536;
+constexpr uint32_t max_identity_resets = 65536;
 constexpr uint64_t max_known_bytes = 16ULL * 1024 * 1024;
 }
 
@@ -32,7 +34,9 @@ void Membership::load_known() {
     if (size && !input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size)))
         throw std::runtime_error("cannot read known-node roster " + known_path_.string());
     Reader reader(bytes);
-    if (reader.fixed<8>() != known_magic)
+    const auto magic = reader.fixed<8>();
+    const bool version2 = magic == known_magic_v2;
+    if (magic != known_magic_v1 && !version2)
         throw DecodeError("bad known-node roster magic");
     const auto count = reader.u32();
     if (count > max_known_nodes)
@@ -44,10 +48,43 @@ void Membership::load_known() {
         node.host = reader.string(4096);
         node.failure_domain = reader.string(4096);
         node.port = reader.u16();
+        if (version2)
+            node.seen_unix_ms = reader.u64();
         if (node.id == NodeId{} || node.id == self_.id || node.host.empty() || !node.port)
             throw DecodeError("bad known-node roster entry");
         if (!nodes_.emplace(node.id, R{std::move(node), stale, std::nullopt}).second)
             throw DecodeError("duplicate known-node roster entry");
+    }
+    if (version2) {
+        const auto reset_count = reader.u32();
+        if (reset_count > max_identity_resets)
+            throw DecodeError("too many identity association resets");
+        for (uint32_t i = 0; i < reset_count; ++i) {
+            IdentityAssociationReset reset;
+            reset.host = reader.string(4096);
+            reset.port = reader.u16();
+            reset.stale_node_id.bytes = reader.fixed<16>();
+            reset.epoch = reader.u64();
+            reset.reset_unix_ms = reader.u64();
+            reset.reset_by.bytes = reader.fixed<16>();
+            reset.reason = reader.string(4096);
+            if (reset.host.empty() || !reset.epoch)
+                throw DecodeError("bad identity association reset");
+            if (!identity_resets_.emplace(identity_reset_key(reset.host, reset.port),
+                                          std::move(reset)).second)
+                throw DecodeError("duplicate identity association reset");
+        }
+        std::erase_if(nodes_, [&](const auto& item) {
+            const auto& node = item.second.info;
+            return std::any_of(identity_resets_.begin(), identity_resets_.end(),
+                               [&](const auto& reset_item) {
+                                   const auto& reset = reset_item.second;
+                                   return identity_reset_matches_endpoint(reset, node.host,
+                                                                          node.port) &&
+                                          identity_reset_matches_node(reset, node.id) &&
+                                          node.seen_unix_ms <= reset.reset_unix_ms;
+                               });
+        });
     }
     reader.finish();
 }
@@ -65,13 +102,33 @@ void Membership::persist_known_locked() const {
         return a.id < b.id;
     });
     Writer writer;
-    writer.fixed(known_magic);
+    writer.fixed(known_magic_v2);
     writer.u32(static_cast<uint32_t>(ordered.size()));
     for (const auto& node : ordered) {
         writer.fixed(node.id.bytes);
         writer.string(node.host);
         writer.string(node.failure_domain);
         writer.u16(node.port);
+        writer.u64(node.seen_unix_ms);
+    }
+    if (identity_resets_.size() > max_identity_resets)
+        throw std::runtime_error("too many identity association resets");
+    std::vector<std::pair<std::string, IdentityAssociationReset>> ordered_resets;
+    ordered_resets.reserve(identity_resets_.size());
+    for (const auto& item : identity_resets_)
+        ordered_resets.push_back(item);
+    std::sort(ordered_resets.begin(), ordered_resets.end(), [](const auto& a, const auto& b) {
+        return a.first < b.first;
+    });
+    writer.u32(static_cast<uint32_t>(ordered_resets.size()));
+    for (const auto& [_, reset] : ordered_resets) {
+        writer.string(reset.host);
+        writer.u16(reset.port);
+        writer.fixed(reset.stale_node_id.bytes);
+        writer.u64(reset.epoch);
+        writer.u64(reset.reset_unix_ms);
+        writer.fixed(reset.reset_by.bytes);
+        writer.string(reset.reason);
     }
     const auto& bytes = writer.data();
     if (bytes.size() > max_known_bytes)
@@ -157,14 +214,15 @@ bool Membership::apply_identity_reset(const IdentityAssociationReset& reset) {
     if (found != identity_resets_.end() && found->second.epoch >= reset.epoch)
         return false;
     identity_resets_[key] = reset;
-    const auto before = nodes_.size();
     std::erase_if(nodes_, [&](const auto& item) {
         const auto& info = item.second.info;
         return identity_reset_matches_endpoint(reset, info.host, info.port) &&
                identity_reset_matches_node(reset, info.id);
     });
-    if (nodes_.size() != before)
-        persist_known_locked();
+    // The tombstone itself is operational recovery state. Persist it even when
+    // the stale member is not currently in the roster, so reset remains usable
+    // while cluster metadata is unavailable and across a local restart.
+    persist_known_locked();
     return true;
 }
 

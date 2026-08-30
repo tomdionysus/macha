@@ -8,6 +8,12 @@
 - Build UPnP support against miniupnpc API 18 headers which predate the symbolic
   `UPNP_GetValidIGD()` return-value macros, while preserving private-WAN and
   disconnected-gateway classification.
+- Install Linux systemd units in systemd's unit search path rather than a
+  Debian multiarch library directory, including migration of the old cached
+  default and warning-free generated install scripts.
+- Make endpoint identity reset an independent recovery primitive: apply,
+  persist, and propagate it before attempting the cluster-metadata audit, so a
+  stale association cannot prevent its own reset.
 
 ## 0.19.0 — metadata replica availability
 

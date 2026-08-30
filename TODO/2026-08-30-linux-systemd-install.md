@@ -18,6 +18,12 @@ The systemd install is enabled by default only when targeting Linux. Both the
 systemd unit directory and configuration directory remain CMake cache options
 for distributions with different layouts.
 
+The unit directory deliberately uses `lib/systemd/system` rather than
+`CMAKE_INSTALL_LIBDIR`. Debian-family multiarch values such as
+`lib/aarch64-linux-gnu` are valid library locations but are not systemd unit
+search paths. Reconfiguring an affected build automatically migrates that exact
+old cached default while preserving other operator-supplied overrides.
+
 ## Configuration safety
 
 The installer copies the complete example to the operational configuration
@@ -64,3 +70,9 @@ The staged check ran on the current macOS development host, so its Mach-O copy
 step emitted a sandboxed `install_name_tool` cache warning. The CMake install
 completed successfully; that platform-specific tool is not used by the Linux
 installation path being added here.
+
+An additional regression check simulated a cached ARM Debian installation with
+`CMAKE_INSTALL_LIBDIR=lib/aarch64-linux-gnu`. Reconfiguration migrated the unit
+destination to `/usr/lib/systemd/system`, the staged install placed the unit
+there, and both generated install scripts ran without the former CMP0012
+developer warning.
