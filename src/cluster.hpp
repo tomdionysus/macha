@@ -19,6 +19,12 @@
 #include <string_view>
 
 namespace macha {
+enum class ServiceEvent : uint8_t {
+    storage,
+    metadata,
+    topology,
+};
+
 struct NodeReadiness {
     bool control_plane_online{};
     bool data_storage_ready{};
@@ -110,9 +116,9 @@ class NodeRuntime {
     std::atomic_int64_t last_playback_activity_ms_{};
     std::atomic_int64_t last_interactive_activity_ms_{};
     mutable std::mutex service_event_mutex_;
-    std::function<void()> service_event_;
+    std::function<void(ServiceEvent)> service_event_;
 
-    void signal_service_event();
+    void signal_service_event(ServiceEvent);
 
     bool ready(ReadyBit bit) const noexcept {
         return (ready_bits_.load(std::memory_order_acquire) & static_cast<uint32_t>(bit)) != 0;
@@ -139,7 +145,7 @@ class NodeRuntime {
     void start();
     void request_stop();
     void stop();
-    void set_service_event_callback(std::function<void()> callback);
+    void set_service_event_callback(std::function<void(ServiceEvent)> callback);
     void notify_storage_mutation();
     bool wait_local_state_ready(std::chrono::milliseconds timeout);
     NodeReadiness readiness() const;

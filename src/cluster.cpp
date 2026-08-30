@@ -158,7 +158,8 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
               remote_metadata_generation_.store(
                   std::max(previous_generation, peer.metadata_generation));
               if (topology_changed || peer.metadata_generation > previous_generation)
-                  signal_service_event();
+                  signal_service_event(topology_changed ? ServiceEvent::topology
+                                                        : ServiceEvent::metadata);
           },
           [this](uint64_t generation) {
               auto current = remote_metadata_generation_.load();
@@ -169,7 +170,7 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
               advanced = current < generation;
               if (advanced) {
                   remote_metadata_epoch_.fetch_add(1, std::memory_order_acq_rel);
-                  signal_service_event();
+                  signal_service_event(ServiceEvent::metadata);
               }
           },
           cfg_.connect_timeout, cfg_.heartbeat, cfg_.dead_after, cfg_.max_frame_size),
@@ -195,7 +196,8 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
                          current, peer.metadata_generation)) {
               }
               if (topology_changed || peer.metadata_generation > previous_generation)
-                  signal_service_event();
+                  signal_service_event(topology_changed ? ServiceEvent::topology
+                                                        : ServiceEvent::metadata);
           },
           cfg_.max_frame_size),
       startup_stage_hook_(std::move(startup_stage_hook)), startup_unix_ms_(unix_ms()) {
@@ -528,23 +530,23 @@ void NodeRuntime::note_activity(FrameType type, uint64_t bytes) {
     }
 }
 
-void NodeRuntime::set_service_event_callback(std::function<void()> callback) {
+void NodeRuntime::set_service_event_callback(std::function<void(ServiceEvent)> callback) {
     std::lock_guard lock(service_event_mutex_);
     service_event_ = std::move(callback);
 }
 
 void NodeRuntime::notify_storage_mutation() {
-    signal_service_event();
+    signal_service_event(ServiceEvent::storage);
 }
 
-void NodeRuntime::signal_service_event() {
-    std::function<void()> callback;
+void NodeRuntime::signal_service_event(ServiceEvent event) {
+    std::function<void(ServiceEvent)> callback;
     {
         std::lock_guard lock(service_event_mutex_);
         callback = service_event_;
     }
     if (callback)
-        callback();
+        callback(event);
 }
 
 uint64_t NodeRuntime::take_activity_bytes(FrameType type) {
@@ -575,7 +577,7 @@ void NodeRuntime::announce_metadata_generation(uint64_t generation) {
     // until the cache TTL expires even though the sibling is already durably
     // accepted locally.
     remote_metadata_epoch_.fetch_add(1, std::memory_order_acq_rel);
-    signal_service_event();
+    signal_service_event(ServiceEvent::metadata);
     members_.metadata_generation(generation);
     server_.set_local(members_.self());
     Writer writer;
@@ -897,9 +899,11 @@ void NodeRuntime::merge(std::span<const uint8_t> payload) {
         std::sort(ids.begin(), ids.end());
         return ids;
     };
-    if (membership_changed || newest_metadata > previous_generation ||
-        active_ids(before_active) != active_ids(members_.active()))
-        signal_service_event();
+    const bool topology_changed = membership_changed ||
+        active_ids(before_active) != active_ids(members_.active());
+    if (topology_changed || newest_metadata > previous_generation)
+        signal_service_event(topology_changed ? ServiceEvent::topology
+                                              : ServiceEvent::metadata);
 }
 
 PublicConnectivityStatus NodeRuntime::public_connectivity_status() const {
