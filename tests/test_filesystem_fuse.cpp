@@ -357,6 +357,69 @@ MACHA_TEST("filesystem_fuse", test_local_snapshot_view_is_local_before_cluster_f
     s1.stop();
 }
 
+MACHA_TEST("filesystem_fuse", test_disconnected_maintenance_sleeps_until_peer_event) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+
+    auto c1 = config_for(cluster.path() / "event-maint-n1", cluster.keyfile(), p1);
+    auto c2 = config_for(cluster.path() / "event-maint-n2", cluster.keyfile(), p2,
+                         {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 1;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 2;
+    c1.heartbeat = c2.heartbeat = 50ms;
+    c1.dead_after = c2.dead_after = 500ms;
+    c1.maintenance.no_progress_backoff = c2.maintenance.no_progress_backoff = 30s;
+    c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = false;
+    c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
+
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+    REQUIRE(s1.node().wait_local_state_ready(5s));
+    (void)s1.filesystem();
+
+    // Allow the initial event and one bounded repair slice to settle. With no
+    // peer and no new input, the scheduler must remain parked rather than
+    // rediscovering the same unavailable write floor on an interval.
+    REQUIRE(wait_until([&] {
+        const auto before = s1.maintenance_wakeups();
+        std::this_thread::sleep_for(300ms);
+        return s1.maintenance_wakeups() == before;
+    }, 3s));
+    const auto parked = s1.maintenance_wakeups();
+    std::this_thread::sleep_for(1500ms);
+    CHECK(s1.maintenance_wakeups() == parked);
+
+    // A peer/membership event must bypass the outstanding retry deadline and
+    // immediately form the metadata floor.
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().metadata_replica().current().generation > 1 &&
+               s2.node().metadata_replica().current().generation > 1;
+    }, 5s));
+
+    // Identical membership exchanges are heartbeats, not maintenance events.
+    // Once the event-triggered convergence and quiet follow-up have completed,
+    // rapid connected heartbeats must leave both maintenance workers parked.
+    REQUIRE(wait_until([&] {
+        const auto before1 = s1.maintenance_wakeups();
+        const auto before2 = s2.maintenance_wakeups();
+        std::this_thread::sleep_for(300ms);
+        return s1.maintenance_wakeups() == before1 &&
+               s2.maintenance_wakeups() == before2;
+    }, 5s));
+    const auto connected_parked1 = s1.maintenance_wakeups();
+    const auto connected_parked2 = s2.maintenance_wakeups();
+    std::this_thread::sleep_for(500ms);
+    CHECK(s1.maintenance_wakeups() == connected_parked1);
+    CHECK(s2.maintenance_wakeups() == connected_parked2);
+
+    s2.stop();
+    s1.stop();
+}
+
 MACHA_TEST("filesystem_fuse", test_fuse_frontend_ordering_merging_and_cache) {
     TestService fixture("fuse-ordering");
     auto& config = fixture.config();
