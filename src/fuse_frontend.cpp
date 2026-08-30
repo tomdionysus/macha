@@ -438,6 +438,7 @@ struct FuseFrontend::State {
     std::deque<NamespaceOp> namespace_unconfirmed;
     bool namespace_inflight{};
     uint64_t namespace_inflight_sequence{};
+    size_t namespace_inflight_operations{};
     std::jthread namespace_worker;
     std::mutex publication_mutex;
 
@@ -483,6 +484,8 @@ struct FuseFrontend::State {
     std::atomic_uint64_t namespace_operations_admitted{};
     std::atomic_uint64_t namespace_operations_recovered{};
     std::atomic_uint64_t namespace_publication_attempts{};
+    std::atomic_uint64_t namespace_publication_batches{};
+    std::atomic_uint64_t namespace_operations_batched{};
     std::atomic_uint64_t namespace_operations_published{};
     std::atomic_uint64_t namespace_operations_confirmed{};
     std::atomic_uint64_t journal_append_batches{};
@@ -611,6 +614,66 @@ struct FuseFrontend::State {
         writer.u32(static_cast<uint32_t>(op.removed.size()));
         for (auto id : op.removed)
             writer.u64(id);
+    }
+
+    static size_t encoded_namespace_op_size(const NamespaceOp& op) {
+        Writer encoded;
+        encode_namespace_op(encoded, op);
+        return encoded.data().size();
+    }
+
+    static bool namespace_batch_compatible(std::span<const NamespaceOp> current,
+                                           const NamespaceOp& candidate) {
+        if (current.empty())
+            return true;
+        const auto is_delete = [](NamespaceOp::Kind kind) {
+            return kind == NamespaceOp::Kind::unlink || kind == NamespaceOp::Kind::rmdir;
+        };
+        const auto is_create = [](NamespaceOp::Kind kind) {
+            return kind == NamespaceOp::Kind::mkdir || kind == NamespaceOp::Kind::create;
+        };
+        const auto first = current.front().kind;
+        if (is_delete(first) && is_delete(candidate.kind))
+            return true;
+        if (is_create(first) && is_create(candidate.kind))
+            return std::none_of(current.begin(), current.end(), [&](const NamespaceOp& op) {
+                return canonical_path(op.from) == canonical_path(candidate.from);
+            });
+        if ((first == NamespaceOp::Kind::chmod || first == NamespaceOp::Kind::chown ||
+             first == NamespaceOp::Kind::utimens) &&
+            candidate.kind == first) {
+            return std::none_of(current.begin(), current.end(), [&](const NamespaceOp& op) {
+                return canonical_path(op.from) == canonical_path(candidate.from);
+            });
+        }
+        // Rename and mixed semantic groups remain singleton for now. Their
+        // intermediate effects cannot always be proven from the final snapshot
+        // after a crash without adding a journal batch-identity record.
+        return false;
+    }
+
+    static FilesystemNamespaceMutation filesystem_namespace_mutation(const NamespaceOp& op) {
+        FilesystemNamespaceMutation out;
+        switch (op.kind) {
+        case NamespaceOp::Kind::mkdir: out.kind = FilesystemNamespaceMutation::Kind::mkdir; break;
+        case NamespaceOp::Kind::create: out.kind = FilesystemNamespaceMutation::Kind::create; break;
+        case NamespaceOp::Kind::rmdir: out.kind = FilesystemNamespaceMutation::Kind::rmdir; break;
+        case NamespaceOp::Kind::unlink: out.kind = FilesystemNamespaceMutation::Kind::unlink; break;
+        case NamespaceOp::Kind::rename: out.kind = FilesystemNamespaceMutation::Kind::rename; break;
+        case NamespaceOp::Kind::chmod: out.kind = FilesystemNamespaceMutation::Kind::chmod; break;
+        case NamespaceOp::Kind::chown: out.kind = FilesystemNamespaceMutation::Kind::chown; break;
+        case NamespaceOp::Kind::utimens: out.kind = FilesystemNamespaceMutation::Kind::utimens; break;
+        }
+        out.from = op.from;
+        out.to = op.to;
+        out.noreplace = op.noreplace;
+        out.mode = op.mode;
+        out.uid = op.uid;
+        out.gid = op.gid;
+        out.set_uid = op.set_uid;
+        out.set_gid = op.set_gid;
+        out.mtime_ns = op.mtime_ns;
+        return out;
     }
 
     static NamespaceOp decode_namespace_op(Reader& reader) {
@@ -881,25 +944,38 @@ struct FuseFrontend::State {
         }
     }
 
-    void journal_namespace_published(uint64_t sequence) {
-        Writer payload;
-        payload.u8(static_cast<uint8_t>(JournalRecord::namespace_published));
-        payload.u64(sequence);
+    void journal_namespace_published(std::span<const NamespaceOp> operations) {
+        std::vector<Bytes> payloads;
+        payloads.reserve(operations.size());
+        for (const auto& op : operations) {
+            Writer payload;
+            payload.u8(static_cast<uint8_t>(JournalRecord::namespace_published));
+            payload.u64(op.sequence);
+            payloads.push_back(payload.data());
+        }
         std::lock_guard lock(journal_mutex);
-        append_journal_record_locked(payload.data());
+        append_journal_records_locked(payloads);
     }
 
-    void journal_namespace_done(uint64_t sequence) {
+    void journal_namespace_done(std::span<const NamespaceOp> operations) {
+        if (operations.empty())
+            return;
         std::lock_guard admission_lock(journal_admission_mutex);
-        Writer payload;
-        payload.u8(static_cast<uint8_t>(JournalRecord::namespace_done));
-        payload.u64(sequence);
+        std::vector<Bytes> payloads;
+        payloads.reserve(operations.size());
+        for (const auto& op : operations) {
+            Writer payload;
+            payload.u8(static_cast<uint8_t>(JournalRecord::namespace_done));
+            payload.u64(op.sequence);
+            payloads.push_back(payload.data());
+        }
         std::lock_guard lock(journal_mutex);
-        append_journal_record_locked(payload.data());
-        const auto previous = durable_pending_operations.fetch_sub(1, std::memory_order_relaxed);
-        if (previous == 0)
+        append_journal_records_locked(payloads);
+        const auto previous =
+            durable_pending_operations.fetch_sub(operations.size(), std::memory_order_relaxed);
+        if (previous < operations.size())
             throw std::logic_error("FUSE journal namespace completion underflow");
-        if (previous == 1)
+        if (previous == operations.size())
             reset_journal_locked();
     }
 
@@ -1550,7 +1626,7 @@ struct FuseFrontend::State {
 
     size_t namespace_pending_locked() const {
         return namespace_queue.size() + namespace_unconfirmed.size() +
-               (namespace_inflight ? 1U : 0U);
+               namespace_inflight_operations;
     }
 
     bool namespace_capacity_available() {
@@ -1715,68 +1791,16 @@ struct FuseFrontend::State {
         }
     }
 
-    void apply_namespace_backend(const NamespaceOp& op) {
-        try {
-            switch (op.kind) {
-            case NamespaceOp::Kind::mkdir:
-                fs.mkdir(op.from, op.mode, op.uid, op.gid);
-                break;
-            case NamespaceOp::Kind::create: {
-                auto committed = fs.create_file(op.from, op.mode, op.uid, op.gid);
-                std::lock_guard lock(namespace_mutex);
-                if (!op.affected.empty()) {
-                    auto found = inodes.find(op.affected.front());
-                    if (found != inodes.end()) {
-                        std::lock_guard inode_lock(found->second->mutex);
-                        found->second->base = committed;
-                        found->second->published_path = op.from;
-                    }
-                }
-                break;
-            }
-            case NamespaceOp::Kind::rmdir:
-                fs.rmdir(op.from);
-                break;
-            case NamespaceOp::Kind::unlink:
-                fs.unlink(op.from);
-                break;
-            case NamespaceOp::Kind::rename:
-                fs.rename(op.from, op.to, op.noreplace);
-                break;
-            case NamespaceOp::Kind::chmod:
-                fs.chmod(op.from, op.mode);
-                break;
-            case NamespaceOp::Kind::chown:
-                fs.chown(op.from, op.uid, op.gid, op.set_uid, op.set_gid);
-                break;
-            case NamespaceOp::Kind::utimens:
-                fs.utimens(op.from, op.mtime_ns);
-                break;
-            }
-        } catch (const FsError&) {
-            // A process can die after the distributed mutation commits but before
-            // its local published marker is fsynced. Recovery must be able to
-            // replay that operation without turning an already-achieved state
-            // into a false permanent error. Re-read the node's local committed
-            // snapshot on this exceptional path and accept the operation iff its
-            // desired effect is already visible there.
-            auto view = fs.local_snapshot_view();
-            if (!namespace_effect_confirmed(op, *view.snapshot))
-                throw;
-            if (op.kind == NamespaceOp::Kind::create && !op.affected.empty()) {
-                if (auto entry = snapshot_entry(*view.snapshot, op.from)) {
-                    std::lock_guard lock(namespace_mutex);
-                    auto found = inodes.find(op.affected.front());
-                    if (found != inodes.end()) {
-                        std::lock_guard inode_lock(found->second->mutex);
-                        found->second->base = *entry;
-                    }
-                }
-            }
-        }
+    FilesystemNamespaceBatchResult apply_namespace_backend(
+        std::span<const NamespaceOp> operations) {
+        std::vector<FilesystemNamespaceMutation> mutations;
+        mutations.reserve(operations.size());
+        for (const auto& op : operations)
+            mutations.push_back(filesystem_namespace_mutation(op));
+        return fs.apply_namespace_batch(mutations);
     }
 
-    void namespace_success(const NamespaceOp& op) {
+    void namespace_success(const NamespaceOp& op, const MetadataSnapshot* snapshot = nullptr) {
         std::lock_guard lock(namespace_mutex);
         for (auto id : op.affected) {
             auto found = inodes.find(id);
@@ -1810,12 +1834,16 @@ struct FuseFrontend::State {
                 std::lock_guard inode_lock(found->second->mutex);
                 found->second->published_path.reset();
             }
-        } else if (op.kind == NamespaceOp::Kind::mkdir) {
+        } else if (op.kind == NamespaceOp::Kind::mkdir || op.kind == NamespaceOp::Kind::create) {
             if (!op.affected.empty()) {
                 auto found = inodes.find(op.affected.front());
                 if (found != inodes.end()) {
                     std::lock_guard inode_lock(found->second->mutex);
                     found->second->published_path = op.from;
+                    if (snapshot) {
+                        if (auto entry = snapshot_entry(*snapshot, op.from))
+                            found->second->base = *entry;
+                    }
                 }
             }
         }
@@ -1823,50 +1851,106 @@ struct FuseFrontend::State {
 
     void namespace_loop(std::stop_token stop) {
         while (!stop.stop_requested() && !stopping.load()) {
-            NamespaceOp op;
+            std::vector<NamespaceOp> batch;
             {
                 std::unique_lock lock(namespace_queue_mutex);
                 namespace_cv.wait(lock, stop, [&] { return !namespace_queue.empty() || stopping.load(); });
                 if (stop.stop_requested() || stopping.load())
                     break;
-                op = namespace_queue.front();
+                batch.push_back(namespace_queue.front());
                 namespace_queue.pop_front();
+                size_t encoded_bytes = encoded_namespace_op_size(batch.front());
+                while (!namespace_queue.empty() &&
+                       batch.size() < config.namespace_batch_operations &&
+                       namespace_batch_compatible(batch, namespace_queue.front())) {
+                    const auto candidate_bytes = encoded_namespace_op_size(namespace_queue.front());
+                    if (encoded_bytes > config.namespace_batch_bytes ||
+                        candidate_bytes > config.namespace_batch_bytes - encoded_bytes)
+                        break;
+                    encoded_bytes += candidate_bytes;
+                    batch.push_back(namespace_queue.front());
+                    namespace_queue.pop_front();
+                }
                 namespace_inflight = true;
-                namespace_inflight_sequence = op.sequence;
+                namespace_inflight_sequence = batch.front().sequence;
+                namespace_inflight_operations = batch.size();
             }
 
-            bool published = false;
+            size_t published_prefix = 0;
+            std::optional<int> prefix_failure_code;
+            std::string prefix_failure_message;
+            std::shared_ptr<const MetadataSnapshot> published_snapshot;
             std::chrono::milliseconds backoff{50};
-            while (!published && !stop.stop_requested() && !stopping.load()) {
+            while (!published_prefix && !stop.stop_requested() && !stopping.load()) {
                 try {
                     // Namespace publication is also asynchronous convergence. It
                     // must not take the shared metadata transaction while viewer
                     // playback is waiting for storage/RPC service.
                     wait_for_playback_quiet();
-                    namespace_publication_attempts.fetch_add(1, std::memory_order_relaxed);
-                    {
-                        std::lock_guard backend(publication_mutex);
-                        apply_namespace_backend(op);
+
+                    // A crash may leave an accepted effect without its local
+                    // marker. Retire only a leading already-achieved prefix so
+                    // operation order remains explicit for the remaining batch.
+                    auto before = fs.local_snapshot_view();
+                    while (published_prefix < batch.size() &&
+                           namespace_effect_confirmed(batch[published_prefix], *before.snapshot))
+                        ++published_prefix;
+
+                    if (published_prefix < batch.size()) {
+                        namespace_publication_attempts.fetch_add(1, std::memory_order_relaxed);
+                        FilesystemNamespaceBatchResult result;
+                        try {
+                            std::lock_guard backend(publication_mutex);
+                            result = apply_namespace_backend(
+                                std::span<const NamespaceOp>(batch).subspan(published_prefix));
+                        } catch (const FsError& error) {
+                            if (!published_prefix)
+                                throw;
+                            prefix_failure_code = error.code();
+                            prefix_failure_message = error.what();
+                            published_snapshot = std::move(before.snapshot);
+                        }
+                        if (result.applied) {
+                            namespace_publication_batches.fetch_add(1, std::memory_order_relaxed);
+                            namespace_operations_batched.fetch_add(result.applied,
+                                                                   std::memory_order_relaxed);
+                            published_prefix += result.applied;
+                            prefix_failure_code = result.failure_code;
+                            prefix_failure_message = std::move(result.failure_message);
+                            published_snapshot = fs.local_snapshot_view().snapshot;
+                        }
+                    } else {
+                        published_snapshot = std::move(before.snapshot);
                     }
-                    namespace_success(op);
-                    journal_namespace_published(op.sequence);
-                    namespace_operations_published.fetch_add(1, std::memory_order_relaxed);
-                    published = true;
+
+                    if (!published_prefix)
+                        throw std::logic_error("namespace batch made no progress");
+                    const auto prefix = std::span<const NamespaceOp>(batch).first(published_prefix);
+                    for (const auto& op : prefix)
+                        namespace_success(op, published_snapshot.get());
+                    journal_namespace_published(prefix);
+                    namespace_operations_published.fetch_add(published_prefix,
+                                                             std::memory_order_relaxed);
                 } catch (const std::exception& e) {
+                    published_prefix = 0;
+                    prefix_failure_code.reset();
+                    prefix_failure_message.clear();
+                    published_snapshot.reset();
                     ++backend_failures;
                     const bool retryable = retryable_backend_error(e);
                     if (!retryable) {
                         int error = EIO;
                         if (const auto* fs_error = dynamic_cast<const FsError*>(&e))
                             error = fs_error->code();
-                        auto errored = op.affected;
-                        errored.insert(errored.end(), op.removed.begin(), op.removed.end());
+                        const auto& blocked = batch.front();
+                        auto errored = blocked.affected;
+                        errored.insert(errored.end(), blocked.removed.begin(), blocked.removed.end());
                         mark_backend_error(errored, error);
                         Log::error("FUSE async namespace publication blocked seq=" +
-                                   std::to_string(op.sequence) + " error=" + e.what());
+                                   std::to_string(blocked.sequence) + " error=" + e.what());
                     } else {
                         Log::debug("FUSE async namespace publication retry seq=" +
-                                   std::to_string(op.sequence) + " error=" + e.what());
+                                   std::to_string(batch.front().sequence) + " error=" + e.what());
                     }
                     // Never retire or skip an acknowledged durable namespace op.
                     // A non-retryable backend error has no automatic conflict
@@ -1880,27 +1964,53 @@ struct FuseFrontend::State {
                 }
             }
 
-            if (published) {
+            if (published_prefix) {
+                const auto prefix = std::span<const NamespaceOp>(batch).first(published_prefix);
                 bool confirmed = false;
-                if (auto available = fs.available_snapshot_view())
-                    confirmed = namespace_effect_confirmed(op, *available->snapshot);
+                if (auto available = fs.available_snapshot_view()) {
+                    confirmed = std::all_of(prefix.begin(), prefix.end(), [&](const NamespaceOp& op) {
+                        return namespace_effect_confirmed(op, *available->snapshot);
+                    });
+                }
                 if (confirmed) {
-                    journal_namespace_done(op.sequence);
-                    namespace_operations_confirmed.fetch_add(1, std::memory_order_relaxed);
+                    journal_namespace_done(prefix);
+                    namespace_operations_confirmed.fetch_add(published_prefix,
+                                                             std::memory_order_relaxed);
                 } else {
                     std::lock_guard lock(namespace_queue_mutex);
-                    namespace_unconfirmed.push_back(op);
+                    namespace_unconfirmed.insert(namespace_unconfirmed.end(), prefix.begin(),
+                                                 prefix.end());
+                }
+
+                if (prefix_failure_code && published_prefix < batch.size()) {
+                    ++backend_failures;
+                    const auto& blocked = batch[published_prefix];
+                    auto errored = blocked.affected;
+                    errored.insert(errored.end(), blocked.removed.begin(), blocked.removed.end());
+                    mark_backend_error(errored, *prefix_failure_code);
+                    Log::error("FUSE async namespace batch committed prefix first_seq=" +
+                               std::to_string(batch.front().sequence) + " operations=" +
+                               std::to_string(published_prefix) + " blocked_seq=" +
+                               std::to_string(blocked.sequence) + " error=" +
+                               prefix_failure_message);
                 }
             } else if (!stopping.load()) {
                 // Stop-requested workers leave the durable operation pending for
                 // startup replay. It was popped from RAM only for this worker.
                 std::lock_guard lock(namespace_queue_mutex);
-                namespace_queue.push_front(op);
+                for (auto i = batch.rbegin(); i != batch.rend(); ++i)
+                    namespace_queue.push_front(*i);
+            }
+            if (published_prefix && published_prefix < batch.size() && !stopping.load()) {
+                std::lock_guard lock(namespace_queue_mutex);
+                for (size_t i = batch.size(); i > published_prefix; --i)
+                    namespace_queue.push_front(batch[i - 1]);
             }
             {
                 std::lock_guard lock(namespace_queue_mutex);
                 namespace_inflight = false;
                 namespace_inflight_sequence = 0;
+                namespace_inflight_operations = 0;
             }
             namespace_cv.notify_all();
         }
@@ -2385,14 +2495,19 @@ struct FuseFrontend::State {
         // stopped, after its durable "published" marker but before the local
         // journal could retire it.  Only retire work once the immutable decoded
         // metadata snapshot actually demonstrates the accepted effect.
+        std::vector<NamespaceOp> confirmed_namespace;
         for (const auto& [sequence, op] : recovery.namespace_ops) {
             if (recovery.namespace_done.contains(sequence) ||
                 !recovery.namespace_published.contains(sequence))
                 continue;
             if (!namespace_effect_confirmed(op, snapshot))
                 continue;
-            journal_namespace_done(sequence);
-            recovery.namespace_done.insert(sequence);
+            confirmed_namespace.push_back(op);
+        }
+        if (!confirmed_namespace.empty()) {
+            journal_namespace_done(confirmed_namespace);
+            for (const auto& op : confirmed_namespace)
+                recovery.namespace_done.insert(op.sequence);
         }
 
         for (const auto& [inode, published] : recovery.data_published) {
@@ -2835,25 +2950,29 @@ struct FuseFrontend::State {
     }
 
     void confirm_namespace_from_snapshot(const MetadataSnapshot& snapshot) {
-        while (true) {
-            NamespaceOp op;
-            {
-                std::lock_guard queue_lock(namespace_queue_mutex);
-                if (namespace_unconfirmed.empty())
-                    return;
-                op = namespace_unconfirmed.front();
+        std::vector<NamespaceOp> confirmed;
+        {
+            std::lock_guard queue_lock(namespace_queue_mutex);
+            for (const auto& op : namespace_unconfirmed) {
+                if (!namespace_effect_confirmed(op, snapshot))
+                    break;
+                confirmed.push_back(op);
             }
-            if (!namespace_effect_confirmed(op, snapshot))
-                return;
-            journal_namespace_done(op.sequence);
-            {
-                std::lock_guard queue_lock(namespace_queue_mutex);
-                if (!namespace_unconfirmed.empty() &&
-                    namespace_unconfirmed.front().sequence == op.sequence)
-                    namespace_unconfirmed.pop_front();
-            }
-            namespace_cv.notify_all();
         }
+        if (confirmed.empty())
+            return;
+        journal_namespace_done(confirmed);
+        {
+            std::lock_guard queue_lock(namespace_queue_mutex);
+            for (const auto& op : confirmed) {
+                if (namespace_unconfirmed.empty() ||
+                    namespace_unconfirmed.front().sequence != op.sequence)
+                    break;
+                namespace_unconfirmed.pop_front();
+            }
+        }
+        namespace_operations_confirmed.fetch_add(confirmed.size(), std::memory_order_relaxed);
+        namespace_cv.notify_all();
     }
 
     bool confirm_data_from_snapshot(const std::shared_ptr<Inode>& inode,
@@ -4143,6 +4262,8 @@ FuseFrontendStatus FuseFrontend::status() const {
     out.namespace_operations_admitted = state_->namespace_operations_admitted.load();
     out.namespace_operations_recovered = state_->namespace_operations_recovered.load();
     out.namespace_publication_attempts = state_->namespace_publication_attempts.load();
+    out.namespace_publication_batches = state_->namespace_publication_batches.load();
+    out.namespace_operations_batched = state_->namespace_operations_batched.load();
     out.namespace_operations_published = state_->namespace_operations_published.load();
     out.namespace_operations_confirmed = state_->namespace_operations_confirmed.load();
     out.journal_append_batches = state_->journal_append_batches.load();

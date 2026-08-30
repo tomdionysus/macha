@@ -70,6 +70,8 @@ struct FuseFrontendStatus {
     uint64_t namespace_operations_admitted{};
     uint64_t namespace_operations_recovered{};
     uint64_t namespace_publication_attempts{};
+    uint64_t namespace_publication_batches{};
+    uint64_t namespace_operations_batched{};
     uint64_t namespace_operations_published{};
     uint64_t namespace_operations_confirmed{};
     uint64_t journal_append_batches{};

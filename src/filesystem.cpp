@@ -1060,63 +1060,62 @@ std::vector<std::pair<std::string, FsEntry>> FileSystem::readdir(const std::stri
 }
 void FileSystem::mkdir(const std::string& p, uint32_t mode, uint32_t uid, uint32_t gid) {
     auto q = resolve_new_path(p);
-    m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
+    const FilesystemNamespaceMutation op{
+        FilesystemNamespaceMutation::Kind::mkdir, q, {}, false, mode, uid, gid};
+    (void)apply_namespace_batch({&op, 1});
+}
+
+std::optional<FsEntry> FileSystem::apply_namespace_mutation(
+    MetadataSnapshot& s, MetadataDelta& delta, const FilesystemNamespaceMutation& op) {
+    const auto& q = op.from;
+    switch (op.kind) {
+    case FilesystemNamespaceMutation::Kind::mkdir: {
         require_parent(s, q);
         if (s.entries.contains(q))
             fail(EEXIST, "exists");
         FsEntry e;
         e.type = EntryType::directory;
-        e.mode = mode & 07777;
-        e.uid = uid;
-        e.gid = gid;
+        e.mode = op.mode & 07777;
+        e.uid = op.uid;
+        e.gid = op.gid;
         e.ctime_ns = e.mtime_ns = wall_time_ns();
         s.entries[q] = e;
         delta.upsert_entries[q] = e;
-    });
-}
-void FileSystem::rmdir(const std::string& p) {
-    auto resolved = resolve_existing_path(p);
-    if (!resolved)
-        fail(ENOENT, "missing");
-    auto q = *resolved;
-    if (q == "/")
-        fail(EBUSY, "root");
-    m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
+        return e;
+    }
+    case FilesystemNamespaceMutation::Kind::create: {
+        require_parent(s, q);
+        if (s.entries.contains(q))
+            fail(EEXIST, "exists");
+        FsEntry e;
+        e.type = EntryType::file;
+        e.mode = op.mode & 07777;
+        e.uid = op.uid;
+        e.gid = op.gid;
+        e.ctime_ns = e.mtime_ns = wall_time_ns();
+        s.entries[q] = e;
+        delta.upsert_entries[q] = e;
+        return e;
+    }
+    case FilesystemNamespaceMutation::Kind::rmdir: {
+        if (q == "/")
+            fail(EBUSY, "root");
         auto i = s.entries.find(q);
         if (i == s.entries.end())
             fail(ENOENT, "missing");
         if (i->second.type != EntryType::directory)
             fail(ENOTDIR, "not directory");
-        for (auto& [x, _] : s.entries)
-            if (x != q && under(x, q))
-                fail(ENOTEMPTY, "not empty");
+        // Namespace entries are ordered by path. Any child/subtree entry is
+        // immediately after its directory, so emptiness is one indexed lookup
+        // rather than a full namespace scan per recovered rmdir.
+        const auto child = s.entries.upper_bound(q);
+        if (child != s.entries.end() && under(child->first, q))
+            fail(ENOTEMPTY, "not empty");
         s.entries.erase(i);
         delta.erase_entries.push_back(q);
-    });
-}
-FsEntry FileSystem::create_file(const std::string& p, uint32_t mode, uint32_t uid, uint32_t gid) {
-    auto q = resolve_new_path(p);
-    FsEntry e;
-    e.type = EntryType::file;
-    e.mode = mode & 07777;
-    e.uid = uid;
-    e.gid = gid;
-    e.ctime_ns = e.mtime_ns = wall_time_ns();
-    m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
-        require_parent(s, q);
-        if (s.entries.contains(q))
-            fail(EEXIST, "exists");
-        s.entries[q] = e;
-        delta.upsert_entries[q] = e;
-    });
-    return e;
-}
-void FileSystem::unlink(const std::string& p) {
-    auto resolved = resolve_existing_path(p);
-    if (!resolved)
-        fail(ENOENT, "missing");
-    auto q = *resolved;
-    m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
+        return {};
+    }
+    case FilesystemNamespaceMutation::Kind::unlink: {
         auto i = s.entries.find(q);
         if (i == s.entries.end())
             fail(ENOENT, "missing");
@@ -1130,33 +1129,24 @@ void FileSystem::unlink(const std::string& p) {
         queue_garbage_batch(s, std::move(retiring), delta);
         s.entries.erase(i);
         delta.erase_entries.push_back(q);
-    });
-}
-void FileSystem::rename(const std::string& a, const std::string& b, bool nr) {
-    auto source = resolve_existing_path(a);
-    if (!source)
-        fail(ENOENT, "source missing");
-    auto x = *source;
-    auto y = resolve_new_path(b);
-    if (x == "/" || y == "/")
-        fail(EBUSY, "root");
-    if (x == y)
-        return;
-    if (under(y, x))
-        fail(EINVAL, "recursive rename");
-
-    // A write handle is currently path-backed rather than inode-backed. Keep
-    // namespace rename and handle-path migration serialized with write commit so
-    // a close/flush cannot observe the source path after it has moved.
-    std::lock_guard handles(open_writes_mutex_);
-    m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
+        return {};
+    }
+    case FilesystemNamespaceMutation::Kind::rename: {
+        const auto& x = op.from;
+        const auto& y = op.to;
+        if (x == "/" || y == "/")
+            fail(EBUSY, "root");
+        if (x == y)
+            return {};
+        if (under(y, x))
+            fail(EINVAL, "recursive rename");
         auto src = s.entries.find(x);
         if (src == s.entries.end())
             fail(ENOENT, "source missing");
         require_parent(s, y);
         auto dst = s.entries.find(y);
         if (dst != s.entries.end()) {
-            if (nr)
+            if (op.noreplace)
                 fail(EEXIST, "target exists");
             if (src->second.type == EntryType::directory &&
                 dst->second.type != EntryType::directory)
@@ -1198,72 +1188,184 @@ void FileSystem::rename(const std::string& a, const std::string& b, bool nr) {
         delta.erase_entries.erase(
             std::unique(delta.erase_entries.begin(), delta.erase_entries.end()),
             delta.erase_entries.end());
-    });
-
-    for (auto i = open_writes_.begin(); i != open_writes_.end();) {
-        auto handle = i->lock();
-        if (!handle) {
-            i = open_writes_.erase(i);
-            continue;
-        }
-        if (under(handle->path_, x)) {
-            const auto before = handle->path_;
-            handle->path_ = y + handle->path_.substr(x.size());
-            if (Log::enabled(LogLevel::all))
-                Log::trace("WRITE rename id=" + std::to_string(handle->diagnostic_id_) +
-                       " from=" + before + " to=" + handle->path_);
-        }
-        ++i;
+        return {};
     }
-}
-void FileSystem::chmod(const std::string& p, uint32_t mode) {
-    auto resolved = resolve_existing_path(p);
-    if (!resolved)
-        fail(ENOENT, "missing");
-    auto q = *resolved;
-    m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
+    case FilesystemNamespaceMutation::Kind::chmod: {
         auto j = s.entries.find(q);
         if (j == s.entries.end())
             fail(ENOENT, "missing");
         auto& i = j->second;
-        i.mode = mode & 07777;
+        i.mode = op.mode & 07777;
         ++i.version;
         i.ctime_ns = wall_time_ns();
         delta.upsert_entries[q] = i;
-    });
-}
-void FileSystem::chown(const std::string& p, uint32_t u, uint32_t g, bool su, bool sg) {
-    auto resolved = resolve_existing_path(p);
-    if (!resolved)
-        fail(ENOENT, "missing");
-    auto q = *resolved;
-    m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
+        return {};
+    }
+    case FilesystemNamespaceMutation::Kind::chown: {
         auto i = s.entries.find(q);
         if (i == s.entries.end())
             fail(ENOENT, "missing");
-        if (su)
-            i->second.uid = u;
-        if (sg)
-            i->second.gid = g;
+        if (op.set_uid)
+            i->second.uid = op.uid;
+        if (op.set_gid)
+            i->second.gid = op.gid;
         ++i->second.version;
         i->second.ctime_ns = wall_time_ns();
         delta.upsert_entries[q] = i->second;
-    });
-}
-void FileSystem::utimens(const std::string& p, int64_t mt) {
-    auto resolved = resolve_existing_path(p);
-    if (!resolved)
-        fail(ENOENT, "missing");
-    auto q = *resolved;
-    m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
+        return {};
+    }
+    case FilesystemNamespaceMutation::Kind::utimens: {
         auto i = s.entries.find(q);
         if (i == s.entries.end())
             fail(ENOENT, "missing");
-        i->second.mtime_ns = mt;
+        i->second.mtime_ns = op.mtime_ns;
         i->second.ctime_ns = wall_time_ns();
         ++i->second.version;
         delta.upsert_entries[q] = i->second;
+        return {};
+    }
+    }
+    throw std::logic_error("unknown filesystem namespace mutation");
+}
+
+FilesystemNamespaceBatchResult FileSystem::apply_namespace_batch(
+    std::span<const FilesystemNamespaceMutation> operations) {
+    if (operations.empty())
+        throw std::invalid_argument("filesystem namespace batch is empty");
+
+    // Write handles are path-backed. Keep every successful rename in this
+    // transaction serialized with write commit, exactly as the former
+    // single-operation rename path did.
+    std::lock_guard handles(open_writes_mutex_);
+    FilesystemNamespaceBatchResult result;
+    result.entries.resize(operations.size());
+    result.record = m_.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+        result.applied = 0;
+        result.failure_code.reset();
+        result.failure_message.clear();
+        std::fill(result.entries.begin(), result.entries.end(), std::nullopt);
+        for (size_t i = 0; i < operations.size(); ++i) {
+            try {
+                result.entries[i] = apply_namespace_mutation(snapshot, delta, operations[i]);
+                ++result.applied;
+            } catch (const FsError& error) {
+                // With no valid prefix there is nothing to publish. Preserve
+                // the old error behaviour and leave the durable queue head in
+                // place. Otherwise commit the largest valid prefix and report
+                // the blocking operation to the caller.
+                if (!result.applied)
+                    throw;
+                result.failure_code = error.code();
+                result.failure_message = error.what();
+                break;
+            }
+        }
+        // Individual filesystem methods previously emitted at most one erase
+        // (rename already canonicalised its subtree). A batch can accumulate
+        // erases in syscall order, while the delta wire format deliberately
+        // requires canonical sorted/unique paths.
+        std::sort(delta.erase_entries.begin(), delta.erase_entries.end());
+        delta.erase_entries.erase(
+            std::unique(delta.erase_entries.begin(), delta.erase_entries.end()),
+            delta.erase_entries.end());
     });
+
+    for (size_t op_index = 0; op_index < result.applied; ++op_index) {
+        const auto& op = operations[op_index];
+        if (op.kind != FilesystemNamespaceMutation::Kind::rename || op.from == op.to)
+            continue;
+        for (auto i = open_writes_.begin(); i != open_writes_.end();) {
+            auto handle = i->lock();
+            if (!handle) {
+                i = open_writes_.erase(i);
+                continue;
+            }
+            if (under(handle->path_, op.from)) {
+                const auto before = handle->path_;
+                handle->path_ = op.to + handle->path_.substr(op.from.size());
+                if (Log::enabled(LogLevel::all))
+                    Log::trace("WRITE rename id=" + std::to_string(handle->diagnostic_id_) +
+                               " from=" + before + " to=" + handle->path_);
+            }
+            ++i;
+        }
+    }
+    return result;
+}
+
+void FileSystem::rmdir(const std::string& p) {
+    auto resolved = resolve_existing_path(p);
+    if (!resolved)
+        fail(ENOENT, "missing");
+    FilesystemNamespaceMutation op;
+    op.kind = FilesystemNamespaceMutation::Kind::rmdir;
+    op.from = *resolved;
+    (void)apply_namespace_batch({&op, 1});
+}
+
+FsEntry FileSystem::create_file(const std::string& p, uint32_t mode, uint32_t uid, uint32_t gid) {
+    auto q = resolve_new_path(p);
+    const FilesystemNamespaceMutation op{
+        FilesystemNamespaceMutation::Kind::create, q, {}, false, mode, uid, gid};
+    auto result = apply_namespace_batch({&op, 1});
+    return *result.entries.front();
+}
+
+void FileSystem::unlink(const std::string& p) {
+    auto resolved = resolve_existing_path(p);
+    if (!resolved)
+        fail(ENOENT, "missing");
+    FilesystemNamespaceMutation op;
+    op.kind = FilesystemNamespaceMutation::Kind::unlink;
+    op.from = *resolved;
+    (void)apply_namespace_batch({&op, 1});
+}
+
+void FileSystem::rename(const std::string& a, const std::string& b, bool noreplace) {
+    auto source = resolve_existing_path(a);
+    if (!source)
+        fail(ENOENT, "source missing");
+    auto target = resolve_new_path(b);
+    if (*source == target)
+        return;
+    const FilesystemNamespaceMutation op{
+        FilesystemNamespaceMutation::Kind::rename, *source, target, noreplace};
+    (void)apply_namespace_batch({&op, 1});
+}
+
+void FileSystem::chmod(const std::string& p, uint32_t mode) {
+    auto resolved = resolve_existing_path(p);
+    if (!resolved)
+        fail(ENOENT, "missing");
+    const FilesystemNamespaceMutation op{
+        FilesystemNamespaceMutation::Kind::chmod, *resolved, {}, false, mode};
+    (void)apply_namespace_batch({&op, 1});
+}
+
+void FileSystem::chown(const std::string& p, uint32_t uid, uint32_t gid,
+                       bool set_uid, bool set_gid) {
+    auto resolved = resolve_existing_path(p);
+    if (!resolved)
+        fail(ENOENT, "missing");
+    FilesystemNamespaceMutation op;
+    op.kind = FilesystemNamespaceMutation::Kind::chown;
+    op.from = *resolved;
+    op.uid = uid;
+    op.gid = gid;
+    op.set_uid = set_uid;
+    op.set_gid = set_gid;
+    (void)apply_namespace_batch({&op, 1});
+}
+
+void FileSystem::utimens(const std::string& p, int64_t mtime_ns) {
+    auto resolved = resolve_existing_path(p);
+    if (!resolved)
+        fail(ENOENT, "missing");
+    FilesystemNamespaceMutation op;
+    op.kind = FilesystemNamespaceMutation::Kind::utimens;
+    op.from = *resolved;
+    op.mtime_ns = mtime_ns;
+    (void)apply_namespace_batch({&op, 1});
 }
 void FileSystem::truncate_file(const std::string& p, uint64_t z) {
     auto resolved = resolve_existing_path(p);

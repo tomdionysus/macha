@@ -115,6 +115,11 @@ struct FuseConfig {
     size_t foreground_commit_workers{1};
     std::chrono::milliseconds publication_quiet{5000};
     size_t max_pending_operations{4096};
+    // Ordered namespace recovery/backlog operations may share one metadata
+    // publication. Both limits are hard bounds; a single operation is always
+    // admitted so an unusually large rename cannot deadlock the queue.
+    size_t namespace_batch_operations{256};
+    size_t namespace_batch_bytes{256 * 1024};
 
     // Aggregate local write-back admission. Queue counts alone do not bound a
     // hot inode: one pending publication can otherwise accumulate arbitrary
