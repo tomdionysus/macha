@@ -170,7 +170,18 @@ executor; object work remains on the priority-aware DATA executors.
 - optional ephemeral authenticated peer telemetry for runtime/load/cache detail;
 - a bounded coalesced last-known telemetry cache persisted independently on each node.
 
-Telemetry never defines cluster membership or metadata durability. Ephemeral telemetry is gossiped with boot-incarnation and sequence ordering and is not journalled as a metrics history. Gossip is best-effort and may be dropped under useful load. The last-known cache is periodically replaced only after a long interactive-idle interval and never mutates the MachaDFS namespace or enters metadata publication. The API marks observations as live, stale, unavailable, or last-known so an online node cannot disappear merely because optional telemetry was dropped.
+Telemetry never defines cluster membership or metadata durability. Ephemeral
+telemetry is gossiped with boot-incarnation and sequence ordering and is not
+journalled as a metrics history. An authenticated peer connection triggers a
+coalesced telemetry dissemination event; periodic local metrics sampling also
+provides bounded eventual retry. Delivery is best-effort and may be dropped
+under useful load. Received notifications enter the bounded speculative RPC
+executor, so decoding and telemetry-store mutation do not occupy socket-reader
+threads. The last-known cache is periodically replaced only after a long
+interactive-idle interval and never mutates the MachaDFS namespace or enters
+metadata publication. The API marks observations as live, stale, unavailable,
+or last-known so an online node cannot disappear merely because optional
+telemetry was dropped.
 
 Storage and cache byte objects include an `available` boolean. When coherent
 telemetry is unavailable, Status may still report membership-known storage
@@ -180,7 +191,17 @@ unavailable if any included node lacks a measurement, rather than treating the
 missing node as zero usage. A genuinely empty measured disk is distinct:
 `available` is true and `used_bytes` is the numeric value `0`.
 
-Cluster capacity distinguishes known durable/cache capacity from the portion currently online. Per-node status reports authoritative membership endpoint/storage fields and enriches them with telemetry when available. Metadata availability is owned and published by `MetadataManager` as exactly `unavailable`, `read-only`, or `writable`; Status consumes that state and may demote a previously writable view immediately if fewer than `metadata_min_write_replicas` active replicas remain, but never promotes to writable merely from peer connectivity.
+Cluster capacity distinguishes known durable/cache capacity from the portion
+currently online. One Status endpoint reports every known node from local
+membership plus the telemetry already disseminated over authenticated cluster
+connections; the HTTP request never calls peers, and clients do not need to
+fan out. Per-node status reports authoritative membership endpoint/storage
+fields and enriches them with telemetry when available. Metadata availability
+is owned and published by `MetadataManager` as exactly `unavailable`,
+`read-only`, or `writable`; Status consumes that state and may demote a
+previously writable view immediately if fewer than
+`metadata_min_write_replicas` active replicas remain, but never promotes to
+writable merely from peer connectivity.
 
 Metadata availability logging is transition-only and canonical, for example `metadata availability changed state=writable previous=read-only reason="metadata write durability floor available"`. Routine negative checkpoint acknowledgements are silent because they are normal convergence decisions; transport/checkpoint exceptions remain diagnostic.
 

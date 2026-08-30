@@ -240,3 +240,46 @@ Evidence: [Phase 5 physical-object GC separation proof](2026-08-30-phase-5-physi
   including the explicit catalogue search/artwork/GC regression.
 
 Evidence: [Status disk-usage availability correction](2026-08-30-status-disk-usage-availability.md)
+
+## Combined Status and repeated-burst UAT
+
+- [x] Verified the unavailable-versus-zero disk contract before and after work
+  on every deployed Status endpoint: live self measurements remained numeric,
+  while unavailable remote usage, free space, cache measurements, and online
+  backend count remained null.
+- [x] Completed 2,064 create/remove operations in 48 publications, advancing
+  all nodes from generation 1439 to 1487 with exact journal accounting, no
+  failure or timeout, and no residual queue.
+- [x] Filled every materialization cache to its 64-entry bound. All 3,960 new
+  requests were hits; reconstructions, misses, and applied-delta totals did not
+  increase, and bounded evictions occurred on every node.
+- [x] Verified all convergence epochs drained, scheduling parked, exact UAT
+  fixtures were absent, and delayed CPU returned to approximately 0.260%,
+  0.142%, and 0.066%.
+- [x] Identified that `runtime.rss_bytes` is lifetime-peak `ru_maxrss`, not
+  current RSS. The memory-ceiling claim was therefore kept active pending a
+  correctly defined metric and repeated post-cap observations.
+
+Evidence: [Combined Status availability and repeated-burst UAT](2026-08-30-combined-status-rss-uat.md)
+
+## Cluster Status telemetry aggregation correction
+
+- [x] Found that authenticated telemetry notifications were transmitted with
+  request ID zero but silently ignored by both RPC notification receive paths.
+- [x] Routed telemetry notifications from both canonical connection directions
+  into the existing bounded speculative executor, keeping decode/store work off
+  critical socket-reader threads.
+- [x] Added an edge-triggered telemetry wake on authenticated peer observation,
+  so connection formation disseminates a coalesced current sample without
+  waiting for the periodic local sampler.
+- [x] Proved that one two-node Status request contains the connected peer's live
+  numeric storage/cache/backend telemetry and a complete online aggregate; no
+  client fan-out or HTTP-time network call is required.
+- [x] Passed both focused regressions, `rpc_cluster` 35/35, and `invariants`
+  36/36. The repository-wide run was accurately retained as 206/207 because
+  the tracked catalogue-burst test timed out under suite load; it passed an
+  immediate isolated rerun in 0.890 seconds, and runtime passed 3/3. A second
+  complete run at four-way concurrency again finished 206/207 with the same
+  test timing out at 10.415 seconds.
+
+Evidence: [Cluster Status telemetry aggregation correction](2026-08-30-cluster-status-telemetry-aggregation.md)

@@ -80,11 +80,16 @@ Repository-wide verification passed:
   and `hydration_catalogue/test_catalogue_sync_search_and_artwork_gc` passed
   explicitly within the complete run.
 
-## Combined UAT boundary
+## Combined UAT result
 
-No production materialization code changed, so this closeout does not justify a
-deployment by itself. The next deployment/UAT should combine:
+The combined deployment UAT filled every materialization cache to its 64-entry
+bound. Across 3,960 new materialization requests there were no new misses,
+reconstructions, or applied historical deltas; bounded evictions occurred on
+all nodes. Publication, convergence, queues, and idle CPU also passed.
 
-- the Status unavailable-versus-zero API correction; and
-- a repeated bounded namespace burst measuring materialization diagnostics and
-  RSS decay/ceiling across rounds.
+The RSS-ceiling question remains open because Status `runtime.rss_bytes` was
+found to use lifetime-peak `ru_maxrss`, not current resident memory, and only
+one local round followed the cache first reaching its bound. Correct metric
+semantics and repeated post-cap measurement remain in `ACTIVE.md`.
+
+Evidence: [Combined Status availability and repeated-burst UAT](2026-08-30-combined-status-rss-uat.md)

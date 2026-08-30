@@ -610,6 +610,69 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     CHECK(cluster->find("metadata_write_available")->asBool());
 }
 
+MACHA_TEST("invariants", test_status_collects_connected_peer_telemetry_without_client_fanout) {
+    TestCluster cluster(ConfigProfile::isolated);
+    const auto first_port = free_port();
+    const auto second_port = free_port();
+    auto first_config =
+        cluster.node_config("status-aggregate-first", first_port, {{"127.0.0.1", second_port}});
+    auto second_config =
+        cluster.node_config("status-aggregate-second", second_port, {{"127.0.0.1", first_port}});
+    first_config.catalogue.api.enabled = true;
+    first_config.catalogue.api.port = free_port();
+    second_config.catalogue.api.enabled = true;
+    second_config.catalogue.api.port = free_port();
+
+    Service first(first_config, cluster.keys());
+    Service second(second_config, cluster.keys());
+    first.start();
+    second.start();
+    (void)first.filesystem();
+    (void)second.filesystem();
+
+    REQUIRE(wait_until(
+        [&] {
+            return first.node().membership().active().size() == 2 &&
+                   second.node().membership().active().size() == 2;
+        },
+        5s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto peer = second.node().node_id();
+            const auto values = first.node().telemetry().all();
+            return std::any_of(values.begin(), values.end(), [&](const NodeTelemetry& value) {
+                return value.node_id == peer && value.storage_capacity > 0 &&
+                       value.storage_backends_online > 0;
+            });
+        },
+        10s));
+
+    const auto response = raw_http_get(first_config.catalogue.api.port, "/api/v1/status");
+    CHECK(response.find("HTTP/1.1 200") != std::string::npos);
+    const auto body_at = response.find("\r\n\r\n");
+    REQUIRE(body_at != std::string::npos);
+    const auto status = Json::parse(response.substr(body_at + 4));
+    const auto* nodes = status.find("nodes");
+    REQUIRE(nodes != nullptr);
+    bool found_peer = false;
+    for (const auto& node : nodes->asArray()) {
+        if (node.find("id")->asString() != to_string(second.node().node_id()))
+            continue;
+        found_peer = true;
+        CHECK(node.find("state")->asString() == "online");
+        CHECK(node.find("telemetry_freshness")->asString() == "live");
+        CHECK(node.find("storage")->find("available")->asBool());
+        CHECK(!node.find("storage")->find("used_bytes")->isNull());
+        CHECK(node.find("cache")->find("available")->asBool());
+        CHECK(!node.find("storage_backends_online")->isNull());
+    }
+    CHECK(found_peer);
+    CHECK(status.find("cluster")->find("storage_online")->find("available")->asBool());
+
+    second.stop();
+    first.stop();
+}
+
 MACHA_TEST("invariants", test_metadata_availability_logs_only_transitions) {
     TestNode fixture("metadata-availability-log");
     auto& config = fixture.config();
