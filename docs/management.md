@@ -46,4 +46,14 @@ The general action accepts `host` plus optional `port`, optional `node_id`, and 
 
 A reset is a durable distributed tombstone, not node deletion. It removes matching live membership, telemetry and RPC endpoint associations, closes matching cached sessions, and is propagated through both the peer management exchange and committed cluster metadata. Persisted node status and MachaDFS data are retained.
 
+Association reset is also a recovery action and therefore does not require
+metadata to be writable. The operational tombstone is applied, persisted in
+the local membership roster, and propagated to reachable peers before Macha
+attempts its cluster-metadata audit commit. A successful audit returns `200`
+with `metadata_persisted: true`. If the write floor is unavailable, the reset
+still succeeds with `202`, `metadata_persisted: false`, and a diagnostic
+`persistence_error`. Reachable peers receive and persist the operational
+tombstone immediately; repeating the action after metadata recovery records
+its cluster-metadata audit.
+
 The tombstone is a freshness boundary. Pre-reset gossip cannot recreate the invalidated mapping, and stale `NodeInfo` references are rejected rather than silently routed to a replacement node. A subsequent directly authenticated peer may establish a fresh association at the endpoint. Reset records contain an epoch, reset timestamp, initiating node, and optional reason for operational auditability; applying the same or an older epoch is idempotent.

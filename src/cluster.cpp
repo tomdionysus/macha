@@ -209,6 +209,11 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
           cfg_.max_frame_size),
       startup_stage_hook_(std::move(startup_stage_hook)), startup_unix_ms_(unix_ms()) {
     server_.attach_client(client_);
+    // Membership loads locally durable identity-reset tombstones before the
+    // transport exists. Seed the other operational consumers now so stale
+    // routes and telemetry are fenced before the control plane starts.
+    for (const auto& reset : members_.identity_resets())
+        apply_identity_reset(reset);
 }
 
 NodeRuntime::~NodeRuntime() {

@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <cctype>
 #include <charconv>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <unistd.h>
@@ -426,29 +427,69 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
             reset.reason = std::move(reason);
             const auto key = identity_reset_key(reset.host, reset.port);
 
-            const auto committed = metadata_.mutate_delta(
-                [&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
-                    uint64_t epoch = 1;
-                    if (auto found = snapshot.identity_resets.find(key);
-                        found != snapshot.identity_resets.end())
-                        epoch = found->second.epoch + 1;
-                    reset.epoch = epoch;
+            // Association reset is a recovery primitive. It must not depend on
+            // the metadata state whose convergence can itself be fenced by the
+            // stale identity. Allocate from every locally known tombstone,
+            // apply and propagate first, then publish the durable metadata audit.
+            reset.epoch = 1;
+            auto advance_epoch = [&](const IdentityAssociationReset& existing) {
+                if (existing.epoch < reset.epoch)
+                    return;
+                if (existing.epoch == std::numeric_limits<uint64_t>::max())
+                    throw std::runtime_error("identity association reset epoch exhausted");
+                reset.epoch = existing.epoch + 1;
+            };
+            for (const auto& existing : node_.identity_resets())
+                if (identity_reset_key(existing.host, existing.port) == key)
+                    advance_epoch(existing);
+            if (auto view = metadata_.available_snapshot_view())
+                if (auto found = view->snapshot->identity_resets.find(key);
+                    found != view->snapshot->identity_resets.end())
+                    advance_epoch(found->second);
+
+            node_.propagate_identity_reset(reset);
+
+            std::optional<uint64_t> metadata_generation;
+            std::string persistence_error;
+            try {
+                const auto committed = metadata_.mutate_delta(
+                    [&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+                        if (auto found = snapshot.identity_resets.find(key);
+                            found != snapshot.identity_resets.end() &&
+                            found->second.epoch >= reset.epoch)
+                            advance_epoch(found->second);
                     snapshot.identity_resets[key] = reset;
                     delta.upsert_identity_resets[key] = reset;
-                });
+                    });
+                metadata_generation = committed.generation;
+                // A concurrent metadata reset may have advanced the epoch in
+                // the mutation callback after the first operational broadcast.
+                node_.propagate_identity_reset(reset);
+            } catch (const MetadataNotReady& error) {
+                persistence_error = error.what();
+                Log::warn("management identity reset applied with metadata persistence pending "
+                          "scope=" + key + " error=" + persistence_error);
+            }
 
-            Log::info("management identity reset committed scope=" + key +
+            Log::info("management identity reset applied scope=" + key +
                       " stale_node_id=" +
                       (stale_id == NodeId{} ? std::string("<any>") : to_string(stale_id)) +
                       " epoch=" + std::to_string(reset.epoch) +
-                      " metadata_generation=" + std::to_string(committed.generation) +
+                      (metadata_generation ? " metadata_generation=" +
+                                                 std::to_string(*metadata_generation)
+                                           : " metadata_persistence=pending") +
                       (reset.reason.empty() ? std::string{} : " reason=" + reset.reason));
-            node_.propagate_identity_reset(reset);
 
             Json::Object out;
             out["reset"] = identity_reset_json(reset);
-            out["metadata_generation"] = committed.generation;
-            return http_json(200, Json(std::move(out)).dump());
+            out["metadata_persisted"] = metadata_generation.has_value();
+            out["metadata_generation"] = metadata_generation
+                                             ? Json(*metadata_generation)
+                                             : Json(nullptr);
+            out["persistence_error"] = persistence_error.empty()
+                                           ? Json(nullptr)
+                                           : Json(persistence_error);
+            return http_json(metadata_generation ? 200 : 202, Json(std::move(out)).dump());
         };
 
         // General cluster management action. This does not require a NodeId:
