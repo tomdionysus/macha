@@ -109,6 +109,10 @@ class NodeRuntime {
     std::atomic_uint64_t interactive_activity_bytes_{};
     std::atomic_int64_t last_playback_activity_ms_{};
     std::atomic_int64_t last_interactive_activity_ms_{};
+    mutable std::mutex service_event_mutex_;
+    std::function<void()> service_event_;
+
+    void signal_service_event();
 
     bool ready(ReadyBit bit) const noexcept {
         return (ready_bits_.load(std::memory_order_acquire) & static_cast<uint32_t>(bit)) != 0;
@@ -135,6 +139,8 @@ class NodeRuntime {
     void start();
     void request_stop();
     void stop();
+    void set_service_event_callback(std::function<void()> callback);
+    void notify_storage_mutation();
     bool wait_local_state_ready(std::chrono::milliseconds timeout);
     NodeReadiness readiness() const;
     const Config& config() const { return cfg_; }

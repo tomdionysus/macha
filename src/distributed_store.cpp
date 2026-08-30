@@ -183,6 +183,8 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
     auto launch = [&](const NodeInfo& owner) {
         if (owner.id == n_.node_id()) {
             const auto started = Clock::now();
+            if (!n_.local_store().has(id))
+                n_.notify_storage_mutation();
             if (batch) {
                 if (const auto token = n_.local_store().put_deferred(id, data)) {
                     ++success;
@@ -645,8 +647,11 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
 
 bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,
                               std::span<const uint8_t> data, bool foreground) {
-    if (target.id == n_.node_id())
+    if (target.id == n_.node_id()) {
+        if (!n_.local_store().has(id))
+            n_.notify_storage_mutation();
         return n_.local_store().put(id, data);
+    }
     Writer writer;
     writer.fixed(id.bytes);
     writer.bytes(data);
