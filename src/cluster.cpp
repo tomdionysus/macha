@@ -163,12 +163,17 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
           },
           [this](uint64_t generation) {
               auto current = remote_metadata_generation_.load();
-              bool advanced = false;
               while (current < generation && !remote_metadata_generation_.compare_exchange_weak(
                                                  current, generation)) {
               }
-              advanced = current < generation;
-              if (advanced) {
+              // An explicit metadata notice is emitted only when a peer's
+              // accepted-head set changes. Equal generation can therefore be
+              // new sibling/topology information even though it does not raise
+              // the numeric high-water mark. Ignore only a notice made stale by
+              // a strictly newer generation already observed. Ordinary equal-
+              // generation membership heartbeats use the separate membership
+              // observer above and remain non-events.
+              if (current <= generation) {
                   remote_metadata_epoch_.fetch_add(1, std::memory_order_acq_rel);
                   signal_service_event(ServiceEvent::metadata);
               }
@@ -576,6 +581,7 @@ void NodeRuntime::announce_metadata_generation(uint64_t generation) {
     // the notice.  Otherwise a node can keep serving its pre-sibling snapshot
     // until the cache TTL expires even though the sibling is already durably
     // accepted locally.
+    metadata_announcements_.fetch_add(1, std::memory_order_relaxed);
     remote_metadata_epoch_.fetch_add(1, std::memory_order_acq_rel);
     signal_service_event(ServiceEvent::metadata);
     members_.metadata_generation(generation);

@@ -28,6 +28,10 @@ namespace macha {
 std::chrono::milliseconds maintenance_background_interval(const MaintenanceConfig&);
 
 class Service {
+  public:
+    using MaintenanceStageHook = std::function<void(std::string_view)>;
+
+  private:
     NodeRuntime node_;
     ClusterStatusService cluster_status_;
     std::unique_ptr<HttpServer> catalogue_http_;
@@ -61,6 +65,7 @@ class Service {
     std::atomic_uint64_t maintenance_event_{1};
     std::atomic_uint64_t maintenance_wakeups_{};
     ConvergenceDemand metadata_convergence_;
+    MaintenanceStageHook maintenance_stage_hook_;
     uint64_t maintenance_inventory_generation_{};
     std::shared_ptr<const std::vector<ObjectId>> maintenance_live_;
     std::shared_ptr<const std::vector<ObjectId>> maintenance_universal_;
@@ -88,7 +93,8 @@ class Service {
     void retain_metadata_publication(const MetadataPublicationContext&);
 
   public:
-    Service(Config, ClusterKeys, NodeRuntime::StartupStageHook startup_stage_hook = {});
+    Service(Config, ClusterKeys, NodeRuntime::StartupStageHook startup_stage_hook = {},
+            MaintenanceStageHook maintenance_stage_hook = {});
     ~Service();
     void start();
     void request_stop();

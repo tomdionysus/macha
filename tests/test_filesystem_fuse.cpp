@@ -421,6 +421,107 @@ MACHA_TEST("filesystem_fuse", test_disconnected_maintenance_sleeps_until_peer_ev
     s1.stop();
 }
 
+MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage_grace) {
+    TestCluster cluster(ConfigProfile::isolated);
+    auto config = cluster.node_config("coalesced-garbage-grace");
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.maintenance.garbage_grace = 750ms;
+    config.maintenance.foreground_quiet = 10ms;
+    config.maintenance.no_progress_backoff = 500ms;
+
+    TestGate repair_gate;
+    std::atomic_bool gate_repair{};
+    std::atomic_bool gate_once{};
+    Service service(config, cluster.keys(), {}, [&](std::string_view stage) {
+        if (stage == "metadata-repair-begin" &&
+            gate_repair.load(std::memory_order_acquire) &&
+            !gate_once.exchange(true, std::memory_order_acq_rel)) {
+            repair_gate.enter_and_wait();
+        }
+    });
+    struct GateOpener {
+        TestGate& gate;
+        ~GateOpener() { gate.open(); }
+    } open_on_exit{repair_gate};
+
+    service.start();
+    auto& fs = service.filesystem();
+    std::vector<ObjectId> retired_ids;
+    for (size_t index = 0; index < 3; ++index) {
+        const auto path = "/garbage-grace-" + std::to_string(index);
+        write_file(fs, path, pattern(64 * 1024 + index, static_cast<uint8_t>(index + 7)));
+        const auto entry = fs.getattr(path);
+        REQUIRE(entry.extents.size() == 1);
+        retired_ids.push_back(entry.extents.front().id);
+        REQUIRE(service.node().local_store().has(retired_ids.back()));
+    }
+    REQUIRE(wait_until([&] {
+        const auto diagnostics = service.metadata_convergence_diagnostics();
+        return !diagnostics.scheduled &&
+               diagnostics.runs_scheduled == diagnostics.runs_completed;
+    }, 5s));
+
+    const auto before = service.metadata_convergence_diagnostics();
+    gate_repair.store(true, std::memory_order_release);
+    fs.unlink("/garbage-grace-0");
+    REQUIRE(repair_gate.wait_for_entries(1, 5s));
+    fs.unlink("/garbage-grace-1");
+    fs.unlink("/garbage-grace-2");
+
+    auto snapshot = service.metadata_manager().snapshot();
+    int64_t latest_retirement{};
+    for (const auto& id : retired_ids) {
+        auto found = std::find_if(snapshot.garbage.begin(), snapshot.garbage.end(),
+                                  [&](const GarbageRef& garbage) {
+                                      return garbage.id == id;
+                                  });
+        REQUIRE(found != snapshot.garbage.end());
+        latest_retirement = std::max(latest_retirement, found->retired_at_ns);
+        CHECK(service.node().local_store().has(id));
+    }
+
+    repair_gate.open();
+    const auto grace_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              config.maintenance.garbage_grace)
+                              .count();
+    const auto before_deadline_ns = latest_retirement + grace_ns - wall_time_ns();
+    if (before_deadline_ns > 100'000'000)
+        std::this_thread::sleep_for(std::chrono::nanoseconds(before_deadline_ns - 50'000'000));
+    CHECK(service.node().local_store().has(retired_ids.back()));
+    const auto before_grace = service.metadata_convergence_diagnostics();
+    CHECK(before_grace.runs_scheduled == before.runs_scheduled + 2);
+    CHECK(before_grace.runs_completed == before.runs_completed + 2);
+
+    REQUIRE(wait_until([&] {
+        return std::none_of(retired_ids.begin(), retired_ids.end(), [&](const ObjectId& id) {
+            return service.node().local_store().has(id);
+        });
+    }, 5s));
+    REQUIRE(wait_until([&] {
+        const auto current = service.metadata_manager().snapshot();
+        return std::none_of(current.garbage.begin(), current.garbage.end(),
+                            [&](const GarbageRef& garbage) {
+                                return std::find(retired_ids.begin(), retired_ids.end(),
+                                                 garbage.id) != retired_ids.end();
+                            });
+    }, 5s));
+
+    REQUIRE(wait_until([&] {
+        const auto diagnostics = service.metadata_convergence_diagnostics();
+        return !diagnostics.scheduled &&
+               diagnostics.runs_scheduled == diagnostics.runs_completed &&
+               diagnostics.runs_completed >= before.runs_completed + 3;
+    }, 5s));
+
+    const auto after = service.metadata_convergence_diagnostics();
+    CHECK(after.runs_scheduled >= before.runs_scheduled + 3);
+    CHECK(after.runs_scheduled <= before.runs_scheduled + 5);
+    CHECK(after.runs_completed == after.runs_scheduled);
+    CHECK(!after.scheduled);
+    service.stop();
+}
+
 MACHA_TEST("filesystem_fuse", test_fuse_frontend_ordering_merging_and_cache) {
     TestService fixture("fuse-ordering");
     auto& config = fixture.config();
