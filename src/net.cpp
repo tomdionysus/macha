@@ -1191,6 +1191,15 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         }
     }
 
+    void dispatch_notification(RpcFrame frame) {
+        if (!inbound_handler_)
+            return;
+        // Notifications have no reply route, but ordinary message handling must
+        // still run on the server's bounded executor rather than this socket
+        // reader. A no-op completion preserves that ownership boundary.
+        inbound_handler_(peer_, std::move(frame), [](const RpcMessage&) {});
+    }
+
     std::deque<Outbound>::iterator best_outbound_locked() {
         return std::min_element(
             outbound_.begin(), outbound_.end(), [](const Outbound& a, const Outbound& b) {
@@ -1354,6 +1363,8 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                         cancel_inbound(target);
                         if (inbound_canceller_)
                             inbound_canceller_(peer_, target);
+                    } else if (frame->message.type == MessageType::telemetry) {
+                        dispatch_notification(std::move(*frame));
                     }
                     continue;
                 }
@@ -2963,6 +2974,16 @@ void RpcServer::enqueue_shared(const NodeInfo& peer, RpcFrame frame,
     request_cv_.notify_all();
 }
 
+void RpcServer::enqueue_notification(const NodeInfo& peer, RpcFrame frame) {
+    bool admitted = false;
+    {
+        DiagnosticLock lock(request_mutex_, "rpc.server.queue");
+        admitted = admit_locked({{}, peer, std::move(frame), {}});
+    }
+    if (admitted)
+        request_cv_.notify_all();
+}
+
 void RpcServer::promote_queued(const NodeInfo& peer, uint64_t request_id, FrameType type) {
     if (type != FrameType::foreground && type != FrameType::read_ahead)
         return;
@@ -3304,6 +3325,8 @@ void RpcServer::session_loop(Session* session) {
                     assembler.discard(target);
                     session->cancel_inbound(target);
                     cancel_queued(session->peer, target);
+                } else if (frame->message.type == MessageType::telemetry) {
+                    enqueue_notification(session->peer, std::move(*frame));
                 }
                 continue;
             }

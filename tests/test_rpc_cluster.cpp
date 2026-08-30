@@ -88,6 +88,93 @@ MACHA_TEST("rpc_cluster", test_async_rpc_move_ownership) {
     CHECK(cancelled.load() == 2);
 }
 
+MACHA_TEST("rpc_cluster", test_best_effort_telemetry_notifications_reach_both_route_directions) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto local_port = free_port();
+    const auto remote_port = free_port();
+
+    NodeInfo local_info;
+    local_info.id = random_node_id();
+    local_info.host = "127.0.0.1";
+    local_info.port = local_port;
+    NodeInfo remote_info;
+    remote_info.id = random_node_id();
+    remote_info.host = "127.0.0.1";
+    remote_info.port = remote_port;
+
+    std::atomic_uint64_t local_received{};
+    std::atomic_uint64_t remote_received{};
+    auto handler = [](std::atomic_uint64_t& received, const RpcMessage& request) {
+        if (request.type == MessageType::telemetry) {
+            const auto values = decode_telemetry_set(request.payload);
+            if (!values.empty())
+                received.fetch_add(1, std::memory_order_relaxed);
+            return RpcMessage{MessageType::telemetry_reply, {}};
+        }
+        return RpcMessage{MessageType::ok, {}};
+    };
+
+    RpcClient local_client(
+        keys, [local_info] { return local_info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 500ms,
+        5s, 30s, 4096);
+    RpcClient remote_client(
+        keys, [remote_info] { return remote_info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 500ms,
+        5s, 30s, 4096);
+    RpcServer local_server(
+        "127.0.0.1", local_port, keys, local_info,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            return handler(local_received, request);
+        },
+        [](const NodeInfo&) {}, 4096);
+    RpcServer remote_server(
+        "127.0.0.1", remote_port, keys, remote_info,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            return handler(remote_received, request);
+        },
+        [](const NodeInfo&) {}, 4096);
+    local_server.attach_client(local_client);
+    remote_server.attach_client(remote_client);
+    local_server.start();
+    remote_server.start();
+
+    const Endpoint local_endpoint{"127.0.0.1", local_port};
+    REQUIRE(remote_client.call(local_endpoint, MessageType::ping, {}, 1s).message.type ==
+            MessageType::ok);
+
+    NodeTelemetry telemetry;
+    telemetry.node_id = remote_info.id;
+    telemetry.boot_id = random_node_id();
+    telemetry.sequence = 1;
+    telemetry.observed_unix_ms = unix_ms();
+    telemetry.host = remote_info.host;
+    telemetry.port = remote_info.port;
+    const RpcMessage notice{MessageType::telemetry, encode_telemetry_set({telemetry})};
+
+    // The dialler-to-acceptor direction enters RpcServer::session_loop.
+    REQUIRE(wait_until(
+        [&] {
+            (void)remote_client.broadcast_best_effort(notice, FrameType::speculative);
+            return local_received.load(std::memory_order_relaxed) > 0;
+        },
+        2s));
+
+    // The acceptor-to-dialler direction enters PeerConnection::reader_loop.
+    // Production route reconciliation can retain either direction, so both are
+    // required for cluster-wide Status aggregation.
+    REQUIRE(wait_until(
+        [&] {
+            (void)local_client.broadcast_best_effort(notice, FrameType::speculative);
+            return remote_received.load(std::memory_order_relaxed) > 0;
+        },
+        2s));
+
+    remote_client.stop();
+    local_client.stop();
+    remote_server.stop();
+    local_server.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_rpc_v15_frame_priority_and_variable_length) {
     CHECK(frame_type_priority(FrameType::control) < frame_type_priority(FrameType::foreground));
     CHECK(frame_type_priority(FrameType::foreground) < frame_type_priority(FrameType::read_ahead));

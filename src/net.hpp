@@ -422,6 +422,7 @@ class RpcServer {
     void execute(RequestJob);
     void reap_sessions(bool all);
     void enqueue_shared(const NodeInfo&, RpcFrame, RpcClient::InboundReply);
+    void enqueue_notification(const NodeInfo&, RpcFrame);
     void promote_queued(const NodeInfo&, uint64_t, FrameType);
     void cancel_queued(const NodeInfo&, uint64_t);
 
