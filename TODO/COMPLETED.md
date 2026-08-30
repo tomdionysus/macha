@@ -320,3 +320,14 @@ Evidence: [Linux systemd install and uninstall targets](2026-08-30-linux-systemd
   legacy systemd-wrapper examples.
 - [x] Reconfigured and rebuilt every target successfully; generated
   `kServerVersion` is `0.21.0`, and runtime dependencies passed 3/3.
+
+## Linux miniupnpc API 18 compatibility
+
+- [x] Removed the compile-time dependency on `UPNP_CONNECTED_IGD` and
+  `UPNP_PRIVATEIP_IGD`, which were added after miniupnpc first shipped API 18
+  without changing its API-version number.
+- [x] Added a version-aware compatibility classifier for the documented
+  `UPNP_GetValidIGD()` ABI values, retaining private-WAN support for API 18+
+  and rejecting disconnected/unknown devices.
+- [x] Rebuilt successfully with UPnP enabled; the focused compatibility test
+  passed and the complete `foundations` group passed 13/13.

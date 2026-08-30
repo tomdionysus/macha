@@ -2,15 +2,16 @@
 #include "public_connectivity.hpp"
 
 #include "log.hpp"
+#include "miniupnpc_compat.hpp"
 
 #include <curl/curl.h>
 
 #include <algorithm>
-#include <array>
 #include <arpa/inet.h>
+#include <array>
+#include <cctype>
 #include <cerrno>
 #include <charconv>
-#include <cctype>
 #include <cstring>
 #include <fcntl.h>
 #include <memory>
@@ -96,8 +97,7 @@ std::string aws_external_ip(std::chrono::milliseconds timeout) {
     long status = 0;
     curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &status);
     if (status != 200)
-        throw std::runtime_error("AWS external IP request returned HTTP " +
-                                 std::to_string(status));
+        throw std::runtime_error("AWS external IP request returned HTTP " + std::to_string(status));
 
     body = trim(std::move(body));
     if (!ipv4_literal(body))
@@ -196,8 +196,7 @@ struct UpnpSession {
     }
 };
 
-std::unique_ptr<UpnpSession> discover_upnp(std::chrono::milliseconds timeout,
-                                           std::string& error) {
+std::unique_ptr<UpnpSession> discover_upnp(std::chrono::milliseconds timeout, std::string& error) {
     auto session = std::make_unique<UpnpSession>();
     int discovery_error = 0;
 #if MINIUPNPC_API_VERSION >= 14
@@ -212,15 +211,14 @@ std::unique_ptr<UpnpSession> discover_upnp(std::chrono::milliseconds timeout,
         return {};
     }
 #if MINIUPNPC_API_VERSION >= 18
-    session->igd_status = UPNP_GetValidIGD(session->devices, &session->urls, &session->data,
-                                           session->lan.data(),
-                                           static_cast<int>(session->lan.size()),
-                                           session->wan.data(),
-                                           static_cast<int>(session->wan.size()));
+    session->igd_status =
+        UPNP_GetValidIGD(session->devices, &session->urls, &session->data, session->lan.data(),
+                         static_cast<int>(session->lan.size()), session->wan.data(),
+                         static_cast<int>(session->wan.size()));
 #else
-    session->igd_status = UPNP_GetValidIGD(session->devices, &session->urls, &session->data,
-                                           session->lan.data(),
-                                           static_cast<int>(session->lan.size()));
+    session->igd_status =
+        UPNP_GetValidIGD(session->devices, &session->urls, &session->data, session->lan.data(),
+                         static_cast<int>(session->lan.size()));
 #endif
     if (session->igd_status <= 0) {
         error = "no valid UPnP IGD found";
@@ -341,12 +339,13 @@ void PublicConnectivity::refresh_locked() {
             status_.upnp.external_address = session->wan.data();
             bool usable_igd = true;
 #if MINIUPNPC_API_VERSION >= 18
-            status_.upnp.private_wan = session->igd_status == UPNP_PRIVATEIP_IGD;
-            usable_igd = session->igd_status == UPNP_CONNECTED_IGD || status_.upnp.private_wan;
-            if (!usable_igd)
-                status_.upnp.error = "UPnP IGD is not connected status=" +
-                                     std::to_string(session->igd_status);
+            status_.upnp.private_wan =
+                miniupnpc_compat::private_wan(MINIUPNPC_API_VERSION, session->igd_status);
 #endif
+            usable_igd = miniupnpc_compat::usable(MINIUPNPC_API_VERSION, session->igd_status);
+            if (!usable_igd)
+                status_.upnp.error =
+                    "UPnP IGD is not connected status=" + std::to_string(session->igd_status);
             if (usable_igd) {
                 const auto ext = std::to_string(external_port);
                 const auto in = std::to_string(configured_.port);
@@ -357,8 +356,7 @@ void PublicConnectivity::refresh_locked() {
                 bool active = existing.exists && existing.internal_port == configured_.port &&
                               existing.internal_client == status_.upnp.lan_address;
                 if (existing.exists && !active) {
-                    status_.upnp.error = "UPnP external port " + ext +
-                                         " is already mapped to " +
+                    status_.upnp.error = "UPnP external port " + ext + " is already mapped to " +
                                          existing.internal_client + ":" +
                                          std::to_string(existing.internal_port);
                 } else if (!active) {
@@ -380,9 +378,9 @@ void PublicConnectivity::refresh_locked() {
                                 "UPnP AddPortMapping succeeded but mapping verification failed";
                         }
                     } else {
-                        status_.upnp.error = "UPnP AddPortMapping failed code=" +
-                                             std::to_string(result) + " (" +
-                                             strupnperror(result) + ")";
+                        status_.upnp.error =
+                            "UPnP AddPortMapping failed code=" + std::to_string(result) + " (" +
+                            strupnperror(result) + ")";
                     }
                 }
                 status_.upnp.mapping_active = active;
@@ -409,7 +407,8 @@ void PublicConnectivity::refresh_locked() {
         try {
             status_.external_ip.address = aws_external_ip(external_ip_config_.timeout);
             status_.advertised.host = status_.external_ip.address;
-            status_.advertised.port = status_.upnp.mapping_active ? external_port : configured_.port;
+            status_.advertised.port =
+                status_.upnp.mapping_active ? external_port : configured_.port;
             status_.advertised_source =
                 status_.upnp.mapping_active ? "upnp+external_ip" : "external_ip";
         } catch (const std::exception& error) {
@@ -421,9 +420,8 @@ void PublicConnectivity::refresh_locked() {
 
     if (upnp_config_.enabled) {
         if (status_.upnp.mapping_active) {
-            Log::info("UPnP port mapping active gateway_external=" +
-                      status_.upnp.external_address + ":" +
-                      std::to_string(status_.upnp.external_port) + " internal=" +
+            Log::info("UPnP port mapping active gateway_external=" + status_.upnp.external_address +
+                      ":" + std::to_string(status_.upnp.external_port) + " internal=" +
                       status_.upnp.lan_address + ":" + std::to_string(configured_.port) +
                       " lease_s=" + std::to_string(upnp_config_.lease_seconds));
             if (status_.upnp.private_wan)
@@ -483,9 +481,8 @@ void PublicConnectivity::remove_owned_mapping_locked() noexcept {
             owned_external_port_ = 0;
             return;
         }
-        const int result = UPNP_DeletePortMapping(session->urls.controlURL,
-                                                  session->data.first.servicetype,
-                                                  ext.c_str(), "TCP", nullptr);
+        const int result = UPNP_DeletePortMapping(
+            session->urls.controlURL, session->data.first.servicetype, ext.c_str(), "TCP", nullptr);
         if (result == UPNPCOMMAND_SUCCESS)
             Log::debug("UPnP port mapping removed external_port=" + ext);
         else
