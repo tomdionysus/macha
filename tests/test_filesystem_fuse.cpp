@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "test_backend_support.hpp"
 #include "fuse_journal.hpp"
+#include "test_backend_support.hpp"
 #include <fcntl.h>
 
 using namespace macha;
@@ -8,6 +8,69 @@ using namespace std::chrono_literals;
 using namespace macha::test_support;
 
 namespace {
+
+MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_counters) {
+    TestService fixture("status-operational-counters", ConfigProfile::isolated);
+    auto& config = fixture.config();
+    config.catalogue.api.enabled = true;
+    config.catalogue.api.listen = "127.0.0.1";
+    config.catalogue.api.port = free_port();
+    config.fuse.publication_quiet = 0ms;
+    auto& service = fixture.start();
+
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    service.attach_fuse_frontend(frontend);
+    frontend->mkdir("/status-counter", 0755, getuid(), getgid());
+    REQUIRE(frontend->wait_for_idle(10s));
+    REQUIRE(wait_until([&] {
+        const auto current = service.metadata_convergence_diagnostics();
+        return !current.scheduled && current.runs_scheduled == current.runs_completed;
+    }));
+
+    const auto response = raw_http_get(config.catalogue.api.port, "/api/v1/status");
+    CHECK(response.find("HTTP/1.1 200") != std::string::npos);
+    const auto body_at = response.find("\r\n\r\n");
+    REQUIRE(body_at != std::string::npos);
+    const auto root = Json::parse(response.substr(body_at + 4));
+    const auto* diagnostics = root.find("diagnostics");
+    REQUIRE(diagnostics != nullptr);
+
+    const auto* filesystem = diagnostics->find("filesystem");
+    REQUIRE(filesystem != nullptr);
+    CHECK(filesystem->find("available")->asBool());
+    CHECK(filesystem->find("namespace_operations_admitted")->asUInt64() == 1);
+    CHECK(filesystem->find("namespace_publication_batches")->asUInt64() == 1);
+    CHECK(filesystem->find("namespace_operations_batched")->asUInt64() == 1);
+    CHECK(filesystem->find("namespace_operations_published")->asUInt64() == 1);
+    CHECK(filesystem->find("namespace_operations_confirmed")->asUInt64() == 1);
+    // A new live inode durably appends its descriptor and operation before
+    // returning, followed by published and done. Recovery frontends report
+    // only the latter two because both admission records predate restart.
+    CHECK(filesystem->find("journal_append_batches")->asUInt64() == 4);
+    CHECK(filesystem->find("journal_records_appended")->asUInt64() == 4);
+    CHECK(filesystem->find("journal_durability_barriers")->asUInt64() == 4);
+
+    const auto* convergence = diagnostics->find("convergence");
+    REQUIRE(convergence != nullptr);
+    CHECK(convergence->find("available")->asBool());
+    CHECK(convergence->find("events_received")->asUInt64() >= 1);
+    CHECK(convergence->find("runs_scheduled")->asUInt64() >= 1);
+    CHECK(convergence->find("runs_completed")->asUInt64() ==
+          convergence->find("runs_scheduled")->asUInt64());
+    CHECK(convergence->find("requested_epoch")->asUInt64() ==
+          convergence->find("completed_epoch")->asUInt64());
+    CHECK(convergence->find("latest_generation")->asUInt64() ==
+          service.node().known_metadata_generation());
+    CHECK(!convergence->find("scheduled")->asBool());
+
+    service.attach_fuse_frontend({});
+    const auto detached_response = raw_http_get(config.catalogue.api.port, "/api/v1/status");
+    const auto detached_body_at = detached_response.find("\r\n\r\n");
+    REQUIRE(detached_body_at != std::string::npos);
+    const auto detached = Json::parse(detached_response.substr(detached_body_at + 4));
+    CHECK(!detached.find("diagnostics")->find("filesystem")->find("available")->asBool());
+    frontend->stop();
+}
 
 MACHA_TEST("filesystem_fuse", test_open_write_metadata_merge) {
     TestService fixture("single-write");
@@ -365,8 +428,8 @@ MACHA_TEST("filesystem_fuse", test_disconnected_maintenance_sleeps_until_peer_ev
     const auto p2 = free_port();
 
     auto c1 = config_for(cluster.path() / "event-maint-n1", cluster.keyfile(), p1);
-    auto c2 = config_for(cluster.path() / "event-maint-n2", cluster.keyfile(), p2,
-                         {{"127.0.0.1", p1}});
+    auto c2 =
+        config_for(cluster.path() / "event-maint-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 1;
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 2;
     c1.heartbeat = c2.heartbeat = 50ms;
@@ -384,11 +447,13 @@ MACHA_TEST("filesystem_fuse", test_disconnected_maintenance_sleeps_until_peer_ev
     // Allow the initial event and one bounded repair slice to settle. With no
     // peer and no new input, the scheduler must remain parked rather than
     // rediscovering the same unavailable write floor on an interval.
-    REQUIRE(wait_until([&] {
-        const auto before = s1.maintenance_wakeups();
-        std::this_thread::sleep_for(300ms);
-        return s1.maintenance_wakeups() == before;
-    }, 3s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto before = s1.maintenance_wakeups();
+            std::this_thread::sleep_for(300ms);
+            return s1.maintenance_wakeups() == before;
+        },
+        3s));
     const auto parked = s1.maintenance_wakeups();
     std::this_thread::sleep_for(1500ms);
     CHECK(s1.maintenance_wakeups() == parked);
@@ -396,21 +461,24 @@ MACHA_TEST("filesystem_fuse", test_disconnected_maintenance_sleeps_until_peer_ev
     // A peer/membership event must bypass the outstanding retry deadline and
     // immediately form the metadata floor.
     s2.start();
-    REQUIRE(wait_until([&] {
-        return s1.node().metadata_replica().current().generation > 1 &&
-               s2.node().metadata_replica().current().generation > 1;
-    }, 5s));
+    REQUIRE(wait_until(
+        [&] {
+            return s1.node().metadata_replica().current().generation > 1 &&
+                   s2.node().metadata_replica().current().generation > 1;
+        },
+        5s));
 
     // Identical membership exchanges are heartbeats, not maintenance events.
     // Once the event-triggered convergence and quiet follow-up have completed,
     // rapid connected heartbeats must leave both maintenance workers parked.
-    REQUIRE(wait_until([&] {
-        const auto before1 = s1.maintenance_wakeups();
-        const auto before2 = s2.maintenance_wakeups();
-        std::this_thread::sleep_for(300ms);
-        return s1.maintenance_wakeups() == before1 &&
-               s2.maintenance_wakeups() == before2;
-    }, 5s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto before1 = s1.maintenance_wakeups();
+            const auto before2 = s2.maintenance_wakeups();
+            std::this_thread::sleep_for(300ms);
+            return s1.maintenance_wakeups() == before1 && s2.maintenance_wakeups() == before2;
+        },
+        5s));
     const auto connected_parked1 = s1.maintenance_wakeups();
     const auto connected_parked2 = s2.maintenance_wakeups();
     std::this_thread::sleep_for(500ms);
@@ -434,15 +502,16 @@ MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage
     std::atomic_bool gate_repair{};
     std::atomic_bool gate_once{};
     Service service(config, cluster.keys(), {}, [&](std::string_view stage) {
-        if (stage == "metadata-repair-begin" &&
-            gate_repair.load(std::memory_order_acquire) &&
+        if (stage == "metadata-repair-begin" && gate_repair.load(std::memory_order_acquire) &&
             !gate_once.exchange(true, std::memory_order_acq_rel)) {
             repair_gate.enter_and_wait();
         }
     });
     struct GateOpener {
         TestGate& gate;
-        ~GateOpener() { gate.open(); }
+        ~GateOpener() {
+            gate.open();
+        }
     } open_on_exit{repair_gate};
 
     service.start();
@@ -456,11 +525,13 @@ MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage
         retired_ids.push_back(entry.extents.front().id);
         REQUIRE(service.node().local_store().has(retired_ids.back()));
     }
-    REQUIRE(wait_until([&] {
-        const auto diagnostics = service.metadata_convergence_diagnostics();
-        return !diagnostics.scheduled &&
-               diagnostics.runs_scheduled == diagnostics.runs_completed;
-    }, 5s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto diagnostics = service.metadata_convergence_diagnostics();
+            return !diagnostics.scheduled &&
+                   diagnostics.runs_scheduled == diagnostics.runs_completed;
+        },
+        5s));
 
     const auto before = service.metadata_convergence_diagnostics();
     gate_repair.store(true, std::memory_order_release);
@@ -473,18 +544,16 @@ MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage
     int64_t latest_retirement{};
     for (const auto& id : retired_ids) {
         auto found = std::find_if(snapshot.garbage.begin(), snapshot.garbage.end(),
-                                  [&](const GarbageRef& garbage) {
-                                      return garbage.id == id;
-                                  });
+                                  [&](const GarbageRef& garbage) { return garbage.id == id; });
         REQUIRE(found != snapshot.garbage.end());
         latest_retirement = std::max(latest_retirement, found->retired_at_ns);
         CHECK(service.node().local_store().has(id));
     }
 
     repair_gate.open();
-    const auto grace_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                              config.maintenance.garbage_grace)
-                              .count();
+    const auto grace_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(config.maintenance.garbage_grace)
+            .count();
     const auto before_deadline_ns = latest_retirement + grace_ns - wall_time_ns();
     if (before_deadline_ns > 100'000'000)
         std::this_thread::sleep_for(std::chrono::nanoseconds(before_deadline_ns - 50'000'000));
@@ -493,26 +562,32 @@ MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage
     CHECK(before_grace.runs_scheduled == before.runs_scheduled + 2);
     CHECK(before_grace.runs_completed == before.runs_completed + 2);
 
-    REQUIRE(wait_until([&] {
-        return std::none_of(retired_ids.begin(), retired_ids.end(), [&](const ObjectId& id) {
-            return service.node().local_store().has(id);
-        });
-    }, 5s));
-    REQUIRE(wait_until([&] {
-        const auto current = service.metadata_manager().snapshot();
-        return std::none_of(current.garbage.begin(), current.garbage.end(),
-                            [&](const GarbageRef& garbage) {
-                                return std::find(retired_ids.begin(), retired_ids.end(),
-                                                 garbage.id) != retired_ids.end();
-                            });
-    }, 5s));
+    REQUIRE(wait_until(
+        [&] {
+            return std::none_of(retired_ids.begin(), retired_ids.end(), [&](const ObjectId& id) {
+                return service.node().local_store().has(id);
+            });
+        },
+        5s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto current = service.metadata_manager().snapshot();
+            return std::none_of(current.garbage.begin(), current.garbage.end(),
+                                [&](const GarbageRef& garbage) {
+                                    return std::find(retired_ids.begin(), retired_ids.end(),
+                                                     garbage.id) != retired_ids.end();
+                                });
+        },
+        5s));
 
-    REQUIRE(wait_until([&] {
-        const auto diagnostics = service.metadata_convergence_diagnostics();
-        return !diagnostics.scheduled &&
-               diagnostics.runs_scheduled == diagnostics.runs_completed &&
-               diagnostics.runs_completed >= before.runs_completed + 3;
-    }, 5s));
+    REQUIRE(wait_until(
+        [&] {
+            const auto diagnostics = service.metadata_convergence_diagnostics();
+            return !diagnostics.scheduled &&
+                   diagnostics.runs_scheduled == diagnostics.runs_completed &&
+                   diagnostics.runs_completed >= before.runs_completed + 3;
+        },
+        5s));
 
     const auto after = service.metadata_convergence_diagnostics();
     CHECK(after.runs_scheduled >= before.runs_scheduled + 3);
@@ -550,12 +625,15 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_ordering_merging_and_cache) {
         // expose one coalesced dirty range to the frontend scheduler.
         auto adjacent = pattern(config.extent_size);
         REQUIRE(frontend->write(inode, first.size(), adjacent) == adjacent.size());
-        std::copy(adjacent.begin(), adjacent.end(), expected.begin() + static_cast<ptrdiff_t>(first.size()));
+        std::copy(adjacent.begin(), adjacent.end(),
+                  expected.begin() + static_cast<ptrdiff_t>(first.size()));
         auto patch = pattern(131072);
         const uint64_t patch_offset = config.extent_size - 65536;
-        for (auto& byte : patch) byte ^= 0xa5;
+        for (auto& byte : patch)
+            byte ^= 0xa5;
         REQUIRE(frontend->write(inode, patch_offset, patch) == patch.size());
-        std::copy(patch.begin(), patch.end(), expected.begin() + static_cast<ptrdiff_t>(patch_offset));
+        std::copy(patch.begin(), patch.end(),
+                  expected.begin() + static_cast<ptrdiff_t>(patch_offset));
 
         auto ranges = frontend->dirty_ranges(inode);
         REQUIRE(ranges.size() == 1);
@@ -583,7 +661,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_ordering_merging_and_cache) {
         CHECK(!frontend->inode_for_path("/.stage.tmp").has_value());
 
         auto tail = pattern(8192);
-        for (auto& byte : tail) byte ^= 0x3c;
+        for (auto& byte : tail)
+            byte ^= 0x3c;
         const uint64_t tail_offset = 3 * config.extent_size;
         REQUIRE(frontend->write(inode, tail_offset, tail) == tail.size());
         std::copy(tail.begin(), tail.end(), expected.begin() + static_cast<ptrdiff_t>(tail_offset));
@@ -629,15 +708,14 @@ MACHA_TEST("filesystem_fuse", test_fuse_completed_publication_unlinks_retired_sp
 
     auto& service = fixture.start();
     auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
-    auto handle = frontend->create("/retire-spool.bin", 0600, getuid(), getgid(),
-                                   true, true, false);
+    auto handle =
+        frontend->create("/retire-spool.bin", 0600, getuid(), getgid(), true, true, false);
     const auto payload = pattern(2 * 1024 * 1024 + 17, 71);
     REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
     frontend->release(handle.inode, true);
     REQUIRE(frontend->wait_for_idle(10s));
 
-    const auto spool_dir =
-        config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
+    const auto spool_dir = config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
     const auto spool = spool_dir / ("inode-" + std::to_string(handle.inode) + ".spool");
     CHECK(!std::filesystem::exists(spool));
     frontend->stop();
@@ -657,8 +735,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_spool_byte_limit_applies_before_unbounde
 
     auto& service = fixture.start();
     auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
-    auto handle = frontend->create("/bounded-spool.bin", 0600, getuid(), getgid(),
-                                   true, true, false);
+    auto handle =
+        frontend->create("/bounded-spool.bin", 0600, getuid(), getgid(), true, true, false);
     const auto first = pattern(256 * 1024, 41);
     REQUIRE(frontend->write(handle.inode, 0, first) == first.size());
 
@@ -671,8 +749,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_spool_byte_limit_applies_before_unbounde
     }
     CHECK(refused);
 
-    const auto spool_dir =
-        config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
+    const auto spool_dir = config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
     const auto spool = spool_dir / ("inode-" + std::to_string(handle.inode) + ".spool");
     REQUIRE(std::filesystem::exists(spool));
     CHECK(std::filesystem::file_size(spool) == first.size());
@@ -695,8 +772,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_operation_journal_admission_is_bounded_w
 
     // Keep one durable DATA operation outstanding so unrelated namespace work
     // cannot take the normal "pending == 0" journal reset fast path.
-    auto hold = frontend->create("/journal-hold.bin", 0600, getuid(), getgid(),
-                                 true, true, false);
+    auto hold = frontend->create("/journal-hold.bin", 0600, getuid(), getgid(), true, true, false);
     const auto payload = pattern(64 * 1024, 91);
     REQUIRE(frontend->write(hold.inode, 0, payload) == payload.size());
     frontend->release(hold.inode, true); // local durability only; publication remains quiet
@@ -793,7 +869,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_yields_to_playback) {
     auto& service = fixture.start();
     {
         auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
-        auto handle = frontend->create("/playback-yield.bin", 0600, getuid(), getgid(), true, true, false);
+        auto handle =
+            frontend->create("/playback-yield.bin", 0600, getuid(), getgid(), true, true, false);
         const auto inode = handle.inode;
         REQUIRE(inode != 0);
         REQUIRE(frontend->wait_for_idle(5s));
@@ -841,8 +918,8 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_durable_journal_recovers_namespace
         service.filesystem().store().foreground_activity(1);
         frontend->mkdir("/TV", 0755, getuid(), getgid());
         frontend->mkdir("/TV/Buffy", 0755, getuid(), getgid());
-        auto handle = frontend->create("/TV/Buffy/S07E01.mp4", 0644, getuid(), getgid(),
-                                       true, true, false);
+        auto handle =
+            frontend->create("/TV/Buffy/S07E01.mp4", 0644, getuid(), getgid(), true, true, false);
         inode = handle.inode;
         REQUIRE(frontend->write(inode, 0, payload) == payload.size());
         frontend->release(inode, true);
@@ -973,13 +1050,19 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_durable_journal_recovers_ordered_m
         REQUIRE(recovered->wait_for_idle(20s));
 
         bool old_missing = false;
-        try { (void)service.filesystem().getattr(std::string(old_path)); }
-        catch (const FsError& e) { old_missing = e.code() == ENOENT; }
+        try {
+            (void)service.filesystem().getattr(std::string(old_path));
+        } catch (const FsError& e) {
+            old_missing = e.code() == ENOENT;
+        }
         CHECK(old_missing);
 
         bool removed_missing = false;
-        try { (void)service.filesystem().getattr(std::string(removed_path)); }
-        catch (const FsError& e) { removed_missing = e.code() == ENOENT; }
+        try {
+            (void)service.filesystem().getattr(std::string(removed_path));
+        } catch (const FsError& e) {
+            removed_missing = e.code() == ENOENT;
+        }
         CHECK(removed_missing);
 
         auto committed = service.filesystem().getattr(std::string(new_path));
@@ -1168,8 +1251,11 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_batches_unlinks_then_parent_rmd
     CHECK(status.journal_records_appended == 6);
     CHECK(service.filesystem().local_committed_metadata_generation() == generation_before + 1);
     bool missing = false;
-    try { (void)service.filesystem().getattr("/doomed"); }
-    catch (const FsError& error) { missing = error.code() == ENOENT; }
+    try {
+        (void)service.filesystem().getattr("/doomed");
+    } catch (const FsError& error) {
+        missing = error.code() == ENOENT;
+    }
     CHECK(missing);
 }
 
@@ -1438,8 +1524,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_preserves_unreferenced_s
         if (!name.starts_with("inode-999.spool.orphan."))
             continue;
         std::ifstream in(entry.path(), std::ios::binary);
-        std::string bytes((std::istreambuf_iterator<char>(in)),
-                          std::istreambuf_iterator<char>());
+        std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         CHECK(bytes == "unattributed bytes");
         preserved = true;
     }
@@ -1450,8 +1535,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_preserves_unreferenced_s
 size_t linux_open_fd_count() {
     std::error_code ec;
     size_t count = 0;
-    for (std::filesystem::directory_iterator it("/proc/self/fd", ec), end;
-         !ec && it != end; it.increment(ec))
+    for (std::filesystem::directory_iterator it("/proc/self/fd", ec), end; !ec && it != end;
+         it.increment(ec))
         ++count;
     REQUIRE(!ec);
     return count;
@@ -1475,8 +1560,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_spool_descriptors_are_bounded) 
         service.filesystem().store().foreground_activity(1);
         const auto before_dirty = linux_open_fd_count();
         for (size_t i = 0; i < dirty_inodes; ++i) {
-            auto handle = frontend->create("/fd-" + std::to_string(i), 0644,
-                                           getuid(), getgid(), true, true, false);
+            auto handle = frontend->create("/fd-" + std::to_string(i), 0644, getuid(), getgid(),
+                                           true, true, false);
             const Bytes byte{static_cast<uint8_t>(i)};
             REQUIRE(frontend->write(handle.inode, 0, byte) == byte.size());
             frontend->release(handle.inode, true);
@@ -1528,8 +1613,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_idle_spool_descriptor_reopens_for_append
     {
         auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
         service.filesystem().store().foreground_activity(1);
-        auto created = frontend->create("/append-after-idle.bin", 0644, getuid(), getgid(),
-                                        true, true, false);
+        auto created =
+            frontend->create("/append-after-idle.bin", 0644, getuid(), getgid(), true, true, false);
         const auto inode = created.inode;
         REQUIRE(frontend->write(inode, 0, first) == first.size());
         frontend->release(inode, true);
@@ -1618,8 +1703,8 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_recovery_starts_without_new_fuse_a
         auto payload = pattern(4 * config.extent_size);
         service.filesystem().store().foreground_activity(1);
         for (size_t i = 0; i < files; ++i) {
-            auto handle = frontend->open("/recover-autostart-" + std::to_string(i) + ".bin",
-                                         true, true, false, false);
+            auto handle = frontend->open("/recover-autostart-" + std::to_string(i) + ".bin", true,
+                                         true, false, false);
             REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
             frontend->release(handle.inode, true);
         }
@@ -1634,9 +1719,9 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_recovery_starts_without_new_fuse_a
     // its own object writes use the same accounting and would otherwise throttle
     // themselves. Do not issue any FUSE request after the restarted frontend is
     // constructed.
-    REQUIRE(wait_until([&] {
-        return service.filesystem().foreground_idle_for() >= config.fuse.publication_quiet;
-    }, 2s));
+    REQUIRE(wait_until(
+        [&] { return service.filesystem().foreground_idle_for() >= config.fuse.publication_quiet; },
+        2s));
     service.filesystem().store().interactive_activity(1);
 
     // With a recovery budget of two, both slots should become runnable immediately
@@ -1672,8 +1757,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_publication_concurrency_is_boun
     constexpr size_t files = 4;
     auto payload = pattern(4 * config.extent_size);
     for (size_t i = 0; i < files; ++i)
-        service.filesystem().create_file("/recover-" + std::to_string(i) + ".bin",
-                                         0644, getuid(), getgid());
+        service.filesystem().create_file("/recover-" + std::to_string(i) + ".bin", 0644, getuid(),
+                                         getgid());
 
     // Make the first frontend leave a real durable backlog rather than racing
     // the local object store while the test is constructing it.
@@ -1681,8 +1766,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_publication_concurrency_is_boun
         auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
         service.filesystem().store().foreground_activity(1);
         for (size_t i = 0; i < files; ++i) {
-            auto handle = frontend->open("/recover-" + std::to_string(i) + ".bin",
-                                         true, true, false, false);
+            auto handle =
+                frontend->open("/recover-" + std::to_string(i) + ".bin", true, true, false, false);
             REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
             frontend->release(handle.inode, true);
         }
@@ -1732,7 +1817,8 @@ void append_fuse_journal_test_records(const std::filesystem::path& journal,
     size_t offset = 0;
     while (offset < bytes.size()) {
         const auto written = ::write(fd, bytes.data() + offset, bytes.size() - offset);
-        if (written < 0 && errno == EINTR) continue;
+        if (written < 0 && errno == EINTR)
+            continue;
         REQUIRE(written > 0);
         offset += static_cast<size_t>(written);
     }
@@ -1753,8 +1839,7 @@ Bytes fuse_namespace_marker(uint8_t type, uint64_t sequence) {
     return payload.take();
 }
 
-std::vector<Bytes> fuse_namespace_markers(uint8_t type, uint64_t first,
-                                          uint64_t last_exclusive) {
+std::vector<Bytes> fuse_namespace_markers(uint8_t type, uint64_t first, uint64_t last_exclusive) {
     std::vector<Bytes> records;
     records.reserve(static_cast<size_t>(last_exclusive - first));
     for (uint64_t sequence = first; sequence < last_exclusive; ++sequence)
@@ -1770,9 +1855,8 @@ std::vector<uint8_t> fuse_journal_record_types(const std::filesystem::path& jour
     constexpr size_t header_size = 8; // "MACHFUS1"
     REQUIRE(bytes.size() >= header_size);
     std::vector<uint8_t> types;
-    const auto scan = scan_fuse_journal_frames(
-        bytes, header_size,
-        [&](std::span<const uint8_t> payload, size_t) {
+    const auto scan =
+        scan_fuse_journal_frames(bytes, header_size, [&](std::span<const uint8_t> payload, size_t) {
             REQUIRE(!payload.empty());
             types.push_back(payload.front());
         });
@@ -1780,7 +1864,8 @@ std::vector<uint8_t> fuse_journal_record_types(const std::filesystem::path& jour
     return types;
 }
 
-MACHA_TEST("filesystem_fuse", test_fuse_namespace_recovery_survives_partial_published_marker_group) {
+MACHA_TEST("filesystem_fuse",
+           test_fuse_namespace_recovery_survives_partial_published_marker_group) {
     TestService fixture("fuse-namespace-partial-published-group");
     auto& config = fixture.config();
     config.replication = 1;
@@ -1794,8 +1879,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_recovery_survives_partial_publ
         auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
         service.filesystem().store().foreground_activity(1);
         for (uint64_t i = 0; i < operations; ++i)
-            frontend->mkdir("/published-crash-" + std::to_string(i), 0755,
-                            getuid(), getgid());
+            frontend->mkdir("/published-crash-" + std::to_string(i), 0755, getuid(), getgid());
         frontend->stop();
     }
 
@@ -1811,13 +1895,10 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_recovery_survives_partial_publ
         committed.push_back(std::move(mutation));
     }
     CHECK(service.filesystem().apply_namespace_batch(committed).applied == operations);
-    const auto generation_after_commit =
-        service.filesystem().local_committed_metadata_generation();
+    const auto generation_after_commit = service.filesystem().local_committed_metadata_generation();
 
-    const auto spool_dir =
-        config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
-    const auto journal = config.fuse.operation_journal_path.value_or(
-        spool_dir / "operations.log");
+    const auto spool_dir = config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
+    const auto journal = config.fuse.operation_journal_path.value_or(spool_dir / "operations.log");
     // A crash can expose any prefix of a grouped append. Sequence zero is
     // reserved; this fresh journal's namespace operations are 1..operations.
     const auto published = fuse_namespace_markers(4, 1, 1 + published_prefix);
@@ -1854,8 +1935,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_recovery_survives_partial_done
         auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
         service.filesystem().store().foreground_activity(1);
         for (uint64_t i = 0; i < operations; ++i)
-            frontend->mkdir("/done-crash-" + std::to_string(i), 0755,
-                            getuid(), getgid());
+            frontend->mkdir("/done-crash-" + std::to_string(i), 0755, getuid(), getgid());
         frontend->stop();
     }
 
@@ -1871,13 +1951,10 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_recovery_survives_partial_done
         committed.push_back(std::move(mutation));
     }
     CHECK(service.filesystem().apply_namespace_batch(committed).applied == operations);
-    const auto generation_after_commit =
-        service.filesystem().local_committed_metadata_generation();
+    const auto generation_after_commit = service.filesystem().local_committed_metadata_generation();
 
-    const auto spool_dir =
-        config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
-    const auto journal = config.fuse.operation_journal_path.value_or(
-        spool_dir / "operations.log");
+    const auto spool_dir = config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
+    const auto journal = config.fuse.operation_journal_path.value_or(spool_dir / "operations.log");
     const auto published = fuse_namespace_markers(4, 1, 1 + operations);
     append_fuse_journal_test_records(journal, published);
     const auto done = fuse_namespace_markers(5, 1, 1 + done_prefix);
@@ -1922,22 +1999,20 @@ MACHA_TEST("filesystem_fuse", test_fuse_live_admission_during_recovery_publicati
         auto frontend = std::make_shared<FuseFrontend>(fixture.filesystem(), config.fuse);
         fixture.store().foreground_activity(1);
         for (size_t i = 0; i < recovered_operations; ++i)
-            frontend->mkdir("/recovery-live-" + std::to_string(i), 0755,
-                            getuid(), getgid());
+            frontend->mkdir("/recovery-live-" + std::to_string(i), 0755, getuid(), getgid());
         frontend->stop();
     }
 
     std::atomic_bool gate_once{};
-    fixture.metadata().set_publication_retention(
-        [&](const MetadataPublicationContext&) {
-            if (!gate_once.exchange(true)) publication_gate.enter_and_wait();
-        });
+    fixture.metadata().set_publication_retention([&](const MetadataPublicationContext&) {
+        if (!gate_once.exchange(true))
+            publication_gate.enter_and_wait();
+    });
 
     auto replay = config.fuse;
     replay.publication_quiet = 0ms;
     replay.namespace_batch_operations = recovered_operations;
-    const auto generation_before =
-        fixture.filesystem().local_committed_metadata_generation();
+    const auto generation_before = fixture.filesystem().local_committed_metadata_generation();
     auto recovered = std::make_shared<FuseFrontend>(fixture.filesystem(), replay);
     const bool publication_entered = publication_gate.wait_for_entries(1, 5s);
     CHECK(publication_entered);
@@ -1971,8 +2046,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_live_admission_during_recovery_publicati
     CHECK(fixture.filesystem().getattr("/live-during-recovery").type == EntryType::directory);
 }
 
-
-MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_accepts_authoritative_data_done_without_published_prefix) {
+MACHA_TEST("filesystem_fuse",
+           test_fuse_durable_journal_accepts_authoritative_data_done_without_published_prefix) {
     TestService fixture("fuse-journal-done-recovery");
     auto& config = fixture.config();
     config.replication = 1;
@@ -1986,9 +2061,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_accepts_authoritative_da
     uint64_t inode = 0;
     {
         auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
-        auto handle =
-            frontend->create("/done-authoritative.bin", 0644, getuid(), getgid(),
-                             true, true, false);
+        auto handle = frontend->create("/done-authoritative.bin", 0644, getuid(), getgid(), true,
+                                       true, false);
         inode = handle.inode;
         const Bytes payload{0x10, 0x20, 0x30, 0x40};
         REQUIRE(frontend->write(inode, 0, payload) == payload.size());
@@ -2001,10 +2075,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_accepts_authoritative_da
         frontend->stop();
     }
 
-    const auto spool_dir =
-        config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
-    const auto journal = config.fuse.operation_journal_path.value_or(
-        spool_dir / "operations.log");
+    const auto spool_dir = config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
+    const auto journal = config.fuse.operation_journal_path.value_or(spool_dir / "operations.log");
 
     // Prove the setup actually produced the intended pre-publication state;
     // this test must not pass merely because publication raced the quiet gate.
@@ -2041,10 +2113,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_rejects_unbacked_data_do
         frontend->stop();
     }
 
-    const auto spool_dir =
-        config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
-    const auto journal = config.fuse.operation_journal_path.value_or(
-        spool_dir / "operations.log");
+    const auto spool_dir = config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
+    const auto journal = config.fuse.operation_journal_path.value_or(spool_dir / "operations.log");
 
     Writer done;
     done.u8(7); // persisted JournalRecord::data_done value
@@ -2085,8 +2155,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_drops_only_inode_with_mi
         frontend->stop();
     }
 
-    const auto spool = config.state_path / "fuse-spool" /
-                       ("inode-" + std::to_string(inode) + ".spool");
+    const auto spool =
+        config.state_path / "fuse-spool" / ("inode-" + std::to_string(inode) + ".spool");
     REQUIRE(std::filesystem::exists(spool));
     REQUIRE(std::filesystem::remove(spool));
 
@@ -2100,7 +2170,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_drops_only_inode_with_mi
     recovered->stop();
 }
 
-MACHA_TEST("filesystem_fuse", test_fuse_recovery_checksum_drops_corrupt_generation_and_preserves_published_file) {
+MACHA_TEST("filesystem_fuse",
+           test_fuse_recovery_checksum_drops_corrupt_generation_and_preserves_published_file) {
     TestService fixture("fuse-journal-corrupt-spool");
     auto& config = fixture.config();
     config.replication = 1;
@@ -2125,8 +2196,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_checksum_drops_corrupt_generati
         frontend->stop();
     }
 
-    const auto spool = config.state_path / "fuse-spool" /
-                       ("inode-" + std::to_string(inode) + ".spool");
+    const auto spool =
+        config.state_path / "fuse-spool" / ("inode-" + std::to_string(inode) + ".spool");
     REQUIRE(std::filesystem::exists(spool));
     {
         std::fstream file(spool, std::ios::binary | std::ios::in | std::ios::out);
@@ -2225,27 +2296,33 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_unlink_and_rename_over_open_ino
         REQUIRE(frontend->wait_for_idle(10s));
         CHECK(!frontend->inode_for_path("/doomed.bin").has_value());
         bool missing = false;
-        try { (void)service.filesystem().getattr("/doomed.bin"); }
-        catch (const FsError& e) { missing = e.code() == ENOENT; }
+        try {
+            (void)service.filesystem().getattr("/doomed.bin");
+        } catch (const FsError& e) {
+            missing = e.code() == ENOENT;
+        }
         CHECK(missing);
 
         // More subtle: POSIX rename may replace a destination which still has
         // an open descriptor. The displaced inode remains a valid open identity,
         // but it no longer owns that pathname. Releasing dirty data through the
         // old descriptor must not overwrite/resurrect the new destination.
-        auto destination = frontend->create("/target.bin", 0600, getuid(), getgid(), true, true, false);
+        auto destination =
+            frontend->create("/target.bin", 0600, getuid(), getgid(), true, true, false);
         auto old_bytes = pattern(32768);
         REQUIRE(frontend->write(destination.inode, 0, old_bytes) == old_bytes.size());
         frontend->release(destination.inode, true);
         REQUIRE(frontend->wait_for_idle(10s));
 
         auto old_open = frontend->open("/target.bin", true, true, false, false);
-        std::array<uint8_t, 8> stale{{'S','T','A','L','E','!','!','!'}};
+        std::array<uint8_t, 8> stale{{'S', 'T', 'A', 'L', 'E', '!', '!', '!'}};
         REQUIRE(frontend->write(old_open.inode, 0, stale) == stale.size());
 
-        auto source = frontend->create("/replacement.bin", 0600, getuid(), getgid(), true, true, false);
+        auto source =
+            frontend->create("/replacement.bin", 0600, getuid(), getgid(), true, true, false);
         auto replacement = pattern(98304);
-        for (auto& byte : replacement) byte ^= 0x7d;
+        for (auto& byte : replacement)
+            byte ^= 0x7d;
         REQUIRE(frontend->write(source.inode, 0, replacement) == replacement.size());
         frontend->flush(source.inode);
         frontend->rename("/replacement.bin", "/target.bin");
@@ -2293,13 +2370,16 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_read_overlay_truncate_and_hydra
         auto handle = frontend->open("/read.bin", true, true, false, false);
 
         auto patch = pattern(16384);
-        for (auto& byte : patch) byte ^= 0x91;
+        for (auto& byte : patch)
+            byte ^= 0x91;
         const uint64_t patch_offset = 4096;
         REQUIRE(frontend->write(handle.inode, patch_offset, patch) == patch.size());
         Bytes view(32768);
         REQUIRE(frontend->read(handle.inode, 0, view) == view.size());
-        auto expected_view = Bytes(committed.begin(), committed.begin() + static_cast<ptrdiff_t>(view.size()));
-        std::copy(patch.begin(), patch.end(), expected_view.begin() + static_cast<ptrdiff_t>(patch_offset));
+        auto expected_view =
+            Bytes(committed.begin(), committed.begin() + static_cast<ptrdiff_t>(view.size()));
+        std::copy(patch.begin(), patch.end(),
+                  expected_view.begin() + static_cast<ptrdiff_t>(patch_offset));
         CHECK(view == expected_view);
 
         // A committed-range read emits one high-priority FUSE run into the
@@ -2332,7 +2412,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_read_overlay_truncate_and_hydra
         CHECK(std::all_of(extended.begin(), extended.end(), [](uint8_t b) { return b == 0; }));
         Bytes beyond_eof(4096, 0xff);
         CHECK(frontend->read(handle.inode, config.extent_size + 1024, beyond_eof) == 0);
-        std::array<uint8_t, 6> marker{{'M','A','C','H','A','!'}};
+        std::array<uint8_t, 6> marker{{'M', 'A', 'C', 'H', 'A', '!'}};
         REQUIRE(frontend->write(handle.inode, 40000, marker) == marker.size());
         Bytes marker_view(64, 0xff);
         REQUIRE(frontend->read(handle.inode, 39984, marker_view) == marker_view.size());
@@ -2346,11 +2426,13 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_read_overlay_truncate_and_hydra
         Bytes final_bytes(65536);
         size_t offset = 0;
         while (offset < final_bytes.size()) {
-            auto n = reader->read(offset, {final_bytes.data() + offset, final_bytes.size() - offset});
+            auto n =
+                reader->read(offset, {final_bytes.data() + offset, final_bytes.size() - offset});
             REQUIRE(n > 0);
             offset += n;
         }
-        CHECK(std::equal(patch.begin(), patch.end(), final_bytes.begin() + static_cast<ptrdiff_t>(patch_offset)));
+        CHECK(std::equal(patch.begin(), patch.end(),
+                         final_bytes.begin() + static_cast<ptrdiff_t>(patch_offset)));
         CHECK(std::equal(marker.begin(), marker.end(), final_bytes.begin() + 40000));
         CHECK(std::all_of(final_bytes.begin() + 32768, final_bytes.begin() + 40000,
                           [](uint8_t b) { return b == 0; }));
@@ -2502,8 +2584,11 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_namespace_refresh_is_demand_dri
         auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
 
         bool missing = false;
-        try { (void)frontend->getattr("/external"); }
-        catch (const FsError& e) { missing = e.code() == ENOENT; }
+        try {
+            (void)frontend->getattr("/external");
+        } catch (const FsError& e) {
+            missing = e.code() == ENOENT;
+        }
         CHECK(missing);
 
         // Mutate the namespace outside the FUSE frontend. There is no refresh
@@ -2515,14 +2600,16 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_namespace_refresh_is_demand_dri
 
         service.filesystem().create_file("/external/media.bin", 0644, getuid(), getgid());
         auto entries = frontend->readdir("/external");
-        CHECK(std::any_of(entries.begin(), entries.end(), [](const auto& item) {
-            return item.first == "media.bin";
-        }));
+        CHECK(std::any_of(entries.begin(), entries.end(),
+                          [](const auto& item) { return item.first == "media.bin"; }));
 
         service.filesystem().unlink("/external/media.bin");
         missing = false;
-        try { (void)frontend->getattr("/external/media.bin"); }
-        catch (const FsError& e) { missing = e.code() == ENOENT; }
+        try {
+            (void)frontend->getattr("/external/media.bin");
+        } catch (const FsError& e) {
+            missing = e.code() == ENOENT;
+        }
         CHECK(missing);
     }
 }

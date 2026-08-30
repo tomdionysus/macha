@@ -124,3 +124,38 @@ Verification: the 27-test `storage_metadata` suite passed; the strengthened cold
   `rpc_cluster` group, 34/34.
 
 Evidence: [Phase 5 operational diagnostics](2026-08-30-phase-5-operational-diagnostics.md)
+
+## Phase 5: three-node operational diagnostics UAT
+
+- [x] Paused one deployed replica, admitted 257 directory operations through
+  MachaDFS, resumed the same process, verified identical 256-child views, and
+  removed the exact fixture with all three nodes active.
+- [x] Measured 12 publications for 514 create/delete operations, zero rejected
+  metadata jobs, zero accepted-head persistence failures, and bounded RPC queue
+  separation from CONTROL work.
+- [x] Proved the lagging replica imported required history and persisted one
+  final create head rather than every intermediate accepted head, with no new
+  reconstruction or delta replay on any node.
+- [x] Verified stable generation/counters/RSS, two canonical connections with
+  zero churn, direct Status responsiveness, and fully sleeping processes after
+  drain.
+- [x] Preserved physical DATA GC and repeated-burst RSS as explicit remaining
+  work rather than over-claiming them from a directory-only fixture.
+
+Evidence: [Phase 5 operational diagnostics UAT](2026-08-30-phase-5-operational-diagnostics-uat.md)
+
+## Phase 5: journal and convergence Status diagnostics
+
+- [x] Exposed existing namespace publication and operation-journal append/barrier
+  totals through an O(1), lock-free FUSE diagnostic snapshot.
+- [x] Exposed convergence event/run/epoch totals and scheduled state from the
+  existing edge-triggered demand object.
+- [x] Kept startup and non-mounted nodes explicit through `available`, and used
+  weak frontend ownership so Status cannot extend mount lifetime.
+- [x] Proved exact live-path journal semantics: inode descriptor admission,
+  operation admission, publication, and completion are four durable append
+  groups; recovered operations retain the existing two-group expectation.
+- [x] Passed the focused production-shaped API test, `filesystem_fuse` 44/44,
+  `invariants` 36/36, the complete default suite 204/204, and runtime 3/3.
+
+Evidence: [Phase 5 journal and convergence Status diagnostics](2026-08-30-phase-5-journal-convergence-status.md)

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "config.hpp"
 #include "crypto.hpp"
-#include "fuse_adapter.hpp"
 #include "ffmpeg_log.hpp"
+#include "fuse_adapter.hpp"
 #include "log.hpp"
 #include "service.hpp"
 #include <chrono>
@@ -17,8 +17,7 @@
 int main(int argc, char** argv) {
     try {
         auto config = macha::parse_config(argc, argv);
-        macha::Log::set_logger(
-            std::make_shared<macha::ConsoleLogger>(config.log_level));
+        macha::Log::set_logger(std::make_shared<macha::ConsoleLogger>(config.log_level));
         macha::configure_ffmpeg_logging(config.ffmpeg_log_level);
         auto keys = macha::load_cluster_keys(config.key_file);
         if (config.mount_path) {
@@ -44,9 +43,12 @@ int main(int argc, char** argv) {
         service.start();
 
         if (config.mount_path) {
-            int rc = macha::run_fuse(service.filesystem(), service.hydration().hydrator(),
-                                        *config.mount_path, config.fuse,
-                                        [&service] { service.request_stop(); });
+            int rc = macha::run_fuse(
+                service.filesystem(), service.hydration().hydrator(), *config.mount_path,
+                config.fuse, [&service] { service.request_stop(); },
+                [&service](std::weak_ptr<macha::FuseFrontend> frontend) {
+                    service.attach_fuse_frontend(std::move(frontend));
+                });
             macha::Log::debug("shutdown: main received FUSE return; stopping service");
             service.stop();
             macha::Log::debug("shutdown: main service stopped");

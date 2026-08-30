@@ -342,6 +342,10 @@ MACHA_TEST("invariants", test_status_api_precedes_control_plane_startup) {
     CHECK(startup->find("phase")->asString() == "starting");
     CHECK(startup->find("api")->asString() == "ready");
     CHECK(startup->find("control_plane")->asString() == "starting");
+    const auto* diagnostics = status.find("diagnostics");
+    REQUIRE(diagnostics != nullptr);
+    CHECK(diagnostics->find("convergence")->find("available")->asBool());
+    CHECK(!diagnostics->find("filesystem")->find("available")->asBool());
 
     control_gate.open();
     starter.join();
@@ -515,6 +519,8 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     CHECK(rpc_diagnostics->find("metadata_pending_jobs")->asUInt64() == 0);
     REQUIRE(rpc_diagnostics->find("frame_timings") != nullptr);
     REQUIRE(rpc_diagnostics->find("message_timings") != nullptr);
+    CHECK(!diagnostics->find("convergence")->find("available")->asBool());
+    CHECK(!diagnostics->find("filesystem")->find("available")->asBool());
 
     const auto* nodes = root.find("nodes");
     REQUIRE(nodes != nullptr);

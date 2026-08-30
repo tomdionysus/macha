@@ -294,6 +294,19 @@ polling. The second complete run passed 203/203 and runtime dependencies passed
 follow-up rather than being erased by the successful rerun. See
 `TODO/2026-08-30-phase-5-operational-diagnostics.md`.
 
+The deployed three-node diagnostic UAT then passed: 514 directory operations
+used 12 publications, the paused replica recovered required history and only
+the final missed accepted head, CONTROL queueing remained isolated from the
+metadata backlog, and all nodes returned to sleeping idle. Physical DATA GC and
+the repeated-burst RSS ceiling remain intentionally open. See
+`TODO/2026-08-30-phase-5-operational-diagnostics-uat.md`.
+
+The remaining journal-barrier and convergence-run counters are now exposed by
+local Status through bounded existing state, with no sampler or polling. The
+default suite passed 204/204 and runtime passed 3/3. A deployed bounded UAT is
+the remaining step for the final counter delta. See
+`TODO/2026-08-30-phase-5-journal-convergence-status.md`.
+
 Exit criteria:
 
 - The three-node reproduction drains in bounded batches, foreground RPCs remain responsive, and all nodes return to event-driven idle.
