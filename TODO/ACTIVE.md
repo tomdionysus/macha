@@ -16,7 +16,6 @@ The existing documents in this directory remain the detailed plans, checkpoints,
 ## Diagnostics and operational proof still needed
 
 - [ ] Record a reproducible local benchmark recipe without default-suite timing thresholds.
-- [ ] Deploy the cluster Status telemetry aggregation correction and run its two-endpoint UAT: each single response must contain live numeric telemetry for every connected node and complete online aggregates, without client fan-out.
 - [ ] Correct the misleading Status `runtime.rss_bytes` metric, which currently uses lifetime-peak `ru_maxrss`. Report current resident bytes, or expose separately and explicitly named current and peak values; add platform-aware contract tests and operational documentation.
 - [ ] After correcting the RSS metric, repeat the namespace-burst UAT for at least three rounds after every materialization cache reaches its 64-entry bound, then establish whether current RSS reaches a stable ceiling or decays after drain.
 - [ ] Diagnose the concurrent-suite failure in `hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`. It originally timed out once during Phase 5 and then passed isolated and in the following full run. During the telemetry-aggregation checkpoint it timed out at the same 10-second assertion in two consecutive complete runs (12-way and 4-way concurrency), while an immediate isolated run passed in 0.890 seconds. Preserve the captured logs and diagnose the missing catalogue completion signal/state transition; do not increase the timeout or dismiss it as timing noise.
