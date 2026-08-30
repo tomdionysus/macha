@@ -51,6 +51,28 @@ struct WriteHandleDiagnostics {
     size_t rebuild_put_extents{};
 };
 
+struct FilesystemNamespaceMutation {
+    enum class Kind : uint8_t { mkdir, create, rmdir, unlink, rename, chmod, chown, utimens };
+    Kind kind{};
+    std::string from;
+    std::string to;
+    bool noreplace{};
+    uint32_t mode{};
+    uint32_t uid{};
+    uint32_t gid{};
+    bool set_uid{};
+    bool set_gid{};
+    int64_t mtime_ns{};
+};
+
+struct FilesystemNamespaceBatchResult {
+    MetadataRecord record;
+    size_t applied{};
+    std::vector<std::optional<FsEntry>> entries;
+    std::optional<int> failure_code;
+    std::string failure_message;
+};
+
 class ReadHandle {
     DistributedStore& s_;
     FsEntry e_;
@@ -194,6 +216,8 @@ class FileSystem {
     void commit_write(WriteHandle&, const FsEntry&, uint64_t,
                       const std::vector<ExtentRef>&, FsEntry*);
     static void require_parent(const MetadataSnapshot&, const std::string&);
+    static std::optional<FsEntry> apply_namespace_mutation(
+        MetadataSnapshot&, MetadataDelta&, const FilesystemNamespaceMutation&);
 
   public:
     FileSystem(NodeRuntime&, DistributedStore&, MetadataManager&, PlaybackTracker* = nullptr);
@@ -207,6 +231,8 @@ class FileSystem {
     void chmod(const std::string&, uint32_t);
     void chown(const std::string&, uint32_t, uint32_t, bool, bool);
     void utimens(const std::string&, int64_t);
+    FilesystemNamespaceBatchResult apply_namespace_batch(
+        std::span<const FilesystemNamespaceMutation>);
     void truncate_file(const std::string&, uint64_t);
     std::shared_ptr<ReadHandle> open_read(const std::string&);
     // Open an already-resolved immutable metadata snapshot. Playback uses this
