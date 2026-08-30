@@ -595,11 +595,10 @@ bool NodeRuntime::accept_metadata_commit(const MetadataAcceptance& acceptance) {
     // reject the transition. MetadataReplica validates the certificate against
     // the commit and its parent policies.
     if (acceptance.required) {
-        auto record = metadata_replica().historical(acceptance.hash);
-        if (!record)
+        auto materialized = metadata_replica().materialized(acceptance.hash);
+        if (!materialized)
             return false;
-        const auto snapshot = decode_snapshot(record->payload);
-        if (snapshot.metadata_write_replicas_required !=
+        if (materialized->snapshot->metadata_write_replicas_required !=
             cfg_.metadata_min_write_replicas)
             return false;
     }

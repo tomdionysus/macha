@@ -477,6 +477,17 @@ struct FuseFrontend::State {
     std::atomic_uint64_t timed_out_requests{};
     std::atomic_uint64_t merged_publications{};
     std::atomic_uint64_t backend_failures{};
+    // Monotonic diagnostic counters. They deliberately count durable frontend
+    // work rather than infer it from queue depth, so batching and crash-replay
+    // tests can assert amplification without timing-sensitive observation.
+    std::atomic_uint64_t namespace_operations_admitted{};
+    std::atomic_uint64_t namespace_operations_recovered{};
+    std::atomic_uint64_t namespace_publication_attempts{};
+    std::atomic_uint64_t namespace_operations_published{};
+    std::atomic_uint64_t namespace_operations_confirmed{};
+    std::atomic_uint64_t journal_append_batches{};
+    std::atomic_uint64_t journal_records_appended{};
+    std::atomic_uint64_t journal_durability_barriers{};
 
     explicit State(FileSystem& filesystem, FuseConfig policy)
         : fs(filesystem), config(std::move(policy)),
@@ -760,6 +771,9 @@ struct FuseFrontend::State {
                 write_exact(journal_fd, frame);
             }
             fsync_fd(journal_fd, "cannot sync FUSE operation journal");
+            journal_append_batches.fetch_add(1, std::memory_order_relaxed);
+            journal_records_appended.fetch_add(payloads.size(), std::memory_order_relaxed);
+            journal_durability_barriers.fetch_add(1, std::memory_order_relaxed);
         } catch (...) {
             // A durability batch is all-or-nothing from recovery's point of
             // view. Do not leave earlier records from a failed batch in front
@@ -831,6 +845,7 @@ struct FuseFrontend::State {
         std::lock_guard lock(journal_mutex);
         append_journal_record_locked(payload.data(), true);
         durable_pending_operations.fetch_add(1, std::memory_order_relaxed);
+        namespace_operations_admitted.fetch_add(1, std::memory_order_relaxed);
     }
 
     void journal_data_operation(uint64_t inode, const DataOp& op) {
@@ -1828,12 +1843,14 @@ struct FuseFrontend::State {
                     // must not take the shared metadata transaction while viewer
                     // playback is waiting for storage/RPC service.
                     wait_for_playback_quiet();
+                    namespace_publication_attempts.fetch_add(1, std::memory_order_relaxed);
                     {
                         std::lock_guard backend(publication_mutex);
                         apply_namespace_backend(op);
                     }
                     namespace_success(op);
                     journal_namespace_published(op.sequence);
+                    namespace_operations_published.fetch_add(1, std::memory_order_relaxed);
                     published = true;
                 } catch (const std::exception& e) {
                     ++backend_failures;
@@ -1869,6 +1886,7 @@ struct FuseFrontend::State {
                     confirmed = namespace_effect_confirmed(op, *available->snapshot);
                 if (confirmed) {
                     journal_namespace_done(op.sequence);
+                    namespace_operations_confirmed.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     std::lock_guard lock(namespace_queue_mutex);
                     namespace_unconfirmed.push_back(op);
@@ -2775,17 +2793,21 @@ struct FuseFrontend::State {
         if (!paths.contains(canonical_path("/")))
             throw std::runtime_error("FUSE frontend cannot initialise without namespace root");
 
+        size_t recovered_namespace_operations = 0;
         {
             std::lock_guard queue_lock(namespace_queue_mutex);
             for (const auto& [sequence, op] : recovery.namespace_ops) {
                 if (recovery.namespace_done.contains(sequence))
                     continue;
+                ++recovered_namespace_operations;
                 if (recovery.namespace_published.contains(sequence))
                     namespace_unconfirmed.push_back(op);
                 else
                     namespace_queue.push_back(op);
             }
         }
+        namespace_operations_recovered.fetch_add(
+            recovered_namespace_operations, std::memory_order_relaxed);
         refreshed_namespace_revision.store(view.namespace_revision, std::memory_order_release);
         if (recovery.pending_operations) {
             Log::warn("recovered durable FUSE operations pending=" +
@@ -4118,6 +4140,14 @@ FuseFrontendStatus FuseFrontend::status() const {
     out.backend_failures = state_->backend_failures.load();
     out.durability_batches = state_->durability_batches.load();
     out.durability_writes = state_->durability_writes.load();
+    out.namespace_operations_admitted = state_->namespace_operations_admitted.load();
+    out.namespace_operations_recovered = state_->namespace_operations_recovered.load();
+    out.namespace_publication_attempts = state_->namespace_publication_attempts.load();
+    out.namespace_operations_published = state_->namespace_operations_published.load();
+    out.namespace_operations_confirmed = state_->namespace_operations_confirmed.load();
+    out.journal_append_batches = state_->journal_append_batches.load();
+    out.journal_records_appended = state_->journal_records_appended.load();
+    out.journal_durability_barriers = state_->journal_durability_barriers.load();
     return out;
 }
 

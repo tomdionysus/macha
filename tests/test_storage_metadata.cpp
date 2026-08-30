@@ -921,6 +921,109 @@ MACHA_FAST_TEST("storage_metadata", test_protocol20_delta_preserves_governance_s
     REQUIRE(reopened.acceptance(child.hash).has_value());
 }
 
+MACHA_FAST_TEST("storage_metadata", test_metadata_delta_chain_reuses_bounded_materialized_head) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto origin = random_node_id();
+
+    auto snapshot = decode_snapshot(genesis_metadata().payload);
+    snapshot.metadata_voters.clear();
+    snapshot.metadata_write_replicas_required = 1;
+
+    MetadataRecord head;
+    head.generation = 2;
+    head.previous = genesis_metadata().hash;
+    head.payload = encode_snapshot(snapshot);
+    head.hash = metadata_hash(head.generation, head.previous, head.payload);
+
+    const auto path = t.path() / "delta-reconstruction-amplification";
+    constexpr size_t chain_length = 200;
+    std::optional<MetadataRecord> early_record;
+    {
+        MetadataReplica replica(path, keys.storage);
+        REQUIRE(replica.store_commit(head));
+        for (size_t i = 0; i < chain_length; ++i) {
+            auto next_snapshot = snapshot;
+            next_snapshot.mutation_sequences[origin] = i + 1;
+            FsEntry entry;
+            entry.type = EntryType::file;
+            entry.mode = 0644;
+            entry.version = 1;
+            next_snapshot.entries["/delta-" + std::to_string(i)] = entry;
+
+            auto delta = metadata_delta(snapshot, next_snapshot);
+            REQUIRE(delta.has_value());
+            auto encoded_delta = encode_metadata_delta(*delta);
+
+            MetadataRecord child;
+            child.generation = head.generation + 1;
+            child.previous = head.hash;
+            child.payload = encode_snapshot(next_snapshot);
+            child.hash = metadata_hash(child.generation, child.previous, child.payload);
+            REQUIRE(replica.store_commit(child, encoded_delta));
+            if (i == 5)
+                early_record = child;
+            snapshot = std::move(next_snapshot);
+            head = std::move(child);
+        }
+    }
+
+    // Reopening removes any process-local materializations produced while the
+    // chain was built. The first lookup must reconstruct it; the second must
+    // reuse the validated immutable result.
+    MetadataReplica replica(path, keys.storage);
+    const auto before = replica.diagnostics();
+    auto first = replica.historical(head.hash);
+    const auto middle = replica.diagnostics();
+    auto second = replica.historical(head.hash);
+    const auto after = replica.diagnostics();
+    REQUIRE(first.has_value());
+    REQUIRE(second.has_value());
+    CHECK(first->payload == head.payload);
+    CHECK(second->payload == head.payload);
+
+    CHECK(middle.historical_requests - before.historical_requests == 1);
+    CHECK(after.historical_requests - middle.historical_requests == 1);
+    CHECK(middle.historical_reconstructions - before.historical_reconstructions == 1);
+    CHECK(after.historical_reconstructions - middle.historical_reconstructions == 0);
+    CHECK(middle.historical_deltas_applied - before.historical_deltas_applied == chain_length);
+    CHECK(after.historical_deltas_applied - middle.historical_deltas_applied == 0);
+    CHECK(after.materialization_cache_hits - middle.materialization_cache_hits == 1);
+    CHECK(middle.materialization_cache_misses - before.materialization_cache_misses == 1);
+    CHECK(after.materialization_cache_entries <= 64);
+    CHECK(after.materialization_cache_evictions > before.materialization_cache_evictions);
+
+    auto first_materialized = replica.materialized(head.hash);
+    auto second_materialized = replica.materialized(head.hash);
+    REQUIRE(first_materialized != nullptr);
+    REQUIRE(second_materialized != nullptr);
+    CHECK(first_materialized == second_materialized);
+    CHECK(first_materialized->snapshot == second_materialized->snapshot);
+    CHECK(encode_snapshot(*first_materialized->snapshot) == head.payload);
+
+    // Materialization is an optimization, never authority. This history was
+    // deliberately stored without an acceptance certificate.
+    CHECK(!replica.acceptance(head.hash).has_value());
+    const auto accepted = replica.accepted_heads();
+    CHECK(std::none_of(accepted.begin(), accepted.end(),
+                       [&](const MetadataRecord& record) { return record.hash == head.hash; }));
+
+    // The bounded cache evicts old, non-authoritative materializations. Such a
+    // record remains reconstructible from durable history and must return
+    // byte-identical state when requested again.
+    REQUIRE(early_record.has_value());
+    const auto before_evicted_lookup = replica.diagnostics();
+    auto reconstructed_early = replica.historical(early_record->hash);
+    const auto after_evicted_lookup = replica.diagnostics();
+    REQUIRE(reconstructed_early.has_value());
+    CHECK(reconstructed_early->payload == early_record->payload);
+    CHECK(after_evicted_lookup.historical_reconstructions -
+              before_evicted_lookup.historical_reconstructions == 1);
+    CHECK(after_evicted_lookup.materialization_cache_entries <= 64);
+}
+
 MACHA_FAST_TEST("storage_metadata", test_metadata_conflict_resolution_is_not_resurrected_by_merge) {
     const auto genesis = genesis_metadata();
     auto base = decode_snapshot(genesis.payload);

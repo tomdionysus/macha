@@ -896,6 +896,48 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_durable_journal_recovers_ordered_m
     }
 }
 
+MACHA_TEST("filesystem_fuse", test_fuse_recovery_characterizes_one_publication_per_namespace_operation) {
+    TestService fixture("fuse-namespace-publication-amplification");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 30s;
+
+    auto& service = fixture.start();
+    constexpr size_t operations = 8;
+
+    // Admit an ordered durable namespace backlog while publication is held
+    // behind the foreground quiet boundary, then cross a frontend restart so
+    // the ordinary recovery path owns the entire backlog.
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        service.filesystem().store().foreground_activity(1);
+        for (size_t i = 0; i < operations; ++i)
+            frontend->mkdir("/pending-" + std::to_string(i), 0755, getuid(), getgid());
+        CHECK(frontend->status().namespace_operations_admitted == operations);
+        frontend->stop();
+    }
+
+    auto replay = config.fuse;
+    replay.publication_quiet = 0ms;
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    REQUIRE(recovered->wait_for_idle(20s));
+    const auto status = recovered->status();
+
+    CHECK(status.namespace_operations_recovered == operations);
+    CHECK(status.namespace_publication_attempts == operations);
+    CHECK(status.namespace_operations_published == operations);
+    CHECK(status.namespace_operations_confirmed == operations);
+    // Current baseline: each operation writes and syncs its own published
+    // marker and then its own done marker. Phase 2 will intentionally replace
+    // these equalities with batch bounds.
+    CHECK(status.journal_append_batches == operations * 2);
+    CHECK(status.journal_records_appended == operations * 2);
+    CHECK(status.journal_durability_barriers == operations * 2);
+}
+
 MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_trims_torn_tail) {
     TestService fixture("fuse-journal-torn-tail");
     auto& config = fixture.config();
