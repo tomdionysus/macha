@@ -91,6 +91,9 @@ fuse:
   request_workers: 24
   max_pending_requests: 4096
   commit_workers: 8
+  # Compatibility setting retained for older configurations. Viewer reads now
+  # gate publication directly; loader writes use commit_workers when playback
+  # is quiet instead of being permanently classified as foreground activity.
   foreground_commit_workers: 1
   publication_quiet_ms: 5000
   max_pending_operations: 4096

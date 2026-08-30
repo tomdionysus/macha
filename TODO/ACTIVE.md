@@ -1,6 +1,6 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-08-30
+Last updated: 2026-08-31
 
 This is the working backlog for the current session. Add new work here. When an item is implemented and its stated verification is complete, remove it from this file and add a dated entry with evidence to `COMPLETED.md`.
 
@@ -45,10 +45,30 @@ The existing documents in this directory remain the detailed plans, checkpoints,
 - [ ] Add a test reproducing the deployed failure before claiming the reset is
   fixed. Retain the current focused tests, but do not treat them as sufficient
   UAT evidence.
-- [ ] Investigate whether ingest from the spool has performance problems unrelated to the namespace batching and convergence work currently in progress.
-- [ ] Extend spool-backpressure verification with multiple concurrent writers,
-  explicit fairness bounds, and restart while occupancy is already above the
-  throttle threshold. The first checkpoint covers configuration, hard-bound
-  accounting, pressure-triggered publication, drain recovery, and a completely
-  stalled publisher.
-- [ ] Run an rsync-style mounted-FUSE UAT: initial writes should run quickly, throughput should progressively approach sustainable publication speed as the spool fills, occupancy should remain bounded, and write speed should recover cleanly after the backlog drains.
+- [ ] Execute the phased FUSE publication throughput work in
+  [2026-08-31-fuse-publication-throughput-plan.md](2026-08-31-fuse-publication-throughput-plan.md).
+  The 2026-08-31 rsync UAT found a direct scheduler defect: any open writer caps
+  publication at the single foreground worker despite eight configured commit
+  workers, causing multi-GB head-of-line blocking at about 1.9 MB/s while disks
+  and CPUs are underused.
+- [ ] Deploy and UAT the first Phase 0/1 implementation checkpoint documented in
+  [2026-08-31-fuse-publication-phase-0-1-checkpoint.md](2026-08-31-fuse-publication-phase-0-1-checkpoint.md).
+  Deterministic coverage now proves open loaders use multiple workers, closed
+  files receive priority, demand coalesces, useful bytes reconcile, and viewer
+  demand gates publication. Explicit byte bounds and fair resumable quanta are
+  still pending, so Phase 1 is not yet complete.
+- [ ] Phase 0: add useful-byte and per-stage publication telemetry, split demand
+  coalescing from real publication counts, and record physical baselines.
+- [ ] Phase 1: remove the false single-publisher cap, prioritise closed files,
+  add fair concurrent publication with worker and byte bounds, and run the
+  four-file/three-node UAT checkpoint.
+- [ ] Phase 2: design and prove versioned durable incremental extent staging and
+  safe spool-range retirement without exposing partial files.
+- [ ] Phase 3: aggregate sequential local write descriptors and make durability
+  group commit byte/urgency driven.
+- [ ] Phase 4: pipeline bounded data RPC, isolate storage waits from control
+  communications, and aggregate compatible physical durability barriers.
+- [ ] Phase 5: integrate continuous progress rates, occupancy hysteresis,
+  concurrent-writer fairness, and authoritative catalogue hints.
+- [ ] Complete the final mixed-size rsync, concurrent-writer, communications,
+  restart, peer-loss, and idle-soak verification matrix.
