@@ -1054,6 +1054,83 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_chain_reuses_bounded_mat
     CHECK(after_evicted_lookup.materialization_cache_entries <= 64);
 }
 
+MACHA_FAST_TEST("storage_metadata",
+                test_metadata_materialization_cache_never_validates_corrupt_delta) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+
+    auto parent_snapshot = decode_snapshot(genesis_metadata().payload);
+    parent_snapshot.metadata_voters.clear();
+    parent_snapshot.metadata_write_replicas_required = 1;
+
+    MetadataRecord parent;
+    parent.generation = 2;
+    parent.previous = genesis_metadata().hash;
+    parent.payload = encode_snapshot(parent_snapshot);
+    parent.hash = metadata_hash(parent.generation, parent.previous, parent.payload);
+
+    MetadataReplica replica(t.path() / "corrupt-delta-cache", keys.storage);
+    REQUIRE(replica.store_commit(parent));
+    auto cached_parent = replica.materialized(parent.hash);
+    REQUIRE(cached_parent != nullptr);
+    const auto cache_after_parent = replica.diagnostics().materialization_cache_entries;
+
+    auto child_snapshot = parent_snapshot;
+    FsEntry child_directory;
+    child_directory.type = EntryType::directory;
+    child_directory.mode = 0755;
+    child_snapshot.entries["/valid-child"] = child_directory;
+    const auto child_delta = metadata_delta(parent_snapshot, child_snapshot);
+    REQUIRE(child_delta.has_value());
+
+    MetadataRecord child;
+    child.generation = parent.generation + 1;
+    child.previous = parent.hash;
+    child.payload = encode_snapshot(child_snapshot);
+    child.hash = metadata_hash(child.generation, child.previous, child.payload);
+
+    // This delta is well-formed and applicable to the cached parent, but it
+    // reconstructs a different successor than the claimed child hash. A cache
+    // hit for the parent must not turn that false history edge into authority.
+    auto wrong_snapshot = parent_snapshot;
+    wrong_snapshot.entries["/wrong-child"] = child_directory;
+    const auto wrong_delta = metadata_delta(parent_snapshot, wrong_snapshot);
+    REQUIRE(wrong_delta.has_value());
+
+    MetadataHistoryEntry corrupt;
+    corrupt.generation = child.generation;
+    corrupt.previous = parent.hash;
+    corrupt.hash = child.hash;
+    corrupt.previous_known = true;
+    corrupt.merge_parents = child_snapshot.merge_parents;
+    corrupt.body = MetadataHistoryEntry::Body::delta;
+    corrupt.payload = encode_metadata_delta(*wrong_delta);
+
+    CHECK(!replica.import_history(corrupt));
+    CHECK(!replica.history_contains(child.hash));
+    CHECK(replica.materialized(child.hash) == nullptr);
+    CHECK(replica.diagnostics().materialization_cache_entries == cache_after_parent);
+    CHECK(!replica.accept_commit({child.generation, child.hash, 1, {random_node_id()}}));
+
+    auto valid = corrupt;
+    valid.payload = encode_metadata_delta(*child_delta);
+    REQUIRE(replica.import_history(valid));
+    auto materialized_child = replica.materialized(child.hash);
+    REQUIRE(materialized_child != nullptr);
+    CHECK(materialized_child->record.payload == child.payload);
+    CHECK(encode_snapshot(*materialized_child->snapshot) == child.payload);
+
+    // A later corrupt duplicate with the same claimed identity is rejected
+    // before the existing valid history/cache entry is consulted as success.
+    CHECK(!replica.import_history(corrupt));
+    auto after_duplicate = replica.materialized(child.hash);
+    REQUIRE(after_duplicate != nullptr);
+    CHECK(after_duplicate == materialized_child);
+    CHECK(after_duplicate->record.payload == child.payload);
+}
+
 MACHA_FAST_TEST("storage_metadata", test_metadata_conflict_resolution_is_not_resurrected_by_merge) {
     const auto genesis = genesis_metadata();
     auto base = decode_snapshot(genesis.payload);
@@ -1374,6 +1451,7 @@ MACHA_TEST("storage_metadata", test_storage_pool_and_persistent_cache) {
         gc_complete = step.complete;
     }
     CHECK(gc_complete);
+    CHECK(gc_slices > 1);
     CHECK(gc_reclaimed > 0);
     CHECK(pool.has(gc_live));
     CHECK(pool.has(gc_protected));

@@ -35,15 +35,21 @@ void merge_membership(PersistedNodeStatus& out, const NodeInfo& member) {
     out.host = member.host;
     out.failure_domain = member.failure_domain;
     out.port = member.port;
-    out.storage_capacity = member.capacity;
-    out.storage_used = member.used;
     out.metadata_generation = std::max(out.metadata_generation, member.metadata_generation);
 }
 
 Json bytes_pair(uint64_t used, uint64_t capacity) {
-    return Json::Object{{"capacity_bytes", capacity},
+    return Json::Object{{"available", true},
+                        {"capacity_bytes", capacity},
                         {"used_bytes", used},
                         {"free_bytes", capacity > used ? capacity - used : 0}};
+}
+
+Json unavailable_bytes(std::optional<uint64_t> capacity = {}) {
+    return Json::Object{{"available", false},
+                        {"capacity_bytes", capacity ? Json(*capacity) : Json(nullptr)},
+                        {"used_bytes", Json(nullptr)},
+                        {"free_bytes", Json(nullptr)}};
 }
 
 Json rpc_timing_json(const RpcServerWorkStats::Timing& timing) {
@@ -126,14 +132,17 @@ Json identity_reset_json(const IdentityAssociationReset& reset) {
 
 Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeInfo* member,
                const NodeTelemetry* live, uint64_t live_age_ms, bool online, bool stale,
-               bool metadata_replica, const IdentityAssociationReset* identity_reset) {
+               bool telemetry_known, bool metadata_replica,
+               const IdentityAssociationReset* identity_reset) {
     Json::Object node;
     node["id"] = to_string(id);
     node["state"] = online ? "online" : "offline";
     node["telemetry_freshness"] =
-        online ? (live ? (stale ? "stale" : "live") : "unavailable") : "last_known";
+        live ? (stale ? "stale" : "live") : (telemetry_known ? "last_known" : "unavailable");
     node["observed_at_unix_ms"] =
-        live ? live->observed_unix_ms : (member ? member->seen_unix_ms : durable.observed_unix_ms);
+        live ? live->observed_unix_ms
+             : (telemetry_known ? durable.observed_unix_ms
+                                : (member ? member->seen_unix_ms : durable.observed_unix_ms));
     node["live_age_ms"] = live ? Json(live_age_ms) : Json(nullptr);
     node["version"] = live ? live->version : durable.version;
     node["host"] = member ? member->host : (live ? live->host : durable.host);
@@ -146,15 +155,22 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
                : (live ? live->metadata_generation : durable.metadata_generation);
 
     const auto storage_capacity =
-        member ? member->capacity : (live ? live->storage_capacity : durable.storage_capacity);
-    const auto storage_used =
-        member ? member->used : (live ? live->storage_used : durable.storage_used);
+        live ? live->storage_capacity
+             : (telemetry_known ? durable.storage_capacity : (member ? member->capacity : 0));
+    const auto storage_used = live ? live->storage_used : durable.storage_used;
     const auto cache_capacity = live ? live->cache_capacity : durable.cache_capacity;
     const auto cache_used = live ? live->cache_used : durable.cache_used;
-    node["storage"] = bytes_pair(storage_used, storage_capacity);
-    node["cache"] = bytes_pair(cache_used, cache_capacity);
-    node["storage_backends_online"] = static_cast<uint64_t>(live ? live->storage_backends_online
-                                                                 : durable.storage_backends_online);
+    node["storage"] =
+        live || telemetry_known
+            ? bytes_pair(storage_used, storage_capacity)
+            : unavailable_bytes(member ? std::optional<uint64_t>(member->capacity) : std::nullopt);
+    node["cache"] =
+        live || telemetry_known ? bytes_pair(cache_used, cache_capacity) : unavailable_bytes();
+    node["storage_backends_online"] =
+        live || telemetry_known
+            ? Json(static_cast<uint64_t>(live ? live->storage_backends_online
+                                              : durable.storage_backends_online))
+            : Json(nullptr);
 
     Json::Array roles;
     if (storage_capacity)
@@ -318,9 +334,20 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     for (const auto& member : membership_all)
         merge_membership(known[member.id], member);
 
+    std::set<NodeId> telemetry_known;
+    if (metadata)
+        for (const auto& [id, _] : metadata->node_status)
+            telemetry_known.insert(id);
+    for (const auto& telemetry : node_.telemetry().persisted())
+        telemetry_known.insert(telemetry.node_id);
+    for (const auto& [id, _] : live)
+        telemetry_known.insert(id);
+
     uint64_t known_capacity = 0, known_used = 0, online_capacity = 0, online_used = 0;
     uint64_t known_cache_capacity = 0, known_cache_used = 0, online_cache_capacity = 0,
              online_cache_used = 0;
+    bool known_storage_available = true, online_storage_available = true;
+    bool known_cache_available = true, online_cache_available = true;
     size_t online_nodes = 0;
     Json::Array nodes;
     for (const auto& [id, durable] : known) {
@@ -337,23 +364,31 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         const bool stale = current && found->second.age > fresh_for;
         const bool metadata_replica = true;
 
+        const bool has_telemetry = current || telemetry_known.contains(id);
         const auto storage_capacity =
-            member ? member->capacity
-                   : (current ? current->storage_capacity : durable.storage_capacity);
-        const auto storage_used =
-            member ? member->used : (current ? current->storage_used : durable.storage_used);
+            current ? current->storage_capacity
+                    : (has_telemetry ? durable.storage_capacity : (member ? member->capacity : 0));
+        const auto storage_used = current ? current->storage_used : durable.storage_used;
         const auto cache_capacity = current ? current->cache_capacity : durable.cache_capacity;
         const auto cache_used = current ? current->cache_used : durable.cache_used;
         known_capacity += storage_capacity;
-        known_used += storage_used;
-        known_cache_capacity += cache_capacity;
-        known_cache_used += cache_used;
+        known_storage_available = known_storage_available && has_telemetry;
+        known_cache_available = known_cache_available && has_telemetry;
+        if (has_telemetry) {
+            known_used += storage_used;
+            known_cache_capacity += cache_capacity;
+            known_cache_used += cache_used;
+        }
         if (online) {
             ++online_nodes;
             online_capacity += storage_capacity;
-            online_used += storage_used;
-            online_cache_capacity += cache_capacity;
-            online_cache_used += cache_used;
+            online_storage_available = online_storage_available && has_telemetry;
+            online_cache_available = online_cache_available && has_telemetry;
+            if (has_telemetry) {
+                online_used += storage_used;
+                online_cache_capacity += cache_capacity;
+                online_cache_used += cache_used;
+            }
         }
         const IdentityAssociationReset* identity_reset = nullptr;
         if (metadata) {
@@ -369,7 +404,7 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                 }
             }
         }
-        nodes.push_back(node_json(id, durable, member, current, age, online, stale,
+        nodes.push_back(node_json(id, durable, member, current, age, online, stale, has_telemetry,
                                   metadata_replica, identity_reset));
     }
 
@@ -454,10 +489,16 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     cluster["metadata_replica_set_validated_at_unix_ms"] = published_metadata.observed_unix_ms;
     cluster["metadata_quorum_validated_at_unix_ms"] =
         published_metadata.observed_unix_ms; // deprecated alias
-    cluster["storage_known"] = bytes_pair(known_used, known_capacity);
-    cluster["storage_online"] = bytes_pair(online_used, online_capacity);
-    cluster["cache_known"] = bytes_pair(known_cache_used, known_cache_capacity);
-    cluster["cache_online"] = bytes_pair(online_cache_used, online_cache_capacity);
+    cluster["storage_known"] = known_storage_available ? bytes_pair(known_used, known_capacity)
+                                                       : unavailable_bytes(known_capacity);
+    cluster["storage_online"] = online_storage_available ? bytes_pair(online_used, online_capacity)
+                                                         : unavailable_bytes(online_capacity);
+    cluster["cache_known"] = known_cache_available
+                                 ? bytes_pair(known_cache_used, known_cache_capacity)
+                                 : unavailable_bytes();
+    cluster["cache_online"] = online_cache_available
+                                  ? bytes_pair(online_cache_used, online_cache_capacity)
+                                  : unavailable_bytes();
 
     Json::Object startup;
     startup["phase"] = readiness.failed

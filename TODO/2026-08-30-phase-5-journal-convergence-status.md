@@ -66,15 +66,13 @@ tests correctly expect only the grouped publication and completion barriers.
   catalogue sync/search/artwork/GC regressions.
 - Runtime dependency suite passed 3/3.
 
-## Continuation boundary
+## UAT completion
 
-Deploy this build before another live measurement. Repeat a bounded namespace
-burst and use Status deltas to report:
+The deployed three-node UAT passed. A 65-create/65-remove burst used six
+metadata publications, produced exact admission and grouped-completion journal
+accounting, converged all nodes at generation 1439, and returned every demand
+epoch and metadata queue to a drained parked state. See
+`TODO/2026-08-30-phase-5-journal-convergence-uat.md`.
 
-- admission versus grouped publication/completion journal barriers;
-- operations per publication;
-- convergence events and completed runs per burst;
-- equality of requested/completed epochs and `scheduled: false` after drain.
-
-That UAT can close the remaining counter-comparison item. Physical DATA GC and
+This closes the remaining Phase 5 live counter comparison. Physical DATA GC and
 the repeated-burst RSS ceiling remain separate measurements.

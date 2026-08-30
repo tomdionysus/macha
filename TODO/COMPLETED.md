@@ -26,6 +26,24 @@ Evidence: [Phase 0 diagnostic foundation](2026-08-30-phase-0-diagnostic-foundati
 
 Evidence: [bounded record materialization](2026-08-30-phase-1-bounded-record-materialization.md), [shared decoded materialization](2026-08-30-phase-1-shared-decoded-materialization.md), and [Phase 1 three-node UAT](2026-08-30-phase-1-three-node-uat.md)
 
+## Phase 1: materialization follow-up closeout
+
+- [x] Audited every remaining intermediate encode and confirmed it is required
+  to validate the current full-snapshot successor hash, including exact legacy
+  delta-version encodings; removing it requires the deferred identity redesign.
+- [x] Added a corrupt-delta regression proving a cached parent cannot validate
+  a false successor, rejection cannot poison the cache, and a corrupt duplicate
+  cannot displace a valid cached target.
+- [x] Completed the merge, same-generation sibling, recovery authority, policy
+  transition, corruption, and eviction audit against explicit deterministic
+  tests.
+- [x] Passed the new regression, `storage_metadata` 28/28, and the live
+  same-generation sibling reconciliation test.
+- [x] Passed the expanded complete default suite 205/205 and runtime
+  dependencies 3/3, including both catalogue regressions.
+
+Evidence: [Phase 1 materialization closeout](2026-08-30-phase-1-materialization-closeout.md)
+
 ## Phase 2: bounded namespace publication and durability
 
 - [x] Replaced one-operation publication with bounded ordered, event-driven batch draining governed by configurable operation-count and encoded-byte limits.
@@ -159,3 +177,66 @@ Evidence: [Phase 5 operational diagnostics UAT](2026-08-30-phase-5-operational-d
   `invariants` 36/36, the complete default suite 204/204, and runtime 3/3.
 
 Evidence: [Phase 5 journal and convergence Status diagnostics](2026-08-30-phase-5-journal-convergence-status.md)
+
+## Phase 5: journal and convergence Status UAT
+
+- [x] Exercised 65 creates followed by 65 removals on the deployed three-node
+  cluster; each half completed in three publications and under 0.3 seconds.
+- [x] Accounted exactly for 520 journal records and 272 durability barriers:
+  two admission barriers per operation plus grouped publication and completion
+  barriers per metadata batch.
+- [x] Measured 130 confirmed namespace operations in six publications, or 21.7
+  operations per publication, with no retries, failures, timeouts, rejected
+  metadata work, or residual queue.
+- [x] Observed 23 convergence events on every node, with 8 local and 12 remote
+  completed runs; all epochs drained, scheduling parked, and all nodes agreed
+  at generation 1439.
+- [x] Verified the fixture was absent, direct Status latency was 1-12 ms, and
+  delayed process CPU returned to approximately 0.21%, 0.12%, and 0.07%.
+
+Evidence: [Phase 5 journal and convergence Status UAT](2026-08-30-phase-5-journal-convergence-uat.md)
+
+## Phase 5: physical-object GC separation proof
+
+- [x] Confirmed namespace deletion completion does not wait for physical DATA
+  removal; metadata publication and grouped journal confirmation remain the
+  foreground durability boundary.
+- [x] Confirmed physical GC uses a resumable cursor capped at 64 examined
+  objects per Service slice and yields immediately to foreground playback or
+  mounted-filesystem activity.
+- [x] Confirmed destructive reclamation remains fenced by cluster reachability,
+  stable/current metadata, catalogue liveness, retention claims, and grace.
+- [x] Strengthened deterministic coverage to require a multi-slice GC pass, and
+  retained the exact-deadline test proving bytes survive namespace deletion
+  until grace before event-driven reclamation.
+- [x] Documented the operational distinction and bounded cursor semantics in
+  the durability and operations guides.
+
+Evidence: [Phase 5 physical-object GC separation proof](2026-08-30-phase-5-physical-object-gc-proof.md)
+
+## Plan-ledger reconciliation
+
+- [x] Removed stale active entries for off-lock materialization, validated
+  short-lock installation, concurrent single-flight deduplication, and its
+  deterministic eight-reader proof; these were completed and verified in
+  Phase 4.
+- [x] Confirmed the final batching/recovery, convergence, RPC-isolation, and
+  physical-GC semantics are recorded across `docs/durability.md`,
+  `docs/metadata.md`, and `docs/operations.md`.
+
+## Status disk-usage availability correction
+
+- [x] Reproduced the alternating plausible/zero presentation from raw Status
+  responses on all three live nodes and located the ambiguity in the API rather
+  than the client.
+- [x] Made unavailable per-node storage usage/free, cache measurements, and
+  online-backend count structurally null instead of fabricated-looking zeros.
+- [x] Made incomplete cluster storage/cache aggregates unavailable rather than
+  summing missing observations as empty disks.
+- [x] Preserved genuine measured zero usage as numeric with `available: true`.
+- [x] Added deterministic regression coverage and passed the focused test,
+  `invariants` 35/35, and the FUSE/convergence Status integration test.
+- [x] Passed the complete default suite 204/204 and runtime dependencies 3/3,
+  including the explicit catalogue search/artwork/GC regression.
+
+Evidence: [Status disk-usage availability correction](2026-08-30-status-disk-usage-availability.md)
