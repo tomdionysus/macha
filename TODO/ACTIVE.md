@@ -6,16 +6,6 @@ This is the working backlog for the current session. Add new work here. When an 
 
 The existing documents in this directory remain the detailed plans, checkpoints, and UAT records. This file is only the current index.
 
-## Phase 1 materialization follow-up
-
-- [ ] Avoid encoding every intermediate snapshot solely to traverse a delta chain; encode only when commit-identity validation requires it.
-- [ ] Move reconstruction, decoding, encoding, and hashing outside the main `MetadataReplica` mutex.
-- [ ] Install calculated materializations through a short lock/CAS-style validation step.
-- [ ] Deduplicate concurrent requests for the same uncached hash so waiters share one computation.
-- [ ] Add deterministic concurrent-request coverage proving one materialization.
-- [ ] Add explicit corrupt-delta coverage proving the cache cannot make invalid history valid.
-- [ ] Complete the edge-case audit for merge commits, same-generation siblings, recovery-required state, policy transitions, corrupt history, and eviction.
-
 ## Phase 2 namespace batching follow-up
 
 - [ ] Design a durable batch identity that permits dependency chains such as create/rename/unlink to share a publication without weakening restart proof.
@@ -25,13 +15,9 @@ The existing documents in this directory remain the detailed plans, checkpoints,
 
 ## Diagnostics and operational proof still needed
 
-- [ ] Investigate status disk-usage telemetry alternating between plausible values and zero for connected remote nodes. Capture the raw `/api/v1/status` responses across refreshes, determine whether the API emits transient zero/unavailable storage and cache values or the client incorrectly selects/renders stale peer records, then fix the responsible layer and add regression coverage that distinguishes unavailable telemetry from genuine zero usage.
 - [ ] Record a reproducible local benchmark recipe without default-suite timing thresholds.
 - [ ] Measure a larger or repeated namespace burst to establish whether materialization-cache RSS reaches a stable ceiling.
 - [ ] Recheck the intermittent suite-load timeout in `hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`: the first Phase 5 full run timed out at 10 seconds, its immediate isolated run passed in 1.024 seconds, and the second full run passed it in 1.147 seconds. Preserve diagnostics on any recurrence; do not dismiss a future failure as timing noise.
-- [ ] Deploy the journal/convergence Status build and repeat a bounded namespace UAT to capture admission/publication journal-barrier deltas and convergence events/runs. The API exposure and deterministic tests are complete; this live delta is the remaining Phase 5 counter comparison.
-- [ ] Confirm physical-object GC remains deliberately rate-limited and operationally distinct from namespace publication completion.
-- [ ] Update `docs/durability.md`, `docs/metadata.md`, and `docs/operations.md` with the final batching, recovery, convergence, and RPC-isolation semantics.
 
 ## Separate known issue
 

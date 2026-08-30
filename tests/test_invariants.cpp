@@ -533,7 +533,69 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
         CHECK(value.find("telemetry_freshness")->asString() == "unavailable");
         CHECK(value.find("host")->asString() == peer.host);
         CHECK(value.find("port")->asUInt64() == peer.port);
-        CHECK(value.find("storage")->find("capacity_bytes")->asUInt64() == peer.capacity);
+        const auto* storage = value.find("storage");
+        REQUIRE(storage != nullptr);
+        CHECK(!storage->find("available")->asBool());
+        CHECK(storage->find("capacity_bytes")->asUInt64() == peer.capacity);
+        CHECK(storage->find("used_bytes")->isNull());
+        CHECK(storage->find("free_bytes")->isNull());
+        CHECK(value.find("storage_backends_online")->isNull());
+        const auto* cache = value.find("cache");
+        REQUIRE(cache != nullptr);
+        CHECK(!cache->find("available")->asBool());
+        CHECK(cache->find("capacity_bytes")->isNull());
+        CHECK(cache->find("used_bytes")->isNull());
+        CHECK(cache->find("free_bytes")->isNull());
+    }
+    CHECK(found);
+    CHECK(!cluster->find("storage_online")->find("available")->asBool());
+    CHECK(cluster->find("storage_online")->find("used_bytes")->isNull());
+    CHECK(cluster->find("storage_online")->find("free_bytes")->isNull());
+
+    // A real zero is different from a missing observation. Once coherent peer
+    // telemetry exists, zero used bytes and zero cache bytes remain numeric and
+    // the API explicitly marks both measurements available.
+    NodeTelemetry peer_telemetry;
+    peer_telemetry.node_id = peer.id;
+    peer_telemetry.boot_id = random_node_id();
+    peer_telemetry.sequence = 1;
+    peer_telemetry.observed_unix_ms = unix_ms();
+    peer_telemetry.host = peer.host;
+    peer_telemetry.failure_domain = peer.failure_domain;
+    peer_telemetry.port = peer.port;
+    peer_telemetry.storage_capacity = peer.capacity;
+    peer_telemetry.storage_used = 0;
+    peer_telemetry.cache_capacity = 1024;
+    peer_telemetry.cache_used = 0;
+    peer_telemetry.metadata_generation = peer.metadata_generation;
+    peer_telemetry.storage_backends_online = 1;
+    node.telemetry().observe(peer_telemetry, true);
+
+    response = status.handle(request);
+    REQUIRE(response.status == 200);
+    root = Json::parse(
+        std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
+    nodes = root.find("nodes");
+    REQUIRE(nodes != nullptr);
+    found = false;
+    for (const auto& value : nodes->asArray()) {
+        if (value.find("id")->asString() != to_string(peer.id))
+            continue;
+        found = true;
+        CHECK(value.find("telemetry_freshness")->asString() == "live");
+        const auto* storage = value.find("storage");
+        REQUIRE(storage != nullptr);
+        CHECK(storage->find("available")->asBool());
+        CHECK(storage->find("capacity_bytes")->asUInt64() == peer.capacity);
+        CHECK(storage->find("used_bytes")->asUInt64() == 0);
+        CHECK(storage->find("free_bytes")->asUInt64() == peer.capacity);
+        CHECK(value.find("storage_backends_online")->asUInt64() == 1);
+        const auto* cache = value.find("cache");
+        REQUIRE(cache != nullptr);
+        CHECK(cache->find("available")->asBool());
+        CHECK(cache->find("capacity_bytes")->asUInt64() == 1024);
+        CHECK(cache->find("used_bytes")->asUInt64() == 0);
+        CHECK(cache->find("free_bytes")->asUInt64() == 1024);
     }
     CHECK(found);
 

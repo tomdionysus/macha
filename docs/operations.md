@@ -45,6 +45,16 @@ A complete no-progress pass backs off instead of repeatedly scanning a settled s
 
 Reachability from committed metadata is authority. Unreferenced objects are not immediately deleted: they must age past `maintenance.garbage_grace_ms`. This protects failed publications and convergence lag.
 
+Namespace deletion and physical reclamation are deliberately separate. Once a
+namespace batch is durably accepted and its operation journal is confirmed, the
+FUSE operation can complete without waiting for DATA objects to be unlinked.
+Physical GC later walks a persistent local-store cursor in slices of at most 64
+objects. A slice yields as soon as playback or mounted-filesystem activity
+appears; destructive work is also fenced on complete cluster reachability,
+stable metadata, catalogue liveness, retention claims, and the configured grace
+period. A completed no-progress sweep parks until a real event or an exact grace
+deadline rather than polling the settled object store.
+
 DATA and CONTROL live sets are separate. Packed dead records become reclaimable bytes and are removed by pack compaction.
 
 ## Pack recovery
@@ -161,6 +171,14 @@ executor; object work remains on the priority-aware DATA executors.
 - a bounded coalesced last-known telemetry cache persisted independently on each node.
 
 Telemetry never defines cluster membership or metadata durability. Ephemeral telemetry is gossiped with boot-incarnation and sequence ordering and is not journalled as a metrics history. Gossip is best-effort and may be dropped under useful load. The last-known cache is periodically replaced only after a long interactive-idle interval and never mutates the MachaDFS namespace or enters metadata publication. The API marks observations as live, stale, unavailable, or last-known so an online node cannot disappear merely because optional telemetry was dropped.
+
+Storage and cache byte objects include an `available` boolean. When coherent
+telemetry is unavailable, Status may still report membership-known storage
+capacity, but `used_bytes` and `free_bytes` are `null`; cache byte fields and
+`storage_backends_online` are also `null`. Cluster storage/cache aggregates are
+unavailable if any included node lacks a measurement, rather than treating the
+missing node as zero usage. A genuinely empty measured disk is distinct:
+`available` is true and `used_bytes` is the numeric value `0`.
 
 Cluster capacity distinguishes known durable/cache capacity from the portion currently online. Per-node status reports authoritative membership endpoint/storage fields and enriches them with telemetry when available. Metadata availability is owned and published by `MetadataManager` as exactly `unavailable`, `read-only`, or `writable`; Status consumes that state and may demote a previously writable view immediately if fewer than `metadata_min_write_replicas` active replicas remain, but never promotes to writable merely from peer connectivity.
 

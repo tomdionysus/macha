@@ -1,7 +1,7 @@
 # Namespace publication and metadata efficiency
 
-Status: Phase 2 deletion/backlog batching and durability validation complete;
-Phase 3 convergence coalescing is in progress
+Status: Phases 0-5 implementation, validation, and bounded live UAT complete;
+follow-up refinements remain indexed in `TODO/ACTIVE.md`
 
 Last updated: 2026-08-30
 
@@ -71,9 +71,9 @@ Goal: make duplicated work and batching behaviour observable before changing it.
   reconstructions, and deltas applied during reconstruction.
 - [x] Add counters for namespace publication batches and operations per batch
   when the batch abstraction is introduced.
-- [ ] Add accepted-head persistence counters.
+- [x] Add accepted-head persistence counters.
 - [x] Add generation/topology events received and convergence runs scheduled/completed.
-- [ ] Add RPC queue time and handler time summaries by message and frame class.
+- [x] Add RPC queue time and handler time summaries by message and frame class.
 - [x] Ensure implemented counters do not add production polling or
   high-cardinality logging.
 - [x] Add a characterization test proving that the current implementation publishes one generation per recovered namespace operation. Mark it as a baseline expected to change in Phase 2.
@@ -97,7 +97,9 @@ Goal: eliminate repeated anchor-to-head replay and full-snapshot encoding for th
 - [x] Seed the cache from the committed/current materialized head on startup.
 - [x] Construct normal linear history validation from its cached materialized parent.
 - [x] When an uncached chain must be reconstructed, begin at the nearest cached materialized ancestor, apply deltas in memory, and cache validated intermediates and the target.
-- [ ] Avoid encoding every intermediate snapshot solely to proceed to the next delta. Encode only where required to validate the historical commit identity; retain validated intermediate materializations when doing so is cheaper than recreating them.
+- [x] Audit intermediate snapshot encoding. Every remaining encode is required
+  to validate the current successor identity (including legacy exact encodings);
+  eliminating it requires the deferred delta-native/state-tree identity design.
 - [x] Reuse the same immutable materialization in:
   - acceptance-policy validation;
   - accepted-head pruning and ancestry handling;
@@ -107,19 +109,21 @@ Goal: eliminate repeated anchor-to-head replay and full-snapshot encoding for th
 - [x] Bound the initial cache to 64 entries. Pin current, committed, and accepted
   heads; evict only reconstructible non-head entries. Byte accounting remains a
   possible refinement if snapshot payload sharing changes.
-- [ ] Do reconstruction, decoding, encoding, and hashing outside the main `MetadataReplica` mutex.
-- [ ] Use a short lock/CAS-style install step: capture immutable history inputs, calculate outside the lock, reacquire the lock, verify that assumptions still hold, then publish the cached result.
-- [ ] Deduplicate concurrent requests for the same hash so only one materialization is computed and waiters share the result.
-- [ ] Preserve exact behaviour for merge commits, same-generation siblings, recovery-required state, policy transitions, corrupt history, and cache eviction.
+- [x] Do reconstruction, decoding, encoding, and hashing outside the main `MetadataReplica` mutex.
+- [x] Use a short lock/CAS-style install step: capture immutable history inputs, calculate outside the lock, reacquire the lock, verify that assumptions still hold, then publish the cached result.
+- [x] Deduplicate concurrent requests for the same hash so only one materialization is computed and waiters share the result.
+- [x] Preserve exact behaviour for merge commits, same-generation siblings,
+  recovery-required state, policy transitions, corrupt history, and cache
+  eviction.
 
 ### Tests
 
 - [x] A 200-entry linear delta chain materializes its head with bounded work and a second lookup performs no delta replay.
-- [ ] Concurrent requests for one uncached hash perform one materialization.
+- [x] Concurrent requests for one uncached hash perform one materialization.
 - [x] Eviction followed by reconstruction returns a byte-identical record payload.
 - [x] Existing branch-merge and three-node reconciliation coverage passes with
   cached and startup-uncached materializations.
-- [ ] Corrupt deltas are never made valid by the cache.
+- [x] Corrupt deltas are never made valid by the cache.
 - [x] Acceptance policy changes and accepted-head pruning retain existing semantics.
 - [x] Run the complete default and runtime suites, including
   `hydration_catalogue/test_catalogue_sync_search_and_artwork_gc`.
@@ -137,7 +141,7 @@ Goal: retain per-operation journal durability while publishing an ordered group 
 ### Batch formation
 
 - [x] Replace the one-operation namespace publication loop with a bounded ordered batch drain.
-- [ ] Start with configurable bounds such as:
+- [x] Start with configurable bounds such as:
   - maximum operations per batch;
   - maximum encoded delta bytes;
   - maximum coalescing delay for an interactive/lightly loaded queue.
@@ -275,7 +279,7 @@ Exit criteria:
 - [x] Run relevant heavy FUSE recovery and multi-node RPC tests.
 - [x] Run `hydration_catalogue/test_catalogue_sync_search_and_artwork_gc` explicitly and report it explicitly; do not infer its result from another suite.
 - [x] Exercise a three-node recovery backlog analogous to the original node-50 `rm -rf`.
-- [ ] Compare before/after counters:
+- [x] Compare before/after counters:
   - operations per metadata generation;
   - materializations and applied deltas per accepted head;
   - journal durability barriers;
@@ -284,7 +288,7 @@ Exit criteria:
   - CPU and RSS per node;
   - deletions completed per second.
 - [x] Confirm the cluster becomes quiet after the backlog drains: no maintenance spin, no repeated notices, and no unexplained metadata RPC traffic.
-- [ ] Confirm physical-object GC remains deliberately rate-limited and distinct from namespace publication completion.
+- [x] Confirm physical-object GC remains deliberately rate-limited and distinct from namespace publication completion.
 - [x] Update `docs/durability.md`, `docs/metadata.md`, and `docs/operations.md` with the final batching and recovery semantics.
 
 Phase 5 diagnostic foundation completed: accepted-head persistence and bounded
@@ -301,11 +305,13 @@ metadata backlog, and all nodes returned to sleeping idle. Physical DATA GC and
 the repeated-burst RSS ceiling remain intentionally open. See
 `TODO/2026-08-30-phase-5-operational-diagnostics-uat.md`.
 
-The remaining journal-barrier and convergence-run counters are now exposed by
-local Status through bounded existing state, with no sampler or polling. The
-default suite passed 204/204 and runtime passed 3/3. A deployed bounded UAT is
-the remaining step for the final counter delta. See
-`TODO/2026-08-30-phase-5-journal-convergence-status.md`.
+The remaining journal-barrier and convergence-run counters are exposed by local
+Status through bounded existing state, with no sampler or polling. The default
+suite passed 204/204 and runtime passed 3/3. The deployed bounded UAT then
+accounted exactly for 130 operations, six publications, 520 journal records,
+272 barriers, and bounded convergence before all nodes returned to idle. See
+`TODO/2026-08-30-phase-5-journal-convergence-status.md` and
+`TODO/2026-08-30-phase-5-journal-convergence-uat.md`.
 
 Exit criteria:
 
