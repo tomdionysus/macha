@@ -124,6 +124,13 @@ Accounting does not replace physical durability tickets; it only controls capaci
 
 Deleting an unreachable object is less safety-critical than publishing a new reference. A lost deletion after a crash merely leaves garbage. Reachability remains authoritative and later GC retries removal.
 
+Namespace deletion completion is not physical deletion completion. The accepted
+metadata mutation and grouped FUSE journal markers establish the namespace
+result; physical DATA reclamation occurs later, after grace and retention
+fences, through a resumable cursor capped at 64 examined objects per maintenance
+slice. Foreground playback or mounted-filesystem activity makes the slice yield.
+This bound affects reclamation latency, not namespace publication latency.
+
 For packed objects, deletion is a logical tombstone and dead physical bytes are reclaimed by compaction.
 
 ## Crash matrix
