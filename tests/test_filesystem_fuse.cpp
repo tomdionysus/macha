@@ -896,7 +896,7 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_durable_journal_recovers_ordered_m
     }
 }
 
-MACHA_TEST("filesystem_fuse", test_fuse_recovery_characterizes_one_publication_per_namespace_operation) {
+MACHA_TEST("filesystem_fuse", test_fuse_recovery_batches_namespace_publication_and_markers) {
     TestService fixture("fuse-namespace-publication-amplification");
     auto& config = fixture.config();
     config.replication = 1;
@@ -922,20 +922,232 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_characterizes_one_publication_p
 
     auto replay = config.fuse;
     replay.publication_quiet = 0ms;
+    replay.namespace_batch_operations = 3;
+    const auto generation_before = service.filesystem().local_committed_metadata_generation();
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    REQUIRE(recovered->wait_for_idle(20s));
+    const auto status = recovered->status();
+    constexpr size_t expected_batches = (operations + 3 - 1) / 3;
+
+    CHECK(status.namespace_operations_recovered == operations);
+    CHECK(status.namespace_publication_attempts == expected_batches);
+    CHECK(status.namespace_publication_batches == expected_batches);
+    CHECK(status.namespace_operations_batched == operations);
+    CHECK(status.namespace_operations_published == operations);
+    CHECK(status.namespace_operations_confirmed == operations);
+    CHECK(service.filesystem().local_committed_metadata_generation() ==
+          generation_before + expected_batches);
+    // Each publication durably groups all individual published markers, then
+    // all individual done markers. The journal format remains replay-compatible.
+    CHECK(status.journal_append_batches == expected_batches * 2);
+    CHECK(status.journal_records_appended == operations * 2);
+    CHECK(status.journal_durability_barriers == expected_batches * 2);
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_recovery_thousand_operations_have_bounded_publications) {
+    TestService fixture("fuse-namespace-thousand-batch");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.fuse.publication_quiet = 30s;
+    auto& service = fixture.start();
+    constexpr size_t operations = 1000;
+    constexpr size_t batch_limit = 256;
+
+    std::vector<FilesystemNamespaceMutation> creates;
+    creates.reserve(operations);
+    for (size_t i = 0; i < operations; ++i) {
+        FilesystemNamespaceMutation op;
+        op.kind = FilesystemNamespaceMutation::Kind::create;
+        op.from = "/bulk-" + std::to_string(i);
+        op.mode = 0644;
+        op.uid = getuid();
+        op.gid = getgid();
+        creates.push_back(std::move(op));
+    }
+    CHECK(service.filesystem().apply_namespace_batch(creates).applied == operations);
+
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        service.filesystem().store().foreground_activity(1);
+        for (size_t i = 0; i < operations; ++i)
+            frontend->unlink("/bulk-" + std::to_string(i));
+        CHECK(frontend->status().namespace_operations_admitted == operations);
+        frontend->stop();
+    }
+
+    auto replay = config.fuse;
+    replay.publication_quiet = 0ms;
+    replay.namespace_batch_operations = batch_limit;
+    const auto generation_before = service.filesystem().local_committed_metadata_generation();
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    REQUIRE(recovered->wait_for_idle(30s));
+    const auto status = recovered->status();
+    constexpr size_t expected_batches = (operations + batch_limit - 1) / batch_limit;
+
+    CHECK(status.namespace_operations_recovered == operations);
+    CHECK(status.namespace_publication_attempts == expected_batches);
+    CHECK(status.namespace_publication_batches == expected_batches);
+    CHECK(status.namespace_operations_batched == operations);
+    CHECK(status.namespace_operations_published == operations);
+    CHECK(status.namespace_operations_confirmed == operations);
+    CHECK(status.journal_append_batches == expected_batches * 2);
+    CHECK(status.journal_records_appended == operations * 2);
+    CHECK(status.journal_durability_barriers == expected_batches * 2);
+    CHECK(service.filesystem().local_committed_metadata_generation() ==
+          generation_before + expected_batches);
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_namespace_batch_encoded_size_limit_is_hard) {
+    TestService fixture("fuse-namespace-byte-limit");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.fuse.publication_quiet = 30s;
+    auto& service = fixture.start();
+    constexpr size_t operations = 4;
+
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        service.filesystem().store().foreground_activity(1);
+        for (size_t i = 0; i < operations; ++i)
+            frontend->mkdir("/byte-limited-" + std::to_string(i), 0755, getuid(), getgid());
+        frontend->stop();
+    }
+
+    auto replay = config.fuse;
+    replay.publication_quiet = 0ms;
+    replay.namespace_batch_bytes = 1;
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    REQUIRE(recovered->wait_for_idle(20s));
+    const auto status = recovered->status();
+
+    // One oversized operation is allowed to make progress, but no second
+    // operation may join it once the encoded-byte bound is exceeded.
+    CHECK(status.namespace_publication_batches == operations);
+    CHECK(status.namespace_operations_batched == operations);
+    CHECK(status.journal_append_batches == operations * 2);
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_recovery_batches_unlinks_then_parent_rmdir) {
+    TestService fixture("fuse-namespace-delete-batch");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.fuse.publication_quiet = 30s;
+    auto& service = fixture.start();
+
+    service.filesystem().mkdir("/doomed", 0755, getuid(), getgid());
+    service.filesystem().create_file("/doomed/one", 0644, getuid(), getgid());
+    service.filesystem().create_file("/doomed/two", 0644, getuid(), getgid());
+
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        service.filesystem().store().foreground_activity(1);
+        frontend->unlink("/doomed/one");
+        frontend->unlink("/doomed/two");
+        frontend->rmdir("/doomed");
+        frontend->stop();
+    }
+
+    auto replay = config.fuse;
+    replay.publication_quiet = 0ms;
+    const auto generation_before = service.filesystem().local_committed_metadata_generation();
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    REQUIRE(recovered->wait_for_idle(20s));
+    const auto status = recovered->status();
+
+    CHECK(status.namespace_operations_recovered == 3);
+    CHECK(status.namespace_publication_batches == 1);
+    CHECK(status.namespace_operations_batched == 3);
+    CHECK(status.namespace_operations_published == 3);
+    CHECK(status.namespace_operations_confirmed == 3);
+    CHECK(status.journal_append_batches == 2);
+    CHECK(status.journal_records_appended == 6);
+    CHECK(service.filesystem().local_committed_metadata_generation() == generation_before + 1);
+    bool missing = false;
+    try { (void)service.filesystem().getattr("/doomed"); }
+    catch (const FsError& error) { missing = error.code() == ENOENT; }
+    CHECK(missing);
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_recovery_all_idempotent_batch_uses_no_generation) {
+    TestService fixture("fuse-namespace-idempotent-batch");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.fuse.publication_quiet = 30s;
+    auto& service = fixture.start();
+    constexpr size_t operations = 4;
+
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        service.filesystem().store().foreground_activity(1);
+        for (size_t i = 0; i < operations; ++i)
+            frontend->mkdir("/already-" + std::to_string(i), 0755, getuid(), getgid());
+        frontend->stop();
+    }
+    for (size_t i = 0; i < operations; ++i)
+        service.filesystem().mkdir("/already-" + std::to_string(i), 0755, getuid(), getgid());
+
+    const auto generation_before = service.filesystem().local_committed_metadata_generation();
+    auto replay = config.fuse;
+    replay.publication_quiet = 0ms;
     auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
     REQUIRE(recovered->wait_for_idle(20s));
     const auto status = recovered->status();
 
     CHECK(status.namespace_operations_recovered == operations);
-    CHECK(status.namespace_publication_attempts == operations);
+    CHECK(status.namespace_publication_attempts == 0);
+    CHECK(status.namespace_publication_batches == 0);
+    CHECK(status.namespace_operations_batched == 0);
     CHECK(status.namespace_operations_published == operations);
     CHECK(status.namespace_operations_confirmed == operations);
-    // Current baseline: each operation writes and syncs its own published
-    // marker and then its own done marker. Phase 2 will intentionally replace
-    // these equalities with batch bounds.
-    CHECK(status.journal_append_batches == operations * 2);
+    CHECK(status.journal_append_batches == 2);
     CHECK(status.journal_records_appended == operations * 2);
-    CHECK(status.journal_durability_barriers == operations * 2);
+    CHECK(service.filesystem().local_committed_metadata_generation() == generation_before);
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_recovery_commits_largest_valid_namespace_prefix) {
+    TestService fixture("fuse-namespace-valid-prefix");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.fuse.publication_quiet = 30s;
+    auto& service = fixture.start();
+
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        service.filesystem().store().foreground_activity(1);
+        frontend->mkdir("/prefix", 0755, getuid(), getgid());
+        frontend->mkdir("/concurrent", 0755, getuid(), getgid());
+        frontend->mkdir("/after", 0755, getuid(), getgid());
+        frontend->stop();
+    }
+
+    // Make operation two already true in the backend. The first recovery
+    // transaction must commit only operation one; operation three cannot pass
+    // the semantic boundary and is committed by the following transaction.
+    service.filesystem().mkdir("/concurrent", 0755, getuid(), getgid());
+    const auto generation_before = service.filesystem().local_committed_metadata_generation();
+    auto replay = config.fuse;
+    replay.publication_quiet = 0ms;
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    REQUIRE(recovered->wait_for_idle(20s));
+    const auto status = recovered->status();
+
+    CHECK(status.namespace_operations_recovered == 3);
+    CHECK(status.namespace_publication_attempts == 2);
+    CHECK(status.namespace_publication_batches == 2);
+    CHECK(status.namespace_operations_batched == 2);
+    CHECK(status.namespace_operations_published == 3);
+    CHECK(status.namespace_operations_confirmed == 3);
+    CHECK(status.journal_append_batches == 4);
+    CHECK(status.journal_records_appended == 6);
+    CHECK(service.filesystem().local_committed_metadata_generation() == generation_before + 2);
+    CHECK(service.filesystem().getattr("/prefix").type == EntryType::directory);
+    CHECK(service.filesystem().getattr("/concurrent").type == EntryType::directory);
+    CHECK(service.filesystem().getattr("/after").type == EntryType::directory);
 }
 
 MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_trims_torn_tail) {

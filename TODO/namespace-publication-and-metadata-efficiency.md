@@ -1,6 +1,6 @@
 # Namespace publication and metadata efficiency
 
-Status: Phase 1 in progress; bounded shared record/snapshot materialization implemented
+Status: Phase 2 in progress; bounded deletion/backlog publication batches implemented
 
 Last updated: 2026-08-30
 
@@ -68,7 +68,7 @@ Goal: make duplicated work and batching behaviour observable before changing it.
   records appended, and successful durability barriers.
 - [x] Add metadata-replica diagnostic counters for historical requests,
   reconstructions, and deltas applied during reconstruction.
-- [ ] Add counters for namespace publication batches and operations per batch
+- [x] Add counters for namespace publication batches and operations per batch
   when the batch abstraction is introduced.
 - [ ] Add accepted-head persistence counters.
 - [ ] Add generation notices received and convergence runs scheduled/completed.
@@ -135,59 +135,63 @@ Goal: retain per-operation journal durability while publishing an ordered group 
 
 ### Batch formation
 
-- [ ] Replace the one-operation namespace publication loop with an adaptive ordered batch drain.
+- [x] Replace the one-operation namespace publication loop with a bounded ordered batch drain.
 - [ ] Start with configurable bounds such as:
   - maximum operations per batch;
   - maximum encoded delta bytes;
   - maximum coalescing delay for an interactive/lightly loaded queue.
-- [ ] If only one operation is available, publish it without an unnecessary delay unless a recovery backlog is already known.
-- [ ] During recovery or sustained backlog, fill batches immediately up to a bound.
-- [ ] Never mix journal epochs or otherwise incompatible publication contexts.
-- [ ] Preserve operation sequence numbers and original order inside the batch.
+- [x] Maximum operations and encoded-operation bytes are configurable. No
+  coalescing timer was added: a lone operation publishes immediately.
+- [x] If only one operation is available, publish it without an unnecessary delay unless a recovery backlog is already known.
+- [x] During recovery or sustained backlog, fill batches immediately up to a bound.
+- [x] Never mix journal epochs or otherwise incompatible publication contexts.
+- [x] Preserve operation sequence numbers and original order inside the batch.
 
 ### Ordered application and failure semantics
 
-- [ ] Add a filesystem API that applies a sequence of namespace operations to one mutable snapshot and one `MetadataDelta`.
-- [ ] Apply operations in exact journal order so rename/create/unlink dependencies retain POSIX behaviour.
-- [ ] Publish the largest valid prefix when an operation fails:
+- [x] Add a filesystem API that applies a sequence of namespace operations to one mutable snapshot and one `MetadataDelta`.
+- [x] Apply operations in exact journal order. The initial worker groups only
+  confirmation-safe operation families; rename and incompatible mixed families
+  deliberately form boundaries until durable batch identity is introduced.
+- [x] Publish the largest valid prefix when an operation fails:
   - commit all preceding valid operations as one batch;
   - leave the failing operation at the head of the durable queue;
   - do not execute later operations past it;
   - retain the current bounded retry/error reporting behaviour for the failing operation.
-- [ ] Treat an already-achieved replay effect as success using the existing idempotence rules.
-- [ ] Define no-op handling explicitly. A batch containing only already-achieved operations must still advance their journal state without inventing a metadata generation.
-- [ ] Ensure one metadata mutation sequence can represent the entire ordered batch while FUSE journal sequence numbers remain individually recoverable.
+- [x] Treat an already-achieved replay effect as success using the existing idempotence rules.
+- [x] Define no-op handling explicitly. A batch containing only already-achieved operations advances its journal state without inventing a metadata generation.
+- [x] Ensure one metadata mutation sequence can represent the entire ordered batch while FUSE journal sequence numbers remain individually recoverable.
 
 ### Publication and journal completion
 
-- [ ] Publish one metadata commit for the valid batch prefix.
+- [x] Publish one metadata commit for the valid batch prefix.
 - [ ] Associate the accepted commit hash/generation with all operations in that prefix in memory.
-- [ ] Append all `published` markers using the existing multi-record journal append facility and one durability barrier.
-- [ ] Confirm the batch against one available snapshot view.
-- [ ] Append all confirmed `done` markers with one grouped durability barrier.
-- [ ] If only a subset can be confirmed after restart, check effects individually but group the resulting markers.
-- [ ] Consider a versioned batch marker or sequence-range marker only if individual marker grouping is insufficient. Prefer no journal-format change for the first implementation.
-- [ ] Keep journal compaction/recovery compatible with journals written by the current release.
+- [x] Append all `published` markers using the existing multi-record journal append facility and one durability barrier.
+- [x] Confirm each confirmation-safe batch against one available snapshot view.
+- [x] Append all confirmed `done` markers with one grouped durability barrier.
+- [x] If only a subset can be confirmed after restart, check effects individually but group the resulting markers.
+- [x] Consider a versioned batch marker or sequence-range marker only if individual marker grouping is insufficient. The first implementation deliberately retains individual markers and groups only operations whose individual effects remain provable in the final snapshot.
+- [x] Keep journal compaction/recovery compatible with journals written by the current release.
 
 ### Filesystem efficiency
 
-- [ ] Avoid copying/encoding the complete snapshot once per operation inside a batch.
-- [ ] Replace the `rmdir` full-map emptiness scan with the existing namespace/directory index or an equivalent indexed child lookup.
-- [ ] Accumulate erased-file garbage retirement into the batch delta without changing grace-period semantics.
-- [ ] Ensure rename subtree behaviour and path shadowing remain correct across a batch.
+- [x] Avoid copying/encoding the complete snapshot once per operation inside a batch.
+- [x] Replace the `rmdir` full-map emptiness scan with an ordered-map child lookup.
+- [x] Accumulate erased-file garbage retirement into the batch delta without changing grace-period semantics.
+- [x] Ensure rename subtree behaviour and path shadowing remain correct across batch boundaries; rename remains a singleton confirmation boundary in this slice.
 
 ### Tests
 
-- [ ] Recover 1,000 independent unlinks and assert publications are bounded by `ceil(operations / batch_limit)` plus explicitly justified boundary cases.
-- [ ] Assert grouped journal records use one barrier per marker group, not one per operation.
-- [ ] Test unlink children followed by parent `rmdir` in one batch.
+- [x] Recover 1,000 independent unlinks and assert publications are bounded by `ceil(operations / batch_limit)` plus explicitly justified boundary cases.
+- [x] Assert grouped journal records use one barrier per marker group, not one per operation.
+- [x] Test unlink children followed by parent `rmdir` in one batch.
 - [ ] Test create/rename/unlink dependencies in one batch and across batch boundaries.
-- [ ] Inject a deterministic failure at operation N and verify largest-valid-prefix publication.
+- [x] Inject a deterministic failure at operation N and verify largest-valid-prefix publication.
 - [ ] Restart after every durability boundary: admission, distributed commit, published-marker group, confirmation, and done-marker group.
 - [ ] Verify no acknowledged operation is lost, reordered, or reported done without its effect.
-- [ ] Test an all-idempotent recovery batch and a partially idempotent batch.
+- [x] Test an all-idempotent recovery batch and a partially idempotent batch.
 - [ ] Test concurrent new FUSE admissions while a recovery batch is publishing.
-- [ ] Verify batch encoded-size limits with large renames or metadata entries.
+- [x] Verify the encoded-size limit is a hard batching boundary while allowing one oversized operation to make progress.
 
 Exit criteria:
 
@@ -300,6 +304,20 @@ Add short dated notes here rather than leaving important choices only in chat hi
 - Metadata executor queue bounds, priority policy, shutdown semantics, and backpressure error behaviour.
 - Any on-disk or wire-format change and its compatibility story.
 
+### 2026-08-30 — Phase 2 deletion/backlog batching decisions
+
+- Namespace batches default to 256 operations and 256 KiB of encoded operation
+  data; both are configurable under `fuse`.
+- A lone operation starts immediately. Recovery and sustained backlogs fill a
+  bounded batch without a timer, polling loop, or maintenance wakeup.
+- The existing per-operation journal format is retained. Only operation
+  families whose individual effects remain provable in the final snapshot are
+  grouped; rename and incompatible mixed families remain singleton boundaries.
+- Individual `published` and `done` records are retained but each marker group
+  is appended with one durability barrier.
+- A durable batch commit identity is a prerequisite for safely widening the
+  implementation to mixed create/rename/unlink dependency chains.
+
 ## Risks and review focus
 
 - Batching can accidentally make later operations visible if an earlier operation fails; prefix semantics must be explicit and tested.
@@ -382,3 +400,24 @@ Each future session should:
   it will not yet demonstrate batched deletion throughput.
 - Detailed implementation, continuation, and UAT notes:
   `TODO/2026-08-30-phase-1-shared-decoded-materialization.md`.
+
+### 2026-08-30 — Phase 2 bounded namespace publication
+
+- Added configurable operation-count and encoded-byte bounds to the
+  event-driven FUSE namespace worker.
+- Added one-transaction ordered namespace mutation with largest-valid-prefix
+  semantics, accumulated garbage retirement, and indexed `rmdir` emptiness
+  checks.
+- Batched confirmation-safe operation families while retaining the existing
+  per-operation journal and restart proof. Grouped `published` and `done`
+  markers each use one durability barrier.
+- A deterministic 1,000-unlink recovery backlog now uses 4 metadata
+  publications and 8 journal durability barriers at the default operation
+  limit, instead of 1,000 publications and 2,000 barriers.
+- Added hard size-limit, idempotence, child-unlink/parent-rmdir, and
+  largest-valid-prefix coverage.
+- Against the final 1,000-unlink test state, the complete core suite passed
+  190/190 and the runtime suite passed 3/3; the catalogue sync/search/artwork GC
+  regression test passed within the full run.
+- Detailed implementation, continuation, and UAT notes:
+  `TODO/2026-08-30-phase-2-namespace-batching.md`.
