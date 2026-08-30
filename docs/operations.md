@@ -78,6 +78,17 @@ startup removes only a mount identified as Macha before any service startup, ver
 
 Preserve the FUSE spool/journal when diagnosing recovery errors. A missing journal-referenced byte range is a data-safety fault.
 
+FUSE spool pressure is normal backpressure, not a capacity fault. Below half of
+`fuse.max_spool_bytes` a copy may burst at local disk speed. Above that point
+the frontend publishes durable prefixes and progressively paces new admission
+against measured end-to-end publication throughput; at the configured bound it
+waits for a real publication/retirement notification. Inspect
+`diagnostics.filesystem.spool_bytes`, `spool_limit_bytes`,
+`spool_publish_rate_bytes_per_second`, `spool_throttle_waits`, and
+`spool_throttle_wait_ms`. If publishing is stalled, writers intentionally stay
+blocked and consume no polling loop; physical `spool_reserve_free` exhaustion
+remains an `ENOSPC` safety condition.
+
 Recovery publication is event-driven. The worker drains compatible operations
 in bounded ordered batches (by default at most 256 operations and 256 KiB of
 encoded operation data), publishes the largest valid prefix, and groups journal

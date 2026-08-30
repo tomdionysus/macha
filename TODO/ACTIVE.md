@@ -32,10 +32,23 @@ The existing documents in this directory remain the detailed plans, checkpoints,
 
 ## Additional investigation
 
+- [ ] Diagnose why the deployed identity-association reset still does not work.
+  The 2026-08-30 UAT failed after changing the handler to apply/propagate before
+  metadata persistence and adding durable `MACHMEM2` tombstones. The synthetic
+  unavailable-metadata and restart tests pass, so they do not reproduce the
+  real failure.
+- [ ] Capture the actual reset HTTP request and response, server log path,
+  membership/telemetry/RPC state before and after the action, and state after a
+  membership refresh. Determine whether the failure is API routing/request
+  shape, reset application, peer propagation, immediate reauthentication, or
+  status aggregation retaining the retired durable node.
+- [ ] Add a test reproducing the deployed failure before claiming the reset is
+  fixed. Retain the current focused tests, but do not treat them as sufficient
+  UAT evidence.
 - [ ] Investigate whether ingest from the spool has performance problems unrelated to the namespace batching and convergence work currently in progress.
-- [ ] Replace the spool's hard-coded 16 GiB capacity limit with a documented, validated configuration setting and a safe default preserving current behaviour.
-- [ ] Design occupancy-aware spool admission backpressure that also tracks sustained publication/drain throughput. Admission should be fast while capacity is readily available, progressively slow as occupancy approaches the configured limit, and never admit data beyond the durable capacity bound.
-- [ ] Define the backpressure policy precisely, including measurement windows, high/low watermarks or hysteresis, minimum progress, fairness between writers, restart behaviour, and behaviour when publishing stalls or the cluster becomes unwritable.
-- [ ] Ensure throttling blocks or paces the ingesting FUSE requests without polling, busy-waiting, unbounded buffering, or consuming critical RPC/control threads.
-- [ ] Add deterministic tests for configurable capacity, occupancy accounting, progressive throttling, recovery as the spool drains, a completely stalled publisher, multiple concurrent writers, restart near capacity, and enforcement of the hard upper bound.
+- [ ] Extend spool-backpressure verification with multiple concurrent writers,
+  explicit fairness bounds, and restart while occupancy is already above the
+  throttle threshold. The first checkpoint covers configuration, hard-bound
+  accounting, pressure-triggered publication, drain recovery, and a completely
+  stalled publisher.
 - [ ] Run an rsync-style mounted-FUSE UAT: initial writes should run quickly, throughput should progressively approach sustainable publication speed as the spool fills, occupancy should remain bounded, and write speed should recover cleanly after the backlog drains.

@@ -604,6 +604,14 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                     values->journal_records_appended;
                 filesystem_diagnostics["journal_durability_barriers"] =
                     values->journal_durability_barriers;
+                filesystem_diagnostics["spool_bytes"] = values->spool_bytes;
+                filesystem_diagnostics["spool_limit_bytes"] = values->spool_limit_bytes;
+                filesystem_diagnostics["spool_publish_rate_bytes_per_second"] =
+                    values->spool_publish_rate_bytes_per_second;
+                filesystem_diagnostics["spool_throttle_waits"] =
+                    values->spool_throttle_waits;
+                filesystem_diagnostics["spool_throttle_wait_ms"] =
+                    values->spool_throttle_wait_ms;
             }
         } catch (const std::exception& error) {
             Log::debug("status filesystem diagnostics unavailable: " + std::string(error.what()));
