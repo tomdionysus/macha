@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "test_backend_support.hpp"
+#include "json.hpp"
 #include "manage_api.hpp"
 #include "status_api.hpp"
-#include "json.hpp"
+#include "test_backend_support.hpp"
 
 #if defined(__linux__)
 #include <sys/syscall.h>
@@ -69,7 +69,6 @@ std::atomic_uint64_t fsync_calls{0};
 std::atomic_uint64_t syncfs_calls{0};
 #endif
 
-
 MACHA_TEST("invariants", test_manage_unmatched_rename_manual_catalogue_and_filesystem_binding) {
     TestService fixture("manage");
     auto& config = fixture.config();
@@ -95,21 +94,24 @@ MACHA_TEST("invariants", test_manage_unmatched_rename_manual_catalogue_and_files
 
     CatalogueScanner scanner(service.node(), fs, service.catalogue(), hints,
                              config.catalogue.scanner);
-    ManageApi manage(service.node(), service.metadata_manager(), fs, service.catalogue(), hints, scanner);
+    ManageApi manage(service.node(), service.metadata_manager(), fs, service.catalogue(), hints,
+                     scanner);
 
     HttpRequest list;
     list.method = "GET";
     list.path = "/api/v1/manage/unmatched";
     auto listed = manage.handle(list);
     REQUIRE(listed.status == 200);
-    auto listed_json = Json::parse(std::string(reinterpret_cast<const char*>(listed.body.data()), listed.body.size()));
+    auto listed_json = Json::parse(
+        std::string(reinterpret_cast<const char*>(listed.body.data()), listed.body.size()));
     REQUIRE(listed_json.find("count") != nullptr);
     CHECK(listed_json.find("count")->asUInt64() == 1);
 
     HttpRequest rename;
     rename.method = "POST";
     rename.path = "/api/v1/manage/filesystem/rename";
-    const std::string rename_body = R"({"path":"/Movies/unknown.mkv","destination":"/Movies/renamed.mkv"})";
+    const std::string rename_body =
+        R"({"path":"/Movies/unknown.mkv","destination":"/Movies/renamed.mkv"})";
     rename.body.assign(rename_body.begin(), rename_body.end());
     REQUIRE(manage.handle(rename).status == 200);
     CHECK(file_media_id(fs.getattr("/Movies/renamed.mkv")) == media_id);
@@ -127,7 +129,8 @@ MACHA_TEST("invariants", test_manage_unmatched_rename_manual_catalogue_and_files
     manual.body.assign(manual_body.begin(), manual_body.end());
     auto created = manage.handle(manual);
     REQUIRE(created.status == 201);
-    auto created_json = Json::parse(std::string(reinterpret_cast<const char*>(created.body.data()), created.body.size()));
+    auto created_json = Json::parse(
+        std::string(reinterpret_cast<const char*>(created.body.data()), created.body.size()));
     const auto leaf_id = created_json.find("leaf_item_id")->asString();
     auto item = service.catalogue().get(leaf_id);
     REQUIRE(item.has_value());
@@ -141,7 +144,8 @@ MACHA_TEST("invariants", test_manage_unmatched_rename_manual_catalogue_and_files
     browse.query["path"] = "/Movies";
     auto browsed = manage.handle(browse);
     REQUIRE(browsed.status == 200);
-    auto browsed_json = Json::parse(std::string(reinterpret_cast<const char*>(browsed.body.data()), browsed.body.size()));
+    auto browsed_json = Json::parse(
+        std::string(reinterpret_cast<const char*>(browsed.body.data()), browsed.body.size()));
     const auto& entries = browsed_json.find("entries")->asArray();
     REQUIRE(entries.size() == 1);
     CHECK(entries.front().find("path")->asString() == "/Movies/renamed.mkv");
@@ -187,8 +191,8 @@ MACHA_TEST("invariants", test_manage_node_identity_association_reset) {
     root.path = "/api/v1/manage";
     auto root_response = manage.handle(root);
     REQUIRE(root_response.status == 200);
-    auto root_json = Json::parse(std::string(reinterpret_cast<const char*>(root_response.body.data()),
-                                             root_response.body.size()));
+    auto root_json = Json::parse(std::string(
+        reinterpret_cast<const char*>(root_response.body.data()), root_response.body.size()));
     CHECK(root_json.find("api")->asString() == "manage");
     CHECK(root_json.find("actions")->find("identity_association_reset") != nullptr);
     CHECK(root_json.find("actions")->find("node_identity_association_reset") != nullptr);
@@ -213,15 +217,14 @@ MACHA_TEST("invariants", test_manage_node_identity_association_reset) {
 
     HttpRequest reset;
     reset.method = "POST";
-    reset.path = "/api/v1/manage/nodes/" + to_string(stale.id) +
-                 "/identity-association/reset";
+    reset.path = "/api/v1/manage/nodes/" + to_string(stale.id) + "/identity-association/reset";
     const std::string reset_body =
         R"({"host":"10.44.1.50","port":57401,"reason":"test endpoint reassignment"})";
     reset.body.assign(reset_body.begin(), reset_body.end());
     auto reset_response = manage.handle(reset);
     REQUIRE(reset_response.status == 200);
-    auto reset_json = Json::parse(std::string(reinterpret_cast<const char*>(reset_response.body.data()),
-                                              reset_response.body.size()));
+    auto reset_json = Json::parse(std::string(
+        reinterpret_cast<const char*>(reset_response.body.data()), reset_response.body.size()));
     const auto& reset_value = *reset_json.find("reset");
     CHECK(reset_value.find("stale_node_id")->asString() == to_string(stale.id));
     CHECK(reset_value.find("epoch")->asUInt64() == 1);
@@ -271,8 +274,9 @@ MACHA_TEST("invariants", test_manage_node_identity_association_reset) {
     reset_ip.body.assign(reset_ip_body.begin(), reset_ip_body.end());
     auto reset_ip_response = manage.handle(reset_ip);
     REQUIRE(reset_ip_response.status == 200);
-    auto reset_ip_json = Json::parse(std::string(
-        reinterpret_cast<const char*>(reset_ip_response.body.data()), reset_ip_response.body.size()));
+    auto reset_ip_json =
+        Json::parse(std::string(reinterpret_cast<const char*>(reset_ip_response.body.data()),
+                                reset_ip_response.body.size()));
     const auto& reset_ip_value = *reset_ip_json.find("reset");
     CHECK(reset_ip_value.find("scope")->asString() == "[10.44.1.50]:*");
     CHECK(reset_ip_value.find("port")->isNull());
@@ -280,12 +284,10 @@ MACHA_TEST("invariants", test_manage_node_identity_association_reset) {
     const auto reset_ip_at = reset_ip_value.find("reset_at_unix_ms")->asUInt64();
 
     const auto after_ip_reset = service.node().membership().all();
-    CHECK(std::none_of(after_ip_reset.begin(), after_ip_reset.end(), [&](const NodeInfo& node) {
-        return node.host == "10.44.1.50";
-    }));
-    CHECK(std::any_of(after_ip_reset.begin(), after_ip_reset.end(), [&](const NodeInfo& node) {
-        return node.id == unrelated.id;
-    }));
+    CHECK(std::none_of(after_ip_reset.begin(), after_ip_reset.end(),
+                       [&](const NodeInfo& node) { return node.host == "10.44.1.50"; }));
+    CHECK(std::any_of(after_ip_reset.begin(), after_ip_reset.end(),
+                      [&](const NodeInfo& node) { return node.id == unrelated.id; }));
 
     // Pre-reset gossip cannot recreate an association for that IP, but direct
     // post-reset authentication can establish a replacement identity.
@@ -309,8 +311,6 @@ MACHA_TEST("invariants", test_manage_node_identity_association_reset) {
     CHECK(metadata_after_ip.identity_resets.at(ip_key).reason == "clear by ip");
 }
 
-
-
 MACHA_TEST("invariants", test_status_api_precedes_control_plane_startup) {
     TestCluster cluster(ConfigProfile::isolated);
     auto config = cluster.node_config("status-first");
@@ -326,7 +326,9 @@ MACHA_TEST("invariants", test_status_api_precedes_control_plane_startup) {
     std::jthread starter([&] { service.start(); });
     struct ReleaseGate {
         TestGate& gate;
-        ~ReleaseGate() { gate.open(); }
+        ~ReleaseGate() {
+            gate.open();
+        }
     } release{control_gate};
     REQUIRE(control_gate.wait_for_entries(1));
 
@@ -360,7 +362,9 @@ MACHA_TEST("invariants", test_control_plane_and_status_api_are_online_while_back
     });
     struct ReleaseGate {
         TestGate& gate;
-        ~ReleaseGate() { gate.open(); }
+        ~ReleaseGate() {
+            gate.open();
+        }
     } release{recovery_gate};
 
     service.start();
@@ -405,7 +409,9 @@ MACHA_TEST("invariants", test_rpc_membership_is_online_while_local_state_recover
     });
     struct ReleaseGate {
         TestGate& gate;
-        ~ReleaseGate() { gate.open(); }
+        ~ReleaseGate() {
+            gate.open();
+        }
     } release{recovery_gate};
 
     recovering.start();
@@ -424,9 +430,8 @@ MACHA_TEST("invariants", test_rpc_membership_is_online_while_local_state_recover
     CHECK(members.message.type == MessageType::members_reply);
     REQUIRE(wait_until([&] {
         const auto all = recovering.membership().all();
-        return std::any_of(all.begin(), all.end(), [&](const NodeInfo& node) {
-            return node.id == peer.node_id();
-        });
+        return std::any_of(all.begin(), all.end(),
+                           [&](const NodeInfo& node) { return node.id == peer.node_id(); });
     }));
 
     recovery_gate.open();
@@ -473,8 +478,8 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     request.path = "/api/v1/status";
     auto response = status.handle(request);
     REQUIRE(response.status == 200);
-    auto root = Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
-                                        response.body.size()));
+    auto root = Json::parse(
+        std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
     const auto* cluster = root.find("cluster");
     REQUIRE(cluster != nullptr);
     CHECK(cluster->find("nodes_known")->asUInt64() == 2);
@@ -497,6 +502,20 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     CHECK(advertised->find("port")->asUInt64() == self.port);
     CHECK(advertised->find("source")->asString() == "configured");
 
+    const auto* diagnostics = root.find("diagnostics");
+    REQUIRE(diagnostics != nullptr);
+    const auto* metadata_diagnostics = diagnostics->find("metadata");
+    REQUIRE(metadata_diagnostics != nullptr);
+    CHECK(metadata_diagnostics->find("available")->asBool());
+    REQUIRE(metadata_diagnostics->find("accepted_head_persistence_writes") != nullptr);
+    REQUIRE(metadata_diagnostics->find("accepted_head_persistence_bytes") != nullptr);
+    CHECK(metadata_diagnostics->find("accepted_head_persistence_failures")->asUInt64() == 0);
+    const auto* rpc_diagnostics = diagnostics->find("rpc_server");
+    REQUIRE(rpc_diagnostics != nullptr);
+    CHECK(rpc_diagnostics->find("metadata_pending_jobs")->asUInt64() == 0);
+    REQUIRE(rpc_diagnostics->find("frame_timings") != nullptr);
+    REQUIRE(rpc_diagnostics->find("message_timings") != nullptr);
+
     const auto* nodes = root.find("nodes");
     REQUIRE(nodes != nullptr);
     bool found = false;
@@ -515,8 +534,8 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     metadata.note_replica_validation(true);
     response = status.handle(request);
     REQUIRE(response.status == 200);
-    root = Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
-                                   response.body.size()));
+    root = Json::parse(
+        std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
     cluster = root.find("cluster");
     REQUIRE(cluster != nullptr);
     CHECK(cluster->find("metadata_availability")->asString() == "writable");
@@ -683,7 +702,6 @@ MACHA_TEST("invariants", test_failed_catalogue_commit_never_deletes_live_filesys
         live_object_readable = false;
     }
     CHECK(live_object_readable);
-
 }
 
 MACHA_TEST("invariants", test_scanner_prune_is_fenced_to_scanned_namespace) {
@@ -727,7 +745,6 @@ MACHA_TEST("invariants", test_scanner_prune_is_fenced_to_scanned_namespace) {
     auto after = catalogue.get(item.id);
     REQUIRE(after.has_value());
     CHECK(after->media_ids == std::vector<std::string>{new_media_id});
-
 }
 
 MACHA_FAST_TEST("invariants", test_scanner_does_not_prune_from_mixed_namespace_generations) {
@@ -894,8 +911,8 @@ MACHA_TEST("invariants", test_rebalance_never_deletes_last_valid_copy_for_corrup
 
     const auto pool_state = t.path() / "pool-state";
     const auto pool_node = random_node_id();
-    const std::vector<StorageBackendConfig> backends{
-        {a, 64ULL * 1024 * 1024}, {b, 64ULL * 1024 * 1024}};
+    const std::vector<StorageBackendConfig> backends{{a, 64ULL * 1024 * 1024},
+                                                     {b, 64ULL * 1024 * 1024}};
 
     // Establish the 0.18 backend identity/format boundary while the stores are
     // empty, then seed the corruption scenario through loose LocalStore objects.
@@ -928,7 +945,8 @@ MACHA_TEST("invariants", test_rebalance_never_deletes_last_valid_copy_for_corrup
     corrupt_object(preferred, id);
     for (int i = 0; i < 8; ++i) {
         auto result = pool.rebalance_step(8ULL * 1024 * 1024, 8);
-        if (result.complete) break;
+        if (result.complete)
+            break;
     }
 
     // Rebalance may converge back to one physical copy, but it must not remove
@@ -953,11 +971,12 @@ MACHA_TEST("invariants", test_rpc_pre_auth_admission_is_bounded) {
     const auto keys = load_cluster_keys(keyfile);
     const auto port = free_port();
     NodeInfo server_info{random_node_id(), "127.0.0.1", "test", port};
-    RpcServer server("127.0.0.1", port, keys, server_info,
-                     [](const NodeInfo&, FrameType, const RpcMessage&) {
-                         return RpcMessage{MessageType::ok, {}};
-                     },
-                     [](const NodeInfo&) {});
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [](const NodeInfo&, FrameType, const RpcMessage&) {
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {});
     server.start();
 
     const auto thread_count = [] {
@@ -970,7 +989,8 @@ MACHA_TEST("invariants", test_rpc_pre_auth_admission_is_bounded) {
     };
     const auto before = thread_count();
     std::vector<int> sockets;
-    for (int i = 0; i < 32; ++i) sockets.push_back(connect_idle(port));
+    for (int i = 0; i < 32; ++i)
+        sockets.push_back(connect_idle(port));
     std::this_thread::sleep_for(100ms);
     const auto after = thread_count();
 
@@ -978,7 +998,8 @@ MACHA_TEST("invariants", test_rpc_pre_auth_admission_is_bounded) {
     // jthread per pre-auth peer is the failure this regression exposes.
     CHECK(after <= before + 8);
 
-    for (auto fd : sockets) close(fd);
+    for (auto fd : sockets)
+        close(fd);
     server.stop();
 #else
     std::cout << "[ARCH-REGRESSION] pre-auth admission check requires /proc/self/task; skipped\n";
@@ -993,8 +1014,8 @@ MACHA_TEST("invariants", test_authoritative_deferred_generation_batches_stable_s
     const auto keys = load_cluster_keys(keyfile);
     const auto root = t.path() / "objects";
     auto domain = std::make_shared<DurabilityDomain>(1, root, 20ms);
-    LocalStore store(root, 64ULL * 1024 * 1024, keys.storage,
-                     LocalStoreMode::authoritative, domain);
+    LocalStore store(root, 64ULL * 1024 * 1024, keys.storage, LocalStoreMode::authoritative,
+                     domain);
     REQUIRE(wait_until([&] { return store.scan_complete(); }));
 
     const auto strict_a = pattern(256 * 1024, 31);
@@ -1055,16 +1076,16 @@ MACHA_TEST("invariants", test_catalogue_artwork_batch_defers_durability_until_ba
         REQUIRE(requirement.replicas.size() == 1);
         const auto& replica = requirement.replicas.front();
         REQUIRE(replica.id == fixture.node().node_id());
-        const StoragePool::DurabilityToken token{
-            replica.domain, replica.generation, replica.backend_instance};
+        const StoragePool::DurabilityToken token{replica.domain, replica.generation,
+                                                 replica.backend_instance};
         CHECK(!fixture.node().local_store().durability_covered(token));
     }
 
     REQUIRE(catalogue.artwork_durability_barrier(batch));
     for (const auto& requirement : batch.requirements) {
         const auto& replica = requirement.replicas.front();
-        const StoragePool::DurabilityToken token{
-            replica.domain, replica.generation, replica.backend_instance};
+        const StoragePool::DurabilityToken token{replica.domain, replica.generation,
+                                                 replica.backend_instance};
         CHECK(fixture.node().local_store().durability_covered(token));
     }
     CHECK(fixture.node().local_store().has(art_a.id));
@@ -1079,8 +1100,8 @@ MACHA_TEST("invariants", test_accounting_dirty_marker_is_process_session_scoped)
     const auto keys = load_cluster_keys(keyfile);
     const auto root = t.path() / "objects";
     auto domain = std::make_shared<DurabilityDomain>(1, root, 10ms);
-    LocalStore store(root, 64ULL * 1024 * 1024, keys.storage,
-                     LocalStoreMode::authoritative, domain);
+    LocalStore store(root, 64ULL * 1024 * 1024, keys.storage, LocalStoreMode::authoritative,
+                     domain);
     REQUIRE(wait_until([&] { return store.scan_complete(); }));
 
     fsync_calls = 0;
@@ -1109,7 +1130,6 @@ MACHA_TEST("invariants", test_accounting_dirty_marker_is_process_session_scoped)
     std::cout << "[ARCH-REGRESSION] accounting session check is Linux-only; skipped\n";
 #endif
 }
-
 
 MACHA_TEST("invariants", test_unclean_accounting_recovery_establishes_durable_baseline) {
 #if defined(__linux__)
@@ -1155,8 +1175,8 @@ MACHA_TEST("invariants", test_unclean_accounting_recovery_establishes_durable_ba
     track_fsync = true;
     {
         auto domain = std::make_shared<DurabilityDomain>(1, root, 10ms);
-        LocalStore recovered(root, 64ULL * 1024 * 1024, keys.storage,
-                             LocalStoreMode::authoritative, domain);
+        LocalStore recovered(root, 64ULL * 1024 * 1024, keys.storage, LocalStoreMode::authoritative,
+                             domain);
         REQUIRE(wait_until([&] { return recovered.scan_complete(); }, 5s));
         CHECK(recovered.used() > clean_used);
         REQUIRE(recovered.get(object_id(b)).has_value());
@@ -1187,8 +1207,8 @@ MACHA_TEST("invariants", test_restart_durable_reaffirmation_requires_no_new_barr
     }
 
     auto domain = std::make_shared<DurabilityDomain>(1, root, 100ms);
-    LocalStore reopened(root, 64ULL * 1024 * 1024, keys.storage,
-                        LocalStoreMode::authoritative, domain);
+    LocalStore reopened(root, 64ULL * 1024 * 1024, keys.storage, LocalStoreMode::authoritative,
+                        domain);
     REQUIRE(reopened.scan_complete());
 
     fsync_calls = 0;
@@ -1222,8 +1242,8 @@ MACHA_TEST("invariants", test_authoritative_delete_is_lazy_durability) {
     }
 
     auto domain = std::make_shared<DurabilityDomain>(1, root, 100ms);
-    LocalStore reopened(root, 64ULL * 1024 * 1024, keys.storage,
-                        LocalStoreMode::authoritative, domain);
+    LocalStore reopened(root, 64ULL * 1024 * 1024, keys.storage, LocalStoreMode::authoritative,
+                        domain);
     REQUIRE(reopened.scan_complete());
     fsync_calls = 0;
     syncfs_calls = 0;
@@ -1249,8 +1269,8 @@ MACHA_TEST("invariants", test_local_store_barrier_remembers_complete_physical_cu
     const auto keys = load_cluster_keys(keyfile);
     const auto root = t.path() / "objects";
     auto domain = std::make_shared<DurabilityDomain>(1, root, 10ms);
-    LocalStore store(root, 64ULL * 1024 * 1024, keys.storage,
-                     LocalStoreMode::authoritative, domain);
+    LocalStore store(root, 64ULL * 1024 * 1024, keys.storage, LocalStoreMode::authoritative,
+                     domain);
     REQUIRE(wait_until([&] { return store.scan_complete(); }));
 
     const auto a = pattern(256 * 1024, 47);
@@ -1301,8 +1321,8 @@ MACHA_TEST("invariants", test_durability_domain_group_commits_independent_public
     const auto keys = load_cluster_keys(keyfile);
     const auto root = t.path() / "objects";
     auto domain = std::make_shared<DurabilityDomain>(1, root, 120ms);
-    LocalStore store(root, 64ULL * 1024 * 1024, keys.storage,
-                     LocalStoreMode::authoritative, domain);
+    LocalStore store(root, 64ULL * 1024 * 1024, keys.storage, LocalStoreMode::authoritative,
+                     domain);
     REQUIRE(wait_until([&] { return store.scan_complete(); }));
 
     const auto a = pattern(256 * 1024, 50);
@@ -1351,8 +1371,8 @@ MACHA_TEST("invariants", test_storage_pool_tokens_name_physical_domain_and_backe
     std::filesystem::create_directories(disk_a);
     std::filesystem::create_directories(disk_b);
     StoragePool pool(t.path() / "state", random_node_id(),
-                     {{disk_a, 64ULL * 1024 * 1024}, {disk_b, 64ULL * 1024 * 1024}},
-                     keys.storage, 100ms);
+                     {{disk_a, 64ULL * 1024 * 1024}, {disk_b, 64ULL * 1024 * 1024}}, keys.storage,
+                     100ms);
     REQUIRE(wait_until([&] { return pool.online_backends() == 2; }));
 
     std::optional<StoragePool::DurabilityToken> first;
@@ -1394,8 +1414,8 @@ MACHA_TEST("invariants", test_immediate_reaffirmation_flushes_provisional_genera
     const auto keys = load_cluster_keys(keyfile);
     const auto root = t.path() / "objects";
     auto domain = std::make_shared<DurabilityDomain>(1, root, 50ms);
-    LocalStore store(root, 64ULL * 1024 * 1024, keys.storage,
-                     LocalStoreMode::authoritative, domain);
+    LocalStore store(root, 64ULL * 1024 * 1024, keys.storage, LocalStoreMode::authoritative,
+                     domain);
     REQUIRE(wait_until([&] { return store.scan_complete(); }));
 
     const auto bytes = pattern(256 * 1024, 35);
@@ -1427,8 +1447,8 @@ MACHA_TEST("invariants", test_publication_generation_barrier_precedes_metadata_c
     fs.create_file("/generation.bin", 0644, getuid(), getgid());
 
     const auto bytes = pattern(config.extent_size * 8, 37);
-    auto writer = fs.open_write("/generation.bin", true, false,
-                                WriteDurability::publication_generation);
+    auto writer =
+        fs.open_write("/generation.bin", true, false, WriteDurability::publication_generation);
     fsync_calls = 0;
     syncfs_calls = 0;
     track_fsync = true;
@@ -1537,8 +1557,8 @@ MACHA_TEST("invariants", test_deferred_object_barrier_rejects_stale_process_epoc
     while (wrong_epoch == acknowledged_epoch)
         wrong_epoch = random_node_id();
     auto stale = barrier_payload(wrong_epoch);
-    auto rejected = client.call(endpoint, MessageType::object_durability_barrier, stale,
-                                FrameType::read_ahead);
+    auto rejected =
+        client.call(endpoint, MessageType::object_durability_barrier, stale, FrameType::read_ahead);
     CHECK(rejected.message.type == MessageType::error);
 
     auto current = barrier_payload(acknowledged_epoch);
@@ -1576,7 +1596,7 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_group_commits_independent_p
         request.fixed(object_id(bytes).bytes);
         request.bytes(bytes);
         auto reply = client.call(endpoint, MessageType::put_object_deferred, request.data(),
-                               FrameType::read_ahead);
+                                 FrameType::read_ahead);
         REQUIRE(reply.message.type == MessageType::ok);
         Reader reader(reply.message.payload);
         RemoteToken token;
@@ -1594,7 +1614,7 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_group_commits_independent_p
         request.u64(token.generation);
         request.u64(token.backend_instance);
         return client.call(endpoint, MessageType::object_durability_barrier, request.data(),
-                         FrameType::read_ahead);
+                           FrameType::read_ahead);
     };
 
     const auto a = defer(53);
@@ -1654,7 +1674,7 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_reuses_already_covered_gene
         request.fixed(object_id(bytes).bytes);
         request.bytes(bytes);
         auto reply = client.call(endpoint, MessageType::put_object_deferred, request.data(),
-                               FrameType::read_ahead);
+                                 FrameType::read_ahead);
         REQUIRE(reply.message.type == MessageType::ok);
         Reader reader(reply.message.payload);
         RemoteToken token;
@@ -1672,7 +1692,7 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_reuses_already_covered_gene
         request.u64(token.generation);
         request.u64(token.backend_instance);
         return client.call(endpoint, MessageType::object_durability_barrier, request.data(),
-                         FrameType::read_ahead);
+                           FrameType::read_ahead);
     };
 
     const auto a = defer(56);
@@ -1725,13 +1745,14 @@ MACHA_TEST("invariants", test_authenticated_receiver_enforces_transport_lane) {
     const auto port = free_port();
     NodeInfo server_info{random_node_id(), "127.0.0.1", "server", port};
     std::atomic_bool object_dispatched{false};
-    RpcServer server("127.0.0.1", port, keys, server_info,
-                     [&](const NodeInfo&, FrameType, const RpcMessage& message) {
-                         if (message.type == MessageType::get_object)
-                             object_dispatched = true;
-                         return RpcMessage{MessageType::ok, {}};
-                     },
-                     [](const NodeInfo&) {});
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, FrameType, const RpcMessage& message) {
+            if (message.type == MessageType::get_object)
+                object_dispatched = true;
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {});
     server.start();
 
     int fd = connect_idle(port);
@@ -1758,9 +1779,7 @@ MACHA_TEST("invariants", test_http_slow_client_cannot_pin_worker_indefinitely) {
     config.max_queued_connections = 4;
     config.client_io_timeout = 100ms;
 
-    HttpServer server(config, [](const HttpRequest&) {
-        return http_json(200, "{\"ok\":true}");
-    });
+    HttpServer server(config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
     server.start();
     REQUIRE(wait_until([&] { return server.bound_port() == config.port; }, 2s));
 
@@ -1781,7 +1800,8 @@ MACHA_TEST("invariants", test_http_slow_client_cannot_pin_worker_indefinitely) {
     char buffer[1024];
     while (true) {
         const auto n = ::recv(fast, buffer, sizeof(buffer), 0);
-        if (n <= 0) break;
+        if (n <= 0)
+            break;
         response.append(buffer, static_cast<size_t>(n));
     }
     CHECK(response.find("HTTP/1.1 200 OK") != std::string::npos);
@@ -1809,7 +1829,6 @@ MACHA_TEST("invariants", test_catalogue_gc_liveness_fails_closed_when_current_ro
     // its metadata-referenced root is unconditionally live and GC must fail closed.
     CHECK(maintenance.control_live.contains(missing_root));
     CHECK(!maintenance.complete);
-
 }
 
 } // namespace

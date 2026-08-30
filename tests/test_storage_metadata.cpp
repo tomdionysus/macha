@@ -49,15 +49,15 @@ MACHA_FAST_TEST("storage_metadata", test_retention_claims_are_causal_durable_and
         // survives an A-only delete context.
         retention.retain(RetentionClass::data, object, {origin_b, 1});
         std::vector<ObjectId> no_live;
-        CHECK(retention.release_unreferenced(
-                  RetentionClass::data, no_live, RetentionClock{{origin_a, 1}}, 16) == 1);
+        CHECK(retention.release_unreferenced(RetentionClass::data, no_live,
+                                             RetentionClock{{origin_a, 1}}, 16) == 1);
         CHECK(retention.retained(RetentionClass::data, object));
 
         // Once a reconciled metadata view has observed both branch dots the
         // now-unreferenced object may lose both claims.
-        CHECK(retention.release_unreferenced(
-                  RetentionClass::data, no_live,
-                  RetentionClock{{origin_a, 1}, {origin_b, 1}}, 16) == 1);
+        CHECK(retention.release_unreferenced(RetentionClass::data, no_live,
+                                             RetentionClock{{origin_a, 1}, {origin_b, 1}},
+                                             16) == 1);
         CHECK(!retention.retained(RetentionClass::data, object));
 
         // Removed clocks suppress delayed/replayed old ADDs but do not suppress
@@ -84,8 +84,8 @@ MACHA_FAST_TEST("storage_metadata", test_retention_claims_are_causal_durable_and
         CHECK(reopened.retained(RetentionClass::control, second));
         reopened.retain(RetentionClass::data, object, {origin_a, 1});
         CHECK(reopened.retained(RetentionClass::data, object));
-        CHECK(reopened.release_unreferenced(
-                  RetentionClass::data, {}, RetentionClock{{origin_a, 2}}, 16) == 1);
+        CHECK(reopened.release_unreferenced(RetentionClass::data, {}, RetentionClock{{origin_a, 2}},
+                                            16) == 1);
         CHECK(!reopened.retained(RetentionClass::data, object));
     }
 }
@@ -104,15 +104,13 @@ MACHA_FAST_TEST("storage_metadata", test_retention_prune_cursor_cannot_starve_la
 
     for (const auto& id : objects)
         retention.retain(RetentionClass::data, id, {origin, 1});
-    CHECK(retention.release_unreferenced(
-              RetentionClass::data, {}, RetentionClock{{origin, 1}}, 32) == objects.size());
+    CHECK(retention.release_unreferenced(RetentionClass::data, {}, RetentionClock{{origin, 1}},
+                                         32) == objects.size());
 
     // The first two tombstones are still backed by physical objects. A fixed
     // budget must nevertheless make forward progress to the later dead rows,
     // rather than restarting at map.begin() forever.
-    auto exists = [&](const ObjectId& id) {
-        return id == objects[0] || id == objects[1];
-    };
+    auto exists = [&](const ObjectId& id) { return id == objects[0] || id == objects[1]; };
     CHECK(retention.prune_unclaimed(RetentionClass::data, exists, 2) == 0);
     CHECK(retention.prune_unclaimed(RetentionClass::data, exists, 2) == 2);
 
@@ -191,28 +189,25 @@ MACHA_FAST_TEST("storage_metadata", test_retention_claim_is_physical_gc_barrier)
     REQUIRE(pool.put(id, bytes));
     auto physical = object_path(disk, id);
     REQUIRE(std::filesystem::exists(physical));
-    std::filesystem::last_write_time(
-        physical, std::filesystem::file_time_type::clock::now() - 48h);
+    std::filesystem::last_write_time(physical, std::filesystem::file_time_type::clock::now() - 48h);
 
     const auto origin = random_node_id();
     retention.retain(RetentionClass::data, id, {origin, 1});
     std::vector<ObjectId> none;
-    auto protected_pass = pool.gc_step(
-        none, none, 0ms, 128, {}, [&](const ObjectId& candidate) {
-            return retention.retained(RetentionClass::data, candidate);
-        });
+    auto protected_pass = pool.gc_step(none, none, 0ms, 128, {}, [&](const ObjectId& candidate) {
+        return retention.retained(RetentionClass::data, candidate);
+    });
     CHECK(protected_pass.complete);
     CHECK(pool.has(id));
 
     // Metadata has now causally observed and removed the only reference. The
     // claim can disappear first; only then may ordinary physical GC reclaim it.
-    CHECK(retention.release_unreferenced(
-              RetentionClass::data, none, RetentionClock{{origin, 1}}, 16) == 1);
+    CHECK(retention.release_unreferenced(RetentionClass::data, none, RetentionClock{{origin, 1}},
+                                         16) == 1);
     CHECK(!retention.retained(RetentionClass::data, id));
-    auto reclaim_pass = pool.gc_step(
-        none, none, 0ms, 128, {}, [&](const ObjectId& candidate) {
-            return retention.retained(RetentionClass::data, candidate);
-        });
+    auto reclaim_pass = pool.gc_step(none, none, 0ms, 128, {}, [&](const ObjectId& candidate) {
+        return retention.retained(RetentionClass::data, candidate);
+    });
     CHECK(reclaim_pass.complete);
     CHECK(!pool.has(id));
 }
@@ -517,11 +512,26 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
     {
         MetadataReplica replica(path, keys.storage);
         REQUIRE(replica.store_commit(left));
+        const auto before_acceptance = replica.diagnostics();
         MetadataAcceptance understrength{left.generation, left.hash, 1, {a}};
         CHECK(!replica.accept_commit(understrength));
+        CHECK(replica.diagnostics().accepted_head_persistence_writes ==
+              before_acceptance.accepted_head_persistence_writes);
         REQUIRE(replica.accept_commit(left_accept));
+        const auto after_left = replica.diagnostics();
+        CHECK(after_left.accepted_head_persistence_writes ==
+              before_acceptance.accepted_head_persistence_writes + 1);
+        CHECK(after_left.accepted_head_persistence_bytes >
+              before_acceptance.accepted_head_persistence_bytes);
+        CHECK(after_left.accepted_head_persistence_failures == 0);
         REQUIRE(replica.store_commit(right));
         REQUIRE(replica.accept_commit(right_accept));
+        const auto after_right = replica.diagnostics();
+        CHECK(after_right.accepted_head_persistence_writes ==
+              after_left.accepted_head_persistence_writes + 1);
+        CHECK(after_right.accepted_head_persistence_bytes >
+              after_left.accepted_head_persistence_bytes);
+        CHECK(after_right.accepted_head_persistence_failures == 0);
         auto heads = replica.accepted_heads();
         REQUIRE(heads.size() == 2);
         CHECK(replica.history_is_ancestor(genesis.hash, left.hash));
@@ -549,8 +559,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
         reconciliation.generation = std::max(left.generation, right.generation) + 1;
         reconciliation.previous = primary.hash;
         reconciliation.payload = encode_snapshot(merged.snapshot);
-        reconciliation.hash = metadata_hash(reconciliation.generation,
-                                            reconciliation.previous,
+        reconciliation.hash = metadata_hash(reconciliation.generation, reconciliation.previous,
                                             reconciliation.payload);
         merge_accept = {reconciliation.generation, reconciliation.hash, 2, {a, c}};
         REQUIRE(replica.store_commit(reconciliation));
@@ -748,7 +757,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_conflict_alternatives_are_gc_r
           std::set<ObjectId>({effective_root, base_root, left_root, right_root}));
 }
 
-MACHA_FAST_TEST("storage_metadata", test_metadata_legacy_prepare_journal_replays_deterministically) {
+MACHA_FAST_TEST("storage_metadata",
+                test_metadata_legacy_prepare_journal_replays_deterministically) {
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -808,7 +818,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_legacy_prepare_journal_replays
     CHECK(reopened.committed().hash == low.hash);
 }
 
-MACHA_FAST_TEST("storage_metadata", test_protocol20_checkpoint_without_acceptance_never_self_promotes) {
+MACHA_FAST_TEST("storage_metadata",
+                test_protocol20_checkpoint_without_acceptance_never_self_promotes) {
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -849,7 +860,8 @@ MACHA_FAST_TEST("storage_metadata", test_protocol20_checkpoint_without_acceptanc
     CHECK(!reopened.acceptance(record.hash).has_value());
 }
 
-MACHA_FAST_TEST("storage_metadata", test_metadata_local_mutation_sequence_never_regresses_with_branch_state) {
+MACHA_FAST_TEST("storage_metadata",
+                test_metadata_local_mutation_sequence_never_regresses_with_branch_state) {
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -901,8 +913,8 @@ MACHA_FAST_TEST("storage_metadata", test_protocol20_delta_preserves_governance_s
     auto encoded_delta = encode_metadata_delta(*delta);
     REQUIRE(encoded_delta.size() >= 8);
     CHECK(encoded_delta[7] == '5');
-    CHECK(encode_snapshot(apply_metadata_delta(parent_snapshot,
-                                                decode_metadata_delta(encoded_delta))) ==
+    CHECK(encode_snapshot(
+              apply_metadata_delta(parent_snapshot, decode_metadata_delta(encoded_delta))) ==
           encode_snapshot(child_snapshot));
 
     MetadataRecord child;
@@ -1037,7 +1049,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_chain_reuses_bounded_mat
     REQUIRE(reconstructed_early.has_value());
     CHECK(reconstructed_early->payload == early_record->payload);
     CHECK(after_evicted_lookup.historical_reconstructions -
-              before_evicted_lookup.historical_reconstructions == 1);
+              before_evicted_lookup.historical_reconstructions ==
+          1);
     CHECK(after_evicted_lookup.materialization_cache_entries <= 64);
 }
 
@@ -1060,8 +1073,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_conflict_resolution_is_not_res
     directory.mode = 0755;
     right.entries["/unrelated"] = directory;
 
-    const auto merged = merge_metadata_snapshots(base, left, right,
-                                                  sha256(pattern(41)), sha256(pattern(42)));
+    const auto merged =
+        merge_metadata_snapshots(base, left, right, sha256(pattern(41)), sha256(pattern(42)));
     CHECK(!merged.snapshot.conflicts.contains(conflict_id));
     CHECK(merged.snapshot.entries.contains("/unrelated"));
 }
@@ -1083,8 +1096,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_divergent_renames_become_confl
     right.entries.erase("/a");
     right.entries["/c"] = file;
 
-    auto merged = merge_metadata_snapshots(base, left, right,
-                                            sha256(pattern(51)), sha256(pattern(52)));
+    auto merged =
+        merge_metadata_snapshots(base, left, right, sha256(pattern(51)), sha256(pattern(52)));
     REQUIRE(merged.snapshot.entries.contains("/a"));
     CHECK(merged.snapshot.entries.at("/a") == file);
     CHECK(!merged.snapshot.entries.contains("/b"));
@@ -1101,8 +1114,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_divergent_renames_become_confl
     right = base;
     right.entries.erase("/a");
     right.entries["/b"] = file;
-    merged = merge_metadata_snapshots(base, left, right,
-                                      sha256(pattern(61)), sha256(pattern(62)));
+    merged = merge_metadata_snapshots(base, left, right, sha256(pattern(61)), sha256(pattern(62)));
     CHECK(!merged.snapshot.entries.contains("/a"));
     REQUIRE(merged.snapshot.entries.contains("/b"));
     CHECK(merged.snapshot.entries.at("/b") == file);
@@ -1112,8 +1124,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_divergent_renames_become_confl
     right = base;
     right.entries["/a"].size = 456;
     right.entries["/a"].version = 8;
-    merged = merge_metadata_snapshots(base, left, right,
-                                      sha256(pattern(71)), sha256(pattern(72)));
+    merged = merge_metadata_snapshots(base, left, right, sha256(pattern(71)), sha256(pattern(72)));
     REQUIRE(merged.snapshot.entries.contains("/a"));
     CHECK(merged.snapshot.entries.at("/a") == file);
     CHECK(!merged.snapshot.entries.contains("/b"));
@@ -1138,8 +1149,8 @@ MACHA_FAST_TEST("storage_metadata", test_protocol20_state_rejects_legacy_authori
     established.generation = genesis.generation + 1;
     established.previous = genesis.hash;
     established.payload = encode_snapshot(snapshot);
-    established.hash = metadata_hash(established.generation, established.previous,
-                                     established.payload);
+    established.hash =
+        metadata_hash(established.generation, established.previous, established.payload);
     NodeId a{}, b{};
     a.bytes[15] = 1;
     b.bytes[15] = 2;
@@ -1266,8 +1277,7 @@ MACHA_TEST("storage_metadata", test_storage_pool_and_persistent_cache) {
     std::filesystem::create_directories(disk3);
 
     auto node = load_or_create_node_id(state);
-    StoragePool pool(state, node,
-                     {{disk1, 64ULL * 1024 * 1024}, {disk2, 64ULL * 1024 * 1024}},
+    StoragePool pool(state, node, {{disk1, 64ULL * 1024 * 1024}, {disk2, 64ULL * 1024 * 1024}},
                      keys.storage);
     CHECK(pool.online_backends() == 2);
     CHECK(pool.limit() == 128ULL * 1024 * 1024);
@@ -1384,9 +1394,8 @@ MACHA_TEST("storage_metadata", test_storage_pool_and_persistent_cache) {
 
     // Add a third disk live and migrate local placement without changing the
     // node identity or DHT replica accounting.
-    pool.reconfigure({{disk1, 64ULL * 1024 * 1024},
-                      {disk2, 64ULL * 1024 * 1024},
-                      {disk3, 64ULL * 1024 * 1024}});
+    pool.reconfigure(
+        {{disk1, 64ULL * 1024 * 1024}, {disk2, 64ULL * 1024 * 1024}, {disk3, 64ULL * 1024 * 1024}});
     pool.refresh();
     CHECK(pool.online_backends() == 3);
     (void)pool.rebalance_once();
@@ -1414,9 +1423,8 @@ MACHA_TEST("storage_metadata", test_storage_pool_and_persistent_cache) {
     pool.refresh();
     CHECK(pool.online_backends() == 2);
     CHECK(pool.limit() == 128ULL * 1024 * 1024);
-    pool.reconfigure({{disk1, 64ULL * 1024 * 1024},
-                      {disk2, 64ULL * 1024 * 1024},
-                      {disk3, 64ULL * 1024 * 1024}});
+    pool.reconfigure(
+        {{disk1, 64ULL * 1024 * 1024}, {disk2, 64ULL * 1024 * 1024}, {disk3, 64ULL * 1024 * 1024}});
     pool.refresh();
     CHECK(pool.online_backends() == 3);
 
@@ -1430,8 +1438,7 @@ MACHA_TEST("storage_metadata", test_storage_pool_and_persistent_cache) {
     std::filesystem::create_directories(large_disk);
     auto weighted_node = load_or_create_node_id(weighted_state);
     StoragePool weighted(weighted_state, weighted_node,
-                         {{small_disk, 8ULL * 1024 * 1024},
-                          {large_disk, 64ULL * 1024 * 1024}},
+                         {{small_disk, 8ULL * 1024 * 1024}, {large_disk, 64ULL * 1024 * 1024}},
                          keys.storage);
     size_t small_objects = 0, large_objects = 0;
     for (size_t i = 0; i < 512; ++i) {
@@ -1505,8 +1512,7 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     file.size = 123;
     snap.entries["/movie.mkv"] = file;
     const std::string unicode_dir = "/Music/Caf\xc3\xa9 del Mar pack 1 (1999-2004)";
-    const std::string unicode_file =
-        unicode_dir + "/01.Clannad - Na Buachaill\xc3\xad lainn.mp3";
+    const std::string unicode_file = unicode_dir + "/01.Clannad - Na Buachaill\xc3\xad lainn.mp3";
     FsEntry unicode_directory_entry;
     unicode_directory_entry.type = EntryType::directory;
     snap.entries[unicode_dir] = unicode_directory_entry;
@@ -1536,7 +1542,8 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     identity_reset.reset_unix_ms = 1712345679999ULL;
     identity_reset.reset_by = a;
     identity_reset.reason = "endpoint reassigned";
-    snap.identity_resets[identity_reset_key(identity_reset.host, identity_reset.port)] = identity_reset;
+    snap.identity_resets[identity_reset_key(identity_reset.host, identity_reset.port)] =
+        identity_reset;
     auto encoded = encode_snapshot(snap);
     auto decoded = decode_snapshot(encoded);
     CHECK(decoded.metadata_voters == snap.metadata_voters);
@@ -1583,7 +1590,8 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     auto replacement_reset = identity_reset;
     replacement_reset.epoch = 4;
     replacement_reset.reset_unix_ms += 1;
-    delta_target.identity_resets[identity_reset_key(identity_reset.host, identity_reset.port)] = replacement_reset;
+    delta_target.identity_resets[identity_reset_key(identity_reset.host, identity_reset.port)] =
+        replacement_reset;
     auto compact = metadata_delta(decoded, delta_target);
     REQUIRE(compact.has_value());
     CHECK(compact->upsert_node_status.size() == 2);
@@ -1667,16 +1675,15 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     legacy_seed.generation = 17;
     legacy_seed.previous = object_id(pattern(211));
     legacy_seed.payload = old_v7.data();
-    legacy_seed.hash = metadata_hash(legacy_seed.generation, legacy_seed.previous,
-                                     legacy_seed.payload);
+    legacy_seed.hash =
+        metadata_hash(legacy_seed.generation, legacy_seed.previous, legacy_seed.payload);
     REQUIRE(legacy_journal.seed(legacy_seed));
-    REQUIRE(legacy_journal.remember_current_committed(legacy_seed.generation,
-                                                       legacy_seed.hash));
+    REQUIRE(legacy_journal.remember_current_committed(legacy_seed.generation, legacy_seed.hash));
     MetadataRecord legacy_successor;
-    REQUIRE(legacy_journal.cas_delta(legacy_seed.generation, legacy_seed.hash,
-                                     old_delta.data(), &legacy_successor));
+    REQUIRE(legacy_journal.cas_delta(legacy_seed.generation, legacy_seed.hash, old_delta.data(),
+                                     &legacy_successor));
     REQUIRE(legacy_journal.remember_current_committed(legacy_successor.generation,
-                                                       legacy_successor.hash));
+                                                      legacy_successor.hash));
     CHECK(std::equal(legacy_successor.payload.begin(), legacy_successor.payload.begin() + 8,
                      old_v7_magic.begin()));
     {
@@ -1752,8 +1759,8 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     const auto journal_before_delta =
         std::filesystem::file_size(replica_path / "metadata" / "journal.log");
     MetadataRecord delta_next;
-    REQUIRE(reopened.cas_delta(reopened.current().generation, reopened.current().hash,
-                               delta_bytes, &delta_next));
+    REQUIRE(reopened.cas_delta(reopened.current().generation, reopened.current().hash, delta_bytes,
+                               &delta_next));
     CHECK(reopened.committed().hash == next.hash);
     REQUIRE(reopened.remember_current_committed(delta_next.generation, delta_next.hash));
     auto journal_size = std::filesystem::file_size(replica_path / "metadata" / "journal.log");
@@ -1964,7 +1971,6 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     MetadataReplica compacted_again(compact_path, keys.storage);
     CHECK(compacted_again.current().generation == 66);
     CHECK(compacted_again.current().hash == compacted_again.committed().hash);
-
 }
 
 MACHA_TEST("storage_metadata", test_metadata_identity_rpc) {
@@ -1988,8 +1994,7 @@ MACHA_TEST("storage_metadata", test_metadata_identity_rpc) {
     auto found = std::find_if(peers.begin(), peers.end(),
                               [&](const NodeInfo& peer) { return peer.id == n2.node_id(); });
     REQUIRE(found != peers.end());
-    auto reply = n1.call(*found, MessageType::get_metadata_identity, {},
-                         FrameType::speculative);
+    auto reply = n1.call(*found, MessageType::get_metadata_identity, {}, FrameType::speculative);
     REQUIRE(reply.message.type == MessageType::metadata_identity_reply);
     CHECK(reply.message.payload.size() == sizeof(uint64_t) + 32);
     Reader reader(reply.message.payload);
@@ -2039,8 +2044,8 @@ MACHA_TEST("storage_metadata", test_repair_step_is_bounded_and_yields) {
     DistributedStore repair(s1.node());
     const auto full_lists_before = s1.node().local_store().full_list_scans();
 
-    auto yielded = repair.repair_step(8ULL * 1024 * 1024, 8, &live, &universal,
-                                      [] { return true; });
+    auto yielded =
+        repair.repair_step(8ULL * 1024 * 1024, 8, &live, &universal, [] { return true; });
     CHECK(yielded.yielded);
     CHECK(!yielded.complete);
     CHECK(yielded.bytes_transferred == 0);

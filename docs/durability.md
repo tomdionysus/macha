@@ -99,6 +99,21 @@ Namespace mutations similarly journal their local intent before exposing the opt
 
 This allows an unclean process restart to replay acknowledged local operations without inventing state from partially written files.
 
+Recovery and sustained namespace backlogs are drained as bounded ordered
+batches, currently limited by both operation count and encoded delta bytes. A
+compatible batch is applied to one mutable snapshot and published as one
+metadata commit. If an operation fails, only the largest valid prefix may be
+published; later operations remain behind the failing journal entry. A batch
+which is already fully reflected in committed metadata advances journal state
+without inventing another metadata generation.
+
+The durable operation journal remains per operation. Its `published` markers
+are written as one durability group after the accepted metadata commit, and its
+`done` markers as a second group before spool retirement. This preserves replay
+proof while avoiding one filesystem barrier per marker. Rename and operation
+families whose individual effects cannot yet be proved from the final snapshot
+remain singleton batch boundaries.
+
 ## Accounting
 
 Authoritative DATA byte accounting is derived state. Clean stores carry an exact checkpoint. If accounting is missing/dirty after an unclean stop, the backend reconciles physical objects before mutation admission becomes authoritative again.
@@ -126,6 +141,12 @@ For packed objects, deletion is a logical tombstone and dead physical bytes are 
 | Catalogue control object missing from one replica | fetch/converge from another replica without invalidating committed root |
 | Cache missing/corrupt | discard/rebuild cache |
 | GC unlink lost | unreachable garbage remains for a later sweep |
+
+For a recovered batch, a crash before the grouped `published` markers causes
+idempotent comparison with the accepted namespace; a crash after only a valid
+prefix of a marker group preserves the remaining operations for replay. No
+operation is reported done merely because another member of its batch was
+accepted.
 
 ## Memory is part of stability
 

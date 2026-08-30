@@ -55,6 +55,18 @@ Reconciliation itself is an ordinary immutable commit with multiple parents and 
 - accepted metadata references install durable causal retention claims on the physical DATA/CONTROL copies before publication; retention claims themselves drive bounded repair if a claimed copy is missing or corrupt;
 - GC remains active during partitions. Each node releases only locally-held claims for objects absent from its sole accepted head, and only claim dots dominated by that head's causal mutation clock. An unseen/concurrent branch which touched the object carries a newer/incomparable claim dot and therefore remains protected without any global branch survey.
 
+Validated historical materializations are shared and bounded. An uncached
+delta chain is reconstructed once outside the replica-state critical section,
+then installed through a short validated cache step; concurrent readers share
+that computation. Current, committed, and accepted heads are protected from
+eviction, but cache presence is never acceptance authority.
+
+History import, immutable commit storage, and acceptance execute on a dedicated
+bounded RPC executor. History transfer is dependency-first and windowed rather
+than stop-and-wait. This keeps ping, membership, ordinary control work, and
+foreground object service independent of reconstruction, encoding, filesystem
+I/O, and metadata durability latency.
+
 The remaining metadata work is conflict inspection/resolution APIs and long-term history/retention compaction policy. Catalogue trees already use semantic three-way item merges, with genuine collisions retained as first-class conflicts.
 
 ## Migration from 0.18

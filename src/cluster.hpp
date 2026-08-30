@@ -150,10 +150,18 @@ class NodeRuntime {
     void notify_storage_mutation();
     bool wait_local_state_ready(std::chrono::milliseconds timeout);
     NodeReadiness readiness() const;
-    const Config& config() const { return cfg_; }
-    const ClusterKeys& keys() const { return keys_; }
-    NodeId node_id() const { return id_; }
-    NodeId durability_epoch() const { return durability_epoch_; }
+    const Config& config() const {
+        return cfg_;
+    }
+    const ClusterKeys& keys() const {
+        return keys_;
+    }
+    NodeId node_id() const {
+        return id_;
+    }
+    NodeId durability_epoch() const {
+        return durability_epoch_;
+    }
     StoragePool& local_store();
     const StoragePool& local_store() const;
     LocalStore& control_store();
@@ -163,10 +171,18 @@ class NodeRuntime {
     const RetentionStore& retention_store() const;
     MetadataReplica& metadata_replica();
     const MetadataReplica& metadata_replica() const;
-    Membership& membership() { return members_; }
-    const Membership& membership() const { return members_; }
-    TelemetryStore& telemetry() { return telemetry_; }
-    const TelemetryStore& telemetry() const { return telemetry_; }
+    Membership& membership() {
+        return members_;
+    }
+    const Membership& membership() const {
+        return members_;
+    }
+    TelemetryStore& telemetry() {
+        return telemetry_;
+    }
+    const TelemetryStore& telemetry() const {
+        return telemetry_;
+    }
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
     RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType);
@@ -184,8 +200,12 @@ class NodeRuntime {
     void note_activity(FrameType, uint64_t bytes = 0);
     uint64_t take_activity_bytes(FrameType);
     std::chrono::milliseconds activity_idle_for(FrameType) const;
-    uint64_t remote_metadata_generation() const { return remote_metadata_generation_.load(); }
-    uint64_t remote_metadata_epoch() const { return remote_metadata_epoch_.load(std::memory_order_acquire); }
+    uint64_t remote_metadata_generation() const {
+        return remote_metadata_generation_.load();
+    }
+    uint64_t remote_metadata_epoch() const {
+        return remote_metadata_epoch_.load(std::memory_order_acquire);
+    }
     uint64_t metadata_announcements() const {
         return metadata_announcements_.load(std::memory_order_acquire);
     }
@@ -196,9 +216,16 @@ class NodeRuntime {
     }
     bool apply_identity_reset(const IdentityAssociationReset&);
     void propagate_identity_reset(const IdentityAssociationReset&);
-    std::vector<IdentityAssociationReset> identity_resets() const { return members_.identity_resets(); }
+    std::vector<IdentityAssociationReset> identity_resets() const {
+        return members_.identity_resets();
+    }
     PublicConnectivityStatus public_connectivity_status() const;
     PublicConnectivityStatus refresh_public_connectivity(bool probe, bool force_probe = false);
-    RpcStats rpc_stats() const { return client_.stats(); }
+    RpcStats rpc_stats() const {
+        return client_.stats();
+    }
+    RpcServerWorkStats rpc_server_work_stats() const {
+        return server_.work_stats();
+    }
 };
 } // namespace macha

@@ -271,10 +271,10 @@ Exit criteria:
 
 ## Phase 5: integrated validation and operational proof
 
-- [ ] Run the complete default suite via the repository's documented test command.
-- [ ] Run relevant heavy FUSE recovery and multi-node RPC tests.
-- [ ] Run `hydration_catalogue/test_catalogue_sync_search_and_artwork_gc` explicitly and report it explicitly; do not infer its result from another suite.
-- [ ] Exercise a three-node recovery backlog analogous to the original node-50 `rm -rf`.
+- [x] Run the complete default suite via the repository's documented test command.
+- [x] Run relevant heavy FUSE recovery and multi-node RPC tests.
+- [x] Run `hydration_catalogue/test_catalogue_sync_search_and_artwork_gc` explicitly and report it explicitly; do not infer its result from another suite.
+- [x] Exercise a three-node recovery backlog analogous to the original node-50 `rm -rf`.
 - [ ] Compare before/after counters:
   - operations per metadata generation;
   - materializations and applied deltas per accepted head;
@@ -283,9 +283,16 @@ Exit criteria:
   - RPC queue/handler latency by class;
   - CPU and RSS per node;
   - deletions completed per second.
-- [ ] Confirm the cluster becomes quiet after the backlog drains: no maintenance spin, no repeated notices, and no unexplained metadata RPC traffic.
+- [x] Confirm the cluster becomes quiet after the backlog drains: no maintenance spin, no repeated notices, and no unexplained metadata RPC traffic.
 - [ ] Confirm physical-object GC remains deliberately rate-limited and distinct from namespace publication completion.
-- [ ] Update `docs/durability.md`, `docs/metadata.md`, and `docs/operations.md` with the final batching and recovery semantics.
+- [x] Update `docs/durability.md`, `docs/metadata.md`, and `docs/operations.md` with the final batching and recovery semantics.
+
+Phase 5 diagnostic foundation completed: accepted-head persistence and bounded
+RPC message/frame execution summaries are exposed through local Status without
+polling. The second complete run passed 203/203 and runtime dependencies passed
+3/3; the first complete run's catalogue-burst timeout remains an explicit
+follow-up rather than being erased by the successful rerun. See
+`TODO/2026-08-30-phase-5-operational-diagnostics.md`.
 
 Exit criteria:
 
