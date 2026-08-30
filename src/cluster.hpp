@@ -100,6 +100,7 @@ class NodeRuntime {
     std::atomic_uint64_t telemetry_metadata_generation_{};
     std::atomic_uint32_t telemetry_peers_known_{1};
     std::atomic_uint32_t telemetry_peers_active_{1};
+    std::atomic_uint64_t telemetry_demand_{1};
     std::jthread maintenance_;
     std::jthread telemetry_worker_;
     std::mutex telemetry_wait_mutex_;
@@ -137,6 +138,7 @@ class NodeRuntime {
     void exchange(const NodeInfo&);
     void merge(std::span<const uint8_t>);
     void refresh_telemetry();
+    void signal_telemetry_refresh();
     void telemetry_loop(std::stop_token);
     std::chrono::milliseconds stall_notice_for(MessageType) const;
 

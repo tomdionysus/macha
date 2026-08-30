@@ -78,10 +78,11 @@ Repository-wide verification then passed:
 - `hydration_catalogue/test_catalogue_sync_search_and_artwork_gc` passed
   explicitly within the complete run in 6.650 seconds.
 
-## Deployment/UAT boundary
+## Deployment/UAT result
 
-After deployment, query all three Status endpoints sequentially. Each endpoint
-should continue to show its self card as live. A remote card with unavailable
-telemetry must show null usage rather than zero; if gossip supplies telemetry,
-the same card may become live/stale/last-known with numeric values. A genuine
-measured zero must remain numeric.
+The combined three-node UAT passed this contract before and after 2,064 live
+namespace operations. Every endpoint kept its self card live and numeric;
+remote cards without telemetry reported unavailable with null usage/free,
+cache measurements, and online-backend count rather than fabricated zeros.
+
+Evidence: [Combined Status availability and repeated-burst UAT](2026-08-30-combined-status-rss-uat.md)

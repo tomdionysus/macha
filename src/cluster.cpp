@@ -118,14 +118,16 @@ NodeId load_v18_node_id(const std::filesystem::path& state) {
         if (!input && value.empty())
             throw std::runtime_error("cannot read storage layout marker");
         if (value != expected)
-            throw std::runtime_error("incompatible Macha storage layout; 0.18 requires a fresh namespace");
+            throw std::runtime_error(
+                "incompatible Macha storage layout; 0.18 requires a fresh namespace");
     } else {
         // 0.18 intentionally has no live migration path. Refuse to reinterpret an
         // older namespace/backend layout as the new storage contract. StorageLock
         // has already created .macha.lock, which is the only allowed pre-existing
         // entry for a fresh state directory.
         for (const auto& entry : std::filesystem::directory_iterator(state)) {
-            if (entry.path().filename() == ".macha.lock") continue;
+            if (entry.path().filename() == ".macha.lock")
+                continue;
             throw std::runtime_error(
                 "existing unversioned Macha state detected; 0.18 requires a fresh namespace");
         }
@@ -146,15 +148,15 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
           keys_, [this] { return members_.self(); },
           [this](const NodeInfo& peer) {
               const auto active_before = members_.active();
-              const auto previous = std::find_if(
-                  active_before.begin(), active_before.end(),
-                  [&](const NodeInfo& item) { return item.id == peer.id; });
+              const auto previous =
+                  std::find_if(active_before.begin(), active_before.end(),
+                               [&](const NodeInfo& item) { return item.id == peer.id; });
               const bool topology_changed =
                   previous == active_before.end() || previous->host != peer.host ||
-                  previous->port != peer.port ||
-                  previous->failure_domain != peer.failure_domain;
+                  previous->port != peer.port || previous->failure_domain != peer.failure_domain;
               const auto previous_generation = remote_metadata_generation_.load();
               members_.observe(peer, true);
+              signal_telemetry_refresh();
               remote_metadata_generation_.store(
                   std::max(previous_generation, peer.metadata_generation));
               if (topology_changed || peer.metadata_generation > previous_generation)
@@ -163,8 +165,8 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
           },
           [this](uint64_t generation) {
               auto current = remote_metadata_generation_.load();
-              while (current < generation && !remote_metadata_generation_.compare_exchange_weak(
-                                                 current, generation)) {
+              while (current < generation &&
+                     !remote_metadata_generation_.compare_exchange_weak(current, generation)) {
               }
               // An explicit metadata notice is emitted only when a peer's
               // accepted-head set changes. Equal generation can therefore be
@@ -186,19 +188,19 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
           },
           [this](const NodeInfo& peer) {
               const auto active_before = members_.active();
-              const auto previous = std::find_if(
-                  active_before.begin(), active_before.end(),
-                  [&](const NodeInfo& item) { return item.id == peer.id; });
+              const auto previous =
+                  std::find_if(active_before.begin(), active_before.end(),
+                               [&](const NodeInfo& item) { return item.id == peer.id; });
               const bool topology_changed =
                   previous == active_before.end() || previous->host != peer.host ||
-                  previous->port != peer.port ||
-                  previous->failure_domain != peer.failure_domain;
+                  previous->port != peer.port || previous->failure_domain != peer.failure_domain;
               const auto previous_generation = remote_metadata_generation_.load();
               members_.observe(peer, true);
+              signal_telemetry_refresh();
               auto current = previous_generation;
               while (current < peer.metadata_generation &&
-                     !remote_metadata_generation_.compare_exchange_weak(
-                         current, peer.metadata_generation)) {
+                     !remote_metadata_generation_.compare_exchange_weak(current,
+                                                                        peer.metadata_generation)) {
               }
               if (topology_changed || peer.metadata_generation > previous_generation)
                   signal_service_event(topology_changed ? ServiceEvent::topology
@@ -231,8 +233,8 @@ void NodeRuntime::mark_recovery_failed(std::string error) {
 }
 
 bool NodeRuntime::all_local_state_ready() const noexcept {
-    constexpr uint32_t required = ready_data_storage | ready_control_storage | ready_cache |
-                                  ready_retention | ready_metadata;
+    constexpr uint32_t required =
+        ready_data_storage | ready_control_storage | ready_cache | ready_retention | ready_metadata;
     const auto bits = ready_bits_.load(std::memory_order_acquire);
     return (bits & required) == required && !(bits & ready_failed);
 }
@@ -320,9 +322,9 @@ void NodeRuntime::recover_storage(std::stop_token stop) {
             startup_stage_hook_("data-storage");
         if (stop.stop_requested())
             return;
-        auto local = std::make_unique<StoragePool>(
-            cfg_.state_path, id_, cfg_.storage_backends, keys_.storage,
-            std::chrono::milliseconds(500), cfg_.storage_packing);
+        auto local = std::make_unique<StoragePool>(cfg_.state_path, id_, cfg_.storage_backends,
+                                                   keys_.storage, std::chrono::milliseconds(500),
+                                                   cfg_.storage_packing);
         if (stop.stop_requested())
             return;
         const auto used = local->used();
@@ -349,8 +351,7 @@ void NodeRuntime::recover_state(std::stop_token stop) {
             return;
         control_ = std::make_unique<LocalStore>(
             cfg_.metadata_store.path,
-            LocalStoreOptions{cfg_.metadata_store.limit, 0,
-                              cfg_.metadata_store.packing.threshold,
+            LocalStoreOptions{cfg_.metadata_store.limit, 0, cfg_.metadata_store.packing.threshold,
                               cfg_.metadata_store.packing.target_size},
             keys_.storage);
         mark_ready(ready_control_storage);
@@ -373,7 +374,8 @@ void NodeRuntime::recover_state(std::stop_token stop) {
             startup_stage_hook_("metadata");
         if (stop.stop_requested())
             return;
-        meta_ = std::make_unique<MetadataReplica>(cfg_.state_path, keys_.storage, cache_->metadata());
+        meta_ =
+            std::make_unique<MetadataReplica>(cfg_.state_path, keys_.storage, cache_->metadata());
 
         // Identity-reset tombstones must be active before metadata exchange.
         try {
@@ -432,9 +434,12 @@ void NodeRuntime::start() {
 }
 
 void NodeRuntime::request_stop() {
-    if (storage_recovery_.joinable()) storage_recovery_.request_stop();
-    if (state_recovery_.joinable()) state_recovery_.request_stop();
-    if (connectivity_worker_.joinable()) connectivity_worker_.request_stop();
+    if (storage_recovery_.joinable())
+        storage_recovery_.request_stop();
+    if (state_recovery_.joinable())
+        state_recovery_.request_stop();
+    if (connectivity_worker_.joinable())
+        connectivity_worker_.request_stop();
     if (telemetry_worker_.joinable()) {
         telemetry_worker_.request_stop();
         telemetry_wait_cv_.notify_all();
@@ -478,8 +483,7 @@ void NodeRuntime::stop() {
 
 std::chrono::milliseconds NodeRuntime::stall_notice_for(MessageType type) const {
     if (type == MessageType::get_object || type == MessageType::put_object ||
-        type == MessageType::put_object_deferred ||
-        type == MessageType::object_durability_barrier)
+        type == MessageType::put_object_deferred || type == MessageType::object_durability_barrier)
         return cfg_.data_stall_notice;
     return cfg_.control_stall_notice;
 }
@@ -494,8 +498,8 @@ RpcReply NodeRuntime::call(const Endpoint& endpoint, MessageType type,
     return client_.call(endpoint, type, payload, stall_notice_for(type));
 }
 
-RpcReply NodeRuntime::call(const NodeInfo& node, MessageType type,
-                           std::span<const uint8_t> payload, FrameType frame_type) {
+RpcReply NodeRuntime::call(const NodeInfo& node, MessageType type, std::span<const uint8_t> payload,
+                           FrameType frame_type) {
     return client_.call(node, type, payload, frame_type, stall_notice_for(type));
 }
 
@@ -754,11 +758,12 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
                 return error_reply("storage durability epoch changed");
             try {
                 local_store().durability_barrier({domain, required_generation, backend_instance},
-                                          DurabilityUrgency::batchable);
+                                                 DurabilityUrgency::batchable);
                 members_.storage(local_store().used(), local_store().limit());
                 return {MessageType::ok, {}};
             } catch (const std::exception& error) {
-                return error_reply(std::string("storage durability barrier failed: ") + error.what());
+                return error_reply(std::string("storage durability barrier failed: ") +
+                                   error.what());
             }
         }
         case MessageType::retain_objects: {
@@ -799,14 +804,17 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             if (retention_store().retained(RetentionClass::data, id))
                 return error_reply("object has an active retention claim");
             (void)local_store().remove(id);
-            if (ready(ready_cache)) (void)block_cache().remove(id);
+            if (ready(ready_cache))
+                (void)block_cache().remove(id);
             members_.storage(local_store().used(), local_store().limit());
             return {MessageType::ok, {}};
         }
         case MessageType::get_metadata:
-            return {MessageType::metadata_reply, encode_metadata_record(metadata_replica().current())};
+            return {MessageType::metadata_reply,
+                    encode_metadata_record(metadata_replica().current())};
         case MessageType::get_committed_metadata:
-            return {MessageType::metadata_reply, encode_metadata_record(metadata_replica().committed())};
+            return {MessageType::metadata_reply,
+                    encode_metadata_record(metadata_replica().committed())};
         case MessageType::get_metadata_identity:
             return metadata_identity_reply(metadata_replica().committed_identity());
         case MessageType::get_metadata_history_entry: {
@@ -880,14 +888,13 @@ void NodeRuntime::merge(std::span<const uint8_t> payload) {
     for (uint32_t i = 0; i < count; ++i) {
         auto node = decode_node_info(reader);
         newest_metadata = std::max(newest_metadata, node.metadata_generation);
-        const auto previous = std::find_if(
-            before_all.begin(), before_all.end(),
-            [&](const NodeInfo& item) { return item.id == node.id; });
-        membership_changed = membership_changed || previous == before_all.end() ||
-                             previous->host != node.host || previous->port != node.port ||
-                             previous->failure_domain != node.failure_domain ||
-                             previous->metadata_write_replicas_required !=
-                                 node.metadata_write_replicas_required;
+        const auto previous =
+            std::find_if(before_all.begin(), before_all.end(),
+                         [&](const NodeInfo& item) { return item.id == node.id; });
+        membership_changed =
+            membership_changed || previous == before_all.end() || previous->host != node.host ||
+            previous->port != node.port || previous->failure_domain != node.failure_domain ||
+            previous->metadata_write_replicas_required != node.metadata_write_replicas_required;
         members_.observe(std::move(node));
     }
     reader.finish();
@@ -905,11 +912,10 @@ void NodeRuntime::merge(std::span<const uint8_t> payload) {
         std::sort(ids.begin(), ids.end());
         return ids;
     };
-    const bool topology_changed = membership_changed ||
-        active_ids(before_active) != active_ids(members_.active());
+    const bool topology_changed =
+        membership_changed || active_ids(before_active) != active_ids(members_.active());
     if (topology_changed || newest_metadata > previous_generation)
-        signal_service_event(topology_changed ? ServiceEvent::topology
-                                              : ServiceEvent::metadata);
+        signal_service_event(topology_changed ? ServiceEvent::topology : ServiceEvent::metadata);
 }
 
 PublicConnectivityStatus NodeRuntime::public_connectivity_status() const {
@@ -925,8 +931,7 @@ PublicConnectivityStatus NodeRuntime::refresh_public_connectivity(bool probe, bo
         server_.set_local(members_.self());
         Log::info("node advertised endpoint changed from=" + before.host + ":" +
                   std::to_string(before.port) + " to=" + status.advertised.host + ":" +
-                  std::to_string(status.advertised.port) + " source=" +
-                  status.advertised_source);
+                  std::to_string(status.advertised.port) + " source=" + status.advertised_source);
     }
     return status;
 }
@@ -951,8 +956,13 @@ void NodeRuntime::refresh_telemetry() {
     const auto peers_known = telemetry_peers_known_.load(std::memory_order_relaxed);
     const auto peers_active = telemetry_peers_active_.load(std::memory_order_relaxed);
     telemetry_.refresh_local(info, std::string(kServerVersion), cache_capacity, cache_used,
-                             storage_backends_online, peers_known, peers_active,
-                             0, 0, peers_active > 0 ? peers_active - 1 : 0);
+                             storage_backends_online, peers_known, peers_active, 0, 0,
+                             peers_active > 0 ? peers_active - 1 : 0);
+}
+
+void NodeRuntime::signal_telemetry_refresh() {
+    telemetry_demand_.fetch_add(1, std::memory_order_release);
+    telemetry_wait_cv_.notify_all();
 }
 
 void NodeRuntime::telemetry_loop(std::stop_token stop) {
@@ -960,7 +970,9 @@ void NodeRuntime::telemetry_loop(std::stop_token stop) {
     const auto interval = std::chrono::seconds(5);
     const auto idle_before_gossip = std::chrono::seconds(2);
     const auto gossip_ttl = std::max(cfg_.dead_after * 2, std::chrono::milliseconds(60000));
+    uint64_t handled_demand = 0;
     while (!stop.stop_requested()) {
+        const auto demand = telemetry_demand_.load(std::memory_order_acquire);
         try {
             refresh_telemetry();
             // Sampling is always local. Network gossip is suppressed while the
@@ -985,9 +997,12 @@ void NodeRuntime::telemetry_loop(std::stop_token stop) {
         } catch (const std::exception& error) {
             Log::debug("telemetry refresh skipped: " + std::string(error.what()));
         }
+        handled_demand = demand;
         cpu_reporter.tick();
         std::unique_lock lock(telemetry_wait_mutex_);
-        telemetry_wait_cv_.wait_for(lock, stop, interval, [] { return false; });
+        telemetry_wait_cv_.wait_for(lock, stop, interval, [&] {
+            return telemetry_demand_.load(std::memory_order_acquire) != handled_demand;
+        });
     }
 }
 
@@ -998,12 +1013,13 @@ bool NodeRuntime::apply_identity_reset(const IdentityAssociationReset& reset) {
     telemetry_.apply_identity_reset(reset);
     client_.invalidate_identity_association(reset);
     if (changed) {
-        Log::info("node identity association reset scope=" +
-                  identity_reset_key(reset.host, reset.port) + " stale_node_id=" +
-                  (reset.stale_node_id == NodeId{} ? std::string("<any>") : to_string(reset.stale_node_id)) +
-                  " epoch=" + std::to_string(reset.epoch) +
-                  " reset_by=" + to_string(reset.reset_by) +
-                  (reset.reason.empty() ? std::string{} : " reason=" + reset.reason));
+        Log::info(
+            "node identity association reset scope=" + identity_reset_key(reset.host, reset.port) +
+            " stale_node_id=" +
+            (reset.stale_node_id == NodeId{} ? std::string("<any>")
+                                             : to_string(reset.stale_node_id)) +
+            " epoch=" + std::to_string(reset.epoch) + " reset_by=" + to_string(reset.reset_by) +
+            (reset.reason.empty() ? std::string{} : " reason=" + reset.reason));
     }
     return changed;
 }
@@ -1074,12 +1090,11 @@ void NodeRuntime::loop(std::stop_token stop) {
         for (const auto& endpoint : cfg_.bootstrap) {
             exchanged.emplace(endpoint.host, endpoint.port);
             try {
-                auto known = std::find_if(known_nodes.begin(), known_nodes.end(),
-                                          [&](const NodeInfo& node) {
-                                              return node.id != id_ &&
-                                                     node.host == endpoint.host &&
-                                                     node.port == endpoint.port;
-                                          });
+                auto known =
+                    std::find_if(known_nodes.begin(), known_nodes.end(), [&](const NodeInfo& node) {
+                        return node.id != id_ && node.host == endpoint.host &&
+                               node.port == endpoint.port;
+                    });
                 if (known != known_nodes.end())
                     exchange(*known);
                 else
@@ -1138,9 +1153,8 @@ void NodeRuntime::local_writer_loop(std::stop_token stop) {
         LocalCopyJob job;
         {
             std::unique_lock lock(local_copy_mutex_);
-            local_copy_cv_.wait(lock, [&] {
-                return stop.stop_requested() || !local_copies_.empty();
-            });
+            local_copy_cv_.wait(lock,
+                                [&] { return stop.stop_requested() || !local_copies_.empty(); });
             if (stop.stop_requested() && local_copies_.empty())
                 return;
             job = std::move(local_copies_.front());
