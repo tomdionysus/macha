@@ -21,6 +21,6 @@ endforeach()
 # manifest, so uninstall and upgrades cannot erase local policy or secrets.
 message(STATUS "Preserved configuration: $ENV{DESTDIR}@MACHA_CONFIG_FILE@")
 message(STATUS "Preserved state, cache, spool, keys, mounts, and media data")
-if("@MACHA_INSTALL_SYSTEMD@")
+if("@MACHA_INSTALL_SYSTEMD@" STREQUAL "ON")
     message(STATUS "Run 'systemctl daemon-reload' to refresh systemd")
 endif()

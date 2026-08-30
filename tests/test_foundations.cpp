@@ -182,6 +182,63 @@ MACHA_FAST_TEST("foundations", test_membership_identity_reset_tombstone) {
     CHECK(!membership.apply_identity_reset(reset2));
 }
 
+MACHA_FAST_TEST("foundations", test_membership_identity_reset_is_durable_without_metadata) {
+    TempDir t;
+    const auto roster = t.path() / "membership" / "known-nodes.bin";
+
+    NodeInfo self;
+    self.id = random_node_id();
+    self.host = "127.0.0.1";
+    self.port = 57401;
+
+    NodeInfo stale;
+    stale.id = random_node_id();
+    stale.host = "10.44.1.50";
+    stale.port = 7437;
+    stale.seen_unix_ms = unix_ms();
+
+    IdentityAssociationReset reset;
+    reset.host = stale.host;
+    reset.port = stale.port;
+    reset.stale_node_id = stale.id;
+    reset.epoch = 1;
+    reset.reset_unix_ms = stale.seen_unix_ms + 1;
+    reset.reset_by = self.id;
+    reset.reason = "metadata unavailable recovery";
+
+    {
+        Membership membership(self, 30s, roster);
+        membership.observe(stale, true);
+        REQUIRE(membership.all().size() == 2);
+        REQUIRE(membership.apply_identity_reset(reset));
+        CHECK(membership.all().size() == 1);
+    }
+
+    {
+        Membership recovered(self, 30s, roster);
+        REQUIRE(recovered.identity_resets().size() == 1);
+        CHECK(recovered.identity_resets().front() == reset);
+        CHECK(recovered.all().size() == 1);
+
+        // Restart cannot restore the invalidated roster entry, and old gossip
+        // remains fenced without requiring a readable metadata snapshot.
+        recovered.observe(stale, false);
+        CHECK(recovered.all().size() == 1);
+
+        stale.seen_unix_ms = reset.reset_unix_ms + 1;
+        recovered.observe(stale, true);
+        REQUIRE(recovered.all().size() == 2);
+    }
+
+    // A genuinely fresh, directly authenticated association survives another
+    // restart; the persisted observation time distinguishes it from stale data.
+    Membership recovered_fresh(self, 30s, roster);
+    const auto fresh_members = recovered_fresh.all();
+    REQUIRE(fresh_members.size() == 2);
+    CHECK(std::any_of(fresh_members.begin(), fresh_members.end(),
+                      [&](const NodeInfo& node) { return node.id == stale.id; }));
+}
+
 MACHA_FAST_TEST("foundations", test_membership_persists_gc_fence_and_requires_direct_reachability) {
     TempDir t;
     const auto roster = t.path() / "membership" / "known-nodes.bin";

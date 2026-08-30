@@ -311,6 +311,59 @@ MACHA_TEST("invariants", test_manage_node_identity_association_reset) {
     CHECK(metadata_after_ip.identity_resets.at(ip_key).reason == "clear by ip");
 }
 
+MACHA_TEST("invariants", test_manage_identity_reset_breaks_metadata_unavailable_cycle) {
+    TestService fixture("manage-identity-reset-unavailable");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 2;
+    config.hydration.enabled = false;
+    config.catalogue.scanner.enabled = false;
+    auto& service = fixture.start();
+
+    auto& fs = service.filesystem();
+    auto& hints = service.catalogue_hints();
+    CatalogueScanner scanner(service.node(), fs, service.catalogue(), hints,
+                             config.catalogue.scanner);
+    ManageApi manage(service.node(), service.metadata_manager(), fs, service.catalogue(), hints,
+                     scanner);
+
+    NodeInfo stale;
+    stale.id = random_node_id();
+    stale.host = "10.44.1.50";
+    stale.port = 7437;
+    stale.failure_domain = "test";
+    stale.seen_unix_ms = unix_ms();
+    service.node().membership().observe(stale, true);
+    REQUIRE(service.node().membership().all().size() == 2);
+
+    HttpRequest reset;
+    reset.method = "POST";
+    reset.path = "/api/v1/manage/nodes/" + to_string(stale.id) +
+                 "/identity-association/reset";
+    const std::string body = R"({"reason":"recover unavailable metadata"})";
+    reset.body.assign(body.begin(), body.end());
+    const auto response = manage.handle(reset);
+
+    // The operational recovery succeeds before its cluster-metadata audit.
+    // HTTP 202 communicates that the durable local tombstone was accepted but
+    // the metadata write floor is not currently available.
+    REQUIRE(response.status == 202);
+    const auto value = Json::parse(std::string(
+        reinterpret_cast<const char*>(response.body.data()), response.body.size()));
+    CHECK(!value.find("metadata_persisted")->asBool());
+    CHECK(value.find("metadata_generation")->isNull());
+    CHECK(!value.find("persistence_error")->asString().empty());
+    CHECK(value.find("reset")->find("stale_node_id")->asString() == to_string(stale.id));
+
+    const auto members = service.node().membership().all();
+    CHECK(std::none_of(members.begin(), members.end(),
+                       [&](const NodeInfo& node) { return node.id == stale.id; }));
+    const auto resets = service.node().identity_resets();
+    REQUIRE(resets.size() == 1);
+    CHECK(resets.front().host == stale.host);
+    CHECK(resets.front().port == stale.port);
+}
+
 MACHA_TEST("invariants", test_status_api_precedes_control_plane_startup) {
     TestCluster cluster(ConfigProfile::isolated);
     auto config = cluster.node_config("status-first");

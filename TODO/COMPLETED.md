@@ -310,8 +310,24 @@ Evidence: [Cluster Status telemetry aggregation UAT](2026-08-30-cluster-status-t
   `ExecStart` and documented service enable/disable/reload steps.
 - [x] Verified a staged `/usr` install, both generated unit paths, complete
   uninstall, configuration preservation, and checksum-stable reinstall.
+- [x] Corrected Debian multiarch systemd installation: cached
+  `lib/<architecture>/systemd/system` defaults migrate to
+  `lib/systemd/system`, while custom paths remain configurable; also removed
+  the generated CMake CMP0012 warning.
 
 Evidence: [Linux systemd install and uninstall targets](2026-08-30-linux-systemd-install.md)
+
+## Identity-association reset recovery
+
+- [x] Removed the circular dependency which required a metadata commit before
+  clearing the stale endpoint identity that could itself prevent convergence.
+- [x] Apply and propagate resets before the metadata audit; return an explicit
+  accepted/pending result when the metadata write floor is unavailable.
+- [x] Persist operational reset tombstones and member observation timestamps in
+  the backward-readable `MACHMEM2` roster so stale identities remain fenced
+  across restart while fresh authenticated replacements remain valid.
+- [x] Added unavailable-metadata and restart durability regressions. The full
+  backend suite passed 210/210 and runtime dependency tests passed 3/3.
 
 ## Version 0.21.0
 

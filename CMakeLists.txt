@@ -239,11 +239,25 @@ if(MACHA_BUILD_SERVER)
     set(MACHA_FUSE_FOUND OFF)
     if(MACHA_ENABLE_FUSE)
         pkg_check_modules(FUSE3 QUIET IMPORTED_TARGET fuse3)
-        if(TARGET PkgConfig::FUSE3)
-            set(MACHA_FUSE_FOUND ON)
-            target_sources(macha PRIVATE src/fuse_adapter.cpp)
-            target_link_libraries(macha PRIVATE PkgConfig::FUSE3)
-        endif()
+if(TARGET PkgConfig::FUSE3)
+    set(MACHA_FUSE_FOUND ON)
+    target_sources(macha PRIVATE src/fuse_adapter.cpp)
+    # On macOS, /usr/local/include is searched by Clang before -isystem
+    # directories.  If both legacy FUSE 2 headers and FUSE 3 are installed,
+    # PkgConfig::FUSE3's system include therefore lets <fuse.h> resolve to
+    # FUSE 2 while <fuse_lowlevel.h> resolves to FUSE 3.  Put the explicit
+    # FUSE 3 directory first as a normal include path so a clean configure is
+    # deterministic (an older CMake cache happened to conceal this).
+    if(APPLE)
+        target_include_directories(macha BEFORE PRIVATE ${FUSE3_INCLUDE_DIRS})
+        target_link_directories(macha PRIVATE ${FUSE3_LIBRARY_DIRS})
+        target_link_libraries(macha PRIVATE ${FUSE3_LIBRARIES})
+        target_compile_options(macha PRIVATE ${FUSE3_CFLAGS_OTHER})
+        target_link_options(macha PRIVATE ${FUSE3_LDFLAGS_OTHER})
+    else()
+        target_link_libraries(macha PRIVATE PkgConfig::FUSE3)
+    endif()
+endif()
 
         if(APPLE AND NOT MACHA_FUSE_FOUND)
             find_path(FUSE3_INCLUDE_DIR fuse.h
@@ -381,8 +395,21 @@ else()
 endif()
 set(MACHA_CONFIG_INSTALL_DIR "${MACHA_CONFIG_INSTALL_DIR_DEFAULT}" CACHE STRING
     "Directory containing the installed Macha configuration")
-set(MACHA_SYSTEMD_UNIT_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/systemd/system" CACHE STRING
-    "Directory containing installed systemd system units")
+set(MACHA_SYSTEMD_UNIT_INSTALL_DIR_DEFAULT "lib/systemd/system")
+set(MACHA_SYSTEMD_UNIT_INSTALL_DIR_LEGACY "${CMAKE_INSTALL_LIBDIR}/systemd/system")
+if(DEFINED MACHA_SYSTEMD_UNIT_INSTALL_DIR
+   AND MACHA_SYSTEMD_UNIT_INSTALL_DIR STREQUAL MACHA_SYSTEMD_UNIT_INSTALL_DIR_LEGACY
+   AND NOT MACHA_SYSTEMD_UNIT_INSTALL_DIR STREQUAL MACHA_SYSTEMD_UNIT_INSTALL_DIR_DEFAULT)
+    # Before 0.21.0 this default incorrectly inherited Debian's multiarch
+    # CMAKE_INSTALL_LIBDIR (for example lib/aarch64-linux-gnu), a directory
+    # systemd does not search.  Migrate that exact cached default but retain
+    # explicit operator overrides.
+    set(MACHA_SYSTEMD_UNIT_INSTALL_DIR "${MACHA_SYSTEMD_UNIT_INSTALL_DIR_DEFAULT}" CACHE STRING
+        "Directory containing installed systemd system units" FORCE)
+else()
+    set(MACHA_SYSTEMD_UNIT_INSTALL_DIR "${MACHA_SYSTEMD_UNIT_INSTALL_DIR_DEFAULT}" CACHE STRING
+        "Directory containing installed systemd system units")
+endif()
 
 function(macha_full_install_path output path)
     if(IS_ABSOLUTE "${path}")
