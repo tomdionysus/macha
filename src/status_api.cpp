@@ -582,6 +582,28 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                 filesystem_diagnostics["available"] = true;
                 filesystem_diagnostics["timed_out_requests"] = values->timed_out_requests;
                 filesystem_diagnostics["merged_publications"] = values->merged_publications;
+                filesystem_diagnostics["data_publication_requests"] =
+                    values->data_publication_requests;
+                filesystem_diagnostics["data_publication_coalesced_queued"] =
+                    values->data_publication_coalesced_queued;
+                filesystem_diagnostics["data_publication_coalesced_running"] =
+                    values->data_publication_coalesced_running;
+                filesystem_diagnostics["data_publication_coalesced_unconfirmed"] =
+                    values->data_publication_coalesced_unconfirmed;
+                filesystem_diagnostics["data_publications_started"] =
+                    values->data_publications_started;
+                filesystem_diagnostics["data_publications_completed"] =
+                    values->data_publications_completed;
+                filesystem_diagnostics["data_publication_peak_active"] =
+                    values->data_publication_peak_active;
+                filesystem_diagnostics["data_closed_priority_selections"] =
+                    values->data_closed_priority_selections;
+                filesystem_diagnostics["data_publication_bytes_read"] =
+                    values->data_publication_bytes_read;
+                filesystem_diagnostics["data_publication_bytes_committed"] =
+                    values->data_publication_bytes_committed;
+                filesystem_diagnostics["data_publication_bytes_confirmed"] =
+                    values->data_publication_bytes_confirmed;
                 filesystem_diagnostics["backend_failures"] = values->backend_failures;
                 filesystem_diagnostics["durability_batches"] = values->durability_batches;
                 filesystem_diagnostics["durability_writes"] = values->durability_writes;
