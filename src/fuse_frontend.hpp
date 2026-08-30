@@ -79,6 +79,27 @@ struct FuseFrontendStatus {
     uint64_t journal_durability_barriers{};
 };
 
+// Lock-free, process-lifetime operational totals suitable for Status. This is
+// deliberately separate from FuseFrontendStatus: obtaining queue state may
+// inspect live inode state, while observational diagnostics must stay O(1).
+struct FuseFrontendDiagnostics {
+    uint64_t timed_out_requests{};
+    uint64_t merged_publications{};
+    uint64_t backend_failures{};
+    uint64_t durability_batches{};
+    uint64_t durability_writes{};
+    uint64_t namespace_operations_admitted{};
+    uint64_t namespace_operations_recovered{};
+    uint64_t namespace_publication_attempts{};
+    uint64_t namespace_publication_batches{};
+    uint64_t namespace_operations_batched{};
+    uint64_t namespace_operations_published{};
+    uint64_t namespace_operations_confirmed{};
+    uint64_t journal_append_batches{};
+    uint64_t journal_records_appended{};
+    uint64_t journal_durability_barriers{};
+};
+
 struct FuseDirtyRange {
     uint64_t offset{};
     uint64_t length{};
@@ -95,8 +116,8 @@ class FuseFrontend final : public HydrationHintProvider {
     std::chrono::milliseconds timeout_for(FuseOperationClass) const;
     bool submit_task(FuseOperationClass, Clock::time_point, std::shared_ptr<std::atomic_bool>,
                      std::function<void(Clock::time_point, std::atomic_bool&)>);
-    size_t read_impl(uint64_t inode, const std::shared_ptr<FuseReadSession>&,
-                     uint64_t offset, std::span<uint8_t>);
+    size_t read_impl(uint64_t inode, const std::shared_ptr<FuseReadSession>&, uint64_t offset,
+                     std::span<uint8_t>);
 
     template <class Fn>
     auto dispatch(FuseOperationClass operation, Fn&& fn)
@@ -113,8 +134,8 @@ class FuseFrontend final : public HydrationHintProvider {
         auto future = promise->get_future();
 
         auto task = [promise, cancelled, request_state, complete_once_started,
-                     fn = std::forward<Fn>(fn)](
-                        Clock::time_point task_deadline, std::atomic_bool& task_cancelled) mutable {
+                     fn = std::forward<Fn>(fn)](Clock::time_point task_deadline,
+                                                std::atomic_bool& task_cancelled) mutable {
             // A mutating FUSE request may be rejected while it is still queued,
             // but once it starts it must have exactly one observable outcome.
             // Returning ETIMEDOUT while a pwrite/truncate/namespace mutation is
@@ -123,8 +144,8 @@ class FuseFrontend final : public HydrationHintProvider {
             // cancellable after they begin.
             if (Clock::now() >= task_deadline) {
                 auto expected = FuseRequestState::queued;
-                if (request_state->compare_exchange_strong(
-                        expected, FuseRequestState::cancelled, std::memory_order_acq_rel)) {
+                if (request_state->compare_exchange_strong(expected, FuseRequestState::cancelled,
+                                                           std::memory_order_acq_rel)) {
                     task_cancelled.store(true, std::memory_order_relaxed);
                     try {
                         promise->set_exception(std::make_exception_ptr(
@@ -136,8 +157,8 @@ class FuseFrontend final : public HydrationHintProvider {
             }
 
             auto expected = FuseRequestState::queued;
-            if (!request_state->compare_exchange_strong(
-                    expected, FuseRequestState::running, std::memory_order_acq_rel))
+            if (!request_state->compare_exchange_strong(expected, FuseRequestState::running,
+                                                        std::memory_order_acq_rel))
                 return;
 
             try {
@@ -166,8 +187,8 @@ class FuseFrontend final : public HydrationHintProvider {
 
         if (future.wait_until(deadline) != std::future_status::ready) {
             auto expected = FuseRequestState::queued;
-            if (request_state->compare_exchange_strong(
-                    expected, FuseRequestState::cancelled, std::memory_order_acq_rel)) {
+            if (request_state->compare_exchange_strong(expected, FuseRequestState::cancelled,
+                                                       std::memory_order_acq_rel)) {
                 cancelled->store(true, std::memory_order_relaxed);
                 note_timeout();
                 throw FsError(ETIMEDOUT, "FUSE request deadline exceeded before execution");
@@ -199,7 +220,9 @@ class FuseFrontend final : public HydrationHintProvider {
     FuseFrontend(const FuseFrontend&) = delete;
     FuseFrontend& operator=(const FuseFrontend&) = delete;
 
-    std::string_view name() const override { return "fuse"; }
+    std::string_view name() const override {
+        return "fuse";
+    }
     std::vector<HydrationHint> hints() override;
     void set_wake_callback(std::function<void()> callback) override;
 
@@ -235,6 +258,7 @@ class FuseFrontend final : public HydrationHintProvider {
     std::optional<uint64_t> inode_for_path(std::string_view path);
     std::vector<FuseDirtyRange> dirty_ranges(uint64_t inode) const;
     FuseFrontendStatus status() const;
+    FuseFrontendDiagnostics diagnostics() const noexcept;
     bool wait_for_idle(std::chrono::milliseconds timeout = std::chrono::seconds(10));
     void stop();
 };

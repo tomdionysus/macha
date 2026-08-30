@@ -1,29 +1,31 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
-#include "catalogue.hpp"
-#include "catalogue_hints.hpp"
-#include "catalogue_api.hpp"
-#include "manage_api.hpp"
 #include "acquisition_api.hpp"
-#include "status_api.hpp"
-#include "ingest.hpp"
-#include "torrent.hpp"
-#include "filesystem.hpp"
+#include "catalogue.hpp"
+#include "catalogue_api.hpp"
+#include "catalogue_hints.hpp"
 #include "convergence_demand.hpp"
+#include "filesystem.hpp"
 #include "hydration.hpp"
+#include "ingest.hpp"
+#include "manage_api.hpp"
 #include "media_catalogue.hpp"
 #include "playback.hpp"
+#include "status_api.hpp"
+#include "torrent.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <ctime>
-#include <mutex>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace macha {
+
+class FuseFrontend;
 
 std::chrono::milliseconds maintenance_background_interval(const MaintenanceConfig&);
 
@@ -100,18 +102,38 @@ class Service {
     void request_stop();
     void stop();
     void reload_config();
-    bool ready() const noexcept { return services_ready_.load(std::memory_order_acquire); }
-    FileSystem& filesystem() { wait_services_ready(); return *fs_; }
-    NodeRuntime& node() { return node_; }
-    MetadataManager& metadata_manager() { wait_services_ready(); return *metadata_; }
-    CatalogueManager& catalogue() { wait_services_ready(); return *catalogue_; }
-    CatalogueHintQueue& catalogue_hints() { wait_services_ready(); return *catalogue_hints_; }
-    HydrationManager& hydration() { wait_services_ready(); return *hydration_; }
+    bool ready() const noexcept {
+        return services_ready_.load(std::memory_order_acquire);
+    }
+    FileSystem& filesystem() {
+        wait_services_ready();
+        return *fs_;
+    }
+    NodeRuntime& node() {
+        return node_;
+    }
+    MetadataManager& metadata_manager() {
+        wait_services_ready();
+        return *metadata_;
+    }
+    CatalogueManager& catalogue() {
+        wait_services_ready();
+        return *catalogue_;
+    }
+    CatalogueHintQueue& catalogue_hints() {
+        wait_services_ready();
+        return *catalogue_hints_;
+    }
+    HydrationManager& hydration() {
+        wait_services_ready();
+        return *hydration_;
+    }
     uint64_t maintenance_wakeups() const noexcept {
         return maintenance_wakeups_.load(std::memory_order_acquire);
     }
     ConvergenceDemandDiagnostics metadata_convergence_diagnostics() const noexcept {
         return metadata_convergence_.diagnostics();
     }
+    void attach_fuse_frontend(std::weak_ptr<FuseFrontend>);
 };
 } // namespace macha

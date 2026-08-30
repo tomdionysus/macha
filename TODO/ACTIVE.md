@@ -29,7 +29,7 @@ The existing documents in this directory remain the detailed plans, checkpoints,
 - [ ] Record a reproducible local benchmark recipe without default-suite timing thresholds.
 - [ ] Measure a larger or repeated namespace burst to establish whether materialization-cache RSS reaches a stable ceiling.
 - [ ] Recheck the intermittent suite-load timeout in `hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`: the first Phase 5 full run timed out at 10 seconds, its immediate isolated run passed in 1.024 seconds, and the second full run passed it in 1.147 seconds. Preserve diagnostics on any recurrence; do not dismiss a future failure as timing noise.
-- [ ] Compare final operational counters: operations per generation, materializations and deltas per head, journal barriers, convergence runs, RPC latency, CPU, RSS, and deletion throughput.
+- [ ] Deploy the journal/convergence Status build and repeat a bounded namespace UAT to capture admission/publication journal-barrier deltas and convergence events/runs. The API exposure and deterministic tests are complete; this live delta is the remaining Phase 5 counter comparison.
 - [ ] Confirm physical-object GC remains deliberately rate-limited and operationally distinct from namespace publication completion.
 - [ ] Update `docs/durability.md`, `docs/metadata.md`, and `docs/operations.md` with the final batching, recovery, convergence, and RPC-isolation semantics.
 

@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "service.hpp"
-#include "log.hpp"
 #include "diagnostics.hpp"
+#include "fuse_frontend.hpp"
+#include "log.hpp"
 #include <algorithm>
 #include <cmath>
 #include <ctime>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
-#include <limits>
 #include <set>
 #include <thread>
 
@@ -61,8 +62,8 @@ uint64_t initialise_scrub_due(const std::filesystem::path& state_path,
     const auto now = unix_ms();
     const auto interval_ms = static_cast<uint64_t>(std::max<int64_t>(1, interval.count()));
     const auto due = now > std::numeric_limits<uint64_t>::max() - interval_ms
-        ? std::numeric_limits<uint64_t>::max()
-        : now + interval_ms;
+                         ? std::numeric_limits<uint64_t>::max()
+                         : now + interval_ms;
     try {
         persist_scrub_due(path, due);
     } catch (const std::exception& error) {
@@ -79,9 +80,8 @@ void log_slow_stage(std::string_view stage, Clock::time_point started,
     const auto ms = elapsed_ms(started);
     if (ms < 50 || !Log::enabled(LogLevel::all))
         return;
-    Log::trace("DIAG maintenance-stage stage=" + std::string(stage) +
-               " elapsed_ms=" + std::to_string(ms) +
-               (detail.empty() ? std::string{} : " " + detail));
+    Log::trace("DIAG maintenance-stage stage=" + std::string(stage) + " elapsed_ms=" +
+               std::to_string(ms) + (detail.empty() ? std::string{} : " " + detail));
 }
 } // namespace
 
@@ -89,12 +89,27 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
                  MaintenanceStageHook maintenance_stage_hook)
     : node_(std::move(config), keys, std::move(startup_stage_hook)), cluster_status_(node_),
       maintenance_stage_hook_(std::move(maintenance_stage_hook)) {
+    cluster_status_.attach_convergence_diagnostics(
+        [this] { return metadata_convergence_.diagnostics(); });
     if (node_.config().catalogue.api.enabled) {
         catalogue_http_ = std::make_unique<HttpServer>(
             node_.config().catalogue.api,
             [this](const HttpRequest& request) { return handle_http(request); },
             [this](const HttpRequest& request) { return capability_request(request); });
     }
+}
+
+void Service::attach_fuse_frontend(std::weak_ptr<FuseFrontend> frontend) {
+    if (!frontend.use_count()) {
+        cluster_status_.detach_fuse_diagnostics();
+        return;
+    }
+    cluster_status_.attach_fuse_diagnostics([frontend = std::move(frontend)] {
+        auto shared = frontend.lock();
+        if (!shared)
+            return std::optional<FuseFrontendDiagnostics>{};
+        return std::optional<FuseFrontendDiagnostics>{shared->diagnostics()};
+    });
 }
 
 Service::~Service() {
@@ -150,9 +165,8 @@ void Service::initialise_services(std::stop_token stop) {
                 break;
             const auto readiness = node_.readiness();
             if (readiness.failed)
-                throw std::runtime_error(readiness.error.empty()
-                                             ? "node local-state recovery failed"
-                                             : readiness.error);
+                throw std::runtime_error(
+                    readiness.error.empty() ? "node local-state recovery failed" : readiness.error);
         }
         if (stop.stop_requested())
             return;
@@ -162,32 +176,31 @@ void Service::initialise_services(std::stop_token stop) {
         auto catalogue = std::make_unique<CatalogueManager>(node_, *store, *metadata);
         auto fs = std::make_unique<FileSystem>(node_, *store, *metadata, &playback_);
         auto catalogue_hints = std::make_unique<CatalogueHintQueue>(node_.config().state_path);
-        auto scanner = std::make_unique<CatalogueScanner>(
-            node_, *fs, *catalogue, *catalogue_hints, node_.config().catalogue.scanner);
-        auto hydration = std::make_unique<HydrationManager>(
-            *store, playback_, *fs, *catalogue, node_.config().hydration,
-            node_.config().read_ahead_extents);
-        auto ingest = std::make_unique<IngestManager>(
-            node_, *fs, *catalogue_hints, node_.config().ingest);
-        auto torrents = std::make_unique<TorrentManager>(
-            *ingest, node_.config().torrent, node_.config().state_path);
+        auto scanner = std::make_unique<CatalogueScanner>(node_, *fs, *catalogue, *catalogue_hints,
+                                                          node_.config().catalogue.scanner);
+        auto hydration = std::make_unique<HydrationManager>(*store, playback_, *fs, *catalogue,
+                                                            node_.config().hydration,
+                                                            node_.config().read_ahead_extents);
+        auto ingest =
+            std::make_unique<IngestManager>(node_, *fs, *catalogue_hints, node_.config().ingest);
+        auto torrents = std::make_unique<TorrentManager>(*ingest, node_.config().torrent,
+                                                         node_.config().state_path);
         auto torrent_search = std::make_unique<TorrentSearchManager>(node_.config().torrent);
-        auto acquisition_api = std::make_unique<AcquisitionApi>(
-            *ingest, *torrents, *torrent_search);
+        auto acquisition_api =
+            std::make_unique<AcquisitionApi>(*ingest, *torrents, *torrent_search);
         auto catalogue_api = std::make_unique<CatalogueApi>(
             *catalogue, *catalogue_hints,
             [scanner_ptr = scanner.get()](const std::vector<std::string>& media_ids) {
                 scanner_ptr->request_media_rescan(media_ids);
             });
-        auto manage_api = std::make_unique<ManageApi>(
-            node_, *metadata, *fs, *catalogue, *catalogue_hints, *scanner);
+        auto manage_api = std::make_unique<ManageApi>(node_, *metadata, *fs, *catalogue,
+                                                      *catalogue_hints, *scanner);
         auto streaming = std::make_unique<PlaybackManager>(
             *fs, *catalogue, node_.config().catalogue.api, node_.config().streaming);
 
-        metadata->set_publication_retention(
-            [this](const MetadataPublicationContext& context) {
-                retain_metadata_publication(context);
-            });
+        metadata->set_publication_retention([this](const MetadataPublicationContext& context) {
+            retain_metadata_publication(context);
+        });
 
         store_ = std::move(store);
         metadata_ = std::move(metadata);
@@ -217,11 +230,9 @@ void Service::initialise_services(std::stop_token stop) {
         // the edge-triggered high-water object; storage-only events still wake
         // ordinary maintenance without scheduling redundant metadata work.
         metadata_convergence_.request(node_.known_metadata_generation());
-        node_.set_service_event_callback(
-            [this](ServiceEvent event) { signal_maintenance(event); });
-        maintenance_ = std::jthread([this](std::stop_token maintenance_stop) {
-            loop(maintenance_stop);
-        });
+        node_.set_service_event_callback([this](ServiceEvent event) { signal_maintenance(event); });
+        maintenance_ =
+            std::jthread([this](std::stop_token maintenance_stop) { loop(maintenance_stop); });
 
         services_ready_.store(true, std::memory_order_release);
         startup_cv_.notify_all();
@@ -253,15 +264,21 @@ void Service::start() {
 void Service::request_stop() {
     if (startup_.joinable())
         startup_.request_stop();
-    if (fs_) fs_->request_io_cancellation();
-    if (torrents_) torrents_->request_stop();
-    if (ingest_) ingest_->request_stop();
-    if (scanner_) scanner_->request_stop();
-    if (hydration_) hydration_->request_stop();
+    if (fs_)
+        fs_->request_io_cancellation();
+    if (torrents_)
+        torrents_->request_stop();
+    if (ingest_)
+        ingest_->request_stop();
+    if (scanner_)
+        scanner_->request_stop();
+    if (hydration_)
+        hydration_->request_stop();
     cluster_status_.request_stop();
     if (catalogue_http_)
         catalogue_http_->request_stop();
-    if (streaming_) streaming_->request_stop();
+    if (streaming_)
+        streaming_->request_stop();
     if (maintenance_.joinable()) {
         maintenance_.request_stop();
         maintenance_wait_cv_.notify_all();
@@ -275,15 +292,20 @@ void Service::stop() {
     request_stop();
     if (startup_.joinable())
         startup_.join();
-    if (torrents_) torrents_->stop();
-    if (ingest_) ingest_->stop();
-    if (scanner_) scanner_->stop();
-    if (hydration_) hydration_->stop();
+    if (torrents_)
+        torrents_->stop();
+    if (ingest_)
+        ingest_->stop();
+    if (scanner_)
+        scanner_->stop();
+    if (hydration_)
+        hydration_->stop();
     cluster_status_.detach_metadata();
     cluster_status_.stop();
     if (catalogue_http_)
         catalogue_http_->stop();
-    if (streaming_) streaming_->stop();
+    if (streaming_)
+        streaming_->stop();
     if (maintenance_.joinable()) {
         Log::debug("shutdown: service maintenance request_stop");
         maintenance_.request_stop();
@@ -310,7 +332,6 @@ void Service::signal_maintenance(ServiceEvent event) {
         maintenance_wait_cv_.notify_all();
 }
 
-
 void Service::retain_metadata_publication(const MetadataPublicationContext& context) {
     const RetentionDot dot{context.origin, context.sequence};
     std::vector<ObjectId> data;
@@ -325,8 +346,8 @@ void Service::retain_metadata_publication(const MetadataPublicationContext& cont
     };
 
     auto before = decode_snapshot(context.parent.payload);
-    const bool establish_baseline = !before.retention_baseline_complete &&
-                                    context.proposed.retention_baseline_complete;
+    const bool establish_baseline =
+        !before.retention_baseline_complete && context.proposed.retention_baseline_complete;
     if (establish_baseline) {
         // Migration safety: before protocol-20 retention-aware GC is enabled for
         // an upgraded namespace, every object reachable from the reconciled
@@ -354,12 +375,12 @@ void Service::retain_metadata_publication(const MetadataPublicationContext& cont
             }
         }
 
-        const bool catalogue_changed = context.delta
-            ? context.delta->catalogue != CatalogueDelta::unchanged
-            : before.catalogue_root != context.proposed.catalogue_root;
+        const bool catalogue_changed =
+            context.delta ? context.delta->catalogue != CatalogueDelta::unchanged
+                          : before.catalogue_root != context.proposed.catalogue_root;
         if (catalogue_changed && context.proposed.catalogue_root) {
             auto objects = catalogue_->retention_objects(before.catalogue_root,
-                                                        context.proposed.catalogue_root);
+                                                         context.proposed.catalogue_root);
             data.insert(data.end(), objects.data.begin(), objects.data.end());
             control.insert(control.end(), objects.control.begin(), objects.control.end());
         }
@@ -387,8 +408,7 @@ void Service::retain_metadata_publication(const MetadataPublicationContext& cont
     if (!data.empty() && !store_->retain_data(data, dot))
         throw MetadataNotReady("DATA retention floor unavailable before metadata publication");
     if (!control.empty() &&
-        !store_->retain_control(control, dot,
-                               context.proposed.metadata_write_replicas_required))
+        !store_->retain_control(control, dot, context.proposed.metadata_write_replicas_required))
         throw MetadataNotReady("CONTROL retention floor unavailable before metadata publication");
     signal_maintenance(ServiceEvent::storage);
 }
@@ -473,14 +493,12 @@ void Service::loop(std::stop_token stop) {
     auto metadata_retry_backoff = maintenance_background_interval(policy);
     auto catalogue_retry_due = Clock::time_point{};
     auto formation_settle_due = Clock::time_point{};
-    uint64_t last_local_metadata_generation =
-        node_.metadata_replica().committed_generation();
+    uint64_t last_local_metadata_generation = node_.metadata_replica().committed_generation();
     uint64_t observed_event = maintenance_event_.load(std::memory_order_acquire);
     auto network_quiescent_until = Clock::time_point{};
     auto local_quiescent_until = Clock::time_point{};
     auto gc_quiescent_until = Clock::time_point{};
-    auto scrub_due_unix_ms = initialise_scrub_due(node_.config().state_path,
-                                                   policy.scrub_interval);
+    auto scrub_due_unix_ms = initialise_scrub_due(node_.config().state_path, policy.scrub_interval);
     double network_credit = 0.0;
     double local_credit = 0.0;
     double scrub_credit = 0.0;
@@ -499,8 +517,7 @@ void Service::loop(std::stop_token stop) {
         const auto current_event = maintenance_event_.load(std::memory_order_acquire);
         const bool event_changed = current_event != observed_event;
         observed_event = current_event;
-        const auto local_metadata_generation =
-            node_.metadata_replica().committed_generation();
+        const auto local_metadata_generation = node_.metadata_replica().committed_generation();
         if (local_metadata_generation != last_local_metadata_generation) {
             catalogue_dirty = true;
             metadata_retry_due = Clock::time_point{};
@@ -539,10 +556,10 @@ void Service::loop(std::stop_token stop) {
 
         auto playback_bytes = store_->take_foreground_bytes();
         auto interactive_bytes = store_->take_interactive_bytes();
-        const bool playback_busy = playback_bytes > 0 ||
-            store_->foreground_idle_for() < policy.foreground_quiet;
-        const bool interactive_busy = interactive_bytes > 0 ||
-            store_->interactive_idle_for() < policy.foreground_quiet;
+        const bool playback_busy =
+            playback_bytes > 0 || store_->foreground_idle_for() < policy.foreground_quiet;
+        const bool interactive_busy =
+            interactive_bytes > 0 || store_->interactive_idle_for() < policy.foreground_quiet;
         // Priority law: playback/seek > mounted MachaDFS/useful prefetch >
         // repair/rebalance/scrub. Both foreground classes suppress background
         // work, while the transport queues themselves keep playback above mount I/O.
@@ -567,11 +584,10 @@ void Service::loop(std::stop_token stop) {
         network_credit = std::min(burst_cap, network_credit + rate * wall_seconds);
         local_credit = std::min(burst_cap, local_credit + rate * wall_seconds);
         const auto wall_now_ms = unix_ms();
-        const bool scrub_due = policy.scrub_fraction > 0.0 &&
-                               wall_now_ms >= scrub_due_unix_ms;
+        const bool scrub_due = policy.scrub_fraction > 0.0 && wall_now_ms >= scrub_due_unix_ms;
         if (scrub_due) {
-            scrub_credit = std::min(
-                burst_cap, scrub_credit + rate * policy.scrub_fraction * wall_seconds);
+            scrub_credit =
+                std::min(burst_cap, scrub_credit + rate * policy.scrub_fraction * wall_seconds);
         } else {
             // Do not bank weeks of scrub credit and explode into a large burst when
             // the next campaign becomes due. Outside a campaign, scrub is truly idle.
@@ -595,65 +611,70 @@ void Service::loop(std::stop_token stop) {
                     const bool virgin_follower =
                         node_.metadata_replica().committed_generation() <= 1 &&
                         !last_active_nodes.empty() &&
-                        node_.node_id() != *std::min_element(last_active_nodes.begin(),
-                                                            last_active_nodes.end());
+                        node_.node_id() !=
+                            *std::min_element(last_active_nodes.begin(), last_active_nodes.end());
                     if (virgin_follower) {
-                    // Exactly one deterministic founder performs generation-2
-                    // formation. Followers remain event-driven and wake on its
-                    // metadata notice; the retry deadline only covers a founder
-                    // disappearing without a final connectivity event.
-                    metadata_ready_for_dependants = false;
-                    metadata_retry_due = Clock::now() + metadata_retry_backoff;
+                        // Exactly one deterministic founder performs generation-2
+                        // formation. Followers remain event-driven and wake on its
+                        // metadata notice; the retry deadline only covers a founder
+                        // disappearing without a final connectivity event.
+                        metadata_ready_for_dependants = false;
+                        metadata_retry_due = Clock::now() + metadata_retry_backoff;
                     } else {
                         const auto convergence_run = metadata_convergence_.begin();
                         if (!convergence_run) {
                             metadata_dirty = false;
                             metadata_ready_for_dependants = true;
                         } else {
-                        const auto stage = Clock::now();
-                        try {
-                    if (maintenance_stage_hook_)
-                        maintenance_stage_hook_("metadata-repair-begin");
-                    metadata_->repair_once();
-                    metadata_->note_replica_validation(true);
-                    metadata_dirty = metadata_convergence_.complete(*convergence_run);
-                    metadata_ready_for_dependants = !metadata_dirty;
-                    catalogue_dirty = true;
-                    metadata_retry_due = Clock::time_point{};
-                    metadata_retry_backoff = maintenance_background_interval(policy);
-                } catch (const std::exception& error) {
-                    metadata_->note_replica_validation(false, error.what());
-                    metadata_ready_for_dependants = false;
-                    metadata_retry_due = Clock::now() + metadata_retry_backoff;
-                    metadata_retry_backoff = std::min(
-                        policy.no_progress_backoff,
-                        std::max(metadata_retry_backoff * 2,
-                                 maintenance_background_interval(policy)));
-                    // In 0.19, inability to validate/reconcile every active
-                    // metadata head must not stall non-destructive DATA repair.
-                    // A locally committed branch remains a valid source of live
-                    // object reachability while reconciliation is pending.
-                    // Destructive GC below is independently fenced on `stable`,
-                    // so continuing here can only add/repair replicas.
-                    const auto local = node_.metadata_replica().committed();
-                    if (node_.metadata_replica().recovery_required() || local.generation <= 1)
-                        throw;
-                    Log::debug("metadata repair deferred; continuing non-destructive maintenance: " +
-                               std::string(error.what()));
-                        } catch (...) {
-                    metadata_->note_replica_validation(false, "metadata validation failed");
-                    metadata_ready_for_dependants = false;
-                    metadata_retry_due = Clock::now() + metadata_retry_backoff;
-                    metadata_retry_backoff = std::min(
-                        policy.no_progress_backoff,
-                        std::max(metadata_retry_backoff * 2,
-                                 maintenance_background_interval(policy)));
-                    const auto local = node_.metadata_replica().committed();
-                    if (node_.metadata_replica().recovery_required() || local.generation <= 1)
-                        throw;
-                    Log::debug("metadata repair deferred; continuing non-destructive maintenance");
-                        }
-                        log_slow_stage("metadata-repair", stage);
+                            const auto stage = Clock::now();
+                            try {
+                                if (maintenance_stage_hook_)
+                                    maintenance_stage_hook_("metadata-repair-begin");
+                                metadata_->repair_once();
+                                metadata_->note_replica_validation(true);
+                                metadata_dirty = metadata_convergence_.complete(*convergence_run);
+                                metadata_ready_for_dependants = !metadata_dirty;
+                                catalogue_dirty = true;
+                                metadata_retry_due = Clock::time_point{};
+                                metadata_retry_backoff = maintenance_background_interval(policy);
+                            } catch (const std::exception& error) {
+                                metadata_->note_replica_validation(false, error.what());
+                                metadata_ready_for_dependants = false;
+                                metadata_retry_due = Clock::now() + metadata_retry_backoff;
+                                metadata_retry_backoff =
+                                    std::min(policy.no_progress_backoff,
+                                             std::max(metadata_retry_backoff * 2,
+                                                      maintenance_background_interval(policy)));
+                                // In 0.19, inability to validate/reconcile every active
+                                // metadata head must not stall non-destructive DATA repair.
+                                // A locally committed branch remains a valid source of live
+                                // object reachability while reconciliation is pending.
+                                // Destructive GC below is independently fenced on `stable`,
+                                // so continuing here can only add/repair replicas.
+                                const auto local = node_.metadata_replica().committed();
+                                if (node_.metadata_replica().recovery_required() ||
+                                    local.generation <= 1)
+                                    throw;
+                                Log::debug("metadata repair deferred; continuing non-destructive "
+                                           "maintenance: " +
+                                           std::string(error.what()));
+                            } catch (...) {
+                                metadata_->note_replica_validation(false,
+                                                                   "metadata validation failed");
+                                metadata_ready_for_dependants = false;
+                                metadata_retry_due = Clock::now() + metadata_retry_backoff;
+                                metadata_retry_backoff =
+                                    std::min(policy.no_progress_backoff,
+                                             std::max(metadata_retry_backoff * 2,
+                                                      maintenance_background_interval(policy)));
+                                const auto local = node_.metadata_replica().committed();
+                                if (node_.metadata_replica().recovery_required() ||
+                                    local.generation <= 1)
+                                    throw;
+                                Log::debug("metadata repair deferred; continuing non-destructive "
+                                           "maintenance");
+                            }
+                            log_slow_stage("metadata-repair", stage);
                         }
                     }
                 }
@@ -682,8 +703,7 @@ void Service::loop(std::stop_token stop) {
                 log_slow_stage("catalogue-repair", stage);
             }
 
-            const bool allow_network_repair =
-                !busy || policy.busy_bandwidth_fraction > 0.0;
+            const bool allow_network_repair = !busy || policy.busy_bandwidth_fraction > 0.0;
             const bool network_due = allow_network_repair && now >= network_quiescent_until &&
                                      network_credit >= node_.config().extent_size;
             const bool garbage_due = !busy && !metadata_dirty;
@@ -713,7 +733,8 @@ void Service::loop(std::stop_token stop) {
                                  catalogue_objects.live.end());
                     universal->insert(universal->end(), catalogue_objects.universal.begin(),
                                       catalogue_objects.universal.end());
-                    control_live->insert(control_live->end(), catalogue_objects.control_live.begin(),
+                    control_live->insert(control_live->end(),
+                                         catalogue_objects.control_live.begin(),
                                          catalogue_objects.control_live.end());
                     std::sort(live->begin(), live->end());
                     live->erase(std::unique(live->begin(), live->end()), live->end());
@@ -752,9 +773,8 @@ void Service::loop(std::stop_token stop) {
                                std::to_string(objects->metadata_generation) +
                                " entries=" + std::to_string(objects->entries) +
                                " extents=" + std::to_string(objects->extents) +
-                               " live=" + std::to_string(maintenance_live_->size()) +
-                               " garbage=" + std::to_string(maintenance_garbage_.size()) +
-                               " stale_garbage=" +
+                               " live=" + std::to_string(maintenance_live_->size()) + " garbage=" +
+                               std::to_string(maintenance_garbage_.size()) + " stale_garbage=" +
                                std::to_string(maintenance_stale_garbage_.size()) +
                                " elapsed_ms=" + std::to_string(elapsed_ms(inventory_stage)));
                 }
@@ -771,7 +791,8 @@ void Service::loop(std::stop_token stop) {
                     size_t retained_repairs = 0;
                     auto repair_retained = [&](RetentionClass type,
                                                std::optional<ObjectId>& cursor) {
-                        for (size_t examined = 0; examined < 2 && network_credit >= extent; ++examined) {
+                        for (size_t examined = 0; examined < 2 && network_credit >= extent;
+                             ++examined) {
                             bool complete = false;
                             auto id = node_.retention_store().next_retained(type, cursor, complete);
                             if (!id)
@@ -786,8 +807,8 @@ void Service::loop(std::stop_token stop) {
                                                       : store_->ensure_control_local(*id);
                             if (restored) {
                                 ++retained_repairs;
-                                network_credit = std::max(0.0, network_credit -
-                                                                   static_cast<double>(extent));
+                                network_credit =
+                                    std::max(0.0, network_credit - static_cast<double>(extent));
                             }
                         }
                     };
@@ -799,8 +820,8 @@ void Service::loop(std::stop_token stop) {
                     // probes: a settled or mostly-settled namespace could issue
                     // thousands of synchronous control RPCs while consuming no
                     // network credit. Bound each repair slice independently.
-                    const size_t operation_budget = static_cast<size_t>(std::clamp<uint64_t>(
-                        (byte_budget / extent), 4, 16));
+                    const size_t operation_budget =
+                        static_cast<size_t>(std::clamp<uint64_t>((byte_budget / extent), 4, 16));
                     const auto repair_stage = Clock::now();
                     auto repair = store_->repair_step(
                         byte_budget, operation_budget, maintenance_live_.get(),
@@ -816,12 +837,12 @@ void Service::loop(std::stop_token stop) {
                         maintenance_inventory_generation_);
                     log_slow_stage("network-repair", repair_stage,
                                    "bytes=" + std::to_string(repair.bytes_transferred) +
-                                   " retained_repairs=" + std::to_string(retained_repairs) +
-                                   " push_examined=" + std::to_string(repair.push_examined) +
-                                   " pull_examined=" + std::to_string(repair.pull_examined) +
-                                   " remote_ops=" + std::to_string(repair.remote_operations) +
-                                   " complete=" + std::to_string(repair.complete ? 1 : 0) +
-                                   " yielded=" + std::to_string(repair.yielded ? 1 : 0));
+                                       " retained_repairs=" + std::to_string(retained_repairs) +
+                                       " push_examined=" + std::to_string(repair.push_examined) +
+                                       " pull_examined=" + std::to_string(repair.pull_examined) +
+                                       " remote_ops=" + std::to_string(repair.remote_operations) +
+                                       " complete=" + std::to_string(repair.complete ? 1 : 0) +
+                                       " yielded=" + std::to_string(repair.yielded ? 1 : 0));
                     if (repair.bytes_transferred) {
                         network_credit = std::max(
                             0.0, network_credit - static_cast<double>(repair.bytes_transferred));
@@ -884,13 +905,16 @@ void Service::loop(std::stop_token stop) {
                                 data_live->push_back(extent_ref.id);
                     }
                     const auto conflict_extents = metadata_conflict_extent_roots(*floor->snapshot);
-                    data_live->insert(data_live->end(), conflict_extents.begin(), conflict_extents.end());
+                    data_live->insert(data_live->end(), conflict_extents.begin(),
+                                      conflict_extents.end());
 
                     for (const auto& root : metadata_catalogue_root_set(*floor->snapshot)) {
                         try {
                             auto retained = catalogue_->retention_objects(std::nullopt, root);
-                            data_live->insert(data_live->end(), retained.data.begin(), retained.data.end());
-                            control_live->insert(control_live->end(), retained.control.begin(), retained.control.end());
+                            data_live->insert(data_live->end(), retained.data.begin(),
+                                              retained.data.end());
+                            control_live->insert(control_live->end(), retained.control.begin(),
+                                                 retained.control.end());
                         } catch (const std::exception& error) {
                             complete = false;
                             Log::debug("retention release horizon catalogue unavailable root=" +
@@ -898,9 +922,11 @@ void Service::loop(std::stop_token stop) {
                         }
                     }
                     std::sort(data_live->begin(), data_live->end());
-                    data_live->erase(std::unique(data_live->begin(), data_live->end()), data_live->end());
+                    data_live->erase(std::unique(data_live->begin(), data_live->end()),
+                                     data_live->end());
                     std::sort(control_live->begin(), control_live->end());
-                    control_live->erase(std::unique(control_live->begin(), control_live->end()), control_live->end());
+                    control_live->erase(std::unique(control_live->begin(), control_live->end()),
+                                        control_live->end());
                     if (complete) {
                         retention_release_floor_hash_ = floor->hash;
                         retention_release_data_live_ = std::move(data_live);
@@ -910,8 +936,7 @@ void Service::loop(std::stop_token stop) {
                     }
                 }
 
-                if (gc_due && destructive_gc_enabled &&
-                    maintenance_catalogue_complete_ &&
+                if (gc_due && destructive_gc_enabled && maintenance_catalogue_complete_ &&
                     maintenance_control_live_ &&
                     maintenance_inventory_generation_ >= node_.known_metadata_generation()) {
                     // Destructive retention release is fenced by direct reachability of
@@ -922,8 +947,8 @@ void Service::loop(std::stop_token stop) {
                             RetentionClass::control, *retention_release_control_live_,
                             retention_release_clock_, 64);
                     }
-                    const auto removed = catalogue_->control_gc_step(
-                        *maintenance_control_live_, policy.garbage_grace, 32);
+                    const auto removed = catalogue_->control_gc_step(*maintenance_control_live_,
+                                                                     policy.garbage_grace, 32);
                     (void)node_.retention_store().prune_unclaimed(
                         RetentionClass::control,
                         [this](const ObjectId& id) { return node_.control_store().has(id); }, 64);
@@ -950,9 +975,9 @@ void Service::loop(std::stop_token stop) {
                     std::vector<ObjectId> protected_ids;
                     protected_ids.reserve(maintenance_garbage_.size());
                     const auto now_ns = wall_time_ns();
-                    const auto grace_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                              policy.garbage_grace)
-                                              .count();
+                    const auto grace_ns =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(policy.garbage_grace)
+                            .count();
                     for (const auto& candidate : maintenance_garbage_) {
                         const bool matured = candidate.retired_at_ns > 0 &&
                                              now_ns >= candidate.retired_at_ns &&
@@ -985,7 +1010,7 @@ void Service::loop(std::stop_token stop) {
                         });
                     log_slow_stage("garbage-collect", gc_stage,
                                    "reclaimed_bytes=" + std::to_string(gc.bytes) +
-                                   " objects=" + std::to_string(gc.objects));
+                                       " objects=" + std::to_string(gc.objects));
                     (void)node_.retention_store().prune_unclaimed(
                         RetentionClass::data,
                         [this](const ObjectId& id) { return node_.local_store().has(id); }, 64);
@@ -997,10 +1022,12 @@ void Service::loop(std::stop_token stop) {
                     } else if (gc.complete) {
                         if (gc.deferred) {
                             gc_quiescent_until = Clock::now() + orphan_grace;
-                            Log::trace("maintenance: recent orphan deferred to exact grace deadline");
+                            Log::trace(
+                                "maintenance: recent orphan deferred to exact grace deadline");
                         } else {
                             gc_quiescent_until = Clock::time_point::max();
-                            Log::trace("maintenance: garbage collection complete; waiting for an event");
+                            Log::trace(
+                                "maintenance: garbage collection complete; waiting for an event");
                         }
                     }
                 }
@@ -1014,18 +1041,17 @@ void Service::loop(std::stop_token stop) {
                 local_credit >= node_.config().extent_size) {
                 const auto rebalance_stage = Clock::now();
                 auto rebalance = node_.local_store().rebalance_step(
-                    static_cast<uint64_t>(local_credit), 64,
-                    [this] {
+                    static_cast<uint64_t>(local_credit), 64, [this] {
                         const auto quiet = node_.config().maintenance.foreground_quiet;
                         return store_->foreground_idle_for() < quiet ||
                                store_->interactive_idle_for() < quiet;
                     });
                 log_slow_stage("local-rebalance", rebalance_stage,
                                "bytes=" + std::to_string(rebalance.bytes) +
-                               " objects=" + std::to_string(rebalance.objects));
+                                   " objects=" + std::to_string(rebalance.objects));
                 if (rebalance.bytes)
-                    local_credit = std::max(
-                        0.0, local_credit - static_cast<double>(rebalance.bytes));
+                    local_credit =
+                        std::max(0.0, local_credit - static_cast<double>(rebalance.bytes));
                 if (rebalance.yielded) {
                     Log::trace("maintenance: local rebalance yielded to foreground I/O");
                 } else if (rebalance.complete && !rebalance.bytes) {
@@ -1057,19 +1083,17 @@ void Service::loop(std::stop_token stop) {
             if (!busy)
                 (void)node_.local_store().compact_packs();
 
-            if (!busy && scrub_due &&
-                scrub_credit >= node_.config().extent_size) {
+            if (!busy && scrub_due && scrub_credit >= node_.config().extent_size) {
                 const auto scrub_stage = Clock::now();
-                auto scrub = node_.local_store().scrub_step(
-                    static_cast<uint64_t>(scrub_credit), 64,
-                    [this] {
+                auto scrub =
+                    node_.local_store().scrub_step(static_cast<uint64_t>(scrub_credit), 64, [this] {
                         const auto quiet = node_.config().maintenance.foreground_quiet;
                         return store_->foreground_idle_for() < quiet ||
                                store_->interactive_idle_for() < quiet;
                     });
                 log_slow_stage("scrub", scrub_stage,
                                "bytes=" + std::to_string(scrub.bytes) +
-                               " objects=" + std::to_string(scrub.objects));
+                                   " objects=" + std::to_string(scrub.objects));
                 if (scrub.bytes)
                     scrub_credit = std::max(0.0, scrub_credit - static_cast<double>(scrub.bytes));
                 if (scrub.yielded) {
@@ -1103,7 +1127,8 @@ void Service::loop(std::stop_token stop) {
             // every maintenance pass.
         } catch (const std::exception& e) {
             const std::string_view message(e.what());
-            if (message != "metadata durable replica set unavailable; reconciliation may be required" &&
+            if (message !=
+                    "metadata durable replica set unavailable; reconciliation may be required" &&
                 message != "metadata write durability floor unavailable")
                 Log::debug("maintenance: " + std::string(message));
         }
@@ -1115,9 +1140,8 @@ void Service::loop(std::stop_token stop) {
             // earliest wall-clock retirement deadline. Without this, the
             // protected object makes the physical sweep look quiescent and it
             // can sleep forever unless an unrelated event happens after grace.
-            const auto grace_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                      policy.garbage_grace)
-                                      .count();
+            const auto grace_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(policy.garbage_grace).count();
             const auto wall_now_ns = wall_time_ns();
             std::optional<std::chrono::nanoseconds> earliest_remaining;
             for (const auto& candidate : maintenance_garbage_) {
@@ -1126,10 +1150,9 @@ void Service::loop(std::stop_token stop) {
                 int64_t remaining_ns{};
                 if (wall_now_ns < candidate.retired_at_ns) {
                     const auto until_retirement = candidate.retired_at_ns - wall_now_ns;
-                    remaining_ns = until_retirement >
-                                           std::numeric_limits<int64_t>::max() - grace_ns
-                        ? std::numeric_limits<int64_t>::max()
-                        : until_retirement + grace_ns;
+                    remaining_ns = until_retirement > std::numeric_limits<int64_t>::max() - grace_ns
+                                       ? std::numeric_limits<int64_t>::max()
+                                       : until_retirement + grace_ns;
                 } else {
                     const auto elapsed = wall_now_ns - candidate.retired_at_ns;
                     if (elapsed >= grace_ns)
@@ -1154,13 +1177,13 @@ void Service::loop(std::stop_token stop) {
         // dependent) indefinitely. The same rule applies when catalogue repair
         // deliberately leaves one more current-state pass to perform.
         if (metadata_dirty)
-            deadline = std::min(deadline,
-                metadata_retry_due == Clock::time_point{} ? now_after_work
-                                                          : metadata_retry_due);
+            deadline =
+                std::min(deadline, metadata_retry_due == Clock::time_point{} ? now_after_work
+                                                                             : metadata_retry_due);
         if (catalogue_dirty && !metadata_dirty)
-            deadline = std::min(deadline,
-                catalogue_retry_due == Clock::time_point{} ? now_after_work
-                                                           : catalogue_retry_due);
+            deadline = std::min(deadline, catalogue_retry_due == Clock::time_point{}
+                                              ? now_after_work
+                                              : catalogue_retry_due);
 
         if (gc_quiescent_until != Clock::time_point{} &&
             gc_quiescent_until != Clock::time_point::max()) {
@@ -1184,33 +1207,29 @@ void Service::loop(std::stop_token stop) {
                     (rate * policy.scrub_fraction);
                 if (std::isfinite(seconds) && seconds > 0.0)
                     deadline = std::min(deadline, now_after_work +
-                        std::chrono::duration_cast<Clock::duration>(
-                            std::chrono::duration<double>(seconds)));
+                                                      std::chrono::duration_cast<Clock::duration>(
+                                                          std::chrono::duration<double>(seconds)));
             }
         } else {
-            deadline = std::min(
-                deadline, now_after_work +
-                    std::chrono::milliseconds(scrub_due_unix_ms - scrub_now_ms));
+            deadline = std::min(deadline, now_after_work + std::chrono::milliseconds(
+                                                               scrub_due_unix_ms - scrub_now_ms));
         }
 
         if (busy) {
-            auto idle = std::min(store_->foreground_idle_for(),
-                                 store_->interactive_idle_for());
+            auto idle = std::min(store_->foreground_idle_for(), store_->interactive_idle_for());
             if (idle < policy.foreground_quiet)
-                deadline = std::min(deadline,
-                                    now_after_work + (policy.foreground_quiet - idle));
+                deadline = std::min(deadline, now_after_work + (policy.foreground_quiet - idle));
         }
 
         auto credit_deadline = [&](double credit, Clock::time_point quiescent) {
             if (quiescent == Clock::time_point::max() || rate <= 0.0 ||
                 credit >= node_.config().extent_size)
                 return;
-            const auto seconds =
-                (static_cast<double>(node_.config().extent_size) - credit) / rate;
+            const auto seconds = (static_cast<double>(node_.config().extent_size) - credit) / rate;
             if (std::isfinite(seconds) && seconds > 0.0)
-                deadline = std::min(deadline, now_after_work +
-                    std::chrono::duration_cast<Clock::duration>(
-                        std::chrono::duration<double>(seconds)));
+                deadline = std::min(deadline,
+                                    now_after_work + std::chrono::duration_cast<Clock::duration>(
+                                                         std::chrono::duration<double>(seconds)));
         };
         credit_deadline(network_credit, network_quiescent_until);
         credit_deadline(local_credit, local_quiescent_until);

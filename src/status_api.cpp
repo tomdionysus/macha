@@ -197,6 +197,23 @@ std::optional<NodeId> parse_node_id(std::string_view text) {
 
 ClusterStatusService::ClusterStatusService(NodeRuntime& node) : node_(node) {}
 
+void ClusterStatusService::attach_fuse_diagnostics(
+    std::function<std::optional<FuseFrontendDiagnostics>()> provider) {
+    std::lock_guard lock(operational_diagnostics_mutex_);
+    fuse_diagnostics_ = std::move(provider);
+}
+
+void ClusterStatusService::detach_fuse_diagnostics() {
+    std::lock_guard lock(operational_diagnostics_mutex_);
+    fuse_diagnostics_ = {};
+}
+
+void ClusterStatusService::attach_convergence_diagnostics(
+    std::function<ConvergenceDemandDiagnostics()> provider) {
+    std::lock_guard lock(operational_diagnostics_mutex_);
+    convergence_diagnostics_ = std::move(provider);
+}
+
 ClusterStatusService::~ClusterStatusService() {
     stop();
 }
@@ -507,6 +524,70 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         message_timings[message_type_name(message)] = rpc_timing_json(timing);
     rpc_diagnostics["message_timings"] = std::move(message_timings);
     diagnostics["rpc_server"] = std::move(rpc_diagnostics);
+
+    std::function<std::optional<FuseFrontendDiagnostics>()> fuse_provider;
+    std::function<ConvergenceDemandDiagnostics()> convergence_provider;
+    {
+        std::lock_guard lock(operational_diagnostics_mutex_);
+        fuse_provider = fuse_diagnostics_;
+        convergence_provider = convergence_diagnostics_;
+    }
+
+    Json::Object filesystem_diagnostics;
+    filesystem_diagnostics["available"] = false;
+    if (fuse_provider) {
+        try {
+            if (auto values = fuse_provider()) {
+                filesystem_diagnostics["available"] = true;
+                filesystem_diagnostics["timed_out_requests"] = values->timed_out_requests;
+                filesystem_diagnostics["merged_publications"] = values->merged_publications;
+                filesystem_diagnostics["backend_failures"] = values->backend_failures;
+                filesystem_diagnostics["durability_batches"] = values->durability_batches;
+                filesystem_diagnostics["durability_writes"] = values->durability_writes;
+                filesystem_diagnostics["namespace_operations_admitted"] =
+                    values->namespace_operations_admitted;
+                filesystem_diagnostics["namespace_operations_recovered"] =
+                    values->namespace_operations_recovered;
+                filesystem_diagnostics["namespace_publication_attempts"] =
+                    values->namespace_publication_attempts;
+                filesystem_diagnostics["namespace_publication_batches"] =
+                    values->namespace_publication_batches;
+                filesystem_diagnostics["namespace_operations_batched"] =
+                    values->namespace_operations_batched;
+                filesystem_diagnostics["namespace_operations_published"] =
+                    values->namespace_operations_published;
+                filesystem_diagnostics["namespace_operations_confirmed"] =
+                    values->namespace_operations_confirmed;
+                filesystem_diagnostics["journal_append_batches"] = values->journal_append_batches;
+                filesystem_diagnostics["journal_records_appended"] =
+                    values->journal_records_appended;
+                filesystem_diagnostics["journal_durability_barriers"] =
+                    values->journal_durability_barriers;
+            }
+        } catch (const std::exception& error) {
+            Log::debug("status filesystem diagnostics unavailable: " + std::string(error.what()));
+        }
+    }
+    diagnostics["filesystem"] = std::move(filesystem_diagnostics);
+
+    Json::Object convergence_diagnostics;
+    convergence_diagnostics["available"] = false;
+    if (convergence_provider) {
+        try {
+            const auto values = convergence_provider();
+            convergence_diagnostics["available"] = true;
+            convergence_diagnostics["events_received"] = values.events_received;
+            convergence_diagnostics["runs_scheduled"] = values.runs_scheduled;
+            convergence_diagnostics["runs_completed"] = values.runs_completed;
+            convergence_diagnostics["requested_epoch"] = values.requested_epoch;
+            convergence_diagnostics["completed_epoch"] = values.completed_epoch;
+            convergence_diagnostics["latest_generation"] = values.latest_generation;
+            convergence_diagnostics["scheduled"] = values.scheduled;
+        } catch (const std::exception& error) {
+            Log::debug("status convergence diagnostics unavailable: " + std::string(error.what()));
+        }
+    }
+    diagnostics["convergence"] = std::move(convergence_diagnostics);
     root["diagnostics"] = std::move(diagnostics);
     root["generated_at_unix_ms"] = unix_ms();
     return http_json(200, Json(std::move(root)).dump());

@@ -66,9 +66,11 @@ std::string hex(uint64_t value) {
 std::string byte_hex(std::string_view value) {
     static constexpr char digits[] = "0123456789abcdef";
     std::string out;
-    if (!value.empty()) out.reserve(value.size() * 3 - 1);
+    if (!value.empty())
+        out.reserve(value.size() * 3 - 1);
     for (unsigned char c : value) {
-        if (!out.empty()) out.push_back(' ');
+        if (!out.empty())
+            out.push_back(' ');
         out.push_back(digits[c >> 4]);
         out.push_back(digits[c & 0x0f]);
     }
@@ -77,20 +79,23 @@ std::string byte_hex(std::string_view value) {
 
 std::string request_identity() {
     auto* c = fuse_get_context();
-    if (!c) return "uid=? gid=? pid=?";
+    if (!c)
+        return "uid=? gid=? pid=?";
     return "uid=" + std::to_string(c->uid) + " gid=" + std::to_string(c->gid) +
            " pid=" + std::to_string(c->pid);
 }
 
 void trace_request(const char* op, const char* path, const fuse_file_info* fi = nullptr) {
-    if (!Log::enabled(LogLevel::all)) return;
-    std::string message = std::string("FUSE TRACE request op=") + op + " path=" +
-                          (path ? path : "<null>");
-    if (path) message += " path_hex=" + byte_hex(path);
+    if (!Log::enabled(LogLevel::all))
+        return;
+    std::string message =
+        std::string("FUSE TRACE request op=") + op + " path=" + (path ? path : "<null>");
+    if (path)
+        message += " path_hex=" + byte_hex(path);
     message += " " + request_identity();
     if (fi)
-        message += " flags=" + hex(static_cast<unsigned int>(fi->flags)) +
-                   " fh=" + std::to_string(fi->fh);
+        message +=
+            " flags=" + hex(static_cast<unsigned int>(fi->flags)) + " fh=" + std::to_string(fi->fh);
     Log::trace(message);
 }
 
@@ -107,7 +112,8 @@ struct FuseLatency {
 
     ~FuseLatency() noexcept {
         try {
-            if (!enabled) return;
+            if (!enabled)
+                return;
             const auto ms = elapsed_ms(started);
             const auto threshold_ms = std::strcmp(op, "write") == 0 ? 250 : 100;
             if (ms >= threshold_ms)
@@ -186,7 +192,8 @@ int op_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t, fuse_
             struct stat st{};
             fill_stat(entry, st);
             const auto fuse_name = macos_fuse_decomposed_name(name);
-            if (filler(buf, fuse_name.c_str(), &st, 0, FUSE_FILL_DIR_DEFAULTS)) break;
+            if (filler(buf, fuse_name.c_str(), &st, 0, FUSE_FILL_DIR_DEFAULTS))
+                break;
         }
         return 0;
     });
@@ -205,13 +212,19 @@ int op_mkdir(const char* path, mode_t mode) {
 int op_rmdir(const char* path) {
     trace_request("rmdir", path);
     FuseLatency latency{"rmdir", path};
-    return guarded("rmdir", [&] { frontend().rmdir(path); return 0; });
+    return guarded("rmdir", [&] {
+        frontend().rmdir(path);
+        return 0;
+    });
 }
 
 int op_unlink(const char* path) {
     trace_request("unlink", path);
     FuseLatency latency{"unlink", path};
-    return guarded("unlink", [&] { frontend().unlink(path); return 0; });
+    return guarded("unlink", [&] {
+        frontend().unlink(path);
+        return 0;
+    });
 }
 
 int op_rename(const char* from, const char* to, unsigned int flags) {
@@ -223,7 +236,8 @@ int op_rename(const char* from, const char* to, unsigned int flags) {
         noreplace = (flags & RENAME_NOREPLACE) != 0;
         flags &= ~static_cast<unsigned int>(RENAME_NOREPLACE);
 #endif
-        if (flags) return -EINVAL;
+        if (flags)
+            return -EINVAL;
         frontend().rename(from, to, noreplace);
         return 0;
     });
@@ -232,7 +246,10 @@ int op_rename(const char* from, const char* to, unsigned int flags) {
 int op_chmod(const char* path, mode_t mode, fuse_file_info* fi) {
     trace_request("chmod", path, fi);
     FuseLatency latency{"chmod", path};
-    return guarded("chmod", [&] { frontend().chmod(path, mode); return 0; });
+    return guarded("chmod", [&] {
+        frontend().chmod(path, mode);
+        return 0;
+    });
 }
 
 int op_chown(const char* path, uid_t uid, gid_t gid, fuse_file_info* fi) {
@@ -249,7 +266,8 @@ int op_utimens(const char* path, const struct timespec tv[2], fuse_file_info* fi
     trace_request("utimens", path, fi);
     FuseLatency latency{"utimens", path};
     return guarded("utimens", [&] {
-        if (tv[1].tv_nsec == UTIME_OMIT) return 0;
+        if (tv[1].tv_nsec == UTIME_OMIT)
+            return 0;
         const int64_t ns = tv[1].tv_nsec == UTIME_NOW
                                ? wall_time_ns()
                                : static_cast<int64_t>(tv[1].tv_sec) * 1000000000LL + tv[1].tv_nsec;
@@ -285,10 +303,9 @@ int op_create(const char* path, mode_t mode, fuse_file_info* fi) {
         const int access = fi->flags & O_ACCMODE;
         auto* c = fuse_get_context();
         auto h = std::make_unique<Handle>();
-        h->file = frontend().create(path, mode, c->uid, c->gid,
-                                    access == O_RDONLY || access == O_RDWR,
-                                    access == O_WRONLY || access == O_RDWR,
-                                    (fi->flags & O_APPEND) != 0);
+        h->file =
+            frontend().create(path, mode, c->uid, c->gid, access == O_RDONLY || access == O_RDWR,
+                              access == O_WRONLY || access == O_RDWR, (fi->flags & O_APPEND) != 0);
         set_file_flags(fi);
         fi->fh = reinterpret_cast<uint64_t>(h.release());
         return 0;
@@ -299,19 +316,22 @@ int op_read(const char* path, char* buf, size_t size, off_t off, fuse_file_info*
     trace_request("read", path, fi);
     FuseLatency latency{"read", path};
     return guarded("read", [&] {
-        if (off < 0) return -EINVAL;
+        if (off < 0)
+            return -EINVAL;
         auto* h = handle(fi);
         uint64_t inode = 0;
         if (h) {
-            if (!h->file.readable) return -EBADF;
+            if (!h->file.readable)
+                return -EBADF;
             inode = h->file.inode;
         } else {
             auto found = frontend().inode_for_path(path);
-            if (!found) return -ENOENT;
+            if (!found)
+                return -ENOENT;
             inode = *found;
         }
         auto n = h ? frontend().read(h->file, static_cast<uint64_t>(off),
-                                      {reinterpret_cast<uint8_t*>(buf), size})
+                                     {reinterpret_cast<uint8_t*>(buf), size})
                    : frontend().read(inode, static_cast<uint64_t>(off),
                                      {reinterpret_cast<uint8_t*>(buf), size});
         return static_cast<int>(n);
@@ -322,9 +342,11 @@ int op_write(const char* path, const char* buf, size_t size, off_t off, fuse_fil
     trace_request("write", path, fi);
     FuseLatency latency{"write", path};
     return guarded("write", [&] {
-        if (off < 0) return -EINVAL;
+        if (off < 0)
+            return -EINVAL;
         auto* h = handle(fi);
-        if (!h || !h->file.writable) return -EBADF;
+        if (!h || !h->file.writable)
+            return -EBADF;
         auto n = frontend().write(h->file.inode, static_cast<uint64_t>(off),
                                   {reinterpret_cast<const uint8_t*>(buf), size}, h->file.append);
         return static_cast<int>(n);
@@ -335,7 +357,8 @@ int op_truncate(const char* path, off_t size, fuse_file_info* fi) {
     trace_request("truncate", path, fi);
     FuseLatency latency{"truncate", path};
     return guarded("truncate", [&] {
-        if (size < 0) return -EINVAL;
+        if (size < 0)
+            return -EINVAL;
         if (auto* h = handle(fi); h && h->file.writable)
             frontend().truncate(h->file.inode, static_cast<uint64_t>(size));
         else
@@ -348,7 +371,8 @@ int op_flush(const char* path, fuse_file_info* fi) {
     trace_request("flush", path, fi);
     FuseLatency latency{"flush", path};
     return guarded("flush", [&] {
-        if (auto* h = handle(fi); h && h->file.writable) frontend().flush(h->file.inode);
+        if (auto* h = handle(fi); h && h->file.writable)
+            frontend().flush(h->file.inode);
         return 0;
     });
 }
@@ -357,7 +381,8 @@ int op_fsync(const char* path, int, fuse_file_info* fi) {
     trace_request("fsync", path, fi);
     FuseLatency latency{"fsync", path};
     return guarded("fsync", [&] {
-        if (auto* h = handle(fi); h && h->file.writable) frontend().fsync(h->file.inode);
+        if (auto* h = handle(fi); h && h->file.writable)
+            frontend().fsync(h->file.inode);
         return 0;
     });
 }
@@ -366,7 +391,8 @@ int op_release(const char* path, fuse_file_info* fi) {
     trace_request("release", path, fi);
     FuseLatency latency{"release", path};
     auto* h = handle(fi);
-    if (!h) return 0;
+    if (!h)
+        return 0;
     int rc = 0;
     try {
         frontend().release(h->file.inode, h->file.writable);
@@ -406,17 +432,14 @@ void* op_init(struct fuse_conn_info*, struct fuse_config* cfg) {
     cfg->entry_timeout = seconds(policy.entry_timeout);
     cfg->attr_timeout = seconds(policy.attr_timeout);
     cfg->negative_timeout = seconds(policy.negative_timeout);
-    Log::debug("FUSE bounded frontend entry_timeout_ms=" + std::to_string(policy.entry_timeout.count()) +
-               " attr_timeout_ms=" + std::to_string(policy.attr_timeout.count()) +
-               " absolute_request_timeout_ms=" +
-               std::to_string(policy.absolute_request_timeout.count()) +
-               " commit_workers=" + std::to_string(policy.commit_workers) +
-               " recovery_commit_workers=" +
-               std::to_string(policy.recovery_commit_workers) +
-               " foreground_commit_workers=" +
-               std::to_string(policy.foreground_commit_workers) +
-               " publication_quiet_ms=" +
-               std::to_string(policy.publication_quiet.count()));
+    Log::debug(
+        "FUSE bounded frontend entry_timeout_ms=" + std::to_string(policy.entry_timeout.count()) +
+        " attr_timeout_ms=" + std::to_string(policy.attr_timeout.count()) +
+        " absolute_request_timeout_ms=" + std::to_string(policy.absolute_request_timeout.count()) +
+        " commit_workers=" + std::to_string(policy.commit_workers) +
+        " recovery_commit_workers=" + std::to_string(policy.recovery_commit_workers) +
+        " foreground_commit_workers=" + std::to_string(policy.foreground_commit_workers) +
+        " publication_quiet_ms=" + std::to_string(policy.publication_quiet.count()));
     return fuse_get_context()->private_data;
 }
 
@@ -453,40 +476,48 @@ class CoveredMountpointGuard {
   public:
     explicit CoveredMountpointGuard(const std::string& path) {
         fd_ = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
-        if (fd_ < 0) throw std::runtime_error("cannot open FUSE mountpoint for fail-closed guard");
+        if (fd_ < 0)
+            throw std::runtime_error("cannot open FUSE mountpoint for fail-closed guard");
         struct stat st{};
         if (::fstat(fd_, &st) != 0) {
             const auto error = errno;
             ::close(fd_);
             fd_ = -1;
-            throw std::runtime_error("cannot stat FUSE mountpoint: " + std::string(std::strerror(error)));
+            throw std::runtime_error("cannot stat FUSE mountpoint: " +
+                                     std::string(std::strerror(error)));
         }
         original_mode_ = st.st_mode & 07777;
     }
 
     ~CoveredMountpointGuard() {
         if (fd_ >= 0) {
-            if (restore_ && protected_) (void)::fchmod(fd_, original_mode_);
+            if (restore_ && protected_)
+                (void)::fchmod(fd_, original_mode_);
             ::close(fd_);
         }
     }
 
     bool protect() {
-        if (fd_ < 0) return false;
+        if (fd_ < 0)
+            return false;
         const auto fail_closed_mode = static_cast<mode_t>(original_mode_ & ~0222);
-        if (::fchmod(fd_, fail_closed_mode) != 0) return false;
+        if (::fchmod(fd_, fail_closed_mode) != 0)
+            return false;
         protected_ = true;
         return true;
     }
 
-    void restore_on_exit(bool value) { restore_ = value; }
+    void restore_on_exit(bool value) {
+        restore_ = value;
+    }
 };
 
 } // namespace
 
 int run_fuse(FileSystem& filesystem, CacheHydrator& hydrator,
              const std::filesystem::path& mount_path, const FuseConfig& config,
-             std::function<void()> request_shutdown) {
+             std::function<void()> request_shutdown,
+             std::function<void(std::weak_ptr<FuseFrontend>)> frontend_observer) {
     auto mount = mount_path.string();
     std::string options = config.allow_other ? "default_permissions,allow_other,fsname=macha"
                                              : "default_permissions,fsname=macha";
@@ -499,7 +530,8 @@ int run_fuse(FileSystem& filesystem, CacheHydrator& hydrator,
 
     std::vector<std::string> fuse_arg_storage{"macha", "-o", options};
     std::vector<char*> fuse_argv;
-    for (auto& arg : fuse_arg_storage) fuse_argv.push_back(arg.data());
+    for (auto& arg : fuse_arg_storage)
+        fuse_argv.push_back(arg.data());
     struct fuse_args args = FUSE_ARGS_INIT(static_cast<int>(fuse_argv.size()), fuse_argv.data());
     auto ops = operations();
     struct fuse* instance = fuse_new(&args, &ops, sizeof(ops), fuse_frontend.get());
@@ -531,6 +563,9 @@ int run_fuse(FileSystem& filesystem, CacheHydrator& hydrator,
         return 6;
     }
 
+    if (frontend_observer)
+        frontend_observer(fuse_frontend);
+
     filesystem.reset_io_cancellation();
     std::atomic_bool unexpected_mount_loss{false};
     // fuse_mount() has already succeeded. A mount-table probe can strengthen
@@ -544,7 +579,8 @@ int run_fuse(FileSystem& filesystem, CacheHydrator& hydrator,
         constexpr size_t missing_threshold = 3;
         while (!stop.stop_requested()) {
             std::this_thread::sleep_for(config.watchdog_interval);
-            if (stop.stop_requested()) break;
+            if (stop.stop_requested())
+                break;
 
             const auto probe = probe_macha_mountpoint(mount);
             if (probe.state == MountTableState::macha_fuse) {
@@ -562,25 +598,26 @@ int run_fuse(FileSystem& filesystem, CacheHydrator& hydrator,
                 if (consecutive_probe_errors == 1 || consecutive_probe_errors % 30 == 0) {
                     Log::warn("FUSE mount-table watchdog probe failed mount=" + mount +
                               " error=" + std::string(std::strerror(probe.error)) +
-                              " consecutive_errors=" +
-                              std::to_string(consecutive_probe_errors) +
+                              " consecutive_errors=" + std::to_string(consecutive_probe_errors) +
                               "; retaining previous mount state");
                 }
                 continue;
             }
 
             consecutive_probe_errors = 0;
-            if (!mount_seen.load()) continue;
+            if (!mount_seen.load())
+                continue;
             if (++consecutive_misses < missing_threshold) {
-                Log::debug("FUSE mount-table watchdog miss " +
-                           std::to_string(consecutive_misses) + "/" +
-                           std::to_string(missing_threshold) + " mount=" + mount);
+                Log::debug("FUSE mount-table watchdog miss " + std::to_string(consecutive_misses) +
+                           "/" + std::to_string(missing_threshold) + " mount=" + mount);
                 continue;
             }
             unexpected_mount_loss.store(true);
-            Log::error("FUSE mount disappeared for three consecutive successful watchdog checks; namespace is fail-closed and service shutdown is requested");
+            Log::error("FUSE mount disappeared for three consecutive successful watchdog checks; "
+                       "namespace is fail-closed and service shutdown is requested");
             filesystem.request_io_cancellation();
-            if (request_shutdown) request_shutdown();
+            if (request_shutdown)
+                request_shutdown();
             fuse_session_exit(session);
             return;
         }
@@ -588,25 +625,32 @@ int run_fuse(FileSystem& filesystem, CacheHydrator& hydrator,
 
     Log::debug("shutdown: entering bounded FUSE main loop");
     const int loop_rc = fuse_loop_mt(instance, 0);
-    if (loop_rc != 0) unexpected_mount_loss.store(true);
+    if (loop_rc != 0)
+        unexpected_mount_loss.store(true);
     filesystem.request_io_cancellation();
-    if (request_shutdown) request_shutdown();
+    if (request_shutdown)
+        request_shutdown();
 
     mount_watchdog.request_stop();
-    if (mount_watchdog.joinable()) mount_watchdog.join();
+    if (mount_watchdog.joinable())
+        mount_watchdog.join();
 
     hydrator.remove_provider(fuse_frontend.get());
+    if (frontend_observer)
+        frontend_observer({});
     fuse_frontend->stop();
     fuse_remove_signal_handlers(session);
     fuse_unmount(instance);
 
-    if (mount_guard) mount_guard->restore_on_exit(!unexpected_mount_loss.load());
+    if (mount_guard)
+        mount_guard->restore_on_exit(!unexpected_mount_loss.load());
 
     fuse_destroy(instance);
     fuse_opt_free_args(&args);
 
     if (unexpected_mount_loss.load()) {
-        Log::error("FUSE frontend terminated unexpectedly; covered mountpoint remains non-writable");
+        Log::error(
+            "FUSE frontend terminated unexpectedly; covered mountpoint remains non-writable");
         return 8;
     }
     Log::debug("shutdown: FUSE main loop returned cleanly");
