@@ -108,13 +108,34 @@ under `diagnostics`:
   persistence writes, encoded bytes, and failures;
 - `rpc_server` reports current metadata queue jobs/bytes, active and rejected
   jobs, plus request count, total/max queue wait, and total/max handler time in
-  microseconds, grouped by wire message and frame class.
+  microseconds, grouped by wire message and frame class;
+- `filesystem` reports lock-free FUSE operation, publication, DATA durability,
+  and operation-journal append/barrier totals when this process owns a mounted
+  frontend; and
+- `convergence` reports semantic events, scheduled/completed runs, requested and
+  completed epochs, the diagnostic generation high-water mark, and whether a
+  run is currently scheduled.
 
 These are bounded counters, not a request history. Reading them does not start
 a sampler, publish metadata, or add gossip traffic. Derive an interval rate or
 average from differences between two status samples; a process restart resets
-the totals. A rejected metadata request increments the rejection counter but is
-not counted as executed handler work.
+the totals. The filesystem snapshot reads only atomics in O(1); it does not call
+the fuller frontend status path which can inspect live inode state. A rejected
+metadata request increments the rejection counter but is not counted as
+executed handler work.
+
+`filesystem.available` is false on a process without the mounted frontend and
+during mount startup/teardown. `convergence.available` is true as soon as the
+Service exists, including while storage recovery is still in progress. An equal
+`runs_scheduled`/`runs_completed`, equal requested/completed epoch, and
+`scheduled: false` describe a drained edge-triggered scheduler.
+
+Operation-journal barrier totals describe successful journal appends, not every
+filesystem barrier in the process. A new live inode normally records its inode
+descriptor and operation admission before returning, then `published` and
+`done`: four journal append barriers. Restart recovery begins after admission is
+already durable, so a one-operation recovered publication records only the
+grouped `published` and `done` barriers.
 
 ## RPC execution isolation
 
