@@ -95,9 +95,12 @@ fuse:
   publication_quiet_ms: 5000
   max_pending_operations: 4096
 
-  # Aggregate local write-back and recovery bounds. New operation-journal
-  # admissions stop at the WAL ceiling while already-durable work drains; the
-  # journal is reset when the pending set reaches zero.
+  # Aggregate local write-back and recovery bounds. max_spool_bytes is the
+  # durable burst/backlog budget, not an ENOSPC threshold: admission is fast
+  # below half occupancy, then progressively tracks measured publication speed
+  # and blocks at the bound until publication creates room. A physical
+  # spool_reserve_free violation remains ENOSPC to protect the host filesystem.
+  # Changes to these FUSE limits take effect after a server restart.
   max_spool_bytes: 16G
   spool_reserve_free: 2G
   max_orphan_bytes: 1G

@@ -123,8 +123,10 @@ struct FuseConfig {
 
     // Aggregate local write-back admission. Queue counts alone do not bound a
     // hot inode: one pending publication can otherwise accumulate arbitrary
-    // spool bytes. Preserve a physical free-space floor independently of the
-    // logical byte ceiling.
+    // spool bytes. Below half this ceiling admission may burst at local disk
+    // speed; above it the frontend starts publication and paces writers against
+    // measured drain throughput. Preserve a physical free-space floor
+    // independently of the logical byte ceiling.
     uint64_t max_spool_bytes{16ULL * 1024 * 1024 * 1024};
     uint64_t spool_reserve_free{2ULL * 1024 * 1024 * 1024};
     // Crash-recovery forensic tails are useful, but never authoritative. Keep

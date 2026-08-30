@@ -317,17 +317,22 @@ Evidence: [Cluster Status telemetry aggregation UAT](2026-08-30-cluster-status-t
 
 Evidence: [Linux systemd install and uninstall targets](2026-08-30-linux-systemd-install.md)
 
-## Identity-association reset recovery
+## FUSE spool rate backpressure — first checkpoint
 
-- [x] Removed the circular dependency which required a metadata commit before
-  clearing the stale endpoint identity that could itself prevent convergence.
-- [x] Apply and propagate resets before the metadata audit; return an explicit
-  accepted/pending result when the metadata write floor is unavailable.
-- [x] Persist operational reset tombstones and member observation timestamps in
-  the backward-readable `MACHMEM2` roster so stale identities remain fenced
-  across restart while fresh authenticated replacements remain valid.
-- [x] Added unavailable-metadata and restart durability regressions. The full
-  backend suite passed 210/210 and runtime dependency tests passed 3/3.
+- [x] Retained the safe 16 GiB default while documenting and testing
+  `fuse.max_spool_bytes` and `fuse.spool_reserve_free` as configurable policy.
+- [x] Replaced logical-capacity `ENOSPC` with event-driven blocking admission;
+  only an impossible single request or the independent physical reserve can
+  fail for capacity.
+- [x] Start publication from spool pressure even while a writer remains open,
+  and pace admission from measured end-to-end publication throughput: local
+  burst below 50%, progressive slowdown, and publish-rate admission by 90%.
+- [x] Added O(1) spool occupancy/rate/wait diagnostics to Status.
+- [x] Added focused drain-recovery and stalled-publisher regressions. The FUSE
+  group passed 45/45, the complete backend suite passed 211/211, and runtime
+  dependencies passed 3/3.
+
+Evidence: [FUSE spool rate backpressure](2026-08-30-fuse-spool-rate-backpressure.md)
 
 ## Version 0.21.0
 
