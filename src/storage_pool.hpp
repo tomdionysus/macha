@@ -33,6 +33,7 @@ class StoragePool {
         size_t objects{};
         bool complete{};
         bool yielded{};
+        bool deferred{};
     };
 
     struct DurabilityToken {

@@ -890,6 +890,8 @@ StoragePool::gc_step(const std::vector<ObjectId>& live,
             const auto bytes = item->store->stored_size(id);
             if (item->store->remove_if_older_than(id, orphan_grace))
                 result.bytes += bytes;
+            else
+                result.deferred = true;
         } catch (const std::exception& error) {
             Log::debug("garbage collection skipped local object " + to_string(id) +
                        " on " + item->path.string() + ": " + error.what());

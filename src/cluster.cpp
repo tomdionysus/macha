@@ -145,15 +145,31 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
       client_(
           keys_, [this] { return members_.self(); },
           [this](const NodeInfo& peer) {
+              const auto active_before = members_.active();
+              const auto previous = std::find_if(
+                  active_before.begin(), active_before.end(),
+                  [&](const NodeInfo& item) { return item.id == peer.id; });
+              const bool topology_changed =
+                  previous == active_before.end() || previous->host != peer.host ||
+                  previous->port != peer.port ||
+                  previous->failure_domain != peer.failure_domain;
+              const auto previous_generation = remote_metadata_generation_.load();
               members_.observe(peer, true);
               remote_metadata_generation_.store(
-                  std::max(remote_metadata_generation_.load(), peer.metadata_generation));
+                  std::max(previous_generation, peer.metadata_generation));
+              if (topology_changed || peer.metadata_generation > previous_generation)
+                  signal_service_event();
           },
           [this](uint64_t generation) {
-              remote_metadata_epoch_.fetch_add(1, std::memory_order_acq_rel);
               auto current = remote_metadata_generation_.load();
+              bool advanced = false;
               while (current < generation && !remote_metadata_generation_.compare_exchange_weak(
                                                  current, generation)) {
+              }
+              advanced = current < generation;
+              if (advanced) {
+                  remote_metadata_epoch_.fetch_add(1, std::memory_order_acq_rel);
+                  signal_service_event();
               }
           },
           cfg_.connect_timeout, cfg_.heartbeat, cfg_.dead_after, cfg_.max_frame_size),
@@ -163,12 +179,23 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
               return handle(peer, frame_type, request);
           },
           [this](const NodeInfo& peer) {
+              const auto active_before = members_.active();
+              const auto previous = std::find_if(
+                  active_before.begin(), active_before.end(),
+                  [&](const NodeInfo& item) { return item.id == peer.id; });
+              const bool topology_changed =
+                  previous == active_before.end() || previous->host != peer.host ||
+                  previous->port != peer.port ||
+                  previous->failure_domain != peer.failure_domain;
+              const auto previous_generation = remote_metadata_generation_.load();
               members_.observe(peer, true);
-              auto current = remote_metadata_generation_.load();
+              auto current = previous_generation;
               while (current < peer.metadata_generation &&
                      !remote_metadata_generation_.compare_exchange_weak(
                          current, peer.metadata_generation)) {
               }
+              if (topology_changed || peer.metadata_generation > previous_generation)
+                  signal_service_event();
           },
           cfg_.max_frame_size),
       startup_stage_hook_(std::move(startup_stage_hook)), startup_unix_ms_(unix_ms()) {
@@ -501,6 +528,25 @@ void NodeRuntime::note_activity(FrameType type, uint64_t bytes) {
     }
 }
 
+void NodeRuntime::set_service_event_callback(std::function<void()> callback) {
+    std::lock_guard lock(service_event_mutex_);
+    service_event_ = std::move(callback);
+}
+
+void NodeRuntime::notify_storage_mutation() {
+    signal_service_event();
+}
+
+void NodeRuntime::signal_service_event() {
+    std::function<void()> callback;
+    {
+        std::lock_guard lock(service_event_mutex_);
+        callback = service_event_;
+    }
+    if (callback)
+        callback();
+}
+
 uint64_t NodeRuntime::take_activity_bytes(FrameType type) {
     if (type == FrameType::foreground)
         return playback_activity_bytes_.exchange(0, std::memory_order_relaxed);
@@ -529,6 +575,7 @@ void NodeRuntime::announce_metadata_generation(uint64_t generation) {
     // until the cache TTL expires even though the sibling is already durably
     // accepted locally.
     remote_metadata_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    signal_service_event();
     members_.metadata_generation(generation);
     server_.set_local(members_.self());
     Writer writer;
@@ -657,6 +704,8 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             auto data = reader.bytes(128 * 1024 * 1024);
             reader.finish();
             note_activity(frame_type, data.size());
+            if (!local_store().has(id))
+                notify_storage_mutation();
             if (request.type == MessageType::put_object_deferred) {
                 const auto generation = local_store().put_deferred(id, data);
                 if (!generation)
@@ -812,18 +861,46 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
 }
 
 void NodeRuntime::merge(std::span<const uint8_t> payload) {
+    const auto before_all = members_.all();
+    const auto before_active = members_.active();
+    const auto previous_generation = remote_metadata_generation_.load();
+    bool membership_changed = false;
     Reader reader(payload);
     auto count = reader.u32();
     if (count > 100000)
         throw DecodeError("member list too large");
-    uint64_t newest_metadata = remote_metadata_generation_.load();
+    uint64_t newest_metadata = previous_generation;
     for (uint32_t i = 0; i < count; ++i) {
         auto node = decode_node_info(reader);
         newest_metadata = std::max(newest_metadata, node.metadata_generation);
+        const auto previous = std::find_if(
+            before_all.begin(), before_all.end(),
+            [&](const NodeInfo& item) { return item.id == node.id; });
+        membership_changed = membership_changed || previous == before_all.end() ||
+                             previous->host != node.host || previous->port != node.port ||
+                             previous->failure_domain != node.failure_domain ||
+                             previous->metadata_write_replicas_required !=
+                                 node.metadata_write_replicas_required;
         members_.observe(std::move(node));
     }
     reader.finish();
     remote_metadata_generation_.store(newest_metadata);
+
+    // Membership exchange is a heartbeat. Repeated identical gossip must not
+    // wake event-driven maintenance (and, in particular, must not perpetually
+    // restart its GC quiet window). Wake only for scheduler-relevant state:
+    // roster/endpoint changes, an active-set transition, or newer metadata.
+    auto active_ids = [](const std::vector<NodeInfo>& nodes) {
+        std::vector<NodeId> ids;
+        ids.reserve(nodes.size());
+        for (const auto& node : nodes)
+            ids.push_back(node.id);
+        std::sort(ids.begin(), ids.end());
+        return ids;
+    };
+    if (membership_changed || newest_metadata > previous_generation ||
+        active_ids(before_active) != active_ids(members_.active()))
+        signal_service_event();
 }
 
 PublicConnectivityStatus NodeRuntime::public_connectivity_status() const {

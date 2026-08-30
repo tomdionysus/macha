@@ -643,6 +643,12 @@ MetadataManager::PublishedCommit MetadataManager::publish_commit(
     if (accepted < required)
         throw MetadataNotReady("metadata acceptance certificate durability floor unavailable");
 
+    // Local publications do not pass through the RPC acceptance handler, so
+    // explicitly deliver the same maintenance/cache wake-up used for remote
+    // metadata notices. This is what drives catalogue convergence and the
+    // subsequent exact GC deadline without a maintenance poll loop.
+    node_.announce_metadata_generation(record.generation);
+
     return out;
 }
 
@@ -1048,8 +1054,7 @@ MetadataRecord MetadataManager::discover_or_form() {
             throw MetadataNotReady(
                 "metadata replica set forming: waiting for bootstrap checkpoint survey");
         if (survey.durable_history)
-            throw MetadataNotReady(
-                "metadata replica set forming: bootstrap peer has durable history");
+            return read_group(ids, FrameType::control);
     }
 
     auto base = genesis_metadata();
@@ -1389,6 +1394,9 @@ MetadataRecord MetadataManager::mutate_delta(
 }
 
 void MetadataManager::repair_once() {
+    // The background reconciliation owner must not race a foreground mutation
+    // through discovery, accepted-head selection, or reconfiguration.
+    std::unique_lock mutation_lock(mutation_mutex_);
     const auto all_active = node_.membership().active();
     const auto active = compatible_replicas(all_active);
     if (active.empty())

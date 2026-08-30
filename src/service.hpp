@@ -57,6 +57,8 @@ class Service {
     std::jthread maintenance_;
     std::mutex maintenance_wait_mutex_;
     std::condition_variable_any maintenance_wait_cv_;
+    std::atomic_uint64_t maintenance_event_{1};
+    std::atomic_uint64_t maintenance_wakeups_{};
     uint64_t maintenance_inventory_generation_{};
     std::shared_ptr<const std::vector<ObjectId>> maintenance_live_;
     std::shared_ptr<const std::vector<ObjectId>> maintenance_universal_;
@@ -77,6 +79,7 @@ class Service {
     HttpResponse handle_http(const HttpRequest&);
     bool capability_request(const HttpRequest&);
     void loop(std::stop_token);
+    void signal_maintenance();
     std::vector<GarbageRef> collect_garbage(const std::vector<GarbageRef>&);
     void maintain_garbage_metadata(const std::vector<GarbageRef>& erase,
                                    const std::vector<GarbageRef>& stamp);
@@ -96,5 +99,8 @@ class Service {
     CatalogueManager& catalogue() { wait_services_ready(); return *catalogue_; }
     CatalogueHintQueue& catalogue_hints() { wait_services_ready(); return *catalogue_hints_; }
     HydrationManager& hydration() { wait_services_ready(); return *hydration_; }
+    uint64_t maintenance_wakeups() const noexcept {
+        return maintenance_wakeups_.load(std::memory_order_acquire);
+    }
 };
 } // namespace macha

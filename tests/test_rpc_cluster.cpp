@@ -1603,6 +1603,11 @@ MACHA_TEST("rpc_cluster", test_retained_missing_copy_repairs_without_namespace_r
     REQUIRE(s2.node().local_store().remove(id));
     CHECK(s2.node().retention_store().retained(RetentionClass::data, id));
     CHECK(!s2.node().local_store().valid(id));
+    // This direct store mutation simulates corruption detection outside the
+    // normal RPC/storage wrappers. In the event-driven scheduler that detector
+    // must publish the concrete mutation event; heartbeat cadence is not a
+    // maintenance trigger.
+    s2.node().notify_storage_mutation();
 
     // `id` is deliberately absent from namespace/catalogue reachability. The
     // only reason maintenance can know it must restore this physical copy is the
