@@ -588,6 +588,78 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
     CHECK(rerooted.historical(reconciliation.hash)->payload == reconciliation.payload);
 }
 
+MACHA_FAST_TEST("storage_metadata", test_compacted_direct_predecessor_cannot_resurface_as_head) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "compacted-stale-head";
+
+    NodeId a{}, b{};
+    a.bytes[15] = 1;
+    b.bytes[15] = 2;
+
+    const auto genesis = genesis_metadata();
+    auto parent_snapshot = decode_snapshot(genesis.payload);
+    parent_snapshot.metadata_write_replicas_required = 2;
+    FsEntry directory;
+    directory.type = EntryType::directory;
+    directory.mode = 0755;
+    parent_snapshot.entries["/parent"] = directory;
+
+    MetadataRecord parent;
+    parent.generation = genesis.generation + 1;
+    parent.previous = genesis.hash;
+    parent.payload = encode_snapshot(parent_snapshot);
+    parent.hash = metadata_hash(parent.generation, parent.previous, parent.payload);
+    const MetadataAcceptance parent_accept{parent.generation, parent.hash, 2, {a, b}};
+
+    auto child_snapshot = parent_snapshot;
+    child_snapshot.entries["/child"] = directory;
+    MetadataRecord child;
+    child.generation = parent.generation + 1;
+    child.previous = parent.hash;
+    child.payload = encode_snapshot(child_snapshot);
+    child.hash = metadata_hash(child.generation, child.previous, child.payload);
+    const MetadataAcceptance child_accept{child.generation, child.hash, 2, {a, b}};
+
+    MetadataHistoryEntry stale_parent;
+    {
+        MetadataReplica replica(path, keys.storage);
+        REQUIRE(replica.store_commit(parent));
+        REQUIRE(replica.accept_commit(parent_accept));
+        REQUIRE(replica.store_commit(child));
+        REQUIRE(replica.accept_commit(child_accept));
+        auto heads = replica.accepted_heads();
+        REQUIRE(heads.size() == 1);
+        CHECK(heads.front().hash == child.hash);
+
+        auto entry = replica.history_entry(parent.hash);
+        REQUIRE(entry.has_value());
+        stale_parent = *entry;
+        REQUIRE(replica.compact_history_if_safe(1, 1));
+        CHECK(!replica.historical(parent.hash).has_value());
+        CHECK(replica.history_is_ancestor(parent.hash, child.hash));
+
+        // Simulate a restarted peer advertising an old but still-valid accepted
+        // head after this node compacted away the predecessor's payload.
+        REQUIRE(replica.import_history(stale_parent));
+        REQUIRE(replica.accept_commit(parent_accept));
+        heads = replica.accepted_heads();
+        REQUIRE(heads.size() == 1);
+        CHECK(heads.front().hash == child.hash);
+
+        const auto common = replica.history_common_ancestor(parent.hash, child.hash);
+        REQUIRE(common.has_value());
+        CHECK(*common == parent.hash);
+    }
+
+    MetadataReplica reopened(path, keys.storage);
+    const auto heads = reopened.accepted_heads();
+    REQUIRE(heads.size() == 1);
+    CHECK(heads.front().hash == child.hash);
+}
+
 MACHA_FAST_TEST("storage_metadata", test_metadata_recovery_cache_seed_is_not_accepted_authority) {
     TempDir t;
     auto keyfile = t.path() / "key";
