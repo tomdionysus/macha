@@ -1,12 +1,28 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "test_backend_support.hpp"
 #include "fuse_mountpoint.hpp"
+#include "miniupnpc_compat.hpp"
+#include "test_backend_support.hpp"
 
 using namespace macha;
 using namespace std::chrono_literals;
 using namespace macha::test_support;
 
 namespace {
+
+MACHA_FAST_TEST("foundations", test_miniupnpc_igd_status_compatibility) {
+    using namespace miniupnpc_compat;
+
+    CHECK(usable(17, connected_igd));
+    CHECK(!private_wan(17, private_wan_igd));
+    CHECK(!usable(17, private_wan_igd));
+
+    CHECK(usable(18, connected_igd));
+    CHECK(!private_wan(18, connected_igd));
+    CHECK(usable(18, private_wan_igd));
+    CHECK(private_wan(18, private_wan_igd));
+    CHECK(!usable(18, 3));
+    CHECK(!usable(18, 4));
+}
 
 MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     Writer w;
@@ -88,8 +104,9 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     Bytes aad{1, 2, 3, 4, 5};
     auto empty_sealed = aes_gcm_seal(keys.auth, empty, aad);
     CHECK(empty_sealed.ciphertext.empty());
-    CHECK(aes_gcm_open(keys.auth, empty_sealed.nonce, empty_sealed.tag,
-                       empty_sealed.ciphertext, aad).empty());
+    CHECK(
+        aes_gcm_open(keys.auth, empty_sealed.nonce, empty_sealed.tag, empty_sealed.ciphertext, aad)
+            .empty());
 
     auto alice = x25519_generate();
     auto bob = x25519_generate();
@@ -274,7 +291,7 @@ MACHA_FAST_TEST("foundations", test_membership_ip_identity_reset_without_node_id
 
     IdentityAssociationReset reset;
     reset.host = "10.44.1.50";
-    reset.port = 0; // every endpoint on this IP
+    reset.port = 0;           // every endpoint on this IP
     reset.stale_node_id = {}; // NodeId unknown
     reset.epoch = 1;
     reset.reset_unix_ms = before_reset + 1;
@@ -283,9 +300,8 @@ MACHA_FAST_TEST("foundations", test_membership_ip_identity_reset_without_node_id
 
     auto after = membership.all();
     CHECK(after.size() == 2);
-    CHECK(std::any_of(after.begin(), after.end(), [&](const NodeInfo& node) {
-        return node.id == other.id;
-    }));
+    CHECK(std::any_of(after.begin(), after.end(),
+                      [&](const NodeInfo& node) { return node.id == other.id; }));
 
     // Gossip containing a pre-reset observation cannot reintroduce either old
     // association, even when the administrator did not know their NodeIds.
@@ -324,7 +340,8 @@ MACHA_FAST_TEST("foundations", test_durable_replace_file_matrix) {
 
         size_t temporaries = 0;
         for (const auto& entry : std::filesystem::directory_iterator(path.parent_path())) {
-            if (entry.path().filename().string().starts_with("state.json.tmp.")) ++temporaries;
+            if (entry.path().filename().string().starts_with("state.json.tmp."))
+                ++temporaries;
         }
         CHECK(temporaries == 0);
     }
@@ -367,13 +384,12 @@ MACHA_FAST_TEST("foundations", test_torrent_uri_safety_matrix) {
     for (const auto& test_case : magnets)
         CHECK(sanitize_magnet_uri(test_case.value).has_value() == test_case.accepted);
 
-    auto sanitized = sanitize_magnet_uri(
-        "magnet:?xt=urn%3Abtih%3A0123456789abcdef"
-        "&dn=%20Example%01%20Name%20"
-        "&tr=https%3A%2F%2Ftracker.example%2Fannounce"
-        "&tr=udp%3A%2F%2Ftracker.example%3A80%2Fannounce"
-        "&tr=file%3A%2F%2F%2Fetc%2Fpasswd"
-        "&xs=https%3A%2F%2Funtrusted.example%2Fpayload");
+    auto sanitized = sanitize_magnet_uri("magnet:?xt=urn%3Abtih%3A0123456789abcdef"
+                                         "&dn=%20Example%01%20Name%20"
+                                         "&tr=https%3A%2F%2Ftracker.example%2Fannounce"
+                                         "&tr=udp%3A%2F%2Ftracker.example%3A80%2Fannounce"
+                                         "&tr=file%3A%2F%2F%2Fetc%2Fpasswd"
+                                         "&xs=https%3A%2F%2Funtrusted.example%2Fpayload");
     REQUIRE(sanitized.has_value());
     CHECK(sanitized->starts_with("magnet:?xt=urn%3Abtih%3A0123456789abcdef"));
     CHECK(sanitized->find("dn=Example%20Name") != std::string::npos);
@@ -542,8 +558,6 @@ MACHA_FAST_TEST("foundations", test_config) {
     CHECK(maintenance_background_interval(maintenance_policy) == 30000ms);
     CHECK(std::string(message_type_name(MessageType::members)) == "members");
     CHECK(std::string(message_type_name(MessageType::get_object)) == "get_object");
-
-
 }
 
 MACHA_FAST_TEST("foundations", test_placement) {
@@ -608,8 +622,8 @@ MACHA_FAST_TEST("foundations", test_capacity_placement) {
         return node;
     };
 
-    std::vector<NodeInfo> asymmetric{
-        make_node(1, 10 * TiB), make_node(2, 10 * TiB), make_node(3, 8 * GiB)};
+    std::vector<NodeInfo> asymmetric{make_node(1, 10 * TiB), make_node(2, 10 * TiB),
+                                     make_node(3, 8 * GiB)};
 
     // With three nodes and R=2, all physical capacity can participate: the two
     // 10 TiB nodes are in almost every shard and the 8 GiB node owns only its
@@ -644,8 +658,8 @@ MACHA_FAST_TEST("foundations", test_capacity_placement) {
     const auto first_small = static_cast<uint32_t>(placement_shards - small_quota);
     auto just_before = capacity_placement_nodes(shard_id(first_small - 1), asymmetric, 2);
     auto at_boundary = capacity_placement_nodes(shard_id(first_small), asymmetric, 2);
-    auto at_end = capacity_placement_nodes(shard_id(std::numeric_limits<uint32_t>::max()),
-                                            asymmetric, 2);
+    auto at_end =
+        capacity_placement_nodes(shard_id(std::numeric_limits<uint32_t>::max()), asymmetric, 2);
     REQUIRE(just_before.size() == 3);
     REQUIRE(at_boundary.size() == 3);
     REQUIRE(at_end.size() == 3);

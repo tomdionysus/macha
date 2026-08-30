@@ -5,6 +5,9 @@
 - Bring the RPC control plane and status API online before local backend recovery.
 - Report startup/readiness independently from cluster reachability and storage availability.
 - Make metadata-history cold-start linear and add periodic full-history anchors.
+- Build UPnP support against miniupnpc API 18 headers which predate the symbolic
+  `UPNP_GetValidIGD()` return-value macros, while preserving private-WAN and
+  disconnected-gateway classification.
 
 ## 0.19.0 — metadata replica availability
 
