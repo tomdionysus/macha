@@ -971,25 +971,42 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_chain_reuses_bounded_mat
     }
 
     // Reopening removes any process-local materializations produced while the
-    // chain was built. The first lookup must reconstruct it; the second must
-    // reuse the validated immutable result.
+    // chain was built. Concurrent cache misses share one off-lock computation;
+    // later callers reuse the validated immutable result.
     MetadataReplica replica(path, keys.storage);
     const auto before = replica.diagnostics();
-    auto first = replica.historical(head.hash);
+    constexpr size_t concurrent_readers = 8;
+    std::array<std::shared_ptr<const MetadataMaterialization>, concurrent_readers> results;
+    std::atomic_bool start{};
+    std::vector<std::jthread> readers;
+    for (size_t index = 0; index < concurrent_readers; ++index) {
+        readers.emplace_back([&, index] {
+            while (!start.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            results[index] = replica.materialized(head.hash);
+        });
+    }
+    start.store(true, std::memory_order_release);
+    readers.clear();
     const auto middle = replica.diagnostics();
     auto second = replica.historical(head.hash);
     const auto after = replica.diagnostics();
-    REQUIRE(first.has_value());
     REQUIRE(second.has_value());
-    CHECK(first->payload == head.payload);
     CHECK(second->payload == head.payload);
+    for (const auto& result : results) {
+        REQUIRE(result != nullptr);
+        CHECK(result->record.payload == head.payload);
+        CHECK(result == results.front());
+    }
 
-    CHECK(middle.historical_requests - before.historical_requests == 1);
+    CHECK(middle.historical_requests - before.historical_requests == concurrent_readers);
     CHECK(after.historical_requests - middle.historical_requests == 1);
     CHECK(middle.historical_reconstructions - before.historical_reconstructions == 1);
     CHECK(after.historical_reconstructions - middle.historical_reconstructions == 0);
     CHECK(middle.historical_deltas_applied - before.historical_deltas_applied == chain_length);
     CHECK(after.historical_deltas_applied - middle.historical_deltas_applied == 0);
+    CHECK(middle.materialization_cache_hits - before.materialization_cache_hits ==
+          concurrent_readers - 1);
     CHECK(after.materialization_cache_hits - middle.materialization_cache_hits == 1);
     CHECK(middle.materialization_cache_misses - before.materialization_cache_misses == 1);
     CHECK(after.materialization_cache_entries <= 64);
