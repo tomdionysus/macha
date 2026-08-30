@@ -6,10 +6,6 @@ This is the working backlog for the current session. Add new work here. When an 
 
 The existing documents in this directory remain the detailed plans, checkpoints, and UAT records. This file is only the current index.
 
-## Next: complete Phase 3 convergence coalescing
-
-- [ ] Run a three-node active-burst UAT after the integrated work: check bounded convergence runs, final state agreement, RPC responsiveness, and return to the already-proven idle state.
-
 ## Phase 1 materialization follow-up
 
 - [ ] Avoid encoding every intermediate snapshot solely to traverse a delta chain; encode only when commit-identity validation requires it.
@@ -27,21 +23,9 @@ The existing documents in this directory remain the detailed plans, checkpoints,
 - [ ] Decide whether each published prefix member needs an explicit in-memory association with its accepted commit hash/generation.
 - [ ] Preserve rename as a safe singleton boundary until the durable mixed-operation design and crash matrix are complete.
 
-## Phase 4: isolate long metadata work from critical RPC service
-
-- [ ] Introduce a dedicated bounded executor for history import, commit storage, and acceptance.
-- [ ] Keep wire reading, frame assembly, basic validation, ping, and membership independent of metadata execution.
-- [ ] Return RPC replies asynchronously after queued metadata work completes.
-- [ ] Bound metadata queues by job count and bytes and apply explicit backpressure.
-- [ ] Coalesce or pipeline consecutive linear commits from one peer where correctness permits.
-- [ ] Reserve foreground capacity so metadata recovery cannot exhaust object/filesystem service lanes.
-- [ ] Define safe peer-disconnect, cancellation, and shutdown behaviour before and after durability boundaries.
-- [ ] Remove filesystem I/O, fsync, reconstruction, and large encoding from global metadata critical sections.
-- [ ] Document which RPC messages may execute on fast-control workers.
-- [ ] Add deterministic tests for slow acceptance versus ping/membership, foreground capacity, bounded backpressure, disconnect states, and shutdown with queued work.
-
 ## Diagnostics and operational proof still needed
 
+- [ ] Investigate status disk-usage telemetry alternating between plausible values and zero for connected remote nodes. Capture the raw `/api/v1/status` responses across refreshes, determine whether the API emits transient zero/unavailable storage and cache values or the client incorrectly selects/renders stale peer records, then fix the responsible layer and add regression coverage that distinguishes unavailable telemetry from genuine zero usage.
 - [ ] Add accepted-head persistence counters.
 - [ ] Add RPC queue-time and handler-time summaries by message and frame class.
 - [ ] Record a reproducible local benchmark recipe without default-suite timing thresholds.

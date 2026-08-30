@@ -2798,11 +2798,15 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
 };
 
 RpcServer::RpcServer(std::string host, uint16_t port, ClusterKeys keys, NodeInfo local,
-                     Handler handler, Observer observer, size_t max_frame_size)
+                     Handler handler, Observer observer, size_t max_frame_size,
+                     RpcServerExecutionLimits execution_limits)
     : host_(std::move(host)), port_(port), keys_(keys), local_(std::move(local)),
       handler_(std::move(handler)), observer_(std::move(observer)),
-      max_frame_size_(max_frame_size) {
+      max_frame_size_(max_frame_size), execution_limits_(execution_limits) {
     validate_frame_limit(max_frame_size_);
+    if (!execution_limits_.metadata_workers || !execution_limits_.metadata_pending_jobs ||
+        !execution_limits_.metadata_pending_bytes)
+        throw std::runtime_error("metadata RPC executor limits must be non-zero");
 }
 
 RpcServer::~RpcServer() {
@@ -2833,6 +2837,17 @@ bool RpcServer::fast_control_request(const RpcFrame& frame) {
            (frame.message.type == MessageType::ping || frame.message.type == MessageType::members);
 }
 
+bool RpcServer::metadata_mutation_request(const RpcFrame& frame) {
+    switch (frame.message.type) {
+    case MessageType::put_metadata_history_entry:
+    case MessageType::put_metadata_commit:
+    case MessageType::accept_metadata_commit:
+        return true;
+    default:
+        return false;
+    }
+}
+
 std::deque<RpcServer::RequestJob>& RpcServer::queue(RequestClass cls) {
     switch (cls) {
     case RequestClass::control:
@@ -2845,6 +2860,29 @@ std::deque<RpcServer::RequestJob>& RpcServer::queue(RequestClass cls) {
         return speculative_requests_;
     }
     return speculative_requests_;
+}
+
+bool RpcServer::admit_locked(RequestJob job) {
+    if (metadata_mutation_request(job.frame)) {
+        const auto bytes = job.frame.message.payload.size();
+        const bool bytes_fit = bytes <= execution_limits_.metadata_pending_bytes &&
+                               metadata_request_bytes_ <=
+                                   execution_limits_.metadata_pending_bytes - bytes;
+        if (metadata_requests_.size() >= execution_limits_.metadata_pending_jobs || !bytes_fit) {
+            rejected_metadata_requests_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        metadata_request_bytes_ += bytes;
+        metadata_requests_.push_back(std::move(job));
+        return true;
+    }
+
+    const bool fast = fast_control_request(job.frame);
+    auto& requests = fast ? fast_control_requests_ : queue(request_class(job.frame.frame_type));
+    if (requests.size() >= max_pending_requests)
+        return false;
+    requests.push_back(std::move(job));
+    return true;
 }
 
 bool RpcServer::data_ready() const {
@@ -2875,14 +2913,14 @@ void RpcServer::attach_client(RpcClient& client) {
 
 void RpcServer::enqueue_shared(const NodeInfo& peer, RpcFrame frame,
                                RpcClient::InboundReply reply) {
-    const bool fast = fast_control_request(frame);
-    const auto cls = request_class(frame.frame_type);
+    bool admitted = false;
     {
         DiagnosticLock lock(request_mutex_, "rpc.server.queue");
-        auto& requests = fast ? fast_control_requests_ : queue(cls);
-        if (requests.size() >= max_pending_requests)
-            throw std::runtime_error("RPC server request queue full");
-        requests.push_back({{}, peer, std::move(frame), std::move(reply)});
+        admitted = admit_locked({{}, peer, std::move(frame), reply});
+    }
+    if (!admitted) {
+        reply({MessageType::error, {}});
+        return;
     }
     request_cv_.notify_all();
 }
@@ -2940,6 +2978,21 @@ void RpcServer::cancel_queued(const NodeInfo& peer, uint64_t request_id) {
         cancel_from(foreground_requests_);
         cancel_from(read_ahead_requests_);
         cancel_from(speculative_requests_);
+        for (auto it = metadata_requests_.begin(); it != metadata_requests_.end();) {
+            if (it->peer.id != peer.id || it->frame.request_id != request_id) {
+                ++it;
+                continue;
+            }
+            metadata_request_bytes_ -= it->frame.message.payload.size();
+            if (it->reply)
+                replies.push_back(std::move(it->reply));
+            if (it->session) {
+                if (it->session->active_requests.load())
+                    --it->session->active_requests;
+                sessions.push_back(it->session);
+            }
+            it = metadata_requests_.erase(it);
+        }
     }
     for (auto& reply : replies) {
         try {
@@ -2959,6 +3012,7 @@ void RpcServer::start() {
 
     fast_control_workers_.reserve(fast_control_worker_count);
     control_workers_.reserve(control_worker_count);
+    metadata_workers_.reserve(execution_limits_.metadata_workers);
     data_workers_.reserve(data_worker_count);
     for (size_t i = 0; i < fast_control_worker_count; ++i)
         fast_control_workers_.emplace_back(
@@ -2966,6 +3020,9 @@ void RpcServer::start() {
     for (size_t i = 0; i < control_worker_count; ++i)
         control_workers_.emplace_back(
             [this](std::stop_token stop) { control_worker_loop(stop); });
+    for (size_t i = 0; i < execution_limits_.metadata_workers; ++i)
+        metadata_workers_.emplace_back(
+            [this](std::stop_token stop) { metadata_worker_loop(stop); });
     for (size_t i = 0; i < data_worker_count; ++i)
         data_workers_.emplace_back([this](std::stop_token stop) { data_worker_loop(stop); });
 
@@ -3010,18 +3067,22 @@ void RpcServer::stop() {
         worker.request_stop();
     for (auto& worker : control_workers_)
         worker.request_stop();
+    for (auto& worker : metadata_workers_)
+        worker.request_stop();
     for (auto& worker : data_workers_)
         worker.request_stop();
     request_cv_.notify_all();
     fast_control_workers_.clear();
     control_workers_.clear();
+    metadata_workers_.clear();
     data_workers_.clear();
 
     std::vector<std::function<void(const RpcMessage&)>> dropped;
     {
         DiagnosticLock lock(request_mutex_, "rpc.server.queue");
         for (auto* requests : {&fast_control_requests_, &control_requests_, &foreground_requests_,
-                               &read_ahead_requests_, &speculative_requests_}) {
+                               &read_ahead_requests_, &speculative_requests_,
+                               &metadata_requests_}) {
             for (auto& job : *requests) {
                 if (job.reply)
                     dropped.push_back(job.reply);
@@ -3030,6 +3091,7 @@ void RpcServer::stop() {
             }
             requests->clear();
         }
+        metadata_request_bytes_ = 0;
     }
     for (auto& reply : dropped) {
         try {
@@ -3227,34 +3289,34 @@ void RpcServer::session_loop(Session* session) {
                 continue;
             }
 
-            const bool fast = fast_control_request(*frame);
-            const auto cls = request_class(frame->frame_type);
+            const auto request_id = frame->request_id;
+            const auto frame_type = frame->frame_type;
             session->register_inbound(frame->request_id, frame->frame_type);
             bool queued = false;
             {
                 DiagnosticLock lock(request_mutex_, "rpc.server.queue");
-                auto& requests = fast ? fast_control_requests_ : queue(cls);
-                if (requests.size() < max_pending_requests) {
-                    std::shared_ptr<Session> shared;
-                    {
-                        std::lock_guard sessions_lock(sessions_mutex_);
-                        auto found = std::find_if(sessions_.begin(), sessions_.end(),
-                                                  [&](const auto& item) {
-                                                      return item.get() == session;
-                                                  });
-                        if (found != sessions_.end())
-                            shared = *found;
-                    }
-                    if (shared) {
-                        ++shared->active_requests;
-                        requests.push_back({std::move(shared), session->peer,
-                                            std::move(*frame), {}});
-                        queued = true;
-                    }
+                std::shared_ptr<Session> shared;
+                {
+                    std::lock_guard sessions_lock(sessions_mutex_);
+                    auto found = std::find_if(sessions_.begin(), sessions_.end(),
+                                              [&](const auto& item) {
+                                                  return item.get() == session;
+                                              });
+                    if (found != sessions_.end())
+                        shared = *found;
+                }
+                if (shared) {
+                    ++shared->active_requests;
+                    queued = admit_locked({shared, session->peer, std::move(*frame), {}});
+                    if (!queued)
+                        --shared->active_requests;
                 }
             }
-            if (!queued)
-                throw std::runtime_error("RPC server request queue full");
+            if (!queued) {
+                (void)session->queue_message(request_id, frame_type,
+                                             {MessageType::error, {}}, true);
+                continue;
+            }
             request_cv_.notify_all();
         }
     } catch (const std::exception& error) {
@@ -3360,6 +3422,59 @@ void RpcServer::control_worker_loop(std::stop_token stop) {
         execute(std::move(job));
         cpu_reporter.tick();
     }
+}
+
+void RpcServer::metadata_worker_loop(std::stop_token stop) {
+    ThreadCpuReporter cpu_reporter("macha-rpc-meta");
+    while (true) {
+        RequestJob job;
+        NodeId peer;
+        {
+            std::unique_lock lock(request_mutex_);
+            request_cv_.wait(lock, [&] {
+                if (stop.stop_requested() && metadata_requests_.empty())
+                    return true;
+                return std::any_of(metadata_requests_.begin(), metadata_requests_.end(),
+                                   [&](const RequestJob& candidate) {
+                                       return !metadata_active_peers_.contains(candidate.peer.id);
+                                   });
+            });
+            if (stop.stop_requested() && metadata_requests_.empty())
+                return;
+            auto ready = std::find_if(metadata_requests_.begin(), metadata_requests_.end(),
+                                      [&](const RequestJob& candidate) {
+                                          return !metadata_active_peers_.contains(candidate.peer.id);
+                                      });
+            if (ready == metadata_requests_.end())
+                continue;
+            job = std::move(*ready);
+            metadata_requests_.erase(ready);
+            metadata_request_bytes_ -= job.frame.message.payload.size();
+            peer = job.peer.id;
+            metadata_active_peers_.insert(peer);
+            active_metadata_requests_.fetch_add(1, std::memory_order_relaxed);
+        }
+        execute(std::move(job));
+        {
+            std::lock_guard lock(request_mutex_);
+            metadata_active_peers_.erase(peer);
+            active_metadata_requests_.fetch_sub(1, std::memory_order_relaxed);
+        }
+        request_cv_.notify_all();
+        cpu_reporter.tick();
+    }
+}
+
+RpcServerWorkStats RpcServer::work_stats() const {
+    RpcServerWorkStats out;
+    {
+        DiagnosticLock lock(request_mutex_, "rpc.server.queue");
+        out.metadata_pending_jobs = metadata_requests_.size();
+        out.metadata_pending_bytes = metadata_request_bytes_;
+    }
+    out.metadata_active_jobs = active_metadata_requests_.load(std::memory_order_relaxed);
+    out.metadata_rejected_jobs = rejected_metadata_requests_.load(std::memory_order_relaxed);
+    return out;
 }
 
 void RpcServer::data_worker_loop(std::stop_token stop) {

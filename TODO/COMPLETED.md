@@ -60,8 +60,9 @@ Evidence: [Phase 2 namespace batching](2026-08-30-phase-2-namespace-batching.md)
 - [x] Verified disconnected maintenance sleeps until a peer event and retained the catalogue search/artwork/GC regression.
 - [x] Performed a three-node idle UAT at generation 1375. All three nodes remained healthy/writable with stable RPC connections, all convergence-related workers were parked, and post-torrent-pause instantaneous process CPU was 0.0% on every node.
 - [x] Isolated the local pre-pause CPU use to libtorrent peer/UTP work rather than metadata, catalogue, hydration, FUSE, HTTP, or RPC work.
+- [x] Performed a three-node active-burst UAT using 81 paced creates followed by 81 paced deletes. Each half used 20 metadata publications, all three nodes agreed on both the 80-entry intermediate namespace and the final empty state, status remained responsive during active work, RPC connections did not churn, and every node returned immediately to the previously proven idle state.
 
-Evidence: [Phase 3 scheduler checkpoint](2026-08-30-phase-2-durability-and-phase-3-scheduler-checkpoint.md) and [Phase 3 three-node idle UAT](2026-08-30-phase-3-three-node-idle-uat.md)
+Evidence: [Phase 3 scheduler checkpoint](2026-08-30-phase-2-durability-and-phase-3-scheduler-checkpoint.md), [Phase 3 three-node idle UAT](2026-08-30-phase-3-three-node-idle-uat.md), and [Phase 3 three-node active-burst UAT](2026-08-30-phase-3-three-node-active-burst-uat.md)
 
 Integrated burst verification: `rpc_cluster/test_service_metadata_repair_coalesces_real_generation_burst` passed six isolated executions; the complete `rpc_cluster` suite passed 28/28, `invariants` passed 36/36, `filesystem_fuse/test_disconnected_maintenance_sleeps_until_peer_event` passed, and `hydration_catalogue/test_catalogue_sync_search_and_artwork_gc` passed.
 
@@ -76,3 +77,25 @@ Acceptance rebroadcast verification: the strengthened real-repair burst first re
 Lagging-replica verification: `rpc_cluster/test_lagging_third_replica_catches_up_linear_burst_in_bounded_runs` passed six isolated executions. The expanded complete `rpc_cluster` suite passed 30/30.
 
 Phase 3 repository-wide checkpoint: `sh run-tests.sh build` passed the complete default suite 199/199 and runtime-dependency suite 3/3. The run explicitly included `hydration_catalogue/test_catalogue_sync_search_and_artwork_gc`, the real burst and sibling tests, the exact garbage-grace test, and the lagging-third catch-up test.
+
+## Phase 4: bounded metadata RPC executor
+
+- [x] Routed history import, commit storage, and acceptance RPCs to a dedicated executor rather than ordinary control or data workers.
+- [x] Kept socket reading, frame assembly, queue admission, ping, membership, ordinary control handlers, and foreground DATA work independent of metadata execution.
+- [x] Preserved asynchronous RPC completion: executor owners finish work and queue replies without occupying the session reader.
+- [x] Bounded pending metadata work by both job count and payload bytes, returning an immediate in-band error on overload without closing the peer session.
+- [x] Preserved per-peer FIFO across history/store/accept operations while permitting explicitly configured workers to execute different peers concurrently.
+- [x] Defined and tested lifecycle boundaries: queued work is cancellable; running work owns its durability boundary and survives reply-route disconnect; shutdown completes a running owner and abandons queued work whose session has closed.
+- [x] Kept metadata recovery from consuming fast-control, ordinary-control, or foreground DATA capacity.
+- [x] Added deterministic gated tests for executor isolation, count/byte backpressure, session survival, per-peer order, cross-peer concurrency, cancellation, disconnect, and shutdown.
+- [x] Set the production default to one metadata owner, 64 queued jobs, and 256 MiB of queued payload. This avoids multiplying idle workers while retaining bounded multi-worker support and per-peer FIFO for explicit configurations.
+- [x] Replaced stop-and-wait history transfer with a dependency-first window of at most eight asynchronous uploads; sender diagnostics and the lagging-third test prove more than one and no more than eight requests are in flight.
+- [x] Moved history-entry reconstruction, delta application, snapshot encoding/hash validation, encryption, and durable history append out of the global replica-state critical section. A separate durability owner preserves append order and a short state lock installs the validated immutable entry afterward.
+- [x] Added single-flight off-lock materialization. Eight concurrent readers of a cold 200-delta chain now share exactly one reconstruction and install through a validated short lock step.
+- [x] Prewarmed acceptance-policy materializations outside the replica lock and moved accepted-head public reconstruction onto the off-lock path.
+- [x] Documented the closed fast-control allow-list (`ping` and `members` on CONTROL frames only), its handler constraints, and the proof required before extending it.
+- [x] Fixed the event-driven follow-up edge exposed by the complete suite: a coalesced convergence run which leaves one follow-up pending now continues immediately without requiring an unrelated external wake, while disconnected settled maintenance remains parked.
+
+Evidence: [Phase 4 bounded metadata RPC executor](2026-08-30-phase-4-bounded-metadata-rpc-executor.md)
+
+Verification: the 27-test `storage_metadata` suite passed; the strengthened cold-chain test proved one reconstruction for eight concurrent callers; and the lagging-third test proved a bounded transfer peak in `(1, 8]`. The first repository-wide run correctly exposed the lost follow-up wake in `hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`; after correcting that scheduler edge, the catalogue burst and disconnected-idle regressions passed explicitly. The final repository-wide run passed the default suite 203/203 plus runtime dependencies 3/3, including both catalogue burst/search/artwork/GC regressions and the lagging-third recovery test.

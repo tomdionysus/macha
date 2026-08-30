@@ -768,6 +768,312 @@ MACHA_TEST("rpc_cluster", test_rpc_health_not_starved_by_slow_control_handlers) 
     server.stop();
 }
 
+MACHA_TEST("rpc_cluster", test_rpc_metadata_mutations_use_bounded_isolated_executor) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto port = free_port();
+
+    NodeInfo server_info;
+    server_info.id = random_node_id();
+    server_info.host = "127.0.0.1";
+    server_info.port = port;
+    server_info.failure_domain = "server-site";
+
+    TestGate metadata_gate;
+    std::atomic_uint32_t metadata_calls{};
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (request.type == MessageType::put_metadata_history_entry ||
+                request.type == MessageType::put_metadata_commit ||
+                request.type == MessageType::accept_metadata_commit) {
+                ++metadata_calls;
+                metadata_gate.enter_and_wait();
+                return RpcMessage{MessageType::bool_reply, Bytes{1}};
+            }
+            if (request.type == MessageType::members)
+                return RpcMessage{MessageType::members_reply, {}};
+            if (request.type == MessageType::have_object)
+                return RpcMessage{MessageType::bool_reply, Bytes{1}};
+            if (request.type == MessageType::get_object)
+                return RpcMessage{MessageType::object_reply, Bytes{0x46}};
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {}, 256 * 1024,
+        RpcServerExecutionLimits{.metadata_workers = 1,
+                                 .metadata_pending_jobs = 2,
+                                 .metadata_pending_bytes = 8});
+    server.start();
+
+    NodeInfo client_info;
+    client_info.id = random_node_id();
+    client_info.host = "127.0.0.1";
+    client_info.port = free_port();
+    client_info.failure_domain = "client-site";
+    RpcClient client(keys, [client_info] { return client_info; }, [](const NodeInfo&) {},
+                     [](uint64_t) {}, 500ms, 100ms, 2s);
+    Endpoint endpoint{"127.0.0.1", port};
+
+    // One metadata mutation may execute while two more wait in the dedicated
+    // bounded queue. These cover every mutation RPC routed to the executor.
+    auto history = client.call_async(endpoint, MessageType::put_metadata_history_entry,
+                                     Bytes{0x01, 0x02});
+    REQUIRE(metadata_gate.wait_for_entries(1));
+    auto commit = client.call_async(endpoint, MessageType::put_metadata_commit,
+                                    Bytes{0x03, 0x04});
+    auto acceptance = client.call_async(endpoint, MessageType::accept_metadata_commit,
+                                        Bytes{0x05, 0x06});
+    REQUIRE(wait_until([&] {
+        const auto stats = server.work_stats();
+        return stats.metadata_active_jobs == 1 && stats.metadata_pending_jobs == 2 &&
+               stats.metadata_pending_bytes == 4;
+    }, 2s));
+
+    // Job-count pressure is explicit: overload receives an ordinary RPC error
+    // without closing the session or occupying a control/data worker.
+    auto queue_full = client.call_async(endpoint, MessageType::put_metadata_commit, Bytes{0x07});
+    REQUIRE(queue_full.wait_for(1s) == std::future_status::ready);
+    CHECK(queue_full.get().message.type == MessageType::error);
+
+    // Health, membership, ordinary control work, and foreground DATA work all
+    // complete while the metadata worker and queue remain deliberately blocked.
+    CHECK(client.call(endpoint, MessageType::ping, {}, 100ms).message.type == MessageType::ok);
+    CHECK(client.call(endpoint, MessageType::members, {}, 100ms).message.type ==
+          MessageType::members_reply);
+    CHECK(client.call(endpoint, MessageType::have_object, Bytes{0x08}, 100ms).message.type ==
+          MessageType::bool_reply);
+    CHECK(client.call(endpoint, MessageType::get_object, Bytes{0x09}, FrameType::foreground,
+                      100ms).message.type == MessageType::object_reply);
+
+    metadata_gate.open();
+    for (auto* rpc : {&history, &commit, &acceptance}) {
+        REQUIRE(rpc->wait_for(2s) == std::future_status::ready);
+        CHECK(rpc->get().message.type == MessageType::bool_reply);
+    }
+    REQUIRE(wait_until([&] {
+        const auto stats = server.work_stats();
+        return stats.metadata_active_jobs == 0 && stats.metadata_pending_jobs == 0 &&
+               stats.metadata_pending_bytes == 0;
+    }, 2s));
+
+    // Payload-byte pressure is enforced even when no other metadata work is
+    // present; the rejected job never reaches the handler.
+    auto too_large = client.call_async(endpoint, MessageType::accept_metadata_commit,
+                                       Bytes(9, 0x0a));
+    REQUIRE(too_large.wait_for(1s) == std::future_status::ready);
+    CHECK(too_large.get().message.type == MessageType::error);
+    CHECK(metadata_calls.load() == 3);
+    const auto final_stats = server.work_stats();
+    CHECK(final_stats.metadata_rejected_jobs == 2);
+
+    // Both CONTROL and DATA sessions remain usable after backpressure replies.
+    CHECK(client.call(endpoint, MessageType::ping, {}, 100ms).message.type == MessageType::ok);
+    CHECK(client.call(endpoint, MessageType::get_object, Bytes{0x0b}, FrameType::foreground,
+                      100ms).message.type == MessageType::object_reply);
+
+    client.stop();
+    server.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_orders_each_peer_and_parallelises_peers) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto port = free_port();
+
+    NodeInfo server_info;
+    server_info.id = random_node_id();
+    server_info.host = "127.0.0.1";
+    server_info.port = port;
+    server_info.failure_domain = "server-site";
+
+    NodeInfo first_client;
+    first_client.id = random_node_id();
+    first_client.host = "127.0.0.1";
+    first_client.port = free_port();
+    first_client.failure_domain = "first-client-site";
+
+    NodeInfo second_client;
+    second_client.id = random_node_id();
+    second_client.host = "127.0.0.1";
+    second_client.port = free_port();
+    second_client.failure_domain = "second-client-site";
+
+    TestGate first_job_gate;
+    std::atomic_bool first_peer_second_started{};
+    std::atomic_bool second_peer_started{};
+    std::mutex order_mutex;
+    std::vector<uint8_t> first_peer_order;
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo& peer, FrameType, const RpcMessage& request) {
+            REQUIRE(request.type == MessageType::put_metadata_commit);
+            REQUIRE(!request.payload.empty());
+            const auto marker = request.payload.front();
+            if (peer.id == first_client.id) {
+                {
+                    std::lock_guard lock(order_mutex);
+                    first_peer_order.push_back(marker);
+                }
+                if (marker == 1)
+                    first_job_gate.enter_and_wait();
+                else if (marker == 2)
+                    first_peer_second_started = true;
+            } else if (peer.id == second_client.id) {
+                second_peer_started = true;
+            }
+            return RpcMessage{MessageType::bool_reply, Bytes{1}};
+        },
+        [](const NodeInfo&) {}, 256 * 1024,
+        RpcServerExecutionLimits{.metadata_workers = 2,
+                                 .metadata_pending_jobs = 8,
+                                 .metadata_pending_bytes = 64});
+    server.start();
+
+    RpcClient client_a(keys, [first_client] { return first_client; }, [](const NodeInfo&) {},
+                       [](uint64_t) {}, 500ms, 100ms, 2s);
+    RpcClient client_b(keys, [second_client] { return second_client; }, [](const NodeInfo&) {},
+                       [](uint64_t) {}, 500ms, 100ms, 2s);
+    Endpoint endpoint{"127.0.0.1", port};
+
+    auto first = client_a.call_async(endpoint, MessageType::put_metadata_commit, Bytes{1});
+    REQUIRE(first_job_gate.wait_for_entries(1));
+    auto same_peer_next =
+        client_a.call_async(endpoint, MessageType::put_metadata_commit, Bytes{2});
+    auto other_peer =
+        client_b.call_async(endpoint, MessageType::put_metadata_commit, Bytes{3});
+
+    // The second worker may serve another peer, but it must not allow one
+    // peer's acceptance/store sequence to overtake that peer's blocked owner.
+    REQUIRE(wait_until([&] { return second_peer_started.load(); }, 2s));
+    CHECK(!first_peer_second_started.load());
+
+    first_job_gate.open();
+    for (auto* rpc : {&first, &same_peer_next, &other_peer}) {
+        REQUIRE(rpc->wait_for(2s) == std::future_status::ready);
+        CHECK(rpc->get().message.type == MessageType::bool_reply);
+    }
+    CHECK(first_peer_second_started.load());
+    {
+        std::lock_guard lock(order_mutex);
+        CHECK(first_peer_order == std::vector<uint8_t>({1, 2}));
+    }
+
+    client_a.stop();
+    client_b.stop();
+    server.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_cancellation_and_disconnect_boundaries) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto port = free_port();
+
+    NodeInfo server_info{random_node_id(), "127.0.0.1", "server-site", port};
+    TestGate before_durability;
+    TestGate after_durability;
+    std::atomic_uint32_t handler_calls{};
+    std::atomic_uint32_t durable_jobs{};
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            REQUIRE(request.type == MessageType::put_metadata_commit);
+            ++handler_calls;
+            before_durability.enter_and_wait();
+            ++durable_jobs;
+            after_durability.enter_and_wait();
+            return RpcMessage{MessageType::bool_reply, Bytes{1}};
+        },
+        [](const NodeInfo&) {}, 256 * 1024,
+        RpcServerExecutionLimits{.metadata_workers = 1,
+                                 .metadata_pending_jobs = 4,
+                                 .metadata_pending_bytes = 64});
+    server.start();
+
+    NodeInfo client_info{random_node_id(), "127.0.0.1", "client-site", free_port()};
+    RpcClient client(keys, [client_info] { return client_info; }, [](const NodeInfo&) {},
+                     [](uint64_t) {}, 500ms, 100ms, 2s);
+    Endpoint endpoint{"127.0.0.1", port};
+
+    auto running = client.call_async(endpoint, MessageType::put_metadata_commit, Bytes{1});
+    REQUIRE(before_durability.wait_for_entries(1));
+    auto queued = client.call_async(endpoint, MessageType::put_metadata_commit, Bytes{2});
+    REQUIRE(wait_until([&] { return server.work_stats().metadata_pending_jobs == 1; }, 2s));
+
+    // A queued job has not crossed a durability boundary and is removed by an
+    // ordinary transfer cancellation without ever entering the handler.
+    queued.cancel();
+    REQUIRE(wait_until([&] { return server.work_stats().metadata_pending_jobs == 0; }, 2s));
+    CHECK(handler_calls.load() == 1);
+
+    // Once execution owns a job, disconnecting its reply route must not cancel
+    // work across an unknown durability boundary. It finishes independently;
+    // the now-detached reply is simply discarded.
+    before_durability.open();
+    REQUIRE(after_durability.wait_for_entries(1));
+    CHECK(durable_jobs.load() == 1);
+    running.abort();
+    after_durability.open();
+    REQUIRE(wait_until([&] { return server.work_stats().metadata_active_jobs == 0; }, 2s));
+    CHECK(handler_calls.load() == 1);
+    CHECK(durable_jobs.load() == 1);
+
+    client.stop();
+    server.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_shutdown_finishes_owner_and_drops_queue) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto port = free_port();
+
+    NodeInfo server_info{random_node_id(), "127.0.0.1", "server-site", port};
+    TestGate running_gate;
+    std::atomic_uint32_t handler_calls{};
+    std::atomic_uint32_t durable_jobs{};
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            REQUIRE(request.type == MessageType::put_metadata_commit);
+            ++handler_calls;
+            running_gate.enter_and_wait();
+            ++durable_jobs;
+            return RpcMessage{MessageType::bool_reply, Bytes{1}};
+        },
+        [](const NodeInfo&) {}, 256 * 1024,
+        RpcServerExecutionLimits{.metadata_workers = 1,
+                                 .metadata_pending_jobs = 4,
+                                 .metadata_pending_bytes = 64});
+    server.start();
+
+    NodeInfo client_info{random_node_id(), "127.0.0.1", "client-site", free_port()};
+    RpcClient client(keys, [client_info] { return client_info; }, [](const NodeInfo&) {},
+                     [](uint64_t) {}, 500ms, 100ms, 2s);
+    Endpoint endpoint{"127.0.0.1", port};
+
+    auto running = client.call_async(endpoint, MessageType::put_metadata_commit, Bytes{1});
+    REQUIRE(running_gate.wait_for_entries(1));
+    auto queued = client.call_async(endpoint, MessageType::put_metadata_commit, Bytes{2});
+    REQUIRE(wait_until([&] { return server.work_stats().metadata_pending_jobs == 1; }, 2s));
+
+    auto stopping = std::async(std::launch::async, [&] { server.stop(); });
+    // Closing the session detaches both client replies before the running
+    // durability owner is released. The queued request can no longer execute.
+    REQUIRE(running.wait_for(2s) == std::future_status::ready);
+    REQUIRE(queued.wait_for(2s) == std::future_status::ready);
+    running_gate.open();
+    REQUIRE(stopping.wait_for(2s) == std::future_status::ready);
+    stopping.get();
+
+    CHECK(handler_calls.load() == 1);
+    CHECK(durable_jobs.load() == 1);
+    const auto stats = server.work_stats();
+    CHECK(stats.metadata_active_jobs == 0);
+    CHECK(stats.metadata_pending_jobs == 0);
+    CHECK(stats.metadata_pending_bytes == 0);
+
+    client.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_rpc_foreground_not_starved_by_busy_data_workers) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
@@ -1659,6 +1965,11 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
     CHECK(heads.front().hash == final.hash);
     CHECK(s3->node().metadata_replica().history_contains(final.hash));
     CHECK(s3->node().metadata_replica().history_is_ancestor(base.hash, final.hash));
+
+    const auto transfer1 = s1.metadata_manager().history_transfer_diagnostics();
+    const auto transfer2 = s2.metadata_manager().history_transfer_diagnostics();
+    CHECK(std::max(transfer1.peak_in_flight, transfer2.peak_in_flight) > 1);
+    CHECK(std::max(transfer1.peak_in_flight, transfer2.peak_in_flight) <= 8);
 
     s3->stop();
     s2.stop();

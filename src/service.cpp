@@ -1146,12 +1146,22 @@ void Service::loop(std::stop_token stop) {
 
         cpu_reporter.tick();
         auto deadline = Clock::time_point::max();
-        if (metadata_dirty && metadata_retry_due != Clock::time_point{})
-            deadline = std::min(deadline, metadata_retry_due);
-        if (catalogue_dirty && catalogue_retry_due != Clock::time_point{})
-            deadline = std::min(deadline, catalogue_retry_due);
-
         const auto now_after_work = Clock::now();
+        // `complete()` can turn an in-flight burst into one pending follow-up
+        // without emitting another external service event. A dirty owner with
+        // no retry delay is therefore runnable now; sleeping until an unrelated
+        // event loses the edge and can strand metadata (and its catalogue
+        // dependent) indefinitely. The same rule applies when catalogue repair
+        // deliberately leaves one more current-state pass to perform.
+        if (metadata_dirty)
+            deadline = std::min(deadline,
+                metadata_retry_due == Clock::time_point{} ? now_after_work
+                                                          : metadata_retry_due);
+        if (catalogue_dirty && !metadata_dirty)
+            deadline = std::min(deadline,
+                catalogue_retry_due == Clock::time_point{} ? now_after_work
+                                                           : catalogue_retry_due);
+
         if (gc_quiescent_until != Clock::time_point{} &&
             gc_quiescent_until != Clock::time_point::max()) {
             if (gc_quiescent_until > now_after_work) {

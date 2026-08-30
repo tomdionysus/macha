@@ -58,6 +58,12 @@ struct MetadataClusterStatus {
     bool write_available{};
 };
 
+struct MetadataHistoryTransferDiagnostics {
+    uint64_t transfers{};
+    uint64_t entries_submitted{};
+    uint64_t peak_in_flight{};
+};
+
 class MetadataManager {
     NodeRuntime& node_;
     std::mutex mutation_mutex_;
@@ -84,6 +90,9 @@ class MetadataManager {
     std::atomic_bool metadata_replica_set_stable_{};
     std::atomic_bool metadata_write_available_{};
     std::atomic<MetadataAvailability> metadata_availability_{MetadataAvailability::unavailable};
+    std::atomic_uint64_t history_transfers_{};
+    std::atomic_uint64_t history_entries_submitted_{};
+    std::atomic_uint64_t history_peak_in_flight_{};
 
     std::optional<NodeInfo> node_info(const NodeId&) const;
     std::vector<NodeInfo> replica_nodes(const std::vector<NodeId>&) const;
@@ -144,6 +153,13 @@ class MetadataManager {
     MetadataSnapshotView snapshot_view();
     std::optional<MetadataSnapshotView> available_snapshot_view() const;
     MetadataClusterStatus cluster_status() const noexcept;
+    MetadataHistoryTransferDiagnostics history_transfer_diagnostics() const noexcept {
+        return {
+            history_transfers_.load(std::memory_order_relaxed),
+            history_entries_submitted_.load(std::memory_order_relaxed),
+            history_peak_in_flight_.load(std::memory_order_relaxed),
+        };
+    }
     void note_replica_validation(bool available, std::string_view reason = {}) {
         publish_replica_state(available, reason);
     }

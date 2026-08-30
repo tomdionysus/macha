@@ -279,6 +279,12 @@ class MetadataReplica {
     std::filesystem::path recovery_p_;
     std::array<uint8_t, 32> key_;
     mutable std::mutex m_;
+    // Serialises durable metadata mutations while their slow file operations
+    // execute without holding m_. Always acquired before m_ by public writers.
+    mutable std::mutex durable_mutation_m_;
+    // Serialises cache-miss computation without blocking short replica-state
+    // readers or durable mutation bookkeeping on the main mutex.
+    mutable std::mutex materialization_compute_m_;
     MetadataRecord cur_;
     MetadataRecord committed_;
     std::map<Hash256, MetadataHistoryEntry> history_;
@@ -305,6 +311,7 @@ class MetadataReplica {
     void append_journal(uint8_t, const MetadataRecord&, std::span<const uint8_t> = {});
     void load_journal();
     Bytes encode_history_frame(const MetadataHistoryEntry&) const;
+    void write_history_frame(std::span<const uint8_t>) const;
     void append_history(const MetadataHistoryEntry&);
     void load_history();
     void load_heads();

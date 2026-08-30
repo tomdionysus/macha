@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <limits>
+#include <map>
 #include <set>
 #include <thread>
 
@@ -392,16 +394,21 @@ bool MetadataManager::push_history_to_peer(const NodeInfo& owner, const Hash256&
     if (!local.history_contains(target))
         return false;
 
+    std::map<Hash256, bool> remote_presence;
     auto remote_has = [&](const Hash256& hash) {
+        if (auto found = remote_presence.find(hash); found != remote_presence.end())
+            return found->second;
+        bool present = false;
         try {
             Writer request;
             request.fixed(hash.bytes);
             auto reply = node_.call(owner, MessageType::has_metadata_history_entry,
                                     request.take(), frame_type);
-            return bool_reply(reply);
+            present = bool_reply(reply);
         } catch (...) {
-            return false;
         }
+        remote_presence.emplace(hash, present);
+        return present;
     };
 
     struct Task {
@@ -413,12 +420,14 @@ bool MetadataManager::push_history_to_peer(const NodeInfo& owner, const Hash256&
 
     std::vector<Task> stack;
     std::set<Hash256> active;
+    std::set<Hash256> planned;
+    std::vector<std::pair<MetadataHistoryEntry, bool>> transfer;
     stack.push_back({target, true, false, {}});
     active.insert(target);
 
     while (!stack.empty()) {
         auto& task = stack.back();
-        if (remote_has(task.hash)) {
+        if (planned.contains(task.hash) || remote_has(task.hash)) {
             active.erase(task.hash);
             stack.pop_back();
             continue;
@@ -448,7 +457,7 @@ bool MetadataManager::push_history_to_peer(const NodeInfo& owner, const Hash256&
 
             bool pushed = false;
             for (auto it = dependencies.rbegin(); it != dependencies.rend(); ++it) {
-                if (remote_has(it->first))
+                if (planned.contains(it->first) || remote_has(it->first))
                     continue;
                 if (!active.insert(it->first).second) {
                     if (it->second)
@@ -462,20 +471,60 @@ bool MetadataManager::push_history_to_peer(const NodeInfo& owner, const Hash256&
                 continue;
         }
 
-        bool ok = false;
-        try {
-            auto encoded = encode_metadata_history_entry(task.entry);
-            ok = bool_reply(node_.call(owner, MessageType::put_metadata_history_entry,
-                                       encoded, frame_type));
-        } catch (...) {
-        }
         const bool required = task.required;
         const auto hash = task.hash;
+        transfer.emplace_back(std::move(task.entry), required);
+        planned.insert(hash);
         active.erase(hash);
         stack.pop_back();
-        if (!ok && required)
+    }
+
+    // Requests on one peer retain FIFO execution order at the receiver. Keep a
+    // small window in flight so network latency and durable history appends can
+    // overlap without allowing an unbounded recovery chain into RPC memory.
+    constexpr size_t transfer_window = 8;
+    struct PendingTransfer {
+        bool required{};
+        AsyncRpc rpc;
+    };
+    std::deque<PendingTransfer> pending;
+    history_transfers_.fetch_add(1, std::memory_order_relaxed);
+
+    auto finish_oldest = [&] {
+        auto item = std::move(pending.front());
+        pending.pop_front();
+        try {
+            return bool_reply(item.rpc.get()) || !item.required;
+        } catch (...) {
+            return !item.required;
+        }
+    };
+    auto note_depth = [&] {
+        auto peak = history_peak_in_flight_.load(std::memory_order_relaxed);
+        while (peak < pending.size() &&
+               !history_peak_in_flight_.compare_exchange_weak(
+                   peak, pending.size(), std::memory_order_relaxed)) {
+        }
+    };
+
+    for (auto& [entry, required] : transfer) {
+        try {
+            auto encoded = encode_metadata_history_entry(entry);
+            pending.push_back({required,
+                node_.call_async(owner, MessageType::put_metadata_history_entry,
+                                 encoded, frame_type)});
+            history_entries_submitted_.fetch_add(1, std::memory_order_relaxed);
+            note_depth();
+        } catch (...) {
+            if (required)
+                return false;
+        }
+        if (pending.size() == transfer_window && !finish_oldest())
             return false;
     }
+    while (!pending.empty())
+        if (!finish_oldest())
+            return false;
     return true;
 }
 

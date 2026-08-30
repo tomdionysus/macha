@@ -94,6 +94,21 @@ Repeated recovery/catalogue mutation should not produce monotonic namespace-size
 
 A DATA failure should be diagnosed as placement/admission/durability; a metadata failure as metadata/control write-floor durability. Keeping those failure domains distinct is intentional and should be preserved in logs and tooling.
 
+## RPC execution isolation
+
+The fast-control executor has a deliberately closed allow-list: only CONTROL-frame
+`ping` and `members` requests may run there. These handlers must remain bounded,
+in-memory operations: they may read already-published state, but must not perform
+filesystem access, durability barriers, network fan-out, metadata reconstruction,
+or other work whose latency depends on backlog size.
+
+Adding a message to the fast-control allow-list requires a test which blocks the
+ordinary and metadata executors and proves the handler completes from published
+memory alone. Metadata mutations (`put_metadata_history_entry`,
+`put_metadata_commit`, and `accept_metadata_commit`) always use the bounded,
+dedicated metadata executor. All other CONTROL messages use the ordinary control
+executor; object work remains on the priority-aware DATA executors.
+
 ## Cluster status and telemetry
 
 `GET /api/v1/status` merges two deliberately different telemetry planes:

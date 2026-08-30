@@ -109,6 +109,22 @@ struct RpcStats {
     uint64_t canonical_connections{};
 };
 
+struct RpcServerExecutionLimits {
+    // One owner is sufficient for the default node and avoids multiplying idle
+    // threads across large test/deployment clusters. The executor supports more
+    // workers when explicitly configured, while preserving per-peer FIFO.
+    size_t metadata_workers{1};
+    size_t metadata_pending_jobs{64};
+    size_t metadata_pending_bytes{256ULL * 1024 * 1024};
+};
+
+struct RpcServerWorkStats {
+    size_t metadata_pending_jobs{};
+    size_t metadata_pending_bytes{};
+    size_t metadata_active_jobs{};
+    uint64_t metadata_rejected_jobs{};
+};
+
 struct WireFragment {
     uint64_t request_id{};
     FrameType frame_type{FrameType::control};
@@ -338,14 +354,21 @@ class RpcServer {
     enum class RequestClass { control, foreground, read_ahead, speculative };
     std::vector<std::jthread> fast_control_workers_;
     std::vector<std::jthread> control_workers_;
+    std::vector<std::jthread> metadata_workers_;
     std::vector<std::jthread> data_workers_;
-    std::mutex request_mutex_;
+    mutable std::mutex request_mutex_;
     std::condition_variable request_cv_;
     std::deque<RequestJob> fast_control_requests_;
     std::deque<RequestJob> control_requests_;
+    std::deque<RequestJob> metadata_requests_;
     std::deque<RequestJob> foreground_requests_;
     std::deque<RequestJob> read_ahead_requests_;
     std::deque<RequestJob> speculative_requests_;
+    RpcServerExecutionLimits execution_limits_;
+    size_t metadata_request_bytes_{};
+    std::set<NodeId> metadata_active_peers_;
+    std::atomic_size_t active_metadata_requests_{};
+    std::atomic_uint64_t rejected_metadata_requests_{};
     size_t active_nonforeground_data_{};
     std::mutex sessions_mutex_;
     std::vector<std::shared_ptr<Session>> sessions_;
@@ -354,13 +377,16 @@ class RpcServer {
 
     static RequestClass request_class(FrameType);
     static bool fast_control_request(const RpcFrame&);
+    static bool metadata_mutation_request(const RpcFrame&);
     std::deque<RequestJob>& queue(RequestClass);
+    bool admit_locked(RequestJob);
     bool data_ready() const;
     RequestClass next_data_class() const;
     void accept_loop(std::stop_token);
     void session_loop(Session*);
     void fast_control_worker_loop(std::stop_token);
     void control_worker_loop(std::stop_token);
+    void metadata_worker_loop(std::stop_token);
     void data_worker_loop(std::stop_token);
     void execute(RequestJob);
     void reap_sessions(bool all);
@@ -370,7 +396,8 @@ class RpcServer {
 
   public:
     RpcServer(std::string, uint16_t, ClusterKeys, NodeInfo, Handler, Observer,
-              size_t max_frame_size = 256 * 1024);
+              size_t max_frame_size = 256 * 1024,
+              RpcServerExecutionLimits execution_limits = {});
     ~RpcServer();
     void start();
     void stop();
@@ -378,5 +405,6 @@ class RpcServer {
     void set_local(NodeInfo);
     void broadcast(const RpcMessage&);
     uint16_t bound_port() const { return bound_port_; }
+    RpcServerWorkStats work_stats() const;
 };
 } // namespace macha
