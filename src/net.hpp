@@ -4,6 +4,7 @@
 #include "crypto.hpp"
 #include "types.hpp"
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -119,10 +120,20 @@ struct RpcServerExecutionLimits {
 };
 
 struct RpcServerWorkStats {
+    struct Timing {
+        uint64_t requests{};
+        uint64_t queue_wait_us_total{};
+        uint64_t queue_wait_us_max{};
+        uint64_t handler_us_total{};
+        uint64_t handler_us_max{};
+    };
+
     size_t metadata_pending_jobs{};
     size_t metadata_pending_bytes{};
     size_t metadata_active_jobs{};
     uint64_t metadata_rejected_jobs{};
+    std::map<FrameType, Timing> frame_timings;
+    std::map<MessageType, Timing> message_timings;
 };
 
 struct WireFragment {
@@ -157,8 +168,12 @@ class MessageAssembler {
     void promote(uint64_t request_id, FrameType);
     void discard(uint64_t request_id);
     std::optional<RpcFrame> push(WireFragment);
-    size_t incomplete_messages() const noexcept { return partial_.size(); }
-    size_t incomplete_bytes() const noexcept { return partial_bytes_; }
+    size_t incomplete_messages() const noexcept {
+        return partial_.size();
+    }
+    size_t incomplete_bytes() const noexcept {
+        return partial_bytes_;
+    }
 };
 
 class SecureChannel {
@@ -185,14 +200,18 @@ class SecureChannel {
     NodeInfo server_handshake(const std::string& remote_host);
     void set_io_timeout(std::chrono::milliseconds);
     void send_fragment(uint64_t request_id, FrameType, MessageType, bool first, bool last,
-                       std::span<const uint8_t>,
-                       const std::function<void(size_t)>& progress = {});
-    WireFragment receive_fragment(
-        const std::function<void(uint64_t, size_t)>& progress = {});
+                       std::span<const uint8_t>, const std::function<void(size_t)>& progress = {});
+    WireFragment receive_fragment(const std::function<void(uint64_t, size_t)>& progress = {});
     void shutdown();
-    size_t max_frame_size() const noexcept { return negotiated_max_frame_size_; }
-    const std::array<uint8_t, 32>& session_id() const noexcept { return session_id_; }
-    TransportLane lane() const noexcept { return lane_; }
+    size_t max_frame_size() const noexcept {
+        return negotiated_max_frame_size_;
+    }
+    const std::array<uint8_t, 32>& session_id() const noexcept {
+        return session_id_;
+    }
+    TransportLane lane() const noexcept {
+        return lane_;
+    }
 };
 
 class AsyncRpc {
@@ -205,8 +224,7 @@ class AsyncRpc {
   public:
     AsyncRpc() = default;
     AsyncRpc(std::future<RpcReply>, std::function<void()>, std::function<void()>,
-             std::function<void(FrameType)> = {},
-             std::function<std::chrono::milliseconds()> = {});
+             std::function<void(FrameType)> = {}, std::function<std::chrono::milliseconds()> = {});
     ~AsyncRpc();
     AsyncRpc(AsyncRpc&&) noexcept;
     AsyncRpc& operator=(AsyncRpc&&) noexcept;
@@ -219,7 +237,9 @@ class AsyncRpc {
     void cancel();
     void abort();
     void promote(FrameType);
-    std::function<void(FrameType)> promotion_callback() const { return promote_; }
+    std::function<void(FrameType)> promotion_callback() const {
+        return promote_;
+    }
     std::chrono::milliseconds idle_for() const;
 };
 
@@ -282,8 +302,8 @@ class RpcClient {
     static TransportLane lane_for(MessageType, FrameType) noexcept;
     std::shared_ptr<PeerConnection> connection(const Endpoint&, const NodeId* expected,
                                                NodeId* actual, TransportLane);
-    AsyncRpc call_async_known(const Endpoint&, const NodeId*, MessageType,
-                              std::span<const uint8_t>, FrameType);
+    AsyncRpc call_async_known(const Endpoint&, const NodeId*, MessageType, std::span<const uint8_t>,
+                              FrameType);
     void observe_result(const std::string&, bool, std::chrono::milliseconds);
     void health_loop(std::stop_token);
     void close_endpoint(const Endpoint&, const std::string&);
@@ -295,8 +315,7 @@ class RpcClient {
     void register_inbound(InboundRoute);
     void unregister_inbound(const NodeId&, TransportLane,
                             const std::array<uint8_t, 32>& session_id);
-    void reconcile_locked(const NodeId&, TransportLane,
-                          std::vector<std::function<void()>>& retire);
+    void reconcile_locked(const NodeId&, TransportLane, std::vector<std::function<void()>>& retire);
     void reap_retired();
 
   public:
@@ -340,6 +359,14 @@ class RpcServer {
         Clock::time_point queued_at{Clock::now()};
     };
 
+    struct AtomicTiming {
+        std::atomic_uint64_t requests{};
+        std::atomic_uint64_t queue_wait_us_total{};
+        std::atomic_uint64_t queue_wait_us_max{};
+        std::atomic_uint64_t handler_us_total{};
+        std::atomic_uint64_t handler_us_max{};
+    };
+
     std::string host_;
     uint16_t port_;
     ClusterKeys keys_;
@@ -369,6 +396,10 @@ class RpcServer {
     std::set<NodeId> metadata_active_peers_;
     std::atomic_size_t active_metadata_requests_{};
     std::atomic_uint64_t rejected_metadata_requests_{};
+    // Message types occupy a small fixed wire namespace. Fixed atomic buckets
+    // keep diagnostics bounded and avoid a lock or allocation on the handler path.
+    std::array<AtomicTiming, 5> frame_timings_{};
+    std::array<AtomicTiming, 256> message_timings_{};
     size_t active_nonforeground_data_{};
     std::mutex sessions_mutex_;
     std::vector<std::shared_ptr<Session>> sessions_;
@@ -396,15 +427,16 @@ class RpcServer {
 
   public:
     RpcServer(std::string, uint16_t, ClusterKeys, NodeInfo, Handler, Observer,
-              size_t max_frame_size = 256 * 1024,
-              RpcServerExecutionLimits execution_limits = {});
+              size_t max_frame_size = 256 * 1024, RpcServerExecutionLimits execution_limits = {});
     ~RpcServer();
     void start();
     void stop();
     void attach_client(RpcClient&);
     void set_local(NodeInfo);
     void broadcast(const RpcMessage&);
-    uint16_t bound_port() const { return bound_port_; }
+    uint16_t bound_port() const {
+        return bound_port_;
+    }
     RpcServerWorkStats work_stats() const;
 };
 } // namespace macha

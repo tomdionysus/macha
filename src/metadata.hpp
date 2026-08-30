@@ -141,18 +141,34 @@ class SharedBytes {
         bytes_ = std::make_shared<const Bytes>(first, last);
     }
 
-    size_t size() const noexcept { return bytes_->size(); }
-    bool empty() const noexcept { return bytes_->empty(); }
-    const uint8_t* data() const noexcept { return bytes_->data(); }
-    Bytes::const_iterator begin() const noexcept { return bytes_->begin(); }
-    Bytes::const_iterator end() const noexcept { return bytes_->end(); }
-    operator std::span<const uint8_t>() const noexcept { return *bytes_; }
+    size_t size() const noexcept {
+        return bytes_->size();
+    }
+    bool empty() const noexcept {
+        return bytes_->empty();
+    }
+    const uint8_t* data() const noexcept {
+        return bytes_->data();
+    }
+    Bytes::const_iterator begin() const noexcept {
+        return bytes_->begin();
+    }
+    Bytes::const_iterator end() const noexcept {
+        return bytes_->end();
+    }
+    operator std::span<const uint8_t>() const noexcept {
+        return *bytes_;
+    }
 
     friend bool operator==(const SharedBytes& a, const SharedBytes& b) {
         return a.bytes_ == b.bytes_ || *a.bytes_ == *b.bytes_;
     }
-    friend bool operator==(const SharedBytes& a, const Bytes& b) { return *a.bytes_ == b; }
-    friend bool operator==(const Bytes& a, const SharedBytes& b) { return a == *b.bytes_; }
+    friend bool operator==(const SharedBytes& a, const Bytes& b) {
+        return *a.bytes_ == b;
+    }
+    friend bool operator==(const Bytes& a, const SharedBytes& b) {
+        return a == *b.bytes_;
+    }
 };
 
 struct MetadataRecord {
@@ -237,8 +253,7 @@ std::string metadata_conflict_id(const MetadataConflict&);
 MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
                                              const MetadataSnapshot& left,
                                              const MetadataSnapshot& right,
-                                             const Hash256& left_head,
-                                             const Hash256& right_head);
+                                             const Hash256& left_head, const Hash256& right_head);
 // Reachability roots held only by unresolved metadata conflicts. These helpers
 // keep GC policy close to the conflict representation so every maintenance
 // consumer protects the alternatives required for later explicit resolution.
@@ -256,6 +271,9 @@ struct MetadataReplicaDiagnostics {
     uint64_t materialization_cache_misses{};
     uint64_t materialization_cache_evictions{};
     size_t materialization_cache_entries{};
+    uint64_t accepted_head_persistence_writes{};
+    uint64_t accepted_head_persistence_bytes{};
+    uint64_t accepted_head_persistence_failures{};
 };
 
 struct MetadataMaterialization {
@@ -306,6 +324,9 @@ class MetadataReplica {
     mutable std::atomic_uint64_t materialization_cache_hits_{};
     mutable std::atomic_uint64_t materialization_cache_misses_{};
     mutable std::atomic_uint64_t materialization_cache_evictions_{};
+    std::atomic_uint64_t accepted_head_persistence_writes_{};
+    std::atomic_uint64_t accepted_head_persistence_bytes_{};
+    std::atomic_uint64_t accepted_head_persistence_failures_{};
     void persist(const std::filesystem::path&, const MetadataRecord&);
     std::optional<MetadataRecord> load(const std::filesystem::path&) const;
     void append_journal(uint8_t, const MetadataRecord&, std::span<const uint8_t> = {});
@@ -325,8 +346,9 @@ class MetadataReplica {
     void set_legacy_committed_head_locked(const MetadataRecord&);
     void refresh_materialized_head_locked();
     MetadataHistoryEntry history_for_current(std::span<const uint8_t> delta = {});
-    std::shared_ptr<const MetadataMaterialization> cache_materialization_locked(
-        const MetadataRecord&, std::shared_ptr<const MetadataSnapshot> = {}) const;
+    std::shared_ptr<const MetadataMaterialization>
+    cache_materialization_locked(const MetadataRecord&,
+                                 std::shared_ptr<const MetadataSnapshot> = {}) const;
     std::shared_ptr<const MetadataMaterialization> materialized_locked(const Hash256&) const;
     std::optional<MetadataRecord> historical_locked(const Hash256&) const;
     bool history_is_ancestor_locked(const Hash256&, const Hash256&) const;

@@ -14,21 +14,15 @@
 namespace macha {
 namespace {
 constexpr std::array<uint8_t, 8> SM5{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'},
-    SM6{'D', 'H', 'T', 'M', 'E', 'T', 'A', '6'},
-    SM7{'D', 'H', 'T', 'M', 'E', 'T', 'A', '7'},
-    SM8{'D', 'H', 'T', 'M', 'E', 'T', 'A', '8'},
-    SM9{'D', 'H', 'T', 'M', 'E', 'T', 'A', '9'},
-    SM10{'D', 'H', 'T', 'M', 'E', 'T', 'B', '0'},
-    SM11{'D', 'H', 'T', 'M', 'E', 'T', 'B', '1'},
-    SM12{'D', 'H', 'T', 'M', 'E', 'T', 'B', '2'},
-    SM13{'D', 'H', 'T', 'M', 'E', 'T', 'B', '3'},
-    DM{'D', 'H', 'T', 'M', 'D', 'B', '0', '1'},
-    MJ{'D', 'H', 'T', 'M', 'J', 'N', 'L', '1'},
-    MH{'D', 'H', 'T', 'M', 'H', 'S', 'T', '1'},
-    MA{'D', 'H', 'T', 'M', 'A', 'C', 'C', '1'},
+    SM6{'D', 'H', 'T', 'M', 'E', 'T', 'A', '6'}, SM7{'D', 'H', 'T', 'M', 'E', 'T', 'A', '7'},
+    SM8{'D', 'H', 'T', 'M', 'E', 'T', 'A', '8'}, SM9{'D', 'H', 'T', 'M', 'E', 'T', 'A', '9'},
+    SM10{'D', 'H', 'T', 'M', 'E', 'T', 'B', '0'}, SM11{'D', 'H', 'T', 'M', 'E', 'T', 'B', '1'},
+    SM12{'D', 'H', 'T', 'M', 'E', 'T', 'B', '2'}, SM13{'D', 'H', 'T', 'M', 'E', 'T', 'B', '3'},
+    DM{'D', 'H', 'T', 'M', 'D', 'B', '0', '1'}, MJ{'D', 'H', 'T', 'M', 'J', 'N', 'L', '1'},
+    MH{'D', 'H', 'T', 'M', 'H', 'S', 'T', '1'}, MA{'D', 'H', 'T', 'M', 'A', 'C', 'C', '1'},
     MS{'D', 'H', 'T', 'M', 'S', 'E', 'Q', '1'};
-constexpr uint8_t JOURNAL_PREPARE_FULL = 1, JOURNAL_PREPARE_DELTA = 2,
-                  JOURNAL_SEED_FULL = 3, JOURNAL_COMMIT = 4;
+constexpr uint8_t JOURNAL_PREPARE_FULL = 1, JOURNAL_PREPARE_DELTA = 2, JOURNAL_SEED_FULL = 3,
+                  JOURNAL_COMMIT = 4;
 void entry(Writer& w, const FsEntry& e) {
     w.u8((uint8_t)e.type);
     w.u32(e.mode);
@@ -323,8 +317,7 @@ void hash_string(Sha256Hasher& hash, const std::string& value) {
 }
 
 void writefile(const std::filesystem::path& p, std::span<const uint8_t> d) {
-    durable_replace_file(
-        p, std::string_view(reinterpret_cast<const char*>(d.data()), d.size()));
+    durable_replace_file(p, std::string_view(reinterpret_cast<const char*>(d.data()), d.size()));
 }
 
 void truncate_durable(const std::filesystem::path& path, size_t size) {
@@ -341,49 +334,48 @@ void truncate_durable(const std::filesystem::path& path, size_t size) {
     if (fsync(fd) != 0) {
         const auto error = errno;
         close(fd);
-        throw std::runtime_error("cannot sync truncated metadata journal " + path.string() +
-                                 ": " + strerror(error));
+        throw std::runtime_error("cannot sync truncated metadata journal " + path.string() + ": " +
+                                 strerror(error));
     }
     if (close(fd) != 0)
-        throw std::runtime_error("cannot close truncated metadata journal " + path.string() +
-                                 ": " + strerror(errno));
+        throw std::runtime_error("cannot close truncated metadata journal " + path.string() + ": " +
+                                 strerror(errno));
 }
 
 std::filesystem::path quarantine_journal_tail(const std::filesystem::path& path,
                                               std::span<const uint8_t> tail) {
     const auto quarantine = path.string() + ".corrupt." + std::to_string(wall_time_ns());
-    durable_replace_file(
-        quarantine,
-        std::string_view(reinterpret_cast<const char*>(tail.data()), tail.size()));
+    durable_replace_file(quarantine,
+                         std::string_view(reinterpret_cast<const char*>(tail.data()), tail.size()));
     return quarantine;
 }
 
 void sync_directory(const std::filesystem::path& path) {
-    const auto directory = path.parent_path().empty() ? std::filesystem::path(".")
-                                                      : path.parent_path();
+    const auto directory =
+        path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path();
     int fd = open(directory.c_str(), O_RDONLY | O_DIRECTORY);
     if (fd < 0)
-        throw std::runtime_error("cannot open metadata directory " + directory.string() +
-                                 ": " + strerror(errno));
+        throw std::runtime_error("cannot open metadata directory " + directory.string() + ": " +
+                                 strerror(errno));
     if (fsync(fd) != 0) {
         const auto error = errno;
         close(fd);
-        throw std::runtime_error("cannot sync metadata directory " + directory.string() +
-                                 ": " + strerror(error));
+        throw std::runtime_error("cannot sync metadata directory " + directory.string() + ": " +
+                                 strerror(error));
     }
     if (close(fd) != 0)
-        throw std::runtime_error("cannot close metadata directory " + directory.string() +
-                                 ": " + strerror(errno));
+        throw std::runtime_error("cannot close metadata directory " + directory.string() + ": " +
+                                 strerror(errno));
 }
 
-std::optional<std::filesystem::path> quarantine_metadata_file(
-    const std::filesystem::path& path, const std::string& suffix) {
+std::optional<std::filesystem::path> quarantine_metadata_file(const std::filesystem::path& path,
+                                                              const std::string& suffix) {
     if (!std::filesystem::exists(path))
         return {};
     const auto quarantine = std::filesystem::path(path.string() + suffix);
     if (rename(path.c_str(), quarantine.c_str()) != 0)
-        throw std::runtime_error("cannot quarantine metadata file " + path.string() +
-                                 ": " + strerror(errno));
+        throw std::runtime_error("cannot quarantine metadata file " + path.string() + ": " +
+                                 strerror(errno));
     sync_directory(path);
     return quarantine;
 }
@@ -400,7 +392,8 @@ Bytes encode_snapshot(const MetadataSnapshot& s) {
     const bool governance_state = !s.metadata_participants.empty() ||
                                   s.metadata_branch_floor != Hash256{} ||
                                   s.retention_baseline_complete;
-    const bool include_node_status = policy_state || branch_state || !s.node_status.empty() || !s.identity_resets.empty();
+    const bool include_node_status =
+        policy_state || branch_state || !s.node_status.empty() || !s.identity_resets.empty();
     if (governance_state)
         w.raw(SM13);
     else if (policy_state)
@@ -788,8 +781,7 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
         before.metadata_participants != after.metadata_participants ||
         before.metadata_branch_floor != after.metadata_branch_floor ||
         before.retention_baseline_complete != after.retention_baseline_complete ||
-        before.merge_parents != after.merge_parents ||
-        before.conflicts != after.conflicts)
+        before.merge_parents != after.merge_parents || before.conflicts != after.conflicts)
         return {};
 
     MetadataDelta delta;
@@ -1008,8 +1000,7 @@ MetadataAcceptance decode_metadata_acceptance(std::span<const uint8_t> data) {
     if (!value.generation || value.hash == Hash256{})
         throw DecodeError("bad metadata acceptance identity");
     if (!std::is_sorted(value.replicas.begin(), value.replicas.end()) ||
-        std::adjacent_find(value.replicas.begin(), value.replicas.end()) !=
-            value.replicas.end())
+        std::adjacent_find(value.replicas.begin(), value.replicas.end()) != value.replicas.end())
         throw DecodeError("metadata acceptance replicas are not canonical");
     if (std::any_of(value.replicas.begin(), value.replicas.end(),
                     [](const NodeId& replica) { return replica == NodeId{}; }))
@@ -1050,7 +1041,6 @@ std::vector<MetadataAcceptance> decode_metadata_acceptance_set(std::span<const u
     reader.finish();
     return values;
 }
-
 
 MetadataRecord decode_metadata_record(std::span<const uint8_t> d) {
     Reader r(d);
@@ -1158,8 +1148,7 @@ std::string metadata_conflict_id(const MetadataConflict& conflict) {
 MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
                                              const MetadataSnapshot& left,
                                              const MetadataSnapshot& right,
-                                             const Hash256& left_head,
-                                             const Hash256& right_head) {
+                                             const Hash256& left_head, const Hash256& right_head) {
     if (left_head == right_head)
         return {left, 0};
     if (right_head < left_head)
@@ -1179,26 +1168,27 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
             return left_value;
         throw std::runtime_error("metadata cluster policy diverged: " + std::string(name));
     };
-    out.data_replication =
-        scalar_merge(base.data_replication, left.data_replication, right.data_replication,
-                     "data_replication");
-    out.extent_size = scalar_merge(base.extent_size, left.extent_size, right.extent_size,
-                                   "extent_size");
-    out.metadata_write_replicas_required = scalar_merge(
-        base.metadata_write_replicas_required, left.metadata_write_replicas_required,
-        right.metadata_write_replicas_required, "metadata_write_replicas_required");
+    out.data_replication = scalar_merge(base.data_replication, left.data_replication,
+                                        right.data_replication, "data_replication");
+    out.extent_size =
+        scalar_merge(base.extent_size, left.extent_size, right.extent_size, "extent_size");
+    out.metadata_write_replicas_required =
+        scalar_merge(base.metadata_write_replicas_required, left.metadata_write_replicas_required,
+                     right.metadata_write_replicas_required, "metadata_write_replicas_required");
     // Participation is monotonic until an explicit branch-retirement protocol
     // says otherwise. A merge must therefore preserve every branch-capable node.
     // Participant rosters are migration bookkeeping only, never branch authority.
     out.metadata_participants = base.metadata_participants;
-    out.metadata_participants.insert(left.metadata_participants.begin(), left.metadata_participants.end());
-    out.metadata_participants.insert(right.metadata_participants.begin(), right.metadata_participants.end());
+    out.metadata_participants.insert(left.metadata_participants.begin(),
+                                     left.metadata_participants.end());
+    out.metadata_participants.insert(right.metadata_participants.begin(),
+                                     right.metadata_participants.end());
     // A branch floor is safe only when both branches independently carry the
     // same advancement. If they differ, fall back to the common-ancestor floor;
     // maintenance will advance it again after all merged participants converge.
     out.metadata_branch_floor = {};
-    out.retention_baseline_complete = left.retention_baseline_complete &&
-                                      right.retention_baseline_complete;
+    out.retention_baseline_complete =
+        left.retention_baseline_complete && right.retention_baseline_complete;
     if (out.retention_baseline_complete)
         out.metadata_participants.clear();
 
@@ -1218,8 +1208,8 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
     for (const auto* source : {&base.conflicts, &left.conflicts, &right.conflicts})
         for (const auto& [id, _] : *source)
             conflict_ids.insert(id);
-    auto find_conflict = [](const auto& conflicts, const std::string& id)
-        -> std::optional<MetadataConflict> {
+    auto find_conflict = [](const auto& conflicts,
+                            const std::string& id) -> std::optional<MetadataConflict> {
         auto found = conflicts.find(id);
         if (found == conflicts.end())
             return {};
@@ -1255,8 +1245,7 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
         else
             out.entries.erase(path);
     };
-    auto add_namespace_conflict = [&](const std::string& path,
-                                      const std::optional<FsEntry>& b,
+    auto add_namespace_conflict = [&](const std::string& path, const std::optional<FsEntry>& b,
                                       const std::optional<FsEntry>& l,
                                       const std::optional<FsEntry>& r) {
         MetadataConflict conflict;
@@ -1345,8 +1334,8 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
         // even though wall-clock ctime/mtime differ. Use the deterministic lesser
         // representation so every reconciler produces the same commit hash.
         if (!b && l && r && l->type == EntryType::directory && r->type == EntryType::directory &&
-            l->mode == r->mode && l->uid == r->uid && l->gid == r->gid &&
-            l->size == r->size && l->extents == r->extents) {
+            l->mode == r->mode && l->uid == r->uid && l->gid == r->gid && l->size == r->size &&
+            l->extents == r->extents) {
             install_entry(path, (*l < *r) ? l : r);
             continue;
         }
@@ -1451,12 +1440,9 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
 }
 MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32> k,
                                  std::optional<MetadataRecord> recovery_seed)
-    : p_(r / "metadata" / "current.meta"),
-      committed_p_(r / "metadata" / "committed.meta"),
-      checkpoint_p_(r / "metadata" / "checkpoint.meta"),
-      journal_p_(r / "metadata" / "journal.log"),
-      history_p_(r / "metadata" / "history.log"),
-      heads_p_(r / "metadata" / "heads.meta"),
+    : p_(r / "metadata" / "current.meta"), committed_p_(r / "metadata" / "committed.meta"),
+      checkpoint_p_(r / "metadata" / "checkpoint.meta"), journal_p_(r / "metadata" / "journal.log"),
+      history_p_(r / "metadata" / "history.log"), heads_p_(r / "metadata" / "heads.meta"),
       mutation_sequence_p_(r / "metadata" / "mutation-sequence.meta"),
       recovery_p_(r / "metadata" / "recovery.required"), key_(k) {
     std::filesystem::create_directories(checkpoint_p_.parent_path());
@@ -1504,7 +1490,8 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
         auto seed = valid_seed();
         if (!seed)
             throw std::runtime_error("metadata recovery required but no valid persistent metadata "
-                                     "cache seed is available at " + recovery_p_.string());
+                                     "cache seed is available at " +
+                                     recovery_p_.string());
         recover_from_seed(*seed, "continuing previously marked metadata recovery");
         return;
     }
@@ -1613,8 +1600,8 @@ void MetadataReplica::recover_from_seed(const MetadataRecord& seed, const std::s
         preserved += path.string();
     }
     Log::error("metadata primary state failed authentication/validation; using persistent cache "
-               "seed pending replica recovery generation=" + std::to_string(seed.generation) +
-               " state=" + checkpoint_p_.parent_path().string() +
+               "seed pending replica recovery generation=" +
+               std::to_string(seed.generation) + " state=" + checkpoint_p_.parent_path().string() +
                " preserved=" + preserved + " reason=" + reason);
 }
 
@@ -1791,8 +1778,7 @@ void MetadataReplica::load_journal() {
         header.finish();
         if (length > 256U * 1024U * 1024U) {
             throw std::runtime_error("metadata journal " + journal_p_.string() +
-                                     " offset=" + std::to_string(offset) +
-                                     ": record too large");
+                                     " offset=" + std::to_string(offset) + ": record too large");
         }
         if (offset + 4ULL + length > bytes.size()) {
             trailing_problem = "incomplete trailing frame";
@@ -1828,14 +1814,12 @@ void MetadataReplica::load_journal() {
             // authenticated prefix. Authentication failure anywhere except EOF
             // remains fatal: silently skipping a middle frame would break the
             // metadata chain and could roll the namespace backwards.
-            if (final_frame && std::string_view(error.what()) ==
-                                   "AES-GCM authentication failed") {
+            if (final_frame && std::string_view(error.what()) == "AES-GCM authentication failed") {
                 trailing_problem = "final frame failed AES-GCM authentication";
                 break;
             }
             throw std::runtime_error("metadata journal " + journal_p_.string() +
-                                     " offset=" + std::to_string(offset) + ": " +
-                                     error.what());
+                                     " offset=" + std::to_string(offset) + ": " + error.what());
         }
 
         try {
@@ -1913,11 +1897,11 @@ void MetadataReplica::load_journal() {
                 const bool fresh = committed_.generation <= 1;
                 const bool direct_parent =
                     std::find(parents.begin(), parents.end(), committed_.hash) != parents.end();
-                const bool known_descendant = history_.contains(record.hash) &&
-                                              history_is_ancestor_locked(committed_.hash,
-                                                                         record.hash);
-                const bool parent_descends_from_committed = std::any_of(
-                    parents.begin(), parents.end(), [&](const Hash256& parent) {
+                const bool known_descendant =
+                    history_.contains(record.hash) &&
+                    history_is_ancestor_locked(committed_.hash, record.hash);
+                const bool parent_descends_from_committed =
+                    std::any_of(parents.begin(), parents.end(), [&](const Hash256& parent) {
                         return history_.contains(parent) &&
                                history_is_ancestor_locked(committed_.hash, parent);
                     });
@@ -1941,8 +1925,7 @@ void MetadataReplica::load_journal() {
             }
         } catch (const std::exception& error) {
             throw std::runtime_error("metadata journal " + journal_p_.string() +
-                                     " offset=" + std::to_string(offset) + ": " +
-                                     error.what());
+                                     " offset=" + std::to_string(offset) + ": " + error.what());
         }
 
         offset += 4 + length;
@@ -1957,11 +1940,9 @@ void MetadataReplica::load_journal() {
         auto tail = input.subspan(valid);
         const auto quarantine = quarantine_journal_tail(journal_p_, tail);
         truncate_durable(journal_p_, valid);
-        Log::warn("metadata journal recovered path=" + journal_p_.string() +
-                  " offset=" + std::to_string(valid) +
-                  " discarded_bytes=" + std::to_string(tail.size()) +
-                  " quarantine=" + quarantine.string() +
-                  " reason=" + trailing_problem);
+        Log::warn("metadata journal recovered path=" + journal_p_.string() + " offset=" +
+                  std::to_string(valid) + " discarded_bytes=" + std::to_string(tail.size()) +
+                  " quarantine=" + quarantine.string() + " reason=" + trailing_problem);
     }
 }
 
@@ -2006,8 +1987,8 @@ void MetadataReplica::write_history_frame(std::span<const uint8_t> bytes) const 
                 continue;
             const auto error = errno;
             close(fd);
-            throw std::runtime_error("cannot write metadata history " + history_p_.string() +
-                                     ": " + strerror(error));
+            throw std::runtime_error("cannot write metadata history " + history_p_.string() + ": " +
+                                     strerror(error));
         }
         offset += static_cast<size_t>(count);
     }
@@ -2098,7 +2079,8 @@ void MetadataReplica::load_history() {
                 if (!entry_value.previous_known || entry_value.generation <= 1)
                     throw DecodeError("metadata delta history has no predecessor");
                 auto parent = history_.find(entry_value.previous);
-                if (parent == history_.end() || parent->second.generation + 1 != entry_value.generation)
+                if (parent == history_.end() ||
+                    parent->second.generation + 1 != entry_value.generation)
                     throw DecodeError("metadata delta history predecessor missing or non-adjacent");
                 (void)decode_metadata_delta(entry_value.payload);
             } else {
@@ -2137,9 +2119,8 @@ void MetadataReplica::load_history() {
         }
         stream.close();
         truncate_durable(history_p_, static_cast<size_t>(valid));
-        Log::warn("metadata history recovered path=" + history_p_.string() +
-                  " offset=" + std::to_string(valid) +
-                  " discarded_bytes=" + std::to_string(tail_size) +
+        Log::warn("metadata history recovered path=" + history_p_.string() + " offset=" +
+                  std::to_string(valid) + " discarded_bytes=" + std::to_string(tail_size) +
                   " quarantine=" + quarantine + " reason=" + trailing_problem);
     }
     history_bytes_ = valid;
@@ -2162,7 +2143,8 @@ void MetadataReplica::load_heads() {
         auto tag = reader.fixed<16>();
         auto ciphertext = reader.bytes();
         reader.finish();
-        auto values = decode_metadata_acceptance_set(aes_gcm_open(key_, nonce, tag, ciphertext, MA));
+        auto values =
+            decode_metadata_acceptance_set(aes_gcm_open(key_, nonce, tag, ciphertext, MA));
         for (auto& value : values) {
             auto reconstructed = materialized_locked(value.hash);
             if (!reconstructed || reconstructed->record.generation != value.generation)
@@ -2191,7 +2173,15 @@ void MetadataReplica::persist_heads_locked() {
     writer.fixed(sealed.nonce);
     writer.fixed(sealed.tag);
     writer.bytes(sealed.ciphertext);
-    writefile(heads_p_, writer.data());
+    const auto bytes = writer.data().size();
+    try {
+        writefile(heads_p_, writer.data());
+        accepted_head_persistence_writes_.fetch_add(1, std::memory_order_relaxed);
+        accepted_head_persistence_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    } catch (...) {
+        accepted_head_persistence_failures_.fetch_add(1, std::memory_order_relaxed);
+        throw;
+    }
 }
 
 bool MetadataReplica::prune_accepted_heads_locked() {
@@ -2228,8 +2218,8 @@ void MetadataReplica::migrate_legacy_head_locked() {
         // commit reached the cluster write floor. Preserve the checkpoint and
         // force peer recovery rather than manufacturing a legacy accepted head.
         recovery_required_ = true;
-        durable_replace_file(recovery_p_,
-            "protocol-20 metadata checkpoint has no durable acceptance certificate");
+        durable_replace_file(
+            recovery_p_, "protocol-20 metadata checkpoint has no durable acceptance certificate");
         return;
     }
 
@@ -2241,10 +2231,10 @@ void MetadataReplica::migrate_legacy_head_locked() {
         bool committed_is_ancestor = false;
         bool all_heads_are_ancestors = true;
         for (const auto& [head, _] : accepted_heads_) {
-            committed_is_ancestor = committed_is_ancestor ||
-                                    history_is_ancestor_locked(committed_.hash, head);
-            all_heads_are_ancestors = all_heads_are_ancestors &&
-                                      history_is_ancestor_locked(head, committed_.hash);
+            committed_is_ancestor =
+                committed_is_ancestor || history_is_ancestor_locked(committed_.hash, head);
+            all_heads_are_ancestors =
+                all_heads_are_ancestors && history_is_ancestor_locked(head, committed_.hash);
         }
         if (committed_is_ancestor)
             return;
@@ -2428,20 +2418,19 @@ std::shared_ptr<const MetadataMaterialization> MetadataReplica::cache_materializ
         snapshot = std::make_shared<const MetadataSnapshot>(decode_snapshot(record.payload));
     auto value = std::make_shared<const MetadataMaterialization>(
         MetadataMaterialization{record, std::move(snapshot)});
-    materialized_history_.emplace(
-        record.hash, MaterializedHistoryEntry{value, ++materialized_history_clock_});
+    materialized_history_.emplace(record.hash,
+                                  MaterializedHistoryEntry{value, ++materialized_history_clock_});
     return value;
 }
 
-std::shared_ptr<const MetadataMaterialization> MetadataReplica::materialized_locked(
-    const Hash256& target) const {
+std::shared_ptr<const MetadataMaterialization>
+MetadataReplica::materialized_locked(const Hash256& target) const {
     historical_requests_.fetch_add(1, std::memory_order_relaxed);
     auto found = history_.find(target);
     if (found == history_.end())
         return {};
 
-    if (auto cached = materialized_history_.find(target);
-        cached != materialized_history_.end()) {
+    if (auto cached = materialized_history_.find(target); cached != materialized_history_.end()) {
         cached->second.last_used = ++materialized_history_clock_;
         materialization_cache_hits_.fetch_add(1, std::memory_order_relaxed);
         return cached->second.value;
@@ -2535,11 +2524,14 @@ MetadataReplicaDiagnostics MetadataReplica::diagnostics() const {
         materialization_cache_misses_.load(std::memory_order_relaxed),
         materialization_cache_evictions_.load(std::memory_order_relaxed),
         materialized_history_.size(),
+        accepted_head_persistence_writes_.load(std::memory_order_relaxed),
+        accepted_head_persistence_bytes_.load(std::memory_order_relaxed),
+        accepted_head_persistence_failures_.load(std::memory_order_relaxed),
     };
 }
 
 bool MetadataReplica::history_is_ancestor_locked(const Hash256& ancestor,
-                                                  const Hash256& descendant) const {
+                                                 const Hash256& descendant) const {
     if (ancestor == descendant)
         return history_.contains(ancestor);
     std::vector<Hash256> pending{descendant};
@@ -2569,8 +2561,8 @@ bool MetadataReplica::history_is_ancestor_locked(const Hash256& ancestor,
     return false;
 }
 
-std::optional<Hash256> MetadataReplica::history_common_ancestor_locked(
-    const Hash256& left, const Hash256& right) const {
+std::optional<Hash256> MetadataReplica::history_common_ancestor_locked(const Hash256& left,
+                                                                       const Hash256& right) const {
     std::map<Hash256, uint64_t> left_ancestors;
     std::vector<Hash256> pending{left};
     while (!pending.empty()) {
@@ -2738,9 +2730,8 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
     std::shared_ptr<const MetadataMaterialization> reconstructed;
     try {
         if (entry_value.body == MetadataHistoryEntry::Body::full) {
-            reconstructed = std::make_shared<const MetadataMaterialization>(
-                MetadataMaterialization{record,
-                    std::make_shared<const MetadataSnapshot>(decode_snapshot(record.payload))});
+            reconstructed = std::make_shared<const MetadataMaterialization>(MetadataMaterialization{
+                record, std::make_shared<const MetadataSnapshot>(decode_snapshot(record.payload))});
         } else {
             auto parent = materialized(entry_value.previous);
             if (!parent)
@@ -2752,9 +2743,8 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
             value.previous = entry_value.previous;
             value.hash = entry_value.hash;
             value.payload = encode_snapshot_for_delta(entry_value.payload, snapshot);
-            reconstructed = std::make_shared<const MetadataMaterialization>(
-                MetadataMaterialization{std::move(value),
-                    std::make_shared<const MetadataSnapshot>(std::move(snapshot))});
+            reconstructed = std::make_shared<const MetadataMaterialization>(MetadataMaterialization{
+                std::move(value), std::make_shared<const MetadataSnapshot>(std::move(snapshot))});
         }
     } catch (...) {
         return false;
@@ -2931,8 +2921,8 @@ std::optional<MetadataRecord> MetadataReplica::historical(const Hash256& hash) c
     return value->record;
 }
 
-std::shared_ptr<const MetadataMaterialization> MetadataReplica::materialized(
-    const Hash256& hash) const {
+std::shared_ptr<const MetadataMaterialization>
+MetadataReplica::materialized(const Hash256& hash) const {
     historical_requests_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard computation(materialization_compute_m_);
 
@@ -2944,8 +2934,7 @@ std::shared_ptr<const MetadataMaterialization> MetadataReplica::materialized(
         auto found = history_.find(hash);
         if (found == history_.end())
             return {};
-        if (auto cached = materialized_history_.find(hash);
-            cached != materialized_history_.end()) {
+        if (auto cached = materialized_history_.find(hash); cached != materialized_history_.end()) {
             cached->second.last_used = ++materialized_history_clock_;
             materialization_cache_hits_.fetch_add(1, std::memory_order_relaxed);
             return cached->second.value;
@@ -2989,9 +2978,8 @@ std::shared_ptr<const MetadataMaterialization> MetadataReplica::materialized(
             auto snapshot = decode_snapshot(record.payload);
             if (snapshot.merge_parents != anchor.merge_parents)
                 return {};
-            value = std::make_shared<const MetadataMaterialization>(
-                MetadataMaterialization{record,
-                    std::make_shared<const MetadataSnapshot>(std::move(snapshot))});
+            value = std::make_shared<const MetadataMaterialization>(MetadataMaterialization{
+                record, std::make_shared<const MetadataSnapshot>(std::move(snapshot))});
             calculated.push_back(value);
         }
 
@@ -3011,9 +2999,8 @@ std::shared_ptr<const MetadataMaterialization> MetadataReplica::materialized(
             record.payload = encode_snapshot_for_delta(child.payload, snapshot);
             if (!valid_metadata_record(record) || snapshot.merge_parents != child.merge_parents)
                 return {};
-            value = std::make_shared<const MetadataMaterialization>(
-                MetadataMaterialization{std::move(record),
-                    std::make_shared<const MetadataSnapshot>(std::move(snapshot))});
+            value = std::make_shared<const MetadataMaterialization>(MetadataMaterialization{
+                std::move(record), std::make_shared<const MetadataSnapshot>(std::move(snapshot))});
             calculated.push_back(value);
         }
     } catch (...) {
@@ -3027,10 +3014,10 @@ std::shared_ptr<const MetadataMaterialization> MetadataReplica::materialized(
         if (history_.contains(item->record.hash))
             value = cache_materialization_locked(item->record, item->snapshot);
     }
-    if (auto cached = materialized_history_.find(hash);
-        cached != materialized_history_.end())
+    if (auto cached = materialized_history_.find(hash); cached != materialized_history_.end())
         return cached->second.value;
-    return value && value->record.hash == hash ? value : std::shared_ptr<const MetadataMaterialization>{};
+    return value && value->record.hash == hash ? value
+                                               : std::shared_ptr<const MetadataMaterialization>{};
 }
 
 void MetadataReplica::reset_checkpoint(const MetadataRecord& record) {
@@ -3053,8 +3040,7 @@ void MetadataReplica::compact_if_needed() {
     const auto snapshot_bytes = committed_.payload.size();
     reset_checkpoint(committed_);
     Log::debug("metadata journal compacted generation=" + std::to_string(generation) +
-               " records=" + std::to_string(records) +
-               " journal_bytes=" + std::to_string(bytes) +
+               " records=" + std::to_string(records) + " journal_bytes=" + std::to_string(bytes) +
                " snapshot_bytes=" + std::to_string(snapshot_bytes));
 }
 
@@ -3085,9 +3071,8 @@ bool MetadataReplica::cas(uint64_t generation, const Hash256& hash,
         // COMMIT time. Keep the lexicographically lowest direct-child proposal as
         // the deterministic contender. Other coordinators can help that contender
         // commit and then retry their own mutation on top of it.
-        const bool competing_direct_child =
-            cur_.generation == generation + 1 && cur_.previous == hash &&
-            cur_.hash != committed_.hash;
+        const bool competing_direct_child = cur_.generation == generation + 1 &&
+                                            cur_.previous == hash && cur_.hash != committed_.hash;
         if (competing_direct_child && pending_recovered_) {
             // PREPARE state recovered after process restart has no live coordinator
             // and therefore no authority.  A later proposal based on the durable
@@ -3155,9 +3140,8 @@ bool MetadataReplica::cas_delta(uint64_t generation, const Hash256& hash,
     next.hash = metadata_hash(next.generation, next.previous, next.payload);
 
     if (cur_.generation != generation || cur_.hash != hash) {
-        const bool competing_direct_child =
-            cur_.generation == generation + 1 && cur_.previous == hash &&
-            cur_.hash != committed_.hash;
+        const bool competing_direct_child = cur_.generation == generation + 1 &&
+                                            cur_.previous == hash && cur_.hash != committed_.hash;
         if (competing_direct_child && pending_recovered_) {
             // PREPARE state recovered after process restart has no live coordinator
             // and therefore no authority.  A later proposal based on the durable
@@ -3268,12 +3252,11 @@ bool MetadataReplica::seed(const MetadataRecord& record) {
     const bool fresh = committed_.generation <= 1;
     const bool direct_parent =
         std::find(parents.begin(), parents.end(), committed_.hash) != parents.end();
-    const bool known_descendant = history_.contains(record.hash) &&
-                                  history_is_ancestor_locked(committed_.hash, record.hash);
-    const bool parent_descends_from_committed = std::any_of(
-        parents.begin(), parents.end(), [&](const Hash256& parent) {
-            return history_.contains(parent) &&
-                   history_is_ancestor_locked(committed_.hash, parent);
+    const bool known_descendant =
+        history_.contains(record.hash) && history_is_ancestor_locked(committed_.hash, record.hash);
+    const bool parent_descends_from_committed =
+        std::any_of(parents.begin(), parents.end(), [&](const Hash256& parent) {
+            return history_.contains(parent) && history_is_ancestor_locked(committed_.hash, parent);
         });
     if (!fresh && !direct_parent && !known_descendant && !parent_descends_from_committed)
         return false;
@@ -3307,8 +3290,8 @@ bool MetadataReplica::remember_committed(const MetadataRecord& record) {
             std::find(parents.begin(), parents.end(), committed_.hash) != parents.end();
         const bool known_descendant = history_.contains(record.hash) &&
                                       history_is_ancestor_locked(committed_.hash, record.hash);
-        const bool parent_descends_from_committed = std::any_of(
-            parents.begin(), parents.end(), [&](const Hash256& parent) {
+        const bool parent_descends_from_committed =
+            std::any_of(parents.begin(), parents.end(), [&](const Hash256& parent) {
                 return history_.contains(parent) &&
                        history_is_ancestor_locked(committed_.hash, parent);
             });
@@ -3366,8 +3349,7 @@ void MetadataReplica::compact() {
     compact_if_needed();
 }
 
-bool MetadataReplica::compact_history_if_safe(size_t record_threshold,
-                                              uint64_t byte_threshold) {
+bool MetadataReplica::compact_history_if_safe(size_t record_threshold, uint64_t byte_threshold) {
     std::lock_guard durable(durable_mutation_m_);
     std::lock_guard lock(m_);
     if ((history_records_ < record_threshold && history_bytes_ < byte_threshold) ||
@@ -3392,8 +3374,7 @@ bool MetadataReplica::compact_history_if_safe(size_t record_threshold,
 
     auto frame = encode_history_frame(root);
     durable_replace_file(
-        history_p_,
-        std::string_view(reinterpret_cast<const char*>(frame.data()), frame.size()));
+        history_p_, std::string_view(reinterpret_cast<const char*>(frame.data()), frame.size()));
 
     history_.clear();
     history_.emplace(root.hash, std::move(root));
@@ -3443,8 +3424,8 @@ std::set<ObjectId> metadata_conflict_extent_roots(const MetadataSnapshot& snapsh
     for (const auto& [_, conflict] : snapshot.conflicts) {
         if (conflict.kind != MetadataConflictKind::namespace_entry)
             continue;
-        for (const auto* candidate : {&conflict.base_entry, &conflict.left_entry,
-                                      &conflict.right_entry}) {
+        for (const auto* candidate :
+             {&conflict.base_entry, &conflict.left_entry, &conflict.right_entry}) {
             if (!*candidate)
                 continue;
             for (const auto& extent : (**candidate).extents) {
@@ -3463,8 +3444,7 @@ std::set<ObjectId> metadata_catalogue_root_set(const MetadataSnapshot& snapshot)
     for (const auto& [_, conflict] : snapshot.conflicts) {
         if (conflict.kind != MetadataConflictKind::catalogue_root)
             continue;
-        for (const auto* candidate : {&conflict.base_catalogue_root,
-                                      &conflict.left_catalogue_root,
+        for (const auto* candidate : {&conflict.base_catalogue_root, &conflict.left_catalogue_root,
                                       &conflict.right_catalogue_root}) {
             if (*candidate)
                 out.insert(**candidate);
