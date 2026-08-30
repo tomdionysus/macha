@@ -1,6 +1,6 @@
 # Current release
 
-## 0.20.0 — asynchronous node startup (development)
+## 0.21.0 — asynchronous node startup (development)
 
 - Bring the RPC control plane and status API online before local backend recovery.
 - Report startup/readiness independently from cluster reachability and storage availability.
