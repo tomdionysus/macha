@@ -2,8 +2,8 @@
 #include "net.hpp"
 
 #include "codec.hpp"
-#include "log.hpp"
 #include "diagnostics.hpp"
+#include "log.hpp"
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -41,12 +41,11 @@ constexpr size_t frame_header_size = 28;
 constexpr uint8_t frame_first = 0x01;
 constexpr uint8_t frame_last = 0x02;
 
-bool reset_invalidates_node_reference(
-    const std::map<std::string, IdentityAssociationReset>& resets, const NodeInfo& node) {
+bool reset_invalidates_node_reference(const std::map<std::string, IdentityAssociationReset>& resets,
+                                      const NodeInfo& node) {
     for (const auto& [_, reset] : resets) {
         if (identity_reset_matches_endpoint(reset, node.host, node.port) &&
-            identity_reset_matches_node(reset, node.id) &&
-            node.seen_unix_ms <= reset.reset_unix_ms)
+            identity_reset_matches_node(reset, node.id) && node.seen_unix_ms <= reset.reset_unix_ms)
             return true;
     }
     return false;
@@ -78,11 +77,10 @@ void socket_timeout(int fd, std::chrono::milliseconds timeout) {
 }
 
 bool allowed_on_lane(TransportLane lane, MessageType type) noexcept {
-    const bool object_message = type == MessageType::get_object ||
-                                type == MessageType::put_object ||
-                                type == MessageType::put_object_deferred ||
-                                type == MessageType::object_durability_barrier ||
-                                type == MessageType::object_reply;
+    const bool object_message =
+        type == MessageType::get_object || type == MessageType::put_object ||
+        type == MessageType::put_object_deferred ||
+        type == MessageType::object_durability_barrier || type == MessageType::object_reply;
     if (lane == TransportLane::control)
         return !object_message;
     if (object_message)
@@ -117,8 +115,7 @@ void send_all(int fd, std::span<const uint8_t> bytes,
     }
 }
 
-void recv_all(int fd, std::span<uint8_t> bytes,
-              const std::function<void(size_t)>& progress = {}) {
+void recv_all(int fd, std::span<uint8_t> bytes, const std::function<void(size_t)>& progress = {}) {
     size_t done = 0;
     while (done < bytes.size()) {
         auto count = ::recv(fd, bytes.data() + done, bytes.size() - done, 0);
@@ -161,8 +158,8 @@ Bytes label(const char* prefix, std::span<const uint8_t> data) {
     return out;
 }
 
-Bytes session_info(std::span<const uint8_t> transcript, const NodeId& client,
-                   const NodeId& server, const char* direction) {
+Bytes session_info(std::span<const uint8_t> transcript, const NodeId& client, const NodeId& server,
+                   const char* direction) {
     Writer writer;
     writer.string("macha/session/v15");
     writer.string(direction);
@@ -301,8 +298,7 @@ FrameType decode_frame_type(uint8_t value) {
 bool is_bulk_message(MessageType type) {
     return type == MessageType::get_object || type == MessageType::put_object ||
            type == MessageType::put_object_deferred ||
-           type == MessageType::object_durability_barrier ||
-           type == MessageType::object_reply;
+           type == MessageType::object_durability_barrier || type == MessageType::object_reply;
 }
 
 bool is_priority_data_message(MessageType type) {
@@ -380,8 +376,6 @@ uint64_t transfer_target(const RpcMessage& message) {
     return id;
 }
 
-
-
 } // namespace
 
 MessageAssembler::MessageAssembler(size_t max_partial_messages, size_t max_partial_bytes,
@@ -410,8 +404,8 @@ std::optional<RpcFrame> MessageAssembler::push(WireFragment fragment) {
     if (fragment.request_id == 0) {
         if (!fragment.first || !fragment.last)
             throw std::runtime_error("notification must fit one frame");
-        return RpcFrame{0, fragment.frame_type,
-                        {fragment.message_type, std::move(fragment.payload)}};
+        return RpcFrame{
+            0, fragment.frame_type, {fragment.message_type, std::move(fragment.payload)}};
     }
 
     auto found = partial_.find(fragment.request_id);
@@ -430,8 +424,7 @@ std::optional<RpcFrame> MessageAssembler::push(WireFragment fragment) {
 
     if (found->second.message_type != fragment.message_type)
         throw std::runtime_error("message type changed during transfer");
-    if (frame_type_priority(fragment.frame_type) >
-        frame_type_priority(found->second.frame_type)) {
+    if (frame_type_priority(fragment.frame_type) > frame_type_priority(found->second.frame_type)) {
         throw std::runtime_error("frame type was demoted during transfer");
     }
     found->second.frame_type = more_urgent(fragment.frame_type, found->second.frame_type);
@@ -482,51 +475,96 @@ const char* frame_type_name(FrameType type) noexcept {
 
 const char* message_type_name(MessageType type) noexcept {
     switch (type) {
-    case MessageType::ping: return "ping";
-    case MessageType::members: return "members";
-    case MessageType::have_object: return "have_object";
-    case MessageType::get_object: return "get_object";
-    case MessageType::put_object: return "put_object";
-    case MessageType::put_object_deferred: return "put_object_deferred";
-    case MessageType::object_durability_barrier: return "object_durability_barrier";
-    case MessageType::get_metadata: return "get_metadata";
-    case MessageType::cas_metadata: return "cas_metadata";
-    case MessageType::cas_metadata_delta: return "cas_metadata_delta";
-    case MessageType::seed_metadata: return "seed_metadata";
-    case MessageType::metadata_notice: return "metadata_notice";
-    case MessageType::get_committed_metadata: return "get_committed_metadata";
-    case MessageType::checkpoint_metadata: return "checkpoint_metadata";
-    case MessageType::session_retire: return "session_retire";
-    case MessageType::delete_object: return "delete_object";
-    case MessageType::promote_read_ahead: return "promote_read_ahead";
-    case MessageType::promote_foreground: return "promote_foreground";
-    case MessageType::cancel_transfer: return "cancel_transfer";
-    case MessageType::commit_metadata: return "commit_metadata";
-    case MessageType::get_control_object: return "get_control_object";
-    case MessageType::put_control_object: return "put_control_object";
-    case MessageType::get_metadata_identity: return "get_metadata_identity";
-    case MessageType::telemetry: return "telemetry";
-    case MessageType::identity_resets: return "identity_resets";
-    case MessageType::get_metadata_history_entry: return "get_metadata_history_entry";
-    case MessageType::has_metadata_history_entry: return "has_metadata_history_entry";
-    case MessageType::put_metadata_history_entry: return "put_metadata_history_entry";
-    case MessageType::get_metadata_heads: return "get_metadata_heads";
-    case MessageType::put_metadata_commit: return "put_metadata_commit";
-    case MessageType::accept_metadata_commit: return "accept_metadata_commit";
-    case MessageType::retain_objects: return "retain_objects";
-    case MessageType::ok: return "ok";
-    case MessageType::error: return "error";
-    case MessageType::members_reply: return "members_reply";
-    case MessageType::bool_reply: return "bool_reply";
-    case MessageType::object_reply: return "object_reply";
-    case MessageType::metadata_reply: return "metadata_reply";
-    case MessageType::cas_reply: return "cas_reply";
-    case MessageType::control_object_reply: return "control_object_reply";
-    case MessageType::metadata_identity_reply: return "metadata_identity_reply";
-    case MessageType::telemetry_reply: return "telemetry_reply";
-    case MessageType::identity_resets_reply: return "identity_resets_reply";
-    case MessageType::metadata_history_entry_reply: return "metadata_history_entry_reply";
-    case MessageType::metadata_heads_reply: return "metadata_heads_reply";
+    case MessageType::ping:
+        return "ping";
+    case MessageType::members:
+        return "members";
+    case MessageType::have_object:
+        return "have_object";
+    case MessageType::get_object:
+        return "get_object";
+    case MessageType::put_object:
+        return "put_object";
+    case MessageType::put_object_deferred:
+        return "put_object_deferred";
+    case MessageType::object_durability_barrier:
+        return "object_durability_barrier";
+    case MessageType::get_metadata:
+        return "get_metadata";
+    case MessageType::cas_metadata:
+        return "cas_metadata";
+    case MessageType::cas_metadata_delta:
+        return "cas_metadata_delta";
+    case MessageType::seed_metadata:
+        return "seed_metadata";
+    case MessageType::metadata_notice:
+        return "metadata_notice";
+    case MessageType::get_committed_metadata:
+        return "get_committed_metadata";
+    case MessageType::checkpoint_metadata:
+        return "checkpoint_metadata";
+    case MessageType::session_retire:
+        return "session_retire";
+    case MessageType::delete_object:
+        return "delete_object";
+    case MessageType::promote_read_ahead:
+        return "promote_read_ahead";
+    case MessageType::promote_foreground:
+        return "promote_foreground";
+    case MessageType::cancel_transfer:
+        return "cancel_transfer";
+    case MessageType::commit_metadata:
+        return "commit_metadata";
+    case MessageType::get_control_object:
+        return "get_control_object";
+    case MessageType::put_control_object:
+        return "put_control_object";
+    case MessageType::get_metadata_identity:
+        return "get_metadata_identity";
+    case MessageType::telemetry:
+        return "telemetry";
+    case MessageType::identity_resets:
+        return "identity_resets";
+    case MessageType::get_metadata_history_entry:
+        return "get_metadata_history_entry";
+    case MessageType::has_metadata_history_entry:
+        return "has_metadata_history_entry";
+    case MessageType::put_metadata_history_entry:
+        return "put_metadata_history_entry";
+    case MessageType::get_metadata_heads:
+        return "get_metadata_heads";
+    case MessageType::put_metadata_commit:
+        return "put_metadata_commit";
+    case MessageType::accept_metadata_commit:
+        return "accept_metadata_commit";
+    case MessageType::retain_objects:
+        return "retain_objects";
+    case MessageType::ok:
+        return "ok";
+    case MessageType::error:
+        return "error";
+    case MessageType::members_reply:
+        return "members_reply";
+    case MessageType::bool_reply:
+        return "bool_reply";
+    case MessageType::object_reply:
+        return "object_reply";
+    case MessageType::metadata_reply:
+        return "metadata_reply";
+    case MessageType::cas_reply:
+        return "cas_reply";
+    case MessageType::control_object_reply:
+        return "control_object_reply";
+    case MessageType::metadata_identity_reply:
+        return "metadata_identity_reply";
+    case MessageType::telemetry_reply:
+        return "telemetry_reply";
+    case MessageType::identity_resets_reply:
+        return "identity_resets_reply";
+    case MessageType::metadata_history_entry_reply:
+        return "metadata_history_entry_reply";
+    case MessageType::metadata_heads_reply:
+        return "metadata_heads_reply";
     }
     return "unknown";
 }
@@ -537,8 +575,7 @@ unsigned frame_type_priority(FrameType type) noexcept {
 
 FrameType default_frame_type(MessageType type) noexcept {
     if (type == MessageType::get_object || type == MessageType::put_object ||
-        type == MessageType::put_object_deferred ||
-        type == MessageType::object_durability_barrier)
+        type == MessageType::put_object_deferred || type == MessageType::object_durability_barrier)
         return FrameType::foreground;
     if (type == MessageType::get_control_object || type == MessageType::put_control_object ||
         type == MessageType::telemetry)
@@ -767,8 +804,8 @@ void SecureChannel::send_fragment(uint64_t request_id, FrameType frame_type,
     send_all(fd_, sealed.ciphertext, progress);
 }
 
-WireFragment SecureChannel::receive_fragment(
-    const std::function<void(uint64_t, size_t)>& progress) {
+WireFragment
+SecureChannel::receive_fragment(const std::function<void(uint64_t, size_t)>& progress) {
     std::array<uint8_t, frame_header_size> header_bytes{};
     recv_all(fd_, header_bytes, [&](size_t count) {
         if (progress)
@@ -808,8 +845,12 @@ WireFragment SecureChannel::receive_fragment(
     recv_all(fd_, ciphertext, body_progress);
     auto payload = aes_gcm_open(rx_, nonce, tag, ciphertext, header_bytes);
     rx_counter_ = counter;
-    return {request_id, frame_type, message_type, (flags & frame_first) != 0,
-            (flags & frame_last) != 0, std::move(payload)};
+    return {request_id,
+            frame_type,
+            message_type,
+            (flags & frame_first) != 0,
+            (flags & frame_last) != 0,
+            std::move(payload)};
 }
 
 AsyncRpc::AsyncRpc(std::future<RpcReply> future, std::function<void()> cancel,
@@ -1005,11 +1046,12 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             writes_active_.load() != 0)
             return;
         retire_notice_sent_ = true;
-        outbound_.push_back({0, FrameType::control, {MessageType::session_retire, {}}, 0, false, {}});
+        outbound_.push_back(
+            {0, FrameType::control, {MessageType::session_retire, {}}, 0, false, {}});
     }
 
-    bool queue_message(uint64_t request_id, FrameType frame_type, RpcMessage message,
-                       bool reply, std::shared_ptr<std::promise<void>> sent = {}) {
+    bool queue_message(uint64_t request_id, FrameType frame_type, RpcMessage message, bool reply,
+                       std::shared_ptr<std::promise<void>> sent = {}) {
         validate_frame_semantics(message.type, frame_type);
         {
             DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
@@ -1027,12 +1069,8 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                 throw std::runtime_error("peer outbound queue full");
             if (!reply && request_id)
                 outbound_classes_[request_id] = frame_type;
-            outbound_.push_back({request_id,
-                                 frame_type,
-                                 std::move(message),
-                                 0,
-                                 reply,
-                                 std::move(sent)});
+            outbound_.push_back(
+                {request_id, frame_type, std::move(message), 0, reply, std::move(sent)});
         }
         outbound_cv_.notify_one();
         return true;
@@ -1088,8 +1126,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
 
         {
             DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
-            if (auto found = outbound_classes_.find(request_id);
-                found != outbound_classes_.end())
+            if (auto found = outbound_classes_.find(request_id); found != outbound_classes_.end())
                 found->second = more_urgent(type, found->second);
             for (auto& item : outbound_) {
                 if (!item.reply && item.request_id == request_id)
@@ -1131,17 +1168,18 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         const auto id = frame.request_id;
         const auto fallback = frame.frame_type;
         try {
-            inbound_handler_(peer_, std::move(frame), [weak, id, fallback](const RpcMessage& reply) {
-                if (auto self = weak.lock()) {
-                    try {
-                        (void)self->queue_message(id, fallback, reply, true);
-                    } catch (...) {
-                        self->close();
-                    }
-                    --self->inbound_active_;
-                    self->finish_retire_if_drained();
-                }
-            });
+            inbound_handler_(peer_, std::move(frame),
+                             [weak, id, fallback](const RpcMessage& reply) {
+                                 if (auto self = weak.lock()) {
+                                     try {
+                                         (void)self->queue_message(id, fallback, reply, true);
+                                     } catch (...) {
+                                         self->close();
+                                     }
+                                     --self->inbound_active_;
+                                     self->finish_retire_if_drained();
+                                 }
+                             });
         } catch (...) {
             {
                 DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
@@ -1154,10 +1192,10 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     }
 
     std::deque<Outbound>::iterator best_outbound_locked() {
-        return std::min_element(outbound_.begin(), outbound_.end(), [](const Outbound& a,
-                                                                      const Outbound& b) {
-            return frame_type_priority(a.frame_type) < frame_type_priority(b.frame_type);
-        });
+        return std::min_element(
+            outbound_.begin(), outbound_.end(), [](const Outbound& a, const Outbound& b) {
+                return frame_type_priority(a.frame_type) < frame_type_priority(b.frame_type);
+            });
     }
 
     void writer_loop(std::stop_token stop) {
@@ -1197,8 +1235,9 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
 
                 ++writes_active_;
                 try {
-                    channel_.send_fragment(item.request_id, item.frame_type, item.message.type, first,
-                                           last, fragment, [this, id = item.request_id](size_t) {
+                    channel_.send_fragment(item.request_id, item.frame_type, item.message.type,
+                                           first, last, fragment,
+                                           [this, id = item.request_id](size_t) {
                                                if (id)
                                                    touch(id);
                                            });
@@ -1350,11 +1389,9 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
 
   public:
     PeerConnection(int fd, ClusterKeys keys, NodeInfo local, size_t max_frame_size,
-                   TransportLane lane,
-                   std::function<void(const NodeInfo&)> peer_observer,
-                   std::function<void(uint64_t)> metadata_observer,
-                   InboundHandler inbound_handler, InboundPromoter inbound_promoter,
-                   InboundCanceller inbound_canceller,
+                   TransportLane lane, std::function<void(const NodeInfo&)> peer_observer,
+                   std::function<void(uint64_t)> metadata_observer, InboundHandler inbound_handler,
+                   InboundPromoter inbound_promoter, InboundCanceller inbound_canceller,
                    std::function<void(bool, std::chrono::milliseconds)> result_observer)
         : channel_(fd, keys, std::move(local), max_frame_size),
           peer_observer_(std::move(peer_observer)),
@@ -1379,11 +1416,21 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             reader_.join();
     }
 
-    bool usable() const { return !broken_.load() && !retiring_.load(); }
-    bool finished() const { return broken_.load(); }
-    const NodeInfo& peer() const { return peer_; }
-    TransportLane lane() const noexcept { return channel_.lane(); }
-    const std::array<uint8_t, 32>& session_id() const noexcept { return channel_.session_id(); }
+    bool usable() const {
+        return !broken_.load() && !retiring_.load();
+    }
+    bool finished() const {
+        return broken_.load();
+    }
+    const NodeInfo& peer() const {
+        return peer_;
+    }
+    TransportLane lane() const noexcept {
+        return channel_.lane();
+    }
+    const std::array<uint8_t, 32>& session_id() const noexcept {
+        return channel_.session_id();
+    }
 
     AsyncRpc call(MessageType type, std::span<const uint8_t> payload, FrameType frame_type) {
         validate_frame_semantics(type, frame_type);
@@ -1405,8 +1452,8 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                 pending_.emplace(id, pending);
             }
             try {
-                (void)queue_message(id, frame_type,
-                                    {type, Bytes(payload.begin(), payload.end())}, false);
+                (void)queue_message(id, frame_type, {type, Bytes(payload.begin(), payload.end())},
+                                    false);
             } catch (...) {
                 DiagnosticLock lock(pending_mutex_, "rpc.client.pending");
                 pending_.erase(id);
@@ -1445,8 +1492,8 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                 return self->idle_for(id);
             return std::chrono::milliseconds::max();
         };
-        return AsyncRpc(std::move(future), std::move(cancel), std::move(abort),
-                        std::move(promote), std::move(idle));
+        return AsyncRpc(std::move(future), std::move(cancel), std::move(abort), std::move(promote),
+                        std::move(idle));
     }
 
     void notify(const RpcMessage& message) {
@@ -1518,8 +1565,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
 RpcClient::RpcClient(ClusterKeys keys, std::function<NodeInfo()> local,
                      std::function<void(const NodeInfo&)> peer_observer,
                      std::function<void(uint64_t)> metadata_observer,
-                     std::chrono::milliseconds connect_timeout,
-                     std::chrono::milliseconds heartbeat,
+                     std::chrono::milliseconds connect_timeout, std::chrono::milliseconds heartbeat,
                      std::chrono::milliseconds dead_after, size_t max_frame_size)
     : keys_(keys), local_(std::move(local)), peer_observer_(std::move(peer_observer)),
       metadata_observer_(std::move(metadata_observer)), connect_timeout_(connect_timeout),
@@ -1556,8 +1602,7 @@ TransportLane RpcClient::lane_for(MessageType type, FrameType frame_type) noexce
     // CONTROL TCP session. This prevents multi-megabyte namespace CAS/repair
     // traffic from sharing a socket with foreground media reads.
     if (type == MessageType::get_object || type == MessageType::put_object ||
-        type == MessageType::put_object_deferred ||
-        type == MessageType::object_durability_barrier)
+        type == MessageType::put_object_deferred || type == MessageType::object_durability_barrier)
         return TransportLane::data;
     (void)frame_type;
     return TransportLane::control;
@@ -1631,10 +1676,10 @@ void RpcClient::reconcile_locked(const NodeId& peer, TransportLane lane,
     const auto k = route_key(peer, lane);
     auto outbound = connections_.find(k);
     auto inbound = inbound_routes_.find(k);
-    const bool have_outbound = outbound != connections_.end() && outbound->second &&
-                               outbound->second->usable();
-    const bool have_inbound = inbound != inbound_routes_.end() && inbound->second.usable &&
-                              inbound->second.usable();
+    const bool have_outbound =
+        outbound != connections_.end() && outbound->second && outbound->second->usable();
+    const bool have_inbound =
+        inbound != inbound_routes_.end() && inbound->second.usable && inbound->second.usable();
     if (!have_outbound || !have_inbound)
         return;
 
@@ -1666,8 +1711,7 @@ void RpcClient::register_inbound(InboundRoute route) {
         }
 
         auto found = inbound_routes_.find(k);
-        if (found == inbound_routes_.end() || !found->second.usable ||
-            !found->second.usable()) {
+        if (found == inbound_routes_.end() || !found->second.usable || !found->second.usable()) {
             inbound_routes_[k] = std::move(route);
         } else if (route.session_id < found->second.session_id) {
             if (found->second.retire)
@@ -1690,9 +1734,10 @@ void RpcClient::unregister_inbound(const NodeId& peer, TransportLane lane,
         inbound_routes_.erase(found);
 }
 
-std::shared_ptr<RpcClient::PeerConnection>
-RpcClient::connection(const Endpoint& endpoint, const NodeId* expected, NodeId* actual,
-                      TransportLane lane) {
+std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint& endpoint,
+                                                                 const NodeId* expected,
+                                                                 NodeId* actual,
+                                                                 TransportLane lane) {
     reap_retired();
     const auto retry_key = dial_key(endpoint, lane);
     std::optional<NodeId> known;
@@ -1700,7 +1745,8 @@ RpcClient::connection(const Endpoint& endpoint, const NodeId* expected, NodeId* 
         std::lock_guard lock(mutex_);
         if (expected) {
             known = *expected;
-        } else if (auto p = endpoint_peers_.find(endpoint_key(endpoint)); p != endpoint_peers_.end())
+        } else if (auto p = endpoint_peers_.find(endpoint_key(endpoint));
+                   p != endpoint_peers_.end())
             known = p->second;
 
         // Retry backoff applies to creating a new TCP connection, not to an
@@ -1805,8 +1851,7 @@ RpcClient::connection(const Endpoint& endpoint, const NodeId* expected, NodeId* 
             fn();
 
         if (installed && winner == fresh) {
-            Log::info("node connection outbound peer=" +
-                      to_string(fresh->peer().id).substr(0, 12) +
+            Log::info("node connection outbound peer=" + to_string(fresh->peer().id).substr(0, 12) +
                       " lane=" + std::string(transport_lane_name(lane)) +
                       " endpoint=" + endpoint_key(endpoint));
         }
@@ -1909,13 +1954,11 @@ AsyncRpc RpcClient::call_async(const NodeInfo& node, MessageType type,
 }
 
 RpcReply RpcClient::call(const Endpoint& endpoint, MessageType type,
-                         std::span<const uint8_t> payload,
-                         std::chrono::milliseconds stall_notice) {
+                         std::span<const uint8_t> payload, std::chrono::milliseconds stall_notice) {
     return call(endpoint, type, payload, default_frame_type(type), stall_notice);
 }
 
-RpcReply RpcClient::call(const NodeInfo& node, MessageType type,
-                         std::span<const uint8_t> payload,
+RpcReply RpcClient::call(const NodeInfo& node, MessageType type, std::span<const uint8_t> payload,
                          std::chrono::milliseconds stall_notice) {
     return call(node, type, payload, default_frame_type(type), stall_notice);
 }
@@ -1931,8 +1974,8 @@ RpcReply RpcClient::call(const Endpoint& endpoint, MessageType type,
     while (async.wait_for(stall_notice) != std::future_status::ready) {
         const auto idle = async.idle_for();
         if (idle >= stall_notice) {
-            Log::debug(std::string("RPC stalled (") + frame_type_name(frame_type) + ") peer=" +
-                       endpoint_key(endpoint) + " message=" + message_type_name(type) +
+            Log::debug(std::string("RPC stalled (") + frame_type_name(frame_type) +
+                       ") peer=" + endpoint_key(endpoint) + " message=" + message_type_name(type) +
                        " age_ms=" + std::to_string(elapsed_ms(call_started)) +
                        " no_progress_ms=" + std::to_string(idle.count()) +
                        "; request remains active while peer health is monitored");
@@ -1941,9 +1984,8 @@ RpcReply RpcClient::call(const Endpoint& endpoint, MessageType type,
     return async.get();
 }
 
-RpcReply RpcClient::call(const NodeInfo& node, MessageType type,
-                         std::span<const uint8_t> payload, FrameType frame_type,
-                         std::chrono::milliseconds stall_notice) {
+RpcReply RpcClient::call(const NodeInfo& node, MessageType type, std::span<const uint8_t> payload,
+                         FrameType frame_type, std::chrono::milliseconds stall_notice) {
     const auto call_started = Clock::now();
     auto async = call_async(node, type, payload, frame_type);
     if (stall_notice.count() <= 0)
@@ -2054,7 +2096,8 @@ void RpcClient::health_loop(std::stop_token stop) {
         probes.reserve(active_peers.size());
         const auto started = Clock::now();
         for (const auto& [peer, endpoint] : active_peers)
-            probes.push_back({peer, endpoint, std::nullopt, started + dead_after_, started, {}, false});
+            probes.push_back(
+                {peer, endpoint, std::nullopt, started + dead_after_, started, {}, false});
 
         size_t remaining = probes.size();
         while (remaining && !stop.stop_requested()) {
@@ -2159,8 +2202,7 @@ void RpcClient::broadcast(const RpcMessage& message) {
     {
         std::lock_guard lock(mutex_);
         for (const auto& [_, connection] : connections_)
-            if (connection && connection->usable() &&
-                connection->lane() == TransportLane::control)
+            if (connection && connection->usable() && connection->lane() == TransportLane::control)
                 outbound.push_back(connection);
         for (const auto& [_, route] : inbound_routes_)
             if (route.lane == TransportLane::control && route.usable && route.usable() &&
@@ -2189,8 +2231,7 @@ size_t RpcClient::broadcast_best_effort(const RpcMessage& message, FrameType fra
         if (!lock.owns_lock())
             return 0;
         for (const auto& [_, connection] : connections_)
-            if (connection && connection->usable() &&
-                connection->lane() == TransportLane::control)
+            if (connection && connection->usable() && connection->lane() == TransportLane::control)
                 outbound.push_back(connection);
         for (const auto& [_, route] : inbound_routes_)
             if (route.lane == TransportLane::control && route.usable && route.usable() &&
@@ -2261,8 +2302,8 @@ void RpcClient::invalidate_identity_association(const IdentityAssociationReset& 
 
         for (auto it = connections_.begin(); it != connections_.end();) {
             const auto& connection = it->second;
-            if (connection && endpoint_in_scope(Endpoint{connection->peer().host,
-                                                         connection->peer().port}) &&
+            if (connection &&
+                endpoint_in_scope(Endpoint{connection->peer().host, connection->peer().port}) &&
                 node_in_scope(connection->peer().id)) {
                 outbound.push_back(std::move(it->second));
                 it = connections_.erase(it);
@@ -2409,11 +2450,12 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
             writes_active.load() != 0)
             return;
         retire_notice_sent = true;
-        outbound.push_back({0, FrameType::control, {MessageType::session_retire, {}}, 0, false, {}});
+        outbound.push_back(
+            {0, FrameType::control, {MessageType::session_retire, {}}, 0, false, {}});
     }
 
-    bool queue_message(uint64_t request_id, FrameType frame_type, RpcMessage message,
-                       bool reply, std::shared_ptr<std::promise<void>> sent = {}) {
+    bool queue_message(uint64_t request_id, FrameType frame_type, RpcMessage message, bool reply,
+                       std::shared_ptr<std::promise<void>> sent = {}) {
         validate_frame_semantics(message.type, frame_type);
         {
             DiagnosticLock lock(outbound_mutex, "rpc.session.outbound");
@@ -2431,12 +2473,8 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                 throw std::runtime_error("peer outbound queue full");
             if (!reply && request_id)
                 outbound_classes[request_id] = frame_type;
-            outbound.push_back({request_id,
-                                frame_type,
-                                std::move(message),
-                                0,
-                                reply,
-                                std::move(sent)});
+            outbound.push_back(
+                {request_id, frame_type, std::move(message), 0, reply, std::move(sent)});
         }
         outbound_cv.notify_one();
         return true;
@@ -2486,8 +2524,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
             return;
         {
             DiagnosticLock lock(outbound_mutex, "rpc.session.outbound");
-            if (auto found = outbound_classes.find(request_id);
-                found != outbound_classes.end())
+            if (auto found = outbound_classes.find(request_id); found != outbound_classes.end())
                 found->second = more_urgent(type, found->second);
             for (auto& item : outbound) {
                 if (!item.reply && item.request_id == request_id)
@@ -2520,10 +2557,10 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
     }
 
     std::deque<Outbound>::iterator best_outbound_locked() {
-        return std::min_element(outbound.begin(), outbound.end(), [](const Outbound& a,
-                                                                     const Outbound& b) {
-            return frame_type_priority(a.frame_type) < frame_type_priority(b.frame_type);
-        });
+        return std::min_element(
+            outbound.begin(), outbound.end(), [](const Outbound& a, const Outbound& b) {
+                return frame_type_priority(a.frame_type) < frame_type_priority(b.frame_type);
+            });
     }
 
     void writer_loop(std::stop_token stop) {
@@ -2563,15 +2600,16 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
 
                 ++writes_active;
                 try {
-                    channel->send_fragment(item.request_id, item.frame_type, item.message.type, first,
-                                           last, fragment, [this, id = item.request_id](size_t) {
-                                               if (!id || (id & 1U))
-                                                   return;
-                                               DiagnosticLock lock(pending_mutex, "rpc.session.pending");
-                                               auto found = pending.find(id);
-                                               if (found != pending.end())
-                                                   found->second->last_progress_ns.store(steady_ns());
-                                           });
+                    channel->send_fragment(
+                        item.request_id, item.frame_type, item.message.type, first, last, fragment,
+                        [this, id = item.request_id](size_t) {
+                            if (!id || (id & 1U))
+                                return;
+                            DiagnosticLock lock(pending_mutex, "rpc.session.pending");
+                            auto found = pending.find(id);
+                            if (found != pending.end())
+                                found->second->last_progress_ns.store(steady_ns());
+                        });
                 } catch (...) {
                     --writes_active;
                     throw;
@@ -2714,8 +2752,8 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                 pending.emplace(id, item);
             }
             try {
-                (void)queue_message(id, frame_type,
-                                    {type, Bytes(payload.begin(), payload.end())}, false);
+                (void)queue_message(id, frame_type, {type, Bytes(payload.begin(), payload.end())},
+                                    false);
             } catch (...) {
                 DiagnosticLock lock(pending_mutex, "rpc.session.pending");
                 pending.erase(id);
@@ -2767,8 +2805,8 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
             return std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::nanoseconds(idle_ns));
         };
-        return AsyncRpc(std::move(future), std::move(cancel), std::move(abort),
-                        std::move(promote), std::move(idle));
+        return AsyncRpc(std::move(future), std::move(cancel), std::move(abort), std::move(promote),
+                        std::move(idle));
     }
 
     void close() {
@@ -2801,8 +2839,8 @@ RpcServer::RpcServer(std::string host, uint16_t port, ClusterKeys keys, NodeInfo
                      Handler handler, Observer observer, size_t max_frame_size,
                      RpcServerExecutionLimits execution_limits)
     : host_(std::move(host)), port_(port), keys_(keys), local_(std::move(local)),
-      handler_(std::move(handler)), observer_(std::move(observer)),
-      max_frame_size_(max_frame_size), execution_limits_(execution_limits) {
+      handler_(std::move(handler)), observer_(std::move(observer)), max_frame_size_(max_frame_size),
+      execution_limits_(execution_limits) {
     validate_frame_limit(max_frame_size_);
     if (!execution_limits_.metadata_workers || !execution_limits_.metadata_pending_jobs ||
         !execution_limits_.metadata_pending_bytes)
@@ -2865,9 +2903,9 @@ std::deque<RpcServer::RequestJob>& RpcServer::queue(RequestClass cls) {
 bool RpcServer::admit_locked(RequestJob job) {
     if (metadata_mutation_request(job.frame)) {
         const auto bytes = job.frame.message.payload.size();
-        const bool bytes_fit = bytes <= execution_limits_.metadata_pending_bytes &&
-                               metadata_request_bytes_ <=
-                                   execution_limits_.metadata_pending_bytes - bytes;
+        const bool bytes_fit =
+            bytes <= execution_limits_.metadata_pending_bytes &&
+            metadata_request_bytes_ <= execution_limits_.metadata_pending_bytes - bytes;
         if (metadata_requests_.size() >= execution_limits_.metadata_pending_jobs || !bytes_fit) {
             rejected_metadata_requests_.fetch_add(1, std::memory_order_relaxed);
             return false;
@@ -3018,8 +3056,7 @@ void RpcServer::start() {
         fast_control_workers_.emplace_back(
             [this](std::stop_token stop) { fast_control_worker_loop(stop); });
     for (size_t i = 0; i < control_worker_count; ++i)
-        control_workers_.emplace_back(
-            [this](std::stop_token stop) { control_worker_loop(stop); });
+        control_workers_.emplace_back([this](std::stop_token stop) { control_worker_loop(stop); });
     for (size_t i = 0; i < execution_limits_.metadata_workers; ++i)
         metadata_workers_.emplace_back(
             [this](std::stop_token stop) { metadata_worker_loop(stop); });
@@ -3080,9 +3117,9 @@ void RpcServer::stop() {
     std::vector<std::function<void(const RpcMessage&)>> dropped;
     {
         DiagnosticLock lock(request_mutex_, "rpc.server.queue");
-        for (auto* requests : {&fast_control_requests_, &control_requests_, &foreground_requests_,
-                               &read_ahead_requests_, &speculative_requests_,
-                               &metadata_requests_}) {
+        for (auto* requests :
+             {&fast_control_requests_, &control_requests_, &foreground_requests_,
+              &read_ahead_requests_, &speculative_requests_, &metadata_requests_}) {
             for (auto& job : *requests) {
                 if (job.reply)
                     dropped.push_back(job.reply);
@@ -3126,8 +3163,7 @@ void RpcServer::accept_loop(std::stop_token stop) {
         size_t pre_auth = pre_auth_sessions_.load(std::memory_order_relaxed);
         while (pre_auth < max_pre_auth_sessions &&
                !pre_auth_sessions_.compare_exchange_weak(
-                   pre_auth, pre_auth + 1, std::memory_order_acq_rel,
-                   std::memory_order_relaxed)) {
+                   pre_auth, pre_auth + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
         }
         if (pre_auth >= max_pre_auth_sessions) {
             ::shutdown(client, SHUT_RDWR);
@@ -3155,16 +3191,14 @@ void RpcServer::accept_loop(std::stop_token stop) {
                 sessions_.push_back(session);
                 registered = true;
             }
-            session->reader = std::jthread([this, raw = session.get()](std::stop_token) {
-                session_loop(raw);
-            });
+            session->reader =
+                std::jthread([this, raw = session.get()](std::stop_token) { session_loop(raw); });
         } catch (...) {
             pre_auth_sessions_.fetch_sub(1, std::memory_order_acq_rel);
             if (registered) {
                 std::lock_guard lock(sessions_mutex_);
-                std::erase_if(sessions_, [&](const auto& candidate) {
-                    return candidate == session;
-                });
+                std::erase_if(sessions_,
+                              [&](const auto& candidate) { return candidate == session; });
             }
             if (!channel_owns_client) {
                 ::shutdown(client, SHUT_RDWR);
@@ -3191,9 +3225,8 @@ void RpcServer::session_loop(Session* session) {
             std::shared_ptr<Session> shared;
             {
                 std::lock_guard sessions_lock(sessions_mutex_);
-                auto found = std::find_if(sessions_.begin(), sessions_.end(), [&](const auto& item) {
-                    return item.get() == session;
-                });
+                auto found = std::find_if(sessions_.begin(), sessions_.end(),
+                                          [&](const auto& item) { return item.get() == session; });
                 if (found != sessions_.end())
                     shared = *found;
             }
@@ -3240,14 +3273,15 @@ void RpcServer::session_loop(Session* session) {
                   " remote=" + session->remote_host + " advertised=" + session->peer.host + ':' +
                   std::to_string(session->peer.port));
         while (true) {
-            auto fragment = session->channel->receive_fragment([session](uint64_t request_id, size_t) {
-                if (!request_id || (request_id & 1U))
-                    return;
-                DiagnosticLock lock(session->pending_mutex, "rpc.session.pending");
-                auto found = session->pending.find(request_id);
-                if (found != session->pending.end())
-                    found->second->last_progress_ns.store(steady_ns());
-            });
+            auto fragment =
+                session->channel->receive_fragment([session](uint64_t request_id, size_t) {
+                    if (!request_id || (request_id & 1U))
+                        return;
+                    DiagnosticLock lock(session->pending_mutex, "rpc.session.pending");
+                    auto found = session->pending.find(request_id);
+                    if (found != session->pending.end())
+                        found->second->last_progress_ns.store(steady_ns());
+                });
             auto frame = assembler.push(std::move(fragment));
             if (!frame)
                 continue;
@@ -3298,10 +3332,9 @@ void RpcServer::session_loop(Session* session) {
                 std::shared_ptr<Session> shared;
                 {
                     std::lock_guard sessions_lock(sessions_mutex_);
-                    auto found = std::find_if(sessions_.begin(), sessions_.end(),
-                                              [&](const auto& item) {
-                                                  return item.get() == session;
-                                              });
+                    auto found =
+                        std::find_if(sessions_.begin(), sessions_.end(),
+                                     [&](const auto& item) { return item.get() == session; });
                     if (found != sessions_.end())
                         shared = *found;
                 }
@@ -3313,8 +3346,8 @@ void RpcServer::session_loop(Session* session) {
                 }
             }
             if (!queued) {
-                (void)session->queue_message(request_id, frame_type,
-                                             {MessageType::error, {}}, true);
+                (void)session->queue_message(request_id, frame_type, {MessageType::error, {}},
+                                             true);
                 continue;
             }
             request_cv_.notify_all();
@@ -3346,15 +3379,27 @@ void RpcServer::execute(RequestJob job) {
     }
 
     const auto execute_started = Clock::now();
-    const auto queue_ms = elapsed_ms(job.queued_at);
+    const auto queue_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(execute_started - job.queued_at)
+            .count());
+    const auto queue_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(execute_started - job.queued_at)
+            .count());
+    auto handler_finished = execute_started;
+    bool handler_completed = false;
     try {
         auto reply = handler_(job.peer, job.frame.frame_type, job.frame.message);
+        handler_finished = Clock::now();
+        handler_completed = true;
         if (job.reply) {
             job.reply(reply);
         } else if (job.session) {
-            (void)job.session->queue_message(job.frame.request_id, job.frame.frame_type, reply, true);
+            (void)job.session->queue_message(job.frame.request_id, job.frame.frame_type, reply,
+                                             true);
         }
     } catch (const std::exception& error) {
+        if (!handler_completed)
+            handler_finished = Clock::now();
         Log::debug(std::string("RPC handler: ") + error.what());
         if (job.reply) {
             try {
@@ -3370,13 +3415,36 @@ void RpcServer::execute(RequestJob job) {
         }
     }
 
-    const auto handler_ms = elapsed_ms(execute_started);
+    const auto handler_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(handler_finished - execute_started)
+            .count());
+    const auto handler_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(handler_finished - execute_started)
+            .count());
+    auto record_timing = [&](AtomicTiming& timing) {
+        timing.requests.fetch_add(1, std::memory_order_relaxed);
+        timing.queue_wait_us_total.fetch_add(queue_us, std::memory_order_relaxed);
+        timing.handler_us_total.fetch_add(handler_us, std::memory_order_relaxed);
+        auto update_max = [](std::atomic_uint64_t& target, uint64_t value) {
+            auto current = target.load(std::memory_order_relaxed);
+            while (current < value &&
+                   !target.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
+            }
+        };
+        update_max(timing.queue_wait_us_max, queue_us);
+        update_max(timing.handler_us_max, handler_us);
+    };
+    const auto frame_index = static_cast<size_t>(job.frame.frame_type);
+    if (frame_index < frame_timings_.size())
+        record_timing(frame_timings_[frame_index]);
+    const auto message_index = static_cast<size_t>(job.frame.message.type);
+    if (message_index < message_timings_.size())
+        record_timing(message_timings_[message_index]);
     if ((queue_ms >= 25 || handler_ms >= 50) && Log::enabled(LogLevel::all)) {
         Log::trace("DIAG rpc-server peer=" + to_string(job.peer.id).substr(0, 12) +
                    " frame=" + frame_type_name(job.frame.frame_type) +
-                   " message=" + message_type_name(job.frame.message.type) +
-                   " queue_wait_ms=" + std::to_string(queue_ms) +
-                   " handler_ms=" + std::to_string(handler_ms));
+                   " message=" + message_type_name(job.frame.message.type) + " queue_wait_ms=" +
+                   std::to_string(queue_ms) + " handler_ms=" + std::to_string(handler_ms));
     }
 
     if (job.session) {
@@ -3392,9 +3460,8 @@ void RpcServer::fast_control_worker_loop(std::stop_token stop) {
         RequestJob job;
         {
             std::unique_lock lock(request_mutex_);
-            request_cv_.wait(lock, [&] {
-                return stop.stop_requested() || !fast_control_requests_.empty();
-            });
+            request_cv_.wait(
+                lock, [&] { return stop.stop_requested() || !fast_control_requests_.empty(); });
             if (stop.stop_requested() && fast_control_requests_.empty())
                 return;
             job = std::move(fast_control_requests_.front());
@@ -3411,9 +3478,8 @@ void RpcServer::control_worker_loop(std::stop_token stop) {
         RequestJob job;
         {
             std::unique_lock lock(request_mutex_);
-            request_cv_.wait(lock, [&] {
-                return stop.stop_requested() || !control_requests_.empty();
-            });
+            request_cv_.wait(lock,
+                             [&] { return stop.stop_requested() || !control_requests_.empty(); });
             if (stop.stop_requested() && control_requests_.empty())
                 return;
             job = std::move(control_requests_.front());
@@ -3441,10 +3507,11 @@ void RpcServer::metadata_worker_loop(std::stop_token stop) {
             });
             if (stop.stop_requested() && metadata_requests_.empty())
                 return;
-            auto ready = std::find_if(metadata_requests_.begin(), metadata_requests_.end(),
-                                      [&](const RequestJob& candidate) {
-                                          return !metadata_active_peers_.contains(candidate.peer.id);
-                                      });
+            auto ready =
+                std::find_if(metadata_requests_.begin(), metadata_requests_.end(),
+                             [&](const RequestJob& candidate) {
+                                 return !metadata_active_peers_.contains(candidate.peer.id);
+                             });
             if (ready == metadata_requests_.end())
                 continue;
             job = std::move(*ready);
@@ -3474,6 +3541,25 @@ RpcServerWorkStats RpcServer::work_stats() const {
     }
     out.metadata_active_jobs = active_metadata_requests_.load(std::memory_order_relaxed);
     out.metadata_rejected_jobs = rejected_metadata_requests_.load(std::memory_order_relaxed);
+    auto snapshot_timing = [](const AtomicTiming& timing) {
+        return RpcServerWorkStats::Timing{
+            timing.requests.load(std::memory_order_relaxed),
+            timing.queue_wait_us_total.load(std::memory_order_relaxed),
+            timing.queue_wait_us_max.load(std::memory_order_relaxed),
+            timing.handler_us_total.load(std::memory_order_relaxed),
+            timing.handler_us_max.load(std::memory_order_relaxed),
+        };
+    };
+    for (size_t index = 1; index < frame_timings_.size(); ++index) {
+        auto timing = snapshot_timing(frame_timings_[index]);
+        if (timing.requests)
+            out.frame_timings.emplace(static_cast<FrameType>(index), timing);
+    }
+    for (size_t index = 1; index < message_timings_.size(); ++index) {
+        auto timing = snapshot_timing(message_timings_[index]);
+        if (timing.requests)
+            out.message_timings.emplace(static_cast<MessageType>(index), timing);
+    }
     return out;
 }
 

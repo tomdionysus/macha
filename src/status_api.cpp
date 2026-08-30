@@ -41,8 +41,19 @@ void merge_membership(PersistedNodeStatus& out, const NodeInfo& member) {
 }
 
 Json bytes_pair(uint64_t used, uint64_t capacity) {
-    return Json::Object{{"capacity_bytes", capacity}, {"used_bytes", used},
+    return Json::Object{{"capacity_bytes", capacity},
+                        {"used_bytes", used},
                         {"free_bytes", capacity > used ? capacity - used : 0}};
+}
+
+Json rpc_timing_json(const RpcServerWorkStats::Timing& timing) {
+    return Json::Object{
+        {"requests", timing.requests},
+        {"queue_wait_us_total", timing.queue_wait_us_total},
+        {"queue_wait_us_max", timing.queue_wait_us_max},
+        {"handler_us_total", timing.handler_us_total},
+        {"handler_us_max", timing.handler_us_max},
+    };
 }
 
 Json endpoint_json(const Endpoint& endpoint, std::string_view source = {}) {
@@ -61,10 +72,10 @@ Json public_connectivity_json(const PublicConnectivityStatus& status) {
     upnp["mapping_created"] = status.upnp.mapping_created;
     upnp["mapping_owned"] = status.upnp.mapping_owned;
     upnp["private_wan"] = status.upnp.private_wan;
-    upnp["lan_address"] = status.upnp.lan_address.empty() ? Json(nullptr) : Json(status.upnp.lan_address);
-    upnp["external_address"] = status.upnp.external_address.empty()
-                                    ? Json(nullptr)
-                                    : Json(status.upnp.external_address);
+    upnp["lan_address"] =
+        status.upnp.lan_address.empty() ? Json(nullptr) : Json(status.upnp.lan_address);
+    upnp["external_address"] =
+        status.upnp.external_address.empty() ? Json(nullptr) : Json(status.upnp.external_address);
     upnp["internal_port"] = static_cast<uint64_t>(status.upnp.internal_port);
     upnp["external_port"] = static_cast<uint64_t>(status.upnp.external_port);
     upnp["lease_seconds"] = static_cast<uint64_t>(status.upnp.lease_seconds);
@@ -74,17 +85,16 @@ Json public_connectivity_json(const PublicConnectivityStatus& status) {
     Json::Object external_ip;
     external_ip["enabled"] = status.external_ip.enabled;
     external_ip["attempted"] = status.external_ip.attempted;
-    external_ip["address"] = status.external_ip.address.empty()
-                                 ? Json(nullptr)
-                                 : Json(status.external_ip.address);
-    external_ip["error"] = status.external_ip.error.empty()
-                               ? Json(nullptr)
-                               : Json(status.external_ip.error);
+    external_ip["address"] =
+        status.external_ip.address.empty() ? Json(nullptr) : Json(status.external_ip.address);
+    external_ip["error"] =
+        status.external_ip.error.empty() ? Json(nullptr) : Json(status.external_ip.error);
 
     Json::Object check;
     check["enabled"] = status.check_enabled;
     check["self_probe"] = status.self_probe;
-    check["error"] = status.self_probe_error.empty() ? Json(nullptr) : Json(status.self_probe_error);
+    check["error"] =
+        status.self_probe_error.empty() ? Json(nullptr) : Json(status.self_probe_error);
     check["checked_at_unix_ms"] = status.checked_unix_ms;
     // A same-node TCP connect is a NAT loopback diagnostic, not proof that an
     // arbitrary Internet host can reach the advertised endpoint. A future peer
@@ -105,9 +115,8 @@ Json identity_reset_json(const IdentityAssociationReset& reset) {
     out["scope"] = identity_reset_key(reset.host, reset.port);
     out["host"] = reset.host;
     out["port"] = reset.port ? Json(static_cast<uint64_t>(reset.port)) : Json(nullptr);
-    out["stale_node_id"] = reset.stale_node_id == NodeId{}
-                               ? Json(nullptr)
-                               : Json(to_string(reset.stale_node_id));
+    out["stale_node_id"] =
+        reset.stale_node_id == NodeId{} ? Json(nullptr) : Json(to_string(reset.stale_node_id));
     out["epoch"] = reset.epoch;
     out["reset_at_unix_ms"] = reset.reset_unix_ms;
     out["reset_by_node_id"] = to_string(reset.reset_by);
@@ -128,35 +137,40 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
     node["live_age_ms"] = live ? Json(live_age_ms) : Json(nullptr);
     node["version"] = live ? live->version : durable.version;
     node["host"] = member ? member->host : (live ? live->host : durable.host);
-    node["port"] = static_cast<uint64_t>(
-        member ? member->port : (live ? live->port : durable.port));
+    node["port"] =
+        static_cast<uint64_t>(member ? member->port : (live ? live->port : durable.port));
     node["failure_domain"] =
         member ? member->failure_domain : (live ? live->failure_domain : durable.failure_domain);
-    node["metadata_generation"] = member ? member->metadata_generation
-                                           : (live ? live->metadata_generation
-                                                   : durable.metadata_generation);
+    node["metadata_generation"] =
+        member ? member->metadata_generation
+               : (live ? live->metadata_generation : durable.metadata_generation);
 
     const auto storage_capacity =
         member ? member->capacity : (live ? live->storage_capacity : durable.storage_capacity);
-    const auto storage_used = member ? member->used : (live ? live->storage_used : durable.storage_used);
+    const auto storage_used =
+        member ? member->used : (live ? live->storage_used : durable.storage_used);
     const auto cache_capacity = live ? live->cache_capacity : durable.cache_capacity;
     const auto cache_used = live ? live->cache_used : durable.cache_used;
     node["storage"] = bytes_pair(storage_used, storage_capacity);
     node["cache"] = bytes_pair(cache_used, cache_capacity);
-    node["storage_backends_online"] = static_cast<uint64_t>(
-        live ? live->storage_backends_online : durable.storage_backends_online);
+    node["storage_backends_online"] = static_cast<uint64_t>(live ? live->storage_backends_online
+                                                                 : durable.storage_backends_online);
 
     Json::Array roles;
-    if (storage_capacity) roles.emplace_back("storage");
-    if (cache_capacity) roles.emplace_back("cache");
-    if (metadata_replica) roles.emplace_back("metadata-replica");
+    if (storage_capacity)
+        roles.emplace_back("storage");
+    if (cache_capacity)
+        roles.emplace_back("cache");
+    if (metadata_replica)
+        roles.emplace_back("metadata-replica");
     node["roles"] = std::move(roles);
 
     Json::Object runtime;
     if (live && online) {
         runtime["uptime_ms"] = live->uptime_ms;
         runtime["rss_bytes"] = live->rss_bytes;
-        runtime["process_cpu_percent"] = static_cast<double>(live->process_cpu_milli_percent) / 1000.0;
+        runtime["process_cpu_percent"] =
+            static_cast<double>(live->process_cpu_milli_percent) / 1000.0;
         runtime["load1"] = static_cast<double>(live->load1_milli) / 1000.0;
         runtime["peers_known"] = static_cast<uint64_t>(live->peers_known);
         runtime["peers_active"] = static_cast<uint64_t>(live->peers_active);
@@ -298,15 +312,17 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         const auto found = live.find(id);
         const NodeTelemetry* current = found == live.end() ? nullptr : &found->second.telemetry;
         const auto member_found = members_by_id.find(id);
-        const NodeInfo* member = member_found == members_by_id.end() ? nullptr : &member_found->second;
-        const uint64_t age = found == live.end() ? 0 : static_cast<uint64_t>(found->second.age.count());
+        const NodeInfo* member =
+            member_found == members_by_id.end() ? nullptr : &member_found->second;
+        const uint64_t age =
+            found == live.end() ? 0 : static_cast<uint64_t>(found->second.age.count());
         const bool online = active_members.contains(id);
         const bool stale = current && found->second.age > fresh_for;
         const bool metadata_replica = true;
 
-        const auto storage_capacity = member ? member->capacity
-                                             : (current ? current->storage_capacity
-                                                        : durable.storage_capacity);
+        const auto storage_capacity =
+            member ? member->capacity
+                   : (current ? current->storage_capacity : durable.storage_capacity);
         const auto storage_used =
             member ? member->used : (current ? current->storage_used : durable.storage_used);
         const auto cache_capacity = current ? current->cache_capacity : durable.cache_capacity;
@@ -336,8 +352,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                 }
             }
         }
-        nodes.push_back(
-            node_json(id, durable, member, current, age, online, stale, metadata_replica, identity_reset));
+        nodes.push_back(node_json(id, durable, member, current, age, online, stale,
+                                  metadata_replica, identity_reset));
     }
 
     if (only) {
@@ -346,7 +362,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         return http_json(200, nodes.front().dump());
     }
 
-    const auto published_metadata = metadata_manager ? metadata_manager->cluster_status() : MetadataClusterStatus{};
+    const auto published_metadata =
+        metadata_manager ? metadata_manager->cluster_status() : MetadataClusterStatus{};
     const size_t metadata_replicas = known.empty() ? published_metadata.replicas : known.size();
     const size_t active_metadata_replicas = online_nodes;
     const size_t metadata_min_write_replicas = node_.config().metadata_min_write_replicas;
@@ -365,10 +382,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     } else {
         metadata_availability = MetadataAvailability::unavailable;
     }
-    const bool metadata_read_available =
-        metadata_availability != MetadataAvailability::unavailable;
-    const bool metadata_write_available =
-        metadata_availability == MetadataAvailability::writable;
+    const bool metadata_read_available = metadata_availability != MetadataAvailability::unavailable;
+    const bool metadata_write_available = metadata_availability == MetadataAvailability::writable;
 
     const auto readiness = node_.readiness();
     std::string health = "healthy";
@@ -378,9 +393,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         conditions.emplace_back("local startup recovery failed");
     } else if (!readiness.local_state_ready || !metadata_manager) {
         health = "recovering";
-        conditions.emplace_back(readiness.local_state_ready
-                                    ? "local services are starting"
-                                    : "local state is recovering");
+        conditions.emplace_back(readiness.local_state_ready ? "local services are starting"
+                                                            : "local state is recovering");
     } else if (!metadata_read_available) {
         health = "critical";
         conditions.emplace_back("metadata unavailable");
@@ -404,8 +418,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     cluster["conditions"] = std::move(conditions);
     cluster["nodes_known"] = static_cast<uint64_t>(known.size());
     cluster["nodes_online"] = static_cast<uint64_t>(online_nodes);
-    cluster["metadata_generation"] = metadata_generation ? metadata_generation
-                                                        : published_metadata.generation;
+    cluster["metadata_generation"] =
+        metadata_generation ? metadata_generation : published_metadata.generation;
     cluster["metadata_replicas"] = static_cast<uint64_t>(metadata_replicas);
     cluster["metadata_replicas_online"] = static_cast<uint64_t>(active_metadata_replicas);
     cluster["metadata_min_write_replicas"] = static_cast<uint64_t>(metadata_min_write_replicas);
@@ -421,16 +435,19 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     cluster["metadata_replica_set_validated"] = published_metadata.stable;
     cluster["metadata_quorum_validated"] = published_metadata.stable; // deprecated alias
     cluster["metadata_replica_set_validated_at_unix_ms"] = published_metadata.observed_unix_ms;
-    cluster["metadata_quorum_validated_at_unix_ms"] = published_metadata.observed_unix_ms; // deprecated alias
+    cluster["metadata_quorum_validated_at_unix_ms"] =
+        published_metadata.observed_unix_ms; // deprecated alias
     cluster["storage_known"] = bytes_pair(known_used, known_capacity);
     cluster["storage_online"] = bytes_pair(online_used, online_capacity);
     cluster["cache_known"] = bytes_pair(known_cache_used, known_cache_capacity);
     cluster["cache_online"] = bytes_pair(online_cache_used, online_cache_capacity);
 
     Json::Object startup;
-    startup["phase"] = readiness.failed ? "failed" :
-                           (readiness.local_state_ready && metadata_manager ? "ready" :
-                            (readiness.control_plane_online ? "recovering" : "starting"));
+    startup["phase"] = readiness.failed
+                           ? "failed"
+                           : (readiness.local_state_ready && metadata_manager
+                                  ? "ready"
+                                  : (readiness.control_plane_online ? "recovering" : "starting"));
     startup["control_plane"] = readiness.control_plane_online ? "ready" : "starting";
     startup["api"] = "ready";
     startup["data_storage"] = readiness.data_storage_ready ? "ready" : "recovering";
@@ -440,7 +457,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     startup["metadata"] = readiness.metadata_ready ? "ready" : "recovering";
     startup["services"] = metadata_manager ? "ready" : "recovering";
     startup["started_at_unix_ms"] = readiness.started_unix_ms;
-    startup["ready_at_unix_ms"] = readiness.ready_unix_ms ? Json(readiness.ready_unix_ms) : Json(nullptr);
+    startup["ready_at_unix_ms"] =
+        readiness.ready_unix_ms ? Json(readiness.ready_unix_ms) : Json(nullptr);
     startup["error"] = readiness.error.empty() ? Json(nullptr) : Json(readiness.error);
 
     Json::Object root;
@@ -448,6 +466,48 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     root["startup"] = std::move(startup);
     root["nodes"] = std::move(nodes);
     root["connectivity"] = public_connectivity_json(node_.public_connectivity_status());
+
+    // Process-lifetime aggregate diagnostics are read directly from local
+    // atomics. They create no sampling loop, persistence work, or gossip load.
+    Json::Object diagnostics;
+    Json::Object metadata_diagnostics;
+    metadata_diagnostics["available"] = readiness.metadata_ready;
+    if (readiness.metadata_ready) {
+        const auto values = node_.metadata_replica().diagnostics();
+        metadata_diagnostics["historical_requests"] = values.historical_requests;
+        metadata_diagnostics["historical_reconstructions"] = values.historical_reconstructions;
+        metadata_diagnostics["historical_deltas_applied"] = values.historical_deltas_applied;
+        metadata_diagnostics["materialization_cache_hits"] = values.materialization_cache_hits;
+        metadata_diagnostics["materialization_cache_misses"] = values.materialization_cache_misses;
+        metadata_diagnostics["materialization_cache_evictions"] =
+            values.materialization_cache_evictions;
+        metadata_diagnostics["materialization_cache_entries"] =
+            static_cast<uint64_t>(values.materialization_cache_entries);
+        metadata_diagnostics["accepted_head_persistence_writes"] =
+            values.accepted_head_persistence_writes;
+        metadata_diagnostics["accepted_head_persistence_bytes"] =
+            values.accepted_head_persistence_bytes;
+        metadata_diagnostics["accepted_head_persistence_failures"] =
+            values.accepted_head_persistence_failures;
+    }
+    diagnostics["metadata"] = std::move(metadata_diagnostics);
+
+    const auto rpc = node_.rpc_server_work_stats();
+    Json::Object rpc_diagnostics;
+    rpc_diagnostics["metadata_pending_jobs"] = static_cast<uint64_t>(rpc.metadata_pending_jobs);
+    rpc_diagnostics["metadata_pending_bytes"] = static_cast<uint64_t>(rpc.metadata_pending_bytes);
+    rpc_diagnostics["metadata_active_jobs"] = static_cast<uint64_t>(rpc.metadata_active_jobs);
+    rpc_diagnostics["metadata_rejected_jobs"] = rpc.metadata_rejected_jobs;
+    Json::Object frame_timings;
+    for (const auto& [frame, timing] : rpc.frame_timings)
+        frame_timings[frame_type_name(frame)] = rpc_timing_json(timing);
+    rpc_diagnostics["frame_timings"] = std::move(frame_timings);
+    Json::Object message_timings;
+    for (const auto& [message, timing] : rpc.message_timings)
+        message_timings[message_type_name(message)] = rpc_timing_json(timing);
+    rpc_diagnostics["message_timings"] = std::move(message_timings);
+    diagnostics["rpc_server"] = std::move(rpc_diagnostics);
+    root["diagnostics"] = std::move(diagnostics);
     root["generated_at_unix_ms"] = unix_ms();
     return http_json(200, Json(std::move(root)).dump());
 }

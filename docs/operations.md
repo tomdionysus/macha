@@ -68,6 +68,13 @@ startup removes only a mount identified as Macha before any service startup, ver
 
 Preserve the FUSE spool/journal when diagnosing recovery errors. A missing journal-referenced byte range is a data-safety fault.
 
+Recovery publication is event-driven. The worker drains compatible operations
+in bounded ordered batches (by default at most 256 operations and 256 KiB of
+encoded operation data), publishes the largest valid prefix, and groups journal
+durability markers. It does not need a periodic maintenance scan. Rename and
+unsafe mixed-operation dependency chains remain singleton boundaries until
+their durable batch identity is defined and crash-tested.
+
 ## Memory monitoring
 
 Metadata mutation is designed to avoid namespace-sized copy amplification, but memory is still an operational signal. On Linux, a useful sampler is:
@@ -93,6 +100,21 @@ Repeated recovery/catalogue mutation should not produce monotonic namespace-size
 `DEBUG` logs show placement, metadata write-floor, catalogue and maintenance state without the per-object volume of `ALL`. `ALL` is intended for targeted tracing and can be expensive on active systems.
 
 A DATA failure should be diagnosed as placement/admission/durability; a metadata failure as metadata/control write-floor durability. Keeping those failure domains distinct is intentional and should be preserved in logs and tooling.
+
+`GET /api/v1/status` includes local, process-lifetime aggregate diagnostics
+under `diagnostics`:
+
+- `metadata` reports historical reconstruction/cache totals and accepted-head
+  persistence writes, encoded bytes, and failures;
+- `rpc_server` reports current metadata queue jobs/bytes, active and rejected
+  jobs, plus request count, total/max queue wait, and total/max handler time in
+  microseconds, grouped by wire message and frame class.
+
+These are bounded counters, not a request history. Reading them does not start
+a sampler, publish metadata, or add gossip traffic. Derive an interval rate or
+average from differences between two status samples; a process restart resets
+the totals. A rejected metadata request increments the rejection counter but is
+not counted as executed handler work.
 
 ## RPC execution isolation
 

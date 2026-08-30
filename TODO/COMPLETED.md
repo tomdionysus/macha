@@ -95,7 +95,32 @@ Phase 3 repository-wide checkpoint: `sh run-tests.sh build` passed the complete 
 - [x] Prewarmed acceptance-policy materializations outside the replica lock and moved accepted-head public reconstruction onto the off-lock path.
 - [x] Documented the closed fast-control allow-list (`ping` and `members` on CONTROL frames only), its handler constraints, and the proof required before extending it.
 - [x] Fixed the event-driven follow-up edge exposed by the complete suite: a coalesced convergence run which leaves one follow-up pending now continues immediately without requiring an unrelated external wake, while disconnected settled maintenance remains parked.
+- [x] Performed the Phase 4 three-node recovery UAT: a paused third replica missed a 65-operation workload, the surviving pair remained writable and responsive, the resumed replica converged to the identical 64-entry namespace, and all nodes returned to sleeping idle at the same generation without RPC churn.
 
-Evidence: [Phase 4 bounded metadata RPC executor](2026-08-30-phase-4-bounded-metadata-rpc-executor.md)
+Evidence: [Phase 4 bounded metadata RPC executor](2026-08-30-phase-4-bounded-metadata-rpc-executor.md) and [Phase 4 three-node recovery UAT](2026-08-30-phase-4-three-node-recovery-uat.md)
 
 Verification: the 27-test `storage_metadata` suite passed; the strengthened cold-chain test proved one reconstruction for eight concurrent callers; and the lagging-third test proved a bounded transfer peak in `(1, 8]`. The first repository-wide run correctly exposed the lost follow-up wake in `hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`; after correcting that scheduler edge, the catalogue burst and disconnected-idle regressions passed explicitly. The final repository-wide run passed the default suite 203/203 plus runtime dependencies 3/3, including both catalogue burst/search/artwork/GC regressions and the lagging-third recovery test.
+
+## Phase 5: bounded operational diagnostics
+
+- [x] Added accepted-head persistence write, byte, and failure counters with
+  success recorded only after durable replacement completes.
+- [x] Added fixed-size atomic RPC execution timing summaries by message and
+  frame class, including count and total/max queue and handler microseconds.
+- [x] Exposed local aggregates through Status without a sampler, polling loop,
+  per-request history, metadata mutation, or gossip expansion.
+- [x] Added deterministic metadata, RPC isolation/backpressure, and Status API
+  assertions for the new diagnostics.
+- [x] Documented bounded FUSE recovery batching, shared metadata
+  materialization, metadata RPC isolation, and operational interpretation of
+  the new counters.
+- [x] Observed and retained one initial catalogue-burst suite timeout; the
+  immediate isolated run passed, and a second complete run passed 203/203.
+  Runtime dependencies passed 3/3.
+- [x] After formatting and rebuilding, explicitly passed the 1,000-operation
+  FUSE recovery test, lagging-third multi-node RPC recovery test, and catalogue
+  sync/search/artwork/GC regression.
+- [x] Verified the final handler-only timing implementation with the complete
+  `rpc_cluster` group, 34/34.
+
+Evidence: [Phase 5 operational diagnostics](2026-08-30-phase-5-operational-diagnostics.md)
