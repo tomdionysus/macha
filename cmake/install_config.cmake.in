@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+set(macha_config_file "$ENV{DESTDIR}@MACHA_CONFIG_FILE@")
+set(macha_config_example "$ENV{DESTDIR}@MACHA_CONFIG_EXAMPLE@")
+
+if(NOT EXISTS "${macha_config_file}")
+    execute_process(
+        COMMAND "@CMAKE_COMMAND@" -E copy "${macha_config_example}" "${macha_config_file}"
+        RESULT_VARIABLE macha_copy_result)
+    if(NOT macha_copy_result EQUAL 0)
+        message(FATAL_ERROR "Could not create initial Macha configuration: ${macha_config_file}")
+    endif()
+    file(CHMOD "${macha_config_file}"
+         PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
+    message(STATUS "Created initial Macha configuration: @MACHA_CONFIG_FILE@")
+else()
+    message(STATUS "Preserved existing Macha configuration: @MACHA_CONFIG_FILE@")
+endif()
+
+message(STATUS "")
+message(STATUS "============================================================")
+message(STATUS "Macha configuration: @MACHA_CONFIG_FILE@")
+message(STATUS "Configuration example: @MACHA_CONFIG_EXAMPLE@")
+message(STATUS "Edit the configuration and create its referenced paths/key")
+if("@MACHA_INSTALL_SYSTEMD@")
+    message(STATUS "Then run: systemctl daemon-reload")
+    message(STATUS "          systemctl enable --now macha.service")
+endif()
+message(STATUS "============================================================")
+message(STATUS "")

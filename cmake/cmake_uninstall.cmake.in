@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+set(macha_manifest "@CMAKE_CURRENT_BINARY_DIR@/install_manifest.txt")
+if(NOT EXISTS "${macha_manifest}")
+    message(FATAL_ERROR "Install manifest not found: ${macha_manifest}")
+endif()
+
+file(STRINGS "${macha_manifest}" macha_installed_files)
+list(REVERSE macha_installed_files)
+foreach(macha_installed_file IN LISTS macha_installed_files)
+    set(macha_target "$ENV{DESTDIR}${macha_installed_file}")
+    if(IS_SYMLINK "${macha_target}" OR EXISTS "${macha_target}")
+        message(STATUS "Removing ${macha_target}")
+        file(REMOVE "${macha_target}")
+    else()
+        message(STATUS "Already absent: ${macha_target}")
+    endif()
+endforeach()
+
+# The generated operator configuration is deliberately not part of the install
+# manifest, so uninstall and upgrades cannot erase local policy or secrets.
+message(STATUS "Preserved configuration: $ENV{DESTDIR}@MACHA_CONFIG_FILE@")
+message(STATUS "Preserved state, cache, spool, keys, mounts, and media data")
+if("@MACHA_INSTALL_SYSTEMD@")
+    message(STATUS "Run 'systemctl daemon-reload' to refresh systemd")
+endif()

@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.20.0 LANGUAGES CXX)
+project(macha VERSION 0.21.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,6 +20,12 @@ option(MACHA_ENABLE_FUSE "Build the FUSE mount adapter when available" ON)
 option(MACHA_BUILD_TESTS "Build tests" ON)
 option(MACHA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(MACHA_TEST_COVERAGE "Instrument the backend test build for source/branch coverage" OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(MACHA_INSTALL_SYSTEMD_DEFAULT ON)
+else()
+    set(MACHA_INSTALL_SYSTEMD_DEFAULT OFF)
+endif()
+option(MACHA_INSTALL_SYSTEMD "Install the systemd service unit" ${MACHA_INSTALL_SYSTEMD_DEFAULT})
 
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(Threads REQUIRED)
@@ -367,16 +373,68 @@ if(MACHA_BUILD_TESTS)
 endif()
 
 include(GNUInstallDirs)
+
+if(MACHA_INSTALL_SYSTEMD)
+    set(MACHA_CONFIG_INSTALL_DIR_DEFAULT "/etc/macha")
+else()
+    set(MACHA_CONFIG_INSTALL_DIR_DEFAULT "${CMAKE_INSTALL_SYSCONFDIR}/macha")
+endif()
+set(MACHA_CONFIG_INSTALL_DIR "${MACHA_CONFIG_INSTALL_DIR_DEFAULT}" CACHE STRING
+    "Directory containing the installed Macha configuration")
+set(MACHA_SYSTEMD_UNIT_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/systemd/system" CACHE STRING
+    "Directory containing installed systemd system units")
+
+function(macha_full_install_path output path)
+    if(IS_ABSOLUTE "${path}")
+        set(${output} "${path}" PARENT_SCOPE)
+    else()
+        set(${output} "${CMAKE_INSTALL_PREFIX}/${path}" PARENT_SCOPE)
+    endif()
+endfunction()
+
+macha_full_install_path(MACHA_INSTALL_BINDIR "${CMAKE_INSTALL_BINDIR}")
+macha_full_install_path(MACHA_CONFIG_DIR "${MACHA_CONFIG_INSTALL_DIR}")
+macha_full_install_path(MACHA_SYSTEMD_UNIT_DIR "${MACHA_SYSTEMD_UNIT_INSTALL_DIR}")
+set(MACHA_CONFIG_FILE "${MACHA_CONFIG_DIR}/macha.yaml")
+set(MACHA_CONFIG_EXAMPLE "${MACHA_CONFIG_DIR}/macha.yaml.example")
+
 if(TARGET macha)
     install(TARGETS macha RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
-install(FILES systemd/macha.service DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system OPTIONAL)
+
+if(MACHA_INSTALL_SYSTEMD)
+    if(NOT UNIX)
+        message(FATAL_ERROR "MACHA_INSTALL_SYSTEMD requires a Unix-like target")
+    endif()
+    configure_file(systemd/macha.service
+                   ${CMAKE_CURRENT_BINARY_DIR}/generated/systemd/macha.service @ONLY)
+    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/generated/systemd/macha.service
+            DESTINATION ${MACHA_SYSTEMD_UNIT_INSTALL_DIR})
+endif()
+
+install(FILES macha.yaml.example
+        DESTINATION ${MACHA_CONFIG_INSTALL_DIR})
+configure_file(cmake/install_config.cmake.in
+               ${CMAKE_CURRENT_BINARY_DIR}/generated/install_config.cmake @ONLY)
+install(SCRIPT ${CMAKE_CURRENT_BINARY_DIR}/generated/install_config.cmake)
+
 install(FILES README.md ARCHITECTURE.md SECURITY.md CHANGELOG.md CONTRIBUTING.md LICENSE
         DESTINATION ${CMAKE_INSTALL_DOCDIR})
 install(DIRECTORY docs/ DESTINATION ${CMAKE_INSTALL_DOCDIR}/docs)
-install(FILES systemd/macha.conf.example macha.yaml.example
+install(FILES macha.yaml.example
         DESTINATION ${CMAKE_INSTALL_DOCDIR}/examples OPTIONAL)
 if(APPLE)
     install(FILES macos/macha.plist.example
             DESTINATION ${CMAKE_INSTALL_DOCDIR}/examples OPTIONAL)
+endif()
+
+configure_file(cmake/cmake_uninstall.cmake.in
+               ${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake @ONLY)
+add_custom_target(uninstall
+    COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake
+    COMMENT "Uninstall Macha (configuration and runtime data are preserved)")
+
+message(STATUS "Macha configuration file: ${MACHA_CONFIG_FILE}")
+if(MACHA_INSTALL_SYSTEMD)
+    message(STATUS "Macha systemd unit: ${MACHA_SYSTEMD_UNIT_DIR}/macha.service")
 endif()

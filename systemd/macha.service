@@ -1,16 +1,19 @@
 [Unit]
-Description=Macha
+Description=Macha distributed filesystem and media server
+Documentation=file://@CMAKE_INSTALL_FULL_DOCDIR@/README.md
 After=network-online.target
 Wants=network-online.target
+ConditionPathExists=@MACHA_CONFIG_FILE@
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/macha
-ExecStart=/usr/local/bin/macha $MACHA_ARGS
-ExecReload=/bin/kill -HUP $MAINPID
+ExecStart=@MACHA_INSTALL_BINDIR@/macha --config @MACHA_CONFIG_FILE@
 Restart=on-failure
 RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=60
 LimitNOFILE=65536
+UMask=0027
 
 [Install]
 WantedBy=multi-user.target

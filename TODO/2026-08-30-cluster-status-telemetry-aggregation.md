@@ -84,10 +84,11 @@ also finished 206/207 and reproduced the same assertion at 10.415 seconds.
 This is now a repeatable concurrent-suite failure, despite the fast isolated
 pass, and must be diagnosed rather than dismissed as incidental timing noise.
 
-## Deployment/UAT boundary
+## Deployment/UAT result
 
-After deploying all nodes, query only one Status endpoint after the cluster has
-connected. Every connected node should have live numeric storage, cache, and
-backend telemetry, and complete online aggregates should be available. Repeat
-from a second endpoint to test the opposite canonical route distribution, not
-because clients are required to fan out.
+The deployed three-node UAT passed from all three endpoints. Every independent
+response contained all three connected nodes with live numeric storage,
+cache, and backend telemetry; online and known aggregates were complete and
+identical. The cluster was healthy and writable at generation 1487.
+
+Evidence: [Cluster Status telemetry aggregation UAT](2026-08-30-cluster-status-telemetry-aggregation-uat.md)

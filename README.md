@@ -43,6 +43,46 @@ See [Storage](docs/storage.md) and [Durability](docs/durability.md) for the prec
 
 The complete configuration example is [`macha.yaml.example`](macha.yaml.example).
 
+## Linux installation
+
+Configure a system-wide build with an explicit prefix, then use the generated
+Make targets:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+cmake --build build
+sudo make -C build install
+```
+
+On Linux this installs the executable, a `macha.service` systemd unit, the
+documentation, and an initial configuration. The installer prints the exact
+paths prominently; with the `/usr` prefix above the configuration is:
+
+```text
+/etc/macha/macha.yaml
+```
+
+The initial file is copied from `macha.yaml.example` only when it does not
+already exist. Reinstalling or upgrading never overwrites operator changes.
+Edit it, create the referenced storage/cache/state/spool paths and cluster key,
+then enable the service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now macha.service
+```
+
+Remove installed binaries, documentation, examples, and the unit with:
+
+```bash
+sudo systemctl disable --now macha.service
+sudo make -C build uninstall
+```
+
+Uninstall deliberately preserves `/etc/macha/macha.yaml`, keys, state, cache,
+spool, mounts, and media data. The uninstall target prints the preserved
+configuration path and reminds the operator to reload systemd.
+
 Developed with substantial use of AI-assisted implementation.
 
 GPL-3.0-or-later. See [`LICENSE`](LICENSE).

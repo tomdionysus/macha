@@ -283,3 +283,40 @@ Evidence: [Combined Status availability and repeated-burst UAT](2026-08-30-combi
   test timing out at 10.415 seconds.
 
 Evidence: [Cluster Status telemetry aggregation correction](2026-08-30-cluster-status-telemetry-aggregation.md)
+
+## Cluster Status telemetry aggregation UAT
+
+- [x] Queried each of the three deployed Status endpoints independently and
+  confirmed that every single response contained all three connected nodes.
+- [x] Verified every node was live with numeric storage/cache/backend telemetry
+  and that all endpoints returned identical available online/known aggregates.
+- [x] Verified the cluster was healthy and writable at generation 1487, all
+  convergence demand was drained, and all metadata executor queues were empty.
+- [x] Confirmed deployed telemetry notifications were executing under the
+  speculative RPC class in both canonical route distributions.
+
+Evidence: [Cluster Status telemetry aggregation UAT](2026-08-30-cluster-status-telemetry-aggregation-uat.md)
+
+## Linux systemd install and uninstall targets
+
+- [x] Added a Linux-default systemd install with binary, unit, configuration,
+  example, and documentation paths derived consistently from CMake settings.
+- [x] Added first-install-only creation of `/etc/macha/macha.yaml`; upgrades
+  preserve operator changes and clearly print the operational config path.
+- [x] Added a manifest-based `make uninstall` target which removes managed
+  artifacts while deliberately preserving configuration, keys, state, cache,
+  spool, mounts, and media data.
+- [x] Replaced the legacy EnvironmentFile indirection with a direct generated
+  `ExecStart` and documented service enable/disable/reload steps.
+- [x] Verified a staged `/usr` install, both generated unit paths, complete
+  uninstall, configuration preservation, and checksum-stable reinstall.
+
+Evidence: [Linux systemd install and uninstall targets](2026-08-30-linux-systemd-install.md)
+
+## Version 0.21.0
+
+- [x] Bumped the project minor version from 0.20.0 to 0.21.0 across CMake,
+  generated server metadata, the release heading, and shipped configuration and
+  legacy systemd-wrapper examples.
+- [x] Reconfigured and rebuilt every target successfully; generated
+  `kServerVersion` is `0.21.0`, and runtime dependencies passed 3/3.
