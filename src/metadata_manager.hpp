@@ -102,7 +102,8 @@ class MetadataManager {
     MetadataRecord maybe_reconfigure(const MetadataRecord&);
     MetadataRecord read_record_uncached();
     MetadataRecord cache_record(const MetadataRecord&);
-    MetadataRecord cache_record(const MetadataRecord&, std::shared_ptr<MetadataSnapshot> decoded);
+    MetadataRecord cache_record(const MetadataRecord&,
+                                std::shared_ptr<const MetadataSnapshot> decoded);
     std::optional<MetadataRecord> cached_record();
     std::optional<MetadataSnapshotView> cached_snapshot_view();
     bool import_history_from_peer(const NodeInfo&, const Hash256&, FrameType);

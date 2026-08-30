@@ -67,6 +67,14 @@ struct FuseFrontendStatus {
     uint64_t backend_failures{};
     uint64_t durability_batches{};
     uint64_t durability_writes{};
+    uint64_t namespace_operations_admitted{};
+    uint64_t namespace_operations_recovered{};
+    uint64_t namespace_publication_attempts{};
+    uint64_t namespace_operations_published{};
+    uint64_t namespace_operations_confirmed{};
+    uint64_t journal_append_batches{};
+    uint64_t journal_records_appended{};
+    uint64_t journal_durability_barriers{};
 };
 
 struct FuseDirtyRange {

@@ -1591,8 +1591,14 @@ MetadataSnapshotView FileSystem::local_snapshot_view() {
         local_snapshot_hash_ != record.hash) {
         local_snapshot_generation_ = record.generation;
         local_snapshot_hash_ = record.hash;
-        local_snapshot_cache_ =
-            std::make_shared<const MetadataSnapshot>(decode_snapshot(record.payload));
+        if (auto materialized = n_.metadata_replica().materialized(record.hash);
+            materialized && materialized->record.generation == record.generation &&
+            materialized->record.payload == record.payload) {
+            local_snapshot_cache_ = materialized->snapshot;
+        } else {
+            local_snapshot_cache_ =
+                std::make_shared<const MetadataSnapshot>(decode_snapshot(record.payload));
+        }
     }
     return MetadataSnapshotView{record.generation, 0, record.hash, local_snapshot_cache_};
 }
