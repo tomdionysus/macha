@@ -85,8 +85,10 @@ void log_slow_stage(std::string_view stage, Clock::time_point started,
 }
 } // namespace
 
-Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook startup_stage_hook)
-    : node_(std::move(config), keys, std::move(startup_stage_hook)), cluster_status_(node_) {
+Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook startup_stage_hook,
+                 MaintenanceStageHook maintenance_stage_hook)
+    : node_(std::move(config), keys, std::move(startup_stage_hook)), cluster_status_(node_),
+      maintenance_stage_hook_(std::move(maintenance_stage_hook)) {
     if (node_.config().catalogue.api.enabled) {
         catalogue_http_ = std::make_unique<HttpServer>(
             node_.config().catalogue.api,
@@ -610,6 +612,8 @@ void Service::loop(std::stop_token stop) {
                         } else {
                         const auto stage = Clock::now();
                         try {
+                    if (maintenance_stage_hook_)
+                        maintenance_stage_hook_("metadata-repair-begin");
                     metadata_->repair_once();
                     metadata_->note_replica_validation(true);
                     metadata_dirty = metadata_convergence_.complete(*convergence_run);
@@ -665,6 +669,8 @@ void Service::loop(std::stop_token stop) {
                 (catalogue_retry_due == Clock::time_point{} || now >= catalogue_retry_due)) {
                 const auto stage = Clock::now();
                 try {
+                    if (maintenance_stage_hook_)
+                        maintenance_stage_hook_("catalogue-repair-begin");
                     catalogue_->repair_once();
                     catalogue_dirty = catalogue_->refresh_needed();
                     catalogue_retry_due = Clock::time_point{};
@@ -1100,6 +1106,42 @@ void Service::loop(std::stop_token stop) {
             if (message != "metadata durable replica set unavailable; reconciliation may be required" &&
                 message != "metadata write durability floor unavailable")
                 Log::debug("maintenance: " + std::string(message));
+        }
+
+        if (gc_due_this_pass && !busy) {
+            // An immature tombstone is concrete future work, not a reason for a
+            // maintenance cadence. Once a GC pass has evaluated the final
+            // accepted inventory, arm one exact steady-clock wake for its
+            // earliest wall-clock retirement deadline. Without this, the
+            // protected object makes the physical sweep look quiescent and it
+            // can sleep forever unless an unrelated event happens after grace.
+            const auto grace_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      policy.garbage_grace)
+                                      .count();
+            const auto wall_now_ns = wall_time_ns();
+            std::optional<std::chrono::nanoseconds> earliest_remaining;
+            for (const auto& candidate : maintenance_garbage_) {
+                if (candidate.retired_at_ns <= 0 || grace_ns <= 0)
+                    continue;
+                int64_t remaining_ns{};
+                if (wall_now_ns < candidate.retired_at_ns) {
+                    const auto until_retirement = candidate.retired_at_ns - wall_now_ns;
+                    remaining_ns = until_retirement >
+                                           std::numeric_limits<int64_t>::max() - grace_ns
+                        ? std::numeric_limits<int64_t>::max()
+                        : until_retirement + grace_ns;
+                } else {
+                    const auto elapsed = wall_now_ns - candidate.retired_at_ns;
+                    if (elapsed >= grace_ns)
+                        continue;
+                    remaining_ns = grace_ns - elapsed;
+                }
+                const auto remaining = std::chrono::nanoseconds(remaining_ns);
+                if (!earliest_remaining || remaining < *earliest_remaining)
+                    earliest_remaining = remaining;
+            }
+            if (earliest_remaining)
+                gc_quiescent_until = Clock::now() + *earliest_remaining;
         }
 
         cpu_reporter.tick();

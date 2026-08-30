@@ -94,6 +94,7 @@ class NodeRuntime {
 
     std::atomic_uint64_t remote_metadata_generation_{};
     std::atomic_uint64_t remote_metadata_epoch_{};
+    std::atomic_uint64_t metadata_announcements_{};
     std::atomic_uint64_t telemetry_storage_used_{};
     std::atomic_uint64_t telemetry_storage_capacity_{};
     std::atomic_uint64_t telemetry_metadata_generation_{};
@@ -185,6 +186,9 @@ class NodeRuntime {
     std::chrono::milliseconds activity_idle_for(FrameType) const;
     uint64_t remote_metadata_generation() const { return remote_metadata_generation_.load(); }
     uint64_t remote_metadata_epoch() const { return remote_metadata_epoch_.load(std::memory_order_acquire); }
+    uint64_t metadata_announcements() const {
+        return metadata_announcements_.load(std::memory_order_acquire);
+    }
     uint64_t known_metadata_generation() const {
         const auto local = ready(ready_metadata) ? metadata_replica().generation() : 0;
         const auto remote = remote_metadata_generation_.load();

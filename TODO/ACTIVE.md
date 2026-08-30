@@ -1,0 +1,72 @@
+# Active tasks and concepts to explore
+
+Last updated: 2026-08-30
+
+This is the working backlog for the current session. Add new work here. When an item is implemented and its stated verification is complete, remove it from this file and add a dated entry with evidence to `COMPLETED.md`.
+
+The existing documents in this directory remain the detailed plans, checkpoints, and UAT records. This file is only the current index.
+
+## Next: complete Phase 3 convergence coalescing
+
+- [ ] Run a three-node active-burst UAT after the integrated work: check bounded convergence runs, final state agreement, RPC responsiveness, and return to the already-proven idle state.
+
+## Phase 1 materialization follow-up
+
+- [ ] Avoid encoding every intermediate snapshot solely to traverse a delta chain; encode only when commit-identity validation requires it.
+- [ ] Move reconstruction, decoding, encoding, and hashing outside the main `MetadataReplica` mutex.
+- [ ] Install calculated materializations through a short lock/CAS-style validation step.
+- [ ] Deduplicate concurrent requests for the same uncached hash so waiters share one computation.
+- [ ] Add deterministic concurrent-request coverage proving one materialization.
+- [ ] Add explicit corrupt-delta coverage proving the cache cannot make invalid history valid.
+- [ ] Complete the edge-case audit for merge commits, same-generation siblings, recovery-required state, policy transitions, corrupt history, and eviction.
+
+## Phase 2 namespace batching follow-up
+
+- [ ] Design a durable batch identity that permits dependency chains such as create/rename/unlink to share a publication without weakening restart proof.
+- [ ] Test mixed create/rename/unlink dependencies within a batch and across batch boundaries after that identity exists.
+- [ ] Decide whether each published prefix member needs an explicit in-memory association with its accepted commit hash/generation.
+- [ ] Preserve rename as a safe singleton boundary until the durable mixed-operation design and crash matrix are complete.
+
+## Phase 4: isolate long metadata work from critical RPC service
+
+- [ ] Introduce a dedicated bounded executor for history import, commit storage, and acceptance.
+- [ ] Keep wire reading, frame assembly, basic validation, ping, and membership independent of metadata execution.
+- [ ] Return RPC replies asynchronously after queued metadata work completes.
+- [ ] Bound metadata queues by job count and bytes and apply explicit backpressure.
+- [ ] Coalesce or pipeline consecutive linear commits from one peer where correctness permits.
+- [ ] Reserve foreground capacity so metadata recovery cannot exhaust object/filesystem service lanes.
+- [ ] Define safe peer-disconnect, cancellation, and shutdown behaviour before and after durability boundaries.
+- [ ] Remove filesystem I/O, fsync, reconstruction, and large encoding from global metadata critical sections.
+- [ ] Document which RPC messages may execute on fast-control workers.
+- [ ] Add deterministic tests for slow acceptance versus ping/membership, foreground capacity, bounded backpressure, disconnect states, and shutdown with queued work.
+
+## Diagnostics and operational proof still needed
+
+- [ ] Add accepted-head persistence counters.
+- [ ] Add RPC queue-time and handler-time summaries by message and frame class.
+- [ ] Record a reproducible local benchmark recipe without default-suite timing thresholds.
+- [ ] Measure a larger or repeated namespace burst to establish whether materialization-cache RSS reaches a stable ceiling.
+- [ ] After all implementation phases, rerun the complete default and runtime suites, heavy FUSE/RPC recovery coverage, and `hydration_catalogue/test_catalogue_sync_search_and_artwork_gc` explicitly.
+- [ ] Compare final operational counters: operations per generation, materializations and deltas per head, journal barriers, convergence runs, RPC latency, CPU, RSS, and deletion throughput.
+- [ ] Confirm physical-object GC remains deliberately rate-limited and operationally distinct from namespace publication completion.
+- [ ] Update `docs/durability.md`, `docs/metadata.md`, and `docs/operations.md` with the final batching, recovery, convergence, and RPC-isolation semantics.
+
+## Separate known issue
+
+- [ ] Diagnose and correct faulty torrent/ingest behaviour. Pausing the torrent removed the local node's residual CPU during Phase 3 idle UAT. Treat this as a separate subsystem investigation so it does not obscure metadata/convergence measurements.
+
+## Deferred architectural concepts
+
+- [ ] Consider delta-native commit identity based on parent identity, canonical delta, and a state-tree root instead of a fully serialized namespace payload.
+- [ ] Consider a persistent or copy-on-write namespace tree with incremental subtree hashing.
+- [ ] If either protocol-level design proceeds, define rolling-upgrade negotiation, checkpoint/anchor migration, and independent corruption validation first.
+
+## Additional investigation
+
+- [ ] Investigate whether ingest from the spool has performance problems unrelated to the namespace batching and convergence work currently in progress.
+- [ ] Replace the spool's hard-coded 16 GiB capacity limit with a documented, validated configuration setting and a safe default preserving current behaviour.
+- [ ] Design occupancy-aware spool admission backpressure that also tracks sustained publication/drain throughput. Admission should be fast while capacity is readily available, progressively slow as occupancy approaches the configured limit, and never admit data beyond the durable capacity bound.
+- [ ] Define the backpressure policy precisely, including measurement windows, high/low watermarks or hysteresis, minimum progress, fairness between writers, restart behaviour, and behaviour when publishing stalls or the cluster becomes unwritable.
+- [ ] Ensure throttling blocks or paces the ingesting FUSE requests without polling, busy-waiting, unbounded buffering, or consuming critical RPC/control threads.
+- [ ] Add deterministic tests for configurable capacity, occupancy accounting, progressive throttling, recovery as the spool drains, a completely stalled publisher, multiple concurrent writers, restart near capacity, and enforcement of the hard upper bound.
+- [ ] Run an rsync-style mounted-FUSE UAT: initial writes should run quickly, throughput should progressively approach sustainable publication speed as the spool fills, occupancy should remain bounded, and write speed should recover cleanly after the backlog drains.

@@ -1296,6 +1296,375 @@ MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_write_floor) {
     s1.stop();
 }
 
+MACHA_TEST("rpc_cluster", test_service_metadata_repair_coalesces_real_generation_burst) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+
+    auto c1 = config_for(cluster.path() / "coalesced-repair-n1", cluster.keyfile(), p1,
+                         {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "coalesced-repair-n2", cluster.keyfile(), p2,
+                         {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 2;
+    c1.min_write_replicas = c2.min_write_replicas = 1;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = false;
+    c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
+    c1.ingest.enabled = c2.ingest.enabled = false;
+    c1.torrent.enabled = c2.torrent.enabled = false;
+
+    TestGate repair_gate;
+    std::atomic_bool gate_repair{};
+    std::atomic_bool gate_once{};
+    Service s1(c1, keys, {}, [&](std::string_view stage) {
+        if (stage == "metadata-repair-begin" &&
+            gate_repair.load(std::memory_order_acquire) &&
+            !gate_once.exchange(true, std::memory_order_acq_rel)) {
+            repair_gate.enter_and_wait();
+        }
+    });
+    Service s2(c2, keys);
+    struct GateOpener {
+        TestGate& gate;
+        ~GateOpener() { gate.open(); }
+    } open_on_exit{repair_gate};
+
+    s1.start();
+    s2.start();
+    (void)s1.filesystem();
+    (void)s2.filesystem();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }));
+    REQUIRE(wait_until([&] {
+        const auto d1 = s1.metadata_convergence_diagnostics();
+        const auto d2 = s2.metadata_convergence_diagnostics();
+        return s1.node().metadata_replica().committed_generation() > 1 &&
+               s1.node().metadata_replica().committed_generation() ==
+                   s2.node().metadata_replica().committed_generation() &&
+               !d1.scheduled && d1.runs_scheduled == d1.runs_completed &&
+               !d2.scheduled && d2.runs_scheduled == d2.runs_completed;
+    }, 10s));
+
+    const auto before = s1.metadata_convergence_diagnostics();
+    const auto baseline_generation =
+        s2.node().metadata_replica().committed_generation();
+    const auto announcements_before = s2.node().metadata_announcements();
+    gate_repair.store(true, std::memory_order_release);
+
+    s2.filesystem().mkdir("/coalesced-0", 0755, getuid(), getgid());
+    REQUIRE(repair_gate.wait_for_entries(1, 5s));
+    const auto claimed = s1.metadata_convergence_diagnostics();
+    CHECK(claimed.runs_scheduled == before.runs_scheduled + 1);
+    CHECK(claimed.runs_completed == before.runs_completed);
+
+    constexpr size_t burst = 32;
+    for (size_t i = 1; i <= burst; ++i) {
+        s2.filesystem().mkdir("/coalesced-" + std::to_string(i),
+                              0755, getuid(), getgid());
+    }
+    const auto final_generation =
+        s2.node().metadata_replica().committed_generation();
+    CHECK(final_generation == baseline_generation + burst + 1);
+    REQUIRE(wait_until([&] {
+        return s1.node().known_metadata_generation() >= final_generation;
+    }, 5s));
+    REQUIRE(wait_until([&] {
+        return s1.metadata_convergence_diagnostics().latest_generation == final_generation;
+    }, 5s));
+    CHECK(s2.node().metadata_announcements() == announcements_before + burst + 1);
+
+    const auto gated = s1.metadata_convergence_diagnostics();
+    CHECK(gated.events_received > claimed.events_received);
+    CHECK(gated.latest_generation == final_generation);
+    CHECK(gated.runs_scheduled == before.runs_scheduled + 1);
+    CHECK(gated.runs_completed == before.runs_completed);
+
+    repair_gate.open();
+    REQUIRE(wait_until([&] {
+        const auto diagnostics = s1.metadata_convergence_diagnostics();
+        return !diagnostics.scheduled &&
+               diagnostics.runs_completed == before.runs_completed + 2 &&
+               s1.node().metadata_replica().committed_generation() == final_generation;
+    }, 10s));
+
+    const auto settled = s1.metadata_convergence_diagnostics();
+    CHECK(settled.runs_scheduled == before.runs_scheduled + 2);
+    CHECK(settled.runs_completed == before.runs_completed + 2);
+    CHECK(settled.completed_epoch == settled.requested_epoch);
+    CHECK(!settled.scheduled);
+    CHECK(s1.filesystem().getattr("/coalesced-32").type == EntryType::directory);
+
+    s2.stop();
+    s1.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_reconciliation) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+
+    auto c1 = config_for(cluster.path() / "sibling-notice-n1", cluster.keyfile(), p1,
+                         {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "sibling-notice-n2", cluster.keyfile(), p2,
+                         {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 2;
+    c1.min_write_replicas = c2.min_write_replicas = 1;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = false;
+    c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
+    c1.ingest.enabled = c2.ingest.enabled = false;
+    c1.torrent.enabled = c2.torrent.enabled = false;
+
+    TestGate repair_gate1;
+    TestGate repair_gate2;
+    std::atomic_bool gate_repairs{};
+    std::atomic_bool gate_once1{};
+    std::atomic_bool gate_once2{};
+    Service s1(c1, keys, {}, [&](std::string_view stage) {
+        if (stage == "metadata-repair-begin" &&
+            gate_repairs.load(std::memory_order_acquire) &&
+            !gate_once1.exchange(true, std::memory_order_acq_rel)) {
+            repair_gate1.enter_and_wait();
+        }
+    });
+    Service s2(c2, keys, {}, [&](std::string_view stage) {
+        if (stage == "metadata-repair-begin" &&
+            gate_repairs.load(std::memory_order_acquire) &&
+            !gate_once2.exchange(true, std::memory_order_acq_rel)) {
+            repair_gate2.enter_and_wait();
+        }
+    });
+    struct GateOpener {
+        TestGate& first;
+        TestGate& second;
+        ~GateOpener() {
+            first.open();
+            second.open();
+        }
+    } open_on_exit{repair_gate1, repair_gate2};
+
+    s1.start();
+    s2.start();
+    (void)s1.filesystem();
+    (void)s2.filesystem();
+    REQUIRE(wait_until([&] {
+        const auto d1 = s1.metadata_convergence_diagnostics();
+        const auto d2 = s2.metadata_convergence_diagnostics();
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2 &&
+               s1.node().metadata_replica().committed_generation() > 1 &&
+               s1.node().metadata_replica().committed().hash ==
+                   s2.node().metadata_replica().committed().hash &&
+               !d1.scheduled && d1.runs_scheduled == d1.runs_completed &&
+               !d2.scheduled && d2.runs_scheduled == d2.runs_completed;
+    }, 10s));
+
+    const auto base = s1.node().metadata_replica().committed();
+    auto make_sibling = [&](NodeRuntime& node, const std::string& path) {
+        auto snapshot = decode_snapshot(base.payload);
+        FsEntry entry;
+        entry.type = EntryType::directory;
+        entry.mode = 0755;
+        entry.uid = getuid();
+        entry.gid = getgid();
+        snapshot.entries[path] = entry;
+        ++snapshot.mutation_sequences[node.node_id()];
+
+        MetadataRecord sibling;
+        sibling.generation = base.generation + 1;
+        sibling.previous = base.hash;
+        sibling.payload = encode_snapshot(snapshot);
+        sibling.hash = metadata_hash(sibling.generation, sibling.previous,
+                                     sibling.payload);
+        REQUIRE(node.metadata_replica().store_commit(sibling));
+        MetadataAcceptance acceptance;
+        acceptance.generation = sibling.generation;
+        acceptance.hash = sibling.hash;
+        acceptance.required = 1;
+        acceptance.replicas = {node.node_id()};
+        REQUIRE(node.accept_metadata_commit(acceptance));
+        return sibling;
+    };
+
+    gate_repairs.store(true, std::memory_order_release);
+    const auto left = make_sibling(s1.node(), "/left-sibling");
+    REQUIRE(repair_gate1.wait_for_entries(1, 5s));
+    REQUIRE(repair_gate2.wait_for_entries(1, 5s));
+
+    // Prime node 1's remote generation to the sibling generation. The next
+    // notice therefore carries no numeric advance; its only new information is
+    // that node 2's accepted-head topology changed at the same generation.
+    s2.node().announce_metadata_generation(left.generation);
+    REQUIRE(wait_until([&] {
+        return s1.node().remote_metadata_generation() == left.generation;
+    }, 5s));
+    const auto before_sibling_notice = s1.metadata_convergence_diagnostics();
+
+    const auto right = make_sibling(s2.node(), "/right-sibling");
+    REQUIRE(right.generation == left.generation);
+    REQUIRE(right.hash != left.hash);
+    REQUIRE(wait_until([&] {
+        return s1.metadata_convergence_diagnostics().requested_epoch >
+               before_sibling_notice.requested_epoch;
+    }, 2s));
+
+    // Installing identical acceptance evidence changes no accepted-head
+    // topology and must therefore produce neither a local event nor a remote
+    // rebroadcast.
+    std::this_thread::sleep_for(100ms);
+    const auto before_duplicate1 = s1.metadata_convergence_diagnostics();
+    const auto before_duplicate2 = s2.metadata_convergence_diagnostics();
+    const auto announcements_before_duplicate = s2.node().metadata_announcements();
+    MetadataAcceptance duplicate;
+    duplicate.generation = right.generation;
+    duplicate.hash = right.hash;
+    duplicate.required = 1;
+    duplicate.replicas = {s2.node().node_id()};
+    REQUIRE(s2.node().accept_metadata_commit(duplicate));
+    CHECK(s2.node().metadata_announcements() == announcements_before_duplicate);
+    std::this_thread::sleep_for(100ms);
+    CHECK(s1.metadata_convergence_diagnostics().requested_epoch ==
+          before_duplicate1.requested_epoch);
+    CHECK(s2.metadata_convergence_diagnostics().requested_epoch ==
+          before_duplicate2.requested_epoch);
+
+    repair_gate1.open();
+    REQUIRE(wait_until([&] {
+        try {
+            const auto heads = s1.node().metadata_replica().accepted_heads();
+            return heads.size() == 1 && heads.front().generation > left.generation &&
+                   s1.filesystem().getattr("/left-sibling").type == EntryType::directory &&
+                   s1.filesystem().getattr("/right-sibling").type == EntryType::directory;
+        } catch (...) {
+            return false;
+        }
+    }, 10s));
+
+    repair_gate2.open();
+    REQUIRE(wait_until([&] {
+        try {
+            return s2.node().metadata_replica().accepted_heads().size() == 1 &&
+                   s2.filesystem().getattr("/left-sibling").type == EntryType::directory &&
+                   s2.filesystem().getattr("/right-sibling").type == EntryType::directory;
+        } catch (...) {
+            return false;
+        }
+    }, 10s));
+
+    s2.stop();
+    s1.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_bounded_runs) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    const auto p3 = free_port();
+
+    auto peers = [&](uint16_t self) {
+        std::vector<Endpoint> out;
+        for (const auto port : {p1, p2, p3})
+            if (port != self)
+                out.push_back({"127.0.0.1", port});
+        return out;
+    };
+    auto c1 = config_for(cluster.path() / "lagging-burst-n1", cluster.keyfile(), p1,
+                         peers(p1));
+    auto c2 = config_for(cluster.path() / "lagging-burst-n2", cluster.keyfile(), p2,
+                         peers(p2));
+    auto c3 = config_for(cluster.path() / "lagging-burst-n3", cluster.keyfile(), p3,
+                         peers(p3));
+    for (auto* config : {&c1, &c2, &c3}) {
+        config->replication = 3;
+        config->min_write_replicas = 1;
+        config->metadata_min_write_replicas = 2;
+        config->heartbeat = 50ms;
+        config->dead_after = 200ms;
+        config->catalogue.scanner.enabled = false;
+        config->catalogue.api.enabled = false;
+        config->ingest.enabled = false;
+        config->torrent.enabled = false;
+    }
+
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    auto s3 = std::make_unique<Service>(c3, keys);
+    s1.start();
+    s2.start();
+    s3->start();
+    (void)s1.filesystem();
+    (void)s2.filesystem();
+    (void)s3->filesystem();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() == 3 &&
+               s2.node().membership().active().size() == 3 &&
+               s3->node().membership().active().size() == 3;
+    }, 10s));
+
+    s1.filesystem().mkdir("/lagging-base", 0755, getuid(), getgid());
+    REQUIRE(wait_until([&] {
+        try {
+            return s3->filesystem().getattr("/lagging-base").type == EntryType::directory;
+        } catch (...) {
+            return false;
+        }
+    }, 10s));
+    const auto base = s3->node().metadata_replica().committed();
+
+    s3->stop();
+    s3.reset();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() == 2 &&
+               s2.node().membership().active().size() == 2;
+    }, 5s));
+
+    constexpr size_t burst = 64;
+    for (size_t index = 0; index < burst; ++index) {
+        s1.filesystem().mkdir("/lagging-burst-" + std::to_string(index),
+                              0755, getuid(), getgid());
+    }
+    const auto final = s1.node().metadata_replica().committed();
+    CHECK(final.generation == base.generation + burst);
+    REQUIRE(wait_until([&] {
+        return s2.node().metadata_replica().committed().hash == final.hash;
+    }, 10s));
+
+    s3 = std::make_unique<Service>(c3, keys);
+    s3->start();
+    (void)s3->filesystem();
+    REQUIRE(wait_until([&] {
+        try {
+            const auto diagnostics = s3->metadata_convergence_diagnostics();
+            return s3->node().metadata_replica().committed().hash == final.hash &&
+                   s3->filesystem().getattr("/lagging-burst-63").type ==
+                       EntryType::directory &&
+                   !diagnostics.scheduled &&
+                   diagnostics.runs_scheduled == diagnostics.runs_completed;
+        } catch (...) {
+            return false;
+        }
+    }, 15s));
+
+    const auto diagnostics = s3->metadata_convergence_diagnostics();
+    CHECK(diagnostics.runs_scheduled <= 4);
+    CHECK(diagnostics.runs_completed <= 4);
+    CHECK(diagnostics.runs_completed < burst);
+    const auto heads = s3->node().metadata_replica().accepted_heads();
+    REQUIRE(heads.size() == 1);
+    CHECK(heads.front().hash == final.hash);
+    CHECK(s3->node().metadata_replica().history_contains(final.hash));
+    CHECK(s3->node().metadata_replica().history_is_ancestor(base.hash, final.hash));
+
+    s3->stop();
+    s2.stop();
+    s1.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_before_acceptance) {
     TestCluster cluster;
     const auto& keys = cluster.keys();

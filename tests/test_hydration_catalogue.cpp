@@ -3076,4 +3076,148 @@ MACHA_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_gc) {
     s1.stop();
 }
 
+MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesced_metadata_burst) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+
+    auto c1 = config_for(cluster.path() / "catalogue-burst-n1", cluster.keyfile(), p1,
+                         {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "catalogue-burst-n2", cluster.keyfile(), p2,
+                         {{"127.0.0.1", p1}});
+    for (auto* config : {&c1, &c2}) {
+        config->replication = 1;
+        config->metadata_min_write_replicas = 1;
+        config->maintenance.garbage_grace = 0ms;
+        config->maintenance.foreground_quiet = 10ms;
+        config->maintenance.no_progress_backoff = 500ms;
+        config->catalogue.scanner.enabled = false;
+        config->catalogue.api.enabled = false;
+        config->ingest.enabled = false;
+        config->torrent.enabled = false;
+    }
+
+    TestGate metadata_gate;
+    std::atomic_bool gate_metadata{};
+    std::atomic_bool gate_once{};
+    std::atomic_uint64_t catalogue_repairs{};
+    Service s1(c1, keys, {}, [&](std::string_view stage) {
+        if (stage == "metadata-repair-begin" &&
+            gate_metadata.load(std::memory_order_acquire) &&
+            !gate_once.exchange(true, std::memory_order_acq_rel)) {
+            metadata_gate.enter_and_wait();
+        } else if (stage == "catalogue-repair-begin") {
+            catalogue_repairs.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    Service s2(c2, keys);
+    struct GateOpener {
+        TestGate& gate;
+        ~GateOpener() { gate.open(); }
+    } open_on_exit{metadata_gate};
+
+    s1.start();
+    s2.start();
+    (void)s1.filesystem();
+    (void)s2.filesystem();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }));
+
+    CatalogueItem item;
+    item.id = "movie:coalesced-catalogue";
+    item.kind = CatalogueKind::movie;
+    item.title = "Initial Catalogue Title";
+    item = s2.catalogue().upsert(item);
+    auto initial_bytes = pattern(32 * 1024 + 11, 41);
+    auto initial_art = s2.catalogue().put_artwork(
+        item.id, "poster", "image/jpeg", initial_bytes, item.revision);
+    item = *s2.catalogue().get(item.id);
+
+    REQUIRE(wait_until([&] {
+        try {
+            const auto found = s1.catalogue().get(item.id);
+            return found && found->title == "Initial Catalogue Title" &&
+                   !s1.catalogue().search("initial catalogue").empty();
+        } catch (...) {
+            return false;
+        }
+    }, 10s));
+    REQUIRE(wait_until([&] {
+        const auto d = s1.metadata_convergence_diagnostics();
+        return !d.scheduled && d.runs_scheduled == d.runs_completed;
+    }, 5s));
+
+    const auto repairs_before = catalogue_repairs.load(std::memory_order_acquire);
+    const auto convergence_before = s1.metadata_convergence_diagnostics();
+    gate_metadata.store(true, std::memory_order_release);
+
+    item.title = "Intermediate Catalogue Title";
+    item = s2.catalogue().upsert(item, item.revision);
+    REQUIRE(metadata_gate.wait_for_entries(1, 5s));
+
+    std::vector<ObjectId> superseded{initial_art.id};
+    for (uint8_t index = 1; index <= 4; ++index) {
+        item = *s2.catalogue().get(item.id);
+        item.title = index == 4 ? "Final Catalogue Title"
+                                : "Intermediate Catalogue Title " + std::to_string(index);
+        item = s2.catalogue().upsert(item, item.revision);
+        auto bytes = pattern(32 * 1024 + index, static_cast<uint8_t>(41 + index));
+        auto art = s2.catalogue().put_artwork(
+            item.id, "poster", "image/jpeg", bytes, item.revision);
+        if (index < 4)
+            superseded.push_back(art.id);
+        else {
+            initial_bytes = std::move(bytes);
+            initial_art = art;
+        }
+    }
+    const auto final_generation =
+        s2.node().metadata_replica().committed_generation();
+    REQUIRE(wait_until([&] {
+        return s1.node().known_metadata_generation() >= final_generation;
+    }, 5s));
+    CHECK(catalogue_repairs.load(std::memory_order_acquire) == repairs_before);
+
+    metadata_gate.open();
+    REQUIRE(wait_until([&] {
+        try {
+            const auto status = s1.catalogue().status();
+            const auto found = s1.catalogue().get(item.id);
+            return status.metadata_generation == final_generation && found &&
+                   found->title == "Final Catalogue Title" &&
+                   std::any_of(found->artwork.begin(), found->artwork.end(),
+                               [&](const CatalogueArtwork& art) {
+                                   return art.id == initial_art.id;
+                               });
+        } catch (...) {
+            return false;
+        }
+    }, 10s));
+
+    const auto final_search = s1.catalogue().search("final catalogue");
+    REQUIRE(!final_search.empty());
+    CHECK(final_search.front().id == item.id);
+    CHECK(s1.catalogue().search("intermediate catalogue").empty());
+    const auto final_artwork = s1.catalogue().artwork(initial_art.id);
+    REQUIRE(final_artwork.has_value());
+    CHECK(final_artwork->bytes == initial_bytes);
+
+    const auto convergence_after = s1.metadata_convergence_diagnostics();
+    CHECK(convergence_after.runs_scheduled == convergence_before.runs_scheduled + 2);
+    CHECK(convergence_after.runs_completed == convergence_before.runs_completed + 2);
+    CHECK(catalogue_repairs.load(std::memory_order_acquire) == repairs_before + 1);
+
+    REQUIRE(wait_until([&] {
+        return std::none_of(superseded.begin(), superseded.end(), [&](const ObjectId& id) {
+            return s1.node().local_store().has(id) || s2.node().local_store().has(id);
+        });
+    }, 12s));
+
+    s2.stop();
+    s1.stop();
+}
+
 } // namespace

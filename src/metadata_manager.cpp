@@ -535,6 +535,9 @@ bool MetadataManager::store_commit_on(const NodeInfo& owner,
 bool MetadataManager::accept_commit_on(const NodeInfo& owner,
                                        const MetadataAcceptance& acceptance,
                                        FrameType frame_type) {
+    // NodeRuntime owns accepted-head change detection and notification for the
+    // local path. Do not add a second publication-level announcement after
+    // this returns: repeated evidence is intentionally a no-op there.
     if (owner.id == node_.node_id())
         return node_.accept_metadata_commit(acceptance);
     try {
@@ -646,12 +649,6 @@ MetadataManager::PublishedCommit MetadataManager::publish_commit(
         throw std::runtime_error("local metadata acceptance persistence failed");
     if (accepted < required)
         throw MetadataNotReady("metadata acceptance certificate durability floor unavailable");
-
-    // Local publications do not pass through the RPC acceptance handler, so
-    // explicitly deliver the same maintenance/cache wake-up used for remote
-    // metadata notices. This is what drives catalogue convergence and the
-    // subsequent exact GC deadline without a maintenance poll loop.
-    node_.announce_metadata_generation(record.generation);
 
     return out;
 }
