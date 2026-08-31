@@ -69,3 +69,10 @@ speed, bounded occupancy, and clean speed recovery after drain.
 
 Concurrent-writer fairness and restart while already above the throttle
 threshold remain explicit follow-up tasks in `ACTIVE.md`.
+
+## 2026-08-31 aggregate-rate correction
+
+The original per-generation EMA undercounted concurrent retirement during the
+Phase 4A UAT. It has been replaced by cumulative physically retired bytes over
+one shared pressured wall-clock epoch. See
+[the aggregate retirement-rate checkpoint](2026-08-31-spool-aggregate-retirement-rate.md).

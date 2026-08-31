@@ -286,8 +286,6 @@ struct FuseFrontend::State {
         size_t operation_index{};
         uint64_t operation_offset{};
         uint64_t publication_bytes{};
-        Clock::time_point started{};
-        Clock::duration active_duration{};
         std::shared_ptr<WriteHandle> writer;
         ScopedFd replay_spool;
     };
@@ -466,9 +464,12 @@ struct FuseFrontend::State {
     std::condition_variable_any spool_admission_cv;
     Clock::time_point next_spool_admission{};
     double spool_publish_rate_bytes_per_second{};
+    SpoolRetirementRateEstimator spool_retirement_rate;
     uint64_t spool_admission_revision{};
     std::atomic_bool spool_drain_requested{};
     std::atomic_uint64_t spool_publish_rate_diagnostic{};
+    std::atomic_uint64_t spool_publish_rate_window_bytes{};
+    std::atomic_uint64_t spool_publish_rate_window_ms{};
     std::atomic_uint64_t spool_throttle_waits{};
     std::atomic_uint64_t spool_throttle_wait_ns{};
 
@@ -699,29 +700,28 @@ struct FuseFrontend::State {
         spool_bytes.store(current + bytes, std::memory_order_release);
     }
 
-    void note_spool_publication(uint64_t bytes, Clock::duration elapsed) {
-        if (!bytes || elapsed <= Clock::duration::zero())
-            return;
-        const auto seconds = std::chrono::duration<double>(elapsed).count();
-        if (seconds <= 0.0)
-            return;
-        const auto sample = static_cast<double>(bytes) / seconds;
+    void note_spool_publication_started() {
         std::lock_guard lock(spool_admission_mutex);
-        spool_publish_rate_bytes_per_second =
-            spool_publish_rate_bytes_per_second > 0.0
-                ? spool_publish_rate_bytes_per_second * 0.75 + sample * 0.25
-                : sample;
-        spool_publish_rate_diagnostic.store(
-            static_cast<uint64_t>(spool_publish_rate_bytes_per_second),
-            std::memory_order_relaxed);
-        ++spool_admission_revision;
-        spool_admission_cv.notify_all();
+        spool_retirement_rate.start(Clock::now());
     }
 
-    void release_spool_bytes(uint64_t bytes) {
+    void release_spool_bytes(uint64_t bytes, bool retired = false) {
         if (!bytes)
             return;
         std::lock_guard lock(spool_admission_mutex);
+        if (retired) {
+            if (const auto sample = spool_retirement_rate.retire(bytes, Clock::now())) {
+                spool_publish_rate_bytes_per_second = sample->bytes_per_second;
+                spool_publish_rate_diagnostic.store(
+                    static_cast<uint64_t>(spool_publish_rate_bytes_per_second),
+                    std::memory_order_relaxed);
+                spool_publish_rate_window_bytes.store(sample->bytes,
+                                                      std::memory_order_relaxed);
+                spool_publish_rate_window_ms.store(
+                    static_cast<uint64_t>(sample->elapsed.count()),
+                    std::memory_order_relaxed);
+            }
+        }
         const auto before = spool_bytes.load(std::memory_order_relaxed);
         if (before < bytes) {
             spool_bytes.store(0, std::memory_order_release);
@@ -732,6 +732,7 @@ struct FuseFrontend::State {
         if (spool_bytes.load(std::memory_order_relaxed) < spool_throttle_start()) {
             next_spool_admission = {};
             spool_drain_requested.store(false, std::memory_order_release);
+            spool_retirement_rate.reset();
         }
         ++spool_admission_revision;
         spool_admission_cv.notify_all();
@@ -1909,7 +1910,7 @@ struct FuseFrontend::State {
             }
             const auto retired_bytes = inode.spool_end;
             inode.spool_end = 0;
-            release_spool_bytes(retired_bytes);
+            release_spool_bytes(retired_bytes, true);
             return true;
         }
 
@@ -1934,7 +1935,7 @@ struct FuseFrontend::State {
         }
         inode.spool_end = 0;
         inode.spool_path.clear();
-        release_spool_bytes(retired_bytes);
+        release_spool_bytes(retired_bytes, true);
         return true;
     }
 
@@ -2442,7 +2443,7 @@ struct FuseFrontend::State {
                             ? std::numeric_limits<uint64_t>::max()
                             : publication->publication_bytes + op.length;
             }
-            publication->started = Clock::now();
+            note_spool_publication_started();
             data_publications_started.fetch_add(1, std::memory_order_relaxed);
             // The durable spool+journal is the WAL for this publication. New
             // extents may therefore be staged provisionally and group-synced
@@ -2457,7 +2458,6 @@ struct FuseFrontend::State {
             publication->initialized = true;
         }
 
-        const auto quantum_started = Clock::now();
         uint64_t served = 0;
         constexpr size_t chunk_size = spool_checksum_chunk_size;
         Bytes buffer(chunk_size);
@@ -2477,7 +2477,6 @@ struct FuseFrontend::State {
                 // which can remain ahead of newly arrived viewer demand.
                 publication->writer->drain_staging();
                 note_pipeline_peak();
-                publication->active_duration += Clock::now() - quantum_started;
                 return false;
             };
             while (publication->operation_index < snapshot.operations.size()) {
@@ -2565,11 +2564,9 @@ struct FuseFrontend::State {
                 publication->writer->commit();
                 note_pipeline_peak();
             }
-            publication->active_duration += Clock::now() - quantum_started;
             data_publications_completed.fetch_add(1, std::memory_order_relaxed);
             data_publication_bytes_committed.fetch_add(publication->publication_bytes,
                                                        std::memory_order_relaxed);
-            note_spool_publication(publication->publication_bytes, publication->active_duration);
         } catch (const FsError& e) {
             if (e.code() == ENOENT || e.code() == EAGAIN) {
                 std::lock_guard lock(inode->mutex);
@@ -4701,6 +4698,8 @@ FuseFrontendStatus FuseFrontend::status() const {
     out.spool_limit_bytes = diagnostics.spool_limit_bytes;
     out.spool_publish_rate_bytes_per_second =
         diagnostics.spool_publish_rate_bytes_per_second;
+    out.spool_publish_rate_window_bytes = diagnostics.spool_publish_rate_window_bytes;
+    out.spool_publish_rate_window_ms = diagnostics.spool_publish_rate_window_ms;
     out.spool_throttle_waits = diagnostics.spool_throttle_waits;
     out.spool_throttle_wait_ms = diagnostics.spool_throttle_wait_ms;
     return out;
@@ -4742,6 +4741,8 @@ FuseFrontendDiagnostics FuseFrontend::diagnostics() const noexcept {
         state_->spool_bytes.load(std::memory_order_relaxed),
         state_->config.max_spool_bytes,
         state_->spool_publish_rate_diagnostic.load(std::memory_order_relaxed),
+        state_->spool_publish_rate_window_bytes.load(std::memory_order_relaxed),
+        state_->spool_publish_rate_window_ms.load(std::memory_order_relaxed),
         state_->spool_throttle_waits.load(std::memory_order_relaxed),
         state_->spool_throttle_wait_ns.load(std::memory_order_relaxed) / 1000000,
     };

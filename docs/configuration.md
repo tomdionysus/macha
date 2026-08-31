@@ -136,8 +136,8 @@ new quantum and an already running publisher checks the viewer gate between
 
 FUSE spool policy is fixed when the frontend starts; changing these values
 requires a server restart. Status exposes current bytes, configured limit,
-measured publication rate, cumulative throttle waits, quantum/yield counts,
-and peak admitted publication bytes beneath
+measured publication rate, its aggregate retirement window, cumulative throttle
+waits, quantum/yield counts, and peak admitted publication bytes beneath
 `diagnostics.filesystem`.
 
 The remaining FUSE worker/timeout fields bound local kernel-facing work. They do not turn `fsync()` into a promise of cluster-wide convergence; accepted local state is made crash-recoverable first and distributed publication continues asynchronously.

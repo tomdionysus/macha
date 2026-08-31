@@ -4,6 +4,44 @@ Last updated: 2026-08-31
 
 This is the completed-work ledger for the current session. An item belongs here only after implementation and its stated verification are complete. Detailed design notes, exact test results, and UAT measurements remain in the linked records.
 
+## Aggregate spool retirement-rate estimator
+
+- [x] Replaced the per-generation throughput EMA with cumulative physically
+  retired spool bytes over one shared wall-clock epoch, so concurrent publisher
+  completions contribute their aggregate capacity.
+- [x] Kept provisional progress and failed reservation rollback out of the
+  capacity signal and reset the internal epoch below the 50% burst threshold.
+- [x] Preserved event-driven admission, hard capacity/free-space bounds,
+  occupancy hysteresis and viewer priority without adding a loop or idle worker.
+- [x] Exposed the rate-window numerator and elapsed milliseconds for operational
+  audit and added deterministic aggregate-rate plus integrated retirement tests.
+- [x] Passed filesystem/FUSE 50/50, foundations 15/15, runtime 3/3 and complete
+  default 218/218 suites, including both catalogue regressions.
+
+Evidence: [aggregate retirement-rate checkpoint](2026-08-31-spool-aggregate-retirement-rate.md)
+
+## FUSE publication Phase 4A: bounded within-file extent pipeline
+
+- [x] Added a configurable byte-bounded provisional extent pipeline for durable
+  spool publication while leaving ordinary writes synchronous.
+- [x] Preserved whole-file atomic visibility and the final aggregate durability
+  barrier by merging private extent durability evidence in order.
+- [x] Drained admitted work before every fairness/viewer yield so the pipeline
+  is the hard bound on already-running loader I/O.
+- [x] Added deterministic bound, atomicity and failure-invisibility tests plus
+  operational pipeline diagnostics.
+- [x] Passed build, new tests 2/2, filesystem/FUSE 50/50 and runtime 3/3. The
+  complete run was accurately recorded as 216/217 because the separately
+  tracked concurrent catalogue final-state test failed; it passed immediately
+  in isolation.
+- [x] Passed three-node UAT: 19.5 MiB/s over the complete observation window,
+  40.2 MiB/s in a clean loaded interval, pipeline peak exactly two, viewer read
+  gating exact, a 4 MiB direct read in 0.37 seconds, protected communications,
+  and zero failures/timeouts.
+
+Evidence: [Phase 4A implementation](2026-08-31-fuse-publication-phase-4a-extent-pipeline.md)
+and [Phase 4A UAT](2026-08-31-fuse-publication-phase-4a-uat.md)
+
 ## FUSE publication Phase 0/1: diagnostics, loader priority and fair quanta
 
 - [x] Added useful-byte, coalescing, publication, quantum/yield, admitted-byte,

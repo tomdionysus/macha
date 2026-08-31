@@ -47,12 +47,11 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   UAT evidence.
 - [ ] Execute the phased FUSE publication throughput work in
   [2026-08-31-fuse-publication-throughput-plan.md](2026-08-31-fuse-publication-throughput-plan.md).
-  Phase 0/1 diagnostics, loader priority, concurrency, fair byte quanta and real
-  viewer pre-emption are complete. Phase 4A bounded within-file extent
-  pipelining is implemented and locally verified; perform its three-node UAT
-  before moving it to `COMPLETED.md`. The pre-change measured limit was roughly
-  7.72 MiB/s aggregate synchronous extent/durability I/O with substantial host
-  I/O wait.
+  Phase 0/1 diagnostics, loader priority, concurrency, fair byte quanta, real
+  viewer pre-emption and Phase 4A bounded within-file extent pipelining are
+  complete. The Phase 4A UAT reached 19.5 MiB/s across the full observation
+  window including viewer pauses and 40.2 MiB/s in a clean loaded interval,
+  versus the pre-change 7.72 MiB/s.
 - [ ] Fix stale FUSE mount recovery ordering. Startup currently calls
   `create_directories(mount_path)` before `prepare_fuse_mountpoint()`, so a
   disconnected Macha mount returns `ENOTCONN` before
@@ -62,12 +61,19 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   safe spool-range retirement without exposing partial files.
 - [ ] Phase 3: aggregate sequential local write descriptors and make durability
   group commit byte/urgency driven.
-- [ ] Phase 4A UAT: verify the bounded within-file extent pipeline materially
-  improves useful throughput while viewer and control latency remain protected.
 - [ ] Phase 4B: replace transient per-extent tasks with a shared byte-bounded
   data executor, add per-peer/storage-domain bounds, isolate all storage waits
   from communications, and aggregate compatible physical durability barriers.
 - [ ] Phase 5: integrate continuous progress rates, occupancy hysteresis,
   concurrent-writer fairness, and authoritative catalogue hints.
+- [ ] UAT the aggregate spool retirement-rate correction documented in
+  [2026-08-31-spool-aggregate-retirement-rate.md](2026-08-31-spool-aggregate-retirement-rate.md).
+  Observe at least two retirements above 50% occupancy and verify window bytes,
+  elapsed time, admission pacing, hard-bound safety and viewer pre-emption.
+- [ ] Verify the aggregated node-status API sometimes reporting a connected
+  peer's `metadata_generation` as 0 while that peer's local API reports the
+  current generation. Recheck the previously observed alternating disk-usage
+  values at the same time and determine whether telemetry aggregation or the UI
+  is substituting a missing sample with zero.
 - [ ] Complete the final mixed-size rsync, concurrent-writer, communications,
   restart, peer-loss, and idle-soak verification matrix.
