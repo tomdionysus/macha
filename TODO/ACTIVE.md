@@ -59,9 +59,18 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   still pending, so Phase 1 is not yet complete.
 - [ ] Phase 0: add useful-byte and per-stage publication telemetry, split demand
   coalescing from real publication counts, and record physical baselines.
-- [ ] Phase 1: remove the false single-publisher cap, prioritise closed files,
+- [ ] Phase 1B: remove the false single-publisher cap, prioritise closed files,
   add fair concurrent publication with worker and byte bounds, and run the
   four-file/three-node UAT checkpoint.
+- [ ] Phase 1A: separate loader priority from crash-recovery provenance. Durable
+  spool publication remains user-requested loader work after restart and must
+  not be capped by `recovery_commit_workers`. Add an RPC loader class below
+  viewer/read-ahead and above speculative maintenance, retain recovered origin
+  only for checksum/cache/crash semantics, and test both scheduler ordering and
+  restart behaviour. Deterministic implementation is complete and documented in
+  [2026-08-31-fuse-publication-phase-1a-loader-priority.md](2026-08-31-fuse-publication-phase-1a-loader-priority.md);
+  coordinated three-node deployment/UAT remains before this item moves to
+  `COMPLETED.md`.
 - [ ] Phase 2: design and prove versioned durable incremental extent staging and
   safe spool-range retirement without exposing partial files.
 - [ ] Phase 3: aggregate sequential local write descriptors and make durability

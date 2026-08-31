@@ -81,6 +81,9 @@ enum class FrameType : uint8_t {
     foreground = 2,
     read_ahead = 3,
     speculative = 4,
+    // User-requested bulk work. Keep the existing speculative wire value
+    // stable; priority is defined by frame_type_priority(), not enum order.
+    loader = 5,
 };
 
 const char* frame_type_name(FrameType) noexcept;
@@ -378,7 +381,7 @@ class RpcServer {
     std::atomic_int listen_fd_{-1};
     uint16_t bound_port_{};
     std::jthread accept_thread_;
-    enum class RequestClass { control, foreground, read_ahead, speculative };
+    enum class RequestClass { control, foreground, read_ahead, loader, speculative };
     std::vector<std::jthread> fast_control_workers_;
     std::vector<std::jthread> control_workers_;
     std::vector<std::jthread> metadata_workers_;
@@ -390,6 +393,7 @@ class RpcServer {
     std::deque<RequestJob> metadata_requests_;
     std::deque<RequestJob> foreground_requests_;
     std::deque<RequestJob> read_ahead_requests_;
+    std::deque<RequestJob> loader_requests_;
     std::deque<RequestJob> speculative_requests_;
     RpcServerExecutionLimits execution_limits_;
     size_t metadata_request_bytes_{};
@@ -398,7 +402,7 @@ class RpcServer {
     std::atomic_uint64_t rejected_metadata_requests_{};
     // Message types occupy a small fixed wire namespace. Fixed atomic buckets
     // keep diagnostics bounded and avoid a lock or allocation on the handler path.
-    std::array<AtomicTiming, 5> frame_timings_{};
+    std::array<AtomicTiming, 6> frame_timings_{};
     std::array<AtomicTiming, 256> message_timings_{};
     size_t active_nonforeground_data_{};
     std::mutex sessions_mutex_;

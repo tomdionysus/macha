@@ -1819,7 +1819,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_idle_spool_descriptor_reopens_for_append
     }
 }
 
-MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_recovery_starts_without_new_fuse_activity) {
+MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_recovered_loader_starts_without_new_fuse_activity) {
     TestService fixture("fuse-recovery-autostart");
     auto& config = fixture.config();
     config.replication = 1;
@@ -1882,8 +1882,9 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_recovery_starts_without_new_fuse_a
         2s));
     service.filesystem().store().interactive_activity(1);
 
-    // With a recovery budget of two, both slots should become runnable immediately
-    // rather than waiting for a new rsync/getattr to kick the scheduler.
+    // Journal restoration is provenance, not a background scheduling class.
+    // The four user-requested files may use loader capacity beyond the legacy
+    // recovery budget without waiting for a new rsync/getattr to kick them.
     size_t max_recovery_active = 0;
     {
         auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
@@ -1891,16 +1892,17 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_recovery_starts_without_new_fuse_a
         while (Clock::now() < deadline) {
             const auto status = recovered->status();
             max_recovery_active = std::max(max_recovery_active, status.active_recovery_data);
-            if (max_recovery_active >= config.fuse.recovery_commit_workers)
+            if (max_recovery_active > config.fuse.recovery_commit_workers)
                 break;
             std::this_thread::sleep_for(1ms);
         }
-        REQUIRE(max_recovery_active == config.fuse.recovery_commit_workers);
+        REQUIRE(max_recovery_active > config.fuse.recovery_commit_workers);
+        CHECK(max_recovery_active <= config.fuse.commit_workers);
         recovered->stop();
     }
 }
 
-MACHA_TEST("filesystem_fuse", test_fuse_recovery_publication_concurrency_is_bounded) {
+MACHA_TEST("filesystem_fuse", test_fuse_recovered_loader_uses_loader_worker_bound) {
     TestService fixture("fuse-recovery-concurrency");
     auto& config = fixture.config();
     config.replication = 1;
@@ -1942,7 +1944,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_publication_concurrency_is_boun
         while (Clock::now() < deadline) {
             auto status = recovered->status();
             max_recovery_active = std::max(max_recovery_active, status.active_recovery_data);
-            CHECK(status.active_recovery_data <= drain.recovery_commit_workers);
+            CHECK(status.active_recovery_data <= drain.commit_workers);
             CHECK(status.pending_recovery_data <= status.pending_data);
             if (!status.pending_data && !status.active_data)
                 break;
@@ -1955,7 +1957,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_publication_concurrency_is_boun
     // At least one recovered publisher must have been observed unless the
     // complete 16-MiB backlog drained between constructor return and the first
     // status sample. Either way, final content proves the recovery path ran.
-    CHECK(max_recovery_active <= drain.recovery_commit_workers);
+    CHECK(max_recovery_active > drain.recovery_commit_workers);
+    CHECK(max_recovery_active <= drain.commit_workers);
     for (size_t i = 0; i < files; ++i) {
         auto entry = service.filesystem().getattr("/recover-" + std::to_string(i) + ".bin");
         CHECK(entry.size == payload.size());

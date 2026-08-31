@@ -466,7 +466,10 @@ struct FuseFrontend::State {
 
     struct DataQueueItem {
         std::shared_ptr<Inode> inode;
-        bool recovery{};
+        // Provenance only. Journal-restored spool remains user-requested loader
+        // work; this flag controls replay validation/cache behaviour, not its
+        // scheduler priority.
+        bool recovered{};
     };
 
     std::mutex data_queue_mutex;
@@ -1943,8 +1946,8 @@ struct FuseFrontend::State {
         }
         inode->data_queued = true;
         inode->data_deferred = false;
-        const bool recovery = inode->published_data_sequence < inode->recovery_data_sequence;
-        data_queue.push_back({inode, recovery});
+        const bool recovered = inode->published_data_sequence < inode->recovery_data_sequence;
+        data_queue.push_back({inode, recovered});
         data_cv.notify_one();
     }
 
@@ -1982,8 +1985,8 @@ struct FuseFrontend::State {
                 continue;
             inode->data_deferred = false;
             inode->data_queued = true;
-            const bool recovery = inode->published_data_sequence < inode->recovery_data_sequence;
-            data_queue.push_back({inode, recovery});
+            const bool recovered = inode->published_data_sequence < inode->recovery_data_sequence;
+            data_queue.push_back({inode, recovered});
         }
         data_cv.notify_all();
     }
@@ -2333,11 +2336,11 @@ struct FuseFrontend::State {
         data_cv.notify_all();
     }
 
-    void replay_data(const std::shared_ptr<Inode>& inode, DataSnapshot snapshot, bool recovery) {
+    void replay_data(const std::shared_ptr<Inode>& inode, DataSnapshot snapshot, bool recovered) {
         if (snapshot.operations.empty())
             return;
 
-        if (recovery) {
+        if (recovered) {
             std::optional<std::string> spool_error;
             {
                 std::lock_guard lock(inode->mutex);
@@ -2416,7 +2419,7 @@ struct FuseFrontend::State {
             // replay deliberately bypasses cache admission so a large backlog
             // cannot evict the useful working set merely by being replayed.
             writer = fs.open_write(*snapshot.published_path, false,
-                                   config.write_through_cache && !recovery,
+                                   config.write_through_cache && !recovered,
                                    WriteDurability::publication_generation);
             constexpr size_t chunk_size = 256 * 1024;
             Bytes buffer(chunk_size);
@@ -2446,7 +2449,7 @@ struct FuseFrontend::State {
                     }
                     if (pread_exact(replay_spool.get(), {buffer.data(), chunk},
                                     op.spool_offset + done) != chunk) {
-                        if (recovery) {
+                        if (recovered) {
                             abandon_corrupt_data(inode, "short read from FUSE write spool");
                             return;
                         }
@@ -2523,40 +2526,26 @@ struct FuseFrontend::State {
         return active_data.load(std::memory_order_relaxed) < config.commit_workers;
     }
 
-    size_t effective_recovery_commit_workers() const {
-        return std::min(config.recovery_commit_workers, config.commit_workers);
-    }
-
     auto runnable_data_locked() {
         if (!data_global_slot_available())
             return data_queue.end();
 
-        // Closed live files win first so a multi-gigabyte open import cannot
+        // Closed loader files win first so a multi-gigabyte open import cannot
         // hide complete files from the authoritative namespace and catalogue.
+        // Journal provenance is deliberately irrelevant: a restart does not
+        // demote user-requested ingest to background recovery.
         // Inspect the current handle state rather than freezing it at enqueue:
         // release() can close an inode while it is already waiting here.
-        auto live = std::find_if(data_queue.begin(), data_queue.end(), [](const DataQueueItem& item) {
-            if (item.recovery)
-                return false;
+        auto loader = std::find_if(data_queue.begin(), data_queue.end(), [](const DataQueueItem& item) {
             std::lock_guard inode_lock(item.inode->mutex);
             return item.inode->writable_handles == 0;
         });
-        if (live != data_queue.end())
-            return live;
+        if (loader != data_queue.end())
+            return loader;
 
-        // Open live files still use otherwise idle capacity. This is essential
-        // under spool pressure and obeys the loader law without weakening the
-        // viewer gate above.
-        live = std::find_if(data_queue.begin(), data_queue.end(),
-                            [](const DataQueueItem& item) { return !item.recovery; });
-        if (live != data_queue.end())
-            return live;
-
-        if (active_recovery_data.load(std::memory_order_relaxed) >=
-            effective_recovery_commit_workers())
-            return data_queue.end();
-        return std::find_if(data_queue.begin(), data_queue.end(),
-                            [](const DataQueueItem& item) { return item.recovery; });
+        // Open loader files, including journal-restored files that an rsync has
+        // resumed, use otherwise idle capacity behind the viewer gate.
+        return data_queue.begin();
     }
 
     bool runnable_data_available_locked() {
@@ -2566,7 +2555,7 @@ struct FuseFrontend::State {
     void data_loop(std::stop_token stop) {
         while (!stop.stop_requested() && !stopping.load()) {
             std::shared_ptr<Inode> inode;
-            bool recovery = false;
+            bool recovered = false;
             {
                 std::unique_lock lock(data_queue_mutex);
                 while (!stop.stop_requested() && !stopping.load()) {
@@ -2603,12 +2592,10 @@ struct FuseFrontend::State {
                 bool selected_closed_ahead_of_open = false;
                 {
                     std::lock_guard selected_inode_lock(selected->inode->mutex);
-                    if (!selected->recovery && selected->inode->writable_handles == 0) {
+                    if (selected->inode->writable_handles == 0) {
                         selected_closed_ahead_of_open =
                             std::any_of(data_queue.begin(), selected,
                                         [](const DataQueueItem& item) {
-                                            if (item.recovery)
-                                                return false;
                                             std::lock_guard inode_lock(item.inode->mutex);
                                             return item.inode->writable_handles > 0;
                                         });
@@ -2617,7 +2604,7 @@ struct FuseFrontend::State {
                 if (selected_closed_ahead_of_open)
                     data_closed_priority_selections.fetch_add(1, std::memory_order_relaxed);
                 inode = selected->inode;
-                recovery = selected->recovery;
+                recovered = selected->recovered;
                 data_queue.erase(selected);
                 const auto active_now = active_data.fetch_add(1, std::memory_order_relaxed) + 1;
                 auto peak = data_publication_peak_active.load(std::memory_order_relaxed);
@@ -2625,7 +2612,7 @@ struct FuseFrontend::State {
                        !data_publication_peak_active.compare_exchange_weak(
                            peak, active_now, std::memory_order_relaxed)) {
                 }
-                if (recovery)
+                if (recovered)
                     ++active_recovery_data;
             }
             {
@@ -2637,7 +2624,7 @@ struct FuseFrontend::State {
             bool retry = false;
             try {
                 auto snapshot = snapshot_data(inode);
-                replay_data(inode, std::move(snapshot), recovery);
+                replay_data(inode, std::move(snapshot), recovered);
             } catch (const std::exception& e) {
                 ++backend_failures;
                 retry = retryable_backend_error(e);
@@ -2662,7 +2649,7 @@ struct FuseFrontend::State {
                     inode->data_deferred = true;
             }
             --active_data;
-            if (recovery)
+            if (recovered)
                 --active_recovery_data;
             data_cv.notify_all();
             if (retry)
@@ -4536,7 +4523,7 @@ FuseFrontendStatus FuseFrontend::status() const {
         out.pending_data = state_->data_queue.size();
         out.pending_recovery_data = static_cast<size_t>(
             std::count_if(state_->data_queue.begin(), state_->data_queue.end(),
-                          [](const State::DataQueueItem& item) { return item.recovery; }));
+                          [](const State::DataQueueItem& item) { return item.recovered; }));
     }
     // Deferred-but-not-admitted work is pending; active work is reported
     // separately and deliberately not double-counted in pending_data.

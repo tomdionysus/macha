@@ -76,7 +76,8 @@ class DistributedStore {
     std::map<ObjectId, std::weak_ptr<SharedFetch>> fetches_;
     ReplicaSelector replica_selector_;
 
-    bool put_impl(const ObjectId&, std::span<const uint8_t>, std::atomic_bool*, DurabilityBatch*);
+    bool put_impl(const ObjectId&, std::span<const uint8_t>, FrameType, std::atomic_bool*,
+                  DurabilityBatch*);
     std::vector<NodeInfo> ranked(const ObjectId&) const;
     std::vector<NodeInfo> owners(const ObjectId&) const;
     bool put_on(const NodeInfo&, const ObjectId&, std::span<const uint8_t>, bool foreground);
@@ -96,12 +97,19 @@ class DistributedStore {
   public:
     explicit DistributedStore(NodeRuntime& n) : n_(n) {}
     ObjectId put(std::span<const uint8_t>, std::atomic_bool* cancelled = nullptr);
+    ObjectId put(std::span<const uint8_t>, FrameType, std::atomic_bool* cancelled = nullptr);
     bool put(const ObjectId&, std::span<const uint8_t>, std::atomic_bool* cancelled = nullptr);
+    bool put(const ObjectId&, std::span<const uint8_t>, FrameType,
+             std::atomic_bool* cancelled = nullptr);
     ObjectId put_deferred(std::span<const uint8_t>, DurabilityBatch&,
+                          std::atomic_bool* cancelled = nullptr);
+    ObjectId put_deferred(std::span<const uint8_t>, DurabilityBatch&, FrameType,
                           std::atomic_bool* cancelled = nullptr);
     bool put_deferred(const ObjectId&, std::span<const uint8_t>, DurabilityBatch&,
                       std::atomic_bool* cancelled = nullptr);
-    bool durability_barrier(const DurabilityBatch&);
+    bool put_deferred(const ObjectId&, std::span<const uint8_t>, DurabilityBatch&, FrameType,
+                      std::atomic_bool* cancelled = nullptr);
+    bool durability_barrier(const DurabilityBatch&, FrameType = FrameType::loader);
     // Publication liveness barrier. Every referenced object touched by a metadata
     // mutation acquires a causal retention claim before that metadata commit may
     // be accepted. DATA uses dht.min_write_replicas; CONTROL uses the supplied

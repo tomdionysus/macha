@@ -104,10 +104,10 @@ struct FuseConfig {
     size_t request_workers{24};
     size_t max_pending_requests{4096};
     size_t commit_workers{8};
-    // Crash-recovered publication is convergence of already-durable local
-    // writes. Keep its storage pressure bounded independently of normal live
-    // publication so restart recovery cannot make the node unresponsive.
-    // The effective limit is min(recovery_commit_workers, commit_workers).
+    // Compatibility setting for older configurations. Journal-restored spool
+    // is user-requested loader work and is no longer demoted merely because the
+    // process restarted. Retain this value for a future genuinely background
+    // recovery lane, or remove it after the compatibility window.
     size_t recovery_commit_workers{2};
     // Retained for configuration compatibility. Viewer demand now gates new
     // publication work directly, while loader activity is work-conserving up to

@@ -51,6 +51,11 @@ playback[a1b2c3d4] session create complete ... elapsed_ms=...
 
 Playback/probe/seek object reads are foreground traffic. Foreground demand is recorded before storage access begins, lower-priority DATA RPC execution retains reserved worker capacity for it, and asynchronous FUSE publication pauses while playback is active. FUSE writes already accepted into the local spool remain locally durable and resume distributed publication after the playback quiet window; a bulk copy through the mount is therefore not allowed to consume all execution/storage service needed to start or seek a stream.
 
+Publication traffic has its own loader transport class below viewer foreground
+and read-ahead but above speculative maintenance. Restarting Macha does not
+demote user-requested spool data: journal recovery is provenance for validation
+and crash safety, while the resumed publication remains loader work.
+
 Seek-only updates are determined by effective session policy rather than JSON shape. A client may resend its current `preferences` object together with `seek_ms`; when those preferences are unchanged Macha reuses the active immutable media probe and reusable VOD/random-access plan instead of performing a fresh container-planning pass.
 
 ## Public HTTP behaviour

@@ -290,6 +290,8 @@ FrameType decode_frame_type(uint8_t value) {
         return FrameType::read_ahead;
     case static_cast<uint8_t>(FrameType::speculative):
         return FrameType::speculative;
+    case static_cast<uint8_t>(FrameType::loader):
+        return FrameType::loader;
     default:
         throw std::runtime_error("bad frame type");
     }
@@ -469,6 +471,8 @@ const char* frame_type_name(FrameType type) noexcept {
         return "read-ahead";
     case FrameType::speculative:
         return "speculative";
+    case FrameType::loader:
+        return "loader";
     }
     return "unknown";
 }
@@ -570,7 +574,19 @@ const char* message_type_name(MessageType type) noexcept {
 }
 
 unsigned frame_type_priority(FrameType type) noexcept {
-    return static_cast<unsigned>(type);
+    switch (type) {
+    case FrameType::control:
+        return 1;
+    case FrameType::foreground:
+        return 2;
+    case FrameType::read_ahead:
+        return 3;
+    case FrameType::loader:
+        return 4;
+    case FrameType::speculative:
+        return 5;
+    }
+    return 5;
 }
 
 FrameType default_frame_type(MessageType type) noexcept {
@@ -2875,6 +2891,8 @@ RpcServer::RequestClass RpcServer::request_class(FrameType type) {
         return RequestClass::foreground;
     case FrameType::read_ahead:
         return RequestClass::read_ahead;
+    case FrameType::loader:
+        return RequestClass::loader;
     case FrameType::speculative:
         return RequestClass::speculative;
     }
@@ -2905,6 +2923,8 @@ std::deque<RpcServer::RequestJob>& RpcServer::queue(RequestClass cls) {
         return foreground_requests_;
     case RequestClass::read_ahead:
         return read_ahead_requests_;
+    case RequestClass::loader:
+        return loader_requests_;
     case RequestClass::speculative:
         return speculative_requests_;
     }
@@ -2936,7 +2956,7 @@ bool RpcServer::admit_locked(RequestJob job) {
 
 bool RpcServer::data_ready() const {
     return !foreground_requests_.empty() || !read_ahead_requests_.empty() ||
-           !speculative_requests_.empty();
+           !loader_requests_.empty() || !speculative_requests_.empty();
 }
 
 RpcServer::RequestClass RpcServer::next_data_class() const {
@@ -2944,6 +2964,8 @@ RpcServer::RequestClass RpcServer::next_data_class() const {
         return RequestClass::foreground;
     if (!read_ahead_requests_.empty())
         return RequestClass::read_ahead;
+    if (!loader_requests_.empty())
+        return RequestClass::loader;
     return RequestClass::speculative;
 }
 
@@ -3008,8 +3030,9 @@ void RpcServer::promote_queued(const NodeInfo& peer, uint64_t request_id, FrameT
     };
 
     if (!promote_from(speculative_requests_))
-        if (!promote_from(read_ahead_requests_))
-            (void)promote_from(foreground_requests_);
+        if (!promote_from(loader_requests_))
+            if (!promote_from(read_ahead_requests_))
+                (void)promote_from(foreground_requests_);
     request_cv_.notify_all();
 }
 
@@ -3036,6 +3059,7 @@ void RpcServer::cancel_queued(const NodeInfo& peer, uint64_t request_id) {
         };
         cancel_from(foreground_requests_);
         cancel_from(read_ahead_requests_);
+        cancel_from(loader_requests_);
         cancel_from(speculative_requests_);
         for (auto it = metadata_requests_.begin(); it != metadata_requests_.end();) {
             if (it->peer.id != peer.id || it->frame.request_id != request_id) {
@@ -3600,7 +3624,8 @@ void RpcServer::data_worker_loop(std::stop_token stop) {
                     return true;
                 const auto lower_limit = data_worker_count - foreground_data_worker_reserve;
                 return active_nonforeground_data_ < lower_limit &&
-                       (!read_ahead_requests_.empty() || !speculative_requests_.empty());
+                       (!read_ahead_requests_.empty() || !loader_requests_.empty() ||
+                        !speculative_requests_.empty());
             });
             if (stop.stop_requested() && !data_ready())
                 return;
@@ -3612,8 +3637,10 @@ void RpcServer::data_worker_loop(std::stop_token stop) {
                 const auto lower_limit = data_worker_count - foreground_data_worker_reserve;
                 if (!stop.stop_requested() && active_nonforeground_data_ >= lower_limit)
                     continue;
-                cls = !read_ahead_requests_.empty() ? RequestClass::read_ahead
-                                                    : RequestClass::speculative;
+                cls = !read_ahead_requests_.empty()
+                          ? RequestClass::read_ahead
+                          : (!loader_requests_.empty() ? RequestClass::loader
+                                                       : RequestClass::speculative);
                 ++active_nonforeground_data_;
                 nonforeground = true;
             }

@@ -178,7 +178,9 @@ MACHA_TEST("rpc_cluster", test_best_effort_telemetry_notifications_reach_both_ro
 MACHA_TEST("rpc_cluster", test_rpc_v15_frame_priority_and_variable_length) {
     CHECK(frame_type_priority(FrameType::control) < frame_type_priority(FrameType::foreground));
     CHECK(frame_type_priority(FrameType::foreground) < frame_type_priority(FrameType::read_ahead));
-    CHECK(frame_type_priority(FrameType::read_ahead) < frame_type_priority(FrameType::speculative));
+    CHECK(frame_type_priority(FrameType::read_ahead) < frame_type_priority(FrameType::loader));
+    CHECK(frame_type_priority(FrameType::loader) < frame_type_priority(FrameType::speculative));
+    CHECK(std::string(frame_type_name(FrameType::loader)) == "loader");
     CHECK(default_frame_type(MessageType::ping) == FrameType::control);
     CHECK(default_frame_type(MessageType::get_object) == FrameType::foreground);
     CHECK(default_frame_type(MessageType::get_control_object) == FrameType::speculative);
@@ -241,6 +243,17 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_frame_priority_and_variable_length) {
     CHECK(control_object_reply.message.type == MessageType::ok);
     CHECK(client.stats().canonical_connections == 1);
 
+    // Loader has a distinct on-wire value and is valid for bulk DATA without
+    // being interpreted as viewer read-ahead or speculative maintenance.
+    auto loader_reply =
+        client.call(endpoint, MessageType::put_object, Bytes{0x4c}, FrameType::loader, 2s);
+    CHECK(loader_reply.message.type == MessageType::ok);
+    CHECK(loader_reply.message.payload == Bytes{0x4c});
+    {
+        std::lock_guard lock(order_mutex);
+        order.clear();
+    }
+
     // Start a large speculative transfer, then introduce foreground work. The
     // writer reconsiders priority after every <=4 KiB variable-length frame, so
     // foreground reaches the server before the speculative message completes.
@@ -260,6 +273,9 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_frame_priority_and_variable_length) {
     REQUIRE(background.wait_for(10s) == std::future_status::ready);
     CHECK(background.get().message.type == MessageType::ok);
     CHECK(client.stats().canonical_connections == 2);
+    const auto work = server.work_stats();
+    REQUIRE(work.frame_timings.contains(FrameType::loader));
+    CHECK(work.frame_timings.at(FrameType::loader).requests >= 1);
 
     // Cancellation can race with the writer while one frame is outside the
     // outbound deque. The cancelled transfer must not be requeued after that
@@ -276,6 +292,23 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_frame_priority_and_variable_length) {
 
     client.stop();
     server.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_loader_put_does_not_signal_viewer_activity) {
+    TestNode fixture("loader-activity-class");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.min_write_replicas = 1;
+    config.metadata_min_write_replicas = 1;
+    auto& node = fixture.start();
+
+    // Remove unrelated startup accounting, then prove a user loader write does
+    // not refresh the viewer/read-ahead activity clock used by playback gates.
+    (void)node.take_activity_bytes(FrameType::read_ahead);
+    DistributedStore store(node);
+    auto bytes = pattern(256 * 1024, 91);
+    REQUIRE(store.put(bytes) == object_id(bytes));
+    CHECK(node.take_activity_bytes(FrameType::read_ahead) == 0);
 }
 
 MACHA_TEST("rpc_cluster", test_rpc_v15_persistence_and_multiplexing) {
@@ -1218,12 +1251,12 @@ MACHA_TEST("rpc_cluster", test_rpc_foreground_not_starved_by_busy_data_workers) 
         100ms, 2s);
     Endpoint endpoint{"127.0.0.1", port};
 
-    // Lower-priority work may use most of the DATA execution pool, but it must
+    // Loader work may use most of the DATA execution pool, but it must
     // leave execution capacity for a playback/seek read that arrives later.
     std::vector<AsyncRpc> bulk;
     for (int i = 0; i < 8; ++i)
         bulk.push_back(client.call_async(endpoint, MessageType::put_object, Bytes{0x42},
-                                         FrameType::read_ahead));
+                                         FrameType::loader));
     REQUIRE(lower_priority_gate.wait_for_entries(6));
 
     auto started = Clock::now();

@@ -2,8 +2,9 @@
 
 Date: 2026-08-31
 
-Status: Phase 0/1 first implementation checkpoint complete; deployment UAT and
-remaining telemetry/byte-bound/fair-quantum work pending
+Status: Phase 1A loader-priority implementation and deterministic verification
+complete; coordinated deployment/UAT and Phase 1B byte-bound/fair-quantum work
+pending
 
 ## Scheduling laws
 
@@ -21,6 +22,24 @@ remaining telemetry/byte-bound/fair-quantum work pending
 These laws define priority, not polling. Viewer demand, resource availability,
 durability completion, queue transitions, and pressure thresholds must wake or
 pace work through events.
+
+### Priority classes and provenance
+
+Durable spool publication is user-requested loader work, including after a
+process restart. Restart changes its provenance and replay requirements; it
+does not demote it to background recovery. The schedulers must represent these
+as separate dimensions:
+
+1. control traffic, which must remain independently responsive;
+2. viewer foreground reads and viewer read-ahead;
+3. user-requested loader/ingest publication;
+4. speculative repair, hydration, garbage collection, and maintenance.
+
+The RPC transport therefore needs a loader frame class between viewer
+read-ahead and speculative work. FUSE queue items need a recovered-provenance
+flag for checksum, cache-admission, and crash-proof behaviour, independently of
+their loader scheduling class. `recovery_commit_workers` must not permanently
+throttle user spool data merely because it was reconstructed from the journal.
 
 ## Outcome
 
@@ -138,13 +157,17 @@ system should meet all of the following:
    the permitted workers and byte window busy. Viewer arrival promptly reduces
    or pauses competing work at safe cancellation/yield boundaries, and viewer
    departure promptly releases that capacity back to ingest.
+9. Restarted spool work retains the same useful-throughput target as continuous
+   ingest. Process lifetime boundaries must not reduce it to a background worker
+   allowance.
 
 ## Phase 0: establish useful-byte telemetry
 
 Add low-cardinality, O(1) diagnostics before tuning the pipeline:
 
-- queued and active publication inodes, split into open, closed, recovery, and
-  confirmation-waiting states;
+- queued and active publication inodes, split into open loader, closed loader,
+  recovered provenance, genuine background work, and confirmation-waiting
+  states; recovered provenance is an orthogonal label, not a queue class;
 - active publication workers and peak active workers;
 - spool bytes read, object bytes submitted, remotely durable bytes, committed
   bytes, confirmed bytes, and retired bytes;
@@ -168,7 +191,52 @@ assert counters and gates, not wall-clock speed.
 Checkpoint: telemetry reconciles exactly for a small deterministic workload and
 adds negligible idle work.
 
-## Phase 1: remove artificial serialization and head-of-line blocking
+## Phase 1A: establish loader priority independently of provenance
+
+This correction precedes concurrency tuning because every later measurement
+depends on classifying the work correctly.
+
+1. Add an explicit transport `loader` class below viewer foreground/read-ahead
+   and above speculative maintenance. Preserve control as an independent lane.
+2. Send publication object puts, durability requests, and their replies as
+   loader traffic. Loader activity must not refresh either viewer-activity
+   clock or manufacture a viewer quiet window.
+3. Replace the FUSE queue's overloaded `recovery` scheduling boolean with two
+   independent properties: user-loader priority and recovered-journal
+   provenance. Provenance continues to control checksum/corruption handling,
+   cache bypass, and restart proof only.
+4. Schedule closed user-loader files before open user-loader files regardless
+   of which process accepted their durable spool records.
+5. Stop applying `recovery_commit_workers` to user-requested spool publication.
+   Retain it temporarily as a documented compatibility setting only for genuine
+   background recovery work; deprecate it if no such work remains in this
+   subsystem.
+6. Assign a new, non-conflicting wire value to `loader`, audit every exhaustive
+   frame-type switch and priority queue, and define mixed-version behaviour.
+   An older peer must never reinterpret loader traffic as viewer traffic; use
+   negotiated downgrade to speculative or require a coordinated deployment
+   until feature negotiation exists.
+
+Deterministic tests:
+
+- spool accepted before restart resumes in the loader lane and can use the same
+  bounded capacity as spool accepted after restart;
+- setting `recovery_commit_workers: 1` does not cap four journal-restored user
+  files to one publisher;
+- viewer traffic wins over loader traffic, loader wins over a saturated
+  speculative-maintenance queue, and control completes independently;
+- loader sends and replies do not update viewer activity or self-throttle;
+- recovered checksum, cache-bypass, corruption, and restart semantics remain
+  unchanged after priority is separated; and
+- frame encoding, decoding, priority order, diagnostics, and mixed-version
+  fallback/rejection behave exactly as documented.
+
+Checkpoint: deploy all three nodes together if loader-frame negotiation is not
+yet available. Prove restart does not reduce confirmed/retired throughput, then
+continue immediately into the bounded concurrency cut; priority correctness
+alone is not a throughput pass.
+
+## Phase 1B: remove artificial serialization and head-of-line blocking
 
 This is the first implementation cut and is expected to produce the largest
 immediate gain.
@@ -178,7 +246,9 @@ immediate gain.
    interactive foreground work.
 2. Track writable handles per inode and maintain distinct runnable lanes:
    closed dirty files, pressure-triggered stable prefixes of open files, and
-   recovery. Prefer closed files, then serve other lanes fairly.
+   background work. Prefer closed loader files, then serve open loader files
+   fairly. Journal-restored spool remains in these loader lanes; recovered
+   provenance is not a scheduling lane.
 3. Permit up to `commit_workers` independent inode publications when there is
    spool pressure or closed work. Preserve explicit playback priority using
    actual playback/read signals rather than the existence of a writer.
@@ -206,8 +276,8 @@ Deterministic tests:
   storm;
 - no two workers publish the same inode concurrently and sequence order is
   preserved;
-- playback gating, recovery limits, stop/cancellation, and confirmation requeue
-  semantics remain correct; and
+- playback gating, loader bounds, recovered-provenance handling,
+  stop/cancellation, and confirmation requeue semantics remain correct; and
 - with playback absent, ready ingest fills the permitted worker and byte budget;
   injected playback demand pre-empts new ingest quanta without corrupting work,
   and ingest resumes immediately when that demand clears; and
@@ -224,7 +294,7 @@ Decouple useful object publication from whole-file closure while retaining
 atomic namespace visibility.
 
 1. Once a full extent is locally durable and no longer mutable for the target
-   sequence, queue it to a background staging pool. FUSE request threads only
+   sequence, queue it to a loader staging pool. FUSE request threads only
    copy and journal local data; they never perform network publication.
 2. Store a durable mapping from file generation/range to staged object identity
    and durability state. On restart, reuse proven staged extents instead of
@@ -329,7 +399,8 @@ Run these cuts after their corresponding deterministic tests pass:
 4. Saturated data publication plus continuous status/ping/metadata operations:
    prove communications isolation and absence of timeouts.
 5. Restart at greater than 90% spool occupancy and at every durable staging
-   state: prove recovery, bounded occupancy, and resumed throughput.
+   state: prove recovery, bounded occupancy, and resumed loader-class throughput
+   without a process-lifetime priority demotion.
 6. Peer loss and return during publication: prove progress with the configured
    write quorum and later convergence without foreground replication
    amplification.
@@ -346,8 +417,11 @@ acceptable result.
 
 ## Sequencing and stop points
 
-- Phase 0 and Phase 1 are one safe delivery sequence: measure, remove the false
-  single-worker cap, add fairness/bounds, test, then UAT.
+- Phase 0, Phase 1A, and Phase 1B are one safe delivery sequence: measure,
+  establish the loader class independently of restart provenance, remove false
+  worker caps, add fairness/bounds, test, then UAT. Do not tune concurrency
+  against the old `recovery` lane or use the earlier two-worker UAT as a
+  performance baseline.
 - Phase 2 is the largest correctness change and should be delivered separately
   behind versioned recovery records and exhaustive fault injection.
 - Phase 3 can proceed independently after Phase 0 if local durability is shown
