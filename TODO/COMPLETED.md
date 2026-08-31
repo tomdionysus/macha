@@ -4,6 +4,110 @@ Last updated: 2026-08-31
 
 This is the completed-work ledger for the current session. An item belongs here only after implementation and its stated verification are complete. Detailed design notes, exact test results, and UAT measurements remain in the linked records.
 
+## Phase 1D.4 partial: transient publication cursor preservation
+
+- [x] Retained the provisional writer, WAL cursor and resumable
+  materialisation/rebuild state across retryable backend failures.
+- [x] Kept failed pipelined extent payloads at their exact manifest offset and
+  retried them in place, preventing both whole-generation replay and manifest
+  holes.
+- [x] Added a deterministic one-shot failure regression proving one publication
+  start, exact one-pass spool reads, atomic visibility and exact final content.
+- [x] Preserved the existing pipeline-failure invisibility contract.
+- [x] Passed focused tests, filesystem/FUSE 58/58, the complete suite 229/229
+  and runtime dependencies 3/3.
+
+Evidence: [transient-failure cursor checkpoint](2026-08-31-fuse-publication-phase-1d-transient-failure-cursor.md)
+
+## Phase 1D.4 partial: pressure-aware retirement selection
+
+- [x] Ranked closed generations above the pressure threshold by releasable
+  spool bytes per remaining replay work, with nearest completion as tie-break.
+- [x] Preserved ordinary below-pressure FIFO, open-loader fallback, bounded
+  quanta, viewer priority and event-driven scheduling.
+- [x] Added `data_retirement_priority_selections`, counted only when a worker
+  actually reorders closed work.
+- [x] Proved a later small closed generation retires ahead of an earlier large
+  generation and wakes a blocked writer in the pathological/full-spool test.
+- [x] Passed the focused regression, filesystem/FUSE 57/57, runtime 3/3 and the
+  final controlled complete suite 228/228.
+
+Evidence: [retirement-selection checkpoint](2026-08-31-fuse-publication-phase-1d-retirement-selection.md)
+
+## Catalogue coalesced-final-state regression correction
+
+- [x] Retained failure-only diagnostics and proved the timed-out cache already
+  held the exact final title and artwork at reconciled generation 18 while the
+  test incorrectly required equality with writer-side generation 15.
+- [x] Accepted newer generations only with exact final content and captured the
+  integration run bound at catalogue-repair entry, before zero-grace artwork GC
+  can add unrelated metadata events.
+- [x] Retained the 10-second timeout, exact final search/artwork/GC assertions,
+  and the separate exact one-follow-up ConvergenceDemand state-machine test.
+- [x] Passed 10/10 isolated repetitions and the controlled complete suite
+  228/228.
+
+Evidence: [retirement-selection checkpoint verification](2026-08-31-fuse-publication-phase-1d-retirement-selection.md#verification)
+
+## Phase 1D.4 partial: publication notification coalescing
+
+- [x] Made one false-to-true spool-drain transition own the all-inode pressure
+  sweep instead of rescanning for every blocked FUSE write.
+- [x] Kept new durable work event-driven through durability-batch notification;
+  no polling or idle owner was introduced.
+- [x] Coalesced publication demand at monotonic data/namespace watermarks and
+  suppressed unchanged flush/release/pressure notifications before queue work.
+- [x] Added a single per-inode enqueue owner across the inode-to-queue lock
+  handoff, preventing concurrent duplicate queue ownership.
+- [x] Added Status counters for suppressed notifications and pressure sweeps.
+- [x] Proved 1,002 notifications become two effective requests and 1,000
+  suppressed duplicates; all three pressure regressions prove one sweep per
+  episode.
+- [x] Passed build, filesystem/FUSE 56/56, controlled complete suite 227/227 and
+  runtime 3/3.
+
+Evidence: [publication notification checkpoint](2026-08-31-fuse-publication-phase-1d-notification-coalescing.md)
+
+## Phase 1D.2 partial: sparse changed-range reconstruction
+
+- [x] Replaced canonical whole-file materialisation with a sparse overlay of
+  sorted, merged changed byte ranges.
+- [x] Reused untouched immutable extents without fetching or hashing them and
+  reconstructed only touched/boundary extents under resumable loader quanta.
+- [x] Preserved append-then-overwrite data, truncate/re-extension zero fill,
+  exact final bytes and old-generation visibility until atomic commit.
+- [x] Added completed-publication cohort counters for spool/source reads,
+  immutable extent reuse and extent puts.
+- [x] Added an eight-extent deterministic regression proving two touched extent
+  reads, six untouched reuses, two puts and no whole-file materialisation.
+- [x] Passed build, filesystem/FUSE 55/55, controlled complete suite 226/226 and
+  runtime 3/3. The default 12-worker complete run is accurately retained as
+  225/226 due to the resource-sensitive catalogue burst test; it passed alone
+  and in the complete four-worker run.
+
+Evidence: [sparse changed-range checkpoint](2026-08-31-fuse-publication-phase-1d-sparse-changed-ranges.md)
+
+## Phase 1D.3 partial: node-wide DATA resource headroom
+
+- [x] Added event-driven byte-bounded admission below RPC scheduling for
+  blocking DATA object, local-store and cache work.
+- [x] Reserved configurable non-borrowable foreground/read-ahead capacity while
+  retaining work-conserving lower-class use of all non-reserved capacity.
+- [x] Kept CONTROL completely outside DATA admission and ordered waiting loader
+  work ahead of speculative work.
+- [x] Covered incoming/outgoing transfer, direct repair placement, ordinary
+  local reads and asynchronous fetched-object persistence; impossible
+  oversized class work fails instead of waiting forever.
+- [x] Added Status counters, configuration validation/documentation, isolated
+  saturation/deadline/fairness tests and a real RPC/local-store saturation test.
+- [x] Passed the clean complete default suite 225/225 and runtime dependencies
+  3/3. The first eight-slot run was accurately retained as 223/225; both
+  load-sensitive failures passed isolated and in the clean four-slot rerun.
+
+Evidence: [DATA resource headroom checkpoint](2026-08-31-phase-1d-data-resource-headroom.md)
+
+Deployment/UAT evidence: [three-node loaded UAT](2026-08-31-phase-1d-data-resource-headroom-uat.md)
+
 ## Aggregate spool retirement-rate estimator
 
 - [x] Replaced the per-generation throughput EMA with cumulative physically
@@ -422,3 +526,33 @@ Evidence: [FUSE spool rate backpressure](2026-08-30-fuse-spool-rate-backpressure
   and rejecting disconnected/unknown devices.
 - [x] Rebuilt successfully with UPnP enabled; the focused compatibility test
   passed and the complete `foundations` group passed 13/13.
+
+## Weighted loader cold-setup accounting
+
+- [x] Separated loader admission/activity tracking from the start of useful
+  weighted service, so cold distributed-writer setup cannot consume the loader
+  slice before producing work or manufacture a ratio-amplified cooldown.
+- [x] Added a deterministic scheduler regression proving that a ten-second cold
+  setup is excluded from the 25 ms service slice and 475 ms cooldown at the
+  default 95:5 weighting.
+- [x] Built and passed the scheduler regression on macOS and natively on both
+  Linux nodes 50 and 51, together with all three spool-pressure regressions.
+
+Evidence: [Spool progress-bootstrap admission checkpoint](2026-08-31-spool-progress-bootstrap-admission.md)
+
+## Spool progress-bootstrap admission
+
+- [x] Removed the zero-rate dead zone above 50% spool occupancy by granting
+  bounded one-for-one admission credit only after useful partial publication
+  has successfully drained.
+- [x] Preserved the configured hard limit, physical reserve, whole-file atomic
+  visibility and event-driven wakeup contract; zero-byte or failed work grants
+  no capacity.
+- [x] Passed the focused regression and all spool-pressure tests on macOS and
+  both Linux nodes, then deployed the identical binary to nodes 50 and 51.
+- [x] Passed loaded UAT with rsync and real playback: rsync accepted roughly
+  506 MB while publication replayed 441 MB in 30 seconds above the soft
+  threshold, with bounded waits, no freeze, no ENOSPC, no backend failure and a
+  healthy 3/3 cluster.
+
+Evidence: [Spool progress-bootstrap admission checkpoint](2026-08-31-spool-progress-bootstrap-admission.md)

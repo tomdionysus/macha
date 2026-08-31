@@ -65,6 +65,74 @@ MACHA_FAST_TEST("foundations", test_weighted_loader_service_is_work_conserving_a
     CHECK(service.finished(start + 1020ms, true) == 190ms);
     CHECK(!service.can_start(start + 1209ms, true));
     CHECK(service.can_start(start + 1210ms, true));
+
+    // Cold writer setup is admitted and tracked as active, but it is not
+    // charged as loader service. Otherwise a slow disk/network setup would
+    // consume the slice before producing a byte and its latency would then be
+    // multiplied by the viewer:loader cooldown ratio.
+    WeightedLoaderService cold_service(95, 5, 25ms);
+    cold_service.started(start, true, false);
+    cold_service.service_started(start + 10s, true);
+    CHECK(!cold_service.should_yield(start + 10024ms, true));
+    CHECK(cold_service.should_yield(start + 10025ms, true));
+    CHECK(cold_service.finished(start + 10025ms, true) == 475ms);
+}
+
+MACHA_TEST("foundations", test_data_resource_arbiter_reserves_viewer_headroom) {
+    DataResourceArbiter resources(4, 1);
+    CHECK(!resources.acquire(DataWorkContext(FrameType::loader), 4));
+    CHECK(!resources.acquire(DataWorkContext(FrameType::foreground), 5));
+    auto loader_context = DataWorkContext(FrameType::loader, 1);
+    auto first = resources.acquire(loader_context, 1);
+    auto second = resources.acquire(loader_context, 1);
+    auto third = resources.acquire(loader_context, 1);
+    REQUIRE(first.has_value());
+    REQUIRE(second.has_value());
+    REQUIRE(third.has_value());
+
+    auto blocked_loader = std::async(std::launch::async, [&] {
+        return resources.acquire(loader_context, 1);
+    });
+    CHECK(blocked_loader.wait_for(20ms) == std::future_status::timeout);
+    auto blocked_speculative = std::async(std::launch::async, [&] {
+        return resources.acquire(DataWorkContext(FrameType::speculative, 1), 1);
+    });
+    CHECK(blocked_speculative.wait_for(20ms) == std::future_status::timeout);
+
+    // Lower-class saturation cannot consume the reserved byte. A viewer which
+    // arrives later starts immediately without cancelling the bounded loader
+    // work already in flight.
+    auto viewer = resources.acquire(DataWorkContext(FrameType::foreground, 1), 1);
+    REQUIRE(viewer.has_value());
+    CHECK(blocked_loader.wait_for(20ms) == std::future_status::timeout);
+    viewer.reset();
+
+    // A bounded deadline terminates through the condition-variable deadline;
+    // there is no periodic admission poll.
+    auto expired = resources.acquire(
+        DataWorkContext(FrameType::loader, 1, DataWorkContext::Clock::now() + 20ms), 1);
+    CHECK(!expired.has_value());
+
+    first.reset();
+    REQUIRE(blocked_loader.wait_for(1s) == std::future_status::ready);
+    auto admitted_loader = blocked_loader.get();
+    REQUIRE(admitted_loader.has_value());
+    CHECK(blocked_speculative.wait_for(20ms) == std::future_status::timeout);
+    second.reset();
+    REQUIRE(blocked_speculative.wait_for(1s) == std::future_status::ready);
+    auto admitted_speculative = blocked_speculative.get();
+    REQUIRE(admitted_speculative.has_value());
+
+    const auto stats = resources.stats();
+    CHECK(stats.capacity_bytes == 4);
+    CHECK(stats.viewer_reserve_bytes == 1);
+    CHECK(stats.peak_used_bytes == 4);
+    CHECK(stats.viewer_admissions == 1);
+    CHECK(stats.loader_admissions == 4);
+    CHECK(stats.loader_waits == 2);
+    CHECK(stats.speculative_admissions == 1);
+    CHECK(stats.speculative_waits == 1);
+    CHECK(stats.cancelled_waits == 1);
 }
 
 MACHA_FAST_TEST("foundations", test_miniupnpc_igd_status_compatibility) {

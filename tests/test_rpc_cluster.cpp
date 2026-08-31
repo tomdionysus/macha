@@ -1275,6 +1275,67 @@ MACHA_TEST("rpc_cluster", test_rpc_foreground_not_starved_by_busy_data_workers) 
     server.stop();
 }
 
+MACHA_TEST("rpc_cluster", test_storage_data_credit_reserves_viewer_headroom_and_control) {
+    TestNode fixture("data-resource-viewer-reserve", ConfigProfile::functional);
+    auto& config = fixture.config();
+    const auto extent = config.extent_size;
+    config.data_inflight_bytes = 4 * extent;
+    config.data_viewer_reserve_bytes = extent;
+    auto& node = fixture.start();
+
+    const auto bytes = pattern(64 * 1024, 77);
+    const auto id = object_id(bytes);
+    REQUIRE(node.local_store().put(id, bytes));
+
+    auto loader_context = DataWorkContext(FrameType::loader, extent);
+    auto first = node.data_resources().acquire(loader_context, extent);
+    auto second = node.data_resources().acquire(loader_context, extent);
+    auto third = node.data_resources().acquire(loader_context, extent);
+    REQUIRE(first.has_value());
+    REQUIRE(second.has_value());
+    REQUIRE(third.has_value());
+
+    NodeInfo client_info;
+    client_info.id = random_node_id();
+    client_info.host = "127.0.0.1";
+    client_info.port = free_port();
+    client_info.failure_domain = "client-site";
+    RpcClient client(fixture.keys(), [client_info] { return client_info; },
+                     [](const NodeInfo&) {}, [](uint64_t) {}, 500ms, 100ms, 2s);
+    Endpoint endpoint{"127.0.0.1", config.port};
+    Writer request;
+    request.fixed(id.bytes);
+
+    auto blocked_loader = client.call_async(endpoint, MessageType::get_object, request.data(),
+                                            FrameType::loader);
+    REQUIRE(wait_until([&] { return node.data_resources().stats().loader_waits >= 1; }, 1s));
+
+    // The storage-backed viewer request uses the reserved physical DATA credit,
+    // while fast CONTROL remains wholly outside the DATA arbiter.
+    auto viewer_started = Clock::now();
+    auto viewer = client.call(endpoint, MessageType::get_object, request.data(),
+                              FrameType::foreground, 500ms);
+    CHECK(viewer.message.type == MessageType::object_reply);
+    CHECK(Clock::now() - viewer_started < 200ms);
+
+    auto control_started = Clock::now();
+    auto control = client.call(endpoint, MessageType::ping, {}, 500ms);
+    CHECK(control.message.type == MessageType::ok);
+    CHECK(Clock::now() - control_started < 200ms);
+    CHECK(blocked_loader.wait_for(20ms) == std::future_status::timeout);
+
+    first.reset();
+    REQUIRE(blocked_loader.wait_for(1s) == std::future_status::ready);
+    CHECK(blocked_loader.get().message.type == MessageType::object_reply);
+
+    const auto stats = node.data_resources().stats();
+    CHECK(stats.viewer_admissions >= 1);
+    CHECK(stats.loader_waits >= 1);
+    CHECK(stats.peak_used_bytes == config.data_inflight_bytes);
+
+    client.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_early_replication_quorum) {
     TestCluster cluster;
     const auto& keys = cluster.keys();

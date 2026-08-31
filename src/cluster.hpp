@@ -2,6 +2,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "data_work.hpp"
 #include "local_store.hpp"
 #include "membership.hpp"
 #include "metadata.hpp"
@@ -66,6 +67,7 @@ class NodeRuntime {
     StorageLock state_lock_;
     NodeId id_;
     NodeId durability_epoch_;
+    DataResourceArbiter data_resources_;
 
     // The control plane is intentionally constructed before any storage or
     // metadata backend. A node is therefore reachable/authenticated while its
@@ -164,6 +166,8 @@ class NodeRuntime {
     NodeId durability_epoch() const {
         return durability_epoch_;
     }
+    DataResourceArbiter& data_resources() noexcept { return data_resources_; }
+    const DataResourceArbiter& data_resources() const noexcept { return data_resources_; }
     StoragePool& local_store();
     const StoragePool& local_store() const;
     LocalStore& control_store();

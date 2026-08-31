@@ -133,6 +133,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "  min_write_replicas: 2\n"
             << "  write_stall_ms: 1750\n"
             << "  extent_size: 16M\n"
+            << "  data_inflight_bytes: 96M\n"
+            << "  data_viewer_reserve_bytes: 24M\n"
             << "  read_ahead: 5\n"
             << "bootstrap:\n"
             << "  - seed1.example:7440\n"
@@ -307,6 +309,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(yc.metadata_min_write_replicas == 2); // legacy metadata_replicas: 3 -> old 2-vote floor
     CHECK(yc.min_write_replicas == 2);
     CHECK(yc.write_stall == 1750ms);
+    CHECK(yc.data_inflight_bytes == 96ULL * 1024 * 1024);
+    CHECK(yc.data_viewer_reserve_bytes == 24ULL * 1024 * 1024);
     CHECK(yc.maintenance.interval == 250ms);
     CHECK(yc.maintenance.garbage_grace == 1234ms);
     CHECK(yc.maintenance.busy_bandwidth_fraction == 0.03);

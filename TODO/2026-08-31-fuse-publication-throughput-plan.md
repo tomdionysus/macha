@@ -8,6 +8,24 @@ but deployed UAT proved that priority can still be bypassed inside synchronous
 materialisation, rebuild, commit and physical I/O. Phase 1D below is now the
 mandatory invariant cut before Phase 1C UAT or later throughput work continues.
 
+The 2026-08-31 loaded Phase 1D UAT subsequently proved two remaining failures:
+the viewer/loader distinction still does not arbitrate already-admitted FUSE
+distributed reads at disk/transfer granularity, and spool admission can wait
+indefinitely at the 50% soft threshold while its publication-rate estimate is
+still zero. The evidence and required regression matrix are recorded in
+[the loaded UAT failure](2026-08-31-phase-1d-loaded-uat-failure.md). These are
+mandatory Phase 1D corrections, not later throughput refinements.
+
+The spool zero-rate dead zone now has a locally verified event-driven
+correction: drained bounded publication work grants capped bootstrap admission
+credit until the first physical retirement supplies the ordinary pacing rate.
+See
+[the progress-bootstrap checkpoint](2026-08-31-spool-progress-bootstrap-admission.md).
+Its deployment UAT remains pending. The same regression exposed zero-byte
+publication setup being charged as weighted loader service and amplified into a
+long proportional cooldown; that accounting belongs to the still-active
+resource-arbitration correction.
+
 ## Scheduling laws
 
 1. **Thou Shalt Not Make Control Wait.** Cluster membership, health, metadata
@@ -525,6 +543,18 @@ reconstruction, restart-boundary injection, asynchronous durability completion
 and origin-aware metadata admission remain. See
 [the rebuild checkpoint](2026-08-31-fuse-publication-phase-1d-resumable-rebuild.md).
 
+Third partial implementation checkpoint (2026-08-31): canonical manifests now
+use a sparse changed-range overlay. Untouched extents are reused by immutable
+reference without fetch or hashing; touched extents alone are seeded and
+reconstructed under the existing resumable quantum. Completed-cohort counters
+make source/spool reads, reused extents and put extents directly comparable to
+completed bytes. The deterministic eight-extent regression proves two touched
+extent reads, six untouched reuses, two puts, exact bytes and atomic visibility.
+Filesystem/FUSE is 55/55 green, the controlled complete suite is 226/226, and
+runtime is 3/3. Restart-boundary injection, asynchronous durability completion
+and origin-aware metadata admission remain. See
+[the sparse changed-range checkpoint](2026-08-31-fuse-publication-phase-1d-sparse-changed-ranges.md).
+
 ### 1D.3: reserve end-to-end resources and remove priority inversion
 
 1. Keep the existing independent fast-control, ordinary-control and metadata
@@ -556,6 +586,19 @@ Checkpoint: with loader I/O saturated and deliberately delayed, control requests
 complete using their reserved path and viewer reads begin within the declared
 bound. Neither waits for a loader-owned mutex or executor slot.
 
+First partial implementation checkpoint (2026-08-31): a node-wide event-driven
+byte arbiter now sits below RPC admission at blocking DATA object/local-store
+boundaries. Loader/speculative work cannot consume configurable viewer
+headroom; CONTROL remains outside the arbiter; lower-class saturation tests
+prove foreground object reads and CONTROL ping complete before a blocked loader
+is released. Direct repair placement, incoming/outgoing transfers, ordinary
+local/cache reads and asynchronous fetched-object persistence are covered.
+Status exposes exact capacity/use/wait counters. The clean complete default
+suite passed 225/225 and runtime dependencies 3/3. Per-peer/storage-domain,
+hashing, durability completion tickets and origin-aware metadata admission
+remain active. See
+[the DATA resource checkpoint](2026-08-31-phase-1d-data-resource-headroom.md).
+
 ### 1D.4: guarantee retirement progress under full-spool pressure
 
 1. Schedule closed or otherwise completable generations that release the most
@@ -574,6 +617,45 @@ bound. Neither waits for a loader-owned mutex or executor slot.
 Checkpoint: fill a small test spool with one pathological overlapping-writer
 inode and independent closed files. Closed files commit, occupancy falls, and
 the blocked writer resumes while control and viewer bounds continue to hold.
+
+First partial implementation checkpoint (2026-08-31): publication notification
+is now coalesced at durable data/namespace watermarks, an explicit enqueue owner
+closes the inode-to-queue handoff race, and unchanged flush/release notifications
+perform no shared queue work. One false-to-true spool-drain transition owns the
+all-inode pressure sweep; later durable batches notify only their affected
+inodes. A deterministic test reduces 1,002 notifications to two effective
+requests and 1,000 suppressed duplicates, the three pressure tests prove one
+sweep per episode, filesystem/FUSE is 56/56, the controlled complete suite is
+227/227 and runtime is 3/3. Retirement selection/reservation and fewer metadata
+generations remain. See
+[the notification-coalescing checkpoint](2026-08-31-fuse-publication-phase-1d-notification-coalescing.md).
+
+Second partial implementation checkpoint (2026-08-31): above the spool-pressure
+threshold, closed generations are ranked by releasable spool bytes per estimated
+remaining replay byte, then nearest completion. Normal below-pressure FIFO and
+open-loader fallback are unchanged. A deterministic small-spool regression
+proves a later small closed generation retires ahead of an earlier large closed
+generation and wakes a blocked writer without polling. The new test and all
+57 filesystem/FUSE tests pass. Failure diagnostics corrected the pre-existing
+catalogue final-state test's invalid exact-generation and asynchronous
+run-sampling assumptions without changing its timeout or content/GC proof; it
+then passed 10/10 isolated repetitions and the final controlled complete suite
+passed 228/228. Deployment and loaded UAT remain. Reserved retirement capacity,
+transient-failure cursor preservation and metadata-generation coalescing remain. See
+[the retirement-selection checkpoint](2026-08-31-fuse-publication-phase-1d-retirement-selection.md).
+
+Third partial implementation checkpoint (2026-08-31): retryable backend errors
+now preserve the exact process-lifetime publication, WAL and
+materialisation/rebuild cursor rather than reopening the writer and replaying
+the generation from byte zero. Pipelined extent futures retain their bounded
+payload and manifest offset on failure, retry in place at the queue head, and
+cannot let later results create a manifest hole. A deterministic one-shot
+failure after the first extent proves one publication start, one backend
+failure, exact one-pass spool reads, atomic final content and successful
+completion. Filesystem/FUSE is 58/58 green, the controlled complete suite is
+229/229 and runtime is 3/3. Reserved retirement capacity and
+metadata-generation coalescing remain. See
+[the transient-failure cursor checkpoint](2026-08-31-fuse-publication-phase-1d-transient-failure-cursor.md).
 
 ### Phase 1D invariant tests and UAT gate
 
