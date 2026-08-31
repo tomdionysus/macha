@@ -96,6 +96,10 @@ fuse:
   # is quiet instead of being permanently classified as foreground activity.
   foreground_commit_workers: 1
   publication_quiet_ms: 5000
+  # A large file yields after each quantum so closed/smaller files make fair
+  # progress. The in-flight budget caps the aggregate quanta admitted at once.
+  publication_quantum_bytes: 32M
+  publication_inflight_bytes: 256M
   max_pending_operations: 4096
 
   # Aggregate local write-back and recovery bounds. max_spool_bytes is the

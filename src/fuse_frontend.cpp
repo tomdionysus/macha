@@ -268,6 +268,30 @@ struct FuseFrontend::State {
         std::vector<Hash256> spool_hashes;
     };
 
+    struct DataSnapshot {
+        uint64_t target_sequence{};
+        uint64_t required_namespace_sequence{};
+        std::vector<DataOp> operations;
+        std::optional<std::string> published_path;
+        std::filesystem::path spool_path;
+    };
+
+    // Durable input remains in the spool while this process-lifetime cursor
+    // retains provisional writer state between fair scheduling quanta. A crash
+    // simply discards the cursor and replays the same journal generation.
+    struct DataPublication {
+        DataSnapshot snapshot;
+        bool recovered{};
+        bool initialized{};
+        size_t operation_index{};
+        uint64_t operation_offset{};
+        uint64_t publication_bytes{};
+        Clock::time_point started{};
+        Clock::duration active_duration{};
+        std::shared_ptr<WriteHandle> writer;
+        ScopedFd replay_spool;
+    };
+
     struct Inode {
         mutable std::mutex mutex;
         uint64_t id{};
@@ -309,6 +333,7 @@ struct FuseFrontend::State {
         bool data_queued{};
         bool data_running{};
         bool data_deferred{};
+        std::shared_ptr<DataPublication> data_publication;
         std::optional<int> backend_error;
         uint64_t journal_epoch{};
         uint64_t unconfirmed_data_sequence{};
@@ -478,6 +503,9 @@ struct FuseFrontend::State {
     std::vector<std::jthread> data_workers;
     std::atomic_size_t active_data{};
     std::atomic_size_t active_recovery_data{};
+    // Protected by data_queue_mutex. Each active worker reserves exactly one
+    // configured logical byte quantum, bounding aggregate publication work.
+    uint64_t publication_inflight_bytes{};
     // Number of writable FUSE handles currently open. This is operational state,
     // not a viewer signal: bulk loaders may keep writers open continuously and
     // must not thereby collapse publication to a single worker.
@@ -503,6 +531,9 @@ struct FuseFrontend::State {
     std::atomic_uint64_t data_publications_started{};
     std::atomic_uint64_t data_publications_completed{};
     std::atomic_uint64_t data_publication_peak_active{};
+    std::atomic_uint64_t data_publication_quanta{};
+    std::atomic_uint64_t data_publication_yields{};
+    std::atomic_uint64_t data_publication_peak_inflight_bytes{};
     std::atomic_uint64_t data_closed_priority_selections{};
     std::atomic_uint64_t data_publication_bytes_read{};
     std::atomic_uint64_t data_publication_bytes_committed{};
@@ -2235,14 +2266,6 @@ struct FuseFrontend::State {
         }
     }
 
-    struct DataSnapshot {
-        uint64_t target_sequence{};
-        uint64_t required_namespace_sequence{};
-        std::vector<DataOp> operations;
-        std::optional<std::string> published_path;
-        std::filesystem::path spool_path;
-    };
-
     DataSnapshot snapshot_data(const std::shared_ptr<Inode>& inode) {
         std::lock_guard lock(inode->mutex);
         DataSnapshot snapshot;
@@ -2336,11 +2359,13 @@ struct FuseFrontend::State {
         data_cv.notify_all();
     }
 
-    void replay_data(const std::shared_ptr<Inode>& inode, DataSnapshot snapshot, bool recovered) {
+    bool replay_data_quantum(const std::shared_ptr<Inode>& inode,
+                             const std::shared_ptr<DataPublication>& publication) {
+        auto& snapshot = publication->snapshot;
         if (snapshot.operations.empty())
-            return;
+            return true;
 
-        if (recovered) {
+        if (!publication->initialized && publication->recovered) {
             std::optional<std::string> spool_error;
             {
                 std::lock_guard lock(inode->mutex);
@@ -2348,127 +2373,162 @@ struct FuseFrontend::State {
             }
             if (spool_error) {
                 abandon_corrupt_data(inode, *spool_error);
-                return;
+                return true;
             }
         }
 
-        // Order data only behind namespace mutations which are actually still
-        // unpublished. A recovered inode descriptor can retain an old namespace
-        // sequence after the corresponding journal history has been retired; a
-        // reconstructed scalar watermark is therefore not a reliable reason to
-        // park a recovery worker indefinitely. The namespace queue/in-flight op
-        // is the authoritative set of work which can still change published_path.
-        {
-            std::unique_lock namespace_lock(namespace_queue_mutex);
-            namespace_cv.wait(namespace_lock, [&] {
-                if (stopping.load())
-                    return true;
-                if (namespace_inflight &&
-                    namespace_inflight_sequence <= snapshot.required_namespace_sequence)
-                    return false;
-                return namespace_queue.empty() ||
-                       namespace_queue.front().sequence > snapshot.required_namespace_sequence;
-            });
-        }
-        if (stopping.load())
-            return;
+        if (!publication->initialized) {
+            // Order the cursor only behind namespace mutations which are still
+            // unpublished. Later quanta retain the already-open writer.
+            {
+                std::unique_lock namespace_lock(namespace_queue_mutex);
+                namespace_cv.wait(namespace_lock, [&] {
+                    if (stopping.load())
+                        return true;
+                    if (namespace_inflight &&
+                        namespace_inflight_sequence <= snapshot.required_namespace_sequence)
+                        return false;
+                    return namespace_queue.empty() || namespace_queue.front().sequence >
+                                                          snapshot.required_namespace_sequence;
+                });
+            }
+            if (stopping.load())
+                throw FsError(EINTR, "FUSE publication stopping");
 
-        {
-            std::lock_guard lock(inode->mutex);
-            snapshot.published_path = inode->published_path;
-            if (inode->backend_error)
-                throw FsError(*inode->backend_error, "FUSE inode has asynchronous backend error");
-        }
-        if (!snapshot.published_path) {
-            const auto retired = snapshot.operations.size();
-            const bool journal_idle =
-                journal_data_done(inode->id, snapshot.target_sequence, retired);
-            bool spool_clean = true;
-            std::lock_guard lock(inode->mutex);
-            inode->data_ops.erase(std::remove_if(inode->data_ops.begin(), inode->data_ops.end(),
-                                                 [&](const DataOp& op) {
-                                                     return op.sequence <= snapshot.target_sequence;
-                                                 }),
-                                  inode->data_ops.end());
-            inode->published_data_sequence =
-                std::max(inode->published_data_sequence, snapshot.target_sequence);
-            if (inode->data_ops.empty() && !inode->durability_pending)
-                spool_clean = retire_spool_locked(*inode);
-            if (journal_idle && spool_clean)
-                reset_journal_if_idle();
-            return;
-        }
+            {
+                std::lock_guard lock(inode->mutex);
+                snapshot.published_path = inode->published_path;
+                if (inode->backend_error)
+                    throw FsError(*inode->backend_error,
+                                  "FUSE inode has asynchronous backend error");
+            }
+            if (!snapshot.published_path) {
+                const auto retired = snapshot.operations.size();
+                const bool journal_idle =
+                    journal_data_done(inode->id, snapshot.target_sequence, retired);
+                bool spool_clean = true;
+                {
+                    std::lock_guard lock(inode->mutex);
+                    inode->data_ops.erase(
+                        std::remove_if(inode->data_ops.begin(), inode->data_ops.end(),
+                                       [&](const DataOp& op) {
+                                           return op.sequence <= snapshot.target_sequence;
+                                       }),
+                        inode->data_ops.end());
+                    inode->published_data_sequence =
+                        std::max(inode->published_data_sequence, snapshot.target_sequence);
+                    if (inode->data_ops.empty() && !inode->durability_pending)
+                        spool_clean = retire_spool_locked(*inode);
+                }
+                if (journal_idle && spool_clean)
+                    reset_journal_if_idle();
+                return true;
+            }
 
-        uint64_t publication_bytes = 0;
-        for (const auto& op : snapshot.operations) {
-            if (op.kind != DataOp::Kind::write)
-                continue;
-            publication_bytes =
-                op.length > std::numeric_limits<uint64_t>::max() - publication_bytes
-                    ? std::numeric_limits<uint64_t>::max()
-                    : publication_bytes + op.length;
-        }
-        const auto publication_started = Clock::now();
-        data_publications_started.fetch_add(1, std::memory_order_relaxed);
-        std::shared_ptr<WriteHandle> writer;
-        ScopedFd replay_spool;
-        try {
+            for (const auto& op : snapshot.operations) {
+                if (op.kind == DataOp::Kind::write)
+                    publication->publication_bytes =
+                        op.length > std::numeric_limits<uint64_t>::max() -
+                                        publication->publication_bytes
+                            ? std::numeric_limits<uint64_t>::max()
+                            : publication->publication_bytes + op.length;
+            }
+            publication->started = Clock::now();
+            data_publications_started.fetch_add(1, std::memory_order_relaxed);
             // The durable spool+journal is the WAL for this publication. New
             // extents may therefore be staged provisionally and group-synced
             // once, immediately before metadata publication. Crash-recovery
             // replay deliberately bypasses cache admission so a large backlog
             // cannot evict the useful working set merely by being replayed.
-            writer = fs.open_write(*snapshot.published_path, false,
-                                   config.write_through_cache && !recovered,
-                                   WriteDurability::publication_generation);
-            constexpr size_t chunk_size = 256 * 1024;
-            Bytes buffer(chunk_size);
-            for (const auto& op : snapshot.operations) {
+            publication->writer = fs.open_write(
+                *snapshot.published_path, false,
+                config.write_through_cache && !publication->recovered,
+                WriteDurability::publication_generation);
+            publication->initialized = true;
+        }
+
+        const auto quantum_started = Clock::now();
+        uint64_t served = 0;
+        constexpr size_t chunk_size = spool_checksum_chunk_size;
+        Bytes buffer(chunk_size);
+        try {
+            while (publication->operation_index < snapshot.operations.size()) {
                 if (stopping.load())
                     throw FsError(EINTR, "FUSE publication stopping");
+                if (!playback_quiet()) {
+                    publication->active_duration += Clock::now() - quantum_started;
+                    return false;
+                }
+                const auto& op = snapshot.operations[publication->operation_index];
                 if (op.kind == DataOp::Kind::truncate) {
-                    wait_for_playback_quiet();
-                    writer->truncate(op.size);
+                    // Metadata-only operations still consume a bounded service
+                    // unit so a pathological truncate stream cannot bypass the
+                    // byte quantum and monopolise a worker.
+                    if (served > config.publication_quantum_bytes - chunk_size) {
+                        publication->active_duration += Clock::now() - quantum_started;
+                        return false;
+                    }
+                    publication->writer->truncate(op.size);
+                    served += chunk_size;
+                    ++publication->operation_index;
+                    publication->operation_offset = 0;
                     continue;
                 }
-                uint64_t done = 0;
-                while (done < op.length) {
+                while (publication->operation_offset < op.length &&
+                       served < config.publication_quantum_bytes) {
                     // Only the locally durable prefix reaches this path. The
                     // write bytes and operation descriptor have completed the
                     // spool -> journal durability barrier, so distributed
                     // publication may yield to viewer playback between bounded
                     // replay chunks without endangering recoverable input.
-                    wait_for_playback_quiet();
+                    if (!playback_quiet()) {
+                        publication->active_duration += Clock::now() - quantum_started;
+                        return false;
+                    }
                     const auto chunk =
-                        static_cast<size_t>(std::min<uint64_t>(buffer.size(), op.length - done));
-                    if (replay_spool.get() < 0) {
+                        static_cast<size_t>(std::min<uint64_t>(
+                            {buffer.size(), op.length - publication->operation_offset,
+                             config.publication_quantum_bytes - served}));
+                    if (publication->replay_spool.get() < 0) {
                         const int fd = ::open(snapshot.spool_path.c_str(), O_RDONLY);
                         if (fd < 0)
                             throw FsError(errno, "cannot open FUSE write spool for publication");
-                        replay_spool.reset(fd);
+                        publication->replay_spool.reset(fd);
                     }
-                    if (pread_exact(replay_spool.get(), {buffer.data(), chunk},
-                                    op.spool_offset + done) != chunk) {
-                        if (recovered) {
+                    if (pread_exact(publication->replay_spool.get(), {buffer.data(), chunk},
+                                    op.spool_offset + publication->operation_offset) != chunk) {
+                        if (publication->recovered) {
                             abandon_corrupt_data(inode, "short read from FUSE write spool");
-                            return;
+                            return true;
                         }
                         throw FsError(EIO, "short read from FUSE write spool");
                     }
                     data_publication_bytes_read.fetch_add(chunk, std::memory_order_relaxed);
                     if (!op.spool_hashes.empty()) {
                         const auto checksum_index =
-                            static_cast<size_t>(done / State::spool_checksum_chunk_size);
+                            static_cast<size_t>(publication->operation_offset /
+                                                State::spool_checksum_chunk_size);
                         if (checksum_index >= op.spool_hashes.size() ||
                             sha256(std::span<const uint8_t>{buffer.data(), chunk}) !=
                                 op.spool_hashes[checksum_index]) {
                             abandon_corrupt_data(inode, "payload checksum mismatch");
-                            return;
+                            return true;
                         }
                     }
-                    if (writer->write(op.offset + done, {buffer.data(), chunk}) != chunk)
+                    if (publication->writer->write(op.offset + publication->operation_offset,
+                                                   {buffer.data(), chunk}) != chunk)
                         throw FsError(EIO, "short replay into Macha write handle");
-                    done += chunk;
+                    publication->operation_offset += chunk;
+                    served += chunk;
+                }
+                if (publication->operation_offset == op.length) {
+                    ++publication->operation_index;
+                    publication->operation_offset = 0;
+                }
+                if (served >= config.publication_quantum_bytes &&
+                    publication->operation_index < snapshot.operations.size()) {
+                    publication->active_duration += Clock::now() - quantum_started;
+                    return false;
                 }
             }
             {
@@ -2478,12 +2538,13 @@ struct FuseFrontend::State {
                 // the serial commit boundary so at most the already-running
                 // bounded operation can precede new viewer demand.
                 wait_for_playback_quiet();
-                writer->commit();
+                publication->writer->commit();
             }
+            publication->active_duration += Clock::now() - quantum_started;
             data_publications_completed.fetch_add(1, std::memory_order_relaxed);
-            data_publication_bytes_committed.fetch_add(publication_bytes,
+            data_publication_bytes_committed.fetch_add(publication->publication_bytes,
                                                        std::memory_order_relaxed);
-            note_spool_publication(publication_bytes, Clock::now() - publication_started);
+            note_spool_publication(publication->publication_bytes, publication->active_duration);
         } catch (const FsError& e) {
             if (e.code() == ENOENT || e.code() == EAGAIN) {
                 std::lock_guard lock(inode->mutex);
@@ -2493,7 +2554,7 @@ struct FuseFrontend::State {
             }
             throw;
         }
-        auto committed = writer->committed_entry();
+        auto committed = publication->writer->committed_entry();
 
         // Record that the backend accepted this exact file generation before
         // changing the in-memory publication watermark. A crash after the
@@ -2505,7 +2566,7 @@ struct FuseFrontend::State {
             inode->published_data_sequence =
                 std::max(inode->published_data_sequence, snapshot.target_sequence);
             inode->unconfirmed_data_sequence = snapshot.target_sequence;
-            inode->unconfirmed_publication_bytes = publication_bytes;
+            inode->unconfirmed_publication_bytes = publication->publication_bytes;
             inode->unconfirmed_data_entry = committed;
         }
 
@@ -2514,6 +2575,7 @@ struct FuseFrontend::State {
         // namespace-facing request will perform the same confirmation.
         if (auto available = fs.available_snapshot_view())
             (void)confirm_data_from_snapshot(inode, *available->snapshot);
+        return true;
     }
 
     bool data_global_slot_available() const {
@@ -2523,7 +2585,9 @@ struct FuseFrontend::State {
         // quanta; publishers also re-check the same gate between replay chunks.
         if (!playback_quiet())
             return false;
-        return active_data.load(std::memory_order_relaxed) < config.commit_workers;
+        return active_data.load(std::memory_order_relaxed) < config.commit_workers &&
+               publication_inflight_bytes <=
+                   config.publication_inflight_bytes - config.publication_quantum_bytes;
     }
 
     auto runnable_data_locked() {
@@ -2606,6 +2670,14 @@ struct FuseFrontend::State {
                 inode = selected->inode;
                 recovered = selected->recovered;
                 data_queue.erase(selected);
+                publication_inflight_bytes += config.publication_quantum_bytes;
+                data_publication_quanta.fetch_add(1, std::memory_order_relaxed);
+                auto byte_peak =
+                    data_publication_peak_inflight_bytes.load(std::memory_order_relaxed);
+                while (byte_peak < publication_inflight_bytes &&
+                       !data_publication_peak_inflight_bytes.compare_exchange_weak(
+                           byte_peak, publication_inflight_bytes, std::memory_order_relaxed)) {
+                }
                 const auto active_now = active_data.fetch_add(1, std::memory_order_relaxed) + 1;
                 auto peak = data_publication_peak_active.load(std::memory_order_relaxed);
                 while (peak < active_now &&
@@ -2622,9 +2694,26 @@ struct FuseFrontend::State {
             }
 
             bool retry = false;
+            bool completed = false;
             try {
-                auto snapshot = snapshot_data(inode);
-                replay_data(inode, std::move(snapshot), recovered);
+                std::shared_ptr<DataPublication> publication;
+                {
+                    std::lock_guard lock(inode->mutex);
+                    publication = inode->data_publication;
+                }
+                if (!publication) {
+                    auto created = std::make_shared<DataPublication>();
+                    created->snapshot = snapshot_data(inode);
+                    created->recovered = recovered;
+                    {
+                        std::lock_guard lock(inode->mutex);
+                        inode->data_publication = created;
+                    }
+                    publication = std::move(created);
+                }
+                completed = replay_data_quantum(inode, publication);
+                if (!completed)
+                    data_publication_yields.fetch_add(1, std::memory_order_relaxed);
             } catch (const std::exception& e) {
                 ++backend_failures;
                 retry = retryable_backend_error(e);
@@ -2643,14 +2732,23 @@ struct FuseFrontend::State {
             {
                 std::lock_guard lock(inode->mutex);
                 inode->data_running = false;
+                // A clean yield retains the provisional writer and exact spool
+                // cursor. Completion or any exception discards it; durable
+                // journal replay then remains the sole retry authority.
+                if (completed || retry || inode->backend_error)
+                    inode->data_publication.reset();
                 const bool still_requested =
                     inode->requested_data_sequence > inode->published_data_sequence;
-                if ((retry || still_requested) && !inode->unconfirmed_data_entry)
+                if ((!completed || retry || still_requested) && !inode->unconfirmed_data_entry)
                     inode->data_deferred = true;
             }
-            --active_data;
-            if (recovered)
-                --active_recovery_data;
+            {
+                std::lock_guard lock(data_queue_mutex);
+                publication_inflight_bytes -= config.publication_quantum_bytes;
+                --active_data;
+                if (recovered)
+                    --active_recovery_data;
+            }
             data_cv.notify_all();
             if (retry)
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -4549,6 +4647,10 @@ FuseFrontendStatus FuseFrontend::status() const {
     out.data_publications_started = diagnostics.data_publications_started;
     out.data_publications_completed = diagnostics.data_publications_completed;
     out.data_publication_peak_active = diagnostics.data_publication_peak_active;
+    out.data_publication_quanta = diagnostics.data_publication_quanta;
+    out.data_publication_yields = diagnostics.data_publication_yields;
+    out.data_publication_peak_inflight_bytes =
+        diagnostics.data_publication_peak_inflight_bytes;
     out.data_closed_priority_selections = diagnostics.data_closed_priority_selections;
     out.data_publication_bytes_read = diagnostics.data_publication_bytes_read;
     out.data_publication_bytes_committed = diagnostics.data_publication_bytes_committed;
@@ -4586,6 +4688,9 @@ FuseFrontendDiagnostics FuseFrontend::diagnostics() const noexcept {
         state_->data_publications_started.load(std::memory_order_relaxed),
         state_->data_publications_completed.load(std::memory_order_relaxed),
         state_->data_publication_peak_active.load(std::memory_order_relaxed),
+        state_->data_publication_quanta.load(std::memory_order_relaxed),
+        state_->data_publication_yields.load(std::memory_order_relaxed),
+        state_->data_publication_peak_inflight_bytes.load(std::memory_order_relaxed),
         state_->data_closed_priority_selections.load(std::memory_order_relaxed),
         state_->data_publication_bytes_read.load(std::memory_order_relaxed),
         state_->data_publication_bytes_committed.load(std::memory_order_relaxed),

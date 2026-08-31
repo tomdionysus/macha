@@ -109,6 +109,19 @@ void validate(Config& config) {
     if (config.fuse.publication_quiet < std::chrono::milliseconds(0) ||
         config.fuse.publication_quiet > std::chrono::seconds(30))
         throw std::runtime_error("fuse.publication_quiet_ms must be 0..30000");
+    constexpr uint64_t publication_chunk = 256ULL * 1024;
+    if (config.fuse.publication_quantum_bytes < publication_chunk ||
+        config.fuse.publication_quantum_bytes > 1024ULL * 1024 * 1024 ||
+        config.fuse.publication_quantum_bytes % publication_chunk ||
+        config.fuse.publication_quantum_bytes < config.extent_size ||
+        config.fuse.publication_quantum_bytes % config.extent_size)
+        throw std::runtime_error(
+            "fuse.publication_quantum_bytes must be an extent-size multiple from extent_size..1G");
+    if (config.fuse.publication_inflight_bytes < config.fuse.publication_quantum_bytes ||
+        config.fuse.publication_inflight_bytes > 16ULL * 1024 * 1024 * 1024 ||
+        config.fuse.publication_inflight_bytes % config.fuse.publication_quantum_bytes)
+        throw std::runtime_error(
+            "fuse.publication_inflight_bytes must be a quantum multiple from quantum..16G");
     if (!config.fuse.max_pending_requests || config.fuse.max_pending_requests > 65536 ||
         !config.fuse.max_pending_operations || config.fuse.max_pending_operations > 65536)
         throw std::runtime_error("fuse pending queue limits must be 1..65536");
