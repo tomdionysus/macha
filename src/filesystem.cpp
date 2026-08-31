@@ -231,9 +231,11 @@ size_t ReadHandle::read(uint64_t off, std::span<uint8_t> out, Clock::time_point 
 }
 
 WriteHandle::WriteHandle(FileSystem& f, std::string p, FsEntry b, bool trunc, bool cache_puts,
-                         WriteDurability durability, uint64_t publication_pipeline_bytes)
+                         WriteDurability durability, uint64_t publication_pipeline_bytes,
+                         DataWorkContext work_context)
     : fs_(f), path_(std::move(p)), base_(std::move(b)), expected_(base_.version),
       sequential_(true), cache_puts_(cache_puts), durability_(durability),
+      work_context_(work_context),
       publication_pipeline_bytes_(publication_pipeline_bytes),
       logical_(trunc ? 0 : base_.size), staged_(trunc ? 0 : base_.size),
       diagnostic_id_(next_write_handle_diagnostic_id.fetch_add(1, std::memory_order_relaxed)) {
@@ -365,10 +367,12 @@ std::chrono::milliseconds WriteHandle::flush() {
         pending_extents_.push_back({
             length,
             std::async(std::launch::async,
-                       [store, cancelled, cache_put, offset, bytes = std::move(bytes)]() mutable {
+                       [store, cancelled, cache_put, offset,
+                        frame_type = work_context_.frame_type(),
+                        bytes = std::move(bytes)]() mutable {
                            const auto put_started = Clock::now();
                            DistributedStore::DurabilityBatch batch;
-                           auto id = store->put_deferred(bytes, batch, cancelled);
+                           auto id = store->put_deferred(bytes, batch, frame_type, cancelled);
                            if (cache_put)
                                (void)store->cache_local(id, bytes);
                            return StagedExtentResult{
@@ -382,9 +386,10 @@ std::chrono::milliseconds WriteHandle::flush() {
     ObjectId id;
     try {
         if (durability_ == WriteDurability::publication_generation)
-            id = fs_.store().put_deferred(buffer_, durability_batch_, &fs_.io_cancelled_);
+            id = fs_.store().put_deferred(buffer_, durability_batch_,
+                                          work_context_.frame_type(), &fs_.io_cancelled_);
         else
-            id = fs_.store().put(buffer_, &fs_.io_cancelled_);
+            id = fs_.store().put(buffer_, work_context_.frame_type(), &fs_.io_cancelled_);
     } catch (...) {
         if (fs_.io_cancellation_requested())
             fail(EINTR, "write cancelled");
@@ -474,7 +479,7 @@ void WriteHandle::prepare_append_tail() {
         bytes.assign(static_cast<size_t>(tail.length), 0);
     } else {
         auto data = fs_.store().get(tail.id, static_cast<size_t>(tail.offset / fs_.extent_size()),
-                                    FrameType::read_ahead, {}, &fs_.io_cancelled_);
+                                    work_context_.frame_type(), {}, &fs_.io_cancelled_);
         if (!data) {
             if (fs_.io_cancellation_requested())
                 fail(EINTR, "write cancelled");
@@ -496,79 +501,141 @@ void WriteHandle::prepare_append_tail() {
                    " bytes=" + std::to_string(tail.length));
 }
 
-void WriteHandle::materialize() {
-    (void)drain_staging_locked();
-    if (temp_ >= 0)
-        return;
-    if (sequential_)
-        prepare_append_tail();
-    if (fs_.io_cancellation_requested())
-        fail(EINTR, "write cancelled");
-    auto d = fs_.node().config().state_path / "tmp";
-    std::filesystem::create_directories(d);
-    auto pattern = (d / ("write." + to_string(fs_.node().node_id()) + ".XXXXXX")).string();
-    std::vector<char> name(pattern.begin(), pattern.end());
-    name.push_back('\0');
-    temp_ = mkstemp(name.data());
-    if (temp_ < 0)
-        fail(EIO, "cannot create staging file");
-    temp_path_ = name.data();
-    if (Log::enabled(LogLevel::all))
-        Log::trace("WRITE materialize-begin id=" + std::to_string(diagnostic_id_) +
-               " path=" + path_ +
-               " logical=" + std::to_string(logical_) +
-               " staged=" + std::to_string(staged_) +
-               " buffer=" + std::to_string(buffer_.size()) +
-               " extents=" + std::to_string(extents_.size()) +
-               " sequential=" + std::to_string(sequential_ ? 1 : 0) +
-               " temp=" + temp_path_.string());
-    if (sequential_) {
-        for (size_t i = 0; i < extents_.size(); ++i) {
-            if (fs_.io_cancellation_requested())
-                fail(EINTR, "write cancelled");
-            if (extents_[i].hole) {
-                Bytes zeros(static_cast<size_t>(extents_[i].length), 0);
-                pwa(temp_, zeros, extents_[i].offset);
-                continue;
-            }
-            auto x = fs_.store().get(extents_[i].id, i, FrameType::read_ahead, {},
-                                     &fs_.io_cancelled_);
-            ++materialize_source_reads_;
-            if (!x) {
-                if (fs_.io_cancellation_requested())
-                    fail(EINTR, "write cancelled");
-                fail(EIO, "cannot rematerialize staged extent");
-            }
-            pwa(temp_, *x, extents_[i].offset);
+WritePreparation WriteHandle::materialize_step(uint64_t byte_budget) {
+    if (!materializing_) {
+        (void)drain_staging_locked();
+        if (temp_ >= 0)
+            return {true, 0};
+        if (sequential_ && append_tail_) {
+            // Non-sequential fallback needs the old tail as immutable source
+            // data, not as an eagerly fetched append seed. Restore the manifest
+            // reference so its fetch and staging write occur inside this
+            // resumable materialisation budget.
+            extents_.push_back(*append_tail_);
+            staged_ = logical_;
+            append_tail_.reset();
         }
-        if (!buffer_.empty())
-            pwa(temp_, buffer_, staged_);
-    } else {
-        ReadHandle r(fs_.store(), base_, 0);
-        Bytes b(std::min<size_t>(fs_.extent_size(), 4 * 1024 * 1024));
-        uint64_t o = 0;
-        while (o < base_.size) {
-            size_t n = std::min<uint64_t>(b.size(), base_.size - o);
-            if (fs_.io_cancellation_requested())
-                fail(EINTR, "write cancelled");
-            ++materialize_source_reads_;
-            if (r.read(o, {b.data(), n}, {}, &fs_.io_cancelled_) != n) {
-                if (fs_.io_cancellation_requested())
-                    fail(EINTR, "write cancelled");
-                fail(EIO, "short source read");
-            }
-            pwa(temp_, {b.data(), n}, o);
-            o += n;
-        }
+        if (fs_.io_cancellation_requested())
+            fail(EINTR, "write cancelled");
+        auto d = fs_.node().config().state_path / "tmp";
+        std::filesystem::create_directories(d);
+        auto pattern = (d / ("write." + to_string(fs_.node().node_id()) + ".XXXXXX")).string();
+        std::vector<char> name(pattern.begin(), pattern.end());
+        name.push_back('\0');
+        temp_ = mkstemp(name.data());
+        if (temp_ < 0)
+            fail(EIO, "cannot create staging file");
+        temp_path_ = name.data();
+        materializing_ = true;
+        materialize_offset_ = 0;
+        materialize_extent_index_ = 0;
+        if (Log::enabled(LogLevel::all))
+            Log::trace("WRITE materialize-begin id=" + std::to_string(diagnostic_id_) +
+                   " path=" + path_ +
+                   " logical=" + std::to_string(logical_) +
+                   " staged=" + std::to_string(staged_) +
+                   " buffer=" + std::to_string(buffer_.size()) +
+                   " extents=" + std::to_string(extents_.size()) +
+                   " sequential=" + std::to_string(sequential_ ? 1 : 0) +
+                   " temp=" + temp_path_.string());
     }
+
+    const bool unlimited = byte_budget == 0;
+    if (!unlimited && byte_budget < fs_.extent_size())
+        fail(EINVAL, "materialization budget must be zero or at least one extent");
+    uint64_t processed = 0;
+    const auto source_size = logical_;
+    while (materialize_offset_ < source_size &&
+           (unlimited || processed < byte_budget)) {
+        if (fs_.io_cancellation_requested())
+            fail(EINTR, "write cancelled");
+        const auto remaining_budget = unlimited
+                                          ? std::numeric_limits<uint64_t>::max()
+                                          : byte_budget - processed;
+
+        if (sequential_ && materialize_offset_ < staged_) {
+            if (materialize_extent_index_ >= extents_.size())
+                fail(EIO, "staged extent manifest has a gap");
+            const auto& extent = extents_[materialize_extent_index_];
+            if (extent.offset != materialize_offset_ || extent.length > remaining_budget)
+                fail(EIO, "staged extent exceeds materialization quantum");
+            if (extent.hole) {
+                Bytes zeros(static_cast<size_t>(extent.length), 0);
+                pwa(temp_, zeros, extent.offset);
+            } else {
+                auto bytes = fs_.store().get(extent.id, materialize_extent_index_,
+                                             work_context_.frame_type(), {},
+                                             &fs_.io_cancelled_);
+                ++materialize_source_reads_;
+                if (!bytes || bytes->size() != extent.length) {
+                    if (fs_.io_cancellation_requested())
+                        fail(EINTR, "write cancelled");
+                    fail(EIO, "cannot rematerialize staged extent");
+                }
+                pwa(temp_, *bytes, extent.offset);
+            }
+            materialize_offset_ += extent.length;
+            processed += extent.length;
+            ++materialize_extent_index_;
+            continue;
+        }
+
+        if (sequential_) {
+            if (materialize_offset_ < staged_ || materialize_offset_ - staged_ >= buffer_.size())
+                fail(EIO, "staged write buffer has a gap");
+            const auto buffer_offset = static_cast<size_t>(materialize_offset_ - staged_);
+            const auto n = static_cast<size_t>(std::min<uint64_t>(
+                {buffer_.size() - buffer_offset, source_size - materialize_offset_,
+                 remaining_budget}));
+            pwa(temp_, {buffer_.data() + buffer_offset, n}, materialize_offset_);
+            materialize_offset_ += n;
+            processed += n;
+            continue;
+        }
+
+        const auto n = static_cast<size_t>(std::min<uint64_t>(
+            {fs_.extent_size(), source_size - materialize_offset_, remaining_budget}));
+        ReadHandle reader(fs_.store(), base_, nullptr, {}, work_context_.frame_type());
+        Bytes bytes(n);
+        ++materialize_source_reads_;
+        if (reader.read(materialize_offset_, bytes, {}, &fs_.io_cancelled_) != n) {
+            if (fs_.io_cancellation_requested())
+                fail(EINTR, "write cancelled");
+            fail(EIO, "short source read");
+        }
+        pwa(temp_, bytes, materialize_offset_);
+        materialize_offset_ += n;
+        processed += n;
+    }
+
+    materialize_source_bytes_ += processed;
+    ++materialize_steps_;
+    if (materialize_offset_ < source_size)
+        return {false, processed};
+
     if (ftruncate(temp_, logical_))
         fail(EIO, "staging truncate failed");
+    materializing_ = false;
+    sequential_ = false;
     diagnostic_stage_checkpoint("post-materialize");
     diagnostic_completed_extents_ = static_cast<size_t>(logical_ / fs_.extent_size());
     if (Log::enabled(LogLevel::all))
         Log::trace("WRITE materialize-end id=" + std::to_string(diagnostic_id_) +
                " physical=" + std::to_string(fd_size(temp_)) +
                " completed_extents=" + std::to_string(diagnostic_completed_extents_));
+    return {true, processed};
+}
+
+void WriteHandle::materialize() {
+    while (!materialize_step(0).ready) {
+    }
+}
+
+WritePreparation WriteHandle::prepare_write(uint64_t offset, uint64_t byte_budget) {
+    std::lock_guard lock(m_);
+    if (!materializing_ && ((sequential_ && offset == logical_) || temp_ >= 0))
+        return {true, 0};
+    return materialize_step(byte_budget);
 }
 size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
     const auto operation_started = Clock::now();
@@ -666,6 +733,10 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
                        " buffer_after=" + std::to_string(buffer_.size()));
         }
     } else {
+        if (materializing_)
+            materialize();
+        if (rebuilding_)
+            rebuild();
         if (temp_ < 0) {
             if (Log::enabled(LogLevel::all))
                 Log::trace("WRITE nonsequential id=" + std::to_string(diagnostic_id_) +
@@ -683,6 +754,8 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
                        " ms=" + std::to_string(elapsed.count()));
             sequential_ = false;
         }
+
+        rebuild_prepared_ = false;
 
         pwa(temp_, d, off);
         logical_ = std::max<uint64_t>(logical_, off + d.size());
@@ -731,7 +804,10 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
         }
     }
     dirty_ = true;
-    fs_.store().interactive_activity(d.size());
+    if (work_context_.frame_type() == FrameType::foreground)
+        fs_.store().foreground_activity(d.size());
+    else if (work_context_.frame_type() == FrameType::read_ahead)
+        fs_.store().interactive_activity(d.size());
     const auto total =
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - operation_started);
     if (total >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
@@ -776,10 +852,13 @@ void WriteHandle::truncate(uint64_t z) {
                    " result=SEQUENTIAL_RESET logical_after=0 staged_after=0");
         return;
     }
+    if (rebuilding_)
+        rebuild();
     if (temp_ < 0) {
         materialize();
         sequential_ = false;
     }
+    rebuild_prepared_ = false;
     if (ftruncate(temp_, z))
         fail(EIO, "truncate failed");
     logical_ = z;
@@ -791,128 +870,165 @@ void WriteHandle::truncate(uint64_t z) {
                " result=OK logical_after=" + std::to_string(logical_) +
                " physical_after=" + std::to_string(fd_size(temp_)));
 }
-void WriteHandle::rebuild() {
-    auto rebuild_started = Clock::now();
-    std::chrono::milliseconds staging_read_time{};
-    std::chrono::milliseconds object_put_time{};
-    size_t reused_this_rebuild = 0;
-    size_t put_this_rebuild = 0;
-    if (Log::enabled(LogLevel::all))
-        Log::trace("WRITE rebuild-begin id=" + std::to_string(diagnostic_id_) +
-               " logical=" + std::to_string(logical_) +
-               " physical=" + std::to_string(fd_size(temp_)));
-    diagnostic_stage_checkpoint("pre-rebuild");
+WritePreparation WriteHandle::rebuild_step(uint64_t byte_budget) {
+    if (rebuild_prepared_ || temp_ < 0)
+        return {true, 0};
+    if (materializing_)
+        fail(EINVAL, "cannot rebuild before materialization completes");
 
-    // The generic staging fallback is still needed for arbitrary overwrites,
-    // but unchanged extents must remain immutable references rather than being
-    // retransmitted merely because another byte in the file changed.  Include
-    // both the committed base and any extents completed by this handle before
-    // it fell back to staging.
-    std::map<std::pair<uint64_t, uint64_t>, ExtentRef> reusable;
-    for (const auto& extent : base_.extents)
-        reusable[{extent.offset, extent.length}] = extent;
-    for (const auto& extent : extents_)
-        reusable[{extent.offset, extent.length}] = extent;
+    if (!rebuilding_) {
+        rebuilding_ = true;
+        rebuild_offset_ = 0;
+        rebuild_index_ = 0;
+        rebuild_handle_extents_ = std::move(extents_);
+        extents_.clear();
+        staged_ = 0;
+        if (Log::enabled(LogLevel::all)) {
+            Log::trace("WRITE rebuild-begin id=" + std::to_string(diagnostic_id_) +
+                   " logical=" + std::to_string(logical_) +
+                   " physical=" + std::to_string(fd_size(temp_)));
+            // Preserve the exhaustive diagnostic for synchronous callers. A
+            // bounded loader step emits per-extent diagnostics below instead
+            // of hiding a second whole-file scan inside tracing.
+            if (!byte_budget)
+                diagnostic_stage_checkpoint("pre-rebuild");
+        }
+    }
 
-    extents_.clear();
-    staged_ = 0;
-    Bytes b(fs_.extent_size());
-    uint64_t o = 0;
-    size_t index = 0;
-    while (o < logical_) {
+    const bool unlimited = byte_budget == 0;
+    if (!unlimited && byte_budget < fs_.extent_size())
+        fail(EINVAL, "rebuild budget must be zero or at least one extent");
+    uint64_t processed = 0;
+    const auto candidate_at = [](const std::vector<ExtentRef>& candidates,
+                                 uint64_t offset, uint64_t length)
+        -> const ExtentRef* {
+        auto found = std::lower_bound(candidates.begin(), candidates.end(), offset,
+                                      [](const ExtentRef& extent, uint64_t value) {
+                                          return extent.offset < value;
+                                      });
+        if (found == candidates.end() || found->offset != offset || found->length != length)
+            return nullptr;
+        return &*found;
+    };
+
+    Bytes bytes(fs_.extent_size());
+    while (rebuild_offset_ < logical_ && (unlimited || processed < byte_budget)) {
         if (fs_.io_cancellation_requested())
             fail(EINTR, "write cancelled");
-        size_t n = std::min<uint64_t>(b.size(), logical_ - o);
-        const auto read_started = Clock::now();
-        if (pra(temp_, {b.data(), n}, o) != n)
+        const auto remaining_budget = unlimited
+                                          ? std::numeric_limits<uint64_t>::max()
+                                          : byte_budget - processed;
+        const auto n = static_cast<size_t>(
+            std::min<uint64_t>(bytes.size(), logical_ - rebuild_offset_));
+        if (!n || n > remaining_budget)
+            break;
+        if (pra(temp_, {bytes.data(), n}, rebuild_offset_) != n)
             fail(EIO, "short staging read");
-        staging_read_time +=
-            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - read_started);
 
-        const auto bytes = std::span<const uint8_t>{b.data(), n};
-        const auto id = object_id(bytes);
-        const auto candidate = reusable.find({o, n});
-        bool reused = false;
+        const auto data = std::span<const uint8_t>{bytes.data(), n};
+        const auto id = object_id(data);
+        // Handle-local immutable extents override the committed base, matching
+        // the previous map insertion order without constructing an O(file)
+        // lookup table before the first yield point.
+        const ExtentRef* candidate =
+            candidate_at(rebuild_handle_extents_, rebuild_offset_, n);
+        if (!candidate)
+            candidate = candidate_at(base_.extents, rebuild_offset_, n);
+        const bool reused = candidate &&
+                            ((!candidate->hole && candidate->id == id) ||
+                             (candidate->hole && all_zero(data)));
         ExtentRef result;
-        if (candidate != reusable.end()) {
-            if ((!candidate->second.hole && candidate->second.id == id) ||
-                (candidate->second.hole && all_zero(bytes))) {
-                result = candidate->second;
-                reused = true;
-            }
-        }
-
         std::chrono::milliseconds elapsed{};
         if (reused) {
-            ++reused_this_rebuild;
+            result = *candidate;
             ++rebuild_reused_extents_;
         } else {
             const auto started = Clock::now();
             const bool ok = durability_ == WriteDurability::publication_generation
-                                ? fs_.store().put_deferred(id, bytes, durability_batch_,
+                                ? fs_.store().put_deferred(id, data, durability_batch_,
+                                                           work_context_.frame_type(),
                                                            &fs_.io_cancelled_)
-                                : fs_.store().put(id, bytes, &fs_.io_cancelled_);
+                                : fs_.store().put(id, data, work_context_.frame_type(),
+                                                  &fs_.io_cancelled_);
             elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
-            object_put_time += elapsed;
             if (!ok) {
                 if (fs_.io_cancellation_requested())
                     fail(EINTR, "write cancelled");
                 fail(EIO, "object replication quorum unavailable");
             }
             if (cache_puts_)
-                (void)fs_.store().cache_local(id, bytes);
-            result = {o, n, id, false};
-            ++put_this_rebuild;
+                (void)fs_.store().cache_local(id, data);
+            result = {rebuild_offset_, n, id, false};
             ++rebuild_put_extents_;
-            if (elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
+            if (elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug))
                 Log::debug("write stage id=" + std::to_string(diagnostic_id_) +
                            " path=" + path_ +
-                           " stage=rebuild-extent-put index=" + std::to_string(index) +
-                           " offset=" + std::to_string(o) +
+                           " stage=rebuild-extent-put index=" +
+                           std::to_string(rebuild_index_) +
+                           " offset=" + std::to_string(rebuild_offset_) +
                            " bytes=" + std::to_string(n) +
                            " object=" + to_string(id) +
                            " elapsed_ms=" + std::to_string(elapsed.count()));
-            }
         }
 
-        if (Log::enabled(LogLevel::all)) {
+        if (Log::enabled(LogLevel::all))
             Log::trace("WRITE rebuild-extent id=" + std::to_string(diagnostic_id_) +
-                       " index=" + std::to_string(index) +
-                       " offset=" + std::to_string(o) +
-                       " length=" + std::to_string(n) +
-                       " object_id=" + to_string(id) +
-                       " reused=" + std::to_string(reused ? 1 : 0) +
-                       " all_zero=" + std::to_string(all_zero(bytes) ? 1 : 0) +
-                       " first16=" + edge_hex(bytes, true) +
-                       " last16=" + edge_hex(bytes, false) +
-                       " ms=" + std::to_string(elapsed.count()));
-        }
+                   " index=" + std::to_string(rebuild_index_) +
+                   " offset=" + std::to_string(rebuild_offset_) +
+                   " length=" + std::to_string(n) +
+                   " object_id=" + to_string(id) +
+                   " reused=" + std::to_string(reused ? 1 : 0) +
+                   " all_zero=" + std::to_string(all_zero(data) ? 1 : 0) +
+                   " first16=" + edge_hex(data, true) +
+                   " last16=" + edge_hex(data, false) +
+                   " ms=" + std::to_string(elapsed.count()));
         extents_.push_back(result);
-        o += n;
-        ++index;
+        rebuild_offset_ += n;
+        processed += n;
+        ++rebuild_index_;
     }
+
+    rebuild_source_bytes_ += processed;
+    ++rebuild_steps_;
+    if (rebuild_offset_ < logical_)
+        return {false, processed};
+
     staged_ = logical_;
     buffer_.clear();
     append_tail_.reset();
-    auto rebuild_elapsed =
-        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - rebuild_started);
-    if (rebuild_elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
-        Log::debug("write stage id=" + std::to_string(diagnostic_id_) +
-                   " path=" + path_ +
-                   " stage=rebuild extents=" + std::to_string(extents_.size()) +
-                   " reused_extents=" + std::to_string(reused_this_rebuild) +
-                   " put_extents=" + std::to_string(put_this_rebuild) +
-                   " staging_read_ms=" + std::to_string(staging_read_time.count()) +
-                   " object_put_ms=" + std::to_string(object_put_time.count()) +
-                   " total_ms=" + std::to_string(rebuild_elapsed.count()));
-    }
+    rebuild_handle_extents_.clear();
+    rebuilding_ = false;
+    rebuild_prepared_ = true;
     if (Log::enabled(LogLevel::all))
         Log::trace("WRITE rebuild-end id=" + std::to_string(diagnostic_id_) +
                " extents=" + std::to_string(extents_.size()) +
-               " reused=" + std::to_string(reused_this_rebuild) +
-               " put=" + std::to_string(put_this_rebuild) +
-               " ms=" + std::to_string(rebuild_elapsed.count()));
+               " reused=" + std::to_string(rebuild_reused_extents_) +
+               " put=" + std::to_string(rebuild_put_extents_));
+    return {true, processed};
+}
+
+void WriteHandle::rebuild() {
+    while (!rebuild_step(0).ready) {
+    }
+}
+
+WritePreparation WriteHandle::prepare_commit(uint64_t byte_budget) {
+    std::lock_guard lock(m_);
+    if (!dirty_)
+        return {true, 0};
+    if (materializing_) {
+        auto preparation = materialize_step(byte_budget);
+        // Do not combine materialisation and rebuild under one opaque call. The
+        // scheduler sees the exact completed unit before admitting another.
+        if (preparation.bytes_processed || !preparation.ready)
+            return {false, preparation.bytes_processed};
+    }
+    if (temp_ >= 0)
+        return rebuild_step(byte_budget);
+    (void)flush();
+    (void)drain_staging_locked();
+    return {true, 0};
 }
 void WriteHandle::commit() {
     const auto operation_started = Clock::now();
@@ -959,7 +1075,7 @@ void WriteHandle::commit() {
     }
     if (durability_ == WriteDurability::publication_generation && !durability_batch_.empty()) {
         const auto durability_started = Clock::now();
-        if (!fs_.store().durability_barrier(durability_batch_))
+        if (!fs_.store().durability_barrier(durability_batch_, work_context_.frame_type()))
             fail(EIO, "object durability quorum unavailable before publication");
         durability_batch_.clear();
         const auto durability_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1022,7 +1138,9 @@ WriteHandleDiagnostics WriteHandle::diagnostics() const {
     return {diagnostic_id_, logical_, staged_, buffer_.size(), sequential_, temp_ >= 0,
             fd_size(temp_), append_tail_fetches_, materialize_source_reads_, new_extent_puts_,
             rebuild_reused_extents_, rebuild_put_extents_, pending_extents_.size(),
-            peak_pending_extents_};
+            peak_pending_extents_, work_context_.frame_type(), work_context_.quantum_bytes(),
+            materialize_source_bytes_, materialize_steps_, rebuild_source_bytes_,
+            rebuild_steps_};
 }
 
 void WriteHandle::cleanup() {
@@ -1633,7 +1751,8 @@ std::shared_ptr<ReadHandle> FileSystem::open_read(const FsEntry& entry, const st
 }
 std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool trunc,
                                                     bool cache_puts, WriteDurability durability,
-                                                    uint64_t publication_pipeline_bytes) {
+                                                    uint64_t publication_pipeline_bytes,
+                                                    DataWorkContext work_context) {
     // Serialize path lookup/registration with rename so an opening writer cannot
     // miss a rename between resolving the entry and joining the handle registry.
     std::lock_guard handles(open_writes_mutex_);
@@ -1649,7 +1768,7 @@ std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool t
     }
     auto handle =
         std::make_shared<WriteHandle>(*this, *resolved, e, trunc || !e.size, cache_puts,
-                                      durability, publication_pipeline_bytes);
+                                      durability, publication_pipeline_bytes, work_context);
     for (auto i = open_writes_.begin(); i != open_writes_.end();) {
         if (i->expired())
             i = open_writes_.erase(i);

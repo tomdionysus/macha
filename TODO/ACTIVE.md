@@ -32,6 +32,28 @@ The existing documents in this directory remain the detailed plans, checkpoints,
 
 ## Additional investigation
 
+- [ ] Support multiple advertised endpoints per node and multiple candidate IPs
+  per bootstrap node. A node must be able to advertise at least its local/LAN
+  and internet/WAN endpoints simultaneously, with address family, scope and
+  provenance sufficient for peers to choose an endpoint reachable from their
+  own network position.
+- [ ] Integrate endpoint discovery with the completed UPnP/external-IP work:
+  automatically combine configured listen/advertise addresses, interface/LAN
+  addresses, discovered public address and mapped public port, while suppressing
+  unusable, stale and duplicate candidates. Common home-network deployments
+  should work with little or no manual advertise configuration.
+- [ ] Deduplicate connections and membership by durable node identity rather
+  than endpoint. Race viable candidates intelligently (with bounded fallback
+  and remembered reachability), converge multiple successful paths onto one
+  logical peer/session, prefer direct LAN paths where appropriate, and avoid
+  reconnect storms when the same node is present through bootstrap, LAN and WAN
+  addresses.
+- [ ] Define configuration/wire compatibility, endpoint refresh/expiry and
+  security rules before implementation. Add deterministic tests for same-LAN,
+  remote-WAN, NAT hairpin unavailable, dual-stack/multi-homed, endpoint change,
+  duplicate bootstrap entries and simultaneous-dial cases, plus UAT with the
+  existing UPnP/public-connectivity status reporting.
+
 - [ ] Diagnose why the deployed identity-association reset still does not work.
   The 2026-08-30 UAT failed after changing the handler to apply/propagate before
   metadata persistence and adding durable `MACHMEM2` tombstones. The synthetic
@@ -53,19 +75,56 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   clean loaded interval, versus the pre-change 7.72 MiB/s. Its FUSE-read
   "viewer" leg is now explicitly invalidated: it proved bounded yielding, but
   FUSE is loader/convenience traffic rather than the real viewing path.
-- [ ] Complete Phase 1C UAT. The implementation and focused deterministic tests
-  are complete, and the verified binary is deployed on nodes 50 and 51. FUSE
+- [ ] Complete Phase 1C/1D invariant UAT. The Phase 1C implementation and focused
+  deterministic tests are complete, and the verified binary is deployed on
+  nodes 50 and 51. FUSE
   reads are loader class, the exclusive playback gate is gone, and configurable
   work-conserving weights default to `95:5`. Live `rsync --append-verify`
   demonstrated concurrent publication, including a 50,122,257-byte publication
   advance in 20.795 seconds after the cluster returned to 3/3. The overnight
   copy is intentionally still running. A real viewer/streaming test remains
-  required: an attempted playback while node 51 was offline failed because its
-  media extents were unavailable, so that incident is not valid scheduler UAT.
+  required after Phase 1D: an attempted playback while node 51 was offline
+  failed because its media extents were unavailable, so that incident is not
+  valid scheduler UAT.
   See
   [the Phase 1C checkpoint](2026-08-31-fuse-publication-phase-1c-weighted-scheduling.md)
   and
   [the integrated plan](2026-08-31-fuse-publication-throughput-plan.md#phase-1c-weighted-viewerloader-scheduling-and-fuse-classification).
+- [ ] Phase 1D invariant gate: propagate `control > viewer >> loader >
+  speculative` through executors, locks, byte credits, physical I/O, RPC,
+  durability and metadata; reserve control capacity and viewer headroom; make
+  materialisation/rebuild resumable at bounded checkpoints; remove the global
+  commit convoy; and prove maximum lower-class work ahead of control/viewer is
+  bounded. Preserve 95:5 viewer/loader service, loader non-starvation,
+  work-conserving borrowing, durability, overlapping-writer functionality and
+  atomic visibility. Implement the testable subphases and UAT gate in
+  [Phase 1D](2026-08-31-fuse-publication-throughput-plan.md#phase-1d-make-control-and-viewer-priority-non-bypassable)
+  before resuming later throughput work. The first 1D.1 cut now preserves an
+  immutable loader class/quantum through nested `WriteHandle` DATA operations
+  and prevents loader writes from manufacturing viewer activity; 51/51
+  filesystem/FUSE tests and both targeted control-isolation tests pass. The
+  remainder of 1D.1 remains active. The first 1D.2 cut also makes old-generation
+  materialisation resumable under the FUSE byte quantum; its end-to-end
+  overwrite regression and all 53 filesystem/FUSE tests pass. Rebuild is now
+  resumable too, and the redundant frontend-wide commit mutex has been removed
+  without weakening the narrower metadata/path/content locks. Changed-range
+  reconstruction, restart-boundary injection, synchronous durability/metadata
+  completion and resource-specific budgets remain active. See
+  [the 1D.1 checkpoint](2026-08-31-fuse-publication-phase-1d-data-work-context.md)
+  and
+  [the materialisation checkpoint](2026-08-31-fuse-publication-phase-1d-resumable-materialization.md)
+  and
+  [the rebuild checkpoint](2026-08-31-fuse-publication-phase-1d-resumable-rebuild.md).
+- [ ] Correct overlapping-writer/full-spool publication collapse documented in
+  [the live diagnosis](2026-08-31-overlapping-fuse-writer-rebuild-stall.md).
+  Concurrent append/resume writers to the same inode currently force the
+  publication `WriteHandle` from its sequential fast path into whole-file
+  materialisation and rebuild. One worker then serialises the commit while the
+  other publication workers wait, all accepted bytes remain pinned, the spool
+  reaches its hard bound, and ingestion stops. Preserve atomic visibility, but
+  merge ordered append ranges incrementally and bound conflicting-writer work;
+  a full file must not be reread/rehashed merely because accepted overlay writes
+  interleave.
 - [ ] Fix stale FUSE mount recovery ordering. Startup currently calls
   `create_directories(mount_path)` before `prepare_fuse_mountpoint()`, so a
   disconnected Macha mount returns `ENOTCONN` before

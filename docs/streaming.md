@@ -49,7 +49,13 @@ playback[a1b2c3d4] session create complete ... elapsed_ms=...
 
 `probe_timeout_ms` places one wall-clock bound on the complete representation-selection pass; candidate media IDs share the remaining budget. The same deadline is propagated through `ReadHandle` into remote DHT object fetches, where an outstanding media RPC is cancelled when it expires. `startup_timeout_ms` independently bounds the wait for the first transformed fragment. A 503 therefore identifies whether inspection or transformed-output startup failed instead of presenting as one long opaque request.
 
-Playback/probe/seek object reads are foreground traffic. Foreground demand is recorded before storage access begins, lower-priority DATA RPC execution retains reserved worker capacity for it, and asynchronous FUSE publication pauses while playback is active. FUSE writes already accepted into the local spool remain locally durable and resume distributed publication after the playback quiet window; a bulk copy through the mount is therefore not allowed to consume all execution/storage service needed to start or seek a stream.
+Playback/probe/seek object reads are foreground traffic. Foreground demand is
+recorded before storage access begins and lower-priority DATA RPC execution
+retains reserved worker capacity for it. Asynchronous FUSE publication is loader
+traffic: under simultaneous demand the configurable default viewer/loader share
+is 95:5, so publication continues without being allowed to consume the
+execution/storage service needed to start or seek a stream. Either class borrows
+unused DATA capacity work-conservingly when the other is idle.
 
 Publication traffic has its own loader transport class below viewer foreground
 and read-ahead but above speculative maintenance. Restarting Macha does not
