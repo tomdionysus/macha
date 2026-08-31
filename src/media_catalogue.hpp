@@ -290,6 +290,7 @@ class CatalogueScanner {
     CatalogueScannerConfig config_;
     std::unique_ptr<HttpClient> http_;
     std::unique_ptr<HttpClient> provider_http_;
+    std::shared_ptr<MediaEngine> profile_engine_;
     std::vector<std::unique_ptr<CatalogueScanProvider>> providers_;
     std::atomic_bool rescan_requested_{};
     std::jthread worker_;
@@ -309,6 +310,7 @@ class CatalogueScanner {
         std::vector<CatalogueItem> items;
         std::string result;
         unsigned attempts{};
+        std::optional<MediaProbeResult> media_profile;
     };
     struct HintBatchResult {
         size_t claimed{};
@@ -324,7 +326,8 @@ class CatalogueScanner {
   public:
     CatalogueScanner(NodeRuntime&, FileSystem&, CatalogueManager&, CatalogueHintQueue&,
                      CatalogueScannerConfig, std::unique_ptr<HttpClient> = {},
-                     std::chrono::milliseconds diagnostic_interval = std::chrono::seconds(5));
+                     std::chrono::milliseconds diagnostic_interval = std::chrono::seconds(5),
+                     std::shared_ptr<MediaEngine> profile_engine = {});
     ~CatalogueScanner();
     void start();
     void request_stop();

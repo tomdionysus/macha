@@ -37,6 +37,7 @@ struct MediaStreamInfo {
     bool forced{};
     uint64_t bitrate{};
     bool attached_picture{};
+    auto operator<=>(const MediaStreamInfo&) const = default;
 };
 
 struct MediaProbeResult {
@@ -44,6 +45,7 @@ struct MediaProbeResult {
     double duration_seconds{};
     uint64_t bitrate{};
     std::vector<MediaStreamInfo> streams;
+    auto operator<=>(const MediaProbeResult&) const = default;
 };
 
 // A seekable immutable media view. Implementations may be backed by the DHT,

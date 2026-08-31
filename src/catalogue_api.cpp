@@ -123,6 +123,35 @@ std::string items_json(const std::vector<CatalogueItem>& items,
     return out;
 }
 
+Json media_profile_json(std::string_view media_id, const MediaProbeResult& profile) {
+    Json::Array streams;
+    for (const auto& stream : profile.streams) {
+        Json::Object value{{"index", stream.index},
+                           {"type", media_stream_type_name(stream.type)},
+                           {"codec", stream.codec},
+                           {"profile", stream.profile},
+                           {"language", stream.language},
+                           {"width", stream.width},
+                           {"height", stream.height},
+                           {"channels", stream.channels},
+                           {"sample_rate", stream.sample_rate},
+                           {"bit_depth", stream.bit_depth},
+                           {"default", stream.default_stream},
+                           {"forced", stream.forced},
+                           {"bitrate", stream.bitrate},
+                           {"attached_picture", stream.attached_picture}};
+        streams.emplace_back(std::move(value));
+    }
+    Json::Object out{{"schema_version", 1},
+                     {"media_id", std::string(media_id)},
+                     {"format", profile.format},
+                     {"duration_ms", static_cast<uint64_t>(
+                         std::max(0.0, profile.duration_seconds) * 1000.0)},
+                     {"bitrate", profile.bitrate},
+                     {"streams", Json(std::move(streams))}};
+    return Json(std::move(out));
+}
+
 std::optional<int32_t> json_i32(const Json& root, std::string_view key) {
     const auto* value = root.find(key);
     if (!value || value->isNull()) return {};
@@ -305,6 +334,24 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             }
             auto snapshot = catalogue_.snapshot_view();
             return json(200, items_json(catalogue_.search(q->second, limit), *snapshot));
+        }
+
+        constexpr std::string_view media_prefix = "/api/v1/catalogue/media/";
+        constexpr std::string_view profile_suffix = "/profile";
+        if (request.method == "GET" && request.path.starts_with(media_prefix) &&
+            request.path.ends_with(profile_suffix)) {
+            auto encoded = std::string_view(request.path).substr(media_prefix.size());
+            encoded.remove_suffix(profile_suffix.size());
+            auto media_id = url_decode(encoded);
+            if (!media_id.starts_with("macha:"))
+                return error(400, "bad_media_id", "immutable macha media ID required");
+            auto profile = catalogue_.media_profile(media_id);
+            if (!profile)
+                return error(404, "profile_not_available", "media profile is not available yet");
+            auto response = json(200, media_profile_json(media_id, *profile).dump());
+            response.headers["Cache-Control"] = "private, max-age=31536000, immutable";
+            response.headers["ETag"] = json_escape(media_id);
+            return response;
         }
 
         constexpr std::string_view item_prefix = "/api/v1/catalogue/items/";

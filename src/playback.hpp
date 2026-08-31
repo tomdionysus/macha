@@ -22,7 +22,7 @@ class PlaybackManager {
 
   public:
     PlaybackManager(FileSystem&, CatalogueManager&, CatalogueApiConfig, StreamingConfig,
-                    std::unique_ptr<MediaEngine> = {});
+                    std::shared_ptr<MediaEngine> = {});
     ~PlaybackManager();
     PlaybackManager(const PlaybackManager&) = delete;
     PlaybackManager& operator=(const PlaybackManager&) = delete;

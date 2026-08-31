@@ -2,11 +2,14 @@
 #pragma once
 
 #include "distributed_store.hpp"
+#include "media_engine.hpp"
 #include "metadata_manager.hpp"
 
 #include <map>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
+#include <functional>
 #include <optional>
 #include <set>
 #include <string>
@@ -54,7 +57,17 @@ struct CatalogueItem {
 
 struct CatalogueSnapshot {
     std::map<std::string, CatalogueItem> items;
+    struct MediaProfile {
+        uint32_t schema_version{1};
+        bool complete{true};
+        MediaProbeResult probe;
+        auto operator<=>(const MediaProfile&) const = default;
+    };
+    std::map<std::string, MediaProfile, std::less<>> media_profiles;
 };
+
+bool valid_catalogue_media_profile(std::string_view media_id,
+                                   const CatalogueSnapshot::MediaProfile&);
 
 struct CatalogueStatus {
     bool enabled{};
@@ -95,6 +108,12 @@ struct CatalogueArtworkContent {
 struct CatalogueClearResult {
     size_t removed_items{};
     std::vector<std::string> media_ids;
+};
+
+struct ResolvedMediaProfile {
+    MediaProbeResult probe;
+    bool generated{};
+    bool coalesced{};
 };
 
 Bytes encode_catalogue(const CatalogueSnapshot&);
@@ -145,6 +164,16 @@ class CatalogueManager {
     std::map<ObjectId, uint64_t> control_gc_unreferenced_epoch_;
     bool ready_{};
     std::string error_;
+    struct MediaProfileFlight {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool complete{};
+        std::optional<MediaProbeResult> result;
+        std::exception_ptr error;
+    };
+    mutable std::mutex media_profile_mutex_;
+    std::map<std::string, MediaProbeResult, std::less<>> resolved_media_profiles_;
+    std::map<std::string, std::shared_ptr<MediaProfileFlight>, std::less<>> media_profile_flights_;
     LocalStore::Cursor control_gc_cursor_;
     std::optional<ObjectId> control_converged_root_;
     std::vector<NodeId> control_converged_nodes_;
@@ -165,12 +194,20 @@ class CatalogueManager {
   public:
     CatalogueManager(NodeRuntime&, DistributedStore&, MetadataManager&);
 
+    const ClusterKeys& cluster_keys() const noexcept { return node_.keys(); }
+
     void repair_once();
     bool refresh_needed() const;
     CatalogueStatus status() const;
     CatalogueSnapshot snapshot();
     std::shared_ptr<const CatalogueSnapshot> snapshot_view();
     std::optional<CatalogueItem> get(std::string_view id);
+    std::optional<MediaProbeResult> media_profile(std::string_view media_id);
+    ResolvedMediaProfile resolve_media_profile(
+        std::string media_id, Clock::time_point deadline,
+        std::function<MediaProbeResult()> generate);
+    void put_media_profile(std::string media_id, MediaProbeResult profile);
+    void put_media_profiles(std::map<std::string, MediaProbeResult, std::less<>> profiles);
     std::vector<CatalogueItem> list(std::optional<CatalogueKind> kind = {},
                                     std::optional<std::string_view> parent = {});
     std::vector<CatalogueItem> search(std::string_view query, size_t limit = 50);
@@ -193,7 +230,8 @@ class CatalogueManager {
     void reconcile_scanner(const std::vector<CatalogueItem>& discovered,
                            const std::set<std::string>& active_media_ids,
                            bool prune_missing = true,
-                           std::optional<Hash256> expected_namespace = std::nullopt);
+                           std::optional<Hash256> expected_namespace = std::nullopt,
+                           const std::map<std::string, MediaProbeResult, std::less<>>& profiles = {});
     std::optional<CatalogueArtworkContent> artwork(const ObjectId&);
     CatalogueMaintenance maintenance_objects();
     CatalogueRetentionObjects retention_objects(const std::optional<ObjectId>& old_root,
