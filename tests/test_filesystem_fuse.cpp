@@ -53,6 +53,8 @@ MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_cou
     CHECK(filesystem->find("spool_limit_bytes")->asUInt64() ==
           config.fuse.max_spool_bytes);
     REQUIRE(filesystem->find("spool_publish_rate_bytes_per_second") != nullptr);
+    REQUIRE(filesystem->find("spool_publish_rate_window_bytes") != nullptr);
+    REQUIRE(filesystem->find("spool_publish_rate_window_ms") != nullptr);
     REQUIRE(filesystem->find("spool_throttle_waits") != nullptr);
     REQUIRE(filesystem->find("spool_throttle_wait_ms") != nullptr);
     REQUIRE(filesystem->find("data_publication_requests") != nullptr);
@@ -856,6 +858,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_spool_capacity_backpressures_until_publi
     CHECK(pressure.spool_bytes <= pressure.spool_limit_bytes);
     CHECK(pressure.spool_throttle_waits >= 1);
     CHECK(pressure.spool_publish_rate_bytes_per_second > 0);
+    CHECK(pressure.spool_publish_rate_window_bytes >= first.size());
+    CHECK(pressure.spool_publish_rate_window_ms > 0);
 
     const auto spool_dir = config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
     const auto spool = spool_dir / ("inode-" + std::to_string(handle.inode) + ".spool");

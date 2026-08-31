@@ -2,8 +2,8 @@
 
 Date: 2026-08-31
 
-Status: implementation checkpoint complete; deployed three-node UAT recommended
-before this slice is moved to `COMPLETED.md`.
+Status: complete. The deployed three-node UAT passed; see
+[the UAT record](2026-08-31-fuse-publication-phase-4a-uat.md).
 
 ## Purpose
 

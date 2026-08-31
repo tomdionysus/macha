@@ -85,7 +85,10 @@ against measured end-to-end publication throughput; at the configured bound it
 waits for a real publication/retirement notification. Inspect
 `diagnostics.filesystem.spool_bytes`, `spool_limit_bytes`,
 `spool_publish_rate_bytes_per_second`, `spool_throttle_waits`, and
-`spool_throttle_wait_ms`. If publishing is stalled, writers intentionally stay
+`spool_throttle_wait_ms`. The rate is aggregate physically retired spool bytes
+over one continuously pressured wall-clock window; its current numerator and
+elapsed time are exposed as `spool_publish_rate_window_bytes` and
+`spool_publish_rate_window_ms`. If publishing is stalled, writers intentionally stay
 blocked and consume no polling loop; physical `spool_reserve_free` exhaustion
 remains an `ENOSPC` safety condition.
 
