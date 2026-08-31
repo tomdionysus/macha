@@ -123,6 +123,10 @@ struct FuseConfig {
     // In-process deterministic crash-fixture hook. It is intentionally absent
     // from YAML/CLI parsing and cannot disable loader service in production.
     bool suspend_loader_for_tests{};
+    // In-process transient-publication fixture. Zero disables it. This is not
+    // parsed from configuration; tests use it to prove that a retryable error
+    // after bounded spool progress retains the exact publication cursor.
+    uint64_t fail_publication_once_after_spool_bytes_for_tests{};
     // A publication worker yields after this much durable spool input so other
     // inodes and newly closed files receive service without restarting the
     // generation. The aggregate budget bounds concurrently admitted quanta.
@@ -374,6 +378,10 @@ struct Config {
     size_t min_write_replicas{1};
     std::chrono::milliseconds write_stall{2500};
     size_t extent_size{16 * 1024 * 1024};
+    // End-to-end DATA object admission. Lower classes may use only the
+    // non-reserved portion; viewer reads retain immediate bounded headroom.
+    uint64_t data_inflight_bytes{128ULL * 1024 * 1024};
+    uint64_t data_viewer_reserve_bytes{32ULL * 1024 * 1024};
     size_t read_ahead_extents{3};
     std::vector<Endpoint> bootstrap;
     std::chrono::milliseconds heartbeat{5000};

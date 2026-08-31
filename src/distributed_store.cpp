@@ -118,6 +118,8 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
                                 DurabilityBatch* batch) {
     if (object_id(data) != id)
         throw std::runtime_error("object hash mismatch");
+    if (data.size() > n_.config().extent_size)
+        throw std::runtime_error("DATA object exceeds configured extent size");
     n_.note_activity(frame_type, data.size());
     const auto operation_started = Clock::now();
 
@@ -141,6 +143,7 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
     struct PendingPut {
         NodeInfo owner;
         std::optional<AsyncRpc> rpc;
+        std::optional<DataResourceArbiter::Lease> resource;
         Clock::time_point started{};
         bool done{};
         bool spilled{};
@@ -203,6 +206,12 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
     };
 
     auto launch = [&](const NodeInfo& owner) {
+        auto resource = n_.data_resources().acquire(
+            DataWorkContext(frame_type, data.size(), {}, cancelled), data.size());
+        if (!resource) {
+            ++replacement_needed;
+            return;
+        }
         if (owner.id == n_.node_id()) {
             const auto started = Clock::now();
             if (!n_.local_store().has(id))
@@ -229,6 +238,7 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
             PendingPut item;
             item.owner = owner;
             item.started = Clock::now();
+            item.resource.emplace(std::move(*resource));
             const auto type = batch ? MessageType::put_object_deferred : MessageType::put_object;
             item.rpc.emplace(n_.call_async(owner, type, payload, frame_type));
             pending.push_back(std::move(item));
@@ -669,6 +679,11 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
 
 bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,
                               std::span<const uint8_t> data, bool foreground) {
+    const auto frame_type = foreground ? FrameType::foreground : FrameType::speculative;
+    auto resource = n_.data_resources().acquire(
+        DataWorkContext(frame_type, data.size()), data.size());
+    if (!resource)
+        return false;
     if (target.id == n_.node_id()) {
         if (!n_.local_store().has(id))
             n_.notify_storage_mutation();
@@ -678,7 +693,6 @@ bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,
     writer.fixed(id.bytes);
     writer.bytes(data);
     auto started = Clock::now();
-    const auto frame_type = foreground ? FrameType::foreground : FrameType::speculative;
     bool ok = n_.call(target, MessageType::put_object, writer.data(), frame_type).message.type ==
               MessageType::ok;
     if (ok)
@@ -695,6 +709,11 @@ std::optional<Bytes> DistributedStore::get_from(const NodeInfo& target, const Ob
                                                 std::atomic_bool* cancelled,
                                                 const std::function<bool()>& abort) {
     try {
+        auto resource = n_.data_resources().acquire(
+            DataWorkContext(frame_type, n_.config().extent_size, deadline, cancelled),
+            n_.config().extent_size);
+        if (!resource)
+            return {};
         if (target.id == n_.node_id())
             return n_.local_store().get(id);
 
@@ -1018,7 +1037,14 @@ std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, Fr
         }
         return elapsed;
     };
-    if (auto data = n_.local_store().get(id)) {
+    auto local_resource = n_.data_resources().acquire(
+        DataWorkContext(frame_type, n_.config().extent_size, deadline, cancelled),
+        n_.config().extent_size);
+    if (!local_resource)
+        return {};
+    auto local_data = n_.local_store().get(id);
+    local_resource.reset();
+    if (auto data = std::move(local_data)) {
         if (interactive)
             n_.note_activity(frame_type, data->size());
         auto elapsed = log_playback_read("owned", data->size(), true);
@@ -1029,7 +1055,14 @@ std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, Fr
         return data;
     }
 
-    if (auto cached = n_.block_cache().get(id)) {
+    auto cache_resource = n_.data_resources().acquire(
+        DataWorkContext(frame_type, n_.config().extent_size, deadline, cancelled),
+        n_.config().extent_size);
+    if (!cache_resource)
+        return {};
+    auto cache_data = n_.block_cache().get(id);
+    cache_resource.reset();
+    if (auto cached = std::move(cache_data)) {
         if (interactive)
             n_.note_activity(frame_type, cached->size());
         if (should_own(id))

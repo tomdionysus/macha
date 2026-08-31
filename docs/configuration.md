@@ -58,6 +58,8 @@ dht:
   min_write_replicas: 1
   write_stall_ms: 2500
   extent_size: 4M
+  data_inflight_bytes: 128M
+  data_viewer_reserve_bytes: 32M
   read_ahead: 3
   metadata_cache_ms: 250
 ```
@@ -67,6 +69,8 @@ dht:
 - `metadata_min_write_replicas`: minimum distinct active nodes that must durably accept a namespace/control mutation before publication. Every node is metadata-capable; this is a write durability floor, not a voter count or convergence target. The legacy `metadata_replicas` key is accepted only for 0.18 migration and is translated to its former majority write floor.
 - `write_stall_ms`: how long a stalled preferred DATA placement may block before deterministic fallback is attempted.
 - `extent_size`: maximum ordinary file extent size. It is unrelated to small-object pack allocation.
+- `data_inflight_bytes`: node-wide byte budget for blocking DATA object reads, writes, and transfers.
+- `data_viewer_reserve_bytes`: non-borrowable headroom inside that budget for foreground playback and read-ahead. Loader and speculative work remain work-conserving within the rest of the budget, but cannot consume this reserve. It must be smaller than `data_inflight_bytes`, and the difference must fit at least one `extent_size` object.
 
 Replica policy should be identical across the cluster and changed as a coordinated cluster operation. `metadata_min_write_replicas: 2` means any two active nodes, not two preselected nodes.
 

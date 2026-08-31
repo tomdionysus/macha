@@ -67,6 +67,25 @@ Verification after the final changes:
 
 The complete project suite was not run.
 
+## Deployment checkpoint
+
+Deployed natively built binaries to Linux nodes 50 and 51 on 2026-08-31. Both
+nodes passed the focused resumable materialisation/rebuild test and end-to-end
+FUSE overwrite-yield test before installation. Node 50's first FUSE test attempt
+was refused by the physical spool reserve because `/tmp` is a 2 GiB tmpfs; the
+unchanged test passed with `TMPDIR` on its root NVMe filesystem. The deployed,
+installed and running binaries on both nodes have identical SHA-256
+`0607671e9211df613640fec64f06d7f0f09ee46c5e009b1ec4f3b0987027c526`.
+
+Node 50 required a hard host reset after an eight-way native build coincided
+with the loaded machine becoming unreachable over SSH. The low-parallelism
+retry completed normally. On restart, recovery discarded three unreferenced
+spool files (9,011,986,432 + 3,148,587,518 + 5,019,246,248 bytes) because the
+operation journal contained no history for their inodes and they exceeded the
+orphan budget. Those unpublished bytes must be resent from their original
+source. After deployment node 50 reported writable metadata at generation 759
+with 3/3 replicas; node 51 reconnected successfully.
+
 ## Remaining work
 
 This bounds rebuild interruption latency but does not yet eliminate the

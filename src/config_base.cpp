@@ -52,6 +52,14 @@ void validate(Config& config) {
         throw std::runtime_error("dht.min_write_replicas must be <= dht.replicas");
     if (config.write_stall.count() <= 0)
         throw std::runtime_error("dht.write_stall_ms must be > 0");
+    if (!config.data_inflight_bytes || !config.data_viewer_reserve_bytes ||
+        config.data_viewer_reserve_bytes >= config.data_inflight_bytes)
+        throw std::runtime_error(
+            "dht.data_inflight_bytes must exceed nonzero data_viewer_reserve_bytes");
+    if (config.extent_size >
+        config.data_inflight_bytes - config.data_viewer_reserve_bytes)
+        throw std::runtime_error(
+            "dht DATA non-viewer capacity must fit one complete extent");
     // DATA placement uses a compact bounded owner set. Metadata publication is
     // an any-node durability floor and must not inherit that historical voter
     // count limit; large clusters may legitimately require more than 31 copies.

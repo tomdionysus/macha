@@ -191,6 +191,11 @@ dht:
   min_write_replicas: 1
   write_stall_ms: 2500
   extent_size: 4M
+  # Bound simultaneous blocking DATA work by bytes, while preserving headroom
+  # which ingest and maintenance cannot consume. CONTROL uses separate lanes
+  # and executors and does not enter this budget.
+  data_inflight_bytes: 128M
+  data_viewer_reserve_bytes: 32M
   read_ahead: 3
   metadata_cache_ms: 250
 

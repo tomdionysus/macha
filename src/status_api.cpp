@@ -566,6 +566,22 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     rpc_diagnostics["message_timings"] = std::move(message_timings);
     diagnostics["rpc_server"] = std::move(rpc_diagnostics);
 
+    const auto data_resource = node_.data_resources().stats();
+    Json::Object data_resource_diagnostics;
+    data_resource_diagnostics["capacity_bytes"] = data_resource.capacity_bytes;
+    data_resource_diagnostics["viewer_reserve_bytes"] = data_resource.viewer_reserve_bytes;
+    data_resource_diagnostics["used_bytes"] = data_resource.used_bytes;
+    data_resource_diagnostics["peak_used_bytes"] = data_resource.peak_used_bytes;
+    data_resource_diagnostics["viewer_admissions"] = data_resource.viewer_admissions;
+    data_resource_diagnostics["loader_admissions"] = data_resource.loader_admissions;
+    data_resource_diagnostics["speculative_admissions"] =
+        data_resource.speculative_admissions;
+    data_resource_diagnostics["viewer_waits"] = data_resource.viewer_waits;
+    data_resource_diagnostics["loader_waits"] = data_resource.loader_waits;
+    data_resource_diagnostics["speculative_waits"] = data_resource.speculative_waits;
+    data_resource_diagnostics["cancelled_waits"] = data_resource.cancelled_waits;
+    diagnostics["data_resources"] = std::move(data_resource_diagnostics);
+
     std::function<std::optional<FuseFrontendDiagnostics>()> fuse_provider;
     std::function<ConvergenceDemandDiagnostics()> convergence_provider;
     {
@@ -584,6 +600,10 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                 filesystem_diagnostics["merged_publications"] = values->merged_publications;
                 filesystem_diagnostics["data_publication_requests"] =
                     values->data_publication_requests;
+                filesystem_diagnostics["data_publication_notifications_suppressed"] =
+                    values->data_publication_notifications_suppressed;
+                filesystem_diagnostics["spool_pressure_publication_sweeps"] =
+                    values->spool_pressure_publication_sweeps;
                 filesystem_diagnostics["data_publication_coalesced_queued"] =
                     values->data_publication_coalesced_queued;
                 filesystem_diagnostics["data_publication_coalesced_running"] =
@@ -608,12 +628,22 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                     values->data_publication_peak_pipeline_extents;
                 filesystem_diagnostics["data_closed_priority_selections"] =
                     values->data_closed_priority_selections;
+                filesystem_diagnostics["data_retirement_priority_selections"] =
+                    values->data_retirement_priority_selections;
                 filesystem_diagnostics["data_publication_bytes_read"] =
                     values->data_publication_bytes_read;
                 filesystem_diagnostics["data_publication_bytes_committed"] =
                     values->data_publication_bytes_committed;
                 filesystem_diagnostics["data_publication_bytes_confirmed"] =
                     values->data_publication_bytes_confirmed;
+                filesystem_diagnostics["data_publication_completed_spool_bytes_read"] =
+                    values->data_publication_completed_spool_bytes_read;
+                filesystem_diagnostics["data_publication_completed_source_bytes_read"] =
+                    values->data_publication_completed_source_bytes_read;
+                filesystem_diagnostics["data_publication_completed_reused_extents"] =
+                    values->data_publication_completed_reused_extents;
+                filesystem_diagnostics["data_publication_completed_put_extents"] =
+                    values->data_publication_completed_put_extents;
                 filesystem_diagnostics["backend_failures"] = values->backend_failures;
                 filesystem_diagnostics["durability_batches"] = values->durability_batches;
                 filesystem_diagnostics["durability_writes"] = values->durability_writes;

@@ -140,6 +140,7 @@ NodeId load_v18_node_id(const std::filesystem::path& state) {
 NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook startup_stage_hook)
     : cfg_(normalize_config(std::move(config))), keys_(keys), state_lock_(cfg_.state_path),
       id_(load_v18_node_id(cfg_.state_path)), durability_epoch_(random_node_id()),
+      data_resources_(cfg_.data_inflight_bytes, cfg_.data_viewer_reserve_bytes),
       members_(self_info(cfg_, id_, 0, 0, 0), cfg_.dead_after,
                cfg_.state_path / "membership" / "known-nodes.bin"),
       public_connectivity_(cfg_, id_, Endpoint{members_.self().host, members_.self().port}),
@@ -439,6 +440,7 @@ void NodeRuntime::start() {
 }
 
 void NodeRuntime::request_stop() {
+    data_resources_.stop();
     if (storage_recovery_.joinable())
         storage_recovery_.request_stop();
     if (state_recovery_.joinable())
@@ -692,6 +694,10 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             Reader reader(request.payload);
             ObjectId id{reader.fixed<32>()};
             reader.finish();
+            auto resource = data_resources_.acquire(
+                DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
+            if (!resource)
+                return error_reply("DATA resource admission stopping");
             auto data = local_store().get(id);
             if (!data)
                 return error_reply("object not found");
@@ -719,6 +725,12 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             ObjectId id{reader.fixed<32>()};
             auto data = reader.bytes(128 * 1024 * 1024);
             reader.finish();
+            if (data.size() > cfg_.extent_size)
+                return error_reply("DATA object exceeds configured extent size");
+            auto resource = data_resources_.acquire(
+                DataWorkContext(frame_type, data.size()), data.size());
+            if (!resource)
+                return error_reply("DATA resource admission stopping");
             note_activity(frame_type, data.size());
             if (!local_store().has(id))
                 notify_storage_mutation();
@@ -1165,6 +1177,13 @@ void NodeRuntime::local_writer_loop(std::stop_token stop) {
             job = std::move(local_copies_.front());
             local_copies_.pop_front();
             local_copy_bytes_ -= job.data.size();
+        }
+        auto resource = data_resources_.acquire(
+            DataWorkContext(FrameType::speculative, job.data.size()), job.data.size());
+        if (!resource) {
+            if (stop.stop_requested())
+                return;
+            continue;
         }
         bool cached = false;
         if (job.cache && ready(ready_cache) && cache_)

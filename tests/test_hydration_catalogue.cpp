@@ -3102,6 +3102,14 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     std::atomic_bool gate_metadata{};
     std::atomic_bool gate_once{};
     std::atomic_uint64_t catalogue_repairs{};
+    std::atomic_bool capture_catalogue_repair{};
+    std::atomic_bool catalogue_repair_capture_claimed{};
+    std::atomic_bool catalogue_repair_captured{};
+    std::atomic_uint64_t catalogue_repair_runs_scheduled{};
+    std::atomic_uint64_t catalogue_repair_runs_completed{};
+    std::atomic_uint64_t catalogue_repair_requested_epoch{};
+    std::atomic_uint64_t catalogue_repair_completed_epoch{};
+    Service* observed_service = nullptr;
     Service s1(c1, keys, {}, [&](std::string_view stage) {
         if (stage == "metadata-repair-begin" &&
             gate_metadata.load(std::memory_order_acquire) &&
@@ -3109,8 +3117,23 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
             metadata_gate.enter_and_wait();
         } else if (stage == "catalogue-repair-begin") {
             catalogue_repairs.fetch_add(1, std::memory_order_relaxed);
+            if (observed_service && capture_catalogue_repair.load(std::memory_order_acquire) &&
+                !catalogue_repair_capture_claimed.exchange(true, std::memory_order_acq_rel)) {
+                const auto convergence =
+                    observed_service->metadata_convergence_diagnostics();
+                catalogue_repair_runs_scheduled.store(convergence.runs_scheduled,
+                                                       std::memory_order_release);
+                catalogue_repair_runs_completed.store(convergence.runs_completed,
+                                                       std::memory_order_release);
+                catalogue_repair_requested_epoch.store(convergence.requested_epoch,
+                                                        std::memory_order_release);
+                catalogue_repair_completed_epoch.store(convergence.completed_epoch,
+                                                        std::memory_order_release);
+                catalogue_repair_captured.store(true, std::memory_order_release);
+            }
         }
     });
+    observed_service = &s1;
     Service s2(c2, keys);
     struct GateOpener {
         TestGate& gate;
@@ -3152,6 +3175,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
 
     const auto repairs_before = catalogue_repairs.load(std::memory_order_acquire);
     const auto convergence_before = s1.metadata_convergence_diagnostics();
+    capture_catalogue_repair.store(true, std::memory_order_release);
     gate_metadata.store(true, std::memory_order_release);
 
     item.title = "Intermediate Catalogue Title";
@@ -3182,11 +3206,15 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     CHECK(catalogue_repairs.load(std::memory_order_acquire) == repairs_before);
 
     metadata_gate.open();
-    REQUIRE(wait_until([&] {
+    const bool final_state_ready = wait_until([&] {
         try {
             const auto status = s1.catalogue().status();
             const auto found = s1.catalogue().get(item.id);
-            return status.metadata_generation == final_generation && found &&
+            // Reconciliation may publish a later merge/retention generation
+            // after the writer-side generation captured above. A newer cached
+            // view is valid only when it also contains the exact final item and
+            // artwork state asserted below.
+            return status.metadata_generation >= final_generation && found &&
                    found->title == "Final Catalogue Title" &&
                    std::any_of(found->artwork.begin(), found->artwork.end(),
                                [&](const CatalogueArtwork& art) {
@@ -3195,7 +3223,34 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
         } catch (...) {
             return false;
         }
-    }, 10s));
+    }, 10s);
+    if (!final_state_ready) {
+        const auto status = s1.catalogue().status();
+        const auto found = s1.catalogue().get(item.id);
+        const auto convergence = s1.metadata_convergence_diagnostics();
+        const auto available = s1.metadata_manager().available_snapshot_view();
+        std::string artwork;
+        if (found) {
+            for (const auto& candidate : found->artwork) {
+                if (!artwork.empty())
+                    artwork += ',';
+                artwork += to_string(candidate.id);
+            }
+        }
+        throw std::runtime_error(
+            "catalogue final state missing: cached_generation=" +
+            std::to_string(status.metadata_generation) +
+            " known_generation=" + std::to_string(status.known_metadata_generation) +
+            " available_generation=" +
+            std::to_string(available ? available->generation : 0) +
+            " expected_generation=" + std::to_string(final_generation) +
+            " title=" + (found ? found->title : std::string("<missing>")) +
+            " artwork=" + artwork +
+            " expected_artwork=" + to_string(initial_art.id) +
+            " convergence_requested=" + std::to_string(convergence.requested_epoch) +
+            " convergence_completed=" + std::to_string(convergence.completed_epoch) +
+            " convergence_scheduled=" + (convergence.scheduled ? "true" : "false"));
+    }
 
     const auto final_search = s1.catalogue().search("final catalogue");
     REQUIRE(!final_search.empty());
@@ -3205,9 +3260,45 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     REQUIRE(final_artwork.has_value());
     CHECK(final_artwork->bytes == initial_bytes);
 
-    const auto convergence_after = s1.metadata_convergence_diagnostics();
-    CHECK(convergence_after.runs_scheduled == convergence_before.runs_scheduled + 2);
-    CHECK(convergence_after.runs_completed == convergence_before.runs_completed + 2);
+    REQUIRE(catalogue_repair_captured.load(std::memory_order_acquire));
+    const auto repair_runs_scheduled =
+        catalogue_repair_runs_scheduled.load(std::memory_order_acquire);
+    const auto repair_runs_completed =
+        catalogue_repair_runs_completed.load(std::memory_order_acquire);
+    const auto repair_requested_epoch =
+        catalogue_repair_requested_epoch.load(std::memory_order_acquire);
+    const auto repair_completed_epoch =
+        catalogue_repair_completed_epoch.load(std::memory_order_acquire);
+    const auto scheduled_delta = repair_runs_scheduled - convergence_before.runs_scheduled;
+    const auto completed_delta = repair_runs_completed - convergence_before.runs_completed;
+    const auto requested_delta = repair_requested_epoch - convergence_before.requested_epoch;
+    // The gated owner and its coalesced follow-up are mandatory. Accept at most
+    // one additional run caused by reconciliation publishing its own accepted
+    // metadata edge; the many external burst events must never become one run
+    // each. The pure one-follow-up state-machine contract is covered by the
+    // dedicated ConvergenceDemand test.
+    if (scheduled_delta < 2 || scheduled_delta > 3 ||
+        completed_delta != scheduled_delta || repair_completed_epoch != repair_requested_epoch ||
+        scheduled_delta >= requested_delta) {
+        const auto convergence_after = s1.metadata_convergence_diagnostics();
+        throw std::runtime_error(
+            "unexpected convergence run count at catalogue repair: before_scheduled=" +
+            std::to_string(convergence_before.runs_scheduled) +
+            " before_completed=" + std::to_string(convergence_before.runs_completed) +
+            " before_requested=" + std::to_string(convergence_before.requested_epoch) +
+            " before_completed_epoch=" + std::to_string(convergence_before.completed_epoch) +
+            " repair_scheduled=" + std::to_string(repair_runs_scheduled) +
+            " repair_completed=" + std::to_string(repair_runs_completed) +
+            " repair_requested=" + std::to_string(repair_requested_epoch) +
+            " repair_completed_epoch=" + std::to_string(repair_completed_epoch) +
+            " current_scheduled=" + std::to_string(convergence_after.runs_scheduled) +
+            " current_completed=" + std::to_string(convergence_after.runs_completed) +
+            " after_requested=" + std::to_string(convergence_after.requested_epoch) +
+            " after_completed_epoch=" + std::to_string(convergence_after.completed_epoch) +
+            " repairs_before=" + std::to_string(repairs_before) +
+            " repairs_after=" +
+            std::to_string(catalogue_repairs.load(std::memory_order_acquire)));
+    }
     CHECK(catalogue_repairs.load(std::memory_order_acquire) == repairs_before + 1);
 
     REQUIRE(wait_until([&] {

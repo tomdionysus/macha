@@ -107,9 +107,26 @@ class WeightedLoaderService {
         return !burst_started_ || now < slice_deadline_;
     }
 
-    void started(TimePoint now, bool viewer_active) {
+    void started(TimePoint now, bool viewer_active, bool begin_service = true) {
         std::lock_guard lock(mutex_);
         ++active_loaders_;
+        if (!viewer_active) {
+            reset_locked();
+            return;
+        }
+        if (!loader_weight_ || !begin_service)
+            return;
+        if (!burst_started_) {
+            burst_started_ = now;
+            slice_deadline_ = now + slice_;
+        }
+    }
+
+    // A cold loader may be admitted before its distributed writer is ready.
+    // Account it as active immediately, but begin its proportional service
+    // slice only when it can perform useful bounded work.
+    void service_started(TimePoint now, bool viewer_active) {
+        std::lock_guard lock(mutex_);
         if (!viewer_active) {
             reset_locked();
             return;
@@ -224,6 +241,8 @@ struct FuseFrontendStatus {
     uint64_t timed_out_requests{};
     uint64_t merged_publications{};
     uint64_t data_publication_requests{};
+    uint64_t data_publication_notifications_suppressed{};
+    uint64_t spool_pressure_publication_sweeps{};
     uint64_t data_publication_coalesced_queued{};
     uint64_t data_publication_coalesced_running{};
     uint64_t data_publication_coalesced_unconfirmed{};
@@ -236,9 +255,14 @@ struct FuseFrontendStatus {
     uint64_t data_publication_pipeline_limit_bytes{};
     uint64_t data_publication_peak_pipeline_extents{};
     uint64_t data_closed_priority_selections{};
+    uint64_t data_retirement_priority_selections{};
     uint64_t data_publication_bytes_read{};
     uint64_t data_publication_bytes_committed{};
     uint64_t data_publication_bytes_confirmed{};
+    uint64_t data_publication_completed_spool_bytes_read{};
+    uint64_t data_publication_completed_source_bytes_read{};
+    uint64_t data_publication_completed_reused_extents{};
+    uint64_t data_publication_completed_put_extents{};
     uint64_t backend_failures{};
     uint64_t durability_batches{};
     uint64_t durability_writes{};
@@ -268,6 +292,8 @@ struct FuseFrontendDiagnostics {
     uint64_t timed_out_requests{};
     uint64_t merged_publications{};
     uint64_t data_publication_requests{};
+    uint64_t data_publication_notifications_suppressed{};
+    uint64_t spool_pressure_publication_sweeps{};
     uint64_t data_publication_coalesced_queued{};
     uint64_t data_publication_coalesced_running{};
     uint64_t data_publication_coalesced_unconfirmed{};
@@ -280,9 +306,14 @@ struct FuseFrontendDiagnostics {
     uint64_t data_publication_pipeline_limit_bytes{};
     uint64_t data_publication_peak_pipeline_extents{};
     uint64_t data_closed_priority_selections{};
+    uint64_t data_retirement_priority_selections{};
     uint64_t data_publication_bytes_read{};
     uint64_t data_publication_bytes_committed{};
     uint64_t data_publication_bytes_confirmed{};
+    uint64_t data_publication_completed_spool_bytes_read{};
+    uint64_t data_publication_completed_source_bytes_read{};
+    uint64_t data_publication_completed_reused_extents{};
+    uint64_t data_publication_completed_put_extents{};
     uint64_t backend_failures{};
     uint64_t durability_batches{};
     uint64_t durability_writes{};
