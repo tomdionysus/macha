@@ -4569,8 +4569,8 @@ std::pair<uint64_t, uint64_t> FuseFrontend::logical_capacity() const {
     return state_->fs.logical_capacity();
 }
 
-void FuseFrontend::note_interactive_activity(uint64_t bytes) {
-    state_->fs.note_interactive_activity(bytes);
+void FuseFrontend::note_viewer_activity(uint64_t bytes) {
+    state_->fs.note_foreground_activity(bytes);
     state_->data_cv.notify_all();
 }
 
