@@ -4,8 +4,8 @@ Date: 2026-08-31
 
 Parent plan: `TODO/2026-08-31-fuse-publication-throughput-plan.md`
 
-Status: implementation and deterministic verification complete; coordinated
-three-node deployment/UAT pending
+Status: implementation, deterministic verification, and coordinated loader
+classification UAT complete; live viewer-pre-emption leg pending
 
 ## Corrected model
 
@@ -92,3 +92,50 @@ This checkpoint corrects priority but does not itself satisfy the throughput
 contract. Phase 1B must add the explicit in-flight-byte bound and fair resumable
 quanta. End-to-end acceptance remains confirmed/retired throughput, usable-file
 latency, and catalogue visibility relative to the direct physical baseline.
+
+## 2026-08-31 coordinated deployment observation
+
+All three nodes were deployed together and formed a healthy, writable
+three-voter cluster. The two Linux installed binaries had identical SHA-256
+`283d3257904987e7aad6f10098a3ccbb27c0b100fbd06d413e8fea0716e1c7d0`;
+the macOS platform build had SHA-256
+`fd668211ce6dc501571813c369d6bcc47b20337b5b2296d06b1c2ba21d4418a7`.
+Every node reported version 0.21.0 and the cluster advanced from metadata
+generation 267 to 268 during the sample.
+
+The loader class worked end to end. Node 51's loader requests advanced from 95
+to 263, including 263 deferred object puts and three durability barriers. Loader
+queue wait remained at or below 100 microseconds. The longest barrier handler
+was 1.151 seconds, but it remained on the loader executor: ping queue maxima
+were 149 microseconds on node 50 and 146 microseconds on node 51. There were no
+filesystem timeouts, backend failures, rejected metadata jobs, or metadata job
+backlogs.
+
+Node 50's recovered publication read advanced from 1,701,576,704 to
+3,004,170,240 bytes over 144.907 seconds, about 8.99 MB/s internal replay. One
+990,904,320-byte generation completed, committed, and confirmed, giving about
+6.84 MB/s end-to-end confirmed throughput over that observation. The rsync
+receiver was directly observed blocked in a 256 KiB FUSE write and later
+advanced from 62,390,272 to 333,971,456 physical write bytes, proving loader
+admission resumed when publication created room.
+
+Peak publication remained two for a legitimate workload-shape reason: the
+16 GiB spool contained exactly two files, approximately 13 GiB and 3.1 GiB.
+There were no additional independent inodes with which to exceed two workers.
+This does not indicate that `recovery_commit_workers: 2` still caps the
+scheduler; the loader frame class and deterministic four-inode restart test
+prove the removed cap directly.
+
+The live result rejects throughput, not priority correctness. Spool occupancy
+rose from 16,744,500,753 to 17,076,375,057 bytes (about 99.4% of its limit),
+throttle waits reached 1,267 with 124.645 seconds of aggregate delay, and a
+completed generation did not reclaim the spool file because newer operations
+for the same inode remained. Two large inodes, serial extent puts, and
+whole-file/generation capacity reclamation therefore dominate this workload.
+Phase 1B fair resumable quanta and Phase 2 incremental durable extent staging
+are required before performance can approach direct copy.
+
+No live viewer was started during this observation. Deterministic viewer
+priority and worker-reserve tests pass, but the deployment checkpoint remains
+active until playback startup/seek is sampled under loader saturation. That leg
+can be combined with the next Phase 1B UAT rather than delaying implementation.

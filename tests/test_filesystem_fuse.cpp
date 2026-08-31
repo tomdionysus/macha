@@ -62,6 +62,9 @@ MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_cou
     REQUIRE(filesystem->find("data_publications_started") != nullptr);
     REQUIRE(filesystem->find("data_publications_completed") != nullptr);
     REQUIRE(filesystem->find("data_publication_peak_active") != nullptr);
+    REQUIRE(filesystem->find("data_publication_quanta") != nullptr);
+    REQUIRE(filesystem->find("data_publication_yields") != nullptr);
+    REQUIRE(filesystem->find("data_publication_peak_inflight_bytes") != nullptr);
     REQUIRE(filesystem->find("data_closed_priority_selections") != nullptr);
     REQUIRE(filesystem->find("data_publication_bytes_read") != nullptr);
     REQUIRE(filesystem->find("data_publication_bytes_committed") != nullptr);
@@ -1048,6 +1051,70 @@ MACHA_TEST("filesystem_fuse", test_fuse_closed_file_is_selected_ahead_of_open_lo
     CHECK(service.filesystem().getattr("/closed-small.bin").size == small.size());
     CHECK(service.filesystem().getattr("/open-large.bin").size == large.size());
     frontend->release(open_large.inode, true);
+    frontend->stop();
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_publication_quanta_are_fair_and_byte_bounded) {
+    TestService fixture("fuse-publication-quanta");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 4;
+    config.fuse.publication_quiet = 80ms;
+    config.fuse.publication_quantum_bytes = config.extent_size;
+    // Although four workers exist, only one logical quantum may be admitted.
+    config.fuse.publication_inflight_bytes = config.fuse.publication_quantum_bytes;
+
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto large_handle =
+        frontend->create("/quantum-large.bin", 0644, getuid(), getgid(), false, true, false);
+    auto small_handle =
+        frontend->create("/quantum-small.bin", 0644, getuid(), getgid(), false, true, false);
+    REQUIRE(frontend->wait_for_idle(10s));
+
+    const auto large = pattern(8 * config.extent_size, 61);
+    const auto small = pattern(64 * 1024, 62);
+    REQUIRE(frontend->write(large_handle.inode, 0, large) == large.size());
+    REQUIRE(frontend->write(small_handle.inode, 0, small) == small.size());
+    REQUIRE(wait_until([&] { return frontend->status().durability_writes == 2; }, 10s));
+
+    // Queue in this order behind the real viewer gate. The large generation is
+    // selected first, but must return to the tail after one quantum; the small
+    // generation can then become atomically visible before the large one.
+    service.filesystem().store().foreground_activity(1);
+    frontend->release(large_handle.inode, true);
+    frontend->release(small_handle.inode, true);
+    REQUIRE(frontend->status().pending_data >= 2);
+
+    bool observed_small_first = false;
+    REQUIRE(wait_until(
+        [&] {
+            const auto small_entry = service.filesystem().getattr("/quantum-small.bin");
+            const auto large_entry = service.filesystem().getattr("/quantum-large.bin");
+            if (small_entry.size == small.size() && large_entry.size == 0)
+                observed_small_first = true;
+            return observed_small_first;
+        },
+        10s));
+    CHECK(observed_small_first);
+    REQUIRE(frontend->wait_for_idle(30s));
+
+    const auto status = frontend->status();
+    CHECK(status.data_publications_started == 2);
+    CHECK(status.data_publications_completed == 2);
+    CHECK(status.data_publication_yields >= large.size() /
+                                                  config.fuse.publication_quantum_bytes -
+                                              1);
+    CHECK(status.data_publication_quanta > status.data_publications_completed);
+    CHECK(status.data_publication_peak_active == 1);
+    CHECK(status.data_publication_peak_inflight_bytes ==
+          config.fuse.publication_inflight_bytes);
+    // Cursor preservation is important: yielding must not reread or restage a
+    // prefix merely to provide fairness.
+    CHECK(status.data_publication_bytes_read == large.size() + small.size());
+    CHECK(service.filesystem().getattr("/quantum-large.bin").size == large.size());
     frontend->stop();
 }
 

@@ -605,6 +605,8 @@ MACHA_FAST_TEST("foundations", test_config) {
     CHECK(maintenance_policy.no_progress_backoff == 300000ms);
     FuseConfig fuse_defaults;
     CHECK(fuse_defaults.recovery_commit_workers == 2);
+    CHECK(fuse_defaults.publication_quantum_bytes == 32ULL * 1024 * 1024);
+    CHECK(fuse_defaults.publication_inflight_bytes == 256ULL * 1024 * 1024);
     CHECK(fuse_defaults.entry_timeout == 1000ms);
     CHECK(fuse_defaults.attr_timeout == 1000ms);
     CHECK(fuse_defaults.negative_timeout == 500ms);

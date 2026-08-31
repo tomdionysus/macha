@@ -71,6 +71,9 @@ struct FuseFrontendStatus {
     uint64_t data_publications_started{};
     uint64_t data_publications_completed{};
     uint64_t data_publication_peak_active{};
+    uint64_t data_publication_quanta{};
+    uint64_t data_publication_yields{};
+    uint64_t data_publication_peak_inflight_bytes{};
     uint64_t data_closed_priority_selections{};
     uint64_t data_publication_bytes_read{};
     uint64_t data_publication_bytes_committed{};
@@ -108,6 +111,9 @@ struct FuseFrontendDiagnostics {
     uint64_t data_publications_started{};
     uint64_t data_publications_completed{};
     uint64_t data_publication_peak_active{};
+    uint64_t data_publication_quanta{};
+    uint64_t data_publication_yields{};
+    uint64_t data_publication_peak_inflight_bytes{};
     uint64_t data_closed_priority_selections{};
     uint64_t data_publication_bytes_read{};
     uint64_t data_publication_bytes_committed{};
