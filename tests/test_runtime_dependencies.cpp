@@ -84,6 +84,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "  recovery_commit_workers: 3\n"
             << "  foreground_commit_workers: 2\n"
             << "  publication_quiet_ms: 425\n"
+            << "  publication_quantum_bytes: 32M\n"
+            << "  publication_inflight_bytes: 128M\n"
             << "  max_pending_operations: 1024\n"
             << "  namespace_batch_operations: 128\n"
             << "  namespace_batch_bytes: 192K\n"
@@ -261,6 +263,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(yc.fuse.recovery_commit_workers == 3);
     CHECK(yc.fuse.foreground_commit_workers == 2);
     CHECK(yc.fuse.publication_quiet == 425ms);
+    CHECK(yc.fuse.publication_quantum_bytes == 32ULL * 1024 * 1024);
+    CHECK(yc.fuse.publication_inflight_bytes == 128ULL * 1024 * 1024);
     CHECK(yc.fuse.max_pending_operations == 1024);
     CHECK(yc.fuse.namespace_batch_operations == 128);
     CHECK(yc.fuse.namespace_batch_bytes == 192 * 1024);

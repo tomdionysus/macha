@@ -596,6 +596,12 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                     values->data_publications_completed;
                 filesystem_diagnostics["data_publication_peak_active"] =
                     values->data_publication_peak_active;
+                filesystem_diagnostics["data_publication_quanta"] =
+                    values->data_publication_quanta;
+                filesystem_diagnostics["data_publication_yields"] =
+                    values->data_publication_yields;
+                filesystem_diagnostics["data_publication_peak_inflight_bytes"] =
+                    values->data_publication_peak_inflight_bytes;
                 filesystem_diagnostics["data_closed_priority_selections"] =
                     values->data_closed_priority_selections;
                 filesystem_diagnostics["data_publication_bytes_read"] =

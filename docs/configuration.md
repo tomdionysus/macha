@@ -102,6 +102,8 @@ fuse:
   allow_other: false
   spool_path: /var/spool/macha/fuse
   operation_journal_path: /var/lib/macha/fuse-operations.log
+  publication_quantum_bytes: 32M
+  publication_inflight_bytes: 256M
   max_spool_bytes: 16G
   spool_reserve_free: 2G
   unmount_if_mounted: true
@@ -115,9 +117,20 @@ When false, any existing Macha mount is a hard startup error.
 
 `spool_path` can contain the full accepted-but-not-yet-published write backlog and must be sized accordingly. `operation_journal_path` contains the ordered durable descriptors needed to interpret that spool. `max_spool_bytes` is configurable and defaults to 16 GiB. It is a bounded backlog budget rather than a logical `ENOSPC` point: writes burst at local-spool speed below 50% occupancy, pressure starts publication, and admission is progressively paced from measured completed-publication throughput until it matches that throughput by 90% occupancy. At the bound, writers sleep on publication/retirement events instead of polling or failing. A single write larger than the complete bound is rejected, and `spool_reserve_free` can still return `ENOSPC` to protect physical free space.
 
+Data publication is fairly time-sliced by bytes. A generation retains its
+provisional writer and exact spool cursor after each
+`publication_quantum_bytes` (32 MiB by default), returns to the loader queue,
+and becomes visible only after its final metadata commit. The quantum must be
+an extent-size multiple. `publication_inflight_bytes` (256 MiB by default) is
+also a quantum multiple and bounds aggregate concurrently admitted publication
+work independently of `commit_workers`. Viewer demand prevents admission of a
+new quantum and an already running publisher checks the viewer gate between
+256 KiB spool chunks.
+
 FUSE spool policy is fixed when the frontend starts; changing these values
 requires a server restart. Status exposes current bytes, configured limit,
-measured publication rate, and cumulative throttle waits beneath
+measured publication rate, cumulative throttle waits, quantum/yield counts,
+and peak admitted publication bytes beneath
 `diagnostics.filesystem`.
 
 The remaining FUSE worker/timeout fields bound local kernel-facing work. They do not turn `fsync()` into a promise of cluster-wide convergence; accepted local state is made crash-recoverable first and distributed publication continues asynchronously.

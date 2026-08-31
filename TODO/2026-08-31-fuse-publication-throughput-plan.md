@@ -2,9 +2,9 @@
 
 Date: 2026-08-31
 
-Status: Phase 1A loader-priority implementation and deterministic verification
-complete; coordinated deployment/UAT and Phase 1B byte-bound/fair-quantum work
-pending
+Status: Phase 1A loader-priority implementation, verification, and coordinated
+classification UAT complete; live viewer leg and Phase 1B byte-bound/fair-
+quantum work pending
 
 ## Scheduling laws
 
@@ -282,6 +282,15 @@ Deterministic tests:
   injected playback demand pre-empts new ingest quanta without corrupting work,
   and ingest resumes immediately when that demand clears; and
 - the byte semaphore bounds memory even when worker count is high.
+
+Implementation checkpoint (2026-08-31): the resumable cursor, extent-aligned
+byte quantum, aggregate admitted-byte budget, fair tail requeue, viewer gate,
+and operational counters are implemented. The deterministic test queues a
+large file before a small file, restricts four workers to one byte quantum, and
+proves the small file becomes atomically visible first while the large file
+remains invisible. It also proves the large prefix is not reread, and that peak
+worker/byte admission remains within the configured bound. Local FUSE coverage
+passes; three-node UAT remains before Phase 1B is complete.
 
 UAT checkpoint: strongly recommended. Repeat the current rsync workload before
 deeper WAL changes. Require visible concurrent progress, prompt completion of

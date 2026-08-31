@@ -61,7 +61,11 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   coalescing from real publication counts, and record physical baselines.
 - [ ] Phase 1B: remove the false single-publisher cap, prioritise closed files,
   add fair concurrent publication with worker and byte bounds, and run the
-  four-file/three-node UAT checkpoint.
+  four-file/three-node UAT checkpoint. Local implementation and deterministic
+  tests are complete: generations now retain a resumable writer/cursor across
+  extent-aligned byte quanta, requeue at the tail, respect a global admitted
+  byte budget, and remain atomically invisible until final commit. See
+  [2026-08-31-fuse-publication-phase-1b-fair-quanta.md](2026-08-31-fuse-publication-phase-1b-fair-quanta.md).
 - [ ] Phase 1A: separate loader priority from crash-recovery provenance. Durable
   spool publication remains user-requested loader work after restart and must
   not be capped by `recovery_commit_workers`. Add an RPC loader class below
@@ -69,7 +73,8 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   only for checksum/cache/crash semantics, and test both scheduler ordering and
   restart behaviour. Deterministic implementation is complete and documented in
   [2026-08-31-fuse-publication-phase-1a-loader-priority.md](2026-08-31-fuse-publication-phase-1a-loader-priority.md);
-  coordinated three-node deployment/UAT remains before this item moves to
+  coordinated loader-class UAT passed, while live viewer pre-emption remains to
+  be combined with the next Phase 1B UAT before this item moves to
   `COMPLETED.md`.
 - [ ] Phase 2: design and prove versioned durable incremental extent staging and
   safe spool-range retirement without exposing partial files.

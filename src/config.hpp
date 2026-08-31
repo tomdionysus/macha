@@ -115,6 +115,11 @@ struct FuseConfig {
     // imports to remain permanently single-threaded.
     size_t foreground_commit_workers{1};
     std::chrono::milliseconds publication_quiet{5000};
+    // A publication worker yields after this much durable spool input so other
+    // inodes and newly closed files receive service without restarting the
+    // generation. The aggregate budget bounds concurrently admitted quanta.
+    uint64_t publication_quantum_bytes{32ULL * 1024 * 1024};
+    uint64_t publication_inflight_bytes{256ULL * 1024 * 1024};
     size_t max_pending_operations{4096};
     // Ordered namespace recovery/backlog operations may share one metadata
     // publication. Both limits are hard bounds; a single operation is always
