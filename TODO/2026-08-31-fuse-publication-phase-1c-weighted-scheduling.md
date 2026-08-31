@@ -62,6 +62,27 @@ metadata generation 442 with 3/3 nodes and no conditions. After recovery:
 - publication quanta and yields each advanced by two; and
 - backend failures and timed-out requests did not increase.
 
+Node 200 (the local macOS process) subsequently became temporarily unreachable
+while its existing process remained alive. A five-second stack sample found its
+threads blocked normally rather than a persistent hot loop; sockets and both
+peer connections then recovered without intervention. The cluster converged to
+generation 624 and healthy 3/3. Do not count the degraded interval as scheduler
+UAT.
+
+The final clean 20.229-second window at generation 624 showed:
+
+- 468,189,184 additional publication bytes read (about 22.1 MiB/s);
+- 14 additional publication quanta and 14 bounded yields;
+- no increase in backend failures or timed-out requests;
+- no matching media-read, extent-unavailable, transcode-limit, timeout,
+  connection-refused, or retention-floor errors in the final two-minute log
+  window; and
+- the spool grew by 46,661,632 bytes while loader publication continued.
+
+Two deliberate rsync workloads were active at handoff: the original Movies-only
+overnight import and a separately launched broader BB2026/Movies/Music/TV
+import. They have different source sets and were left untouched.
+
 ## Remaining UAT
 
 After the overnight import, deliberately run genuine Macha streaming playback

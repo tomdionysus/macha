@@ -53,6 +53,17 @@ struct WriteHandleDiagnostics {
     size_t rebuild_put_extents{};
     size_t pending_extent_puts{};
     size_t peak_pending_extent_puts{};
+    FrameType work_frame_type{FrameType::loader};
+    uint64_t work_quantum_bytes{};
+    uint64_t materialize_source_bytes{};
+    size_t materialize_steps{};
+    uint64_t rebuild_source_bytes{};
+    size_t rebuild_steps{};
+};
+
+struct WritePreparation {
+    bool ready{};
+    uint64_t bytes_processed{};
 };
 
 struct FilesystemNamespaceMutation {
@@ -101,6 +112,28 @@ enum class WriteDurability : uint8_t {
     publication_generation,
 };
 
+// Provenance for DATA-plane work performed by a write generation. This is
+// deliberately separate from CONTROL scheduling: loader work must not be
+// silently promoted merely because it reaches a nested operation.
+class DataWorkContext {
+    FrameType frame_type_{FrameType::loader};
+    uint64_t quantum_bytes_{};
+
+  public:
+    explicit DataWorkContext(FrameType frame_type = FrameType::loader,
+                             uint64_t quantum_bytes = 0)
+        : frame_type_(frame_type), quantum_bytes_(quantum_bytes) {
+        if (frame_type == FrameType::control)
+            throw std::invalid_argument("control is not a DATA work class");
+    }
+
+    FrameType frame_type() const noexcept { return frame_type_; }
+    uint64_t quantum_bytes() const noexcept { return quantum_bytes_; }
+    bool records_activity() const noexcept {
+        return frame_type_ == FrameType::foreground || frame_type_ == FrameType::read_ahead;
+    }
+};
+
 class WriteHandle {
     friend class FileSystem;
 class PlaybackTracker;
@@ -112,6 +145,7 @@ class PlaybackTracker;
     bool sequential_{}, dirty_{};
     bool cache_puts_{};
     WriteDurability durability_{WriteDurability::immediate};
+    DataWorkContext work_context_{};
     DistributedStore::DurabilityBatch durability_batch_;
     struct StagedExtentResult {
         ExtentRef extent;
@@ -138,9 +172,21 @@ class PlaybackTracker;
     size_t diagnostic_completed_extents_{};
     size_t append_tail_fetches_{};
     size_t materialize_source_reads_{};
+    uint64_t materialize_source_bytes_{};
+    size_t materialize_steps_{};
+    bool materializing_{};
+    uint64_t materialize_offset_{};
+    size_t materialize_extent_index_{};
     size_t new_extent_puts_{};
     size_t rebuild_reused_extents_{};
     size_t rebuild_put_extents_{};
+    uint64_t rebuild_source_bytes_{};
+    size_t rebuild_steps_{};
+    bool rebuilding_{};
+    bool rebuild_prepared_{};
+    uint64_t rebuild_offset_{};
+    size_t rebuild_index_{};
+    std::vector<ExtentRef> rebuild_handle_extents_;
     struct DiagnosticWriteRange {
         uint64_t sequence{};
         uint64_t offset{};
@@ -153,7 +199,9 @@ class PlaybackTracker;
     std::chrono::milliseconds drain_one_extent();
     std::chrono::milliseconds drain_staging_locked();
     void prepare_append_tail();
+    WritePreparation materialize_step(uint64_t);
     void materialize();
+    WritePreparation rebuild_step(uint64_t);
     void rebuild();
     void cleanup();
     void diagnostic_stage_extent(const char*, size_t, uint64_t, size_t);
@@ -162,8 +210,14 @@ class PlaybackTracker;
   public:
     WriteHandle(FileSystem&, std::string, FsEntry, bool, bool cache_puts = false,
                 WriteDurability = WriteDurability::immediate,
-                uint64_t publication_pipeline_bytes = 0);
+                uint64_t publication_pipeline_bytes = 0,
+                DataWorkContext work_context = DataWorkContext{});
     ~WriteHandle();
+    // Prepare any existing generation needed for a write at `offset`. A zero
+    // budget preserves the synchronous API; a non-zero budget is a hard DATA
+    // byte quantum and may return !ready so an outer scheduler can yield.
+    WritePreparation prepare_write(uint64_t offset, uint64_t byte_budget = 0);
+    WritePreparation prepare_commit(uint64_t byte_budget = 0);
     size_t write(uint64_t, std::span<const uint8_t>);
     void truncate(uint64_t);
     void commit();
@@ -264,7 +318,8 @@ class FileSystem {
     std::optional<std::pair<std::string, FsEntry>> find_media(std::string_view);
     std::shared_ptr<WriteHandle> open_write(const std::string&, bool, bool cache_puts = false,
                                             WriteDurability = WriteDurability::immediate,
-                                            uint64_t publication_pipeline_bytes = 0);
+                                            uint64_t publication_pipeline_bytes = 0,
+                                            DataWorkContext work_context = DataWorkContext{});
     std::optional<uint64_t> active_write_size(const std::string&);
     std::vector<WriteHandleDiagnostics> active_write_diagnostics(const std::string&);
     void commit_file(const std::string&, const FsEntry&, uint64_t,

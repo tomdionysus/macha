@@ -161,6 +161,162 @@ MACHA_TEST("filesystem_fuse", test_open_write_metadata_merge) {
     CHECK(conflicted);
 }
 
+MACHA_TEST("filesystem_fuse", test_write_data_work_context_preserves_loader_provenance) {
+    TestService fixture("write-data-work-context");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    auto& service = fixture.start();
+
+    bool rejected_control = false;
+    try {
+        (void)DataWorkContext(FrameType::control, config.extent_size);
+    } catch (const std::invalid_argument&) {
+        rejected_control = true;
+    }
+    CHECK(rejected_control);
+
+    service.filesystem().create_file("/loader.bin", 0644, getuid(), getgid());
+    auto contents = pattern(2 * config.extent_size + 123);
+    auto seed = service.filesystem().open_write("/loader.bin", true);
+    REQUIRE(seed->write(0, contents) == contents.size());
+    seed->commit();
+    seed.reset();
+    (void)service.filesystem().store().take_interactive_bytes();
+
+    // A non-sequential overwrite forces the hidden materialisation/rebuild
+    // path which previously hard-coded read_ahead and manufactured viewer
+    // activity. It must inherit loader provenance and its admitted quantum.
+    auto loader = service.filesystem().open_write(
+        "/loader.bin", false, false, WriteDurability::publication_generation, 0,
+        DataWorkContext(FrameType::loader, config.extent_size));
+    const uint8_t replacement = static_cast<uint8_t>(contents[17] ^ 0x5a);
+    REQUIRE(loader->write(17, {&replacement, 1}) == 1);
+    loader->commit();
+    const auto loader_diagnostics = loader->diagnostics();
+    CHECK(loader_diagnostics.temp_open);
+    CHECK(loader_diagnostics.materialize_source_reads == 3);
+    CHECK(loader_diagnostics.materialize_source_bytes == contents.size());
+    CHECK(loader_diagnostics.work_frame_type == FrameType::loader);
+    CHECK(loader_diagnostics.work_quantum_bytes == config.extent_size);
+    CHECK(service.filesystem().store().take_interactive_bytes() == 0);
+    CHECK(service.filesystem().store().take_foreground_bytes() == 0);
+
+    // The same context remains usable for genuinely interactive DATA work;
+    // only those viewer classes may refresh viewer demand accounting.
+    service.filesystem().create_file("/interactive.bin", 0644, getuid(), getgid());
+    auto interactive = service.filesystem().open_write(
+        "/interactive.bin", true, false, WriteDurability::immediate, 0,
+        DataWorkContext(FrameType::read_ahead, config.extent_size));
+    const auto bytes = pattern(4096);
+    REQUIRE(interactive->write(0, bytes) == bytes.size());
+    CHECK(service.filesystem().store().take_interactive_bytes() == bytes.size());
+}
+
+MACHA_TEST("filesystem_fuse", test_loader_materialization_is_resumable_and_byte_bounded) {
+    TestService fixture("resumable-loader-materialization");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    auto& service = fixture.start();
+
+    service.filesystem().create_file("/large.bin", 0644, getuid(), getgid());
+    auto contents = pattern(4 * config.extent_size);
+    auto seed = service.filesystem().open_write("/large.bin", true);
+    REQUIRE(seed->write(0, contents) == contents.size());
+    seed->commit();
+    seed.reset();
+
+    auto loader = service.filesystem().open_write(
+        "/large.bin", false, false, WriteDurability::publication_generation, 0,
+        DataWorkContext(FrameType::loader, config.extent_size));
+    for (size_t step = 0; step < 4; ++step) {
+        const auto preparation = loader->prepare_write(17, config.extent_size);
+        CHECK(preparation.bytes_processed == config.extent_size);
+        CHECK(preparation.ready == (step == 3));
+        // Preparing an overlay is never authoritative visibility.
+        CHECK(service.filesystem().getattr("/large.bin").size == contents.size());
+        const auto diagnostics = loader->diagnostics();
+        CHECK(diagnostics.materialize_source_reads == step + 1);
+        CHECK(diagnostics.materialize_source_bytes == (step + 1) * config.extent_size);
+        CHECK(diagnostics.materialize_steps == step + 1);
+    }
+
+    // Once prepared, the original write is accepted without repeating any
+    // source read. Rebuild then rereads/hashes exactly one canonical extent per
+    // fresh grant while the old authoritative generation remains visible.
+    const auto original = contents;
+    const uint8_t replacement = static_cast<uint8_t>(contents[17] ^ 0x6d);
+    contents[17] = replacement;
+    REQUIRE(loader->write(17, {&replacement, 1}) == 1);
+    CHECK(loader->diagnostics().materialize_source_reads == 4);
+    for (size_t step = 0; step < 4; ++step) {
+        const auto preparation = loader->prepare_commit(config.extent_size);
+        CHECK(preparation.bytes_processed == config.extent_size);
+        CHECK(preparation.ready == (step == 3));
+        const auto diagnostics = loader->diagnostics();
+        CHECK(diagnostics.rebuild_source_bytes == (step + 1) * config.extent_size);
+        CHECK(diagnostics.rebuild_steps == step + 1);
+        auto old_reader = service.filesystem().open_read("/large.bin");
+        Bytes visible(original.size());
+        REQUIRE(old_reader->read(0, visible) == visible.size());
+        CHECK(visible == original);
+    }
+    const auto rebuilt = loader->diagnostics();
+    CHECK(rebuilt.rebuild_reused_extents == 3);
+    CHECK(rebuilt.rebuild_put_extents == 1);
+    loader->commit();
+    auto reader = service.filesystem().open_read("/large.bin");
+    Bytes output(contents.size());
+    REQUIRE(reader->read(0, output) == output.size());
+    CHECK(output == contents);
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_overwrite_materialization_yields_between_quanta) {
+    TestService fixture("fuse-overwrite-materialization-quanta");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 1;
+    config.fuse.publication_quantum_bytes = config.extent_size;
+    config.fuse.publication_inflight_bytes = config.extent_size;
+    config.fuse.publication_pipeline_bytes = config.extent_size;
+    auto& service = fixture.start();
+
+    service.filesystem().create_file("/overwrite.bin", 0644, getuid(), getgid());
+    auto contents = pattern(4 * config.extent_size);
+    auto seed = service.filesystem().open_write("/overwrite.bin", true);
+    REQUIRE(seed->write(0, contents) == contents.size());
+    seed->commit();
+    seed.reset();
+
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto handle = frontend->open("/overwrite.bin", true, true, false, false);
+    const uint8_t replacement = static_cast<uint8_t>(contents[17] ^ 0x39);
+    contents[17] = replacement;
+    REQUIRE(frontend->write(handle.inode, 17, {&replacement, 1}) == 1);
+    frontend->release(handle.inode, true);
+    REQUIRE(frontend->wait_for_idle(20s));
+
+    const auto status = frontend->status();
+    CHECK(status.data_publications_completed == 1);
+    CHECK(status.data_publication_bytes_read == 1);
+    // Four old extents are materialised and four rebuilt under separate
+    // one-extent grants. WAL replay also yields before extent-aligned rebuild.
+    CHECK(status.data_publication_yields >= 9);
+    auto reader = service.filesystem().open_read("/overwrite.bin");
+    Bytes output(contents.size());
+    REQUIRE(reader->read(0, output) == output.size());
+    CHECK(output == contents);
+    frontend->stop();
+}
+
 MACHA_TEST("filesystem_fuse", test_publication_extent_pipeline_is_bounded_and_atomic) {
     TestService fixture("publication-extent-pipeline");
     auto& config = fixture.config();
