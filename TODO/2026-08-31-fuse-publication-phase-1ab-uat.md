@@ -2,7 +2,7 @@
 
 Date: 2026-08-31
 
-Result: **partial pass; viewer-pre-emption failed**
+Result: **passed after viewer-signal correction and repeat deployment**
 
 ## Workload
 
@@ -91,8 +91,30 @@ Verification after this correction:
   `test_catalogue_sync_search_and_artwork_gc` and the coalesced catalogue burst
   test.
 
-The only remaining item in this checkpoint is redeployment and repetition of
-the bounded live FUSE viewer probe.
+At this local correction point, the only remaining item was redeployment and
+repetition of the bounded live FUSE viewer probe; that result follows below.
+
+## Repeat deployed viewer UAT
+
+After redeployment, node 50 recovered with a newly restarted rsync and a new
+spool workload. The cluster was healthy with all three nodes online. Seven
+independent generations initially reached seven active 32 MiB quanta, with a
+224 MiB peak below the 256 MiB configured budget.
+
+The same bounded 4 MiB FUSE read completed in 0.40 seconds including SSH
+overhead, versus roughly 3.5 seconds before the correction. Immediately after
+the viewer signal:
+
+- the admitted-quantum count remained exactly 28 across five samples;
+- 13.6 MiB of an already-running bounded operation retired, then useful-byte
+  progress stopped;
+- a publisher yielded and no replacement quantum was admitted; and
+- partial file metadata remained unpublished.
+
+After the configured five-second quiet window, publication resumed immediately
+and advanced from 28 to 36 quanta. The cluster remained healthy, node 50's
+control queue maximum was 259 microseconds, and FUSE backend failures and
+request timeouts both remained zero. This closes the Phase 1A/1B UAT.
 
 ## Performance conclusion
 

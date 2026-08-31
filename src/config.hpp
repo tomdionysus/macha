@@ -120,6 +120,13 @@ struct FuseConfig {
     // generation. The aggregate budget bounds concurrently admitted quanta.
     uint64_t publication_quantum_bytes{32ULL * 1024 * 1024};
     uint64_t publication_inflight_bytes{256ULL * 1024 * 1024};
+    // Maximum provisional extent data admitted concurrently by one file
+    // publication. This is bounded independently from the aggregate quantum
+    // budget so viewer demand has only a small, known amount of already-started
+    // loader I/O to retire.
+    // Zero selects two extents, capped at one publication quantum. Validation
+    // resolves this to an effective byte value before service startup.
+    uint64_t publication_pipeline_bytes{};
     size_t max_pending_operations{4096};
     // Ordered namespace recovery/backlog operations may share one metadata
     // publication. Both limits are hard bounds; a single operation is always

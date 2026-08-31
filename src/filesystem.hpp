@@ -5,6 +5,8 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <future>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -49,6 +51,8 @@ struct WriteHandleDiagnostics {
     size_t new_extent_puts{};
     size_t rebuild_reused_extents{};
     size_t rebuild_put_extents{};
+    size_t pending_extent_puts{};
+    size_t peak_pending_extent_puts{};
 };
 
 struct FilesystemNamespaceMutation {
@@ -109,6 +113,19 @@ class PlaybackTracker;
     bool cache_puts_{};
     WriteDurability durability_{WriteDurability::immediate};
     DistributedStore::DurabilityBatch durability_batch_;
+    struct StagedExtentResult {
+        ExtentRef extent;
+        DistributedStore::DurabilityBatch durability;
+        std::chrono::milliseconds elapsed{};
+    };
+    struct PendingExtent {
+        uint64_t bytes{};
+        std::future<StagedExtentResult> result;
+    };
+    std::deque<PendingExtent> pending_extents_;
+    uint64_t pending_extent_bytes_{};
+    uint64_t publication_pipeline_bytes_{};
+    size_t peak_pending_extents_{};
     uint64_t logical_{}, staged_{};
     std::vector<ExtentRef> extents_;
     Bytes buffer_;
@@ -133,6 +150,8 @@ class PlaybackTracker;
     std::map<std::pair<uint64_t, size_t>, std::pair<uint64_t, Hash256>> diagnostic_exact_writes_;
     std::vector<DiagnosticWriteRange> diagnostic_writes_;
     std::chrono::milliseconds flush();
+    std::chrono::milliseconds drain_one_extent();
+    std::chrono::milliseconds drain_staging_locked();
     void prepare_append_tail();
     void materialize();
     void rebuild();
@@ -142,11 +161,13 @@ class PlaybackTracker;
 
   public:
     WriteHandle(FileSystem&, std::string, FsEntry, bool, bool cache_puts = false,
-                WriteDurability = WriteDurability::immediate);
+                WriteDurability = WriteDurability::immediate,
+                uint64_t publication_pipeline_bytes = 0);
     ~WriteHandle();
     size_t write(uint64_t, std::span<const uint8_t>);
     void truncate(uint64_t);
     void commit();
+    void drain_staging();
     WriteHandleDiagnostics diagnostics() const;
     FsEntry committed_entry() const { std::lock_guard lock(m_); return base_; }
     uint64_t diagnostic_id() const noexcept {
@@ -242,7 +263,8 @@ class FileSystem {
                                           FrameType frame_type = FrameType::foreground);
     std::optional<std::pair<std::string, FsEntry>> find_media(std::string_view);
     std::shared_ptr<WriteHandle> open_write(const std::string&, bool, bool cache_puts = false,
-                                            WriteDurability = WriteDurability::immediate);
+                                            WriteDurability = WriteDurability::immediate,
+                                            uint64_t publication_pipeline_bytes = 0);
     std::optional<uint64_t> active_write_size(const std::string&);
     std::vector<WriteHandleDiagnostics> active_write_diagnostics(const std::string&);
     void commit_file(const std::string&, const FsEntry&, uint64_t,

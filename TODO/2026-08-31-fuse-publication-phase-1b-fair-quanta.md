@@ -69,5 +69,11 @@ adapter mismatch. Phase 1B remains active. Full observations are in
 
 The mismatch has since been corrected locally and the regression now enters
 through the public hook used by the adapter after publication is already in
-progress. FUSE 48/48, runtime 3/3, and the complete 215/215 suite pass. A repeat
-live viewer probe remains necessary before closing Phase 1B.
+progress. FUSE 48/48, runtime 3/3, and the complete 215/215 suite pass. At that
+local checkpoint a repeat live viewer probe remained before closing Phase 1B.
+
+The repeat deployed probe passed: the 4 MiB FUSE read completed in 0.40 seconds,
+the quantum count remained fixed throughout the observed viewer window after
+already-running bounded work retired, and publication resumed immediately at
+quiet-window expiry with no failure or timeout. Phase 1B is complete; the
+separate synchronous-I/O throughput limitation continues into the next phase.

@@ -47,46 +47,26 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   UAT evidence.
 - [ ] Execute the phased FUSE publication throughput work in
   [2026-08-31-fuse-publication-throughput-plan.md](2026-08-31-fuse-publication-throughput-plan.md).
-  The 2026-08-31 rsync UAT found a direct scheduler defect: any open writer caps
-  publication at the single foreground worker despite eight configured commit
-  workers, causing multi-GB head-of-line blocking at about 1.9 MB/s while disks
-  and CPUs are underused.
-- [ ] Deploy and UAT the first Phase 0/1 implementation checkpoint documented in
-  [2026-08-31-fuse-publication-phase-0-1-checkpoint.md](2026-08-31-fuse-publication-phase-0-1-checkpoint.md).
-  Deterministic coverage now proves open loaders use multiple workers, closed
-  files receive priority, demand coalesces, useful bytes reconcile, and viewer
-  demand gates publication. Explicit byte bounds and fair resumable quanta are
-  still pending, so Phase 1 is not yet complete.
-- [ ] Phase 0: add useful-byte and per-stage publication telemetry, split demand
-  coalescing from real publication counts, and record physical baselines.
-- [ ] Phase 1B: remove the false single-publisher cap, prioritise closed files,
-  add fair concurrent publication with worker and byte bounds, and run the
-  four-file/three-node UAT checkpoint. Local implementation and deterministic
-  tests are complete: generations now retain a resumable writer/cursor across
-  extent-aligned byte quanta, requeue at the tail, respect a global admitted
-  byte budget, and remain atomically invisible until final commit. See
-  [2026-08-31-fuse-publication-phase-1b-fair-quanta.md](2026-08-31-fuse-publication-phase-1b-fair-quanta.md).
-  The three-node UAT found that real FUSE reads updated the interactive clock
-  while the publication gate watched only the foreground clock. The signal
-  mismatch is now fixed and covered through the adapter's public viewer hook;
-  redeploy and repeat the bounded viewer-pre-emption UAT before completion. See
-  [2026-08-31-fuse-publication-phase-1ab-uat.md](2026-08-31-fuse-publication-phase-1ab-uat.md).
-- [ ] Phase 1A: separate loader priority from crash-recovery provenance. Durable
-  spool publication remains user-requested loader work after restart and must
-  not be capped by `recovery_commit_workers`. Add an RPC loader class below
-  viewer/read-ahead and above speculative maintenance, retain recovered origin
-  only for checksum/cache/crash semantics, and test both scheduler ordering and
-  restart behaviour. Deterministic implementation is complete and documented in
-  [2026-08-31-fuse-publication-phase-1a-loader-priority.md](2026-08-31-fuse-publication-phase-1a-loader-priority.md);
-  coordinated loader-class UAT passed, while live viewer pre-emption remains to
-  be combined with the next Phase 1B UAT before this item moves to
-  `COMPLETED.md`.
+  Phase 0/1 diagnostics, loader priority, concurrency, fair byte quanta and real
+  viewer pre-emption are complete. Phase 4A bounded within-file extent
+  pipelining is implemented and locally verified; perform its three-node UAT
+  before moving it to `COMPLETED.md`. The pre-change measured limit was roughly
+  7.72 MiB/s aggregate synchronous extent/durability I/O with substantial host
+  I/O wait.
+- [ ] Fix stale FUSE mount recovery ordering. Startup currently calls
+  `create_directories(mount_path)` before `prepare_fuse_mountpoint()`, so a
+  disconnected Macha mount returns `ENOTCONN` before
+  `fuse.unmount_if_mounted: true` can recover it. Add a regression around the
+  preflight contract and retain refusal of unrelated filesystems.
 - [ ] Phase 2: design and prove versioned durable incremental extent staging and
   safe spool-range retirement without exposing partial files.
 - [ ] Phase 3: aggregate sequential local write descriptors and make durability
   group commit byte/urgency driven.
-- [ ] Phase 4: pipeline bounded data RPC, isolate storage waits from control
-  communications, and aggregate compatible physical durability barriers.
+- [ ] Phase 4A UAT: verify the bounded within-file extent pipeline materially
+  improves useful throughput while viewer and control latency remain protected.
+- [ ] Phase 4B: replace transient per-extent tasks with a shared byte-bounded
+  data executor, add per-peer/storage-domain bounds, isolate all storage waits
+  from communications, and aggregate compatible physical durability barriers.
 - [ ] Phase 5: integrate continuous progress rates, occupancy hysteresis,
   concurrent-writer fairness, and authoritative catalogue hints.
 - [ ] Complete the final mixed-size rsync, concurrent-writer, communications,

@@ -602,6 +602,10 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                     values->data_publication_yields;
                 filesystem_diagnostics["data_publication_peak_inflight_bytes"] =
                     values->data_publication_peak_inflight_bytes;
+                filesystem_diagnostics["data_publication_pipeline_limit_bytes"] =
+                    values->data_publication_pipeline_limit_bytes;
+                filesystem_diagnostics["data_publication_peak_pipeline_extents"] =
+                    values->data_publication_peak_pipeline_extents;
                 filesystem_diagnostics["data_closed_priority_selections"] =
                     values->data_closed_priority_selections;
                 filesystem_diagnostics["data_publication_bytes_read"] =

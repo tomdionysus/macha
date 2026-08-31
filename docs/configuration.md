@@ -104,6 +104,7 @@ fuse:
   operation_journal_path: /var/lib/macha/fuse-operations.log
   publication_quantum_bytes: 32M
   publication_inflight_bytes: 256M
+  publication_pipeline_bytes: 8M
   max_spool_bytes: 16G
   spool_reserve_free: 2G
   unmount_if_mounted: true
@@ -123,7 +124,13 @@ provisional writer and exact spool cursor after each
 and becomes visible only after its final metadata commit. The quantum must be
 an extent-size multiple. `publication_inflight_bytes` (256 MiB by default) is
 also a quantum multiple and bounds aggregate concurrently admitted publication
-work independently of `commit_workers`. Viewer demand prevents admission of a
+work. `publication_pipeline_bytes` bounds provisional extent puts concurrently
+started for one file. When omitted it is two extents, capped at one quantum
+(8 MiB with the documented 4 MiB extent configuration). An explicit value must
+be an extent-size multiple no larger than a quantum or eight extents; lowering it reduces the
+loader I/O which may already be in flight when viewer demand arrives, while
+raising it can improve bulk-import throughput on higher-latency storage. These byte bounds work independently of
+`commit_workers`. Viewer demand prevents admission of a
 new quantum and an already running publisher checks the viewer gate between
 256 KiB spool chunks.
 
