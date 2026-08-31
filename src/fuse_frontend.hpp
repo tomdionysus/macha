@@ -5,6 +5,7 @@
 #include "filesystem.hpp"
 #include "hydration.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -13,6 +14,7 @@
 #include <future>
 #include <memory>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -58,6 +60,123 @@ class SpoolRetirementRateEstimator {
     void reset() {
         started_.reset();
         bytes_ = 0;
+    }
+};
+
+// Event-driven duty-cycle gate for loader publication while genuine viewer
+// traffic is active. A bounded loader burst is followed by a proportional
+// cooldown. The ratio is relative active time, not a static bandwidth cap;
+// when viewer traffic is absent the loader is always admitted.
+class WeightedLoaderService {
+  public:
+    using Clock = std::chrono::steady_clock;
+    using TimePoint = Clock::time_point;
+
+  private:
+    mutable std::mutex mutex_;
+    size_t viewer_weight_;
+    size_t loader_weight_;
+    std::chrono::milliseconds slice_;
+    std::optional<TimePoint> burst_started_;
+    TimePoint slice_deadline_{};
+    TimePoint not_before_{};
+    size_t active_loaders_{};
+
+    void reset_locked() {
+        burst_started_.reset();
+        slice_deadline_ = {};
+        not_before_ = {};
+    }
+
+  public:
+    explicit WeightedLoaderService(size_t viewer_weight = 95, size_t loader_weight = 5,
+                                   std::chrono::milliseconds slice =
+                                       std::chrono::milliseconds(25))
+        : viewer_weight_(viewer_weight), loader_weight_(loader_weight), slice_(slice) {}
+
+    bool can_start(TimePoint now, bool viewer_active) {
+        std::lock_guard lock(mutex_);
+        if (!viewer_active) {
+            reset_locked();
+            return true;
+        }
+        if (!loader_weight_)
+            return false;
+        if (now < not_before_)
+            return false;
+        return !burst_started_ || now < slice_deadline_;
+    }
+
+    void started(TimePoint now, bool viewer_active) {
+        std::lock_guard lock(mutex_);
+        ++active_loaders_;
+        if (!viewer_active) {
+            reset_locked();
+            return;
+        }
+        if (!loader_weight_)
+            return;
+        if (!burst_started_) {
+            burst_started_ = now;
+            slice_deadline_ = now + slice_;
+        }
+    }
+
+    bool should_yield(TimePoint now, bool viewer_active) {
+        std::lock_guard lock(mutex_);
+        if (!viewer_active) {
+            reset_locked();
+            return false;
+        }
+        if (!loader_weight_)
+            return true;
+        // Viewer arrival during an unrestricted loader quantum yields at the
+        // next bounded chunk. Its pipeline drain is accounted as the first
+        // contended loader burst before the proportional cooldown.
+        if (!burst_started_) {
+            burst_started_ = now;
+            slice_deadline_ = now;
+            return true;
+        }
+        return now >= slice_deadline_;
+    }
+
+    std::chrono::milliseconds finished(TimePoint now, bool viewer_active) {
+        std::lock_guard lock(mutex_);
+        if (active_loaders_)
+            --active_loaders_;
+        if (!viewer_active) {
+            reset_locked();
+            return {};
+        }
+        if (!loader_weight_ || active_loaders_ || !burst_started_)
+            return {};
+        auto active = std::chrono::duration_cast<std::chrono::milliseconds>(now - *burst_started_);
+        active = std::max(active, std::chrono::milliseconds(1));
+        const auto ratio = static_cast<long double>(viewer_weight_) /
+                           static_cast<long double>(loader_weight_);
+        const auto raw = static_cast<long double>(active.count()) * ratio;
+        const auto capped = std::min<long double>(
+            raw, static_cast<long double>(std::chrono::hours(24).count()) * 60.0L * 60.0L *
+                     1000.0L);
+        const auto cooldown = std::chrono::milliseconds(static_cast<int64_t>(capped));
+        not_before_ = now + cooldown;
+        burst_started_.reset();
+        slice_deadline_ = {};
+        return cooldown;
+    }
+
+    std::chrono::milliseconds wait_for(TimePoint now, bool viewer_active) {
+        std::lock_guard lock(mutex_);
+        if (!viewer_active) {
+            reset_locked();
+            return {};
+        }
+        if (!loader_weight_)
+            return std::chrono::hours(24);
+        if (now >= not_before_)
+            return {};
+        return std::chrono::duration_cast<std::chrono::milliseconds>(not_before_ - now);
     }
 };
 

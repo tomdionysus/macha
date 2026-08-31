@@ -2,14 +2,15 @@
 
 Date: 2026-08-31
 
-Status: Phase 1A loader-priority implementation, verification, and coordinated
-classification UAT complete; live viewer leg and Phase 1B byte-bound/fair-
-quantum work pending
+Status: Phase 4A and the aggregate retirement-rate implementation are locally
+complete. A deployed rate UAT exposed a prerequisite scheduling correction:
+FUSE traffic must be loader class, and viewer priority must be weighted rather
+than an exclusive quiet-window gate. Phase 1C below is now the next cut.
 
 ## Scheduling laws
 
 1. **Thou Shalt Not Make The Viewer Wait.** Playback startup, reads, seeks, and
-   the control work required to serve them have absolute priority. No ingest
+   the control work required to serve them have overwhelming priority. No ingest
    throughput improvement is acceptable if it introduces viewer-visible delay,
    buffering, starvation, or latency spikes.
 2. **Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The
@@ -23,6 +24,13 @@ These laws define priority, not polling. Viewer demand, resource availability,
 durability completion, queue transitions, and pressure thresholds must wake or
 pace work through events.
 
+They also define priority, not exclusion. Viewer demand must not stop every
+other class indefinitely. While viewer and loader work are both runnable, the
+default service ratio is 95:5. The weights are configurable and work conserving:
+either class borrows all unused capacity when the other is idle. Bounded quanta
+limit the delay imposed by already-admitted loader work, while the non-zero
+loader share proves continued progress under sustained viewing.
+
 ### Priority classes and provenance
 
 Durable spool publication is user-requested loader work, including after a
@@ -34,6 +42,12 @@ as separate dimensions:
 2. viewer foreground reads and viewer read-ahead;
 3. user-requested loader/ingest publication;
 4. speculative repair, hydration, garbage collection, and maintenance.
+
+The FUSE mount is an ingest and convenience interface, not a viewer interface.
+All FUSE reads and writes are loader class and must not refresh viewer activity
+or create a playback quiet window. Viewer demand is emitted only by the actual
+viewer/streaming path. This is an interface contract; do not infer intent from
+process names, PIDs, open flags, or per-inode writer state.
 
 The RPC transport therefore needs a loader frame class between viewer
 read-ahead and speculative work. FUSE queue items need a recovered-provenance
@@ -155,8 +169,9 @@ system should meet all of the following:
    were authoritative.
 8. With no viewer demand and no genuine resource bound, queued ingest work keeps
    the permitted workers and byte window busy. Viewer arrival promptly reduces
-   or pauses competing work at safe cancellation/yield boundaries, and viewer
-   departure promptly releases that capacity back to ingest.
+   loader service to its configured weighted share at safe yield boundaries,
+   without starving it; viewer departure promptly releases full capacity back
+   to ingest.
 9. Restarted spool work retains the same useful-throughput target as continuous
    ingest. Process lifetime boundaries must not reduce it to a background worker
    allowance.
@@ -251,7 +266,7 @@ immediate gain.
    provenance is not a scheduling lane.
 3. Permit up to `commit_workers` independent inode publications when there is
    spool pressure or closed work. Preserve explicit playback priority using
-   actual playback/read signals rather than the existence of a writer.
+   signals from the viewer/streaming path, never ordinary FUSE reads.
 4. Enforce both a worker limit and an in-flight-byte semaphore. Worker count
    alone is unsafe because each publisher holds extent buffers, RPC payloads,
    and durability state.
@@ -276,16 +291,18 @@ Deterministic tests:
   storm;
 - no two workers publish the same inode concurrently and sequence order is
   preserved;
-- playback gating, loader bounds, recovered-provenance handling,
+- weighted viewer/loader scheduling, loader bounds, recovered-provenance handling,
   stop/cancellation, and confirmation requeue semantics remain correct; and
 - with playback absent, ready ingest fills the permitted worker and byte budget;
-  injected playback demand pre-empts new ingest quanta without corrupting work,
-  and ingest resumes immediately when that demand clears; and
+  injected playback demand receives the configured dominant share without
+  corrupting work or starving ingest, and ingest returns immediately to full
+  service when that demand clears; and
 - the byte semaphore bounds memory even when worker count is high.
 
 Implementation checkpoint (2026-08-31): the resumable cursor, extent-aligned
-byte quantum, aggregate admitted-byte budget, fair tail requeue, viewer gate,
-and operational counters are implemented. The deterministic test queues a
+byte quantum, aggregate admitted-byte budget, fair tail requeue, original
+viewer gate, and operational counters are implemented. Phase 1C supersedes the
+gate while retaining the cursor, bounds and yield points. The deterministic test queues a
 large file before a small file, restricts four workers to one byte quantum, and
 proves the small file becomes atomically visible first while the large file
 remains invisible. It also proves the large prefix is not reread, and that peak
@@ -296,6 +313,69 @@ UAT checkpoint: strongly recommended. Repeat the current rsync workload before
 deeper WAL changes. Require visible concurrent progress, prompt completion of
 closed files, rising disk/network utilisation, responsive status, and catalogue
 activity as each file becomes authoritative.
+
+## Phase 1C: weighted viewer/loader scheduling and FUSE classification
+
+This corrective cut precedes further throughput phases. The aggregate-rate UAT
+showed `rsync --append-verify` reading an existing destination through FUSE at
+about 6.4 MiB/s. Those convenience/verification reads were incorrectly recorded
+as viewer demand, and the binary `playback_quiet()` gate then stopped all new
+publication quanta and serialized commits behind a quiet window.
+
+1. Classify every FUSE operation, including read-only open and read, as loader
+   traffic. FUSE must not update foreground/read-ahead viewer clocks.
+2. Tag the actual streaming/viewer path explicitly as viewer foreground or
+   viewer read-ahead. Classification belongs at the caller boundary, not in a
+   heuristic inside the scheduler.
+3. Replace the binary viewer quiet-window publication gate with an event-driven,
+   byte-quantum weighted scheduler. Add `fuse.viewer_weight` and
+   `fuse.loader_weight`, defaulting to 95 and 5. Require both to be positive and
+   use relative weights rather than requiring a sum of 100.
+4. Make service work conserving. Viewer-only and loader-only workloads each use
+   all safe capacity. When both are continuously runnable, accumulated service
+   debt selects approximately 95 viewer bytes/quanta for every 5 loader bytes/
+   quanta without allowing either class to starve.
+5. Preserve immediate viewer admission through reserved viewer executor/RPC
+   capacity. Weighting must not put a viewer behind a loader queue; it controls
+   shared storage/network service after independently responsive admission.
+6. Retain bounded loader quanta and the byte-bounded extent pipeline. A viewer
+   can wait only for already-admitted bounded work, not a whole file or a global
+   quiet interval.
+7. Remove `wait_for_playback_quiet()` from the serialized commit boundary.
+   Long durability/commit work must run on the loader/data executor and must not
+   occupy communications threads. If a physical commit cannot be pre-empted,
+   admission must bound its size and preserve viewer headroom before it starts.
+8. Expose per-class admitted/completed bytes or quanta, runnable time, and
+   starvation/debt counters so the configured ratio and borrowing behaviour are
+   auditable without polling.
+9. Deprecate `fuse.publication_quiet_ms` and
+   `fuse.foreground_commit_workers` after compatibility parsing is documented;
+   they must no longer implement normal scheduling policy.
+
+Deterministic tests:
+
+- configuration defaults to 95:5, accepts other positive relative weights, and
+  rejects zero/overflow values;
+- sustained FUSE `--append-verify` analogue reads do not refresh viewer activity
+  and publication continues making bounded progress;
+- genuine viewer reads receive prompt service and approximately the configured
+  share while a saturated loader remains runnable;
+- the loader completes repeated quanta under continuous viewer demand, proving
+  non-starvation;
+- either class borrows full capacity when the other queue is empty, including
+  immediate loader recovery when viewer demand ends;
+- different-process convenience reads, read-only FUSE handles, and FUSE reads
+  of an inode also open for writing all remain loader class;
+- viewer admission, control RPC latency, in-flight byte bounds, cancellation,
+  restart provenance, and atomic whole-file visibility remain unchanged; and
+- no scheduler timer, maintenance loop, or busy wait is introduced.
+
+UAT checkpoint: rerun the live `rsync --append-verify` workload and real
+viewer/streaming playback together. Prove FUSE verification no longer suppresses
+publication, the loader continues at its configured residual share during
+sustained viewing, the viewer remains responsive, and loader throughput returns
+to full safe capacity immediately after playback. Only then resume the paused
+aggregate-retirement-rate UAT.
 
 ## Phase 2: stage immutable extents incrementally
 
@@ -425,8 +505,9 @@ Run these cuts after their corresponding deterministic tests pass:
    delayed work, and stable memory.
 8. Viewer-under-load test: begin playback and perform repeated seeks during a
    saturated import, prove viewer startup/read latency stays within its defined
-   envelope, then prove ingest promptly returns to full safe capacity when the
-   viewer becomes idle.
+   envelope, prove ingest retains its configured non-zero share throughout,
+   then prove ingest promptly returns to full safe capacity when the viewer
+   becomes idle.
 
 Each UAT record must include the raw physical baseline and the new useful-byte
 counters. A throughput number without an identified limiting stage is not an
@@ -434,9 +515,10 @@ acceptable result.
 
 ## Sequencing and stop points
 
-- Phase 0, Phase 1A, and Phase 1B are one safe delivery sequence: measure,
+- Phase 0, Phase 1A, Phase 1B, and corrective Phase 1C are one safe delivery sequence: measure,
   establish the loader class independently of restart provenance, remove false
-  worker caps, add fairness/bounds, test, then UAT. Do not tune concurrency
+  worker caps, add fairness/bounds, replace exclusion with weighted service,
+  test, then UAT. Do not tune concurrency
   against the old `recovery` lane or use the earlier two-worker UAT as a
   performance baseline.
 - Phase 2 is the largest correctness change and should be delivered separately

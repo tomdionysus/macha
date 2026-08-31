@@ -426,6 +426,7 @@ struct FuseFrontend::State {
 
     FileSystem& fs;
     FuseConfig config;
+    WeightedLoaderService weighted_loader;
     std::filesystem::path spool_dir;
     std::filesystem::path journal_path;
     std::filesystem::path journal_dir;
@@ -557,6 +558,8 @@ struct FuseFrontend::State {
 
     explicit State(FileSystem& filesystem, FuseConfig policy)
         : fs(filesystem), config(std::move(policy)),
+          weighted_loader(config.viewer_weight,
+                          config.suspend_loader_for_tests ? 0 : config.loader_weight),
           spool_dir(config.spool_path.value_or(fs.node().config().state_path / "fuse-spool")),
           journal_path(config.operation_journal_path.value_or(spool_dir / "operations.log")),
           journal_dir(journal_path.parent_path().empty() ? std::filesystem::path(".")
@@ -2137,10 +2140,10 @@ struct FuseFrontend::State {
             std::chrono::milliseconds backoff{50};
             while (!published_prefix && !stop.stop_requested() && !stopping.load()) {
                 try {
-                    // Namespace publication is also asynchronous convergence. It
-                    // must not take the shared metadata transaction while viewer
-                    // playback is waiting for storage/RPC service.
-                    wait_for_playback_quiet();
+                    // FUSE namespace publication is loader/convenience work.
+                    // Its batches are explicitly bounded and execute away from
+                    // viewer/control RPC lanes; viewer activity is priority,
+                    // not a reason to stop namespace convergence indefinitely.
 
                     // A crash may leave an accepted effect without its local
                     // marker. Retire only a leading already-achieved prefix so
@@ -2154,14 +2157,16 @@ struct FuseFrontend::State {
                         namespace_publication_attempts.fetch_add(1, std::memory_order_relaxed);
                         FilesystemNamespaceBatchResult result;
                         try {
-                            std::lock_guard backend(publication_mutex);
-                            // Viewer demand may arrive after the outer gate but
-                            // while another publication owns this boundary.
-                            // Re-check after acquiring it so queued background
-                            // commits cannot form a train in front of playback.
-                            wait_for_playback_quiet();
-                            result = apply_namespace_backend(
-                                std::span<const NamespaceOp>(batch).subspan(published_prefix));
+                            wait_for_weighted_loader_service();
+                            try {
+                                std::lock_guard backend(publication_mutex);
+                                result = apply_namespace_backend(
+                                    std::span<const NamespaceOp>(batch).subspan(published_prefix));
+                            } catch (...) {
+                                finish_weighted_loader_service();
+                                throw;
+                            }
+                            finish_weighted_loader_service();
                         } catch (const FsError& error) {
                             if (!published_prefix)
                                 throw;
@@ -2299,24 +2304,41 @@ struct FuseFrontend::State {
         return snapshot;
     }
 
-    bool playback_quiet() const {
-        return config.publication_quiet.count() <= 0 ||
-               fs.foreground_idle_for() >= config.publication_quiet;
+    bool viewer_active() const {
+        return config.publication_quiet.count() > 0 &&
+               fs.foreground_idle_for() < config.publication_quiet;
     }
 
-    void wait_for_playback_quiet() {
-        while (!stopping.load(std::memory_order_relaxed) && !playback_quiet()) {
+    bool weighted_loader_should_yield() {
+        return weighted_loader.should_yield(Clock::now(), viewer_active());
+    }
+
+    void wait_for_weighted_loader_service() {
+        for (;;) {
+            if (stopping.load(std::memory_order_relaxed))
+                throw FsError(EINTR, "FUSE publication stopping");
+            const auto active = viewer_active();
+            const auto now = Clock::now();
+            if (weighted_loader.can_start(now, active)) {
+                weighted_loader.started(now, active);
+                return;
+            }
             const auto idle = fs.foreground_idle_for();
-            const auto remaining = idle < config.publication_quiet ? config.publication_quiet - idle
-                                                                   : std::chrono::milliseconds(0);
-            if (remaining <= std::chrono::milliseconds(0))
-                break;
+            auto wake_after = idle < config.publication_quiet
+                                  ? config.publication_quiet - idle
+                                  : std::chrono::milliseconds(1);
+            const auto cooldown = weighted_loader.wait_for(now, active);
+            if (cooldown > std::chrono::milliseconds(0))
+                wake_after = std::min(wake_after, cooldown);
             std::unique_lock lock(data_queue_mutex);
-            data_cv.wait_for(lock, remaining,
+            data_cv.wait_for(lock, wake_after,
                              [&] { return stopping.load(std::memory_order_relaxed); });
         }
-        if (stopping.load(std::memory_order_relaxed))
-            throw FsError(EINTR, "FUSE publication stopping");
+    }
+
+    void finish_weighted_loader_service() {
+        (void)weighted_loader.finished(Clock::now(), viewer_active());
+        data_cv.notify_all();
     }
 
     void abandon_corrupt_data(const std::shared_ptr<Inode>& inode, std::string_view reason) {
@@ -2482,7 +2504,7 @@ struct FuseFrontend::State {
             while (publication->operation_index < snapshot.operations.size()) {
                 if (stopping.load())
                     throw FsError(EINTR, "FUSE publication stopping");
-                if (!playback_quiet()) {
+                if (weighted_loader_should_yield()) {
                     return yield_quantum();
                 }
                 const auto& op = snapshot.operations[publication->operation_index];
@@ -2506,7 +2528,7 @@ struct FuseFrontend::State {
                     // spool -> journal durability barrier, so distributed
                     // publication may yield to viewer playback between bounded
                     // replay chunks without endangering recoverable input.
-                    if (!playback_quiet()) {
+                    if (weighted_loader_should_yield()) {
                         return yield_quantum();
                     }
                     const auto chunk =
@@ -2554,13 +2576,10 @@ struct FuseFrontend::State {
                     return yield_quantum();
                 }
             }
+            if (weighted_loader_should_yield())
+                return yield_quantum();
             {
                 std::lock_guard backend(publication_mutex);
-                // Multiple data workers may have passed the chunk gate before
-                // a viewer arrived and then queued here. Re-check while owning
-                // the serial commit boundary so at most the already-running
-                // bounded operation can precede new viewer demand.
-                wait_for_playback_quiet();
                 publication->writer->commit();
                 note_pipeline_peak();
             }
@@ -2600,12 +2619,11 @@ struct FuseFrontend::State {
         return true;
     }
 
-    bool data_global_slot_available() const {
-        // Viewer demand is the only foreground gate. Loader writes are already
-        // durable in the local spool and are useful queued work, not a reason to
-        // collapse publication concurrency. A viewer blocks new publication
-        // quanta; publishers also re-check the same gate between replay chunks.
-        if (!playback_quiet())
+    bool data_global_slot_available() {
+        // Viewer demand receives the dominant configured service share, but is
+        // not an exclusion gate. Bounded loader bursts remain runnable after a
+        // proportional cooldown and borrow all capacity when viewing is idle.
+        if (!weighted_loader.can_start(Clock::now(), viewer_active()))
             return false;
         return active_data.load(std::memory_order_relaxed) < config.commit_workers &&
                publication_inflight_bytes <=
@@ -2653,17 +2671,26 @@ struct FuseFrontend::State {
                     if (runnable_data_available_locked())
                         break;
 
-                    // Active publications and viewer activity transitions notify
-                    // data_cv. Quiet-window expiry is the only transition without
-                    // a producer event, so sleep directly to that deadline.
-                    const auto playback_idle = fs.foreground_idle_for();
-                    if (config.publication_quiet.count() > 0 &&
-                        playback_idle < config.publication_quiet) {
-                        data_cv.wait_for(lock, stop, config.publication_quiet - playback_idle, [&] {
-                            return stopping.load() || data_queue.empty() ||
-                                   runnable_data_available_locked();
-                        });
-                        continue;
+                    // Cooldown expiry and viewer-idle expiry are deadline
+                    // transitions. Sleep directly to the earlier one; active
+                    // publication completion and new queue work notify data_cv.
+                    if (viewer_active()) {
+                        const auto now = Clock::now();
+                        const auto cooldown = weighted_loader.wait_for(now, true);
+                        const auto viewer_idle = fs.foreground_idle_for();
+                        const auto quiet_remaining =
+                            viewer_idle < config.publication_quiet
+                                ? config.publication_quiet - viewer_idle
+                                : std::chrono::milliseconds(0);
+                        auto wake_after = quiet_remaining;
+                        if (cooldown > std::chrono::milliseconds(0))
+                            wake_after = std::min(wake_after, cooldown);
+                        if (wake_after > std::chrono::milliseconds(0)) {
+                            data_cv.wait_for(lock, stop, wake_after, [&] {
+                                return stopping.load() || data_queue.empty();
+                            });
+                            continue;
+                        }
                     }
                     data_cv.wait(lock, stop, [&] {
                         return stopping.load() || data_queue.empty() ||
@@ -2692,6 +2719,7 @@ struct FuseFrontend::State {
                 inode = selected->inode;
                 recovered = selected->recovered;
                 data_queue.erase(selected);
+                weighted_loader.started(Clock::now(), viewer_active());
                 publication_inflight_bytes += config.publication_quantum_bytes;
                 data_publication_quanta.fetch_add(1, std::memory_order_relaxed);
                 auto byte_peak =
@@ -2767,9 +2795,10 @@ struct FuseFrontend::State {
             {
                 std::lock_guard lock(data_queue_mutex);
                 publication_inflight_bytes -= config.publication_quantum_bytes;
-                --active_data;
+                (void)active_data.fetch_sub(1, std::memory_order_relaxed);
                 if (recovered)
                     --active_recovery_data;
+                (void)weighted_loader.finished(Clock::now(), viewer_active());
             }
             data_cv.notify_all();
             if (retry)
@@ -4250,12 +4279,12 @@ size_t FuseFrontend::read_impl(uint64_t inode_id,
                     throw FsError(EBADF, "FUSE read session inode mismatch");
                 if (!read_session->reader || read_session->base_version != base.version) {
                     read_session->reader =
-                        state_->fs.open_read(base, logical_path, false, FrameType::read_ahead);
+                        state_->fs.open_read(base, logical_path, false, FrameType::loader);
                     read_session->base_version = base.version;
                 }
                 reader = read_session->reader;
             } else {
-                reader = state_->fs.open_read(base, logical_path, false, FrameType::read_ahead);
+                reader = state_->fs.open_read(base, logical_path, false, FrameType::loader);
             }
             size_t done = 0;
             while (done < base_count) {
