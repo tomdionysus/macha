@@ -86,6 +86,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "  publication_quiet_ms: 425\n"
             << "  publication_quantum_bytes: 32M\n"
             << "  publication_inflight_bytes: 128M\n"
+            << "  publication_pipeline_bytes: 32M\n"
             << "  max_pending_operations: 1024\n"
             << "  namespace_batch_operations: 128\n"
             << "  namespace_batch_bytes: 192K\n"
@@ -265,6 +266,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(yc.fuse.publication_quiet == 425ms);
     CHECK(yc.fuse.publication_quantum_bytes == 32ULL * 1024 * 1024);
     CHECK(yc.fuse.publication_inflight_bytes == 128ULL * 1024 * 1024);
+    CHECK(yc.fuse.publication_pipeline_bytes == 32ULL * 1024 * 1024);
     CHECK(yc.fuse.max_pending_operations == 1024);
     CHECK(yc.fuse.namespace_batch_operations == 128);
     CHECK(yc.fuse.namespace_batch_bytes == 192 * 1024);

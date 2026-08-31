@@ -352,6 +352,14 @@ flush triggers, ordering, error fan-out, restart recovery, and bounded latency.
 
 ## Phase 4: pipeline data RPC and aggregate durability barriers
 
+Implementation note (2026-08-31): Phase 4A now pipelines a configurable,
+byte-bounded set of provisional extent puts within each file and drains that
+set at every fairness/viewer boundary. Atomic visibility and the final aggregate
+durability barrier are preserved. Local verification is recorded in
+[the Phase 4A checkpoint](2026-08-31-fuse-publication-phase-4a-extent-pipeline.md).
+The shared data executor, per-peer/domain limits and cross-publication physical
+barrier aggregation below remain open.
+
 1. Pipeline bounded extent puts across files and, where beneficial, within a
    file. Bound queued and active work by bytes per peer and per storage domain.
 2. Execute data-object storage and durability waits on a dedicated data executor.

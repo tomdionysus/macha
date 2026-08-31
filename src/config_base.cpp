@@ -122,6 +122,17 @@ void validate(Config& config) {
         config.fuse.publication_inflight_bytes % config.fuse.publication_quantum_bytes)
         throw std::runtime_error(
             "fuse.publication_inflight_bytes must be a quantum multiple from quantum..16G");
+    if (!config.fuse.publication_pipeline_bytes)
+        config.fuse.publication_pipeline_bytes =
+            std::min<uint64_t>(config.fuse.publication_quantum_bytes,
+                               static_cast<uint64_t>(config.extent_size) * 2);
+    if (config.fuse.publication_pipeline_bytes < config.extent_size ||
+        config.fuse.publication_pipeline_bytes > config.fuse.publication_quantum_bytes ||
+        config.fuse.publication_pipeline_bytes % config.extent_size ||
+        config.fuse.publication_pipeline_bytes / config.extent_size > 8)
+        throw std::runtime_error(
+            "fuse.publication_pipeline_bytes must be an extent-size multiple from "
+            "extent_size..min(publication_quantum_bytes, 8 extents)");
     if (!config.fuse.max_pending_requests || config.fuse.max_pending_requests > 65536 ||
         !config.fuse.max_pending_operations || config.fuse.max_pending_operations > 65536)
         throw std::runtime_error("fuse pending queue limits must be 1..65536");
