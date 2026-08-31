@@ -41,6 +41,32 @@ MACHA_FAST_TEST("foundations", test_spool_retirement_rate_is_aggregate) {
     CHECK(static_cast<uint64_t>(restarted->bytes_per_second) == 100);
 }
 
+MACHA_FAST_TEST("foundations", test_weighted_loader_service_is_work_conserving_and_non_starving) {
+    WeightedLoaderService service(95, 5, 25ms);
+    const WeightedLoaderService::TimePoint start{};
+
+    REQUIRE(service.can_start(start, true));
+    service.started(start, true);
+    CHECK(!service.should_yield(start + 24ms, true));
+    CHECK(service.should_yield(start + 25ms, true));
+    const auto cooldown = service.finished(start + 25ms, true);
+    CHECK(cooldown == 475ms);
+    CHECK(!service.can_start(start + 499ms, true));
+    CHECK(service.can_start(start + 500ms, true));
+
+    // Viewer absence immediately lends the entire resource to the loader,
+    // regardless of an outstanding contended cooldown.
+    CHECK(service.can_start(start + 100ms, false));
+
+    // A viewer arriving during an unrestricted loader quantum causes a bounded
+    // yield, then a finite proportional cooldown rather than indefinite arrest.
+    service.started(start + 1s, false);
+    CHECK(service.should_yield(start + 1010ms, true));
+    CHECK(service.finished(start + 1020ms, true) == 190ms);
+    CHECK(!service.can_start(start + 1209ms, true));
+    CHECK(service.can_start(start + 1210ms, true));
+}
+
 MACHA_FAST_TEST("foundations", test_miniupnpc_igd_status_compatibility) {
     using namespace miniupnpc_compat;
 
@@ -640,6 +666,8 @@ MACHA_FAST_TEST("foundations", test_config) {
     CHECK(fuse_defaults.publication_quantum_bytes == 32ULL * 1024 * 1024);
     CHECK(fuse_defaults.publication_inflight_bytes == 256ULL * 1024 * 1024);
     CHECK(fuse_defaults.publication_pipeline_bytes == 0);
+    CHECK(fuse_defaults.viewer_weight == 95);
+    CHECK(fuse_defaults.loader_weight == 5);
     CHECK(fuse_defaults.entry_timeout == 1000ms);
     CHECK(fuse_defaults.attr_timeout == 1000ms);
     CHECK(fuse_defaults.negative_timeout == 500ms);

@@ -115,6 +115,14 @@ struct FuseConfig {
     // imports to remain permanently single-threaded.
     size_t foreground_commit_workers{1};
     std::chrono::milliseconds publication_quiet{5000};
+    // Relative service weights while genuine viewer traffic and loader
+    // publication are both runnable. Capacity is work conserving: either
+    // class may borrow all of it while the other is idle.
+    size_t viewer_weight{95};
+    size_t loader_weight{5};
+    // In-process deterministic crash-fixture hook. It is intentionally absent
+    // from YAML/CLI parsing and cannot disable loader service in production.
+    bool suspend_loader_for_tests{};
     // A publication worker yields after this much durable spool input so other
     // inodes and newly closed files receive service without restarting the
     // generation. The aggregate budget bounds concurrently admitted quanta.

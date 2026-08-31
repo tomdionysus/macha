@@ -2,7 +2,10 @@
 
 Date: 2026-08-31
 
-Result: passed, with an aggregate spool-rate estimator follow-up.
+Result: the Phase 4A bounded extent pipeline passed, with an aggregate
+spool-rate estimator follow-up. The FUSE-read portion was later invalidated as
+viewer-priority evidence because FUSE is loader/convenience traffic; see the
+Phase 1C correction in the main throughput plan.
 
 ## Workload and topology
 
@@ -29,8 +32,8 @@ Node 50 reported:
 
 A clean early interval advanced from 2,810,445,824 to 5,223,743,488 useful
 bytes in 57.311 seconds: 42.11 MB/s, or 40.16 MiB/s. Across the complete
-observed interval, including the deliberately sustained viewer read and its
-quiet windows, useful publication advanced by 6,623,861,602 bytes in 324.7
+observed interval, including the deliberately sustained FUSE convenience read
+and the old gate's quiet windows, useful publication advanced by 6,623,861,602 bytes in 324.7
 seconds: 20.4 MB/s, or 19.5 MiB/s. The previous Phase 1 UAT measured about
 7.72 MiB/s, so this checkpoint demonstrates a material improvement rather than
 mere additional queued work.
@@ -39,11 +42,12 @@ The two completions included one approximately 899 MiB generation and a small
 follow-on generation. Large open files continued making exact quantum progress;
 no prefix reread amplification appeared.
 
-## Viewer law
+## Bounded-yield observation (not viewer UAT evidence)
 
-A short cached probe could not prove adapter signalling, so the conclusive test
-used a sustained 256 MiB direct FUSE read at an uncached offset. While that read
-was active:
+A sustained 256 MiB direct FUSE read at an uncached offset proved that the
+bounded pipeline drained and yielded cleanly under the then-current gate. It did
+not prove viewer classification: the mount is now explicitly defined as an
+ingest/convenience interface. While that read was active:
 
 - `data_publication_bytes_read` stayed exactly 8,714,404,341;
 - `data_publication_quanta` stayed exactly 269;
@@ -52,9 +56,11 @@ was active:
 - timeouts remained zero.
 
 A separate 4 MiB direct read at another uncached offset completed in 0.37
-seconds including SSH setup. After viewer activity ceased, the five-second quiet
-window expired and publication resumed. This satisfies “Thou Shalt Not Make The
-Viewer Wait” for this phase.
+seconds including SSH setup. After FUSE activity ceased, the five-second quiet
+window expired and publication resumed. The bounded pause/resumption mechanism
+worked, but the exclusive gate and the classification that activated it are
+superseded by Phase 1C. Genuine viewer behaviour must be exercised through the
+streaming path with weighted 95:5 service and loader non-starvation.
 
 ## Communications and resource behaviour
 
@@ -85,6 +91,8 @@ Its short deployed UAT remains before the broader Phase 5 admission work.
 
 ## Decision
 
-Phase 4A is accepted. Continue with the aggregate rate-estimator correction and
-then the shared byte-bounded data executor/per-peer pipeline. A later mixed-size
-UAT should verify completion cadence as well as useful-byte throughput.
+Phase 4A's bounded pipeline is accepted. Before the aggregate rate UAT resumes,
+complete Phase 1C: all FUSE traffic is loader class and genuine viewer demand
+receives configurable weighted service rather than stopping publication. Then
+continue to the shared byte-bounded data executor/per-peer pipeline. A later
+mixed-size UAT should verify completion cadence as well as useful-byte throughput.

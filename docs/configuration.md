@@ -105,6 +105,8 @@ fuse:
   publication_quantum_bytes: 32M
   publication_inflight_bytes: 256M
   publication_pipeline_bytes: 8M
+  viewer_weight: 95
+  loader_weight: 5
   max_spool_bytes: 16G
   spool_reserve_free: 2G
   unmount_if_mounted: true
@@ -130,9 +132,14 @@ started for one file. When omitted it is two extents, capped at one quantum
 be an extent-size multiple no larger than a quantum or eight extents; lowering it reduces the
 loader I/O which may already be in flight when viewer demand arrives, while
 raising it can improve bulk-import throughput on higher-latency storage. These byte bounds work independently of
-`commit_workers`. Viewer demand prevents admission of a
-new quantum and an already running publisher checks the viewer gate between
-256 KiB spool chunks.
+`commit_workers`. All FUSE reads and writes are loader/convenience traffic and
+do not manufacture viewer demand. Genuine streaming reads receive relative
+`viewer_weight` service while publication receives `loader_weight` service
+(95:5 by default). The weights are positive relative values, not a static
+bandwidth cap: either class borrows all unused capacity while the other is idle.
+Under simultaneous demand, bounded loader bursts yield at 256 KiB spool chunk
+boundaries and receive a proportional event-driven cooldown; loader progress is
+never stopped indefinitely.
 
 FUSE spool policy is fixed when the frontend starts; changing these values
 requires a server restart. Status exposes current bytes, configured limit,

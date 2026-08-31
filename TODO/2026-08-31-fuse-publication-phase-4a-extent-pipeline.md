@@ -77,8 +77,9 @@ the rsync import, and sample:
 2. `data_publication_peak_pipeline_extents` (expected at least 2 under load and
    no more than the configured byte limit divided by extent size);
 3. loader/control RPC queue and service latency;
-4. a real FUSE viewer read during import, confirming no new quanta start inside
-   the viewer quiet window;
+4. a bounded loader-yield exercise during import; genuine viewer priority must
+   be tested through the streaming path after Phase 1C, because FUSE is an
+   ingest/convenience interface;
 5. CPU, I/O wait, RSS, spool occupancy, failures and timeouts.
 
 If throughput does not materially improve, the next measurement should split
