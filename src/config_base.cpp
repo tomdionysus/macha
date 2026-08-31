@@ -109,6 +109,9 @@ void validate(Config& config) {
     if (config.fuse.publication_quiet < std::chrono::milliseconds(0) ||
         config.fuse.publication_quiet > std::chrono::seconds(30))
         throw std::runtime_error("fuse.publication_quiet_ms must be 0..30000");
+    if (!config.fuse.viewer_weight || config.fuse.viewer_weight > 10000 ||
+        !config.fuse.loader_weight || config.fuse.loader_weight > 10000)
+        throw std::runtime_error("fuse viewer_weight and loader_weight must be 1..10000");
     constexpr uint64_t publication_chunk = 256ULL * 1024;
     if (config.fuse.publication_quantum_bytes < publication_chunk ||
         config.fuse.publication_quantum_bytes > 1024ULL * 1024 * 1024 ||

@@ -53,20 +53,21 @@ and [Phase 4A UAT](2026-08-31-fuse-publication-phase-4a-uat.md)
 - [x] Added extent-aligned resumable publication quanta, a global admitted-byte
   budget, one retained cursor per inode, fair tail requeueing and atomic final
   metadata visibility.
-- [x] Corrected real FUSE viewer signalling so adapter open/read callbacks drive
-  the foreground clock consumed by the loader gate, without classifying loader
-  writes or read-ahead as viewers.
+- [x] Added bounded mid-generation yield/resumption machinery and its original
+  FUSE-read signalling test. The later aggregate-rate UAT established that the
+  FUSE classification and exclusive gate policy were wrong; Phase 1C now
+  supersedes that policy while retaining the bounded-yield mechanism.
 - [x] Added deterministic coverage for loader RPC ordering, recovery provenance,
   concurrent/open/closed loaders, coalescing, byte bounds, fair small-file
   progress, exact useful bytes, mid-generation viewer pre-emption, resumption,
   crash replay and confirmation.
 - [x] Passed the final local build, `filesystem_fuse` 48/48, runtime 3/3 and
   complete 215/215 suites.
-- [x] Passed the corrected three-node UAT: two live loader generations used fair
-  bounded quanta with no amplification; loader/control queue waits remained
-  sub-millisecond; a 4 MiB FUSE read completed in 0.40 seconds; no new quantum
-  was admitted during the five-second viewer window; publication resumed
-  immediately afterward; and failures/timeouts remained zero.
+- [x] Passed the Phase 0/1 bounded-quantum three-node UAT: two live loader
+  generations used fair bounded quanta with no amplification; loader/control
+  queue waits remained sub-millisecond; a FUSE read demonstrated the old gate
+  and clean resumption; and failures/timeouts remained zero. That FUSE leg is
+  not accepted as viewer UAT evidence after the Phase 1C classification decision.
 
 Evidence: [Phase 0/1 checkpoint](2026-08-31-fuse-publication-phase-0-1-checkpoint.md),
 [Phase 1A loader priority](2026-08-31-fuse-publication-phase-1a-loader-priority.md),

@@ -778,6 +778,18 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_ordering_merging_and_cache) {
         CHECK(frontend->status().pending_data == 0);
         auto entry = service.filesystem().getattr("/movie.bin");
         CHECK(entry.size == expected.size());
+
+        // The mount is an ingest/convenience interface. Even a read-only FUSE
+        // handle uses loader traffic and must not refresh either viewer clock.
+        auto fuse_reader = frontend->open("/movie.bin", true, false, false, false);
+        Bytes fuse_probe(4096);
+        const auto foreground_before = service.filesystem().foreground_idle_for();
+        const auto interactive_before = service.filesystem().store().interactive_idle_for();
+        REQUIRE(frontend->read(fuse_reader, 0, fuse_probe) == fuse_probe.size());
+        CHECK(service.filesystem().foreground_idle_for() >= foreground_before);
+        CHECK(service.filesystem().store().interactive_idle_for() >= interactive_before);
+        frontend->release(fuse_reader.inode, false);
+
         auto reader = service.filesystem().open_read("/movie.bin");
         Bytes actual(expected.size());
         size_t offset = 0;
@@ -1039,18 +1051,18 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_yields_to_playback) {
         frontend->release(inode, true);
         REQUIRE(wait_until([&] { return frontend->status().data_publication_yields >= 1; }, 5s));
 
-        // This is the public hook used by the real FUSE adapter before open/read,
-        // not a direct test-only mutation of DistributedStore's clock. The
-        // already-running bounded quantum may finish, then the resumable cursor
-        // must remain parked for the rest of the viewer quiet window.
+        // Inject genuine viewer activity. The already-running bounded quantum
+        // yields promptly, but weighted priority must not stop loader work for
+        // the complete viewer window.
         frontend->note_viewer_activity(1);
         REQUIRE(wait_until([&] { return frontend->status().active_data == 0; }, 2s));
         const auto paused_quanta = frontend->status().data_publication_quanta;
-        std::this_thread::sleep_for(100ms);
-        const auto during = frontend->status();
-        CHECK(during.data_publication_quanta == paused_quanta);
-        CHECK(during.pending_data + during.active_data >= 1);
-        CHECK(service.filesystem().getattr("/playback-yield.bin").size == 0);
+        REQUIRE(wait_until(
+            [&] {
+                frontend->note_viewer_activity(1); // sustained genuine viewing
+                return frontend->status().data_publication_quanta > paused_quanta;
+            },
+            3s, 25ms));
 
         REQUIRE(frontend->wait_for_idle(10s));
         CHECK(service.filesystem().getattr("/playback-yield.bin").size == payload.size());
@@ -1084,14 +1096,10 @@ MACHA_TEST("filesystem_fuse", test_fuse_open_loaders_use_available_publication_w
         REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
     REQUIRE(wait_until([&] { return frontend->status().durability_writes == files; }, 10s));
 
-    // Hold the real viewer gate while all four durable inodes are queued. This
-    // makes the runnable set deterministic without adding a scheduler test hook.
-    service.filesystem().store().foreground_activity(1);
     for (const auto& handle : handles) {
         frontend->flush(handle.inode);
         frontend->flush(handle.inode); // repeated demand must coalesce
     }
-    REQUIRE(frontend->status().pending_data >= files);
     REQUIRE(frontend->wait_for_idle(30s));
 
     const auto status = frontend->status();
@@ -1099,7 +1107,10 @@ MACHA_TEST("filesystem_fuse", test_fuse_open_loaders_use_available_publication_w
     CHECK(status.data_publications_completed == files);
     CHECK(status.data_publication_peak_active >= 2);
     CHECK(status.data_publication_peak_active <= config.fuse.commit_workers);
-    CHECK(status.data_publication_coalesced_queued >= files);
+    CHECK(status.data_publication_coalesced_queued +
+              status.data_publication_coalesced_running +
+              status.data_publication_coalesced_unconfirmed >=
+          files);
     CHECK(status.data_publication_bytes_read == files * payload.size());
     CHECK(status.data_publication_bytes_committed == files * payload.size());
     CHECK(status.data_publication_bytes_confirmed == files * payload.size());
@@ -1118,6 +1129,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_closed_file_is_selected_ahead_of_open_lo
     config.fuse.commit_workers = 1;
     config.fuse.foreground_commit_workers = 1;
     config.fuse.publication_quiet = 500ms;
+    config.fuse.suspend_loader_for_tests = true;
 
     auto& service = fixture.start();
     auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
@@ -1173,13 +1185,11 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_quanta_are_fair_and_byte_bou
     REQUIRE(frontend->write(small_handle.inode, 0, small) == small.size());
     REQUIRE(wait_until([&] { return frontend->status().durability_writes == 2; }, 10s));
 
-    // Queue in this order behind the real viewer gate. The large generation is
-    // selected first, but must return to the tail after one quantum; the small
-    // generation can then become atomically visible before the large one.
-    service.filesystem().store().foreground_activity(1);
+    // Queue in this order. The large generation is selected first, but must
+    // return to the tail after one quantum; the small generation can then
+    // become atomically visible before the large one.
     frontend->release(large_handle.inode, true);
     frontend->release(small_handle.inode, true);
-    REQUIRE(frontend->status().pending_data >= 2);
 
     bool observed_small_first = false;
     REQUIRE(wait_until(
@@ -1407,6 +1417,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_batches_namespace_publication_a
     config.fuse.commit_workers = 1;
     config.fuse.foreground_commit_workers = 1;
     config.fuse.publication_quiet = 30s;
+    config.fuse.suspend_loader_for_tests = true;
 
     auto& service = fixture.start();
     constexpr size_t operations = 8;
@@ -1453,6 +1464,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_thousand_operations_have_bounde
     config.replication = 1;
     config.metadata_min_write_replicas = 1;
     config.fuse.publication_quiet = 30s;
+    config.fuse.suspend_loader_for_tests = true;
     auto& service = fixture.start();
     constexpr size_t operations = 1000;
     constexpr size_t batch_limit = 256;
@@ -1507,6 +1519,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_batch_encoded_size_limit_is_ha
     config.replication = 1;
     config.metadata_min_write_replicas = 1;
     config.fuse.publication_quiet = 30s;
+    config.fuse.suspend_loader_for_tests = true;
     auto& service = fixture.start();
     constexpr size_t operations = 4;
 
@@ -1538,6 +1551,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_batches_unlinks_then_parent_rmd
     config.replication = 1;
     config.metadata_min_write_replicas = 1;
     config.fuse.publication_quiet = 30s;
+    config.fuse.suspend_loader_for_tests = true;
     auto& service = fixture.start();
 
     service.filesystem().mkdir("/doomed", 0755, getuid(), getgid());
@@ -1583,6 +1597,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_all_idempotent_batch_uses_no_ge
     config.replication = 1;
     config.metadata_min_write_replicas = 1;
     config.fuse.publication_quiet = 30s;
+    config.fuse.suspend_loader_for_tests = true;
     auto& service = fixture.start();
     constexpr size_t operations = 4;
 
@@ -1620,6 +1635,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_commits_largest_valid_namespace
     config.replication = 1;
     config.metadata_min_write_replicas = 1;
     config.fuse.publication_quiet = 30s;
+    config.fuse.suspend_loader_for_tests = true;
     auto& service = fixture.start();
 
     {
@@ -1664,6 +1680,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_trims_torn_tail) {
     config.fuse.commit_workers = 1;
     config.fuse.foreground_commit_workers = 1;
     config.fuse.publication_quiet = 30s;
+    config.fuse.suspend_loader_for_tests = true;
 
     auto& service = fixture.start();
     {
@@ -1705,6 +1722,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_trims_checksum_invalid_c
     // namespace record in the journal; it does not test a 30-second quiet
     // policy. One second gives the same state with a bounded worst-case delay.
     config.fuse.publication_quiet = 1s;
+    config.fuse.suspend_loader_for_tests = true;
 
     auto& service = fixture.start();
     {
@@ -2192,6 +2210,7 @@ MACHA_TEST("filesystem_fuse",
     config.replication = 1;
     config.metadata_min_write_replicas = 1;
     config.fuse.publication_quiet = 30s;
+    config.fuse.suspend_loader_for_tests = true;
     auto& service = fixture.start();
     constexpr uint64_t operations = 6;
     constexpr uint64_t published_prefix = 3;
@@ -2248,6 +2267,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_recovery_survives_partial_done
     config.replication = 1;
     config.metadata_min_write_replicas = 1;
     config.fuse.publication_quiet = 30s;
+    config.fuse.suspend_loader_for_tests = true;
     auto& service = fixture.start();
     constexpr uint64_t operations = 6;
     constexpr uint64_t done_prefix = 2;
@@ -2309,6 +2329,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_live_admission_during_recovery_publicati
     config.replication = 1;
     config.metadata_min_write_replicas = 1;
     config.fuse.publication_quiet = 30s;
+    config.fuse.suspend_loader_for_tests = true;
     fixture.start();
     // TestNode deliberately omits Service's background metadata owner. A
     // synchronous seed mutation forms the one-node replica set before the

@@ -2,8 +2,9 @@
 
 Date: 2026-08-31
 
-Status: implementation and local verification complete; short deployed UAT
-recommended.
+Status: implementation and local verification complete; deployed UAT paused on
+the weighted viewer/loader scheduler correction documented in
+[the throughput plan](2026-08-31-fuse-publication-throughput-plan.md#phase-1c-weighted-viewerloader-scheduling-and-fuse-classification).
 
 ## Problem reproduced
 
@@ -72,5 +73,14 @@ spool retirements while occupancy remains above 50%. Verify:
 2. reported rate equals window bytes divided by window milliseconds;
 3. admission accelerates relative to the former 5.95 MB/s estimate without
    exceeding the hard spool limit;
-4. viewer activity still freezes new publication quanta; and
+4. FUSE verification remains loader class, while genuine viewer activity gets
+   its configured dominant share without starving publication; and
 5. control latency, failures and timeouts remain healthy.
+
+The first deployed attempt observed one 3,115,266,923-byte physical retirement
+over a 444,906 ms window, correctly reporting 7,002,065 B/s. A second retirement
+could not be collected because `rsync --append-verify` destination reads were
+misclassified as viewer traffic and the old binary quiet-window gate stopped
+publication. This is a failed scheduler prerequisite, not a failed aggregate
+rate calculation. Evidence is recorded in
+[the paused UAT record](2026-08-31-spool-aggregate-retirement-rate-uat.md).

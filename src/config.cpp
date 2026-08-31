@@ -214,6 +214,8 @@ void parse_fuse(const YAML::Node& root, Config& c) {
     if (f["recovery_commit_workers"]) c.fuse.recovery_commit_workers = f["recovery_commit_workers"].as<size_t>();
     if (f["foreground_commit_workers"]) c.fuse.foreground_commit_workers = f["foreground_commit_workers"].as<size_t>();
     if (f["publication_quiet_ms"]) c.fuse.publication_quiet = milliseconds(f["publication_quiet_ms"], "fuse.publication_quiet_ms");
+    if (f["viewer_weight"]) c.fuse.viewer_weight = f["viewer_weight"].as<size_t>();
+    if (f["loader_weight"]) c.fuse.loader_weight = f["loader_weight"].as<size_t>();
     if (f["publication_quantum_bytes"])
         c.fuse.publication_quantum_bytes = yaml_size(f["publication_quantum_bytes"]);
     if (f["publication_inflight_bytes"])

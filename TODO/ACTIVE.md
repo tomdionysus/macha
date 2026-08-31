@@ -47,11 +47,25 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   UAT evidence.
 - [ ] Execute the phased FUSE publication throughput work in
   [2026-08-31-fuse-publication-throughput-plan.md](2026-08-31-fuse-publication-throughput-plan.md).
-  Phase 0/1 diagnostics, loader priority, concurrency, fair byte quanta, real
-  viewer pre-emption and Phase 4A bounded within-file extent pipelining are
-  complete. The Phase 4A UAT reached 19.5 MiB/s across the full observation
-  window including viewer pauses and 40.2 MiB/s in a clean loaded interval,
-  versus the pre-change 7.72 MiB/s.
+  Phase 0/1 diagnostics, loader RPC priority, concurrency, fair byte quanta and
+  Phase 4A bounded within-file extent pipelining are complete. The Phase 4A UAT
+  reached 19.5 MiB/s across the full observation window and 40.2 MiB/s in a
+  clean loaded interval, versus the pre-change 7.72 MiB/s. Its FUSE-read
+  "viewer" leg is now explicitly invalidated: it proved bounded yielding, but
+  FUSE is loader/convenience traffic rather than the real viewing path.
+- [ ] Complete Phase 1C UAT. The implementation and focused deterministic tests
+  are complete, and the verified binary is deployed on nodes 50 and 51. FUSE
+  reads are loader class, the exclusive playback gate is gone, and configurable
+  work-conserving weights default to `95:5`. Live `rsync --append-verify`
+  demonstrated concurrent publication, including a 50,122,257-byte publication
+  advance in 20.795 seconds after the cluster returned to 3/3. The overnight
+  copy is intentionally still running. A real viewer/streaming test remains
+  required: an attempted playback while node 51 was offline failed because its
+  media extents were unavailable, so that incident is not valid scheduler UAT.
+  See
+  [the Phase 1C checkpoint](2026-08-31-fuse-publication-phase-1c-weighted-scheduling.md)
+  and
+  [the integrated plan](2026-08-31-fuse-publication-throughput-plan.md#phase-1c-weighted-viewerloader-scheduling-and-fuse-classification).
 - [ ] Fix stale FUSE mount recovery ordering. Startup currently calls
   `create_directories(mount_path)` before `prepare_fuse_mountpoint()`, so a
   disconnected Macha mount returns `ENOTCONN` before
@@ -68,8 +82,12 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   concurrent-writer fairness, and authoritative catalogue hints.
 - [ ] UAT the aggregate spool retirement-rate correction documented in
   [2026-08-31-spool-aggregate-retirement-rate.md](2026-08-31-spool-aggregate-retirement-rate.md).
-  Observe at least two retirements above 50% occupancy and verify window bytes,
-  elapsed time, admission pacing, hard-bound safety and viewer pre-emption.
+  This UAT is paused until Phase 1C passes: the first attempt proved one correct
+  aggregate sample but exposed FUSE `--append-verify` reads being misclassified
+  as viewer traffic and the binary viewer gate starving publication. After the
+  correction, observe at least two retirements above 50% occupancy and verify
+  window bytes, elapsed time, admission pacing, hard-bound safety, weighted
+  genuine-viewer priority and loader non-starvation.
 - [ ] Verify the aggregated node-status API sometimes reporting a connected
   peer's `metadata_generation` as 0 while that peer's local API reports the
   current generation. Recheck the previously observed alternating disk-usage
