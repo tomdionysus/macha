@@ -1023,7 +1023,7 @@ CatalogueArtwork CatalogueManager::stage_artwork(std::string role, std::string m
     if (bytes.empty())
         throw std::runtime_error("artwork body is empty");
     CatalogueArtwork art{std::move(role), object_id(bytes), std::move(mime_type)};
-    if (!store_.put(art.id, bytes))
+    if (!store_.put(art.id, bytes, FrameType::speculative))
         throw std::runtime_error("cannot store artwork in distributed DATA storage");
     return art;
 }
@@ -1034,14 +1034,14 @@ CatalogueArtwork CatalogueManager::stage_artwork_deferred(
     if (bytes.empty())
         throw std::runtime_error("artwork body is empty");
     CatalogueArtwork art{std::move(role), object_id(bytes), std::move(mime_type)};
-    if (!store_.put_deferred(art.id, bytes, batch))
+    if (!store_.put_deferred(art.id, bytes, batch, FrameType::speculative))
         throw std::runtime_error("cannot stage artwork in distributed DATA storage");
     return art;
 }
 
 bool CatalogueManager::artwork_durability_barrier(
     const DistributedStore::DurabilityBatch& batch) {
-    return store_.durability_barrier(batch);
+    return store_.durability_barrier(batch, FrameType::speculative);
 }
 
 void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& discovered,

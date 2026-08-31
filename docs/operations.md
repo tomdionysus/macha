@@ -173,6 +173,11 @@ memory alone. Metadata mutations (`put_metadata_history_entry`,
 dedicated metadata executor. All other CONTROL messages use the ordinary control
 executor; object work remains on the priority-aware DATA executors.
 
+DATA execution priority is viewer foreground, viewer read-ahead, user loader,
+then speculative maintenance. Durable FUSE spool publication uses the loader
+class even when its journal records were reconstructed after restart. Recovery
+provenance affects replay validation and cache policy, not scheduling priority.
+
 ## Cluster status and telemetry
 
 `GET /api/v1/status` merges two deliberately different telemetry planes:

@@ -56,9 +56,14 @@ bool DistributedStore::should_own(const ObjectId& id) const {
 }
 
 ObjectId DistributedStore::put(std::span<const uint8_t> data, std::atomic_bool* cancelled) {
+    return put(data, FrameType::loader, cancelled);
+}
+
+ObjectId DistributedStore::put(std::span<const uint8_t> data, FrameType frame_type,
+                               std::atomic_bool* cancelled) {
     auto started = Clock::now();
     auto id = object_id(data);
-    if (!put_impl(id, data, cancelled, nullptr)) {
+    if (!put_impl(id, data, frame_type, cancelled, nullptr)) {
         if (cancelled && cancelled->load(std::memory_order_relaxed))
             throw std::runtime_error("object replication cancelled");
         throw std::runtime_error("object replication quorum unavailable");
@@ -73,13 +78,23 @@ ObjectId DistributedStore::put(std::span<const uint8_t> data, std::atomic_bool* 
 
 bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data,
                            std::atomic_bool* cancelled) {
-    return put_impl(id, data, cancelled, nullptr);
+    return put(id, data, FrameType::loader, cancelled);
+}
+
+bool DistributedStore::put(const ObjectId& id, std::span<const uint8_t> data,
+                           FrameType frame_type, std::atomic_bool* cancelled) {
+    return put_impl(id, data, frame_type, cancelled, nullptr);
 }
 
 ObjectId DistributedStore::put_deferred(std::span<const uint8_t> data, DurabilityBatch& batch,
                                         std::atomic_bool* cancelled) {
+    return put_deferred(data, batch, FrameType::loader, cancelled);
+}
+
+ObjectId DistributedStore::put_deferred(std::span<const uint8_t> data, DurabilityBatch& batch,
+                                        FrameType frame_type, std::atomic_bool* cancelled) {
     auto id = object_id(data);
-    if (!put_impl(id, data, cancelled, &batch)) {
+    if (!put_impl(id, data, frame_type, cancelled, &batch)) {
         if (cancelled && cancelled->load(std::memory_order_relaxed))
             throw std::runtime_error("object replication cancelled");
         throw std::runtime_error("object replication quorum unavailable");
@@ -89,14 +104,21 @@ ObjectId DistributedStore::put_deferred(std::span<const uint8_t> data, Durabilit
 
 bool DistributedStore::put_deferred(const ObjectId& id, std::span<const uint8_t> data,
                                     DurabilityBatch& batch, std::atomic_bool* cancelled) {
-    return put_impl(id, data, cancelled, &batch);
+    return put_deferred(id, data, batch, FrameType::loader, cancelled);
+}
+
+bool DistributedStore::put_deferred(const ObjectId& id, std::span<const uint8_t> data,
+                                    DurabilityBatch& batch, FrameType frame_type,
+                                    std::atomic_bool* cancelled) {
+    return put_impl(id, data, frame_type, cancelled, &batch);
 }
 
 bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
-                                std::atomic_bool* cancelled, DurabilityBatch* batch) {
+                                FrameType frame_type, std::atomic_bool* cancelled,
+                                DurabilityBatch* batch) {
     if (object_id(data) != id)
         throw std::runtime_error("object hash mismatch");
-    n_.note_activity(FrameType::read_ahead, data.size());
+    n_.note_activity(frame_type, data.size());
     const auto operation_started = Clock::now();
 
     auto nodes = ranked(id);
@@ -208,7 +230,7 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
             item.owner = owner;
             item.started = Clock::now();
             const auto type = batch ? MessageType::put_object_deferred : MessageType::put_object;
-            item.rpc.emplace(n_.call_async(owner, type, payload, FrameType::read_ahead));
+            item.rpc.emplace(n_.call_async(owner, type, payload, frame_type));
             pending.push_back(std::move(item));
         } catch (...) {
             ++replacement_needed;
@@ -310,7 +332,7 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
     return finish(success >= floor, floor);
 }
 
-bool DistributedStore::durability_barrier(const DurabilityBatch& batch) {
+bool DistributedStore::durability_barrier(const DurabilityBatch& batch, FrameType frame_type) {
     if (batch.empty())
         return true;
 
@@ -362,7 +384,7 @@ bool DistributedStore::durability_barrier(const DurabilityBatch& batch) {
             PendingBarrier item;
             item.replica = replica;
             item.rpc.emplace(n_.call_async(found->second, MessageType::object_durability_barrier,
-                                           payload.data(), FrameType::read_ahead));
+                                           payload.data(), frame_type));
             pending.push_back(std::move(item));
         } catch (...) {
         }
