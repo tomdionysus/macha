@@ -66,6 +66,11 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   extent-aligned byte quanta, requeue at the tail, respect a global admitted
   byte budget, and remain atomically invisible until final commit. See
   [2026-08-31-fuse-publication-phase-1b-fair-quanta.md](2026-08-31-fuse-publication-phase-1b-fair-quanta.md).
+  The three-node UAT found that real FUSE reads updated the interactive clock
+  while the publication gate watched only the foreground clock. The signal
+  mismatch is now fixed and covered through the adapter's public viewer hook;
+  redeploy and repeat the bounded viewer-pre-emption UAT before completion. See
+  [2026-08-31-fuse-publication-phase-1ab-uat.md](2026-08-31-fuse-publication-phase-1ab-uat.md).
 - [ ] Phase 1A: separate loader priority from crash-recovery provenance. Durable
   spool publication remains user-requested loader work after restart and must
   not be capped by `recovery_commit_workers`. Add an RPC loader class below

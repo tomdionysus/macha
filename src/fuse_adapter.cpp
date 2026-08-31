@@ -108,7 +108,7 @@ struct FuseLatency {
     FuseLatency(const char* operation, const char* pathname, bool viewer_critical = false)
         : op(operation), path(pathname), started(enabled ? Clock::now() : Clock::time_point{}) {
         if (viewer_critical)
-            frontend().note_interactive_activity();
+            frontend().note_viewer_activity();
     }
 
     ~FuseLatency() noexcept {
