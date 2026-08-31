@@ -3,17 +3,25 @@
 Date: 2026-08-31
 
 Status: Phase 4A and the aggregate retirement-rate implementation are locally
-complete. A deployed rate UAT exposed a prerequisite scheduling correction:
-FUSE traffic must be loader class, and viewer priority must be weighted rather
-than an exclusive quiet-window gate. Phase 1C below is now the next cut.
+complete. Phase 1C corrected FUSE classification and exclusive viewer gating,
+but deployed UAT proved that priority can still be bypassed inside synchronous
+materialisation, rebuild, commit and physical I/O. Phase 1D below is now the
+mandatory invariant cut before Phase 1C UAT or later throughput work continues.
 
 ## Scheduling laws
 
-1. **Thou Shalt Not Make The Viewer Wait.** Playback startup, reads, seeks, and
+1. **Thou Shalt Not Make Control Wait.** Cluster membership, health, metadata
+   coordination, cancellation, shutdown and the bounded control work needed to
+   admit viewer operations must never queue behind or execute inline with bulk
+   data work. Control has independently reserved admission and execution
+   capacity which lower classes never occupy. Shared physical capacity may be
+   used work-conservingly only while an independent control submission credit
+   and a bounded completion path remain available.
+2. **Thou Shalt Not Make The Viewer Wait.** Playback startup, reads, seeks, and
    the control work required to serve them have overwhelming priority. No ingest
    throughput improvement is acceptable if it introduces viewer-visible delay,
    buffering, starvation, or latency spikes.
-2. **Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The
+3. **Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The
    Viewer Wait.** In the absence of viewer contention, ingest must use the
    available spool, storage, network, CPU, and publication capacity. It may be
    paced for hard capacity, durability, bounded-memory, fairness, or genuine
@@ -24,12 +32,52 @@ These laws define priority, not polling. Viewer demand, resource availability,
 durability completion, queue transitions, and pressure thresholds must wake or
 pace work through events.
 
-They also define priority, not exclusion. Viewer demand must not stop every
-other class indefinitely. While viewer and loader work are both runnable, the
+They also define priority, not exclusion. The strict order is
+`control > viewer >> loader > speculative`. The hard control admission/executor
+reservation is outside the viewer/loader ratio and is never borrowed. While
+viewer and loader work are both runnable, their
 default service ratio is 95:5. The weights are configurable and work conserving:
-either class borrows all unused capacity when the other is idle. Bounded quanta
-limit the delay imposed by already-admitted loader work, while the non-zero
-loader share proves continued progress under sustained viewing.
+any class may borrow unused capacity, but a lower class may have only a bounded
+amount of non-pre-emptible work outstanding when a higher class arrives.
+Bounded quanta limit that delay, while the non-zero loader share proves
+continued progress under sustained viewing.
+
+### Non-bypassable end-to-end invariant
+
+Classification at the API, FUSE or RPC boundary is necessary but insufficient.
+Priority must accompany a request through every resource it can wait for or
+occupy:
+
+```text
+admission -> executor -> lock -> buffer/byte credit -> CPU/hash work
+          -> physical I/O -> RPC -> durability barrier -> metadata commit
+```
+
+No function called from a bounded quantum may hide an unbounded subordinate
+operation. In particular, `materialize()`, `rebuild()`, object hashing, extent
+puts, durability waits and metadata publication must be resumable at bounded
+byte/time checkpoints. A lower-priority operation may not hold a shared lock,
+executor slot, buffer reservation, disk queue allowance or communications
+thread while waiting for slow I/O.
+
+Application scheduling must bound physical I/O before submission. Kernel I/O
+already issued cannot be recalled portably, so the application must reserve an
+independent, non-borrowable control admission/executor path and physical
+submission credit, retain viewer headroom, cap lower-class outstanding
+bytes/operations, and submit the next loader unit only after the scheduler
+grants a credit. Non-control pooled capacity is borrowed work-conservingly.
+
+Priority inversion is a correctness failure, not merely a poor benchmark.
+Every shared mutex must have a bounded non-waiting critical section; no disk,
+network, durability or metadata wait may occur while holding a cross-class or
+cross-inode lock. Pure control requests must remain memory-only or enqueue a
+bounded data ticket and return; they must never execute bulk work inline.
+
+These are software scheduling invariants, not a promise that failed hardware
+has zero latency. If a required peer/device/control store is unavailable, the
+higher class must complete from published memory where its contract permits or
+fail/degrade within its explicit deadline. It must never wait indefinitely
+while Macha continues issuing lower-class work to that resource.
 
 ### Priority classes and provenance
 
@@ -71,6 +119,11 @@ The change must retain these invariants:
 - restart can distinguish locally durable, remotely staged, committed, and
   confirmed work without guessing;
 - playback and control RPCs remain responsive under bulk ingest;
+- control admission and completion have reserved capacity above viewer work,
+  and viewer work has reserved capacity above loader work, at every shared
+  executor and physical resource boundary;
+- the maximum lower-class work admitted ahead of a newly runnable higher class
+  is explicitly byte/time bounded and observable;
 - when playback is absent, ingest is work conserving and uses all safe available
   publication capacity;
 - spool occupancy never exceeds the configured logical limit and physical free
@@ -377,6 +430,187 @@ sustained viewing, the viewer remains responsive, and loader throughput returns
 to full safe capacity immediately after playback. Only then resume the paused
 aggregate-retirement-rate UAT.
 
+## Phase 1D: make control and viewer priority non-bypassable
+
+This phase is a correctness prerequisite, not throughput tuning. The deployed
+overlapping-writer UAT showed that a loader grant can call `materialize()` or
+`rebuild()` and synchronously process an entire file. The outer weighted
+scheduler cannot observe or pre-empt that work. Ordinary kernel block I/O then
+has no knowledge of Macha's priority classes, and `publication_mutex` serialises
+other commits behind it. The detailed live evidence is in
+[the rebuild-stall diagnosis](2026-08-31-overlapping-fuse-writer-rebuild-stall.md).
+
+### 1D.1: propagate a data-work budget and audit existing control isolation
+
+Macha already has separate CONTROL/DATA transport lanes, a closed fast-control
+allow-list, a dedicated metadata executor, and separate CONTROL storage. Keep
+and strengthen that design rather than replacing it with one universal
+scheduler.
+
+1. Audit the existing fast-control allow-list and dedicated metadata executor.
+   Retain the rule that fast control is bounded published-memory work only and
+   prove it remains responsive with every DATA executor blocked.
+2. Introduce an immutable `DataWorkContext` containing class (`viewer`,
+   `loader`, `speculative`), cancellation/deadline, granted byte/CPU budget, and
+   accounting ticket. Require it at potentially blocking DATA object, DATA RPC,
+   hashing and durability boundaries.
+3. Carry the originating class into metadata work caused by DATA publication.
+   A loader-originated manifest/namespace commit must not become high-priority
+   merely because it uses a metadata RPC; the dedicated metadata executor needs
+   bounded origin-aware admission behind genuine control metadata work.
+4. A child DATA operation inherits or lowers its parent's priority; it may never
+   raise itself. Only an explicit streaming entry point may originate viewer
+   DATA work.
+5. Record admitted, started, yielded, completed and cancelled bytes/operations,
+   plus maximum uninterrupted service and queue delay, per class and resource.
+
+Checkpoint: existing control-isolation tests remain green, compile-time/API
+tests prove bulk DATA I/O cannot be submitted without a context, and
+deterministic accounting proves priority is retained through nested DATA calls
+and loader-originated metadata publication.
+
+Partial implementation checkpoint (2026-08-31): FUSE publication now creates
+an immutable loader `DataWorkContext` containing its admitted byte quantum, and
+`WriteHandle` preserves that class through nested extent fetch/put, rebuild and
+durability operations. Loader writes no longer manufacture viewer activity, and
+CONTROL is rejected at the DATA context boundary. Filesystem/FUSE coverage is
+51/51 green and the existing foreground/control isolation tests are green. This
+does **not** complete 1D.1: mandatory context APIs, deadline/cancellation and
+accounting tickets, origin-aware metadata admission, and per-resource service
+accounting remain. See
+[the checkpoint](2026-08-31-fuse-publication-phase-1d-data-work-context.md).
+
+### 1D.2: turn unbounded file work into resumable state machines
+
+1. Replace synchronous whole-file `materialize()` and `rebuild()` calls with
+   resumable cursors over changed ranges/extents. Each step consumes at most the
+   granted byte/time budget and returns `complete`, `yielded`, `cancelled`, or
+   `failed`.
+2. Preserve immutable references for unchanged extents. Compatible interleaved
+   append ranges are ordered and coalesced from the durable operation journal;
+   they do not force base-file materialisation.
+3. Detect genuinely conflicting overwrites explicitly. Reconstruct only the
+   changed extent and its boundary extents; never reread/re-hash the full file
+   merely because writes arrived from two handles.
+4. Keep the Phase 1D cursor resumable in memory and preserve the current durable
+   spool/journal as restart authority. Restart may redo a bounded, idempotent
+   unit but must not re-enter an unbounded whole-file call. Durable staged-range
+   reuse belongs to Phase 2's versioned journal work.
+5. Add a higher-class check before every read, hash, object put and durability
+   submission. A loader yields without discarding proven staged work.
+
+Checkpoint: a large-base/two-writer deterministic test shows bounded unchanged
+base reads, repeated loader yields, exact final content, atomic visibility and
+restart at every cursor boundary.
+
+Partial implementation checkpoint (2026-08-31): old-generation materialisation
+is now an in-memory resumable cursor. FUSE charges each preparation step to its
+existing loader byte quantum and retains both staging and WAL cursors across a
+clean event-driven requeue. Direct and end-to-end FUSE tests prove exact
+one-extent steps, repeated yields, no repeated source reads, partial-tail
+handling, atomic visibility and exact final content; filesystem/FUSE coverage is
+53/53 green. This is not the complete 1D.2 checkpoint: rebuild and commit remain
+synchronous and restart-boundary injection has not yet been added. See
+[the materialisation checkpoint](2026-08-31-fuse-publication-phase-1d-resumable-materialization.md).
+
+Second partial implementation checkpoint (2026-08-31): rebuild is also a
+per-handle resumable cursor and FUSE charges complete canonical extents to fresh
+loader grants before final publication. The redundant frontend-wide
+`publication_mutex` has been removed; metadata mutation, write-handle rename
+ordering and content-version conflict checks retain their narrower authority.
+Tests prove old-generation visibility at every rebuild boundary, exact extent
+reuse/put counts and at least nine end-to-end yields for the four-extent
+overwrite analogue; filesystem/FUSE coverage remains 53/53 green. Changed-range
+reconstruction, restart-boundary injection, asynchronous durability completion
+and origin-aware metadata admission remain. See
+[the rebuild checkpoint](2026-08-31-fuse-publication-phase-1d-resumable-rebuild.md).
+
+### 1D.3: reserve end-to-end resources and remove priority inversion
+
+1. Keep the existing independent fast-control, ordinary-control and metadata
+   RPC admission/execution capacity. Fast-control handlers perform bounded
+   published-memory work only; ordinary control/metadata handlers enqueue
+   bounded work on their existing isolated executors and never run bulk DATA
+   work inline.
+2. Add priority-aware, byte-bounded credits within the DATA plane for object
+   reads/writes, hashing, per-peer RPC, per-storage-domain I/O and durability
+   barriers. Preserve separate CONTROL storage/quota and the hard
+   non-borrowable control executors. Viewer has reserved DATA headroom;
+   loader/speculative work may borrow unused DATA capacity only while their
+   bounded outstanding work leaves the viewer bound intact.
+3. Retain configurable 95:5 viewer/loader service over the non-control capacity.
+   A viewer arrival stops new loader submissions immediately, but already-issued
+   loader I/O is bounded so viewer delay has a deterministic ceiling. Loader
+   continues receiving its non-zero share during sustained viewing.
+4. Remove `publication_mutex`. Use per-inode generation ownership and a shared
+   priority-aware commit executor. No cross-inode lock spans materialisation,
+   hashing, object I/O, a durability barrier or metadata observation.
+5. Split durability into submission and completion tickets. A waiting loader
+   releases executor and byte credits that are not required to preserve the
+   submitted operation; completion events requeue it at its original class.
+6. Audit metadata locks and store locks for priority inversion. Critical
+   sections may update bounded in-memory state only and must expose measured
+   maximum hold time.
+
+Checkpoint: with loader I/O saturated and deliberately delayed, control requests
+complete using their reserved path and viewer reads begin within the declared
+bound. Neither waits for a loader-owned mutex or executor slot.
+
+### 1D.4: guarantee retirement progress under full-spool pressure
+
+1. Schedule closed or otherwise completable generations that release the most
+   spool per bounded unit, while retaining per-inode fairness. One conflicting
+   inode cannot occupy every publication/commit credit.
+2. Reserve at least one loader retirement ticket while the spool is above its
+   pressure threshold. It remains below viewer/control priority and participates
+   in the loader's configured share, but speculative work cannot consume it.
+3. Coalesce publication notification at durable sequence/byte boundaries.
+   Eliminate the observed per-write request storm; repeated notification of an
+   already-running inode updates one target watermark and performs no queue work.
+4. Keep the hard spool bound and proportional acceptance pacing. Backpressure
+   may stop an ingester at the bound, but an available completable generation
+   must continue retiring without requiring new writes or polling.
+
+Checkpoint: fill a small test spool with one pathological overlapping-writer
+inode and independent closed files. Closed files commit, occupancy falls, and
+the blocked writer resumes while control and viewer bounds continue to hold.
+
+### Phase 1D invariant tests and UAT gate
+
+Deterministic tests must cover:
+
+- control arrival during every loader checkpoint and every injected slow
+  resource, with a bounded completion assertion;
+- viewer startup, streaming reads and repeated seeks during materialisation,
+  rebuild, object put, durability and metadata delay;
+- continuous viewer demand retaining approximately the configured 95:5
+  viewer/loader share without loader starvation;
+- immediate work-conserving borrowing after control/viewer demand ends;
+- two compatible appenders, conflicting overwrite/append, truncate, cancellation
+  and restart at every resumable cursor state;
+- a full spool with a pathological inode plus independently retireable files;
+- no lower-class disk/network wait on control/RPC threads and no I/O while a
+  cross-class/cross-inode mutex is held; and
+- assertions on maximum outstanding lower-class bytes, uninterrupted work,
+  lock hold time and per-class queue delay, rather than timing-only sleeps.
+
+Deployed UAT must run overlapping `rsync --append-verify`, force the spool above
+its pressure threshold, start real playback with repeated seeks, and exercise
+status/membership/metadata control requests concurrently. Pass only if:
+
+1. control remains within its declared latency envelope with no timeouts;
+2. playback starts and continues without a loader-induced stall;
+3. loader progress remains non-zero during playback and promptly becomes
+   work-conserving afterward;
+4. spool occupancy retires below pressure without restarting any process;
+5. unchanged file regions are not reread/rehashed; and
+6. counters prove every lower-class uninterrupted unit and outstanding-I/O
+   bound was respected.
+
+Phase 1C is not UAT-complete until this gate passes. Phase 2 may reuse the
+resumable range/cursor machinery, but it must not be used to postpone these
+invariants.
+
 ## Phase 2: stage immutable extents incrementally
 
 Decouple useful object publication from whole-file closure while retaining
@@ -515,14 +749,20 @@ acceptable result.
 
 ## Sequencing and stop points
 
-- Phase 0, Phase 1A, Phase 1B, and corrective Phase 1C are one safe delivery sequence: measure,
-  establish the loader class independently of restart provenance, remove false
-  worker caps, add fairness/bounds, replace exclusion with weighted service,
-  test, then UAT. Do not tune concurrency
+- Phase 0, Phase 1A, Phase 1B, corrective Phase 1C and invariant Phase 1D are one
+  safe delivery sequence: measure, establish the loader class independently of
+  restart provenance, remove false worker caps, add fairness/bounds, replace
+  exclusion with weighted service, propagate priority through every resource,
+  make hidden whole-file work resumable, then UAT. Do not tune concurrency
   against the old `recovery` lane or use the earlier two-worker UAT as a
   performance baseline.
-- Phase 2 is the largest correctness change and should be delivered separately
-  behind versioned recovery records and exhaustive fault injection.
+- Phase 1D is a release gate. Do not claim viewer/control priority, resume the
+  aggregate-rate UAT, or begin throughput tuning while any lower-class call can
+  issue unbounded work or hold an unreserved shared resource.
+- Phase 2 remains a large correctness change and should be delivered separately
+  behind versioned recovery records and exhaustive fault injection. It should
+  build on Phase 1D's resumable range state rather than reintroducing a second
+  publication mechanism.
 - Phase 3 can proceed independently after Phase 0 if local durability is shown
   to limit the new pipeline.
 - Phase 4 should follow Phase 1 telemetry; add concurrency before barrier

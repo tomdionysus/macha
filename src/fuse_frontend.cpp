@@ -489,8 +489,6 @@ struct FuseFrontend::State {
     uint64_t namespace_inflight_sequence{};
     size_t namespace_inflight_operations{};
     std::jthread namespace_worker;
-    std::mutex publication_mutex;
-
     struct DataQueueItem {
         std::shared_ptr<Inode> inode;
         // Provenance only. Journal-restored spool remains user-requested loader
@@ -2159,7 +2157,6 @@ struct FuseFrontend::State {
                         try {
                             wait_for_weighted_loader_service();
                             try {
-                                std::lock_guard backend(publication_mutex);
                                 result = apply_namespace_backend(
                                     std::span<const NamespaceOp>(batch).subspan(published_prefix));
                             } catch (...) {
@@ -2476,7 +2473,8 @@ struct FuseFrontend::State {
                 *snapshot.published_path, false,
                 config.write_through_cache && !publication->recovered,
                 WriteDurability::publication_generation,
-                config.publication_pipeline_bytes);
+                config.publication_pipeline_bytes,
+                DataWorkContext(FrameType::loader, config.publication_quantum_bytes));
             publication->initialized = true;
         }
 
@@ -2531,6 +2529,19 @@ struct FuseFrontend::State {
                     if (weighted_loader_should_yield()) {
                         return yield_quantum();
                     }
+                    const auto write_offset = op.offset + publication->operation_offset;
+                    const auto remaining_quantum = config.publication_quantum_bytes - served;
+                    // A conflicting/overlapping write can require the old
+                    // generation to be staged first. Advance that hidden DATA
+                    // work under the same byte grant before consuming more WAL
+                    // input, and retain both cursors across a clean yield.
+                    if (remaining_quantum < fs.extent_size())
+                        return yield_quantum();
+                    const auto preparation = publication->writer->prepare_write(
+                        write_offset, remaining_quantum);
+                    served += preparation.bytes_processed;
+                    if (!preparation.ready || served >= config.publication_quantum_bytes)
+                        return yield_quantum();
                     const auto chunk =
                         static_cast<size_t>(std::min<uint64_t>(
                             {buffer.size(), op.length - publication->operation_offset,
@@ -2561,7 +2572,7 @@ struct FuseFrontend::State {
                             return true;
                         }
                     }
-                    if (publication->writer->write(op.offset + publication->operation_offset,
+                    if (publication->writer->write(write_offset,
                                                    {buffer.data(), chunk}) != chunk)
                         throw FsError(EIO, "short replay into Macha write handle");
                     publication->operation_offset += chunk;
@@ -2578,11 +2589,21 @@ struct FuseFrontend::State {
             }
             if (weighted_loader_should_yield())
                 return yield_quantum();
-            {
-                std::lock_guard backend(publication_mutex);
-                publication->writer->commit();
-                note_pipeline_peak();
-            }
+            // Rebuild hashes canonical extent boundaries. Start it with a fresh
+            // extent-aligned grant rather than letting arbitrary WAL write
+            // lengths fragment the rebuilt manifest.
+            if (served)
+                return yield_quantum();
+            const auto remaining_quantum = config.publication_quantum_bytes - served;
+            if (remaining_quantum < fs.extent_size())
+                return yield_quantum();
+            const auto commit_preparation =
+                publication->writer->prepare_commit(remaining_quantum);
+            served += commit_preparation.bytes_processed;
+            if (!commit_preparation.ready || served >= config.publication_quantum_bytes)
+                return yield_quantum();
+            publication->writer->commit();
+            note_pipeline_peak();
             data_publications_completed.fetch_add(1, std::memory_order_relaxed);
             data_publication_bytes_committed.fetch_add(publication->publication_bytes,
                                                        std::memory_order_relaxed);
