@@ -100,6 +100,7 @@ fuse:
   # progress. The in-flight budget caps the aggregate quanta admitted at once.
   publication_quantum_bytes: 32M
   publication_inflight_bytes: 256M
+  publication_pipeline_bytes: 8M
   max_pending_operations: 4096
 
   # Aggregate local write-back and recovery bounds. max_spool_bytes is the

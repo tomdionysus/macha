@@ -91,7 +91,10 @@ remains an `ENOSPC` safety condition.
 
 Large-file publication is resumable rather than an indivisible worker job.
 Inspect `data_publication_quanta`, `data_publication_yields`, and
-`data_publication_peak_inflight_bytes` under `diagnostics.filesystem`. A healthy
+`data_publication_peak_inflight_bytes` under `diagnostics.filesystem`. The
+configured per-file bound and observed high-water mark are exposed as
+`data_publication_pipeline_limit_bytes` and
+`data_publication_peak_pipeline_extents`. A healthy
 bulk import normally has more quanta than completed generations, useful-byte
 counters that do not repeatedly read the same prefixes, and a peak no greater
 than `fuse.publication_inflight_bytes`. Metadata visibility remains whole-file:

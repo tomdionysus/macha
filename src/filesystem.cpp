@@ -231,9 +231,10 @@ size_t ReadHandle::read(uint64_t off, std::span<uint8_t> out, Clock::time_point 
 }
 
 WriteHandle::WriteHandle(FileSystem& f, std::string p, FsEntry b, bool trunc, bool cache_puts,
-                         WriteDurability durability)
+                         WriteDurability durability, uint64_t publication_pipeline_bytes)
     : fs_(f), path_(std::move(p)), base_(std::move(b)), expected_(base_.version),
       sequential_(true), cache_puts_(cache_puts), durability_(durability),
+      publication_pipeline_bytes_(publication_pipeline_bytes),
       logical_(trunc ? 0 : base_.size), staged_(trunc ? 0 : base_.size),
       diagnostic_id_(next_write_handle_diagnostic_id.fetch_add(1, std::memory_order_relaxed)) {
     buffer_.reserve(fs_.extent_size());
@@ -275,6 +276,14 @@ WriteHandle::WriteHandle(FileSystem& f, std::string p, FsEntry b, bool trunc, bo
                " append_tail=" + std::to_string(append_tail_ ? 1 : 0));
 }
 WriteHandle::~WriteHandle() {
+    try {
+        std::lock_guard lock(m_);
+        (void)drain_staging_locked();
+    } catch (...) {
+        // An abandoned or failed generation has no visible metadata. Joining
+        // its bounded provisional puts is nevertheless required before the
+        // handle releases references captured by those tasks.
+    }
     cleanup();
 }
 
@@ -339,6 +348,37 @@ std::chrono::milliseconds WriteHandle::flush() {
     if (fs_.io_cancellation_requested())
         fail(EINTR, "write cancelled");
     auto started = Clock::now();
+    if (durability_ == WriteDurability::publication_generation &&
+        publication_pipeline_bytes_) {
+        std::chrono::milliseconds waited{};
+        while (pending_extent_bytes_ + length > publication_pipeline_bytes_)
+            waited += drain_one_extent();
+
+        Bytes bytes = std::move(buffer_);
+        buffer_.clear();
+        buffer_.reserve(fs_.extent_size());
+        staged_ += length;
+        pending_extent_bytes_ += length;
+        auto* store = &fs_.store();
+        auto* cancelled = &fs_.io_cancelled_;
+        const bool cache_put = cache_puts_;
+        pending_extents_.push_back({
+            length,
+            std::async(std::launch::async,
+                       [store, cancelled, cache_put, offset, bytes = std::move(bytes)]() mutable {
+                           const auto put_started = Clock::now();
+                           DistributedStore::DurabilityBatch batch;
+                           auto id = store->put_deferred(bytes, batch, cancelled);
+                           if (cache_put)
+                               (void)store->cache_local(id, bytes);
+                           return StagedExtentResult{
+                               {offset, bytes.size(), id, false}, std::move(batch),
+                               std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   Clock::now() - put_started)};
+                       })});
+        peak_pending_extents_ = std::max(peak_pending_extents_, pending_extents_.size());
+        return waited;
+    }
     ObjectId id;
     try {
         if (durability_ == WriteDurability::publication_generation)
@@ -377,6 +417,51 @@ std::chrono::milliseconds WriteHandle::flush() {
     buffer_.clear();
     return elapsed;
 }
+
+std::chrono::milliseconds WriteHandle::drain_one_extent() {
+    if (pending_extents_.empty())
+        return {};
+    auto pending = std::move(pending_extents_.front());
+    pending_extents_.pop_front();
+    pending_extent_bytes_ -= pending.bytes;
+    auto result = pending.result.get();
+    durability_batch_.requirements.insert(
+        durability_batch_.requirements.end(),
+        std::make_move_iterator(result.durability.requirements.begin()),
+        std::make_move_iterator(result.durability.requirements.end()));
+    extents_.push_back(result.extent);
+    ++new_extent_puts_;
+    if (result.elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
+        Log::debug("write stage id=" + std::to_string(diagnostic_id_) +
+                   " path=" + path_ + " stage=extent-put offset=" +
+                   std::to_string(result.extent.offset) + " bytes=" +
+                   std::to_string(result.extent.length) + " object=" +
+                   to_string(result.extent.id) + " elapsed_ms=" +
+                   std::to_string(result.elapsed.count()));
+    }
+    return result.elapsed;
+}
+
+std::chrono::milliseconds WriteHandle::drain_staging_locked() {
+    std::chrono::milliseconds elapsed{};
+    std::exception_ptr failure;
+    while (!pending_extents_.empty()) {
+        try {
+            elapsed += drain_one_extent();
+        } catch (...) {
+            if (!failure)
+                failure = std::current_exception();
+        }
+    }
+    if (failure)
+        std::rethrow_exception(failure);
+    return elapsed;
+}
+
+void WriteHandle::drain_staging() {
+    std::lock_guard lock(m_);
+    (void)drain_staging_locked();
+}
 void WriteHandle::prepare_append_tail() {
     if (!append_tail_)
         return;
@@ -412,6 +497,7 @@ void WriteHandle::prepare_append_tail() {
 }
 
 void WriteHandle::materialize() {
+    (void)drain_staging_locked();
     if (temp_ >= 0)
         return;
     if (sequential_)
@@ -661,6 +747,7 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
 }
 void WriteHandle::truncate(uint64_t z) {
     std::lock_guard g(m_);
+    (void)drain_staging_locked();
     const bool diagnostics = Log::enabled(LogLevel::all);
     if (diagnostics) {
         Log::trace("WRITE truncate-begin id=" + std::to_string(diagnostic_id_) +
@@ -855,8 +942,10 @@ void WriteHandle::commit() {
     const auto data_started = Clock::now();
     if (temp_ >= 0)
         rebuild();
-    else
+    else {
         (void)flush();
+        (void)drain_staging_locked();
+    }
     const auto data_time =
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - data_started);
     for (size_t i = 0; i < extents_.size(); ++i) {
@@ -932,7 +1021,8 @@ WriteHandleDiagnostics WriteHandle::diagnostics() const {
     std::lock_guard g(m_);
     return {diagnostic_id_, logical_, staged_, buffer_.size(), sequential_, temp_ >= 0,
             fd_size(temp_), append_tail_fetches_, materialize_source_reads_, new_extent_puts_,
-            rebuild_reused_extents_, rebuild_put_extents_};
+            rebuild_reused_extents_, rebuild_put_extents_, pending_extents_.size(),
+            peak_pending_extents_};
 }
 
 void WriteHandle::cleanup() {
@@ -1542,7 +1632,8 @@ std::shared_ptr<ReadHandle> FileSystem::open_read(const FsEntry& entry, const st
                                         normalize_path(logical_path), frame_type);
 }
 std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool trunc,
-                                                    bool cache_puts, WriteDurability durability) {
+                                                    bool cache_puts, WriteDurability durability,
+                                                    uint64_t publication_pipeline_bytes) {
     // Serialize path lookup/registration with rename so an opening writer cannot
     // miss a rename between resolving the entry and joining the handle registry.
     std::lock_guard handles(open_writes_mutex_);
@@ -1558,7 +1649,7 @@ std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool t
     }
     auto handle =
         std::make_shared<WriteHandle>(*this, *resolved, e, trunc || !e.size, cache_puts,
-                                      durability);
+                                      durability, publication_pipeline_bytes);
     for (auto i = open_writes_.begin(); i != open_writes_.end();) {
         if (i->expired())
             i = open_writes_.erase(i);

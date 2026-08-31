@@ -534,6 +534,7 @@ struct FuseFrontend::State {
     std::atomic_uint64_t data_publication_quanta{};
     std::atomic_uint64_t data_publication_yields{};
     std::atomic_uint64_t data_publication_peak_inflight_bytes{};
+    std::atomic_uint64_t data_publication_peak_pipeline_extents{};
     std::atomic_uint64_t data_closed_priority_selections{};
     std::atomic_uint64_t data_publication_bytes_read{};
     std::atomic_uint64_t data_publication_bytes_committed{};
@@ -558,7 +559,15 @@ struct FuseFrontend::State {
           spool_dir(config.spool_path.value_or(fs.node().config().state_path / "fuse-spool")),
           journal_path(config.operation_journal_path.value_or(spool_dir / "operations.log")),
           journal_dir(journal_path.parent_path().empty() ? std::filesystem::path(".")
-                                                         : journal_path.parent_path()) {}
+                                                         : journal_path.parent_path()) {
+        // Unit/in-process callers may construct a frontend from an unvalidated
+        // FuseConfig. Preserve the same adaptive default used by Config
+        // validation rather than silently falling back to serial publication.
+        if (!config.publication_pipeline_bytes)
+            config.publication_pipeline_bytes =
+                std::min<uint64_t>(config.publication_quantum_bytes,
+                                   static_cast<uint64_t>(fs.extent_size()) * 2);
+    }
 
     ~State() {
         if (journal_fd >= 0)
@@ -2443,7 +2452,8 @@ struct FuseFrontend::State {
             publication->writer = fs.open_write(
                 *snapshot.published_path, false,
                 config.write_through_cache && !publication->recovered,
-                WriteDurability::publication_generation);
+                WriteDurability::publication_generation,
+                config.publication_pipeline_bytes);
             publication->initialized = true;
         }
 
@@ -2452,12 +2462,29 @@ struct FuseFrontend::State {
         constexpr size_t chunk_size = spool_checksum_chunk_size;
         Bytes buffer(chunk_size);
         try {
+            const auto note_pipeline_peak = [&] {
+                const auto observed = publication->writer->diagnostics().peak_pending_extent_puts;
+                auto peak = data_publication_peak_pipeline_extents.load(std::memory_order_relaxed);
+                while (peak < observed &&
+                       !data_publication_peak_pipeline_extents.compare_exchange_weak(
+                           peak, observed, std::memory_order_relaxed)) {
+                }
+            };
+            const auto yield_quantum = [&] {
+                // A quantum owns its aggregate byte reservation until every
+                // provisional extent it admitted has retired. This also makes
+                // the per-file pipeline the hard upper bound on loader I/O
+                // which can remain ahead of newly arrived viewer demand.
+                publication->writer->drain_staging();
+                note_pipeline_peak();
+                publication->active_duration += Clock::now() - quantum_started;
+                return false;
+            };
             while (publication->operation_index < snapshot.operations.size()) {
                 if (stopping.load())
                     throw FsError(EINTR, "FUSE publication stopping");
                 if (!playback_quiet()) {
-                    publication->active_duration += Clock::now() - quantum_started;
-                    return false;
+                    return yield_quantum();
                 }
                 const auto& op = snapshot.operations[publication->operation_index];
                 if (op.kind == DataOp::Kind::truncate) {
@@ -2465,8 +2492,7 @@ struct FuseFrontend::State {
                     // unit so a pathological truncate stream cannot bypass the
                     // byte quantum and monopolise a worker.
                     if (served > config.publication_quantum_bytes - chunk_size) {
-                        publication->active_duration += Clock::now() - quantum_started;
-                        return false;
+                        return yield_quantum();
                     }
                     publication->writer->truncate(op.size);
                     served += chunk_size;
@@ -2482,8 +2508,7 @@ struct FuseFrontend::State {
                     // publication may yield to viewer playback between bounded
                     // replay chunks without endangering recoverable input.
                     if (!playback_quiet()) {
-                        publication->active_duration += Clock::now() - quantum_started;
-                        return false;
+                        return yield_quantum();
                     }
                     const auto chunk =
                         static_cast<size_t>(std::min<uint64_t>(
@@ -2527,8 +2552,7 @@ struct FuseFrontend::State {
                 }
                 if (served >= config.publication_quantum_bytes &&
                     publication->operation_index < snapshot.operations.size()) {
-                    publication->active_duration += Clock::now() - quantum_started;
-                    return false;
+                    return yield_quantum();
                 }
             }
             {
@@ -2539,6 +2563,7 @@ struct FuseFrontend::State {
                 // bounded operation can precede new viewer demand.
                 wait_for_playback_quiet();
                 publication->writer->commit();
+                note_pipeline_peak();
             }
             publication->active_duration += Clock::now() - quantum_started;
             data_publications_completed.fetch_add(1, std::memory_order_relaxed);
@@ -4651,6 +4676,10 @@ FuseFrontendStatus FuseFrontend::status() const {
     out.data_publication_yields = diagnostics.data_publication_yields;
     out.data_publication_peak_inflight_bytes =
         diagnostics.data_publication_peak_inflight_bytes;
+    out.data_publication_pipeline_limit_bytes =
+        diagnostics.data_publication_pipeline_limit_bytes;
+    out.data_publication_peak_pipeline_extents =
+        diagnostics.data_publication_peak_pipeline_extents;
     out.data_closed_priority_selections = diagnostics.data_closed_priority_selections;
     out.data_publication_bytes_read = diagnostics.data_publication_bytes_read;
     out.data_publication_bytes_committed = diagnostics.data_publication_bytes_committed;
@@ -4691,6 +4720,8 @@ FuseFrontendDiagnostics FuseFrontend::diagnostics() const noexcept {
         state_->data_publication_quanta.load(std::memory_order_relaxed),
         state_->data_publication_yields.load(std::memory_order_relaxed),
         state_->data_publication_peak_inflight_bytes.load(std::memory_order_relaxed),
+        state_->config.publication_pipeline_bytes,
+        state_->data_publication_peak_pipeline_extents.load(std::memory_order_relaxed),
         state_->data_closed_priority_selections.load(std::memory_order_relaxed),
         state_->data_publication_bytes_read.load(std::memory_order_relaxed),
         state_->data_publication_bytes_committed.load(std::memory_order_relaxed),

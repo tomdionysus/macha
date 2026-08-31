@@ -65,6 +65,10 @@ MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_cou
     REQUIRE(filesystem->find("data_publication_quanta") != nullptr);
     REQUIRE(filesystem->find("data_publication_yields") != nullptr);
     REQUIRE(filesystem->find("data_publication_peak_inflight_bytes") != nullptr);
+    REQUIRE(filesystem->find("data_publication_pipeline_limit_bytes") != nullptr);
+    REQUIRE(filesystem->find("data_publication_peak_pipeline_extents") != nullptr);
+    CHECK(filesystem->find("data_publication_pipeline_limit_bytes")->asUInt64() ==
+          2 * config.extent_size);
     REQUIRE(filesystem->find("data_closed_priority_selections") != nullptr);
     REQUIRE(filesystem->find("data_publication_bytes_read") != nullptr);
     REQUIRE(filesystem->find("data_publication_bytes_committed") != nullptr);
@@ -153,6 +157,82 @@ MACHA_TEST("filesystem_fuse", test_open_write_metadata_merge) {
         conflicted = e.code() == EAGAIN;
     }
     CHECK(conflicted);
+}
+
+MACHA_TEST("filesystem_fuse", test_publication_extent_pipeline_is_bounded_and_atomic) {
+    TestService fixture("publication-extent-pipeline");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    auto& service = fixture.start();
+
+    service.filesystem().create_file("/pipeline.bin", 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write(
+        "/pipeline.bin", true, false, WriteDurability::publication_generation,
+        2 * config.extent_size);
+    const auto input = pattern(4 * config.extent_size);
+    for (size_t offset = 0; offset < input.size(); offset += config.extent_size) {
+        REQUIRE(writer->write(offset,
+                              {input.data() + offset, config.extent_size}) ==
+                config.extent_size);
+    }
+
+    // Enqueueing a third extent must retire the oldest one first. Completed
+    // provisional objects are intentionally not namespace-visible.
+    auto staged = writer->diagnostics();
+    CHECK(staged.peak_pending_extent_puts == 2);
+    CHECK(staged.pending_extent_puts == 2);
+    CHECK(staged.new_extent_puts == 2);
+    CHECK(service.filesystem().getattr("/pipeline.bin").size == 0);
+
+    // A fairness/viewer boundary drains the bounded admitted set while leaving
+    // the complete-file metadata transaction uncommitted.
+    writer->drain_staging();
+    staged = writer->diagnostics();
+    CHECK(staged.pending_extent_puts == 0);
+    CHECK(staged.new_extent_puts == 4);
+    CHECK(service.filesystem().getattr("/pipeline.bin").size == 0);
+
+    writer->commit();
+    CHECK(service.filesystem().getattr("/pipeline.bin").size == input.size());
+    auto reader = service.filesystem().open_read("/pipeline.bin");
+    Bytes output(input.size());
+    REQUIRE(reader->read(0, output) == output.size());
+    CHECK(output == input);
+}
+
+MACHA_TEST("filesystem_fuse", test_publication_extent_pipeline_failure_stays_invisible) {
+    TestService fixture("publication-extent-pipeline-failure");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    config.storage_backends.front().limit = 2 * config.extent_size;
+    auto& service = fixture.start();
+
+    service.filesystem().create_file("/pipeline-failure.bin", 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write(
+        "/pipeline-failure.bin", true, false, WriteDurability::publication_generation,
+        2 * config.extent_size);
+    const auto input = pattern(4 * config.extent_size);
+    bool failed = false;
+    try {
+        for (size_t offset = 0; offset < input.size(); offset += config.extent_size)
+            writer->write(offset, {input.data() + offset, config.extent_size});
+        writer->drain_staging();
+    } catch (const std::exception&) {
+        failed = true;
+    }
+    CHECK(failed);
+    writer.reset();
+
+    // Successful provisional extents from the abandoned generation are not a
+    // partial file. The durable spool caller remains free to replay the whole
+    // generation after storage becomes available.
+    CHECK(service.filesystem().getattr("/pipeline-failure.bin").size == 0);
 }
 
 MACHA_TEST("filesystem_fuse", test_fresh_and_resumed_write_exactness) {
@@ -939,6 +1019,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_yields_to_playback) {
     config.fuse.publication_quiet = 500ms;
     config.fuse.publication_quantum_bytes = config.extent_size;
     config.fuse.publication_inflight_bytes = config.extent_size;
+    config.fuse.publication_pipeline_bytes = config.extent_size;
 
     auto& service = fixture.start();
     {
@@ -1072,6 +1153,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_quanta_are_fair_and_byte_bou
     config.fuse.publication_quantum_bytes = config.extent_size;
     // Although four workers exist, only one logical quantum may be admitted.
     config.fuse.publication_inflight_bytes = config.fuse.publication_quantum_bytes;
+    config.fuse.publication_pipeline_bytes = config.extent_size;
 
     auto& service = fixture.start();
     auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
