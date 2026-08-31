@@ -9,6 +9,38 @@ using namespace macha::test_support;
 
 namespace {
 
+MACHA_FAST_TEST("foundations", test_spool_retirement_rate_is_aggregate) {
+    SpoolRetirementRateEstimator rate;
+    const SpoolRetirementRateEstimator::TimePoint start{};
+    rate.start(start);
+
+    auto first = rate.retire(100, start + 10s);
+    REQUIRE(first.has_value());
+    CHECK(first->bytes == 100);
+    CHECK(first->elapsed == 10s);
+    CHECK(static_cast<uint64_t>(first->bytes_per_second) == 10);
+
+    // A concurrent completion shares the same wall-clock denominator. The old
+    // per-file EMA would still report 10 B/s here; aggregate retirement is 20.
+    auto concurrent = rate.retire(100, start + 10s);
+    REQUIRE(concurrent.has_value());
+    CHECK(concurrent->bytes == 200);
+    CHECK(concurrent->elapsed == 10s);
+    CHECK(static_cast<uint64_t>(concurrent->bytes_per_second) == 20);
+
+    auto later = rate.retire(200, start + 20s);
+    REQUIRE(later.has_value());
+    CHECK(later->bytes == 400);
+    CHECK(static_cast<uint64_t>(later->bytes_per_second) == 20);
+
+    rate.reset();
+    CHECK(!rate.retire(50, start + 30s).has_value());
+    auto restarted = rate.retire(50, start + 31s);
+    REQUIRE(restarted.has_value());
+    CHECK(restarted->bytes == 100);
+    CHECK(static_cast<uint64_t>(restarted->bytes_per_second) == 100);
+}
+
 MACHA_FAST_TEST("foundations", test_miniupnpc_igd_status_compatibility) {
     using namespace miniupnpc_compat;
 

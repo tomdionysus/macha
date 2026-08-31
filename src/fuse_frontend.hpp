@@ -12,6 +12,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -20,6 +21,45 @@
 #include <vector>
 
 namespace macha {
+
+class SpoolRetirementRateEstimator {
+  public:
+    using TimePoint = std::chrono::steady_clock::time_point;
+    struct Sample {
+        uint64_t bytes{};
+        std::chrono::milliseconds elapsed{};
+        double bytes_per_second{};
+    };
+
+  private:
+    std::optional<TimePoint> started_;
+    uint64_t bytes_{};
+
+  public:
+    void start(TimePoint now) {
+        if (!started_)
+            started_ = now;
+    }
+    std::optional<Sample> retire(uint64_t bytes, TimePoint now) {
+        if (!bytes)
+            return {};
+        if (!started_)
+            started_ = now;
+        bytes_ = bytes > std::numeric_limits<uint64_t>::max() - bytes_
+                     ? std::numeric_limits<uint64_t>::max()
+                     : bytes_ + bytes;
+        const auto elapsed = now - *started_;
+        const auto seconds = std::chrono::duration<double>(elapsed).count();
+        if (seconds <= 0.0)
+            return {};
+        return Sample{bytes_, std::chrono::duration_cast<std::chrono::milliseconds>(elapsed),
+                      static_cast<double>(bytes_) / seconds};
+    }
+    void reset() {
+        started_.reset();
+        bytes_ = 0;
+    }
+};
 
 enum class FuseOperationClass : uint8_t {
     lookup,
@@ -96,6 +136,8 @@ struct FuseFrontendStatus {
     uint64_t spool_bytes{};
     uint64_t spool_limit_bytes{};
     uint64_t spool_publish_rate_bytes_per_second{};
+    uint64_t spool_publish_rate_window_bytes{};
+    uint64_t spool_publish_rate_window_ms{};
     uint64_t spool_throttle_waits{};
     uint64_t spool_throttle_wait_ms{};
 };
@@ -138,6 +180,8 @@ struct FuseFrontendDiagnostics {
     uint64_t spool_bytes{};
     uint64_t spool_limit_bytes{};
     uint64_t spool_publish_rate_bytes_per_second{};
+    uint64_t spool_publish_rate_window_bytes{};
+    uint64_t spool_publish_rate_window_ms{};
     uint64_t spool_throttle_waits{};
     uint64_t spool_throttle_wait_ms{};
 };
