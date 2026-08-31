@@ -176,8 +176,13 @@ void Service::initialise_services(std::stop_token stop) {
         auto catalogue = std::make_unique<CatalogueManager>(node_, *store, *metadata);
         auto fs = std::make_unique<FileSystem>(node_, *store, *metadata, &playback_);
         auto catalogue_hints = std::make_unique<CatalogueHintQueue>(node_.config().state_path);
+        std::shared_ptr<MediaEngine> media_engine;
+        if (node_.config().streaming.enabled)
+            media_engine = make_libav_media_engine(node_.config().streaming);
         auto scanner = std::make_unique<CatalogueScanner>(node_, *fs, *catalogue, *catalogue_hints,
-                                                          node_.config().catalogue.scanner);
+                                                          node_.config().catalogue.scanner,
+                                                          std::unique_ptr<HttpClient>{},
+                                                          std::chrono::seconds(5), media_engine);
         auto hydration = std::make_unique<HydrationManager>(*store, playback_, *fs, *catalogue,
                                                             node_.config().hydration,
                                                             node_.config().read_ahead_extents);
@@ -196,7 +201,8 @@ void Service::initialise_services(std::stop_token stop) {
         auto manage_api = std::make_unique<ManageApi>(node_, *metadata, *fs, *catalogue,
                                                       *catalogue_hints, *scanner);
         auto streaming = std::make_unique<PlaybackManager>(
-            *fs, *catalogue, node_.config().catalogue.api, node_.config().streaming);
+            *fs, *catalogue, node_.config().catalogue.api, node_.config().streaming,
+            media_engine);
 
         metadata->set_publication_retention([this](const MetadataPublicationContext& context) {
             retain_metadata_publication(context);

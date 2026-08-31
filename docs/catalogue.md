@@ -25,9 +25,32 @@ catalogue item
       |
       +--> media IDs / metadata
       `--> artwork ObjectIds (DATA)
+
+immutable media ID
+      `--> validated playback profile (format, duration, bitrate and streams)
 ```
 
 A mutation rewrites only affected shards plus the manifest rather than serializing the complete catalogue for every item.
+
+## Immutable media profiles
+
+Catalogue hint processing precomputes the playback profile using loader-priority
+reads and commits it in the same batched catalogue reconciliation as descriptive
+metadata. Playback performs a bounded, coalesced first-use probe only when that
+profile is genuinely absent. Profile validity is tied to the content-derived
+`macha:` identity, never merely to a mutable path.
+
+Clients can read the validated profile without opening the media:
+
+```text
+GET /api/v1/catalogue/media/{url-encoded-macha-media-id}/profile
+```
+
+The response contains `schema_version`, `media_id`, `format`, `duration_ms`,
+aggregate `bitrate`, and every stream's codec/profile, language, bitrate,
+dimensions/audio properties and default/forced/attached-picture flags. It is
+served with private immutable cache headers. `404 profile_not_available` is temporary;
+session admission can still use the bounded first-use fallback.
 
 ## Commit protocol
 

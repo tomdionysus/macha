@@ -482,6 +482,39 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     REQUIRE(codec_roundtrip.items.contains(codec_item.id));
     CHECK(codec_roundtrip.items.at(codec_item.id).external_ids == codec_item.external_ids);
 
+    CatalogueSnapshot::MediaProfile detailed_profile;
+    detailed_profile.probe.format = "mov,mp4,m4a,3gp,3g2,mj2";
+    detailed_profile.probe.duration_seconds = 7265.125;
+    detailed_profile.probe.bitrate = 5'123'456;
+    detailed_profile.probe.streams.push_back(MediaStreamInfo{
+        0, MediaStreamType::video, "hevc", "Main 10", "und", 3840, 2160,
+        0, 0, 10, true, false, 4'700'000, false});
+    detailed_profile.probe.streams.push_back(MediaStreamInfo{
+        2, MediaStreamType::audio, "eac3", "", "eng", 0, 0,
+        6, 48000, 24, true, false, 384'000, false});
+    detailed_profile.probe.streams.push_back(MediaStreamInfo{
+        7, MediaStreamType::subtitle, "hdmv_pgs_subtitle", "", "fra", 0, 0,
+        0, 0, 0, false, true, 0, false});
+    const std::string detailed_media_id = "macha:" + std::string(64, 'a');
+    codec_snapshot.media_profiles.emplace(detailed_media_id, detailed_profile);
+    codec_roundtrip = decode_catalogue(encode_catalogue(codec_snapshot));
+    REQUIRE(codec_roundtrip.media_profiles.contains(detailed_media_id));
+    CHECK(codec_roundtrip.media_profiles.at(detailed_media_id) == detailed_profile);
+    CHECK(valid_catalogue_media_profile(
+        detailed_media_id, codec_roundtrip.media_profiles.at(detailed_media_id)));
+
+    // Unknown/incomplete semantic data remains decodable so one bad cached
+    // profile cannot poison the complete catalogue snapshot. Consumers treat
+    // it as a miss and use their bounded probe path.
+    auto incomplete = detailed_profile;
+    incomplete.complete = false;
+    incomplete.probe.format.clear();
+    codec_snapshot.media_profiles[detailed_media_id] = incomplete;
+    codec_roundtrip = decode_catalogue(encode_catalogue(codec_snapshot));
+    REQUIRE(codec_roundtrip.media_profiles.contains(detailed_media_id));
+    CHECK(!valid_catalogue_media_profile(
+        detailed_media_id, codec_roundtrip.media_profiles.at(detailed_media_id)));
+
     FsEntry fake;
     fake.type = EntryType::file;
     fake.size = 123456;
@@ -1305,8 +1338,9 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     scanner_config.movies.tmdb.token_file = scanner_token;
     scanner_config.tv.enabled = false;
     scanner_config.music.enabled = false;
+    auto profile_engine = std::make_shared<FakeMediaEngine>();
     CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
-                             scanner_config, std::move(fake_http));
+                             scanner_config, std::move(fake_http), 5s, profile_engine);
     const auto namespace_before_scan = service.filesystem().namespace_signature();
     CHECK(scanner.scan_once() == 1);
     CHECK(service.filesystem().namespace_signature() == namespace_before_scan);
@@ -1316,6 +1350,8 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     CHECK(catalogued->external_ids.at("tmdb_collection") == "422837");
     CHECK(catalogued->external_ids.at("macha_scanner") == "1");
     CHECK(catalogued->media_ids == std::vector<std::string>{media_id});
+    REQUIRE(service.catalogue().media_profile(media_id).has_value());
+    CHECK(profile_engine->probes() == 1);
     CHECK(catalogued->artwork.size() == 2);
     for (const auto& art : catalogued->artwork)
         CHECK(service.node().local_store().has(art.id));

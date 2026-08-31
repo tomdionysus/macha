@@ -26,6 +26,22 @@
 namespace macha {
 namespace {
 
+class CatalogueMediaInput final : public MediaInput {
+    std::shared_ptr<ReadHandle> handle_;
+    uint64_t size_{};
+  public:
+    CatalogueMediaInput(std::shared_ptr<ReadHandle> handle, uint64_t size)
+        : handle_(std::move(handle)), size_(size) {}
+    uint64_t size() const override { return size_; }
+    size_t read(uint64_t offset, std::span<uint8_t> destination,
+                Clock::time_point deadline, std::atomic_bool* cancelled) override {
+        if (offset >= size_) return 0;
+        const auto wanted = static_cast<size_t>(
+            std::min<uint64_t>(destination.size(), size_ - offset));
+        return handle_->read(offset, destination.first(wanted), deadline, cancelled);
+    }
+};
+
 std::string lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -2358,10 +2374,12 @@ CatalogueScanner::CatalogueScanner(NodeRuntime& node, FileSystem& fs,
                                    CatalogueManager& catalogue, CatalogueHintQueue& hints,
                                    CatalogueScannerConfig config,
                                    std::unique_ptr<HttpClient> http,
-                                   std::chrono::milliseconds diagnostic_interval)
+                                   std::chrono::milliseconds diagnostic_interval,
+                                   std::shared_ptr<MediaEngine> profile_engine)
     : node_(node), fs_(fs), catalogue_(catalogue), hints_(hints), config_(std::move(config)),
       http_(http ? std::move(http) : std::make_unique<CurlHttpClient>()),
       provider_http_(std::make_unique<BudgetHttpClient>(*http_)),
+      profile_engine_(std::move(profile_engine)),
       diagnostic_interval_(diagnostic_interval) {
     configure_providers();
 }
@@ -2593,7 +2611,7 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
     if (!existing_ids.empty() && !manual_refresh) {
         return PreparedHintMatch{hint.id, std::string(provider->name()), media_id,
                                  std::move(existing_ids), {},
-                                 "already catalogued", hint.attempts};
+                                 "already catalogued", hint.attempts, {}};
     }
 
     auto probed = provider->probe_file(fs_, root, hint.path, entry);
@@ -2640,7 +2658,7 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
         }
         return PreparedHintMatch{hint.id, std::string(provider->name()), media_id,
                                  std::move(existing_ids), std::move(updates),
-                                 "already catalogued", hint.attempts};
+                                 "already catalogued", hint.attempts, {}};
     }
 
     constexpr size_t max_candidate_attempts = 5;
@@ -2786,7 +2804,7 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
     for (const auto& item : match.items) item_ids.push_back(item.id);
     return PreparedHintMatch{hint.id, std::string(provider->name()), probe.media_id,
                              std::move(item_ids), std::move(match.items),
-                             "matched " + selected_candidate->generator, hint.attempts};
+                             "matched " + selected_candidate->generator, hint.attempts, {}};
 }
 
 CatalogueScanner::HintBatchResult
@@ -2819,8 +2837,46 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
                 if (!namespace_view)
                     namespace_view = fs_.local_snapshot_view();
             }
-            if (auto match = prepare_hint(*hint, stop, *namespace_view->snapshot, artwork_batch))
+            if (auto match = prepare_hint(*hint, stop, *namespace_view->snapshot, artwork_batch)) {
+                if (profile_engine_ && profile_engine_->status().available &&
+                    match->media_id.starts_with("macha:")) {
+                    auto entry = namespace_view->snapshot->entries.find(normalize_path(hint->path));
+                    if (entry != namespace_view->snapshot->entries.end() &&
+                        entry->second.type == EntryType::file && entry->second.size) {
+                        try {
+                            const auto media_id = match->media_id;
+                            const auto path = normalize_path(hint->path);
+                            const auto source_entry = entry->second;
+                            const auto deadline = Clock::now() +
+                                node_.config().streaming.probe_timeout;
+                            auto resolved = catalogue_.resolve_media_profile(
+                                media_id, deadline, [&] {
+                                    MediaSource source{
+                                        media_id, path, source_entry.size,
+                                        [this, source_entry, path](MediaReadPurpose)
+                                            -> std::shared_ptr<MediaInput> {
+                                            return std::make_shared<CatalogueMediaInput>(
+                                                fs_.open_read(source_entry, path, false,
+                                                              FrameType::loader),
+                                                source_entry.size);
+                                        }};
+                                    auto remaining = std::max(
+                                        std::chrono::milliseconds(1),
+                                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            deadline - Clock::now()));
+                                    return profile_engine_->probe(source, remaining);
+                                });
+                            match->media_profile = std::move(resolved.probe);
+                        } catch (const std::exception& e) {
+                            if (!stop.stop_requested())
+                                Log::warn("catalogue media profile deferred media=" +
+                                          match->media_id + " path=" + hint->path +
+                                          " error=" + e.what());
+                        }
+                    }
+                }
                 prepared.push_back(std::move(*match));
+            }
         } catch (const CatalogueConflict& e) {
             hints_.defer(hint->id, e.what(), unix_ms() + 500);
         } catch (const CatalogueUnavailable& e) {
@@ -2850,14 +2906,17 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
 
     std::vector<CatalogueItem> discovered;
     std::set<std::string> active_media_ids;
+    std::map<std::string, MediaProbeResult, std::less<>> media_profiles;
     for (const auto& match : prepared) {
         active_media_ids.insert(match.media_id);
         discovered.insert(discovered.end(), match.items.begin(), match.items.end());
+        if (match.media_profile)
+            media_profiles[match.media_id] = *match.media_profile;
     }
 
     try {
-        if (!discovered.empty())
-            catalogue_.reconcile_scanner(discovered, active_media_ids, false);
+        if (!discovered.empty() || !media_profiles.empty())
+            catalogue_.reconcile_scanner(discovered, active_media_ids, false, {}, media_profiles);
     } catch (const CatalogueConflict& e) {
         for (const auto& match : prepared)
             hints_.defer(match.hint_id, e.what(), unix_ms() + 500);

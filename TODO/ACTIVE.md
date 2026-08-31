@@ -32,6 +32,19 @@ The existing documents in this directory remain the detailed plans, checkpoints,
 
 ## Additional investigation
 
+- [ ] Update the client to consume the immutable media-profile endpoint; see
+  [the short client handoff](2026-08-31-clientside-media-profile.md).
+
+- [ ] Eliminate synchronous playback re-probing for already catalogued immutable
+  media and make session-creation POSTs retry-safe. Persist a complete validated
+  media profile against the content-derived identity, coalesce genuine cold
+  misses, retain exact negotiation/response semantics, and add client-generated
+  idempotency keys without moving client playback state into the server. The
+  structural cold-cache defect is independent of current FUSE publication work;
+  rsync load may only multiply its observed 9--11 second cost. Implement and UAT
+  the phased contract in
+  [the playback admission plan](2026-08-31-playback-immutable-media-profile-and-idempotent-admission.md).
+
 - [ ] Support multiple advertised endpoints per node and multiple candidate IPs
   per bootstrap node. A node must be able to advertise at least its local/LAN
   and internet/WAN endpoints simultaneously, with address family, scope and
