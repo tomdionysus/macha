@@ -356,30 +356,14 @@ std::chrono::milliseconds WriteHandle::flush() {
         while (pending_extent_bytes_ + length > publication_pipeline_bytes_)
             waited += drain_one_extent();
 
-        Bytes bytes = std::move(buffer_);
+        auto bytes = std::make_shared<const Bytes>(std::move(buffer_));
         buffer_.clear();
         buffer_.reserve(fs_.extent_size());
         staged_ += length;
         pending_extent_bytes_ += length;
-        auto* store = &fs_.store();
-        auto* cancelled = &fs_.io_cancelled_;
-        const bool cache_put = cache_puts_;
-        pending_extents_.push_back({
-            length,
-            std::async(std::launch::async,
-                       [store, cancelled, cache_put, offset,
-                        frame_type = work_context_.frame_type(),
-                        bytes = std::move(bytes)]() mutable {
-                           const auto put_started = Clock::now();
-                           DistributedStore::DurabilityBatch batch;
-                           auto id = store->put_deferred(bytes, batch, frame_type, cancelled);
-                           if (cache_put)
-                               (void)store->cache_local(id, bytes);
-                           return StagedExtentResult{
-                               {offset, bytes.size(), id, false}, std::move(batch),
-                               std::chrono::duration_cast<std::chrono::milliseconds>(
-                                   Clock::now() - put_started)};
-                       })});
+        PendingExtent pending{length, offset, cache_puts_, std::move(bytes), {}};
+        launch_pending_extent(pending);
+        pending_extents_.push_back(std::move(pending));
         peak_pending_extents_ = std::max(peak_pending_extents_, pending_extents_.size());
         return waited;
     }
@@ -423,12 +407,37 @@ std::chrono::milliseconds WriteHandle::flush() {
     return elapsed;
 }
 
+void WriteHandle::launch_pending_extent(PendingExtent& pending) {
+    auto* store = &fs_.store();
+    auto* cancelled = &fs_.io_cancelled_;
+    const auto cache_put = pending.cache_put;
+    const auto offset = pending.offset;
+    const auto bytes = pending.payload;
+    const auto frame_type = work_context_.frame_type();
+    pending.result = std::async(
+        std::launch::async,
+        [store, cancelled, cache_put, offset, frame_type, bytes] {
+            const auto put_started = Clock::now();
+            DistributedStore::DurabilityBatch batch;
+            auto id = store->put_deferred(*bytes, batch, frame_type, cancelled);
+            if (cache_put)
+                (void)store->cache_local(id, *bytes);
+            return StagedExtentResult{
+                {offset, bytes->size(), id, false}, std::move(batch),
+                std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - put_started)};
+        });
+}
+
 std::chrono::milliseconds WriteHandle::drain_one_extent() {
     if (pending_extents_.empty())
         return {};
-    auto pending = std::move(pending_extents_.front());
-    pending_extents_.pop_front();
-    pending_extent_bytes_ -= pending.bytes;
+    auto& pending = pending_extents_.front();
+    // A failed asynchronous put leaves its payload and exact manifest offset
+    // at the queue head. The next publication attempt relaunches that bounded,
+    // content-addressed operation instead of discarding the complete writer
+    // and replaying every earlier spool byte.
+    if (!pending.result.valid())
+        launch_pending_extent(pending);
     auto result = pending.result.get();
     durability_batch_.requirements.insert(
         durability_batch_.requirements.end(),
@@ -444,22 +453,17 @@ std::chrono::milliseconds WriteHandle::drain_one_extent() {
                    to_string(result.extent.id) + " elapsed_ms=" +
                    std::to_string(result.elapsed.count()));
     }
+    pending_extent_bytes_ -= pending.bytes;
+    pending_extents_.pop_front();
     return result.elapsed;
 }
 
 std::chrono::milliseconds WriteHandle::drain_staging_locked() {
     std::chrono::milliseconds elapsed{};
-    std::exception_ptr failure;
-    while (!pending_extents_.empty()) {
-        try {
-            elapsed += drain_one_extent();
-        } catch (...) {
-            if (!failure)
-                failure = std::current_exception();
-        }
-    }
-    if (failure)
-        std::rethrow_exception(failure);
+    // Stop at the first failed offset. Later pipelined futures may finish in
+    // parallel, but cannot enter the manifest ahead of the missing extent.
+    while (!pending_extents_.empty())
+        elapsed += drain_one_extent();
     return elapsed;
 }
 
@@ -499,6 +503,78 @@ void WriteHandle::prepare_append_tail() {
                    " path=" + path_ +
                    " stage=append-tail-fetch offset=" + std::to_string(tail.offset) +
                    " bytes=" + std::to_string(tail.length));
+}
+
+bool WriteHandle::canonical_base() const {
+    uint64_t offset = 0;
+    for (const auto& extent : base_.extents) {
+        if (extent.offset != offset || !extent.length || extent.length > fs_.extent_size())
+            return false;
+        const auto remaining = base_.size - std::min(base_.size, offset);
+        const auto expected = std::min<uint64_t>(fs_.extent_size(), remaining);
+        if (extent.length != expected)
+            return false;
+        offset += extent.length;
+    }
+    return offset == base_.size;
+}
+
+void WriteHandle::note_changed_range(uint64_t begin, uint64_t end) {
+    if (begin >= end)
+        return;
+    ChangedRange merged{begin, end};
+    auto it = changed_ranges_.begin();
+    while (it != changed_ranges_.end() && it->end < merged.begin)
+        ++it;
+    while (it != changed_ranges_.end() && it->begin <= merged.end) {
+        merged.begin = std::min(merged.begin, it->begin);
+        merged.end = std::max(merged.end, it->end);
+        it = changed_ranges_.erase(it);
+    }
+    changed_ranges_.insert(it, merged);
+}
+
+bool WriteHandle::range_changed(uint64_t begin, uint64_t end) const {
+    auto it = std::lower_bound(changed_ranges_.begin(), changed_ranges_.end(), begin,
+                               [](const ChangedRange& range, uint64_t value) {
+                                   return range.end <= value;
+                               });
+    return it != changed_ranges_.end() && it->begin < end;
+}
+
+void WriteHandle::begin_sparse_overlay() {
+    if (temp_ >= 0)
+        return;
+    if (!canonical_base())
+        fail(EINVAL, "sparse overlay requires a canonical base manifest");
+    (void)drain_staging_locked();
+    if (fs_.io_cancellation_requested())
+        fail(EINTR, "write cancelled");
+    auto directory = fs_.node().config().state_path / "tmp";
+    std::filesystem::create_directories(directory);
+    auto pattern =
+        (directory / ("write." + to_string(fs_.node().node_id()) + ".XXXXXX")).string();
+    std::vector<char> name(pattern.begin(), pattern.end());
+    name.push_back('\0');
+    temp_ = mkstemp(name.data());
+    if (temp_ < 0)
+        fail(EIO, "cannot create sparse overlay file");
+    temp_path_ = name.data();
+    sparse_overlay_ = true;
+    sequential_ = false;
+    rebuild_prepared_ = false;
+
+    // Sequential work may have staged an incomplete new tail before a later
+    // write changed direction. Preserve only that tail as overlay data; full
+    // immutable extents already present in extents_ remain reusable by ID.
+    if (!buffer_.empty()) {
+        pwa(temp_, buffer_, staged_);
+        note_changed_range(staged_, staged_ + buffer_.size());
+        buffer_.clear();
+    }
+    append_tail_.reset();
+    if (ftruncate(temp_, logical_))
+        fail(EIO, "sparse overlay truncate failed");
 }
 
 WritePreparation WriteHandle::materialize_step(uint64_t byte_budget) {
@@ -635,6 +711,10 @@ WritePreparation WriteHandle::prepare_write(uint64_t offset, uint64_t byte_budge
     std::lock_guard lock(m_);
     if (!materializing_ && ((sequential_ && offset == logical_) || temp_ >= 0))
         return {true, 0};
+    if (!materializing_ && temp_ < 0 && canonical_base()) {
+        begin_sparse_overlay();
+        return {true, 0};
+    }
     return materialize_step(byte_budget);
 }
 size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
@@ -745,7 +825,10 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
                        " logical=" + std::to_string(logical_) +
                        " bytes=" + std::to_string(d.size()) + " materializing=1");
             auto started = Clock::now();
-            materialize();
+            if (canonical_base())
+                begin_sparse_overlay();
+            else
+                materialize();
             auto elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
             if (Log::enabled(LogLevel::all))
@@ -758,6 +841,8 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
         rebuild_prepared_ = false;
 
         pwa(temp_, d, off);
+        if (sparse_overlay_)
+            note_changed_range(off, off + d.size());
         logical_ = std::max<uint64_t>(logical_, off + d.size());
 
         if (diagnostics) {
@@ -855,10 +940,16 @@ void WriteHandle::truncate(uint64_t z) {
     if (rebuilding_)
         rebuild();
     if (temp_ < 0) {
-        materialize();
-        sequential_ = false;
+        if (canonical_base())
+            begin_sparse_overlay();
+        else {
+            materialize();
+            sequential_ = false;
+        }
     }
     rebuild_prepared_ = false;
+    if (sparse_overlay_ && z < logical_)
+        note_changed_range(z, logical_);
     if (ftruncate(temp_, z))
         fail(EIO, "truncate failed");
     logical_ = z;
@@ -912,6 +1003,7 @@ WritePreparation WriteHandle::rebuild_step(uint64_t byte_budget) {
     };
 
     Bytes bytes(fs_.extent_size());
+    uint64_t source_bytes = 0;
     while (rebuild_offset_ < logical_ && (unlimited || processed < byte_budget)) {
         if (fs_.io_cancellation_requested())
             fail(EINTR, "write cancelled");
@@ -922,11 +1014,6 @@ WritePreparation WriteHandle::rebuild_step(uint64_t byte_budget) {
             std::min<uint64_t>(bytes.size(), logical_ - rebuild_offset_));
         if (!n || n > remaining_budget)
             break;
-        if (pra(temp_, {bytes.data(), n}, rebuild_offset_) != n)
-            fail(EIO, "short staging read");
-
-        const auto data = std::span<const uint8_t>{bytes.data(), n};
-        const auto id = object_id(data);
         // Handle-local immutable extents override the committed base, matching
         // the previous map insertion order without constructing an O(file)
         // lookup table before the first yield point.
@@ -934,15 +1021,74 @@ WritePreparation WriteHandle::rebuild_step(uint64_t byte_budget) {
             candidate_at(rebuild_handle_extents_, rebuild_offset_, n);
         if (!candidate)
             candidate = candidate_at(base_.extents, rebuild_offset_, n);
+        const bool changed = sparse_overlay_ &&
+                             range_changed(rebuild_offset_, rebuild_offset_ + n);
+        bool have_data = !sparse_overlay_ || changed || !candidate;
+        ObjectId id{};
+        bool zero_data = false;
+        if (have_data) {
+            std::fill_n(bytes.data(), n, 0);
+            if (sparse_overlay_) {
+                const ExtentRef* source_extent = candidate;
+                if (!source_extent) {
+                    auto base_extent = std::lower_bound(
+                        base_.extents.begin(), base_.extents.end(), rebuild_offset_,
+                        [](const ExtentRef& extent, uint64_t value) {
+                            return extent.offset < value;
+                        });
+                    if (base_extent != base_.extents.end() &&
+                        base_extent->offset == rebuild_offset_)
+                        source_extent = &*base_extent;
+                }
+                if (rebuild_offset_ < base_.size && !source_extent)
+                        fail(EIO, "canonical base extent missing during sparse rebuild");
+                if (source_extent) {
+                    const auto copy = static_cast<size_t>(
+                        std::min<uint64_t>(n, source_extent->length));
+                    if (!source_extent->hole) {
+                        auto source = fs_.store().get(
+                            source_extent->id, rebuild_index_, work_context_.frame_type(), {},
+                            &fs_.io_cancelled_);
+                        if (!source || source->size() != source_extent->length ||
+                            source->size() < copy)
+                            fail(EIO, "cannot read changed source extent");
+                        std::copy_n(source->data(), copy, bytes.data());
+                        source_bytes += source->size();
+                    }
+                }
+                for (const auto& range : changed_ranges_) {
+                    const auto begin = std::max(range.begin, rebuild_offset_);
+                    const auto end = std::min(range.end, rebuild_offset_ + n);
+                    if (begin >= end)
+                        continue;
+                    const auto length = static_cast<size_t>(end - begin);
+                    auto destination = std::span<uint8_t>{
+                        bytes.data() + static_cast<size_t>(begin - rebuild_offset_), length};
+                    if (pra(temp_, destination, begin) != length)
+                        fail(EIO, "short sparse overlay read");
+                    source_bytes += length;
+                }
+            } else {
+                if (pra(temp_, {bytes.data(), n}, rebuild_offset_) != n)
+                    fail(EIO, "short staging read");
+                source_bytes += n;
+            }
+            const auto data = std::span<const uint8_t>{bytes.data(), n};
+            id = object_id(data);
+            zero_data = all_zero(data);
+        } else if (candidate && !candidate->hole) {
+            id = candidate->id;
+        }
         const bool reused = candidate &&
-                            ((!candidate->hole && candidate->id == id) ||
-                             (candidate->hole && all_zero(data)));
+                            (!have_data || (!candidate->hole && candidate->id == id) ||
+                             (candidate->hole && zero_data));
         ExtentRef result;
         std::chrono::milliseconds elapsed{};
         if (reused) {
             result = *candidate;
             ++rebuild_reused_extents_;
         } else {
+            const auto data = std::span<const uint8_t>{bytes.data(), n};
             const auto started = Clock::now();
             const bool ok = durability_ == WriteDurability::publication_generation
                                 ? fs_.store().put_deferred(id, data, durability_batch_,
@@ -972,16 +1118,16 @@ WritePreparation WriteHandle::rebuild_step(uint64_t byte_budget) {
                            " elapsed_ms=" + std::to_string(elapsed.count()));
         }
 
-        if (Log::enabled(LogLevel::all))
+        if (Log::enabled(LogLevel::all) && have_data)
             Log::trace("WRITE rebuild-extent id=" + std::to_string(diagnostic_id_) +
                    " index=" + std::to_string(rebuild_index_) +
                    " offset=" + std::to_string(rebuild_offset_) +
                    " length=" + std::to_string(n) +
                    " object_id=" + to_string(id) +
                    " reused=" + std::to_string(reused ? 1 : 0) +
-                   " all_zero=" + std::to_string(all_zero(data) ? 1 : 0) +
-                   " first16=" + edge_hex(data, true) +
-                   " last16=" + edge_hex(data, false) +
+                   " all_zero=" + std::to_string(zero_data ? 1 : 0) +
+                   " first16=" + edge_hex(std::span<const uint8_t>{bytes.data(), n}, true) +
+                   " last16=" + edge_hex(std::span<const uint8_t>{bytes.data(), n}, false) +
                    " ms=" + std::to_string(elapsed.count()));
         extents_.push_back(result);
         rebuild_offset_ += n;
@@ -989,7 +1135,7 @@ WritePreparation WriteHandle::rebuild_step(uint64_t byte_budget) {
         ++rebuild_index_;
     }
 
-    rebuild_source_bytes_ += processed;
+    rebuild_source_bytes_ += source_bytes;
     ++rebuild_steps_;
     if (rebuild_offset_ < logical_)
         return {false, processed};
@@ -1094,6 +1240,19 @@ void WriteHandle::commit() {
     base_ = std::move(committed);
     expected_ = base_.version;
     dirty_ = false;
+
+    if (sparse_overlay_) {
+        // The committed manifest is now the immutable authority. Discard the
+        // process-local overlay and make a still-open handle append-capable
+        // again, just like a freshly opened handle on this generation.
+        cleanup();
+        temp_path_.clear();
+        sparse_overlay_ = false;
+        changed_ranges_.clear();
+        rebuild_prepared_ = false;
+        sequential_ = true;
+        staged_ = logical_;
+    }
 
     // flush() publishes a partial final extent at commit time.  The handle may
     // remain open and receive more append writes after flush/fsync, so re-arm

@@ -137,6 +137,10 @@ void parse_dht(const YAML::Node& root, Config& c) {
         c.write_stall = milliseconds(d["write_stall_ms"], "dht.write_stall_ms");
     if (d["extent_size"])
         c.extent_size = yaml_size(d["extent_size"]);
+    if (d["data_inflight_bytes"])
+        c.data_inflight_bytes = yaml_size(d["data_inflight_bytes"]);
+    if (d["data_viewer_reserve_bytes"])
+        c.data_viewer_reserve_bytes = yaml_size(d["data_viewer_reserve_bytes"]);
     if (d["read_ahead"])
         c.read_ahead_extents = d["read_ahead"].as<size_t>();
     if (d["metadata_cache_ms"])

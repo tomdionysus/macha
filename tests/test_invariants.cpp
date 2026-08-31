@@ -572,6 +572,15 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     CHECK(rpc_diagnostics->find("metadata_pending_jobs")->asUInt64() == 0);
     REQUIRE(rpc_diagnostics->find("frame_timings") != nullptr);
     REQUIRE(rpc_diagnostics->find("message_timings") != nullptr);
+    const auto* data_resources = diagnostics->find("data_resources");
+    REQUIRE(data_resources != nullptr);
+    CHECK(data_resources->find("capacity_bytes")->asUInt64() == config.data_inflight_bytes);
+    CHECK(data_resources->find("viewer_reserve_bytes")->asUInt64() ==
+          config.data_viewer_reserve_bytes);
+    CHECK(data_resources->find("used_bytes")->asUInt64() == 0);
+    REQUIRE(data_resources->find("viewer_admissions") != nullptr);
+    REQUIRE(data_resources->find("loader_waits") != nullptr);
+    REQUIRE(data_resources->find("speculative_waits") != nullptr);
     CHECK(!diagnostics->find("convergence")->find("available")->asBool());
     CHECK(!diagnostics->find("filesystem")->find("available")->asBool());
 

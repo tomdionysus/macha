@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include "data_work.hpp"
 #include "distributed_store.hpp"
 #include "metadata_manager.hpp"
 #include <atomic>
@@ -112,28 +113,6 @@ enum class WriteDurability : uint8_t {
     publication_generation,
 };
 
-// Provenance for DATA-plane work performed by a write generation. This is
-// deliberately separate from CONTROL scheduling: loader work must not be
-// silently promoted merely because it reaches a nested operation.
-class DataWorkContext {
-    FrameType frame_type_{FrameType::loader};
-    uint64_t quantum_bytes_{};
-
-  public:
-    explicit DataWorkContext(FrameType frame_type = FrameType::loader,
-                             uint64_t quantum_bytes = 0)
-        : frame_type_(frame_type), quantum_bytes_(quantum_bytes) {
-        if (frame_type == FrameType::control)
-            throw std::invalid_argument("control is not a DATA work class");
-    }
-
-    FrameType frame_type() const noexcept { return frame_type_; }
-    uint64_t quantum_bytes() const noexcept { return quantum_bytes_; }
-    bool records_activity() const noexcept {
-        return frame_type_ == FrameType::foreground || frame_type_ == FrameType::read_ahead;
-    }
-};
-
 class WriteHandle {
     friend class FileSystem;
 class PlaybackTracker;
@@ -154,6 +133,9 @@ class PlaybackTracker;
     };
     struct PendingExtent {
         uint64_t bytes{};
+        uint64_t offset{};
+        bool cache_put{};
+        std::shared_ptr<const Bytes> payload;
         std::future<StagedExtentResult> result;
     };
     std::deque<PendingExtent> pending_extents_;
@@ -184,6 +166,15 @@ class PlaybackTracker;
     size_t rebuild_steps_{};
     bool rebuilding_{};
     bool rebuild_prepared_{};
+    // Canonical committed manifests can be edited as a sparse changed-range
+    // overlay. Unchanged extents remain immutable references and are never
+    // copied into the temporary file merely to discover they are unchanged.
+    bool sparse_overlay_{};
+    struct ChangedRange {
+        uint64_t begin{};
+        uint64_t end{};
+    };
+    std::vector<ChangedRange> changed_ranges_;
     uint64_t rebuild_offset_{};
     size_t rebuild_index_{};
     std::vector<ExtentRef> rebuild_handle_extents_;
@@ -199,6 +190,10 @@ class PlaybackTracker;
     std::chrono::milliseconds drain_one_extent();
     std::chrono::milliseconds drain_staging_locked();
     void prepare_append_tail();
+    bool canonical_base() const;
+    void begin_sparse_overlay();
+    void note_changed_range(uint64_t, uint64_t);
+    bool range_changed(uint64_t, uint64_t) const;
     WritePreparation materialize_step(uint64_t);
     void materialize();
     WritePreparation rebuild_step(uint64_t);
@@ -206,6 +201,7 @@ class PlaybackTracker;
     void cleanup();
     void diagnostic_stage_extent(const char*, size_t, uint64_t, size_t);
     void diagnostic_stage_checkpoint(const char*);
+    void launch_pending_extent(PendingExtent&);
 
   public:
     WriteHandle(FileSystem&, std::string, FsEntry, bool, bool cache_puts = false,

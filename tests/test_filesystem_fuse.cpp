@@ -58,6 +58,8 @@ MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_cou
     REQUIRE(filesystem->find("spool_throttle_waits") != nullptr);
     REQUIRE(filesystem->find("spool_throttle_wait_ms") != nullptr);
     REQUIRE(filesystem->find("data_publication_requests") != nullptr);
+    REQUIRE(filesystem->find("data_publication_notifications_suppressed") != nullptr);
+    REQUIRE(filesystem->find("spool_pressure_publication_sweeps") != nullptr);
     REQUIRE(filesystem->find("data_publication_coalesced_queued") != nullptr);
     REQUIRE(filesystem->find("data_publication_coalesced_running") != nullptr);
     REQUIRE(filesystem->find("data_publication_coalesced_unconfirmed") != nullptr);
@@ -72,9 +74,14 @@ MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_cou
     CHECK(filesystem->find("data_publication_pipeline_limit_bytes")->asUInt64() ==
           2 * config.extent_size);
     REQUIRE(filesystem->find("data_closed_priority_selections") != nullptr);
+    REQUIRE(filesystem->find("data_retirement_priority_selections") != nullptr);
     REQUIRE(filesystem->find("data_publication_bytes_read") != nullptr);
     REQUIRE(filesystem->find("data_publication_bytes_committed") != nullptr);
     REQUIRE(filesystem->find("data_publication_bytes_confirmed") != nullptr);
+    REQUIRE(filesystem->find("data_publication_completed_spool_bytes_read") != nullptr);
+    REQUIRE(filesystem->find("data_publication_completed_source_bytes_read") != nullptr);
+    REQUIRE(filesystem->find("data_publication_completed_reused_extents") != nullptr);
+    REQUIRE(filesystem->find("data_publication_completed_put_extents") != nullptr);
 
     const auto* convergence = diagnostics->find("convergence");
     REQUIRE(convergence != nullptr);
@@ -186,9 +193,8 @@ MACHA_TEST("filesystem_fuse", test_write_data_work_context_preserves_loader_prov
     seed.reset();
     (void)service.filesystem().store().take_interactive_bytes();
 
-    // A non-sequential overwrite forces the hidden materialisation/rebuild
-    // path which previously hard-coded read_ahead and manufactured viewer
-    // activity. It must inherit loader provenance and its admitted quantum.
+    // A non-sequential overwrite uses a changed-range rebuild. It must inherit
+    // loader provenance without rereading the unchanged committed prefix.
     auto loader = service.filesystem().open_write(
         "/loader.bin", false, false, WriteDurability::publication_generation, 0,
         DataWorkContext(FrameType::loader, config.extent_size));
@@ -196,9 +202,12 @@ MACHA_TEST("filesystem_fuse", test_write_data_work_context_preserves_loader_prov
     REQUIRE(loader->write(17, {&replacement, 1}) == 1);
     loader->commit();
     const auto loader_diagnostics = loader->diagnostics();
-    CHECK(loader_diagnostics.temp_open);
-    CHECK(loader_diagnostics.materialize_source_reads == 3);
-    CHECK(loader_diagnostics.materialize_source_bytes == contents.size());
+    CHECK(!loader_diagnostics.temp_open);
+    CHECK(loader_diagnostics.materialize_source_reads == 0);
+    CHECK(loader_diagnostics.materialize_source_bytes == 0);
+    CHECK(loader_diagnostics.rebuild_source_bytes == config.extent_size + 1);
+    CHECK(loader_diagnostics.rebuild_reused_extents == 2);
+    CHECK(loader_diagnostics.rebuild_put_extents == 1);
     CHECK(loader_diagnostics.work_frame_type == FrameType::loader);
     CHECK(loader_diagnostics.work_quantum_bytes == config.extent_size);
     CHECK(service.filesystem().store().take_interactive_bytes() == 0);
@@ -234,17 +243,11 @@ MACHA_TEST("filesystem_fuse", test_loader_materialization_is_resumable_and_byte_
     auto loader = service.filesystem().open_write(
         "/large.bin", false, false, WriteDurability::publication_generation, 0,
         DataWorkContext(FrameType::loader, config.extent_size));
-    for (size_t step = 0; step < 4; ++step) {
-        const auto preparation = loader->prepare_write(17, config.extent_size);
-        CHECK(preparation.bytes_processed == config.extent_size);
-        CHECK(preparation.ready == (step == 3));
-        // Preparing an overlay is never authoritative visibility.
-        CHECK(service.filesystem().getattr("/large.bin").size == contents.size());
-        const auto diagnostics = loader->diagnostics();
-        CHECK(diagnostics.materialize_source_reads == step + 1);
-        CHECK(diagnostics.materialize_source_bytes == (step + 1) * config.extent_size);
-        CHECK(diagnostics.materialize_steps == step + 1);
-    }
+    const auto overlay = loader->prepare_write(17, config.extent_size);
+    CHECK(overlay.ready);
+    CHECK(overlay.bytes_processed == 0);
+    CHECK(service.filesystem().getattr("/large.bin").size == contents.size());
+    CHECK(loader->diagnostics().materialize_source_reads == 0);
 
     // Once prepared, the original write is accepted without repeating any
     // source read. Rebuild then rereads/hashes exactly one canonical extent per
@@ -253,13 +256,13 @@ MACHA_TEST("filesystem_fuse", test_loader_materialization_is_resumable_and_byte_
     const uint8_t replacement = static_cast<uint8_t>(contents[17] ^ 0x6d);
     contents[17] = replacement;
     REQUIRE(loader->write(17, {&replacement, 1}) == 1);
-    CHECK(loader->diagnostics().materialize_source_reads == 4);
+    CHECK(loader->diagnostics().materialize_source_reads == 0);
     for (size_t step = 0; step < 4; ++step) {
         const auto preparation = loader->prepare_commit(config.extent_size);
         CHECK(preparation.bytes_processed == config.extent_size);
         CHECK(preparation.ready == (step == 3));
         const auto diagnostics = loader->diagnostics();
-        CHECK(diagnostics.rebuild_source_bytes == (step + 1) * config.extent_size);
+        CHECK(diagnostics.rebuild_source_bytes == config.extent_size + 1);
         CHECK(diagnostics.rebuild_steps == step + 1);
         auto old_reader = service.filesystem().open_read("/large.bin");
         Bytes visible(original.size());
@@ -274,6 +277,94 @@ MACHA_TEST("filesystem_fuse", test_loader_materialization_is_resumable_and_byte_
     Bytes output(contents.size());
     REQUIRE(reader->read(0, output) == output.size());
     CHECK(output == contents);
+}
+
+MACHA_TEST("filesystem_fuse", test_sparse_changed_range_overlay_avoids_whole_file_amplification) {
+    TestService fixture("sparse-changed-range-overlay");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    auto& service = fixture.start();
+
+    service.filesystem().create_file("/changed.bin", 0644, getuid(), getgid());
+    auto expected = pattern(8 * config.extent_size);
+    auto seed = service.filesystem().open_write("/changed.bin", true);
+    REQUIRE(seed->write(0, expected) == expected.size());
+    seed->commit();
+    seed.reset();
+    const auto original = expected;
+
+    auto writer = service.filesystem().open_write(
+        "/changed.bin", false, false, WriteDurability::publication_generation, 0,
+        DataWorkContext(FrameType::loader, config.extent_size));
+    const Bytes first{0xa1, 0xa2, 0xa3};
+    const Bytes overlapping{0xb1, 0xb2, 0xb3};
+    const Bytes distant{0xc1, 0xc2};
+    REQUIRE(writer->write(17, first) == first.size());
+    REQUIRE(writer->write(18, overlapping) == overlapping.size());
+    const uint64_t distant_offset = 5 * config.extent_size + 10;
+    REQUIRE(writer->write(distant_offset, distant) == distant.size());
+    std::copy(first.begin(), first.end(), expected.begin() + 17);
+    std::copy(overlapping.begin(), overlapping.end(), expected.begin() + 18);
+    std::copy(distant.begin(), distant.end(), expected.begin() + distant_offset);
+
+    for (size_t step = 0; step < 8; ++step) {
+        const auto preparation = writer->prepare_commit(config.extent_size);
+        CHECK(preparation.bytes_processed == config.extent_size);
+        CHECK(preparation.ready == (step == 7));
+        auto visible = service.filesystem().open_read("/changed.bin");
+        Bytes bytes(original.size());
+        REQUIRE(visible->read(0, bytes) == bytes.size());
+        CHECK(bytes == original);
+    }
+
+    const auto diagnostics = writer->diagnostics();
+    CHECK(diagnostics.materialize_source_bytes == 0);
+    // Two touched base extents plus six unique overlay bytes. The overlapping
+    // writes are merged and do not cause either base extent to be reread.
+    CHECK(diagnostics.rebuild_source_bytes == 2 * config.extent_size + 6);
+    CHECK(diagnostics.rebuild_reused_extents == 6);
+    CHECK(diagnostics.rebuild_put_extents == 2);
+    writer->commit();
+
+    auto reader = service.filesystem().open_read("/changed.bin");
+    Bytes actual(expected.size());
+    REQUIRE(reader->read(0, actual) == actual.size());
+    CHECK(actual == expected);
+
+    // A direction change after sequential appends must seed a touched extent
+    // from this handle's provisional immutable extent, not from zeros or the
+    // older committed generation.
+    service.filesystem().create_file("/append-then-overwrite.bin", 0644, getuid(), getgid());
+    auto combined = pattern(4 * config.extent_size, 91);
+    auto prefix = service.filesystem().open_write("/append-then-overwrite.bin", true);
+    REQUIRE(prefix->write(0, {combined.data(), 2 * config.extent_size}) ==
+            2 * config.extent_size);
+    prefix->commit();
+    prefix.reset();
+
+    auto direction_change =
+        service.filesystem().open_write("/append-then-overwrite.bin", false);
+    REQUIRE(direction_change->write(2 * config.extent_size,
+                                    {combined.data() + 2 * config.extent_size,
+                                     2 * config.extent_size}) ==
+            2 * config.extent_size);
+    const uint64_t appended_change = 2 * config.extent_size + 11;
+    const uint8_t final_byte = static_cast<uint8_t>(combined[appended_change] ^ 0x7c);
+    combined[appended_change] = final_byte;
+    REQUIRE(direction_change->write(appended_change, {&final_byte, 1}) == 1);
+    direction_change->commit();
+    const auto direction_diagnostics = direction_change->diagnostics();
+    CHECK(direction_diagnostics.materialize_source_bytes == 0);
+    CHECK(direction_diagnostics.rebuild_source_bytes == config.extent_size + 1);
+    CHECK(direction_diagnostics.rebuild_reused_extents == 3);
+    CHECK(direction_diagnostics.rebuild_put_extents == 1);
+    auto direction_reader = service.filesystem().open_read("/append-then-overwrite.bin");
+    Bytes direction_actual(combined.size());
+    REQUIRE(direction_reader->read(0, direction_actual) == direction_actual.size());
+    CHECK(direction_actual == combined);
 }
 
 MACHA_TEST("filesystem_fuse", test_fuse_overwrite_materialization_yields_between_quanta) {
@@ -307,9 +398,13 @@ MACHA_TEST("filesystem_fuse", test_fuse_overwrite_materialization_yields_between
     const auto status = frontend->status();
     CHECK(status.data_publications_completed == 1);
     CHECK(status.data_publication_bytes_read == 1);
-    // Four old extents are materialised and four rebuilt under separate
-    // one-extent grants. WAL replay also yields before extent-aligned rebuild.
-    CHECK(status.data_publication_yields >= 9);
+    CHECK(status.data_publication_completed_spool_bytes_read == 1);
+    CHECK(status.data_publication_completed_source_bytes_read == config.extent_size + 1);
+    CHECK(status.data_publication_completed_reused_extents == 3);
+    CHECK(status.data_publication_completed_put_extents == 1);
+    // WAL replay yields before extent-aligned rebuild. The four rebuild
+    // checkpoints remain bounded, but whole-file materialisation is gone.
+    CHECK(status.data_publication_yields >= 5);
     auto reader = service.filesystem().open_read("/overwrite.bin");
     Bytes output(contents.size());
     REQUIRE(reader->read(0, output) == output.size());
@@ -514,9 +609,9 @@ MACHA_TEST("filesystem_fuse", test_fresh_and_resumed_write_exactness) {
     CHECK(aligned_again_diag.rebuild_put_extents == 0);
     CHECK(read_exact("/aligned.bin", aligned.size()) == aligned);
 
-    // Arbitrary overwrite still uses staging, but unchanged extents are reused
-    // rather than re-put. Change one byte in a four-extent file and assert only
-    // the touched extent is newly stored at rebuild time.
+    // Arbitrary overwrite uses a sparse changed-range overlay. Change one byte
+    // in a four-extent file and assert only the touched base extent is fetched
+    // and newly stored; unchanged extents are reused without source reads.
     auto random_write = pattern(4 * config.extent_size);
     service.filesystem().create_file("/random.bin", 0644, getuid(), getgid());
     auto random_seed = service.filesystem().open_write("/random.bin", true);
@@ -530,8 +625,9 @@ MACHA_TEST("filesystem_fuse", test_fresh_and_resumed_write_exactness) {
     REQUIRE(random_writer->write(changed_offset, {&changed, 1}) == 1);
     random_writer->commit();
     const auto random_diag = random_writer->diagnostics();
-    CHECK(random_diag.temp_open);
-    CHECK(random_diag.materialize_source_reads == 4);
+    CHECK(!random_diag.temp_open);
+    CHECK(random_diag.materialize_source_reads == 0);
+    CHECK(random_diag.rebuild_source_bytes == config.extent_size + 1);
     CHECK(random_diag.rebuild_reused_extents == 3);
     CHECK(random_diag.rebuild_put_extents == 1);
     CHECK(read_exact("/random.bin", random_write.size()) == random_write);
@@ -1025,6 +1121,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_spool_capacity_backpressures_until_publi
     CHECK(pressure.spool_limit_bytes == config.fuse.max_spool_bytes);
     CHECK(pressure.spool_bytes <= pressure.spool_limit_bytes);
     CHECK(pressure.spool_throttle_waits >= 1);
+    CHECK(pressure.spool_pressure_publication_sweeps == 1);
     CHECK(pressure.spool_publish_rate_bytes_per_second > 0);
     CHECK(pressure.spool_publish_rate_window_bytes >= first.size());
     CHECK(pressure.spool_publish_rate_window_ms > 0);
@@ -1035,6 +1132,64 @@ MACHA_TEST("filesystem_fuse", test_fuse_spool_capacity_backpressures_until_publi
     CHECK(std::filesystem::file_size(spool) <= config.fuse.max_spool_bytes);
     frontend->release(handle.inode, true);
     REQUIRE(frontend->wait_for_idle(10s));
+    frontend->stop();
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_spool_threshold_bootstraps_from_partial_publication) {
+    TestService fixture("fuse-spool-progress-bootstrap");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 30s;
+    config.fuse.publication_quantum_bytes = 1024 * 1024;
+    config.fuse.publication_inflight_bytes = 1024 * 1024;
+    config.fuse.publication_pipeline_bytes = 1024 * 1024;
+    config.fuse.max_spool_bytes = 8 * 1024 * 1024;
+    config.fuse.spool_reserve_free = 0;
+
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto first = frontend->create("/large-open.bin", 0600, getuid(), getgid(), true, true,
+                                  false);
+    auto follower = frontend->create("/follower.bin", 0600, getuid(), getgid(), true, true,
+                                     false);
+
+    // Cross the 50% soft threshold before any whole-file retirement can
+    // establish a rate. A seven-quantum open file leaves enough work after the
+    // first drained quantum to demonstrate that admission does not depend on
+    // whole-file retirement. Viewer/loader duty cycling is covered separately;
+    // this regression isolates the spool progress-credit contract.
+    const auto initial = pattern(7 * 1024 * 1024, 61);
+    REQUIRE(frontend->write(first.inode, 0, initial) == initial.size());
+
+    auto admitted = std::async(std::launch::async, [&] {
+        const auto next = pattern(1024 * 1024, 62);
+        return frontend->write(follower.inode, 0, next);
+    });
+    CHECK(admitted.wait_for(20ms) == std::future_status::timeout);
+    REQUIRE(wait_until(
+        [&] {
+            const auto state = frontend->status();
+            return state.data_publication_yields >= 1 &&
+                   state.data_publication_bytes_read >= 1024 * 1024;
+        },
+        10s));
+    REQUIRE(admitted.wait_for(1s) == std::future_status::ready);
+    CHECK(admitted.get() == 1024 * 1024);
+
+    const auto progress = frontend->status();
+    CHECK(progress.spool_bytes <= progress.spool_limit_bytes);
+    CHECK(progress.spool_throttle_waits >= 1);
+    CHECK(progress.spool_pressure_publication_sweeps == 1);
+    CHECK(progress.data_publication_yields >= 1);
+    // Admission was released by drained partial publication, not by the
+    // whole-file retirement rate which is deliberately still unavailable.
+    CHECK(progress.spool_publish_rate_bytes_per_second == 0);
+    CHECK(progress.data_publications_completed == 0);
+
     frontend->stop();
 }
 
@@ -1071,6 +1226,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_spool_stalled_publisher_blocks_without_e
     const auto pressure = frontend->status();
     CHECK(pressure.spool_bytes <= pressure.spool_limit_bytes);
     CHECK(pressure.spool_throttle_waits >= 1);
+    CHECK(pressure.spool_pressure_publication_sweeps == 1);
 
     // Shutdown is a real wake event for blocked admissions. A permanently
     // stalled publisher does not busy-poll and does not manufacture ENOSPC;
@@ -1261,18 +1417,64 @@ MACHA_TEST("filesystem_fuse", test_fuse_open_loaders_use_available_publication_w
     const auto status = frontend->status();
     CHECK(status.data_publications_started == files);
     CHECK(status.data_publications_completed == files);
+    CHECK(status.data_publication_requests == files);
+    CHECK(status.data_publication_notifications_suppressed >= files);
     CHECK(status.data_publication_peak_active >= 2);
     CHECK(status.data_publication_peak_active <= config.fuse.commit_workers);
     CHECK(status.data_publication_coalesced_queued +
               status.data_publication_coalesced_running +
-              status.data_publication_coalesced_unconfirmed >=
-          files);
+              status.data_publication_coalesced_unconfirmed ==
+          0);
     CHECK(status.data_publication_bytes_read == files * payload.size());
     CHECK(status.data_publication_bytes_committed == files * payload.size());
     CHECK(status.data_publication_bytes_confirmed == files * payload.size());
 
     for (const auto& handle : handles)
         frontend->release(handle.inode, true);
+    frontend->stop();
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_publication_notifications_coalesce_to_durable_watermarks) {
+    TestService fixture("fuse-publication-notification-watermarks");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    // Retain the queued owner so this test measures notification and watermark
+    // coalescing rather than publication throughput.
+    config.fuse.suspend_loader_for_tests = true;
+    config.fuse.publication_quiet = 30s;
+
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto handle =
+        frontend->create("/notification-watermark.bin", 0600, getuid(), getgid(), true, true,
+                         false);
+    REQUIRE(frontend->wait_for_idle(5s));
+    service.filesystem().store().foreground_activity(1);
+
+    const auto first = pattern(64 * 1024, 71);
+    REQUIRE(frontend->write(handle.inode, 0, first) == first.size());
+    REQUIRE(wait_until([&] { return frontend->status().durability_writes == 1; }, 5s));
+    frontend->flush(handle.inode);
+    for (size_t i = 0; i < 500; ++i)
+        frontend->flush(handle.inode);
+
+    const auto second = pattern(64 * 1024, 72);
+    REQUIRE(frontend->write(handle.inode, first.size(), second) == second.size());
+    REQUIRE(wait_until([&] { return frontend->status().durability_writes == 2; }, 5s));
+    frontend->flush(handle.inode); // one new durable watermark
+    for (size_t i = 0; i < 500; ++i)
+        frontend->flush(handle.inode);
+
+    const auto status = frontend->status();
+    CHECK(status.data_publication_requests == 2);
+    CHECK(status.data_publication_notifications_suppressed == 1000);
+    CHECK(status.data_publication_coalesced_queued == 1);
+    CHECK(status.data_publication_coalesced_running == 0);
+    CHECK(status.data_publication_coalesced_unconfirmed == 0);
+    CHECK(status.data_publications_started == 0);
+    CHECK(status.pending_data == 1);
     frontend->stop();
 }
 
@@ -1311,6 +1513,81 @@ MACHA_TEST("filesystem_fuse", test_fuse_closed_file_is_selected_ahead_of_open_lo
     CHECK(service.filesystem().getattr("/closed-small.bin").size == small.size());
     CHECK(service.filesystem().getattr("/open-large.bin").size == large.size());
     frontend->release(open_large.inode, true);
+    frontend->stop();
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_spool_pressure_selects_nearest_retirement) {
+    TestService fixture("fuse-pressure-retirement-selection");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quantum_bytes = config.extent_size;
+    config.fuse.publication_inflight_bytes = config.extent_size;
+    config.fuse.publication_pipeline_bytes = config.extent_size;
+    config.fuse.publication_quiet = 500ms;
+    config.fuse.suspend_loader_for_tests = true;
+    config.fuse.max_spool_bytes = 16 * config.extent_size;
+    config.fuse.spool_reserve_free = 0;
+
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto pathological = frontend->create("/open-pathological.bin", 0644, getuid(), getgid(),
+                                         false, true, false);
+    auto closed_large = frontend->create("/closed-large.bin", 0644, getuid(), getgid(), false,
+                                         true, false);
+    auto closed_small = frontend->create("/closed-small.bin", 0644, getuid(), getgid(), false,
+                                         true, false);
+    auto blocked_follower = frontend->create("/blocked-follower.bin", 0644, getuid(), getgid(),
+                                             false, true, false);
+    REQUIRE(frontend->wait_for_idle(10s));
+
+    // Hold publication while the queue is populated in deliberately bad FIFO
+    // order. The three generations fill the spool exactly to its 50% pressure
+    // threshold: an open pathological inode, then a large closed file, then a
+    // much nearer closed retirement.
+    service.filesystem().store().foreground_activity(1);
+    const auto open_bytes = pattern(3 * config.extent_size, 81);
+    const auto large_bytes = pattern(4 * config.extent_size, 82);
+    const auto small_bytes = pattern(config.extent_size, 83);
+    REQUIRE(frontend->write(pathological.inode, 0, open_bytes) == open_bytes.size());
+    REQUIRE(frontend->write(closed_large.inode, 0, large_bytes) == large_bytes.size());
+    REQUIRE(frontend->write(closed_small.inode, 0, small_bytes) == small_bytes.size());
+    REQUIRE(wait_until([&] { return frontend->status().durability_writes == 3; }, 10s));
+
+    frontend->flush(pathological.inode);
+    frontend->release(closed_large.inode, true);
+    frontend->release(closed_small.inode, true);
+
+    // The first byte above the pressure threshold is event-driven
+    // backpressure and asserts the single pressure drain transition. Once the
+    // viewer window expires, the closest closed retirement must run before the
+    // earlier queued large generation and create admission progress.
+    auto admitted = std::async(std::launch::async, [&] {
+        const auto byte = pattern(1, 84);
+        return frontend->write(blocked_follower.inode, 0, byte);
+    });
+    CHECK(admitted.wait_for(100ms) == std::future_status::timeout);
+    REQUIRE(wait_until(
+        [&] {
+            return service.filesystem().getattr("/closed-small.bin").size ==
+                       small_bytes.size() &&
+                   service.filesystem().getattr("/closed-large.bin").size == 0;
+        },
+        10s));
+    REQUIRE(admitted.wait_for(5s) == std::future_status::ready);
+    CHECK(admitted.get() == 1);
+
+    const auto selected = frontend->status();
+    CHECK(selected.spool_pressure_publication_sweeps == 1);
+    CHECK(selected.data_retirement_priority_selections >= 1);
+
+    frontend->release(pathological.inode, true);
+    frontend->release(blocked_follower.inode, true);
+    REQUIRE(frontend->wait_for_idle(30s));
+    CHECK(service.filesystem().getattr("/closed-large.bin").size == large_bytes.size());
     frontend->stop();
 }
 
@@ -1374,6 +1651,47 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_quanta_are_fair_and_byte_bou
     // prefix merely to provide fairness.
     CHECK(status.data_publication_bytes_read == large.size() + small.size());
     CHECK(service.filesystem().getattr("/quantum-large.bin").size == large.size());
+    frontend->stop();
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_retryable_publication_failure_preserves_cursor) {
+    TestService fixture("fuse-publication-transient-cursor");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 1;
+    config.fuse.publication_quiet = 0ms;
+    config.fuse.publication_quantum_bytes = config.extent_size;
+    config.fuse.publication_inflight_bytes = config.extent_size;
+    config.fuse.publication_pipeline_bytes = config.extent_size;
+    config.fuse.fail_publication_once_after_spool_bytes_for_tests = config.extent_size;
+
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto handle = frontend->create("/transient-cursor.bin", 0644, getuid(), getgid(), false,
+                                   true, false);
+    REQUIRE(frontend->wait_for_idle(10s));
+
+    const auto contents = pattern(3 * config.extent_size + 12345, 73);
+    REQUIRE(frontend->write(handle.inode, 0, contents) == contents.size());
+    frontend->release(handle.inode, true);
+    REQUIRE(frontend->wait_for_idle(20s));
+
+    const auto status = frontend->status();
+    CHECK(status.backend_failures == 1);
+    CHECK(status.data_publications_started == 1);
+    CHECK(status.data_publications_completed == 1);
+    // The retry resumes after the injected fault. Discarding the publication
+    // would reread the first extent and increment starts a second time.
+    CHECK(status.data_publication_bytes_read == contents.size());
+    CHECK(status.data_publication_completed_spool_bytes_read == contents.size());
+
+    auto reader = service.filesystem().open_read("/transient-cursor.bin");
+    Bytes output(contents.size());
+    REQUIRE(reader->read(0, output) == output.size());
+    CHECK(output == contents);
     frontend->stop();
 }
 
