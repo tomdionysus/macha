@@ -802,7 +802,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_spool_stalled_publisher_blocks_without_e
     auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
     auto handle = frontend->create("/stalled-spool.bin", 0600, getuid(), getgid(), true, true,
                                    false);
-    frontend->note_interactive_activity();
+    frontend->note_viewer_activity();
     const auto first = pattern(256 * 1024, 51);
     REQUIRE(frontend->write(handle.inode, 0, first) == first.size());
 
@@ -936,7 +936,9 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_yields_to_playback) {
     config.extent_size = 1024 * 1024;
     config.fuse.commit_workers = 1;
     config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 80ms;
+    config.fuse.publication_quiet = 500ms;
+    config.fuse.publication_quantum_bytes = config.extent_size;
+    config.fuse.publication_inflight_bytes = config.extent_size;
 
     auto& service = fixture.start();
     {
@@ -947,20 +949,25 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_yields_to_playback) {
         REQUIRE(inode != 0);
         REQUIRE(frontend->wait_for_idle(5s));
 
-        auto payload = pattern(512 * 1024);
+        auto payload = pattern(8 * config.extent_size);
         REQUIRE(frontend->write(inode, 0, payload) == payload.size());
-
-        // Playback demand is recorded before its storage read begins.  Bytes
-        // already accepted by FUSE stay in the local spool, while distributed
-        // publication waits for the viewer-critical quiet window to expire.
-        service.filesystem().store().foreground_activity(1);
         frontend->release(inode, true);
-        std::this_thread::sleep_for(20ms);
-        auto during = frontend->status();
+        REQUIRE(wait_until([&] { return frontend->status().data_publication_yields >= 1; }, 5s));
+
+        // This is the public hook used by the real FUSE adapter before open/read,
+        // not a direct test-only mutation of DistributedStore's clock. The
+        // already-running bounded quantum may finish, then the resumable cursor
+        // must remain parked for the rest of the viewer quiet window.
+        frontend->note_viewer_activity(1);
+        REQUIRE(wait_until([&] { return frontend->status().active_data == 0; }, 2s));
+        const auto paused_quanta = frontend->status().data_publication_quanta;
+        std::this_thread::sleep_for(100ms);
+        const auto during = frontend->status();
+        CHECK(during.data_publication_quanta == paused_quanta);
         CHECK(during.pending_data + during.active_data >= 1);
         CHECK(service.filesystem().getattr("/playback-yield.bin").size == 0);
 
-        REQUIRE(frontend->wait_for_idle(5s));
+        REQUIRE(frontend->wait_for_idle(10s));
         CHECK(service.filesystem().getattr("/playback-yield.bin").size == payload.size());
     }
 }

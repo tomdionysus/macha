@@ -57,10 +57,17 @@ time out (`test_catalogue_uses_final_state_after_coalesced_metadata_burst`). It
 then passed alone in 883 ms and passed in the complete four-slot run in 799 ms.
 This is recorded rather than describing that earlier run as green.
 
-## Remaining checkpoint
+## Three-node UAT result
 
-Run the mixed Phase 1A/1B three-node UAT with loader traffic and a viewer probe.
-Confirm loader RPC priority, bounded ping/viewer latency, multiple independent
-publishers when the byte budget permits it, fair progress for smaller/closed
-files, no useful-byte amplification, and peak admitted bytes at or below the
-configured limit. Phase 1B remains active until that UAT is recorded.
+The 2026-08-31 mixed Phase 1A/1B UAT passed loader classification, fair quantum,
+byte-bound, useful-work, cluster-health and control-queue checks, but failed the
+real viewer-pre-emption check. The FUSE adapter records actual reads on the
+interactive activity clock while publication watches the foreground clock. The
+local deterministic test called the latter directly and therefore missed the
+adapter mismatch. Phase 1B remains active. Full observations are in
+[2026-08-31-fuse-publication-phase-1ab-uat.md](2026-08-31-fuse-publication-phase-1ab-uat.md).
+
+The mismatch has since been corrected locally and the regression now enters
+through the public hook used by the adapter after publication is already in
+progress. FUSE 48/48, runtime 3/3, and the complete 215/215 suite pass. A repeat
+live viewer probe remains necessary before closing Phase 1B.

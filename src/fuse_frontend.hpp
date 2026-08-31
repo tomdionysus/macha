@@ -291,7 +291,9 @@ class FuseFrontend final : public HydrationHintProvider {
     void release(uint64_t inode, bool writable);
 
     std::pair<uint64_t, uint64_t> logical_capacity() const;
-    void note_interactive_activity(uint64_t bytes = 0);
+    // Called by the kernel adapter before viewer-critical open/read callbacks.
+    // This must drive the same foreground clock used to gate loader publication.
+    void note_viewer_activity(uint64_t bytes = 0);
     std::string path_for_inode(uint64_t inode) const;
     std::optional<uint64_t> inode_for_path(std::string_view path);
     std::vector<FuseDirtyRange> dirty_ranges(uint64_t inode) const;
