@@ -85,9 +85,18 @@ Reports enablement, current session/transcode counts, media-engine backend/versi
 ```text
 POST /api/v1/playback/sessions
 Content-Type: application/json
+Idempotency-Key: <client-generated logical request key>
 ```
 
 Use either `item_id` or `media_id`. `item_id` allows the resolver to choose among every media representation attached to the catalogue item. `path:/logical/file` is also accepted as a media identity.
+
+Clients should generate one opaque `Idempotency-Key` for each logical creation
+attempt and reuse it after a timeout, disconnect or failover. The same key and
+normalized request joins or replays the same session ID, capability and
+`generation`; using that key for different request semantics returns
+`409 idempotency_conflict`. The response echoes `Idempotency-Key` and reports
+`X-Macha-Idempotency: created|replayed`. Omitting the header preserves the
+legacy non-idempotent behaviour.
 
 Minimal request:
 

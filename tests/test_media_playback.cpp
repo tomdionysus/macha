@@ -7,6 +7,47 @@ using namespace macha::test_support;
 
 namespace {
 
+class CoalescingProbeMediaEngine final : public MediaEngine {
+    TestGate& gate_;
+    std::atomic_uint probes_{};
+  public:
+    explicit CoalescingProbeMediaEngine(TestGate& gate) : gate_(gate) {}
+    MediaEngineStatus status() const override {
+        return {true, "fake", "coalescing-probe", true, true};
+    }
+    MediaProbeResult probe(const MediaSource&, std::chrono::milliseconds = {}) override {
+        ++probes_;
+        gate_.enter_and_wait();
+        MediaProbeResult result;
+        result.format = "mov,mp4,m4a,3gp,3g2,mj2";
+        result.duration_seconds = 60.0;
+        result.bitrate = 4'000'000;
+        result.streams.push_back(MediaStreamInfo{
+            0, MediaStreamType::video, "h264", "High", "", 1920, 1080,
+            0, 0, 8, true, false, 3'700'000, false});
+        result.streams.push_back(MediaStreamInfo{
+            1, MediaStreamType::audio, "aac", "LC", "eng", 0, 0,
+            2, 48000, 0, true, false, 192'000, false});
+        return result;
+    }
+    HlsVodPlan prepare_hls_vod(const MediaSource&, const PlaybackPlan&, double,
+                               std::chrono::milliseconds, bool,
+                               std::chrono::milliseconds = {}) override {
+        throw std::runtime_error("direct test must not prepare HLS");
+    }
+    std::unique_ptr<MediaEngineSession> start_hls(
+        const MediaSource&, const HlsVodPlan&, std::chrono::milliseconds, size_t, uint64_t,
+        const std::filesystem::path&) override {
+        throw std::runtime_error("direct test must not start HLS");
+    }
+    std::string extract_webvtt_segment(
+        const MediaSource&, int, std::chrono::milliseconds, std::chrono::milliseconds,
+        std::chrono::milliseconds) override {
+        throw std::runtime_error("direct test must not extract subtitles");
+    }
+    unsigned probes() const { return probes_.load(); }
+};
+
 MACHA_TEST("media_playback", test_media_segment_store_backpressure_and_spill) {
     TempDir t;
     auto store = std::make_shared<MediaSegmentStore>(2, 2 * 1024, t.path() / "spill", 4000ms,
@@ -290,6 +331,207 @@ MACHA_TEST("media_playback", test_playback_probe_failure_is_stage_specific) {
     REQUIRE(response.headers.contains("X-Macha-Playback-Trace"));
     REQUIRE(response.headers.contains("X-Macha-Playback-Stage"));
     CHECK(response.headers.at("X-Macha-Playback-Stage") == "probe");
+
+    playback.stop();
+    service.stop();
+}
+
+MACHA_TEST("media_playback", test_immutable_media_profile_survives_cold_playback_manager) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/profile.mp4", 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write("/media/profile.mp4", true);
+    auto bytes = pattern(128 * 1024 + 37);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    const auto first_media_id = file_media_id(service.filesystem().getattr("/media/profile.mp4"));
+
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback";
+
+    auto request_for = [](const std::string& media_id) {
+        Json::Object preferences{{"mode", "direct"}};
+        Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
+        auto text = Json(std::move(root)).dump();
+        HttpRequest request;
+        request.method = "POST";
+        request.path = "/api/v1/playback/sessions";
+        request.headers["idempotency-key"] = media_id;
+        request.body.assign(text.begin(), text.end());
+        return request;
+    };
+
+    Json first_body;
+    std::string first_session_id;
+    {
+        auto engine = std::make_unique<FakeMediaEngine>();
+        auto* observed = engine.get();
+        PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                                 std::move(engine));
+        playback.start();
+        auto created = playback.handle(request_for(first_media_id));
+        REQUIRE(created.status == 201);
+        CHECK(observed->probes() == 1);
+        first_body = Json::parse(std::string(created.body.begin(), created.body.end()));
+        first_session_id = first_body.find("session_id")->asString();
+        CHECK(created.headers.at("X-Macha-Idempotency") == "created");
+        playback.stop();
+    }
+    REQUIRE(service.catalogue().media_profile(first_media_id).has_value());
+    {
+        CatalogueApi catalogue_api(service.catalogue(), service.catalogue_hints());
+        HttpRequest profile_request;
+        profile_request.method = "GET";
+        profile_request.path = "/api/v1/catalogue/media/" + first_media_id + "/profile";
+        auto response = catalogue_api.handle(profile_request);
+        REQUIRE(response.status == 200);
+        CHECK(response.headers.at("Cache-Control").find("immutable") != std::string::npos);
+        auto profile = Json::parse(std::string(response.body.begin(), response.body.end()));
+        CHECK(profile.find("media_id")->asString() == first_media_id);
+        CHECK(profile.find("format")->asString() == "mov,mp4,m4a,3gp,3g2,mj2");
+        CHECK(profile.find("duration_ms")->asUInt64() == 60'000);
+        REQUIRE(profile.find("streams")->asArray().size() == 4);
+    }
+
+    // A distinct manager has an empty process-local cache. It must construct
+    // the identical response semantics without invoking its media engine's
+    // probe path (and therefore without opening the media source for probing).
+    {
+        auto engine = std::make_unique<FakeMediaEngine>();
+        auto* observed = engine.get();
+        PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                                 std::move(engine));
+        playback.start();
+        auto created = playback.handle(request_for(first_media_id));
+        REQUIRE(created.status == 201);
+        CHECK(observed->probes() == 0);
+        auto cached_body = Json::parse(std::string(created.body.begin(), created.body.end()));
+        CHECK(cached_body.find("session_id")->asString() == first_session_id);
+        CHECK(cached_body.find("generation")->dump() ==
+              first_body.find("generation")->dump());
+        for (const auto* field : {"mode", "media_id", "duration_ms", "preferences",
+                                  "selection", "source", "output", "options"}) {
+            REQUIRE(first_body.find(field) != nullptr);
+            REQUIRE(cached_body.find(field) != nullptr);
+            CHECK(first_body.find(field)->dump() == cached_body.find(field)->dump());
+        }
+        playback.stop();
+    }
+
+    // Replacing the path changes its immutable extent-manifest identity. The
+    // old profile remains valid for the old object but cannot hit the new one.
+    auto replacement = pattern(128 * 1024 + 41);
+    for (auto& byte : replacement) byte ^= 0x5a;
+    auto replacement_writer = service.filesystem().open_write("/media/profile.mp4", true);
+    REQUIRE(replacement_writer->write(0, replacement) == replacement.size());
+    replacement_writer->commit();
+    const auto second_media_id = file_media_id(service.filesystem().getattr("/media/profile.mp4"));
+    REQUIRE(second_media_id != first_media_id);
+    {
+        auto engine = std::make_unique<FakeMediaEngine>();
+        auto* observed = engine.get();
+        PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                                 std::move(engine));
+        playback.start();
+        auto created = playback.handle(request_for(second_media_id));
+        REQUIRE(created.status == 201);
+        CHECK(observed->probes() == 1);
+        playback.stop();
+    }
+
+    service.stop();
+}
+
+MACHA_TEST("media_playback", test_concurrent_immutable_profile_misses_coalesce) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/coalesce.mp4", 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write("/media/coalesce.mp4", true);
+    auto bytes = pattern(64 * 1024 + 19);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto media_id = file_media_id(service.filesystem().getattr("/media/coalesce.mp4"));
+
+    TestGate gate;
+    auto engine = std::make_unique<CoalescingProbeMediaEngine>(gate);
+    auto* observed = engine.get();
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback";
+    streaming.probe_timeout = 2s;
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             std::move(engine));
+    playback.start();
+
+    Json::Object preferences{{"mode", "direct"}};
+    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
+    auto text = Json(std::move(root)).dump();
+    HttpRequest request;
+    request.method = "POST";
+    request.path = "/api/v1/playback/sessions";
+    request.headers["idempotency-key"] = "coalesced-create-1";
+    request.body.assign(text.begin(), text.end());
+    HttpResponse first, second;
+    std::jthread a([&] { first = playback.handle(request); });
+    REQUIRE(gate.wait_for_entries(1));
+    std::jthread b([&] { second = playback.handle(request); });
+    std::this_thread::sleep_for(50ms);
+    CHECK(gate.entered() == 1);
+    CHECK(observed->probes() == 1);
+    gate.open();
+    a.join();
+    b.join();
+    CHECK(first.status == 201);
+    CHECK(second.status == 201);
+    CHECK(observed->probes() == 1);
+    auto first_json = Json::parse(std::string(first.body.begin(), first.body.end()));
+    auto second_json = Json::parse(std::string(second.body.begin(), second.body.end()));
+    CHECK(first_json.find("session_id")->dump() == second_json.find("session_id")->dump());
+    CHECK(first_json.find("generation")->dump() == second_json.find("generation")->dump());
+    CHECK(first.headers.at("X-Macha-Idempotency") == "created");
+    CHECK(second.headers.at("X-Macha-Idempotency") == "replayed");
+
+    auto replay = playback.handle(request);
+    REQUIRE(replay.status == 201);
+    CHECK(replay.headers.at("X-Macha-Idempotency") == "replayed");
+    auto replay_json = Json::parse(std::string(replay.body.begin(), replay.body.end()));
+    CHECK(replay_json.find("session_id")->dump() == first_json.find("session_id")->dump());
+    CHECK(observed->probes() == 1);
+
+    Json::Object changed_preferences{{"mode", "direct"}};
+    Json::Object changed_root{{"media_id", media_id},
+                              {"seek_ms", 1000},
+                              {"preferences", Json(std::move(changed_preferences))}};
+    auto changed_text = Json(std::move(changed_root)).dump();
+    auto conflicting = request;
+    conflicting.body.assign(changed_text.begin(), changed_text.end());
+    auto conflict = playback.handle(conflicting);
+    REQUIRE(conflict.status == 409);
+    const std::string conflict_body(conflict.body.begin(), conflict.body.end());
+    CHECK(conflict_body.find("idempotency_conflict") != std::string::npos);
+    REQUIRE(service.catalogue().media_profile(media_id).has_value());
 
     playback.stop();
     service.stop();

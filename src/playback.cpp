@@ -543,13 +543,21 @@ struct PlaybackManager::Impl {
     FileSystem& fs;
     CatalogueManager& catalogue;
     StreamingConfig config;
-    std::unique_ptr<MediaEngine> engine;
+    std::shared_ptr<MediaEngine> engine;
     std::jthread cleanup_thread;
     mutable std::mutex mutex;
     std::condition_variable_any cleanup_cv;
     uint64_t cleanup_revision{};
     std::map<std::string, std::shared_ptr<Session>, std::less<>> sessions;
     std::map<std::string, MediaProbeResult, std::less<>> probe_cache;
+    struct ProbeFlight {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool complete{};
+        std::optional<MediaProbeResult> result;
+        std::exception_ptr error;
+    };
+    std::map<std::string, std::shared_ptr<ProbeFlight>, std::less<>> probe_flights;
     std::map<std::string, HlsVodPlan, std::less<>> vod_plan_cache;
     std::deque<std::string> vod_plan_cache_order;
     static constexpr size_t max_vod_plan_cache_entries = 64;
@@ -560,9 +568,18 @@ struct PlaybackManager::Impl {
     size_t reserved_video_transcodes{};
     size_t reserved_audio_transcodes{};
     bool started{};
+    struct IdempotentCreation {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::string fingerprint;
+        bool complete{};
+        std::weak_ptr<Session> session;
+        std::exception_ptr error;
+    };
+    std::map<std::string, std::shared_ptr<IdempotentCreation>, std::less<>> idempotent_creations;
 
     Impl(FileSystem& filesystem, CatalogueManager& cat, CatalogueApiConfig api,
-         StreamingConfig streaming, std::unique_ptr<MediaEngine> media_engine)
+         StreamingConfig streaming, std::shared_ptr<MediaEngine> media_engine)
         : fs(filesystem), catalogue(cat), config(std::move(streaming)),
           engine(media_engine ? std::move(media_engine) :
                 (config.enabled ? make_libav_media_engine(config) : nullptr)) {
@@ -571,6 +588,63 @@ struct PlaybackManager::Impl {
 
     std::string public_stream_prefix(const Session& session) const {
         return "/api/v1/playback/stream/" + session.id + "/" + session.token;
+    }
+
+    std::pair<std::string, std::string> deterministic_session_credentials(
+        std::string_view request_key, std::string_view fingerprint) const {
+        auto derive = [&](std::string_view domain) {
+            std::string material(domain);
+            material.push_back('\0');
+            material.append(request_key);
+            material.push_back('\0');
+            material.append(fingerprint);
+            return hmac_sha256(catalogue.cluster_keys().auth,
+                               {reinterpret_cast<const uint8_t*>(material.data()), material.size()});
+        };
+        const auto id = derive("macha-playback-session-id-v1");
+        const auto token = derive("macha-playback-session-token-v1");
+        return {hex(std::span<const uint8_t>(id).first(16)), hex(token)};
+    }
+
+    std::string creation_fingerprint(
+        std::string_view item_id, std::string_view media_id,
+        const ClientCapabilities& caps, const PlaybackPreferences& prefs,
+        const std::optional<int64_t>& seek_ms) const {
+        std::ostringstream canonical;
+        canonical << "v1|item=" << item_id << "|media=" << media_id << "|containers=";
+        for (const auto& value : caps.containers) canonical << value << ',';
+        canonical << "|video=";
+        for (const auto& value : caps.video_codecs) canonical << value << ',';
+        canonical << "|audio=";
+        for (const auto& value : caps.audio_codecs) canonical << value << ',';
+        canonical << "|hls=" << caps.hls_fmp4
+                  << "|cw=" << caps.max_width.value_or(-1)
+                  << "|ch=" << caps.max_height.value_or(-1)
+                  << "|mode=" << prefs.mode
+                  << "|ph=" << prefs.max_height.value_or(-1)
+                  << "|pb=" << prefs.max_bitrate.value_or(0)
+                  << "|pa=" << prefs.audio_stream.value_or(-1)
+                  << "|ps=" << prefs.subtitle_stream.value_or(-1)
+                  << "|pal=" << prefs.audio_language
+                  << "|psl=" << prefs.subtitle_language
+                  << "|seek=" << seek_ms.value_or(0);
+        const auto text = canonical.str();
+        return to_string(sha256({reinterpret_cast<const uint8_t*>(text.data()), text.size()}));
+    }
+
+    HttpResponse creation_response(const Session& session, std::string trace,
+                                   std::string_view idempotency_key = {},
+                                   std::string_view idempotency_status = {}) const {
+        auto payload = session_json(session);
+        payload["trace_id"] = trace;
+        auto response = http_json(201, payload.dump());
+        response.headers["Location"] = "/api/v1/playback/sessions/" + session.id;
+        response.headers["X-Macha-Playback-Trace"] = std::move(trace);
+        if (!idempotency_key.empty()) {
+            response.headers["Idempotency-Key"] = std::string(idempotency_key);
+            response.headers["X-Macha-Idempotency"] = std::string(idempotency_status);
+        }
+        return response;
     }
 
     bool plan_supported(const PlaybackPlan& plan) const {
@@ -619,6 +693,7 @@ struct PlaybackManager::Impl {
     MediaProbeResult probe_source(const SourceLease& lease, std::string_view trace,
                                   Clock::time_point resolve_deadline) {
         auto key = probe_key(lease);
+        const auto lookup_started = Clock::now();
         {
             std::lock_guard lock(mutex);
             if (auto it = probe_cache.find(key); it != probe_cache.end()) {
@@ -626,9 +701,111 @@ struct PlaybackManager::Impl {
                 return it->second;
             }
         }
+        if (lease.media_id.starts_with("macha:")) {
+            try {
+                auto resolved = catalogue.resolve_media_profile(
+                    lease.media_id, resolve_deadline, [&] {
+                        auto started_at = Clock::now();
+                        if (started_at >= resolve_deadline)
+                            throw PlaybackStageError(
+                                std::string(trace), "probe",
+                                "media inspection deadline exhausted before probing candidate");
+                        auto remaining = std::max(
+                            std::chrono::milliseconds(1),
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                resolve_deadline - started_at));
+                        Log::debug("playback[" + std::string(trace) + "] probe start media=" +
+                                   lease.media_id + " path=" + lease.path + " bytes=" +
+                                   std::to_string(lease.entry.size) + " deadline_ms=" +
+                                   std::to_string(remaining.count()));
+                        MediaProbeResult result;
+                        try {
+                            result = engine->probe(media_source(lease), remaining);
+                        } catch (const PlaybackStageError&) {
+                            throw;
+                        } catch (const std::exception& e) {
+                            throw PlaybackStageError(std::string(trace), "probe", e.what());
+                        }
+                        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            Clock::now() - started_at).count();
+                        Log::info("playback[" + std::string(trace) + "] probe complete media=" +
+                                  lease.media_id + " elapsed_ms=" + std::to_string(elapsed) +
+                                  " format=" + result.format + " streams=" +
+                                  std::to_string(result.streams.size()));
+                        return result;
+                    });
+                {
+                    std::lock_guard lock(mutex);
+                    probe_cache[key] = resolved.probe;
+                }
+                const auto lookup_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now() - lookup_started).count();
+                if (!resolved.generated) {
+                    Log::info("playback[" + std::string(trace) + "] immutable profile " +
+                              std::string(resolved.coalesced ? "coalesced" : "hit") +
+                              " media=" + lease.media_id + " lookup_ms=" +
+                              std::to_string(lookup_elapsed));
+                } else {
+                    try {
+                        catalogue.put_media_profile(lease.media_id, resolved.probe);
+                    } catch (const std::exception& e) {
+                        Log::warn("playback[" + std::string(trace) +
+                                  "] immutable profile publication failed media=" + lease.media_id +
+                                  " error=" + e.what());
+                    }
+                }
+                return resolved.probe;
+            } catch (const PlaybackStageError&) {
+                throw;
+            } catch (const std::exception& e) {
+                throw PlaybackStageError(std::string(trace), "probe", e.what());
+            }
+        }
+
+        std::shared_ptr<ProbeFlight> flight;
+        bool owner = false;
+        {
+            std::lock_guard lock(mutex);
+            if (auto it = probe_cache.find(key); it != probe_cache.end()) return it->second;
+            auto [it, inserted] = probe_flights.try_emplace(key, std::make_shared<ProbeFlight>());
+            flight = it->second;
+            owner = inserted;
+        }
+        if (!owner) {
+            const auto wait_started = Clock::now();
+            std::unique_lock flight_lock(flight->mutex);
+            if (!flight->cv.wait_until(flight_lock, resolve_deadline,
+                                       [&] { return flight->complete; }))
+                throw PlaybackStageError(std::string(trace), "probe",
+                                         "timed out waiting for concurrent media inspection");
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                Clock::now() - wait_started).count();
+            Log::info("playback[" + std::string(trace) + "] probe coalesced media=" +
+                      lease.media_id + " wait_ms=" + std::to_string(elapsed));
+            if (flight->error) std::rethrow_exception(flight->error);
+            return *flight->result;
+        }
+
+        auto complete_flight = [&](std::optional<MediaProbeResult> result,
+                                   std::exception_ptr error = {}) {
+            {
+                std::lock_guard flight_lock(flight->mutex);
+                flight->result = std::move(result);
+                flight->error = error;
+                flight->complete = true;
+            }
+            flight->cv.notify_all();
+            std::lock_guard lock(mutex);
+            auto it = probe_flights.find(key);
+            if (it != probe_flights.end() && it->second == flight) probe_flights.erase(it);
+        };
         auto started_at = Clock::now();
-        if (started_at >= resolve_deadline)
-            throw std::runtime_error("media inspection deadline exhausted before probing candidate");
+        if (started_at >= resolve_deadline) {
+            auto error = std::make_exception_ptr(PlaybackStageError(
+                std::string(trace), "probe", "media inspection deadline exhausted before probing candidate"));
+            complete_flight({}, error);
+            std::rethrow_exception(error);
+        }
         auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(resolve_deadline - started_at);
         remaining = std::max(std::chrono::milliseconds(1), remaining);
         Log::debug("playback[" + std::string(trace) + "] probe start media=" + lease.media_id +
@@ -638,9 +815,12 @@ struct PlaybackManager::Impl {
         try {
             probed = engine->probe(media_source(lease), remaining);
         } catch (const PlaybackStageError&) {
+            complete_flight({}, std::current_exception());
             throw;
         } catch (const std::exception& e) {
-            throw PlaybackStageError(std::string(trace), "probe", e.what());
+            auto error = std::make_exception_ptr(PlaybackStageError(std::string(trace), "probe", e.what()));
+            complete_flight({}, error);
+            std::rethrow_exception(error);
         }
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started_at).count();
         Log::info("playback[" + std::string(trace) + "] probe complete media=" + lease.media_id +
@@ -648,8 +828,9 @@ struct PlaybackManager::Impl {
                   " streams=" + std::to_string(probed.streams.size()));
         {
             std::lock_guard lock(mutex);
-            probe_cache[std::move(key)] = probed;
+            probe_cache[key] = probed;
         }
+        complete_flight(probed);
         return probed;
     }
 
@@ -876,12 +1057,21 @@ struct PlaybackManager::Impl {
         for (const auto& media_id : media_ids) {
             try {
                 auto lease = create_source(media_id);
+                const auto profile_started = Clock::now();
                 auto probe = probe_source(lease, trace, resolve_deadline);
+                const auto profile_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now() - profile_started).count();
+                const auto selection_started = Clock::now();
                 auto plan = negotiate(probe, lease.path, capabilities, preferences);
                 require_plan_supported(plan);
+                const auto selection_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now() - selection_started).count();
                 int rank = plan.mode == PlaybackMode::direct ? 0 : (plan.mode == PlaybackMode::remux ? 1 : 2);
-                Log::debug("playback[" + std::string(trace) + "] candidate media=" + media_id +
-                           " mode=" + playback_mode_name(plan.mode) + " rank=" + std::to_string(rank));
+                Log::info("playback[" + std::string(trace) + "] admission candidate media=" +
+                          media_id + " mode=" + playback_mode_name(plan.mode) +
+                          " rank=" + std::to_string(rank) +
+                          " metadata_ms=" + std::to_string(profile_ms) +
+                          " selection_ms=" + std::to_string(selection_ms));
                 if (!best || rank < best->rank) best = Candidate{std::move(lease), std::move(probe), plan, rank};
                 if (rank == 0) break;
             } catch (const std::exception& e) {
@@ -1080,6 +1270,7 @@ struct PlaybackManager::Impl {
                             {"mime_type", mime_type},
                             {"subtitle_url", session.subtitle_url.empty() ? Json(nullptr) : Json(session.subtitle_url)}};
         Json::Object out{{"session_id", session.id},
+                         {"generation", session.generation},
                          {"media_id", session.source.media_id},
                          {"mode", playback_mode_name(session.plan.mode)},
                          {"duration_ms", static_cast<uint64_t>(std::max(0.0, session.probe.duration_seconds) * 1000.0)},
@@ -1335,11 +1526,77 @@ struct PlaybackManager::Impl {
             if (!seek_ms) return http_error(400, "bad_seek", "seek_ms must be non-negative");
         }
         auto media = media_id.empty() ? item_media(item_id) : std::vector<std::string>{media_id};
+        std::string idempotency_key;
+        if (auto it = request.headers.find("idempotency-key"); it != request.headers.end())
+            idempotency_key = it->second;
+        else if (auto it = request.headers.find("Idempotency-Key"); it != request.headers.end())
+            idempotency_key = it->second;
+        if (idempotency_key.size() > 256 ||
+            std::any_of(idempotency_key.begin(), idempotency_key.end(), [](unsigned char c) {
+                return c < 0x21 || c > 0x7e;
+            }))
+            return http_error(400, "bad_idempotency_key",
+                              "Idempotency-Key must be 1..256 visible ASCII characters");
+
+        std::string fingerprint;
+        std::shared_ptr<IdempotentCreation> idempotent;
+        bool idempotent_owner = false;
+        if (!idempotency_key.empty()) {
+            fingerprint = creation_fingerprint(item_id, media_id, caps, prefs, seek_ms);
+            {
+                std::lock_guard lock(mutex);
+                auto it = idempotent_creations.find(idempotency_key);
+                if (it != idempotent_creations.end() &&
+                    it->second->fingerprint != fingerprint)
+                    return http_error(409, "idempotency_conflict",
+                                      "Idempotency-Key was already used for a different playback request");
+                if (it == idempotent_creations.end()) {
+                    idempotent = std::make_shared<IdempotentCreation>();
+                    idempotent->fingerprint = fingerprint;
+                    idempotent_creations.emplace(idempotency_key, idempotent);
+                    idempotent_owner = true;
+                } else {
+                    idempotent = it->second;
+                }
+            }
+            if (!idempotent_owner) {
+                std::unique_lock lock(idempotent->mutex);
+                if (!idempotent->complete) {
+                    const auto deadline = Clock::now() + config.probe_timeout + config.startup_timeout;
+                    if (!idempotent->cv.wait_until(lock, deadline,
+                                                   [&] { return idempotent->complete; }))
+                        return http_error(503, "idempotency_in_progress",
+                                          "matching session creation is still in progress");
+                }
+                if (idempotent->error) std::rethrow_exception(idempotent->error);
+                auto existing = idempotent->session.lock();
+                if (!existing)
+                    return http_error(409, "idempotency_expired",
+                                      "the prior playback session has expired");
+                {
+                    std::lock_guard sessions_lock(mutex);
+                    auto active = sessions.find(existing->id);
+                    if (active == sessions.end() || active->second != existing)
+                        return http_error(409, "idempotency_expired",
+                                          "the prior playback session has expired");
+                    existing->touched = Clock::now();
+                    signal_cleanup_locked();
+                }
+                return creation_response(*existing, trace, idempotency_key, "replayed");
+            }
+        }
         reserve_session_slot();
         bool resources_reserved = false;
         std::shared_ptr<Session> session;
         try {
-            session = resolve_session(item_id, std::move(media), std::move(caps), std::move(prefs), trace);
+            std::string deterministic_id, deterministic_token;
+            if (idempotent) {
+                auto credentials = deterministic_session_credentials(idempotency_key, fingerprint);
+                deterministic_id = std::move(credentials.first);
+                deterministic_token = std::move(credentials.second);
+            }
+            session = resolve_session(item_id, std::move(media), std::move(caps), std::move(prefs), trace,
+                                      std::move(deterministic_id), std::move(deterministic_token));
             if (seek_ms) session->plan.seek = std::chrono::milliseconds(*seek_ms);
             prepare_transformed_vod(*session, trace);
             reserve_resources(session->plan);
@@ -1354,20 +1611,37 @@ struct PlaybackManager::Impl {
                 resources_reserved = false;
             }
         } catch (...) {
+            auto error = std::current_exception();
             if (session) stop_pipeline(*session);
             if (resources_reserved && session) release_resources(session->plan);
             release_session_slot();
-            throw;
+            if (idempotent) {
+                {
+                    std::lock_guard lock(idempotent->mutex);
+                    idempotent->error = error;
+                    idempotent->complete = true;
+                }
+                idempotent->cv.notify_all();
+                std::lock_guard lock(mutex);
+                auto it = idempotent_creations.find(idempotency_key);
+                if (it != idempotent_creations.end() && it->second == idempotent)
+                    idempotent_creations.erase(it);
+            }
+            std::rethrow_exception(error);
+        }
+        if (idempotent) {
+            {
+                std::lock_guard lock(idempotent->mutex);
+                idempotent->session = session;
+                idempotent->complete = true;
+            }
+            idempotent->cv.notify_all();
         }
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - request_started).count();
         Log::info("playback[" + trace + "] session create complete id=" + session->id +
                   " mode=" + playback_mode_name(session->plan.mode) + " elapsed_ms=" + std::to_string(elapsed));
-        auto payload = session_json(*session);
-        payload["trace_id"] = trace;
-        auto response = http_json(201, payload.dump());
-        response.headers["Location"] = "/api/v1/playback/sessions/" + session->id;
-        response.headers["X-Macha-Playback-Trace"] = trace;
-        return response;
+        return creation_response(*session, trace, idempotency_key,
+                                 idempotent ? "created" : "");
     }
 
     HttpResponse get_session(std::string_view id) {
@@ -1598,8 +1872,9 @@ struct PlaybackManager::Impl {
 };
 
 PlaybackManager::PlaybackManager(FileSystem& fs, CatalogueManager& catalogue, CatalogueApiConfig api,
-                                 StreamingConfig streaming, std::unique_ptr<MediaEngine> engine)
-    : impl_(std::make_unique<Impl>(fs, catalogue, std::move(api), std::move(streaming), std::move(engine))) {}
+                                 StreamingConfig streaming, std::shared_ptr<MediaEngine> engine)
+    : impl_(std::make_unique<Impl>(fs, catalogue, std::move(api), std::move(streaming),
+                                  std::move(engine))) {}
 
 PlaybackManager::~PlaybackManager() { stop(); }
 

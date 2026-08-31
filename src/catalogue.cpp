@@ -6,6 +6,7 @@
 #include "log.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <limits>
 #include <cctype>
 #include <cmath>
@@ -13,7 +14,8 @@
 
 namespace macha {
 namespace {
-constexpr std::array<uint8_t, 8> magic{'M', 'C', 'A', 'T', '0', '0', '1', '8'};
+constexpr std::array<uint8_t, 8> legacy_magic{'M', 'C', 'A', 'T', '0', '0', '1', '8'};
+constexpr std::array<uint8_t, 8> magic{'M', 'C', 'A', 'T', '0', '0', '2', '1'};
 constexpr std::array<uint8_t, 8> manifest_magic{'M', 'C', 'R', 'O', 'O', 'T', '1', '8'};
 constexpr size_t catalogue_shard_count = 64;
 
@@ -165,6 +167,8 @@ shard_catalogue(const CatalogueSnapshot& snapshot) {
     std::array<CatalogueSnapshot, catalogue_shard_count> shards;
     for (const auto& [id, item] : snapshot.items)
         shards[catalogue_shard(id)].items.emplace(id, item);
+    for (const auto& [id, profile] : snapshot.media_profiles)
+        shards[catalogue_shard(id)].media_profiles.emplace(id, profile);
     return shards;
 }
 
@@ -173,7 +177,85 @@ bool valid_kind(uint8_t value) {
            value <= static_cast<uint8_t>(CatalogueKind::track);
 }
 
+bool valid_stream_type(uint8_t value) {
+    return value <= static_cast<uint8_t>(MediaStreamType::other);
+}
+
+void encode_media_profile(Writer& w, const CatalogueSnapshot::MediaProfile& profile) {
+    w.u32(profile.schema_version);
+    w.u8(profile.complete);
+    w.string(profile.probe.format);
+    w.u64(std::bit_cast<uint64_t>(profile.probe.duration_seconds));
+    w.u64(profile.probe.bitrate);
+    w.u32(profile.probe.streams.size());
+    for (const auto& stream : profile.probe.streams) {
+        w.u32(static_cast<uint32_t>(stream.index));
+        w.u8(static_cast<uint8_t>(stream.type));
+        w.string(stream.codec);
+        w.string(stream.profile);
+        w.string(stream.language);
+        w.u32(static_cast<uint32_t>(stream.width));
+        w.u32(static_cast<uint32_t>(stream.height));
+        w.u32(static_cast<uint32_t>(stream.channels));
+        w.u32(static_cast<uint32_t>(stream.sample_rate));
+        w.u32(static_cast<uint32_t>(stream.bit_depth));
+        w.u8(stream.default_stream);
+        w.u8(stream.forced);
+        w.u64(stream.bitrate);
+        w.u8(stream.attached_picture);
+    }
+}
+
+CatalogueSnapshot::MediaProfile decode_media_profile(Reader& r) {
+    CatalogueSnapshot::MediaProfile profile;
+    profile.schema_version = r.u32();
+    profile.complete = r.u8();
+    profile.probe.format = r.string(1024 * 1024);
+    profile.probe.duration_seconds = std::bit_cast<double>(r.u64());
+    profile.probe.bitrate = r.u64();
+    const auto count = r.u32();
+    if (count > 100000) throw DecodeError("too many media streams");
+    profile.probe.streams.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        MediaStreamInfo stream;
+        stream.index = static_cast<int32_t>(r.u32());
+        const auto type = r.u8();
+        if (!valid_stream_type(type)) throw DecodeError("bad media stream type");
+        stream.type = static_cast<MediaStreamType>(type);
+        stream.codec = r.string(1024 * 1024);
+        stream.profile = r.string(1024 * 1024);
+        stream.language = r.string(1024 * 1024);
+        stream.width = static_cast<int32_t>(r.u32());
+        stream.height = static_cast<int32_t>(r.u32());
+        stream.channels = static_cast<int32_t>(r.u32());
+        stream.sample_rate = static_cast<int32_t>(r.u32());
+        stream.bit_depth = static_cast<int32_t>(r.u32());
+        stream.default_stream = r.u8();
+        stream.forced = r.u8();
+        stream.bitrate = r.u64();
+        stream.attached_picture = r.u8();
+        profile.probe.streams.push_back(std::move(stream));
+    }
+    return profile;
+}
+
 } // namespace
+
+bool valid_catalogue_media_profile(
+    std::string_view media_id, const CatalogueSnapshot::MediaProfile& profile) {
+    if (!media_id.starts_with("macha:") || profile.schema_version != 1 || !profile.complete ||
+        profile.probe.format.empty() || !std::isfinite(profile.probe.duration_seconds) ||
+        profile.probe.duration_seconds < 0.0 || profile.probe.streams.empty())
+        return false;
+    std::set<int> indexes;
+    for (const auto& stream : profile.probe.streams) {
+        if (stream.index < 0 || !indexes.insert(stream.index).second || stream.codec.empty() ||
+            stream.width < 0 || stream.height < 0 || stream.channels < 0 ||
+            stream.sample_rate < 0 || stream.bit_depth < 0)
+            return false;
+    }
+    return true;
+}
 
 Bytes encode_catalogue(const CatalogueSnapshot& snapshot) {
     Writer w;
@@ -211,13 +293,20 @@ Bytes encode_catalogue(const CatalogueSnapshot& snapshot) {
         w.u64(item.revision);
         w.i64(item.updated_ns);
     }
+    w.u32(snapshot.media_profiles.size());
+    for (const auto& [media_id, profile] : snapshot.media_profiles) {
+        if (media_id.empty()) throw std::runtime_error("invalid catalogue media profile identity");
+        w.string(media_id);
+        encode_media_profile(w, profile);
+    }
     return w.take();
 }
 
 CatalogueSnapshot decode_catalogue(std::span<const uint8_t> data) {
     Reader r(data);
     auto m = r.raw(magic.size());
-    if (!std::equal(m.begin(), m.end(), magic.begin()))
+    const bool legacy = std::equal(m.begin(), m.end(), legacy_magic.begin());
+    if (!legacy && !std::equal(m.begin(), m.end(), magic.begin()))
         throw DecodeError("bad catalogue snapshot");
     auto count = r.u32();
     if (count > 1000000)
@@ -266,6 +355,17 @@ CatalogueSnapshot decode_catalogue(std::span<const uint8_t> data) {
         if (item.id.empty() || !item.revision || !snapshot.items.emplace(item.id, item).second)
             throw DecodeError("invalid or duplicate catalogue item");
     }
+    if (!legacy) {
+        const auto profile_count = r.u32();
+        if (profile_count > 1000000) throw DecodeError("too many media profiles");
+        for (uint32_t i = 0; i < profile_count; ++i) {
+            auto media_id = r.string(1024 * 1024);
+            auto profile = decode_media_profile(r);
+            if (media_id.empty() ||
+                !snapshot.media_profiles.emplace(std::move(media_id), std::move(profile)).second)
+                throw DecodeError("invalid or duplicate media profile identity");
+        }
+    }
     r.finish();
     return snapshot;
 }
@@ -302,6 +402,23 @@ std::optional<CatalogueSnapshot> merge_catalogue_snapshots(
             return {};
         if (selected)
             merged.items.emplace(id, std::move(*selected));
+    }
+
+    std::set<std::string> media_ids;
+    for (const auto* source : {&base.media_profiles, &left.media_profiles, &right.media_profiles})
+        for (const auto& [id, _] : *source) media_ids.insert(id);
+    for (const auto& id : media_ids) {
+        auto find = [&](const auto& profiles) -> std::optional<CatalogueSnapshot::MediaProfile> {
+            auto it = profiles.find(id);
+            return it == profiles.end() ? std::optional<CatalogueSnapshot::MediaProfile>{} : it->second;
+        };
+        const auto b = find(base.media_profiles), l = find(left.media_profiles), r = find(right.media_profiles);
+        std::optional<CatalogueSnapshot::MediaProfile> selected;
+        if (l == r) selected = l;
+        else if (l == b) selected = r;
+        else if (r == b) selected = l;
+        else return {};
+        if (selected) merged.media_profiles.emplace(id, std::move(*selected));
     }
 
     // Avoid combining a parent deletion on one branch with a child creation or
@@ -420,6 +537,10 @@ CatalogueSnapshot CatalogueManager::load_root(const std::optional<ObjectId>& roo
         for (auto& [id, item] : shard.items) {
             if (!snapshot.items.emplace(id, std::move(item)).second)
                 throw std::runtime_error("catalogue item appears in multiple shards");
+        }
+        for (auto& [id, profile] : shard.media_profiles) {
+            if (!snapshot.media_profiles.emplace(id, std::move(profile)).second)
+                throw std::runtime_error("media profile appears in multiple shards");
         }
     }
     return snapshot;
@@ -695,6 +816,119 @@ std::optional<CatalogueItem> CatalogueManager::get(std::string_view id) {
     return it == snapshot->items.end() ? std::optional<CatalogueItem>{} : it->second;
 }
 
+std::optional<MediaProbeResult> CatalogueManager::media_profile(std::string_view media_id) {
+    auto snapshot = current_snapshot();
+    auto it = snapshot->media_profiles.find(std::string(media_id));
+    if (it == snapshot->media_profiles.end() || !valid_catalogue_media_profile(media_id, it->second))
+        return {};
+    return it->second.probe;
+}
+
+ResolvedMediaProfile CatalogueManager::resolve_media_profile(
+    std::string media_id, Clock::time_point deadline,
+    std::function<MediaProbeResult()> generate) {
+    try {
+        if (auto persisted = media_profile(media_id)) return {*persisted, false, false};
+    } catch (const std::exception& e) {
+        Log::warn("immutable media profile lookup unavailable media=" + media_id +
+                  " error=" + e.what() + "; retaining bounded generation fallback");
+    }
+
+    std::shared_ptr<MediaProfileFlight> flight;
+    bool owner = false;
+    {
+        std::lock_guard lock(media_profile_mutex_);
+        if (auto cached = resolved_media_profiles_.find(media_id);
+            cached != resolved_media_profiles_.end())
+            return {cached->second, false, false};
+        auto [it, inserted] = media_profile_flights_.try_emplace(
+            media_id, std::make_shared<MediaProfileFlight>());
+        flight = it->second;
+        owner = inserted;
+    }
+    if (!owner) {
+        std::unique_lock lock(flight->mutex);
+        if (!flight->cv.wait_until(lock, deadline, [&] { return flight->complete; }))
+            throw std::runtime_error("timed out waiting for concurrent immutable media profiling");
+        if (flight->error) std::rethrow_exception(flight->error);
+        return {*flight->result, false, true};
+    }
+
+    auto finish = [&](std::optional<MediaProbeResult> result, std::exception_ptr error = {}) {
+        {
+            std::lock_guard lock(flight->mutex);
+            flight->result = result;
+            flight->error = error;
+            flight->complete = true;
+        }
+        if (result) {
+            std::lock_guard lock(media_profile_mutex_);
+            resolved_media_profiles_[media_id] = *result;
+        }
+        flight->cv.notify_all();
+        std::lock_guard lock(media_profile_mutex_);
+        auto it = media_profile_flights_.find(media_id);
+        if (it != media_profile_flights_.end() && it->second == flight)
+            media_profile_flights_.erase(it);
+    };
+
+    try {
+        auto result = generate();
+        CatalogueSnapshot::MediaProfile profile{1, true, result};
+        if (!valid_catalogue_media_profile(media_id, profile))
+            throw std::runtime_error("generated immutable media profile is incomplete");
+        finish(result);
+        return {std::move(result), true, false};
+    } catch (...) {
+        finish({}, std::current_exception());
+        throw;
+    }
+}
+
+void CatalogueManager::put_media_profile(std::string media_id, MediaProbeResult probe) {
+    CatalogueSnapshot::MediaProfile profile{1, true, std::move(probe)};
+    if (!valid_catalogue_media_profile(media_id, profile))
+        throw std::invalid_argument("invalid immutable media profile");
+    DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
+    repair_once();
+    auto current = *current_snapshot();
+    if (auto it = current.media_profiles.find(media_id);
+        it != current.media_profiles.end() && it->second == profile)
+        return;
+    std::optional<ObjectId> expected_root;
+    {
+        std::lock_guard lock(mutex_);
+        expected_root = cached_root_;
+    }
+    auto old_art = artwork_ids(current);
+    current.media_profiles[std::move(media_id)] = std::move(profile);
+    commit(expected_root, current, old_art);
+}
+
+void CatalogueManager::put_media_profiles(
+    std::map<std::string, MediaProbeResult, std::less<>> profiles) {
+    if (profiles.empty()) return;
+    DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
+    repair_once();
+    auto current = *current_snapshot();
+    bool changed = false;
+    for (auto& [media_id, probe] : profiles) {
+        CatalogueSnapshot::MediaProfile profile{1, true, std::move(probe)};
+        if (!valid_catalogue_media_profile(media_id, profile)) continue;
+        auto it = current.media_profiles.find(media_id);
+        if (it != current.media_profiles.end() && it->second == profile) continue;
+        current.media_profiles[media_id] = std::move(profile);
+        changed = true;
+    }
+    if (!changed) return;
+    std::optional<ObjectId> expected_root;
+    {
+        std::lock_guard lock(mutex_);
+        expected_root = cached_root_;
+    }
+    commit(expected_root, current, artwork_ids(current));
+}
+
 std::vector<CatalogueItem> CatalogueManager::list(std::optional<CatalogueKind> kind,
                                                   std::optional<std::string_view> parent) {
     auto snapshot = current_snapshot();
@@ -779,7 +1013,7 @@ void CatalogueManager::commit(
     std::vector<std::pair<ObjectId, Bytes>> changed_control;
     changed_control.reserve(catalogue_shard_count + 1);
     for (size_t i = 0; i < catalogue_shard_count; ++i) {
-        if (shards[i].items.empty()) continue;
+        if (shards[i].items.empty() && shards[i].media_profiles.empty()) continue;
         auto encoded = encode_catalogue(shards[i]);
         const auto id = object_id(encoded);
         manifest.shards[i] = id;
@@ -1047,7 +1281,8 @@ bool CatalogueManager::artwork_durability_barrier(
 void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& discovered,
                                          const std::set<std::string>& active_media_ids,
                                          bool prune_missing,
-                                         std::optional<Hash256> expected_namespace) {
+                                         std::optional<Hash256> expected_namespace,
+                                         const std::map<std::string, MediaProbeResult, std::less<>>& profiles) {
     DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     repair_once();
     auto current = *current_snapshot();
@@ -1058,6 +1293,15 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
     }
     auto old_art = artwork_ids(current);
     bool changed = false;
+
+    for (const auto& [media_id, probe] : profiles) {
+        CatalogueSnapshot::MediaProfile profile{1, true, probe};
+        if (!valid_catalogue_media_profile(media_id, profile)) continue;
+        auto it = current.media_profiles.find(media_id);
+        if (it != current.media_profiles.end() && it->second == profile) continue;
+        current.media_profiles[media_id] = std::move(profile);
+        changed = true;
+    }
 
     auto same_content = [](const CatalogueItem& a, const CatalogueItem& b) {
         return a.id == b.id && a.kind == b.kind && a.title == b.title &&
