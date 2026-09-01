@@ -240,6 +240,11 @@ struct MetadataDelta {
     std::vector<GarbageRef> upsert_garbage;
     std::map<NodeId, PersistedNodeStatus> upsert_node_status;
     std::map<std::string, IdentityAssociationReset, std::less<>> upsert_identity_resets;
+    // Reconciliation-only replacements. Ordinary mutations leave these unset
+    // and retain the rolling-compatible DLT5 encoding.
+    std::optional<std::vector<Hash256>> replace_merge_parents;
+    std::optional<std::map<std::string, MetadataConflict, std::less<>>>
+        replace_conflicts;
     CatalogueDelta catalogue{CatalogueDelta::unchanged};
     std::optional<ObjectId> catalogue_root;
 };
@@ -284,6 +289,11 @@ struct MetadataReplicaDiagnostics {
     uint64_t materialization_cache_misses{};
     uint64_t materialization_cache_evictions{};
     size_t materialization_cache_entries{};
+    uint64_t materialization_cache_bytes{};
+    uint64_t materialization_cache_limit_bytes{};
+    uint64_t history_records{};
+    uint64_t history_file_bytes{};
+    uint64_t history_resident_payload_bytes{};
     uint64_t accepted_head_persistence_writes{};
     uint64_t accepted_head_persistence_bytes{};
     uint64_t accepted_head_persistence_failures{};
@@ -295,9 +305,21 @@ struct MetadataMaterialization {
 };
 
 class MetadataReplica {
+    struct HistoryIndexEntry {
+        uint64_t generation{};
+        Hash256 previous{};
+        Hash256 hash{};
+        bool previous_known{};
+        std::vector<Hash256> merge_parents;
+        MetadataHistoryEntry::Body body{MetadataHistoryEntry::Body::full};
+        uint64_t file_offset{};
+        uint64_t frame_bytes{};
+    };
+
     struct MaterializedHistoryEntry {
         std::shared_ptr<const MetadataMaterialization> value;
         uint64_t last_used{};
+        uint64_t bytes{};
     };
 
     std::filesystem::path p_;
@@ -318,7 +340,9 @@ class MetadataReplica {
     mutable std::mutex materialization_compute_m_;
     MetadataRecord cur_;
     MetadataRecord committed_;
-    std::map<Hash256, MetadataHistoryEntry> history_;
+    // Durable history payloads live in history.log. Memory retains only the
+    // ancestry and frame-location index needed to find them on demand.
+    std::map<Hash256, HistoryIndexEntry> history_;
     std::map<Hash256, MetadataAcceptance> accepted_heads_;
     std::optional<MetadataHistoryEntry> pending_history_;
     bool pending_recovered_{};
@@ -332,6 +356,8 @@ class MetadataReplica {
     bool accept_pristine_genesis_authority_{true};
     mutable std::map<Hash256, MaterializedHistoryEntry> materialized_history_;
     mutable uint64_t materialized_history_clock_{};
+    mutable uint64_t materialized_history_bytes_{};
+    uint64_t materialized_history_limit_bytes_{};
     mutable std::atomic_uint64_t historical_requests_{};
     mutable std::atomic_uint64_t historical_reconstructions_{};
     mutable std::atomic_uint64_t historical_deltas_applied_{};
@@ -346,6 +372,8 @@ class MetadataReplica {
     void append_journal(uint8_t, const MetadataRecord&, std::span<const uint8_t> = {});
     void load_journal();
     Bytes encode_history_frame(const MetadataHistoryEntry&) const;
+    MetadataHistoryEntry read_history_entry(const HistoryIndexEntry&) const;
+    static HistoryIndexEntry index_history_entry(const MetadataHistoryEntry&, uint64_t, uint64_t);
     void write_history_frame(std::span<const uint8_t>) const;
     void append_history(const MetadataHistoryEntry&);
     void load_history();
@@ -375,7 +403,8 @@ class MetadataReplica {
   public:
     MetadataReplica(std::filesystem::path, std::array<uint8_t, 32>,
                     std::optional<MetadataRecord> recovery_seed = {},
-                    bool accept_pristine_genesis_authority = true);
+                    bool accept_pristine_genesis_authority = true,
+                    uint64_t materialization_cache_limit_bytes = 128ULL * 1024ULL * 1024ULL);
     MetadataRecord current() const;
     MetadataRecord committed() const;
     MetadataIdentity current_identity() const;

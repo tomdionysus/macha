@@ -1,5 +1,14 @@
 # Current release
 
+## 0.22.2 — metadata reconciliation recovery (development)
+
+- Reject compact metadata deltas which cannot reproduce the exact immutable
+  snapshot byte ordering, including reconciliation which canonicalises an
+  append-ordered garbage/tombstone set.
+- Give local metadata replicas the same single-shot full-record fallback as
+  remote replicas when a compact body fails exact reconstruction, preventing a
+  valid library from becoming permanently unavailable behind a failed merge.
+
 ## 0.21.0 — asynchronous node startup (development)
 
 - Bring the RPC control plane and status API online before local backend recovery.

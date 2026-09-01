@@ -303,6 +303,12 @@ void Service::request_stop() {
         maintenance_wait_cv_.notify_all();
     }
     node_.request_stop();
+    // Service maintenance performs synchronous control-replication calls. A
+    // thread stop token wakes its event wait but cannot complete an RPC future.
+    // Close client routes now so every pending call fails promptly before
+    // Service::stop joins the maintenance owner. NodeRuntime::stop later closes
+    // the server and completes the remaining node-owned teardown.
+    node_.cancel_outbound_calls();
     startup_cv_.notify_all();
 }
 
@@ -1110,7 +1116,7 @@ void Service::loop(std::stop_token stop) {
             // rewrite this has a fixed temporary-space envelope and therefore
             // remains viable on multi-terabyte backends.
             if (!busy)
-                (void)node_.local_store().compact_packs();
+                (void)node_.local_store().compact_packs(stop);
 
             if (!busy && scrub_due && scrub_credit >= node_.config().extent_size) {
                 const auto scrub_stage = Clock::now();

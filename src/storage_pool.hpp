@@ -132,7 +132,7 @@ class StoragePool {
     // Reclaim dead records from packed authoritative DATA incrementally. Each
     // LocalStore invocation rewrites at most one pack, so temporary disk demand
     // is bounded by a pack rather than by the backend's complete live corpus.
-    size_t compact_packs();
+    size_t compact_packs(std::stop_token = {});
 
     uint64_t used() const;
     uint64_t limit() const;

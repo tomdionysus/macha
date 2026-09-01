@@ -93,6 +93,7 @@ class LocalStore {
 
     std::filesystem::path path(const ObjectId&) const;
     void wait_for_accounting(std::unique_lock<std::mutex>&) const;
+    bool wait_for_accounting(std::unique_lock<std::mutex>&, std::stop_token) const;
     bool restore_accounting();
     void persist_accounting(uint64_t used, uint8_t operation, const ObjectId&, uint64_t size,
                             bool durable);
@@ -144,7 +145,7 @@ class LocalStore {
     std::filesystem::file_time_type last_write(const ObjectId&) const;
     void touch(const ObjectId&);
     bool is_packed(const ObjectId&) const;
-    bool compact_packs();
+    bool compact_packs(std::stop_token = {});
     uint64_t used() const { return used_.load(std::memory_order_relaxed); }
     uint64_t limit() const { return limit_; }
     bool scan_complete() const { return scan_complete_.load(std::memory_order_acquire); }

@@ -84,6 +84,10 @@ void validate(Config& config) {
         throw std::runtime_error("network heartbeat and dead_after must be > 0");
     if (config.metadata_cache > std::chrono::seconds(5))
         throw std::runtime_error("metadata cache must be <= 5000ms");
+    if (config.metadata_materialization_cache_bytes < 8ULL * 1024 * 1024 ||
+        config.metadata_materialization_cache_bytes > 4ULL * 1024 * 1024 * 1024)
+        throw std::runtime_error(
+            "dht.metadata_materialization_cache_bytes must be 8M..4G");
     if (config.fuse.entry_timeout > std::chrono::seconds(5) ||
         config.fuse.attr_timeout > std::chrono::seconds(5) ||
         config.fuse.negative_timeout > std::chrono::seconds(5))
@@ -226,6 +230,8 @@ void validate(Config& config) {
         throw std::runtime_error("streaming transcode limits cannot exceed max_sessions");
     if (config.streaming.session_idle < std::chrono::seconds(30))
         throw std::runtime_error("streaming.session_idle_ms must be >= 30000");
+    if (config.streaming.pipeline_idle < std::chrono::seconds(10))
+        throw std::runtime_error("streaming.pipeline_idle_ms must be >= 10000");
     if (config.streaming.startup_timeout < std::chrono::milliseconds(1000) ||
         config.streaming.startup_timeout > std::chrono::minutes(2))
         throw std::runtime_error("streaming.startup_timeout_ms must be 1000..120000");

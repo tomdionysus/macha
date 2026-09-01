@@ -159,6 +159,26 @@ MACHA_TEST("storage_v18", test_pack_compaction_reclaims_dead_space_incrementally
     }
 }
 
+MACHA_TEST("storage_v18", test_pack_compaction_honours_shutdown_before_accounting_wait) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+
+    LocalStoreOptions options;
+    options.limit = 64ULL * 1024 * 1024;
+    options.pack_threshold = 256 * 1024;
+    options.pack_target_size = 1024 * 1024;
+
+    LocalStore store(t.path() / "store", options, keys.storage);
+    std::stop_source shutdown;
+    shutdown.request_stop();
+
+    const auto started = std::chrono::steady_clock::now();
+    CHECK(!store.compact_packs(shutdown.get_token()));
+    CHECK(std::chrono::steady_clock::now() - started < 250ms);
+}
+
 MACHA_TEST("storage_v18", test_local_backend_capacity_falls_through_to_larger_backend) {
     TempDir t;
     auto keyfile = t.path() / "key";

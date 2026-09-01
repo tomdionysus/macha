@@ -1195,6 +1195,60 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_chain_reuses_bounded_mat
     CHECK(after_evicted_lookup.materialization_cache_entries <= 64);
 }
 
+MACHA_FAST_TEST("storage_metadata", test_metadata_history_payloads_are_disk_backed_and_byte_bounded) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "disk-backed-history";
+    const auto origin = random_node_id();
+
+    auto snapshot = decode_snapshot(genesis_metadata().payload);
+    snapshot.metadata_voters.clear();
+    snapshot.metadata_write_replicas_required = 1;
+    for (size_t i = 0; i < 1000; ++i) {
+        FsEntry entry;
+        entry.type = EntryType::file;
+        entry.mode = 0644;
+        entry.size = i * 4096;
+        entry.version = 1;
+        snapshot.entries["/library/long-title-" + std::to_string(i)] = entry;
+    }
+
+    MetadataRecord head = genesis_metadata();
+    {
+        MetadataReplica writer(path, keys.storage);
+        for (uint64_t generation = 2; generation <= 42; ++generation) {
+            snapshot.mutation_sequences[origin] = generation;
+            MetadataRecord next;
+            next.generation = generation;
+            next.previous = head.hash;
+            next.payload = encode_snapshot(snapshot);
+            next.hash = metadata_hash(next.generation, next.previous, next.payload);
+            REQUIRE(writer.store_commit(next));
+            head = std::move(next);
+        }
+    }
+
+    constexpr uint64_t cache_limit = 64 * 1024;
+    MetadataReplica reopened(path, keys.storage, {}, true, cache_limit);
+    const auto cold = reopened.diagnostics();
+    CHECK(cold.history_records >= 41);
+    CHECK(cold.history_file_bytes > 1024 * 1024);
+    CHECK(cold.history_resident_payload_bytes == 0);
+    CHECK(cold.materialization_cache_limit_bytes == cache_limit);
+    CHECK(cold.materialization_cache_bytes <= cache_limit);
+
+    auto recovered = reopened.materialized(head.hash);
+    REQUIRE(recovered != nullptr);
+    CHECK(recovered->record.payload == head.payload);
+    const auto after = reopened.diagnostics();
+    // This historical full snapshot is larger than the cache budget. It is
+    // returned to the caller but not retained as unbounded process state.
+    CHECK(after.materialization_cache_bytes <= cache_limit);
+    CHECK(after.history_resident_payload_bytes == 0);
+}
+
 MACHA_FAST_TEST("storage_metadata",
                 test_metadata_materialization_cache_never_validates_corrupt_delta) {
     TempDir t;
@@ -2316,6 +2370,53 @@ MACHA_TEST("storage_metadata", test_genesis_root_configuration) {
     CHECK(root.mode == 0750);
     CHECK(root.ctime_ns > 0);
     CHECK(root.mtime_ns > 0);
+}
+
+MACHA_FAST_TEST("storage_metadata", test_metadata_delta_rejects_unrepresentable_garbage_reordering) {
+    auto before = decode_snapshot(genesis_metadata().payload);
+    GarbageRef first{object_id(pattern(4097)), 10, random_node_id()};
+    GarbageRef second{object_id(pattern(8193)), 20, random_node_id()};
+    if (first.id < second.id)
+        std::swap(first, second);
+    before.garbage = {first, second};
+
+    auto reordered = before;
+    std::sort(reordered.garbage.begin(), reordered.garbage.end(),
+              [](const GarbageRef& a, const GarbageRef& b) { return a.id < b.id; });
+    REQUIRE(reordered.garbage != before.garbage);
+
+    // DLT6 can erase, replace and append tombstones, but cannot reorder retained
+    // entries. Claiming this transition is compact would reconstruct a
+    // semantically equal but byte-different immutable record.
+    CHECK(!metadata_delta(before, reordered).has_value());
+}
+
+MACHA_TEST("storage_metadata", test_local_metadata_store_falls_back_from_invalid_delta) {
+    TestService fixture("local-delta-fallback");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.catalogue.scanner.enabled = false;
+    config.catalogue.api.enabled = false;
+    config.ingest.enabled = false;
+    config.torrent.enabled = false;
+
+    auto& service = fixture.start();
+    MetadataManager metadata(service.node());
+    auto committed = metadata.mutate_delta([](MetadataSnapshot& snapshot, MetadataDelta&) {
+        FsEntry entry;
+        entry.type = EntryType::directory;
+        entry.mode = 0755;
+        snapshot.entries["/full-fallback"] = entry;
+        // Deliberately omit the entry from the supplied exact delta. The local
+        // replica must reject that compact body and retry the immutable full
+        // record, matching the existing remote-replica safety path.
+    });
+
+    CHECK(service.filesystem().getattr("/full-fallback").type == EntryType::directory);
+    auto history = service.node().metadata_replica().history_entry(committed.hash);
+    REQUIRE(history.has_value());
+    CHECK(history->body == MetadataHistoryEntry::Body::full);
 }
 
 } // namespace

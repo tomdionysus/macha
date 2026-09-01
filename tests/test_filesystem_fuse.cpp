@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "fuse_journal.hpp"
+#include "fuse_adapter.hpp"
 #include "test_backend_support.hpp"
+#include <cerrno>
+#include <csignal>
 #include <fcntl.h>
 
 using namespace macha;
@@ -8,6 +11,13 @@ using namespace std::chrono_literals;
 using namespace macha::test_support;
 
 namespace {
+
+MACHA_TEST("filesystem_fuse", test_fuse_signal_exit_is_a_clean_service_shutdown) {
+    CHECK(!fuse_loop_result_is_error(0));
+    CHECK(!fuse_loop_result_is_error(SIGTERM));
+    CHECK(!fuse_loop_result_is_error(SIGINT));
+    CHECK(fuse_loop_result_is_error(-EIO));
+}
 
 MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_counters) {
     TestService fixture("status-operational-counters", ConfigProfile::isolated);

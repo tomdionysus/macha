@@ -136,6 +136,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "  data_inflight_bytes: 96M\n"
             << "  data_viewer_reserve_bytes: 24M\n"
             << "  read_ahead: 5\n"
+            << "  metadata_materialization_cache_bytes: 96M\n"
             << "bootstrap:\n"
             << "  - seed1.example:7440\n"
             << "  - seed2.example:7440\n"
@@ -224,6 +225,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "  max_video_transcodes: 2\n"
             << "  max_audio_transcodes: 5\n"
             << "  session_idle_ms: 60000\n"
+            << "  pipeline_idle_ms: 45000\n"
             << "  startup_timeout_ms: 7000\n"
             << "  segment_duration_ms: 3000\n"
             << "  max_ahead_segments: 11\n"
@@ -248,6 +250,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(yc.metadata_store.limit == 2ULL * 1024 * 1024 * 1024);
     CHECK(yc.metadata_store.packing.threshold == 256ULL * 1024);
     CHECK(yc.metadata_store.packing.target_size == 16ULL * 1024 * 1024);
+    CHECK(yc.metadata_materialization_cache_bytes == 96ULL * 1024 * 1024);
     CHECK(yc.cache.path == cache_dir);
     CHECK(yc.cache.max_blocks == 4096);
     CHECK(yc.log_level == LogLevel::warn);
@@ -369,6 +372,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(yc.streaming.max_video_transcodes == 2);
     CHECK(yc.streaming.max_audio_transcodes == 5);
     CHECK(yc.streaming.session_idle == 60000ms);
+    CHECK(yc.streaming.pipeline_idle == 45000ms);
     CHECK(yc.streaming.startup_timeout == 7000ms);
     CHECK(yc.streaming.segment_duration == 3000ms);
     CHECK(yc.streaming.max_ahead_segments == 11);

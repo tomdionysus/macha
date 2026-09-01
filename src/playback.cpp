@@ -539,6 +539,8 @@ struct PlaybackManager::Impl {
         std::string subtitle_url;
         std::shared_ptr<SubtitleCache> subtitle_cache{std::make_shared<SubtitleCache>()};
         Clock::time_point touched{Clock::now()};
+        Clock::time_point stream_touched{Clock::now()};
+        size_t active_stream_requests{};
     };
 
     FileSystem& fs;
@@ -572,6 +574,7 @@ struct PlaybackManager::Impl {
     size_t pending_sessions{};
     size_t reserved_video_transcodes{};
     size_t reserved_audio_transcodes{};
+    uint64_t idle_pipelines_reclaimed{};
     bool started{};
     std::function<size_t(const std::vector<std::string>&)> request_media_profiles;
     MediaInformationService* media_information{};
@@ -907,12 +910,19 @@ struct PlaybackManager::Impl {
                 pending_profile_publications.erase(it);
             }
             try {
-                catalogue.put_media_profile(pending.first, std::move(pending.second));
+                catalogue.put_media_profile(pending.first, pending.second);
                 Log::debug("playback immutable profile published asynchronously media=" +
                            pending.first);
             } catch (const std::exception& e) {
                 Log::warn("playback immutable profile asynchronous publication failed media=" +
                           pending.first + " error=" + e.what());
+                std::unique_lock lock(profile_publish_mutex);
+                pending_profile_publications.insert_or_assign(pending.first, pending.second);
+                // A catalogue CAS conflict is transient. Preserve the completed
+                // scan and retry from this event-driven worker after a bounded
+                // backoff instead of forcing another foreground probe.
+                profile_publish_cv.wait_for(lock, stop, std::chrono::milliseconds(250),
+                                            [] { return false; });
             }
         }
     }
@@ -1077,6 +1087,7 @@ struct PlaybackManager::Impl {
 
     void start_pipeline(Session& session, std::string_view trace) {
         stop_pipeline(session);
+        session.stream_touched = Clock::now();
         ++session.generation;
         session.generation_dir = *config.temp_path / session.id / std::to_string(session.generation);
         std::error_code ec;
@@ -1445,11 +1456,17 @@ struct PlaybackManager::Impl {
             if (it == sessions.end() || it->second->token != token)
                 return http_error(404, "not_found", "stream not found");
             session = it->second;
-            session->touched = Clock::now();
-            signal_cleanup_locked();
         }
         if (request.method != "GET" && request.method != "HEAD") return http_error(405, "method", "GET or HEAD required");
         if (rest == "direct") {
+            {
+                std::lock_guard lock(mutex);
+                auto it = sessions.find(id);
+                if (it == sessions.end() || it->second != session)
+                    return http_error(404, "not_found", "stream not found");
+                session->touched = Clock::now();
+                signal_cleanup_locked();
+            }
             return ranged_response(request, session->source_entry.size, direct_mime(session->source.logical_path),
                                    [this, path = session->source.logical_path, entry = session->source_entry](uint64_t offset, uint64_t length) {
                                        return std::make_shared<LogicalBody>(fs.open_read(entry, path, false, FrameType::foreground), offset, length);
@@ -1465,6 +1482,23 @@ struct PlaybackManager::Impl {
         auto name = std::string(rest.substr(slash3 + 1));
         if (name.empty() || name == "." || name == ".." || name.find("..") != std::string::npos)
             return http_error(400, "bad_path", "invalid stream object");
+        {
+            std::lock_guard lock(mutex);
+            auto it = sessions.find(id);
+            if (it == sessions.end() || it->second != session ||
+                session->generation != generation)
+                return http_error(404, "not_found", "stream generation not found");
+            const auto now = Clock::now();
+            session->touched = now;
+            session->stream_touched = now;
+            ++session->active_stream_requests;
+            signal_cleanup_locked();
+        }
+        [[maybe_unused]] auto stream_request = std::shared_ptr<void>(nullptr, [this, session](void*) {
+            std::lock_guard lock(mutex);
+            if (session->active_stream_requests) --session->active_stream_requests;
+            signal_cleanup_locked();
+        });
         if (name.starts_with("subtitle-")) {
             auto slash = name.find('/');
             if (slash == std::string::npos)
@@ -1872,11 +1906,15 @@ struct PlaybackManager::Impl {
         MediaEngineStatus state;
         if (engine) state = engine->status();
         size_t session_count = 0, video_transcodes = 0, audio_transcodes = 0;
+        uint64_t reclaimed = 0;
+        std::chrono::milliseconds pipeline_idle{};
         {
             std::lock_guard lock(mutex);
             session_count = sessions.size();
             video_transcodes = video_transcodes_locked();
             audio_transcodes = audio_transcodes_locked();
+            reclaimed = idle_pipelines_reclaimed;
+            pipeline_idle = config.pipeline_idle;
         }
         Json::Object out{{"server_version", std::string(kServerVersion)},
                          {"enabled", config.enabled},
@@ -1886,6 +1924,8 @@ struct PlaybackManager::Impl {
                          {"max_video_transcodes", static_cast<uint64_t>(config.max_video_transcodes)},
                          {"audio_transcodes", static_cast<uint64_t>(audio_transcodes)},
                          {"max_audio_transcodes", static_cast<uint64_t>(config.max_audio_transcodes)},
+                         {"pipeline_idle_ms", static_cast<uint64_t>(pipeline_idle.count())},
+                         {"idle_pipelines_reclaimed", reclaimed},
                          {"media_engine_available", state.available},
                          {"media_engine", state.backend},
                          {"media_engine_version", state.version},
@@ -1924,10 +1964,14 @@ struct PlaybackManager::Impl {
         set_thread_name("macha-play-gc");
         while (!stop.stop_requested()) {
             std::vector<std::shared_ptr<Session>> expired;
+            std::vector<std::pair<std::shared_ptr<Session>,
+                                  std::shared_ptr<MediaEngineSession>>> idle_pipelines;
             std::optional<Clock::time_point> next_expiry;
+            std::chrono::milliseconds idle_timeout{};
             {
                 std::unique_lock lock(mutex);
                 const auto now = Clock::now();
+                idle_timeout = config.pipeline_idle;
                 for (auto it = sessions.begin(); it != sessions.end();) {
                     const auto expires = it->second->touched + config.session_idle;
                     if (now >= expires) {
@@ -1936,11 +1980,27 @@ struct PlaybackManager::Impl {
                         it = sessions.erase(it);
                     } else {
                         if (!next_expiry || expires < *next_expiry) next_expiry = expires;
+                        const auto pipeline_expires =
+                            it->second->stream_touched + idle_timeout;
+                        {
+                            std::lock_guard pipeline_lock(it->second->pipeline_mutex);
+                            if (!it->second->active_stream_requests &&
+                                it->second->engine_session &&
+                                it->second->engine_session->running()) {
+                                if (now >= pipeline_expires) {
+                                    idle_pipelines.emplace_back(
+                                        it->second, std::move(it->second->engine_session));
+                                    ++idle_pipelines_reclaimed;
+                                } else if (!next_expiry || pipeline_expires < *next_expiry) {
+                                    next_expiry = pipeline_expires;
+                                }
+                            }
+                        }
                         ++it;
                     }
                 }
 
-                if (expired.empty()) {
+                if (expired.empty() && idle_pipelines.empty()) {
                     const auto observed_revision = cleanup_revision;
                     const auto changed = [&] { return cleanup_revision != observed_revision; };
                     if (next_expiry)
@@ -1954,6 +2014,14 @@ struct PlaybackManager::Impl {
                 stop_pipeline(*session);
                 std::error_code ec;
                 std::filesystem::remove_all(*config.temp_path / session->id, ec);
+            }
+            for (auto& [session, pipeline] : idle_pipelines) {
+                pipeline->stop();
+                std::error_code ec;
+                std::filesystem::remove_all(session->generation_dir, ec);
+                Log::info("playback pipeline reclaimed after stream inactivity session=" +
+                          session->id + " idle_ms=" +
+                          std::to_string(idle_timeout.count()));
             }
         }
     }
@@ -2023,6 +2091,7 @@ void PlaybackManager::reconfigure(StreamingConfig config) {
     impl_->config.max_video_transcodes = config.max_video_transcodes;
     impl_->config.max_audio_transcodes = config.max_audio_transcodes;
     impl_->config.session_idle = config.session_idle;
+    impl_->config.pipeline_idle = config.pipeline_idle;
     impl_->config.startup_timeout = config.startup_timeout;
     impl_->config.segment_duration = config.segment_duration;
     impl_->config.max_ahead_segments = config.max_ahead_segments;

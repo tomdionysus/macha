@@ -1,5 +1,12 @@
 # FUSE publication throughput plan
 
+> **P0 stability gate (2026-09-01):** further loaded/overnight ingest UAT is
+> paused behind the
+> [metadata-history memory remediation](2026-09-01-metadata-history-memory-remediation.md).
+> Sustained rsync exposed unbounded retained metadata history and caused a real
+> OOM on node 50. Throughput work must not resume until metadata memory and
+> crash-to-rejoin recovery are bounded and proven.
+
 Date: 2026-08-31
 
 Status: Phase 4A and the aggregate retirement-rate implementation are locally
