@@ -929,6 +929,32 @@ void CatalogueManager::put_media_profiles(
     commit(expected_root, current, artwork_ids(current));
 }
 
+size_t CatalogueManager::prune_media_profiles(
+    const std::set<std::string>& live_media_ids) {
+    DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
+    repair_once();
+    auto current = *current_snapshot();
+    const auto before = current.media_profiles.size();
+    std::erase_if(current.media_profiles, [&](const auto& item) {
+        return !live_media_ids.contains(item.first);
+    });
+    const auto removed = before - current.media_profiles.size();
+    if (!removed) return 0;
+    std::optional<ObjectId> expected_root;
+    {
+        std::lock_guard lock(mutex_);
+        expected_root = cached_root_;
+    }
+    commit(expected_root, current, artwork_ids(current));
+    {
+        std::lock_guard lock(media_profile_mutex_);
+        std::erase_if(resolved_media_profiles_, [&](const auto& item) {
+            return !live_media_ids.contains(item.first);
+        });
+    }
+    return removed;
+}
+
 std::vector<CatalogueItem> CatalogueManager::list(std::optional<CatalogueKind> kind,
                                                   std::optional<std::string_view> parent) {
     auto snapshot = current_snapshot();

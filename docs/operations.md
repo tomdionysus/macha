@@ -236,3 +236,27 @@ writable merely from peer connectivity.
 Metadata availability logging is transition-only and canonical, for example `metadata availability changed state=writable previous=read-only reason="metadata write durability floor available"`. Routine negative checkpoint acknowledgements are silent because they are normal convergence decisions; transport/checkpoint exceptions remain diagnostic.
 
 `POST /api/v1/status/connectivity/check` and the node-specific equivalent perform diagnostic connectivity checks without changing cluster configuration. State-changing administrative operations belong under `/api/v1/manage`.
+
+## Manual metadata ancestry repair
+
+`macha-metadata-repair` is an offline recovery tool, not a daemon maintenance
+path. With no option it reports committed/accepted heads and retained ancestry.
+Its causal-merge operation is intentionally manual and narrowly fenced: it
+requires exactly two accepted heads with no retained common ancestor and one
+head's durable mutation clock must strictly dominate the other. It refuses
+ordinary mergeable histories, concurrent/equal clocks, unstaged acceptance and
+insufficient distinct witnesses.
+
+Stop every Macha node and make a recoverable copy of each configured
+`state_path/metadata` directory before use. Run `--plan-causal-merge` against
+every replica and require the generation, repair hash, primary, dominant and
+subsumed hashes to match exactly. Then run `--stage-causal-merge` everywhere.
+Only after the same record is durably staged on the named witness nodes may
+`--accept-causal-merge STATE_PATH KEY_FILE WITNESS...` be run on every replica.
+Start the whole cluster and verify one accepted descendant, writable metadata,
+matching local generations and zero unresolved reconciliation conflicts.
+
+This operation does not choose the numerically newest head. The state comes
+only from strict causal dominance, while the subsumed accepted head remains an
+authenticated additional parent of the repair record. Concurrent heads require
+a separate conflict-preserving repair and must not use this command.

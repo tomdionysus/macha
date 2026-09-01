@@ -1438,13 +1438,51 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
     out.merge_parents.clear();
     return result;
 }
+
+std::optional<MetadataManualRepairPlan> plan_causally_dominant_metadata_repair(
+    const MetadataRecord& left_record, const MetadataSnapshot& left,
+    const MetadataRecord& right_record, const MetadataSnapshot& right) {
+    auto dominates = [](const MetadataSnapshot& candidate, const MetadataSnapshot& other) {
+        for (const auto& [origin, sequence] : other.mutation_sequences) {
+            const auto found = candidate.mutation_sequences.find(origin);
+            if (found == candidate.mutation_sequences.end() || found->second < sequence)
+                return false;
+        }
+        return true;
+    };
+    const bool left_dominates = dominates(left, right);
+    const bool right_dominates = dominates(right, left);
+    // Equal clocks with different state are not safe to choose between, and
+    // concurrent clocks require a conflict-preserving operator workflow.
+    if (left_dominates == right_dominates)
+        return {};
+
+    const auto& dominant_record = left_dominates ? left_record : right_record;
+    const auto& subsumed_record = left_dominates ? right_record : left_record;
+    auto merged = left_dominates ? left : right;
+
+    const auto& primary = left_record.hash < right_record.hash ? left_record : right_record;
+    const auto& secondary = left_record.hash < right_record.hash ? right_record : left_record;
+    merged.metadata_voters.clear();
+    merged.merge_parents = {secondary.hash};
+
+    MetadataRecord repair;
+    repair.generation = std::max(left_record.generation, right_record.generation) + 1;
+    repair.previous = primary.hash;
+    repair.payload = encode_snapshot(merged);
+    repair.hash = metadata_hash(repair.generation, repair.previous, repair.payload);
+    return MetadataManualRepairPlan{std::move(repair), dominant_record.hash,
+                                    subsumed_record.hash};
+}
 MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32> k,
-                                 std::optional<MetadataRecord> recovery_seed)
+                                 std::optional<MetadataRecord> recovery_seed,
+                                 bool accept_pristine_genesis_authority)
     : p_(r / "metadata" / "current.meta"), committed_p_(r / "metadata" / "committed.meta"),
       checkpoint_p_(r / "metadata" / "checkpoint.meta"), journal_p_(r / "metadata" / "journal.log"),
       history_p_(r / "metadata" / "history.log"), heads_p_(r / "metadata" / "heads.meta"),
       mutation_sequence_p_(r / "metadata" / "mutation-sequence.meta"),
-      recovery_p_(r / "metadata" / "recovery.required"), key_(k) {
+      recovery_p_(r / "metadata" / "recovery.required"), key_(k),
+      accept_pristine_genesis_authority_(accept_pristine_genesis_authority) {
     std::filesystem::create_directories(checkpoint_p_.parent_path());
 
     auto valid_seed = [&]() -> std::optional<MetadataRecord> {
@@ -2191,7 +2229,7 @@ bool MetadataReplica::prune_accepted_heads_locked() {
         for (const auto& [other, _] : accepted_heads_) {
             if (other == it->first)
                 continue;
-            if (history_is_ancestor_locked(it->first, other)) {
+            if (accepted_head_is_ancestor_locked(it->first, other)) {
                 ancestor = true;
                 break;
             }
@@ -2206,8 +2244,38 @@ bool MetadataReplica::prune_accepted_heads_locked() {
     return changed;
 }
 
+bool MetadataReplica::accepted_head_is_ancestor_locked(const Hash256& ancestor,
+                                                        const Hash256& descendant) const {
+    if (history_is_ancestor_locked(ancestor, descendant))
+        return true;
+
+    // Generation 1 is the deterministic, mutation-free protocol genesis. Old
+    // history compaction may have re-rooted an established head and discarded
+    // the physical edge back to genesis. In accepted-head semantics the exact
+    // canonical genesis is nevertheless always subsumed by any valid
+    // post-genesis record. This lets a pristine replica adopt an established
+    // cluster head without advertising genesis as a rootless sibling, and lets
+    // established replicas ignore a late genesis certificate from a joiner.
+    // No other rootless head receives this treatment.
+    const auto genesis = genesis_metadata();
+    if (ancestor != genesis.hash)
+        return false;
+    auto materialized = materialized_locked(descendant);
+    return materialized && materialized->record.generation > genesis.generation;
+}
+
 void MetadataReplica::migrate_legacy_head_locked() {
     ensure_history_root(committed_);
+    const auto genesis = genesis_metadata();
+    if (!accept_pristine_genesis_authority_ && committed_.hash == genesis.hash) {
+        // A node with configured bootstrap peers is a joiner, not a namespace
+        // founder. Keep deterministic genesis only as non-authoritative local
+        // material needed by the codec; never advertise or persist it as an
+        // accepted head. This also cleans state written by older binaries.
+        if (accepted_heads_.erase(genesis.hash))
+            persist_heads_locked();
+        return;
+    }
     if (accepted_heads_.contains(committed_.hash))
         return;
 
@@ -2814,7 +2882,7 @@ bool MetadataReplica::accept_commit(const MetadataAcceptance& input) {
     // of returning early and leaving a non-maximal accepted head behind.
     bool incoming_is_ancestor = false;
     for (const auto& [head, _] : accepted_heads_) {
-        if (head != value.hash && history_is_ancestor_locked(value.hash, head)) {
+        if (head != value.hash && accepted_head_is_ancestor_locked(value.hash, head)) {
             incoming_is_ancestor = true;
             break;
         }
@@ -2828,7 +2896,8 @@ bool MetadataReplica::accept_commit(const MetadataAcceptance& input) {
     }
 
     for (auto it = accepted_heads_.begin(); it != accepted_heads_.end();) {
-        if (it->first != value.hash && history_is_ancestor_locked(it->first, value.hash)) {
+        if (it->first != value.hash &&
+            accepted_head_is_ancestor_locked(it->first, value.hash)) {
             it = accepted_heads_.erase(it);
             changed = true;
         } else {

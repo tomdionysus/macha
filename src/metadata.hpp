@@ -213,6 +213,19 @@ struct MetadataMergeResult {
     size_t conflicts_created{};
 };
 
+struct MetadataManualRepairPlan {
+    MetadataRecord record;
+    Hash256 dominant_head{};
+    Hash256 subsumed_head{};
+};
+
+// Offline/manual recovery only. This is deliberately not part of automatic
+// reconciliation: it can join histories whose common ancestor was discarded
+// only when one durable causal clock strictly dominates the other.
+std::optional<MetadataManualRepairPlan> plan_causally_dominant_metadata_repair(
+    const MetadataRecord&, const MetadataSnapshot&,
+    const MetadataRecord&, const MetadataSnapshot&);
+
 enum class CatalogueDelta : uint8_t { unchanged = 0, clear = 1, set = 2 };
 
 // Compact deterministic mutation from one canonical metadata snapshot to the
@@ -316,6 +329,7 @@ class MetadataReplica {
     size_t history_records_{};
     uint64_t history_bytes_{};
     bool recovery_required_{};
+    bool accept_pristine_genesis_authority_{true};
     mutable std::map<Hash256, MaterializedHistoryEntry> materialized_history_;
     mutable uint64_t materialized_history_clock_{};
     mutable std::atomic_uint64_t historical_requests_{};
@@ -340,6 +354,7 @@ class MetadataReplica {
     void ensure_history_root(const MetadataRecord&);
     void migrate_legacy_head_locked();
     bool prune_accepted_heads_locked();
+    bool accepted_head_is_ancestor_locked(const Hash256&, const Hash256&) const;
     bool acceptance_matches_record_policy_locked(const MetadataAcceptance&,
                                                  const MetadataMaterialization&) const;
     bool legacy_write_api_allowed_locked() const;
@@ -359,7 +374,8 @@ class MetadataReplica {
 
   public:
     MetadataReplica(std::filesystem::path, std::array<uint8_t, 32>,
-                    std::optional<MetadataRecord> recovery_seed = {});
+                    std::optional<MetadataRecord> recovery_seed = {},
+                    bool accept_pristine_genesis_authority = true);
     MetadataRecord current() const;
     MetadataRecord committed() const;
     MetadataIdentity current_identity() const;

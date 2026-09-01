@@ -1550,6 +1550,10 @@ MACHA_TEST("rpc_cluster", test_joiner_cannot_form_genesis) {
     config.metadata_min_write_replicas = 1;
 
     auto& service = fixture.start();
+    // Bootstrap-configured pristine nodes retain genesis only as local codec
+    // material. It is not accepted authority and must never be advertised to
+    // an established cluster while the joiner is disconnected.
+    CHECK(service.node().metadata_replica().accepted_heads().empty());
     bool rejected = false;
     try {
         (void)service.filesystem().getattr("/");

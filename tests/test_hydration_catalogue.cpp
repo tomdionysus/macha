@@ -467,6 +467,7 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
 }
 
 MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_scanner) {
+    CHECK(catalogue_media_profile_frame_type() == FrameType::speculative);
     // External IDs are part of the durable catalogue format. Read fields in
     // deterministic order: function-argument evaluation order must not be
     // allowed to swap provider/id pairs during decoding.
@@ -1651,6 +1652,57 @@ MACHA_TEST("hydration_catalogue", test_catalogue_zero_length_files_wait_for_comm
     REQUIRE(item.has_value());
     CHECK(item->media_ids == std::vector<std::string>{committed_media_id});
     CHECK(fake_http_ptr->requests() == 2);
+}
+
+MACHA_TEST("hydration_catalogue", test_terminal_media_profile_job_is_not_requeued_forever) {
+    TestService fixture("node");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.catalogue.scanner.enabled = false;
+    auto& service = fixture.start();
+
+    service.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
+    const std::string path = "/Movies/Profile.Failure.2026.mp4";
+    service.filesystem().create_file(path, 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write(path, true);
+    auto bytes = pattern(32771);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    const auto media_id = file_media_id(service.filesystem().getattr(path));
+
+    auto token = fixture.path() / "tmdb.token";
+    {
+        std::ofstream out(token);
+        out << "test-token\n";
+    }
+    CatalogueScannerConfig scanner_config;
+    scanner_config.enabled = true;
+    scanner_config.movies.roots = {"/Movies"};
+    scanner_config.movies.tmdb.token_file = token;
+    scanner_config.tv.enabled = false;
+    scanner_config.music.enabled = false;
+    auto profile_engine = std::make_shared<FakeMediaEngine>();
+    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(),
+                             service.catalogue_hints(), scanner_config,
+                             std::make_unique<FakeHttpClient>(), 5s, profile_engine);
+
+    CHECK(scanner.request_media_profiles({media_id}) == 1);
+    auto hints = service.catalogue_hints().list();
+    REQUIRE(hints.size() == 1);
+    CHECK(hints.front().state == CatalogueHintState::queued);
+    service.catalogue_hints().fail(hints.front().id, "synthetic profile failure");
+
+    // A retry observes the terminal result instead of reopening the same
+    // immutable profile job and reporting an endless pending state. Playback
+    // interprets zero as permission to use its bounded media-engine fallback.
+    CHECK(scanner.request_media_profiles({media_id}) == 0);
+    auto terminal = service.catalogue_hints().get(hints.front().id);
+    REQUIRE(terminal.has_value());
+    CHECK(terminal->state == CatalogueHintState::failed);
+    CHECK(!service.catalogue().media_profile(media_id).has_value());
+
+    service.stop();
 }
 
 MACHA_TEST("hydration_catalogue", test_catalogue_cache_ignores_unrelated_metadata_generation) {

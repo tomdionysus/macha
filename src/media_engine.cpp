@@ -1261,7 +1261,7 @@ class LibavMediaEngine final : public MediaEngine {
         auto started = Clock::now();
         if (timeout.count() <= 0) timeout = config_.probe_timeout;
         Log::debug("playback probe begin media=" + source.media_id + " size=" + std::to_string(source.size));
-        InputContext input(source, MediaReadPurpose::probe, nullptr, config_.probe_bytes,
+        InputContext input(source, MediaReadPurpose::probe, source.cancelled.get(), config_.probe_bytes,
                            config_.probe_analyze_duration, timeout);
         auto* format = input.get();
         auto probe_rc = avformat_find_stream_info(format, nullptr);
@@ -1318,7 +1318,7 @@ class LibavMediaEngine final : public MediaEngine {
         double requested_seek = std::clamp(requested.seek.count() / 1000.0, 0.0,
                                            std::max(0.0, source_duration_seconds - 0.001));
 
-        InputContext input(source, MediaReadPurpose::probe, nullptr, config_.probe_bytes,
+        InputContext input(source, MediaReadPurpose::probe, source.cancelled.get(), config_.probe_bytes,
                            config_.probe_analyze_duration, timeout);
         auto* format = input.get();
         auto rc = avformat_find_stream_info(format, nullptr);

@@ -669,6 +669,147 @@ MACHA_FAST_TEST("storage_metadata", test_compacted_direct_predecessor_cannot_res
     CHECK(heads.front().hash == child.hash);
 }
 
+MACHA_FAST_TEST("storage_metadata", test_pristine_joiner_adopts_compacted_cluster_head) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto established_path = t.path() / "established";
+    const auto joiner_path = t.path() / "joiner";
+
+    NodeId a{}, b{};
+    a.bytes[15] = 1;
+    b.bytes[15] = 2;
+
+    const auto genesis = genesis_metadata();
+    auto snapshot = decode_snapshot(genesis.payload);
+    snapshot.metadata_write_replicas_required = 2;
+    snapshot.mutation_sequences[a] = 7;
+    FsEntry directory;
+    directory.type = EntryType::directory;
+    directory.mode = 0755;
+    snapshot.entries["/established"] = directory;
+
+    MetadataRecord established;
+    established.generation = 50;
+    established.previous = genesis.hash;
+    established.payload = encode_snapshot(snapshot);
+    established.hash =
+        metadata_hash(established.generation, established.previous, established.payload);
+    const MetadataAcceptance established_accept{
+        established.generation, established.hash, 2, {a, b}};
+
+    MetadataHistoryEntry compacted_head;
+    {
+        MetadataReplica replica(established_path, keys.storage);
+        REQUIRE(replica.store_commit(established));
+        REQUIRE(replica.accept_commit(established_accept));
+        REQUIRE(replica.compact_history_if_safe(1, 1));
+        auto entry = replica.history_entry(established.hash);
+        REQUIRE(entry.has_value());
+        compacted_head = *entry;
+        CHECK(!compacted_head.previous_known);
+        CHECK(!replica.historical(genesis.hash).has_value());
+    }
+
+    MetadataHistoryEntry genesis_entry;
+    {
+        MetadataReplica joiner(joiner_path, keys.storage, {}, false);
+        CHECK(joiner.accepted_heads().empty());
+        auto entry = joiner.history_entry(genesis.hash);
+        REQUIRE(entry.has_value());
+        genesis_entry = *entry;
+
+        // A pristine node imports a valid established head whose physical
+        // ancestry was compacted away. Canonical genesis is a semantic ancestor,
+        // not a competing rootless branch, so adoption is immediate.
+        REQUIRE(joiner.import_history(compacted_head));
+        REQUIRE(joiner.accept_commit(established_accept));
+        const auto heads = joiner.accepted_heads();
+        REQUIRE(heads.size() == 1);
+        CHECK(heads.front().hash == established.hash);
+        CHECK(joiner.committed().hash == established.hash);
+    }
+
+    {
+        MetadataReplica replica(established_path, keys.storage);
+        // Exercise the opposite race: an established replica sees the joiner's
+        // genesis certificate before the joiner has adopted the cluster head.
+        REQUIRE(replica.import_history(genesis_entry));
+        REQUIRE(replica.accept_commit({genesis.generation, genesis.hash, 0, {}}));
+        const auto heads = replica.accepted_heads();
+        REQUIRE(heads.size() == 1);
+        CHECK(heads.front().hash == established.hash);
+    }
+
+    MetadataReplica reopened_joiner(joiner_path, keys.storage, {}, false);
+    auto joiner_heads = reopened_joiner.accepted_heads();
+    REQUIRE(joiner_heads.size() == 1);
+    CHECK(joiner_heads.front().hash == established.hash);
+
+    MetadataReplica reopened_established(established_path, keys.storage);
+    auto established_heads = reopened_established.accepted_heads();
+    REQUIRE(established_heads.size() == 1);
+    CHECK(established_heads.front().hash == established.hash);
+}
+
+MACHA_FAST_TEST("storage_metadata", test_manual_causal_metadata_repair_requires_strict_dominance) {
+    NodeId a{}, b{};
+    a.bytes[15] = 1;
+    b.bytes[15] = 2;
+    FsEntry directory;
+    directory.type = EntryType::directory;
+    directory.mode = 0755;
+
+    auto left_snapshot = decode_snapshot(genesis_metadata().payload);
+    left_snapshot.metadata_write_replicas_required = 2;
+    left_snapshot.mutation_sequences[a] = 7;
+    left_snapshot.mutation_sequences[b] = 3;
+    left_snapshot.entries["/preserved"] = directory;
+
+    auto right_snapshot = left_snapshot;
+    right_snapshot.mutation_sequences[a] = 6;
+    right_snapshot.entries.erase("/preserved");
+
+    auto record_for = [](uint64_t generation, const MetadataSnapshot& snapshot,
+                         uint8_t previous_seed) {
+        MetadataRecord record;
+        record.generation = generation;
+        record.previous.bytes[0] = previous_seed;
+        record.payload = encode_snapshot(snapshot);
+        record.hash = metadata_hash(record.generation, record.previous, record.payload);
+        return record;
+    };
+    const auto left = record_for(50, left_snapshot, 10);
+    const auto right = record_for(40, right_snapshot, 20);
+    auto plan = plan_causally_dominant_metadata_repair(left, left_snapshot,
+                                                        right, right_snapshot);
+    REQUIRE(plan.has_value());
+    CHECK(plan->dominant_head == left.hash);
+    CHECK(plan->subsumed_head == right.hash);
+    CHECK(plan->record.generation == 51);
+    CHECK(plan->record.previous == std::min(left.hash, right.hash));
+    const auto repaired = decode_snapshot(plan->record.payload);
+    CHECK(repaired.entries == left_snapshot.entries);
+    CHECK(repaired.mutation_sequences == left_snapshot.mutation_sequences);
+    REQUIRE(repaired.merge_parents.size() == 1);
+    CHECK(repaired.merge_parents.front() == std::max(left.hash, right.hash));
+    CHECK(valid_metadata_record(plan->record));
+
+    auto concurrent = right_snapshot;
+    concurrent.mutation_sequences[a] = 6;
+    concurrent.mutation_sequences[b] = 4;
+    const auto concurrent_record = record_for(41, concurrent, 30);
+    CHECK(!plan_causally_dominant_metadata_repair(left, left_snapshot,
+                                                   concurrent_record, concurrent));
+
+    auto equal_clock = left_snapshot;
+    equal_clock.entries.erase("/preserved");
+    const auto equal_record = record_for(42, equal_clock, 40);
+    CHECK(!plan_causally_dominant_metadata_repair(left, left_snapshot,
+                                                   equal_record, equal_clock));
+}
+
 MACHA_FAST_TEST("storage_metadata", test_metadata_recovery_cache_seed_is_not_accepted_authority) {
     TempDir t;
     auto keyfile = t.path() / "key";
