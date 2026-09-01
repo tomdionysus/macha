@@ -626,8 +626,10 @@ int run_fuse(FileSystem& filesystem, CacheHydrator& hydrator,
 
     Log::debug("shutdown: entering bounded FUSE main loop");
     const int loop_rc = fuse_loop_mt(instance, 0);
-    if (loop_rc != 0)
+    if (fuse_loop_result_is_error(loop_rc))
         unexpected_mount_loss.store(true);
+    else if (loop_rc > 0)
+        Log::debug("shutdown: FUSE main loop received signal=" + std::to_string(loop_rc));
     filesystem.request_io_cancellation();
     if (request_shutdown)
         request_shutdown();

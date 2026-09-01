@@ -115,6 +115,7 @@ class NodeRuntime {
     std::deque<LocalCopyJob> local_copies_;
     size_t local_copy_bytes_{};
     std::atomic_bool started_{};
+    std::atomic_bool outbound_calls_stopped_{};
     std::atomic_uint64_t playback_activity_bytes_{};
     std::atomic_uint64_t interactive_activity_bytes_{};
     std::atomic_int64_t last_playback_activity_ms_{};
@@ -149,6 +150,10 @@ class NodeRuntime {
     ~NodeRuntime();
     void start();
     void request_stop();
+    // Close outbound/inbound client routes and fail every pending synchronous
+    // call without waiting for the rest of NodeRuntime teardown. Service-owned
+    // workers must be able to leave an RPC wait before Service joins them.
+    void cancel_outbound_calls();
     void stop();
     void set_service_event_callback(std::function<void(ServiceEvent)> callback);
     void notify_storage_mutation();

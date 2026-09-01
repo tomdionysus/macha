@@ -145,6 +145,9 @@ void parse_dht(const YAML::Node& root, Config& c) {
         c.read_ahead_extents = d["read_ahead"].as<size_t>();
     if (d["metadata_cache_ms"])
         c.metadata_cache = milliseconds(d["metadata_cache_ms"], "metadata_cache_ms");
+    if (d["metadata_materialization_cache_bytes"])
+        c.metadata_materialization_cache_bytes =
+            yaml_size(d["metadata_materialization_cache_bytes"]);
 }
 
 void parse_maintenance(const YAML::Node& root, Config& c) {
@@ -427,6 +430,8 @@ void parse_streaming(const YAML::Node& root, Config& c) {
         c.streaming.max_audio_transcodes = streaming["max_audio_transcodes"].as<size_t>();
     if (streaming["session_idle_ms"])
         c.streaming.session_idle = milliseconds(streaming["session_idle_ms"], "streaming.session_idle_ms");
+    if (streaming["pipeline_idle_ms"])
+        c.streaming.pipeline_idle = milliseconds(streaming["pipeline_idle_ms"], "streaming.pipeline_idle_ms");
     if (streaming["startup_timeout_ms"])
         c.streaming.startup_timeout = milliseconds(streaming["startup_timeout_ms"], "streaming.startup_timeout_ms");
     if (streaming["segment_duration_ms"])

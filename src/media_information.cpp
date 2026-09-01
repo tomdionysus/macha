@@ -52,9 +52,10 @@ struct MediaInformationService::Flight {
 
 MediaInformationService::MediaInformationService(
     FileSystem& fs, CatalogueManager& catalogue, std::shared_ptr<MediaEngine> engine,
-    const std::filesystem::path& state_path)
+    const std::filesystem::path& state_path, ProfilePublisher profile_publisher)
     : fs_(fs), catalogue_(catalogue), engine_(std::move(engine)),
-      hints_(state_path / "media-information") {}
+      hints_(state_path / "media-information"),
+      profile_publisher_(std::move(profile_publisher)) {}
 
 MediaInformationService::~MediaInformationService() { stop(); }
 
@@ -303,7 +304,10 @@ void MediaInformationService::publish_one(std::string media_id, MediaProbeResult
         flights_.erase(media_id);
         return;
     }
-    catalogue_.put_media_profile(media_id, std::move(probe));
+    if (profile_publisher_)
+        profile_publisher_(media_id, std::move(probe));
+    else
+        catalogue_.put_media_profile(media_id, std::move(probe));
     std::lock_guard lock(mutex_);
     flights_.erase(media_id);
 }
@@ -335,10 +339,13 @@ void MediaInformationService::loop(std::stop_token stop) {
         bool do_prune = false;
         {
             std::lock_guard lock(mutex_);
-            if (!pending_publications_.empty()) {
+            const auto now = Clock::now();
+            if (!pending_publications_.empty() &&
+                (!publication_retry_at_ || now >= *publication_retry_at_)) {
                 auto it = pending_publications_.begin();
                 publication = *it;
                 pending_publications_.erase(it);
+                if (pending_publications_.empty()) publication_retry_at_.reset();
             } else if (prune_requested_) {
                 prune_requested_ = false;
                 do_prune = true;
@@ -346,9 +353,19 @@ void MediaInformationService::loop(std::stop_token stop) {
         }
         if (publication) {
             try {
-                publish_one(std::move(publication->first), std::move(publication->second));
+                // Retain the completed probe until publication commits. A
+                // catalogue CAS conflict must retry this result, not discard
+                // it and force a second media scan.
+                publish_one(publication->first, publication->second);
             } catch (const std::exception& e) {
                 Log::warn("media information publication failed: " + std::string(e.what()));
+                {
+                    std::lock_guard lock(mutex_);
+                    pending_publications_.insert_or_assign(
+                        publication->first, publication->second);
+                    publication_retry_at_ = Clock::now() + publication_retry_delay_;
+                }
+                cv_.notify_all();
             }
             continue;
         }
@@ -366,10 +383,20 @@ void MediaInformationService::loop(std::stop_token stop) {
         std::unique_lock lock(mutex_);
         const auto ready_delay = hints_.next_ready_delay();
         const auto changed = [&] {
-            return !pending_publications_.empty() || prune_requested_;
+            return prune_requested_ ||
+                   (!pending_publications_.empty() &&
+                    (!publication_retry_at_ || Clock::now() >= *publication_retry_at_));
         };
-        if (ready_delay)
-            cv_.wait_for(lock, stop, *ready_delay, changed);
+        std::optional<std::chrono::milliseconds> wait_delay = ready_delay;
+        if (publication_retry_at_) {
+            const auto retry_delay = std::max(
+                std::chrono::milliseconds(0),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    *publication_retry_at_ - Clock::now()));
+            if (!wait_delay || retry_delay < *wait_delay) wait_delay = retry_delay;
+        }
+        if (wait_delay)
+            cv_.wait_for(lock, stop, *wait_delay, changed);
         else
             cv_.wait(lock, stop, changed);
     }

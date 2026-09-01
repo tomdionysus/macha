@@ -541,6 +541,14 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
             values.materialization_cache_evictions;
         metadata_diagnostics["materialization_cache_entries"] =
             static_cast<uint64_t>(values.materialization_cache_entries);
+        metadata_diagnostics["materialization_cache_bytes"] =
+            values.materialization_cache_bytes;
+        metadata_diagnostics["materialization_cache_limit_bytes"] =
+            values.materialization_cache_limit_bytes;
+        metadata_diagnostics["history_records"] = values.history_records;
+        metadata_diagnostics["history_file_bytes"] = values.history_file_bytes;
+        metadata_diagnostics["history_resident_payload_bytes"] =
+            values.history_resident_payload_bytes;
         metadata_diagnostics["accepted_head_persistence_writes"] =
             values.accepted_head_persistence_writes;
         metadata_diagnostics["accepted_head_persistence_bytes"] =

@@ -1219,6 +1219,83 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_shutdown_finishes_owner_and
     client.stop();
 }
 
+MACHA_TEST("rpc_cluster", test_service_shutdown_cancels_pending_outbound_rpc_before_join) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto config = config_for(cluster.path() / "shutdown-client", cluster.keyfile(), free_port());
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.catalogue.scanner.enabled = false;
+    config.catalogue.api.enabled = false;
+    config.ingest.enabled = false;
+    config.torrent.enabled = false;
+
+    Service service(config, keys);
+    service.start();
+    (void)service.filesystem();
+
+    const auto peer_port = free_port();
+    NodeInfo peer{random_node_id(), "127.0.0.1", "blocked-peer", peer_port};
+    peer.metadata_write_replicas_required = 1;
+    TestGate blocked;
+    RpcServer server(
+        "127.0.0.1", peer_port, keys, peer,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (request.type == MessageType::get_object) {
+                blocked.enter_and_wait();
+                return RpcMessage{MessageType::object_reply, {}};
+            }
+            return RpcMessage{MessageType::error, {}};
+        },
+        [](const NodeInfo&) {}, 256 * 1024);
+    server.start();
+    struct GateOpener {
+        TestGate& gate;
+        ~GateOpener() { gate.open(); }
+    } open_on_exit{blocked};
+
+    const Endpoint endpoint{"127.0.0.1", peer_port};
+    auto pending = std::async(std::launch::async, [&] {
+        try {
+            Bytes object_id(32, 0x7b);
+            (void)service.node().call(endpoint, MessageType::get_object, object_id,
+                                      FrameType::speculative);
+            return false;
+        } catch (...) {
+            return true;
+        }
+    });
+    REQUIRE(blocked.wait_for_entries(1));
+
+    // This is the live node-50 failure shape: a synchronous RPC is still
+    // outstanding when Service joins its maintenance owner. Shutdown must close
+    // outbound routes first, causing the call to fail without waiting for its
+    // ordinary peer-health/stall deadline.
+    const auto started = Clock::now();
+    auto stopping = std::async(std::launch::async, [&] { service.stop(); });
+    REQUIRE(stopping.wait_for(2s) == std::future_status::ready);
+    stopping.get();
+    CHECK(Clock::now() - started < 2s);
+    REQUIRE(pending.wait_for(1s) == std::future_status::ready);
+    CHECK(pending.get());
+
+    // Cancellation is a shutdown state, not merely a one-shot connection
+    // close. A maintenance pass already between stop checks must not recreate a
+    // route and begin another synchronous RPC after the first close completes.
+    const auto retry_started = Clock::now();
+    bool retry_rejected = false;
+    try {
+        (void)service.node().call(endpoint, MessageType::ping, {});
+    } catch (const std::exception&) {
+        retry_rejected = true;
+    }
+    CHECK(retry_rejected);
+    CHECK(Clock::now() - retry_started < 250ms);
+
+    blocked.open();
+    server.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_rpc_foreground_not_starved_by_busy_data_workers) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
@@ -2686,6 +2763,14 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
         const auto merged = s2.node().metadata_replica().accepted_heads().front();
         CHECK(s2.node().metadata_replica().history_is_ancestor(left_head, merged.hash));
         CHECK(s2.node().metadata_replica().history_is_ancestor(right_head, merged.hash));
+        const auto local_history = s2.node().metadata_replica().history_entry(merged.hash);
+        const auto remote_history = s3.node().metadata_replica().history_entry(merged.hash);
+        REQUIRE(local_history.has_value());
+        REQUIRE(remote_history.has_value());
+        CHECK(local_history->body == MetadataHistoryEntry::Body::delta);
+        CHECK(remote_history->body == MetadataHistoryEntry::Body::delta);
+        CHECK(local_history->payload.size() < merged.payload.size());
+        CHECK(remote_history->payload == local_history->payload);
 
         s2.stop();
         s3.stop();

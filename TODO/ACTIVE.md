@@ -6,6 +6,47 @@ This is the working backlog for the current session. Add new work here. When an 
 
 The existing documents in this directory remain the detailed plans, checkpoints, and UAT records. This file is only the current index.
 
+## Deployment rule
+
+- [ ] For every deployment, synchronize the complete source tree and all
+  top-level build metadata needed by CMake. Never construct a remote build tree
+  by copying only files believed to have changed. Configure after synchronization,
+  build nodes in parallel, and verify installed binary versions and hashes on
+  identical hardware before UAT.
+
+## P0: bounded metadata history and crash recovery
+
+- [ ] Execute the phased
+  [metadata-history memory remediation](2026-09-01-metadata-history-memory-remediation.md)
+  before resuming loaded ingest/throughput UAT. Overnight rsync grew each
+  replica's `history.log` from roughly 64 MB to about 2.1 GB; Macha retained the
+  complete decrypted history plus a 64-entry full materialisation cache and the
+  kernel OOM-killed node 50.
+- [ ] Replace the disabled history compactor with an exact-head,
+  cluster-acknowledged checkpoint/ancestry-floor protocol that is safe across
+  partitions, returning nodes, same-generation siblings, concurrent notices,
+  and restart.
+- [ ] Extend the now-correct current-RSS Status reporting with current swap and
+  separately named peak memory. Add pinned-cache byte diagnostics and
+  pressure-triggered cache shedding; service-manager limits are a final safety
+  net, not the primary fix.
+- [ ] Complete live stale-FUSE recovery proof: preflight ordering is fixed, but
+  UAT must hard-kill a mounted node and prove automatic detach, identity
+  retention and clean generation rejoin.
+- [ ] Remove serial remote `has_on` amplification from metadata publication
+  retention. Live 0.22.2 recovery showed one recovered FUSE file commit holding
+  `mutation_mutex_` inside `retain_metadata_publication()` while checking its
+  extents remotely; GBNI-1's convergence/catalogue refresh waited behind it and
+  RSS temporarily reached 2.5 GB. Batch or otherwise bound those checks without
+  weakening retention-before-acceptance, and keep them off critical control
+  traffic. See the
+  [reconciliation recovery record](2026-09-01-metadata-reconciliation-recovery.md).
+- [ ] Pass synthetic multi-gigabyte-equivalent history, branch/partition,
+  unclean-restart and cache-pressure regressions, then run an overnight four-node
+  rsync UAT. The gate requires bounded/stable RSS and swap, automatic node
+  restart/rejoin, bounded history growth, writable metadata, no viewer/control
+  regression, and no operator mount cleanup.
+
 ## Phase 2 namespace batching follow-up
 
 - [ ] Design a durable batch identity that permits dependency chains such as create/rename/unlink to share a publication without weakening restart proof.
@@ -16,13 +57,13 @@ The existing documents in this directory remain the detailed plans, checkpoints,
 ## Diagnostics and operational proof still needed
 
 - [ ] Record a reproducible local benchmark recipe without default-suite timing thresholds.
-- [ ] Correct the misleading Status `runtime.rss_bytes` metric, which currently uses lifetime-peak `ru_maxrss`. Report current resident bytes, or expose separately and explicitly named current and peak values; add platform-aware contract tests and operational documentation.
-- [ ] After correcting the RSS metric, repeat the namespace-burst UAT for at least three rounds after every materialization cache reaches its 64-entry bound, then establish whether current RSS reaches a stable ceiling or decays after drain.
+- [ ] After the P0 byte-bounded cache and Status memory metrics land, repeat the
+  namespace-burst UAT for at least three cache-fill/eviction rounds and prove
+  current RSS and swap reach a stable ceiling and recover after drain.
 
 ## Separate known issue
 
 - [ ] Diagnose and correct faulty torrent/ingest behaviour. Pausing the torrent removed the local node's residual CPU during Phase 3 idle UAT. Treat this as a separate subsystem investigation so it does not obscure metadata/convergence measurements.
-- [ ] Diagnose node 51's non-graceful shutdown observed during the 2026-08-31 rolling deployment. The process reached `Service::stop`, stopped at `service maintenance joining`, exceeded systemd's one-minute stop timeout and was killed. Add a bounded shutdown regression that identifies which maintenance owner fails to observe stop; do not hide it by increasing `TimeoutStopSec`.
 
 ## Deferred architectural concepts
 
@@ -42,12 +83,26 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   negotiation rather than returning `profile_pending`; and record cold-process,
   repeated-session, same-key replay, and start/seek latency evidence in
   [the playback admission plan](2026-08-31-playback-immutable-media-profile-and-idempotent-admission.md).
+  The 2026-09-01 loaded UAT proved a remaining violation: a profile miss did
+  3,358 ms of synchronous remote inspection and session creation took 4,708 ms.
+  Profile optimisation must remain advisory; a miss must not put speculative
+  profiling on the admission critical path. The first remediation cut now
+  preserves and retries completed profiles across catalogue publication
+  conflicts without rescanning; local verification is 248/248. Deployment and
+  loaded UAT remain; see
+  [the playback reclamation checkpoint](2026-09-01-playback-profile-publication-and-pipeline-reclamation.md).
 
 - [ ] Support multiple advertised endpoints per node and multiple candidate IPs
   per bootstrap node. A node must be able to advertise at least its local/LAN
   and internet/WAN endpoints simultaneously, with address family, scope and
   provenance sufficient for peers to choose an endpoint reachable from their
-  own network position.
+  own network position. Include ordinary poor-network behaviour in the design:
+  transient connection loss, latency and packet loss must not destroy a logical
+  playback attempt, create duplicate sessions or turn a retry into an ambiguous
+  404. Reuse connections where practical, retry/reconcile creation with the
+  same idempotency key, fail over among advertised endpoints, preserve precise
+  server error codes, and test loss immediately after request commit and during
+  playlist/fragment delivery.
 - [ ] Integrate endpoint discovery with the completed UPnP/external-IP work:
   automatically combine configured listen/advertise addresses, interface/LAN
   addresses, discovered public address and mapped public port, while suppressing
@@ -183,11 +238,6 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   ranges into fewer metadata generations, preserve bounded cursor progress
   across transient object failures, and reserve full-spool retirement progress
   so accepted bytes cannot remain pinned behind pathological or failing work.
-- [ ] Fix stale FUSE mount recovery ordering. Startup currently calls
-  `create_directories(mount_path)` before `prepare_fuse_mountpoint()`, so a
-  disconnected Macha mount returns `ENOTCONN` before
-  `fuse.unmount_if_mounted: true` can recover it. Add a regression around the
-  preflight contract and retain refusal of unrelated filesystems.
 - [ ] Phase 2: design and prove versioned durable incremental extent staging and
   safe spool-range retirement without exposing partial files.
 - [ ] Phase 3: aggregate sequential local write descriptors and make durability
@@ -246,7 +296,14 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   leases from running physical encoders, make teardown event-driven and bounded,
   expose enough session/pipeline age and ownership diagnostics to identify a
   leak, and add regressions proving dead or superseded transcodes promptly stop
-  consuming admission capacity.
+  consuming admission capacity. The 2026-09-01 poor-Wi-Fi UAT reproduced this:
+  after playback failed, node 50 retained two sessions, two audio transcodes and
+  the sole allowed video transcode. The current 30-minute idle expiry makes a
+  lost client DELETE capable of blocking subsequent playback for far too long.
+  A configurable event-driven physical `pipeline_idle_ms` lease (60 seconds by
+  default) is now implemented and locally tested without shortening the logical
+  session lifetime. Keep this broader item active until loaded Wi-Fi UAT proves
+  reclamation, replay/reconciliation and physical memory release.
 - [ ] Investigate node 50 becoming unable to complete even a 30-second SSH banner
   during the 0.22.0 deployment build while the old Macha daemon remained active.
   Do not attribute this to a four-job compile without evidence: correlate Macha
@@ -254,13 +311,6 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   queues and publication/catalogue/playback activity. Verify that loader and
   background work cannot starve host control access, and repeat a controlled
   build both with Macha active and hard-stopped.
-- [ ] Replace the disabled metadata-history compactor with a protocol that
-  proves exact accepted-head identity—not merely generation/stability—on every
-  durable known participant before advancing an ancestry floor. The proof must
-  remain valid across a returning node, same-generation siblings, concurrent
-  acceptance notices and restart. Until that protocol and its partition/
-  compaction regression exist, retaining ancestry is the intentional safe
-  behavior.
 - [ ] Add an optional free-form human-readable `node_name` configuration value,
   advertise it through cluster telemetry, and expose it consistently at JSON
   path `.nodes[].node_name` in the aggregated Status response. Node identity,

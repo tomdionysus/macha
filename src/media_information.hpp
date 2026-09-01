@@ -7,6 +7,7 @@
 #include "media_engine.hpp"
 
 #include <condition_variable>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -38,8 +39,11 @@ class MediaInformationService {
     std::condition_variable_any cv_;
     std::map<std::string, std::shared_ptr<Flight>, std::less<>> flights_;
     std::map<std::string, MediaProbeResult, std::less<>> pending_publications_;
+    std::optional<Clock::time_point> publication_retry_at_;
+    std::chrono::milliseconds publication_retry_delay_{250};
     bool prune_requested_{true};
     bool started_{};
+    std::function<void(std::string, MediaProbeResult)> profile_publisher_;
 
     std::optional<std::pair<std::string, FsEntry>> source_for(std::string_view media_id) const;
     bool media_is_live(std::string_view media_id) const;
@@ -51,8 +55,11 @@ class MediaInformationService {
     void loop(std::stop_token);
 
   public:
+    using ProfilePublisher = std::function<void(std::string, MediaProbeResult)>;
+
     MediaInformationService(FileSystem&, CatalogueManager&, std::shared_ptr<MediaEngine>,
-                            const std::filesystem::path& state_path);
+                            const std::filesystem::path& state_path,
+                            ProfilePublisher profile_publisher = {});
     ~MediaInformationService();
 
     void start();

@@ -198,6 +198,9 @@ dht:
   data_viewer_reserve_bytes: 32M
   read_ahead: 3
   metadata_cache_ms: 250
+  # Process-memory ceiling for decoded metadata snapshots. Durable history
+  # payloads stay disk-backed and are loaded only when required.
+  metadata_materialization_cache_bytes: 128M
 
 # Speculative cache hydration. Hint engines are independent and their priorities
 # are merged by a weighted-fair scheduler. Ordered runs stay sequential: a next
@@ -375,6 +378,10 @@ streaming:
   max_video_transcodes: 1
   max_audio_transcodes: 4
   session_idle_ms: 1800000
+  # Stop an abandoned physical remux/transcode pipeline after one minute
+  # without a valid current-generation stream request. The logical session is
+  # retained until session_idle_ms for retry/reconciliation.
+  pipeline_idle_ms: 60000
   startup_timeout_ms: 15000
   segment_duration_ms: 4000
   max_ahead_segments: 8

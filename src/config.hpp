@@ -306,6 +306,9 @@ struct StreamingConfig {
     size_t max_video_transcodes{1};
     size_t max_audio_transcodes{4};
     std::chrono::milliseconds session_idle{std::chrono::minutes(30)};
+    // Reclaim an abandoned physical encoder while retaining the logical
+    // session long enough for client retry/reconciliation.
+    std::chrono::milliseconds pipeline_idle{std::chrono::seconds(60)};
     std::chrono::milliseconds startup_timeout{15000};
     std::chrono::milliseconds segment_duration{4000};
     size_t max_ahead_segments{8};
@@ -393,6 +396,9 @@ struct Config {
     std::chrono::milliseconds control_stall_notice{5000};
     std::chrono::milliseconds data_stall_notice{120000};
     std::chrono::milliseconds metadata_cache{250};
+    // Logical byte budget for immutable metadata records plus their decoded
+    // snapshots. Durable history payloads remain disk-backed outside it.
+    uint64_t metadata_materialization_cache_bytes{128ULL * 1024 * 1024};
     LogLevel log_level{LogLevel::info};
     FfmpegLogLevel ffmpeg_log_level{FfmpegLogLevel::error};
 };

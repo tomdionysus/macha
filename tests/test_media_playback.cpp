@@ -1049,6 +1049,144 @@ MACHA_TEST("media_playback", test_media_information_profile_pruning_tracks_last_
     service.stop();
 }
 
+MACHA_TEST("media_playback", test_media_information_retries_profile_publication_without_rescanning) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    const std::string path = "/media/retry-publication.mp4";
+    service.filesystem().create_file(path, 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write(path, true);
+    auto bytes = pattern(65547);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    const auto media_id = file_media_id(service.filesystem().getattr(path));
+
+    auto engine = std::make_shared<PriorityMediaInformationEngine>();
+    std::atomic_uint publication_attempts{};
+    MediaInformationService information(
+        service.filesystem(), service.catalogue(), engine, t.path() / "media-info",
+        [&](std::string id, MediaProbeResult profile) {
+            if (++publication_attempts == 1)
+                throw std::runtime_error("synthetic catalogue conflict");
+            service.catalogue().put_media_profile(id, std::move(profile));
+        });
+    REQUIRE(information.request_path(path));
+    information.start();
+
+    REQUIRE(wait_until([&] {
+        return service.catalogue().media_profile(media_id).has_value();
+    }, 3s));
+    CHECK(publication_attempts.load() == 2);
+    CHECK(engine->starts() == 1);
+    CHECK(engine->completions() == 1);
+
+    information.stop();
+    service.stop();
+}
+
+MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_before_session) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/abandoned.mp4", 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write("/media/abandoned.mp4", true);
+    auto bytes = pattern(65549);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    const auto media_id = file_media_id(service.filesystem().getattr("/media/abandoned.mp4"));
+
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback";
+    streaming.max_video_transcodes = 1;
+    streaming.pipeline_idle = 50ms;
+    streaming.session_idle = 5min;
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             std::make_unique<FakeMediaEngine>());
+    playback.start();
+
+    Json::Object preferences{{"mode", "transcode"}};
+    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
+    auto text = Json(std::move(root)).dump();
+    HttpRequest create;
+    create.method = "POST";
+    create.path = "/api/v1/playback/sessions";
+    create.body.assign(text.begin(), text.end());
+    auto first = playback.handle(create);
+    REQUIRE(first.status == 201);
+    auto first_json = Json::parse(std::string(first.body.begin(), first.body.end()));
+    auto stale_stream = first_json.find("stream")->find("url")->asString();
+    const auto current_stream = stale_stream;
+    auto generation = stale_stream.find("/1/master.m3u8");
+    REQUIRE(generation != std::string::npos);
+    stale_stream.replace(generation, std::string("/1/master.m3u8").size(),
+                         "/0/master.m3u8");
+
+    auto playback_status = [&] {
+        HttpRequest request;
+        request.method = "GET";
+        request.path = "/api/v1/playback/status";
+        auto response = playback.handle(request);
+        REQUIRE(response.status == 200);
+        return Json::parse(std::string(response.body.begin(), response.body.end()));
+    };
+    auto active = playback_status();
+    CHECK(active.find("sessions")->asUInt64() == 1);
+    CHECK(active.find("video_transcodes")->asUInt64() == 1);
+
+    // Valid current-generation traffic renews the physical pipeline lease.
+    for (int i = 0; i < 4; ++i) {
+        HttpRequest current;
+        current.method = "GET";
+        current.path = current_stream;
+        CHECK(playback.handle(current).status == 200);
+        std::this_thread::sleep_for(20ms);
+    }
+    CHECK(playback_status().find("video_transcodes")->asUInt64() == 1);
+
+    // A client retrying an obsolete generation receives a precise 404, but
+    // those invalid requests must not keep an abandoned encoder leased.
+    for (int i = 0; i < 4; ++i) {
+        HttpRequest stale;
+        stale.method = "GET";
+        stale.path = stale_stream;
+        CHECK(playback.handle(stale).status == 404);
+        std::this_thread::sleep_for(20ms);
+    }
+
+    REQUIRE(wait_until([&] {
+        auto status = playback_status();
+        return status.find("sessions")->asUInt64() == 1 &&
+               status.find("video_transcodes")->asUInt64() == 0 &&
+               status.find("idle_pipelines_reclaimed")->asUInt64() == 1;
+    }, 1s));
+
+    // The logical session may remain available for reconciliation, but its
+    // abandoned physical encoder must no longer deny a new viewer.
+    auto second = playback.handle(create);
+    REQUIRE(second.status == 201);
+
+    playback.stop();
+    service.stop();
+}
+
 MACHA_TEST("media_playback", test_attached_picture_audio_direct_play) {
     TempDir t;
     auto keyfile = t.path() / "key";

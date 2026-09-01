@@ -9,8 +9,10 @@
 #include <algorithm>
 #include <ctime>
 #include <fstream>
-#include <sys/resource.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 
 namespace macha {
 namespace {
@@ -18,13 +20,23 @@ constexpr std::array<uint8_t, 8> magic{'M', 'A', 'C', 'H', 'T', 'E', 'L', '1'};
 constexpr size_t max_persisted_records = 1024;
 
 uint64_t resident_bytes() {
-    struct rusage usage {};
-    if (getrusage(RUSAGE_SELF, &usage) != 0)
-        return 0;
 #if defined(__APPLE__)
-    return static_cast<uint64_t>(usage.ru_maxrss);
+    mach_task_basic_info_data_t info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS)
+        return 0;
+    return static_cast<uint64_t>(info.resident_size);
+#elif defined(__linux__)
+    std::ifstream stream("/proc/self/statm");
+    uint64_t virtual_pages = 0;
+    uint64_t resident_pages = 0;
+    if (!(stream >> virtual_pages >> resident_pages))
+        return 0;
+    const auto page_size = sysconf(_SC_PAGESIZE);
+    return page_size > 0 ? resident_pages * static_cast<uint64_t>(page_size) : 0;
 #else
-    return static_cast<uint64_t>(usage.ru_maxrss) * 1024ULL;
+    return 0;
 #endif
 }
 

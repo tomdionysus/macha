@@ -910,9 +910,10 @@ uint64_t StoragePool::rebalance_once(uint64_t budget_bytes) {
     }
 }
 
-size_t StoragePool::compact_packs() {
+size_t StoragePool::compact_packs(std::stop_token stop) {
     size_t visited = 0;
     for (const auto& backend : snapshot()) {
+        if (stop.stop_requested()) break;
         std::shared_ptr<LocalStore> store;
         std::filesystem::path path;
         {
@@ -923,7 +924,7 @@ size_t StoragePool::compact_packs() {
             path = backend->cfg.path;
         }
         try {
-            (void)store->compact_packs();
+            (void)store->compact_packs(stop);
             ++visited;
         } catch (const std::exception& error) {
             // Compaction failure must not make authoritative bytes disappear.

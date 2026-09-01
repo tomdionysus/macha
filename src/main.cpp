@@ -21,8 +21,8 @@ int main(int argc, char** argv) {
         macha::configure_ffmpeg_logging(config.ffmpeg_log_level);
         auto keys = macha::load_cluster_keys(config.key_file);
         if (config.mount_path) {
-            std::filesystem::create_directories(*config.mount_path);
             macha::prepare_fuse_mountpoint(*config.mount_path, config.fuse);
+            std::filesystem::create_directories(*config.mount_path);
         }
 
         sigset_t service_signals;

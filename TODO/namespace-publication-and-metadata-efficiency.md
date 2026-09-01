@@ -90,6 +90,13 @@ Exit criteria:
 
 Goal: eliminate repeated anchor-to-head replay and full-snapshot encoding for the same hash.
 
+> **2026-09-01 operational correction:** the implemented 64-entry cache is
+> entry-bounded but not byte-bounded. With 5.67 MB encoded snapshots, decoded
+> namespace trees and a 2.1 GB retained history, it contributed to a real OOM on
+> node 50. The implementation remains useful deduplication, but its memory-bound
+> claim is superseded by the P0
+> [metadata-history memory remediation](2026-09-01-metadata-history-memory-remediation.md).
+
 ### Design
 
 - [x] Add a bounded materialization cache keyed by commit hash for immutable,

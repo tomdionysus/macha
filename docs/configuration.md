@@ -62,6 +62,7 @@ dht:
   data_viewer_reserve_bytes: 32M
   read_ahead: 3
   metadata_cache_ms: 250
+  metadata_materialization_cache_bytes: 128M
 ```
 
 - `replicas`: desired converged authoritative DATA copies.
@@ -71,6 +72,7 @@ dht:
 - `extent_size`: maximum ordinary file extent size. It is unrelated to small-object pack allocation.
 - `data_inflight_bytes`: node-wide byte budget for blocking DATA object reads, writes, and transfers.
 - `data_viewer_reserve_bytes`: non-borrowable headroom inside that budget for foreground playback and read-ahead. Loader and speculative work remain work-conserving within the rest of the budget, but cannot consume this reserve. It must be smaller than `data_inflight_bytes`, and the difference must fit at least one `extent_size` object.
+- `metadata_materialization_cache_bytes`: bounded process-memory budget for decoded metadata snapshots and their immutable records. Historical payloads remain in `history.log` and are read on demand. The default is `128M`.
 
 Replica policy should be identical across the cluster and changed as a coordinated cluster operation. `metadata_min_write_replicas: 2` means any two active nodes, not two preselected nodes.
 
@@ -152,6 +154,25 @@ waits, quantum/yield counts, and peak admitted publication bytes beneath
 `diagnostics.filesystem`.
 
 The remaining FUSE worker/timeout fields bound local kernel-facing work. They do not turn `fsync()` into a promise of cluster-wide convergence; accepted local state is made crash-recoverable first and distributed publication continues asynchronously.
+
+## Streaming
+
+```yaml
+streaming:
+  enabled: true
+  max_sessions: 8
+  max_video_transcodes: 1
+  max_audio_transcodes: 4
+  pipeline_idle_ms: 60000
+  session_idle_ms: 1800000
+```
+
+`pipeline_idle_ms` releases an abandoned physical remux/transcode encoder after
+valid current-generation stream requests stop (60 seconds by default). The
+logical session remains reconcilable until `session_idle_ms`; invalid or stale
+generation retries do not renew the physical lease. This bounds leaked
+transcode capacity after a client disappears on an unreliable network without
+shortening the logical session lifetime.
 
 ## Cache
 

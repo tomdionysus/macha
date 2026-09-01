@@ -248,4 +248,19 @@ A direct MP4 can be assigned directly to a normal HTML `<video>` element. For tr
 
 `max_sessions`, `max_video_transcodes` and `max_audio_transcodes` are enforced independently. Admission reserves pending session/transcode capacity before pipeline startup, so simultaneous POST/PATCH requests cannot race through a limit before either session becomes visible. Hitting a limit returns HTTP 429. Malformed/incompatible playback requests return 400, missing media/session state returns 404, and media-engine failures return 503. Probe and pipeline-start failures use stage-specific error codes (`playback_probe_failed` or `playback_pipeline_start_failed`), include `trace`/`stage` in the JSON body, and return the same trace in `X-Macha-Playback-Trace` for correlation with `playback[trace]` server logs.
 
-Sessions expire after `session_idle_ms` without control or stream activity. Expiry cancels the in-process pipeline and removes any spilled generated fragments. Explicit `DELETE` performs the same cleanup immediately.
+Logical sessions expire after `session_idle_ms` without control or valid
+current-generation stream activity. Expiry cancels the in-process pipeline and
+removes any spilled generated fragments. Explicit `DELETE` performs the same
+cleanup immediately.
+
+Physical remux/transcode pipelines have a shorter independent
+`pipeline_idle_ms` lease (60 seconds by default). Valid current-generation
+playlist, fragment and subtitle requests renew it. Obsolete-generation and
+otherwise invalid stream requests do not, so a client retry loop cannot retain
+an abandoned encoder. Reclamation is event-driven, never interrupts an active
+stream HTTP request, and leaves the logical session available until
+`session_idle_ms` for client reconciliation. `GET /api/v1/playback/status`
+reports `pipeline_idle_ms` and the cumulative `idle_pipelines_reclaimed` count.
+After physical reclamation, `GET` still returns the logical session with no
+running engine; a client that resumes it can `PATCH` the session (including its
+current preferences/position) to create a fresh physical generation.

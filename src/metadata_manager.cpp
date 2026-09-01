@@ -550,13 +550,23 @@ MetadataHistoryEntry MetadataManager::commit_history_entry(
 
 bool MetadataManager::store_commit_on(const NodeInfo& owner,
                                       const MetadataHistoryEntry& compact,
-                                      const MetadataRecord& record,
+    const MetadataRecord& record,
                                       FrameType frame_type) {
     if (owner.id == node_.node_id()) {
-        return node_.metadata_replica().store_commit(
-            record, compact.body == MetadataHistoryEntry::Body::delta
-                        ? std::span<const uint8_t>(compact.payload)
-                        : std::span<const uint8_t>{});
+        if (compact.body != MetadataHistoryEntry::Body::delta)
+            return node_.metadata_replica().store_commit(record);
+        if (node_.metadata_replica().store_commit(record, compact.payload))
+            return true;
+
+        // The immutable full record is already present in the publication
+        // proposal. A compact body can be rejected because its parent is absent
+        // or because an exact caller supplied a non-reconstructing delta; neither
+        // condition should make the local path weaker than a remote replica,
+        // which already retries the full body below. This is a single bounded
+        // fallback, not a retry loop.
+        Log::warn("local metadata delta rejected; retrying full record generation=" +
+                  std::to_string(record.generation));
+        return node_.metadata_replica().store_commit(record);
     }
 
     try {
@@ -566,10 +576,17 @@ bool MetadataManager::store_commit_on(const NodeInfo& owner,
             return true;
 
         // A compact delta may arrive at a perfectly valid replica which simply
-        // has not imported its parent yet. Commit storage is not a CAS: fall back
-        // to the immutable full commit rather than rejecting the branch because
-        // of that replica's current/effective head.
+        // has not imported its parent yet. Supply that immutable dependency and
+        // retry the compact body before considering a full fallback. Otherwise
+        // ordinary replica lag turns every reconciliation into another complete
+        // namespace snapshot on the lagging node.
         if (compact.body == MetadataHistoryEntry::Body::delta) {
+            if (push_history_to_peer(owner, compact.previous, frame_type)) {
+                encoded = encode_metadata_history_entry(compact);
+                if (bool_reply(
+                        node_.call(owner, MessageType::put_metadata_commit, encoded, frame_type)))
+                    return true;
+            }
             auto full = commit_history_entry(record);
             encoded = encode_metadata_history_entry(full);
             return bool_reply(
@@ -904,9 +921,25 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
                                             reconciliation.previous,
                                             reconciliation.payload);
 
-        (void)publish_commit(nodes, reconciliation, {}, frame_type);
+        Bytes reconciliation_delta;
+        const auto* primary_snapshot =
+            left_materialized->record.hash == reconciliation.previous
+                ? left_materialized->snapshot.get()
+                : right_materialized->snapshot.get();
+        if (auto delta = metadata_delta(*primary_snapshot, merged.snapshot)) {
+            auto encoded = encode_metadata_delta(*delta);
+            if (encoded.size() < reconciliation.payload.size())
+                reconciliation_delta = std::move(encoded);
+        }
+        (void)publish_commit(nodes, reconciliation, reconciliation_delta, frame_type);
         Log::info("metadata histories reconciled generation=" +
                   std::to_string(reconciliation.generation) +
+                  " history_body=" +
+                  std::string(reconciliation_delta.empty() ? "full" : "delta") +
+                  " history_bytes=" +
+                  std::to_string(reconciliation_delta.empty()
+                                     ? reconciliation.payload.size()
+                                     : reconciliation_delta.size()) +
                   " conflicts=" + std::to_string(merged.conflicts_created) +
                   " remaining_heads=" + std::to_string(heads.size() - 1));
         // accept_commit() removes accepted ancestors from the local head set. The
