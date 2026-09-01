@@ -1,8 +1,52 @@
 # Completed and tested
 
-Last updated: 2026-08-31
+Last updated: 2026-09-01
 
 This is the completed-work ledger for the current session. An item belongs here only after implementation and its stated verification are complete. Detailed design notes, exact test results, and UAT measurements remain in the linked records.
+
+## Dedicated immutable media-information engine
+
+- [x] Added an event-driven, durably hinted profiling service used by ingest,
+  cataloguing, the profile API, and playback; it performs no idle polling.
+- [x] Ordered and deduplicated optional scans while keeping every background
+  media read in the speculative class below loader work.
+- [x] Removed the client-visible playback profiling gate. A stored immutable
+  profile feeds the unchanged negotiation path with zero probe reads; a genuine
+  miss continues normal viewer-priority media-engine negotiation.
+- [x] Coalesced concurrent scans by immutable media ID. Viewer-required
+  negotiation cancels/takes over speculative ownership, and successful results
+  are asynchronously persisted regardless of which path produced them.
+- [x] Pruned profiles only when their immutable media ID has no live namespace
+  copy, retaining one shared profile across identical aliases/copies.
+- [x] Added separated profile-lookup, fallback-inspection, selection and total
+  admission timing diagnostics and corrected the streaming/catalogue docs.
+- [x] Passed all 242 core tests and all 3 runtime/libav tests, then built and
+  deployed the source on all four nodes. Each node reported ready, writable and
+  online at metadata generation 1633.
+
+Evidence: [media-information checkpoint](2026-09-01-media-information-engine.md)
+
+## Manual causal metadata repair and ancestry safety
+
+- [x] Proved all three replicas held accepted generations 1552 and 1516 but no
+  retained common ancestor because local history compaction had discarded the
+  required bridge.
+- [x] Proved generation 1552 strictly causally dominated every mutation in 1516,
+  retained the same catalogue root, and contained all 622 older namespace
+  entries plus 12 additions.
+- [x] Added a dry-run/two-phase offline repair tool which refuses automatic,
+  mergeable, concurrent, equal-clock, unstaged or under-witnessed repairs.
+- [x] Backed up all three metadata replicas, staged one identical generation
+  1553 two-parent record everywhere, then accepted it with nodes 50 and 51 as
+  actual durable witnesses. No branch or object was discarded.
+- [x] Disabled unsafe automatic history compaction until exact cluster-wide
+  accepted-head identity can be proven durably.
+- [x] Passed 29/29 storage/metadata tests, 234/234 core tests and 3/3 runtime
+  tests. Live UAT converged all nodes, replayed queued operations, and remained
+  healthy/writable overnight at generation 1569; later ordinary divergent
+  branches reconciled automatically with zero conflicts.
+
+Evidence: [manual causal repair record](2026-09-01-metadata-manual-causal-repair.md)
 
 ## Phase 1D.4 partial: transient publication cursor preservation
 

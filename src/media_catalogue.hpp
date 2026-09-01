@@ -20,6 +20,8 @@
 
 namespace macha {
 
+class MediaInformationService;
+
 enum class MediaProbeKind { movie, episode, track };
 
 enum class MediaProbeLookupStrategy { automatic, music_release_first, music_recording_first };
@@ -87,6 +89,7 @@ std::vector<MediaProbeCandidate> probe_media_candidates(std::string_view path, c
 std::vector<MediaProbeCandidate> probe_host_media_candidates(const std::filesystem::path&,
                                                              uint64_t size);
 std::optional<MediaProbe> probe_media_path(std::string_view path, const FsEntry&);
+FrameType catalogue_media_profile_frame_type() noexcept;
 
 struct RemoteArtwork {
     std::string item_id;
@@ -291,6 +294,7 @@ class CatalogueScanner {
     std::unique_ptr<HttpClient> http_;
     std::unique_ptr<HttpClient> provider_http_;
     std::shared_ptr<MediaEngine> profile_engine_;
+    MediaInformationService* media_information_{};
     std::vector<std::unique_ptr<CatalogueScanProvider>> providers_;
     std::atomic_bool rescan_requested_{};
     std::jthread worker_;
@@ -327,7 +331,8 @@ class CatalogueScanner {
     CatalogueScanner(NodeRuntime&, FileSystem&, CatalogueManager&, CatalogueHintQueue&,
                      CatalogueScannerConfig, std::unique_ptr<HttpClient> = {},
                      std::chrono::milliseconds diagnostic_interval = std::chrono::seconds(5),
-                     std::shared_ptr<MediaEngine> profile_engine = {});
+                     std::shared_ptr<MediaEngine> profile_engine = {},
+                     MediaInformationService* media_information = nullptr);
     ~CatalogueScanner();
     void start();
     void request_stop();
@@ -335,6 +340,7 @@ class CatalogueScanner {
     void reconfigure(CatalogueScannerConfig);
     void request_rescan();
     size_t request_media_rescan(const std::vector<std::string>& media_ids);
+    size_t request_media_profiles(const std::vector<std::string>& media_ids);
     std::vector<MediaProbeCandidate> probe_unmatched(std::string_view hint_id);
     size_t scan_once();
 };

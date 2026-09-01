@@ -295,6 +295,13 @@ std::vector<std::string> CatalogueHintQueue::submit_many(
         if (was_terminal) {
             if (submission.source == "manual") {
                 reopen_terminal = true;
+            } else if (submission.source == "media-profile") {
+                // An explicit profile request is made only after the durable
+                // catalogue has reported a miss. Reopen path-level catalogue
+                // work even if this origin was seen before; otherwise a
+                // cleared, rejected, or previously incomplete profile could
+                // remain pending forever.
+                reopen_terminal = true;
             } else if (submission.source == "scanner" || submission.source == "namespace") {
                 if (!hint.media_id.empty() && !submission.source_ref.empty())
                     reopen_terminal = submission.source_ref != hint.media_id;

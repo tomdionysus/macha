@@ -10,6 +10,7 @@
 #include "ingest.hpp"
 #include "manage_api.hpp"
 #include "media_catalogue.hpp"
+#include "media_information.hpp"
 #include "playback.hpp"
 #include "status_api.hpp"
 #include "torrent.hpp"
@@ -44,6 +45,7 @@ class Service {
     PlaybackTracker playback_;
     std::unique_ptr<FileSystem> fs_;
     std::unique_ptr<CatalogueHintQueue> catalogue_hints_;
+    std::unique_ptr<MediaInformationService> media_information_;
     std::unique_ptr<CatalogueScanner> scanner_;
     std::unique_ptr<HydrationManager> hydration_;
     std::unique_ptr<IngestManager> ingest_;

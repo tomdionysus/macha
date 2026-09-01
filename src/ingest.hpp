@@ -18,6 +18,8 @@
 
 namespace macha {
 
+class MediaInformationService;
+
 enum class IngestJobState {
     queued,
     scanning,
@@ -104,6 +106,7 @@ class IngestManager {
     NodeRuntime& node_;
     FileSystem& fs_;
     CatalogueHintQueue& hints_;
+    MediaInformationService* media_information_{};
     IngestConfig config_;
     StagingArea staging_;
     std::filesystem::path state_file_;
@@ -133,7 +136,8 @@ class IngestManager {
     void cleanup_partials(const IngestJob&);
 
   public:
-    IngestManager(NodeRuntime&, FileSystem&, CatalogueHintQueue&, IngestConfig);
+    IngestManager(NodeRuntime&, FileSystem&, CatalogueHintQueue&, IngestConfig,
+                  MediaInformationService* media_information = nullptr);
     ~IngestManager();
 
     void start();

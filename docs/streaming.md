@@ -98,6 +98,15 @@ normalized request joins or replays the same session ID, capability and
 `X-Macha-Idempotency: created|replayed`. Omitting the header preserves the
 legacy non-idempotent behaviour.
 
+Session admission first reads the immutable media profile from cluster metadata,
+which requires no media-object reads. A miss never produces a client-visible
+profiling gate: Macha continues normal media negotiation using its configured
+media engine. Concurrent inspection of the same immutable file is coalesced,
+and a viewer takes over an already-running speculative scan instead of waiting
+behind background work. The successful result is published asynchronously for
+later sessions. Clients should still reuse the same idempotency key after a
+timeout or disconnect.
+
 Minimal request:
 
 ```json

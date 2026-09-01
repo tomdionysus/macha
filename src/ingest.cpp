@@ -6,6 +6,7 @@
 #include "json.hpp"
 #include "log.hpp"
 #include "media_catalogue.hpp"
+#include "media_information.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -317,8 +318,9 @@ StagingStatus StagingArea::status() const {
 }
 
 IngestManager::IngestManager(NodeRuntime& node, FileSystem& fs, CatalogueHintQueue& hints,
-                             IngestConfig config)
-    : node_(node), fs_(fs), hints_(hints), config_(std::move(config)), staging_(config_),
+                             IngestConfig config, MediaInformationService* media_information)
+    : node_(node), fs_(fs), hints_(hints), media_information_(media_information),
+      config_(std::move(config)), staging_(config_),
       state_file_(node_.config().state_path / "ingest" / "jobs.json") {
     if (config_.enabled) {
         std::filesystem::create_directories(state_file_.parent_path());
@@ -369,8 +371,10 @@ void IngestManager::load_state() {
             Log::warn("ingest state ignored: " + std::string(e.what()));
         }
     }
-    for (const auto& [job_id, path] : migration_hints)
+    for (const auto& [job_id, path] : migration_hints) {
         (void)hints_.submit(path, "ingest", job_id, CatalogueHintPriority::ingest);
+        if (media_information_) (void)media_information_->request_path(path);
+    }
 }
 
 void IngestManager::save_state_locked() const {
@@ -741,6 +745,8 @@ void IngestManager::enqueue_catalogue_hints(IngestJob& job) {
     for (const auto& file : job.files) {
         if (!file.completed || !file.catalogue_candidate || file.destination_path.empty()) continue;
         (void)hints_.submit(file.destination_path, "ingest", job.id, CatalogueHintPriority::ingest);
+        if (media_information_)
+            (void)media_information_->request_path(file.destination_path);
     }
 }
 
@@ -1132,8 +1138,11 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
             if (final.type == EntryType::file && final.size == file.size) {
                 file.copied = file.size;
                 file.completed = true;
-                if (file.catalogue_candidate)
+                if (file.catalogue_candidate) {
                     (void)hints_.submit(file.destination_path, "ingest", job.id, CatalogueHintPriority::ingest);
+                    if (media_information_)
+                        (void)media_information_->request_path(file.destination_path);
+                }
                 refresh_progress(job);
                 return true;
             }
@@ -1241,8 +1250,11 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
     if (file.copied != file.size) throw std::runtime_error("ingest committed size mismatch");
     fs_.rename(file.temporary_path, file.destination_path, true);
     file.completed = true;
-    if (file.catalogue_candidate)
+    if (file.catalogue_candidate) {
         (void)hints_.submit(file.destination_path, "ingest", job.id, CatalogueHintPriority::ingest);
+        if (media_information_)
+            (void)media_information_->request_path(file.destination_path);
+    }
     ++job.files_completed;
     refresh_progress(job);
     return true;

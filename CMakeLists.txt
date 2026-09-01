@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.22.0 LANGUAGES CXX)
+project(macha VERSION 0.22.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -176,6 +176,7 @@ set(MACHA_CORE_SOURCES
     src/media_vod.cpp
     src/subtitle_text.cpp
     src/media_engine_common.cpp
+    src/media_information.cpp
     src/playback.cpp
     src/catalogue.cpp
     src/catalogue_hints.cpp
@@ -224,6 +225,12 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     if(MACHA_WARNINGS_AS_ERRORS)
         target_compile_options(macha_core PRIVATE -Werror)
     endif()
+endif()
+
+add_executable(macha-metadata-repair tools/metadata_inspect.cpp)
+target_link_libraries(macha-metadata-repair PRIVATE macha_core)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    target_compile_options(macha-metadata-repair PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 if(MACHA_BUILD_SERVER)
@@ -428,6 +435,7 @@ set(MACHA_CONFIG_EXAMPLE "${MACHA_CONFIG_DIR}/macha.yaml.example")
 if(TARGET macha)
     install(TARGETS macha RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
+install(TARGETS macha-metadata-repair RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(MACHA_INSTALL_SYSTEMD)
     if(NOT UNIX)

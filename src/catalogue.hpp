@@ -208,6 +208,7 @@ class CatalogueManager {
         std::function<MediaProbeResult()> generate);
     void put_media_profile(std::string media_id, MediaProbeResult profile);
     void put_media_profiles(std::map<std::string, MediaProbeResult, std::less<>> profiles);
+    size_t prune_media_profiles(const std::set<std::string>& live_media_ids);
     std::vector<CatalogueItem> list(std::optional<CatalogueKind> kind = {},
                                     std::optional<std::string_view> parent = {});
     std::vector<CatalogueItem> search(std::string_view query, size_t limit = 50);

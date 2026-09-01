@@ -13,8 +13,11 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <functional>
 
 namespace macha {
+
+class MediaInformationService;
 
 class PlaybackManager {
     struct Impl;
@@ -22,7 +25,9 @@ class PlaybackManager {
 
   public:
     PlaybackManager(FileSystem&, CatalogueManager&, CatalogueApiConfig, StreamingConfig,
-                    std::shared_ptr<MediaEngine> = {});
+                    std::shared_ptr<MediaEngine> = {},
+                    std::function<size_t(const std::vector<std::string>&)> request_media_profiles = {},
+                    MediaInformationService* media_information = nullptr);
     ~PlaybackManager();
     PlaybackManager(const PlaybackManager&) = delete;
     PlaybackManager& operator=(const PlaybackManager&) = delete;

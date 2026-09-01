@@ -346,8 +346,19 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             if (!media_id.starts_with("macha:"))
                 return error(400, "bad_media_id", "immutable macha media ID required");
             auto profile = catalogue_.media_profile(media_id);
-            if (!profile)
-                return error(404, "profile_not_available", "media profile is not available yet");
+            if (!profile) {
+                const auto accepted = request_media_profiles_
+                                          ? request_media_profiles_({media_id})
+                                          : 0;
+                if (!accepted)
+                    return error(503, "profile_unavailable",
+                                 "media profile is unavailable and could not be queued");
+                Json::Object pending{{"status", "pending"}, {"media_id", media_id}};
+                auto response = json(202, Json(std::move(pending)).dump());
+                response.headers["Retry-After"] = "1";
+                response.headers["Location"] = request.path;
+                return response;
+            }
             auto response = json(200, media_profile_json(media_id, *profile).dump());
             response.headers["Cache-Control"] = "private, max-age=31536000, immutable";
             response.headers["ETag"] = json_escape(media_id);

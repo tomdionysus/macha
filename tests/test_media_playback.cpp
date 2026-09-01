@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
+#include "media_information.hpp"
 
 using namespace macha;
 using namespace std::chrono_literals;
@@ -9,15 +10,18 @@ namespace {
 
 class CoalescingProbeMediaEngine final : public MediaEngine {
     TestGate& gate_;
+    bool fail_{};
     std::atomic_uint probes_{};
   public:
-    explicit CoalescingProbeMediaEngine(TestGate& gate) : gate_(gate) {}
+    explicit CoalescingProbeMediaEngine(TestGate& gate, bool fail = false)
+        : gate_(gate), fail_(fail) {}
     MediaEngineStatus status() const override {
         return {true, "fake", "coalescing-probe", true, true};
     }
     MediaProbeResult probe(const MediaSource&, std::chrono::milliseconds = {}) override {
         ++probes_;
         gate_.enter_and_wait();
+        if (fail_) throw std::runtime_error("synthetic coalesced probe failure");
         MediaProbeResult result;
         result.format = "mov,mp4,m4a,3gp,3g2,mj2";
         result.duration_seconds = 60.0;
@@ -46,6 +50,69 @@ class CoalescingProbeMediaEngine final : public MediaEngine {
         throw std::runtime_error("direct test must not extract subtitles");
     }
     unsigned probes() const { return probes_.load(); }
+};
+
+class PriorityMediaInformationEngine final : public MediaEngine {
+    bool cancel_first_{};
+    mutable std::mutex mutex_;
+    std::vector<std::string> order_;
+    std::atomic_uint starts_{};
+    std::atomic_uint completions_{};
+    std::atomic_uint cancellations_{};
+  public:
+    explicit PriorityMediaInformationEngine(bool cancel_first = false)
+        : cancel_first_(cancel_first) {}
+    MediaEngineStatus status() const override {
+        return {true, "fake", "media-information-priority", true, true};
+    }
+    MediaProbeResult probe(const MediaSource& source,
+                           std::chrono::milliseconds = {}) override {
+        const auto attempt = ++starts_;
+        {
+            std::lock_guard lock(mutex_);
+            order_.push_back(source.media_id);
+        }
+        if (cancel_first_ && attempt == 1) {
+            while (!source.cancelled || !source.cancelled->load())
+                std::this_thread::sleep_for(1ms);
+            ++cancellations_;
+            throw std::runtime_error("synthetic speculative cancellation");
+        }
+        ++completions_;
+        MediaProbeResult result;
+        result.format = "mov,mp4,m4a,3gp,3g2,mj2";
+        result.duration_seconds = 60.0;
+        result.bitrate = 4'000'000;
+        result.streams.push_back(MediaStreamInfo{
+            0, MediaStreamType::video, "h264", "High", "", 1920, 1080,
+            0, 0, 8, true, false, 3'700'000, false});
+        result.streams.push_back(MediaStreamInfo{
+            1, MediaStreamType::audio, "aac", "LC", "eng", 0, 0,
+            2, 48000, 0, true, false, 192'000, false});
+        return result;
+    }
+    HlsVodPlan prepare_hls_vod(const MediaSource&, const PlaybackPlan&, double,
+                               std::chrono::milliseconds, bool,
+                               std::chrono::milliseconds = {}) override {
+        throw std::runtime_error("media information test does not prepare VOD");
+    }
+    std::unique_ptr<MediaEngineSession> start_hls(
+        const MediaSource&, const HlsVodPlan&, std::chrono::milliseconds, size_t, uint64_t,
+        const std::filesystem::path&) override {
+        throw std::runtime_error("media information test does not start HLS");
+    }
+    std::string extract_webvtt_segment(
+        const MediaSource&, int, std::chrono::milliseconds, std::chrono::milliseconds,
+        std::chrono::milliseconds) override {
+        throw std::runtime_error("media information test does not extract subtitles");
+    }
+    unsigned starts() const { return starts_.load(); }
+    unsigned completions() const { return completions_.load(); }
+    unsigned cancellations() const { return cancellations_.load(); }
+    std::vector<std::string> order() const {
+        std::lock_guard lock(mutex_);
+        return order_;
+    }
 };
 
 MACHA_TEST("media_playback", test_media_segment_store_backpressure_and_spill) {
@@ -531,9 +598,454 @@ MACHA_TEST("media_playback", test_concurrent_immutable_profile_misses_coalesce) 
     REQUIRE(conflict.status == 409);
     const std::string conflict_body(conflict.body.begin(), conflict.body.end());
     CHECK(conflict_body.find("idempotency_conflict") != std::string::npos);
-    REQUIRE(service.catalogue().media_profile(media_id).has_value());
+
+    HttpRequest remove;
+    remove.method = "DELETE";
+    remove.path = "/api/v1/playback/sessions/" + first_json.find("session_id")->asString();
+    CHECK(playback.handle(remove).status == 204);
+    auto reused_after_delete = playback.handle(conflicting);
+    REQUIRE(reused_after_delete.status == 201);
+    CHECK(reused_after_delete.headers.at("X-Macha-Idempotency") == "created");
+    CHECK(observed->probes() == 1);
+    REQUIRE(wait_until([&] { return service.catalogue().media_profile(media_id).has_value(); }, 2s));
 
     playback.stop();
+    service.stop();
+}
+
+MACHA_TEST("media_playback", test_failed_idempotent_creation_releases_joiners_and_reservations) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/failing.mp4", 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write("/media/failing.mp4", true);
+    auto bytes = pattern(64 * 1024 + 7);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto media_id = file_media_id(service.filesystem().getattr("/media/failing.mp4"));
+
+    TestGate gate;
+    auto engine = std::make_unique<CoalescingProbeMediaEngine>(gate, true);
+    auto* observed = engine.get();
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback-failure";
+    streaming.probe_timeout = 2s;
+    streaming.max_sessions = 1;
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             std::move(engine));
+    playback.start();
+
+    Json::Object preferences{{"mode", "direct"}};
+    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
+    auto text = Json(std::move(root)).dump();
+    HttpRequest request;
+    request.method = "POST";
+    request.path = "/api/v1/playback/sessions";
+    request.headers["idempotency-key"] = "failing-create-1";
+    request.body.assign(text.begin(), text.end());
+
+    HttpResponse first, second;
+    std::jthread a([&] { first = playback.handle(request); });
+    REQUIRE(gate.wait_for_entries(1));
+    std::jthread b([&] { second = playback.handle(request); });
+    std::this_thread::sleep_for(30ms);
+    CHECK(observed->probes() == 1);
+    gate.open();
+    a.join();
+    b.join();
+    CHECK(first.status == 503);
+    CHECK(second.status == 503);
+    CHECK(observed->probes() == 1);
+
+    // The failed association and its sole pending-session reservation must be
+    // gone. With max_sessions=1, reaching a second probe proves both releases.
+    auto retry = playback.handle(request);
+    CHECK(retry.status == 503);
+    CHECK(observed->probes() == 2);
+
+    playback.stop();
+    service.stop();
+}
+
+MACHA_TEST("media_playback", test_profile_endpoint_pending_does_not_gate_session_negotiation) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/pending.mp4", 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write("/media/pending.mp4", true);
+    auto bytes = pattern(32 * 1024 + 3);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto media_id = file_media_id(service.filesystem().getattr("/media/pending.mp4"));
+
+    auto engine = std::make_shared<FakeMediaEngine>();
+    MediaInformationService information(service.filesystem(), service.catalogue(), engine,
+                                        c.state_path);
+    std::atomic_uint queue_requests{};
+    auto queue = [&](const std::vector<std::string>& media_ids) {
+        ++queue_requests;
+        return information.request(media_ids, MediaInformationPriority::requested,
+                                   "media-information-api");
+    };
+
+    CatalogueApi catalogue_api(service.catalogue(), service.catalogue_hints(), {}, queue);
+    HttpRequest profile_request;
+    profile_request.method = "GET";
+    profile_request.path = "/api/v1/catalogue/media/" + media_id + "/profile";
+    auto profile_pending = catalogue_api.handle(profile_request);
+    REQUIRE(profile_pending.status == 202);
+    CHECK(profile_pending.headers.at("Retry-After") == "1");
+
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback-pending";
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             engine, queue, &information);
+    playback.start();
+    Json::Object preferences{{"mode", "direct"}};
+    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
+    auto text = Json(std::move(root)).dump();
+    HttpRequest create;
+    create.method = "POST";
+    create.path = "/api/v1/playback/sessions";
+    create.headers["idempotency-key"] = "pending-profile-create";
+    create.body.assign(text.begin(), text.end());
+    auto admitted = playback.handle(create);
+    REQUIRE(admitted.status == 201);
+    CHECK(admitted.headers.at("X-Macha-Idempotency") == "created");
+    CHECK(engine->probes() == 1);
+    CHECK(queue_requests.load() == 1);
+
+    // Session negotiation produced the profile through the same shared flight,
+    // but publication remains asynchronous and outside admission.
+    CHECK(!service.catalogue().media_profile(media_id).has_value());
+    information.start();
+    REQUIRE(wait_until([&] { return service.catalogue().media_profile(media_id).has_value(); }, 2s));
+
+    playback.stop();
+    information.stop();
+    service.stop();
+}
+
+MACHA_TEST("media_playback", test_unavailable_profile_queue_uses_media_engine_fallback) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/fallback.mp4", 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write("/media/fallback.mp4", true);
+    auto bytes = pattern(32 * 1024 + 5);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto media_id = file_media_id(service.filesystem().getattr("/media/fallback.mp4"));
+
+    std::atomic_uint queue_attempts{};
+    auto unavailable = [&](const std::vector<std::string>&) {
+        ++queue_attempts;
+        return size_t{0};
+    };
+    auto engine = std::make_shared<FakeMediaEngine>();
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback-fallback";
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             engine, unavailable);
+    playback.start();
+
+    Json::Object preferences{{"mode", "direct"}};
+    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
+    auto text = Json(std::move(root)).dump();
+    HttpRequest create;
+    create.method = "POST";
+    create.path = "/api/v1/playback/sessions";
+    create.headers["idempotency-key"] = "unavailable-profile-fallback";
+    create.body.assign(text.begin(), text.end());
+
+    auto admitted = playback.handle(create);
+    REQUIRE(admitted.status == 201);
+    CHECK(admitted.headers.at("X-Macha-Idempotency") == "created");
+    CHECK(queue_attempts.load() == 0);
+    CHECK(engine->probes() == 1);
+    REQUIRE(wait_until([&] { return service.catalogue().media_profile(media_id).has_value(); }, 2s));
+
+    playback.stop();
+    service.stop();
+}
+
+MACHA_TEST("media_playback", test_failed_profile_job_retry_falls_back_and_replays_once) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/retry.mp4", 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write("/media/retry.mp4", true);
+    auto bytes = pattern(32 * 1024 + 7);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto media_id = file_media_id(service.filesystem().getattr("/media/retry.mp4"));
+
+    std::atomic_uint requests{};
+    auto pending_then_failed = [&](const std::vector<std::string>&) {
+        return ++requests == 1 ? size_t{1} : size_t{0};
+    };
+    CatalogueApi catalogue_api(service.catalogue(), service.catalogue_hints(), {},
+                               pending_then_failed);
+    HttpRequest profile_request;
+    profile_request.method = "GET";
+    profile_request.path = "/api/v1/catalogue/media/" + media_id + "/profile";
+    auto pending = catalogue_api.handle(profile_request);
+    REQUIRE(pending.status == 202);
+    auto engine = std::make_shared<FakeMediaEngine>();
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback-retry";
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             engine, pending_then_failed);
+    playback.start();
+
+    Json::Object preferences{{"mode", "direct"}};
+    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
+    auto text = Json(std::move(root)).dump();
+    HttpRequest create;
+    create.method = "POST";
+    create.path = "/api/v1/playback/sessions";
+    create.headers["idempotency-key"] = "failed-profile-retry";
+    create.body.assign(text.begin(), text.end());
+
+    auto admitted = playback.handle(create);
+    REQUIRE(admitted.status == 201);
+    CHECK(admitted.headers.at("X-Macha-Idempotency") == "created");
+    CHECK(engine->probes() == 1);
+    CHECK(requests.load() == 1);
+    auto admitted_body = Json::parse(std::string(admitted.body.begin(), admitted.body.end()));
+
+    auto replayed = playback.handle(create);
+    REQUIRE(replayed.status == 201);
+    CHECK(replayed.headers.at("X-Macha-Idempotency") == "replayed");
+    CHECK(engine->probes() == 1);
+    auto replayed_body = Json::parse(std::string(replayed.body.begin(), replayed.body.end()));
+    CHECK(replayed_body.find("session_id")->dump() == admitted_body.find("session_id")->dump());
+    CHECK(replayed_body.find("generation")->dump() == admitted_body.find("generation")->dump());
+
+    playback.stop();
+    service.stop();
+}
+
+MACHA_TEST("media_playback", test_media_information_hints_reorder_by_priority) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+
+    auto create_media = [&](std::string path, size_t size) {
+        service.filesystem().create_file(path, 0644, getuid(), getgid());
+        auto writer = service.filesystem().open_write(path, true);
+        auto bytes = pattern(size);
+        REQUIRE(writer->write(0, bytes) == bytes.size());
+        writer->commit();
+        return file_media_id(service.filesystem().getattr(path));
+    };
+    const auto low_a = create_media("/media/low-a.mp4", 32769);
+    const auto low_b = create_media("/media/low-b.mp4", 32771);
+    const auto requested = create_media("/media/requested.mp4", 32773);
+
+    auto engine = std::make_shared<PriorityMediaInformationEngine>();
+    MediaInformationService information(service.filesystem(), service.catalogue(), engine,
+                                        t.path() / "media-info");
+    REQUIRE(information.request_path("/media/low-a.mp4",
+                                     MediaInformationPriority::background));
+    REQUIRE(information.request_path("/media/low-b.mp4",
+                                     MediaInformationPriority::background));
+    REQUIRE(information.request_path("/media/requested.mp4",
+                                     MediaInformationPriority::requested,
+                                     "media-information-request"));
+    information.start();
+
+    REQUIRE(wait_until([&] { return engine->completions() == 3; }, 5s));
+    auto order = engine->order();
+    REQUIRE(order.size() == 3);
+    CHECK(order.front() == requested);
+    REQUIRE(wait_until([&] {
+        return service.catalogue().media_profile(low_a).has_value() &&
+               service.catalogue().media_profile(low_b).has_value() &&
+               service.catalogue().media_profile(requested).has_value();
+    }, 5s));
+
+    information.stop();
+    service.stop();
+}
+
+MACHA_TEST("media_playback", test_media_information_foreground_requests_share_one_scan) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    const std::string path = "/media/single-flight.mp4";
+    service.filesystem().create_file(path, 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write(path, true);
+    auto bytes = pattern(65539);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto entry = service.filesystem().getattr(path);
+    auto media_id = file_media_id(entry);
+
+    TestGate gate;
+    auto engine = std::make_shared<CoalescingProbeMediaEngine>(gate);
+    MediaInformationService information(service.filesystem(), service.catalogue(), engine,
+                                        t.path() / "media-info");
+    information.start();
+    std::optional<MediaProbeResult> first, second;
+    std::jthread a([&] {
+        first = information.resolve_playback(media_id, path, entry, Clock::now() + 2s);
+    });
+    REQUIRE(gate.wait_for_entries(1));
+    std::jthread b([&] {
+        second = information.resolve_playback(media_id, path, entry, Clock::now() + 2s);
+    });
+    std::this_thread::sleep_for(30ms);
+    CHECK(engine->probes() == 1);
+    gate.open();
+    a.join();
+    b.join();
+    REQUIRE(first.has_value());
+    REQUIRE(second.has_value());
+    CHECK(*first == *second);
+    CHECK(engine->probes() == 1);
+    REQUIRE(wait_until([&] { return service.catalogue().media_profile(media_id).has_value(); }, 2s));
+
+    information.stop();
+    service.stop();
+}
+
+MACHA_TEST("media_playback", test_media_information_playback_takes_over_speculative_scan) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    const std::string path = "/media/takeover.mp4";
+    service.filesystem().create_file(path, 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write(path, true);
+    auto bytes = pattern(65541);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto entry = service.filesystem().getattr(path);
+    auto media_id = file_media_id(entry);
+
+    auto engine = std::make_shared<PriorityMediaInformationEngine>(true);
+    MediaInformationService information(service.filesystem(), service.catalogue(), engine,
+                                        t.path() / "media-info");
+    REQUIRE(information.request_path(path));
+    information.start();
+    REQUIRE(wait_until([&] { return engine->starts() == 1; }, 1s));
+
+    auto resolved = information.resolve_playback(media_id, path, entry, Clock::now() + 2s);
+    CHECK(!resolved.streams.empty());
+    CHECK(engine->starts() == 2);
+    CHECK(engine->cancellations() == 1);
+    CHECK(engine->completions() == 1);
+    REQUIRE(wait_until([&] { return service.catalogue().media_profile(media_id).has_value(); }, 2s));
+
+    information.stop();
+    service.stop();
+}
+
+MACHA_TEST("media_playback", test_media_information_profile_pruning_tracks_last_live_copy) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    auto bytes = pattern(65543);
+    for (const auto* path : {"/media/copy-a.mp4", "/media/copy-b.mp4"}) {
+        service.filesystem().create_file(path, 0644, getuid(), getgid());
+        auto writer = service.filesystem().open_write(path, true);
+        REQUIRE(writer->write(0, bytes) == bytes.size());
+        writer->commit();
+    }
+    auto first = service.filesystem().getattr("/media/copy-a.mp4");
+    auto second = service.filesystem().getattr("/media/copy-b.mp4");
+    const auto media_id = file_media_id(first);
+    REQUIRE(file_media_id(second) == media_id);
+
+    auto engine = std::make_shared<PriorityMediaInformationEngine>();
+    MediaInformationService information(service.filesystem(), service.catalogue(), engine,
+                                        t.path() / "media-info");
+    REQUIRE(information.request_path("/media/copy-a.mp4"));
+    information.start();
+    REQUIRE(wait_until([&] { return service.catalogue().media_profile(media_id).has_value(); }, 2s));
+
+    service.filesystem().unlink("/media/copy-a.mp4");
+    information.request_prune();
+    std::this_thread::sleep_for(100ms);
+    CHECK(service.catalogue().media_profile(media_id).has_value());
+
+    service.filesystem().unlink("/media/copy-b.mp4");
+    information.request_prune();
+    REQUIRE(wait_until([&] { return !service.catalogue().media_profile(media_id).has_value(); }, 2s));
+
+    information.stop();
     service.stop();
 }
 

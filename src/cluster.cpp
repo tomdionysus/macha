@@ -380,8 +380,8 @@ void NodeRuntime::recover_state(std::stop_token stop) {
             startup_stage_hook_("metadata");
         if (stop.stop_requested())
             return;
-        meta_ =
-            std::make_unique<MetadataReplica>(cfg_.state_path, keys_.storage, cache_->metadata());
+        meta_ = std::make_unique<MetadataReplica>(cfg_.state_path, keys_.storage,
+                                                 cache_->metadata(), cfg_.bootstrap.empty());
 
         // Identity-reset tombstones must be active before metadata exchange.
         try {

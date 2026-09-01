@@ -1,6 +1,6 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-08-31
+Last updated: 2026-09-01
 
 This is the working backlog for the current session. Add new work here. When an item is implemented and its stated verification is complete, remove it from this file and add a dated entry with evidence to `COMPLETED.md`.
 
@@ -35,14 +35,12 @@ The existing documents in this directory remain the detailed plans, checkpoints,
 - [ ] Update the client to consume the immutable media-profile endpoint; see
   [the short client handoff](2026-08-31-clientside-media-profile.md).
 
-- [ ] Eliminate synchronous playback re-probing for already catalogued immutable
-  media and make session-creation POSTs retry-safe. Persist a complete validated
-  media profile against the content-derived identity, coalesce genuine cold
-  misses, retain exact negotiation/response semantics, and add client-generated
-  idempotency keys without moving client playback state into the server. The
-  structural cold-cache defect is independent of current FUSE publication work;
-  rsync load may only multiply its observed 9--11 second cost. Implement and UAT
-  the phased contract in
+- [ ] Complete real playback UAT for the dedicated media-information engine and
+  idempotent admission. Implementation, 242/242 core tests, 3/3 runtime checks
+  and four-node deployment are complete. From ES-1 verify an ordinary profiled
+  session has no source reads; verify a genuine miss continues normal media
+  negotiation rather than returning `profile_pending`; and record cold-process,
+  repeated-session, same-key replay, and start/seek latency evidence in
   [the playback admission plan](2026-08-31-playback-immutable-media-profile-and-idempotent-admission.md).
 
 - [ ] Support multiple advertised endpoints per node and multiple candidate IPs
@@ -232,3 +230,57 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   is substituting a missing sample with zero.
 - [ ] Complete the final mixed-size rsync, concurrent-writer, communications,
   restart, peer-loss, and idle-soak verification matrix.
+- [ ] Replace provider-shaped public catalogue identities such as `tmdb:*` with
+  stable, opaque Macha-owned entity IDs such as `macha:item:*`. Keep immutable
+  `macha:<content-hash>` file identities separate; retain provider IDs only in
+  server-internal provenance/matching indexes; omit them from normal client
+  responses; atomically rewrite hierarchy/artwork associations; and preserve
+  temporary server-side aliases so existing links, caches and client-owned
+  playback state survive migration.
+- [ ] Diagnose and correct leaked or over-retained playback transcode sessions.
+  The live UI repeatedly reports `Macha playback request failed: video transcode
+  limit reached` despite only two possible viewers (web on node 200 and one
+  Samsung TV). Verify teardown on client disconnect, abandoned session-creation
+  responses, playback end, source/player replacement, PATCH generation handover,
+  DELETE, idle expiry, pipeline failure and node failover. Distinguish logical
+  leases from running physical encoders, make teardown event-driven and bounded,
+  expose enough session/pipeline age and ownership diagnostics to identify a
+  leak, and add regressions proving dead or superseded transcodes promptly stop
+  consuming admission capacity.
+- [ ] Investigate node 50 becoming unable to complete even a 30-second SSH banner
+  during the 0.22.0 deployment build while the old Macha daemon remained active.
+  Do not attribute this to a four-job compile without evidence: correlate Macha
+  thread CPU, runnable/blocked tasks, memory/swap pressure, I/O wait, transport
+  queues and publication/catalogue/playback activity. Verify that loader and
+  background work cannot starve host control access, and repeat a controlled
+  build both with Macha active and hard-stopped.
+- [ ] Replace the disabled metadata-history compactor with a protocol that
+  proves exact accepted-head identity—not merely generation/stability—on every
+  durable known participant before advancing an ancestry floor. The proof must
+  remain valid across a returning node, same-generation siblings, concurrent
+  acceptance notices and restart. Until that protocol and its partition/
+  compaction regression exist, retaining ancestry is the intentional safe
+  behavior.
+- [ ] Add an optional free-form human-readable `node_name` configuration value,
+  advertise it through cluster telemetry, and expose it consistently at JSON
+  path `.nodes[].node_name` in the aggregated Status response. Node identity,
+  authentication and deduplication must continue to use the durable node ID;
+  the name is display-only and may be empty or duplicated. Add parsing,
+  propagation, compatibility and status-contract tests, then configure the four
+  current nodes as `Corvus GBNI-1` (10.44.1.50), `Corvus GBNI-2`
+  (10.44.1.51), `Corvus ES-1` (10.34.1.50), and `Corvus MacBook Pro`
+  (10.44.1.200).
+- [ ] Make playback negotiation representation-aware at the catalogue-item
+  level. One human work identity (currently often provider-shaped, such as a
+  TMDB item; ultimately an opaque Macha item ID) may reference many distinct
+  immutable files: resolution/quality variants, codecs, containers, editions,
+  languages, commentary tracks, separate audio/subtitle assets, or duplicate
+  copies. Persist one media-information profile per immutable file ID, then
+  plan across the complete representation set in this order: prefer the best
+  appropriate direct-stream file; otherwise choose the cheapest correct remux,
+  including a valid combination of separate assets where supported; otherwise
+  transcode the cheapest suitable source while respecting requested quality and
+  preferring the highest useful source quality. Preserve client preferences,
+  stream language/default/forced semantics, availability, locality, seek cost,
+  viewer priority and resource limits. Add deterministic multi-representation
+  Direct/Remux/Transcode selection tests before changing the current planner.

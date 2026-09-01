@@ -65,6 +65,7 @@ struct MediaSource {
     std::string logical_path;
     uint64_t size{};
     std::function<std::shared_ptr<MediaInput>(MediaReadPurpose)> open;
+    std::shared_ptr<std::atomic_bool> cancelled;
 };
 
 struct PlaybackPlan {
