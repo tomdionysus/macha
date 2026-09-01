@@ -6,6 +6,7 @@
 #include "log.hpp"
 #include "macha_version.hpp"
 #include "media_metadata.hpp"
+#include "media_information.hpp"
 
 #include <curl/curl.h>
 
@@ -1338,6 +1339,13 @@ std::optional<MediaProbe> probe_media_path(std::string_view path, const FsEntry&
     return probe;
 }
 
+FrameType catalogue_media_profile_frame_type() noexcept {
+    // Media profiles are optional catalogue enrichment. Generating one is
+    // never part of playback admission and must yield to both viewer and
+    // user-requested loader traffic.
+    return FrameType::speculative;
+}
+
 CurlHttpClient::CurlHttpClient() {
     static const int initialized = [] { return curl_global_init(CURL_GLOBAL_DEFAULT); }();
     if (initialized != CURLE_OK) throw std::runtime_error("curl_global_init failed");
@@ -2375,11 +2383,13 @@ CatalogueScanner::CatalogueScanner(NodeRuntime& node, FileSystem& fs,
                                    CatalogueScannerConfig config,
                                    std::unique_ptr<HttpClient> http,
                                    std::chrono::milliseconds diagnostic_interval,
-                                   std::shared_ptr<MediaEngine> profile_engine)
+                                   std::shared_ptr<MediaEngine> profile_engine,
+                                   MediaInformationService* media_information)
     : node_(node), fs_(fs), catalogue_(catalogue), hints_(hints), config_(std::move(config)),
       http_(http ? std::move(http) : std::make_unique<CurlHttpClient>()),
       provider_http_(std::make_unique<BudgetHttpClient>(*http_)),
       profile_engine_(std::move(profile_engine)),
+      media_information_(media_information),
       diagnostic_interval_(diagnostic_interval) {
     configure_providers();
 }
@@ -2473,6 +2483,63 @@ size_t CatalogueScanner::request_media_rescan(const std::vector<std::string>& me
     Log::debug("catalogue metadata clear targeted rematch media_ids=" +
                std::to_string(wanted.size()) + " queued=" + std::to_string(queued));
     return queued;
+}
+
+size_t CatalogueScanner::request_media_profiles(const std::vector<std::string>& media_ids) {
+    if (media_information_)
+        return media_information_->request(media_ids, MediaInformationPriority::requested,
+                                           "media-information-request");
+    if (media_ids.empty()) return 0;
+    {
+        std::lock_guard lock(config_mutex_);
+        if (!config_.enabled || !profile_engine_ || !profile_engine_->status().available)
+            return 0;
+    }
+    std::set<std::string> wanted(media_ids.begin(), media_ids.end());
+    auto available = fs_.available_snapshot_view();
+    if (!available) return 0;
+    const auto existing = hints_.list();
+    std::map<std::string, CatalogueHint, std::less<>> existing_by_path;
+    for (const auto& hint : existing)
+        existing_by_path.emplace(hint.path, hint);
+    std::vector<CatalogueHintSubmission> submissions;
+    size_t pending = 0;
+    for (const auto& [path, entry] : available->snapshot->entries) {
+        if (entry.type != EntryType::file || !entry.size) continue;
+        const auto media_id = file_media_id(entry);
+        if (!wanted.contains(media_id)) continue;
+        std::string root;
+        auto* provider = provider_for_path(path, root);
+        if (!provider || !provider->accepts_path(path)) continue;
+
+        // An explicit immutable-profile request is a single background job,
+        // not permission to reopen the same terminal catalogue hint forever.
+        // Report an existing live job as pending; a terminal result returns
+        // zero so playback can use its media-engine fallback. A changed
+        // immutable identity is a different origin and is queued normally.
+        if (auto it = existing_by_path.find(path); it != existing_by_path.end()) {
+            const auto& hint = it->second;
+            const bool same_profile_request = std::any_of(
+                hint.origins.begin(), hint.origins.end(), [&](const auto& origin) {
+                    return origin.source == "media-profile" && origin.source_ref == media_id;
+                });
+            if (same_profile_request) {
+                if (hint.state == CatalogueHintState::queued ||
+                    hint.state == CatalogueHintState::processing ||
+                    hint.state == CatalogueHintState::deferred)
+                    ++pending;
+                continue;
+            }
+        }
+        submissions.push_back({path, "media-profile", media_id,
+                               CatalogueHintPriority::periodic_scan});
+    }
+    const auto queued = hints_.submit_many(std::move(submissions)).size();
+    pending += queued;
+    Log::debug("catalogue media profile requested media_ids=" +
+               std::to_string(wanted.size()) + " queued=" + std::to_string(queued) +
+               " pending=" + std::to_string(pending));
+    return pending;
 }
 
 
@@ -2838,7 +2905,11 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
                     namespace_view = fs_.local_snapshot_view();
             }
             if (auto match = prepare_hint(*hint, stop, *namespace_view->snapshot, artwork_batch)) {
-                if (profile_engine_ && profile_engine_->status().available &&
+                if (media_information_ && match->media_id.starts_with("macha:")) {
+                    (void)media_information_->request(
+                        {match->media_id}, MediaInformationPriority::background,
+                        "media-information-catalogue");
+                } else if (profile_engine_ && profile_engine_->status().available &&
                     match->media_id.starts_with("macha:")) {
                     auto entry = namespace_view->snapshot->entries.find(normalize_path(hint->path));
                     if (entry != namespace_view->snapshot->entries.end() &&
@@ -2857,9 +2928,9 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
                                             -> std::shared_ptr<MediaInput> {
                                             return std::make_shared<CatalogueMediaInput>(
                                                 fs_.open_read(source_entry, path, false,
-                                                              FrameType::loader),
+                                                              catalogue_media_profile_frame_type()),
                                                 source_entry.size);
-                                        }};
+                                        }, {}};
                                     auto remaining = std::max(
                                         std::chrono::milliseconds(1),
                                         std::chrono::duration_cast<std::chrono::milliseconds>(

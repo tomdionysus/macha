@@ -34,11 +34,18 @@ A mutation rewrites only affected shards plus the manifest rather than serializi
 
 ## Immutable media profiles
 
-Catalogue hint processing precomputes the playback profile using loader-priority
-reads and commits it in the same batched catalogue reconciliation as descriptive
-metadata. Playback performs a bounded, coalesced first-use probe only when that
-profile is genuinely absent. Profile validity is tied to the content-derived
-`macha:` identity, never merely to a mutable path.
+An event-driven media-information worker accepts durable hints from ingest,
+cataloguing and the profile API. It orders and deduplicates those hints, probes
+with speculative/background reads below loader priority, and publishes the
+result against the immutable content-derived `macha:` identity rather than a
+mutable path. It does no work while the queue is idle.
+
+Playback uses a valid stored profile without media-object reads. If one is
+missing, profile generation remains an optimisation rather than an admission
+prerequisite: normal media negotiation continues through the configured media
+engine. That viewer-required inspection takes over any speculative scan for the
+same immutable media, concurrent callers share the flight, and success is
+published asynchronously for future sessions.
 
 Clients can read the validated profile without opening the media:
 
@@ -49,8 +56,10 @@ GET /api/v1/catalogue/media/{url-encoded-macha-media-id}/profile
 The response contains `schema_version`, `media_id`, `format`, `duration_ms`,
 aggregate `bitrate`, and every stream's codec/profile, language, bitrate,
 dimensions/audio properties and default/forced/attached-picture flags. It is
-served with private immutable cache headers. `404 profile_not_available` is temporary;
-session admission can still use the bounded first-use fallback.
+served with private immutable cache headers. A miss queues speculative profiling
+and returns `202 Accepted` with `Retry-After`; clients may retry the endpoint.
+This advisory response does not prevent them from starting normal playback
+negotiation immediately.
 
 ## Commit protocol
 

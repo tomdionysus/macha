@@ -6,6 +6,7 @@
 #include "json.hpp"
 #include "log.hpp"
 #include "macha_version.hpp"
+#include "media_information.hpp"
 
 #include <algorithm>
 #include <array>
@@ -545,6 +546,7 @@ struct PlaybackManager::Impl {
     StreamingConfig config;
     std::shared_ptr<MediaEngine> engine;
     std::jthread cleanup_thread;
+    std::jthread profile_publish_thread;
     mutable std::mutex mutex;
     std::condition_variable_any cleanup_cv;
     uint64_t cleanup_revision{};
@@ -558,6 +560,9 @@ struct PlaybackManager::Impl {
         std::exception_ptr error;
     };
     std::map<std::string, std::shared_ptr<ProbeFlight>, std::less<>> probe_flights;
+    std::mutex profile_publish_mutex;
+    std::condition_variable_any profile_publish_cv;
+    std::map<std::string, MediaProbeResult, std::less<>> pending_profile_publications;
     std::map<std::string, HlsVodPlan, std::less<>> vod_plan_cache;
     std::deque<std::string> vod_plan_cache_order;
     static constexpr size_t max_vod_plan_cache_entries = 64;
@@ -568,21 +573,26 @@ struct PlaybackManager::Impl {
     size_t reserved_video_transcodes{};
     size_t reserved_audio_transcodes{};
     bool started{};
+    std::function<size_t(const std::vector<std::string>&)> request_media_profiles;
+    MediaInformationService* media_information{};
     struct IdempotentCreation {
         std::mutex mutex;
         std::condition_variable cv;
         std::string fingerprint;
         bool complete{};
-        std::weak_ptr<Session> session;
+        std::string session_id;
         std::exception_ptr error;
     };
     std::map<std::string, std::shared_ptr<IdempotentCreation>, std::less<>> idempotent_creations;
 
     Impl(FileSystem& filesystem, CatalogueManager& cat, CatalogueApiConfig api,
-         StreamingConfig streaming, std::shared_ptr<MediaEngine> media_engine)
+         StreamingConfig streaming, std::shared_ptr<MediaEngine> media_engine,
+         std::function<size_t(const std::vector<std::string>&)> request_profiles,
+         MediaInformationService* information)
         : fs(filesystem), catalogue(cat), config(std::move(streaming)),
           engine(media_engine ? std::move(media_engine) :
-                (config.enabled ? make_libav_media_engine(config) : nullptr)) {
+                (config.enabled ? make_libav_media_engine(config) : nullptr)),
+          request_media_profiles(std::move(request_profiles)), media_information(information) {
         (void)api;
     }
 
@@ -647,6 +657,16 @@ struct PlaybackManager::Impl {
         return response;
     }
 
+    void erase_idempotency_for_session_locked(std::string_view session_id) {
+        for (auto it = idempotent_creations.begin(); it != idempotent_creations.end();) {
+            std::lock_guard creation_lock(it->second->mutex);
+            if (it->second->complete && it->second->session_id == session_id)
+                it = idempotent_creations.erase(it);
+            else
+                ++it;
+        }
+    }
+
     bool plan_supported(const PlaybackPlan& plan) const {
         if (!engine) return plan.video != MediaTransform::transcode && plan.audio != MediaTransform::transcode;
         const auto status = engine->status();
@@ -679,7 +699,7 @@ struct PlaybackManager::Impl {
                 const bool track_playback = purpose == MediaReadPurpose::playback;
                 return std::make_shared<LogicalMediaInput>(
                     fs.open_read(entry, path, track_playback, FrameType::foreground), size);
-            }};
+            }, {}};
     }
 
     std::string probe_key(const SourceLease& lease) const {
@@ -699,6 +719,42 @@ struct PlaybackManager::Impl {
             if (auto it = probe_cache.find(key); it != probe_cache.end()) {
                 Log::debug("playback[" + std::string(trace) + "] probe cache-hit media=" + lease.media_id);
                 return it->second;
+            }
+        }
+        if (lease.media_id.starts_with("macha:")) {
+            if (auto stored = catalogue.media_profile(lease.media_id)) {
+                const auto lookup_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now() - lookup_started).count();
+                Log::info("playback[" + std::string(trace) +
+                          "] immutable profile hit media=" + lease.media_id +
+                          " lookup_ms=" + std::to_string(lookup_elapsed));
+                std::lock_guard lock(mutex);
+                probe_cache[key] = *stored;
+                return *stored;
+            }
+            const auto lookup_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                Clock::now() - lookup_started).count();
+            Log::info("playback[" + std::string(trace) +
+                      "] immutable profile miss media=" + lease.media_id +
+                      " lookup_ms=" + std::to_string(lookup_elapsed));
+        }
+        if (lease.media_id.starts_with("macha:") && media_information) {
+            try {
+                const auto fallback_started = Clock::now();
+                auto resolved = media_information->resolve_playback(
+                    lease.media_id, lease.path, lease.entry, resolve_deadline);
+                const auto fallback_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now() - fallback_started).count();
+                Log::info("playback[" + std::string(trace) +
+                          "] foreground media inspection complete media=" + lease.media_id +
+                          " fallback_ms=" + std::to_string(fallback_elapsed) +
+                          " format=" + resolved.format + " streams=" +
+                          std::to_string(resolved.streams.size()));
+                std::lock_guard lock(mutex);
+                probe_cache[key] = resolved;
+                return resolved;
+            } catch (const std::exception& e) {
+                throw PlaybackStageError(std::string(trace), "probe", e.what());
             }
         }
         if (lease.media_id.starts_with("macha:")) {
@@ -740,19 +796,21 @@ struct PlaybackManager::Impl {
                 }
                 const auto lookup_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                     Clock::now() - lookup_started).count();
-                if (!resolved.generated) {
-                    Log::info("playback[" + std::string(trace) + "] immutable profile " +
-                              std::string(resolved.coalesced ? "coalesced" : "hit") +
-                              " media=" + lease.media_id + " lookup_ms=" +
-                              std::to_string(lookup_elapsed));
+                if (!resolved.generated && !resolved.coalesced) {
+                    Log::info("playback[" + std::string(trace) +
+                              "] immutable profile hit media=" + lease.media_id +
+                              " lookup_ms=" + std::to_string(lookup_elapsed));
                 } else {
-                    try {
-                        catalogue.put_media_profile(lease.media_id, resolved.probe);
-                    } catch (const std::exception& e) {
-                        Log::warn("playback[" + std::string(trace) +
-                                  "] immutable profile publication failed media=" + lease.media_id +
-                                  " error=" + e.what());
+                    if (resolved.coalesced)
+                        Log::info("playback[" + std::string(trace) +
+                                  "] immutable profile coalesced media=" + lease.media_id +
+                                  " wait_ms=" + std::to_string(lookup_elapsed));
+                    {
+                        std::lock_guard lock(profile_publish_mutex);
+                        pending_profile_publications.insert_or_assign(
+                            lease.media_id, resolved.probe);
                     }
+                    profile_publish_cv.notify_one();
                 }
                 return resolved.probe;
             } catch (const PlaybackStageError&) {
@@ -832,6 +890,31 @@ struct PlaybackManager::Impl {
         }
         complete_flight(probed);
         return probed;
+    }
+
+    void publish_profiles(std::stop_token stop) {
+        set_thread_name("macha-prof-pub");
+        while (!stop.stop_requested()) {
+            std::pair<std::string, MediaProbeResult> pending;
+            {
+                std::unique_lock lock(profile_publish_mutex);
+                profile_publish_cv.wait(lock, stop, [&] {
+                    return !pending_profile_publications.empty();
+                });
+                if (stop.stop_requested()) break;
+                auto it = pending_profile_publications.begin();
+                pending = *it;
+                pending_profile_publications.erase(it);
+            }
+            try {
+                catalogue.put_media_profile(pending.first, std::move(pending.second));
+                Log::debug("playback immutable profile published asynchronously media=" +
+                           pending.first);
+            } catch (const std::exception& e) {
+                Log::warn("playback immutable profile asynchronous publication failed media=" +
+                          pending.first + " error=" + e.what());
+            }
+        }
     }
 
     size_t video_transcodes_locked(std::string_view excluding = {}) const {
@@ -1569,16 +1652,19 @@ struct PlaybackManager::Impl {
                                           "matching session creation is still in progress");
                 }
                 if (idempotent->error) std::rethrow_exception(idempotent->error);
-                auto existing = idempotent->session.lock();
-                if (!existing)
+                auto existing_id = idempotent->session_id;
+                lock.unlock();
+                if (existing_id.empty())
                     return http_error(409, "idempotency_expired",
                                       "the prior playback session has expired");
+                std::shared_ptr<Session> existing;
                 {
                     std::lock_guard sessions_lock(mutex);
-                    auto active = sessions.find(existing->id);
-                    if (active == sessions.end() || active->second != existing)
+                    auto active = sessions.find(existing_id);
+                    if (active == sessions.end())
                         return http_error(409, "idempotency_expired",
                                           "the prior playback session has expired");
+                    existing = active->second;
                     existing->touched = Clock::now();
                     signal_cleanup_locked();
                 }
@@ -1632,7 +1718,7 @@ struct PlaybackManager::Impl {
         if (idempotent) {
             {
                 std::lock_guard lock(idempotent->mutex);
-                idempotent->session = session;
+                idempotent->session_id = session->id;
                 idempotent->complete = true;
             }
             idempotent->cv.notify_all();
@@ -1773,6 +1859,7 @@ struct PlaybackManager::Impl {
             if (it == sessions.end()) return http_error(404, "not_found", "playback session not found");
             session = it->second;
             sessions.erase(it);
+            erase_idempotency_for_session_locked(id);
             signal_cleanup_locked();
         }
         stop_pipeline(*session);
@@ -1845,6 +1932,7 @@ struct PlaybackManager::Impl {
                     const auto expires = it->second->touched + config.session_idle;
                     if (now >= expires) {
                         expired.push_back(it->second);
+                        erase_idempotency_for_session_locked(it->first);
                         it = sessions.erase(it);
                     } else {
                         if (!next_expiry || expires < *next_expiry) next_expiry = expires;
@@ -1872,9 +1960,12 @@ struct PlaybackManager::Impl {
 };
 
 PlaybackManager::PlaybackManager(FileSystem& fs, CatalogueManager& catalogue, CatalogueApiConfig api,
-                                 StreamingConfig streaming, std::shared_ptr<MediaEngine> engine)
+                                 StreamingConfig streaming, std::shared_ptr<MediaEngine> engine,
+                                 std::function<size_t(const std::vector<std::string>&)> request_profiles,
+                                 MediaInformationService* media_information)
     : impl_(std::make_unique<Impl>(fs, catalogue, std::move(api), std::move(streaming),
-                                  std::move(engine))) {}
+                                  std::move(engine), std::move(request_profiles),
+                                  media_information)) {}
 
 PlaybackManager::~PlaybackManager() { stop(); }
 
@@ -1885,6 +1976,8 @@ void PlaybackManager::start() {
     auto status = impl_->engine->status();
     if (!status.available) throw std::runtime_error("streaming media engine is unavailable");
     impl_->cleanup_thread = std::jthread([this](std::stop_token stop) { impl_->cleanup(stop); });
+    impl_->profile_publish_thread =
+        std::jthread([this](std::stop_token stop) { impl_->publish_profiles(stop); });
     impl_->started = true;
     Log::info("streaming enabled engine=" + status.backend + " version=" + status.version +
               " h264_encoder=" + std::string(status.h264_encoder ? "yes" : "no") +
@@ -1896,6 +1989,9 @@ void PlaybackManager::stop() {
     request_stop();
     if (impl_->cleanup_thread.joinable()) {
         impl_->cleanup_thread.join();
+    }
+    if (impl_->profile_publish_thread.joinable()) {
+        impl_->profile_publish_thread.join();
     }
     std::vector<std::shared_ptr<Impl::Session>> sessions;
     {
@@ -1912,6 +2008,10 @@ void PlaybackManager::request_stop() {
     if (impl_->cleanup_thread.joinable()) {
         impl_->cleanup_thread.request_stop();
         impl_->cleanup_cv.notify_all();
+    }
+    if (impl_->profile_publish_thread.joinable()) {
+        impl_->profile_publish_thread.request_stop();
+        impl_->profile_publish_cv.notify_all();
     }
 }
 

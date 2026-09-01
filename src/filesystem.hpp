@@ -94,7 +94,7 @@ class ReadHandle {
     FsEntry e_;
     PlaybackTracker* playback_{};
     uint64_t playback_session_{};
-    FrameType frame_type_{FrameType::read_ahead};
+    std::atomic<FrameType> frame_type_{FrameType::read_ahead};
     std::mutex m_;
     uint64_t last_{};
     size_t cached_index_{static_cast<size_t>(-1)};
@@ -105,6 +105,7 @@ class ReadHandle {
     ReadHandle(DistributedStore&, FsEntry, PlaybackTracker* = nullptr,
                std::string path = {}, FrameType frame_type = FrameType::read_ahead);
     ~ReadHandle();
+    void promote(FrameType) noexcept;
     size_t read(uint64_t, std::span<uint8_t>, Clock::time_point deadline = {},
                 std::atomic_bool* cancelled = nullptr);
 };

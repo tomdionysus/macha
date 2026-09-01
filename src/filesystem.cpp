@@ -152,6 +152,13 @@ ReadHandle::~ReadHandle() {
         playback_->close(playback_session_);
 }
 
+void ReadHandle::promote(FrameType requested) noexcept {
+    auto current = frame_type_.load(std::memory_order_relaxed);
+    while (frame_type_priority(requested) < frame_type_priority(current) &&
+           !frame_type_.compare_exchange_weak(current, requested,
+                                              std::memory_order_relaxed)) {}
+}
+
 const Bytes& ReadHandle::extent(size_t i, Clock::time_point deadline,
                                 std::atomic_bool* cancelled) {
     if (cached_index_ == i) {
@@ -164,7 +171,7 @@ const Bytes& ReadHandle::extent(size_t i, Clock::time_point deadline,
 
     auto& x = e_.extents.at(i);
     auto started = Clock::now();
-    auto data = s_.get(x.id, i, frame_type_, deadline, cancelled);
+    auto data = s_.get(x.id, i, frame_type_.load(std::memory_order_relaxed), deadline, cancelled);
     if (!data) {
         if (cancelled && cancelled->load())
             fail(ECANCELED, "extent read cancelled");
@@ -220,9 +227,10 @@ size_t ReadHandle::read(uint64_t off, std::span<uint8_t> out, Clock::time_point 
     bool seq = off == last_;
     last_ = off + done;
     if (done) {
-        if (frame_type_ == FrameType::foreground)
+        const auto frame_type = frame_type_.load(std::memory_order_relaxed);
+        if (frame_type == FrameType::foreground)
             s_.foreground_activity(done);
-        else if (frame_type_ == FrameType::read_ahead)
+        else if (frame_type == FrameType::read_ahead)
             s_.interactive_activity(done);
     }
     if (seq && done && playback_ && playback_session_ && last_extent != static_cast<size_t>(-1))

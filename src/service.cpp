@@ -179,15 +179,18 @@ void Service::initialise_services(std::stop_token stop) {
         std::shared_ptr<MediaEngine> media_engine;
         if (node_.config().streaming.enabled)
             media_engine = make_libav_media_engine(node_.config().streaming);
+        auto media_information = std::make_unique<MediaInformationService>(
+            *fs, *catalogue, media_engine, node_.config().state_path);
         auto scanner = std::make_unique<CatalogueScanner>(node_, *fs, *catalogue, *catalogue_hints,
                                                           node_.config().catalogue.scanner,
                                                           std::unique_ptr<HttpClient>{},
-                                                          std::chrono::seconds(5), media_engine);
+                                                          std::chrono::seconds(5), media_engine,
+                                                          media_information.get());
         auto hydration = std::make_unique<HydrationManager>(*store, playback_, *fs, *catalogue,
                                                             node_.config().hydration,
                                                             node_.config().read_ahead_extents);
-        auto ingest =
-            std::make_unique<IngestManager>(node_, *fs, *catalogue_hints, node_.config().ingest);
+        auto ingest = std::make_unique<IngestManager>(
+            node_, *fs, *catalogue_hints, node_.config().ingest, media_information.get());
         auto torrents = std::make_unique<TorrentManager>(*ingest, node_.config().torrent,
                                                          node_.config().state_path);
         auto torrent_search = std::make_unique<TorrentSearchManager>(node_.config().torrent);
@@ -197,12 +200,18 @@ void Service::initialise_services(std::stop_token stop) {
             *catalogue, *catalogue_hints,
             [scanner_ptr = scanner.get()](const std::vector<std::string>& media_ids) {
                 scanner_ptr->request_media_rescan(media_ids);
+            },
+            [scanner_ptr = scanner.get()](const std::vector<std::string>& media_ids) {
+                return scanner_ptr->request_media_profiles(media_ids);
             });
         auto manage_api = std::make_unique<ManageApi>(node_, *metadata, *fs, *catalogue,
                                                       *catalogue_hints, *scanner);
         auto streaming = std::make_unique<PlaybackManager>(
             *fs, *catalogue, node_.config().catalogue.api, node_.config().streaming,
-            media_engine);
+            media_engine,
+            [scanner_ptr = scanner.get()](const std::vector<std::string>& media_ids) {
+                return scanner_ptr->request_media_profiles(media_ids);
+            }, media_information.get());
 
         metadata->set_publication_retention([this](const MetadataPublicationContext& context) {
             retain_metadata_publication(context);
@@ -213,6 +222,7 @@ void Service::initialise_services(std::stop_token stop) {
         catalogue_ = std::move(catalogue);
         fs_ = std::move(fs);
         catalogue_hints_ = std::move(catalogue_hints);
+        media_information_ = std::move(media_information);
         scanner_ = std::move(scanner);
         hydration_ = std::move(hydration);
         ingest_ = std::move(ingest);
@@ -226,6 +236,7 @@ void Service::initialise_services(std::stop_token stop) {
         if (stop.stop_requested())
             return;
 
+        media_information_->start();
         ingest_->start();
         torrents_->start();
         streaming_->start();
@@ -278,6 +289,8 @@ void Service::request_stop() {
         ingest_->request_stop();
     if (scanner_)
         scanner_->request_stop();
+    if (media_information_)
+        media_information_->request_stop();
     if (hydration_)
         hydration_->request_stop();
     cluster_status_.request_stop();
@@ -304,6 +317,8 @@ void Service::stop() {
         ingest_->stop();
     if (scanner_)
         scanner_->stop();
+    if (media_information_)
+        media_information_->stop();
     if (hydration_)
         hydration_->stop();
     cluster_status_.detach_metadata();
@@ -326,6 +341,8 @@ void Service::stop() {
 }
 
 void Service::signal_maintenance(ServiceEvent event) {
+    if (event == ServiceEvent::metadata && media_information_)
+        media_information_->request_prune();
     bool wake = true;
     if (event == ServiceEvent::metadata || event == ServiceEvent::topology)
         wake = metadata_convergence_.request(node_.known_metadata_generation());
@@ -539,8 +556,13 @@ void Service::loop(std::stop_token stop) {
             gc_quiescent_until = now + policy.foreground_quiet;
         }
         std::vector<NodeId> active_nodes;
-        for (const auto& peer : node_.membership().active())
+        bool established_metadata_peer = false;
+        for (const auto& peer : node_.membership().active()) {
             active_nodes.push_back(peer.id);
+            established_metadata_peer = established_metadata_peer ||
+                                        (peer.id != node_.node_id() &&
+                                         peer.metadata_generation > 1);
+        }
         std::sort(active_nodes.begin(), active_nodes.end());
         const auto remote_epoch = node_.remote_metadata_epoch();
         const bool topology_changed = active_nodes != last_active_nodes;
@@ -610,12 +632,14 @@ void Service::loop(std::stop_token stop) {
             if (metadata_dirty &&
                 (metadata_retry_due == Clock::time_point{} || now >= metadata_retry_due)) {
                 if (node_.metadata_replica().committed_generation() <= 1 &&
+                    !established_metadata_peer &&
                     now < formation_settle_due) {
                     metadata_ready_for_dependants = false;
                     metadata_retry_due = formation_settle_due;
                 } else {
                     const bool virgin_follower =
                         node_.metadata_replica().committed_generation() <= 1 &&
+                        !established_metadata_peer &&
                         !last_active_nodes.empty() &&
                         node_.node_id() !=
                             *std::min_element(last_active_nodes.begin(), last_active_nodes.end());
@@ -1074,13 +1098,12 @@ void Service::loop(std::stop_token stop) {
             if (!busy)
                 (void)node_.retention_store().compact_if_needed(4096);
 
-            // Metadata ancestry is required while a known node may still return
-            // with an unseen branch. Once the complete durable roster is directly
-            // reachable and repair reports convergence, re-root that history so
-            // lifetime metadata mutation count does not become lifetime disk/RSS.
-            if (!busy && node_.membership().all_known_reachable() &&
-                metadata_->cluster_status().stable)
-                (void)node_.metadata_replica().compact_history_if_safe();
+            // Do not re-root metadata ancestry from a local stability snapshot.
+            // Exact accepted-head identity must be durably proven across the
+            // complete cluster before history can be discarded. Generation-only
+            // status allowed a returning accepted branch to outlive the common
+            // ancestor on every replica. History compaction remains disabled
+            // until that stronger protocol exists.
 
             // Packed DATA tombstones are physical dead space. Compact one
             // victim pack per backend at a time; unlike the old whole-store
