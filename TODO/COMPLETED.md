@@ -4,6 +4,63 @@ Last updated: 2026-09-01
 
 This is the completed-work ledger for the current session. An item belongs here only after implementation and its stated verification are complete. Detailed design notes, exact test results, and UAT measurements remain in the linked records.
 
+## Exact metadata reconciliation recovery — 0.22.2
+
+- [x] Reproduced and corrected compact-delta selection for reconciliation which
+  reorders an append-ordered garbage/tombstone set. Unrepresentable ordering now
+  selects a full immutable record instead of emitting a byte-inexact delta.
+- [x] Added one bounded local full-record fallback after compact-body rejection,
+  matching remote-replica safety without retrying or loading full history.
+- [x] Added regressions for both ordering rejection and local fallback; all
+  250/250 core and 3/3 runtime tests passed.
+- [x] Deployed complete source as 0.22.2 to all four nodes. The three identical
+  Linux builds have SHA-256
+  `1fc6c8473a64525da48d6fead630780615f525f22ae136dd2ff9bdf5731144d0`.
+- [x] Live generation-2128 branches reconciled without reset or library loss.
+  Metadata became writable/validated, ordinary queued publication advanced the
+  cluster through generation 2155, and every catalogue API returned the same
+  331 items and 374 artwork objects. Linux services remained active with zero
+  restarts.
+
+Evidence: [metadata reconciliation recovery](2026-09-01-metadata-reconciliation-recovery.md)
+
+## Metadata-history bounded-memory and delta-reconciliation checkpoint
+
+- [x] Replaced retained decrypted history payloads with a compact authenticated
+  on-disk frame index and on-demand reconstruction.
+- [x] Added a configurable `128M` default materialisation byte budget, retained
+  the secondary 64-entry guard, and exposed history/cache byte diagnostics.
+- [x] Made deterministic merges store DLT6 deltas when smaller, including
+  merge-parent/conflict replacement, while preserving the immutable full record
+  hash and safely supplying missing parents before full fallback.
+- [x] Corrected `runtime.rss_bytes` to report current RSS on Linux/macOS and
+  moved stale-Macha-mount recovery before mount-path filesystem access.
+- [x] Added disk-backed large-history and four-node merge-body regressions.
+  The authoritative serial suite passed 246/246 and runtime dependencies passed
+  3/3. Live bounded-RSS/restart UAT remains active before loaded ingest resumes.
+
+Evidence: [P0 metadata-history remediation](2026-09-01-metadata-history-memory-remediation.md)
+
+## Bounded shutdown and clean cluster rejoin
+
+- [x] Reproduced the deployed shutdown timeout and captured both maintenance
+  owners that could remain blocked after stop: a synchronous outbound control
+  RPC and pack compaction waiting for startup storage accounting.
+- [x] Made shutdown close pending outbound routes before joining service
+  maintenance, permanently reject new outbound calls once cancellation begins,
+  and make the accounting wait stop-token-aware.
+- [x] Correctly classified libfuse's positive signal return as an intentional
+  shutdown rather than a frontend failure, while retaining negative errno and
+  watchdog mount loss as fail-closed errors.
+- [x] Added regressions for pending RPC cancellation, post-cancellation retry
+  rejection, accounting-wait cancellation, and FUSE exit-result semantics.
+- [x] Passed the final 245/245 core and 3/3 runtime suites. Live UAT on
+  node 50 stopped Macha in 215 ms with systemd `Result=success`, then restarted
+  it as the same node at generation 1643; node 51 independently reported it
+  online at the same writable generation.
+
+Evidence: [bounded shutdown and rejoin record](2026-09-01-bounded-shutdown-and-rejoin.md)
+
 ## Dedicated immutable media-information engine
 
 - [x] Added an event-driven, durably hinted profiling service used by ingest,

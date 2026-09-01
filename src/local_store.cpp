@@ -1233,19 +1233,27 @@ bool LocalStore::compact_packs_locked() {
     }
 }
 
-bool LocalStore::compact_packs() {
+bool LocalStore::compact_packs(std::stop_token stop) {
     std::unique_lock lock(m_);
-    wait_for_accounting(lock);
+    if (!wait_for_accounting(lock, stop)) return false;
     return compact_packs_locked();
 }
 
 void LocalStore::wait_for_accounting(std::unique_lock<std::mutex>& lock) const {
-    accounting_cv_.wait(lock, [this] {
+    (void)wait_for_accounting(lock, {});
+}
+
+bool LocalStore::wait_for_accounting(std::unique_lock<std::mutex>& lock,
+                                     std::stop_token stop) const {
+    std::stop_callback wake_waiter(stop, [this] { accounting_cv_.notify_all(); });
+    accounting_cv_.wait(lock, [this, stop] {
         return scan_complete_.load(std::memory_order_acquire) ||
-               scan_failed_.load(std::memory_order_acquire);
+               scan_failed_.load(std::memory_order_acquire) || stop.stop_requested();
     });
+    if (stop.stop_requested()) return false;
     if (scan_failed_.load(std::memory_order_acquire))
         throw std::runtime_error("storage accounting reconciliation failed");
+    return true;
 }
 
 void LocalStore::scan(std::stop_token stop) {
