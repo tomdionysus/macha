@@ -114,6 +114,10 @@ class MediaSegmentStore {
         std::string error;
         uint64_t segment_count{};
         uint64_t highest_requested{};
+        uint64_t resident_bytes{};
+        uint64_t spill_bytes{};
+        uint64_t descriptor_bytes{};
+        uint64_t planned_segments{};
     };
 
     MediaSegmentStore(size_t max_ahead_segments, uint64_t memory_limit,

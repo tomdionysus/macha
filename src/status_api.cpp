@@ -623,6 +623,24 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     data_resource_diagnostics["cancelled_waits"] = data_resource.cancelled_waits;
     diagnostics["data_resources"] = std::move(data_resource_diagnostics);
 
+    Json::Object data_store_diagnostics;
+    data_store_diagnostics["available"] = false;
+    if (readiness.data_storage_ready) {
+        try {
+            const auto data_store = node_.local_store().diagnostics();
+            data_store_diagnostics["available"] = true;
+            data_store_diagnostics["loose_reaffirmation_fast_paths"] =
+                data_store.loose_reaffirmation_fast_paths;
+            data_store_diagnostics["loose_reaffirmation_full_validations"] =
+                data_store.loose_reaffirmation_full_validations;
+        } catch (...) {
+            // Readiness can transition while Status is assembled. Diagnostics
+            // are observational and must never make the startup API fail.
+            data_store_diagnostics["available"] = false;
+        }
+    }
+    diagnostics["data_store"] = std::move(data_store_diagnostics);
+
     std::function<std::optional<FuseFrontendDiagnostics>()> fuse_provider;
     std::function<ConvergenceDemandDiagnostics()> convergence_provider;
     {
@@ -685,6 +703,28 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                     values->data_publication_completed_reused_extents;
                 filesystem_diagnostics["data_publication_completed_put_extents"] =
                     values->data_publication_completed_put_extents;
+                filesystem_diagnostics["data_overlay_read_queries"] =
+                    values->data_overlay_read_queries;
+                filesystem_diagnostics["data_overlay_ranges_examined"] =
+                    values->data_overlay_ranges_examined;
+                filesystem_diagnostics["data_overlay_descriptors_copied"] =
+                    values->data_overlay_descriptors_copied;
+                filesystem_diagnostics["retained_data_operations"] =
+                    values->retained_data_operations;
+                filesystem_diagnostics["retained_data_operation_bytes"] =
+                    values->retained_data_operation_bytes;
+                filesystem_diagnostics["retained_overlay_ranges"] =
+                    values->retained_overlay_ranges;
+                filesystem_diagnostics["retained_overlay_bytes"] =
+                    values->retained_overlay_bytes;
+                filesystem_diagnostics["retained_publication_operations"] =
+                    values->retained_publication_operations;
+                filesystem_diagnostics["retained_publication_operation_bytes"] =
+                    values->retained_publication_operation_bytes;
+                filesystem_diagnostics["retained_durability_tickets"] =
+                    values->retained_durability_tickets;
+                filesystem_diagnostics["data_publication_inflight_bytes"] =
+                    values->data_publication_inflight_bytes;
                 filesystem_diagnostics["backend_failures"] = values->backend_failures;
                 filesystem_diagnostics["durability_batches"] = values->durability_batches;
                 filesystem_diagnostics["durability_writes"] = values->durability_writes;
