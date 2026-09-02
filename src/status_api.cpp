@@ -607,6 +607,13 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     rpc_diagnostics["message_timings"] = std::move(message_timings);
     diagnostics["rpc_server"] = std::move(rpc_diagnostics);
 
+    const auto transport = node_.rpc_stats();
+    Json::Object transport_diagnostics;
+    transport_diagnostics["connections_created"] = transport.connections_created;
+    transport_diagnostics["connections_reused"] = transport.connections_reused;
+    transport_diagnostics["canonical_connections"] = transport.canonical_connections;
+    diagnostics["rpc_transport"] = std::move(transport_diagnostics);
+
     const auto data_resource = node_.data_resources().stats();
     Json::Object data_resource_diagnostics;
     data_resource_diagnostics["capacity_bytes"] = data_resource.capacity_bytes;

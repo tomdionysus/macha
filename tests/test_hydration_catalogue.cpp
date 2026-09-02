@@ -3258,6 +3258,13 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
         config->maintenance.garbage_grace = 0ms;
         config->maintenance.foreground_quiet = 10ms;
         config->maintenance.no_progress_backoff = 500ms;
+        // This case verifies metadata-burst coalescing and catalogue GC, not
+        // failure detection.  The generic 500 ms test deadline can expire when
+        // the process is descheduled under the parallel suite, causing a false
+        // topology edge (and correctly fencing destructive GC).  Keep liveness
+        // comfortably above scheduler jitter while retaining the short test
+        // heartbeat and all existing behavioural deadlines.
+        config->dead_after = 5s;
         config->catalogue.scanner.enabled = false;
         config->catalogue.api.enabled = false;
         config->ingest.enabled = false;
