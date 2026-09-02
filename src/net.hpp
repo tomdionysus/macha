@@ -260,7 +260,10 @@ class RpcClient {
     class PeerConnection;
     friend class RpcServer;
 
-    using InboundReply = std::function<void(const RpcMessage&)>;
+    // Replies transfer ownership from the bounded handler directly into the
+    // transport queue. Passing by const reference silently copied complete
+    // multi-megabyte object replies at this boundary.
+    using InboundReply = std::function<void(RpcMessage)>;
     using InboundHandler = std::function<void(const NodeInfo&, RpcFrame, InboundReply)>;
     using InboundPromoter = std::function<void(const NodeInfo&, uint64_t, FrameType)>;
     using InboundCanceller = std::function<void(const NodeInfo&, uint64_t)>;
@@ -374,7 +377,7 @@ class RpcServer {
         std::shared_ptr<Session> session;
         NodeInfo peer;
         RpcFrame frame;
-        std::function<void(const RpcMessage&)> reply;
+        RpcClient::InboundReply reply;
         Clock::time_point queued_at{Clock::now()};
     };
 

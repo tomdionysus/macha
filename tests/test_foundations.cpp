@@ -677,6 +677,7 @@ MACHA_TEST("foundations", test_thread_cpu_reporter_debug_escalation) {
 MACHA_FAST_TEST("foundations", test_config) {
     CHECK(Config{}.log_level == LogLevel::info);
     CHECK(Config{}.ffmpeg_log_level == FfmpegLogLevel::error);
+    CHECK(Config{}.runtime.glibc_arena_max == 4);
     CHECK(parse_log_level("all") == LogLevel::all);
     CHECK(parse_log_level("DEBUG") == LogLevel::debug);
     CHECK(parse_log_level("Info") == LogLevel::info);

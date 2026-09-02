@@ -5,6 +5,7 @@
 #include "placement.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <limits>
 #include <set>
 #include <tuple>
@@ -16,6 +17,28 @@ bool read_aborted(Clock::time_point deadline, const std::atomic_bool* cancelled,
     return (cancelled && cancelled->load(std::memory_order_relaxed)) ||
            (abort && abort()) ||
            (deadline != Clock::time_point{} && Clock::now() >= deadline);
+}
+
+Bytes take_object_reply_payload(RpcMessage message, const ObjectId& expected) {
+    if (message.type != MessageType::object_reply)
+        throw std::runtime_error("remote object reply has the wrong message type");
+
+    // The stable wire representation is ObjectId + length + bytes. Validate it
+    // in place, then slide the bytes over the small prefix and retain the same
+    // allocation. Reader::bytes() would allocate and copy the complete extent.
+    Reader reader(message.payload);
+    const ObjectId returned{reader.fixed<32>()};
+    const auto size = reader.u32();
+    if (size > 128ULL * 1024 * 1024 || reader.remaining() != size)
+        throw DecodeError("invalid remote object reply size");
+    constexpr size_t prefix = 32 + 4;
+    const auto data = std::span<const uint8_t>(message.payload).subspan(prefix, size);
+    if (returned != expected || object_id(data) != expected)
+        throw std::runtime_error("remote integrity failure");
+    if (size)
+        std::memmove(message.payload.data(), message.payload.data() + prefix, size);
+    message.payload.resize(size);
+    return std::move(message.payload);
 }
 } // namespace
 
@@ -771,12 +794,7 @@ std::optional<Bytes> DistributedStore::get_from(const NodeInfo& target, const Ob
         }
         if (reply.message.type != MessageType::object_reply)
             return {};
-        Reader reader(reply.message.payload);
-        ObjectId returned{reader.fixed<32>()};
-        auto data = reader.bytes(128 * 1024 * 1024);
-        reader.finish();
-        if (returned != id || object_id(data) != id)
-            throw std::runtime_error("remote integrity failure");
+        auto data = take_object_reply_payload(std::move(reply.message), id);
         note_network(data.size(), Clock::now() - started);
         return data;
     } catch (const std::exception& e) {

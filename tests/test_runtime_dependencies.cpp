@@ -1,11 +1,77 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
+#include "process_allocator.hpp"
 
 extern "C" {
 #include <libavutil/log.h>
 }
 
+#if defined(__linux__)
+#include <features.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#define MACHA_TEST_GLIBC 1
+#endif
+#endif
+
 using namespace macha::test_support;
+
+MACHA_FAST_TEST("runtime_dependencies", test_glibc_allocator_arena_limit_is_hard) {
+    bool rejected_zero = false;
+    try {
+        (void)configure_process_allocator(0);
+    } catch (const std::invalid_argument&) {
+        rejected_zero = true;
+    }
+    CHECK(rejected_zero);
+    const auto policy = configure_process_allocator(2);
+#if defined(MACHA_TEST_GLIBC)
+    REQUIRE(policy.supported);
+    REQUIRE(policy.arena_max == 2);
+
+    auto arena_count = [] {
+        auto* stream = std::tmpfile();
+        REQUIRE(stream != nullptr);
+        REQUIRE(malloc_info(0, stream) == 0);
+        REQUIRE(std::fflush(stream) == 0);
+        REQUIRE(std::fseek(stream, 0, SEEK_END) == 0);
+        const auto length = std::ftell(stream);
+        REQUIRE(length >= 0);
+        REQUIRE(std::fseek(stream, 0, SEEK_SET) == 0);
+        std::string xml(static_cast<size_t>(length), '\0');
+        if (!xml.empty())
+            REQUIRE(std::fread(xml.data(), 1, xml.size(), stream) == xml.size());
+        REQUIRE(std::fclose(stream) == 0);
+        size_t count = 0;
+        for (size_t at = 0; (at = xml.find("<heap nr=", at)) != std::string::npos;
+             at += 9)
+            ++count;
+        return count;
+    };
+
+    for (int wave = 0; wave < 3; ++wave) {
+        TestGate hold;
+        std::vector<std::jthread> workers;
+        workers.reserve(16);
+        for (int i = 0; i < 16; ++i) {
+            workers.emplace_back([&, i] {
+                std::vector<uint8_t> allocation(4 * 1024 * 1024);
+                for (size_t page = 0; page < allocation.size(); page += 4096)
+                    allocation[page] = static_cast<uint8_t>(i + wave);
+                hold.enter_and_wait();
+            });
+        }
+        REQUIRE(hold.wait_for_entries(16));
+        CHECK(arena_count() <= 2);
+        hold.open();
+        workers.clear();
+    }
+    CHECK(arena_count() <= 2);
+#else
+    CHECK(!policy.supported);
+    CHECK(policy.arena_max == 2);
+#endif
+}
 
 MACHA_FAST_TEST("runtime_dependencies", test_ffmpeg_log_bridge) {
     auto capture = std::make_shared<CapturingLogger>(LogLevel::info);
@@ -233,7 +299,9 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "  segment_memory_bytes: 96M\n"
             << "  probe_bytes: 12M\n"
             << "  probe_analyze_duration_ms: 4000\n"
-            << "  probe_timeout_ms: 9000\n";
+            << "  probe_timeout_ms: 9000\n"
+            << "runtime:\n"
+            << "  glibc_arena_max: 6\n";
     }
 
     std::vector<std::string> yaml_args{"macha", "--config", yaml.string()};
@@ -382,6 +450,18 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(yc.streaming.probe_bytes == 12ULL * 1024 * 1024);
     CHECK(yc.streaming.probe_analyze_duration == 4000ms);
     CHECK(yc.streaming.probe_timeout == 9000ms);
+    CHECK(yc.runtime.glibc_arena_max == 6);
+    for (const size_t invalid_arena_max : {size_t{0}, size_t{65}}) {
+        auto invalid = yc;
+        invalid.runtime.glibc_arena_max = invalid_arena_max;
+        bool rejected = false;
+        try {
+            (void)normalize_config(std::move(invalid));
+        } catch (const std::exception&) {
+            rejected = true;
+        }
+        CHECK(rejected);
+    }
 
     // CLI remains useful for node-local/runtime overrides, but configuration
     // now always starts from an explicit YAML file.
