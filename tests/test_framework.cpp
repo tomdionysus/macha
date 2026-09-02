@@ -24,6 +24,15 @@
 namespace macha::test {
 namespace {
 
+#if defined(__linux__) && (defined(__GNUC__) || defined(__clang__))
+// Test cases deliberately use _Exit() after fork so child teardown cannot run
+// parent-owned process handlers. That also bypasses LeakSanitizer's atexit
+// hook, so sanitizer builds must request the check explicitly after the test
+// function (and all of its local owners) has unwound. The weak symbol keeps
+// ordinary builds independent of the sanitizer runtime.
+extern "C" int __lsan_do_recoverable_leak_check() __attribute__((weak));
+#endif
+
 using Clock = std::chrono::steady_clock;
 
 std::vector<TestCase>& registry() {
@@ -159,6 +168,12 @@ std::string read_capture(int fd) {
         std::cerr << "uncaught non-standard exception\n";
         child_failures.fetch_add(1, std::memory_order_relaxed);
     }
+#if defined(__linux__) && (defined(__GNUC__) || defined(__clang__))
+    if (__lsan_do_recoverable_leak_check && __lsan_do_recoverable_leak_check()) {
+        std::cerr << "LeakSanitizer reported live allocations after test teardown\n";
+        child_failures.fetch_add(1, std::memory_order_relaxed);
+    }
+#endif
     std::cout.flush();
     std::cerr.flush();
     std::_Exit(child_failures.load(std::memory_order_relaxed) == 0 ? 0 : 1);
@@ -167,6 +182,13 @@ std::string read_capture(int fd) {
 RunningCase launch(const TestCase& test, std::size_t selection_index) {
     const int capture_fd = create_capture_file();
     const auto started = Clock::now();
+    // fork() duplicates userspace stream buffers.  If the parent has reported
+    // completed cases into a redirected (and therefore fully-buffered) stream,
+    // a later child would otherwise flush that inherited text into its own
+    // capture file.  That made parallel failures appear to contain results and
+    // timeouts from unrelated tests.
+    std::cout.flush();
+    std::cerr.flush();
     const pid_t pid = ::fork();
     if (pid < 0) {
         ::close(capture_fd);
@@ -368,6 +390,10 @@ int run_all(int argc, char** argv) {
     if (failed) {
         std::cerr << failed << '/' << results.size() << " tests failed; wall=" << elapsed.count()
                   << "ms case-sum=" << serial_time.count() << "ms\n";
+        std::cerr << "Failed cases:\n";
+        for (const auto& result : results)
+            if (!result.passed)
+                std::cerr << "  " << full_name(*result.test) << '\n';
         return 1;
     }
     std::cout << "All " << results.size() << " tests passed; wall=" << elapsed.count()

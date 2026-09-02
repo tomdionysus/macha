@@ -535,6 +535,10 @@ struct PlaybackManager::Impl {
         struct SubtitleCache {
             std::mutex mutex;
             std::map<std::pair<int, uint64_t>, std::string> segments;
+            std::deque<std::pair<int, uint64_t>> order;
+            size_t bytes{};
+            static constexpr size_t max_entries = 256;
+            static constexpr size_t max_bytes = 4ULL * 1024 * 1024;
         };
         std::string subtitle_url;
         std::shared_ptr<SubtitleCache> subtitle_cache{std::make_shared<SubtitleCache>()};
@@ -554,6 +558,9 @@ struct PlaybackManager::Impl {
     uint64_t cleanup_revision{};
     std::map<std::string, std::shared_ptr<Session>, std::less<>> sessions;
     std::map<std::string, MediaProbeResult, std::less<>> probe_cache;
+    size_t probe_cache_bytes{};
+    static constexpr size_t max_probe_cache_entries = 512;
+    static constexpr size_t max_probe_cache_bytes = 8ULL * 1024 * 1024;
     struct ProbeFlight {
         std::mutex mutex;
         std::condition_variable cv;
@@ -565,6 +572,9 @@ struct PlaybackManager::Impl {
     std::mutex profile_publish_mutex;
     std::condition_variable_any profile_publish_cv;
     std::map<std::string, MediaProbeResult, std::less<>> pending_profile_publications;
+    size_t pending_profile_publication_bytes{};
+    static constexpr size_t max_pending_profile_publications = 128;
+    static constexpr size_t max_pending_profile_publication_bytes = 4ULL * 1024 * 1024;
     std::map<std::string, HlsVodPlan, std::less<>> vod_plan_cache;
     std::deque<std::string> vod_plan_cache_order;
     static constexpr size_t max_vod_plan_cache_entries = 64;
@@ -578,6 +588,67 @@ struct PlaybackManager::Impl {
     bool started{};
     std::function<size_t(const std::vector<std::string>&)> request_media_profiles;
     MediaInformationService* media_information{};
+
+    static size_t probe_resident_weight(const MediaProbeResult& probe) {
+        size_t bytes = sizeof(probe) + probe.format.capacity();
+        for (const auto& stream : probe.streams) {
+            bytes += sizeof(stream) + stream.codec.capacity() + stream.profile.capacity() +
+                     stream.language.capacity();
+        }
+        return bytes;
+    }
+
+    // Precondition: profile_publish_mutex is held. This retry cache is an
+    // optimization, not durable state; a broken metadata publisher must not
+    // turn successful playback probes into an unbounded process-lifetime owner.
+    void queue_profile_publication(std::string media_id, MediaProbeResult probe) {
+        const auto weight = probe_resident_weight(probe) + media_id.size();
+        if (weight > max_pending_profile_publication_bytes)
+            return;
+        if (auto found = pending_profile_publications.find(media_id);
+            found != pending_profile_publications.end()) {
+            pending_profile_publication_bytes -=
+                probe_resident_weight(found->second) + found->first.size();
+            found->second = std::move(probe);
+            pending_profile_publication_bytes += weight;
+            return;
+        }
+        while (!pending_profile_publications.empty() &&
+               (pending_profile_publications.size() >= max_pending_profile_publications ||
+                pending_profile_publication_bytes >
+                    max_pending_profile_publication_bytes - weight)) {
+            auto victim = pending_profile_publications.begin();
+            pending_profile_publication_bytes -=
+                probe_resident_weight(victim->second) + victim->first.size();
+            pending_profile_publications.erase(victim);
+        }
+        pending_profile_publications.emplace(std::move(media_id), std::move(probe));
+        pending_profile_publication_bytes += weight;
+    }
+
+    // Precondition: mutex is held. Immutable identity makes entries valid, but
+    // validity is not ownership: this process cache has a hard count and byte
+    // lifetime independent of catalogue size and is safely repopulated.
+    void cache_probe(std::string key, MediaProbeResult probe) {
+        const auto weight = probe_resident_weight(probe);
+        if (weight > max_probe_cache_bytes)
+            return;
+        if (auto found = probe_cache.find(key); found != probe_cache.end()) {
+            probe_cache_bytes -= probe_resident_weight(found->second);
+            found->second = std::move(probe);
+            probe_cache_bytes += weight;
+            return;
+        }
+        while (!probe_cache.empty() &&
+               (probe_cache.size() >= max_probe_cache_entries ||
+                probe_cache_bytes > max_probe_cache_bytes - weight)) {
+            auto victim = probe_cache.begin();
+            probe_cache_bytes -= probe_resident_weight(victim->second);
+            probe_cache.erase(victim);
+        }
+        probe_cache.emplace(std::move(key), std::move(probe));
+        probe_cache_bytes += weight;
+    }
     struct IdempotentCreation {
         std::mutex mutex;
         std::condition_variable cv;
@@ -732,7 +803,7 @@ struct PlaybackManager::Impl {
                           "] immutable profile hit media=" + lease.media_id +
                           " lookup_ms=" + std::to_string(lookup_elapsed));
                 std::lock_guard lock(mutex);
-                probe_cache[key] = *stored;
+                cache_probe(key, *stored);
                 return *stored;
             }
             const auto lookup_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -754,7 +825,7 @@ struct PlaybackManager::Impl {
                           " format=" + resolved.format + " streams=" +
                           std::to_string(resolved.streams.size()));
                 std::lock_guard lock(mutex);
-                probe_cache[key] = resolved;
+                cache_probe(key, resolved);
                 return resolved;
             } catch (const std::exception& e) {
                 throw PlaybackStageError(std::string(trace), "probe", e.what());
@@ -795,7 +866,7 @@ struct PlaybackManager::Impl {
                     });
                 {
                     std::lock_guard lock(mutex);
-                    probe_cache[key] = resolved.probe;
+                    cache_probe(key, resolved.probe);
                 }
                 const auto lookup_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                     Clock::now() - lookup_started).count();
@@ -810,8 +881,7 @@ struct PlaybackManager::Impl {
                                   " wait_ms=" + std::to_string(lookup_elapsed));
                     {
                         std::lock_guard lock(profile_publish_mutex);
-                        pending_profile_publications.insert_or_assign(
-                            lease.media_id, resolved.probe);
+                        queue_profile_publication(lease.media_id, resolved.probe);
                     }
                     profile_publish_cv.notify_one();
                 }
@@ -889,7 +959,7 @@ struct PlaybackManager::Impl {
                   " streams=" + std::to_string(probed.streams.size()));
         {
             std::lock_guard lock(mutex);
-            probe_cache[key] = probed;
+            cache_probe(key, probed);
         }
         complete_flight(probed);
         return probed;
@@ -907,6 +977,8 @@ struct PlaybackManager::Impl {
                 if (stop.stop_requested()) break;
                 auto it = pending_profile_publications.begin();
                 pending = *it;
+                pending_profile_publication_bytes -=
+                    probe_resident_weight(it->second) + it->first.size();
                 pending_profile_publications.erase(it);
             }
             try {
@@ -917,7 +989,7 @@ struct PlaybackManager::Impl {
                 Log::warn("playback immutable profile asynchronous publication failed media=" +
                           pending.first + " error=" + e.what());
                 std::unique_lock lock(profile_publish_mutex);
-                pending_profile_publications.insert_or_assign(pending.first, pending.second);
+                queue_profile_publication(pending.first, pending.second);
                 // A catalogue CAS conflict is transient. Preserve the completed
                 // scan and retry from this event-driven worker after a bounded
                 // backoff instead of forcing another foreground probe.
@@ -1546,7 +1618,22 @@ struct PlaybackManager::Impl {
                             std::chrono::milliseconds(source_start_ms),
                             std::chrono::milliseconds(source_end_ms),
                             std::chrono::milliseconds(origin_ms));
-                        session->subtitle_cache->segments.emplace(key, data);
+                        auto& cache = *session->subtitle_cache;
+                        if (data.size() <= cache.max_bytes) {
+                            while (!cache.order.empty() &&
+                                   (cache.segments.size() >= cache.max_entries ||
+                                    cache.bytes > cache.max_bytes - data.size())) {
+                                auto victim = cache.order.front();
+                                cache.order.pop_front();
+                                auto found = cache.segments.find(victim);
+                                if (found == cache.segments.end()) continue;
+                                cache.bytes -= found->second.size();
+                                cache.segments.erase(found);
+                            }
+                            cache.segments.emplace(key, data);
+                            cache.order.push_back(key);
+                            cache.bytes += data.size();
+                        }
                         Log::debug("subtitle segment generated session=" + session->id +
                                    " stream=" + std::to_string(stream_index) +
                                    " index=" + std::to_string(*index) +
@@ -1906,6 +1993,8 @@ struct PlaybackManager::Impl {
         MediaEngineStatus state;
         if (engine) state = engine->status();
         size_t session_count = 0, video_transcodes = 0, audio_transcodes = 0;
+        size_t cached_probes = 0, cached_probe_bytes = 0;
+        size_t cached_subtitle_segments = 0, cached_subtitle_bytes = 0;
         uint64_t reclaimed = 0;
         std::chrono::milliseconds pipeline_idle{};
         {
@@ -1915,6 +2004,13 @@ struct PlaybackManager::Impl {
             audio_transcodes = audio_transcodes_locked();
             reclaimed = idle_pipelines_reclaimed;
             pipeline_idle = config.pipeline_idle;
+            cached_probes = probe_cache.size();
+            cached_probe_bytes = probe_cache_bytes;
+            for (const auto& [_, session] : sessions) {
+                std::lock_guard subtitle_lock(session->subtitle_cache->mutex);
+                cached_subtitle_segments += session->subtitle_cache->segments.size();
+                cached_subtitle_bytes += session->subtitle_cache->bytes;
+            }
         }
         Json::Object out{{"server_version", std::string(kServerVersion)},
                          {"enabled", config.enabled},
@@ -1926,6 +2022,15 @@ struct PlaybackManager::Impl {
                          {"max_audio_transcodes", static_cast<uint64_t>(config.max_audio_transcodes)},
                          {"pipeline_idle_ms", static_cast<uint64_t>(pipeline_idle.count())},
                          {"idle_pipelines_reclaimed", reclaimed},
+                         {"probe_cache_entries", static_cast<uint64_t>(cached_probes)},
+                         {"probe_cache_bytes", static_cast<uint64_t>(cached_probe_bytes)},
+                         {"probe_cache_limit_entries",
+                          static_cast<uint64_t>(max_probe_cache_entries)},
+                         {"probe_cache_limit_bytes",
+                          static_cast<uint64_t>(max_probe_cache_bytes)},
+                         {"subtitle_cache_entries",
+                          static_cast<uint64_t>(cached_subtitle_segments)},
+                         {"subtitle_cache_bytes", static_cast<uint64_t>(cached_subtitle_bytes)},
                          {"media_engine_available", state.available},
                          {"media_engine", state.backend},
                          {"media_engine_version", state.version},

@@ -106,6 +106,7 @@ class TorrentSearchManager {
     std::vector<std::unique_ptr<TorrentSearchProvider>> providers_;
     mutable std::mutex mutex_;
     std::map<std::string, CachedAcquisition, std::less<>> acquisitions_;
+    static constexpr size_t max_acquisitions_ = 4096;
 
   public:
     explicit TorrentSearchManager(const TorrentConfig&);

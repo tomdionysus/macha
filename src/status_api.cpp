@@ -132,11 +132,11 @@ Json identity_reset_json(const IdentityAssociationReset& reset) {
 
 Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeInfo* member,
                const NodeTelemetry* live, uint64_t live_age_ms, bool online, bool stale,
-               bool telemetry_known, bool metadata_replica,
+               bool retired, bool telemetry_known, bool metadata_replica,
                const IdentityAssociationReset* identity_reset) {
     Json::Object node;
     node["id"] = to_string(id);
-    node["state"] = online ? "online" : "offline";
+    node["state"] = retired ? "retired" : (online ? "online" : "offline");
     node["telemetry_freshness"] =
         live ? (stale ? "stale" : "live") : (telemetry_known ? "last_known" : "unavailable");
     node["observed_at_unix_ms"] =
@@ -343,12 +343,24 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     for (const auto& [id, _] : live)
         telemetry_known.insert(id);
 
+    // Operational resets are locally durable before their optional metadata
+    // audit. Merge both sources so Status reflects retirement immediately.
+    std::map<std::string, IdentityAssociationReset, std::less<>> identity_resets;
+    if (metadata)
+        identity_resets = metadata->identity_resets;
+    for (const auto& reset : node_.identity_resets()) {
+        const auto key = identity_reset_key(reset.host, reset.port);
+        auto found = identity_resets.find(key);
+        if (found == identity_resets.end() || found->second.epoch < reset.epoch)
+            identity_resets[key] = reset;
+    }
+
     uint64_t known_capacity = 0, known_used = 0, online_capacity = 0, online_used = 0;
     uint64_t known_cache_capacity = 0, known_cache_used = 0, online_cache_capacity = 0,
              online_cache_used = 0;
     bool known_storage_available = true, online_storage_available = true;
     bool known_cache_available = true, online_cache_available = true;
-    size_t online_nodes = 0;
+    size_t known_nodes = 0, online_nodes = 0;
     Json::Array nodes;
     for (const auto& [id, durable] : known) {
         if (only && id != *only)
@@ -363,6 +375,35 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         const bool online = active_members.contains(id);
         const bool stale = current && found->second.age > fresh_for;
         const bool metadata_replica = true;
+
+        const auto& host = member ? member->host : (current ? current->host : durable.host);
+        const auto port = member ? member->port : (current ? current->port : durable.port);
+        const auto observed_unix_ms = std::max(
+            {durable.observed_unix_ms, member ? member->seen_unix_ms : uint64_t{},
+             current ? current->observed_unix_ms : uint64_t{}});
+        const IdentityAssociationReset* identity_reset = nullptr;
+        if (!host.empty() && port) {
+            for (const auto& [_, reset] : identity_resets) {
+                if (!identity_reset_matches_endpoint(reset, host, port) ||
+                    !identity_reset_matches_node(reset, id))
+                    continue;
+                if (!identity_reset || reset.reset_unix_ms > identity_reset->reset_unix_ms)
+                    identity_reset = &reset;
+            }
+        }
+        // A reset retires the pre-reset durable identity, but it is only a
+        // freshness boundary: a later directly authenticated observation of
+        // the same identity remains an ordinary live/known node.
+        const bool retired = !online && identity_reset &&
+                             observed_unix_ms <= identity_reset->reset_unix_ms;
+        if (retired) {
+            if (only)
+                nodes.push_back(node_json(id, durable, member, current, age, false, stale, true,
+                                          telemetry_known.contains(id), metadata_replica,
+                                          identity_reset));
+            continue;
+        }
+        ++known_nodes;
 
         const bool has_telemetry = current || telemetry_known.contains(id);
         const auto storage_capacity =
@@ -390,22 +431,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                 online_cache_used += cache_used;
             }
         }
-        const IdentityAssociationReset* identity_reset = nullptr;
-        if (metadata) {
-            const auto& host = member ? member->host : (current ? current->host : durable.host);
-            const auto port = member ? member->port : (current ? current->port : durable.port);
-            if (!host.empty() && port) {
-                for (const auto& [_, reset] : metadata->identity_resets) {
-                    if (!identity_reset_matches_endpoint(reset, host, port) ||
-                        !identity_reset_matches_node(reset, id))
-                        continue;
-                    if (!identity_reset || reset.reset_unix_ms > identity_reset->reset_unix_ms)
-                        identity_reset = &reset;
-                }
-            }
-        }
-        nodes.push_back(node_json(id, durable, member, current, age, online, stale, has_telemetry,
-                                  metadata_replica, identity_reset));
+        nodes.push_back(node_json(id, durable, member, current, age, online, stale, false,
+                                  has_telemetry, metadata_replica, identity_reset));
     }
 
     if (only) {
@@ -416,7 +443,7 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
 
     const auto published_metadata =
         metadata_manager ? metadata_manager->cluster_status() : MetadataClusterStatus{};
-    const size_t metadata_replicas = known.empty() ? published_metadata.replicas : known.size();
+    const size_t metadata_replicas = known_nodes == 0 ? published_metadata.replicas : known_nodes;
     const size_t active_metadata_replicas = online_nodes;
     const size_t metadata_min_write_replicas = node_.config().metadata_min_write_replicas;
 
@@ -454,7 +481,7 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         health = "degraded";
         conditions.emplace_back("metadata read-only");
     }
-    if (online_nodes < known.size()) {
+    if (online_nodes < known_nodes) {
         if (health == "healthy")
             health = "degraded";
         conditions.emplace_back("one or more known nodes are offline");
@@ -468,7 +495,7 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     Json::Object cluster;
     cluster["health"] = health;
     cluster["conditions"] = std::move(conditions);
-    cluster["nodes_known"] = static_cast<uint64_t>(known.size());
+    cluster["nodes_known"] = static_cast<uint64_t>(known_nodes);
     cluster["nodes_online"] = static_cast<uint64_t>(online_nodes);
     cluster["metadata_generation"] =
         metadata_generation ? metadata_generation : published_metadata.generation;
@@ -564,6 +591,12 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     rpc_diagnostics["metadata_pending_bytes"] = static_cast<uint64_t>(rpc.metadata_pending_bytes);
     rpc_diagnostics["metadata_active_jobs"] = static_cast<uint64_t>(rpc.metadata_active_jobs);
     rpc_diagnostics["metadata_rejected_jobs"] = rpc.metadata_rejected_jobs;
+    rpc_diagnostics["fast_control_pending_bytes"] =
+        static_cast<uint64_t>(rpc.fast_control_pending_bytes);
+    rpc_diagnostics["control_pending_bytes"] =
+        static_cast<uint64_t>(rpc.control_pending_bytes);
+    rpc_diagnostics["data_pending_bytes"] = static_cast<uint64_t>(rpc.data_pending_bytes);
+    rpc_diagnostics["rejected_jobs"] = rpc.rejected_jobs;
     Json::Object frame_timings;
     for (const auto& [frame, timing] : rpc.frame_timings)
         frame_timings[frame_type_name(frame)] = rpc_timing_json(timing);
@@ -686,6 +719,28 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                     values->spool_throttle_waits;
                 filesystem_diagnostics["spool_throttle_wait_ms"] =
                     values->spool_throttle_wait_ms;
+                filesystem_diagnostics["pending_write_request_bytes"] =
+                    values->pending_write_request_bytes;
+                filesystem_diagnostics["peak_pending_write_request_bytes"] =
+                    values->peak_pending_write_request_bytes;
+                filesystem_diagnostics["pending_write_request_limit_bytes"] =
+                    values->pending_write_request_limit_bytes;
+                filesystem_diagnostics["extent_executor_workers"] =
+                    values->extent_executor_workers;
+                filesystem_diagnostics["extent_executor_queued"] =
+                    values->extent_executor_queued;
+                filesystem_diagnostics["extent_executor_active"] =
+                    values->extent_executor_active;
+                filesystem_diagnostics["extent_executor_peak_queued"] =
+                    values->extent_executor_peak_queued;
+                filesystem_diagnostics["extent_executor_peak_active"] =
+                    values->extent_executor_peak_active;
+                filesystem_diagnostics["extent_executor_submitted"] =
+                    values->extent_executor_submitted;
+                filesystem_diagnostics["inode_count"] = values->inode_count;
+                filesystem_diagnostics["peak_inode_count"] = values->peak_inode_count;
+                filesystem_diagnostics["reclaimed_inode_count"] =
+                    values->reclaimed_inode_count;
             }
         } catch (const std::exception& error) {
             Log::debug("status filesystem diagnostics unavailable: " + std::string(error.what()));

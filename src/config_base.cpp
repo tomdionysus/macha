@@ -96,6 +96,9 @@ void validate(Config& config) {
         throw std::runtime_error("fuse.spool_path must not be empty");
     if (config.fuse.operation_journal_path && config.fuse.operation_journal_path->empty())
         throw std::runtime_error("fuse.operation_journal_path must not be empty");
+    if (!config.fuse.max_pending_write_bytes ||
+        config.fuse.max_pending_write_bytes > 4ULL * 1024 * 1024 * 1024)
+        throw std::runtime_error("fuse.max_pending_write_bytes must be 1..4G");
     const auto fuse_max = std::chrono::seconds(30);
     const auto positive = [](std::chrono::milliseconds value) { return value.count() > 0; };
     if (!positive(config.fuse.absolute_request_timeout) ||

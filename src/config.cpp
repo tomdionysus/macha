@@ -217,6 +217,8 @@ void parse_fuse(const YAML::Node& root, Config& c) {
     if (f["absolute_request_timeout_ms"]) c.fuse.absolute_request_timeout = milliseconds(f["absolute_request_timeout_ms"], "fuse.absolute_request_timeout_ms");
     if (f["request_workers"]) c.fuse.request_workers = f["request_workers"].as<size_t>();
     if (f["max_pending_requests"]) c.fuse.max_pending_requests = f["max_pending_requests"].as<size_t>();
+    if (f["max_pending_write_bytes"])
+        c.fuse.max_pending_write_bytes = yaml_size(f["max_pending_write_bytes"]);
     if (f["commit_workers"]) c.fuse.commit_workers = f["commit_workers"].as<size_t>();
     if (f["recovery_commit_workers"]) c.fuse.recovery_commit_workers = f["recovery_commit_workers"].as<size_t>();
     if (f["foreground_commit_workers"]) c.fuse.foreground_commit_workers = f["foreground_commit_workers"].as<size_t>();

@@ -148,6 +148,7 @@ class TmdbProvider final : public MetadataProvider {
     std::map<std::string, std::optional<Json>> movie_cache_;
     std::map<std::string, std::optional<Json>> show_cache_;
     std::map<std::string, std::optional<Json>> season_cache_;
+    size_t cache_bytes_{};
 
     Json api(std::string_view path, const std::vector<std::pair<std::string, std::string>>& query = {});
     std::optional<Json> api_optional(std::string_view path,
@@ -160,6 +161,10 @@ class TmdbProvider final : public MetadataProvider {
     std::string_view name() const noexcept override { return "tmdb"; }
     bool supports(MediaProbeKind) const override;
     std::optional<ProviderMatch> lookup(const MediaProbe&) override;
+    size_t cache_entries() const noexcept {
+        return movie_cache_.size() + show_cache_.size() + season_cache_.size();
+    }
+    size_t cache_bytes() const noexcept { return cache_bytes_; }
 };
 
 class MusicBrainzProvider final : public MetadataProvider {
@@ -169,6 +174,7 @@ class MusicBrainzProvider final : public MetadataProvider {
     std::map<std::string, std::optional<Json>> release_id_cache_;
     std::map<std::string, std::optional<Json>> recording_cache_;
     std::map<std::string, std::optional<std::string>> cover_cache_;
+    size_t cache_bytes_{};
     std::chrono::steady_clock::time_point last_request_{};
     std::chrono::steady_clock::time_point unavailable_until_{};
 
@@ -183,6 +189,11 @@ class MusicBrainzProvider final : public MetadataProvider {
     std::string_view name() const noexcept override { return "musicbrainz"; }
     bool supports(MediaProbeKind) const override;
     std::optional<ProviderMatch> lookup(const MediaProbe&) override;
+    size_t cache_entries() const noexcept {
+        return release_cache_.size() + release_id_cache_.size() + recording_cache_.size() +
+               cover_cache_.size();
+    }
+    size_t cache_bytes() const noexcept { return cache_bytes_; }
 };
 
 class DiscogsProvider final : public MetadataProvider {
@@ -191,6 +202,7 @@ class DiscogsProvider final : public MetadataProvider {
     std::string token_;
     std::map<std::string, std::optional<Json>> search_cache_;
     std::map<std::string, std::optional<Json>> release_cache_;
+    size_t cache_bytes_{};
     std::chrono::steady_clock::time_point last_request_{};
     std::chrono::steady_clock::time_point unavailable_until_{};
 
@@ -204,6 +216,8 @@ class DiscogsProvider final : public MetadataProvider {
     std::string_view name() const noexcept override { return "discogs"; }
     bool supports(MediaProbeKind) const override;
     std::optional<ProviderMatch> lookup(const MediaProbe&) override;
+    size_t cache_entries() const noexcept { return search_cache_.size() + release_cache_.size(); }
+    size_t cache_bytes() const noexcept { return cache_bytes_; }
 };
 
 class CatalogueScanProvider {

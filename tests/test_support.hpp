@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <condition_variable>
 #include <filesystem>
@@ -74,6 +75,7 @@ inline uint16_t free_port() {
     constexpr uint16_t blocks = 600; // 20000..58399
     const auto case_block = static_cast<uint16_t>(macha::test::case_index() % blocks);
 
+    int last_bind_error = 0;
     for (uint16_t attempt = 0; attempt < block; ++attempt) {
         const auto slot = static_cast<uint16_t>((within_case + attempt) % block);
         const auto candidate = static_cast<uint16_t>(first + case_block * block + slot);
@@ -90,8 +92,12 @@ inline uint16_t free_port() {
             within_case = static_cast<uint16_t>(slot + 1);
             return candidate;
         }
+        last_bind_error = errno;
         close(fd);
     }
+    if (last_bind_error != EADDRINUSE)
+        throw std::runtime_error("cannot probe loopback test port: " +
+                                 std::string(std::strerror(last_bind_error)));
     throw std::runtime_error("no free port remains in this test case's port namespace");
 }
 
@@ -118,6 +124,12 @@ inline Config config_for(const std::filesystem::path& path, const std::filesyste
     c.advertise_host = "127.0.0.1";
     c.port = port;
     c.extent_size = 1024 * 1024;
+    // Test state lives under the platform temporary directory. Linux commonly
+    // mounts /tmp as a 2 GiB tmpfs, equal to or slightly smaller than the
+    // production 2 GiB physical reserve after filesystem overhead. Capacity
+    // policy is tested with explicit limits; ordinary functional tests must not
+    // depend on the host's /tmp mount size.
+    c.fuse.spool_reserve_free = 0;
     c.hydration.enabled = false;
     c.dead_after = 500ms;
     c.connect_timeout = 500ms;

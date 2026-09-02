@@ -81,6 +81,7 @@ class DistributedStore {
     std::vector<NodeInfo> ranked(const ObjectId&) const;
     std::vector<NodeInfo> owners(const ObjectId&) const;
     bool put_on(const NodeInfo&, const ObjectId&, std::span<const uint8_t>, bool foreground);
+    RpcReply bounded_control_call(const NodeInfo&, MessageType, std::span<const uint8_t>);
     bool retain_on(const NodeInfo&, RetentionClass, const std::vector<ObjectId>&,
                    const RetentionDot&);
     std::optional<Bytes> get_from(const NodeInfo&, const ObjectId&, FrameType,

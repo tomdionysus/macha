@@ -35,6 +35,9 @@ constexpr size_t foreground_data_worker_reserve = 2;
 static_assert(foreground_data_worker_reserve < data_worker_count);
 constexpr size_t max_pending_requests = 512;
 constexpr size_t max_peer_outbound = 256;
+// A connection owns at most this many queued payload bytes. The writer may
+// additionally own one dequeued message, itself bounded to the same size.
+constexpr size_t max_peer_outbound_bytes = 128ULL * 1024 * 1024;
 constexpr size_t max_pre_auth_sessions = 8;
 constexpr auto rpc_handshake_timeout = std::chrono::seconds(5);
 constexpr size_t frame_header_size = 28;
@@ -985,6 +988,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     std::mutex outbound_mutex_;
     std::condition_variable outbound_cv_;
     std::deque<Outbound> outbound_;
+    size_t outbound_bytes_{}; // queued payload bytes; guarded by outbound_mutex_
     std::map<uint64_t, FrameType> inbound_classes_; // guarded by outbound_mutex_
     std::set<uint64_t> cancelled_inbound_;          // guarded by outbound_mutex_
     // Outbound request state must survive while the writer has temporarily
@@ -1066,6 +1070,17 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             {0, FrameType::control, {MessageType::session_retire, {}}, 0, false, {}});
     }
 
+    void erase_queued_locked(const std::function<bool(const Outbound&)>& predicate) {
+        for (auto item = outbound_.begin(); item != outbound_.end();) {
+            if (!predicate(*item)) {
+                ++item;
+                continue;
+            }
+            outbound_bytes_ -= item->message.payload.size();
+            item = outbound_.erase(item);
+        }
+    }
+
     bool queue_message(uint64_t request_id, FrameType frame_type, RpcMessage message, bool reply,
                        std::shared_ptr<std::promise<void>> sent = {}) {
         validate_frame_semantics(message.type, frame_type);
@@ -1083,10 +1098,15 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             }
             if (outbound_.size() >= max_peer_outbound)
                 throw std::runtime_error("peer outbound queue full");
+            if (message.payload.size() > max_peer_outbound_bytes ||
+                outbound_bytes_ > max_peer_outbound_bytes - message.payload.size())
+                throw std::runtime_error("peer outbound byte queue full");
             if (!reply && request_id)
                 outbound_classes_[request_id] = frame_type;
+            const auto payload_bytes = message.payload.size();
             outbound_.push_back(
                 {request_id, frame_type, std::move(message), 0, reply, std::move(sent)});
+            outbound_bytes_ += payload_bytes;
         }
         outbound_cv_.notify_one();
         return true;
@@ -1126,7 +1146,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             return;
         cancelled_inbound_.insert(request_id);
         inbound_classes_.erase(request_id);
-        std::erase_if(outbound_, [&](const Outbound& item) {
+        erase_queued_locked([&](const Outbound& item) {
             return item.reply && item.request_id == request_id;
         });
     }
@@ -1159,11 +1179,14 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         {
             DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
             const bool active = outbound_classes_.contains(request_id);
-            const auto before = outbound_.size();
-            std::erase_if(outbound_, [&](const Outbound& item) {
-                return !item.reply && item.request_id == request_id;
+            bool removed_queued = false;
+            erase_queued_locked([&](const Outbound& item) {
+                if (!item.reply && item.request_id == request_id) {
+                    removed_queued = true;
+                    return true;
+                }
+                return false;
             });
-            const bool removed_queued = outbound_.size() != before;
             outbound_classes_.erase(request_id);
             if (active && !removed_queued)
                 cancelled_outgoing_.insert(request_id);
@@ -1241,6 +1264,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                         return;
                     auto best = best_outbound_locked();
                     item = std::move(*best);
+                    outbound_bytes_ -= item.message.payload.size();
                     outbound_.erase(best);
                     if (item.reply) {
                         if (auto found = inbound_classes_.find(item.request_id);
@@ -1284,6 +1308,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                                 found != inbound_classes_.end())
                                 item.frame_type = more_urgent(found->second, item.frame_type);
                             outbound_.push_back(std::move(item));
+                            outbound_bytes_ += outbound_.back().message.payload.size();
                         }
                     } else {
                         if (cancelled_outgoing_.erase(item.request_id)) {
@@ -1293,6 +1318,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                                 found != outbound_classes_.end())
                                 item.frame_type = more_urgent(found->second, item.frame_type);
                             outbound_.push_back(std::move(item));
+                            outbound_bytes_ += outbound_.back().message.payload.size();
                         }
                     }
                     maybe_queue_retire_locked();
@@ -1333,6 +1359,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                     }
                 }
                 outbound_.clear();
+                outbound_bytes_ = 0;
                 outbound_classes_.clear();
                 cancelled_outgoing_.clear();
             }
@@ -1476,6 +1503,8 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                 throw std::runtime_error("RPC request id exhausted");
             {
                 DiagnosticLock lock(pending_mutex_, "rpc.client.pending");
+                if (pending_.size() >= max_pending_requests)
+                    throw std::runtime_error("peer pending reply limit reached");
                 pending_.emplace(id, pending);
             }
             try {
@@ -1541,7 +1570,10 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         // It must never add queueing delay in front of operational RPC.
         if (!lock.owns_lock() || broken_.load() || !outbound_.empty())
             return false;
+        if (message.payload.size() > max_peer_outbound_bytes)
+            return false;
         outbound_.push_back({0, frame_type, message, 0, false, {}});
+        outbound_bytes_ += message.payload.size();
         lock.unlock();
         outbound_cv_.notify_one();
         return true;
@@ -1578,6 +1610,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                 }
             }
             outbound_.clear();
+            outbound_bytes_ = 0;
             outbound_classes_.clear();
             cancelled_outgoing_.clear();
         }
@@ -2435,6 +2468,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
     std::mutex outbound_mutex;
     std::condition_variable outbound_cv;
     std::deque<Outbound> outbound;
+    size_t outbound_bytes{}; // queued payload bytes; guarded by outbound_mutex
     std::map<uint64_t, FrameType> inbound_classes;
     std::set<uint64_t> cancelled_inbound;
     std::map<uint64_t, FrameType> outbound_classes;
@@ -2481,6 +2515,17 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
             {0, FrameType::control, {MessageType::session_retire, {}}, 0, false, {}});
     }
 
+    void erase_queued_locked(const std::function<bool(const Outbound&)>& predicate) {
+        for (auto item = outbound.begin(); item != outbound.end();) {
+            if (!predicate(*item)) {
+                ++item;
+                continue;
+            }
+            outbound_bytes -= item->message.payload.size();
+            item = outbound.erase(item);
+        }
+    }
+
     bool queue_message(uint64_t request_id, FrameType frame_type, RpcMessage message, bool reply,
                        std::shared_ptr<std::promise<void>> sent = {}) {
         validate_frame_semantics(message.type, frame_type);
@@ -2498,10 +2543,15 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
             }
             if (outbound.size() >= max_peer_outbound)
                 throw std::runtime_error("peer outbound queue full");
+            if (message.payload.size() > max_peer_outbound_bytes ||
+                outbound_bytes > max_peer_outbound_bytes - message.payload.size())
+                throw std::runtime_error("peer outbound byte queue full");
             if (!reply && request_id)
                 outbound_classes[request_id] = frame_type;
+            const auto payload_bytes = message.payload.size();
             outbound.push_back(
                 {request_id, frame_type, std::move(message), 0, reply, std::move(sent)});
+            outbound_bytes += payload_bytes;
         }
         outbound_cv.notify_one();
         return true;
@@ -2534,9 +2584,14 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
 
     void cancel_inbound(uint64_t request_id) {
         DiagnosticLock lock(outbound_mutex, "rpc.session.outbound");
+        // Cancellation IDs are untrusted input. Only remember cancellation for
+        // work this session actually owns, otherwise arbitrary IDs become an
+        // unbounded tombstone set.
+        if (!inbound_classes.contains(request_id))
+            return;
         cancelled_inbound.insert(request_id);
         inbound_classes.erase(request_id);
-        std::erase_if(outbound, [&](const Outbound& item) {
+        erase_queued_locked([&](const Outbound& item) {
             return item.reply && item.request_id == request_id;
         });
     }
@@ -2568,11 +2623,14 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
         {
             DiagnosticLock lock(outbound_mutex, "rpc.session.outbound");
             const bool active = outbound_classes.contains(request_id);
-            const auto before = outbound.size();
-            std::erase_if(outbound, [&](const Outbound& item) {
-                return !item.reply && item.request_id == request_id;
+            bool removed_queued = false;
+            erase_queued_locked([&](const Outbound& item) {
+                if (!item.reply && item.request_id == request_id) {
+                    removed_queued = true;
+                    return true;
+                }
+                return false;
             });
-            const bool removed_queued = outbound.size() != before;
             outbound_classes.erase(request_id);
             if (active && !removed_queued)
                 cancelled_outgoing.insert(request_id);
@@ -2608,6 +2666,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                         return;
                     auto best = best_outbound_locked();
                     item = std::move(*best);
+                    outbound_bytes -= item.message.payload.size();
                     outbound.erase(best);
                     if (item.reply) {
                         if (auto found = inbound_classes.find(item.request_id);
@@ -2655,6 +2714,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                                 found != inbound_classes.end())
                                 item.frame_type = more_urgent(found->second, item.frame_type);
                             outbound.push_back(std::move(item));
+                            outbound_bytes += outbound.back().message.payload.size();
                         }
                     } else {
                         if (cancelled_outgoing.erase(item.request_id)) {
@@ -2664,6 +2724,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                                 found != outbound_classes.end())
                                 item.frame_type = more_urgent(found->second, item.frame_type);
                             outbound.push_back(std::move(item));
+                            outbound_bytes += outbound.back().message.payload.size();
                         }
                     }
                     maybe_queue_retire_locked();
@@ -2705,6 +2766,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                     }
                 }
                 outbound.clear();
+                outbound_bytes = 0;
                 outbound_classes.clear();
                 cancelled_outgoing.clear();
             }
@@ -2734,7 +2796,10 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
         // It must never add queueing delay in front of operational RPC.
         if (!lock.owns_lock() || !ready.load() || done.load() || !outbound.empty())
             return false;
+        if (message.payload.size() > max_peer_outbound_bytes)
+            return false;
         outbound.push_back({0, frame_type, message, 0, false, {}});
+        outbound_bytes += message.payload.size();
         lock.unlock();
         outbound_cv.notify_one();
         return true;
@@ -2776,6 +2841,8 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                 throw std::runtime_error("RPC request id exhausted");
             {
                 DiagnosticLock lock(pending_mutex, "rpc.session.pending");
+                if (pending.size() >= max_pending_requests)
+                    throw std::runtime_error("peer pending reply limit reached");
                 pending.emplace(id, item);
             }
             try {
@@ -2853,6 +2920,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                 }
             }
             outbound.clear();
+            outbound_bytes = 0;
             outbound_classes.clear();
             cancelled_outgoing.clear();
         }
@@ -2870,8 +2938,10 @@ RpcServer::RpcServer(std::string host, uint16_t port, ClusterKeys keys, NodeInfo
       execution_limits_(execution_limits) {
     validate_frame_limit(max_frame_size_);
     if (!execution_limits_.metadata_workers || !execution_limits_.metadata_pending_jobs ||
-        !execution_limits_.metadata_pending_bytes)
-        throw std::runtime_error("metadata RPC executor limits must be non-zero");
+        !execution_limits_.metadata_pending_bytes ||
+        !execution_limits_.fast_control_pending_bytes ||
+        !execution_limits_.control_pending_bytes || !execution_limits_.data_pending_bytes)
+        throw std::runtime_error("RPC executor ownership limits must be non-zero");
 }
 
 RpcServer::~RpcServer() {
@@ -2947,9 +3017,27 @@ bool RpcServer::admit_locked(RequestJob job) {
     }
 
     const bool fast = fast_control_request(job.frame);
-    auto& requests = fast ? fast_control_requests_ : queue(request_class(job.frame.frame_type));
-    if (requests.size() >= max_pending_requests)
+    const auto cls = request_class(job.frame.frame_type);
+    auto& requests = fast ? fast_control_requests_ : queue(cls);
+    const auto bytes = job.frame.message.payload.size();
+    size_t* owned_bytes = nullptr;
+    size_t byte_limit = 0;
+    if (fast) {
+        owned_bytes = &fast_control_request_bytes_;
+        byte_limit = execution_limits_.fast_control_pending_bytes;
+    } else if (cls == RequestClass::control) {
+        owned_bytes = &control_request_bytes_;
+        byte_limit = execution_limits_.control_pending_bytes;
+    } else {
+        owned_bytes = &data_request_bytes_;
+        byte_limit = execution_limits_.data_pending_bytes;
+    }
+    const bool bytes_fit = bytes <= byte_limit && *owned_bytes <= byte_limit - bytes;
+    if (requests.size() >= max_pending_requests || !bytes_fit) {
+        rejected_requests_.fetch_add(1, std::memory_order_relaxed);
         return false;
+    }
+    *owned_bytes += bytes;
     requests.push_back(std::move(job));
     return true;
 }
@@ -3047,6 +3135,13 @@ void RpcServer::cancel_queued(const NodeInfo& peer, uint64_t request_id) {
                     ++it;
                     continue;
                 }
+                const auto bytes = it->frame.message.payload.size();
+                if (&requests == &fast_control_requests_)
+                    fast_control_request_bytes_ -= bytes;
+                else if (&requests == &control_requests_)
+                    control_request_bytes_ -= bytes;
+                else
+                    data_request_bytes_ -= bytes;
                 if (it->reply)
                     replies.push_back(std::move(it->reply));
                 if (it->session) {
@@ -3164,7 +3259,8 @@ void RpcServer::stop() {
         DiagnosticLock lock(request_mutex_, "rpc.server.queue");
         for (auto* requests :
              {&fast_control_requests_, &control_requests_, &foreground_requests_,
-              &read_ahead_requests_, &speculative_requests_, &metadata_requests_}) {
+              &read_ahead_requests_, &loader_requests_, &speculative_requests_,
+              &metadata_requests_}) {
             for (auto& job : *requests) {
                 if (job.reply)
                     dropped.push_back(job.reply);
@@ -3174,6 +3270,9 @@ void RpcServer::stop() {
             requests->clear();
         }
         metadata_request_bytes_ = 0;
+        fast_control_request_bytes_ = 0;
+        control_request_bytes_ = 0;
+        data_request_bytes_ = 0;
     }
     for (auto& reply : dropped) {
         try {
@@ -3513,6 +3612,7 @@ void RpcServer::fast_control_worker_loop(std::stop_token stop) {
                 return;
             job = std::move(fast_control_requests_.front());
             fast_control_requests_.pop_front();
+            fast_control_request_bytes_ -= job.frame.message.payload.size();
         }
         execute(std::move(job));
         cpu_reporter.tick();
@@ -3531,6 +3631,7 @@ void RpcServer::control_worker_loop(std::stop_token stop) {
                 return;
             job = std::move(control_requests_.front());
             control_requests_.pop_front();
+            control_request_bytes_ -= job.frame.message.payload.size();
         }
         execute(std::move(job));
         cpu_reporter.tick();
@@ -3585,9 +3686,13 @@ RpcServerWorkStats RpcServer::work_stats() const {
         DiagnosticLock lock(request_mutex_, "rpc.server.queue");
         out.metadata_pending_jobs = metadata_requests_.size();
         out.metadata_pending_bytes = metadata_request_bytes_;
+        out.fast_control_pending_bytes = fast_control_request_bytes_;
+        out.control_pending_bytes = control_request_bytes_;
+        out.data_pending_bytes = data_request_bytes_;
     }
     out.metadata_active_jobs = active_metadata_requests_.load(std::memory_order_relaxed);
     out.metadata_rejected_jobs = rejected_metadata_requests_.load(std::memory_order_relaxed);
+    out.rejected_jobs = rejected_requests_.load(std::memory_order_relaxed);
     auto snapshot_timing = [](const AtomicTiming& timing) {
         return RpcServerWorkStats::Timing{
             timing.requests.load(std::memory_order_relaxed),
@@ -3647,6 +3752,7 @@ void RpcServer::data_worker_loop(std::stop_token stop) {
             auto& requests = queue(cls);
             job = std::move(requests.front());
             requests.pop_front();
+            data_request_bytes_ -= job.frame.message.payload.size();
         }
         execute(std::move(job));
         if (nonforeground) {

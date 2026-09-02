@@ -90,6 +90,8 @@ fuse:
     lifecycle_ms: 2000
   request_workers: 24
   max_pending_requests: 4096
+  # Aggregate heap ownership of copied writes waiting to enter the disk spool.
+  max_pending_write_bytes: 32M
   commit_workers: 8
   # Compatibility setting retained for older configurations.
   foreground_commit_workers: 1

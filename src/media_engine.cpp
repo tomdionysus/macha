@@ -33,6 +33,7 @@ extern "C" {
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -40,6 +41,66 @@ extern "C" {
 
 namespace macha {
 namespace {
+
+struct AvFrameDeleter {
+    void operator()(AVFrame* value) const noexcept { av_frame_free(&value); }
+};
+struct AvPacketDeleter {
+    void operator()(AVPacket* value) const noexcept { av_packet_free(&value); }
+};
+struct AvOutputContextDeleter {
+    void operator()(AVFormatContext* value) const noexcept {
+        if (value) avformat_free_context(value);
+    }
+};
+struct AvCodecContextDeleter {
+    void operator()(AVCodecContext* value) const noexcept { avcodec_free_context(&value); }
+};
+using AvFrameOwner = std::unique_ptr<AVFrame, AvFrameDeleter>;
+using AvPacketOwner = std::unique_ptr<AVPacket, AvPacketDeleter>;
+using AvOutputContextOwner = std::unique_ptr<AVFormatContext, AvOutputContextDeleter>;
+using AvCodecContextOwner = std::unique_ptr<AVCodecContext, AvCodecContextDeleter>;
+
+class AvDictionaryOwner {
+    AVDictionary* value_{};
+  public:
+    ~AvDictionaryOwner() { av_dict_free(&value_); }
+    AVDictionary** put() noexcept { return &value_; }
+    AvDictionaryOwner(const AvDictionaryOwner&) = delete;
+    AvDictionaryOwner& operator=(const AvDictionaryOwner&) = delete;
+    AvDictionaryOwner() = default;
+};
+
+class AvChannelLayoutOwner {
+    AVChannelLayout value_{};
+  public:
+    ~AvChannelLayoutOwner() { av_channel_layout_uninit(&value_); }
+    AVChannelLayout* get() noexcept { return &value_; }
+    AvChannelLayoutOwner(const AvChannelLayoutOwner&) = delete;
+    AvChannelLayoutOwner& operator=(const AvChannelLayoutOwner&) = delete;
+    AvChannelLayoutOwner() = default;
+};
+
+AvFrameOwner make_av_frame() {
+    AvFrameOwner value(av_frame_alloc());
+    if (!value) throw std::bad_alloc();
+    return value;
+}
+
+AvPacketOwner make_av_packet() {
+    AvPacketOwner value(av_packet_alloc());
+    if (!value) throw std::bad_alloc();
+    return value;
+}
+
+class AvSubtitleOwner {
+    AVSubtitle* value_{};
+  public:
+    explicit AvSubtitleOwner(AVSubtitle& value) : value_(&value) {}
+    ~AvSubtitleOwner() { avsubtitle_free(value_); }
+    AvSubtitleOwner(const AvSubtitleOwner&) = delete;
+    AvSubtitleOwner& operator=(const AvSubtitleOwner&) = delete;
+};
 
 std::string av_error(int code) {
     std::array<char, AV_ERROR_MAX_STRING_SIZE> text{};
@@ -678,20 +739,18 @@ void encode_video_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame* 
                           ? decoded->best_effort_timestamp
                           : decoded->pts;
     if (source_pts != AV_NOPTS_VALUE && source_pts < 0) return;
-    AVFrame* frame = av_frame_alloc();
-    if (!frame) throw std::bad_alloc();
+    auto frame = make_av_frame();
     frame->format = pipe.encoder->pix_fmt;
     frame->width = pipe.encoder->width;
     frame->height = pipe.encoder->height;
-    int rc = av_frame_get_buffer(frame, 32);
-    if (rc >= 0) rc = av_frame_make_writable(frame);
+    int rc = av_frame_get_buffer(frame.get(), 32);
+    if (rc >= 0) rc = av_frame_make_writable(frame.get());
     if (rc >= 0) {
         pipe.sws = sws_getCachedContext(
             pipe.sws, decoded->width, decoded->height, static_cast<AVPixelFormat>(decoded->format),
             pipe.encoder->width, pipe.encoder->height, pipe.encoder->pix_fmt, SWS_BILINEAR,
             nullptr, nullptr, nullptr);
         if (!pipe.sws) {
-            av_frame_free(&frame);
             throw std::runtime_error("cannot create video scaler for decoded frame");
         }
         sws_scale(pipe.sws, decoded->data, decoded->linesize, 0, decoded->height,
@@ -710,9 +769,8 @@ void encode_video_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame* 
         if (frame->pts != AV_NOPTS_VALUE &&
             cuts.force_transcode_keyframe(frame->pts * av_q2d(pipe.encoder->time_base)))
             frame->pict_type = AV_PICTURE_TYPE_I;
-        rc = avcodec_send_frame(pipe.encoder, frame);
+        rc = avcodec_send_frame(pipe.encoder, frame.get());
     }
-    av_frame_free(&frame);
     av_require(rc, "send video frame to encoder");
     while (true) {
         rc = avcodec_receive_packet(pipe.encoder, encoded);
@@ -772,14 +830,13 @@ void encode_audio_available(StreamPipeline& pipe, AVFormatContext* output, AVPac
     const auto frame_size = pipe.encoder->frame_size > 0 ? pipe.encoder->frame_size : 1024;
     while (av_audio_fifo_size(pipe.fifo) >= frame_size || (flush_partial && av_audio_fifo_size(pipe.fifo) > 0)) {
         auto available = av_audio_fifo_size(pipe.fifo);
-        AVFrame* frame = av_frame_alloc();
-        if (!frame) throw std::bad_alloc();
+        auto frame = make_av_frame();
         frame->nb_samples = frame_size;
         frame->format = pipe.encoder->sample_fmt;
         frame->sample_rate = pipe.encoder->sample_rate;
         int rc = av_channel_layout_copy(&frame->ch_layout, &pipe.encoder->ch_layout);
-        if (rc >= 0) rc = av_frame_get_buffer(frame, 0);
-        if (rc >= 0) rc = av_frame_make_writable(frame);
+        if (rc >= 0) rc = av_frame_get_buffer(frame.get(), 0);
+        if (rc >= 0) rc = av_frame_make_writable(frame.get());
         if (rc >= 0) {
             auto take = std::min(available, frame_size);
             rc = av_audio_fifo_read(pipe.fifo, reinterpret_cast<void**>(frame->extended_data), take);
@@ -791,8 +848,7 @@ void encode_audio_available(StreamPipeline& pipe, AVFormatContext* output, AVPac
         }
         frame->pts = pipe.audio_next_pts;
         pipe.audio_next_pts += frame_size;
-        if (rc >= 0) rc = avcodec_send_frame(pipe.encoder, frame);
-        av_frame_free(&frame);
+        if (rc >= 0) rc = avcodec_send_frame(pipe.encoder, frame.get());
         av_require(rc, "send audio frame to encoder");
         while (true) {
             rc = avcodec_receive_packet(pipe.encoder, encoded);
@@ -816,20 +872,19 @@ void ensure_audio_resampler(StreamPipeline& pipe, const AVFrame* decoded) {
     if (input_format == AV_SAMPLE_FMT_NONE)
         throw std::runtime_error("decoded audio has no sample format");
 
-    AVChannelLayout input_layout{};
+    AvChannelLayoutOwner input_layout;
     int rc = 0;
     if (decoded->ch_layout.nb_channels > 0)
-        rc = av_channel_layout_copy(&input_layout, &decoded->ch_layout);
+        rc = av_channel_layout_copy(input_layout.get(), &decoded->ch_layout);
     else if (pipe.decoder->ch_layout.nb_channels > 0)
-        rc = av_channel_layout_copy(&input_layout, &pipe.decoder->ch_layout);
+        rc = av_channel_layout_copy(input_layout.get(), &pipe.decoder->ch_layout);
     else
-        av_channel_layout_default(&input_layout, 2);
+        av_channel_layout_default(input_layout.get(), 2);
     av_require(rc, "copy decoded audio channel layout");
 
     rc = swr_alloc_set_opts2(&pipe.swr, &pipe.encoder->ch_layout, pipe.encoder->sample_fmt,
-                             pipe.encoder->sample_rate, &input_layout, input_format,
+                             pipe.encoder->sample_rate, input_layout.get(), input_format,
                              input_rate, 0, nullptr);
-    av_channel_layout_uninit(&input_layout);
     av_require(rc, "configure audio resampler");
     av_require(swr_init(pipe.swr), "open audio resampler");
     pipe.audio_input_rate = input_rate;
@@ -851,13 +906,12 @@ void process_audio_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame*
     auto max_samples = static_cast<int>(av_rescale_rnd(
         swr_get_delay(pipe.swr, input_rate) + decoded->nb_samples,
         pipe.encoder->sample_rate, input_rate, AV_ROUND_UP));
-    AVFrame* converted = av_frame_alloc();
-    if (!converted) throw std::bad_alloc();
+    auto converted = make_av_frame();
     converted->nb_samples = std::max(1, max_samples);
     converted->format = pipe.encoder->sample_fmt;
     converted->sample_rate = pipe.encoder->sample_rate;
     int rc = av_channel_layout_copy(&converted->ch_layout, &pipe.encoder->ch_layout);
-    if (rc >= 0) rc = av_frame_get_buffer(converted, 0);
+    if (rc >= 0) rc = av_frame_get_buffer(converted.get(), 0);
     if (rc >= 0) {
         auto** input_data = const_cast<const uint8_t**>(decoded->extended_data);
         rc = swr_convert(pipe.swr, converted->extended_data, converted->nb_samples,
@@ -871,7 +925,6 @@ void process_audio_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame*
         if (rc != converted->nb_samples) rc = AVERROR(EIO);
         else rc = 0;
     }
-    av_frame_free(&converted);
     av_require(rc, "resample audio frame");
     encode_audio_available(pipe, output, encoded, false);
 }
@@ -884,13 +937,12 @@ void flush_audio_resampler(StreamPipeline& pipe) {
         auto max_samples = static_cast<int>(av_rescale_rnd(
             delay, pipe.encoder->sample_rate, pipe.audio_input_rate, AV_ROUND_UP));
         if (max_samples <= 0) break;
-        AVFrame* converted = av_frame_alloc();
-        if (!converted) throw std::bad_alloc();
+        auto converted = make_av_frame();
         converted->nb_samples = max_samples;
         converted->format = pipe.encoder->sample_fmt;
         converted->sample_rate = pipe.encoder->sample_rate;
         int rc = av_channel_layout_copy(&converted->ch_layout, &pipe.encoder->ch_layout);
-        if (rc >= 0) rc = av_frame_get_buffer(converted, 0);
+        if (rc >= 0) rc = av_frame_get_buffer(converted.get(), 0);
         if (rc >= 0) rc = swr_convert(pipe.swr, converted->extended_data, converted->nb_samples, nullptr, 0);
         if (rc > 0) {
             converted->nb_samples = rc;
@@ -900,7 +952,6 @@ void flush_audio_resampler(StreamPipeline& pipe) {
             if (written != rc) rc = AVERROR(EIO);
             else rc = 0;
         }
-        av_frame_free(&converted);
         av_require(rc, "drain audio resampler");
         if (delay == swr_get_delay(pipe.swr, pipe.audio_input_rate)) break;
     }
@@ -911,19 +962,17 @@ void flush_decoder(StreamPipeline& pipe, AVFormatContext* output, AVPacket* enco
     if (!pipe.decoder) return;
     int rc = avcodec_send_packet(pipe.decoder, nullptr);
     if (rc < 0 && rc != AVERROR_EOF) av_require(rc, "flush decoder");
-    AVFrame* decoded = av_frame_alloc();
-    if (!decoded) throw std::bad_alloc();
+    auto decoded = make_av_frame();
     while (true) {
-        rc = avcodec_receive_frame(pipe.decoder, decoded);
+        rc = avcodec_receive_frame(pipe.decoder, decoded.get());
         if (rc == AVERROR_EOF || rc == AVERROR(EAGAIN)) break;
         av_require(rc, "receive flushed frame");
         if (pipe.type == MediaStreamType::video)
-            encode_video_frame(pipe, output, decoded, encoded, cuts);
+            encode_video_frame(pipe, output, decoded.get(), encoded, cuts);
         else
-            process_audio_frame(pipe, output, decoded, encoded);
-        av_frame_unref(decoded);
+            process_audio_frame(pipe, output, decoded.get(), encoded);
+        av_frame_unref(decoded.get());
     }
-    av_frame_free(&decoded);
 }
 
 void flush_encoder(StreamPipeline& pipe, AVFormatContext* output, AVPacket* packet) {
@@ -995,10 +1044,13 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                    "seek media");
     }
 
-    AVFormatContext* out = nullptr;
-    av_require(avformat_alloc_output_context2(&out, nullptr, "mp4", nullptr), "create fragmented MP4 muxer");
-    if (!out) throw std::runtime_error("MP4 muxer is unavailable");
-    auto out_cleanup = [&] { if (out) avformat_free_context(out); };
+    AVFormatContext* raw_out = nullptr;
+    const auto output_rc =
+        avformat_alloc_output_context2(&raw_out, nullptr, "mp4", nullptr);
+    AvOutputContextOwner output_owner(raw_out);
+    av_require(output_rc, "create fragmented MP4 muxer");
+    if (!output_owner) throw std::runtime_error("MP4 muxer is unavailable");
+    auto* out = output_owner.get();
 
     std::vector<std::unique_ptr<StreamPipeline>> pipelines;
     auto add_stream = [&](int index, MediaStreamType type, MediaTransform transform) {
@@ -1043,34 +1095,38 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
         out->flags |= AVFMT_FLAG_CUSTOM_IO;
         out->avoid_negative_ts = AVFMT_AVOID_NEG_TS_MAKE_ZERO;
 
-        AVDictionary* options = nullptr;
-        av_dict_set(&options, "movflags",
-                    "frag_custom+empty_moov+default_base_moof+omit_tfhd_offset+negative_cts_offsets", 0);
+        AvDictionaryOwner options;
+        av_require(av_dict_set(options.put(), "movflags",
+                               "frag_custom+empty_moov+default_base_moof+omit_tfhd_offset+negative_cts_offsets",
+                               0),
+                   "set fragmented MP4 options");
         const bool has_video = std::any_of(pipelines.begin(), pipelines.end(), [](const auto& p) {
             return p->type == MediaStreamType::video;
         });
         if (!has_video) {
-            av_dict_set(&options, "frag_duration",
-                        std::to_string(static_cast<int64_t>(segment_duration.count()) * 1000).c_str(), 0);
+            av_require(av_dict_set(
+                           options.put(), "frag_duration",
+                           std::to_string(static_cast<int64_t>(segment_duration.count()) * 1000)
+                               .c_str(),
+                           0),
+                       "set audio fragment duration");
         }
-        int rc = avformat_write_header(out, &options);
-        av_dict_free(&options);
+        int rc = avformat_write_header(out, options.put());
         av_require(rc, "write fragmented MP4 header");
         avio_flush(out->pb);
 
         std::map<int, StreamPipeline*> by_input;
         for (auto& pipe : pipelines) by_input[pipe->input_index] = pipe.get();
 
-        AVPacket* packet = av_packet_alloc();
-        AVPacket* encoded = av_packet_alloc();
-        AVFrame* decoded = av_frame_alloc();
-        if (!packet || !encoded || !decoded) throw std::bad_alloc();
+        auto packet = make_av_packet();
+        auto encoded = make_av_packet();
+        auto decoded = make_av_frame();
 
         try {
-            while (!cancelled.load() && (rc = av_read_frame(in, packet)) >= 0) {
+            while (!cancelled.load() && (rc = av_read_frame(in, packet.get())) >= 0) {
                 auto it = by_input.find(packet->stream_index);
                 if (it == by_input.end()) {
-                    av_packet_unref(packet);
+                    av_packet_unref(packet.get());
                     continue;
                 }
                 auto& pipe = *it->second;
@@ -1079,11 +1135,11 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                 if (pipe.transform == MediaTransform::copy) {
                     const auto presentation = packet->pts != AV_NOPTS_VALUE ? packet->pts : packet->dts;
                     if (presentation != AV_NOPTS_VALUE && presentation < origin) {
-                        av_packet_unref(packet);
+                        av_packet_unref(packet.get());
                         continue;
                     }
                     const auto repairs_before = pipe.copy_timestamps.repair_count();
-                    prepare_copy_packet(pipe, packet, origin);
+                    prepare_copy_packet(pipe, packet.get(), origin);
                     if (!pipe.copy_repair_reported && pipe.copy_timestamps.repair_count() != repairs_before) {
                         pipe.copy_repair_reported = true;
                         Log::warn("libav remux repairing packet timestamps media=" + source.media_id +
@@ -1097,23 +1153,23 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                             avio_flush(out->pb);
                         }
                     }
-                    write_mux_packet(out, packet);
+                    write_mux_packet(out, packet.get());
                 } else {
                     if (packet->pts != AV_NOPTS_VALUE) packet->pts -= origin;
                     if (packet->dts != AV_NOPTS_VALUE) packet->dts -= origin;
-                    av_require(avcodec_send_packet(pipe.decoder, packet), "send packet to decoder");
+                    av_require(avcodec_send_packet(pipe.decoder, packet.get()), "send packet to decoder");
                     while (true) {
-                        rc = avcodec_receive_frame(pipe.decoder, decoded);
+                        rc = avcodec_receive_frame(pipe.decoder, decoded.get());
                         if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
                         av_require(rc, "receive decoded frame");
                         if (pipe.type == MediaStreamType::video)
-                            encode_video_frame(pipe, out, decoded, encoded, cuts);
+                            encode_video_frame(pipe, out, decoded.get(), encoded.get(), cuts);
                         else
-                            process_audio_frame(pipe, out, decoded, encoded);
-                        av_frame_unref(decoded);
+                            process_audio_frame(pipe, out, decoded.get(), encoded.get());
+                        av_frame_unref(decoded.get());
                     }
                 }
-                av_packet_unref(packet);
+                av_packet_unref(packet.get());
             }
             if (rc < 0 && rc != AVERROR_EOF && !cancelled.load())
                 av_require(rc, "read media packet");
@@ -1131,28 +1187,20 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                 }
                 for (auto& pipe : pipelines)
                     if (pipe->transform == MediaTransform::transcode)
-                        flush_decoder(*pipe, out, encoded, cuts);
+                        flush_decoder(*pipe, out, encoded.get(), cuts);
                 for (auto& pipe : pipelines)
                     if (pipe->transform == MediaTransform::transcode)
-                        flush_encoder(*pipe, out, encoded);
+                        flush_encoder(*pipe, out, encoded.get());
                 av_require(av_write_trailer(out), "write fragmented MP4 trailer");
                 avio_flush(out->pb);
                 writer.finish();
             }
         } catch (...) {
-            av_frame_free(&decoded);
-            av_packet_free(&encoded);
-            av_packet_free(&packet);
             throw;
         }
-        av_frame_free(&decoded);
-        av_packet_free(&encoded);
-        av_packet_free(&packet);
     } catch (...) {
-        out_cleanup();
         throw;
     }
-    out_cleanup();
 }
 
 class LibavSession final : public MediaEngineSession {
@@ -1443,13 +1491,13 @@ class LibavMediaEngine final : public MediaEngine {
         auto* stream = format->streams[subtitle_stream];
         const auto* codec = avcodec_find_decoder(stream->codecpar->codec_id);
         if (!codec) throw std::runtime_error("subtitle decoder is unavailable");
-        AVCodecContext* decoder = avcodec_alloc_context3(codec);
+        AvCodecContextOwner decoder(avcodec_alloc_context3(codec));
         if (!decoder) throw std::bad_alloc();
         try {
-            av_require(avcodec_parameters_to_context(decoder, stream->codecpar),
+            av_require(avcodec_parameters_to_context(decoder.get(), stream->codecpar),
                        "copy subtitle decoder parameters");
             decoder->pkt_timebase = stream->time_base;
-            av_require(avcodec_open2(decoder, codec, nullptr), "open subtitle decoder");
+            av_require(avcodec_open2(decoder.get(), codec, nullptr), "open subtitle decoder");
 
             const int64_t input_start_us = format->start_time == AV_NOPTS_VALUE ? 0 : format->start_time;
             if (range_start.count() > 0) {
@@ -1461,17 +1509,16 @@ class LibavMediaEngine final : public MediaEngine {
                                              std::numeric_limits<int64_t>::max(),
                                              AVSEEK_FLAG_BACKWARD),
                            "seek subtitle stream");
-                avcodec_flush_buffers(decoder);
+                avcodec_flush_buffers(decoder.get());
             }
 
             std::ostringstream out;
             out << "WEBVTT\n\n";
-            AVPacket* packet = av_packet_alloc();
-            if (!packet) throw std::bad_alloc();
+            auto packet = make_av_packet();
             uint64_t cue = 0;
             int rc = 0;
             bool past_range = false;
-            while (!past_range && (rc = av_read_frame(format, packet)) >= 0) {
+            while (!past_range && (rc = av_read_frame(format, packet.get())) >= 0) {
                 // Keep ordinary A/V packets visible to the demux loop so they
                 // provide a bounded timeline cursor even when there is a long
                 // gap between subtitle cues. Otherwise asking for an empty
@@ -1486,22 +1533,23 @@ class LibavMediaEngine final : public MediaEngine {
                     const auto packet_ms = av_rescale_q(packet_us - input_start_us, AV_TIME_BASE_Q,
                                                         AVRational{1, 1000});
                     if (packet_ms >= range_end.count() + 1500) {
-                        av_packet_unref(packet);
+                        av_packet_unref(packet.get());
                         past_range = true;
                         break;
                     }
                 }
 
                 if (packet->stream_index != subtitle_stream) {
-                    av_packet_unref(packet);
+                    av_packet_unref(packet.get());
                     continue;
                 }
 
                 const auto packet_pts = packet->pts;
                 AVSubtitle subtitle{};
+                AvSubtitleOwner subtitle_owner(subtitle);
                 int got = 0;
-                rc = avcodec_decode_subtitle2(decoder, &subtitle, &got, packet);
-                av_packet_unref(packet);
+                rc = avcodec_decode_subtitle2(decoder.get(), &subtitle, &got, packet.get());
+                av_packet_unref(packet.get());
                 av_require(rc, "decode subtitle");
                 if (!got) continue;
 
@@ -1524,7 +1572,6 @@ class LibavMediaEngine final : public MediaEngine {
                 // without being duplicated in the next segment.
                 if (begin_source >= range_end.count()) {
                     past_range = true;
-                    avsubtitle_free(&subtitle);
                     break;
                 }
                 if (begin_source >= range_start.count()) {
@@ -1548,14 +1595,10 @@ class LibavMediaEngine final : public MediaEngine {
                         }
                     }
                 }
-                avsubtitle_free(&subtitle);
             }
-            av_packet_free(&packet);
             if (rc < 0 && rc != AVERROR_EOF) av_require(rc, "read subtitle packets");
-            avcodec_free_context(&decoder);
             return out.str();
         } catch (...) {
-            avcodec_free_context(&decoder);
             throw;
         }
     }

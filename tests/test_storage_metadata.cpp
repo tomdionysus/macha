@@ -1163,7 +1163,11 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_chain_reuses_bounded_mat
     CHECK(after.materialization_cache_hits - middle.materialization_cache_hits == 1);
     CHECK(middle.materialization_cache_misses - before.materialization_cache_misses == 1);
     CHECK(after.materialization_cache_entries <= 64);
-    CHECK(after.materialization_cache_evictions > before.materialization_cache_evictions);
+    // Replaying a long delta chain must not retain every full intermediate
+    // decoded namespace. Only the requested immutable result may enter the
+    // cache; this is the regression for multi-gigabyte restart RSS.
+    CHECK(middle.materialization_cache_entries <= before.materialization_cache_entries + 1);
+    CHECK(middle.materialization_cache_bytes >= results.front()->resident_bytes);
 
     auto first_materialized = replica.materialized(head.hash);
     auto second_materialized = replica.materialized(head.hash);
@@ -1242,11 +1246,78 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_history_payloads_are_disk_back
     auto recovered = reopened.materialized(head.hash);
     REQUIRE(recovered != nullptr);
     CHECK(recovered->record.payload == head.payload);
+    const uint64_t structural_floor =
+        recovered->record.payload.size() + sizeof(MetadataSnapshot) +
+        recovered->snapshot->entries.size() *
+            (sizeof(decltype(snapshot.entries)::value_type) + 4 * sizeof(void*));
+    CHECK(recovered->resident_bytes >= structural_floor);
     const auto after = reopened.diagnostics();
     // This historical full snapshot is larger than the cache budget. It is
     // returned to the caller but not retained as unbounded process state.
     CHECK(after.materialization_cache_bytes <= cache_limit);
     CHECK(after.history_resident_payload_bytes == 0);
+}
+
+MACHA_FAST_TEST("storage_metadata",
+                test_cold_accepted_head_validation_caches_only_owned_results) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "cold-accepted-head-ownership";
+    auto witness = random_node_id();
+
+    auto snapshot = decode_snapshot(genesis_metadata().payload);
+    snapshot.metadata_voters.clear();
+    snapshot.metadata_write_replicas_required = 1;
+    MetadataRecord head = genesis_metadata();
+    constexpr size_t chain_length = 80;
+    {
+        MetadataReplica writer(path, keys.storage);
+        MetadataRecord policy_root;
+        policy_root.generation = head.generation + 1;
+        policy_root.previous = head.hash;
+        policy_root.payload = encode_snapshot(snapshot);
+        policy_root.hash = metadata_hash(policy_root.generation, policy_root.previous,
+                                         policy_root.payload);
+        REQUIRE(writer.store_commit(policy_root));
+        head = std::move(policy_root);
+        for (size_t i = 0; i < chain_length; ++i) {
+            auto next_snapshot = snapshot;
+            next_snapshot.mutation_sequences[witness] = i + 1;
+            FsEntry entry;
+            entry.type = EntryType::file;
+            entry.mode = 0644;
+            entry.version = 1;
+            next_snapshot.entries["/owned-" + std::to_string(i)] = entry;
+            auto delta = metadata_delta(snapshot, next_snapshot);
+            REQUIRE(delta.has_value());
+
+            MetadataRecord child;
+            child.generation = head.generation + 1;
+            child.previous = head.hash;
+            child.payload = encode_snapshot(next_snapshot);
+            child.hash = metadata_hash(child.generation, child.previous, child.payload);
+            REQUIRE(writer.store_commit(child, encode_metadata_delta(*delta)));
+            snapshot = std::move(next_snapshot);
+            head = std::move(child);
+        }
+        REQUIRE(writer.accept_commit(
+            MetadataAcceptance{head.generation, head.hash, 1, {witness}}));
+    }
+
+    // Constructor-time accepted-head validation uses materialized_locked(). It
+    // may retain the accepted result and its direct policy parent, but never one
+    // complete tree for every delta traversed to obtain them.
+    MetadataReplica reopened(path, keys.storage);
+    const auto diagnostics = reopened.diagnostics();
+    CHECK(diagnostics.materialization_cache_entries <= 2);
+    auto accepted = reopened.accepted_heads();
+    REQUIRE(accepted.size() == 1);
+    CHECK(accepted.front().hash == head.hash);
+    auto materialized = reopened.materialized(head.hash);
+    REQUIRE(materialized != nullptr);
+    CHECK(materialized->record.payload == head.payload);
 }
 
 MACHA_FAST_TEST("storage_metadata",

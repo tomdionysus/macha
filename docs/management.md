@@ -44,16 +44,16 @@ Cluster-wide endpoint identity resets are exposed as:
 
 The general action accepts `host` plus optional `port`, optional `node_id`, and optional `reason`. Omitting `node_id` is intentional: an administrator can clear an association even after the stale node identity is no longer known. Omitting `port` creates a host/IP-wide reset covering every advertised port on that host.
 
-A reset is a durable distributed tombstone, not node deletion. It removes matching live membership, telemetry and RPC endpoint associations, closes matching cached sessions, and is propagated through both the peer management exchange and committed cluster metadata. Persisted node status and MachaDFS data are retained.
+A reset is a durable distributed tombstone, not node deletion. It removes matching live membership, telemetry and RPC endpoint associations and closes matching cached sessions. Persisted node status and MachaDFS data are retained. Retired identities are excluded from the ordinary cluster node list, health and capacity totals; `GET /api/v1/status/nodes/{node_id}` retains an explicit `state: "retired"` audit view.
 
 Association reset is also a recovery action and therefore does not require
-metadata to be writable. The operational tombstone is applied, persisted in
-the local membership roster, and propagated to reachable peers before Macha
-attempts its cluster-metadata audit commit. A successful audit returns `200`
-with `metadata_persisted: true`. If the write floor is unavailable, the reset
-still succeeds with `202`, `metadata_persisted: false`, and a diagnostic
-`persistence_error`. Reachable peers receive and persist the operational
-tombstone immediately; repeating the action after metadata recovery records
-its cluster-metadata audit.
+metadata to be writable. The request synchronously applies only the small,
+locally durable operational tombstone and returns `202 Accepted` with
+`audit_state: "queued"`. Peer propagation and the cluster-metadata audit run
+asynchronously and can never extend request latency. The response therefore
+reports `metadata_persisted: false` and a null `metadata_generation`; these
+fields describe the queued audit rather than failure of the already-effective
+local reset. Reachable peers persist the operational tombstone during
+background propagation and subsequent identity-reset exchanges.
 
 The tombstone is a freshness boundary. Pre-reset gossip cannot recreate the invalidated mapping, and stale `NodeInfo` references are rejected rather than silently routed to a replacement node. A subsequent directly authenticated peer may establish a fresh association at the endpoint. Reset records contain an epoch, reset timestamp, initiating node, and optional reason for operational auditability; applying the same or an older epoch is idempotent.
