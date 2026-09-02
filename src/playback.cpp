@@ -2078,6 +2078,8 @@ struct PlaybackManager::Impl {
                          {"max_video_transcodes", static_cast<uint64_t>(config.max_video_transcodes)},
                          {"audio_transcodes", static_cast<uint64_t>(audio_transcodes)},
                          {"max_audio_transcodes", static_cast<uint64_t>(config.max_audio_transcodes)},
+                         {"video_decoder_threads",
+                          static_cast<uint64_t>(config.video_decoder_threads)},
                          {"pipeline_idle_ms", static_cast<uint64_t>(pipeline_idle.count())},
                          {"idle_pipelines_reclaimed", reclaimed},
                          {"heap_reclaim_pending", heap_pending},

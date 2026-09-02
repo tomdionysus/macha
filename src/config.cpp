@@ -430,6 +430,8 @@ void parse_streaming(const YAML::Node& root, Config& c) {
         c.streaming.max_video_transcodes = streaming["max_video_transcodes"].as<size_t>();
     if (streaming["max_audio_transcodes"])
         c.streaming.max_audio_transcodes = streaming["max_audio_transcodes"].as<size_t>();
+    if (streaming["video_decoder_threads"])
+        c.streaming.video_decoder_threads = streaming["video_decoder_threads"].as<size_t>();
     if (streaming["session_idle_ms"])
         c.streaming.session_idle = milliseconds(streaming["session_idle_ms"], "streaming.session_idle_ms");
     if (streaming["pipeline_idle_ms"])

@@ -291,6 +291,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "  max_sessions: 9\n"
             << "  max_video_transcodes: 2\n"
             << "  max_audio_transcodes: 5\n"
+            << "  video_decoder_threads: 3\n"
             << "  session_idle_ms: 60000\n"
             << "  pipeline_idle_ms: 45000\n"
             << "  startup_timeout_ms: 7000\n"
@@ -441,6 +442,10 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(yc.streaming.max_sessions == 9);
     CHECK(yc.streaming.max_video_transcodes == 2);
     CHECK(yc.streaming.max_audio_transcodes == 5);
+    CHECK(yc.streaming.video_decoder_threads == 3);
+    auto media_engine = make_libav_media_engine(yc.streaming);
+    REQUIRE(media_engine != nullptr);
+    CHECK(media_engine->status().video_decoder_threads == 3);
     CHECK(yc.streaming.session_idle == 60000ms);
     CHECK(yc.streaming.pipeline_idle == 45000ms);
     CHECK(yc.streaming.startup_timeout == 7000ms);
@@ -451,6 +456,17 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(yc.streaming.probe_analyze_duration == 4000ms);
     CHECK(yc.streaming.probe_timeout == 9000ms);
     CHECK(yc.runtime.glibc_arena_max == 6);
+    for (const size_t invalid_decoder_threads : {size_t{0}, size_t{17}}) {
+        auto invalid = yc;
+        invalid.streaming.video_decoder_threads = invalid_decoder_threads;
+        bool rejected = false;
+        try {
+            (void)normalize_config(std::move(invalid));
+        } catch (const std::exception&) {
+            rejected = true;
+        }
+        CHECK(rejected);
+    }
     for (const size_t invalid_arena_max : {size_t{0}, size_t{65}}) {
         auto invalid = yc;
         invalid.runtime.glibc_arena_max = invalid_arena_max;

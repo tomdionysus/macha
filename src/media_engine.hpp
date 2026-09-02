@@ -101,6 +101,7 @@ struct MediaEngineStatus {
     std::string version;
     bool h264_encoder{};
     bool aac_encoder{};
+    size_t video_decoder_threads{};
 };
 
 // Published fragments are produced directly by the libav muxer. The store is

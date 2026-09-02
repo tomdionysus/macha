@@ -30,6 +30,7 @@ void Service::reload_config() {
         updated.streaming.enabled != current_streaming.enabled ||
         updated.streaming.temp_path != current_streaming.temp_path ||
         updated.streaming.segment_memory_bytes != current_streaming.segment_memory_bytes ||
+        updated.streaming.video_decoder_threads != current_streaming.video_decoder_threads ||
         updated.streaming.probe_bytes != current_streaming.probe_bytes ||
         updated.streaming.probe_analyze_duration != current_streaming.probe_analyze_duration ||
         updated.streaming.probe_timeout != current_streaming.probe_timeout;
@@ -41,7 +42,7 @@ void Service::reload_config() {
     ingest_->reconfigure(updated.ingest);
     torrents_->reconfigure(updated.torrent);
     if (streaming_restart_required)
-        Log::warn("streaming enable/buffer/probe/path changes require restart; live limits were reloaded");
+        Log::warn("streaming enable/buffer/probe/path/codec changes require restart; live limits were reloaded");
     streaming_->reconfigure(updated.streaming);
     Log::info("reloaded storage backends, persistent cache, catalogue scanner, ingest, torrent, hydration and streaming limits");
 }

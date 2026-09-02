@@ -681,6 +681,35 @@ Evidence: [FUSE spool rate backpressure](2026-08-30-fuse-spool-rate-backpressure
 
 Evidence: [Spool progress-bootstrap admission checkpoint](2026-08-31-spool-progress-bootstrap-admission.md)
 
+## FUSE write admission shutdown race
+
+- [x] Closed the final byte-admission race in which shutdown could release one
+  blocked writer's lease and allow another waiter to acquire newly available
+  capacity after `stopping` had already become true.
+- [x] Preserve the bounded-memory contract by checking shutdown after the wait
+  condition clears and before accounting or copying the request payload.
+- [x] The focused shutdown/admission regression passes, runtime dependencies
+  pass 4/4, and the complete core suite passes 262/262 at 12-way process
+  isolation.
+
+## Playback allocator bound and decoder parallelism — versions 0.22.6–0.23.0
+
+- [x] Removed the temporary hot-path transport ownership and allocator-sampling
+  instrumentation before performance validation.
+- [x] Bounded glibc arenas at process start with configurable
+  `runtime.glibc_arena_max` (default four) and a hard Linux multi-wave test.
+- [x] Added bounded `streaming.video_decoder_threads` (default two, range
+  1–16), applied it before codec open, exposed the effective configuration in
+  playback Status, and made changes restart-required.
+- [x] Passed runtime dependencies 4/4 and the complete core suite 262/262 at
+  12-way process isolation.
+- [x] Passed four-node UAT: three smooth allocator-bound lifecycles followed by
+  two smooth two-thread HEVC lifecycles. Every teardown reached zero playback
+  ownership, all heap reclaim attempts succeeded, and drained RSS remained on
+  a stable approximately 204–223 MiB plateau without lifecycle ratcheting.
+
+Evidence: [Transport, allocator and decoder checkpoint](2026-09-02-transport-and-allocator-attribution-checkpoint.md)
+
 ## Spool progress-bootstrap admission
 
 - [x] Removed the zero-rate dead zone above 50% spool occupancy by granting
