@@ -260,7 +260,6 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_frame_priority_and_variable_length) {
     Bytes speculative(32 * 1024 * 1024, 0x53);
     auto background =
         client.call_async(endpoint, MessageType::put_object, speculative, FrameType::speculative);
-    std::this_thread::sleep_for(2ms);
     auto foreground =
         client.call_async(endpoint, MessageType::put_object, Bytes{0x46}, FrameType::foreground);
     REQUIRE(foreground.wait_for(2s) == std::future_status::ready);
@@ -455,6 +454,53 @@ MACHA_TEST("rpc_cluster", test_rpc_concurrent_cold_data_calls_share_one_dial) {
     server.stop();
 }
 
+MACHA_TEST("rpc_cluster", test_rpc_full_extent_reply_uses_owned_transport_handoff) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto port = free_port();
+
+    NodeInfo server_info;
+    server_info.id = random_node_id();
+    server_info.host = "127.0.0.1";
+    server_info.port = port;
+    server_info.failure_domain = "server-site";
+    const auto extent_reply = pattern(4 * 1024 * 1024 + 36, 117);
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (request.type == MessageType::get_object)
+                return RpcMessage{MessageType::object_reply, extent_reply};
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {});
+    server.start();
+
+    NodeInfo client_info;
+    client_info.id = random_node_id();
+    client_info.host = "127.0.0.1";
+    client_info.port = free_port();
+    client_info.failure_domain = "client-site";
+    RpcClient client(
+        keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms);
+
+    auto reply = client.call(server_info, MessageType::get_object, Bytes{0x01},
+                             FrameType::foreground, 2s);
+    CHECK(reply.message.type == MessageType::object_reply);
+    CHECK(reply.message.payload == extent_reply);
+
+    // Moving the handler result into the transport must leave the canonical
+    // fragmented DATA session aligned and reusable.
+    auto repeated = client.call(server_info, MessageType::get_object, Bytes{0x02},
+                                FrameType::foreground, 2s);
+    CHECK(repeated.message.payload == extent_reply);
+    CHECK(client.stats().connections_created == 1);
+    CHECK(client.stats().canonical_connections == 1);
+
+    client.stop();
+    server.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_rpc_v15_bidirectional_and_deduplication) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
@@ -513,6 +559,7 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_bidirectional_and_deduplication) {
         CHECK(b.client.stats().connections_created == 0);
         CHECK(a.client.stats().canonical_connections == 2);
         CHECK(b.client.stats().canonical_connections == 2);
+
     }
 
     // Simultaneous cross-dial starts with two physical sessions. Both nodes

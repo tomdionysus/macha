@@ -23,6 +23,8 @@ void Service::reload_config() {
     if (updated.replication != node_.config().replication ||
         updated.metadata_min_write_replicas != node_.config().metadata_min_write_replicas)
         throw std::runtime_error("replica policy changes require a coordinated cluster restart");
+    if (updated.runtime.glibc_arena_max != node_.config().runtime.glibc_arena_max)
+        throw std::runtime_error("runtime.glibc_arena_max changes require a process restart");
     const auto& current_streaming = node_.config().streaming;
     const bool streaming_restart_required =
         updated.streaming.enabled != current_streaming.enabled ||

@@ -670,10 +670,29 @@ void setup_video_transcode(StreamPipeline& pipe, AVFormatContext* input, AVForma
     }
     if (output->oformat->flags & AVFMT_GLOBALHEADER) enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     if (enc->priv_data) {
-        (void)av_opt_set(enc->priv_data, "preset", "veryfast", 0);
+        // This encoder feeds an interactive fragmented stream, not an offline
+        // file. x264's ordinary look-ahead retains decoded frames and delays
+        // the first fragment for compression efficiency which the viewer
+        // cannot use. Zero-latency mode removes that queue while preserving
+        // frame threading and the selected bitrate/quality policy.
+        if (std::string_view(codec->name) == "libx264") {
+            av_require(av_opt_set(enc->priv_data, "preset", "veryfast", 0),
+                       "set x264 realtime preset");
+            av_require(av_opt_set(enc->priv_data, "tune", "zerolatency", 0),
+                       "set x264 zero-latency mode");
+        } else {
+            (void)av_opt_set(enc->priv_data, "preset", "veryfast", 0);
+        }
         if (!plan.target_video_bitrate) (void)av_opt_set(enc->priv_data, "crf", "20", 0);
     }
     av_require(avcodec_open2(enc, codec, nullptr), "open H.264 encoder");
+    Log::debug("libav interactive video codec decoder=" +
+               std::string(pipe.decoder->codec ? pipe.decoder->codec->name : "unknown") +
+               " decoder_threads=" + std::to_string(pipe.decoder->thread_count) +
+               " encoder=" + std::string(codec->name ? codec->name : "unknown") +
+               " encoder_threads=" + std::to_string(enc->thread_count) +
+               " zero_latency=" +
+               std::to_string(std::string_view(codec->name) == "libx264" ? 1 : 0));
     pipe.output_stream->time_base = enc->time_base;
     pipe.output_stream->sample_aspect_ratio = enc->sample_aspect_ratio;
     av_require(avcodec_parameters_from_context(pipe.output_stream->codecpar, enc), "export video encoder parameters");

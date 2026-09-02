@@ -355,6 +355,12 @@ struct ConnectivityCheckConfig {
     std::chrono::milliseconds timeout{3000};
 };
 
+struct RuntimeConfig {
+    // glibc otherwise permits a CPU-derived number of independent arenas,
+    // allowing short-lived codec threads to ratchet retained process memory.
+    size_t glibc_arena_max{4};
+};
+
 struct Config {
     std::filesystem::path state_path;
     std::vector<StorageBackendConfig> storage_backends;
@@ -369,6 +375,7 @@ struct Config {
     TorrentConfig torrent;
     StreamingConfig streaming;
     HydrationConfig hydration;
+    RuntimeConfig runtime;
 
     std::filesystem::path key_file;
     std::optional<std::filesystem::path> mount_path;

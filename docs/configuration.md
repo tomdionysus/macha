@@ -16,6 +16,22 @@ mount_path: /srv/media
 
 A fresh state namespace is required. Non-empty unversioned state is refused.
 
+## Runtime memory bound
+
+```yaml
+runtime:
+  glibc_arena_max: 4
+```
+
+On Linux/glibc, Macha applies this process-wide allocator arena limit before it
+creates service or codec threads. It prevents successive short-lived transcode
+threads from creating an ever-growing set of retained arenas. The default is
+four and the accepted range is 1–64. Increasing it may reduce allocator
+contention on large machines at the cost of a larger retained-memory ceiling.
+The setting is accepted but has no effect with non-glibc allocators, including
+macOS. Changing it requires a process restart; live reload rejects a different
+value rather than claiming to apply a limit after worker arenas already exist.
+
 ## Authoritative storage
 
 ```yaml

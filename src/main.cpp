@@ -4,6 +4,7 @@
 #include "ffmpeg_log.hpp"
 #include "fuse_adapter.hpp"
 #include "log.hpp"
+#include "process_allocator.hpp"
 #include "service.hpp"
 #include <chrono>
 #include <csignal>
@@ -18,6 +19,11 @@ int main(int argc, char** argv) {
     try {
         auto config = macha::parse_config(argc, argv);
         macha::Log::set_logger(std::make_shared<macha::ConsoleLogger>(config.log_level));
+        const auto allocator =
+            macha::configure_process_allocator(config.runtime.glibc_arena_max);
+        if (allocator.supported)
+            macha::Log::debug("glibc allocator arena limit=" +
+                              std::to_string(allocator.arena_max));
         macha::configure_ffmpeg_logging(config.ffmpeg_log_level);
         auto keys = macha::load_cluster_keys(config.key_file);
         if (config.mount_path) {

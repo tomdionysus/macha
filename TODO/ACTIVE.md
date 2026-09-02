@@ -55,8 +55,46 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   coverage; 23/23 playback, 261/261 core and 3/3 runtime tests pass. Four-node
   UAT then returned GBNI-1 from approximately 783 MiB live to 406 MiB
   immediately after teardown (one request/run/success), passing the physical
-  teardown gate. Continue reducing the separately observed roughly 385 MiB
-  live transcode increase, full-stripe reply copies and 7.56-second startup.
+  teardown gate. The next local checkpoint removes two full-stripe copies from
+  every remote object reply and enables x264's interactive zero-latency mode;
+  40/40 RPC, 262/262 core and 3/3 runtime tests pass. Deploy 0.22.4 for the
+  focused UAT in
+  [the checkpoint](2026-09-02-live-transcode-copy-and-latency-checkpoint.md).
+  That UAT passed: first fragment improved from 7.47 to 3.44 seconds, admission
+  from 7.56 to 3.53 seconds, and live RSS from roughly 783 to 673 MiB; teardown
+  returned RSS to about 415 MiB. Active transport/reassembly ownership and
+  cached glibc allocator attribution are now exposed without sampling on a
+  request-critical thread; 40/40 RPC, 262/262 core and 3/3 runtime tests pass.
+  Deploy 0.22.5 for the bounded attribution UAT in
+  [the checkpoint](2026-09-02-transport-and-allocator-attribution-checkpoint.md).
+  Do not impose a codec thread cap until that run shows whether the remaining
+  live plateau belongs to transport buffers, allocator arenas/direct mappings,
+  the segment store, or the codec itself. The clean four-node UAT has now made
+  that attribution: transport and DATA ownership remained zero, live growth
+  tracked the segment store plus codec/glibc allocations, and arena-in-use
+  returned to baseline after teardown. Playback was nevertheless choppy, but
+  the logged 2–5 second intervals are client-facing segment delivery times, not
+  producer timings, and average faster than the four-second media duration;
+  they do not establish decoder starvation. Playback was smooth before this
+  checkpoint, and the less frequent observer coincided with less choppiness.
+  The temporary attribution layer has therefore been removed completely before
+  further UAT: no per-fragment ownership writes, no Status acquisition of
+  connection queue/pending locks, and no `mallinfo2` sampler remain. The P0
+  memory correction in 0.22.6 applies a configurable process-start glibc arena
+  maximum (default four). Its Linux regression passes three waves of 16
+  simultaneous 4 MiB allocators without exceeding a configured two arenas on
+  both GBNI Pis. The complete 262-case core suite passes twice consecutively at
+  12-way process isolation after correcting a catalogue/GC test that had
+  accidentally treated a 500 ms suite-load scheduling pause as peer death; no
+  test was serialized and no behavioural deadline was extended. Four-node UAT
+  then passed three successive forced-transcode lifecycles on GBNI-1: playback
+  was smooth, live RSS formed bounded plateaus, every teardown reached zero
+  sessions/transcodes/segment bytes, heap reclaim succeeded 3/3 times, and
+  drained RSS settled at approximately 223, 211 and 212 MiB from a 202 MiB
+  initial baseline. The allocator-growth P0 is complete. Proceed next with
+  bounded/configurable decoder parallelism, retaining the same repeated-
+  lifecycle memory and smoothness gates; it remains an improvement rather than
+  the diagnosis of the removed instrumentation regression.
 
 ### Backlog precedence and supersession
 

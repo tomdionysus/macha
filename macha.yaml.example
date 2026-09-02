@@ -21,6 +21,13 @@ log_level: INFO
 # QUIET, PANIC, FATAL, ERROR, WARN, INFO, VERBOSE, DEBUG or TRACE. Default: ERROR.
 ffmpeg_log_level: ERROR
 
+# Linux/glibc process-memory bound. Apply one allocator arena per RPi core by
+# default instead of glibc's much larger CPU-derived allowance. This prevents
+# short-lived codec threads from ratcheting retained process memory after each
+# playback session. Accepted range: 1..64. Non-glibc platforms ignore it.
+runtime:
+  glibc_arena_max: 4
+
 # Authoritative storage is split by correctness class. DATA holds media extents,
 # artwork and other immutable payloads. CONTROL/METADATA has an independent
 # priority quota and cannot be blocked by a full DATA backend.

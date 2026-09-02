@@ -452,6 +452,14 @@ void parse_streaming(const YAML::Node& root, Config& c) {
             milliseconds(streaming["probe_timeout_ms"], "streaming.probe_timeout_ms");
 }
 
+void parse_runtime(const YAML::Node& root, Config& c) {
+    auto runtime = root["runtime"];
+    if (!runtime)
+        return;
+    if (runtime["glibc_arena_max"])
+        c.runtime.glibc_arena_max = runtime["glibc_arena_max"].as<size_t>();
+}
+
 void parse_hydration_engine(const YAML::Node& engines, const char* name,
                             HydrationEngineConfig& engine) {
     auto node = engines[name];
@@ -573,6 +581,7 @@ Config load_yaml_config(const std::filesystem::path& path) {
     parse_torrent(root, c);
     parse_streaming(root, c);
     parse_hydration(root, c);
+    parse_runtime(root, c);
 
     if (auto bootstrap = root["bootstrap"]) {
         if (!bootstrap.IsSequence())

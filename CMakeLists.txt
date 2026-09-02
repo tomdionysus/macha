@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.22.4 LANGUAGES CXX)
+project(macha VERSION 0.23.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -149,6 +149,7 @@ set(MACHA_CORE_SOURCES
     src/codec.cpp
     src/crypto.cpp
     src/config_base.cpp
+    src/process_allocator.cpp
     src/log.cpp
     src/ffmpeg_log_base.cpp
     src/diagnostics.cpp

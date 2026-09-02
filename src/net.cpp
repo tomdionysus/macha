@@ -1208,10 +1208,11 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         const auto fallback = frame.frame_type;
         try {
             inbound_handler_(peer_, std::move(frame),
-                             [weak, id, fallback](const RpcMessage& reply) {
+                             [weak, id, fallback](RpcMessage reply) {
                                  if (auto self = weak.lock()) {
                                      try {
-                                         (void)self->queue_message(id, fallback, reply, true);
+                                         (void)self->queue_message(id, fallback,
+                                                                   std::move(reply), true);
                                      } catch (...) {
                                          self->close();
                                      }
@@ -2270,8 +2271,8 @@ void RpcClient::health_loop(std::stop_token stop) {
 }
 
 RpcStats RpcClient::stats() const {
-    std::lock_guard lock(mutex_);
     RpcStats stats{connections_created_.load(), connections_reused_.load()};
+    std::lock_guard lock(mutex_);
     for (const auto& [_, connection] : connections_)
         if (connection && connection->usable())
             ++stats.canonical_connections;
@@ -2530,6 +2531,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
     bool usable() const {
         return ready.load() && !done.load() && !retiring.load();
     }
+
 
     void maybe_queue_retire_locked() {
         if (!retiring.load() || retire_notice_sent || !outbound.empty() ||
@@ -3279,7 +3281,7 @@ void RpcServer::stop() {
     metadata_workers_.clear();
     data_workers_.clear();
 
-    std::vector<std::function<void(const RpcMessage&)>> dropped;
+    std::vector<RpcClient::InboundReply> dropped;
     {
         DiagnosticLock lock(request_mutex_, "rpc.server.queue");
         for (auto* requests :
@@ -3288,7 +3290,7 @@ void RpcServer::stop() {
               &metadata_requests_}) {
             for (auto& job : *requests) {
                 if (job.reply)
-                    dropped.push_back(job.reply);
+                    dropped.push_back(std::move(job.reply));
                 if (job.session && job.session->active_requests.load())
                     --job.session->active_requests;
             }
@@ -3563,7 +3565,7 @@ void RpcServer::execute(RequestJob job) {
         handler_finished = Clock::now();
         handler_completed = true;
         if (job.reply) {
-            job.reply(reply);
+            job.reply(std::move(reply));
         } else if (job.session) {
             (void)job.session->queue_message(job.frame.request_id, job.frame.frame_type, reply,
                                              true);

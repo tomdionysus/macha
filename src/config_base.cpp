@@ -19,6 +19,8 @@ unsigned parse_unsigned(const std::string& value, const char* what) {
 }
 
 void validate(Config& config) {
+    if (!config.runtime.glibc_arena_max || config.runtime.glibc_arena_max > 64)
+        throw std::runtime_error("runtime.glibc_arena_max must be 1..64");
     if (config.state_path.empty())
         throw std::runtime_error("state_path is required");
     if (config.key_file.empty())
