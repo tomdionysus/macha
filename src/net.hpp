@@ -120,6 +120,12 @@ struct RpcServerExecutionLimits {
     size_t metadata_workers{1};
     size_t metadata_pending_jobs{64};
     size_t metadata_pending_bytes{256ULL * 1024 * 1024};
+    // Queue ownership is bounded in bytes as well as jobs. These pools are
+    // deliberately separate: loader/speculative payloads cannot consume the
+    // memory reserved for control or viewer work.
+    size_t fast_control_pending_bytes{1ULL * 1024 * 1024};
+    size_t control_pending_bytes{16ULL * 1024 * 1024};
+    size_t data_pending_bytes{64ULL * 1024 * 1024};
 };
 
 struct RpcServerWorkStats {
@@ -135,6 +141,10 @@ struct RpcServerWorkStats {
     size_t metadata_pending_bytes{};
     size_t metadata_active_jobs{};
     uint64_t metadata_rejected_jobs{};
+    size_t fast_control_pending_bytes{};
+    size_t control_pending_bytes{};
+    size_t data_pending_bytes{};
+    uint64_t rejected_jobs{};
     std::map<FrameType, Timing> frame_timings;
     std::map<MessageType, Timing> message_timings;
 };
@@ -397,9 +407,13 @@ class RpcServer {
     std::deque<RequestJob> speculative_requests_;
     RpcServerExecutionLimits execution_limits_;
     size_t metadata_request_bytes_{};
+    size_t fast_control_request_bytes_{};
+    size_t control_request_bytes_{};
+    size_t data_request_bytes_{};
     std::set<NodeId> metadata_active_peers_;
     std::atomic_size_t active_metadata_requests_{};
     std::atomic_uint64_t rejected_metadata_requests_{};
+    std::atomic_uint64_t rejected_requests_{};
     // Message types occupy a small fixed wire namespace. Fixed atomic buckets
     // keep diagnostics bounded and avoid a lock or allocation on the handler path.
     std::array<AtomicTiming, 6> frame_timings_{};

@@ -302,6 +302,9 @@ struct MetadataReplicaDiagnostics {
 struct MetadataMaterialization {
     MetadataRecord record;
     std::shared_ptr<const MetadataSnapshot> snapshot;
+    // Conservative deep weight of the immutable record and decoded object
+    // graph. Computed once, off the replica-state mutex, when materialized.
+    uint64_t resident_bytes{};
 };
 
 class MetadataReplica {
@@ -391,7 +394,8 @@ class MetadataReplica {
     MetadataHistoryEntry history_for_current(std::span<const uint8_t> delta = {});
     std::shared_ptr<const MetadataMaterialization>
     cache_materialization_locked(const MetadataRecord&,
-                                 std::shared_ptr<const MetadataSnapshot> = {}) const;
+                                 std::shared_ptr<const MetadataSnapshot> = {},
+                                 uint64_t resident_bytes = 0) const;
     std::shared_ptr<const MetadataMaterialization> materialized_locked(const Hash256&) const;
     std::optional<MetadataRecord> historical_locked(const Hash256&) const;
     bool history_is_ancestor_locked(const Hash256&, const Hash256&) const;

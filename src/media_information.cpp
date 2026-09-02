@@ -36,6 +36,14 @@ bool pending(CatalogueHintState state) {
            state == CatalogueHintState::deferred;
 }
 
+size_t profile_weight(std::string_view media_id, const MediaProbeResult& probe) {
+    size_t bytes = media_id.size() + sizeof(probe) + probe.format.capacity();
+    for (const auto& stream : probe.streams)
+        bytes += sizeof(stream) + stream.codec.capacity() + stream.profile.capacity() +
+                 stream.language.capacity();
+    return bytes;
+}
+
 } // namespace
 
 struct MediaInformationService::Flight {
@@ -58,6 +66,32 @@ MediaInformationService::MediaInformationService(
       profile_publisher_(std::move(profile_publisher)) {}
 
 MediaInformationService::~MediaInformationService() { stop(); }
+
+void MediaInformationService::queue_publication_locked(std::string media_id,
+                                                        MediaProbeResult probe) {
+    const auto weight = profile_weight(media_id, probe);
+    if (weight > max_pending_publication_bytes_) {
+        flights_.erase(media_id);
+        return;
+    }
+    if (auto found = pending_publications_.find(media_id);
+        found != pending_publications_.end()) {
+        pending_publication_bytes_ -= profile_weight(found->first, found->second);
+        found->second = std::move(probe);
+        pending_publication_bytes_ += weight;
+        return;
+    }
+    while (!pending_publications_.empty() &&
+           (pending_publications_.size() >= max_pending_publications_ ||
+            pending_publication_bytes_ > max_pending_publication_bytes_ - weight)) {
+        auto victim = pending_publications_.begin();
+        pending_publication_bytes_ -= profile_weight(victim->first, victim->second);
+        flights_.erase(victim->first);
+        pending_publications_.erase(victim);
+    }
+    pending_publications_.emplace(std::move(media_id), std::move(probe));
+    pending_publication_bytes_ += weight;
+}
 
 void MediaInformationService::start() {
     if (started_ || !engine_ || !engine_->status().available) return;
@@ -225,7 +259,7 @@ MediaProbeResult MediaInformationService::resolve(
             flight->cv.notify_all();
             {
                 std::lock_guard lock(mutex_);
-                pending_publications_.insert_or_assign(media_id, result);
+                queue_publication_locked(media_id, result);
             }
             cv_.notify_all();
             return result;
@@ -344,6 +378,7 @@ void MediaInformationService::loop(std::stop_token stop) {
                 (!publication_retry_at_ || now >= *publication_retry_at_)) {
                 auto it = pending_publications_.begin();
                 publication = *it;
+                pending_publication_bytes_ -= profile_weight(it->first, it->second);
                 pending_publications_.erase(it);
                 if (pending_publications_.empty()) publication_retry_at_.reset();
             } else if (prune_requested_) {
@@ -361,8 +396,7 @@ void MediaInformationService::loop(std::stop_token stop) {
                 Log::warn("media information publication failed: " + std::string(e.what()));
                 {
                     std::lock_guard lock(mutex_);
-                    pending_publications_.insert_or_assign(
-                        publication->first, publication->second);
+                    queue_publication_locked(publication->first, publication->second);
                     publication_retry_at_ = Clock::now() + publication_retry_delay_;
                 }
                 cv_.notify_all();

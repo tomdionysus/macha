@@ -449,6 +449,16 @@ TorrentSearchResponse TorrentSearchManager::search(std::string_view query) {
     for (auto& result : response.results) {
         auto uri = result.magnet_uri ? result.magnet_uri : result.torrent_url;
         if (!uri) continue;
+        while (acquisitions_.size() >= max_acquisitions_) {
+            // References are opaque and equivalent except for expiry. Retire
+            // the one with the least remaining lifetime before admitting a new
+            // owner so repeated searches cannot grow the process indefinitely.
+            auto victim = std::min_element(
+                acquisitions_.begin(), acquisitions_.end(), [](const auto& a, const auto& b) {
+                    return a.second.expires_unix_ms < b.second.expires_unix_ms;
+                });
+            acquisitions_.erase(victim);
+        }
         result.acquisition_ref = to_string(random_node_id());
         acquisitions_[result.acquisition_ref] = {*uri, expires};
     }

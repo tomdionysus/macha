@@ -8,6 +8,12 @@
 - Give local metadata replicas the same single-shot full-record fallback as
   remote replicas when a compact body fails exact reconstruction, preventing a
   valid library from becoming permanently unavailable behind a failed merge.
+- Make node identity-association reset admission asynchronous: the API returns
+  `202` after its small local durable tombstone, while peer propagation and the
+  cluster metadata audit execute off the request path.
+- Retire reset identities from ordinary status listings, cluster health and
+  capacity totals while preserving an explicit per-node `state: "retired"`
+  audit response.
 
 ## 0.21.0 — asynchronous node startup (development)
 

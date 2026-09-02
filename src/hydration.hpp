@@ -7,7 +7,9 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -142,6 +144,11 @@ struct HydrationStatus {
     uint64_t unavailable{};
     size_t in_flight{};
     size_t peak_in_flight{};
+    size_t executor_workers{};
+    size_t executor_queued{};
+    size_t executor_peak_queued{};
+    uint64_t executor_submitted{};
+    uint64_t executor_completed{};
     std::optional<ObjectId> last_object;
     std::string last_reason;
 };
@@ -156,10 +163,25 @@ class CacheHydrator {
     HydrationScheduler scheduler_;
     std::map<ObjectId, Clock::time_point> failed_until_;
     std::jthread worker_;
+    struct FetchTask {
+        HydrationRequest request;
+        std::promise<bool> result;
+    };
+    std::mutex fetch_mutex_;
+    std::condition_variable_any fetch_cv_;
+    std::deque<std::shared_ptr<FetchTask>> fetch_queue_;
+    std::vector<std::jthread> fetch_workers_;
+    bool fetch_stopping_{true};
+    std::atomic_size_t fetch_queued_{};
+    std::atomic_size_t fetch_peak_queued_{};
+    std::atomic_uint64_t fetch_submitted_{};
+    std::atomic_uint64_t fetch_completed_{};
     HydrationStatus status_;
 
     std::vector<HydrationHint> collect_hints();
     void loop(std::stop_token);
+    void fetch_loop(std::stop_token);
+    std::future<bool> submit(HydrationRequest);
 
   public:
     CacheHydrator(DistributedStore&, HydrationConfig);

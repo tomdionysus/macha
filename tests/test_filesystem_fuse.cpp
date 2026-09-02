@@ -67,6 +67,20 @@ MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_cou
     REQUIRE(filesystem->find("spool_publish_rate_window_ms") != nullptr);
     REQUIRE(filesystem->find("spool_throttle_waits") != nullptr);
     REQUIRE(filesystem->find("spool_throttle_wait_ms") != nullptr);
+    REQUIRE(filesystem->find("pending_write_request_bytes") != nullptr);
+    REQUIRE(filesystem->find("peak_pending_write_request_bytes") != nullptr);
+    REQUIRE(filesystem->find("pending_write_request_limit_bytes") != nullptr);
+    CHECK(filesystem->find("pending_write_request_limit_bytes")->asUInt64() ==
+          config.fuse.max_pending_write_bytes);
+    REQUIRE(filesystem->find("extent_executor_workers") != nullptr);
+    REQUIRE(filesystem->find("extent_executor_queued") != nullptr);
+    REQUIRE(filesystem->find("extent_executor_active") != nullptr);
+    REQUIRE(filesystem->find("extent_executor_peak_queued") != nullptr);
+    REQUIRE(filesystem->find("extent_executor_peak_active") != nullptr);
+    REQUIRE(filesystem->find("extent_executor_submitted") != nullptr);
+    REQUIRE(filesystem->find("inode_count") != nullptr);
+    REQUIRE(filesystem->find("peak_inode_count") != nullptr);
+    REQUIRE(filesystem->find("reclaimed_inode_count") != nullptr);
     REQUIRE(filesystem->find("data_publication_requests") != nullptr);
     REQUIRE(filesystem->find("data_publication_notifications_suppressed") != nullptr);
     REQUIRE(filesystem->find("spool_pressure_publication_sweeps") != nullptr);
@@ -799,6 +813,12 @@ MACHA_TEST("filesystem_fuse", test_disconnected_maintenance_sleeps_until_peer_ev
     c1.heartbeat = c2.heartbeat = 50ms;
     c1.dead_after = c2.dead_after = 500ms;
     c1.maintenance.no_progress_backoff = c2.maintenance.no_progress_backoff = 30s;
+    // This test observes event-driven parking, not credit accrual.  Make the
+    // final bounded startup slice immediately affordable even when parallel
+    // sanitizers inflate process CPU accounting; otherwise a legitimate
+    // one-shot credit deadline can land inside the purported quiet window.
+    c1.maintenance.initial_bandwidth = c2.maintenance.initial_bandwidth = 1024ULL * 1024 * 1024;
+    c1.maintenance.cpu_target = c2.maintenance.cpu_target = 1.0;
     c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = false;
     c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
 
@@ -1287,6 +1307,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_operation_journal_admission_is_bounded_w
     // Completion records for work admitted just before the ceiling are allowed
     // to drain beyond the admission threshold. Rejected *new* work must not keep
     // extending the WAL indefinitely.
+    REQUIRE(wait_until([&] { return frontend->status().pending_namespace == 0; }, 5s));
     const auto bounded_size = std::filesystem::file_size(journal);
     for (size_t i = 0; i < 8; ++i) {
         bool rejected_again = false;
@@ -1438,10 +1459,78 @@ MACHA_TEST("filesystem_fuse", test_fuse_open_loaders_use_available_publication_w
     CHECK(status.data_publication_bytes_read == files * payload.size());
     CHECK(status.data_publication_bytes_committed == files * payload.size());
     CHECK(status.data_publication_bytes_confirmed == files * payload.size());
+    CHECK(status.extent_executor_workers == config.fuse.commit_workers);
+    CHECK(status.extent_executor_submitted >= files * 8);
+    CHECK(status.extent_executor_peak_active >= 1);
+    CHECK(status.extent_executor_peak_active <= config.fuse.commit_workers);
+    CHECK(status.extent_executor_peak_queued <= config.fuse.commit_workers * 2);
+    CHECK(status.extent_executor_active == 0);
+    CHECK(status.extent_executor_queued == 0);
 
     for (const auto& handle : handles)
         frontend->release(handle.inode, true);
     frontend->stop();
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_pending_write_payloads_are_byte_bounded) {
+    TestService fixture("fuse-write-byte-admission");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 1;
+    config.fuse.suspend_loader_for_tests = true;
+    config.fuse.max_spool_bytes = 128 * 1024;
+    config.fuse.spool_reserve_free = 0;
+    config.fuse.max_pending_write_bytes = 128 * 1024;
+    config.fuse.timeouts.write = 2s;
+
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto handle = frontend->create("/write-byte-bound.bin", 0600, getuid(), getgid(), true,
+                                   true, false);
+    // A zero loader weight is an active-viewer policy, not an idle-system stop:
+    // the scheduler is deliberately work-conserving when no viewer exists.
+    // Hold the viewer window so spool pressure cannot publish the first write
+    // and invalidate the pending-byte ownership state this test is measuring.
+    frontend->note_viewer_activity();
+    const auto payload = pattern(128 * 1024, 91);
+    REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
+    REQUIRE(wait_until([&] { return frontend->status().durability_writes == 1; }, 5s));
+
+    auto blocked_in_spool = std::async(std::launch::async, [&] {
+        try {
+            (void)frontend->write(handle.inode, payload.size(), payload);
+            return 0;
+        } catch (const FsError& error) {
+            return error.code();
+        }
+    });
+    REQUIRE(wait_until(
+        [&] {
+            return frontend->status().pending_write_request_bytes == payload.size();
+        },
+        1s));
+
+    auto blocked_before_copy = std::async(std::launch::async, [&] {
+        try {
+            (void)frontend->write(handle.inode, payload.size() * 2, payload);
+            return 0;
+        } catch (const FsError& error) {
+            return error.code();
+        }
+    });
+    CHECK(blocked_before_copy.wait_for(100ms) == std::future_status::timeout);
+    const auto bounded = frontend->status();
+    CHECK(bounded.pending_write_request_bytes == payload.size());
+    CHECK(bounded.peak_pending_write_request_bytes == payload.size());
+    CHECK(bounded.pending_write_request_limit_bytes == payload.size());
+
+    frontend->stop();
+    REQUIRE(blocked_in_spool.wait_for(2s) == std::future_status::ready);
+    REQUIRE(blocked_before_copy.wait_for(2s) == std::future_status::ready);
+    CHECK(blocked_in_spool.get() == EINTR);
+    CHECK(blocked_before_copy.get() == EINTR);
 }
 
 MACHA_TEST("filesystem_fuse", test_fuse_publication_notifications_coalesce_to_durable_watermarks) {
@@ -3157,7 +3246,15 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_unlink_and_rename_over_open_ino
         frontend->release(old_open.inode, true);
         REQUIRE(frontend->wait_for_idle(10s));
 
-        CHECK(frontend->path_for_inode(old_open.inode).empty());
+        // release() ended the final descriptor owner; once its detached dirty
+        // generation is retired, the stale inode number must no longer resolve.
+        bool stale_inode_reclaimed = false;
+        try {
+            (void)frontend->path_for_inode(old_open.inode);
+        } catch (const FsError& e) {
+            stale_inode_reclaimed = e.code() == EBADF;
+        }
+        CHECK(stale_inode_reclaimed);
         auto final = service.filesystem().getattr("/target.bin");
         CHECK(final.size == replacement.size());
         auto reader = service.filesystem().open_read("/target.bin");
@@ -3170,6 +3267,52 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_unlink_and_rename_over_open_ino
         }
         CHECK(actual == replacement);
     }
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_inode_ownership_reclaims_only_after_all_owners_release) {
+    TestService fixture("fuse-inode-ownership");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.fuse.publication_quiet = 0ms;
+
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    const auto baseline = frontend->status().inode_count;
+
+    // A detached inode remains owned by an open descriptor even after the
+    // durable unlink is fully confirmed.
+    auto created = frontend->create("/open-unlinked.bin", 0600, getuid(), getgid(), true, false,
+                                    false);
+    REQUIRE(frontend->wait_for_idle(10s));
+    frontend->unlink("/open-unlinked.bin");
+    REQUIRE(frontend->wait_for_idle(10s));
+    auto detached = frontend->status();
+    CHECK(detached.inode_count == baseline + 1);
+    CHECK(detached.detached_inode_count == 1);
+
+    frontend->release(created.inode, false);
+    auto released = frontend->status();
+    CHECK(released.inode_count == baseline);
+    CHECK(released.detached_inode_count == 0);
+    CHECK(released.reclaimed_inode_count == 1);
+
+    // Repeated create/close/unlink cycles must return the authoritative owner
+    // table to the same baseline; neither success batching nor container
+    // capacity is allowed to manufacture a process-lifetime inode owner.
+    constexpr size_t cycles = 64;
+    for (size_t i = 0; i < cycles; ++i) {
+        const auto path = "/lifecycle-" + std::to_string(i);
+        auto handle = frontend->create(path, 0600, getuid(), getgid(), true, false, false);
+        frontend->release(handle.inode, false);
+        frontend->unlink(path);
+    }
+    REQUIRE(frontend->wait_for_idle(20s));
+    const auto final = frontend->status();
+    CHECK(final.inode_count == baseline);
+    CHECK(final.detached_inode_count == 0);
+    CHECK(final.reclaimed_inode_count == cycles + 1);
+    CHECK(final.peak_inode_count <= baseline + cycles);
 }
 
 MACHA_TEST("filesystem_fuse", test_fuse_frontend_read_overlay_truncate_and_hydration_hints) {

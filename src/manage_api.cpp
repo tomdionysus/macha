@@ -388,6 +388,86 @@ Json identity_reset_json(const IdentityAssociationReset& reset) {
 
 } // namespace
 
+ManageApi::ManageApi(NodeRuntime& node, MetadataManager& metadata, FileSystem& fs,
+                     CatalogueManager& catalogue, CatalogueHintQueue& hints,
+                     CatalogueScanner& scanner)
+    : node_(node), metadata_(metadata), fs_(fs), catalogue_(catalogue), hints_(hints),
+      scanner_(scanner),
+      identity_audit_worker_([this](std::stop_token stop) {
+          identity_reset_audit_loop(stop);
+      }) {}
+
+ManageApi::~ManageApi() {
+    stop();
+}
+
+void ManageApi::request_stop() {
+    identity_audit_worker_.request_stop();
+    identity_audit_cv_.notify_all();
+}
+
+void ManageApi::stop() {
+    request_stop();
+    if (identity_audit_worker_.joinable())
+        identity_audit_worker_.join();
+}
+
+void ManageApi::queue_identity_reset_audit(IdentityAssociationReset reset) {
+    const auto key = identity_reset_key(reset.host, reset.port);
+    {
+        std::lock_guard lock(identity_audit_mutex_);
+        auto found = identity_audit_pending_.find(key);
+        if (found == identity_audit_pending_.end() || found->second.epoch < reset.epoch)
+            identity_audit_pending_[key] = std::move(reset);
+    }
+    identity_audit_cv_.notify_one();
+}
+
+void ManageApi::identity_reset_audit_loop(std::stop_token stop) {
+    while (!stop.stop_requested()) {
+        IdentityAssociationReset reset;
+        {
+            std::unique_lock lock(identity_audit_mutex_);
+            identity_audit_cv_.wait(lock, stop, [&] { return !identity_audit_pending_.empty(); });
+            if (stop.stop_requested())
+                break;
+            auto found = identity_audit_pending_.begin();
+            reset = std::move(found->second);
+            identity_audit_pending_.erase(found);
+        }
+
+        const auto key = identity_reset_key(reset.host, reset.port);
+        try {
+            // Peer propagation and the cluster-metadata audit are deliberately
+            // outside the HTTP request. The locally durable tombstone is the
+            // operational commit; these steps make that intent converge.
+            node_.propagate_identity_reset(reset);
+            const auto committed = metadata_.mutate_delta(
+                [&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+                    if (auto found = snapshot.identity_resets.find(key);
+                        found != snapshot.identity_resets.end() &&
+                        found->second.epoch >= reset.epoch) {
+                        if (found->second.epoch == std::numeric_limits<uint64_t>::max())
+                            throw std::runtime_error("identity association reset epoch exhausted");
+                        reset.epoch = found->second.epoch + 1;
+                    }
+                    snapshot.identity_resets[key] = reset;
+                    delta.upsert_identity_resets[key] = reset;
+                });
+            node_.propagate_identity_reset(reset);
+            Log::info("management identity reset audit completed scope=" + key +
+                      " epoch=" + std::to_string(reset.epoch) +
+                      " metadata_generation=" + std::to_string(committed.generation));
+        } catch (const std::exception& error) {
+            // The operational reset remains durable in Membership and travels
+            // in subsequent identity-reset exchanges. A later explicit reset
+            // can retry the optional cluster-metadata audit without undoing it.
+            Log::warn("management identity reset audit deferred scope=" + key +
+                      " epoch=" + std::to_string(reset.epoch) + " error=" + error.what());
+        }
+    }
+}
+
 HttpResponse ManageApi::handle(const HttpRequest& request) {
     // Management writes are intentionally serialized. Combined with immutable
     // media-id verification below this prevents two stale UI sessions from both
@@ -442,54 +522,27 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
             for (const auto& existing : node_.identity_resets())
                 if (identity_reset_key(existing.host, existing.port) == key)
                     advance_epoch(existing);
-            if (auto view = metadata_.available_snapshot_view())
-                if (auto found = view->snapshot->identity_resets.find(key);
-                    found != view->snapshot->identity_resets.end())
-                    advance_epoch(found->second);
 
-            node_.propagate_identity_reset(reset);
+            // The request commits only the small local recovery record. Peer
+            // propagation and metadata auditing may be arbitrarily slow and
+            // therefore belong exclusively to the asynchronous audit worker.
+            node_.apply_identity_reset(reset);
+            queue_identity_reset_audit(reset);
 
-            std::optional<uint64_t> metadata_generation;
-            std::string persistence_error;
-            try {
-                const auto committed = metadata_.mutate_delta(
-                    [&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
-                        if (auto found = snapshot.identity_resets.find(key);
-                            found != snapshot.identity_resets.end() &&
-                            found->second.epoch >= reset.epoch)
-                            advance_epoch(found->second);
-                    snapshot.identity_resets[key] = reset;
-                    delta.upsert_identity_resets[key] = reset;
-                    });
-                metadata_generation = committed.generation;
-                // A concurrent metadata reset may have advanced the epoch in
-                // the mutation callback after the first operational broadcast.
-                node_.propagate_identity_reset(reset);
-            } catch (const MetadataNotReady& error) {
-                persistence_error = error.what();
-                Log::warn("management identity reset applied with metadata persistence pending "
-                          "scope=" + key + " error=" + persistence_error);
-            }
-
-            Log::info("management identity reset applied scope=" + key +
+            Log::info("management identity reset accepted scope=" + key +
                       " stale_node_id=" +
                       (stale_id == NodeId{} ? std::string("<any>") : to_string(stale_id)) +
                       " epoch=" + std::to_string(reset.epoch) +
-                      (metadata_generation ? " metadata_generation=" +
-                                                 std::to_string(*metadata_generation)
-                                           : " metadata_persistence=pending") +
+                      " audit=queued" +
                       (reset.reason.empty() ? std::string{} : " reason=" + reset.reason));
 
             Json::Object out;
             out["reset"] = identity_reset_json(reset);
-            out["metadata_persisted"] = metadata_generation.has_value();
-            out["metadata_generation"] = metadata_generation
-                                             ? Json(*metadata_generation)
-                                             : Json(nullptr);
-            out["persistence_error"] = persistence_error.empty()
-                                           ? Json(nullptr)
-                                           : Json(persistence_error);
-            return http_json(metadata_generation ? 200 : 202, Json(std::move(out)).dump());
+            out["audit_state"] = "queued";
+            out["metadata_persisted"] = false;
+            out["metadata_generation"] = Json(nullptr);
+            out["persistence_error"] = Json(nullptr);
+            return http_json(202, Json(std::move(out)).dump());
         };
 
         // General cluster management action. This does not require a NodeId:
@@ -698,7 +751,7 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
                 return http_error(400, "not_directory", "path is not a directory");
             std::map<std::string, std::vector<std::string>, std::less<>> bindings;
             try {
-                bindings = media_bindings(catalogue_.snapshot());
+                bindings = media_bindings(*catalogue_.snapshot_view());
             } catch (const std::exception& e) {
                 // MachaDFS browsing is independent of catalogue availability.
                 // Binding annotations are a convenience only.

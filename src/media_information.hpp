@@ -39,6 +39,9 @@ class MediaInformationService {
     std::condition_variable_any cv_;
     std::map<std::string, std::shared_ptr<Flight>, std::less<>> flights_;
     std::map<std::string, MediaProbeResult, std::less<>> pending_publications_;
+    size_t pending_publication_bytes_{};
+    static constexpr size_t max_pending_publications_ = 128;
+    static constexpr size_t max_pending_publication_bytes_ = 4ULL * 1024 * 1024;
     std::optional<Clock::time_point> publication_retry_at_;
     std::chrono::milliseconds publication_retry_delay_{250};
     bool prune_requested_{true};
@@ -50,6 +53,7 @@ class MediaInformationService {
     MediaProbeResult resolve(std::string media_id, std::string path, FsEntry entry,
                              bool foreground, Clock::time_point deadline);
     void process_hint(const CatalogueHint&, std::stop_token);
+    void queue_publication_locked(std::string media_id, MediaProbeResult);
     void publish_one(std::string media_id, MediaProbeResult);
     void prune();
     void loop(std::stop_token);

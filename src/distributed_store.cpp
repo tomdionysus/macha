@@ -444,6 +444,21 @@ bool DistributedStore::durability_barrier(const DurabilityBatch& batch, FrameTyp
 }
 
 
+RpcReply DistributedStore::bounded_control_call(const NodeInfo& target, MessageType type,
+                                                std::span<const uint8_t> payload) {
+    auto request = n_.call_async(target, type, payload, FrameType::control);
+    const auto deadline = std::max(n_.config().dead_after, n_.config().connect_timeout);
+    if (request.wait_for(deadline) != std::future_status::ready) {
+        // Fast health probes can continue to succeed while an ordinary control
+        // worker is wedged. Abort this exact route so a retention-before-commit
+        // barrier is bounded and its pending promise/queue ownership is released.
+        request.abort();
+        throw std::runtime_error("control RPC deadline exceeded peer=" + target.host +
+                                 " message=" + std::to_string(static_cast<unsigned>(type)));
+    }
+    return request.get();
+}
+
 bool DistributedStore::retain_on(const NodeInfo& target, RetentionClass object_class,
                                  const std::vector<ObjectId>& input,
                                  const RetentionDot& dot) {
@@ -472,7 +487,7 @@ bool DistributedStore::retain_on(const NodeInfo& target, RetentionClass object_c
     for (const auto& id : ids)
         writer.fixed(id.bytes);
     try {
-        return n_.call(target, MessageType::retain_objects, writer.data(), FrameType::control)
+        return bounded_control_call(target, MessageType::retain_objects, writer.data())
                    .message.type == MessageType::ok;
     } catch (const std::exception& error) {
         Log::debug("retention claim peer=" + target.host + " error=" + error.what());
@@ -1095,7 +1110,7 @@ bool DistributedStore::has_on(const NodeInfo& target, const ObjectId& id) {
         return n_.local_store().valid(id);
     Writer writer;
     writer.fixed(id.bytes);
-    auto reply = n_.call(target, MessageType::have_object, writer.data());
+    auto reply = bounded_control_call(target, MessageType::have_object, writer.data());
     if (reply.message.type != MessageType::bool_reply)
         return false;
     Reader reader(reply.message.payload);

@@ -80,6 +80,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "  absolute_request_timeout_ms: 14000\n"
             << "  request_workers: 18\n"
             << "  max_pending_requests: 2048\n"
+            << "  max_pending_write_bytes: 24M\n"
             << "  commit_workers: 4\n"
             << "  recovery_commit_workers: 3\n"
             << "  foreground_commit_workers: 2\n"
@@ -267,6 +268,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(yc.fuse.absolute_request_timeout == 14000ms);
     CHECK(yc.fuse.request_workers == 18);
     CHECK(yc.fuse.max_pending_requests == 2048);
+    CHECK(yc.fuse.max_pending_write_bytes == 24ULL * 1024 * 1024);
     CHECK(yc.fuse.commit_workers == 4);
     CHECK(yc.fuse.recovery_commit_workers == 3);
     CHECK(yc.fuse.foreground_commit_workers == 2);

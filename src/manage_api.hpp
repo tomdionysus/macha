@@ -9,6 +9,9 @@
 #include "media_catalogue.hpp"
 
 #include <mutex>
+#include <condition_variable>
+#include <map>
+#include <thread>
 
 namespace macha {
 
@@ -23,12 +26,20 @@ class ManageApi {
     CatalogueHintQueue& hints_;
     CatalogueScanner& scanner_;
     std::mutex mutation_mutex_;
+    std::mutex identity_audit_mutex_;
+    std::condition_variable_any identity_audit_cv_;
+    std::map<std::string, IdentityAssociationReset, std::less<>> identity_audit_pending_;
+    std::jthread identity_audit_worker_;
+
+    void queue_identity_reset_audit(IdentityAssociationReset);
+    void identity_reset_audit_loop(std::stop_token);
 
   public:
     ManageApi(NodeRuntime& node, MetadataManager& metadata, FileSystem& fs,
-              CatalogueManager& catalogue, CatalogueHintQueue& hints, CatalogueScanner& scanner)
-        : node_(node), metadata_(metadata), fs_(fs), catalogue_(catalogue), hints_(hints),
-          scanner_(scanner) {}
+              CatalogueManager& catalogue, CatalogueHintQueue& hints, CatalogueScanner& scanner);
+    ~ManageApi();
+    void request_stop();
+    void stop();
 
     HttpResponse handle(const HttpRequest&);
 };

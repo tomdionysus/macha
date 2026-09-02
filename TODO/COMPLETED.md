@@ -4,6 +4,28 @@ Last updated: 2026-09-01
 
 This is the completed-work ledger for the current session. An item belongs here only after implementation and its stated verification are complete. Detailed design notes, exact test results, and UAT measurements remain in the linked records.
 
+## Asynchronous identity reset and retired-node status — 0.22.2
+
+- [x] Captured the deployed failure: resetting obsolete ES-1 identity `85ff…`
+  applied its tombstone immediately but held the HTTP response for 34.7 seconds
+  while synchronously publishing a 5.77 MB metadata snapshot.
+- [x] Moved peer propagation and metadata auditing to a coalescing background
+  worker. Reset now returns `202 Accepted` after only its small locally durable
+  operational tombstone, with `audit_state: "queued"`.
+- [x] Excluded retired identities from ordinary status rows, offline health,
+  replica counts and capacity totals. Per-node detail preserves the durable
+  record with `state: "retired"` and reset audit data.
+- [x] Added a regression which holds the metadata mutation owner while reset
+  admission completes in under 500 ms, plus reset propagation/unavailable-state
+  and retired-status coverage. All 252 core tests and all 3 runtime tests pass.
+- [x] Deployed to all four nodes. Live reset returned `202` in 2.568 ms and its
+  queued metadata audit completed 312 ms later at generation 2234. Both GBNI
+  observers omitted obsolete identity `85ff…` from normal cluster status. After
+  recovery from a separate ES-1 disk `EIO`, all four current identities reported
+  online, healthy and writable at generation 2234.
+
+Evidence: [identity association retirement](2026-09-01-identity-association-retirement.md)
+
 ## Exact metadata reconciliation recovery — 0.22.2
 
 - [x] Reproduced and corrected compact-delta selection for reconciliation which

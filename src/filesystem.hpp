@@ -5,7 +5,9 @@
 #include "metadata_manager.hpp"
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <deque>
 #include <memory>
@@ -15,6 +17,7 @@
 #include <set>
 #include <stdexcept>
 #include <vector>
+#include <thread>
 namespace macha {
 class FsError : public std::runtime_error {
     int c_;
@@ -65,6 +68,15 @@ struct WriteHandleDiagnostics {
 struct WritePreparation {
     bool ready{};
     uint64_t bytes_processed{};
+};
+
+struct ExtentExecutorDiagnostics {
+    uint64_t workers{};
+    uint64_t queued{};
+    uint64_t active{};
+    uint64_t peak_queued{};
+    uint64_t peak_active{};
+    uint64_t submitted{};
 };
 
 struct FilesystemNamespaceMutation {
@@ -186,7 +198,10 @@ class PlaybackTracker;
         Hash256 hash{};
     };
     std::map<std::pair<uint64_t, size_t>, std::pair<uint64_t, Hash256>> diagnostic_exact_writes_;
-    std::vector<DiagnosticWriteRange> diagnostic_writes_;
+    // Trace-only ownership is bounded. A diagnostic mode must never become a
+    // process/file-lifetime recorder for every write in a bulk transfer.
+    std::deque<DiagnosticWriteRange> diagnostic_writes_;
+    static constexpr size_t diagnostic_write_limit_ = 4096;
     std::chrono::milliseconds flush();
     std::chrono::milliseconds drain_one_extent();
     std::chrono::milliseconds drain_staging_locked();
@@ -242,6 +257,25 @@ class FileSystem {
     // daemon shutdown. Namespace-only operations are short metadata calls;
     // extent transfers carry this token into DistributedStore.
     std::atomic_bool io_cancelled_{};
+    // Publication extents use a fixed process-lifetime executor. Launching one
+    // std::async thread per extent caused glibc's per-thread arenas to retain
+    // gigabytes after sustained ingest even though logical DATA admission was
+    // bounded. The queue is bounded to two tasks per worker, matching the
+    // default per-publication pipeline without permitting thread proliferation.
+    using ExtentTask = std::packaged_task<WriteHandle::StagedExtentResult()>;
+    mutable std::mutex extent_tasks_mutex_;
+    std::condition_variable_any extent_tasks_cv_;
+    std::deque<std::shared_ptr<ExtentTask>> extent_tasks_;
+    size_t extent_worker_limit_{};
+    size_t extent_task_limit_{};
+    std::atomic_uint64_t extent_tasks_active_{};
+    std::atomic_uint64_t extent_tasks_peak_queued_{};
+    std::atomic_uint64_t extent_tasks_peak_active_{};
+    std::atomic_uint64_t extent_tasks_submitted_{};
+    std::vector<std::jthread> extent_workers_;
+    void extent_worker(std::stop_token);
+    std::future<WriteHandle::StagedExtentResult> submit_extent_task(
+        std::function<WriteHandle::StagedExtentResult()>);
     // Immutable media ids are used heavily by catalogue/playback resolution.
     // Cache their namespace lookup by metadata generation so playback startup
     // does not linearly re-hash every file for every candidate representation.
@@ -352,10 +386,14 @@ class FileSystem {
     std::chrono::milliseconds foreground_idle_for() const { return s_.foreground_idle_for(); }
     std::chrono::milliseconds interactive_idle_for() const { return s_.interactive_idle_for(); }
     void reset_io_cancellation() { io_cancelled_.store(false, std::memory_order_relaxed); }
-    void request_io_cancellation() { io_cancelled_.store(true, std::memory_order_relaxed); }
+    void request_io_cancellation() {
+        io_cancelled_.store(true, std::memory_order_relaxed);
+        extent_tasks_cv_.notify_all();
+    }
     bool io_cancellation_requested() const {
         return io_cancelled_.load(std::memory_order_relaxed);
     }
+    ExtentExecutorDiagnostics extent_executor_diagnostics() const;
     std::atomic_bool* io_cancellation_flag() { return &io_cancelled_; }
     NodeRuntime& node() {
         return n_;

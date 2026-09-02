@@ -14,12 +14,41 @@ extern "C" {
 #include <charconv>
 #include <cerrno>
 #include <limits>
+#include <memory>
 #include <regex>
 #include <set>
 #include <stdexcept>
 
 namespace macha {
 namespace {
+
+struct AvioContextDeleter {
+    void operator()(AVIOContext* value) const noexcept {
+        if (!value) return;
+        // avio_alloc_context() does not assume ownership of the caller's
+        // av_malloc() buffer. Release both parts as one scoped allocation.
+        av_freep(&value->buffer);
+        avio_context_free(&value);
+    }
+};
+using AvioContextOwner = std::unique_ptr<AVIOContext, AvioContextDeleter>;
+
+class AvInputContextOwner {
+    AVFormatContext* value_{};
+    bool opened_{};
+  public:
+    AvInputContextOwner(AVFormatContext* value, bool opened)
+        : value_(value), opened_(opened) {}
+    ~AvInputContextOwner() {
+        if (opened_)
+            avformat_close_input(&value_);
+        else if (value_)
+            avformat_free_context(value_);
+    }
+    AVFormatContext* get() const noexcept { return value_; }
+    AvInputContextOwner(const AvInputContextOwner&) = delete;
+    AvInputContextOwner& operator=(const AvInputContextOwner&) = delete;
+};
 
 std::string trim(std::string value) {
     auto ws = [](unsigned char c) { return std::isspace(c) != 0; };
@@ -210,8 +239,9 @@ void apply_embedded_music_metadata(FileSystem& fs, std::string_view path, const 
     constexpr int buffer_size = 64 * 1024;
     auto* buffer = static_cast<uint8_t*>(av_malloc(buffer_size));
     if (!buffer) throw std::bad_alloc();
-    auto* io = avio_alloc_context(buffer, buffer_size, 0, &state,
-                                  audio_metadata_read, nullptr, audio_metadata_seek);
+    AvioContextOwner io(avio_alloc_context(buffer, buffer_size, 0, &state,
+                                           audio_metadata_read, nullptr,
+                                           audio_metadata_seek));
     if (!io) {
         av_free(buffer);
         throw std::bad_alloc();
@@ -219,38 +249,32 @@ void apply_embedded_music_metadata(FileSystem& fs, std::string_view path, const 
     io->seekable = AVIO_SEEKABLE_NORMAL;
     auto* format = avformat_alloc_context();
     if (!format) {
-        avio_context_free(&io);
         throw std::bad_alloc();
     }
-    format->pb = io;
+    format->pb = io.get();
     format->flags |= AVFMT_FLAG_CUSTOM_IO;
     auto* candidate = format;
     const auto opened = avformat_open_input(&candidate, nullptr, nullptr, nullptr);
-    format = candidate;
+    AvInputContextOwner input(candidate, opened >= 0);
     if (opened < 0) {
-        if (format) avformat_free_context(format);
-        avio_context_free(&io);
         return;
     }
 
-    apply_format_audio_metadata(format, path, probe, artwork, max_artwork_bytes);
-    avformat_close_input(&format);
-    avio_context_free(&io);
+    apply_format_audio_metadata(input.get(), path, probe, artwork, max_artwork_bytes);
 }
 
 std::optional<MediaProbe> embedded_music_metadata_from_host(const std::filesystem::path& path) {
     AVFormatContext* format = nullptr;
     const auto opened = avformat_open_input(&format, path.string().c_str(), nullptr, nullptr);
-    if (opened < 0 || !format) {
-        if (format) avformat_close_input(&format);
+    AvInputContextOwner input(format, opened >= 0);
+    if (opened < 0 || !input.get()) {
         return std::nullopt;
     }
     MediaProbe probe;
     probe.kind = MediaProbeKind::track;
     probe.path = path.generic_string();
     std::vector<LocalArtworkCandidate> ignored_artwork;
-    apply_format_audio_metadata(format, probe.path, probe, ignored_artwork, 0);
-    avformat_close_input(&format);
+    apply_format_audio_metadata(input.get(), probe.path, probe, ignored_artwork, 0);
     return probe;
 }
 

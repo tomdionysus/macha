@@ -222,13 +222,15 @@ MACHA_TEST("invariants", test_manage_node_identity_association_reset) {
         R"({"host":"10.44.1.50","port":57401,"reason":"test endpoint reassignment"})";
     reset.body.assign(reset_body.begin(), reset_body.end());
     auto reset_response = manage.handle(reset);
-    REQUIRE(reset_response.status == 200);
+    REQUIRE(reset_response.status == 202);
     auto reset_json = Json::parse(std::string(
         reinterpret_cast<const char*>(reset_response.body.data()), reset_response.body.size()));
     const auto& reset_value = *reset_json.find("reset");
     CHECK(reset_value.find("stale_node_id")->asString() == to_string(stale.id));
     CHECK(reset_value.find("epoch")->asUInt64() == 1);
     CHECK(reset_value.find("scope")->asString() == "[10.44.1.50]:57401");
+    CHECK(reset_json.find("audit_state")->asString() == "queued");
+    CHECK(!reset_json.find("metadata_persisted")->asBool());
 
     const auto membership_after = service.node().membership().all();
     CHECK(std::none_of(membership_after.begin(), membership_after.end(),
@@ -248,10 +250,12 @@ MACHA_TEST("invariants", test_manage_node_identity_association_reset) {
     CHECK(std::any_of(membership_replacement.begin(), membership_replacement.end(),
                       [&](const NodeInfo& node) { return node.id == replacement.id; }));
 
+    const auto key = identity_reset_key(stale.host, stale.port);
+    REQUIRE(wait_until([&] {
+        return service.metadata_manager().snapshot().identity_resets.contains(key);
+    }));
     const auto metadata = service.metadata_manager().snapshot();
     CHECK(metadata.node_status.contains(stale.id));
-    const auto key = identity_reset_key(stale.host, stale.port);
-    REQUIRE(metadata.identity_resets.contains(key));
     CHECK(metadata.identity_resets.at(key).stale_node_id == stale.id);
     CHECK(metadata.identity_resets.at(key).reason == "test endpoint reassignment");
 
@@ -273,7 +277,7 @@ MACHA_TEST("invariants", test_manage_node_identity_association_reset) {
     const std::string reset_ip_body = R"({"host":"10.44.1.50","reason":"clear by ip"})";
     reset_ip.body.assign(reset_ip_body.begin(), reset_ip_body.end());
     auto reset_ip_response = manage.handle(reset_ip);
-    REQUIRE(reset_ip_response.status == 200);
+    REQUIRE(reset_ip_response.status == 202);
     auto reset_ip_json =
         Json::parse(std::string(reinterpret_cast<const char*>(reset_ip_response.body.data()),
                                 reset_ip_response.body.size()));
@@ -304,8 +308,11 @@ MACHA_TEST("invariants", test_manage_node_identity_association_reset) {
     CHECK(std::any_of(after_fresh_auth.begin(), after_fresh_auth.end(),
                       [&](const NodeInfo& node) { return node.id == fresh.id; }));
 
-    const auto metadata_after_ip = service.metadata_manager().snapshot();
     const auto ip_key = identity_reset_key("10.44.1.50", 0);
+    REQUIRE(wait_until([&] {
+        return service.metadata_manager().snapshot().identity_resets.contains(ip_key);
+    }));
+    const auto metadata_after_ip = service.metadata_manager().snapshot();
     REQUIRE(metadata_after_ip.identity_resets.contains(ip_key));
     CHECK(metadata_after_ip.identity_resets.at(ip_key).stale_node_id == NodeId{});
     CHECK(metadata_after_ip.identity_resets.at(ip_key).reason == "clear by ip");
@@ -345,14 +352,15 @@ MACHA_TEST("invariants", test_manage_identity_reset_breaks_metadata_unavailable_
     const auto response = manage.handle(reset);
 
     // The operational recovery succeeds before its cluster-metadata audit.
-    // HTTP 202 communicates that the durable local tombstone was accepted but
-    // the metadata write floor is not currently available.
+    // HTTP 202 communicates that the durable local tombstone was accepted and
+    // all cluster propagation/auditing is asynchronous.
     REQUIRE(response.status == 202);
     const auto value = Json::parse(std::string(
         reinterpret_cast<const char*>(response.body.data()), response.body.size()));
     CHECK(!value.find("metadata_persisted")->asBool());
     CHECK(value.find("metadata_generation")->isNull());
-    CHECK(!value.find("persistence_error")->asString().empty());
+    CHECK(value.find("persistence_error")->isNull());
+    CHECK(value.find("audit_state")->asString() == "queued");
     CHECK(value.find("reset")->find("stale_node_id")->asString() == to_string(stale.id));
 
     const auto members = service.node().membership().all();
@@ -362,6 +370,70 @@ MACHA_TEST("invariants", test_manage_identity_reset_breaks_metadata_unavailable_
     REQUIRE(resets.size() == 1);
     CHECK(resets.front().host == stale.host);
     CHECK(resets.front().port == stale.port);
+}
+
+MACHA_TEST("invariants", test_manage_identity_reset_does_not_wait_for_metadata_audit) {
+    TestService fixture("manage-identity-reset-async");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.hydration.enabled = false;
+    config.catalogue.scanner.enabled = false;
+    auto& service = fixture.start();
+    REQUIRE(wait_until([&] {
+        return service.metadata_manager().cluster_status().availability ==
+               MetadataAvailability::writable;
+    }));
+
+    auto& fs = service.filesystem();
+    auto& hints = service.catalogue_hints();
+    CatalogueScanner scanner(service.node(), fs, service.catalogue(), hints,
+                             config.catalogue.scanner);
+    ManageApi manage(service.node(), service.metadata_manager(), fs, service.catalogue(), hints,
+                     scanner);
+
+    NodeInfo stale;
+    stale.id = random_node_id();
+    stale.host = "10.34.1.50";
+    stale.port = 7437;
+    stale.failure_domain = "remote";
+    stale.seen_unix_ms = unix_ms();
+    service.node().membership().observe(stale, true);
+
+    // Hold the metadata mutation owner exactly where the deployed request
+    // spent 34.7 seconds. Reset admission must remain independent of it.
+    TestGate mutation_gate;
+    std::jthread blocker([&] {
+        service.metadata_manager().mutate_delta(
+            [&](MetadataSnapshot&, MetadataDelta&) { mutation_gate.enter_and_wait(); });
+    });
+    REQUIRE(mutation_gate.wait_for_entries(1));
+
+    HttpRequest reset;
+    reset.method = "POST";
+    reset.path = "/api/v1/manage/nodes/" + to_string(stale.id) +
+                 "/identity-association/reset";
+    const std::string body = R"({"reason":"latency regression"})";
+    reset.body.assign(body.begin(), body.end());
+    const auto began = Clock::now();
+    const auto response = manage.handle(reset);
+    const auto elapsed = Clock::now() - began;
+
+    REQUIRE(response.status == 202);
+    CHECK(elapsed < 500ms);
+    const auto members = service.node().membership().all();
+    CHECK(std::none_of(members.begin(), members.end(),
+                       [&](const NodeInfo& node) { return node.id == stale.id; }));
+    const auto value = Json::parse(std::string(
+        reinterpret_cast<const char*>(response.body.data()), response.body.size()));
+    CHECK(value.find("audit_state")->asString() == "queued");
+
+    mutation_gate.open();
+    blocker.join();
+    const auto key = identity_reset_key(stale.host, stale.port);
+    REQUIRE(wait_until([&] {
+        return service.metadata_manager().snapshot().identity_resets.contains(key);
+    }));
 }
 
 MACHA_TEST("invariants", test_status_api_precedes_control_plane_startup) {
@@ -670,6 +742,67 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     REQUIRE(cluster != nullptr);
     CHECK(cluster->find("metadata_availability")->asString() == "writable");
     CHECK(cluster->find("metadata_write_available")->asBool());
+}
+
+MACHA_TEST("invariants", test_status_excludes_retired_identity_from_live_cluster_health) {
+    TestNode fixture("status-retired-identity");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    auto& node = fixture.start();
+    auto& metadata = fixture.metadata();
+
+    const auto stale_id = random_node_id();
+    PersistedNodeStatus stale;
+    stale.observed_unix_ms = unix_ms() - 1000;
+    stale.host = "10.34.1.50";
+    stale.port = 7437;
+    stale.failure_domain = "remote";
+    stale.storage_capacity = 8ULL * 1024 * 1024 * 1024;
+    stale.storage_used = 1024;
+    metadata.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+        snapshot.node_status[stale_id] = stale;
+        delta.upsert_node_status[stale_id] = stale;
+    });
+
+    IdentityAssociationReset reset;
+    reset.host = stale.host;
+    reset.port = stale.port;
+    reset.stale_node_id = stale_id;
+    reset.epoch = 1;
+    reset.reset_unix_ms = unix_ms();
+    reset.reset_by = node.node_id();
+    reset.reason = "replaced node identity";
+    REQUIRE(node.apply_identity_reset(reset));
+    metadata.note_replica_validation(true);
+
+    ClusterStatusService status(node);
+    status.attach_metadata(metadata);
+    HttpRequest root_request;
+    root_request.method = "GET";
+    root_request.path = "/api/v1/status";
+    const auto root_response = status.handle(root_request);
+    REQUIRE(root_response.status == 200);
+    const auto root = Json::parse(std::string(
+        reinterpret_cast<const char*>(root_response.body.data()), root_response.body.size()));
+    CHECK(root.find("cluster")->find("nodes_known")->asUInt64() == 1);
+    CHECK(root.find("cluster")->find("nodes_online")->asUInt64() == 1);
+    CHECK(root.find("cluster")->find("health")->asString() == "healthy");
+    CHECK(root.find("nodes")->asArray().size() == 1);
+    CHECK(root.find("nodes")->asArray().front().find("id")->asString() ==
+          to_string(node.node_id()));
+
+    // The durable record remains explicitly queryable for audit, but is no
+    // longer presented as a failed member of the operational cluster.
+    HttpRequest detail_request;
+    detail_request.method = "GET";
+    detail_request.path = "/api/v1/status/nodes/" + to_string(stale_id);
+    const auto detail_response = status.handle(detail_request);
+    REQUIRE(detail_response.status == 200);
+    const auto detail = Json::parse(std::string(
+        reinterpret_cast<const char*>(detail_response.body.data()), detail_response.body.size()));
+    CHECK(detail.find("state")->asString() == "retired");
+    CHECK(detail.find("identity_association_reset")->find("epoch")->asUInt64() == 1);
 }
 
 MACHA_TEST("invariants", test_status_collects_connected_peer_telemetry_without_client_fanout) {

@@ -298,6 +298,8 @@ void Service::request_stop() {
         catalogue_http_->request_stop();
     if (streaming_)
         streaming_->request_stop();
+    if (manage_api_)
+        manage_api_->request_stop();
     if (maintenance_.joinable()) {
         maintenance_.request_stop();
         maintenance_wait_cv_.notify_all();
@@ -333,6 +335,8 @@ void Service::stop() {
         catalogue_http_->stop();
     if (streaming_)
         streaming_->stop();
+    if (manage_api_)
+        manage_api_->stop();
     if (maintenance_.joinable()) {
         Log::debug("shutdown: service maintenance request_stop");
         maintenance_.request_stop();

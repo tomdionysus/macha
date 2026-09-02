@@ -422,8 +422,7 @@ void WriteHandle::launch_pending_extent(PendingExtent& pending) {
     const auto offset = pending.offset;
     const auto bytes = pending.payload;
     const auto frame_type = work_context_.frame_type();
-    pending.result = std::async(
-        std::launch::async,
+    pending.result = fs_.submit_extent_task(
         [store, cancelled, cache_put, offset, frame_type, bytes] {
             const auto put_started = Clock::now();
             DistributedStore::DurabilityBatch batch;
@@ -795,6 +794,14 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
                                     std::to_string(i->hash == input_hash ? 1 : 0)
                               : std::string{}));
             ++overlap_logged;
+        }
+        if (diagnostic_writes_.size() >= diagnostic_write_limit_) {
+            const auto& victim = diagnostic_writes_.front();
+            auto exact = diagnostic_exact_writes_.find({victim.offset, victim.length});
+            if (exact != diagnostic_exact_writes_.end() &&
+                exact->second.first == victim.sequence)
+                diagnostic_exact_writes_.erase(exact);
+            diagnostic_writes_.pop_front();
         }
         diagnostic_exact_writes_[key] = {sequence, input_hash};
         diagnostic_writes_.push_back({sequence, off, d.size(), input_hash});
@@ -1321,7 +1328,80 @@ void WriteHandle::cleanup() {
     }
 }
 FileSystem::FileSystem(NodeRuntime& n, DistributedStore& s, MetadataManager& m, PlaybackTracker* playback)
-    : n_(n), s_(s), m_(m), playback_(playback) {}
+    : n_(n), s_(s), m_(m), playback_(playback) {
+    extent_worker_limit_ = std::max<size_t>(1, n_.config().fuse.commit_workers);
+    extent_task_limit_ = extent_worker_limit_ * 2;
+    extent_workers_.reserve(extent_worker_limit_);
+}
+
+void FileSystem::extent_worker(std::stop_token stop) {
+    while (true) {
+        std::shared_ptr<ExtentTask> task;
+        {
+            std::unique_lock lock(extent_tasks_mutex_);
+            extent_tasks_cv_.wait(lock, stop,
+                                  [&] { return !extent_tasks_.empty(); });
+            if (extent_tasks_.empty()) {
+                if (stop.stop_requested())
+                    return;
+                continue;
+            }
+            task = std::move(extent_tasks_.front());
+            extent_tasks_.pop_front();
+        }
+        extent_tasks_cv_.notify_all();
+        const auto active = extent_tasks_active_.fetch_add(1, std::memory_order_relaxed) + 1;
+        auto peak = extent_tasks_peak_active_.load(std::memory_order_relaxed);
+        while (peak < active && !extent_tasks_peak_active_.compare_exchange_weak(
+                                    peak, active, std::memory_order_relaxed)) {
+        }
+        (*task)();
+        extent_tasks_active_.fetch_sub(1, std::memory_order_relaxed);
+    }
+}
+
+std::future<WriteHandle::StagedExtentResult> FileSystem::submit_extent_task(
+    std::function<WriteHandle::StagedExtentResult()> fn) {
+    auto task = std::make_shared<ExtentTask>(std::move(fn));
+    auto result = task->get_future();
+    {
+        std::unique_lock lock(extent_tasks_mutex_);
+        if (extent_workers_.empty()) {
+            for (size_t i = 0; i < extent_worker_limit_; ++i)
+                extent_workers_.emplace_back(
+                    [this](std::stop_token stop) { extent_worker(stop); });
+        }
+        extent_tasks_cv_.wait(lock, [&] {
+            return io_cancellation_requested() || extent_tasks_.size() < extent_task_limit_;
+        });
+        if (io_cancellation_requested())
+            throw std::runtime_error("extent publication cancelled");
+        extent_tasks_.push_back(std::move(task));
+        extent_tasks_submitted_.fetch_add(1, std::memory_order_relaxed);
+        const auto queued = extent_tasks_.size();
+        auto peak = extent_tasks_peak_queued_.load(std::memory_order_relaxed);
+        while (peak < queued && !extent_tasks_peak_queued_.compare_exchange_weak(
+                                    peak, queued, std::memory_order_relaxed)) {
+        }
+    }
+    extent_tasks_cv_.notify_one();
+    return result;
+}
+
+ExtentExecutorDiagnostics FileSystem::extent_executor_diagnostics() const {
+    uint64_t queued = 0;
+    uint64_t workers = 0;
+    {
+        std::lock_guard lock(extent_tasks_mutex_);
+        queued = extent_tasks_.size();
+        workers = extent_workers_.size();
+    }
+    return {workers, queued,
+            extent_tasks_active_.load(std::memory_order_relaxed),
+            extent_tasks_peak_queued_.load(std::memory_order_relaxed),
+            extent_tasks_peak_active_.load(std::memory_order_relaxed),
+            extent_tasks_submitted_.load(std::memory_order_relaxed)};
+}
 MetadataSnapshot FileSystem::snap() {
     return m_.snapshot();
 }

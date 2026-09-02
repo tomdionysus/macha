@@ -929,7 +929,12 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_mutations_use_bounded_isolated_execu
         },
         [](const NodeInfo&) {}, 256 * 1024,
         RpcServerExecutionLimits{
-            .metadata_workers = 1, .metadata_pending_jobs = 2, .metadata_pending_bytes = 8});
+            .metadata_workers = 1,
+            .metadata_pending_jobs = 2,
+            .metadata_pending_bytes = 8,
+            .fast_control_pending_bytes = 1,
+            .control_pending_bytes = 1,
+            .data_pending_bytes = 1});
     server.start();
 
     NodeInfo client_info;
@@ -994,8 +999,24 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_mutations_use_bounded_isolated_execu
     REQUIRE(too_large.wait_for(1s) == std::future_status::ready);
     CHECK(too_large.get().message.type == MessageType::error);
     CHECK(metadata_calls.load() == 3);
+    // Every other executor class has an independent byte owner as well. A
+    // rejected payload never enters a queue and cannot consume another class's
+    // reserved memory.
+    auto fast_too_large = client.call_async(endpoint, MessageType::ping, Bytes(2, 0x11));
+    auto control_too_large =
+        client.call_async(endpoint, MessageType::have_object, Bytes(2, 0x12));
+    auto data_too_large = client.call_async(endpoint, MessageType::get_object, Bytes(2, 0x13),
+                                            FrameType::foreground);
+    for (auto* rejected : {&fast_too_large, &control_too_large, &data_too_large}) {
+        REQUIRE(rejected->wait_for(1s) == std::future_status::ready);
+        CHECK(rejected->get().message.type == MessageType::error);
+    }
     const auto final_stats = server.work_stats();
     CHECK(final_stats.metadata_rejected_jobs == 2);
+    CHECK(final_stats.rejected_jobs == 3);
+    CHECK(final_stats.fast_control_pending_bytes == 0);
+    CHECK(final_stats.control_pending_bytes == 0);
+    CHECK(final_stats.data_pending_bytes == 0);
     REQUIRE(final_stats.message_timings.contains(MessageType::put_metadata_history_entry));
     REQUIRE(final_stats.message_timings.contains(MessageType::put_metadata_commit));
     REQUIRE(final_stats.message_timings.contains(MessageType::accept_metadata_commit));
@@ -1940,6 +1961,9 @@ MACHA_TEST("rpc_cluster", test_service_metadata_repair_coalesces_real_generation
         return s1.node().membership().active().size() >= 2 &&
                s2.node().membership().active().size() >= 2;
     }));
+    // Equal generation is not convergence: simultaneous founders can briefly
+    // hold distinct same-generation heads.  Establish a single shared head so
+    // later reconciliation cannot pollute the burst/coalescing counters.
     REQUIRE(wait_until(
         [&] {
             const auto d1 = s1.metadata_convergence_diagnostics();
@@ -1947,6 +1971,10 @@ MACHA_TEST("rpc_cluster", test_service_metadata_repair_coalesces_real_generation
             return s1.node().metadata_replica().committed_generation() > 1 &&
                    s1.node().metadata_replica().committed_generation() ==
                        s2.node().metadata_replica().committed_generation() &&
+                   s1.node().metadata_replica().committed().hash ==
+                       s2.node().metadata_replica().committed().hash &&
+                   s1.node().metadata_replica().accepted_heads().size() == 1 &&
+                   s2.node().metadata_replica().accepted_heads().size() == 1 &&
                    !d1.scheduled && d1.runs_scheduled == d1.runs_completed && !d2.scheduled &&
                    d2.runs_scheduled == d2.runs_completed;
         },
@@ -2278,7 +2306,7 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
     s1.stop();
 }
 
-MACHA_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_before_acceptance) {
+MACHA_HEAVY_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_before_acceptance) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
@@ -2364,6 +2392,23 @@ MACHA_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_before_acc
                s2.node().membership().active().size() == 3 &&
                s3->node().membership().active().size() == 3;
     }));
+    // Membership is a control-plane observation; it can precede availability
+    // of the ordinary control worker which serves retention/object queries.
+    // Prove that exact path is usable before requiring the W=3 mutation. Each
+    // failed attempt is itself deadline-bounded and aborts its concrete route.
+    REQUIRE(wait_until([&] {
+        try {
+            const auto returning_id = s3->node().node_id();
+            const auto active = s1.node().membership().active();
+            const auto returning = std::find_if(active.begin(), active.end(), [&](const auto& n) {
+                return n.id == returning_id;
+            });
+            return returning != active.end() &&
+                   s1.filesystem().store().has_on(*returning, extent);
+        } catch (...) {
+            return false;
+        }
+    }, 10s));
     s1.filesystem().chmod("/retained.bin", 0600);
     CHECK((s1.filesystem().getattr("/retained.bin").mode & 0777U) == 0600U);
     CHECK(s1.node().metadata_replica().committed().hash != before.hash);

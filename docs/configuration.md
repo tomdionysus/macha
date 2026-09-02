@@ -126,6 +126,11 @@ When false, any existing Macha mount is a hard startup error.
 
 `spool_path` can contain the full accepted-but-not-yet-published write backlog and must be sized accordingly. `operation_journal_path` contains the ordered durable descriptors needed to interpret that spool. `max_spool_bytes` is configurable and defaults to 16 GiB. It is a bounded backlog budget rather than a logical `ENOSPC` point: writes burst at local-spool speed below 50% occupancy, pressure starts publication, and admission is progressively paced from measured completed-publication throughput until it matches that throughput by 90% occupancy. At the bound, writers sleep on publication/retirement events instead of polling or failing. A single write larger than the complete bound is rejected, and `spool_reserve_free` can still return `ENOSPC` to protect physical free space.
 
+`max_pending_write_bytes` bounds copied FUSE write payloads before they enter
+the disk spool (32 MiB by default). Admission waits before copying when this
+budget is occupied, so the request-count limit cannot translate into an
+unbounded heap commitment during a slow or saturated spool.
+
 Data publication is fairly time-sliced by bytes. A generation retains its
 provisional writer and exact spool cursor after each
 `publication_quantum_bytes` (32 MiB by default), returns to the loader queue,
@@ -152,6 +157,8 @@ requires a server restart. Status exposes current bytes, configured limit,
 measured publication rate, its aggregate retirement window, cumulative throttle
 waits, quantum/yield counts, and peak admitted publication bytes beneath
 `diagnostics.filesystem`.
+The same object reports pending/peak write-request bytes and fixed extent
+executor worker, queue, active and peak counts.
 
 The remaining FUSE worker/timeout fields bound local kernel-facing work. They do not turn `fsync()` into a promise of cluster-wide convergence; accepted local state is made crash-recoverable first and distributed publication continues asynchronously.
 

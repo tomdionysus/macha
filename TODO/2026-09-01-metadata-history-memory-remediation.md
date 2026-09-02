@@ -90,6 +90,10 @@ amplification, and tests fail for the intended bounds.
 - [ ] Preserve current/committed/accepted heads, but account pinned bytes. If
   required pins exceed the configured budget, report pressure explicitly and
   avoid admitting optional history work; never silently discard authority.
+  Decoded accepted-head trees are no longer pins: acceptance certificates and
+  indexed durable history preserve their authority and reconstructibility.
+  Current/committed decoded views remain pinned and accurately deep-accounted;
+  explicit pinned-byte/pressure Status diagnostics remain to be added.
 - [x] Avoid duplicate ownership of the same encoded snapshot between history,
   `MetadataRecord`, materialisation and decoded-view caches where immutable
   sharing is possible.
@@ -104,6 +108,8 @@ Tests:
   and restart return byte-identical records with on-demand paging.
 - [x] Concurrent identical misses perform one reconstruction and share the
   immutable result.
+- [x] A 200-delta cold reconstruction retains and caches only its requested
+  final snapshot, rather than every complete intermediate namespace.
 - [ ] Eviction and pressure shedding preserve pinned authority and do no work on
   viewer/control threads.
 
