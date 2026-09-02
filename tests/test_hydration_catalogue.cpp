@@ -411,10 +411,19 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
     concurrent.add_provider(concurrent_provider);
     concurrent.start();
     REQUIRE(wait_until([&] { return concurrent.status().fetched >= 3; }, 5s));
+    REQUIRE(wait_until([&] { return concurrent.status().executor_completed >= 3; }, 1s));
+    const auto live_executor = concurrent.status();
+    CHECK(live_executor.executor_workers == concurrent_config.max_inflight);
+    CHECK(live_executor.executor_submitted == 3);
+    CHECK(live_executor.executor_completed == 3);
+    CHECK(live_executor.executor_queued == 0);
+    CHECK(live_executor.executor_peak_queued <= concurrent_config.max_inflight);
     concurrent.stop();
     auto concurrent_status = concurrent.status();
     CHECK(concurrent_status.peak_in_flight == 2);
     CHECK(concurrent_status.in_flight == 0);
+    CHECK(concurrent_status.executor_workers == 0);
+    CHECK(concurrent_status.executor_queued == 0);
     CHECK(n2.block_cache().has(parallel0));
     CHECK(n2.block_cache().has(parallel1));
     CHECK(n2.block_cache().has(parallel2));
@@ -1222,6 +1231,16 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     CHECK(tmdb_miss_http.requests() == 1);
     CHECK(!tmdb_miss.lookup(missing_movie).has_value());
     CHECK(tmdb_miss_http.requests() == 1);
+
+    // Provider validity caches are optional acceleration, not process-lifetime
+    // ownership of every title ever inspected.
+    for (size_t i = 0; i < 300; ++i) {
+        auto distinct = missing_movie;
+        distinct.title = "Missing cache ownership " + std::to_string(i);
+        CHECK(!tmdb_miss.lookup(distinct).has_value());
+    }
+    CHECK(tmdb_miss.cache_entries() <= 256);
+    CHECK(tmdb_miss.cache_bytes() <= 8ULL * 1024 * 1024);
 
     // Transport/provider failures are deliberately not negative-cached: the
     // next scan gets another chance after a transient outage.
@@ -2970,7 +2989,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_control_gc_protects_future_root
     CHECK(!service.node().control_store().has(staged_id));
 }
 
-MACHA_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_gc) {
+MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_gc) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
     uint16_t p1 = free_port();
@@ -3054,6 +3073,16 @@ MACHA_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_gc) {
     auto s3_first_art = s3.catalogue().artwork(first_art.id);
     REQUIRE(s3_first_art.has_value());
     CHECK(s3_first_art->bytes == first_art_bytes);
+
+    // Catalogue metadata can arrive through the bootstrap node before the
+    // joining nodes have learned routes to one another.  R=1 placement and
+    // fallback reads are only meaningful against a common membership view, so
+    // establish that precondition rather than racing topology dissemination.
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() == 3 &&
+               s2.node().membership().active().size() == 3 &&
+               s3.node().membership().active().size() == 3;
+    }, 10s));
 
     // Replacing the poster retires the old DATA object in committed metadata.
     // With a zero grace period, reachability GC must delete the old authoritative

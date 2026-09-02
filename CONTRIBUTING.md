@@ -1,5 +1,10 @@
 # Contributing
 
+Memory-owning changes must follow the repository's
+[ownership and lifecycle contract](docs/ownership.md). Long-lived state is not
+complete without an explicit owner, bound, release paths, diagnostics and a
+repeat-cycle lifecycle test.
+
 Macha is intentionally small. Prefer a direct fix over another layer.
 
 ## Build and test

@@ -23,6 +23,76 @@ constexpr std::array<uint8_t, 8> SM5{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'},
     MS{'D', 'H', 'T', 'M', 'S', 'E', 'Q', '1'};
 constexpr uint8_t JOURNAL_PREPARE_FULL = 1, JOURNAL_PREPARE_DELTA = 2, JOURNAL_SEED_FULL = 3,
                   JOURNAL_COMMIT = 4;
+
+void saturated_add(uint64_t& total, uint64_t value) {
+    total = value > std::numeric_limits<uint64_t>::max() - total
+                ? std::numeric_limits<uint64_t>::max()
+                : total + value;
+}
+
+template <class Map> void account_map_nodes(uint64_t& total, const Map& values) {
+    // Standard tree implementations allocate one node per value. Four pointers
+    // covers parent/children plus allocator/alignment bookkeeping without
+    // pretending that sizeof(map::value_type) describes the allocation.
+    saturated_add(total, static_cast<uint64_t>(values.size()) *
+                             (sizeof(typename Map::value_type) + 4 * sizeof(void*)));
+}
+
+void account_string(uint64_t& total, const std::string& value) {
+    // capacity() includes any allocator slack which encoded-size multipliers miss.
+    saturated_add(total, static_cast<uint64_t>(value.capacity()) + 1);
+}
+
+void account_entry_allocations(uint64_t& total, const FsEntry& entry) {
+    saturated_add(total, static_cast<uint64_t>(entry.extents.capacity()) * sizeof(ExtentRef));
+}
+
+uint64_t snapshot_resident_bytes(const MetadataSnapshot& snapshot) {
+    uint64_t total = sizeof(MetadataSnapshot);
+    saturated_add(total, snapshot.metadata_voters.capacity() * sizeof(NodeId));
+    account_map_nodes(total, snapshot.mutation_sequences);
+    account_map_nodes(total, snapshot.metadata_participants);
+    account_map_nodes(total, snapshot.entries);
+    for (const auto& [path, entry] : snapshot.entries) {
+        account_string(total, path);
+        account_entry_allocations(total, entry);
+    }
+    saturated_add(total, snapshot.garbage.capacity() * sizeof(GarbageRef));
+    account_map_nodes(total, snapshot.node_status);
+    for (const auto& [_, status] : snapshot.node_status) {
+        account_string(total, status.version);
+        account_string(total, status.host);
+        account_string(total, status.failure_domain);
+    }
+    account_map_nodes(total, snapshot.identity_resets);
+    for (const auto& [key, reset] : snapshot.identity_resets) {
+        account_string(total, key);
+        account_string(total, reset.host);
+        account_string(total, reset.reason);
+    }
+    saturated_add(total, snapshot.merge_parents.capacity() * sizeof(Hash256));
+    account_map_nodes(total, snapshot.conflicts);
+    for (const auto& [id, conflict] : snapshot.conflicts) {
+        account_string(total, id);
+        account_string(total, conflict.key);
+        if (conflict.base_entry)
+            account_entry_allocations(total, *conflict.base_entry);
+        if (conflict.left_entry)
+            account_entry_allocations(total, *conflict.left_entry);
+        if (conflict.right_entry)
+            account_entry_allocations(total, *conflict.right_entry);
+    }
+    return total;
+}
+
+std::shared_ptr<const MetadataMaterialization>
+make_materialization(MetadataRecord record, std::shared_ptr<const MetadataSnapshot> snapshot) {
+    uint64_t bytes = sizeof(MetadataMaterialization) + sizeof(Bytes) + 64;
+    saturated_add(bytes, record.payload.size());
+    saturated_add(bytes, snapshot_resident_bytes(*snapshot));
+    return std::make_shared<const MetadataMaterialization>(
+        MetadataMaterialization{std::move(record), std::move(snapshot), bytes});
+}
 void entry(Writer& w, const FsEntry& e) {
     w.u8((uint8_t)e.type);
     w.u32(e.mode);
@@ -2582,7 +2652,8 @@ MetadataHistoryEntry MetadataReplica::history_for_current(std::span<const uint8_
 }
 
 std::shared_ptr<const MetadataMaterialization> MetadataReplica::cache_materialization_locked(
-    const MetadataRecord& record, std::shared_ptr<const MetadataSnapshot> snapshot) const {
+    const MetadataRecord& record, std::shared_ptr<const MetadataSnapshot> snapshot,
+    uint64_t resident_bytes) const {
     constexpr size_t cache_limit = 64;
     auto found = materialized_history_.find(record.hash);
     if (found != materialized_history_.end()) {
@@ -2592,34 +2663,28 @@ std::shared_ptr<const MetadataMaterialization> MetadataReplica::cache_materializ
 
     if (!snapshot)
         snapshot = std::make_shared<const MetadataSnapshot>(decode_snapshot(record.payload));
-    auto value = std::make_shared<const MetadataMaterialization>(
-        MetadataMaterialization{record, std::move(snapshot)});
-    // Account conservatively for the decoded object graph without walking it
-    // on every insertion. Encoded namespace state is compact; four times its
-    // size plus fixed overhead is a safe operational cache weight.
-    const uint64_t bytes = record.payload.size() >
-                                   (std::numeric_limits<uint64_t>::max() - 4096) / 4
-                               ? std::numeric_limits<uint64_t>::max()
-                               : static_cast<uint64_t>(record.payload.size()) * 4 + 4096;
-    const bool incoming_pinned = record.hash == cur_.hash || record.hash == committed_.hash ||
-                                 accepted_heads_.contains(record.hash);
+    auto value = resident_bytes
+                     ? std::make_shared<const MetadataMaterialization>(MetadataMaterialization{
+                           record, std::move(snapshot), resident_bytes})
+                     : make_materialization(record, std::move(snapshot));
+    const uint64_t bytes = value->resident_bytes;
+    const bool incoming_pinned = record.hash == cur_.hash || record.hash == committed_.hash;
 
     while (materialized_history_.size() >= cache_limit ||
-           (bytes <= materialized_history_limit_bytes_ &&
-            materialized_history_bytes_ > materialized_history_limit_bytes_ - bytes)) {
+           bytes > materialized_history_limit_bytes_ ||
+           materialized_history_bytes_ > materialized_history_limit_bytes_ - bytes) {
         auto victim = materialized_history_.end();
         for (auto it = materialized_history_.begin(); it != materialized_history_.end(); ++it) {
-            const bool pinned = it->first == cur_.hash || it->first == committed_.hash ||
-                                accepted_heads_.contains(it->first);
+            const bool pinned = it->first == cur_.hash || it->first == committed_.hash;
             if (pinned)
                 continue;
             if (victim == materialized_history_.end() ||
                 it->second.last_used < victim->second.last_used)
                 victim = it;
         }
-        // Accepted/current heads are correctness-relevant hot materializations.
-        // A pathological number of concurrent accepted heads may temporarily
-        // exceed the soft bound rather than evicting one of those entries.
+        // Current/committed decoded views are hot. Accepted-head authority is
+        // the durable certificate plus history record, never this reconstructible
+        // optimization, so divergent heads must not multiply permanent RAM.
         if (victim == materialized_history_.end())
             break;
         materialized_history_bytes_ -= victim->second.bytes;
@@ -2629,7 +2694,7 @@ std::shared_ptr<const MetadataMaterialization> MetadataReplica::cache_materializ
 
     // A one-off historical snapshot larger than the entire budget remains
     // usable by its caller but does not become permanent process state. Current
-    // and accepted heads stay pinned because they are active authority.
+    // heads stay pinned because they are the active local view.
     if (bytes > materialized_history_limit_bytes_ && !incoming_pinned)
         return value;
     materialized_history_.emplace(record.hash,
@@ -2655,7 +2720,10 @@ MetadataReplica::materialized_locked(const Hash256& target) const {
 
     historical_reconstructions_.fetch_add(1, std::memory_order_relaxed);
 
-    std::vector<MetadataHistoryEntry> deltas;
+    // Ownership invariant: history_ owns only lightweight frame indexes; this
+    // reconstruction owns one mutable decoded tree and at most one delta body
+    // at a time. Intermediate full trees and payloads never enter the cache.
+    std::vector<HistoryIndexEntry> deltas;
     std::set<Hash256> seen;
     HistoryIndexEntry cursor = found->second;
     std::shared_ptr<const MetadataMaterialization> materialized_parent;
@@ -2663,7 +2731,7 @@ MetadataReplica::materialized_locked(const Hash256& target) const {
         if (!seen.insert(cursor.hash).second || !cursor.previous_known)
             return {};
         try {
-            deltas.push_back(read_history_entry(cursor));
+            deltas.push_back(cursor);
         } catch (...) {
             return {};
         }
@@ -2679,9 +2747,12 @@ MetadataReplica::materialized_locked(const Hash256& target) const {
         }
     }
 
-    std::shared_ptr<const MetadataMaterialization> materialized;
+    MetadataRecord working_record;
+    MetadataSnapshot working_snapshot;
     if (materialized_parent) {
-        materialized = std::move(materialized_parent);
+        working_record = materialized_parent->record;
+        working_snapshot = *materialized_parent->snapshot;
+        materialized_parent.reset();
     } else {
         MetadataHistoryEntry anchor;
         try {
@@ -2689,48 +2760,48 @@ MetadataReplica::materialized_locked(const Hash256& target) const {
         } catch (...) {
             return {};
         }
-        MetadataRecord record;
-        record.generation = anchor.generation;
-        record.previous = anchor.previous;
-        record.hash = anchor.hash;
-        record.payload = anchor.payload;
-        if (!valid_metadata_record(record))
+        working_record.generation = anchor.generation;
+        working_record.previous = anchor.previous;
+        working_record.hash = anchor.hash;
+        working_record.payload = std::move(anchor.payload);
+        if (!valid_metadata_record(working_record))
             return {};
         try {
-            auto snapshot = decode_snapshot(record.payload);
-            if (snapshot.merge_parents != anchor.merge_parents)
+            working_snapshot = decode_snapshot(working_record.payload);
+            if (working_snapshot.merge_parents != anchor.merge_parents)
                 return {};
-            materialized = cache_materialization_locked(
-                record, std::make_shared<const MetadataSnapshot>(std::move(snapshot)));
         } catch (...) {
             return {};
         }
     }
 
     for (auto it = deltas.rbegin(); it != deltas.rend(); ++it) {
-        const auto& child = *it;
-        const auto& parent = materialized->record;
-        if (child.previous != parent.hash || child.generation != parent.generation + 1)
-            return {};
         try {
-            auto snapshot = *materialized->snapshot;
+            const auto child = read_history_entry(*it);
+            if (child.previous != working_record.hash ||
+                child.generation != working_record.generation + 1)
+                return {};
             const auto delta = decode_metadata_delta(child.payload);
-            apply_metadata_delta_in_place(snapshot, delta);
+            apply_metadata_delta_in_place(working_snapshot, delta);
             historical_deltas_applied_.fetch_add(1, std::memory_order_relaxed);
             MetadataRecord next;
             next.generation = child.generation;
             next.previous = child.previous;
             next.hash = child.hash;
-            next.payload = encode_snapshot_for_delta(child.payload, snapshot);
-            if (!valid_metadata_record(next) || snapshot.merge_parents != child.merge_parents)
+            next.payload = encode_snapshot_for_delta(child.payload, working_snapshot);
+            if (!valid_metadata_record(next) ||
+                working_snapshot.merge_parents != child.merge_parents)
                 return {};
-            materialized = cache_materialization_locked(
-                next, std::make_shared<const MetadataSnapshot>(std::move(snapshot)));
+            working_record = std::move(next);
         } catch (...) {
             return {};
         }
     }
-    return materialized;
+    if (working_record.hash != target)
+        return {};
+    return cache_materialization_locked(
+        working_record,
+        std::make_shared<const MetadataSnapshot>(std::move(working_snapshot)));
 }
 
 std::optional<MetadataRecord> MetadataReplica::historical_locked(const Hash256& target) const {
@@ -2908,8 +2979,7 @@ bool MetadataReplica::import_history(const MetadataHistoryEntry& entry_value) {
         }
         if (!valid_metadata_record(record) || snapshot->merge_parents != entry_value.merge_parents)
             return false;
-        candidate = std::make_shared<const MetadataMaterialization>(
-            MetadataMaterialization{std::move(record), std::move(snapshot)});
+        candidate = make_materialization(std::move(record), std::move(snapshot));
     } catch (...) {
         return false;
     }
@@ -2935,7 +3005,8 @@ bool MetadataReplica::import_history(const MetadataHistoryEntry& entry_value) {
                      index_history_entry(entry_value, file_offset, frame.size()));
     ++history_records_;
     history_bytes_ += frame.size();
-    cache_materialization_locked(candidate->record, candidate->snapshot);
+    cache_materialization_locked(candidate->record, candidate->snapshot,
+                                 candidate->resident_bytes);
     if (prune_accepted_heads_locked()) {
         persist_heads_locked();
         refresh_materialized_head_locked();
@@ -2975,8 +3046,8 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
     std::shared_ptr<const MetadataMaterialization> reconstructed;
     try {
         if (entry_value.body == MetadataHistoryEntry::Body::full) {
-            reconstructed = std::make_shared<const MetadataMaterialization>(MetadataMaterialization{
-                record, std::make_shared<const MetadataSnapshot>(decode_snapshot(record.payload))});
+            reconstructed = make_materialization(
+                record, std::make_shared<const MetadataSnapshot>(decode_snapshot(record.payload)));
         } else {
             auto parent = materialized(entry_value.previous);
             if (!parent)
@@ -2988,8 +3059,8 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
             value.previous = entry_value.previous;
             value.hash = entry_value.hash;
             value.payload = encode_snapshot_for_delta(entry_value.payload, snapshot);
-            reconstructed = std::make_shared<const MetadataMaterialization>(MetadataMaterialization{
-                std::move(value), std::make_shared<const MetadataSnapshot>(std::move(snapshot))});
+            reconstructed = make_materialization(
+                std::move(value), std::make_shared<const MetadataSnapshot>(std::move(snapshot)));
         }
     } catch (...) {
         return false;
@@ -3021,7 +3092,8 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
                      index_history_entry(entry_value, file_offset, frame.size()));
     ++history_records_;
     history_bytes_ += frame.size();
-    cache_materialization_locked(reconstructed->record, reconstructed->snapshot);
+    cache_materialization_locked(reconstructed->record, reconstructed->snapshot,
+                                 reconstructed->resident_bytes);
     return true;
 }
 
@@ -3216,57 +3288,62 @@ MetadataReplica::materialized(const Hash256& hash) const {
 
     // Snapshot decoding, delta application, encoding, and hashing can dominate
     // recovery time. They deliberately run without the global replica mutex.
-    std::vector<std::shared_ptr<const MetadataMaterialization>> calculated;
-    std::shared_ptr<const MetadataMaterialization> value = std::move(base);
+    // Keep exactly one mutable reconstruction. The old implementation retained
+    // every full intermediate snapshot until replay completed, multiplying a
+    // large namespace by the delta-chain length before cache eviction ran.
+    MetadataRecord working_record;
+    MetadataSnapshot working_snapshot;
     try {
-        if (!value) {
-            const auto anchor = read_history_entry(anchor_index);
-            MetadataRecord record;
-            record.generation = anchor.generation;
-            record.previous = anchor.previous;
-            record.hash = anchor.hash;
-            record.payload = anchor.payload;
-            if (!valid_metadata_record(record))
+        if (base) {
+            working_record = base->record;
+            working_snapshot = *base->snapshot;
+            base.reset();
+        } else {
+            auto anchor = read_history_entry(anchor_index);
+            working_record.generation = anchor.generation;
+            working_record.previous = anchor.previous;
+            working_record.hash = anchor.hash;
+            working_record.payload = std::move(anchor.payload);
+            if (!valid_metadata_record(working_record))
                 return {};
-            auto snapshot = decode_snapshot(record.payload);
-            if (snapshot.merge_parents != anchor.merge_parents)
+            working_snapshot = decode_snapshot(working_record.payload);
+            if (working_snapshot.merge_parents != anchor.merge_parents)
                 return {};
-            value = std::make_shared<const MetadataMaterialization>(MetadataMaterialization{
-                record, std::make_shared<const MetadataSnapshot>(std::move(snapshot))});
-            calculated.push_back(value);
         }
 
         for (auto it = delta_indexes.rbegin(); it != delta_indexes.rend(); ++it) {
             const auto child = read_history_entry(*it);
-            if (child.previous != value->record.hash ||
-                child.generation != value->record.generation + 1)
+            if (child.previous != working_record.hash ||
+                child.generation != working_record.generation + 1)
                 return {};
-            auto snapshot = *value->snapshot;
             const auto delta = decode_metadata_delta(child.payload);
-            apply_metadata_delta_in_place(snapshot, delta);
+            apply_metadata_delta_in_place(working_snapshot, delta);
             historical_deltas_applied_.fetch_add(1, std::memory_order_relaxed);
             MetadataRecord record;
             record.generation = child.generation;
             record.previous = child.previous;
             record.hash = child.hash;
-            record.payload = encode_snapshot_for_delta(child.payload, snapshot);
-            if (!valid_metadata_record(record) || snapshot.merge_parents != child.merge_parents)
+            record.payload = encode_snapshot_for_delta(child.payload, working_snapshot);
+            if (!valid_metadata_record(record) ||
+                working_snapshot.merge_parents != child.merge_parents)
                 return {};
-            value = std::make_shared<const MetadataMaterialization>(MetadataMaterialization{
-                std::move(record), std::make_shared<const MetadataSnapshot>(std::move(snapshot))});
-            calculated.push_back(value);
+            working_record = std::move(record);
         }
     } catch (...) {
         return {};
     }
 
+    auto value = make_materialization(
+        std::move(working_record),
+        std::make_shared<const MetadataSnapshot>(std::move(working_snapshot)));
+
     std::lock_guard lock(m_);
-    // History is append-only except for explicit compaction. Install only values
-    // whose immutable source entry still exists after the off-lock calculation.
-    for (const auto& item : calculated) {
-        if (history_.contains(item->record.hash))
-            value = cache_materialization_locked(item->record, item->snapshot);
-    }
+    // History is append-only except for explicit compaction. Intermediates are
+    // validation work, not useful permanent state; install only the requested
+    // immutable result if its source still exists.
+    if (history_.contains(value->record.hash))
+        value = cache_materialization_locked(value->record, value->snapshot,
+                                             value->resident_bytes);
     if (auto cached = materialized_history_.find(hash); cached != materialized_history_.end())
         return cached->second.value;
     return value && value->record.hash == hash ? value

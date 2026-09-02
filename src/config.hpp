@@ -103,6 +103,10 @@ struct FuseConfig {
     // Local request broker and asynchronous publication queues.
     size_t request_workers{24};
     size_t max_pending_requests{4096};
+    // Heap bytes owned by FUSE write requests before they reach the durable
+    // spool. Request-count admission alone permits thousands of large copied
+    // callbacks to exhaust memory while spool backpressure is working.
+    uint64_t max_pending_write_bytes{32ULL * 1024 * 1024};
     size_t commit_workers{8};
     // Compatibility setting for older configurations. Journal-restored spool
     // is user-requested loader work and is no longer demoted merely because the

@@ -1479,6 +1479,14 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
                                                         playback_status_response.body.end()));
     REQUIRE(playback_status_json.find("server_version") != nullptr);
     CHECK(playback_status_json.find("server_version")->asString() == kServerVersion);
+    REQUIRE(playback_status_json.find("probe_cache_entries") != nullptr);
+    REQUIRE(playback_status_json.find("probe_cache_bytes") != nullptr);
+    CHECK(playback_status_json.find("probe_cache_entries")->asUInt64() <=
+          playback_status_json.find("probe_cache_limit_entries")->asUInt64());
+    CHECK(playback_status_json.find("probe_cache_bytes")->asUInt64() <=
+          playback_status_json.find("probe_cache_limit_bytes")->asUInt64());
+    REQUIRE(playback_status_json.find("subtitle_cache_entries") != nullptr);
+    REQUIRE(playback_status_json.find("subtitle_cache_bytes") != nullptr);
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately

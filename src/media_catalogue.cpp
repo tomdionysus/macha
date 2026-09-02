@@ -27,6 +27,56 @@
 namespace macha {
 namespace {
 
+constexpr size_t provider_cache_max_entries = 256;
+constexpr size_t provider_cache_max_bytes = 8ULL * 1024 * 1024;
+
+size_t provider_cache_weight(const Json& value) {
+    // Parsed DOM nodes cost more than their serialized text. The factor is an
+    // intentionally conservative ownership estimate, not allocator accounting.
+    return sizeof(Json) + value.dump().size() * 2;
+}
+
+size_t provider_cache_weight(const std::string& value) {
+    return sizeof(std::string) + value.capacity();
+}
+
+template <class T>
+size_t provider_cache_weight(const std::optional<T>& value) {
+    return sizeof(std::optional<T>) + (value ? provider_cache_weight(*value) : 0);
+}
+
+template <class Map, class Value>
+void provider_cache_store(Map& cache, size_t& owned_bytes, std::string key, Value value) {
+    using Stored = typename Map::mapped_type;
+    Stored stored(std::move(value));
+    const auto weight = sizeof(typename Map::value_type) + key.capacity() +
+                        provider_cache_weight(stored);
+    if (weight > provider_cache_max_bytes)
+        return;
+    if (auto found = cache.find(key); found != cache.end()) {
+        owned_bytes -= sizeof(typename Map::value_type) + found->first.capacity() +
+                       provider_cache_weight(found->second);
+        found->second = std::move(stored);
+        owned_bytes += weight;
+        return;
+    }
+    while (!cache.empty() &&
+           (cache.size() >= provider_cache_max_entries ||
+            owned_bytes > provider_cache_max_bytes - weight)) {
+        auto victim = cache.begin();
+        owned_bytes -= sizeof(typename Map::value_type) + victim->first.capacity() +
+                       provider_cache_weight(victim->second);
+        cache.erase(victim);
+    }
+    // Several provider maps share one owner budget. If another map owns the
+    // remaining budget this cache cannot evict it; simply decline this optional
+    // entry rather than exceed the provider lifetime bound.
+    if (owned_bytes > provider_cache_max_bytes - weight)
+        return;
+    cache.emplace(std::move(key), std::move(stored));
+    owned_bytes += weight;
+}
+
 class CatalogueMediaInput final : public MediaInput {
     std::shared_ptr<ReadHandle> handle_;
     uint64_t size_{};
@@ -1381,10 +1431,19 @@ RemoteHttpResponse CurlHttpClient::get(std::string_view url, const std::vector<s
     curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &stop_requested_);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, curl_write);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &sink);
-    struct curl_slist* raw_headers = nullptr;
-    for (const auto& header : headers) raw_headers = curl_slist_append(raw_headers, header.c_str());
-    std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> header_guard(raw_headers, curl_slist_free_all);
-    if (raw_headers) curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, raw_headers);
+    std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> header_guard(
+        nullptr, curl_slist_free_all);
+    for (const auto& header : headers) {
+        auto* appended = curl_slist_append(header_guard.get(), header.c_str());
+        if (!appended)
+            throw std::bad_alloc();
+        // curl_slist_append returns the (possibly new) list head while retaining
+        // ownership of the existing chain. Transfer that one owner atomically.
+        (void)header_guard.release();
+        header_guard.reset(appended);
+    }
+    if (header_guard)
+        curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, header_guard.get());
     auto rc = curl_easy_perform(curl.get());
     if (rc != CURLE_OK) {
         if (rc == CURLE_ABORTED_BY_CALLBACK && stop_requested_.load(std::memory_order_relaxed))
@@ -1442,10 +1501,10 @@ std::optional<Json> TmdbProvider::find_show(const MediaProbe& probe) {
     const auto* result = best_result(root, probe.series, "name", probe.year,
                                      "first_air_date", true);
     if (!result) {
-        show_cache_[key] = std::nullopt;
+        provider_cache_store(show_cache_, cache_bytes_, key, std::optional<Json>{});
         return {};
     }
-    show_cache_[key] = *result;
+    provider_cache_store(show_cache_, cache_bytes_, key, std::optional<Json>{*result});
     return *result;
 }
 
@@ -1465,17 +1524,17 @@ std::optional<ProviderMatch> TmdbProvider::lookup(const MediaProbe& probe) {
             auto search = api("/search/movie", q);
             auto found = best_result(search, probe.title, "title", probe.year, "release_date");
             if (!found) {
-                movie_cache_[key] = std::nullopt;
+                provider_cache_store(movie_cache_, cache_bytes_, key, std::optional<Json>{});
                 return {};
             }
             auto id_value = json_i32(found->find("id"));
             if (!id_value) {
-                movie_cache_[key] = std::nullopt;
+                provider_cache_store(movie_cache_, cache_bytes_, key, std::optional<Json>{});
                 return {};
             }
             const auto tmdb_id = std::to_string(*id_value);
             cached_detail = api("/movie/" + tmdb_id, {{"language", config_.language}});
-            movie_cache_[key] = cached_detail;
+            provider_cache_store(movie_cache_, cache_bytes_, key, cached_detail);
         }
         if (!cached_detail) return {};
         const auto& detail = *cached_detail;
@@ -1514,7 +1573,7 @@ std::optional<ProviderMatch> TmdbProvider::lookup(const MediaProbe& probe) {
             return it->second;
         auto season = api_optional("/tv/" + series_id + "/season/" + std::to_string(season_number),
                                    {{"language", config_.language}});
-        season_cache_[season_key] = season;
+        provider_cache_store(season_cache_, cache_bytes_, season_key, season);
         return season;
     };
 
@@ -1750,7 +1809,7 @@ std::optional<Json> MusicBrainzProvider::release_by_id(std::string_view release_
     if (auto it = release_id_cache_.find(key); it != release_id_cache_.end()) return it->second;
     auto detail = api("/release/" + key,
                       {{"inc", "recordings+artist-credits+release-groups"}});
-    release_id_cache_[key] = detail;
+    provider_cache_store(release_id_cache_, cache_bytes_, key, detail);
     return detail;
 }
 
@@ -1764,7 +1823,7 @@ std::optional<Json> MusicBrainzProvider::find_release(const MediaProbe& probe) {
     auto search = api("/release", {{"query", query}, {"limit", "10"}});
     auto releases = search.find("releases");
     if (!releases || !releases->isArray() || releases->asArray().empty()) {
-        release_cache_[key] = std::nullopt;
+        provider_cache_store(release_cache_, cache_bytes_, key, std::optional<Json>{});
         return {};
     }
     const Json* best = &releases->asArray().front();
@@ -1777,16 +1836,16 @@ std::optional<Json> MusicBrainzProvider::find_release(const MediaProbe& probe) {
         if (score > best_score) { best_score = score; best = &candidate; }
     }
     if (best_score < 100) {
-        release_cache_[key] = std::nullopt;
+        provider_cache_store(release_cache_, cache_bytes_, key, std::optional<Json>{});
         return {};
     }
     auto release_id = json_string(best->find("id"));
     if (release_id.empty()) {
-        release_cache_[key] = std::nullopt;
+        provider_cache_store(release_cache_, cache_bytes_, key, std::optional<Json>{});
         return {};
     }
     auto detail = release_by_id(release_id);
-    release_cache_[key] = detail;
+    provider_cache_store(release_cache_, cache_bytes_, key, detail);
     return detail;
 }
 
@@ -1808,7 +1867,7 @@ std::optional<Json> MusicBrainzProvider::find_recording(const MediaProbe& probe)
         auto search = api("/recording", {{"query", query}, {"limit", "10"}});
         auto recordings = search.find("recordings");
         if (!recordings || !recordings->isArray() || recordings->asArray().empty()) {
-            recording_cache_[key] = std::nullopt;
+            provider_cache_store(recording_cache_, cache_bytes_, key, std::optional<Json>{});
             return {};
         }
         const Json* best = &recordings->asArray().front();
@@ -1821,19 +1880,19 @@ std::optional<Json> MusicBrainzProvider::find_recording(const MediaProbe& probe)
             if (score > best_score) { best_score = score; best = &candidate; }
         }
         if (best_score < 120) {
-            recording_cache_[key] = std::nullopt;
+            provider_cache_store(recording_cache_, cache_bytes_, key, std::optional<Json>{});
             return {};
         }
         recording_id = json_string(best->find("id"));
         if (recording_id.empty()) {
-            recording_cache_[key] = std::nullopt;
+            provider_cache_store(recording_cache_, cache_bytes_, key, std::optional<Json>{});
             return {};
         }
     }
 
     auto detail = api("/recording/" + recording_id,
                       {{"inc", "artist-credits+releases"}});
-    recording_cache_[key] = detail;
+    provider_cache_store(recording_cache_, cache_bytes_, key, detail);
     return detail;
 }
 
@@ -1861,7 +1920,7 @@ std::optional<std::string> MusicBrainzProvider::cover_url(std::string_view relea
             }
         }
     }
-    cover_cache_[key] = result;
+    provider_cache_store(cover_cache_, cache_bytes_, key, result);
     return result;
 }
 
@@ -2076,7 +2135,7 @@ std::optional<Json> DiscogsProvider::release_by_id(std::string_view release_id) 
     const auto key = std::string(release_id);
     if (auto it = release_cache_.find(key); it != release_cache_.end()) return it->second;
     auto detail = api("/releases/" + key);
-    release_cache_[key] = detail;
+    provider_cache_store(release_cache_, cache_bytes_, key, detail);
     return detail;
 }
 
@@ -2140,7 +2199,7 @@ std::optional<Json> DiscogsProvider::find_release(const MediaProbe& probe) {
             ? (probe.album.empty() ? 60 : 100)
             : (probe.album.empty() ? 90 : 145);
         if (best && best_score >= minimum) selected = *best;
-        search_cache_[key] = selected;
+        provider_cache_store(search_cache_, cache_bytes_, key, selected);
     }
     if (!selected) return {};
     auto id = json_i32(selected->find("id"));
@@ -2660,9 +2719,9 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
     }
 
     const auto media_id = file_media_id(entry);
-    auto existing = catalogue_.snapshot();
+    auto existing = catalogue_.snapshot_view();
     std::vector<std::string> existing_ids;
-    for (const auto& [id, item] : existing.items) {
+    for (const auto& [id, item] : existing->items) {
         if (std::find(item.media_ids.begin(), item.media_ids.end(), media_id) != item.media_ids.end())
             existing_ids.push_back(id);
     }
@@ -2693,12 +2752,13 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
     // supported embedded artwork, but it never needs an online metadata lookup.
     std::optional<CatalogueItem> artwork_target;
     if (!existing_ids.empty()) {
-        for (const auto& [id, item] : existing.items) {
+        for (const auto& [id, item] : existing->items) {
             if (std::find(item.media_ids.begin(), item.media_ids.end(), media_id) == item.media_ids.end())
                 continue;
             if (!probed.artwork.empty()) {
                 if (item.kind == CatalogueKind::track && item.parent_id) {
-                    if (auto parent = existing.items.find(*item.parent_id); parent != existing.items.end())
+                    if (auto parent = existing->items.find(*item.parent_id);
+                        parent != existing->items.end())
                         artwork_target = parent->second;
                 } else {
                     artwork_target = item;
@@ -2843,7 +2903,7 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
             return item.id == art.item_id;
         });
         if (target == match.items.end()) continue;
-        if (auto old = existing.items.find(art.item_id); old != existing.items.end()) {
+        if (auto old = existing->items.find(art.item_id); old != existing->items.end()) {
             const auto locked = old->second.external_ids.find("macha_metadata_locked");
             if (locked != old->second.external_ids.end() && locked->second == "1") continue;
         }
@@ -3077,9 +3137,9 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
                   " files=" + std::to_string(files.size()));
     }
 
-    auto existing = catalogue_.snapshot();
+    auto existing = catalogue_.snapshot_view();
     std::set<std::string> bound;
-    for (const auto& [_, item] : existing.items)
+    for (const auto& [_, item] : existing->items)
         bound.insert(item.media_ids.begin(), item.media_ids.end());
 
     std::set<std::string> active_media_ids;

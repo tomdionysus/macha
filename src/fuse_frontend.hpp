@@ -283,6 +283,22 @@ struct FuseFrontendStatus {
     uint64_t spool_publish_rate_window_ms{};
     uint64_t spool_throttle_waits{};
     uint64_t spool_throttle_wait_ms{};
+    uint64_t pending_write_request_bytes{};
+    uint64_t peak_pending_write_request_bytes{};
+    uint64_t pending_write_request_limit_bytes{};
+    uint64_t extent_executor_workers{};
+    uint64_t extent_executor_queued{};
+    uint64_t extent_executor_active{};
+    uint64_t extent_executor_peak_queued{};
+    uint64_t extent_executor_peak_active{};
+    uint64_t extent_executor_submitted{};
+    // Inode ownership is explicit: the table owns namespace-visible inodes and
+    // detached inodes only while a handle, durable namespace operation, data
+    // operation, publication or recovery activity still refers to them.
+    uint64_t inode_count{};
+    uint64_t detached_inode_count{};
+    uint64_t peak_inode_count{};
+    uint64_t reclaimed_inode_count{};
 };
 
 // Lock-free, process-lifetime operational totals suitable for Status. This is
@@ -334,6 +350,18 @@ struct FuseFrontendDiagnostics {
     uint64_t spool_publish_rate_window_ms{};
     uint64_t spool_throttle_waits{};
     uint64_t spool_throttle_wait_ms{};
+    uint64_t pending_write_request_bytes{};
+    uint64_t peak_pending_write_request_bytes{};
+    uint64_t pending_write_request_limit_bytes{};
+    uint64_t extent_executor_workers{};
+    uint64_t extent_executor_queued{};
+    uint64_t extent_executor_active{};
+    uint64_t extent_executor_peak_queued{};
+    uint64_t extent_executor_peak_active{};
+    uint64_t extent_executor_submitted{};
+    uint64_t inode_count{};
+    uint64_t peak_inode_count{};
+    uint64_t reclaimed_inode_count{};
 };
 
 struct FuseDirtyRange {

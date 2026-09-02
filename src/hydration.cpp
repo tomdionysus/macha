@@ -401,20 +401,20 @@ std::vector<HydrationHint> CatalogueSequenceHintProvider::hints() {
     if (active.empty())
         return {};
 
-    CatalogueSnapshot snapshot;
+    std::shared_ptr<const CatalogueSnapshot> snapshot;
     try {
-        snapshot = catalogue_.snapshot();
+        snapshot = catalogue_.snapshot_view();
     } catch (...) {
         return {};
     }
 
     std::vector<HydrationHint> out;
     for (const auto& observation : active) {
-        const auto* current = find_current_catalogue_item(snapshot, observation);
+        const auto* current = find_current_catalogue_item(*snapshot, observation);
         if (!current)
             continue;
         for (size_t distance = 0; distance < lookahead_.load(); ++distance) {
-            current = next_catalogue_item(snapshot, *current);
+            current = next_catalogue_item(*snapshot, *current);
             if (!current)
                 break;
 
@@ -489,16 +489,44 @@ void CacheHydrator::remove_provider(const HydrationHintProvider* provider) {
 }
 
 void CacheHydrator::start() {
-    std::lock_guard lock(mutex_);
-    if (worker_.joinable())
-        return;
-    worker_ = std::jthread([this](std::stop_token stop) { loop(stop); });
+    size_t workers = 0;
+    {
+        std::lock_guard lock(mutex_);
+        if (worker_.joinable())
+            return;
+        workers = config_.max_inflight;
+    }
+    {
+        std::lock_guard lock(fetch_mutex_);
+        fetch_stopping_ = false;
+        fetch_queue_.clear();
+        fetch_queued_.store(0, std::memory_order_relaxed);
+    }
+    fetch_workers_.reserve(workers);
+    try {
+        for (size_t i = 0; i < workers; ++i)
+            fetch_workers_.emplace_back([this](std::stop_token stop) { fetch_loop(stop); });
+        std::lock_guard lock(mutex_);
+        worker_ = std::jthread([this](std::stop_token stop) { loop(stop); });
+    } catch (...) {
+        request_stop();
+        for (auto& fetch : fetch_workers_)
+            if (fetch.joinable()) fetch.join();
+        fetch_workers_.clear();
+        throw;
+    }
 }
 
 void CacheHydrator::stop() {
     request_stop();
     if (worker_.joinable())
         worker_.join();
+    for (auto& fetch : fetch_workers_)
+        if (fetch.joinable()) fetch.join();
+    fetch_workers_.clear();
+    std::lock_guard lock(fetch_mutex_);
+    fetch_queue_.clear();
+    fetch_queued_.store(0, std::memory_order_relaxed);
 }
 
 void CacheHydrator::request_stop() {
@@ -506,15 +534,83 @@ void CacheHydrator::request_stop() {
         worker_.request_stop();
         cv_.notify_all();
     }
+    {
+        std::lock_guard lock(fetch_mutex_);
+        fetch_stopping_ = true;
+        for (auto& fetch : fetch_workers_)
+            fetch.request_stop();
+    }
+    fetch_cv_.notify_all();
 }
 
 void CacheHydrator::reconfigure(HydrationConfig config) {
+    bool restart = false;
+    {
+        std::lock_guard lock(mutex_);
+        restart = worker_.joinable() && config.max_inflight != config_.max_inflight;
+    }
+    if (restart)
+        stop();
     {
         std::lock_guard lock(mutex_);
         config_ = std::move(config);
         status_.enabled = config_.enabled;
     }
+    if (restart)
+        start();
     wake();
+}
+
+void CacheHydrator::fetch_loop(std::stop_token stop) {
+    while (!stop.stop_requested()) {
+        std::shared_ptr<FetchTask> task;
+        {
+            std::unique_lock lock(fetch_mutex_);
+            fetch_cv_.wait(lock, stop, [&] { return fetch_stopping_ || !fetch_queue_.empty(); });
+            if (stop.stop_requested() || fetch_stopping_)
+                break;
+            task = std::move(fetch_queue_.front());
+            fetch_queue_.pop_front();
+            fetch_queued_.fetch_sub(1, std::memory_order_relaxed);
+        }
+        try {
+            task->result.set_value(store_.hydrate(task->request.object,
+                                                  task->request.sequence_index,
+                                                  task->request.frame_type));
+        } catch (...) {
+            try {
+                task->result.set_exception(std::current_exception());
+            } catch (...) {
+            }
+        }
+        fetch_completed_.fetch_add(1, std::memory_order_relaxed);
+        cv_.notify_all();
+    }
+}
+
+std::future<bool> CacheHydrator::submit(HydrationRequest request) {
+    auto task = std::make_shared<FetchTask>();
+    task->request = std::move(request);
+    auto future = task->result.get_future();
+    {
+        std::lock_guard lock(fetch_mutex_);
+        if (fetch_stopping_)
+            throw std::runtime_error("hydration executor is stopping");
+        // The scheduler owns at most max_inflight outstanding futures and the
+        // executor owns exactly max_inflight workers. This assertion makes a
+        // future ownership regression fail locally instead of growing a queue.
+        if (fetch_queue_.size() >= fetch_workers_.size())
+            throw std::runtime_error("hydration executor queue ownership bound exceeded");
+        fetch_queue_.push_back(std::move(task));
+        const auto queued = fetch_queued_.fetch_add(1, std::memory_order_relaxed) + 1;
+        auto peak = fetch_peak_queued_.load(std::memory_order_relaxed);
+        while (peak < queued && !fetch_peak_queued_.compare_exchange_weak(
+                                    peak, queued, std::memory_order_relaxed)) {
+        }
+        fetch_submitted_.fetch_add(1, std::memory_order_relaxed);
+    }
+    fetch_cv_.notify_one();
+    return future;
 }
 
 std::vector<HydrationHint> CacheHydrator::collect_hints() {
@@ -585,7 +681,13 @@ bool CacheHydrator::run_once() {
 
 HydrationStatus CacheHydrator::status() const {
     std::lock_guard lock(mutex_);
-    return status_;
+    auto result = status_;
+    result.executor_workers = worker_.joinable() ? config_.max_inflight : 0;
+    result.executor_queued = fetch_queued_.load(std::memory_order_relaxed);
+    result.executor_peak_queued = fetch_peak_queued_.load(std::memory_order_relaxed);
+    result.executor_submitted = fetch_submitted_.load(std::memory_order_relaxed);
+    result.executor_completed = fetch_completed_.load(std::memory_order_relaxed);
+    return result;
 }
 
 void CacheHydrator::wake() {
@@ -674,10 +776,7 @@ void CacheHydrator::loop(std::stop_token stop) {
 
                 pending.push_back({
                     *request,
-                    std::async(std::launch::async, [this, request = *request] {
-                        return store_.hydrate(request.object, request.sequence_index,
-                                              request.frame_type);
-                    }),
+                    submit(*request),
                 });
             }
         }
