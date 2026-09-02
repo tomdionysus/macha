@@ -534,13 +534,24 @@ void CacheHydrator::request_stop() {
         worker_.request_stop();
         cv_.notify_all();
     }
+    std::deque<std::shared_ptr<FetchTask>> cancelled;
     {
         std::lock_guard lock(fetch_mutex_);
         fetch_stopping_ = true;
+        cancelled.swap(fetch_queue_);
+        fetch_queued_.store(0, std::memory_order_relaxed);
         for (auto& fetch : fetch_workers_)
             fetch.request_stop();
     }
+    for (auto& task : cancelled) {
+        try {
+            task->result.set_value(false);
+        } catch (...) {
+        }
+    }
+    fetch_cancelled_.fetch_add(cancelled.size(), std::memory_order_relaxed);
     fetch_cv_.notify_all();
+    cv_.notify_all();
 }
 
 void CacheHydrator::reconfigure(HydrationConfig config) {
@@ -588,14 +599,16 @@ void CacheHydrator::fetch_loop(std::stop_token stop) {
     }
 }
 
-std::future<bool> CacheHydrator::submit(HydrationRequest request) {
+std::optional<std::future<bool>> CacheHydrator::submit(HydrationRequest request) {
     auto task = std::make_shared<FetchTask>();
     task->request = std::move(request);
     auto future = task->result.get_future();
     {
         std::lock_guard lock(fetch_mutex_);
-        if (fetch_stopping_)
-            throw std::runtime_error("hydration executor is stopping");
+        if (fetch_stopping_) {
+            fetch_rejected_.fetch_add(1, std::memory_order_relaxed);
+            return {};
+        }
         // The scheduler owns at most max_inflight outstanding futures and the
         // executor owns exactly max_inflight workers. This assertion makes a
         // future ownership regression fail locally instead of growing a queue.
@@ -610,7 +623,7 @@ std::future<bool> CacheHydrator::submit(HydrationRequest request) {
         fetch_submitted_.fetch_add(1, std::memory_order_relaxed);
     }
     fetch_cv_.notify_one();
-    return future;
+    return std::optional<std::future<bool>>(std::move(future));
 }
 
 std::vector<HydrationHint> CacheHydrator::collect_hints() {
@@ -687,6 +700,8 @@ HydrationStatus CacheHydrator::status() const {
     result.executor_peak_queued = fetch_peak_queued_.load(std::memory_order_relaxed);
     result.executor_submitted = fetch_submitted_.load(std::memory_order_relaxed);
     result.executor_completed = fetch_completed_.load(std::memory_order_relaxed);
+    result.executor_cancelled = fetch_cancelled_.load(std::memory_order_relaxed);
+    result.executor_rejected = fetch_rejected_.load(std::memory_order_relaxed);
     return result;
 }
 
@@ -774,10 +789,14 @@ void CacheHydrator::loop(std::stop_token stop) {
                     status_.last_reason = request->reason;
                 }
 
-                pending.push_back({
-                    *request,
-                    submit(*request),
-                });
+                auto future = submit(*request);
+                if (!future) {
+                    std::lock_guard lock(mutex_);
+                    if (status_.in_flight)
+                        --status_.in_flight;
+                    break;
+                }
+                pending.push_back({*request, std::move(*future)});
             }
         }
 

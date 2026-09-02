@@ -469,6 +469,7 @@ MACHA_TEST("invariants", test_status_api_precedes_control_plane_startup) {
     CHECK(startup->find("control_plane")->asString() == "starting");
     const auto* diagnostics = status.find("diagnostics");
     REQUIRE(diagnostics != nullptr);
+    CHECK(!diagnostics->find("data_store")->find("available")->asBool());
     CHECK(diagnostics->find("convergence")->find("available")->asBool());
     CHECK(!diagnostics->find("filesystem")->find("available")->asBool());
 
@@ -511,6 +512,7 @@ MACHA_TEST("invariants", test_control_plane_and_status_api_are_online_while_back
     CHECK(startup->find("control_plane")->asString() == "ready");
     CHECK(startup->find("data_storage")->asString() == "recovering");
     CHECK(startup->find("control_storage")->asString() == "recovering");
+    CHECK(!status.find("diagnostics")->find("data_store")->find("available")->asBool());
     CHECK(!service.ready());
 
     const auto ordinary = raw_http_get(config.catalogue.api.port, "/api/v1/catalogue/status");

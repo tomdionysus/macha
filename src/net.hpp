@@ -291,6 +291,12 @@ class RpcClient {
     std::chrono::milliseconds dead_after_;
     size_t max_frame_size_{};
     mutable std::mutex mutex_;
+    std::condition_variable connection_cv_;
+    // Creating a transport is expensive: authentication starts two persistent
+    // threads and DATA traffic immediately exercises multi-megabyte buffers.
+    // Coalesce cold concurrent callers for the same authenticated peer/lane,
+    // while allowing unrelated peers and lanes to connect independently.
+    std::set<std::string> connection_dials_;
     std::map<std::string, std::shared_ptr<PeerConnection>> connections_;
     std::vector<std::shared_ptr<PeerConnection>> retired_connections_;
     std::map<std::string, InboundRoute> inbound_routes_;

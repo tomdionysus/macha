@@ -282,6 +282,16 @@ struct FuseFrontend::State {
         std::filesystem::path spool_path;
     };
 
+    // Runtime read index for the durable append-only DataOp journal. Ranges are
+    // non-overlapping and contain only the newest visible source for an
+    // interval. The journal remains the recovery/publication authority; reads
+    // must not copy and replay that whole history for every kernel request.
+    struct DataOverlayRange {
+        uint64_t end{};
+        uint64_t spool_offset{};
+        bool zero{};
+    };
+
     // Durable input remains in the spool while this process-lifetime cursor
     // retains provisional writer state between fair scheduling quanta. A crash
     // simply discards the cursor and replays the same journal generation.
@@ -324,6 +334,7 @@ struct FuseFrontend::State {
         uint64_t recovery_data_sequence{};
         uint64_t requested_namespace_sequence{};
         std::vector<DataOp> data_ops;
+        std::map<uint64_t, DataOverlayRange> data_overlay;
         int spool_fd{-1};
         std::filesystem::path spool_path;
         uint64_t spool_end{};
@@ -352,6 +363,12 @@ struct FuseFrontend::State {
         bool data_running{};
         bool data_deferred{};
         std::shared_ptr<DataPublication> data_publication;
+        uint64_t accounted_data_operations{};
+        uint64_t accounted_data_operation_bytes{};
+        uint64_t accounted_overlay_ranges{};
+        uint64_t accounted_overlay_bytes{};
+        uint64_t accounted_publication_operations{};
+        uint64_t accounted_publication_operation_bytes{};
         std::optional<int> backend_error;
         uint64_t journal_epoch{};
         uint64_t unconfirmed_data_sequence{};
@@ -363,6 +380,97 @@ struct FuseFrontend::State {
                 ::close(spool_fd);
         }
     };
+
+    static bool overlay_ranges_mergeable(
+        const std::pair<const uint64_t, DataOverlayRange>& left,
+        const std::pair<const uint64_t, DataOverlayRange>& right) {
+        return left.second.end == right.first && left.second.zero == right.second.zero &&
+               (left.second.zero ||
+                left.second.spool_offset + (left.second.end - left.first) ==
+                    right.second.spool_offset);
+    }
+
+    static void assign_overlay_range_locked(Inode& inode, uint64_t begin, uint64_t end,
+                                            bool zero, uint64_t spool_offset = 0) {
+        if (begin >= end)
+            return;
+
+        auto it = inode.data_overlay.lower_bound(begin);
+        if (it != inode.data_overlay.begin()) {
+            auto previous = std::prev(it);
+            if (previous->second.end > begin)
+                it = previous;
+        }
+
+        std::optional<std::pair<uint64_t, DataOverlayRange>> left;
+        std::optional<std::pair<uint64_t, DataOverlayRange>> right;
+        while (it != inode.data_overlay.end() && it->first < end) {
+            const auto existing_begin = it->first;
+            const auto existing = it->second;
+            if (existing.end <= begin) {
+                ++it;
+                continue;
+            }
+            if (existing_begin < begin) {
+                left = std::pair{existing_begin,
+                                 DataOverlayRange{begin, existing.spool_offset,
+                                                  existing.zero}};
+            }
+            if (existing.end > end) {
+                right = std::pair{
+                    end, DataOverlayRange{existing.end,
+                                          existing.zero
+                                              ? 0
+                                              : existing.spool_offset + (end - existing_begin),
+                                          existing.zero}};
+            }
+            it = inode.data_overlay.erase(it);
+        }
+        if (left)
+            inode.data_overlay.insert_or_assign(left->first, left->second);
+        if (right)
+            inode.data_overlay.insert_or_assign(right->first, right->second);
+        auto inserted = inode.data_overlay.insert_or_assign(
+            begin, DataOverlayRange{end, spool_offset, zero}).first;
+
+        if (inserted != inode.data_overlay.begin()) {
+            auto previous = std::prev(inserted);
+            if (overlay_ranges_mergeable(*previous, *inserted)) {
+                previous->second.end = inserted->second.end;
+                inode.data_overlay.erase(inserted);
+                inserted = previous;
+            }
+        }
+        auto next = std::next(inserted);
+        if (next != inode.data_overlay.end() && overlay_ranges_mergeable(*inserted, *next)) {
+            inserted->second.end = next->second.end;
+            inode.data_overlay.erase(next);
+        }
+    }
+
+    static void apply_data_overlay_locked(Inode& inode, const DataOp& op) {
+        const auto old_size = inode.visible.size;
+        if (op.kind == DataOp::Kind::truncate) {
+            assign_overlay_range_locked(inode, std::min(old_size, op.size),
+                                        std::max(old_size, op.size), true);
+            return;
+        }
+        if (op.offset > old_size)
+            assign_overlay_range_locked(inode, old_size, op.offset, true);
+        assign_overlay_range_locked(inode, op.offset, op.offset + op.length, false,
+                                    op.spool_offset);
+    }
+
+    static void rebuild_data_overlay_locked(Inode& inode) {
+        inode.data_overlay.clear();
+        inode.visible.size = inode.base.size;
+        for (const auto& op : inode.data_ops) {
+            apply_data_overlay_locked(inode, op);
+            inode.visible.size = op.kind == DataOp::Kind::truncate
+                                     ? op.size
+                                     : std::max(inode.visible.size, op.offset + op.length);
+        }
+    }
 
     struct NamespaceOp {
         enum class Kind : uint8_t { mkdir, create, rmdir, unlink, rename, chmod, chown, utimens };
@@ -472,6 +580,7 @@ struct FuseFrontend::State {
     std::exception_ptr durability_error;
     std::atomic_uint64_t durability_batches{};
     std::atomic_uint64_t durability_writes{};
+    std::atomic_uint64_t retained_durability_tickets{};
     // Aggregate authoritative bytes currently held in inode-*.spool files.
     // This is reserved before pwrite and released only after successful spool
     // retirement, so concurrent hot inodes cannot bypass the configured cap.
@@ -535,6 +644,7 @@ struct FuseFrontend::State {
     // Protected by data_queue_mutex. Each active worker reserves exactly one
     // configured logical byte quantum, bounding aggregate publication work.
     uint64_t publication_inflight_bytes{};
+    std::atomic_uint64_t publication_inflight_bytes_diagnostic{};
     // Number of writable FUSE handles currently open. This is operational state,
     // not a viewer signal: bulk loaders may keep writers open continuously and
     // must not thereby collapse publication to a single worker.
@@ -589,6 +699,15 @@ struct FuseFrontend::State {
     std::atomic_uint64_t data_publication_completed_source_bytes_read{};
     std::atomic_uint64_t data_publication_completed_reused_extents{};
     std::atomic_uint64_t data_publication_completed_put_extents{};
+    std::atomic_uint64_t data_overlay_read_queries{};
+    std::atomic_uint64_t data_overlay_ranges_examined{};
+    std::atomic_uint64_t data_overlay_descriptors_copied{};
+    std::atomic_uint64_t retained_data_operations{};
+    std::atomic_uint64_t retained_data_operation_bytes{};
+    std::atomic_uint64_t retained_overlay_ranges{};
+    std::atomic_uint64_t retained_overlay_bytes{};
+    std::atomic_uint64_t retained_publication_operations{};
+    std::atomic_uint64_t retained_publication_operation_bytes{};
     std::atomic_uint64_t backend_failures{};
     std::atomic_bool publication_failure_injected_for_tests{};
     // Monotonic diagnostic counters. They deliberately count durable frontend
@@ -625,6 +744,57 @@ struct FuseFrontend::State {
     ~State() {
         if (journal_fd >= 0)
             ::close(journal_fd);
+    }
+
+    static uint64_t operation_bytes(const std::vector<DataOp>& operations) {
+        uint64_t bytes = static_cast<uint64_t>(operations.capacity()) * sizeof(DataOp);
+        for (const auto& op : operations)
+            bytes += static_cast<uint64_t>(op.spool_hashes.capacity()) * sizeof(Hash256);
+        return bytes;
+    }
+
+    static void replace_accounted(std::atomic_uint64_t& total, uint64_t& accounted,
+                                  uint64_t current) {
+        if (current >= accounted)
+            total.fetch_add(current - accounted, std::memory_order_relaxed);
+        else
+            total.fetch_sub(accounted - current, std::memory_order_relaxed);
+        accounted = current;
+    }
+
+    void refresh_retained_owners_locked(Inode& inode) {
+        const auto operation_count = static_cast<uint64_t>(inode.data_ops.size());
+        const auto operation_memory = operation_bytes(inode.data_ops);
+        const auto overlay_count = static_cast<uint64_t>(inode.data_overlay.size());
+        const auto overlay_memory = overlay_count *
+            (sizeof(std::pair<const uint64_t, DataOverlayRange>) + 3 * sizeof(void*));
+        uint64_t publication_count = 0;
+        uint64_t publication_memory = 0;
+        if (inode.data_publication) {
+            publication_count = inode.data_publication->snapshot.operations.size();
+            publication_memory = operation_bytes(inode.data_publication->snapshot.operations);
+        }
+        replace_accounted(retained_data_operations, inode.accounted_data_operations,
+                          operation_count);
+        replace_accounted(retained_data_operation_bytes, inode.accounted_data_operation_bytes,
+                          operation_memory);
+        replace_accounted(retained_overlay_ranges, inode.accounted_overlay_ranges, overlay_count);
+        replace_accounted(retained_overlay_bytes, inode.accounted_overlay_bytes, overlay_memory);
+        replace_accounted(retained_publication_operations,
+                          inode.accounted_publication_operations, publication_count);
+        replace_accounted(retained_publication_operation_bytes,
+                          inode.accounted_publication_operation_bytes, publication_memory);
+    }
+
+    void release_retained_owners_locked(Inode& inode) {
+        replace_accounted(retained_data_operations, inode.accounted_data_operations, 0);
+        replace_accounted(retained_data_operation_bytes, inode.accounted_data_operation_bytes, 0);
+        replace_accounted(retained_overlay_ranges, inode.accounted_overlay_ranges, 0);
+        replace_accounted(retained_overlay_bytes, inode.accounted_overlay_bytes, 0);
+        replace_accounted(retained_publication_operations,
+                          inode.accounted_publication_operations, 0);
+        replace_accounted(retained_publication_operation_bytes,
+                          inode.accounted_publication_operation_bytes, 0);
     }
 
     std::shared_ptr<WriteRequestLease> reserve_write_request_bytes(
@@ -1677,6 +1847,7 @@ struct FuseFrontend::State {
             // Queue even after a concurrent poison transition: the coordinator
             // owns failure accounting for admitted descriptors and inode state.
             durability_queue.push_back(ticket);
+            retained_durability_tickets.fetch_add(1, std::memory_order_relaxed);
         }
         durability_cv.notify_one();
     }
@@ -1775,6 +1946,7 @@ struct FuseFrontend::State {
                                            [&] { return stop.stop_requested(); });
                 batch.assign(durability_queue.begin(), durability_queue.end());
                 durability_queue.clear();
+                retained_durability_tickets.fetch_sub(batch.size(), std::memory_order_relaxed);
                 if (durability_poisoned) {
                     auto error = durability_error
                                      ? durability_error
@@ -1961,6 +2133,7 @@ struct FuseFrontend::State {
                 return item.second.get() == inode.get();
             }))
             return;
+        release_retained_owners_locked(*inode);
         inodes.erase(found);
         inode_count.fetch_sub(1, std::memory_order_relaxed);
         reclaimed_inode_count.fetch_add(1, std::memory_order_relaxed);
@@ -2600,6 +2773,8 @@ struct FuseFrontend::State {
                 std::remove_if(inode->data_ops.begin(), inode->data_ops.end(),
                                [&](const DataOp& op) { return op.sequence <= target; }),
                 inode->data_ops.end());
+            if (inode->data_ops.empty())
+                std::vector<DataOp>{}.swap(inode->data_ops);
             inode->published_data_sequence = std::max(inode->published_data_sequence, target);
             inode->requested_data_sequence = inode->published_data_sequence;
             inode->recovery_data_sequence = inode->published_data_sequence;
@@ -2611,6 +2786,8 @@ struct FuseFrontend::State {
             inode->visible.size = inode->base.size;
             inode->visible.mtime_ns = inode->base.mtime_ns;
             inode->visible.ctime_ns = inode->base.ctime_ns;
+            rebuild_data_overlay_locked(*inode);
+            refresh_retained_owners_locked(*inode);
             if (inode->data_ops.empty())
                 spool_clean = retire_spool_locked(*inode);
         }
@@ -2677,6 +2854,10 @@ struct FuseFrontend::State {
                                            return op.sequence <= snapshot.target_sequence;
                                        }),
                         inode->data_ops.end());
+                    if (inode->data_ops.empty())
+                        std::vector<DataOp>{}.swap(inode->data_ops);
+                    rebuild_data_overlay_locked(*inode);
+                    refresh_retained_owners_locked(*inode);
                     inode->published_data_sequence =
                         std::max(inode->published_data_sequence, snapshot.target_sequence);
                     if (inode->data_ops.empty() && !inode->durability_pending)
@@ -3092,6 +3273,8 @@ struct FuseFrontend::State {
                 data_queue.erase(selected);
                 weighted_loader.started(Clock::now(), viewer_active(), false);
                 publication_inflight_bytes += config.publication_quantum_bytes;
+                publication_inflight_bytes_diagnostic.store(publication_inflight_bytes,
+                                                             std::memory_order_relaxed);
                 data_publication_quanta.fetch_add(1, std::memory_order_relaxed);
                 auto byte_peak =
                     data_publication_peak_inflight_bytes.load(std::memory_order_relaxed);
@@ -3129,6 +3312,7 @@ struct FuseFrontend::State {
                     {
                         std::lock_guard lock(inode->mutex);
                         inode->data_publication = created;
+                        refresh_retained_owners_locked(*inode);
                     }
                     publication = std::move(created);
                 }
@@ -3160,6 +3344,7 @@ struct FuseFrontend::State {
                 // input. Completion and terminal errors discard the cursor.
                 if (completed || inode->backend_error)
                     inode->data_publication.reset();
+                refresh_retained_owners_locked(*inode);
                 const bool still_requested =
                     inode->requested_data_sequence > inode->published_data_sequence;
                 if ((!completed || retry || still_requested) && !inode->unconfirmed_data_entry)
@@ -3168,6 +3353,8 @@ struct FuseFrontend::State {
             {
                 std::lock_guard lock(data_queue_mutex);
                 publication_inflight_bytes -= config.publication_quantum_bytes;
+                publication_inflight_bytes_diagnostic.store(publication_inflight_bytes,
+                                                             std::memory_order_relaxed);
                 (void)active_data.fetch_sub(1, std::memory_order_relaxed);
                 if (recovered)
                     --active_recovery_data;
@@ -3615,6 +3802,8 @@ struct FuseFrontend::State {
                 }
             }
             apply_pending_data_metadata(*inode, inode->data_ops);
+            rebuild_data_overlay_locked(*inode);
+            refresh_retained_owners_locked(*inode);
             if (!inode->data_ops.empty()) {
                 inode->durable_data_sequence = inode->data_ops.back().sequence;
                 inode->requested_data_sequence = inode->durable_data_sequence;
@@ -3758,6 +3947,10 @@ struct FuseFrontend::State {
                 std::remove_if(inode->data_ops.begin(), inode->data_ops.end(),
                                [&](const DataOp& op) { return op.sequence <= target; }),
                 inode->data_ops.end());
+            if (inode->data_ops.empty())
+                std::vector<DataOp>{}.swap(inode->data_ops);
+            rebuild_data_overlay_locked(*inode);
+            refresh_retained_owners_locked(*inode);
             data_publication_bytes_confirmed.fetch_add(inode->unconfirmed_publication_bytes,
                                                        std::memory_order_relaxed);
             inode->unconfirmed_publication_bytes = 0;
@@ -4526,7 +4719,9 @@ FuseOpenHandle FuseFrontend::open(std::string_view path, bool readable, bool wri
                 state_->journal_data_operation(inode->id, op);
             }
             inode->next_data_sequence = seq + 1;
+            State::apply_data_overlay_locked(*inode, op);
             inode->data_ops.push_back(op);
+            state_->refresh_retained_owners_locked(*inode);
             inode->durable_data_sequence = seq;
             inode->visible.size = 0;
             inode->visible.mtime_ns = now;
@@ -4618,49 +4813,96 @@ size_t FuseFrontend::read_impl(uint64_t inode_id,
                                                output](Clock::time_point deadline,
                                                        std::atomic_bool& cancelled) {
         auto inode = state_->resolve_inode(inode_id);
-        FsEntry base;
-        FsEntry visible;
-        std::vector<State::DataOp> operations;
+        struct ReadOverlay {
+            uint64_t begin{};
+            uint64_t end{};
+            uint64_t spool_offset{};
+            bool zero{};
+        };
+        std::optional<FsEntry> base_snapshot;
+        uint64_t base_size = 0;
+        uint64_t base_version = 0;
+        uint64_t visible_size = 0;
+        size_t count = 0;
+        std::vector<ReadOverlay> overlay;
         std::filesystem::path spool_path;
         std::string logical_path;
         {
             std::lock_guard lock(inode->mutex);
             if (inode->visible.type != EntryType::file)
                 throw FsError(EISDIR, "directory");
-            base = inode->base;
-            visible = inode->visible;
-            operations = inode->data_ops;
+            visible_size = inode->visible.size;
+            if (offset >= visible_size || output.empty())
+                return size_t{0};
+            count = static_cast<size_t>(
+                std::min<uint64_t>(output.size(), visible_size - offset));
+            base_size = inode->base.size;
+            base_version = inode->base.version;
+            if (offset < base_size) {
+                bool need_snapshot = !read_session;
+                if (read_session) {
+                    std::lock_guard session_lock(read_session->mutex);
+                    need_snapshot = !read_session->reader ||
+                                    read_session->base_version != base_version;
+                }
+                if (need_snapshot)
+                    base_snapshot = inode->base;
+            }
             spool_path = inode->spool_path;
             logical_path =
                 inode->current_path.empty() ? std::string("<unlinked>") : inode->current_path;
+
+            auto range = inode->data_overlay.lower_bound(offset);
+            if (range != inode->data_overlay.begin()) {
+                auto previous = std::prev(range);
+                if (previous->second.end > offset)
+                    range = previous;
+            }
+            uint64_t examined = 0;
+            const auto requested_end = offset + count;
+            for (; range != inode->data_overlay.end() && range->first < requested_end; ++range) {
+                ++examined;
+                const auto copy_begin = std::max(offset, range->first);
+                const auto copy_end = std::min(requested_end, range->second.end);
+                if (copy_begin >= copy_end)
+                    continue;
+                overlay.push_back(
+                    {copy_begin, copy_end,
+                     range->second.zero
+                         ? 0
+                         : range->second.spool_offset + (copy_begin - range->first),
+                     range->second.zero});
+            }
+            state_->data_overlay_read_queries.fetch_add(1, std::memory_order_relaxed);
+            state_->data_overlay_ranges_examined.fetch_add(examined,
+                                                           std::memory_order_relaxed);
+            state_->data_overlay_descriptors_copied.fetch_add(overlay.size(),
+                                                              std::memory_order_relaxed);
         }
-        if (offset >= visible.size || output.empty())
-            return size_t{0};
-        const auto count =
-            static_cast<size_t>(std::min<uint64_t>(output.size(), visible.size - offset));
         std::fill_n(output.data(), count, uint8_t{0});
 
-        uint64_t base_limit = base.size;
-        for (const auto& op : operations)
-            if (op.kind == State::DataOp::Kind::truncate)
-                base_limit = std::min(base_limit, op.size);
-
-        if (offset < base_limit) {
+        if (offset < base_size) {
             const auto base_count =
-                static_cast<size_t>(std::min<uint64_t>(count, base_limit - offset));
+                static_cast<size_t>(std::min<uint64_t>(count, base_size - offset));
             std::shared_ptr<ReadHandle> reader;
             if (read_session) {
                 std::lock_guard session_lock(read_session->mutex);
                 if (read_session->inode != inode_id)
                     throw FsError(EBADF, "FUSE read session inode mismatch");
-                if (!read_session->reader || read_session->base_version != base.version) {
+                if (!read_session->reader || read_session->base_version != base_version) {
+                    if (!base_snapshot)
+                        throw std::logic_error("FUSE read base snapshot unavailable");
                     read_session->reader =
-                        state_->fs.open_read(base, logical_path, false, FrameType::loader);
-                    read_session->base_version = base.version;
+                        state_->fs.open_read(*base_snapshot, logical_path, false,
+                                             FrameType::loader);
+                    read_session->base_version = base_version;
                 }
                 reader = read_session->reader;
             } else {
-                reader = state_->fs.open_read(base, logical_path, false, FrameType::loader);
+                if (!base_snapshot)
+                    throw std::logic_error("FUSE read base snapshot unavailable");
+                reader = state_->fs.open_read(*base_snapshot, logical_path, false,
+                                              FrameType::loader);
             }
             size_t done = 0;
             while (done < base_count) {
@@ -4676,46 +4918,32 @@ size_t FuseFrontend::read_impl(uint64_t inode_id,
                               "FUSE read source unavailable");
         }
 
-        uint64_t virtual_size = base.size;
         ScopedFd spool;
-        for (const auto& op : operations) {
+        for (const auto& range : overlay) {
             check_deadline(deadline, cancelled);
-            if (op.kind == State::DataOp::Kind::truncate) {
-                if (op.size < virtual_size) {
-                    const auto zero_begin = std::max<uint64_t>(offset, op.size);
-                    const auto zero_end = std::min<uint64_t>(offset + count, virtual_size);
-                    if (zero_begin < zero_end)
-                        std::fill(output.begin() + static_cast<ptrdiff_t>(zero_begin - offset),
-                                  output.begin() + static_cast<ptrdiff_t>(zero_end - offset), 0);
-                }
-                virtual_size = op.size;
+            if (range.zero) {
+                std::fill(output.begin() + static_cast<ptrdiff_t>(range.begin - offset),
+                          output.begin() + static_cast<ptrdiff_t>(range.end - offset), 0);
                 continue;
             }
-            const auto write_begin = op.offset;
-            const auto write_end = op.offset + op.length;
-            const auto copy_begin = std::max<uint64_t>(offset, write_begin);
-            const auto copy_end = std::min<uint64_t>(offset + count, write_end);
-            if (copy_begin < copy_end) {
-                if (spool.get() < 0) {
-                    const int fd = ::open(spool_path.c_str(), O_RDONLY);
-                    if (fd < 0)
-                        throw FsError(errno, "cannot open FUSE write spool for read");
-                    spool.reset(fd);
-                }
-                const auto n = static_cast<size_t>(copy_end - copy_begin);
-                const auto spool_offset = op.spool_offset + (copy_begin - write_begin);
-                if (pread_exact(spool.get(),
-                                {output.data() + static_cast<size_t>(copy_begin - offset), n},
-                                spool_offset) != n)
-                    throw FsError(EIO, "short FUSE spool read");
+            if (spool.get() < 0) {
+                const int fd = ::open(spool_path.c_str(), O_RDONLY);
+                if (fd < 0)
+                    throw FsError(errno, "cannot open FUSE write spool for read");
+                spool.reset(fd);
             }
-            virtual_size = std::max(virtual_size, write_end);
+            const auto n = static_cast<size_t>(range.end - range.begin);
+            if (pread_exact(spool.get(),
+                            {output.data() + static_cast<size_t>(range.begin - offset), n},
+                            range.spool_offset) != n)
+                throw FsError(EIO, "short FUSE spool read");
         }
 
         // Immediate kernel demand becomes a high-priority hint in the existing
         // cache architecture. The foreground read above still has its own hard
         // deadline; the hint is useful for read-ahead and retries.
-        if (!base.extents.empty()) {
+        if (base_snapshot && !base_snapshot->extents.empty()) {
+            const auto& base = *base_snapshot;
             size_t first = base.extents.size();
             size_t last = 0;
             for (size_t i = 0; i < base.extents.size(); ++i) {
@@ -4852,7 +5080,9 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
                     // journal fsync. Distributed publication is clamped to that durable
                     // prefix, so relaxing write acknowledgement cannot expose an
                     // unstable generation to other nodes or the metadata write floor.
+                    State::apply_data_overlay_locked(*inode, overlay_op);
                     inode->data_ops.push_back(std::move(overlay_op));
+                    state_->refresh_retained_owners_locked(*inode);
                     inode->visible.size =
                         std::max<uint64_t>(inode->visible.size, target + owned.size());
                     inode->visible.mtime_ns = now;
@@ -4919,7 +5149,9 @@ void FuseFrontend::truncate(uint64_t inode_id, uint64_t size) {
                      state_->journal_data_operation(inode->id, op);
                  }
                  inode->next_data_sequence = seq + 1;
+                 State::apply_data_overlay_locked(*inode, op);
                  inode->data_ops.push_back(op);
+                 state_->refresh_retained_owners_locked(*inode);
                  inode->durable_data_sequence = seq;
                  inode->visible.size = size;
                  inode->visible.mtime_ns = now;
@@ -5113,6 +5345,18 @@ FuseFrontendStatus FuseFrontend::status() const {
         diagnostics.data_publication_completed_reused_extents;
     out.data_publication_completed_put_extents =
         diagnostics.data_publication_completed_put_extents;
+    out.data_overlay_read_queries = diagnostics.data_overlay_read_queries;
+    out.data_overlay_ranges_examined = diagnostics.data_overlay_ranges_examined;
+    out.data_overlay_descriptors_copied = diagnostics.data_overlay_descriptors_copied;
+    out.retained_data_operations = diagnostics.retained_data_operations;
+    out.retained_data_operation_bytes = diagnostics.retained_data_operation_bytes;
+    out.retained_overlay_ranges = diagnostics.retained_overlay_ranges;
+    out.retained_overlay_bytes = diagnostics.retained_overlay_bytes;
+    out.retained_publication_operations = diagnostics.retained_publication_operations;
+    out.retained_publication_operation_bytes =
+        diagnostics.retained_publication_operation_bytes;
+    out.retained_durability_tickets = diagnostics.retained_durability_tickets;
+    out.data_publication_inflight_bytes = diagnostics.data_publication_inflight_bytes;
     out.backend_failures = diagnostics.backend_failures;
     out.durability_batches = diagnostics.durability_batches;
     out.durability_writes = diagnostics.durability_writes;
@@ -5174,6 +5418,17 @@ FuseFrontendDiagnostics FuseFrontend::diagnostics() const noexcept {
         state_->data_publication_completed_source_bytes_read.load(std::memory_order_relaxed),
         state_->data_publication_completed_reused_extents.load(std::memory_order_relaxed),
         state_->data_publication_completed_put_extents.load(std::memory_order_relaxed),
+        state_->data_overlay_read_queries.load(std::memory_order_relaxed),
+        state_->data_overlay_ranges_examined.load(std::memory_order_relaxed),
+        state_->data_overlay_descriptors_copied.load(std::memory_order_relaxed),
+        state_->retained_data_operations.load(std::memory_order_relaxed),
+        state_->retained_data_operation_bytes.load(std::memory_order_relaxed),
+        state_->retained_overlay_ranges.load(std::memory_order_relaxed),
+        state_->retained_overlay_bytes.load(std::memory_order_relaxed),
+        state_->retained_publication_operations.load(std::memory_order_relaxed),
+        state_->retained_publication_operation_bytes.load(std::memory_order_relaxed),
+        state_->retained_durability_tickets.load(std::memory_order_relaxed),
+        state_->publication_inflight_bytes_diagnostic.load(std::memory_order_relaxed),
         state_->backend_failures.load(std::memory_order_relaxed),
         state_->durability_batches.load(std::memory_order_relaxed),
         state_->durability_writes.load(std::memory_order_relaxed),

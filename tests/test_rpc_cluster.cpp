@@ -394,6 +394,67 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_persistence_and_multiplexing) {
     server.stop();
 }
 
+MACHA_TEST("rpc_cluster", test_rpc_concurrent_cold_data_calls_share_one_dial) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto port = free_port();
+
+    NodeInfo server_info;
+    server_info.id = random_node_id();
+    server_info.host = "127.0.0.1";
+    server_info.port = port;
+    server_info.failure_domain = "server-site";
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [](const NodeInfo&, FrameType, const RpcMessage& request) {
+            return RpcMessage{MessageType::ok, request.payload};
+        },
+        [](const NodeInfo&) {});
+    server.start();
+
+    NodeInfo client_info;
+    client_info.id = random_node_id();
+    client_info.host = "127.0.0.1";
+    client_info.port = free_port();
+    client_info.failure_domain = "client-site";
+    RpcClient client(
+        keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms);
+
+    constexpr size_t callers = 24;
+    std::atomic_size_t ready{};
+    std::atomic_bool release{};
+    std::atomic_size_t failures{};
+    std::vector<std::jthread> threads;
+    threads.reserve(callers);
+    for (size_t i = 0; i < callers; ++i) {
+        threads.emplace_back([&, i] {
+            ++ready;
+            while (!release.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            try {
+                Bytes payload{static_cast<uint8_t>(i)};
+                auto reply = client.call(server_info, MessageType::put_object, payload,
+                                         FrameType::foreground, 2s);
+                if (reply.message.type != MessageType::ok || reply.message.payload != payload)
+                    ++failures;
+            } catch (...) {
+                ++failures;
+            }
+        });
+    }
+    REQUIRE(wait_until([&] { return ready.load() == callers; }));
+    release.store(true, std::memory_order_release);
+    threads.clear();
+
+    CHECK(failures.load() == 0);
+    CHECK(client.stats().connections_created == 1);
+    CHECK(client.stats().canonical_connections == 1);
+
+    client.stop();
+    server.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_rpc_v15_bidirectional_and_deduplication) {
     TestCluster cluster;
     const auto& keys = cluster.keys();

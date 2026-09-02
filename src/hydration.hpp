@@ -149,6 +149,8 @@ struct HydrationStatus {
     size_t executor_peak_queued{};
     uint64_t executor_submitted{};
     uint64_t executor_completed{};
+    uint64_t executor_cancelled{};
+    uint64_t executor_rejected{};
     std::optional<ObjectId> last_object;
     std::string last_reason;
 };
@@ -176,12 +178,14 @@ class CacheHydrator {
     std::atomic_size_t fetch_peak_queued_{};
     std::atomic_uint64_t fetch_submitted_{};
     std::atomic_uint64_t fetch_completed_{};
+    std::atomic_uint64_t fetch_cancelled_{};
+    std::atomic_uint64_t fetch_rejected_{};
     HydrationStatus status_;
 
     std::vector<HydrationHint> collect_hints();
     void loop(std::stop_token);
     void fetch_loop(std::stop_token);
-    std::future<bool> submit(HydrationRequest);
+    std::optional<std::future<bool>> submit(HydrationRequest);
 
   public:
     CacheHydrator(DistributedStore&, HydrationConfig);

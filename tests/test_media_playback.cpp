@@ -155,6 +155,10 @@ MACHA_TEST("media_playback", test_media_segment_store_backpressure_and_spill) {
     CHECK(state.finished);
     CHECK(state.segment_count == 4);
     CHECK(state.highest_requested == 3);
+    CHECK(state.resident_bytes <= 2 * 1024 + 1024 + 4);
+    CHECK(state.spill_bytes >= 1024);
+    CHECK(state.descriptor_bytes >= state.segment_count);
+    CHECK(state.planned_segments == 4);
 
     auto playlist = store->playlist();
     CHECK(playlist == initial_playlist);
@@ -1175,7 +1179,10 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
         auto status = playback_status();
         return status.find("sessions")->asUInt64() == 1 &&
                status.find("video_transcodes")->asUInt64() == 0 &&
-               status.find("idle_pipelines_reclaimed")->asUInt64() == 1;
+               status.find("idle_pipelines_reclaimed")->asUInt64() == 1 &&
+               !status.find("heap_reclaim_pending")->asBool() &&
+               status.find("heap_reclaim_requests")->asUInt64() >= 1 &&
+               status.find("heap_reclaim_runs")->asUInt64() >= 1;
     }, 1s));
 
     // The logical session may remain available for reconciliation, but its
@@ -1487,6 +1494,15 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
           playback_status_json.find("probe_cache_limit_bytes")->asUInt64());
     REQUIRE(playback_status_json.find("subtitle_cache_entries") != nullptr);
     REQUIRE(playback_status_json.find("subtitle_cache_bytes") != nullptr);
+    REQUIRE(playback_status_json.find("segment_store_resident_bytes") != nullptr);
+    REQUIRE(playback_status_json.find("segment_store_spill_bytes") != nullptr);
+    REQUIRE(playback_status_json.find("segment_store_descriptor_bytes") != nullptr);
+    REQUIRE(playback_status_json.find("segment_store_segments") != nullptr);
+    REQUIRE(playback_status_json.find("segment_store_planned_segments") != nullptr);
+    REQUIRE(playback_status_json.find("heap_reclaim_pending") != nullptr);
+    REQUIRE(playback_status_json.find("heap_reclaim_requests") != nullptr);
+    REQUIRE(playback_status_json.find("heap_reclaim_runs") != nullptr);
+    REQUIRE(playback_status_json.find("heap_reclaim_successes") != nullptr);
 
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately

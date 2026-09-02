@@ -233,6 +233,66 @@ MACHA_TEST("storage_v18", test_data_reserve_free_blocks_admission_before_filesys
     CHECK(store.used() == 0);
 }
 
+MACHA_TEST("storage_v18", test_unrelated_loose_object_read_bypasses_blocked_loader_write) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+
+    LocalStoreOptions options;
+    options.limit = 64ULL * 1024 * 1024;
+    options.pack_threshold = 0;
+    options.pack_target_size = 0;
+    LocalStore store(t.path() / "store", options, keys.storage);
+
+    const auto viewer = pattern(512 * 1024, 0x41);
+    const auto viewer_id = object_id(viewer);
+    REQUIRE(store.put(viewer_id, viewer));
+
+    const auto loader = pattern(4 * 1024 * 1024, 0x82);
+    const auto loader_id = object_id(loader);
+    std::promise<void> loader_entered;
+    auto loader_entered_future = loader_entered.get_future();
+    std::promise<void> release_loader;
+    auto release_loader_future = release_loader.get_future().share();
+    std::atomic_uint64_t loader_hook_calls{};
+    store.set_before_loose_write_for_tests([&](const ObjectId& id) {
+        if (id != loader_id)
+            return;
+        if (loader_hook_calls.fetch_add(1, std::memory_order_relaxed) == 0)
+            loader_entered.set_value();
+        release_loader_future.wait();
+    });
+
+    auto blocked_loader = std::async(std::launch::async, [&] {
+        return store.put(loader_id, loader);
+    });
+    REQUIRE(loader_entered_future.wait_for(2s) == std::future_status::ready);
+
+    // The loader is deliberately stopped after capacity/accounting admission
+    // but before crypto and disk I/O. An unrelated viewer object must need only
+    // the short index lock and then complete its physical read independently.
+    auto viewer_read = std::async(std::launch::async, [&] { return store.get(viewer_id); });
+    REQUIRE(viewer_read.wait_for(2s) == std::future_status::ready);
+    REQUIRE(viewer_read.get().has_value());
+    CHECK(*store.get(viewer_id) == viewer);
+
+    // A second operation for the same immutable ID remains single-flight.
+    auto same_object = std::async(std::launch::async, [&] {
+        return store.put(loader_id, loader);
+    });
+    std::this_thread::sleep_for(20ms);
+    CHECK(loader_hook_calls.load(std::memory_order_relaxed) == 1);
+
+    release_loader.set_value();
+    REQUIRE(blocked_loader.wait_for(2s) == std::future_status::ready);
+    CHECK(blocked_loader.get());
+    REQUIRE(same_object.wait_for(2s) == std::future_status::ready);
+    CHECK(same_object.get());
+    CHECK(loader_hook_calls.load(std::memory_order_relaxed) == 1);
+    CHECK(store.get(loader_id) == std::optional<Bytes>{loader});
+}
+
 MACHA_TEST("storage_v18", test_metadata_control_store_is_independent_of_data_quota) {
     TestNode fixture("metadata-priority");
     auto& config = fixture.config();

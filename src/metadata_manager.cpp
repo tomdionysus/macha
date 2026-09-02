@@ -291,16 +291,49 @@ bool MetadataManager::import_history_from_peer(const NodeInfo& owner, const Hash
                                                FrameType frame_type) {
     auto& local = node_.metadata_replica();
     if (local.history_contains(target)) {
-        // A prior peer may have supplied the head as a full commit while lacking
-        // some optional ancestry. Use every later source to fill those holes;
-        // common-ancestor discovery must not depend on which certificate holder
-        // happened to answer first.
-        if (auto entry = local.history_entry(target)) {
-            if (entry->previous_known && !local.history_contains(entry->previous))
-                (void)import_history_from_peer(owner, entry->previous, frame_type);
-            for (const auto& parent : entry->merge_parents) {
-                if (!local.history_contains(parent))
-                    (void)import_history_from_peer(owner, parent, frame_type);
+        // A prior peer may have supplied a full checkpoint while lacking an
+        // older part of its authenticated ancestry. Looking only at the head's
+        // direct parent misses a hole below an otherwise continuous suffix and
+        // can make a real ancestor appear rootless. Heal only while the accepted
+        // heads actually lack a common ancestor, and stop as soon as that proof
+        // becomes possible. Traversal uses the resident link index: reading the
+        // multi-megabyte checkpoint payload for every historical record caused
+        // severe CPU/RSS amplification during the original recovery.
+        auto remains_rootless = [&] {
+            const auto certificates = local.accepted_head_certificates();
+            for (size_t left = 0; left < certificates.size(); ++left) {
+                for (size_t right = left + 1; right < certificates.size(); ++right) {
+                    if (!local.history_common_ancestor(certificates[left].hash,
+                                                       certificates[right].hash))
+                        return true;
+                }
+            }
+            return false;
+        };
+        if (remains_rootless() && owner.id != node_.node_id()) {
+            std::vector<Hash256> pending{target};
+            std::set<Hash256> inspected;
+            while (!pending.empty()) {
+                const auto hash = pending.back();
+                pending.pop_back();
+                if (!inspected.insert(hash).second)
+                    continue;
+                const auto entry = local.history_links(hash);
+                if (!entry)
+                    continue;
+
+                std::vector<Hash256> parents = entry->merge_parents;
+                if (entry->previous != Hash256{})
+                    parents.push_back(entry->previous);
+                for (const auto& parent : parents) {
+                    if (!local.history_contains(parent)) {
+                        (void)import_history_from_peer(owner, parent, frame_type);
+                        if (!remains_rootless())
+                            return true;
+                    }
+                    if (local.history_contains(parent))
+                        pending.push_back(parent);
+                }
             }
         }
         return true;
@@ -350,13 +383,15 @@ bool MetadataManager::import_history_from_peer(const NodeInfo& owner, const Hash
             }
 
             std::vector<std::pair<Hash256, bool>> dependencies;
-            if (task.entry.previous_known) {
-                dependencies.emplace_back(
-                    task.entry.previous,
-                    task.entry.body == MetadataHistoryEntry::Body::delta);
-            }
-            for (const auto& parent : task.entry.merge_parents)
-                dependencies.emplace_back(parent, false);
+            // A full checkpoint is independently materializable. Its previous
+            // and merge-parent links are useful ancestry, not transfer
+            // prerequisites; recursively pulling them copied gigabytes of
+            // unrelated retained history for every newly observed head. A
+            // delta alone requires its primary predecessor, so follow exactly
+            // that chain until the nearest full checkpoint.
+            for (const auto& dependency :
+                 metadata_history_materialization_dependencies(task.entry))
+                dependencies.emplace_back(dependency, true);
 
             bool pushed = false;
             for (auto it = dependencies.rbegin(); it != dependencies.rend(); ++it) {
@@ -447,13 +482,15 @@ bool MetadataManager::push_history_to_peer(const NodeInfo& owner, const Hash256&
             task.expanded = true;
 
             std::vector<std::pair<Hash256, bool>> dependencies;
-            if (entry->previous_known) {
-                dependencies.emplace_back(
-                    entry->previous,
-                    entry->body == MetadataHistoryEntry::Body::delta);
-            }
-            for (const auto& parent : entry->merge_parents)
-                dependencies.emplace_back(parent, false);
+            // Mirror the pull-side rule: only a delta's primary predecessor is
+            // required to materialize it. Full checkpoints are self-contained;
+            // their previous and merge-parent links preserve ancestry but are
+            // not transfer prerequisites. Walking those optional links here
+            // caused peers which already shared the current head to exchange
+            // their entire retained history during convergence.
+            for (const auto& dependency :
+                 metadata_history_materialization_dependencies(*entry))
+                dependencies.emplace_back(dependency, true);
 
             bool pushed = false;
             for (auto it = dependencies.rbegin(); it != dependencies.rend(); ++it) {
@@ -840,6 +877,16 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         if (!accepted)
             Log::warn("ignoring metadata head without a valid acceptance certificate hash=" +
                       to_string(hash));
+        else {
+            // Installing this certificate may have exposed a second head whose
+            // common ancestry crosses a compacted boundary. Revisit the now-
+            // local head so the lightweight, rootless-only healer can request
+            // just the missing proof records in this same convergence event.
+            for (const auto& owner : history_sources) {
+                if (owner.id != node_.node_id())
+                    (void)import_history_from_peer(owner, hash, frame_type);
+            }
+        }
     }
 
     const size_t need = node_.config().metadata_min_write_replicas;

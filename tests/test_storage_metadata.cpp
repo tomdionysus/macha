@@ -597,6 +597,162 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
     CHECK(rerooted.historical(reconciliation.hash)->payload == reconciliation.payload);
 }
 
+MACHA_FAST_TEST("storage_metadata", test_merge_delta_primary_may_precede_merge_generation) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "merge-delta-generation-gap";
+
+    NodeId a{}, b{};
+    a.bytes[15] = 1;
+    b.bytes[15] = 2;
+    FsEntry directory;
+    directory.type = EntryType::directory;
+    directory.mode = 0755;
+    const auto genesis = genesis_metadata();
+
+    auto older_snapshot = decode_snapshot(genesis.payload);
+    older_snapshot.metadata_write_replicas_required = 2;
+    older_snapshot.entries["/older"] = directory;
+    MetadataRecord older;
+    older.generation = 10;
+    older.previous = genesis.hash;
+    older.payload = encode_snapshot(older_snapshot);
+    older.hash = metadata_hash(older.generation, older.previous, older.payload);
+
+    MetadataRecord newer;
+    MetadataSnapshot newer_snapshot;
+    for (size_t attempt = 0; attempt < 256; ++attempt) {
+        newer_snapshot = decode_snapshot(genesis.payload);
+        newer_snapshot.metadata_write_replicas_required = 2;
+        newer_snapshot.entries["/newer-" + std::to_string(attempt)] = directory;
+        newer.generation = 20;
+        newer.previous = genesis.hash;
+        newer.payload = encode_snapshot(newer_snapshot);
+        newer.hash = metadata_hash(newer.generation, newer.previous, newer.payload);
+        if (older.hash < newer.hash)
+            break;
+    }
+    REQUIRE(older.hash < newer.hash);
+
+    MetadataRecord merge;
+    auto merged_snapshot = older_snapshot;
+    merged_snapshot.entries.insert(newer_snapshot.entries.begin(), newer_snapshot.entries.end());
+    merged_snapshot.merge_parents = {newer.hash};
+    merge.generation = newer.generation + 1;
+    merge.previous = older.hash; // deterministic lower hash, not generation-1
+    merge.payload = encode_snapshot(merged_snapshot);
+    merge.hash = metadata_hash(merge.generation, merge.previous, merge.payload);
+    auto delta = metadata_delta(older_snapshot, merged_snapshot);
+    REQUIRE(delta.has_value());
+    const auto encoded_delta = encode_metadata_delta(*delta);
+
+    {
+        MetadataReplica replica(path, keys.storage);
+        REQUIRE(replica.store_commit(older));
+        REQUIRE(replica.accept_commit({older.generation, older.hash, 2, {a, b}}));
+        REQUIRE(replica.store_commit(newer));
+        REQUIRE(replica.accept_commit({newer.generation, newer.hash, 2, {a, b}}));
+        REQUIRE(replica.store_commit(merge, encoded_delta));
+        REQUIRE(replica.accept_commit({merge.generation, merge.hash, 2, {a, b}}));
+        auto entry = replica.history_entry(merge.hash);
+        REQUIRE(entry.has_value());
+        CHECK(entry->body == MetadataHistoryEntry::Body::delta);
+        CHECK(older.generation + 1 < merge.generation);
+    }
+
+    MetadataReplica reopened(path, keys.storage);
+    const auto heads = reopened.accepted_heads();
+    REQUIRE(heads.size() == 1);
+    CHECK(heads.front().hash == merge.hash);
+    CHECK(reopened.history_is_ancestor(older.hash, merge.hash));
+    CHECK(reopened.history_is_ancestor(newer.hash, merge.hash));
+}
+
+MACHA_FAST_TEST("storage_metadata", test_full_fallback_boundary_heals_when_parent_arrives) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto source_path = t.path() / "boundary-source";
+    const auto target_path = t.path() / "boundary-target";
+
+    FsEntry directory;
+    directory.type = EntryType::directory;
+    directory.mode = 0755;
+    const auto genesis = genesis_metadata();
+    auto parent_snapshot = decode_snapshot(genesis.payload);
+    parent_snapshot.metadata_write_replicas_required = 2;
+    parent_snapshot.entries["/parent"] = directory;
+    MetadataRecord parent;
+    parent.generation = 49;
+    parent.previous = genesis.hash;
+    parent.payload = encode_snapshot(parent_snapshot);
+    parent.hash = metadata_hash(parent.generation, parent.previous, parent.payload);
+
+    auto child_snapshot = parent_snapshot;
+    child_snapshot.entries["/child"] = directory;
+    MetadataRecord child;
+    child.generation = 50;
+    child.previous = parent.hash;
+    child.payload = encode_snapshot(child_snapshot);
+    child.hash = metadata_hash(child.generation, child.previous, child.payload);
+
+    auto descendant_snapshot = child_snapshot;
+    descendant_snapshot.entries["/descendant"] = directory;
+    MetadataRecord descendant;
+    descendant.generation = 51;
+    descendant.previous = child.hash;
+    descendant.payload = encode_snapshot(descendant_snapshot);
+    descendant.hash =
+        metadata_hash(descendant.generation, descendant.previous, descendant.payload);
+
+    auto sibling_snapshot = parent_snapshot;
+    sibling_snapshot.entries["/sibling"] = directory;
+    MetadataRecord sibling;
+    sibling.generation = 50;
+    sibling.previous = parent.hash;
+    sibling.payload = encode_snapshot(sibling_snapshot);
+    sibling.hash = metadata_hash(sibling.generation, sibling.previous, sibling.payload);
+
+    MetadataReplica source(source_path, keys.storage);
+    REQUIRE(source.store_commit(parent));
+    auto parent_entry = source.history_entry(parent.hash);
+    REQUIRE(parent_entry.has_value());
+
+    {
+        MetadataReplica target(target_path, keys.storage);
+        REQUIRE(target.store_commit(child));
+        auto boundary = target.history_entry(child.hash);
+        REQUIRE(boundary.has_value());
+        CHECK(!boundary->previous_known);
+
+        // The current head's direct predecessor exists. The missing ancestry is
+        // one level deeper, matching the live failure where head-only healing
+        // stopped before reaching a compacted checkpoint boundary.
+        REQUIRE(target.store_commit(descendant));
+        REQUIRE(target.history_contains(descendant.previous));
+        CHECK(!target.history_contains(parent.hash));
+        const auto resident_before = target.diagnostics().materialization_cache_bytes;
+        const auto links = target.history_links(descendant.hash);
+        REQUIRE(links.has_value());
+        CHECK(links->previous == child.hash);
+        CHECK(target.diagnostics().materialization_cache_bytes == resident_before);
+
+        REQUIRE(target.import_history(*parent_entry));
+        REQUIRE(target.store_commit(sibling));
+        auto common = target.history_common_ancestor(descendant.hash, sibling.hash);
+        REQUIRE(common.has_value());
+        CHECK(*common == parent.hash);
+    }
+
+    MetadataReplica reopened(target_path, keys.storage);
+    auto common = reopened.history_common_ancestor(descendant.hash, sibling.hash);
+    REQUIRE(common.has_value());
+    CHECK(*common == parent.hash);
+}
+
 MACHA_FAST_TEST("storage_metadata", test_compacted_direct_predecessor_cannot_resurface_as_head) {
     TempDir t;
     auto keyfile = t.path() / "key";
@@ -667,6 +823,26 @@ MACHA_FAST_TEST("storage_metadata", test_compacted_direct_predecessor_cannot_res
     const auto heads = reopened.accepted_heads();
     REQUIRE(heads.size() == 1);
     CHECK(heads.front().hash == child.hash);
+}
+
+MACHA_FAST_TEST("storage_metadata", test_history_transfer_follows_only_materialization_dependencies) {
+    Hash256 previous{}, merge_parent{};
+    previous.bytes[0] = 1;
+    merge_parent.bytes[0] = 2;
+
+    MetadataHistoryEntry checkpoint;
+    checkpoint.generation = 10;
+    checkpoint.previous = previous;
+    checkpoint.previous_known = true;
+    checkpoint.merge_parents = {merge_parent};
+    checkpoint.body = MetadataHistoryEntry::Body::full;
+    CHECK(metadata_history_materialization_dependencies(checkpoint).empty());
+
+    MetadataHistoryEntry delta = checkpoint;
+    delta.body = MetadataHistoryEntry::Body::delta;
+    const auto required = metadata_history_materialization_dependencies(delta);
+    REQUIRE(required.size() == 1);
+    CHECK(required.front() == previous);
 }
 
 MACHA_FAST_TEST("storage_metadata", test_pristine_joiner_adopts_compacted_cluster_head) {
@@ -1553,10 +1729,22 @@ MACHA_TEST("storage_metadata", test_local_store) {
         }
         CHECK(!found_plain);
 
+        const auto reaffirm_before = store.diagnostics();
+        REQUIRE(store.put(id, plain));
+        const auto reaffirm_after = store.diagnostics();
+        CHECK(reaffirm_after.loose_reaffirmation_fast_paths ==
+              reaffirm_before.loose_reaffirmation_fast_paths + 1);
+        CHECK(reaffirm_after.loose_reaffirmation_full_validations ==
+              reaffirm_before.loose_reaffirmation_full_validations);
+
         // A successful PUT acknowledgement means the named immutable replica
         // contains the requested bytes, not merely that its pathname exists.
         corrupt_object(root, id);
+        const auto repair_before = store.diagnostics();
         REQUIRE(store.put(id, plain));
+        const auto repair_after = store.diagnostics();
+        CHECK(repair_after.loose_reaffirmation_full_validations ==
+              repair_before.loose_reaffirmation_full_validations + 1);
         auto repaired = store.get(id);
         REQUIRE(repaired.has_value());
         CHECK(*repaired == plain);

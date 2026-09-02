@@ -471,6 +471,55 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
     REQUIRE(wait_until([&] { return n2.block_cache().has(event_object); }, 3s));
     event_hydrator.stop();
 
+    // A service stop can race a provider which is already inside hints(). The
+    // scheduler must treat the resulting late executor submission as ordinary
+    // cancellation: it must not throw out of the jthread entry point, abort the
+    // process, or leave a promise owned by a stopped fetch queue.
+    const auto shutdown_object = make_remote(70);
+    class BlockingHints final : public HydrationHintProvider {
+        std::mutex mutex_;
+        std::condition_variable cv_;
+        bool entered_{};
+        bool released_{};
+        ObjectId object_;
+      public:
+        explicit BlockingHints(ObjectId object) : object_(object) {}
+        std::string_view name() const override { return "blocking-stop-test"; }
+        std::vector<HydrationHint> hints() override {
+            std::unique_lock lock(mutex_);
+            entered_ = true;
+            cv_.notify_all();
+            cv_.wait(lock, [&] { return released_; });
+            return {{"shutdown", {object_}, 1000, "shutdown-race"}};
+        }
+        bool wait_until_entered() {
+            std::unique_lock lock(mutex_);
+            return cv_.wait_for(lock, 2s, [&] { return entered_; });
+        }
+        void release() {
+            std::lock_guard lock(mutex_);
+            released_ = true;
+            cv_.notify_all();
+        }
+    };
+    auto blocking_provider = std::make_shared<BlockingHints>(shutdown_object);
+    HydrationConfig shutdown_config;
+    shutdown_config.max_inflight = 1;
+    CacheHydrator shutdown_hydrator(target, shutdown_config);
+    shutdown_hydrator.add_provider(blocking_provider);
+    shutdown_hydrator.start();
+    REQUIRE(blocking_provider->wait_until_entered());
+    shutdown_hydrator.request_stop();
+    blocking_provider->release();
+    shutdown_hydrator.stop();
+    const auto shutdown_status = shutdown_hydrator.status();
+    CHECK(shutdown_status.in_flight == 0);
+    CHECK(shutdown_status.executor_workers == 0);
+    CHECK(shutdown_status.executor_queued == 0);
+    CHECK(shutdown_status.executor_submitted == 0);
+    CHECK(shutdown_status.executor_rejected == 1);
+    CHECK(!n2.block_cache().has(shutdown_object));
+
     n2.stop();
     n1.stop();
 }

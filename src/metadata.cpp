@@ -11,6 +11,9 @@
 #include <set>
 #include <tuple>
 #include <unistd.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 namespace macha {
 namespace {
 constexpr std::array<uint8_t, 8> SM5{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'},
@@ -1211,6 +1214,14 @@ MetadataRecord decode_metadata_record(std::span<const uint8_t> d) {
         throw DecodeError("bad metadata hash");
     return m;
 }
+
+std::vector<Hash256> metadata_history_materialization_dependencies(
+    const MetadataHistoryEntry& entry) {
+    if (entry.body == MetadataHistoryEntry::Body::delta)
+        return {entry.previous};
+    return {};
+}
+
 Bytes encode_metadata_history_entry(const MetadataHistoryEntry& entry_value) {
     Writer writer;
     writer.u8(static_cast<uint8_t>(entry_value.body));
@@ -2307,16 +2318,23 @@ void MetadataReplica::load_history() {
                 record.payload = entry_value.payload;
                 if (!valid_metadata_record(record))
                     throw DecodeError("invalid full metadata history record");
-                auto snapshot = decode_snapshot(record.payload);
-                if (snapshot.merge_parents != entry_value.merge_parents)
-                    throw DecodeError("metadata history merge parents mismatch");
+                // Do not rebuild the complete namespace object graph for every
+                // historical checkpoint during cold replay. The encrypted frame
+                // and immutable record hash authenticate the indexed identity;
+                // store/import already validated payload merge parents, and any
+                // accepted/current head is decoded and cross-checked again when
+                // materialized. Re-decoding hundreds of multi-megabyte snapshots
+                // here retained gigabytes in allocator arenas on small nodes.
             } else if (entry_value.body == MetadataHistoryEntry::Body::delta) {
                 if (!entry_value.previous_known || entry_value.generation <= 1)
                     throw DecodeError("metadata delta history has no predecessor");
                 auto parent = history_.find(entry_value.previous);
+                // Merge commits are numbered after their newest parent, while
+                // the deterministic primary parent is selected by hash. The
+                // primary can therefore be more than one generation behind.
                 if (parent == history_.end() ||
-                    parent->second.generation + 1 != entry_value.generation)
-                    throw DecodeError("metadata delta history predecessor missing or non-adjacent");
+                    parent->second.generation >= entry_value.generation)
+                    throw DecodeError("metadata delta history predecessor missing or invalid");
                 (void)decode_metadata_delta(entry_value.payload);
             } else {
                 throw DecodeError("unknown metadata history body");
@@ -2360,6 +2378,13 @@ void MetadataReplica::load_history() {
                   " quarantine=" + quarantine + " reason=" + trailing_problem);
     }
     history_bytes_ = valid;
+#if defined(__GLIBC__)
+    // Cold replay intentionally owns only the compact history index after this
+    // point. Return transient decrypt/frame arenas to the OS before the node
+    // starts serving; otherwise a multi-gigabyte history scan can leave a small
+    // node with gigabytes of RSS despite zero resident history payload bytes.
+    (void)malloc_trim(0);
+#endif
 }
 
 void MetadataReplica::load_heads() {
@@ -2852,7 +2877,8 @@ bool MetadataReplica::history_is_ancestor_locked(const Hash256& ancestor,
         // beyond that boundary.  The direct edge is still valid ancestry.
         if (entry_value.previous != Hash256{} && entry_value.previous == ancestor)
             return true;
-        if (entry_value.previous_known)
+        if (entry_value.previous_known ||
+            (entry_value.previous != Hash256{} && history_.contains(entry_value.previous)))
             pending.push_back(entry_value.previous);
         for (const auto& parent : entry_value.merge_parents) {
             if (parent == ancestor)
@@ -2877,7 +2903,9 @@ std::optional<Hash256> MetadataReplica::history_common_ancestor_locked(const Has
         left_ancestors[current] = generation;
         if (found == history_.end())
             continue;
-        if (found->second.previous_known) {
+        if (found->second.previous_known ||
+            (found->second.previous != Hash256{} &&
+             history_.contains(found->second.previous))) {
             pending.push_back(found->second.previous);
         } else if (found->second.previous != Hash256{}) {
             // Record the authenticated boundary parent as a possible common
@@ -2916,7 +2944,9 @@ std::optional<Hash256> MetadataReplica::history_common_ancestor_locked(const Has
         consider(current, found == history_.end() ? 0 : found->second.generation);
         if (found == history_.end())
             continue;
-        if (found->second.previous_known) {
+        if (found->second.previous_known ||
+            (found->second.previous != Hash256{} &&
+             history_.contains(found->second.previous))) {
             pending.push_back(found->second.previous);
         } else if (found->second.previous != Hash256{}) {
             // As above, the boundary parent participates in ancestry matching
@@ -2947,51 +2977,67 @@ std::optional<MetadataHistoryEntry> MetadataReplica::history_entry(const Hash256
     }
 }
 
+std::optional<MetadataHistoryLinks> MetadataReplica::history_links(const Hash256& hash) const {
+    std::lock_guard lock(m_);
+    const auto found = history_.find(hash);
+    if (found == history_.end())
+        return {};
+    return MetadataHistoryLinks{found->second.generation, found->second.previous,
+                                found->second.previous_known,
+                                found->second.merge_parents, found->second.body};
+}
+
 bool MetadataReplica::import_history(const MetadataHistoryEntry& entry_value) {
     if (!entry_value.generation || entry_value.hash == Hash256{} ||
         entry_value.merge_parents.size() > 64)
         return false;
+    auto entry = entry_value;
     std::shared_ptr<const MetadataMaterialization> parent;
-    if (entry_value.body == MetadataHistoryEntry::Body::delta) {
-        if (!entry_value.previous_known)
+    if (entry.body == MetadataHistoryEntry::Body::delta) {
+        if (!entry.previous_known)
             return false;
-        parent = materialized(entry_value.previous);
-        if (!parent)
+        parent = materialized(entry.previous);
+        if (!parent || parent->record.generation >= entry.generation)
             return false;
+    } else if (entry.previous_known && entry.previous != Hash256{} &&
+               !history_contains(entry.previous)) {
+        // Full-record fallback is safe without its ancestry, but it must not
+        // persist a false claim that the predecessor is locally traversable.
+        entry.previous_known = false;
     }
 
     std::shared_ptr<const MetadataMaterialization> candidate;
     try {
         MetadataRecord record;
-        record.generation = entry_value.generation;
-        record.previous = entry_value.previous;
-        record.hash = entry_value.hash;
+        record.generation = entry.generation;
+        record.previous = entry.previous;
+        record.hash = entry.hash;
         std::shared_ptr<const MetadataSnapshot> snapshot;
-        if (entry_value.body == MetadataHistoryEntry::Body::full) {
-            record.payload = entry_value.payload;
+        if (entry.body == MetadataHistoryEntry::Body::full) {
+            record.payload = entry.payload;
             auto decoded = decode_snapshot(record.payload);
             snapshot = std::make_shared<const MetadataSnapshot>(std::move(decoded));
         } else {
             auto decoded = *parent->snapshot;
-            apply_metadata_delta_in_place(decoded, decode_metadata_delta(entry_value.payload));
-            record.payload = encode_snapshot_for_delta(entry_value.payload, decoded);
+            apply_metadata_delta_in_place(decoded, decode_metadata_delta(entry.payload));
+            record.payload = encode_snapshot_for_delta(entry.payload, decoded);
             snapshot = std::make_shared<const MetadataSnapshot>(std::move(decoded));
         }
-        if (!valid_metadata_record(record) || snapshot->merge_parents != entry_value.merge_parents)
+        if (!valid_metadata_record(record) || snapshot->merge_parents != entry.merge_parents)
             return false;
         candidate = make_materialization(std::move(record), std::move(snapshot));
     } catch (...) {
         return false;
     }
-    auto frame = encode_history_frame(entry_value);
+    auto frame = encode_history_frame(entry);
 
     std::lock_guard durable(durable_mutation_m_);
     {
         std::lock_guard lock(m_);
-        if (history_.contains(entry_value.hash))
+        if (history_.contains(entry.hash))
             return true;
-        if (entry_value.body == MetadataHistoryEntry::Body::delta &&
-            !history_.contains(entry_value.previous))
+        if (entry.body == MetadataHistoryEntry::Body::delta &&
+            !history_.contains(entry.previous))
             return false;
     }
     uint64_t file_offset;
@@ -3001,8 +3047,8 @@ bool MetadataReplica::import_history(const MetadataHistoryEntry& entry_value) {
     }
     write_history_frame(frame);
     std::lock_guard lock(m_);
-    history_.emplace(entry_value.hash,
-                     index_history_entry(entry_value, file_offset, frame.size()));
+    history_.emplace(entry.hash,
+                     index_history_entry(entry, file_offset, frame.size()));
     ++history_records_;
     history_bytes_ += frame.size();
     cache_materialization_locked(candidate->record, candidate->snapshot,
@@ -3027,7 +3073,8 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
     entry_value.generation = record.generation;
     entry_value.previous = record.previous;
     entry_value.hash = record.hash;
-    entry_value.previous_known = record.generation > 1 && record.previous != Hash256{};
+    entry_value.previous_known = record.generation > 1 && record.previous != Hash256{} &&
+                                 history_contains(record.previous);
     try {
         entry_value.merge_parents = decode_snapshot(record.payload).merge_parents;
     } catch (...) {
@@ -3050,7 +3097,7 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
                 record, std::make_shared<const MetadataSnapshot>(decode_snapshot(record.payload)));
         } else {
             auto parent = materialized(entry_value.previous);
-            if (!parent)
+            if (!parent || parent->record.generation >= record.generation)
                 return false;
             auto snapshot = *parent->snapshot;
             apply_metadata_delta_in_place(snapshot, decode_metadata_delta(entry_value.payload));

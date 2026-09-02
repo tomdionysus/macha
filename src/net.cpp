@@ -1801,8 +1801,9 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
     reap_retired();
     const auto retry_key = dial_key(endpoint, lane);
     std::optional<NodeId> known;
-    {
-        std::lock_guard lock(mutex_);
+    std::string flight_key;
+    while (true) {
+        std::unique_lock lock(mutex_);
         if (expected) {
             known = *expected;
         } else if (auto p = endpoint_peers_.find(endpoint_key(endpoint));
@@ -1832,7 +1833,29 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
         auto health = health_.find(retry_key);
         if (health != health_.end() && Clock::now() < health->second.retry_after)
             throw std::runtime_error("peer in retry backoff");
+
+        flight_key = known ? route_key(*known, lane) : retry_key;
+        if (connection_dials_.insert(flight_key).second)
+            break;
+
+        connection_cv_.wait(lock, [&] { return !connection_dials_.contains(flight_key); });
+        // The leader may have installed an outbound route, accepted a
+        // simultaneous inbound route, or failed and established retry
+        // backoff. Re-evaluate all three states rather than blindly redialling.
+        known.reset();
     }
+
+    bool flight_active = true;
+    auto finish_flight = [&] {
+        if (!flight_active)
+            return;
+        {
+            std::lock_guard lock(mutex_);
+            connection_dials_.erase(flight_key);
+        }
+        flight_active = false;
+        connection_cv_.notify_all();
+    };
 
     try {
         int fd = connect_socket(endpoint, connect_timeout_);
@@ -1915,8 +1938,10 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
                       " lane=" + std::string(transport_lane_name(lane)) +
                       " endpoint=" + endpoint_key(endpoint));
         }
+        finish_flight();
         return winner;
     } catch (...) {
+        finish_flight();
         observe_result(retry_key, false, std::chrono::milliseconds(0));
         throw;
     }

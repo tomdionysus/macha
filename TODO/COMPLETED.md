@@ -1,8 +1,26 @@
 # Completed and tested
 
-Last updated: 2026-09-01
+Last updated: 2026-09-02
 
 This is the completed-work ledger for the current session. An item belongs here only after implementation and its stated verification are complete. Detailed design notes, exact test results, and UAT measurements remain in the linked records.
+
+## Hydration shutdown ownership and first retained-owner diagnostics
+
+- [x] Reproduced the live late-submit race which threw `hydration executor is
+  stopping` through a scheduler `std::jthread` and aborted GBNI-1 during stop.
+- [x] Made late submission a normal rejected result, completed executor-owned
+  queued promises before join, and added explicit cancellation/rejection
+  accounting plus a deterministic blocked-provider shutdown regression.
+- [x] Added O(1) current retained-owner counters for FUSE operations, checksums,
+  overlay ranges, publication snapshots, durability tickets and publication
+  pipeline bytes; clean completed inodes release empty operation-vector
+  capacity.
+- [x] Added active playback fragment resident, spill, descriptor and VOD-plan
+  ownership counters.
+- [x] Passed 62/62 focused FUSE tests, a clean 260/260 parallel core run, and
+  3/3 runtime tests. Loaded stable-RSS acceptance remains active.
+
+Evidence: [shutdown and retained-owner checkpoint](2026-09-02-shutdown-and-retained-owner-checkpoint.md)
 
 ## Asynchronous identity reset and retired-node status — 0.22.2
 

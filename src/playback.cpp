@@ -25,8 +25,20 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(__linux__)
+#include <malloc.h>
+#endif
+
 namespace macha {
 namespace {
+
+bool release_free_process_heap_pages() noexcept {
+#if defined(__linux__) && defined(__GLIBC__)
+    return ::malloc_trim(0) != 0;
+#else
+    return false;
+#endif
+}
 
 std::string hex_token(size_t bytes = 24) {
     static constexpr char alphabet[] = "0123456789abcdef";
@@ -585,6 +597,10 @@ struct PlaybackManager::Impl {
     size_t reserved_video_transcodes{};
     size_t reserved_audio_transcodes{};
     uint64_t idle_pipelines_reclaimed{};
+    bool heap_reclaim_pending{};
+    uint64_t heap_reclaim_requests{};
+    uint64_t heap_reclaim_runs{};
+    uint64_t heap_reclaim_successes{};
     bool started{};
     std::function<size_t(const std::vector<std::string>&)> request_media_profiles;
     MediaInformationService* media_information{};
@@ -1066,13 +1082,33 @@ struct PlaybackManager::Impl {
         return session.engine_session;
     }
 
+    static bool transformed(const PlaybackPlan& plan) {
+        return plan.video == MediaTransform::transcode ||
+               plan.audio == MediaTransform::transcode;
+    }
+
+    void request_heap_reclaim() {
+        std::lock_guard lock(mutex);
+        heap_reclaim_pending = true;
+        ++heap_reclaim_requests;
+        signal_cleanup_locked();
+    }
+
     void stop_pipeline(Session& session) {
         std::shared_ptr<MediaEngineSession> active;
         {
             std::lock_guard lock(session.pipeline_mutex);
             active.swap(session.engine_session);
         }
-        if (active) active->stop();
+        if (active) {
+            active->stop();
+            // Destroy codec and segment owners before waking the asynchronous
+            // reclaimer. stop_pipeline() is also used by viewer-facing seek
+            // and reconfiguration paths, so it must never trim synchronously.
+            active.reset();
+            if (transformed(session.plan))
+                request_heap_reclaim();
+        }
     }
 
     void wait_for_initial_fragment(Session& session, std::string_view trace) {
@@ -1995,22 +2031,44 @@ struct PlaybackManager::Impl {
         size_t session_count = 0, video_transcodes = 0, audio_transcodes = 0;
         size_t cached_probes = 0, cached_probe_bytes = 0;
         size_t cached_subtitle_segments = 0, cached_subtitle_bytes = 0;
+        uint64_t segment_store_resident_bytes = 0, segment_store_spill_bytes = 0;
+        uint64_t segment_store_descriptor_bytes = 0, segment_store_segments = 0;
+        uint64_t segment_store_planned_segments = 0;
         uint64_t reclaimed = 0;
+        bool heap_pending = false;
+        uint64_t heap_requests = 0, heap_runs = 0, heap_successes = 0;
         std::chrono::milliseconds pipeline_idle{};
+        std::vector<std::shared_ptr<Session>> active_sessions;
         {
             std::lock_guard lock(mutex);
             session_count = sessions.size();
             video_transcodes = video_transcodes_locked();
             audio_transcodes = audio_transcodes_locked();
             reclaimed = idle_pipelines_reclaimed;
+            heap_pending = heap_reclaim_pending;
+            heap_requests = heap_reclaim_requests;
+            heap_runs = heap_reclaim_runs;
+            heap_successes = heap_reclaim_successes;
             pipeline_idle = config.pipeline_idle;
             cached_probes = probe_cache.size();
             cached_probe_bytes = probe_cache_bytes;
             for (const auto& [_, session] : sessions) {
+                active_sessions.push_back(session);
                 std::lock_guard subtitle_lock(session->subtitle_cache->mutex);
                 cached_subtitle_segments += session->subtitle_cache->segments.size();
                 cached_subtitle_bytes += session->subtitle_cache->bytes;
             }
+        }
+        for (const auto& session : active_sessions) {
+            auto active = active_engine(*session);
+            if (!active)
+                continue;
+            const auto segment_state = active->segments()->snapshot();
+            segment_store_resident_bytes += segment_state.resident_bytes;
+            segment_store_spill_bytes += segment_state.spill_bytes;
+            segment_store_descriptor_bytes += segment_state.descriptor_bytes;
+            segment_store_segments += segment_state.segment_count;
+            segment_store_planned_segments += segment_state.planned_segments;
         }
         Json::Object out{{"server_version", std::string(kServerVersion)},
                          {"enabled", config.enabled},
@@ -2022,6 +2080,10 @@ struct PlaybackManager::Impl {
                          {"max_audio_transcodes", static_cast<uint64_t>(config.max_audio_transcodes)},
                          {"pipeline_idle_ms", static_cast<uint64_t>(pipeline_idle.count())},
                          {"idle_pipelines_reclaimed", reclaimed},
+                         {"heap_reclaim_pending", heap_pending},
+                         {"heap_reclaim_requests", heap_requests},
+                         {"heap_reclaim_runs", heap_runs},
+                         {"heap_reclaim_successes", heap_successes},
                          {"probe_cache_entries", static_cast<uint64_t>(cached_probes)},
                          {"probe_cache_bytes", static_cast<uint64_t>(cached_probe_bytes)},
                          {"probe_cache_limit_entries",
@@ -2031,6 +2093,11 @@ struct PlaybackManager::Impl {
                          {"subtitle_cache_entries",
                           static_cast<uint64_t>(cached_subtitle_segments)},
                          {"subtitle_cache_bytes", static_cast<uint64_t>(cached_subtitle_bytes)},
+                         {"segment_store_resident_bytes", segment_store_resident_bytes},
+                         {"segment_store_spill_bytes", segment_store_spill_bytes},
+                         {"segment_store_descriptor_bytes", segment_store_descriptor_bytes},
+                         {"segment_store_segments", segment_store_segments},
+                         {"segment_store_planned_segments", segment_store_planned_segments},
                          {"media_engine_available", state.available},
                          {"media_engine", state.backend},
                          {"media_engine_version", state.version},
@@ -2073,6 +2140,7 @@ struct PlaybackManager::Impl {
                                   std::shared_ptr<MediaEngineSession>>> idle_pipelines;
             std::optional<Clock::time_point> next_expiry;
             std::chrono::milliseconds idle_timeout{};
+            bool reclaim_heap = false;
             {
                 std::unique_lock lock(mutex);
                 const auto now = Clock::now();
@@ -2105,7 +2173,24 @@ struct PlaybackManager::Impl {
                     }
                 }
 
-                if (expired.empty() && idle_pipelines.empty()) {
+                if (heap_reclaim_pending) {
+                    bool transformed_pipeline_active = false;
+                    for (const auto& [_, session] : sessions) {
+                        if (!transformed(session->plan))
+                            continue;
+                        std::lock_guard pipeline_lock(session->pipeline_mutex);
+                        if (session->engine_session) {
+                            transformed_pipeline_active = true;
+                            break;
+                        }
+                    }
+                    if (!transformed_pipeline_active) {
+                        heap_reclaim_pending = false;
+                        reclaim_heap = true;
+                    }
+                }
+
+                if (expired.empty() && idle_pipelines.empty() && !reclaim_heap) {
                     const auto observed_revision = cleanup_revision;
                     const auto changed = [&] { return cleanup_revision != observed_revision; };
                     if (next_expiry)
@@ -2122,11 +2207,25 @@ struct PlaybackManager::Impl {
             }
             for (auto& [session, pipeline] : idle_pipelines) {
                 pipeline->stop();
+                pipeline.reset();
+                if (transformed(session->plan))
+                    request_heap_reclaim();
                 std::error_code ec;
                 std::filesystem::remove_all(session->generation_dir, ec);
                 Log::info("playback pipeline reclaimed after stream inactivity session=" +
                           session->id + " idle_ms=" +
                           std::to_string(idle_timeout.count()));
+            }
+            if (reclaim_heap) {
+                const bool released = release_free_process_heap_pages();
+                {
+                    std::lock_guard lock(mutex);
+                    ++heap_reclaim_runs;
+                    if (released)
+                        ++heap_reclaim_successes;
+                }
+                Log::debug("playback post-transcode heap reclaim released=" +
+                           std::to_string(released ? 1 : 0));
             }
         }
     }

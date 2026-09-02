@@ -433,12 +433,75 @@ void LocalStore::reap_durable_generations_locked() {
 
 bool LocalStore::physical_space_available_locked(uint64_t need) const {
     const auto before = used_.load(std::memory_order_relaxed);
-    if (need > limit_ || before > limit_ - need) return false;
+    if (need > limit_ || reserved_write_bytes_ > limit_ - need ||
+        before > limit_ - need - reserved_write_bytes_)
+        return false;
     std::error_code error;
     const auto space = std::filesystem::space(root_, error);
     if (error) return false;
-    if (need > space.available) return false;
-    return reserve_free_ <= space.available - need;
+    if (reserved_write_bytes_ > space.available || need > space.available - reserved_write_bytes_)
+        return false;
+    return reserve_free_ <= space.available - reserved_write_bytes_ - need;
+}
+
+std::optional<LocalStore::LooseStamp>
+LocalStore::loose_stamp(const std::filesystem::path& path) {
+    struct stat value {};
+    if (::stat(path.c_str(), &value) != 0 || value.st_size < 0)
+        return {};
+#if defined(__APPLE__)
+    const auto modified = static_cast<int64_t>(value.st_mtimespec.tv_sec) * 1000000000LL +
+                          value.st_mtimespec.tv_nsec;
+    const auto changed = static_cast<int64_t>(value.st_ctimespec.tv_sec) * 1000000000LL +
+                         value.st_ctimespec.tv_nsec;
+#else
+    const auto modified = static_cast<int64_t>(value.st_mtim.tv_sec) * 1000000000LL +
+                          value.st_mtim.tv_nsec;
+    const auto changed = static_cast<int64_t>(value.st_ctim.tv_sec) * 1000000000LL +
+                         value.st_ctim.tv_nsec;
+#endif
+    return LooseStamp{static_cast<uint64_t>(value.st_dev),
+                      static_cast<uint64_t>(value.st_ino),
+                      static_cast<uint64_t>(value.st_size), modified, changed};
+}
+
+std::shared_ptr<std::mutex> LocalStore::object_mutex(const ObjectId& id) const {
+    std::lock_guard lock(object_mutex_map_mutex_);
+    if (auto found = object_mutexes_.find(id); found != object_mutexes_.end()) {
+        if (auto existing = found->second.lock())
+            return existing;
+        object_mutexes_.erase(found);
+    }
+    auto created = std::make_shared<std::mutex>();
+    object_mutexes_[id] = created;
+    if (object_mutexes_.size() > 4096) {
+        std::erase_if(object_mutexes_, [](const auto& item) { return item.second.expired(); });
+    }
+    return created;
+}
+
+void LocalStore::remember_verified_loose_locked(const ObjectId& id,
+                                                const LooseStamp& stamp) const {
+    const auto sequence = ++verified_loose_sequence_;
+    verified_loose_[id] = {stamp, sequence};
+    verified_loose_order_.push_back({sequence, id});
+    while (verified_loose_.size() > verified_loose_limit && !verified_loose_order_.empty()) {
+        const auto [candidate_sequence, candidate] = verified_loose_order_.front();
+        verified_loose_order_.pop_front();
+        auto found = verified_loose_.find(candidate);
+        if (found != verified_loose_.end() && found->second.sequence == candidate_sequence)
+            verified_loose_.erase(found);
+    }
+    if (verified_loose_order_.size() > verified_loose_limit * 4) {
+        verified_loose_order_.clear();
+        for (const auto& [candidate, verified] : verified_loose_)
+            verified_loose_order_.push_back({verified.sequence, candidate});
+        std::sort(verified_loose_order_.begin(), verified_loose_order_.end());
+    }
+}
+
+void LocalStore::forget_verified_loose_locked(const ObjectId& id) const {
+    verified_loose_.erase(id);
 }
 
 void LocalStore::select_active_pack_locked(uint64_t next_record_size) {
@@ -640,30 +703,51 @@ void LocalStore::rebuild_pack_index_locked(bool truncate_incomplete_tail) {
 bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> data,
                                   StoreWriteDurability durability, uint64_t* deferred_generation,
                                   std::unique_lock<std::mutex>& lock) {
-    auto sealed = aes_gcm_seal(key_, data, id.bytes);
-    Writer header;
-    header.raw(M);
-    header.u64(data.size());
-    header.fixed(sealed.nonce);
-    header.fixed(sealed.tag);
-    const uint64_t need = header.data().size() + sealed.ciphertext.size();
+    // Encryption and physical I/O are object-scoped work. Reserve capacity and
+    // make crash accounting dirty under the short store lock, then let unrelated
+    // object reads/writes proceed while this object is sealed and installed.
+    constexpr uint64_t loose_header_size = M.size() + sizeof(uint64_t) + 12 + 16;
+    const uint64_t need = loose_header_size + data.size();
     if (!physical_space_available_locked(need)) return false;
-    const auto before = used_.load(std::memory_order_relaxed);
     const bool ephemeral = mode_ == LocalStoreMode::ephemeral;
     if (!ephemeral) mark_accounting_dirty_locked();
-
-    auto p = path(id);
-    std::filesystem::create_directories(p.parent_path());
-    auto temp = p.string() + ".tmp." + std::to_string(getpid()) + "." + std::to_string(unix_ms());
-    int fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (fd < 0) throw std::runtime_error(strerror(errno));
+    reserved_write_bytes_ += need;
+    auto before_write = before_loose_write_for_tests_;
+    lock.unlock();
+    std::string temp;
+    int fd = -1;
     try {
+        if (before_write)
+            before_write(id);
+        auto sealed = aes_gcm_seal(key_, data, id.bytes);
+        Writer header;
+        header.raw(M);
+        header.u64(data.size());
+        header.fixed(sealed.nonce);
+        header.fixed(sealed.tag);
+        if (header.data().size() + sealed.ciphertext.size() != need)
+            throw std::logic_error("local store loose object size mismatch");
+
+        auto p = path(id);
+        std::filesystem::create_directories(p.parent_path());
+        temp = p.string() + ".tmp." + std::to_string(getpid()) + "." +
+               std::to_string(unix_ms());
+        fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd < 0) throw std::runtime_error(strerror(errno));
         wa(fd, header.data());
         wa(fd, sealed.ciphertext);
         if (::close(fd) != 0) throw std::runtime_error(strerror(errno));
         fd = -1;
         if (::rename(temp.c_str(), p.c_str()) != 0) throw std::runtime_error(strerror(errno));
-        used_.store(before + need, std::memory_order_relaxed);
+        const auto installed_stamp = loose_stamp(p);
+        if (!installed_stamp)
+            throw std::runtime_error("cannot stat installed local object");
+        lock.lock();
+        if (reserved_write_bytes_ < need)
+            throw std::logic_error("local store write reservation underflow");
+        reserved_write_bytes_ -= need;
+        used_.fetch_add(need, std::memory_order_relaxed);
+        remember_verified_loose_locked(id, *installed_stamp);
         uint64_t generation = 0;
         if (!ephemeral && durability_domain_) {
             generation = durability_domain_->complete_mutation(p, p.parent_path());
@@ -681,7 +765,13 @@ bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> d
     } catch (...) {
         if (fd >= 0) ::close(fd);
         std::error_code remove_error;
-        std::filesystem::remove(temp, remove_error);
+        if (!temp.empty())
+            std::filesystem::remove(temp, remove_error);
+        if (!lock.owns_lock())
+            lock.lock();
+        if (reserved_write_bytes_ < need)
+            throw std::logic_error("local store write reservation underflow during failure");
+        reserved_write_bytes_ -= need;
         throw;
     }
 }
@@ -721,41 +811,27 @@ bool LocalStore::put_packed_locked(const ObjectId& id, std::span<const uint8_t> 
 bool LocalStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
                           StoreWriteDurability durability, uint64_t* deferred_generation) {
     if (object_id(data) != id) throw std::runtime_error("object hash mismatch");
+    auto object_lock = object_mutex(id);
+    std::lock_guard object_guard(*object_lock);
     std::unique_lock lock(m_);
     wait_for_accounting(lock);
 
-    std::optional<Bytes> existing;
-    try {
-        if (packed_.contains(id)) existing = get_packed_locked(id);
-        else if (std::filesystem::exists(path(id))) {
-            auto encoded = rf(path(id));
-            Reader r(encoded);
-            auto magic = r.raw(M.size());
-            if (!std::equal(magic.begin(), magic.end(), M.begin()))
-                throw std::runtime_error("bad object header");
-            auto size = r.u64();
-            auto nonce = r.fixed<12>();
-            auto tag = r.fixed<16>();
-            auto cipher = r.raw(r.remaining());
-            auto plain = aes_gcm_open(key_, nonce, tag, cipher, id.bytes);
-            if (plain.size() != size || object_id(plain) != id)
-                throw std::runtime_error("object integrity failure");
-            existing = std::move(plain);
+    if (packed_.contains(id)) {
+        std::optional<Bytes> existing;
+        try {
+            existing = get_packed_locked(id);
+        } catch (...) {
+            existing.reset();
         }
-    } catch (...) {
-        existing.reset();
-    }
-    if (existing && existing->size() == data.size() &&
-        std::equal(existing->begin(), existing->end(), data.begin())) {
-        const auto packed = packed_.find(id);
-        if (packed != packed_.end()) {
+        if (existing && existing->size() == data.size() &&
+            std::equal(existing->begin(), existing->end(), data.begin())) {
             // A compact touch record makes the re-affirmation age crash-recoverable.
             const auto before = used_.load(std::memory_order_relaxed);
             uint64_t record_size = 0;
             if (mode_ != LocalStoreMode::ephemeral) mark_accounting_dirty_locked();
             const auto touched = unix_ms();
             append_pack_record_locked(pack_touch, id, {}, touched, nullptr, &record_size);
-            packed->second.touched_unix_ms = touched;
+            packed_.at(id).touched_unix_ms = touched;
             pack_dead_bytes_ += record_size;
             used_.store(before + record_size, std::memory_order_relaxed);
             uint64_t generation = 0;
@@ -772,27 +848,74 @@ bool LocalStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
             }
             return true;
         }
-        std::error_code touch_error;
-        std::filesystem::last_write_time(path(id), std::filesystem::file_time_type::clock::now(),
-                                         touch_error);
-        reap_durable_generations_locked();
-        uint64_t generation = 0;
-        if (auto found = provisional_generations_.find(id); found != provisional_generations_.end())
-            generation = found->second;
-        if (deferred_generation) *deferred_generation = generation;
-        if (durability == StoreWriteDurability::immediate && durability_domain_ &&
-            generation > durability_domain_->durable_generation()) {
-            lock.unlock();
-            durability_domain_->await_durable(generation, DurabilityUrgency::immediate);
-        }
-        return true;
-    }
-
-    if (packed_.contains(id)) {
         // A corrupt packed record is superseded by the new record. The old bytes
         // remain dead until compaction; no in-place rewrite can damage neighbours.
-    } else if (std::filesystem::exists(path(id))) {
-        if (!remove_locked(id) && std::filesystem::exists(path(id)))
+        return put_packed_locked(id, data, durability, deferred_generation, lock);
+    }
+
+    const auto loose_path = path(id);
+    if (std::filesystem::exists(loose_path)) {
+        std::optional<LooseStamp> remembered;
+        if (auto verified = verified_loose_.find(id); verified != verified_loose_.end())
+            remembered = verified->second.stamp;
+        std::optional<Bytes> existing;
+        lock.unlock();
+        const auto current_stamp = loose_stamp(loose_path);
+        const bool verified_fast = remembered && current_stamp && *remembered == *current_stamp;
+        if (verified_fast) {
+            loose_reaffirmation_fast_paths_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            loose_reaffirmation_full_validations_.fetch_add(1, std::memory_order_relaxed);
+            try {
+                auto encoded = rf(loose_path);
+                Reader r(encoded);
+                auto magic = r.raw(M.size());
+                if (!std::equal(magic.begin(), magic.end(), M.begin()))
+                    throw std::runtime_error("bad object header");
+                auto size = r.u64();
+                auto nonce = r.fixed<12>();
+                auto tag = r.fixed<16>();
+                auto cipher = r.raw(r.remaining());
+                auto plain = aes_gcm_open(key_, nonce, tag, cipher, id.bytes);
+                if (plain.size() != size || object_id(plain) != id)
+                    throw std::runtime_error("object integrity failure");
+                existing = std::move(plain);
+            } catch (...) {
+                existing.reset();
+            }
+        }
+        if (verified_fast ||
+            (existing && existing->size() == data.size() &&
+             std::equal(existing->begin(), existing->end(), data.begin()))) {
+            std::error_code touch_error;
+            std::filesystem::last_write_time(loose_path,
+                                             std::filesystem::file_time_type::clock::now(),
+                                             touch_error);
+            const auto touched_stamp = loose_stamp(loose_path);
+            lock.lock();
+            if (touched_stamp)
+                remember_verified_loose_locked(id, *touched_stamp);
+            else
+                forget_verified_loose_locked(id);
+            reap_durable_generations_locked();
+            uint64_t generation = 0;
+            if (auto found = provisional_generations_.find(id);
+                found != provisional_generations_.end())
+                generation = found->second;
+            if (deferred_generation) *deferred_generation = generation;
+            if (durability == StoreWriteDurability::immediate && durability_domain_ &&
+                generation > durability_domain_->durable_generation()) {
+                lock.unlock();
+                durability_domain_->await_durable(generation, DurabilityUrgency::immediate);
+            }
+            return true;
+        }
+
+        // Preserve the strong PUT acknowledgement contract: an externally
+        // corrupted object is replaced by the supplied bytes rather than being
+        // trusted merely because its content-addressed pathname exists.
+        lock.lock();
+        if (!remove_locked(id) && std::filesystem::exists(loose_path))
             throw std::runtime_error("cannot replace corrupt local object");
     }
 
@@ -802,9 +925,13 @@ bool LocalStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
 }
 
 std::optional<Bytes> LocalStore::get(const ObjectId& id) const {
-    std::lock_guard lock(m_);
-    if (auto data = get_packed_locked(id)) return data;
-    auto p = path(id);
+    auto object_lock = object_mutex(id);
+    std::lock_guard object_guard(*object_lock);
+    std::unique_lock lock(m_);
+    if (packed_.contains(id))
+        return get_packed_locked(id);
+    const auto p = path(id);
+    lock.unlock();
     if (!std::filesystem::exists(p)) return {};
     auto encoded = rf(p);
     Reader r(encoded);
@@ -818,10 +945,17 @@ std::optional<Bytes> LocalStore::get(const ObjectId& id) const {
     auto plain = aes_gcm_open(key_, nonce, tag, cipher, id.bytes);
     if (plain.size() != size || object_id(plain) != id)
         throw std::runtime_error("object integrity failure");
+    const auto stamp = loose_stamp(p);
+    if (stamp) {
+        lock.lock();
+        remember_verified_loose_locked(id, *stamp);
+    }
     return plain;
 }
 
 bool LocalStore::has(const ObjectId& id) const {
+    auto object_lock = object_mutex(id);
+    std::lock_guard object_guard(*object_lock);
     std::lock_guard lock(m_);
     return packed_.contains(id) || std::filesystem::exists(path(id));
 }
@@ -831,6 +965,7 @@ bool LocalStore::valid(const ObjectId& id) const noexcept {
 }
 
 bool LocalStore::remove_locked(const ObjectId& id) {
+    forget_verified_loose_locked(id);
     if (auto found = packed_.find(id); found != packed_.end()) {
         const auto before = used_.load(std::memory_order_relaxed);
         if (mode_ != LocalStoreMode::ephemeral) mark_accounting_dirty_locked();
@@ -900,12 +1035,16 @@ uint64_t LocalStore::durability_domain_id() const noexcept {
 }
 
 bool LocalStore::remove(const ObjectId& id) {
+    auto object_lock = object_mutex(id);
+    std::lock_guard object_guard(*object_lock);
     std::unique_lock lock(m_);
     wait_for_accounting(lock);
     return remove_locked(id);
 }
 
 bool LocalStore::remove_if_older_than(const ObjectId& id, std::chrono::milliseconds age) {
+    auto object_lock = object_mutex(id);
+    std::lock_guard object_guard(*object_lock);
     std::unique_lock lock(m_);
     wait_for_accounting(lock);
     if (auto found = packed_.find(id); found != packed_.end()) {
@@ -985,6 +1124,8 @@ std::filesystem::path LocalStore::object_path(const ObjectId& id) const {
 }
 
 uint64_t LocalStore::stored_size(const ObjectId& id) const {
+    auto object_lock = object_mutex(id);
+    std::lock_guard object_guard(*object_lock);
     std::lock_guard lock(m_);
     if (auto found = packed_.find(id); found != packed_.end()) return found->second.record_size;
     std::error_code error;
@@ -993,6 +1134,8 @@ uint64_t LocalStore::stored_size(const ObjectId& id) const {
 }
 
 std::filesystem::file_time_type LocalStore::last_write(const ObjectId& id) const {
+    auto object_lock = object_mutex(id);
+    std::lock_guard object_guard(*object_lock);
     std::lock_guard lock(m_);
     if (auto found = packed_.find(id); found != packed_.end())
         return file_time_from_unix_ms(found->second.touched_unix_ms);
@@ -1002,6 +1145,8 @@ std::filesystem::file_time_type LocalStore::last_write(const ObjectId& id) const
 }
 
 void LocalStore::touch(const ObjectId& id) {
+    auto object_lock = object_mutex(id);
+    std::lock_guard object_guard(*object_lock);
     std::lock_guard lock(m_);
     if (auto found = packed_.find(id); found != packed_.end()) {
         const auto before = used_.load(std::memory_order_relaxed);
@@ -1023,6 +1168,8 @@ void LocalStore::touch(const ObjectId& id) {
 }
 
 bool LocalStore::older_than(const ObjectId& id, std::chrono::milliseconds age) const {
+    auto object_lock = object_mutex(id);
+    std::lock_guard object_guard(*object_lock);
     std::lock_guard lock(m_);
     if (auto found = packed_.find(id); found != packed_.end()) {
         const auto now = unix_ms();
@@ -1036,6 +1183,8 @@ bool LocalStore::older_than(const ObjectId& id, std::chrono::milliseconds age) c
 }
 
 bool LocalStore::is_packed(const ObjectId& id) const {
+    auto object_lock = object_mutex(id);
+    std::lock_guard object_guard(*object_lock);
     std::lock_guard lock(m_);
     return packed_.contains(id);
 }

@@ -6,6 +6,83 @@ This is the working backlog for the current session. Add new work here. When an 
 
 The existing documents in this directory remain the detailed plans, checkpoints, and UAT records. This file is only the current index.
 
+## Primary programme: structural ingest and runtime remediation
+
+- [ ] Execute the phased
+  [structural ingest and runtime remediation](2026-09-02-structural-ingest-runtime-remediation.md)
+  before further throughput tuning or loaded ingest UAT. The 2026-09-02 live
+  append-verify plus playback run showed node 50 growing from roughly 218 MiB
+  RSS to over 1 GiB in about five minutes while completing only one file.
+  Inspection found implementation-level amplification rather than a failed
+  architecture: store-wide locks cover disk/crypto, existing object puts redo
+  full payload work, FUSE reads copy and replay complete pending histories,
+  retained memory is not governed process-wide, small metadata mutations do
+  whole-snapshot work, profile pruning scans unstable whole-library views, and
+  several expensive paths bypass work-class priority.
+- [ ] Treat the plan's Phase 0–3 gates as P0 and primary. Do not resume loaded
+  rsync, overnight ingest or throughput UAT until object-store priority,
+  append-verify complexity and process-wide retained-memory bounds pass their
+  deterministic tests.
+- [ ] Treat Phases 4–7 as the continuation of the same programme, not optional
+  optimisation. They remove metadata/publication amplification, causally unsafe
+  profile GC, priority bypass and diagnostic amplification.
+- [ ] Remediate the failed short guarded UAT defined by the
+  [first structural runtime checkpoint](2026-09-02-structural-runtime-first-checkpoint.md).
+  The indexed overlay passed with one range examined per read, but GBNI-1 RSS
+  rose from 498,794,496 to 992,722,944 bytes in about 65 seconds and crossed the
+  confirming growth-rate stop gate. Stopping also exposed an uncaught
+  `hydration executor is stopping` exception on GBNI-1. Complete retained-owner
+  diagnostics and shutdown lifecycle regressions before repeating loaded UAT;
+  see the [UAT record](2026-09-02-structural-runtime-first-uat.md). The shutdown
+  race and first retained-owner instrumentation are now locally corrected and
+  260/260 core plus 3/3 runtime tests pass; deploy only for the guarded
+  attribution UAT described in the
+  [checkpoint](2026-09-02-shutdown-and-retained-owner-checkpoint.md).
+- [ ] Correct the playback-local memory/copy amplification isolated in the
+  [rsync/playback attribution UAT](2026-09-02-isolated-rsync-playback-uat.md).
+  Rsync-only plateaued near 445 MiB, while a clean transcode-only run rose from
+  roughly 386 MiB to 790 MiB and retained roughly 205 MiB above baseline after
+  Status reported no session, pipeline or segment ownership. Prioritise active
+  RPC/reassembly/object payload accounting, elimination of repeated 4 MiB
+  stripe copies, bounded DATA connection ownership and physical teardown.
+  The first correction now single-flights cold connection creation per
+  authenticated peer/lane; a 24-caller regression creates exactly one DATA
+  transport and the 261/261 core plus 3/3 runtime suites pass. Its clean UAT
+  proved one canonical connection but still retained about 258 MiB after
+  teardown; a diagnostic glibc trim returned that memory immediately. The
+  event-driven playback cleanup worker now requests Linux heap reclamation only
+  after the final transformed pipeline has stopped, with regression and Status
+  coverage; 23/23 playback, 261/261 core and 3/3 runtime tests pass. Four-node
+  UAT then returned GBNI-1 from approximately 783 MiB live to 406 MiB
+  immediately after teardown (one request/run/success), passing the physical
+  teardown gate. Continue reducing the separately observed roughly 385 MiB
+  live transcode increase, full-stripe reply copies and 7.56-second startup.
+
+### Backlog precedence and supersession
+
+- Existing completed checkpoints remain valid evidence for exactly the layer
+  they tested, but they do not override a newly demonstrated lower-layer
+  failure. In particular, zero DATA-arbiter viewer waits is not end-to-end proof
+  that the viewer did not wait on store locks, CPU, disk, metadata or logging.
+- The active heap audit, ingest heap remediation, Phase 1D priority work, Phase
+  2/3 descriptor and metadata batching, Phase 4B executor work, metadata
+  representation concepts, and profile lifecycle work are merged into the new
+  primary plan at the phase named in its `Superseded or paused work` section.
+- Smooth spool-throttle tuning and aggregate throughput UAT are paused. Their
+  current input rate is distorted by avoidable work amplification; tuning now
+  would preserve the wrong behaviour.
+- [ ] Make spool backpressure smooth and visibly progressive once occupancy is
+  high. The 2026-09-02 rsync-only isolation run remained memory-stable but, at
+  17,179,856,131 bytes against the 16 GiB limit, rsync appeared frozen: accepted
+  bytes and progress stopped instead of converging toward the measured
+  publication/drain rate. Replace the hard-wall behaviour with bounded,
+  occupancy-aware pacing that continues to acknowledge incremental progress,
+  while preserving the viewer/control priority laws. Resume this tuning only
+  after the primary Phase 1-3 amplification and ownership gates pass.
+- Any older task that proposes another independently bounded queue or accepts
+  admission-layer priority as the final invariant is superseded. Its document
+  is retained as historical evidence, not as current design authority.
+
 ## Deployment rule
 
 - [ ] For every deployment, synchronize the complete source tree and all
@@ -14,21 +91,17 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   build nodes in parallel, and verify installed binary versions and hashes on
   identical hardware before UAT.
 
-## P0: bounded metadata history and crash recovery
+## Preserved P0 safety work, subordinate to the primary Phase 0–3 gates
 
-- [ ] Execute the ranked source-wide
-  [heap allocation and ownership audit](2026-09-01-heap-allocation-audit.md).
-  The application-owned lifecycle fixes, bounds, RAII conversion and parallel
-  regression suite are implemented and pass on macOS plus aarch64 ASan/LSan.
-  Add the remaining large-index current/peak byte diagnostics and prove a stable
-  loaded RSS plateau; allocator statistics alone are not an explanation.
-  Implementation is tracked in the resumable
-  [ownership/lifecycle remediation checkpoint](2026-09-02-ownership-lifecycle-remediation.md).
-
-- [ ] Complete and UAT the
-  [ingest heap-amplification remediation](2026-09-01-ingest-heap-amplification.md):
-  fixed extent workers and pre-copy FUSE write byte admission are implemented;
-  full-suite verification, four-node deployment and loaded RSS proof remain.
+- The remaining work from the
+  [heap allocation and ownership audit](2026-09-01-heap-allocation-audit.md),
+  [ownership/lifecycle checkpoint](2026-09-02-ownership-lifecycle-remediation.md)
+  and
+  [ingest heap-amplification remediation](2026-09-01-ingest-heap-amplification.md)
+  is absorbed into primary Phases 0–3. Their RAII, fixed-worker and pre-copy
+  admission changes remain useful completed evidence, but their previous loaded
+  RSS acceptance gate is replaced by the process-wide ownership and stable-RSS
+  gate in the primary plan.
 
 - [ ] Execute the phased
   [metadata-history memory remediation](2026-09-01-metadata-history-memory-remediation.md)
@@ -61,7 +134,7 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   restart/rejoin, bounded history growth, writable metadata, no viewer/control
   regression, and no operator mount cleanup.
 
-## Phase 2 namespace batching follow-up
+## Namespace batching requirements absorbed into primary Phase 4
 
 - [ ] Design a durable batch identity that permits dependency chains such as create/rename/unlink to share a publication without weakening restart proof.
 - [ ] Test mixed create/rename/unlink dependencies within a batch and across batch boundaries after that identity exists.
@@ -69,6 +142,14 @@ The existing documents in this directory remain the detailed plans, checkpoints,
 - [ ] Preserve rename as a safe singleton boundary until the durable mixed-operation design and crash matrix are complete.
 
 ## Diagnostics and operational proof still needed
+
+- [ ] Make storage-capacity telemetry explicitly unavailable while a backend's
+  crash-recovery accounting scan is still reconciling. A live 0.22.2 restart on
+  GBNI-1 had `/mnt/diskB` mounted read-write with its objects/packs present and
+  312 GB physically used, but Status advertised authoritative `used_bytes: 0`
+  and the full 8 TiB quota free until the recursive scan completed. Preserve
+  capacity and backend-online state, publish null/unavailable used/free values,
+  expose the reconciliation state, and add restart/status regressions.
 
 - [ ] Record a reproducible local benchmark recipe without default-suite timing thresholds.
 - [ ] After the P0 byte-bounded cache and Status memory metrics land, repeat the
@@ -79,11 +160,14 @@ The existing documents in this directory remain the detailed plans, checkpoints,
 
 - [ ] Diagnose and correct faulty torrent/ingest behaviour. Pausing the torrent removed the local node's residual CPU during Phase 3 idle UAT. Treat this as a separate subsystem investigation so it does not obscure metadata/convergence measurements.
 
-## Deferred architectural concepts
+## Architectural concepts absorbed into primary Phase 5
 
-- [ ] Consider delta-native commit identity based on parent identity, canonical delta, and a state-tree root instead of a fully serialized namespace payload.
-- [ ] Consider a persistent or copy-on-write namespace tree with incremental subtree hashing.
-- [ ] If either protocol-level design proceeds, define rolling-upgrade negotiation, checkpoint/anchor migration, and independent corruption validation first.
+- Delta-native commit identity and a persistent/copy-on-write namespace tree are
+  no longer detached concepts. They are design candidates for primary Phase 5,
+  whose acceptance requirement is mutation cost proportional to changed state.
+- Rolling-upgrade negotiation, checkpoint/anchor migration and independent
+  corruption validation remain mandatory prerequisites to any wire-identity
+  change.
 
 ## Additional investigation
 
@@ -134,153 +218,40 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   duplicate bootstrap entries and simultaneous-dial cases, plus UAT with the
   existing UPnP/public-connectivity status reporting.
 
-- [ ] Execute the phased FUSE publication throughput work in
-  [2026-08-31-fuse-publication-throughput-plan.md](2026-08-31-fuse-publication-throughput-plan.md).
-  Phase 0/1 diagnostics, loader RPC priority, concurrency, fair byte quanta and
-  Phase 4A bounded within-file extent pipelining are complete. The Phase 4A UAT
-  reached 19.5 MiB/s across the full observation window and 40.2 MiB/s in a
-  clean loaded interval, versus the pre-change 7.72 MiB/s. Its FUSE-read
-  "viewer" leg is now explicitly invalidated: it proved bounded yielding, but
-  FUSE is loader/convenience traffic rather than the real viewing path.
-- [ ] Complete Phase 1C/1D invariant UAT. The Phase 1C implementation and focused
-  deterministic tests are complete, and the verified binary is deployed on
-  nodes 50 and 51. FUSE
-  reads are loader class, the exclusive playback gate is gone, and configurable
-  work-conserving weights default to `95:5`. Live `rsync --append-verify`
-  demonstrated concurrent publication, including a 50,122,257-byte publication
-  advance in 20.795 seconds after the cluster returned to 3/3. The overnight
-  copy is intentionally still running. A real viewer/streaming test remains
-  required after Phase 1D: an attempted playback while node 51 was offline
-  failed because its media extents were unavailable, so that incident is not
-  valid scheduler UAT.
-  See
-  [the Phase 1C checkpoint](2026-08-31-fuse-publication-phase-1c-weighted-scheduling.md)
-  and
-  [the integrated plan](2026-08-31-fuse-publication-throughput-plan.md#phase-1c-weighted-viewerloader-scheduling-and-fuse-classification).
-- [ ] Correct the remaining failure found by the deployed Phase 1D loaded UAT:
-  viewer priority currently ends at RPC admission and does not bound
-  already-admitted loader disk/object-transfer work. Add deterministic
-  viewer-versus-loader distributed-read tests, then repeat the real
-  `rsync --append-verify` plus playback/seek UAT. See
-  [the failed UAT record](2026-08-31-phase-1d-loaded-uat-failure.md).
-  The zero-rate spool dead zone is now corrected, natively tested and passed
-  deployment UAT: drained partial publication grants bounded one-for-one
-  bootstrap credits without weakening the hard limit, and live rsync remained
-  active above 50% occupancy during playback. Viewer/resource arbitration is
-  still active. See
-  [the bootstrap-admission checkpoint](2026-08-31-spool-progress-bootstrap-admission.md).
-  The first local correction is now implemented: blocking DATA object/store
-  work has configurable node-wide byte admission and non-borrowable viewer
-  headroom below RPC admission, with deterministic loader-saturation proof and
-  operational counters. A short loaded rsync plus real playback/seek UAT is the
-  next gate; per-device/per-peer and durability resources remain active. See
-  [the DATA resource checkpoint](2026-08-31-phase-1d-data-resource-headroom.md).
-  The deployed loaded UAT passed its objective gate: 24 viewer admissions had
-  zero waits while loader work completed a 696,597,597-byte publication, net
-  spool occupancy fell by 1,348,025,437 bytes, all nodes converged to generation
-  885, and timeouts/RPC failures remained zero. Operator confirmation of
-  subjective playback/seek quality is still required. The live run's apparent
-  6.8x read ratio compared five in-progress publications with one completed
-  publication, so it was not a valid same-cohort amplification measurement.
-  Completed-cohort counters now make the next UAT comparison exact. See
-  [the UAT record](2026-08-31-phase-1d-data-resource-headroom-uat.md).
-- [ ] Phase 1D invariant gate: propagate `control > viewer >> loader >
-  speculative` through executors, locks, byte credits, physical I/O, RPC,
-  durability and metadata; reserve control capacity and viewer headroom; make
-  materialisation/rebuild resumable at bounded checkpoints; remove the global
-  commit convoy; and prove maximum lower-class work ahead of control/viewer is
-  bounded. Preserve 95:5 viewer/loader service, loader non-starvation,
-  work-conserving borrowing, durability, overlapping-writer functionality and
-  atomic visibility. Implement the testable subphases and UAT gate in
-  [Phase 1D](2026-08-31-fuse-publication-throughput-plan.md#phase-1d-make-control-and-viewer-priority-non-bypassable)
-  before resuming later throughput work. The first 1D.1 cut now preserves an
-  immutable loader class/quantum through nested `WriteHandle` DATA operations
-  and prevents loader writes from manufacturing viewer activity; 51/51
-  filesystem/FUSE tests and both targeted control-isolation tests pass. The
-  remainder of 1D.1 remains active. The first 1D.2 cut also makes old-generation
-  materialisation resumable under the FUSE byte quantum; its end-to-end
-  overwrite regression and all 53 filesystem/FUSE tests pass. Rebuild is now
-  resumable too, and the redundant frontend-wide commit mutex has been removed
-  without weakening the narrower metadata/path/content locks. Sparse
-  changed-range reconstruction is now complete locally: untouched extents are
-  reused without fetch/hash, touched extents alone are rebuilt, and completed
-  cohort counters expose exact amplification. Publication notifications are
-  also coalesced at durable watermarks, and only one pressure transition sweeps
-  dirty inodes. Restart-boundary injection, synchronous durability/metadata
-  completion, metadata-generation coalescing and resource-specific budgets
-  remain active. See
-  [the 1D.1 checkpoint](2026-08-31-fuse-publication-phase-1d-data-work-context.md)
-  and
-  [the materialisation checkpoint](2026-08-31-fuse-publication-phase-1d-resumable-materialization.md)
-  and
-  [the rebuild checkpoint](2026-08-31-fuse-publication-phase-1d-resumable-rebuild.md)
-  and
-  [the sparse changed-range checkpoint](2026-08-31-fuse-publication-phase-1d-sparse-changed-ranges.md)
-  and
-  [the notification-coalescing checkpoint](2026-08-31-fuse-publication-phase-1d-notification-coalescing.md).
-  Pressure-aware retirement selection is now implemented and its focused
-  full-spool proof, all 57 filesystem/FUSE tests and the controlled 228/228
-  complete suite pass locally. Deployment and loaded UAT remain. The
-  Transient-failure cursor preservation is now complete locally: a failed
-  pipelined extent remains retryable in place and the publication retains its
-  exact process-lifetime WAL/materialisation/rebuild cursor. The reserved
-  retirement ticket and resource-specific priority bounds remain active. See
-  [the retirement-selection checkpoint](2026-08-31-fuse-publication-phase-1d-retirement-selection.md).
-  See also
-  [the transient-failure cursor checkpoint](2026-08-31-fuse-publication-phase-1d-transient-failure-cursor.md).
-- [ ] Correct overlapping-writer/full-spool publication collapse documented in
-  [the live diagnosis](2026-08-31-overlapping-fuse-writer-rebuild-stall.md).
-  Sparse changed-range reconstruction now prevents an interleaved overlay from
-  rereading/rehashing the whole canonical file and preserves atomic visibility.
-  Redundant per-write queue notifications and repeated pressure sweeps are now
-  eliminated. Closed generations are now selected by greatest bounded
-  retirement return under pressure, with nearest completion as the tie-break.
-  The broader collapse remains active: coalesce compatible durable append
-  ranges into fewer metadata generations, preserve bounded cursor progress
-  across transient object failures, and reserve full-spool retirement progress
-  so accepted bytes cannot remain pinned behind pathological or failing work.
-- [ ] Phase 2: design and prove versioned durable incremental extent staging and
-  safe spool-range retirement without exposing partial files.
-- [ ] Phase 3: aggregate sequential local write descriptors and make durability
-  group commit byte/urgency driven.
-- [ ] Phase 4B: replace transient per-extent tasks with a shared byte-bounded
-  data executor, add per-peer/storage-domain bounds, isolate all storage waits
-  from communications, and aggregate compatible physical durability barriers.
-- [ ] As part of Phase 4B, remove the avoidable 1 ms completion polling in
-  `DistributedStore::put_impl`. The 2026-08-31 deployment sample found each
-  outstanding deferred extent put in `sleep_for(1ms)` while publisher workers
-  waited on their futures. Use event-driven completion/deadline notification,
-  and ensure stalled/spilled RPCs cease to count as viable unfinished quorum
-  work once every fallback has been exhausted.
-- [ ] Replace the FUSE spool admission cliff with smooth, publication-rate-driven
-  backpressure. The 2026-08-31 loaded UAT admitted about 1.4 GB at unrestricted
-  speed, crossed the fixed 50% threshold (8.59 GB of 16 GiB), then accumulated
-  169 seconds of throttle wait because no whole-file retirement had established
-  a rate. Measure successful bounded partial-publication progress continuously
-  and use a token-bucket-style controller that tapers admission as occupancy
-  rises, retains a bounded fast initial burst, approaches sustainable publishing
-  throughput without stop/start oscillation, and blocks only at the hard limit
-  or when publication genuinely makes no progress. Add deterministic tests for
-  smooth threshold crossing, zero-whole-file-retirement bootstrap, rate changes,
-  hard-limit safety and event-driven wake-up, then repeat loaded rsync UAT and
-  verify steady forward progress without weakening viewer/control priority.
-- [ ] Phase 5: integrate continuous progress rates, occupancy hysteresis,
-  concurrent-writer fairness, and authoritative catalogue hints.
-- [ ] UAT the aggregate spool retirement-rate correction documented in
-  [2026-08-31-spool-aggregate-retirement-rate.md](2026-08-31-spool-aggregate-retirement-rate.md).
-  This UAT is paused until Phase 1C passes: the first attempt proved one correct
-  aggregate sample but exposed FUSE `--append-verify` reads being misclassified
-  as viewer traffic and the binary viewer gate starving publication. After the
-  correction, observe at least two retirements above 50% occupancy and verify
-  window bytes, elapsed time, admission pacing, hard-bound safety, weighted
-  genuine-viewer priority and loader non-starvation.
+### Historical FUSE throughput plan — absorbed and paused
+
+The detailed
+[FUSE publication throughput plan](2026-08-31-fuse-publication-throughput-plan.md)
+and its Phase 1A–1D/4A checkpoints remain evidence of useful bounded-quanta,
+resumable-rebuild, sparse-range, notification-coalescing, retirement-selection,
+DATA-headroom and transient-cursor work. They are no longer a separate active
+programme.
+
+Their remaining work is reassigned as follows:
+
+- object/RPC isolation, event-driven completion and durability coalescing:
+  primary Phase 1;
+- incremental extent staging, sequential descriptor aggregation, overlapping
+  writers and safe spool retirement: primary Phase 2 and Phase 4;
+- shared byte-bounded execution, per-peer/domain bounds and resource-specific
+  priority: primary Phase 1 and Phase 3, under the single process-wide ledger;
+- end-to-end `control > viewer >> loader > speculative`: primary Phase 7;
+- smooth spool control, aggregate retirement-rate UAT and final throughput
+  matrix: paused until primary Phases 1–3 pass.
+
+This explicitly drops the earlier claim that DATA-headroom counters or weighted
+publication alone establish the viewer invariant. They establish only their
+local admission behaviour. The older documents are not deleted because their
+tests and measurements remain useful.
+
 - [ ] Verify the aggregated node-status API sometimes reporting a connected
   peer's `metadata_generation` as 0 while that peer's local API reports the
   current generation. Recheck the previously observed alternating disk-usage
   values at the same time and determine whether telemetry aggregation or the UI
   is substituting a missing sample with zero.
-- [ ] Complete the final mixed-size rsync, concurrent-writer, communications,
-  restart, peer-loss, and idle-soak verification matrix.
+- The former final mixed-size rsync, concurrent-writer, communications,
+  restart, peer-loss and idle-soak matrix is absorbed into the primary Phase 7
+  exit gate and remains paused until Phases 1–3 pass.
 - [ ] Replace provider-shaped public catalogue identities such as `tmdb:*` with
   stable, opaque Macha-owned entity IDs such as `macha:item:*`. Keep immutable
   `macha:<content-hash>` file identities separate; retain provider IDs only in

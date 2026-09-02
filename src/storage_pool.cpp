@@ -974,4 +974,23 @@ uint64_t StoragePool::limit() const {
 size_t StoragePool::online_backends() const {
     return online_backends_cached_.load(std::memory_order_relaxed);
 }
+
+LocalStoreDiagnostics StoragePool::diagnostics() const {
+    LocalStoreDiagnostics total;
+    for (const auto& backend : snapshot()) {
+        std::shared_ptr<LocalStore> store;
+        {
+            std::lock_guard lock(backend->mutex);
+            if (backend->online)
+                store = backend->store;
+        }
+        if (!store)
+            continue;
+        const auto current = store->diagnostics();
+        total.loose_reaffirmation_fast_paths += current.loose_reaffirmation_fast_paths;
+        total.loose_reaffirmation_full_validations +=
+            current.loose_reaffirmation_full_validations;
+    }
+    return total;
+}
 } // namespace macha

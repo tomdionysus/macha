@@ -137,5 +137,6 @@ class StoragePool {
     uint64_t used() const;
     uint64_t limit() const;
     size_t online_backends() const;
+    LocalStoreDiagnostics diagnostics() const;
 };
 } // namespace macha
