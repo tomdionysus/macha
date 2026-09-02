@@ -626,14 +626,20 @@ struct StreamPipeline {
     }
 };
 
-void open_decoder(StreamPipeline& pipe) {
+void open_decoder(StreamPipeline& pipe, size_t thread_limit = 1) {
     const auto* codec = avcodec_find_decoder(pipe.input_stream->codecpar->codec_id);
     if (!codec) throw std::runtime_error("decoder unavailable for " + std::string(avcodec_get_name(pipe.input_stream->codecpar->codec_id)));
     pipe.decoder = avcodec_alloc_context3(codec);
     if (!pipe.decoder) throw std::bad_alloc();
     av_require(avcodec_parameters_to_context(pipe.decoder, pipe.input_stream->codecpar), "copy decoder parameters");
     pipe.decoder->pkt_timebase = pipe.input_stream->time_base;
+    // Never leave decoder parallelism at libav's codec-dependent automatic
+    // setting. This is viewer work, so use more than one thread by default,
+    // while preserving a hard per-pipeline bound controlled by configuration.
+    pipe.decoder->thread_count = static_cast<int>(thread_limit);
     av_require(avcodec_open2(pipe.decoder, codec, nullptr), "open decoder");
+    if (pipe.decoder->thread_count > static_cast<int>(thread_limit))
+        throw std::runtime_error("decoder exceeded configured thread limit");
 }
 
 const AVCodec* h264_encoder() {
@@ -642,8 +648,9 @@ const AVCodec* h264_encoder() {
 }
 
 void setup_video_transcode(StreamPipeline& pipe, AVFormatContext* input, AVFormatContext* output,
-                           const PlaybackPlan& plan, std::chrono::milliseconds segment_duration) {
-    open_decoder(pipe);
+                           const PlaybackPlan& plan, std::chrono::milliseconds segment_duration,
+                           size_t decoder_threads) {
+    open_decoder(pipe, decoder_threads);
     const auto* codec = h264_encoder();
     if (!codec) throw std::runtime_error("H.264 encoder is unavailable in libavcodec");
     pipe.encoder = avcodec_alloc_context3(codec);
@@ -1026,7 +1033,7 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                   std::chrono::milliseconds segment_duration,
                   std::shared_ptr<MediaSegmentStore> store, std::atomic_bool& cancelled,
                   uint64_t probe_bytes, std::chrono::milliseconds analyze_duration,
-                  std::chrono::milliseconds startup_timeout) {
+                  std::chrono::milliseconds startup_timeout, size_t video_decoder_threads) {
     const auto& plan = vod_plan.playback;
     if (vod_plan.segment_durations.empty())
         throw std::runtime_error("VOD plan contains no media segments");
@@ -1095,7 +1102,8 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
             pipe->output_stream->time_base = input_stream->time_base;
             pipe->output_stream->sample_aspect_ratio = input_stream->sample_aspect_ratio;
         } else if (type == MediaStreamType::video) {
-            setup_video_transcode(*pipe, in, out, plan, segment_duration);
+            setup_video_transcode(*pipe, in, out, plan, segment_duration,
+                                  video_decoder_threads);
         } else {
             setup_audio_transcode(*pipe, out);
         }
@@ -1229,6 +1237,7 @@ class LibavSession final : public MediaEngineSession {
     uint64_t probe_bytes_{};
     std::chrono::milliseconds analyze_duration_{};
     std::chrono::milliseconds startup_timeout_{};
+    size_t video_decoder_threads_{};
     std::shared_ptr<MediaSegmentStore> store_;
     std::jthread worker_;
     std::atomic_bool cancelled_{};
@@ -1241,7 +1250,8 @@ class LibavSession final : public MediaEngineSession {
         try {
             if (stop.stop_requested()) cancelled_.store(true);
             run_pipeline(source_, vod_plan_, segment_duration_, store_, cancelled_,
-                         probe_bytes_, analyze_duration_, startup_timeout_);
+                         probe_bytes_, analyze_duration_, startup_timeout_,
+                         video_decoder_threads_);
             if (cancelled_.load()) {
                 exit_code_.store(0);
             } else {
@@ -1276,10 +1286,10 @@ class LibavSession final : public MediaEngineSession {
                  size_t max_ahead_segments, uint64_t memory_limit,
                  std::filesystem::path spill_directory, uint64_t probe_bytes,
                  std::chrono::milliseconds analyze_duration,
-                 std::chrono::milliseconds startup_timeout)
+                 std::chrono::milliseconds startup_timeout, size_t video_decoder_threads)
         : source_(std::move(source)), vod_plan_(std::move(vod_plan)), segment_duration_(segment_duration),
           probe_bytes_(probe_bytes), analyze_duration_(analyze_duration),
-          startup_timeout_(startup_timeout),
+          startup_timeout_(startup_timeout), video_decoder_threads_(video_decoder_threads),
           store_(std::make_shared<MediaSegmentStore>(max_ahead_segments, memory_limit,
                                                      std::move(spill_directory), segment_duration,
                                                      vod_plan_.segment_durations)) {
@@ -1320,6 +1330,7 @@ class LibavMediaEngine final : public MediaEngine {
         status_.version = av_version_info();
         status_.h264_encoder = h264_encoder() != nullptr;
         status_.aac_encoder = avcodec_find_encoder(AV_CODEC_ID_AAC) != nullptr;
+        status_.video_decoder_threads = config_.video_decoder_threads;
     }
 
     MediaEngineStatus status() const override { return status_; }
@@ -1471,7 +1482,8 @@ class LibavMediaEngine final : public MediaEngine {
         return std::make_unique<LibavSession>(source, vod_plan, segment_duration, max_ahead_segments,
                                               segment_memory_bytes, spill_directory,
                                               config_.probe_bytes, config_.probe_analyze_duration,
-                                              config_.startup_timeout);
+                                              config_.startup_timeout,
+                                              config_.video_decoder_threads);
     }
 
     std::string extract_webvtt_segment(const MediaSource& source, int subtitle_stream,

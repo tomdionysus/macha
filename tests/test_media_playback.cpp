@@ -1120,6 +1120,7 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
     streaming.enabled = true;
     streaming.temp_path = t.path() / "playback";
     streaming.max_video_transcodes = 1;
+    streaming.video_decoder_threads = 3;
     streaming.pipeline_idle = 50ms;
     streaming.session_idle = 5min;
     PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
@@ -1154,6 +1155,7 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
     auto active = playback_status();
     CHECK(active.find("sessions")->asUInt64() == 1);
     CHECK(active.find("video_transcodes")->asUInt64() == 1);
+    CHECK(active.find("video_decoder_threads")->asUInt64() == 3);
 
     // Valid current-generation traffic renews the physical pipeline lease.
     for (int i = 0; i < 4; ++i) {

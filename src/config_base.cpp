@@ -233,6 +233,8 @@ void validate(Config& config) {
     if (config.streaming.max_video_transcodes > config.streaming.max_sessions ||
         config.streaming.max_audio_transcodes > config.streaming.max_sessions)
         throw std::runtime_error("streaming transcode limits cannot exceed max_sessions");
+    if (!config.streaming.video_decoder_threads || config.streaming.video_decoder_threads > 16)
+        throw std::runtime_error("streaming.video_decoder_threads must be 1..16");
     if (config.streaming.session_idle < std::chrono::seconds(30))
         throw std::runtime_error("streaming.session_idle_ms must be >= 30000");
     if (config.streaming.pipeline_idle < std::chrono::seconds(10))

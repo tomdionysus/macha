@@ -207,3 +207,45 @@ This passes the allocator-growth P0 and confirms that removing the temporary
 instrumentation restored smooth playback. The next playback work may proceed
 to bounded/configurable decoder parallelism, retaining the same repeated-
 lifecycle memory and smoothness gates.
+
+## 0.23.0 decoder-parallelism implementation checkpoint
+
+The next local phase adds `streaming.video_decoder_threads`, defaulting to two
+and validated in the range 1–16. The value is installed on the video decoder
+context before `avcodec_open2`; the pipeline rejects any backend result above
+the configured limit. Audio decode remains single-threaded. Together with the
+existing `max_video_transcodes`, the setting provides both a per-pipeline and a
+process-wide requested decoder-thread bound. It is visible as
+`video_decoder_threads` in playback Status and requires a process restart to
+change, avoiding a live-reload status/configuration mismatch.
+
+Configuration parsing, invalid bounds, defaults, Status exposure and retention
+by the real libav backend are covered. Runtime dependencies pass 4/4 and the
+complete core suite passes 262/262 at 12-way process isolation. That suite also
+exposed and now covers an independent FUSE shutdown race: a waiting writer
+must recheck `stopping` after capacity becomes available and before acquiring
+byte ownership. Deployment and matched forced-transcode UAT remain the phase
+gate.
+
+### 0.23.0 UAT result
+
+The complete source was built concurrently on all three Pi nodes; all three
+executables were byte-identical. All four nodes joined healthy at version
+0.23.0 and metadata generation 3019. GBNI-1 reported the configured default of
+two decoder threads, and the real HEVC codec-open diagnostic confirmed
+`decoder_threads=2`.
+
+Two successive forced-transcode lifecycles were smooth with no choppiness or
+stalls. In the first, admission completed in 3.58 seconds and the first fragment
+in 3.49 seconds, modestly improving the comparable roughly 3.9-second
+single-decoder-thread run. Live RSS remained bounded at approximately 389 MiB.
+The second run held an exact approximately 402 MiB plateau for 80 seconds; its
+larger live value coincided with roughly 63 MiB resident and 75 MiB spilled
+segment data.
+
+Both teardowns reached zero sessions, transcodes and segment bytes. Heap reclaim
+succeeded 2/2 times. Drained RSS settled at approximately 204 MiB and 206 MiB
+and remained byte-for-byte stable during each observation window, from an
+approximately 185 MiB startup baseline. There is no repeated-lifecycle ratchet.
+The decoder-parallelism phase passes its viewer, CPU-utilisation, memory and
+teardown gates.

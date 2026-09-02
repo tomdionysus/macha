@@ -186,6 +186,7 @@ streaming:
   max_sessions: 8
   max_video_transcodes: 1
   max_audio_transcodes: 4
+  video_decoder_threads: 2
   pipeline_idle_ms: 60000
   session_idle_ms: 1800000
 ```
@@ -196,6 +197,12 @@ logical session remains reconcilable until `session_idle_ms`; invalid or stale
 generation retries do not renew the physical lease. This bounds leaked
 transcode capacity after a client disappears on an unreliable network without
 shortening the logical session lifetime.
+
+`video_decoder_threads` bounds decoder parallelism per transformed video in the
+range 1–16. It defaults to two so viewer work can use otherwise-idle CPU without
+allowing libav to choose an unbounded automatic value. Together with
+`max_video_transcodes`, it also bounds the process-wide requested decoder thread
+count. Changing it requires a process restart.
 
 ## Cache
 

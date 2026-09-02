@@ -808,6 +808,12 @@ struct FuseFrontend::State {
             if (write_request_cv.wait_until(lock, deadline) == std::cv_status::timeout)
                 throw FsError(EAGAIN, "FUSE write byte admission saturated");
         }
+        // Stop can release an earlier request's lease and wake this waiter at
+        // the same time. Capacity becoming available does not authorize a new
+        // owner after shutdown has begun; close that final admission race
+        // before accounting or copying the request payload.
+        if (stopping.load())
+            throw FsError(EINTR, "FUSE write admission stopping");
         pending_write_request_bytes += bytes;
         pending_write_request_bytes_diagnostic.store(pending_write_request_bytes,
                                                      std::memory_order_relaxed);

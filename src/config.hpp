@@ -309,6 +309,9 @@ struct StreamingConfig {
     size_t max_sessions{8};
     size_t max_video_transcodes{1};
     size_t max_audio_transcodes{4};
+    // Per transformed video. Combined with max_video_transcodes this is a
+    // hard process-wide upper bound on concurrently requested decoder threads.
+    size_t video_decoder_threads{2};
     std::chrono::milliseconds session_idle{std::chrono::minutes(30)};
     // Reclaim an abandoned physical encoder while retaining the logical
     // session long enough for client retry/reconciliation.

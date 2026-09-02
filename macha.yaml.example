@@ -386,6 +386,9 @@ streaming:
   max_sessions: 8
   max_video_transcodes: 1
   max_audio_transcodes: 4
+  # Decoder threads per video transcode (1-16). max_video_transcodes bounds the
+  # number of such pipelines that may run concurrently.
+  video_decoder_threads: 2
   session_idle_ms: 1800000
   # Stop an abandoned physical remux/transcode pipeline after one minute
   # without a valid current-generation stream request. The logical session is

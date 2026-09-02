@@ -91,10 +91,12 @@ The existing documents in this directory remain the detailed plans, checkpoints,
   was smooth, live RSS formed bounded plateaus, every teardown reached zero
   sessions/transcodes/segment bytes, heap reclaim succeeded 3/3 times, and
   drained RSS settled at approximately 223, 211 and 212 MiB from a 202 MiB
-  initial baseline. The allocator-growth P0 is complete. Proceed next with
-  bounded/configurable decoder parallelism, retaining the same repeated-
-  lifecycle memory and smoothness gates; it remains an improvement rather than
-  the diagnosis of the removed instrumentation regression.
+  initial baseline. The allocator-growth P0 and bounded decoder-parallelism
+  follow-up are complete. Version 0.23.0 passed two smooth forced-transcode
+  lifecycles with the real HEVC decoder confirmed at two threads, bounded live
+  RSS plateaus, zero post-stop playback ownership, heap reclaim success 2/2,
+  and stable drained RSS of approximately 204 and 206 MiB. See
+  [the completed checkpoint](2026-09-02-transport-and-allocator-attribution-checkpoint.md).
 
 ### Backlog precedence and supersession
 
