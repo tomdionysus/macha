@@ -208,6 +208,11 @@ struct MetadataHistoryEntry {
     auto operator<=>(const MetadataHistoryEntry&) const = default;
 };
 
+// Immutable history bodies carry ancestry links for topology and repair, but
+// only these links are prerequisites for materializing the body itself.
+std::vector<Hash256> metadata_history_materialization_dependencies(
+    const MetadataHistoryEntry&);
+
 struct MetadataMergeResult {
     MetadataSnapshot snapshot;
     size_t conflicts_created{};
@@ -305,6 +310,14 @@ struct MetadataMaterialization {
     // Conservative deep weight of the immutable record and decoded object
     // graph. Computed once, off the replica-state mutex, when materialized.
     uint64_t resident_bytes{};
+};
+
+struct MetadataHistoryLinks {
+    uint64_t generation{};
+    Hash256 previous{};
+    bool previous_known{};
+    std::vector<Hash256> merge_parents;
+    MetadataHistoryEntry::Body body{MetadataHistoryEntry::Body::full};
 };
 
 class MetadataReplica {
@@ -426,6 +439,7 @@ class MetadataReplica {
     bool remember_committed(const MetadataRecord&);
     bool remember_current_committed(uint64_t, const Hash256&);
     std::optional<MetadataHistoryEntry> history_entry(const Hash256&) const;
+    std::optional<MetadataHistoryLinks> history_links(const Hash256&) const;
     bool import_history(const MetadataHistoryEntry&);
     bool history_contains(const Hash256&) const;
     bool store_commit(const MetadataRecord&, std::span<const uint8_t> delta = {});

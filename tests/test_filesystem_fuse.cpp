@@ -45,6 +45,12 @@ MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_cou
     const auto* diagnostics = root.find("diagnostics");
     REQUIRE(diagnostics != nullptr);
 
+    const auto* data_store = diagnostics->find("data_store");
+    REQUIRE(data_store != nullptr);
+    CHECK(data_store->find("available")->asBool());
+    REQUIRE(data_store->find("loose_reaffirmation_fast_paths") != nullptr);
+    REQUIRE(data_store->find("loose_reaffirmation_full_validations") != nullptr);
+
     const auto* filesystem = diagnostics->find("filesystem");
     REQUIRE(filesystem != nullptr);
     CHECK(filesystem->find("available")->asBool());
@@ -106,6 +112,17 @@ MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_cou
     REQUIRE(filesystem->find("data_publication_completed_source_bytes_read") != nullptr);
     REQUIRE(filesystem->find("data_publication_completed_reused_extents") != nullptr);
     REQUIRE(filesystem->find("data_publication_completed_put_extents") != nullptr);
+    REQUIRE(filesystem->find("data_overlay_read_queries") != nullptr);
+    REQUIRE(filesystem->find("data_overlay_ranges_examined") != nullptr);
+    REQUIRE(filesystem->find("data_overlay_descriptors_copied") != nullptr);
+    REQUIRE(filesystem->find("retained_data_operations") != nullptr);
+    REQUIRE(filesystem->find("retained_data_operation_bytes") != nullptr);
+    REQUIRE(filesystem->find("retained_overlay_ranges") != nullptr);
+    REQUIRE(filesystem->find("retained_overlay_bytes") != nullptr);
+    REQUIRE(filesystem->find("retained_publication_operations") != nullptr);
+    REQUIRE(filesystem->find("retained_publication_operation_bytes") != nullptr);
+    REQUIRE(filesystem->find("retained_durability_tickets") != nullptr);
+    REQUIRE(filesystem->find("data_publication_inflight_bytes") != nullptr);
 
     const auto* convergence = diagnostics->find("convergence");
     REQUIRE(convergence != nullptr);
@@ -126,6 +143,74 @@ MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_cou
     REQUIRE(detached_body_at != std::string::npos);
     const auto detached = Json::parse(detached_response.substr(detached_body_at + 4));
     CHECK(!detached.find("diagnostics")->find("filesystem")->find("available")->asBool());
+    frontend->stop();
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_pending_overlay_reads_only_intersecting_ranges) {
+    TestService fixture("fuse-indexed-pending-overlay", ConfigProfile::isolated);
+    auto& config = fixture.config();
+    config.fuse.publication_quiet = 30s;
+    config.fuse.max_spool_bytes = 64ULL * 1024 * 1024;
+    config.fuse.spool_reserve_free = 0;
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+
+    auto handle = frontend->create("/append-verify.bin", 0644, getuid(), getgid(), true, true,
+                                   false);
+    constexpr size_t chunk_size = 4096;
+    constexpr size_t chunks = 256;
+    Bytes expected(chunk_size * chunks);
+    for (size_t chunk = 0; chunk < chunks; ++chunk) {
+        auto bytes = pattern(chunk_size, static_cast<uint8_t>(chunk));
+        std::copy(bytes.begin(), bytes.end(), expected.begin() + chunk * chunk_size);
+        REQUIRE(frontend->write(handle.inode, chunk * chunk_size, bytes, false) == bytes.size());
+    }
+
+    // The durable journal still contains all 256 write records. The derived
+    // runtime index coalesces their contiguous spool mappings, so a small
+    // append-verify read copies and examines one intersecting descriptor rather
+    // than cloning and replaying the complete history.
+    const auto before = frontend->diagnostics();
+    CHECK(before.retained_data_operations == chunks);
+    CHECK(before.retained_data_operation_bytes >= chunks * sizeof(uint64_t));
+    CHECK(before.retained_overlay_ranges == 1);
+    CHECK(before.retained_overlay_bytes > 0);
+    CHECK(before.retained_publication_operations == 0);
+    CHECK(before.retained_publication_operation_bytes == 0);
+    Bytes probe(1024);
+    const uint64_t probe_offset = 173 * chunk_size + 777;
+    REQUIRE(frontend->read(handle, probe_offset, probe) == probe.size());
+    CHECK(std::equal(probe.begin(), probe.end(), expected.begin() + probe_offset));
+    const auto after = frontend->diagnostics();
+    CHECK(after.data_overlay_read_queries == before.data_overlay_read_queries + 1);
+    CHECK(after.data_overlay_ranges_examined - before.data_overlay_ranges_examined == 1);
+    CHECK(after.data_overlay_descriptors_copied - before.data_overlay_descriptors_copied == 1);
+
+    // A later overwrite splits the compact range but a read contained by that
+    // overwrite still examines only that newest interval.
+    auto replacement = pattern(257, 0xe3);
+    const uint64_t replacement_offset = 91 * chunk_size + 123;
+    REQUIRE(frontend->write(handle.inode, replacement_offset, replacement, false) ==
+            replacement.size());
+    std::copy(replacement.begin(), replacement.end(), expected.begin() + replacement_offset);
+    const auto overwrite_before = frontend->diagnostics();
+    Bytes overwritten(replacement.size());
+    REQUIRE(frontend->read(handle, replacement_offset, overwritten) == overwritten.size());
+    CHECK(overwritten == replacement);
+    const auto overwrite_after = frontend->diagnostics();
+    CHECK(overwrite_after.data_overlay_ranges_examined -
+              overwrite_before.data_overlay_ranges_examined ==
+          1);
+
+    // Shrink followed by regrowth must expose zeros, never bytes from the old
+    // base or an earlier pending write beyond the truncate boundary.
+    const uint64_t truncated = expected.size() / 2;
+    frontend->truncate(handle.inode, truncated);
+    frontend->truncate(handle.inode, truncated + 8192);
+    Bytes zero_tail(8192, 0xff);
+    REQUIRE(frontend->read(handle, truncated, zero_tail) == zero_tail.size());
+    CHECK(std::all_of(zero_tail.begin(), zero_tail.end(), [](uint8_t byte) { return byte == 0; }));
+
     frontend->stop();
 }
 

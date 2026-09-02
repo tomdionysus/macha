@@ -32,6 +32,7 @@ struct MediaSegmentStore::Impl {
     size_t max_ahead{8};
     uint64_t memory_limit{64ULL * 1024 * 1024};
     uint64_t memory_bytes{};
+    uint64_t spill_bytes{};
     std::filesystem::path spill_directory;
     std::chrono::milliseconds target_duration{4000};
 
@@ -59,6 +60,7 @@ struct MediaSegmentStore::Impl {
                 continue;
             }
             memory_bytes -= segments[i].memory->size();
+            spill_bytes += segments[i].memory->size();
             segments[i].spill = std::move(path);
             segments[i].memory.reset();
         }
@@ -241,7 +243,11 @@ void MediaSegmentStore::note_requested(uint64_t index) {
 MediaSegmentStore::Snapshot MediaSegmentStore::snapshot() const {
     std::lock_guard lock(impl_->mutex);
     return {static_cast<bool>(impl_->init), impl_->finished, impl_->error,
-            static_cast<uint64_t>(impl_->segments.size()), impl_->highest_requested};
+            static_cast<uint64_t>(impl_->segments.size()), impl_->highest_requested,
+            impl_->memory_bytes, impl_->spill_bytes,
+            static_cast<uint64_t>(impl_->segments.capacity() * sizeof(Impl::Segment) +
+                                  impl_->vod_segment_durations.capacity() * sizeof(double)),
+            static_cast<uint64_t>(impl_->vod_segment_durations.size())};
 }
 
 void MediaSegmentStore::cancel() {

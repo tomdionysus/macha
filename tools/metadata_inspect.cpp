@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <set>
 #include <string>
@@ -19,6 +20,29 @@ NodeId parse_node_id(const std::string& text) {
     NodeId out;
     std::copy(bytes->begin(), bytes->end(), out.bytes.begin());
     return out;
+}
+
+Hash256 parse_hash(const std::string& text) {
+    const auto bytes = unhex(text);
+    if (!bytes || bytes->size() != Hash256{}.bytes.size())
+        throw std::runtime_error("invalid metadata hash: " + text);
+    Hash256 out;
+    std::copy(bytes->begin(), bytes->end(), out.bytes.begin());
+    return out;
+}
+
+Bytes read_bytes(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error("cannot open acceptance file: " + path.string());
+    return Bytes(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+}
+
+void write_bytes(const std::filesystem::path& path, std::span<const uint8_t> bytes) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) throw std::runtime_error("cannot create acceptance file: " + path.string());
+    output.write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+    if (!output) throw std::runtime_error("cannot write acceptance file: " + path.string());
 }
 
 MetadataManualRepairPlan repair_plan(MetadataReplica& replica) {
@@ -49,7 +73,9 @@ int main(int argc, char** argv) {
         std::cerr << "usage: macha-metadata-repair STATE_PATH KEY_FILE\n"
                      "       macha-metadata-repair --plan-causal-merge STATE_PATH KEY_FILE\n"
                      "       macha-metadata-repair --stage-causal-merge STATE_PATH KEY_FILE\n"
-                     "       macha-metadata-repair --accept-causal-merge STATE_PATH KEY_FILE WITNESS...\n";
+                     "       macha-metadata-repair --accept-causal-merge STATE_PATH KEY_FILE WITNESS...\n"
+                     "       macha-metadata-repair --export-acceptance STATE_PATH KEY_FILE HASH FILE\n"
+                     "       macha-metadata-repair --import-acceptance STATE_PATH KEY_FILE FILE\n";
         return 2;
     }
     try {
@@ -61,6 +87,31 @@ int main(int argc, char** argv) {
         MetadataReplica replica(std::filesystem::path(argv[state_index]), keys.storage);
         if (command) {
             const std::string action = argv[1];
+            if (action == "--export-acceptance") {
+                if (argc != 6) throw std::runtime_error("hash and output file are required");
+                const auto hash = parse_hash(argv[4]);
+                const auto acceptance = replica.acceptance(hash);
+                if (!acceptance) throw std::runtime_error("metadata head is not accepted here");
+                write_bytes(argv[5], encode_metadata_acceptance(*acceptance));
+                std::cout << "exported generation=" << acceptance->generation
+                          << " hash=" << to_string(acceptance->hash)
+                          << " required=" << acceptance->required
+                          << " witnesses=" << acceptance->replicas.size() << '\n';
+                return 0;
+            }
+            if (action == "--import-acceptance") {
+                if (argc != 5) throw std::runtime_error("acceptance file is required");
+                const auto acceptance = decode_metadata_acceptance(read_bytes(argv[4]));
+                if (!replica.history_contains(acceptance.hash))
+                    throw std::runtime_error("accepted record is absent from local history");
+                if (!replica.accept_commit(acceptance))
+                    throw std::runtime_error("acceptance certificate failed local policy validation");
+                std::cout << "imported generation=" << acceptance.generation
+                          << " hash=" << to_string(acceptance.hash)
+                          << " required=" << acceptance.required
+                          << " witnesses=" << acceptance.replicas.size() << '\n';
+                return 0;
+            }
             auto plan = repair_plan(replica);
             print_plan(plan);
             if (action == "--plan-causal-merge") return 0;

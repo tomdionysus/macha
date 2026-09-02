@@ -7,7 +7,9 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stop_token>
@@ -41,6 +43,11 @@ struct LocalStoreOptions {
     size_t pack_target_size{};
 };
 
+struct LocalStoreDiagnostics {
+    uint64_t loose_reaffirmation_fast_paths{};
+    uint64_t loose_reaffirmation_full_validations{};
+};
+
 class LocalStore {
   public:
     struct Cursor {
@@ -62,6 +69,20 @@ class LocalStore {
         std::array<uint8_t, 16> tag{};
     };
 
+    struct LooseStamp {
+        uint64_t device{};
+        uint64_t inode{};
+        uint64_t size{};
+        int64_t modified_ns{};
+        int64_t changed_ns{};
+        auto operator<=>(const LooseStamp&) const = default;
+    };
+
+    struct VerifiedLoose {
+        LooseStamp stamp;
+        uint64_t sequence{};
+    };
+
     std::filesystem::path root_, objects_, packs_, accounting_path_;
     uint64_t limit_{};
     uint64_t reserve_free_{};
@@ -71,6 +92,19 @@ class LocalStore {
     LocalStoreMode mode_{LocalStoreMode::authoritative};
     std::atomic<uint64_t> used_{};
     mutable std::mutex m_;
+    // Physical work for unrelated immutable objects must not serialize behind
+    // the store index/accounting mutex. Weak entries give an exact per-object
+    // single-flight domain and disappear after their last active operation.
+    mutable std::mutex object_mutex_map_mutex_;
+    mutable std::map<ObjectId, std::weak_ptr<std::mutex>> object_mutexes_;
+    uint64_t reserved_write_bytes_{};
+    std::function<void(const ObjectId&)> before_loose_write_for_tests_;
+    static constexpr size_t verified_loose_limit = 4096;
+    mutable std::map<ObjectId, VerifiedLoose> verified_loose_;
+    mutable std::deque<std::pair<uint64_t, ObjectId>> verified_loose_order_;
+    mutable uint64_t verified_loose_sequence_{};
+    std::atomic_uint64_t loose_reaffirmation_fast_paths_{};
+    std::atomic_uint64_t loose_reaffirmation_full_validations_{};
     mutable std::condition_variable accounting_cv_;
     std::jthread scan_thread_;
     std::atomic_bool scan_complete_{};
@@ -114,6 +148,10 @@ class LocalStore {
     bool compact_packs_locked();
     bool remove_locked(const ObjectId&);
     bool physical_space_available_locked(uint64_t need) const;
+    static std::optional<LooseStamp> loose_stamp(const std::filesystem::path&);
+    void remember_verified_loose_locked(const ObjectId&, const LooseStamp&) const;
+    void forget_verified_loose_locked(const ObjectId&) const;
+    std::shared_ptr<std::mutex> object_mutex(const ObjectId&) const;
 
   public:
     LocalStore(std::filesystem::path, LocalStoreOptions, std::array<uint8_t, 32>,
@@ -146,9 +184,17 @@ class LocalStore {
     void touch(const ObjectId&);
     bool is_packed(const ObjectId&) const;
     bool compact_packs(std::stop_token = {});
+    void set_before_loose_write_for_tests(std::function<void(const ObjectId&)> hook) {
+        std::lock_guard lock(m_);
+        before_loose_write_for_tests_ = std::move(hook);
+    }
     uint64_t used() const { return used_.load(std::memory_order_relaxed); }
     uint64_t limit() const { return limit_; }
     bool scan_complete() const { return scan_complete_.load(std::memory_order_acquire); }
+    LocalStoreDiagnostics diagnostics() const noexcept {
+        return {loose_reaffirmation_fast_paths_.load(std::memory_order_relaxed),
+                loose_reaffirmation_full_validations_.load(std::memory_order_relaxed)};
+    }
 };
 NodeId load_or_create_node_id(const std::filesystem::path&);
 } // namespace macha
