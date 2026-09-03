@@ -141,6 +141,10 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
     : cfg_(normalize_config(std::move(config))), keys_(keys), state_lock_(cfg_.state_path),
       id_(load_v18_node_id(cfg_.state_path)), durability_epoch_(random_node_id()),
       data_resources_(cfg_.data_inflight_bytes, cfg_.data_viewer_reserve_bytes),
+      retained_memory_(cfg_.runtime.retained_memory_bytes,
+                       cfg_.runtime.control_memory_reserve_bytes,
+                       cfg_.runtime.viewer_memory_reserve_bytes,
+                       cfg_.runtime.loader_memory_reserve_bytes),
       members_(self_info(cfg_, id_, 0, 0, 0), cfg_.dead_after,
                cfg_.state_path / "membership" / "known-nodes.bin"),
       public_connectivity_(cfg_, id_, Endpoint{members_.self().host, members_.self().port}),
@@ -181,7 +185,8 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
                   signal_service_event(ServiceEvent::metadata);
               }
           },
-          cfg_.connect_timeout, cfg_.heartbeat, cfg_.dead_after, cfg_.max_frame_size),
+          cfg_.connect_timeout, cfg_.heartbeat, cfg_.dead_after, cfg_.max_frame_size,
+          &retained_memory_),
       server_(
           cfg_.listen_host, cfg_.port, keys_, members_.self(),
           [this](const NodeInfo& peer, FrameType frame_type, const RpcMessage& request) {
@@ -207,7 +212,7 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
                   signal_service_event(topology_changed ? ServiceEvent::topology
                                                         : ServiceEvent::metadata);
           },
-          cfg_.max_frame_size),
+          cfg_.max_frame_size, {}, &retained_memory_),
       startup_stage_hook_(std::move(startup_stage_hook)), startup_unix_ms_(unix_ms()) {
     server_.attach_client(client_);
     // Membership loads locally durable identity-reset tombstones before the
@@ -442,6 +447,7 @@ void NodeRuntime::start() {
 
 void NodeRuntime::request_stop() {
     data_resources_.stop();
+    retained_memory_.stop();
     if (storage_recovery_.joinable())
         storage_recovery_.request_stop();
     if (state_recovery_.joinable())
@@ -708,6 +714,10 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             ObjectId id{reader.fixed<32>()};
             reader.finish();
             Writer writer;
+            auto resource = data_resources_.try_acquire(
+                DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
+            if (!resource)
+                return error_reply("DATA resource admission busy or stopping");
             // Replica-presence RPCs are durability decisions, not directory
             // existence probes. Authenticate/decrypt/hash the object before
             // allowing repair or write-floor logic to count this replica.
@@ -829,6 +839,10 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             }
             reader.finish();
             for (const auto& id : ids) {
+                auto resource = data_resources_.try_acquire(
+                    DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
+                if (!resource)
+                    return error_reply("DATA resource admission busy or stopping");
                 const bool present = object_class == RetentionClass::data
                                          ? local_store().valid(id)
                                          : control_store().valid(id);
@@ -844,6 +858,10 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             reader.finish();
             if (retention_store().retained(RetentionClass::data, id))
                 return error_reply("object has an active retention claim");
+            auto resource = data_resources_.try_acquire(
+                DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
+            if (!resource)
+                return error_reply("DATA resource admission busy or stopping");
             (void)local_store().remove(id);
             if (ready(ready_cache))
                 (void)block_cache().remove(id);
@@ -1171,6 +1189,11 @@ void NodeRuntime::enqueue_fetched(const ObjectId& id, std::span<const uint8_t> d
     if (!cache && !promote)
         return;
 
+    auto memory = retained_memory_.try_acquire(MemoryClass::speculative,
+                                               MemoryOwner::object_payload, data.size());
+    if (!memory)
+        return;
+
     // Do not let opportunistic persistence become back-pressure on playback.
     // If the bounded memory queue is full we simply drop this opportunity; the
     // normal repair loop will converge authoritative replicas later.
@@ -1183,6 +1206,7 @@ void NodeRuntime::enqueue_fetched(const ObjectId& id, std::span<const uint8_t> d
     job.data.assign(data.begin(), data.end());
     job.promote = promote;
     job.cache = cache;
+    job.memory = std::move(*memory);
     local_copy_bytes_ += job.data.size();
     local_copies_.push_back(std::move(job));
     local_copy_cv_.notify_one();

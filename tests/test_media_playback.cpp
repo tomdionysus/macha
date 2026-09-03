@@ -117,8 +117,12 @@ class PriorityMediaInformationEngine final : public MediaEngine {
 
 MACHA_TEST("media_playback", test_media_segment_store_backpressure_and_spill) {
     TempDir t;
+    RetainedMemoryLedger retained(8 * 1024, 1024, 4 * 1024, 1024);
     auto store = std::make_shared<MediaSegmentStore>(2, 2 * 1024, t.path() / "spill", 4000ms,
                                                      std::vector<double>{4.0, 4.0, 4.0, 4.0});
+    REQUIRE(store->attach_memory_ledger(retained));
+    CHECK(retained.stats().owner_bytes[static_cast<size_t>(MemoryOwner::playback_segment)] ==
+          2 * 1024);
     REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
     const auto initial_playlist = store->playlist();
     CHECK(initial_playlist.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
@@ -179,6 +183,8 @@ MACHA_TEST("media_playback", test_media_segment_store_backpressure_and_spill) {
         CHECK(segment->size() == 1024);
         CHECK((*segment)[0] == static_cast<uint8_t>(0x10 + i));
     }
+    store.reset();
+    CHECK(retained.stats().used_bytes == 0);
 }
 
 MACHA_TEST("media_playback", test_http_server_serves_streams_concurrently) {
@@ -1180,16 +1186,26 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
     REQUIRE(wait_until([&] {
         auto status = playback_status();
         return status.find("sessions")->asUInt64() == 1 &&
-               status.find("video_transcodes")->asUInt64() == 0 &&
+               status.find("video_transcodes")->asUInt64() == 1 &&
+               status.find("running_video_transcode_pipelines")->asUInt64() == 0 &&
                status.find("idle_pipelines_reclaimed")->asUInt64() == 1 &&
                !status.find("heap_reclaim_pending")->asBool() &&
                status.find("heap_reclaim_requests")->asUInt64() >= 1 &&
                status.find("heap_reclaim_runs")->asUInt64() >= 1;
     }, 1s));
 
-    // The logical session may remain available for reconciliation, but its
-    // abandoned physical encoder must no longer deny a new viewer.
+    // Physical reclamation does not surrender the persistent viewer's logical
+    // entitlement: otherwise an ordinary resume/seek could be rejected after
+    // another viewer slipped into the transient idle gap.
     auto second = playback.handle(create);
+    REQUIRE(second.status == 429);
+
+    HttpRequest remove;
+    remove.method = "DELETE";
+    remove.path = "/api/v1/playback/sessions/" +
+                  first_json.find("session_id")->asString();
+    REQUIRE(playback.handle(remove).status == 204);
+    second = playback.handle(create);
     REQUIRE(second.status == 201);
 
     playback.stop();
@@ -1438,6 +1454,142 @@ MACHA_TEST("media_playback", test_concurrent_transcode_admission_is_reserved) {
     remove.method = "DELETE";
     remove.path = "/api/v1/playback/sessions/" + first_json.find("session_id")->asString();
     CHECK(playback.handle(remove).status == 204);
+
+    playback.stop();
+    service.stop();
+}
+
+MACHA_TEST("media_playback", test_logical_viewer_keeps_one_transcode_entitlement_across_replacements) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/logical.mp4", 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write("/media/logical.mp4", true);
+    auto bytes = pattern(64 * 1024);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    const auto media_id =
+        file_media_id(service.filesystem().getattr("/media/logical.mp4"));
+
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback";
+    streaming.max_sessions = 4;
+    streaming.max_video_transcodes = 1;
+    streaming.max_audio_transcodes = 1;
+    streaming.startup_timeout = 2s;
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             std::make_unique<FakeMediaEngine>());
+    playback.start();
+
+    auto create = [&](std::string mode, std::string viewer, std::string attempt,
+                      std::optional<int64_t> seek_ms = {}) {
+        Json::Object preferences{{"mode", std::move(mode)}};
+        Json::Object root{{"media_id", media_id},
+                          {"preferences", Json(std::move(preferences))}};
+        if (seek_ms) root["seek_ms"] = *seek_ms;
+        auto text = Json(std::move(root)).dump();
+        HttpRequest request;
+        request.method = "POST";
+        request.path = "/api/v1/playback/sessions";
+        request.headers["Macha-Viewer-Session"] = std::move(viewer);
+        request.headers["Idempotency-Key"] = std::move(attempt);
+        request.body.assign(text.begin(), text.end());
+        return playback.handle(request);
+    };
+    auto status = [&] {
+        HttpRequest request;
+        request.method = "GET";
+        request.path = "/api/v1/playback/status";
+        auto response = playback.handle(request);
+        REQUIRE(response.status == 200);
+        return Json::parse(std::string(response.body.begin(), response.body.end()));
+    };
+
+    auto first = create("transcode", "ui-player-1", "logical-attempt-1");
+    REQUIRE(first.status == 201);
+    CHECK(first.headers.at("Macha-Viewer-Session") == "ui-player-1");
+    auto first_json = Json::parse(std::string(first.body.begin(), first.body.end()));
+    const auto session_id = first_json.find("session_id")->asString();
+    CHECK(status().find("video_transcodes")->asUInt64() == 1);
+
+    HttpResponse concurrent_direct, concurrent_remux;
+    std::jthread replace_a([&] {
+        concurrent_direct =
+            create("direct", "ui-player-1", "logical-concurrent-direct");
+    });
+    std::jthread replace_b([&] {
+        concurrent_remux =
+            create("remux", "ui-player-1", "logical-concurrent-remux");
+    });
+    replace_a.join();
+    replace_b.join();
+    REQUIRE(concurrent_direct.status == 201);
+    REQUIRE(concurrent_remux.status == 201);
+    for (const auto* response : {&concurrent_direct, &concurrent_remux}) {
+        auto body = Json::parse(std::string(response->body.begin(), response->body.end()));
+        CHECK(body.find("session_id")->asString() == session_id);
+    }
+    CHECK(status().find("sessions")->asUInt64() == 1);
+    CHECK(status().find("video_transcodes")->asUInt64() == 1);
+
+    // A replacement POST is a new request attempt in the same persistent UI
+    // session. It keeps the server session identity and entitlement even while
+    // the selected representation temporarily requires no encoder.
+    auto direct = create("direct", "ui-player-1", "logical-attempt-2");
+    REQUIRE(direct.status == 201);
+    auto direct_json = Json::parse(std::string(direct.body.begin(), direct.body.end()));
+    CHECK(direct_json.find("session_id")->asString() == session_id);
+    CHECK(direct_json.find("mode")->asString() == "direct");
+    auto direct_status = status();
+    CHECK(direct_status.find("sessions")->asUInt64() == 1);
+    CHECK(direct_status.find("video_transcodes")->asUInt64() == 1);
+
+    // Another logical viewer cannot steal the retained slot during that Direct
+    // interval, but the original viewer can switch back and seek repeatedly.
+    CHECK(create("transcode", "ui-player-2", "other-attempt").status == 429);
+    auto remux = create("remux", "ui-player-1", "logical-attempt-3");
+    REQUIRE(remux.status == 201);
+    auto remux_json = Json::parse(std::string(remux.body.begin(), remux.body.end()));
+    CHECK(remux_json.find("session_id")->asString() == session_id);
+    CHECK(remux_json.find("mode")->asString() == "remux");
+    CHECK(status().find("video_transcodes")->asUInt64() == 1);
+
+    auto transcoded = create("transcode", "ui-player-1", "logical-attempt-4", 10'000);
+    REQUIRE(transcoded.status == 201);
+    auto transcoded_json =
+        Json::parse(std::string(transcoded.body.begin(), transcoded.body.end()));
+    CHECK(transcoded_json.find("session_id")->asString() == session_id);
+    CHECK(status().find("video_transcodes")->asUInt64() == 1);
+
+    for (int64_t seek_ms : {20'000, 30'000, 40'000}) {
+        Json::Object patch_root{{"seek_ms", seek_ms}};
+        auto text = Json(std::move(patch_root)).dump();
+        HttpRequest patch;
+        patch.method = "PATCH";
+        patch.path = "/api/v1/playback/sessions/" + session_id;
+        patch.body.assign(text.begin(), text.end());
+        auto response = playback.handle(patch);
+        REQUIRE(response.status == 200);
+        CHECK(status().find("video_transcodes")->asUInt64() == 1);
+    }
+
+    HttpRequest remove;
+    remove.method = "DELETE";
+    remove.path = "/api/v1/playback/sessions/" + session_id;
+    REQUIRE(playback.handle(remove).status == 204);
+    CHECK(status().find("video_transcodes")->asUInt64() == 0);
+    CHECK(create("transcode", "ui-player-2", "other-attempt-2").status == 201);
 
     playback.stop();
     service.stop();

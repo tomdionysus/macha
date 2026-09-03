@@ -272,6 +272,15 @@ struct FuseFrontend::State {
         // New journal records carry one SHA-256 per bounded spool chunk. Empty
         // means a legacy pre-checksum record and remains replay-compatible.
         std::vector<Hash256> spool_hashes;
+        // Conservative heap ownership reserved before this durable operation
+        // is accepted. Copies in DataSnapshot do not own a second reservation;
+        // the estimate already includes both live representations and vector
+        // allocation slack.
+        uint64_t metadata_charge{};
+        // Shared by the authoritative history, durability ticket and any
+        // publication snapshot. Process ownership is released only after the
+        // final representation disappears.
+        std::shared_ptr<RetainedMemoryLedger::Lease> process_memory;
     };
 
     struct DataSnapshot {
@@ -369,6 +378,7 @@ struct FuseFrontend::State {
         uint64_t accounted_overlay_bytes{};
         uint64_t accounted_publication_operations{};
         uint64_t accounted_publication_operation_bytes{};
+        uint64_t accounted_operation_metadata_bytes{};
         std::optional<int> backend_error;
         uint64_t journal_epoch{};
         uint64_t unconfirmed_data_sequence{};
@@ -708,6 +718,12 @@ struct FuseFrontend::State {
     std::atomic_uint64_t retained_overlay_bytes{};
     std::atomic_uint64_t retained_publication_operations{};
     std::atomic_uint64_t retained_publication_operation_bytes{};
+    std::mutex operation_metadata_mutex;
+    std::condition_variable_any operation_metadata_cv;
+    uint64_t operation_metadata_bytes{};
+    std::atomic_uint64_t operation_metadata_bytes_diagnostic{};
+    std::atomic_uint64_t peak_operation_metadata_bytes{};
+    std::atomic_uint64_t operation_metadata_waits{};
     std::atomic_uint64_t backend_failures{};
     std::atomic_bool publication_failure_injected_for_tests{};
     // Monotonic diagnostic counters. They deliberately count durable frontend
@@ -753,6 +769,70 @@ struct FuseFrontend::State {
         return bytes;
     }
 
+    static uint64_t operation_metadata_charge(size_t checksum_count) {
+        // Both the authoritative history and one publication snapshot may be
+        // live. std::vector may retain up to roughly twice its element count in
+        // each representation, so four times the logical element+checksum size
+        // is a conservative portable admission charge.
+        constexpr uint64_t copies_with_capacity_slack = 4;
+        const auto hashes = static_cast<uint64_t>(checksum_count) * sizeof(Hash256);
+        if (hashes > std::numeric_limits<uint64_t>::max() / copies_with_capacity_slack -
+                         sizeof(DataOp))
+            throw FsError(E2BIG, "FUSE operation metadata charge overflow");
+        return copies_with_capacity_slack * (sizeof(DataOp) + hashes);
+    }
+
+    void release_operation_metadata(uint64_t bytes) {
+        if (!bytes)
+            return;
+        {
+            std::lock_guard lock(operation_metadata_mutex);
+            operation_metadata_bytes = bytes > operation_metadata_bytes
+                                           ? 0
+                                           : operation_metadata_bytes - bytes;
+            operation_metadata_bytes_diagnostic.store(operation_metadata_bytes,
+                                                       std::memory_order_relaxed);
+        }
+        operation_metadata_cv.notify_all();
+    }
+
+    std::unique_ptr<WriteRequestLease> reserve_operation_metadata(
+        uint64_t bytes, Clock::time_point deadline, const std::function<void()>& request_progress) {
+        if (bytes > config.max_operation_metadata_bytes)
+            throw FsError(E2BIG, "single FUSE operation exceeds metadata byte limit");
+        std::unique_lock lock(operation_metadata_mutex);
+        while (operation_metadata_bytes > config.max_operation_metadata_bytes - bytes) {
+            operation_metadata_waits.fetch_add(1, std::memory_order_relaxed);
+            lock.unlock();
+            request_progress();
+            lock.lock();
+            if (stopping.load(std::memory_order_relaxed))
+                throw FsError(EINTR, "FUSE operation metadata admission stopping");
+            if (operation_metadata_cv.wait_until(lock, deadline) == std::cv_status::timeout)
+                throw FsError(EAGAIN, "FUSE operation metadata admission saturated");
+        }
+        operation_metadata_bytes += bytes;
+        operation_metadata_bytes_diagnostic.store(operation_metadata_bytes,
+                                                   std::memory_order_relaxed);
+        auto peak = peak_operation_metadata_bytes.load(std::memory_order_relaxed);
+        while (peak < operation_metadata_bytes &&
+               !peak_operation_metadata_bytes.compare_exchange_weak(
+                   peak, operation_metadata_bytes, std::memory_order_relaxed)) {
+        }
+        return std::make_unique<WriteRequestLease>([this, bytes] {
+            release_operation_metadata(bytes);
+        });
+    }
+
+    std::shared_ptr<RetainedMemoryLedger::Lease> reserve_process_memory(
+        MemoryClass memory_class, MemoryOwner owner, uint64_t bytes,
+        Clock::time_point deadline) {
+        auto lease = fs.node().retained_memory().acquire(memory_class, owner, bytes, deadline);
+        if (!lease)
+            throw FsError(EAGAIN, "process retained-memory admission saturated");
+        return std::make_shared<RetainedMemoryLedger::Lease>(std::move(*lease));
+    }
+
     static void replace_accounted(std::atomic_uint64_t& total, uint64_t& accounted,
                                   uint64_t current) {
         if (current >= accounted)
@@ -784,6 +864,28 @@ struct FuseFrontend::State {
                           inode.accounted_publication_operations, publication_count);
         replace_accounted(retained_publication_operation_bytes,
                           inode.accounted_publication_operation_bytes, publication_memory);
+        uint64_t metadata_memory = 0;
+        for (const auto& op : inode.data_ops)
+            metadata_memory += op.metadata_charge;
+        if (metadata_memory < inode.accounted_operation_metadata_bytes)
+            release_operation_metadata(inode.accounted_operation_metadata_bytes -
+                                       metadata_memory);
+        else if (metadata_memory > inode.accounted_operation_metadata_bytes) {
+            // Recovery reconstructs already-acknowledged ownership before
+            // admission begins. It may exceed a newly lowered limit, but then
+            // blocks new work until normal publication drains it.
+            const auto added = metadata_memory - inode.accounted_operation_metadata_bytes;
+            std::lock_guard metadata_lock(operation_metadata_mutex);
+            operation_metadata_bytes += added;
+            operation_metadata_bytes_diagnostic.store(operation_metadata_bytes,
+                                                       std::memory_order_relaxed);
+            auto peak = peak_operation_metadata_bytes.load(std::memory_order_relaxed);
+            while (peak < operation_metadata_bytes &&
+                   !peak_operation_metadata_bytes.compare_exchange_weak(
+                       peak, operation_metadata_bytes, std::memory_order_relaxed)) {
+            }
+        }
+        inode.accounted_operation_metadata_bytes = metadata_memory;
     }
 
     void release_retained_owners_locked(Inode& inode) {
@@ -795,6 +897,8 @@ struct FuseFrontend::State {
                           inode.accounted_publication_operations, 0);
         replace_accounted(retained_publication_operation_bytes,
                           inode.accounted_publication_operation_bytes, 0);
+        release_operation_metadata(inode.accounted_operation_metadata_bytes);
+        inode.accounted_operation_metadata_bytes = 0;
     }
 
     std::shared_ptr<WriteRequestLease> reserve_write_request_bytes(
@@ -1273,6 +1377,7 @@ struct FuseFrontend::State {
             if (op.kind == DataOp::Kind::write && count != maximum)
                 throw DecodeError("FUSE data journal checksum coverage is incomplete");
         }
+        op.metadata_charge = operation_metadata_charge(op.spool_hashes.size());
         return {inode, op};
     }
 
@@ -1929,6 +2034,10 @@ struct FuseFrontend::State {
             }
             inode->durability_cv.notify_all();
         }
+        // A metadata-bound writer may have asked for publication before this
+        // batch became durable. Durability advancement is a real progress
+        // event: wake it to re-evaluate and enqueue the new durable prefix.
+        operation_metadata_cv.notify_all();
     }
 
     void durability_loop(std::stop_token stop) {
@@ -2336,7 +2445,11 @@ struct FuseFrontend::State {
         bool enqueue = false;
         {
             std::lock_guard inode_lock(inode->mutex);
-            if (inode->data_ops.empty() ||
+            // A terminal backend error poisons this inode until an explicit
+            // namespace operation or operator recovery clears it. Re-admitting
+            // the same durable generation cannot change that result and turns
+            // one bad inode into an unbounded worker/logging loop.
+            if (inode->backend_error || inode->data_ops.empty() ||
                 inode->durable_data_sequence <= inode->published_data_sequence)
                 return;
             const bool watermark_advanced =
@@ -2433,6 +2546,10 @@ struct FuseFrontend::State {
             if (data_queue.size() >= config.max_pending_operations)
                 break;
             std::lock_guard inode_lock(inode->mutex);
+            if (inode->backend_error) {
+                inode->data_deferred = false;
+                continue;
+            }
             if (!inode->data_deferred || inode->data_enqueue_pending || inode->data_queued ||
                 inode->data_running || inode->unconfirmed_data_entry)
                 continue;
@@ -3353,8 +3470,16 @@ struct FuseFrontend::State {
                 refresh_retained_owners_locked(*inode);
                 const bool still_requested =
                     inode->requested_data_sequence > inode->published_data_sequence;
-                if ((!completed || retry || still_requested) && !inode->unconfirmed_data_entry)
+                if (inode->backend_error) {
+                    // Terminal failures remain visible on the affected inode,
+                    // but are not runnable work. In particular, do not let
+                    // admit_deferred() immediately feed a poisoned recovered
+                    // inode back to this loop.
+                    inode->data_deferred = false;
+                } else if ((!completed || retry || still_requested) &&
+                           !inode->unconfirmed_data_entry) {
                     inode->data_deferred = true;
+                }
             }
             {
                 std::lock_guard lock(data_queue_mutex);
@@ -3803,8 +3928,15 @@ struct FuseFrontend::State {
                 for (const auto& op : operations->second) {
                     inode->next_data_sequence =
                         std::max(inode->next_data_sequence, op.sequence + 1);
-                    if (op.sequence > done)
-                        inode->data_ops.push_back(op);
+                    if (op.sequence > done) {
+                        auto recovered_op = op;
+                        auto memory = fs.node().retained_memory().restore(
+                            MemoryClass::loader, MemoryOwner::fuse_operation,
+                            recovered_op.metadata_charge);
+                        recovered_op.process_memory =
+                            std::make_shared<RetainedMemoryLedger::Lease>(std::move(memory));
+                        inode->data_ops.push_back(std::move(recovered_op));
+                    }
                 }
             }
             apply_pending_data_metadata(*inode, inode->data_ops);
@@ -4168,6 +4300,7 @@ struct FuseFrontend::State {
         data_cv.notify_all();
         spool_admission_cv.notify_all();
         write_request_cv.notify_all();
+        operation_metadata_cv.notify_all();
         for (auto& queue : broker)
             queue.cv.notify_all();
         if (namespace_worker.joinable())
@@ -4705,6 +4838,16 @@ FuseOpenHandle FuseFrontend::open(std::string_view path, bool readable, bool wri
         }
         if (truncate_on_open)
             state_->wait_for_inode_durability(inode, deadline, cancelled);
+        auto process_memory = truncate_on_open
+                                  ? state_->reserve_process_memory(
+                                        MemoryClass::loader, MemoryOwner::fuse_operation,
+                                        State::operation_metadata_charge(0), deadline)
+                                  : nullptr;
+        auto metadata_admission = truncate_on_open
+                                      ? state_->reserve_operation_metadata(
+                                            State::operation_metadata_charge(0), deadline,
+                                            [&] { state_->request_data_publication(inode); })
+                                      : nullptr;
         std::lock_guard inode_lock(inode->mutex);
         if (inode->visible.type != EntryType::file)
             throw FsError(EISDIR, "directory");
@@ -4715,6 +4858,8 @@ FuseOpenHandle FuseFrontend::open(std::string_view path, bool readable, bool wri
             const auto now = wall_time_ns();
             State::DataOp op;
             op.kind = State::DataOp::Kind::truncate;
+            op.metadata_charge = State::operation_metadata_charge(0);
+            op.process_memory = process_memory;
             op.sequence = seq;
             op.size = 0;
             op.mtime_ns = now;
@@ -4727,6 +4872,8 @@ FuseOpenHandle FuseFrontend::open(std::string_view path, bool readable, bool wri
             inode->next_data_sequence = seq + 1;
             State::apply_data_overlay_locked(*inode, op);
             inode->data_ops.push_back(op);
+            inode->accounted_operation_metadata_bytes += op.metadata_charge;
+            metadata_admission->release = {};
             state_->refresh_retained_owners_locked(*inode);
             inode->durable_data_sequence = seq;
             inode->visible.size = 0;
@@ -4994,16 +5141,29 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
         Clock::now() + std::min(timeout_for(FuseOperationClass::write), absolute_timeout());
     auto write_admission =
         state_->reserve_write_request_bytes(static_cast<uint64_t>(data.size()), admission_deadline);
+    auto process_write_admission = state_->reserve_process_memory(
+        MemoryClass::loader, MemoryOwner::fuse_request, data.size(), admission_deadline);
     Bytes owned(data.begin(), data.end());
     return dispatch(
         FuseOperationClass::write, [this, inode_id, offset, append,
                                     write_admission = std::move(write_admission),
+                                    process_write_admission = std::move(process_write_admission),
                                     owned = std::move(owned)](
                                        Clock::time_point deadline, std::atomic_bool& cancelled) {
             (void)write_admission;
+            (void)process_write_admission;
             auto inode = state_->resolve_inode(inode_id);
             state_->throw_if_durability_poisoned();
             check_deadline(deadline, cancelled);
+
+            const auto checksum_count =
+                (owned.size() + State::spool_checksum_chunk_size - 1) /
+                State::spool_checksum_chunk_size;
+            const auto metadata_charge = State::operation_metadata_charge(checksum_count);
+            auto process_operation = state_->reserve_process_memory(
+                MemoryClass::loader, MemoryOwner::fuse_operation, metadata_charge, deadline);
+            auto metadata_admission = state_->reserve_operation_metadata(
+                metadata_charge, deadline, [&] { state_->request_data_publication(inode); });
 
             // Admission may wait for distributed publication to create spool
             // capacity. Never hold an inode mutex across that wait: durability
@@ -5029,6 +5189,8 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
                 const auto seq = inode->next_data_sequence;
                 const auto now = wall_time_ns();
                 ticket->op.kind = State::DataOp::Kind::write;
+                ticket->op.metadata_charge = metadata_charge;
+                ticket->op.process_memory = process_operation;
                 ticket->op.sequence = seq;
                 ticket->op.offset = target;
                 ticket->op.length = static_cast<uint64_t>(owned.size());
@@ -5088,6 +5250,8 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
                     // unstable generation to other nodes or the metadata write floor.
                     State::apply_data_overlay_locked(*inode, overlay_op);
                     inode->data_ops.push_back(std::move(overlay_op));
+                    inode->accounted_operation_metadata_bytes += metadata_charge;
+                    metadata_admission->release = {};
                     state_->refresh_retained_owners_locked(*inode);
                     inode->visible.size =
                         std::max<uint64_t>(inode->visible.size, target + owned.size());
@@ -5135,6 +5299,12 @@ void FuseFrontend::truncate(uint64_t inode_id, uint64_t size) {
              [this, inode_id, size](Clock::time_point deadline, std::atomic_bool& cancelled) {
                  auto inode = state_->resolve_inode(inode_id);
                  state_->wait_for_inode_durability(inode, deadline, cancelled);
+                 auto process_memory = state_->reserve_process_memory(
+                     MemoryClass::loader, MemoryOwner::fuse_operation,
+                     State::operation_metadata_charge(0), deadline);
+                 auto metadata_admission = state_->reserve_operation_metadata(
+                     State::operation_metadata_charge(0), deadline,
+                     [&] { state_->request_data_publication(inode); });
                  std::lock_guard lock(inode->mutex);
                  check_deadline(deadline, cancelled);
                  if (inode->visible.type != EntryType::file)
@@ -5145,6 +5315,8 @@ void FuseFrontend::truncate(uint64_t inode_id, uint64_t size) {
                  const auto now = wall_time_ns();
                  State::DataOp op;
                  op.kind = State::DataOp::Kind::truncate;
+                 op.metadata_charge = State::operation_metadata_charge(0);
+                 op.process_memory = process_memory;
                  op.sequence = seq;
                  op.size = size;
                  op.mtime_ns = now;
@@ -5157,6 +5329,8 @@ void FuseFrontend::truncate(uint64_t inode_id, uint64_t size) {
                  inode->next_data_sequence = seq + 1;
                  State::apply_data_overlay_locked(*inode, op);
                  inode->data_ops.push_back(op);
+                 inode->accounted_operation_metadata_bytes += op.metadata_charge;
+                 metadata_admission->release = {};
                  state_->refresh_retained_owners_locked(*inode);
                  inode->durable_data_sequence = seq;
                  inode->visible.size = size;
@@ -5361,6 +5535,10 @@ FuseFrontendStatus FuseFrontend::status() const {
     out.retained_publication_operations = diagnostics.retained_publication_operations;
     out.retained_publication_operation_bytes =
         diagnostics.retained_publication_operation_bytes;
+    out.operation_metadata_bytes = diagnostics.operation_metadata_bytes;
+    out.peak_operation_metadata_bytes = diagnostics.peak_operation_metadata_bytes;
+    out.operation_metadata_limit_bytes = diagnostics.operation_metadata_limit_bytes;
+    out.operation_metadata_waits = diagnostics.operation_metadata_waits;
     out.retained_durability_tickets = diagnostics.retained_durability_tickets;
     out.data_publication_inflight_bytes = diagnostics.data_publication_inflight_bytes;
     out.backend_failures = diagnostics.backend_failures;
@@ -5433,6 +5611,10 @@ FuseFrontendDiagnostics FuseFrontend::diagnostics() const noexcept {
         state_->retained_overlay_bytes.load(std::memory_order_relaxed),
         state_->retained_publication_operations.load(std::memory_order_relaxed),
         state_->retained_publication_operation_bytes.load(std::memory_order_relaxed),
+        state_->operation_metadata_bytes_diagnostic.load(std::memory_order_relaxed),
+        state_->peak_operation_metadata_bytes.load(std::memory_order_relaxed),
+        state_->config.max_operation_metadata_bytes,
+        state_->operation_metadata_waits.load(std::memory_order_relaxed),
         state_->retained_durability_tickets.load(std::memory_order_relaxed),
         state_->publication_inflight_bytes_diagnostic.load(std::memory_order_relaxed),
         state_->backend_failures.load(std::memory_order_relaxed),

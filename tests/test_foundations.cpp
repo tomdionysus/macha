@@ -2,6 +2,7 @@
 #include "fuse_mountpoint.hpp"
 #include "miniupnpc_compat.hpp"
 #include "test_backend_support.hpp"
+#include "retained_memory.hpp"
 
 using namespace macha;
 using namespace std::chrono_literals;
@@ -890,6 +891,66 @@ MACHA_FAST_TEST("foundations", test_capacity_placement) {
     auto diverse = capacity_placement_nodes(key, domains, 2);
     REQUIRE(diverse.size() == 3);
     CHECK(diverse[0].failure_domain != diverse[1].failure_domain);
+}
+
+MACHA_FAST_TEST("foundations", test_retained_memory_ledger_preserves_priority_headroom) {
+    RetainedMemoryLedger ledger(100, 10, 30, 10);
+    auto speculative = ledger.try_acquire(MemoryClass::speculative, MemoryOwner::cache, 50);
+    REQUIRE(speculative.has_value());
+    CHECK(!ledger.try_acquire(MemoryClass::speculative, MemoryOwner::cache, 1).has_value());
+
+    // Speculative ownership cannot consume the loader floor. Viewer and
+    // control reservations remain independently usable at full lower load.
+    auto loader = ledger.try_acquire(MemoryClass::loader, MemoryOwner::publication, 10);
+    auto viewer = ledger.try_acquire(MemoryClass::viewer, MemoryOwner::playback_segment, 30);
+    auto control = ledger.try_acquire(MemoryClass::control, MemoryOwner::rpc_frame, 10);
+    REQUIRE(loader.has_value());
+    REQUIRE(viewer.has_value());
+    REQUIRE(control.has_value());
+    const auto full = ledger.stats();
+    CHECK(full.used_bytes == 100);
+    CHECK(full.peak_used_bytes == 100);
+    CHECK(full.owner_bytes[static_cast<size_t>(MemoryOwner::cache)] == 50);
+
+    control.reset();
+    viewer.reset();
+    loader.reset();
+    speculative.reset();
+    CHECK(ledger.stats().used_bytes == 0);
+}
+
+MACHA_FAST_TEST("foundations", test_retained_memory_ledger_sheds_borrowed_cache_for_viewer) {
+    RetainedMemoryLedger ledger(100, 10, 30, 10);
+    std::optional<RetainedMemoryLedger::Lease> borrowed;
+    borrowed = ledger.try_acquire(MemoryClass::loader, MemoryOwner::cache, 90, true,
+                                  [&] { borrowed.reset(); });
+    REQUIRE(borrowed.has_value());
+    CHECK(ledger.stats().reclaimable_bytes == 90);
+
+    auto viewer = ledger.acquire(MemoryClass::viewer, MemoryOwner::playback_segment, 30,
+                                 RetainedMemoryLedger::Clock::now() + 1s);
+    REQUIRE(viewer.has_value());
+    CHECK(!borrowed.has_value());
+    const auto after = ledger.stats();
+    CHECK(after.used_bytes == 30);
+    CHECK(after.reclaimable_bytes == 0);
+    CHECK(after.shed_requests == 1);
+    viewer.reset();
+    CHECK(ledger.stats().used_bytes == 0);
+}
+
+MACHA_FAST_TEST("foundations", test_retained_memory_ledger_restores_durable_overcommit) {
+    RetainedMemoryLedger ledger(100, 10, 30, 10);
+    auto restored = ledger.restore(MemoryClass::loader, MemoryOwner::fuse_operation, 120);
+    const auto overcommitted = ledger.stats();
+    CHECK(overcommitted.used_bytes == 120);
+    CHECK(overcommitted.restored_bytes == 120);
+    CHECK(!ledger.try_acquire(MemoryClass::viewer, MemoryOwner::playback_segment, 1).has_value());
+
+    restored.reset();
+    auto viewer = ledger.try_acquire(MemoryClass::viewer, MemoryOwner::playback_segment, 30);
+    REQUIRE(viewer.has_value());
+    CHECK(ledger.stats().used_bytes == 30);
 }
 
 } // namespace

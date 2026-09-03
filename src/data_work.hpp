@@ -142,6 +142,7 @@ class DataResourceArbiter {
   public:
     DataResourceArbiter(uint64_t capacity_bytes, uint64_t viewer_reserve_bytes);
     std::optional<Lease> acquire(const DataWorkContext& context, uint64_t bytes);
+    std::optional<Lease> try_acquire(const DataWorkContext& context, uint64_t bytes);
     void stop();
     DataResourceStats stats() const;
 };
@@ -215,6 +216,33 @@ DataResourceArbiter::acquire(const DataWorkContext& context, uint64_t requested_
         cv_.notify_all();
         return {};
     }
+    used_bytes_ += bytes;
+    if (!viewer(frame_type))
+        lower_used_bytes_ += bytes;
+    peak_used_bytes_ = std::max(peak_used_bytes_, used_bytes_);
+    if (viewer(frame_type))
+        ++viewer_admissions_;
+    else if (loader(frame_type))
+        ++loader_admissions_;
+    else
+        ++speculative_admissions_;
+    return Lease(*this, frame_type, bytes);
+}
+
+inline std::optional<DataResourceArbiter::Lease>
+DataResourceArbiter::try_acquire(const DataWorkContext& context, uint64_t requested_bytes) {
+    const auto frame_type = context.frame_type();
+    if (frame_type == FrameType::control)
+        throw std::invalid_argument("control cannot acquire DATA resource credit");
+    const auto bytes = charge(requested_bytes);
+    const auto class_capacity = viewer(frame_type)
+                                    ? capacity_bytes_
+                                    : capacity_bytes_ - viewer_reserve_bytes_;
+    if (bytes > class_capacity || context.cancelled() || context.expired())
+        return {};
+    std::lock_guard lock(mutex_);
+    if (stopping_ || !available(frame_type, bytes))
+        return {};
     used_bytes_ += bytes;
     if (!viewer(frame_type))
         lower_used_bytes_ += bytes;

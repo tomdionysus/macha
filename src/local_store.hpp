@@ -92,6 +92,10 @@ class LocalStore {
     LocalStoreMode mode_{LocalStoreMode::authoritative};
     std::atomic<uint64_t> used_{};
     mutable std::mutex m_;
+    // Serialises the append-only pack stream and compaction. It is deliberately
+    // distinct from m_: crypto and pack filesystem I/O must not exclude
+    // unrelated loose-object or index operations.
+    mutable std::mutex pack_io_mutex_;
     // Physical work for unrelated immutable objects must not serialize behind
     // the store index/accounting mutex. Weak entries give an exact per-object
     // single-flight domain and disappear after their last active operation.
@@ -99,6 +103,9 @@ class LocalStore {
     mutable std::map<ObjectId, std::weak_ptr<std::mutex>> object_mutexes_;
     uint64_t reserved_write_bytes_{};
     std::function<void(const ObjectId&)> before_loose_write_for_tests_;
+    std::function<void(const ObjectId&)> before_packed_read_for_tests_;
+    std::function<void(const ObjectId&)> before_packed_write_for_tests_;
+    std::function<void()> before_pack_compaction_for_tests_;
     static constexpr size_t verified_loose_limit = 4096;
     mutable std::map<ObjectId, VerifiedLoose> verified_loose_;
     mutable std::deque<std::pair<uint64_t, ObjectId>> verified_loose_order_;
@@ -114,12 +121,16 @@ class LocalStore {
     uint64_t accounting_sequence_{};
     unsigned accounting_slot_{};
     bool accounting_dirty_{};
+    bool accounting_dirty_in_progress_{};
+    mutable std::condition_variable accounting_state_cv_;
     std::shared_ptr<DurabilityDomain> durability_domain_;
     uint64_t last_mutation_generation_{};
     std::map<ObjectId, uint64_t> provisional_generations_;
     std::deque<std::pair<uint64_t, ObjectId>> provisional_order_;
 
     std::map<ObjectId, PackEntry> packed_;
+    mutable std::map<std::filesystem::path, size_t> active_pack_readers_;
+    mutable std::condition_variable pack_readers_cv_;
     uint64_t pack_dead_bytes_{};
     uint64_t next_pack_sequence_{1};
     std::filesystem::path active_pack_;
@@ -131,7 +142,7 @@ class LocalStore {
     bool restore_accounting();
     void persist_accounting(uint64_t used, uint8_t operation, const ObjectId&, uint64_t size,
                             bool durable);
-    void mark_accounting_dirty_locked();
+    void ensure_accounting_dirty(std::unique_lock<std::mutex>&);
     void checkpoint_accounting_locked();
     void reap_durable_generations_locked();
     bool put_impl(const ObjectId&, std::span<const uint8_t>, StoreWriteDurability, uint64_t*);
@@ -141,13 +152,16 @@ class LocalStore {
                            uint64_t*, std::unique_lock<std::mutex>&);
     void scan(std::stop_token);
     void rebuild_pack_index_locked(bool truncate_incomplete_tail);
-    std::optional<Bytes> get_packed_locked(const ObjectId&) const;
+    std::optional<Bytes> get_packed_locked(const ObjectId&,
+                                           std::unique_lock<std::mutex>&) const;
     bool append_pack_record_locked(uint8_t type, const ObjectId&, std::span<const uint8_t>,
-                                   uint64_t touched_ms, PackEntry*, uint64_t* record_size);
+                                   uint64_t touched_ms, PackEntry*, uint64_t* record_size,
+                                   std::unique_lock<std::mutex>&);
     void select_active_pack_locked(uint64_t next_record_size);
-    bool compact_packs_locked();
-    bool remove_locked(const ObjectId&);
+    bool compact_packs_locked(std::unique_lock<std::mutex>&);
+    bool remove_locked(const ObjectId&, std::unique_lock<std::mutex>&);
     bool physical_space_available_locked(uint64_t need) const;
+    bool filesystem_space_available_for_reservations() const;
     static std::optional<LooseStamp> loose_stamp(const std::filesystem::path&);
     void remember_verified_loose_locked(const ObjectId&, const LooseStamp&) const;
     void forget_verified_loose_locked(const ObjectId&) const;
@@ -187,6 +201,18 @@ class LocalStore {
     void set_before_loose_write_for_tests(std::function<void(const ObjectId&)> hook) {
         std::lock_guard lock(m_);
         before_loose_write_for_tests_ = std::move(hook);
+    }
+    void set_before_packed_read_for_tests(std::function<void(const ObjectId&)> hook) {
+        std::lock_guard lock(m_);
+        before_packed_read_for_tests_ = std::move(hook);
+    }
+    void set_before_packed_write_for_tests(std::function<void(const ObjectId&)> hook) {
+        std::lock_guard lock(m_);
+        before_packed_write_for_tests_ = std::move(hook);
+    }
+    void set_before_pack_compaction_for_tests(std::function<void()> hook) {
+        std::lock_guard lock(m_);
+        before_pack_compaction_for_tests_ = std::move(hook);
     }
     uint64_t used() const { return used_.load(std::memory_order_relaxed); }
     uint64_t limit() const { return limit_; }
