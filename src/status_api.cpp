@@ -630,6 +630,44 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     data_resource_diagnostics["cancelled_waits"] = data_resource.cancelled_waits;
     diagnostics["data_resources"] = std::move(data_resource_diagnostics);
 
+    const auto retained_memory = node_.retained_memory().stats();
+    Json::Object retained_memory_diagnostics;
+    retained_memory_diagnostics["capacity_bytes"] = retained_memory.capacity_bytes;
+    retained_memory_diagnostics["control_reserve_bytes"] =
+        retained_memory.control_reserve_bytes;
+    retained_memory_diagnostics["viewer_reserve_bytes"] =
+        retained_memory.viewer_reserve_bytes;
+    retained_memory_diagnostics["loader_reserve_bytes"] =
+        retained_memory.loader_reserve_bytes;
+    retained_memory_diagnostics["used_bytes"] = retained_memory.used_bytes;
+    retained_memory_diagnostics["peak_used_bytes"] = retained_memory.peak_used_bytes;
+    retained_memory_diagnostics["reclaimable_bytes"] = retained_memory.reclaimable_bytes;
+    retained_memory_diagnostics["shed_requests"] = retained_memory.shed_requests;
+    retained_memory_diagnostics["cancelled_waits"] = retained_memory.cancelled_waits;
+    retained_memory_diagnostics["restored_bytes"] = retained_memory.restored_bytes;
+    retained_memory_diagnostics["overcommit_bytes"] =
+        retained_memory.used_bytes > retained_memory.capacity_bytes
+            ? retained_memory.used_bytes - retained_memory.capacity_bytes
+            : 0;
+    Json::Object retained_admissions;
+    Json::Object retained_waits;
+    constexpr std::array<std::string_view, 4> memory_class_names{
+        "control", "viewer", "loader", "speculative"};
+    for (size_t i = 0; i < memory_class_names.size(); ++i) {
+        retained_admissions[std::string(memory_class_names[i])] = retained_memory.admissions[i];
+        retained_waits[std::string(memory_class_names[i])] = retained_memory.waits[i];
+    }
+    retained_memory_diagnostics["admissions"] = std::move(retained_admissions);
+    retained_memory_diagnostics["waits"] = std::move(retained_waits);
+    Json::Object retained_owners;
+    constexpr std::array<std::string_view, static_cast<size_t>(MemoryOwner::count)> owner_names{
+        "fuse_request", "fuse_operation", "publication", "rpc_frame", "object_payload",
+        "durability", "metadata", "catalogue", "media_profile", "playback_segment", "cache"};
+    for (size_t i = 0; i < owner_names.size(); ++i)
+        retained_owners[std::string(owner_names[i])] = retained_memory.owner_bytes[i];
+    retained_memory_diagnostics["owners"] = std::move(retained_owners);
+    diagnostics["retained_memory"] = std::move(retained_memory_diagnostics);
+
     Json::Object data_store_diagnostics;
     data_store_diagnostics["available"] = false;
     if (readiness.data_storage_ready) {
@@ -728,6 +766,14 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                     values->retained_publication_operations;
                 filesystem_diagnostics["retained_publication_operation_bytes"] =
                     values->retained_publication_operation_bytes;
+                filesystem_diagnostics["operation_metadata_bytes"] =
+                    values->operation_metadata_bytes;
+                filesystem_diagnostics["peak_operation_metadata_bytes"] =
+                    values->peak_operation_metadata_bytes;
+                filesystem_diagnostics["operation_metadata_limit_bytes"] =
+                    values->operation_metadata_limit_bytes;
+                filesystem_diagnostics["operation_metadata_waits"] =
+                    values->operation_metadata_waits;
                 filesystem_diagnostics["retained_durability_tickets"] =
                     values->retained_durability_tickets;
                 filesystem_diagnostics["data_publication_inflight_bytes"] =

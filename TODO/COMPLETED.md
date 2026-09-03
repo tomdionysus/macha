@@ -1,6 +1,49 @@
 # Completed and tested
 
-Last updated: 2026-09-02
+Last updated: 2026-09-03
+
+## Bounded terminal FUSE recovery failure
+
+- [x] Reproduced GBNI-1's crash-recovery state in which durable spooled writes
+  target a path absent from the accepted namespace.
+- [x] Prevented a terminally poisoned inode from being re-admitted indefinitely,
+  while preserving its journal/spool and leaving retryable failure semantics
+  unchanged.
+- [x] Passed 65/65 FUSE tests, 277/277 complete core tests and 4/4 runtime tests.
+- [x] Deployed complete source as 0.23.1 to all four nodes. The three Linux
+  binaries are byte-identical. The exact live inode-922 failure occurred once,
+  stayed settled, and left the mount and local API responsive.
+
+Evidence: [terminal FUSE recovery loop](2026-09-03-fuse-terminal-recovery-loop.md)
+
+## Persistent logical-viewer transcode admission
+
+- [x] Replaced physical-running-pipeline admission accounting with one retained
+  video/audio entitlement per persistent logical player/UI session.
+- [x] Added `Macha-Viewer-Session` reconciliation for replacement POSTs while
+  preserving PATCH, generation, idempotency and ownerless ephemeral-session
+  semantics.
+- [x] Serialized child-pipeline handover, retained entitlement through idle
+  reclaim and Direct/Remux transitions, and released it only at DELETE/expiry.
+- [x] Added separate physical-pipeline diagnostics and deterministic coverage
+  for replacement POSTs, repeated seeks, every playback mode, contention,
+  reclamation and exact capacity release.
+- [x] Passed 24/24 playback tests, 276/276 complete core tests and 4/4 runtime
+  dependency tests; deployed complete source to all four nodes with identical
+  Linux binaries and a healthy, writable generation-3904 clean baseline.
+
+Evidence: [logical viewer transcode admission](2026-09-03-logical-viewer-transcode-admission.md)
+
+## Phase 2 bounded FUSE operation metadata
+
+- [x] Added a configurable aggregate heap admission bound for durable `DataOp`
+  history, checksum-vector capacity and a concurrent publication snapshot.
+- [x] Made saturation wake publication and wait on durability/retirement events;
+  acknowledged work remains durable and recovery-safe.
+- [x] Added current/peak/limit/wait diagnostics and hard-bound plus liveness
+  regressions. The complete filesystem/FUSE suite passed 64/64.
+
+Evidence: [Phase 2 operation-metadata bound](2026-09-02-phase-2-operation-metadata-bound.md)
 
 This is the completed-work ledger for the current session. An item belongs here only after implementation and its stated verification are complete. Detailed design notes, exact test results, and UAT measurements remain in the linked records.
 
@@ -726,3 +769,23 @@ Evidence: [Transport, allocator and decoder checkpoint](2026-09-02-transport-and
   healthy 3/3 cluster.
 
 Evidence: [Spool progress-bootstrap admission checkpoint](2026-08-31-spool-progress-bootstrap-admission.md)
+
+## Structural remediation Phase 1 — object-store concurrency and priority
+
+- [x] Removed store-index locking from loose/packed payload I/O, AES-GCM,
+  hashing, filesystem capacity inspection, loose removal, crash-accounting
+  fsync and bounded pack compaction.
+- [x] Preserved exact same-object single-flight and introduced logical pack
+  reader leases so compaction cannot unlink a pack between index selection and
+  `open(2)`.
+- [x] Moved physical validation/retention/deletion off CONTROL workers and
+  propagated loader/speculative/viewer classes through the shared DATA
+  admission boundary, with non-blocking inner RPC admission to avoid bounded
+  worker inversion.
+- [x] Coalesced deferred durability ownership into exact non-dominated physical
+  generation frontiers.
+- [x] Passed deterministic blocked-operation, priority, recovery, corruption,
+  durability and compaction regressions; final local verification is 267/267
+  core plus 4/4 runtime at 12-way process isolation.
+
+Evidence: [Object-store concurrency checkpoint](2026-09-02-object-store-concurrency-checkpoint.md)

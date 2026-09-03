@@ -1,5 +1,16 @@
 # Current release
 
+## 0.23.1 — bounded FUSE recovery failure (development)
+
+- Stop terminal asynchronous publication failures from being immediately
+  re-admitted as deferred work. A journal-restored inode whose accepted
+  namespace path has disappeared now remains explicitly poisoned for recovery
+  instead of consuming a worker and flooding logs indefinitely; unrelated FUSE
+  paths and control traffic remain serviceable.
+- Add a crash analogue covering durable spooled writes followed by accepted
+  namespace removal, proving exactly one terminal attempt, scheduler quiescence,
+  and continued access to unrelated files.
+
 ## 0.22.2 — metadata reconciliation recovery (development)
 
 - Reject compact metadata deltas which cannot reproduce the exact immutable

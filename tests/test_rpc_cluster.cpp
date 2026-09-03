@@ -58,6 +58,41 @@ MACHA_FAST_TEST("rpc_cluster", test_rpc_reassembly_has_count_byte_and_message_bo
     CHECK(message_bound.incomplete_bytes() == 3);
 }
 
+MACHA_FAST_TEST("rpc_cluster", test_rpc_reassembly_is_process_memory_charged_until_consumed) {
+    RetainedMemoryLedger memory(4096, 512, 1024, 512);
+    MessageAssembler assembler(4, 2048, 2048, &memory);
+    auto fragment = [](uint64_t request, bool first, bool last, size_t bytes,
+                       FrameType frame_type = FrameType::loader) {
+        return WireFragment{request, frame_type, MessageType::put_object, first, last,
+                            Bytes(bytes, 0x5a)};
+    };
+
+    CHECK(!assembler.push(fragment(1, true, false, 700)).has_value());
+    const auto partial = memory.stats().owner_bytes[static_cast<size_t>(MemoryOwner::rpc_frame)];
+    CHECK(partial >= 700);
+
+    auto complete = assembler.push(fragment(1, false, true, 300));
+    REQUIRE(complete.has_value());
+    CHECK(complete->message.payload.size() == 1000);
+    CHECK(memory.stats().owner_bytes[static_cast<size_t>(MemoryOwner::rpc_frame)] >= 1000);
+
+    auto delivered = std::move(complete->message);
+    complete.reset();
+    CHECK(memory.stats().owner_bytes[static_cast<size_t>(MemoryOwner::rpc_frame)] >= 1000);
+    delivered = {};
+    CHECK(memory.stats().owner_bytes[static_cast<size_t>(MemoryOwner::rpc_frame)] == 0);
+
+    MessageAssembler saturated(4, 4096, 4096, &memory);
+    CHECK(!saturated.push(fragment(2, true, false, 1500)).has_value());
+    bool rejected = false;
+    try {
+        (void)saturated.push(fragment(3, true, false, 1100));
+    } catch (...) {
+        rejected = true;
+    }
+    CHECK(rejected);
+}
+
 MACHA_TEST("rpc_cluster", test_async_rpc_move_ownership) {
     std::atomic_int cancelled{};
 
@@ -308,6 +343,78 @@ MACHA_TEST("rpc_cluster", test_loader_put_does_not_signal_viewer_activity) {
     auto bytes = pattern(256 * 1024, 91);
     REQUIRE(store.put(bytes) == object_id(bytes));
     CHECK(node.take_activity_bytes(FrameType::read_ahead) == 0);
+}
+
+MACHA_TEST("rpc_cluster", test_concurrent_object_fetch_waiters_share_one_retained_buffer) {
+    TestNode fixture("shared-object-buffer", ConfigProfile::functional);
+    auto& config = fixture.config();
+    config.replication = 2;
+    config.metadata_min_write_replicas = 1;
+    config.heartbeat = 30s;
+    auto& node = fixture.start();
+
+    const auto bytes = pattern(512 * 1024, 73);
+    const auto id = object_id(bytes);
+    const auto port = free_port();
+    NodeInfo peer;
+    peer.id = random_node_id();
+    peer.host = "127.0.0.1";
+    peer.port = port;
+    peer.failure_domain = "remote";
+    peer.capacity = 1024ULL * 1024 * 1024;
+    peer.seen_unix_ms = unix_ms();
+
+    TestGate reply_gate;
+    std::atomic_uint fetches{};
+    RpcServer server(
+        "127.0.0.1", port, fixture.keys(), peer,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (request.type == MessageType::get_object) {
+                ++fetches;
+                reply_gate.enter_and_wait();
+                Writer writer;
+                writer.fixed(id.bytes);
+                writer.bytes(bytes);
+                return RpcMessage{MessageType::object_reply, writer.take()};
+            }
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {}, 4ULL * 1024 * 1024, {}, &node.retained_memory());
+    server.start();
+    node.membership().observe(peer, true);
+
+    DistributedStore store(node);
+    auto first = std::async(std::launch::async, [&] {
+        return store.get_shared(id, 0, FrameType::foreground);
+    });
+    REQUIRE(reply_gate.wait_for_entries(1));
+    auto second = std::async(std::launch::async, [&] {
+        return store.get_shared(id, 0, FrameType::foreground);
+    });
+    std::this_thread::sleep_for(20ms);
+    reply_gate.open();
+
+    auto a = first.get();
+    auto b = second.get();
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    CHECK(a.get() == b.get());
+    CHECK(a->bytes == bytes);
+    CHECK(fetches.load() == 1);
+
+    const auto held = node.retained_memory().stats()
+                          .owner_bytes[static_cast<size_t>(MemoryOwner::rpc_frame)];
+    CHECK(held >= bytes.size());
+    a.reset();
+    CHECK(node.retained_memory().stats()
+              .owner_bytes[static_cast<size_t>(MemoryOwner::rpc_frame)] >= bytes.size());
+    b.reset();
+    REQUIRE(wait_until([&] {
+        return node.retained_memory().stats()
+                   .owner_bytes[static_cast<size_t>(MemoryOwner::rpc_frame)] < bytes.size();
+    }));
+
+    server.stop();
 }
 
 MACHA_TEST("rpc_cluster", test_rpc_v15_persistence_and_multiplexing) {
@@ -867,6 +974,53 @@ MACHA_TEST("rpc_cluster", test_rpc_slow_control_does_not_abort_data) {
     server.stop();
 }
 
+MACHA_TEST("rpc_cluster", test_rpc_request_payload_is_charged_until_handler_completion) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto port = free_port();
+    NodeInfo server_info;
+    server_info.id = random_node_id();
+    server_info.host = "127.0.0.1";
+    server_info.port = port;
+    server_info.failure_domain = "server-site";
+
+    RetainedMemoryLedger memory(1024 * 1024, 64 * 1024, 256 * 1024, 64 * 1024);
+    TestGate handler_gate;
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (request.type == MessageType::put_object)
+                handler_gate.enter_and_wait();
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {}, 256 * 1024, {}, &memory);
+    server.start();
+
+    NodeInfo client_info;
+    client_info.id = random_node_id();
+    client_info.host = "127.0.0.1";
+    client_info.port = free_port();
+    client_info.failure_domain = "client-site";
+    RpcClient client(keys, [client_info] { return client_info; }, [](const NodeInfo&) {},
+                     [](uint64_t) {}, 500ms);
+
+    Bytes payload(64 * 1024, 0x5a);
+    auto request = client.call_async(Endpoint{"127.0.0.1", port}, MessageType::put_object,
+                                     payload, FrameType::loader);
+    REQUIRE(handler_gate.wait_for_entries(1));
+    const auto active = memory.stats();
+    CHECK(active.owner_bytes[static_cast<size_t>(MemoryOwner::rpc_frame)] >= payload.size());
+    CHECK(active.used_bytes ==
+          active.owner_bytes[static_cast<size_t>(MemoryOwner::rpc_frame)]);
+
+    handler_gate.open();
+    REQUIRE(request.wait_for(2s) == std::future_status::ready);
+    CHECK(request.get().message.type == MessageType::ok);
+    REQUIRE(wait_until([&] { return memory.stats().used_bytes == 0; }));
+    client.stop();
+    server.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_rpc_health_and_control_not_starved_by_data) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
@@ -1077,8 +1231,9 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_mutations_use_bounded_isolated_execu
     REQUIRE(queue_full.wait_for(1s) == std::future_status::ready);
     CHECK(queue_full.get().message.type == MessageType::error);
 
-    // Health, membership, ordinary control work, and foreground DATA work all
-    // complete while the metadata worker and queue remain deliberately blocked.
+    // Health, membership, speculative storage validation, and foreground DATA
+    // work all complete while the metadata worker and queue remain deliberately
+    // blocked.
     CHECK(client.call(endpoint, MessageType::ping, {}, 100ms).message.type == MessageType::ok);
     CHECK(client.call(endpoint, MessageType::members, {}, 100ms).message.type ==
           MessageType::members_reply);
@@ -1111,11 +1266,11 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_mutations_use_bounded_isolated_execu
     // rejected payload never enters a queue and cannot consume another class's
     // reserved memory.
     auto fast_too_large = client.call_async(endpoint, MessageType::ping, Bytes(2, 0x11));
-    auto control_too_large =
+    auto validation_too_large =
         client.call_async(endpoint, MessageType::have_object, Bytes(2, 0x12));
     auto data_too_large = client.call_async(endpoint, MessageType::get_object, Bytes(2, 0x13),
                                             FrameType::foreground);
-    for (auto* rejected : {&fast_too_large, &control_too_large, &data_too_large}) {
+    for (auto* rejected : {&fast_too_large, &validation_too_large, &data_too_large}) {
         REQUIRE(rejected->wait_for(1s) == std::future_status::ready);
         CHECK(rejected->get().message.type == MessageType::error);
     }
@@ -1138,8 +1293,10 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_mutations_use_bounded_isolated_execu
           0);
     REQUIRE(final_stats.frame_timings.contains(FrameType::control));
     REQUIRE(final_stats.frame_timings.contains(FrameType::foreground));
-    CHECK(final_stats.frame_timings.at(FrameType::control).requests >= 6);
+    REQUIRE(final_stats.frame_timings.contains(FrameType::speculative));
+    CHECK(final_stats.frame_timings.at(FrameType::control).requests >= 4);
     CHECK(final_stats.frame_timings.at(FrameType::foreground).requests == 1);
+    CHECK(final_stats.frame_timings.at(FrameType::speculative).requests == 1);
 
     // Both CONTROL and DATA sessions remain usable after backpressure replies.
     CHECK(client.call(endpoint, MessageType::ping, {}, 100ms).message.type == MessageType::ok);
@@ -1528,11 +1685,23 @@ MACHA_TEST("rpc_cluster", test_storage_data_credit_reserves_viewer_headroom_and_
     auto control = client.call(endpoint, MessageType::ping, {}, 500ms);
     CHECK(control.message.type == MessageType::ok);
     CHECK(Clock::now() - control_started < 200ms);
+
+    // Presence validation decrypts and hashes the complete stored object. Its
+    // default RPC classification must therefore enter speculative DATA
+    // admission rather than execute synchronously on a CONTROL worker.
+    auto blocked_validation =
+        client.call_async(endpoint, MessageType::have_object, request.data());
+    REQUIRE(blocked_validation.wait_for(1s) == std::future_status::ready);
+    CHECK(blocked_validation.get().message.type == MessageType::error);
+    auto second_control = client.call(endpoint, MessageType::ping, {}, 500ms);
+    CHECK(second_control.message.type == MessageType::ok);
     CHECK(blocked_loader.wait_for(20ms) == std::future_status::timeout);
 
     first.reset();
     REQUIRE(blocked_loader.wait_for(1s) == std::future_status::ready);
     CHECK(blocked_loader.get().message.type == MessageType::object_reply);
+    CHECK(client.call(endpoint, MessageType::have_object, request.data(), 500ms).message.type ==
+          MessageType::bool_reply);
 
     const auto stats = node.data_resources().stats();
     CHECK(stats.viewer_admissions >= 1);

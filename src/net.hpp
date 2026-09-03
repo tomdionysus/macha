@@ -17,6 +17,7 @@
 #include <stop_token>
 #include <thread>
 #include <vector>
+#include "retained_memory.hpp"
 
 namespace macha {
 enum class MessageType : uint16_t {
@@ -94,6 +95,15 @@ FrameType default_frame_type(MessageType) noexcept;
 struct RpcMessage {
     MessageType type{MessageType::error};
     Bytes payload;
+    // Fragment payload ownership follows the completed message through any
+    // executor/future handoff. This prevents an uncharged asynchronous gap.
+    std::shared_ptr<std::vector<RetainedMemoryLedger::Lease>> retained_memory;
+
+    RpcMessage() = default;
+    RpcMessage(MessageType message_type, Bytes message_payload,
+               std::shared_ptr<std::vector<RetainedMemoryLedger::Lease>> memory = {})
+        : type(message_type), payload(std::move(message_payload)),
+          retained_memory(std::move(memory)) {}
 };
 
 struct RpcFrame {
@@ -166,6 +176,7 @@ class MessageAssembler {
         FrameType frame_type{FrameType::control};
         MessageType message_type{MessageType::error};
         Bytes payload;
+        std::shared_ptr<std::vector<RetainedMemoryLedger::Lease>> retained_memory;
     };
 
     std::map<uint64_t, Partial> partial_;
@@ -173,11 +184,13 @@ class MessageAssembler {
     size_t max_partial_messages_;
     size_t max_partial_bytes_;
     size_t max_message_bytes_;
+    RetainedMemoryLedger* retained_memory_{};
 
   public:
     explicit MessageAssembler(size_t max_partial_messages = 64,
                               size_t max_partial_bytes = 256ULL * 1024 * 1024,
-                              size_t max_message_bytes = 128ULL * 1024 * 1024);
+                              size_t max_message_bytes = 128ULL * 1024 * 1024,
+                              RetainedMemoryLedger* retained_memory = nullptr);
     void promote(uint64_t request_id, FrameType);
     void discard(uint64_t request_id);
     std::optional<RpcFrame> push(WireFragment);
@@ -293,6 +306,7 @@ class RpcClient {
     std::chrono::milliseconds heartbeat_;
     std::chrono::milliseconds dead_after_;
     size_t max_frame_size_{};
+    RetainedMemoryLedger* retained_memory_{};
     mutable std::mutex mutex_;
     std::condition_variable connection_cv_;
     // Creating a transport is expensive: authentication starts two persistent
@@ -345,7 +359,8 @@ class RpcClient {
               std::function<void(uint64_t)>, std::chrono::milliseconds connect_timeout,
               std::chrono::milliseconds heartbeat = std::chrono::seconds(5),
               std::chrono::milliseconds dead_after = std::chrono::seconds(30),
-              size_t max_frame_size = 256 * 1024);
+              size_t max_frame_size = 256 * 1024,
+              RetainedMemoryLedger* retained_memory = nullptr);
     ~RpcClient();
     AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
     AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
@@ -379,6 +394,7 @@ class RpcServer {
         RpcFrame frame;
         RpcClient::InboundReply reply;
         Clock::time_point queued_at{Clock::now()};
+        RetainedMemoryLedger::Lease memory;
     };
 
     struct AtomicTiming {
@@ -415,6 +431,7 @@ class RpcServer {
     std::deque<RequestJob> loader_requests_;
     std::deque<RequestJob> speculative_requests_;
     RpcServerExecutionLimits execution_limits_;
+    RetainedMemoryLedger* retained_memory_{};
     size_t metadata_request_bytes_{};
     size_t fast_control_request_bytes_{};
     size_t control_request_bytes_{};
@@ -455,7 +472,8 @@ class RpcServer {
 
   public:
     RpcServer(std::string, uint16_t, ClusterKeys, NodeInfo, Handler, Observer,
-              size_t max_frame_size = 256 * 1024, RpcServerExecutionLimits execution_limits = {});
+              size_t max_frame_size = 256 * 1024, RpcServerExecutionLimits execution_limits = {},
+              RetainedMemoryLedger* retained_memory = nullptr);
     ~RpcServer();
     void start();
     void stop();

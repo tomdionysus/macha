@@ -144,6 +144,11 @@ struct FuseConfig {
     // resolves this to an effective byte value before service startup.
     uint64_t publication_pipeline_bytes{};
     size_t max_pending_operations{4096};
+    // Conservative retained-heap budget for durable DataOp history, checksum
+    // vectors and the publication snapshot which may coexist with it. This is
+    // independent of spool payload bytes: many tiny writes/truncates must not
+    // turn a bounded spool into an unbounded descriptor heap.
+    uint64_t max_operation_metadata_bytes{64ULL * 1024 * 1024};
     // Ordered namespace recovery/backlog operations may share one metadata
     // publication. Both limits are hard bounds; a single operation is always
     // admitted so an unusually large rename cannot deadlock the queue.
@@ -362,6 +367,12 @@ struct RuntimeConfig {
     // glibc otherwise permits a CPU-derived number of independent arenas,
     // allowing short-lived codec threads to ratchet retained process memory.
     size_t glibc_arena_max{4};
+    // Aggregate heap retained across asynchronous subsystem boundaries. The
+    // reserves are priority headroom inside this total, not extra capacity.
+    uint64_t retained_memory_bytes{768ULL * 1024 * 1024};
+    uint64_t control_memory_reserve_bytes{64ULL * 1024 * 1024};
+    uint64_t viewer_memory_reserve_bytes{192ULL * 1024 * 1024};
+    uint64_t loader_memory_reserve_bytes{64ULL * 1024 * 1024};
 };
 
 struct Config {

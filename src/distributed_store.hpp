@@ -15,6 +15,12 @@
 namespace macha {
 class DistributedStore {
   public:
+    struct ObjectBuffer {
+        Bytes bytes;
+        std::shared_ptr<std::vector<RetainedMemoryLedger::Lease>> retained_memory;
+    };
+    using ObjectData = std::shared_ptr<const ObjectBuffer>;
+
     struct RepairResult {
         uint64_t bytes_transferred{};
         size_t push_examined{};
@@ -44,6 +50,7 @@ class DistributedStore {
         std::vector<DurabilityRequirement> requirements;
         bool empty() const noexcept { return requirements.empty(); }
         void clear() { requirements.clear(); }
+        void add(DurabilityRequirement);
     };
 
   private:
@@ -60,7 +67,7 @@ class DistributedStore {
         std::atomic_size_t waiters{};
         std::optional<NodeInfo> active_peer;
         ReplicaWorkClass active_class{ReplicaWorkClass::speculative};
-        std::optional<Bytes> result;
+        ObjectData result;
     };
 
     NodeRuntime& n_;
@@ -81,17 +88,18 @@ class DistributedStore {
     std::vector<NodeInfo> ranked(const ObjectId&) const;
     std::vector<NodeInfo> owners(const ObjectId&) const;
     bool put_on(const NodeInfo&, const ObjectId&, std::span<const uint8_t>, bool foreground);
-    RpcReply bounded_control_call(const NodeInfo&, MessageType, std::span<const uint8_t>);
+    RpcReply bounded_control_call(const NodeInfo&, MessageType, std::span<const uint8_t>,
+                                  FrameType = FrameType::control);
     bool retain_on(const NodeInfo&, RetentionClass, const std::vector<ObjectId>&,
                    const RetentionDot&);
-    std::optional<Bytes> get_from(const NodeInfo&, const ObjectId&, FrameType,
-                                  const std::shared_ptr<SharedFetch>&,
-                                  Clock::time_point deadline, std::atomic_bool* cancelled,
-                                  const std::function<bool()>& abort = {});
-    std::optional<Bytes> get_remote(const ObjectId&, size_t stripe, FrameType, bool foreground,
-                                    bool opportunistic_persist, Clock::time_point deadline = {},
-                                    std::atomic_bool* cancelled = nullptr,
-                                    const std::function<bool()>& abort = {});
+    ObjectData get_from(const NodeInfo&, const ObjectId&, FrameType,
+                        const std::shared_ptr<SharedFetch>&,
+                        Clock::time_point deadline, std::atomic_bool* cancelled,
+                        const std::function<bool()>& abort = {});
+    ObjectData get_remote(const ObjectId&, size_t stripe, FrameType, bool foreground,
+                          bool opportunistic_persist, Clock::time_point deadline = {},
+                          std::atomic_bool* cancelled = nullptr,
+                          const std::function<bool()>& abort = {});
     void note_foreground(uint64_t);
     void note_network(uint64_t, Clock::duration);
 
@@ -121,6 +129,9 @@ class DistributedStore {
                              Clock::time_point deadline = {}, std::atomic_bool* cancelled = nullptr);
     std::optional<Bytes> get(const ObjectId&, size_t stripe, FrameType,
                              Clock::time_point deadline = {}, std::atomic_bool* cancelled = nullptr);
+    ObjectData get_shared(const ObjectId&, size_t stripe, FrameType,
+                          Clock::time_point deadline = {},
+                          std::atomic_bool* cancelled = nullptr);
     bool has_on(const NodeInfo&, const ObjectId&);
     bool should_own(const ObjectId&) const;
     size_t replicate_all(const ObjectId&, std::span<const uint8_t>, bool foreground = false);
@@ -158,5 +169,6 @@ class DistributedStore {
     double estimated_network_bps() const {
         return network_bps_.load();
     }
+    RetainedMemoryLedger& retained_memory() noexcept { return n_.retained_memory(); }
 };
 } // namespace macha

@@ -21,6 +21,17 @@ unsigned parse_unsigned(const std::string& value, const char* what) {
 void validate(Config& config) {
     if (!config.runtime.glibc_arena_max || config.runtime.glibc_arena_max > 64)
         throw std::runtime_error("runtime.glibc_arena_max must be 1..64");
+    if (!config.runtime.retained_memory_bytes ||
+        !config.runtime.control_memory_reserve_bytes ||
+        !config.runtime.viewer_memory_reserve_bytes ||
+        !config.runtime.loader_memory_reserve_bytes ||
+        config.runtime.control_memory_reserve_bytes > config.runtime.retained_memory_bytes ||
+        config.runtime.viewer_memory_reserve_bytes >
+            config.runtime.retained_memory_bytes - config.runtime.control_memory_reserve_bytes ||
+        config.runtime.loader_memory_reserve_bytes >
+            config.runtime.retained_memory_bytes - config.runtime.control_memory_reserve_bytes -
+                config.runtime.viewer_memory_reserve_bytes)
+        throw std::runtime_error("runtime retained-memory reserves exceed total capacity");
     if (config.state_path.empty())
         throw std::runtime_error("state_path is required");
     if (config.key_file.empty())
@@ -101,6 +112,9 @@ void validate(Config& config) {
     if (!config.fuse.max_pending_write_bytes ||
         config.fuse.max_pending_write_bytes > 4ULL * 1024 * 1024 * 1024)
         throw std::runtime_error("fuse.max_pending_write_bytes must be 1..4G");
+    if (config.fuse.max_operation_metadata_bytes < 512 ||
+        config.fuse.max_operation_metadata_bytes > 4ULL * 1024 * 1024 * 1024)
+        throw std::runtime_error("fuse.max_operation_metadata_bytes must be 512..4G");
     const auto fuse_max = std::chrono::seconds(30);
     const auto positive = [](std::chrono::milliseconds value) { return value.count() > 0; };
     if (!positive(config.fuse.absolute_request_timeout) ||

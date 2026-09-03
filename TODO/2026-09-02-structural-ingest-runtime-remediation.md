@@ -96,19 +96,37 @@ visible in diagnostics.
 
 ## Phase 1 — object-store concurrency and idempotence
 
-- [ ] Split store metadata/index protection from physical I/O and crypto. Use
+- [x] Split store metadata/index protection from physical I/O and crypto. Use
   short critical sections, immutable index snapshots where useful, and
   per-object single-flight coordination for mutations of the same ID.
+  - 2026-09-02 checkpoint: loose and packed reads/writes, loose removal,
+    filesystem-capacity inspection, and bounded pack compaction no longer hold
+    the store index mutex across payload I/O, hashing, AES-GCM or filesystem
+    waits. Packed appends/compaction use a separate physical stream domain;
+    mutations of one immutable ID retain exact per-object single-flight.
+    Deterministic blocked-operation tests cover loose write, packed read,
+    packed write and compaction. Logical pack-reader leases also remove
+    `open(2)` from the index lock while preventing compaction/unlink races.
 - [x] Make existing-object reaffirmation an indexed/idempotent fast path. Define
   the separate scrub/integrity-validation policy rather than validating the
   entire payload synchronously on every put.
-- [ ] Ensure remote put/get handlers do not perform long storage work on
+- [x] Ensure remote put/get handlers do not perform long storage work on
   critical communications threads. Completion, cancellation and deadlines must
   be event driven and bounded.
-- [ ] Propagate work class into store and physical-I/O admission so viewer/control
+  Storage validation, retention and deletion are now classified DATA-executor
+  work rather than CONTROL-worker work. Their inner physical admission is
+  non-blocking so a saturated bounded executor cannot form a cross-node wait
+  cycle; callers receive an error and retry/reconcile.
+- [x] Propagate work class into store and physical-I/O admission so viewer/control
   work can overtake loader work without starving loader progress.
-- [ ] Coalesce durability requirements by physical replica/domain generation as
+  Distributed reads/writes, cache promotion, retention validation, repair and
+  remote physical handlers now enter the common priority-aware DATA resource
+  boundary. The final whole-program audit remains in Phase 7.
+- [x] Coalesce durability requirements by physical replica/domain generation as
   they are accumulated rather than retaining one full requirement per extent.
+  Each exact replica-set/quorum retains only its non-dominated cumulative
+  generation frontier; incomparable alternatives remain separate so the
+  original per-object durability formula is not strengthened or weakened.
 
 Exit gate: unrelated object operations run concurrently; duplicate puts do no
 payload read/decrypt/rewrite; viewer/control latency remains bounded under
@@ -123,8 +141,14 @@ loader saturation; crash durability and integrity tests remain unchanged.
   acknowledgement.
 - [x] Make reads query `O(log n + intersecting ranges)` and copy only immutable
   descriptors needed after dropping the inode lock.
-- [ ] Bound and charge `DataOp`, checksum and publication-snapshot metadata.
+- [x] Bound and charge `DataOp`, checksum and publication-snapshot metadata.
   Backpressure or compact before the bound is exceeded.
+  - 2026-09-02 checkpoint: each accepted operation reserves a conservative
+    heap charge covering authoritative history, checksum-vector capacity and
+    one concurrent publication snapshot. The configurable 64 MiB aggregate
+    bound wakes publication and waits on durability/retirement events; recovery
+    preserves acknowledged history even if a lowered limit is initially
+    exceeded, while blocking new admissions until it drains.
 - [x] Rebuild the same compact overlay deterministically from the journal after
   crash/restart and prove truncate/overwrite/rename/unlink semantics.
 
@@ -144,6 +168,15 @@ bound; restart replay produces the identical visible file.
   borrowing when idle, and preserve a non-zero loader share.
 - [ ] Add pressure-triggered shedding only for reconstructible caches. Durable
   and acknowledged work must backpressure rather than disappear.
+
+2026-09-02 checkpoint: the common ledger, priority reserves, recovery
+overcommit, event-driven admission and first concrete owner lifetimes are
+implemented. FUSE/RPC/publication/object/playback owners are substantially
+wired, and concurrent remote object readers now share one charged immutable
+buffer rather than copying one complete extent per waiter. Phase 3 remains open
+for metadata/catalogue/profile ownership, remaining transient materialisation
+buffers, complete-suite verification and the stable-RSS loaded exit gate. See
+[the retained-memory checkpoint](2026-09-02-phase-3-retained-memory-checkpoint.md).
 
 Exit gate: deterministic saturation tests and a multi-file loaded run reach a
 stable RSS plateau on a 4 GiB node without swap growth, OOM, lost work or viewer

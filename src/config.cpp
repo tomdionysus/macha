@@ -232,6 +232,8 @@ void parse_fuse(const YAML::Node& root, Config& c) {
     if (f["publication_pipeline_bytes"])
         c.fuse.publication_pipeline_bytes = yaml_size(f["publication_pipeline_bytes"]);
     if (f["max_pending_operations"]) c.fuse.max_pending_operations = f["max_pending_operations"].as<size_t>();
+    if (f["max_operation_metadata_bytes"])
+        c.fuse.max_operation_metadata_bytes = yaml_size(f["max_operation_metadata_bytes"]);
     if (f["namespace_batch_operations"])
         c.fuse.namespace_batch_operations = f["namespace_batch_operations"].as<size_t>();
     if (f["namespace_batch_bytes"])
@@ -460,6 +462,17 @@ void parse_runtime(const YAML::Node& root, Config& c) {
         return;
     if (runtime["glibc_arena_max"])
         c.runtime.glibc_arena_max = runtime["glibc_arena_max"].as<size_t>();
+    if (runtime["retained_memory_bytes"])
+        c.runtime.retained_memory_bytes = yaml_size(runtime["retained_memory_bytes"]);
+    if (runtime["control_memory_reserve_bytes"])
+        c.runtime.control_memory_reserve_bytes =
+            yaml_size(runtime["control_memory_reserve_bytes"]);
+    if (runtime["viewer_memory_reserve_bytes"])
+        c.runtime.viewer_memory_reserve_bytes =
+            yaml_size(runtime["viewer_memory_reserve_bytes"]);
+    if (runtime["loader_memory_reserve_bytes"])
+        c.runtime.loader_memory_reserve_bytes =
+            yaml_size(runtime["loader_memory_reserve_bytes"]);
 }
 
 void parse_hydration_engine(const YAML::Node& engines, const char* name,

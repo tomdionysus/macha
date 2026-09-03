@@ -35,6 +35,7 @@ struct MediaSegmentStore::Impl {
     uint64_t spill_bytes{};
     std::filesystem::path spill_directory;
     std::chrono::milliseconds target_duration{4000};
+    std::optional<RetainedMemoryLedger::Lease> retained_memory;
 
     void maybe_spill_locked() {
         if (!memory_limit || memory_bytes <= memory_limit || spill_directory.empty()) return;
@@ -134,6 +135,18 @@ MediaSegmentStore::MediaSegmentStore(size_t max_ahead_segments, uint64_t memory_
 }
 
 MediaSegmentStore::~MediaSegmentStore() = default;
+
+bool MediaSegmentStore::attach_memory_ledger(RetainedMemoryLedger& ledger) {
+    std::lock_guard lock(impl_->mutex);
+    if (impl_->retained_memory)
+        return true;
+    auto lease = ledger.try_acquire(MemoryClass::viewer, MemoryOwner::playback_segment,
+                                    impl_->memory_limit);
+    if (!lease)
+        return false;
+    impl_->retained_memory.emplace(std::move(*lease));
+    return true;
+}
 
 bool MediaSegmentStore::wait_ready(std::chrono::milliseconds timeout) {
     std::unique_lock lock(impl_->mutex);

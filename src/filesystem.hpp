@@ -110,7 +110,7 @@ class ReadHandle {
     std::mutex m_;
     uint64_t last_{};
     size_t cached_index_{static_cast<size_t>(-1)};
-    Bytes cached_extent_;
+    DistributedStore::ObjectData cached_extent_;
     const Bytes& extent(size_t, Clock::time_point, std::atomic_bool*);
 
   public:
@@ -150,6 +150,7 @@ class PlaybackTracker;
         bool cache_put{};
         std::shared_ptr<const Bytes> payload;
         std::future<StagedExtentResult> result;
+        std::optional<RetainedMemoryLedger::Lease> memory;
     };
     std::deque<PendingExtent> pending_extents_;
     uint64_t pending_extent_bytes_{};
@@ -158,6 +159,7 @@ class PlaybackTracker;
     uint64_t logical_{}, staged_{};
     std::vector<ExtentRef> extents_;
     Bytes buffer_;
+    std::optional<RetainedMemoryLedger::Lease> buffer_memory_;
     std::optional<ExtentRef> append_tail_;
     int temp_{-1};
     std::filesystem::path temp_path_;
@@ -218,6 +220,7 @@ class PlaybackTracker;
     void diagnostic_stage_extent(const char*, size_t, uint64_t, size_t);
     void diagnostic_stage_checkpoint(const char*);
     void launch_pending_extent(PendingExtent&);
+    void ensure_buffer_memory();
 
   public:
     WriteHandle(FileSystem&, std::string, FsEntry, bool, bool cache_puts = false,

@@ -272,6 +272,10 @@ struct FuseFrontendStatus {
     uint64_t retained_overlay_bytes{};
     uint64_t retained_publication_operations{};
     uint64_t retained_publication_operation_bytes{};
+    uint64_t operation_metadata_bytes{};
+    uint64_t peak_operation_metadata_bytes{};
+    uint64_t operation_metadata_limit_bytes{};
+    uint64_t operation_metadata_waits{};
     uint64_t retained_durability_tickets{};
     uint64_t data_publication_inflight_bytes{};
     uint64_t backend_failures{};
@@ -350,6 +354,10 @@ struct FuseFrontendDiagnostics {
     uint64_t retained_overlay_bytes{};
     uint64_t retained_publication_operations{};
     uint64_t retained_publication_operation_bytes{};
+    uint64_t operation_metadata_bytes{};
+    uint64_t peak_operation_metadata_bytes{};
+    uint64_t operation_metadata_limit_bytes{};
+    uint64_t operation_metadata_waits{};
     uint64_t retained_durability_tickets{};
     uint64_t data_publication_inflight_bytes{};
     uint64_t backend_failures{};

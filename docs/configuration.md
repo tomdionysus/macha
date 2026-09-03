@@ -21,7 +21,20 @@ A fresh state namespace is required. Non-empty unversioned state is refused.
 ```yaml
 runtime:
   glibc_arena_max: 4
+  retained_memory_bytes: 768M
+  control_memory_reserve_bytes: 64M
+  viewer_memory_reserve_bytes: 192M
+  loader_memory_reserve_bytes: 64M
 ```
+
+`retained_memory_bytes` is the process-wide admission budget for heap objects
+which survive an asynchronous boundary, including FUSE write/operation state,
+RPC queues and active playback fragment stores. The three reserves are
+headroom within that total. Durable loader work cannot consume viewer or
+control headroom; speculative work also preserves a loader floor.
+Reconstructible caches may borrow otherwise idle capacity only when they can be
+shed before higher-priority admission. These limits govern owned allocations,
+not the allocator's RSS bookkeeping or the on-disk FUSE spool.
 
 On Linux/glibc, Macha applies this process-wide allocator arena limit before it
 creates service or codec threads. It prevents successive short-lived transcode
@@ -146,6 +159,12 @@ When false, any existing Macha mount is a hard startup error.
 the disk spool (32 MiB by default). Admission waits before copying when this
 budget is occupied, so the request-count limit cannot translate into an
 unbounded heap commitment during a slow or saturated spool.
+
+`max_operation_metadata_bytes` (64 MiB by default) bounds the conservative
+heap charge for durable write/truncate descriptors, their checksum vectors,
+and a simultaneously active publication snapshot. When full, new mutations
+wake publication and wait for a real retirement event; acknowledged work is
+never dropped.
 
 Data publication is fairly time-sliced by bytes. A generation retains its
 provisional writer and exact spool cursor after each

@@ -447,9 +447,9 @@ void HttpServer::handle_client(int fd) {
     }
 
     response.headers.try_emplace("Access-Control-Allow-Origin", "*");
-    response.headers.try_emplace("Access-Control-Allow-Headers", "Authorization, Content-Type, If-Match, Range, Idempotency-Key");
+    response.headers.try_emplace("Access-Control-Allow-Headers", "Authorization, Content-Type, If-Match, Range, Idempotency-Key, Macha-Viewer-Session");
     response.headers.try_emplace("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS");
-    response.headers.try_emplace("Access-Control-Expose-Headers", "Accept-Ranges, Content-Length, Content-Range, Location, Retry-After, Idempotency-Key, X-Macha-Idempotency");
+    response.headers.try_emplace("Access-Control-Expose-Headers", "Accept-Ranges, Content-Length, Content-Range, Location, Retry-After, Idempotency-Key, X-Macha-Idempotency, Macha-Viewer-Session");
     response.headers.try_emplace("Accept-Ranges", response.stream ? "bytes" : "none");
 
     std::ostringstream out;

@@ -27,6 +27,10 @@ ffmpeg_log_level: ERROR
 # playback session. Accepted range: 1..64. Non-glibc platforms ignore it.
 runtime:
   glibc_arena_max: 4
+  retained_memory_bytes: 768M
+  control_memory_reserve_bytes: 64M
+  viewer_memory_reserve_bytes: 192M
+  loader_memory_reserve_bytes: 64M
 
 # Authoritative storage is split by correctness class. DATA holds media extents,
 # artwork and other immutable payloads. CONTROL/METADATA has an independent
@@ -114,6 +118,8 @@ fuse:
   publication_inflight_bytes: 256M
   publication_pipeline_bytes: 8M
   max_pending_operations: 4096
+  # DataOp/checksum history plus one concurrent publication snapshot.
+  max_operation_metadata_bytes: 64M
 
   # Aggregate local write-back and recovery bounds. max_spool_bytes is the
   # durable burst/backlog budget, not an ENOSPC threshold: admission is fast

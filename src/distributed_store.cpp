@@ -19,7 +19,19 @@ bool read_aborted(Clock::time_point deadline, const std::atomic_bool* cancelled,
            (deadline != Clock::time_point{} && Clock::now() >= deadline);
 }
 
-Bytes take_object_reply_payload(RpcMessage message, const ObjectId& expected) {
+MemoryClass object_memory_class(FrameType frame_type) {
+    switch (frame_type) {
+    case FrameType::control: return MemoryClass::control;
+    case FrameType::foreground:
+    case FrameType::read_ahead: return MemoryClass::viewer;
+    case FrameType::loader: return MemoryClass::loader;
+    case FrameType::speculative: return MemoryClass::speculative;
+    }
+    return MemoryClass::speculative;
+}
+
+DistributedStore::ObjectData take_object_reply_payload(RpcMessage message,
+                                                       const ObjectId& expected) {
     if (message.type != MessageType::object_reply)
         throw std::runtime_error("remote object reply has the wrong message type");
 
@@ -38,9 +50,49 @@ Bytes take_object_reply_payload(RpcMessage message, const ObjectId& expected) {
     if (size)
         std::memmove(message.payload.data(), message.payload.data() + prefix, size);
     message.payload.resize(size);
-    return std::move(message.payload);
+    auto object = std::make_shared<DistributedStore::ObjectBuffer>();
+    object->bytes = std::move(message.payload);
+    object->retained_memory = std::move(message.retained_memory);
+    return object;
 }
 } // namespace
+
+void DistributedStore::DurabilityBatch::add(DurabilityRequirement next) {
+    auto same_replica_keys = [](const DurabilityRequirement& a,
+                                const DurabilityRequirement& b) {
+        if (a.required != b.required || a.replicas.size() != b.replicas.size())
+            return false;
+        for (size_t i = 0; i < a.replicas.size(); ++i) {
+            const auto& left = a.replicas[i];
+            const auto& right = b.replicas[i];
+            if (left.id != right.id || left.epoch != right.epoch ||
+                left.domain != right.domain ||
+                left.backend_instance != right.backend_instance)
+                return false;
+        }
+        return true;
+    };
+    auto dominates = [&](const DurabilityRequirement& stronger,
+                         const DurabilityRequirement& weaker) {
+        if (!same_replica_keys(stronger, weaker))
+            return false;
+        for (size_t i = 0; i < stronger.replicas.size(); ++i)
+            if (stronger.replicas[i].generation < weaker.replicas[i].generation)
+                return false;
+        return true;
+    };
+
+    // Durability generations are cumulative within an exact
+    // node/epoch/domain/backend incarnation. Keep only the non-dominated
+    // frontier for each replica set: the normal sequential publication case
+    // therefore retains one compact requirement instead of one per extent.
+    for (const auto& existing : requirements)
+        if (dominates(existing, next))
+            return;
+    std::erase_if(requirements,
+                  [&](const auto& existing) { return dominates(next, existing); });
+    requirements.push_back(std::move(next));
+}
 
 void DistributedStore::note_foreground(uint64_t bytes) {
     n_.note_activity(FrameType::foreground, bytes);
@@ -209,7 +261,7 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
                 }
             }
             successful_replicas = std::move(coalesced);
-            batch->requirements.push_back({id, required, successful_replicas});
+            batch->add({id, required, successful_replicas});
         }
         const auto elapsed =
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - operation_started);
@@ -468,8 +520,9 @@ bool DistributedStore::durability_barrier(const DurabilityBatch& batch, FrameTyp
 
 
 RpcReply DistributedStore::bounded_control_call(const NodeInfo& target, MessageType type,
-                                                std::span<const uint8_t> payload) {
-    auto request = n_.call_async(target, type, payload, FrameType::control);
+                                                std::span<const uint8_t> payload,
+                                                FrameType frame_type) {
+    auto request = n_.call_async(target, type, payload, frame_type);
     const auto deadline = std::max(n_.config().dead_after, n_.config().connect_timeout);
     if (request.wait_for(deadline) != std::future_status::ready) {
         // Fast health probes can continue to succeed while an ordinary control
@@ -492,6 +545,11 @@ bool DistributedStore::retain_on(const NodeInfo& target, RetentionClass object_c
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     if (target.id == n_.node_id()) {
         for (const auto& id : ids) {
+            auto resource = n_.data_resources().acquire(
+                DataWorkContext(FrameType::loader, n_.config().extent_size),
+                n_.config().extent_size);
+            if (!resource)
+                return false;
             const bool present = object_class == RetentionClass::data
                                      ? n_.local_store().valid(id)
                                      : n_.control_store().valid(id);
@@ -510,7 +568,8 @@ bool DistributedStore::retain_on(const NodeInfo& target, RetentionClass object_c
     for (const auto& id : ids)
         writer.fixed(id.bytes);
     try {
-        return bounded_control_call(target, MessageType::retain_objects, writer.data())
+        return bounded_control_call(target, MessageType::retain_objects, writer.data(),
+                                    FrameType::loader)
                    .message.type == MessageType::ok;
     } catch (const std::exception& error) {
         Log::debug("retention claim peer=" + target.host + " error=" + error.what());
@@ -740,20 +799,33 @@ bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,
     return ok;
 }
 
-std::optional<Bytes> DistributedStore::get_from(const NodeInfo& target, const ObjectId& id,
-                                                FrameType frame_type,
-                                                const std::shared_ptr<SharedFetch>& shared,
-                                                Clock::time_point deadline,
-                                                std::atomic_bool* cancelled,
-                                                const std::function<bool()>& abort) {
+DistributedStore::ObjectData
+DistributedStore::get_from(const NodeInfo& target, const ObjectId& id, FrameType frame_type,
+                           const std::shared_ptr<SharedFetch>& shared,
+                           Clock::time_point deadline, std::atomic_bool* cancelled,
+                           const std::function<bool()>& abort) {
     try {
         auto resource = n_.data_resources().acquire(
             DataWorkContext(frame_type, n_.config().extent_size, deadline, cancelled),
             n_.config().extent_size);
         if (!resource)
             return {};
-        if (target.id == n_.node_id())
-            return n_.local_store().get(id);
+        if (target.id == n_.node_id()) {
+            auto memory = n_.retained_memory().acquire(
+                object_memory_class(frame_type), MemoryOwner::object_payload,
+                n_.config().extent_size, deadline, cancelled);
+            if (!memory)
+                return {};
+            auto bytes = n_.local_store().get(id);
+            if (!bytes)
+                return {};
+            auto object = std::make_shared<ObjectBuffer>();
+            object->bytes = std::move(*bytes);
+            object->retained_memory =
+                std::make_shared<std::vector<RetainedMemoryLedger::Lease>>();
+            object->retained_memory->push_back(std::move(*memory));
+            return object;
+        }
 
         Writer writer;
         writer.fixed(id.bytes);
@@ -795,7 +867,7 @@ std::optional<Bytes> DistributedStore::get_from(const NodeInfo& target, const Ob
         if (reply.message.type != MessageType::object_reply)
             return {};
         auto data = take_object_reply_payload(std::move(reply.message), id);
-        note_network(data.size(), Clock::now() - started);
+        note_network(data->bytes.size(), Clock::now() - started);
         return data;
     } catch (const std::exception& e) {
         if (shared) {
@@ -807,19 +879,18 @@ std::optional<Bytes> DistributedStore::get_from(const NodeInfo& target, const Ob
     }
 }
 
-std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t stripe,
-                                                  FrameType frame_type, bool foreground,
-                                                  bool opportunistic_persist,
-                                                  Clock::time_point deadline,
-                                                  std::atomic_bool* cancelled,
-                                                  const std::function<bool()>& abort) {
+DistributedStore::ObjectData
+DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_type,
+                             bool foreground, bool opportunistic_persist,
+                             Clock::time_point deadline, std::atomic_bool* cancelled,
+                             const std::function<bool()>& abort) {
     // A hard wall-clock deadline belongs to one caller, not to an ObjectId-wide
     // shared fetch. Probe reads therefore use a private transfer so expiry can
     // abort the underlying RPC. Cancellation-only playback reads retain normal
     // shared-fetch deduplication/promotion; a stopped caller may abandon its wait
     // but does not cancel an ObjectId transfer other readers may still need.
     if (deadline != Clock::time_point{}) {
-        auto try_private = [&](std::vector<NodeInfo> candidates) -> std::optional<Bytes> {
+        auto try_private = [&](std::vector<NodeInfo> candidates) -> ObjectData {
             std::erase_if(candidates, [&](const NodeInfo& node) { return node.id == n_.node_id(); });
             size_t attempt = 0;
             const auto work = foreground ? ReplicaWorkClass::foreground
@@ -836,8 +907,8 @@ std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t str
                 auto started = Clock::now();
                 replica_selector_.started(target, work);
                 auto data = get_from(target, id, frame_type, nullptr, deadline, cancelled, abort);
-                replica_selector_.finished(target, work, data ? data->size() : 0,
-                                           Clock::now() - started, data.has_value());
+                replica_selector_.finished(target, work, data ? data->bytes.size() : 0,
+                                           Clock::now() - started, static_cast<bool>(data));
                 if (data) return data;
                 ++attempt;
             }
@@ -856,8 +927,9 @@ std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t str
             data = try_private(std::move(fallback));
         }
         if (data) {
-            if (foreground) note_foreground(data->size());
-            if (opportunistic_persist) n_.enqueue_fetched(id, *data, should_own(id));
+            if (foreground) note_foreground(data->bytes.size());
+            if (opportunistic_persist)
+                n_.enqueue_fetched(id, data->bytes, should_own(id));
         }
         return data;
     }
@@ -911,18 +983,18 @@ std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t str
             return {};
         if (shared->result) {
             if (foreground && !shared->foreground_accounted) {
-                note_foreground(shared->result->size());
+                note_foreground(shared->result->bytes.size());
                 shared->foreground_accounted = true;
             }
             if (opportunistic_persist && !shared->persist_queued) {
-                n_.enqueue_fetched(id, *shared->result, should_own(id));
+                n_.enqueue_fetched(id, shared->result->bytes, should_own(id));
                 shared->persist_queued = true;
             }
         }
         return shared->result;
     }
 
-    auto finish = [&](std::optional<Bytes> result) {
+    auto finish = [&](ObjectData result) {
         bool account_foreground = false;
         bool queue_persist = false;
         {
@@ -953,14 +1025,14 @@ std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t str
         }
 
         if (result && account_foreground)
-            note_foreground(result->size());
+            note_foreground(result->bytes.size());
         if (result && queue_persist)
-            n_.enqueue_fetched(id, *result, should_own(id));
+            n_.enqueue_fetched(id, result->bytes, should_own(id));
         shared->cv.notify_all();
         return result;
     };
 
-    auto try_candidates = [&](std::vector<NodeInfo> candidates) -> std::optional<Bytes> {
+    auto try_candidates = [&](std::vector<NodeInfo> candidates) -> ObjectData {
         std::erase_if(candidates, [&](const NodeInfo& node) { return node.id == n_.node_id(); });
         size_t attempt = 0;
         while (!candidates.empty() && !read_aborted(deadline, cancelled, abort)) {
@@ -1004,8 +1076,8 @@ std::optional<Bytes> DistributedStore::get_remote(const ObjectId& id, size_t str
             {
                 std::lock_guard lock(shared->mutex);
                 replica_selector_.finished(target, shared->active_class,
-                                           data ? data->size() : 0, Clock::now() - started,
-                                           data.has_value());
+                                           data ? data->bytes.size() : 0,
+                                           Clock::now() - started, static_cast<bool>(data));
                 shared->active_peer.reset();
             }
             if (data)
@@ -1048,6 +1120,15 @@ std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, bo
 std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, FrameType frame_type,
                                            Clock::time_point deadline,
                                            std::atomic_bool* cancelled) {
+    auto data = get_shared(id, stripe, frame_type, deadline, cancelled);
+    if (!data)
+        return {};
+    return data->bytes;
+}
+
+DistributedStore::ObjectData
+DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_type,
+                             Clock::time_point deadline, std::atomic_bool* cancelled) {
     const bool foreground = frame_type == FrameType::foreground;
     const bool interactive = frame_type == FrameType::foreground || frame_type == FrameType::read_ahead;
     // Record foreground demand before touching local/cache/network storage.
@@ -1075,6 +1156,11 @@ std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, Fr
         n_.config().extent_size);
     if (!local_resource)
         return {};
+    auto local_memory = n_.retained_memory().acquire(
+        object_memory_class(frame_type), MemoryOwner::object_payload,
+        n_.config().extent_size, deadline, cancelled);
+    if (!local_memory)
+        return {};
     auto local_data = n_.local_store().get(id);
     local_resource.reset();
     if (auto data = std::move(local_data)) {
@@ -1085,13 +1171,24 @@ std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, Fr
             Log::trace("DIAG object-get id=" + to_string(id) +
                    " source=owned bytes=" + std::to_string(data->size()) +
                    " ms=" + std::to_string(elapsed.count()));
-        return data;
+        auto object = std::make_shared<ObjectBuffer>();
+        object->bytes = std::move(*data);
+        object->retained_memory =
+            std::make_shared<std::vector<RetainedMemoryLedger::Lease>>();
+        object->retained_memory->push_back(std::move(*local_memory));
+        return object;
     }
+    local_memory.reset();
 
     auto cache_resource = n_.data_resources().acquire(
         DataWorkContext(frame_type, n_.config().extent_size, deadline, cancelled),
         n_.config().extent_size);
     if (!cache_resource)
+        return {};
+    auto cache_memory = n_.retained_memory().acquire(
+        object_memory_class(frame_type), MemoryOwner::object_payload,
+        n_.config().extent_size, deadline, cancelled);
+    if (!cache_memory)
         return {};
     auto cache_data = n_.block_cache().get(id);
     cache_resource.reset();
@@ -1105,30 +1202,44 @@ std::optional<Bytes> DistributedStore::get(const ObjectId& id, size_t stripe, Fr
             Log::trace("DIAG object-get id=" + to_string(id) +
                    " source=cache bytes=" + std::to_string(cached->size()) +
                    " ms=" + std::to_string(elapsed.count()));
-        return cached;
+        auto object = std::make_shared<ObjectBuffer>();
+        object->bytes = std::move(*cached);
+        object->retained_memory =
+            std::make_shared<std::vector<RetainedMemoryLedger::Lease>>();
+        object->retained_memory->push_back(std::move(*cache_memory));
+        return object;
     }
+    cache_memory.reset();
 
     if (read_aborted(deadline, cancelled))
         return {};
     auto data = get_remote(id, stripe, frame_type,
                            foreground, interactive, deadline, cancelled);
     if (data && frame_type == FrameType::read_ahead)
-        n_.note_activity(frame_type, data->size());
-    auto elapsed = log_playback_read("remote", data ? data->size() : 0, data.has_value());
+        n_.note_activity(frame_type, data->bytes.size());
+    auto elapsed = log_playback_read("remote", data ? data->bytes.size() : 0,
+                                     static_cast<bool>(data));
     if (Log::enabled(LogLevel::all))
         Log::trace("DIAG object-get id=" + to_string(id) +
                " source=remote result=" + std::to_string(data ? 1 : 0) +
-               " bytes=" + std::to_string(data ? data->size() : 0) +
+               " bytes=" + std::to_string(data ? data->bytes.size() : 0) +
                " ms=" + std::to_string(elapsed.count()));
     return data;
 }
 
 bool DistributedStore::has_on(const NodeInfo& target, const ObjectId& id) {
-    if (target.id == n_.node_id())
+    if (target.id == n_.node_id()) {
+        auto resource = n_.data_resources().acquire(
+            DataWorkContext(FrameType::loader, n_.config().extent_size),
+            n_.config().extent_size);
+        if (!resource)
+            return false;
         return n_.local_store().valid(id);
+    }
     Writer writer;
     writer.fixed(id.bytes);
-    auto reply = bounded_control_call(target, MessageType::have_object, writer.data());
+    auto reply = bounded_control_call(target, MessageType::have_object, writer.data(),
+                                      FrameType::speculative);
     if (reply.message.type != MessageType::bool_reply)
         return false;
     Reader reader(reply.message.payload);
@@ -1192,6 +1303,10 @@ bool DistributedStore::cache_local(const ObjectId& id, std::span<const uint8_t> 
     if (!n_.block_cache().enabled())
         return false;
     try {
+        auto resource = n_.data_resources().acquire(
+            DataWorkContext(FrameType::speculative, data.size()), data.size());
+        if (!resource)
+            return false;
         return n_.block_cache().put(id, data);
     } catch (const std::exception& e) {
         Log::debug("cache write-through skipped object=" + to_string(id) + " error=" + e.what());
@@ -1209,25 +1324,49 @@ bool DistributedStore::hydrate(const ObjectId& id, size_t stripe, FrameType fram
     if (!n_.block_cache().enabled())
         return false;
     auto data = get_remote(id, stripe, frame_type, false, false);
-    return data && n_.block_cache().put(id, *data);
+    if (!data)
+        return false;
+    auto resource = n_.data_resources().acquire(
+        DataWorkContext(frame_type, data->bytes.size()), data->bytes.size());
+    return resource && n_.block_cache().put(id, data->bytes);
 }
 
 bool DistributedStore::ensure_local(const ObjectId& id, bool foreground) {
-    if (n_.local_store().valid(id))
-        return true;
+    const auto local_class = foreground ? FrameType::foreground : FrameType::speculative;
+    {
+        auto resource = n_.data_resources().acquire(
+            DataWorkContext(local_class, n_.config().extent_size), n_.config().extent_size);
+        if (!resource)
+            return false;
+        if (n_.local_store().valid(id))
+            return true;
+    }
     if (auto cached = n_.block_cache().get(id)) {
-        if (n_.local_store().put(id, *cached))
+        auto resource = n_.data_resources().acquire(
+            DataWorkContext(local_class, cached->size()), cached->size());
+        if (resource && n_.local_store().put(id, *cached))
             return true;
     }
     auto data = get_remote(id, 0,
                            foreground ? FrameType::foreground : FrameType::speculative,
                            foreground, false);
-    return data && n_.local_store().put(id, *data);
+    if (!data)
+        return false;
+    auto resource = n_.data_resources().acquire(
+        DataWorkContext(local_class, data->bytes.size()), data->bytes.size());
+    return resource && n_.local_store().put(id, data->bytes);
 }
 
 bool DistributedStore::ensure_control_local(const ObjectId& id) {
-    if (n_.control_store().valid(id))
-        return true;
+    {
+        auto resource = n_.data_resources().acquire(
+            DataWorkContext(FrameType::speculative, n_.config().extent_size),
+            n_.config().extent_size);
+        if (!resource)
+            return false;
+        if (n_.control_store().valid(id))
+            return true;
+    }
 
     Writer writer;
     writer.fixed(id.bytes);
@@ -1256,7 +1395,10 @@ bool DistributedStore::ensure_control_local(const ObjectId& id) {
                 continue;
             }
             note_network(data.size(), Clock::now() - started);
-            if (n_.control_store().put(id, data))
+            auto resource = n_.data_resources().acquire(
+                DataWorkContext(FrameType::speculative, n_.config().extent_size),
+                n_.config().extent_size);
+            if (resource && n_.control_store().put(id, data))
                 return true;
         } catch (const std::exception& e) {
             Log::debug("control object read " + target.host + ": " + e.what());
@@ -1271,11 +1413,15 @@ void DistributedStore::erase_all(const ObjectId& id) {
     for (const auto& target : n_.membership().active()) {
         try {
             if (target.id == n_.node_id()) {
-                if (!n_.retention_store().retained(RetentionClass::data, id))
+                auto resource = n_.data_resources().acquire(
+                    DataWorkContext(FrameType::speculative, n_.config().extent_size),
+                    n_.config().extent_size);
+                if (resource && !n_.retention_store().retained(RetentionClass::data, id))
                     (void)n_.local_store().remove(id);
                 (void)n_.block_cache().remove(id);
             } else {
-                (void)n_.call(target, MessageType::delete_object, writer.data());
+                (void)n_.call(target, MessageType::delete_object, writer.data(),
+                              FrameType::speculative);
             }
         } catch (const std::exception& e) {
             Log::debug("object delete " + target.host + ": " + e.what());
@@ -1358,8 +1504,14 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
 
     auto maintenance_has_on = [&](const NodeInfo& target,
                                   const ObjectId& id) -> std::optional<bool> {
-        if (target.id == n_.node_id())
+        if (target.id == n_.node_id()) {
+            auto resource = n_.data_resources().acquire(
+                DataWorkContext(FrameType::speculative, n_.config().extent_size),
+                n_.config().extent_size);
+            if (!resource)
+                return std::nullopt;
             return n_.local_store().valid(id);
+        }
         if (!reserve_operation() || yielded())
             return std::nullopt;
 
@@ -1387,8 +1539,13 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
 
     auto maintenance_put_on = [&](const NodeInfo& target, const ObjectId& id,
                                   std::span<const uint8_t> data) -> std::optional<bool> {
-        if (target.id == n_.node_id())
+        if (target.id == n_.node_id()) {
+            auto resource = n_.data_resources().acquire(
+                DataWorkContext(FrameType::speculative, data.size()), data.size());
+            if (!resource)
+                return std::nullopt;
             return n_.local_store().put(id, data);
+        }
         if (!reserve_operation() || yielded())
             return std::nullopt;
 
@@ -1482,6 +1639,13 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 bool present = *present_result;
                 if (!present) {
                     if (!source) {
+                        auto resource = n_.data_resources().acquire(
+                            DataWorkContext(FrameType::speculative, n_.config().extent_size),
+                            n_.config().extent_size);
+                        if (!resource) {
+                            retry = true;
+                            break;
+                        }
                         source = n_.local_store().get(id);
                         if (!source)
                             break;
@@ -1507,8 +1671,13 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 break;
 
             if (!everywhere && keepers.size() >= target && !keepers.contains(n_.node_id()) &&
-                !n_.retention_store().retained(RetentionClass::data, id))
-                n_.local_store().remove(id);
+                !n_.retention_store().retained(RetentionClass::data, id)) {
+                auto resource = n_.data_resources().acquire(
+                    DataWorkContext(FrameType::speculative, n_.config().extent_size),
+                    n_.config().extent_size);
+                if (resource)
+                    n_.local_store().remove(id);
+            }
 
             repair_push_pending_.reset();
             ++scanned_total;
@@ -1533,7 +1702,16 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             const ObjectId id = *it;
             const bool everywhere = universal &&
                                     std::binary_search(universal->begin(), universal->end(), id);
-            if ((!everywhere && !should_own(id)) || n_.local_store().valid(id)) {
+            bool local_valid = false;
+            if (everywhere || should_own(id)) {
+                auto resource = n_.data_resources().acquire(
+                    DataWorkContext(FrameType::speculative, n_.config().extent_size),
+                    n_.config().extent_size);
+                if (!resource)
+                    break;
+                local_valid = n_.local_store().valid(id);
+            }
+            if ((!everywhere && !should_own(id)) || local_valid) {
                 repair_pull_after_ = id;
                 ++it;
                 ++scanned_total;
@@ -1546,6 +1724,10 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             // any network I/O, so playback-assisted convergence never requires
             // a second download.
             if (auto cached = n_.block_cache().get(id)) {
+                auto resource = n_.data_resources().acquire(
+                    DataWorkContext(FrameType::speculative, cached->size()), cached->size());
+                if (!resource)
+                    break;
                 (void)n_.local_store().put(id, *cached);
                 repair_pull_after_ = id;
                 ++it;
@@ -1560,8 +1742,15 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                                    should_yield);
             if (yielded())
                 break;
-            if (data && n_.local_store().put(id, *data))
-                transferred += data->size();
+            if (data) {
+                auto resource = n_.data_resources().acquire(
+                    DataWorkContext(FrameType::speculative, data->bytes.size()),
+                    data->bytes.size());
+                if (!resource)
+                    break;
+                if (n_.local_store().put(id, data->bytes))
+                    transferred += data->bytes.size();
+            }
 
             repair_pull_after_ = id;
             ++it;

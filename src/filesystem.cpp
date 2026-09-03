@@ -20,6 +20,17 @@ namespace macha {
 namespace {
 std::atomic_uint64_t next_write_handle_diagnostic_id{1};
 
+MemoryClass filesystem_memory_class(FrameType frame_type) {
+    switch (frame_type) {
+    case FrameType::control: return MemoryClass::control;
+    case FrameType::foreground:
+    case FrameType::read_ahead: return MemoryClass::viewer;
+    case FrameType::loader: return MemoryClass::loader;
+    case FrameType::speculative: return MemoryClass::speculative;
+    }
+    return MemoryClass::speculative;
+}
+
 [[noreturn]] void fail(int c, const std::string& s) {
     throw FsError(c, s);
 }
@@ -166,12 +177,18 @@ const Bytes& ReadHandle::extent(size_t i, Clock::time_point deadline,
             Log::trace("DIAG read-extent cache-hit ptr=" +
                    std::to_string(reinterpret_cast<uintptr_t>(this)) +
                    " index=" + std::to_string(i));
-        return cached_extent_;
+        return cached_extent_->bytes;
     }
 
     auto& x = e_.extents.at(i);
+    // The previous extent is no longer observable once this handle advances.
+    // Release it before reserving the replacement so a two-buffer handoff
+    // cannot consume the viewer headroom indefinitely.
+    cached_extent_.reset();
+    cached_index_ = static_cast<size_t>(-1);
     auto started = Clock::now();
-    auto data = s_.get(x.id, i, frame_type_.load(std::memory_order_relaxed), deadline, cancelled);
+    auto data =
+        s_.get_shared(x.id, i, frame_type_.load(std::memory_order_relaxed), deadline, cancelled);
     if (!data) {
         if (cancelled && cancelled->load())
             fail(ECANCELED, "extent read cancelled");
@@ -179,7 +196,7 @@ const Bytes& ReadHandle::extent(size_t i, Clock::time_point deadline,
             fail(ETIMEDOUT, "extent read timed out");
         fail(EIO, "extent unavailable");
     }
-    if (data->size() != x.length)
+    if (data->bytes.size() != x.length)
         fail(EIO, "extent corrupt");
 
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
@@ -192,9 +209,9 @@ const Bytes& ReadHandle::extent(size_t i, Clock::time_point deadline,
                " id=" + to_string(x.id) +
                " source=direct ms=" + std::to_string(elapsed.count()));
 
-    cached_extent_ = std::move(*data);
+    cached_extent_ = std::move(data);
     cached_index_ = i;
-    return cached_extent_;
+    return cached_extent_->bytes;
 }
 
 size_t ReadHandle::read(uint64_t off, std::span<uint8_t> out, Clock::time_point deadline,
@@ -247,8 +264,6 @@ WriteHandle::WriteHandle(FileSystem& f, std::string p, FsEntry b, bool trunc, bo
       publication_pipeline_bytes_(publication_pipeline_bytes),
       logical_(trunc ? 0 : base_.size), staged_(trunc ? 0 : base_.size),
       diagnostic_id_(next_write_handle_diagnostic_id.fetch_add(1, std::memory_order_relaxed)) {
-    buffer_.reserve(fs_.extent_size());
-
     // Existing files are append-capable without rematerialising the prefix.
     // Keep every complete immutable extent by reference.  If EOF lands inside
     // the final extent, fetch only that tail lazily when the first append
@@ -284,6 +299,18 @@ WriteHandle::WriteHandle(FileSystem& f, std::string p, FsEntry b, bool trunc, bo
                " sequential=" + std::to_string(sequential_ ? 1 : 0) +
                " retained_extents=" + std::to_string(extents_.size()) +
                " append_tail=" + std::to_string(append_tail_ ? 1 : 0));
+}
+
+void WriteHandle::ensure_buffer_memory() {
+    if (buffer_memory_)
+        return;
+    auto memory = fs_.node().retained_memory().acquire(
+        filesystem_memory_class(work_context_.frame_type()), MemoryOwner::publication,
+        fs_.extent_size(), work_context_.deadline(), work_context_.cancellation());
+    if (!memory)
+        fail(EAGAIN, "write extent retained-memory admission saturated");
+    buffer_memory_.emplace(std::move(*memory));
+    buffer_.reserve(fs_.extent_size());
 }
 WriteHandle::~WriteHandle() {
     try {
@@ -365,11 +392,13 @@ std::chrono::milliseconds WriteHandle::flush() {
             waited += drain_one_extent();
 
         auto bytes = std::make_shared<const Bytes>(std::move(buffer_));
+        auto memory = std::move(buffer_memory_);
+        buffer_memory_.reset();
         buffer_.clear();
-        buffer_.reserve(fs_.extent_size());
         staged_ += length;
         pending_extent_bytes_ += length;
-        PendingExtent pending{length, offset, cache_puts_, std::move(bytes), {}};
+        PendingExtent pending{length, offset, cache_puts_, std::move(bytes), {},
+                              std::move(memory)};
         launch_pending_extent(pending);
         pending_extents_.push_back(std::move(pending));
         peak_pending_extents_ = std::max(peak_pending_extents_, pending_extents_.size());
@@ -485,6 +514,7 @@ void WriteHandle::prepare_append_tail() {
         fail(EINTR, "write cancelled");
 
     const auto tail = *append_tail_;
+    ensure_buffer_memory();
     Bytes bytes;
     if (tail.hole) {
         bytes.assign(static_cast<size_t>(tail.length), 0);
@@ -812,6 +842,7 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
         prepare_append_tail();
         size_t p = 0;
         while (p < d.size()) {
+            ensure_buffer_memory();
             size_t n = std::min(fs_.extent_size() - buffer_.size(), d.size() - p);
             buffer_.insert(buffer_.end(), d.begin() + p, d.begin() + p + n);
             p += n;
@@ -1255,6 +1286,10 @@ void WriteHandle::commit() {
     base_ = std::move(committed);
     expected_ = base_.version;
     dirty_ = false;
+    if (buffer_.empty()) {
+        Bytes{}.swap(buffer_);
+        buffer_memory_.reset();
+    }
 
     if (sparse_overlay_) {
         // The committed manifest is now the immutable authority. Discard the

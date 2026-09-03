@@ -837,11 +837,6 @@ void Service::loop(std::stop_token stop) {
                             auto id = node_.retention_store().next_retained(type, cursor, complete);
                             if (!id)
                                 break;
-                            const bool present = type == RetentionClass::data
-                                                     ? node_.local_store().valid(*id)
-                                                     : node_.control_store().valid(*id);
-                            if (present)
-                                continue;
                             const bool restored = type == RetentionClass::data
                                                       ? store_->ensure_local(*id, false)
                                                       : store_->ensure_control_local(*id);
