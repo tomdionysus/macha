@@ -1402,7 +1402,10 @@ MACHA_TEST("invariants", test_catalogue_artwork_batch_defers_durability_until_ba
     const auto art_a = catalogue.stage_artwork_deferred("poster", "image/jpeg", a, batch);
     const auto art_b = catalogue.stage_artwork_deferred("backdrop", "image/jpeg", b, batch);
 
-    REQUIRE(batch.requirements.size() == 2);
+    // Both objects use the same physical durability domain. The later
+    // generation cumulatively covers the earlier one, so the batch retains a
+    // one-entry non-dominated frontier rather than one record per object.
+    REQUIRE(batch.requirements.size() == 1);
     for (const auto& requirement : batch.requirements) {
         REQUIRE(requirement.replicas.size() == 1);
         const auto& replica = requirement.replicas.front();
@@ -1421,6 +1424,41 @@ MACHA_TEST("invariants", test_catalogue_artwork_batch_defers_durability_until_ba
     }
     CHECK(fixture.node().local_store().has(art_a.id));
     CHECK(fixture.node().local_store().has(art_b.id));
+}
+
+MACHA_TEST("invariants", test_durability_batch_retains_exact_nondominated_frontier) {
+    DistributedStore::DurabilityBatch batch;
+    const auto first = random_node_id();
+    const auto second = random_node_id();
+    const auto first_epoch = random_node_id();
+    const auto second_epoch = random_node_id();
+    const auto object_a = object_id(pattern(32, 0x31));
+    const auto object_b = object_id(pattern(32, 0x41));
+    const auto object_c = object_id(pattern(32, 0x51));
+
+    auto requirement = [&](const ObjectId& id, uint64_t first_generation,
+                           uint64_t second_generation) {
+        DistributedStore::DurabilityRequirement out;
+        out.id = id;
+        out.required = 1;
+        out.replicas = {{first, first_epoch, 1, first_generation, 11},
+                        {second, second_epoch, 2, second_generation, 22}};
+        return out;
+    };
+
+    batch.add(requirement(object_a, 10, 1));
+    batch.add(requirement(object_b, 1, 10));
+    // Neither alternative dominates the other: retaining both is required to
+    // preserve the original per-object quorum formula.
+    REQUIRE(batch.requirements.size() == 2);
+
+    batch.add(requirement(object_c, 11, 11));
+    REQUIRE(batch.requirements.size() == 1);
+    CHECK(batch.requirements.front().id == object_c);
+
+    // A later insertion already covered by the frontier retains no metadata.
+    batch.add(requirement(object_a, 9, 9));
+    CHECK(batch.requirements.size() == 1);
 }
 
 MACHA_TEST("invariants", test_accounting_dirty_marker_is_process_session_scoped) {

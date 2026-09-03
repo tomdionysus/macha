@@ -86,6 +86,7 @@ Reports enablement, current session/transcode counts, media-engine backend/versi
 POST /api/v1/playback/sessions
 Content-Type: application/json
 Idempotency-Key: <client-generated logical request key>
+Macha-Viewer-Session: <client-generated persistent player key>
 ```
 
 Use either `item_id` or `media_id`. `item_id` allows the resolver to choose among every media representation attached to the catalogue item. `path:/logical/file` is also accepted as a media identity.
@@ -97,6 +98,18 @@ normalized request joins or replays the same session ID, capability and
 `409 idempotency_conflict`. The response echoes `Idempotency-Key` and reports
 `X-Macha-Idempotency: created|replayed`. Omitting the header preserves the
 legacy non-idempotent behaviour.
+
+`Macha-Viewer-Session` has a different, longer lifetime from
+`Idempotency-Key`: use one stable opaque value for the lifetime of a player/UI
+session, while using a fresh idempotency key for each distinct creation
+attempt. A later POST with the same viewer-session key atomically replaces the
+player's current generation while retaining its session ID and transcode
+entitlement. This makes POST-based seek/reload recovery equivalent to PATCH for
+admission purposes. The key can instead be supplied as `viewer_session_id` in
+the JSON body; if both forms are present they must agree. Clients should prefer
+the header and must not share a key among simultaneous independent viewers.
+Omitting it preserves the legacy behaviour in which each POST is a distinct
+logical session.
 
 Session admission first reads the immutable media profile from cluster metadata,
 which requires no media-object reads. A miss never produces a client-visible
@@ -246,7 +259,7 @@ A direct MP4 can be assigned directly to a normal HTML `<video>` element. For tr
 
 ## Resource limits and cleanup
 
-`max_sessions`, `max_video_transcodes` and `max_audio_transcodes` are enforced independently. Admission reserves pending session/transcode capacity before pipeline startup, so simultaneous POST/PATCH requests cannot race through a limit before either session becomes visible. Hitting a limit returns HTTP 429. Malformed/incompatible playback requests return 400, missing media/session state returns 404, and media-engine failures return 503. Probe and pipeline-start failures use stage-specific error codes (`playback_probe_failed` or `playback_pipeline_start_failed`), include `trace`/`stage` in the JSON body, and return the same trace in `X-Macha-Playback-Trace` for correlation with `playback[trace]` server logs.
+`max_sessions`, `max_video_transcodes` and `max_audio_transcodes` are enforced independently. Transcode limits count logical viewer entitlements, not seeks, replacement generations or physical encoder processes. Once acquired, a logical session retains its entitlement through Direct/Remux/Transcode changes and physical idle-pipeline reclamation, then releases it exactly once on DELETE or session expiry. Admission reserves pending session/transcode capacity before pipeline startup, so simultaneous POST/PATCH requests cannot race through a limit before either session becomes visible. `video_transcodes` and `audio_transcodes` in status report those admission entitlements; `running_video_transcode_pipelines` and `running_audio_transcode_pipelines` separately report live physical encoders. Hitting a limit returns HTTP 429. Malformed/incompatible playback requests return 400, missing media/session state returns 404, and media-engine failures return 503. Probe and pipeline-start failures use stage-specific error codes (`playback_probe_failed` or `playback_pipeline_start_failed`), include `trace`/`stage` in the JSON body, and return the same trace in `X-Macha-Playback-Trace` for correlation with `playback[trace]` server logs.
 
 Logical sessions expire after `session_idle_ms` without control or valid
 current-generation stream activity. Expiry cancels the in-process pipeline and

@@ -10,6 +10,7 @@
 #include "persistent_cache.hpp"
 #include "public_connectivity.hpp"
 #include "retention.hpp"
+#include "retained_memory.hpp"
 #include "storage_pool.hpp"
 #include "telemetry.hpp"
 
@@ -50,6 +51,7 @@ class NodeRuntime {
         Bytes data;
         bool promote{};
         bool cache{};
+        RetainedMemoryLedger::Lease memory;
     };
 
     enum ReadyBit : uint32_t {
@@ -68,6 +70,7 @@ class NodeRuntime {
     NodeId id_;
     NodeId durability_epoch_;
     DataResourceArbiter data_resources_;
+    RetainedMemoryLedger retained_memory_;
 
     // The control plane is intentionally constructed before any storage or
     // metadata backend. A node is therefore reachable/authenticated while its
@@ -173,6 +176,8 @@ class NodeRuntime {
     }
     DataResourceArbiter& data_resources() noexcept { return data_resources_; }
     const DataResourceArbiter& data_resources() const noexcept { return data_resources_; }
+    RetainedMemoryLedger& retained_memory() noexcept { return retained_memory_; }
+    const RetainedMemoryLedger& retained_memory() const noexcept { return retained_memory_; }
     StoragePool& local_store();
     const StoragePool& local_store() const;
     LocalStore& control_store();

@@ -44,6 +44,17 @@ constexpr size_t frame_header_size = 28;
 constexpr uint8_t frame_first = 0x01;
 constexpr uint8_t frame_last = 0x02;
 
+MemoryClass retained_memory_class(FrameType frame_type) {
+    switch (frame_type) {
+    case FrameType::control: return MemoryClass::control;
+    case FrameType::foreground:
+    case FrameType::read_ahead: return MemoryClass::viewer;
+    case FrameType::loader: return MemoryClass::loader;
+    case FrameType::speculative: return MemoryClass::speculative;
+    }
+    return MemoryClass::speculative;
+}
+
 bool reset_invalidates_node_reference(const std::map<std::string, IdentityAssociationReset>& resets,
                                       const NodeInfo& node) {
     for (const auto& [_, reset] : resets) {
@@ -309,6 +320,8 @@ bool is_bulk_message(MessageType type) {
 bool is_priority_data_message(MessageType type) {
     switch (type) {
     case MessageType::have_object:
+    case MessageType::retain_objects:
+    case MessageType::delete_object:
     case MessageType::get_metadata:
     case MessageType::cas_metadata:
     case MessageType::cas_metadata_delta:
@@ -384,9 +397,10 @@ uint64_t transfer_target(const RpcMessage& message) {
 } // namespace
 
 MessageAssembler::MessageAssembler(size_t max_partial_messages, size_t max_partial_bytes,
-                                   size_t max_message_bytes)
+                                   size_t max_message_bytes,
+                                   RetainedMemoryLedger* retained_memory)
     : max_partial_messages_(max_partial_messages), max_partial_bytes_(max_partial_bytes),
-      max_message_bytes_(max_message_bytes) {
+      max_message_bytes_(max_message_bytes), retained_memory_(retained_memory) {
     if (!max_partial_messages_ || !max_partial_bytes_ || !max_message_bytes_)
         throw std::invalid_argument("RPC reassembly limits must be non-zero");
 }
@@ -409,8 +423,19 @@ std::optional<RpcFrame> MessageAssembler::push(WireFragment fragment) {
     if (fragment.request_id == 0) {
         if (!fragment.first || !fragment.last)
             throw std::runtime_error("notification must fit one frame");
+        std::shared_ptr<std::vector<RetainedMemoryLedger::Lease>> memory;
+        if (retained_memory_) {
+            auto lease = retained_memory_->try_acquire(
+                retained_memory_class(fragment.frame_type), MemoryOwner::rpc_frame,
+                fragment.payload.size() + sizeof(RetainedMemoryLedger::Lease));
+            if (!lease)
+                throw std::runtime_error("process retained-memory RPC reassembly saturated");
+            memory = std::make_shared<std::vector<RetainedMemoryLedger::Lease>>();
+            memory->push_back(std::move(*lease));
+        }
         return RpcFrame{
-            0, fragment.frame_type, {fragment.message_type, std::move(fragment.payload)}};
+            0, fragment.frame_type,
+            {fragment.message_type, std::move(fragment.payload), std::move(memory)}};
     }
 
     auto found = partial_.find(fragment.request_id);
@@ -422,6 +447,9 @@ std::optional<RpcFrame> MessageAssembler::push(WireFragment fragment) {
         Partial item;
         item.frame_type = fragment.frame_type;
         item.message_type = fragment.message_type;
+        if (retained_memory_)
+            item.retained_memory =
+                std::make_shared<std::vector<RetainedMemoryLedger::Lease>>();
         found = partial_.emplace(fragment.request_id, std::move(item)).first;
     } else if (found == partial_.end()) {
         throw std::runtime_error("continuation without first fragment");
@@ -439,6 +467,14 @@ std::optional<RpcFrame> MessageAssembler::push(WireFragment fragment) {
     if (partial_bytes_ > max_partial_bytes_ ||
         fragment.payload.size() > max_partial_bytes_ - partial_bytes_)
         throw std::runtime_error("incomplete RPC reassembly budget exceeded");
+    if (retained_memory_) {
+        auto memory = retained_memory_->try_acquire(
+            retained_memory_class(found->second.frame_type), MemoryOwner::rpc_frame,
+            fragment.payload.size() + sizeof(RetainedMemoryLedger::Lease));
+        if (!memory)
+            throw std::runtime_error("process retained-memory RPC reassembly saturated");
+        found->second.retained_memory->push_back(std::move(*memory));
+    }
     found->second.payload.insert(found->second.payload.end(), fragment.payload.begin(),
                                  fragment.payload.end());
     partial_bytes_ += fragment.payload.size();
@@ -449,7 +485,8 @@ std::optional<RpcFrame> MessageAssembler::push(WireFragment fragment) {
     partial_bytes_ -= found->second.payload.size();
     RpcFrame complete{fragment.request_id,
                       found->second.frame_type,
-                      {found->second.message_type, std::move(found->second.payload)}};
+                      {found->second.message_type, std::move(found->second.payload),
+                       std::move(found->second.retained_memory)}};
     partial_.erase(found);
     return complete;
 }
@@ -597,7 +634,8 @@ FrameType default_frame_type(MessageType type) noexcept {
         type == MessageType::put_object_deferred || type == MessageType::object_durability_barrier)
         return FrameType::foreground;
     if (type == MessageType::get_control_object || type == MessageType::put_control_object ||
-        type == MessageType::telemetry)
+        type == MessageType::telemetry || type == MessageType::have_object ||
+        type == MessageType::retain_objects || type == MessageType::delete_object)
         return FrameType::speculative;
     return FrameType::control;
 }
@@ -971,6 +1009,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         size_t offset{};
         bool reply{};
         std::shared_ptr<std::promise<void>> sent;
+        RetainedMemoryLedger::Lease memory;
     };
 
     SecureChannel channel_;
@@ -981,6 +1020,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     InboundPromoter inbound_promoter_;
     InboundCanceller inbound_canceller_;
     std::function<void(bool, std::chrono::milliseconds)> result_observer_;
+    RetainedMemoryLedger* retained_memory_{};
 
     std::mutex admission_mutex_;
     std::mutex pending_mutex_;
@@ -1067,7 +1107,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             return;
         retire_notice_sent_ = true;
         outbound_.push_back(
-            {0, FrameType::control, {MessageType::session_retire, {}}, 0, false, {}});
+            {0, FrameType::control, {MessageType::session_retire, {}}, 0, false, {}, {}});
     }
 
     void erase_queued_locked(const std::function<bool(const Outbound&)>& predicate) {
@@ -1084,6 +1124,14 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     bool queue_message(uint64_t request_id, FrameType frame_type, RpcMessage message, bool reply,
                        std::shared_ptr<std::promise<void>> sent = {}) {
         validate_frame_semantics(message.type, frame_type);
+        std::optional<RetainedMemoryLedger::Lease> memory;
+        if (retained_memory_) {
+            memory = retained_memory_->try_acquire(
+                retained_memory_class(frame_type), MemoryOwner::rpc_frame,
+                sizeof(Outbound) + message.payload.size());
+            if (!memory)
+                throw std::runtime_error("process retained-memory RPC admission saturated");
+        }
         {
             DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
             if (broken_.load())
@@ -1105,7 +1153,8 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                 outbound_classes_[request_id] = frame_type;
             const auto payload_bytes = message.payload.size();
             outbound_.push_back(
-                {request_id, frame_type, std::move(message), 0, reply, std::move(sent)});
+                {request_id, frame_type, std::move(message), 0, reply, std::move(sent),
+                 memory ? std::move(*memory) : RetainedMemoryLedger::Lease{}});
             outbound_bytes_ += payload_bytes;
         }
         outbound_cv_.notify_one();
@@ -1376,7 +1425,8 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
 
     void reader_loop(std::stop_token stop) {
         set_thread_name("macha-peer-rd");
-        MessageAssembler assembler;
+        MessageAssembler assembler(64, 256ULL * 1024 * 1024, 128ULL * 1024 * 1024,
+                                   retained_memory_);
         try {
             while (!stop.stop_requested()) {
                 auto fragment = channel_.receive_fragment([this](uint64_t request_id, size_t) {
@@ -1447,14 +1497,15 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                    TransportLane lane, std::function<void(const NodeInfo&)> peer_observer,
                    std::function<void(uint64_t)> metadata_observer, InboundHandler inbound_handler,
                    InboundPromoter inbound_promoter, InboundCanceller inbound_canceller,
-                   std::function<void(bool, std::chrono::milliseconds)> result_observer)
+                   std::function<void(bool, std::chrono::milliseconds)> result_observer,
+                   RetainedMemoryLedger* retained_memory)
         : channel_(fd, keys, std::move(local), max_frame_size),
           peer_observer_(std::move(peer_observer)),
           metadata_observer_(std::move(metadata_observer)),
           inbound_handler_(std::move(inbound_handler)),
           inbound_promoter_(std::move(inbound_promoter)),
           inbound_canceller_(std::move(inbound_canceller)),
-          result_observer_(std::move(result_observer)) {
+          result_observer_(std::move(result_observer)), retained_memory_(retained_memory) {
         channel_.set_io_timeout(rpc_handshake_timeout);
         peer_ = channel_.client_handshake(lane);
         channel_.set_io_timeout(std::chrono::milliseconds(0));
@@ -1566,6 +1617,14 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         validate_frame_semantics(message.type, frame_type);
         if (!usable())
             return false;
+        std::optional<RetainedMemoryLedger::Lease> memory;
+        if (retained_memory_) {
+            memory = retained_memory_->try_acquire(
+                retained_memory_class(frame_type), MemoryOwner::rpc_frame,
+                sizeof(Outbound) + message.payload.size());
+            if (!memory)
+                return false;
+        }
         std::unique_lock lock(outbound_mutex_, std::try_to_lock);
         // Best-effort traffic is admitted only onto an otherwise idle writer.
         // It must never add queueing delay in front of operational RPC.
@@ -1573,7 +1632,8 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             return false;
         if (message.payload.size() > max_peer_outbound_bytes)
             return false;
-        outbound_.push_back({0, frame_type, message, 0, false, {}});
+        outbound_.push_back({0, frame_type, message, 0, false, {},
+                             memory ? std::move(*memory) : RetainedMemoryLedger::Lease{}});
         outbound_bytes_ += message.payload.size();
         lock.unlock();
         outbound_cv_.notify_one();
@@ -1627,10 +1687,12 @@ RpcClient::RpcClient(ClusterKeys keys, std::function<NodeInfo()> local,
                      std::function<void(const NodeInfo&)> peer_observer,
                      std::function<void(uint64_t)> metadata_observer,
                      std::chrono::milliseconds connect_timeout, std::chrono::milliseconds heartbeat,
-                     std::chrono::milliseconds dead_after, size_t max_frame_size)
+                     std::chrono::milliseconds dead_after, size_t max_frame_size,
+                     RetainedMemoryLedger* retained_memory)
     : keys_(keys), local_(std::move(local)), peer_observer_(std::move(peer_observer)),
       metadata_observer_(std::move(metadata_observer)), connect_timeout_(connect_timeout),
-      heartbeat_(heartbeat), dead_after_(dead_after), max_frame_size_(max_frame_size) {
+      heartbeat_(heartbeat), dead_after_(dead_after), max_frame_size_(max_frame_size),
+      retained_memory_(retained_memory) {
     validate_frame_limit(max_frame_size_);
     health_thread_ = std::jthread([this](std::stop_token stop) { health_loop(stop); });
 }
@@ -1873,7 +1935,7 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
             },
             [this, retry_key](bool success, std::chrono::milliseconds elapsed) {
                 observe_result(retry_key, success, elapsed);
-            });
+            }, retained_memory_);
         ++connections_created_;
 
         if (expected && fresh->peer().id != *expected) {
@@ -2475,6 +2537,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
         size_t offset{};
         bool reply{};
         std::shared_ptr<std::promise<void>> sent;
+        RetainedMemoryLedger::Lease memory;
     };
 
     std::unique_ptr<SecureChannel> channel;
@@ -2502,6 +2565,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
     std::atomic_uint64_t next_request{2}; // TCP acceptor owns even request IDs.
     std::jthread reader;
     std::jthread writer;
+    RetainedMemoryLedger* retained_memory{};
 
     void fail_pending(const std::string& text) {
         std::map<uint64_t, std::shared_ptr<Pending>> failed;
@@ -2539,7 +2603,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
             return;
         retire_notice_sent = true;
         outbound.push_back(
-            {0, FrameType::control, {MessageType::session_retire, {}}, 0, false, {}});
+            {0, FrameType::control, {MessageType::session_retire, {}}, 0, false, {}, {}});
     }
 
     void erase_queued_locked(const std::function<bool(const Outbound&)>& predicate) {
@@ -2556,6 +2620,14 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
     bool queue_message(uint64_t request_id, FrameType frame_type, RpcMessage message, bool reply,
                        std::shared_ptr<std::promise<void>> sent = {}) {
         validate_frame_semantics(message.type, frame_type);
+        std::optional<RetainedMemoryLedger::Lease> memory;
+        if (retained_memory) {
+            memory = retained_memory->try_acquire(
+                retained_memory_class(frame_type), MemoryOwner::rpc_frame,
+                sizeof(Outbound) + message.payload.size());
+            if (!memory)
+                throw std::runtime_error("process retained-memory RPC admission saturated");
+        }
         {
             DiagnosticLock lock(outbound_mutex, "rpc.session.outbound");
             if (!ready.load() || done.load())
@@ -2577,7 +2649,8 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                 outbound_classes[request_id] = frame_type;
             const auto payload_bytes = message.payload.size();
             outbound.push_back(
-                {request_id, frame_type, std::move(message), 0, reply, std::move(sent)});
+                {request_id, frame_type, std::move(message), 0, reply, std::move(sent),
+                 memory ? std::move(*memory) : RetainedMemoryLedger::Lease{}});
             outbound_bytes += payload_bytes;
         }
         outbound_cv.notify_one();
@@ -2818,6 +2891,14 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
         validate_frame_semantics(message.type, frame_type);
         if (!usable())
             return false;
+        std::optional<RetainedMemoryLedger::Lease> memory;
+        if (retained_memory) {
+            memory = retained_memory->try_acquire(
+                retained_memory_class(frame_type), MemoryOwner::rpc_frame,
+                sizeof(Outbound) + message.payload.size());
+            if (!memory)
+                return false;
+        }
         std::unique_lock lock(outbound_mutex, std::try_to_lock);
         // Best-effort traffic is admitted only onto an otherwise idle writer.
         // It must never add queueing delay in front of operational RPC.
@@ -2825,7 +2906,8 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
             return false;
         if (message.payload.size() > max_peer_outbound_bytes)
             return false;
-        outbound.push_back({0, frame_type, message, 0, false, {}});
+        outbound.push_back({0, frame_type, message, 0, false, {},
+                            memory ? std::move(*memory) : RetainedMemoryLedger::Lease{}});
         outbound_bytes += message.payload.size();
         lock.unlock();
         outbound_cv.notify_one();
@@ -2959,10 +3041,11 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
 
 RpcServer::RpcServer(std::string host, uint16_t port, ClusterKeys keys, NodeInfo local,
                      Handler handler, Observer observer, size_t max_frame_size,
-                     RpcServerExecutionLimits execution_limits)
+                     RpcServerExecutionLimits execution_limits,
+                     RetainedMemoryLedger* retained_memory)
     : host_(std::move(host)), port_(port), keys_(keys), local_(std::move(local)),
       handler_(std::move(handler)), observer_(std::move(observer)), max_frame_size_(max_frame_size),
-      execution_limits_(execution_limits) {
+      execution_limits_(execution_limits), retained_memory_(retained_memory) {
     validate_frame_limit(max_frame_size_);
     if (!execution_limits_.metadata_workers || !execution_limits_.metadata_pending_jobs ||
         !execution_limits_.metadata_pending_bytes ||
@@ -3029,6 +3112,31 @@ std::deque<RpcServer::RequestJob>& RpcServer::queue(RequestClass cls) {
 }
 
 bool RpcServer::admit_locked(RequestJob job) {
+    if (retained_memory_) {
+        const auto memory_class = [&] {
+            switch (job.frame.frame_type) {
+            case FrameType::control:
+                return MemoryClass::control;
+            case FrameType::foreground:
+            case FrameType::read_ahead:
+                return MemoryClass::viewer;
+            case FrameType::loader:
+                return MemoryClass::loader;
+            case FrameType::speculative:
+                return MemoryClass::speculative;
+            }
+            return MemoryClass::speculative;
+        }();
+        auto memory = retained_memory_->try_acquire(
+            memory_class, MemoryOwner::rpc_frame,
+            sizeof(RequestJob) +
+                (job.frame.message.retained_memory ? 0 : job.frame.message.payload.size()));
+        if (!memory) {
+            rejected_requests_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        job.memory = std::move(*memory);
+    }
     if (metadata_mutation_request(job.frame)) {
         const auto bytes = job.frame.message.payload.size();
         const bool bytes_fit =
@@ -3102,7 +3210,7 @@ void RpcServer::enqueue_shared(const NodeInfo& peer, RpcFrame frame,
     bool admitted = false;
     {
         DiagnosticLock lock(request_mutex_, "rpc.server.queue");
-        admitted = admit_locked({{}, peer, std::move(frame), reply});
+        admitted = admit_locked({{}, peer, std::move(frame), reply, Clock::now(), {}});
     }
     if (!admitted) {
         reply({MessageType::error, {}});
@@ -3115,7 +3223,7 @@ void RpcServer::enqueue_notification(const NodeInfo& peer, RpcFrame frame) {
     bool admitted = false;
     {
         DiagnosticLock lock(request_mutex_, "rpc.server.queue");
-        admitted = admit_locked({{}, peer, std::move(frame), {}});
+        admitted = admit_locked({{}, peer, std::move(frame), {}, Clock::now(), {}});
     }
     if (admitted)
         request_cv_.notify_all();
@@ -3347,6 +3455,7 @@ void RpcServer::accept_loop(std::stop_token stop) {
         std::shared_ptr<Session> session;
         try {
             session = std::make_shared<Session>();
+            session->retained_memory = retained_memory_;
             session->remote_host = numeric_host(address, size);
             NodeInfo local;
             {
@@ -3381,7 +3490,8 @@ void RpcServer::accept_loop(std::stop_token stop) {
 
 void RpcServer::session_loop(Session* session) {
     set_thread_name("macha-accept-rd");
-    MessageAssembler assembler;
+    MessageAssembler assembler(64, 256ULL * 1024 * 1024, 128ULL * 1024 * 1024,
+                               session->retained_memory);
     bool pre_auth_slot = true;
     try {
         session->peer = session->channel->server_handshake(session->remote_host);
@@ -3513,7 +3623,8 @@ void RpcServer::session_loop(Session* session) {
                 }
                 if (shared) {
                     ++shared->active_requests;
-                    queued = admit_locked({shared, session->peer, std::move(*frame), {}});
+                    queued = admit_locked(
+                        {shared, session->peer, std::move(*frame), {}, Clock::now(), {}});
                     if (!queued)
                         --shared->active_requests;
                 }

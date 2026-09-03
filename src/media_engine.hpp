@@ -2,6 +2,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "retained_memory.hpp"
 #include "types.hpp"
 
 #include <atomic>
@@ -137,6 +138,9 @@ class MediaSegmentStore {
     void note_requested(uint64_t index);
     Snapshot snapshot() const;
     void cancel();
+    // Reserve this store's bounded resident capacity as viewer ownership before
+    // exposing the pipeline. False means admission must fail cleanly.
+    bool attach_memory_ledger(RetainedMemoryLedger&);
 
     // Producer-side publication API. MediaEngine implementations publish an
     // initialization fragment and media fragments here; consumers only use

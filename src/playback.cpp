@@ -522,6 +522,13 @@ Json output_json(const MediaProbeResult& probe, const PlaybackPlan& plan,
 } // namespace
 
 struct PlaybackManager::Impl {
+    struct LogicalViewerSession {
+        mutable std::mutex operation_mutex;
+        std::string client_key;
+        bool video_transcode_entitled{};
+        bool audio_transcode_entitled{};
+    };
+
     struct SourceLease {
         std::string media_id;
         std::string path;
@@ -557,6 +564,7 @@ struct PlaybackManager::Impl {
         Clock::time_point touched{Clock::now()};
         Clock::time_point stream_touched{Clock::now()};
         size_t active_stream_requests{};
+        std::shared_ptr<LogicalViewerSession> logical_session;
     };
 
     FileSystem& fs;
@@ -569,6 +577,10 @@ struct PlaybackManager::Impl {
     std::condition_variable_any cleanup_cv;
     uint64_t cleanup_revision{};
     std::map<std::string, std::shared_ptr<Session>, std::less<>> sessions;
+    // Client keys are advisory local reconciliation handles, never cluster
+    // ownership. Weak values ensure an expired/deleted logical session leaves
+    // no permanent server-side playback state.
+    std::map<std::string, std::weak_ptr<LogicalViewerSession>, std::less<>> logical_sessions;
     std::map<std::string, MediaProbeResult, std::less<>> probe_cache;
     size_t probe_cache_bytes{};
     static constexpr size_t max_probe_cache_entries = 512;
@@ -709,7 +721,8 @@ struct PlaybackManager::Impl {
     std::string creation_fingerprint(
         std::string_view item_id, std::string_view media_id,
         const ClientCapabilities& caps, const PlaybackPreferences& prefs,
-        const std::optional<int64_t>& seek_ms) const {
+        const std::optional<int64_t>& seek_ms,
+        std::string_view viewer_session_key) const {
         std::ostringstream canonical;
         canonical << "v1|item=" << item_id << "|media=" << media_id << "|containers=";
         for (const auto& value : caps.containers) canonical << value << ',';
@@ -727,14 +740,16 @@ struct PlaybackManager::Impl {
                   << "|ps=" << prefs.subtitle_stream.value_or(-1)
                   << "|pal=" << prefs.audio_language
                   << "|psl=" << prefs.subtitle_language
-                  << "|seek=" << seek_ms.value_or(0);
+                  << "|seek=" << seek_ms.value_or(0)
+                  << "|viewer=" << viewer_session_key;
         const auto text = canonical.str();
         return to_string(sha256({reinterpret_cast<const uint8_t*>(text.data()), text.size()}));
     }
 
     HttpResponse creation_response(const Session& session, std::string trace,
                                    std::string_view idempotency_key = {},
-                                   std::string_view idempotency_status = {}) const {
+                                   std::string_view idempotency_status = {},
+                                   std::string_view viewer_session_key = {}) const {
         auto payload = session_json(session);
         payload["trace_id"] = trace;
         auto response = http_json(201, payload.dump());
@@ -744,6 +759,8 @@ struct PlaybackManager::Impl {
             response.headers["Idempotency-Key"] = std::string(idempotency_key);
             response.headers["X-Macha-Idempotency"] = std::string(idempotency_status);
         }
+        if (!viewer_session_key.empty())
+            response.headers["Macha-Viewer-Session"] = std::string(viewer_session_key);
         return response;
     }
 
@@ -755,6 +772,34 @@ struct PlaybackManager::Impl {
             else
                 ++it;
         }
+    }
+
+    std::shared_ptr<LogicalViewerSession> logical_session_for(std::string client_key) {
+        if (client_key.empty())
+            return std::make_shared<LogicalViewerSession>();
+        std::lock_guard lock(mutex);
+        auto& weak = logical_sessions[client_key];
+        auto logical = weak.lock();
+        if (!logical) {
+            logical = std::make_shared<LogicalViewerSession>();
+            logical->client_key = std::move(client_key);
+            weak = logical;
+        }
+        return logical;
+    }
+
+    std::shared_ptr<Session> session_for_logical_locked(
+        const std::shared_ptr<LogicalViewerSession>& logical) const {
+        for (const auto& [_, session] : sessions)
+            if (session->logical_session == logical) return session;
+        return {};
+    }
+
+    static bool valid_client_key(std::string_view key) {
+        return !key.empty() && key.size() <= 256 &&
+               std::all_of(key.begin(), key.end(), [](unsigned char c) {
+                   return c >= 0x21 && c <= 0x7e;
+               });
     }
 
     bool plan_supported(const PlaybackPlan& plan) const {
@@ -1017,27 +1062,54 @@ struct PlaybackManager::Impl {
 
     size_t video_transcodes_locked(std::string_view excluding = {}) const {
         size_t count = 0;
+        std::set<const LogicalViewerSession*> counted;
         for (const auto& [id, session] : sessions) {
             if (id == excluding) continue;
-            if (session->plan.video == MediaTransform::transcode) {
-                std::lock_guard pipeline_lock(session->pipeline_mutex);
-                if (session->engine_session && session->engine_session->running()) ++count;
-            }
+            if (session->logical_session &&
+                session->logical_session->video_transcode_entitled &&
+                counted.insert(session->logical_session.get()).second)
+                ++count;
         }
         return count;
     }
 
     size_t audio_transcodes_locked(std::string_view excluding = {}) const {
         size_t count = 0;
+        std::set<const LogicalViewerSession*> counted;
         for (const auto& [id, session] : sessions) {
             if (id == excluding) continue;
-            if (session->plan.audio == MediaTransform::transcode) {
-                std::lock_guard pipeline_lock(session->pipeline_mutex);
-                if (session->engine_session && session->engine_session->running()) ++count;
-            }
+            if (session->logical_session &&
+                session->logical_session->audio_transcode_entitled &&
+                counted.insert(session->logical_session.get()).second)
+                ++count;
         }
         return count;
     }
+
+    size_t running_video_transcode_pipelines_locked() const {
+        size_t count = 0;
+        for (const auto& [_, session] : sessions) {
+            if (session->plan.video != MediaTransform::transcode) continue;
+            std::lock_guard pipeline_lock(session->pipeline_mutex);
+            if (session->engine_session && session->engine_session->running()) ++count;
+        }
+        return count;
+    }
+
+    size_t running_audio_transcode_pipelines_locked() const {
+        size_t count = 0;
+        for (const auto& [_, session] : sessions) {
+            if (session->plan.audio != MediaTransform::transcode) continue;
+            std::lock_guard pipeline_lock(session->pipeline_mutex);
+            if (session->engine_session && session->engine_session->running()) ++count;
+        }
+        return count;
+    }
+
+    struct ResourceReservation {
+        bool video{};
+        bool audio{};
+    };
 
     void reserve_session_slot() {
         std::lock_guard lock(mutex);
@@ -1051,10 +1123,14 @@ struct PlaybackManager::Impl {
         if (pending_sessions) --pending_sessions;
     }
 
-    void reserve_resources(const PlaybackPlan& plan, std::string_view excluding = {}) {
+    ResourceReservation reserve_resources(Session& session, std::string_view excluding = {}) {
         std::lock_guard lock(mutex);
-        const bool video = plan.video == MediaTransform::transcode;
-        const bool audio = plan.audio == MediaTransform::transcode;
+        if (!session.logical_session)
+            throw std::logic_error("playback session has no logical viewer session");
+        const bool video = session.plan.video == MediaTransform::transcode &&
+                           !session.logical_session->video_transcode_entitled;
+        const bool audio = session.plan.audio == MediaTransform::transcode &&
+                           !session.logical_session->audio_transcode_entitled;
         if (video && video_transcodes_locked(excluding) + reserved_video_transcodes >=
                          config.max_video_transcodes)
             throw ResourceLimitError("video transcode limit reached");
@@ -1063,18 +1139,21 @@ struct PlaybackManager::Impl {
             throw ResourceLimitError("audio transcode limit reached");
         if (video) ++reserved_video_transcodes;
         if (audio) ++reserved_audio_transcodes;
+        if (video) session.logical_session->video_transcode_entitled = true;
+        if (audio) session.logical_session->audio_transcode_entitled = true;
+        return {video, audio};
     }
 
-    void release_resources_locked(const PlaybackPlan& plan) {
-        if (plan.video == MediaTransform::transcode && reserved_video_transcodes)
-            --reserved_video_transcodes;
-        if (plan.audio == MediaTransform::transcode && reserved_audio_transcodes)
-            --reserved_audio_transcodes;
+    void commit_resources_locked(const ResourceReservation& reservation) {
+        if (reservation.video && reserved_video_transcodes) --reserved_video_transcodes;
+        if (reservation.audio && reserved_audio_transcodes) --reserved_audio_transcodes;
     }
 
-    void release_resources(const PlaybackPlan& plan) {
+    void rollback_resources(Session& session, const ResourceReservation& reservation) {
         std::lock_guard lock(mutex);
-        release_resources_locked(plan);
+        commit_resources_locked(reservation);
+        if (reservation.video) session.logical_session->video_transcode_entitled = false;
+        if (reservation.audio) session.logical_session->audio_transcode_entitled = false;
     }
 
     std::shared_ptr<MediaEngineSession> active_engine(const Session& session) const {
@@ -1214,6 +1293,11 @@ struct PlaybackManager::Impl {
             auto launched = engine->start_hls(session.source, *session.vod_plan, config.segment_duration,
                                               config.max_ahead_segments, config.segment_memory_bytes,
                                               session.generation_dir);
+            auto segment_store = launched->segments();
+            if (!segment_store || !segment_store->attach_memory_ledger(fs.node().retained_memory())) {
+                launched->stop();
+                throw std::runtime_error("viewer fragment memory admission unavailable");
+            }
             {
                 std::lock_guard lock(session.pipeline_mutex);
                 session.engine_session = std::shared_ptr<MediaEngineSession>(std::move(launched));
@@ -1322,6 +1406,7 @@ struct PlaybackManager::Impl {
         session->vod_plan = std::move(*reseeked);
         session->generation = old.generation;
         session->touched = Clock::now();
+        session->logical_session = old.logical_session;
         Log::info("playback[" + std::string(trace) + "] seek fast-path media=" +
                   session->source.media_id + " requested_ms=" +
                   std::to_string(requested_seek.count()) + " aligned_ms=" +
@@ -1363,6 +1448,7 @@ struct PlaybackManager::Impl {
         session->engine_session = active_engine(old);
         session->stream_url = old.stream_url;
         session->subtitle_cache = old.subtitle_cache;
+        session->logical_session = old.logical_session;
         if (session->plan.subtitle_stream >= 0) {
             session->subtitle_url = public_stream_prefix(*session) + "/" +
                                     std::to_string(session->generation) + "/subtitle-" +
@@ -1778,11 +1864,33 @@ struct PlaybackManager::Impl {
             return http_error(400, "bad_idempotency_key",
                               "Idempotency-Key must be 1..256 visible ASCII characters");
 
+        std::string viewer_session_key;
+        if (auto value = root.find("viewer_session_id"); value && value->isString())
+            viewer_session_key = value->asString();
+        auto read_viewer_header = [&](std::string_view name) -> std::string {
+            if (auto it = request.headers.find(std::string(name)); it != request.headers.end())
+                return it->second;
+            return {};
+        };
+        auto header_key = read_viewer_header("macha-viewer-session");
+        if (header_key.empty()) header_key = read_viewer_header("Macha-Viewer-Session");
+        if (header_key.empty()) header_key = read_viewer_header("x-macha-viewer-session");
+        if (header_key.empty()) header_key = read_viewer_header("X-Macha-Viewer-Session");
+        if (!header_key.empty() && !viewer_session_key.empty() &&
+            header_key != viewer_session_key)
+            return http_error(400, "bad_viewer_session",
+                              "viewer session header and JSON field disagree");
+        if (!header_key.empty()) viewer_session_key = std::move(header_key);
+        if (!viewer_session_key.empty() && !valid_client_key(viewer_session_key))
+            return http_error(400, "bad_viewer_session",
+                              "Macha-Viewer-Session must be 1..256 visible ASCII characters");
+
         std::string fingerprint;
         std::shared_ptr<IdempotentCreation> idempotent;
         bool idempotent_owner = false;
         if (!idempotency_key.empty()) {
-            fingerprint = creation_fingerprint(item_id, media_id, caps, prefs, seek_ms);
+            fingerprint = creation_fingerprint(item_id, media_id, caps, prefs, seek_ms,
+                                               viewer_session_key);
             {
                 std::lock_guard lock(mutex);
                 auto it = idempotent_creations.find(idempotency_key);
@@ -1825,39 +1933,63 @@ struct PlaybackManager::Impl {
                     existing->touched = Clock::now();
                     signal_cleanup_locked();
                 }
-                return creation_response(*existing, trace, idempotency_key, "replayed");
+                return creation_response(*existing, trace, idempotency_key, "replayed",
+                                         existing->logical_session
+                                             ? existing->logical_session->client_key
+                                             : std::string{});
             }
         }
-        reserve_session_slot();
-        bool resources_reserved = false;
+        auto logical_session = logical_session_for(viewer_session_key);
+        std::unique_lock logical_operation(logical_session->operation_mutex);
+        std::shared_ptr<Session> previous;
+        {
+            std::lock_guard lock(mutex);
+            previous = session_for_logical_locked(logical_session);
+        }
+        const bool session_slot_reserved = !previous;
+        if (session_slot_reserved) reserve_session_slot();
+        ResourceReservation resource_reservation;
         std::shared_ptr<Session> session;
         try {
             std::string deterministic_id, deterministic_token;
-            if (idempotent) {
+            if (previous) {
+                deterministic_id = previous->id;
+                deterministic_token = previous->token;
+            } else if (idempotent) {
                 auto credentials = deterministic_session_credentials(idempotency_key, fingerprint);
                 deterministic_id = std::move(credentials.first);
                 deterministic_token = std::move(credentials.second);
             }
             session = resolve_session(item_id, std::move(media), std::move(caps), std::move(prefs), trace,
                                       std::move(deterministic_id), std::move(deterministic_token));
+            session->logical_session = logical_session;
+            if (previous) session->generation = previous->generation;
             if (seek_ms) session->plan.seek = std::chrono::milliseconds(*seek_ms);
             prepare_transformed_vod(*session, trace);
-            reserve_resources(session->plan);
-            resources_reserved = true;
+            resource_reservation = reserve_resources(*session,
+                                                     previous ? previous->id : std::string_view{});
             start_pipeline(*session, trace);
+            if (previous) stop_pipeline(*previous);
             {
                 std::lock_guard lock(mutex);
+                if (previous) {
+                    auto current = sessions.find(previous->id);
+                    if (current == sessions.end() || current->second != previous)
+                        throw std::runtime_error(
+                            "playback logical session changed during replacement");
+                }
                 sessions[session->id] = session;
                 signal_cleanup_locked();
-                if (pending_sessions) --pending_sessions;
-                release_resources_locked(session->plan);
-                resources_reserved = false;
+                if (session_slot_reserved && pending_sessions) --pending_sessions;
+                commit_resources_locked(resource_reservation);
+                resource_reservation = {};
             }
         } catch (...) {
             auto error = std::current_exception();
             if (session) stop_pipeline(*session);
-            if (resources_reserved && session) release_resources(session->plan);
-            release_session_slot();
+            if (session && (resource_reservation.video || resource_reservation.audio))
+                rollback_resources(*session, resource_reservation);
+            if (session_slot_reserved) release_session_slot();
             if (idempotent) {
                 {
                     std::lock_guard lock(idempotent->mutex);
@@ -1883,8 +2015,13 @@ struct PlaybackManager::Impl {
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - request_started).count();
         Log::info("playback[" + trace + "] session create complete id=" + session->id +
                   " mode=" + playback_mode_name(session->plan.mode) + " elapsed_ms=" + std::to_string(elapsed));
+        if (previous && !previous->generation_dir.empty() &&
+            previous->generation_dir != session->generation_dir) {
+            std::error_code ec;
+            std::filesystem::remove_all(previous->generation_dir, ec);
+        }
         return creation_response(*session, trace, idempotency_key,
-                                 idempotent ? "created" : "");
+                                 idempotent ? "created" : "", viewer_session_key);
     }
 
     HttpResponse get_session(std::string_view id) {
@@ -1914,6 +2051,16 @@ struct PlaybackManager::Impl {
             std::lock_guard lock(mutex);
             auto it = sessions.find(id);
             if (it == sessions.end()) return http_error(404, "not_found", "playback session not found");
+            old = it->second;
+        }
+        if (!old->logical_session)
+            throw std::logic_error("playback session has no logical viewer session");
+        std::unique_lock logical_operation(old->logical_session->operation_mutex);
+        {
+            std::lock_guard lock(mutex);
+            auto it = sessions.find(id);
+            if (it == sessions.end())
+                return http_error(404, "not_found", "playback session not found");
             old = it->second;
         }
         auto trace = hex_token(4);
@@ -1974,14 +2121,14 @@ struct PlaybackManager::Impl {
                              : std::vector<std::string>{media_override};
             replacement = resolve_session(old->item_id, std::move(media), old->capabilities, prefs,
                                           trace, old->id, old->token);
+            replacement->logical_session = old->logical_session;
             replacement->generation = old->generation;
             if (seek_ms) replacement->plan.seek = std::chrono::milliseconds(*seek_ms);
             prepare_transformed_vod(*replacement, trace);
         }
-        bool resources_reserved = false;
+        ResourceReservation resource_reservation;
         try {
-            reserve_resources(replacement->plan, old->id);
-            resources_reserved = true;
+            resource_reservation = reserve_resources(*replacement, old->id);
             start_pipeline(*replacement, trace);
             // Keep the replacement reservation until the old physical pipeline
             // is stopped.  Otherwise a third concurrent request could consume
@@ -1994,12 +2141,13 @@ struct PlaybackManager::Impl {
                     throw std::runtime_error("playback session changed during update");
                 it->second = replacement;
                 signal_cleanup_locked();
-                release_resources_locked(replacement->plan);
-                resources_reserved = false;
+                commit_resources_locked(resource_reservation);
+                resource_reservation = {};
             }
         } catch (...) {
             stop_pipeline(*replacement);
-            if (resources_reserved) release_resources(replacement->plan);
+            if (resource_reservation.video || resource_reservation.audio)
+                rollback_resources(*replacement, resource_reservation);
             throw;
         }
         std::error_code ec;
@@ -2015,8 +2163,17 @@ struct PlaybackManager::Impl {
             auto it = sessions.find(id);
             if (it == sessions.end()) return http_error(404, "not_found", "playback session not found");
             session = it->second;
+        }
+        std::unique_lock logical_operation(session->logical_session->operation_mutex);
+        {
+            std::lock_guard lock(mutex);
+            auto it = sessions.find(id);
+            if (it == sessions.end()) return http_error(404, "not_found", "playback session not found");
+            session = it->second;
             sessions.erase(it);
             erase_idempotency_for_session_locked(id);
+            if (!session->logical_session->client_key.empty())
+                logical_sessions.erase(session->logical_session->client_key);
             signal_cleanup_locked();
         }
         stop_pipeline(*session);
@@ -2029,6 +2186,8 @@ struct PlaybackManager::Impl {
         MediaEngineStatus state;
         if (engine) state = engine->status();
         size_t session_count = 0, video_transcodes = 0, audio_transcodes = 0;
+        size_t running_video_transcode_pipelines = 0;
+        size_t running_audio_transcode_pipelines = 0;
         size_t cached_probes = 0, cached_probe_bytes = 0;
         size_t cached_subtitle_segments = 0, cached_subtitle_bytes = 0;
         uint64_t segment_store_resident_bytes = 0, segment_store_spill_bytes = 0;
@@ -2044,6 +2203,8 @@ struct PlaybackManager::Impl {
             session_count = sessions.size();
             video_transcodes = video_transcodes_locked();
             audio_transcodes = audio_transcodes_locked();
+            running_video_transcode_pipelines = running_video_transcode_pipelines_locked();
+            running_audio_transcode_pipelines = running_audio_transcode_pipelines_locked();
             reclaimed = idle_pipelines_reclaimed;
             heap_pending = heap_reclaim_pending;
             heap_requests = heap_reclaim_requests;
@@ -2078,6 +2239,10 @@ struct PlaybackManager::Impl {
                          {"max_video_transcodes", static_cast<uint64_t>(config.max_video_transcodes)},
                          {"audio_transcodes", static_cast<uint64_t>(audio_transcodes)},
                          {"max_audio_transcodes", static_cast<uint64_t>(config.max_audio_transcodes)},
+                         {"running_video_transcode_pipelines",
+                          static_cast<uint64_t>(running_video_transcode_pipelines)},
+                         {"running_audio_transcode_pipelines",
+                          static_cast<uint64_t>(running_audio_transcode_pipelines)},
                          {"video_decoder_threads",
                           static_cast<uint64_t>(config.video_decoder_threads)},
                          {"pipeline_idle_ms", static_cast<uint64_t>(pipeline_idle.count())},
@@ -2152,6 +2317,8 @@ struct PlaybackManager::Impl {
                     if (now >= expires) {
                         expired.push_back(it->second);
                         erase_idempotency_for_session_locked(it->first);
+                        if (!it->second->logical_session->client_key.empty())
+                            logical_sessions.erase(it->second->logical_session->client_key);
                         it = sessions.erase(it);
                     } else {
                         if (!next_expiry || expires < *next_expiry) next_expiry = expires;
@@ -2272,6 +2439,8 @@ void PlaybackManager::stop() {
         std::lock_guard lock(impl_->mutex);
         for (auto& [_, session] : impl_->sessions) sessions.push_back(session);
         impl_->sessions.clear();
+        impl_->logical_sessions.clear();
+        impl_->idempotent_creations.clear();
     }
     for (auto& session : sessions) impl_->stop_pipeline(*session);
     impl_->started = false;

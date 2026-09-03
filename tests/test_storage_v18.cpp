@@ -293,6 +293,222 @@ MACHA_TEST("storage_v18", test_unrelated_loose_object_read_bypasses_blocked_load
     CHECK(store.get(loader_id) == std::optional<Bytes>{loader});
 }
 
+MACHA_TEST("storage_v18", test_unrelated_object_read_bypasses_blocked_packed_read) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+
+    LocalStoreOptions options;
+    options.limit = 64ULL * 1024 * 1024;
+    options.pack_threshold = 256 * 1024;
+    options.pack_target_size = 4 * 1024 * 1024;
+    LocalStore store(t.path() / "store", options, keys.storage);
+
+    const auto blocked = pattern(128 * 1024, 0x37);
+    const auto blocked_id = object_id(blocked);
+    const auto viewer = pattern(512 * 1024, 0x91);
+    const auto viewer_id = object_id(viewer);
+    REQUIRE(store.put(blocked_id, blocked));
+    REQUIRE(store.is_packed(blocked_id));
+    REQUIRE(store.put(viewer_id, viewer));
+    CHECK(!store.is_packed(viewer_id));
+
+    std::promise<void> read_entered;
+    auto read_entered_future = read_entered.get_future();
+    std::promise<void> release_read;
+    auto release_read_future = release_read.get_future().share();
+    std::atomic_bool first{true};
+    store.set_before_packed_read_for_tests([&](const ObjectId& id) {
+        if (id == blocked_id && first.exchange(false)) {
+            read_entered.set_value();
+            release_read_future.wait();
+        }
+    });
+
+    auto packed_read = std::async(std::launch::async,
+                                  [&] { return store.get(blocked_id); });
+    REQUIRE(read_entered_future.wait_for(2s) == std::future_status::ready);
+
+    // The packed inode has been pinned, but its physical read and decrypt are
+    // deliberately stalled. An unrelated viewer read must still acquire the
+    // short index lock and complete.
+    auto viewer_read = std::async(std::launch::async,
+                                  [&] { return store.get(viewer_id); });
+    REQUIRE(viewer_read.wait_for(2s) == std::future_status::ready);
+    CHECK(viewer_read.get() == std::optional<Bytes>{viewer});
+
+    // Same-ID access remains coalesced behind the per-object single-flight.
+    auto same_object = std::async(std::launch::async,
+                                  [&] { return store.get(blocked_id); });
+    CHECK(same_object.wait_for(20ms) == std::future_status::timeout);
+
+    release_read.set_value();
+    REQUIRE(packed_read.wait_for(2s) == std::future_status::ready);
+    CHECK(packed_read.get() == std::optional<Bytes>{blocked});
+    REQUIRE(same_object.wait_for(2s) == std::future_status::ready);
+    CHECK(same_object.get() == std::optional<Bytes>{blocked});
+}
+
+MACHA_TEST("storage_v18", test_unrelated_viewer_read_bypasses_blocked_packed_write) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+
+    LocalStoreOptions options;
+    options.limit = 64ULL * 1024 * 1024;
+    options.pack_threshold = 256 * 1024;
+    options.pack_target_size = 4 * 1024 * 1024;
+    LocalStore store(t.path() / "store", options, keys.storage);
+
+    const auto viewer = pattern(512 * 1024, 0x22);
+    const auto viewer_id = object_id(viewer);
+    REQUIRE(store.put(viewer_id, viewer));
+
+    const auto loader = pattern(128 * 1024, 0x73);
+    const auto loader_id = object_id(loader);
+    std::promise<void> write_entered;
+    auto write_entered_future = write_entered.get_future();
+    std::promise<void> release_write;
+    auto release_write_future = release_write.get_future().share();
+    std::atomic_uint64_t hook_calls{};
+    store.set_before_packed_write_for_tests([&](const ObjectId& id) {
+        if (id == loader_id && hook_calls.fetch_add(1, std::memory_order_relaxed) == 0) {
+            write_entered.set_value();
+            release_write_future.wait();
+        }
+    });
+
+    auto packed_write = std::async(std::launch::async,
+                                   [&] { return store.put(loader_id, loader); });
+    REQUIRE(write_entered_future.wait_for(2s) == std::future_status::ready);
+
+    // The packed loader append is stalled before crypto and physical I/O. Its
+    // capacity reservation and per-object ownership must not retain the global
+    // index mutex needed by an unrelated viewer read.
+    auto viewer_read = std::async(std::launch::async,
+                                  [&] { return store.get(viewer_id); });
+    REQUIRE(viewer_read.wait_for(2s) == std::future_status::ready);
+    CHECK(viewer_read.get() == std::optional<Bytes>{viewer});
+
+    auto same_object = std::async(std::launch::async,
+                                  [&] { return store.put(loader_id, loader); });
+    CHECK(same_object.wait_for(20ms) == std::future_status::timeout);
+    CHECK(hook_calls.load(std::memory_order_relaxed) == 1);
+
+    release_write.set_value();
+    REQUIRE(packed_write.wait_for(2s) == std::future_status::ready);
+    CHECK(packed_write.get());
+    REQUIRE(same_object.wait_for(2s) == std::future_status::ready);
+    CHECK(same_object.get());
+    // The second PUT may append its compact crash-recoverable touch only after
+    // the first mutation has completed; it must never overlap the first write.
+    CHECK(hook_calls.load(std::memory_order_relaxed) == 2);
+    CHECK(store.get(loader_id) == std::optional<Bytes>{loader});
+}
+
+MACHA_TEST("storage_v18", test_viewer_reads_bypass_blocked_pack_compaction) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+
+    LocalStoreOptions options;
+    options.limit = 64ULL * 1024 * 1024;
+    options.pack_threshold = 256 * 1024;
+    options.pack_target_size = 4 * 1024 * 1024;
+    LocalStore store(t.path() / "store", options, keys.storage);
+
+    const auto dead = pattern(128 * 1024, 0x19);
+    const auto dead_id = object_id(dead);
+    const auto packed_viewer = pattern(128 * 1024, 0x29);
+    const auto packed_viewer_id = object_id(packed_viewer);
+    const auto loose_viewer = pattern(512 * 1024, 0x39);
+    const auto loose_viewer_id = object_id(loose_viewer);
+    REQUIRE(store.put(dead_id, dead));
+    REQUIRE(store.put(packed_viewer_id, packed_viewer));
+    REQUIRE(store.put(loose_viewer_id, loose_viewer));
+    REQUIRE(store.remove(dead_id));
+
+    std::promise<void> compaction_entered;
+    auto compaction_entered_future = compaction_entered.get_future();
+    std::promise<void> release_compaction;
+    auto release_compaction_future = release_compaction.get_future().share();
+    store.set_before_pack_compaction_for_tests([&] {
+        compaction_entered.set_value();
+        release_compaction_future.wait();
+    });
+
+    auto compaction =
+        std::async(std::launch::async, [&] { return store.compact_packs(); });
+    REQUIRE(compaction_entered_future.wait_for(2s) == std::future_status::ready);
+
+    auto packed_read = std::async(std::launch::async,
+                                  [&] { return store.get(packed_viewer_id); });
+    auto loose_read = std::async(std::launch::async,
+                                 [&] { return store.get(loose_viewer_id); });
+    REQUIRE(packed_read.wait_for(2s) == std::future_status::ready);
+    REQUIRE(loose_read.wait_for(2s) == std::future_status::ready);
+    CHECK(packed_read.get() == std::optional<Bytes>{packed_viewer});
+    CHECK(loose_read.get() == std::optional<Bytes>{loose_viewer});
+
+    release_compaction.set_value();
+    REQUIRE(compaction.wait_for(2s) == std::future_status::ready);
+    CHECK(compaction.get());
+    CHECK(store.get(packed_viewer_id) == std::optional<Bytes>{packed_viewer});
+    CHECK(store.get(loose_viewer_id) == std::optional<Bytes>{loose_viewer});
+}
+
+MACHA_TEST("storage_v18", test_pack_compaction_waits_for_preopen_reader_lease) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+
+    LocalStoreOptions options;
+    options.limit = 64ULL * 1024 * 1024;
+    options.pack_threshold = 256 * 1024;
+    options.pack_target_size = 4 * 1024 * 1024;
+    LocalStore store(t.path() / "store", options, keys.storage);
+
+    const auto live = pattern(128 * 1024, 0x51);
+    const auto live_id = object_id(live);
+    const auto dead = pattern(128 * 1024, 0x61);
+    const auto dead_id = object_id(dead);
+    REQUIRE(store.put(live_id, live));
+    REQUIRE(store.put(dead_id, dead));
+    REQUIRE(store.remove(dead_id));
+
+    std::promise<void> reader_leased;
+    auto reader_leased_future = reader_leased.get_future();
+    std::promise<void> release_reader;
+    auto release_reader_future = release_reader.get_future().share();
+    std::atomic_bool first{true};
+    store.set_before_packed_read_for_tests([&](const ObjectId& id) {
+        if (id == live_id && first.exchange(false)) {
+            reader_leased.set_value();
+            release_reader_future.wait();
+        }
+    });
+
+    auto read = std::async(std::launch::async, [&] { return store.get(live_id); });
+    REQUIRE(reader_leased_future.wait_for(2s) == std::future_status::ready);
+    auto compaction =
+        std::async(std::launch::async, [&] { return store.compact_packs(); });
+
+    // The reader owns only a logical lease and has not called open(2). The
+    // compactor may build and switch its replacement, but cannot unlink the
+    // selected victim until this exact reader has opened and finished it.
+    CHECK(compaction.wait_for(20ms) == std::future_status::timeout);
+    release_reader.set_value();
+    REQUIRE(read.wait_for(2s) == std::future_status::ready);
+    CHECK(read.get() == std::optional<Bytes>{live});
+    REQUIRE(compaction.wait_for(2s) == std::future_status::ready);
+    CHECK(compaction.get());
+    CHECK(store.get(live_id) == std::optional<Bytes>{live});
+}
+
 MACHA_TEST("storage_v18", test_metadata_control_store_is_independent_of_data_quota) {
     TestNode fixture("metadata-priority");
     auto& config = fixture.config();
