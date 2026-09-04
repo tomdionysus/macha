@@ -360,30 +360,28 @@ void HttpServer::worker(std::stop_token stop) {
     }
 }
 
-void HttpServer::handle_client(int fd) {
-    // Queue depth and worker count bound admission; the socket timeout also
-    // bounds occupancy so a stalled/incomplete client cannot pin a worker forever.
-    set_client_io_timeout(fd, config_.client_io_timeout);
-#ifdef SO_NOSIGPIPE
-    int no_sigpipe = 1;
-    (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
-#endif
-#ifdef MSG_NOSIGNAL
-    constexpr int send_flags = MSG_NOSIGNAL;
-#else
-    constexpr int send_flags = 0;
-#endif
+bool HttpServer::queue_has_backlog() {
+    std::lock_guard lock(queue_mutex_);
+    return !queue_.empty();
+}
 
-    const auto request_deadline = Clock::now() + config_.client_io_timeout;
+bool HttpServer::handle_one_request(int fd, int send_flags, bool is_continuation, size_t requests_served) {
+    // A continuation request gets a distinct (normally shorter) idle allowance
+    // so a keep-alive connection sitting silently between requests cannot pin
+    // a worker for as long as one that is actively mid-request. This single
+    // deadline covers headers and body together, exactly as the equivalent
+    // single deadline did for the very first request before keep-alive.
+    const auto request_deadline =
+        Clock::now() + (is_continuation ? config_.keep_alive_idle_timeout : config_.client_io_timeout);
     std::string input;
     std::array<char, 8192> buffer{};
     auto header_end = std::string::npos;
     while ((header_end = input.find("\r\n\r\n")) == std::string::npos) {
         auto n = recv_before(fd, buffer.data(), buffer.size(), request_deadline);
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return;
+        if (n <= 0) return false;
         input.append(buffer.data(), static_cast<size_t>(n));
-        if (input.size() > 64 * 1024) return;
+        if (input.size() > 64 * 1024) return false;
     }
 
     std::istringstream headers(input.substr(0, header_end));
@@ -394,7 +392,7 @@ void HttpServer::handle_client(int fd) {
     HttpRequest request;
     std::string target, version;
     request_stream >> request.method >> target >> version;
-    if (request.method.empty() || target.empty()) return;
+    if (request.method.empty() || target.empty()) return false;
     auto question = target.find('?');
     request.path = http_url_decode(target.substr(0, question));
     if (question != std::string::npos) request.query = parse_query(target.substr(question + 1));
@@ -411,11 +409,22 @@ void HttpServer::handle_client(int fd) {
         request.headers[key] = value;
         if (key == "content-length") {
             auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), content_length);
-            if (ec != std::errc{} || end != value.data() + value.size()) return;
+            if (ec != std::errc{} || end != value.data() + value.size()) return false;
         }
     }
 
+    // HTTP/1.1 connections default to persistent unless the client asks to
+    // close; HTTP/1.0 connections default to close unless the client
+    // explicitly asks to keep the connection alive.
+    const auto connection_header = request.headers.find("connection");
+    const std::string connection_value =
+        connection_header != request.headers.end() ? lower(connection_header->second) : std::string();
+    const bool requested_close = connection_value.find("close") != std::string::npos;
+    const bool requested_keep_alive = connection_value.find("keep-alive") != std::string::npos;
+    bool keep_alive = version == "HTTP/1.1" ? !requested_close : requested_keep_alive;
+
     HttpResponse response;
+    bool read_body = false;
     if (request.method == "OPTIONS") {
         response = {204, "text/plain", {}, {}, {}};
     } else if (content_length > config_.max_request_bytes) {
@@ -428,10 +437,11 @@ void HttpServer::handle_client(int fd) {
                                  std::min(buffer.size(), content_length - request.body.size()),
                                  request_deadline);
             if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) return;
+            if (n <= 0) return false;
             request.body.insert(request.body.end(), buffer.begin(), buffer.begin() + n);
         }
         if (request.body.size() > content_length) request.body.resize(content_length);
+        read_body = true;
 
         const bool exempt = bearer_exempt_ && bearer_exempt_(request);
         if (bearer_token_ && !exempt) {
@@ -446,6 +456,17 @@ void HttpServer::handle_client(int fd) {
         }
     }
 
+    // Reusing the connection is only safe once the declared request body has
+    // actually been consumed from the wire (today: every path except an
+    // oversized/413 body) — otherwise the next "request" read would really be
+    // the tail of this one's unread body.
+    if (!read_body && content_length > 0)
+        keep_alive = false;
+    if (keep_alive && requests_served + 1 >= config_.keep_alive_max_requests)
+        keep_alive = false;
+    if (keep_alive && queue_has_backlog())
+        keep_alive = false; // prefer serving a waiting new connection
+
     response.headers.try_emplace("Access-Control-Allow-Origin", "*");
     response.headers.try_emplace("Access-Control-Allow-Headers", "Authorization, Content-Type, If-Match, Range, Idempotency-Key, Macha-Viewer-Session");
     response.headers.try_emplace("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS");
@@ -456,12 +477,12 @@ void HttpServer::handle_client(int fd) {
     out << "HTTP/1.1 " << response.status << ' ' << reason(response.status) << "\r\n";
     out << "Content-Type: " << response.content_type << "\r\n";
     out << "Content-Length: " << response.content_length() << "\r\n";
-    out << "Connection: close\r\n";
+    out << "Connection: " << (keep_alive ? "keep-alive" : "close") << "\r\n";
     for (const auto& [key, value] : response.headers) out << key << ": " << value << "\r\n";
     out << "\r\n";
     auto head = out.str();
-    if (!send_all(fd, head.data(), head.size(), send_flags)) return;
-    if (request.method == "HEAD") return;
+    if (!send_all(fd, head.data(), head.size(), send_flags)) return false;
+    if (request.method == "HEAD") return keep_alive;
 
     if (response.stream) {
         Bytes chunk(std::max<size_t>(16 * 1024, config_.stream_chunk_bytes));
@@ -470,13 +491,34 @@ void HttpServer::handle_client(int fd) {
         while (offset < total) {
             const auto wanted = static_cast<size_t>(std::min<uint64_t>(chunk.size(), total - offset));
             auto n = response.stream->read(offset, std::span<uint8_t>(chunk.data(), wanted));
-            if (!n) break;
-            if (!send_all(fd, chunk.data(), n, send_flags)) break;
+            if (!n) return false; // fewer bytes than the declared Content-Length: cannot reuse the connection
+            if (!send_all(fd, chunk.data(), n, send_flags)) return false;
             offset += n;
         }
     } else if (!response.body.empty()) {
-        (void)send_all(fd, response.body.data(), response.body.size(), send_flags);
+        if (!send_all(fd, response.body.data(), response.body.size(), send_flags)) return false;
     }
+    return keep_alive;
+}
+
+void HttpServer::handle_client(int fd) {
+    // Queue depth and worker count bound admission; the socket timeout also
+    // bounds occupancy so a stalled/incomplete client cannot pin a worker forever.
+    set_client_io_timeout(fd, config_.client_io_timeout);
+#ifdef SO_NOSIGPIPE
+    int no_sigpipe = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
+#endif
+#ifdef MSG_NOSIGNAL
+    constexpr int send_flags = MSG_NOSIGNAL;
+#else
+    constexpr int send_flags = 0;
+#endif
+
+    size_t requests_served = 0;
+    while (running_.load(std::memory_order_relaxed) &&
+           handle_one_request(fd, send_flags, requests_served > 0, requests_served))
+        ++requests_served;
 }
 
 } // namespace macha
