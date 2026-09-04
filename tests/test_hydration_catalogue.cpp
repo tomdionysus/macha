@@ -2314,7 +2314,7 @@ MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_int
     torrent_config.dht = false;
     torrent_config.pex = false;
     torrent_config.lsd = false;
-    TorrentManager torrents(ingest, torrent_config, state_path);
+    TorrentManager torrents(fixture.node(), ingest, torrent_config, state_path);
 
     auto failed_ingest = ingest.job("ingest-retry");
     REQUIRE(failed_ingest.has_value());

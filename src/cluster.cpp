@@ -588,6 +588,18 @@ void NodeRuntime::set_service_event_callback(std::function<void(ServiceEvent)> c
     service_event_ = std::move(callback);
 }
 
+void NodeRuntime::set_ingest_bridge(JobsQueryHandler jobs, JobActionHandler action) {
+    std::lock_guard lock(job_bridge_mutex_);
+    ingest_jobs_handler_ = std::move(jobs);
+    ingest_action_handler_ = std::move(action);
+}
+
+void NodeRuntime::set_torrent_bridge(JobsQueryHandler jobs, JobActionHandler action) {
+    std::lock_guard lock(job_bridge_mutex_);
+    torrent_jobs_handler_ = std::move(jobs);
+    torrent_action_handler_ = std::move(action);
+}
+
 void NodeRuntime::notify_storage_mutation() {
     signal_service_event(ServiceEvent::storage);
 }
@@ -912,6 +924,42 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
         case MessageType::get_metadata_heads:
             return {MessageType::metadata_heads_reply,
                     encode_metadata_acceptance_set(metadata_heads())};
+        case MessageType::get_ingest_jobs: {
+            JobsQueryHandler handler;
+            {
+                std::lock_guard lock(job_bridge_mutex_);
+                handler = ingest_jobs_handler_;
+            }
+            if (!handler) return error_reply("ingest not available on this node");
+            return {MessageType::ingest_jobs_reply, handler(request.payload)};
+        }
+        case MessageType::ingest_job_action: {
+            JobActionHandler handler;
+            {
+                std::lock_guard lock(job_bridge_mutex_);
+                handler = ingest_action_handler_;
+            }
+            if (!handler) return error_reply("ingest not available on this node");
+            return {MessageType::ingest_job_action_reply, handler(request.payload)};
+        }
+        case MessageType::get_torrent_jobs: {
+            JobsQueryHandler handler;
+            {
+                std::lock_guard lock(job_bridge_mutex_);
+                handler = torrent_jobs_handler_;
+            }
+            if (!handler) return error_reply("torrents not available on this node");
+            return {MessageType::torrent_jobs_reply, handler(request.payload)};
+        }
+        case MessageType::torrent_job_action: {
+            JobActionHandler handler;
+            {
+                std::lock_guard lock(job_bridge_mutex_);
+                handler = torrent_action_handler_;
+            }
+            if (!handler) return error_reply("torrents not available on this node");
+            return {MessageType::torrent_job_action_reply, handler(request.payload)};
+        }
         case MessageType::put_metadata_commit: {
             auto entry = decode_metadata_history_entry(request.payload);
             Writer writer;

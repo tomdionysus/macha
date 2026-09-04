@@ -261,6 +261,120 @@ std::optional<IngestJobState> parse_ingest_job_state(std::string_view state) {
     return {};
 }
 
+Json optional_u64(const std::optional<uint64_t>& value) {
+    return value ? Json(*value) : Json(nullptr);
+}
+
+Json catalogue_summary_json(const IngestJob& job, const CatalogueHintSummary* detail) {
+    Json::Object out;
+    out["total"] = static_cast<uint64_t>(job.catalogue_total);
+    out["pending"] = static_cast<uint64_t>(job.catalogue_pending);
+    out["catalogued"] = static_cast<uint64_t>(job.catalogue_catalogued);
+    out["no_match"] = static_cast<uint64_t>(job.catalogue_no_match);
+    out["failed"] = static_cast<uint64_t>(job.catalogue_failed);
+    if (job.state == IngestJobState::cataloguing || job.catalogue_pending)
+        out["state"] = "processing";
+    else if (!job.catalogue_total && job.state != IngestJobState::completed)
+        out["state"] = "waiting";
+    else if (job.catalogue_failed || job.catalogue_no_match)
+        out["state"] = "completed_with_issues";
+    else
+        out["state"] = "completed";
+
+    if (detail) {
+        Json::Array items;
+        items.reserve(detail->hints.size());
+        for (const auto& hint : detail->hints) {
+            Json::Object item;
+            item["id"] = hint.id;
+            item["path"] = hint.path;
+            item["state"] = catalogue_hint_state_name(hint.state);
+            item["provider"] = hint.provider.empty() ? Json(nullptr) : Json(hint.provider);
+            item["media_id"] = hint.media_id.empty() ? Json(nullptr) : Json(hint.media_id);
+            item["priority"] = static_cast<int64_t>(hint.priority);
+            item["attempts"] = static_cast<uint64_t>(hint.attempts);
+            item["result"] = hint.result.empty() ? Json(nullptr) : Json(hint.result);
+            item["error"] = hint.error.empty() ? Json(nullptr) : Json(hint.error);
+            Json::Array ids;
+            for (const auto& id : hint.catalogue_item_ids) ids.emplace_back(id);
+            item["catalogue_item_ids"] = std::move(ids);
+            items.emplace_back(std::move(item));
+        }
+        out["items"] = std::move(items);
+    }
+    return Json(std::move(out));
+}
+
+Json ingest_job_json(const IngestJob& job, bool include_files,
+                     const CatalogueHintSummary* catalogue_detail) {
+    Json::Object out;
+    out["id"] = job.id;
+    out["source_type"] = job.source_type;
+    out["source_ref"] = job.source_ref.empty() ? Json(nullptr) : Json(job.source_ref);
+    out["display_name"] = job.display_name;
+    out["source_path"] = job.source_path.string();
+    out["source_owned"] = job.source_owned;
+    out["delete_source_on_clear"] = job.delete_source_on_clear;
+    out["state"] = ingest_job_state_name(job.state);
+    out["bytes_total"] = job.bytes_total;
+    out["bytes_completed"] = job.bytes_completed;
+    out["files_total"] = static_cast<uint64_t>(job.files_total);
+    out["files_completed"] = static_cast<uint64_t>(job.files_completed);
+    out["rate_bytes_per_second"] = job.rate_bytes_per_second;
+    out["eta_seconds"] = optional_u64(job.eta_seconds);
+    out["progress"] = job.bytes_total
+                          ? Json(std::min(1.0, static_cast<double>(job.bytes_completed) /
+                                                   static_cast<double>(job.bytes_total)))
+                          : Json(nullptr);
+    out["current_file"] = job.current_file.empty() ? Json(nullptr) : Json(job.current_file);
+    out["current_destination"] =
+        job.current_destination.empty() ? Json(nullptr) : Json(job.current_destination);
+    out["catalogue"] = catalogue_summary_json(job, catalogue_detail);
+    out["created_unix_ms"] = job.created_unix_ms;
+    out["updated_unix_ms"] = job.updated_unix_ms;
+    out["error"] = job.error.empty() ? Json(nullptr) : Json(job.error);
+
+    if (include_files) {
+        Json::Array files;
+        files.reserve(job.files.size());
+        for (const auto& file : job.files) {
+            Json::Object item;
+            item["source_path"] = file.source_path;
+            item["destination_path"] = file.destination_path;
+            item["size"] = file.size;
+            item["copied"] = file.copied;
+            item["completed"] = file.completed;
+            item["skipped"] = file.skipped;
+            item["catalogue_candidate"] = file.catalogue_candidate;
+            files.emplace_back(std::move(item));
+        }
+        out["files"] = std::move(files);
+    }
+    return Json(std::move(out));
+}
+
+namespace {
+// Wire shape for the cluster RPC survey: the persistence shape (job_json/
+// parse_job) plus the two transient fields it deliberately never persists
+// (rate_bytes_per_second, eta_seconds -- resetting those across a local
+// restart is intentional; a remote peer answering a live survey should
+// still report its own current values).
+Json ingest_job_wire_json(const IngestJob& job) {
+    auto out = job_json(job);
+    out["rate_bytes_per_second"] = job.rate_bytes_per_second;
+    out["eta_seconds"] = optional_u64(job.eta_seconds);
+    return out;
+}
+
+IngestJob parse_ingest_job_wire(const Json& value) {
+    auto job = parse_job(value);
+    job.rate_bytes_per_second = json_u64(value, "rate_bytes_per_second");
+    if (const auto* eta = value.find("eta_seconds"); eta && !eta->isNull())
+        job.eta_seconds = eta->asUInt64();
+    return job;
+}
+} // namespace
+
 StagingArea::StagingArea(IngestConfig config) : config_(std::move(config)) {
     if (!config_.staging_path.empty()) std::filesystem::create_directories(config_.staging_path);
 }
@@ -327,9 +441,178 @@ IngestManager::IngestManager(NodeRuntime& node, FileSystem& fs, CatalogueHintQue
         if (!config_.staging_path.empty()) std::filesystem::create_directories(config_.staging_path);
         load_state();
     }
+    node_.set_ingest_bridge(
+        [this](std::span<const uint8_t> payload) { return handle_jobs_query(payload); },
+        [this](std::span<const uint8_t> payload) { return handle_job_action(payload); });
 }
 
 IngestManager::~IngestManager() { stop(); }
+
+Bytes IngestManager::handle_jobs_query(std::span<const uint8_t> request_payload) const {
+    std::string job_id;
+    if (!request_payload.empty()) {
+        try {
+            const std::string text(reinterpret_cast<const char*>(request_payload.data()),
+                                   request_payload.size());
+            auto request = Json::parse(text);
+            if (const auto* id = request.find("job_id"); id && id->isString())
+                job_id = id->asString();
+        } catch (const std::exception&) {
+            // Malformed survey request: answer as "list all" rather than fail
+            // the whole peer.
+        }
+    }
+    Json::Array out_jobs;
+    if (job_id.empty()) {
+        for (const auto& job : jobs()) out_jobs.push_back(ingest_job_wire_json(job));
+    } else if (auto found = job(job_id)) {
+        out_jobs.push_back(ingest_job_wire_json(*found));
+    }
+    Json::Object out;
+    out["jobs"] = std::move(out_jobs);
+    const auto text = Json(std::move(out)).dump();
+    return Bytes(text.begin(), text.end());
+}
+
+Bytes IngestManager::handle_job_action(std::span<const uint8_t> request_payload) {
+    std::string job_id, action;
+    try {
+        const std::string text(reinterpret_cast<const char*>(request_payload.data()),
+                               request_payload.size());
+        auto request = Json::parse(text);
+        if (const auto* id = request.find("job_id"); id && id->isString()) job_id = id->asString();
+        if (const auto* act = request.find("action"); act && act->isString())
+            action = act->asString();
+    } catch (const std::exception&) {
+    }
+    Json::Object out;
+    const bool exists = job(job_id).has_value();
+    out["exists"] = exists;
+    bool changed = false;
+    if (exists) {
+        if (action == "pause") changed = pause(job_id);
+        else if (action == "resume") changed = resume(job_id);
+        else if (action == "cancel") changed = cancel(job_id);
+        else if (action == "clear") changed = clear(job_id);
+    }
+    out["changed"] = changed;
+    if (auto updated = job(job_id))
+        out["job"] = ingest_job_wire_json(*updated);
+    else
+        out["job"] = Json(nullptr);
+    const auto text = Json(std::move(out)).dump();
+    return Bytes(text.begin(), text.end());
+}
+
+std::vector<ClusterIngestJob> IngestManager::jobs_cluster_wide() const {
+    std::vector<ClusterIngestJob> out;
+    for (auto& job : jobs()) {
+        auto summary = catalogue_summary(job.id);
+        out.push_back({node_.node_id(), std::move(job), std::move(summary)});
+    }
+    for (const auto& peer : node_.membership().active()) {
+        if (peer.id == node_.node_id()) continue;
+        try {
+            auto reply = node_.call(peer, MessageType::get_ingest_jobs, {}, FrameType::control);
+            if (reply.message.type != MessageType::ingest_jobs_reply) continue;
+            const std::string text(reinterpret_cast<const char*>(reply.message.payload.data()),
+                                   reply.message.payload.size());
+            auto parsed = Json::parse(text);
+            const auto* peer_jobs = parsed.find("jobs");
+            if (!peer_jobs) continue;
+            for (const auto& value : peer_jobs->asArray())
+                out.push_back({peer.id, parse_ingest_job_wire(value), {}});
+        } catch (const std::exception& error) {
+            Log::debug("ingest job survey " + peer.host + ": " + error.what());
+        }
+    }
+    return out;
+}
+
+std::optional<ClusterIngestJob> IngestManager::job_cluster_wide(std::string_view id) const {
+    if (auto local = job(id))
+        return ClusterIngestJob{node_.node_id(), std::move(*local), catalogue_summary(id)};
+    Json::Object request;
+    request["job_id"] = std::string(id);
+    const auto request_text = Json(std::move(request)).dump();
+    const Bytes request_bytes(request_text.begin(), request_text.end());
+    for (const auto& peer : node_.membership().active()) {
+        if (peer.id == node_.node_id()) continue;
+        try {
+            auto reply = node_.call(peer, MessageType::get_ingest_jobs, request_bytes,
+                                    FrameType::control);
+            if (reply.message.type != MessageType::ingest_jobs_reply) continue;
+            const std::string text(reinterpret_cast<const char*>(reply.message.payload.data()),
+                                   reply.message.payload.size());
+            auto parsed = Json::parse(text);
+            const auto* peer_jobs = parsed.find("jobs");
+            if (!peer_jobs || peer_jobs->asArray().empty()) continue;
+            return ClusterIngestJob{peer.id, parse_ingest_job_wire(peer_jobs->asArray().front()), {}};
+        } catch (const std::exception& error) {
+            Log::debug("ingest job survey " + peer.host + ": " + error.what());
+        }
+    }
+    return std::nullopt;
+}
+
+IngestActionResult IngestManager::dispatch_action_cluster_wide(std::string_view id,
+                                                               std::string_view action) {
+    IngestActionResult result;
+    if (auto local = job(id)) {
+        result.exists = true;
+        if (action == "pause") result.changed = pause(id);
+        else if (action == "resume") result.changed = resume(id);
+        else if (action == "cancel") result.changed = cancel(id);
+        else if (action == "clear") result.changed = clear(id);
+        if (auto updated = job(id))
+            result.updated = ClusterIngestJob{node_.node_id(), std::move(*updated),
+                                              catalogue_summary(id)};
+        return result;
+    }
+    Json::Object request;
+    request["job_id"] = std::string(id);
+    request["action"] = std::string(action);
+    const auto request_text = Json(std::move(request)).dump();
+    const Bytes request_bytes(request_text.begin(), request_text.end());
+    for (const auto& peer : node_.membership().active()) {
+        if (peer.id == node_.node_id()) continue;
+        try {
+            auto reply = node_.call(peer, MessageType::ingest_job_action, request_bytes,
+                                    FrameType::control);
+            if (reply.message.type != MessageType::ingest_job_action_reply) continue;
+            const std::string text(reinterpret_cast<const char*>(reply.message.payload.data()),
+                                   reply.message.payload.size());
+            auto parsed = Json::parse(text);
+            const auto* exists = parsed.find("exists");
+            if (!exists || !exists->isBool() || !exists->asBool()) continue;
+            result.exists = true;
+            if (const auto* changed = parsed.find("changed"); changed && changed->isBool())
+                result.changed = changed->asBool();
+            if (const auto* updated = parsed.find("job"); updated && !updated->isNull())
+                result.updated = ClusterIngestJob{peer.id, parse_ingest_job_wire(*updated), {}};
+            return result;
+        } catch (const std::exception& error) {
+            Log::debug("ingest job action survey " + peer.host + ": " + error.what());
+        }
+    }
+    return result;
+}
+
+IngestActionResult IngestManager::pause_cluster_wide(std::string_view id) {
+    return dispatch_action_cluster_wide(id, "pause");
+}
+
+IngestActionResult IngestManager::resume_cluster_wide(std::string_view id) {
+    return dispatch_action_cluster_wide(id, "resume");
+}
+
+IngestActionResult IngestManager::cancel_cluster_wide(std::string_view id) {
+    return dispatch_action_cluster_wide(id, "cancel");
+}
+
+IngestActionResult IngestManager::clear_cluster_wide(std::string_view id) {
+    return dispatch_action_cluster_wide(id, "clear");
+}
 
 void IngestManager::load_state() {
     std::vector<std::pair<std::string, std::string>> migration_hints;

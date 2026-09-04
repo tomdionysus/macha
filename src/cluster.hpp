@@ -44,6 +44,13 @@ struct NodeReadiness {
 class NodeRuntime {
   public:
     using StartupStageHook = std::function<void(std::string_view)>;
+    // Payload-agnostic bridge to whichever component owns ingest/torrent job
+    // state (IngestManager / TorrentManager). NodeRuntime never needs to know
+    // what "ingest" or "torrent" even means — it just carries opaque JSON
+    // bytes between the RPC wire and the owning component, same as it does
+    // for the raw storage/metadata payloads elsewhere in this class.
+    using JobsQueryHandler = std::function<Bytes(std::span<const uint8_t> request_payload)>;
+    using JobActionHandler = std::function<Bytes(std::span<const uint8_t> request_payload)>;
 
   private:
     struct LocalCopyJob {
@@ -125,6 +132,11 @@ class NodeRuntime {
     std::atomic_int64_t last_interactive_activity_ms_{};
     mutable std::mutex service_event_mutex_;
     std::function<void(ServiceEvent)> service_event_;
+    mutable std::mutex job_bridge_mutex_;
+    JobsQueryHandler ingest_jobs_handler_;
+    JobActionHandler ingest_action_handler_;
+    JobsQueryHandler torrent_jobs_handler_;
+    JobActionHandler torrent_action_handler_;
 
     void signal_service_event(ServiceEvent);
 
@@ -159,6 +171,12 @@ class NodeRuntime {
     void cancel_outbound_calls();
     void stop();
     void set_service_event_callback(std::function<void(ServiceEvent)> callback);
+    // Registered once, at construction, by whichever component owns that job
+    // type (IngestManager / TorrentManager). The handler bodies must answer
+    // using only that component's local-only state -- never survey peers
+    // themselves -- or a single cluster-wide query fans out unboundedly.
+    void set_ingest_bridge(JobsQueryHandler jobs, JobActionHandler action);
+    void set_torrent_bridge(JobsQueryHandler jobs, JobActionHandler action);
     void notify_storage_mutation();
     bool wait_local_state_ready(std::chrono::milliseconds timeout);
     NodeReadiness readiness() const;

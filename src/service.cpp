@@ -238,7 +238,7 @@ void Service::initialise_services(std::stop_token stop) {
                                                             node_.config().read_ahead_extents);
         auto ingest = std::make_unique<IngestManager>(
             node_, *fs, *catalogue_hints, node_.config().ingest, media_information.get());
-        auto torrents = std::make_unique<TorrentManager>(*ingest, node_.config().torrent,
+        auto torrents = std::make_unique<TorrentManager>(node_, *ingest, node_.config().torrent,
                                                          node_.config().state_path);
         auto torrent_search = std::make_unique<TorrentSearchManager>(node_.config().torrent);
         auto acquisition_api =

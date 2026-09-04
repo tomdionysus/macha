@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <thread>
@@ -60,6 +61,25 @@ struct TorrentJob {
     uint64_t created_unix_ms{};
     uint64_t updated_unix_ms{};
     std::string error;
+};
+
+// HTTP/RPC-facing JSON shape for a torrent job -- shared by the local HTTP
+// handler (acquisition_api.cpp) and the cluster-wide RPC bridge, so a remote
+// job renders identically to a local one (plus a "node_id" field the caller
+// tags on afterward). Named distinctly from torrent_job_json()/
+// parse_torrent_job() in torrent.cpp (the on-disk jobs.json persistence
+// shape, file-local) since both live in that translation unit.
+Json torrent_job_api_json(const TorrentJob&);
+
+struct ClusterTorrentJob {
+    NodeId node_id;
+    TorrentJob job;
+};
+
+struct TorrentActionResult {
+    bool exists{};
+    bool changed{};
+    std::optional<ClusterTorrentJob> updated;
 };
 
 struct TorrentSearchResult {
@@ -118,6 +138,7 @@ class TorrentSearchManager {
 class TorrentManager {
     struct Impl;
 
+    NodeRuntime& node_;
     IngestManager& ingest_;
     TorrentConfig config_;
     std::filesystem::path state_file_;
@@ -135,8 +156,16 @@ class TorrentManager {
     bool has_active_jobs_locked() const;
     std::string add_impl(std::string uri, bool allow_fetch);
 
+    // NodeRuntime::set_torrent_bridge() handler bodies. Local-only -- never
+    // call the *_cluster_wide() methods from here, or a peer's survey would
+    // itself re-survey its own peers.
+    Bytes handle_jobs_query(std::span<const uint8_t> request_payload) const;
+    Bytes handle_job_action(std::span<const uint8_t> request_payload);
+    TorrentActionResult dispatch_action_cluster_wide(std::string_view id, std::string_view action);
+
   public:
-    TorrentManager(IngestManager&, TorrentConfig, const std::filesystem::path& state_path);
+    TorrentManager(NodeRuntime&, IngestManager&, TorrentConfig,
+                   const std::filesystem::path& state_path);
     ~TorrentManager();
 
     static bool build_available() noexcept;
@@ -156,6 +185,22 @@ class TorrentManager {
     bool retry(std::string_view id);
     bool cancel(std::string_view id);
     bool clear(std::string_view id);
+
+    // Cluster-wide visibility: local jobs (this node's own jobs()), plus one
+    // RPC survey per active peer. An unreachable/erroring peer is logged and
+    // skipped, never fails the whole call.
+    std::vector<ClusterTorrentJob> jobs_cluster_wide() const;
+    // Local job(id) first (zero added latency for the common owned-here
+    // case); only surveys peers when the job is locally absent.
+    std::optional<ClusterTorrentJob> job_cluster_wide(std::string_view id) const;
+    // Each: local action first; only surveys peers when the job is locally
+    // absent. The first peer reporting the job exists is authoritative,
+    // preserving the local 404-vs-409 distinction cluster-wide.
+    TorrentActionResult pause_cluster_wide(std::string_view id);
+    TorrentActionResult resume_cluster_wide(std::string_view id);
+    TorrentActionResult retry_cluster_wide(std::string_view id);
+    TorrentActionResult cancel_cluster_wide(std::string_view id);
+    TorrentActionResult clear_cluster_wide(std::string_view id);
 };
 
 std::optional<std::string> sanitize_magnet_uri(std::string_view);

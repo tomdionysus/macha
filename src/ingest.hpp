@@ -4,6 +4,7 @@
 #include "catalogue_hints.hpp"
 #include "config.hpp"
 #include "filesystem.hpp"
+#include "json.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -11,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <thread>
@@ -75,6 +77,28 @@ struct IngestJob {
     std::vector<IngestFileProgress> files;
 };
 
+// HTTP/RPC-facing JSON shape for an ingest job -- shared by the local HTTP
+// handler (acquisition_api.cpp) and the cluster-wide RPC bridge below, so a
+// remote job renders identically to a local one (plus a "node_id" field the
+// caller tags on afterward). Distinct from job_json()/parse_job() in
+// ingest.cpp, which is the on-disk jobs.json persistence shape.
+Json optional_u64(const std::optional<uint64_t>&);
+Json catalogue_summary_json(const IngestJob&, const CatalogueHintSummary* detail = nullptr);
+Json ingest_job_json(const IngestJob&, bool include_files,
+                     const CatalogueHintSummary* catalogue_detail = nullptr);
+
+struct ClusterIngestJob {
+    NodeId node_id;
+    IngestJob job;
+    CatalogueHintSummary catalogue;
+};
+
+struct IngestActionResult {
+    bool exists{};
+    bool changed{};
+    std::optional<ClusterIngestJob> updated;
+};
+
 struct StagingStatus {
     std::filesystem::path path;
     uint64_t limit{};
@@ -135,6 +159,13 @@ class IngestManager {
     void set_blocked(IngestJob&, std::string);
     void cleanup_partials(const IngestJob&);
 
+    // NodeRuntime::set_ingest_bridge() handler bodies. Local-only -- never
+    // call the *_cluster_wide() methods from here, or a peer's survey would
+    // itself re-survey its own peers.
+    Bytes handle_jobs_query(std::span<const uint8_t> request_payload) const;
+    Bytes handle_job_action(std::span<const uint8_t> request_payload);
+    IngestActionResult dispatch_action_cluster_wide(std::string_view id, std::string_view action);
+
   public:
     IngestManager(NodeRuntime&, FileSystem&, CatalogueHintQueue&, IngestConfig,
                   MediaInformationService* media_information = nullptr);
@@ -165,6 +196,22 @@ class IngestManager {
     bool delete_owned_source_on_cancel() const;
     StagingArea& staging() noexcept { return staging_; }
     const StagingArea& staging() const noexcept { return staging_; }
+
+    // Cluster-wide visibility: local jobs (this node's own jobs()), plus one
+    // RPC survey per active peer. An unreachable/erroring peer is logged and
+    // skipped, never fails the whole call -- same partial-tolerance contract
+    // as MetadataManager::discover_accepted_heads().
+    std::vector<ClusterIngestJob> jobs_cluster_wide() const;
+    // Local job(id) first (zero added latency for the common owned-here
+    // case); only surveys peers when the job is locally absent.
+    std::optional<ClusterIngestJob> job_cluster_wide(std::string_view id) const;
+    // Each: local action first; only surveys peers when the job is locally
+    // absent. The first peer reporting the job exists is authoritative,
+    // preserving the local 404-vs-409 distinction cluster-wide.
+    IngestActionResult pause_cluster_wide(std::string_view id);
+    IngestActionResult resume_cluster_wide(std::string_view id);
+    IngestActionResult cancel_cluster_wide(std::string_view id);
+    IngestActionResult clear_cluster_wide(std::string_view id);
 };
 
 } // namespace macha
