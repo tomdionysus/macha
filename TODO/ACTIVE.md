@@ -144,6 +144,17 @@ absorbed here rather than separate active programmes.
   build; correlate CPU, runnable tasks, RSS/swap, I/O wait and queues.
 - [ ] Diagnose faulty torrent/ingest independently so it does not obscure
   convergence and runtime measurements.
+- [ ] Make ingest/torrent job visibility and control cluster-wide.
+  `/api/v1/ingest/jobs` and `/api/v1/torrents/jobs` were node-local: which
+  imports/downloads a client could see, and which it could pause/resume/
+  cancel, depended entirely on which node's API answered. Fan `GET .../jobs`
+  (list and single-job) out across the cluster via RPC survey, tag each job
+  with its owning `node_id`, and forward pause/resume/retry/cancel/clear to
+  the owning node when the receiving node doesn't have the job locally.
+  (In progress this session.)
+- [ ] Diagnose `ingest failed: metadata acceptance certificate durability
+  floor unavailable` failures on torrent ingest once the torrent has
+  downloaded, which are also unaccountably slow.
 
 ## P2 — Catalogue and media model
 

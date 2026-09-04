@@ -3873,4 +3873,202 @@ MACHA_HEAVY_TEST("rpc_cluster", test_three_node_cluster) {
     }
 }
 
+MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+
+    const auto source_dir = cluster.path() / "jobvis-n1-src";
+    std::filesystem::create_directories(source_dir);
+    const auto source_file = source_dir / "movie.mkv";
+    {
+        std::ofstream out(source_file, std::ios::binary);
+        REQUIRE(out.good());
+        out << "not really media, just needs to exist";
+    }
+
+    auto c1 = config_for(cluster.path() / "jobvis-n1", cluster.keyfile(), p1,
+                         {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "jobvis-n2", cluster.keyfile(), p2,
+                         {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 2;
+    c1.min_write_replicas = c2.min_write_replicas = 1;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    // ingest.enabled requires catalogue.scanner.enabled; disable the actual
+    // provider lookups (they'd otherwise require a TMDB token file) since
+    // this test never lets a job reach the cataloguing phase.
+    c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = true;
+    c1.catalogue.scanner.movies.enabled = c2.catalogue.scanner.movies.enabled = false;
+    c1.catalogue.scanner.tv.enabled = c2.catalogue.scanner.tv.enabled = false;
+    c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
+    c1.ingest.enabled = c2.ingest.enabled = true;
+    c1.ingest.source_roots = {source_dir};
+    c1.torrent.enabled = c2.torrent.enabled = true;
+
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+              s2.node().membership().active().size() >= 2;
+    }));
+
+    const auto node1_id = to_string(s1.node().node_id());
+
+    // Only node 1 owns these jobs. Node 2 must see and act on them purely
+    // through the new cluster-wide RPC survey. The dummy source file is not
+    // real media, so the worker rejects it almost immediately -- wait for
+    // that deterministic "failed" convergence rather than racing to pause it
+    // mid-flight (a pause() that wins the race is still overwritten when the
+    // in-flight plan_job() finishes and unconditionally writes its own
+    // terminal state).
+    const auto ingest_id = s1.ingest().submit_path(source_file, "filesystem");
+    REQUIRE(wait_until(
+        [&] {
+            auto job = s1.ingest().job(ingest_id);
+            return job && job->state == IngestJobState::failed;
+        },
+        5s));
+
+    REQUIRE(TorrentManager::build_available());
+    const auto torrent_id = s1.torrents().add(
+        "magnet:?xt=urn:btih:3333333333333333333333333333333333333333&dn=Test");
+    // A torrent job has no equivalent fast-fail path (add() only creates the
+    // libtorrent session entry), so pausing it immediately is reliable.
+    REQUIRE(s1.torrents().pause(torrent_id));
+
+    auto get = [](AcquisitionApi& api, const std::string& path) {
+        HttpRequest request;
+        request.method = "GET";
+        request.path = path;
+        return api.handle(request);
+    };
+    auto post = [](AcquisitionApi& api, const std::string& path) {
+        HttpRequest request;
+        request.method = "POST";
+        request.path = path;
+        return api.handle(request);
+    };
+    auto body_json = [](const HttpResponse& response) {
+        return Json::parse(
+            std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
+    };
+
+    // --- Ingest: list visibility from the non-owning node ---
+    {
+        const auto response = get(s2.acquisition_api(), "/api/v1/ingest/jobs");
+        REQUIRE(response.status == 200);
+        const auto parsed = body_json(response);
+        const auto* jobs = parsed.find("jobs");
+        REQUIRE(jobs != nullptr);
+        bool found = false;
+        for (const auto& job : jobs->asArray()) {
+            const auto* id = job.find("id");
+            if (!id || id->asString() != ingest_id) continue;
+            found = true;
+            const auto* node_id = job.find("node_id");
+            REQUIRE(node_id != nullptr);
+            CHECK(node_id->asString() == node1_id);
+            const auto* state = job.find("state");
+            REQUIRE(state != nullptr);
+            CHECK(state->asString() == "failed");
+        }
+        CHECK(found);
+    }
+
+    // --- Ingest: single-job detail visibility from the non-owning node ---
+    {
+        const auto response = get(s2.acquisition_api(), "/api/v1/ingest/jobs/" + ingest_id);
+        REQUIRE(response.status == 200);
+        const auto parsed = body_json(response);
+        const auto* node_id = parsed.find("node_id");
+        REQUIRE(node_id != nullptr);
+        CHECK(node_id->asString() == node1_id);
+        const auto* catalogue = parsed.find("catalogue");
+        REQUIRE(catalogue != nullptr);
+        CHECK(catalogue->isObject());
+    }
+
+    // --- Ingest: resume from the non-owning node actually lands on node 1 ---
+    {
+        const auto response = post(s2.acquisition_api(), "/api/v1/ingest/jobs/" + ingest_id + "/resume");
+        REQUIRE(response.status == 200);
+        const auto parsed = body_json(response);
+        const auto* node_id = parsed.find("node_id");
+        REQUIRE(node_id != nullptr);
+        CHECK(node_id->asString() == node1_id);
+        const auto* state = parsed.find("state");
+        REQUIRE(state != nullptr);
+        // This response is node 1's own synchronous answer, round-tripped
+        // through the RPC survey -- it is the proof the action landed there,
+        // not the UI's local guess. A separate re-fetch immediately after
+        // would race the worker thread picking the now-queued job back up
+        // and re-failing it against the same non-media dummy file, so it is
+        // deliberately not asserted here.
+        CHECK(state->asString() == "queued");
+    }
+
+    // --- Torrent: list visibility from the non-owning node ---
+    {
+        const auto response = get(s2.acquisition_api(), "/api/v1/torrents/jobs");
+        REQUIRE(response.status == 200);
+        const auto parsed = body_json(response);
+        const auto* jobs = parsed.find("jobs");
+        REQUIRE(jobs != nullptr);
+        bool found = false;
+        for (const auto& job : jobs->asArray()) {
+            const auto* id = job.find("id");
+            if (!id || id->asString() != torrent_id) continue;
+            found = true;
+            const auto* node_id = job.find("node_id");
+            REQUIRE(node_id != nullptr);
+            CHECK(node_id->asString() == node1_id);
+            const auto* state = job.find("state");
+            REQUIRE(state != nullptr);
+            CHECK(state->asString() == "paused");
+        }
+        CHECK(found);
+    }
+
+    // --- Torrent: resume from the non-owning node actually lands on node 1 ---
+    {
+        const auto response =
+            post(s2.acquisition_api(), "/api/v1/torrents/jobs/" + torrent_id + "/resume");
+        REQUIRE(response.status == 200);
+        const auto parsed = body_json(response);
+        const auto* node_id = parsed.find("node_id");
+        REQUIRE(node_id != nullptr);
+        CHECK(node_id->asString() == node1_id);
+        const auto* state = parsed.find("state");
+        REQUIRE(state != nullptr);
+        CHECK(state->asString() == "queued");
+    }
+
+    // --- A job that exists nowhere still 404s cluster-wide, not just locally ---
+    {
+        const auto response = get(s2.acquisition_api(), "/api/v1/ingest/jobs/does-not-exist");
+        CHECK(response.status == 404);
+    }
+
+    // --- Partial-peer-failure tolerance: node 1 alone still answers with its
+    // own jobs once node 2 is unreachable, instead of erroring the request ---
+    s2.stop();
+    {
+        const auto response = get(s1.acquisition_api(), "/api/v1/ingest/jobs");
+        REQUIRE(response.status == 200);
+        const auto parsed = body_json(response);
+        const auto* jobs = parsed.find("jobs");
+        REQUIRE(jobs != nullptr);
+        bool found = false;
+        for (const auto& job : jobs->asArray()) {
+            const auto* id = job.find("id");
+            if (id && id->asString() == ingest_id) found = true;
+        }
+        CHECK(found);
+    }
+    s1.stop();
+}
+
 } // namespace

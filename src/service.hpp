@@ -138,6 +138,18 @@ class Service {
         wait_services_ready();
         return *hydration_;
     }
+    IngestManager& ingest() {
+        wait_services_ready();
+        return *ingest_;
+    }
+    TorrentManager& torrents() {
+        wait_services_ready();
+        return *torrents_;
+    }
+    AcquisitionApi& acquisition_api() {
+        wait_services_ready();
+        return *acquisition_api_;
+    }
     uint64_t maintenance_wakeups() const noexcept {
         return maintenance_wakeups_.load(std::memory_order_acquire);
     }
