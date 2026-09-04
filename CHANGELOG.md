@@ -1,5 +1,26 @@
 # Current release
 
+## 0.23.5 — Cluster-wide ingest/torrent job visibility and control (development)
+
+- `GET /api/v1/ingest/jobs` and `GET /api/v1/torrents/jobs` (list and
+  single-job) now answer with every job in the cluster, not just the jobs
+  owned by the node the client happened to talk to. Each job is tagged with
+  its owning `node_id`. Implemented as an on-demand RPC survey of active
+  peers (new `get_ingest_jobs`/`get_torrent_jobs` wire messages), not
+  replication — a peer that can't be reached is skipped, not fatal to the
+  request.
+- `POST .../jobs/{id}/{pause,resume,retry,cancel,clear}` now works
+  regardless of which node's API receives the request: if the job isn't
+  owned locally, the action is forwarded to the owning node via a new
+  `ingest_job_action`/`torrent_job_action` RPC and the result (including the
+  updated job, still tagged with its `node_id`) is returned as if it had
+  been handled locally. The existing 404-vs-409 semantics (job not found vs.
+  job can't perform that action in its current state) are preserved
+  cluster-wide.
+- No client-visible API surface changed beyond the new `node_id` field on
+  each job — existing UIs keep working unmodified, just with complete
+  visibility instead of a partial, node-dependent view.
+
 ## 0.23.4 — Signed artwork capability URLs (development)
 
 - Embed a signed, short-lived capability URL (`?exp=...&sig=...`, HMAC'd with

@@ -583,6 +583,14 @@ const char* message_type_name(MessageType type) noexcept {
         return "accept_metadata_commit";
     case MessageType::retain_objects:
         return "retain_objects";
+    case MessageType::get_ingest_jobs:
+        return "get_ingest_jobs";
+    case MessageType::ingest_job_action:
+        return "ingest_job_action";
+    case MessageType::get_torrent_jobs:
+        return "get_torrent_jobs";
+    case MessageType::torrent_job_action:
+        return "torrent_job_action";
     case MessageType::ok:
         return "ok";
     case MessageType::error:
@@ -609,6 +617,14 @@ const char* message_type_name(MessageType type) noexcept {
         return "metadata_history_entry_reply";
     case MessageType::metadata_heads_reply:
         return "metadata_heads_reply";
+    case MessageType::ingest_jobs_reply:
+        return "ingest_jobs_reply";
+    case MessageType::ingest_job_action_reply:
+        return "ingest_job_action_reply";
+    case MessageType::torrent_jobs_reply:
+        return "torrent_jobs_reply";
+    case MessageType::torrent_job_action_reply:
+        return "torrent_job_action_reply";
     }
     return "unknown";
 }

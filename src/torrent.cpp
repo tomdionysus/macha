@@ -283,6 +283,46 @@ std::optional<TorrentJobState> parse_torrent_job_state(std::string_view state) {
     return {};
 }
 
+Json torrent_job_api_json(const TorrentJob& job) {
+    Json::Object out;
+    out["id"] = job.id;
+    out["name"] = job.name;
+    out["info_hash"] = job.info_hash.empty() ? Json(nullptr) : Json(job.info_hash);
+    out["state"] = torrent_job_state_name(job.state);
+    out["bytes_total"] = job.bytes_total;
+    out["bytes_completed"] = job.bytes_completed;
+    out["download_rate"] = job.download_rate;
+    out["upload_rate"] = job.upload_rate;
+    out["uploaded_total"] = job.uploaded_total;
+    out["peers"] = static_cast<uint64_t>(job.peers);
+    out["seeds"] = static_cast<uint64_t>(job.seeds);
+    Json::Object catalogue;
+    catalogue["total"] = static_cast<uint64_t>(job.catalogue_total);
+    catalogue["pending"] = static_cast<uint64_t>(job.catalogue_pending);
+    catalogue["catalogued"] = static_cast<uint64_t>(job.catalogue_catalogued);
+    catalogue["no_match"] = static_cast<uint64_t>(job.catalogue_no_match);
+    catalogue["failed"] = static_cast<uint64_t>(job.catalogue_failed);
+    if (job.catalogue_pending)
+        catalogue["state"] = "processing";
+    else if (job.catalogue_total && (job.catalogue_failed || job.catalogue_no_match))
+        catalogue["state"] = "completed_with_issues";
+    else if (job.catalogue_total)
+        catalogue["state"] = "completed";
+    else
+        catalogue["state"] = "waiting";
+    out["catalogue"] = std::move(catalogue);
+    out["eta_seconds"] = optional_u64(job.eta_seconds);
+    out["progress"] = job.bytes_total
+                          ? Json(std::min(1.0, static_cast<double>(job.bytes_completed) /
+                                                   static_cast<double>(job.bytes_total)))
+                          : Json(nullptr);
+    out["ingest_job_id"] = job.ingest_job_id ? Json(*job.ingest_job_id) : Json(nullptr);
+    out["created_unix_ms"] = job.created_unix_ms;
+    out["updated_unix_ms"] = job.updated_unix_ms;
+    out["error"] = job.error.empty() ? Json(nullptr) : Json(job.error);
+    return Json(std::move(out));
+}
+
 std::optional<std::string> http_origin(std::string_view value) {
     const auto scheme_end = value.find("://");
     if (scheme_end == std::string_view::npos) return {};
@@ -488,9 +528,13 @@ struct TorrentManager::Impl {
 struct TorrentManager::Impl {};
 #endif
 
-TorrentManager::TorrentManager(IngestManager& ingest, TorrentConfig config,
+TorrentManager::TorrentManager(NodeRuntime& node, IngestManager& ingest, TorrentConfig config,
                                const std::filesystem::path& state_path)
-    : ingest_(ingest), config_(std::move(config)), state_file_(state_path / "torrent" / "jobs.json") {
+    : node_(node), ingest_(ingest), config_(std::move(config)),
+      state_file_(state_path / "torrent" / "jobs.json") {
+    node_.set_torrent_bridge(
+        [this](std::span<const uint8_t> payload) { return handle_jobs_query(payload); },
+        [this](std::span<const uint8_t> payload) { return handle_job_action(payload); });
     if (!config_.enabled) return;
     std::filesystem::create_directories(state_file_.parent_path());
 #ifdef MACHA_HAVE_LIBTORRENT
@@ -500,6 +544,202 @@ TorrentManager::TorrentManager(IngestManager& ingest, TorrentConfig config,
 }
 
 TorrentManager::~TorrentManager() { stop(); }
+
+namespace {
+// Wire shape for the cluster RPC survey: the persistence shape
+// (torrent_job_json/parse_torrent_job) plus the transient fields it
+// deliberately never persists (download_rate, upload_rate, peers, seeds,
+// eta_seconds -- resetting those across a local restart is intentional; a
+// remote peer answering a live survey should still report its own current
+// values).
+Json torrent_job_wire_json(const TorrentJob& job) {
+    auto out = torrent_job_json(job);
+    out["download_rate"] = job.download_rate;
+    out["upload_rate"] = job.upload_rate;
+    out["peers"] = static_cast<uint64_t>(job.peers);
+    out["seeds"] = static_cast<uint64_t>(job.seeds);
+    out["eta_seconds"] = optional_u64(job.eta_seconds);
+    return out;
+}
+
+TorrentJob parse_torrent_job_wire(const Json& value) {
+    auto job = parse_torrent_job(value);
+    if (const auto* v = value.find("download_rate")) job.download_rate = v->asUInt64();
+    if (const auto* v = value.find("upload_rate")) job.upload_rate = v->asUInt64();
+    if (const auto* v = value.find("peers")) job.peers = static_cast<unsigned>(v->asUInt64());
+    if (const auto* v = value.find("seeds")) job.seeds = static_cast<unsigned>(v->asUInt64());
+    if (const auto* v = value.find("eta_seconds"); v && !v->isNull()) job.eta_seconds = v->asUInt64();
+    return job;
+}
+} // namespace
+
+Bytes TorrentManager::handle_jobs_query(std::span<const uint8_t> request_payload) const {
+    std::string job_id;
+    if (!request_payload.empty()) {
+        try {
+            const std::string text(reinterpret_cast<const char*>(request_payload.data()),
+                                   request_payload.size());
+            auto request = Json::parse(text);
+            if (const auto* id = request.find("job_id"); id && id->isString())
+                job_id = id->asString();
+        } catch (const std::exception&) {
+            // Malformed survey request: answer as "list all" rather than fail
+            // the whole peer.
+        }
+    }
+    Json::Array out_jobs;
+    if (job_id.empty()) {
+        for (const auto& job : jobs()) out_jobs.push_back(torrent_job_wire_json(job));
+    } else if (auto found = job(job_id)) {
+        out_jobs.push_back(torrent_job_wire_json(*found));
+    }
+    Json::Object out;
+    out["jobs"] = std::move(out_jobs);
+    const auto text = Json(std::move(out)).dump();
+    return Bytes(text.begin(), text.end());
+}
+
+Bytes TorrentManager::handle_job_action(std::span<const uint8_t> request_payload) {
+    std::string job_id, action;
+    try {
+        const std::string text(reinterpret_cast<const char*>(request_payload.data()),
+                               request_payload.size());
+        auto request = Json::parse(text);
+        if (const auto* id = request.find("job_id"); id && id->isString()) job_id = id->asString();
+        if (const auto* act = request.find("action"); act && act->isString())
+            action = act->asString();
+    } catch (const std::exception&) {
+    }
+    Json::Object out;
+    const bool exists = job(job_id).has_value();
+    out["exists"] = exists;
+    bool changed = false;
+    if (exists) {
+        if (action == "pause") changed = pause(job_id);
+        else if (action == "resume") changed = resume(job_id);
+        else if (action == "retry") changed = retry(job_id);
+        else if (action == "cancel") changed = cancel(job_id);
+        else if (action == "clear") changed = clear(job_id);
+    }
+    out["changed"] = changed;
+    if (auto updated = job(job_id))
+        out["job"] = torrent_job_wire_json(*updated);
+    else
+        out["job"] = Json(nullptr);
+    const auto text = Json(std::move(out)).dump();
+    return Bytes(text.begin(), text.end());
+}
+
+std::vector<ClusterTorrentJob> TorrentManager::jobs_cluster_wide() const {
+    std::vector<ClusterTorrentJob> out;
+    for (auto& job : jobs()) out.push_back({node_.node_id(), std::move(job)});
+    for (const auto& peer : node_.membership().active()) {
+        if (peer.id == node_.node_id()) continue;
+        try {
+            auto reply = node_.call(peer, MessageType::get_torrent_jobs, {}, FrameType::control);
+            if (reply.message.type != MessageType::torrent_jobs_reply) continue;
+            const std::string text(reinterpret_cast<const char*>(reply.message.payload.data()),
+                                   reply.message.payload.size());
+            auto parsed = Json::parse(text);
+            const auto* peer_jobs = parsed.find("jobs");
+            if (!peer_jobs) continue;
+            for (const auto& value : peer_jobs->asArray())
+                out.push_back({peer.id, parse_torrent_job_wire(value)});
+        } catch (const std::exception& error) {
+            Log::debug("torrent job survey " + peer.host + ": " + error.what());
+        }
+    }
+    return out;
+}
+
+std::optional<ClusterTorrentJob> TorrentManager::job_cluster_wide(std::string_view id) const {
+    if (auto local = job(id))
+        return ClusterTorrentJob{node_.node_id(), std::move(*local)};
+    Json::Object request;
+    request["job_id"] = std::string(id);
+    const auto request_text = Json(std::move(request)).dump();
+    const Bytes request_bytes(request_text.begin(), request_text.end());
+    for (const auto& peer : node_.membership().active()) {
+        if (peer.id == node_.node_id()) continue;
+        try {
+            auto reply = node_.call(peer, MessageType::get_torrent_jobs, request_bytes,
+                                    FrameType::control);
+            if (reply.message.type != MessageType::torrent_jobs_reply) continue;
+            const std::string text(reinterpret_cast<const char*>(reply.message.payload.data()),
+                                   reply.message.payload.size());
+            auto parsed = Json::parse(text);
+            const auto* peer_jobs = parsed.find("jobs");
+            if (!peer_jobs || peer_jobs->asArray().empty()) continue;
+            return ClusterTorrentJob{peer.id, parse_torrent_job_wire(peer_jobs->asArray().front())};
+        } catch (const std::exception& error) {
+            Log::debug("torrent job survey " + peer.host + ": " + error.what());
+        }
+    }
+    return std::nullopt;
+}
+
+TorrentActionResult TorrentManager::dispatch_action_cluster_wide(std::string_view id,
+                                                                 std::string_view action) {
+    TorrentActionResult result;
+    if (auto local = job(id)) {
+        result.exists = true;
+        if (action == "pause") result.changed = pause(id);
+        else if (action == "resume") result.changed = resume(id);
+        else if (action == "retry") result.changed = retry(id);
+        else if (action == "cancel") result.changed = cancel(id);
+        else if (action == "clear") result.changed = clear(id);
+        if (auto updated = job(id))
+            result.updated = ClusterTorrentJob{node_.node_id(), std::move(*updated)};
+        return result;
+    }
+    Json::Object request;
+    request["job_id"] = std::string(id);
+    request["action"] = std::string(action);
+    const auto request_text = Json(std::move(request)).dump();
+    const Bytes request_bytes(request_text.begin(), request_text.end());
+    for (const auto& peer : node_.membership().active()) {
+        if (peer.id == node_.node_id()) continue;
+        try {
+            auto reply = node_.call(peer, MessageType::torrent_job_action, request_bytes,
+                                    FrameType::control);
+            if (reply.message.type != MessageType::torrent_job_action_reply) continue;
+            const std::string text(reinterpret_cast<const char*>(reply.message.payload.data()),
+                                   reply.message.payload.size());
+            auto parsed = Json::parse(text);
+            const auto* exists = parsed.find("exists");
+            if (!exists || !exists->isBool() || !exists->asBool()) continue;
+            result.exists = true;
+            if (const auto* changed = parsed.find("changed"); changed && changed->isBool())
+                result.changed = changed->asBool();
+            if (const auto* updated = parsed.find("job"); updated && !updated->isNull())
+                result.updated = ClusterTorrentJob{peer.id, parse_torrent_job_wire(*updated)};
+            return result;
+        } catch (const std::exception& error) {
+            Log::debug("torrent job action survey " + peer.host + ": " + error.what());
+        }
+    }
+    return result;
+}
+
+TorrentActionResult TorrentManager::pause_cluster_wide(std::string_view id) {
+    return dispatch_action_cluster_wide(id, "pause");
+}
+
+TorrentActionResult TorrentManager::resume_cluster_wide(std::string_view id) {
+    return dispatch_action_cluster_wide(id, "resume");
+}
+
+TorrentActionResult TorrentManager::retry_cluster_wide(std::string_view id) {
+    return dispatch_action_cluster_wide(id, "retry");
+}
+
+TorrentActionResult TorrentManager::cancel_cluster_wide(std::string_view id) {
+    return dispatch_action_cluster_wide(id, "cancel");
+}
+
+TorrentActionResult TorrentManager::clear_cluster_wide(std::string_view id) {
+    return dispatch_action_cluster_wide(id, "clear");
+}
 
 bool TorrentManager::build_available() noexcept {
 #ifdef MACHA_HAVE_LIBTORRENT
