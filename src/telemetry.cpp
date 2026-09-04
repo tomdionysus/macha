@@ -72,6 +72,8 @@ void encode(Writer& writer, const NodeTelemetry& value) {
     writer.u64(value.rpc_connections_reused);
     writer.u64(value.rpc_connections_canonical);
     writer.u8(static_cast<uint8_t>(value.phase));
+    writer.string(value.api_host);
+    writer.u16(value.api_port);
 }
 
 NodeTelemetry decode(Reader& reader) {
@@ -107,6 +109,13 @@ NodeTelemetry decode(Reader& reader) {
         if (phase > static_cast<uint8_t>(NodePhase::ready))
             throw DecodeError("invalid telemetry node phase");
         value.phase = static_cast<NodePhase>(phase);
+    }
+    // Optional trailing fields: a record encoded before api_host/api_port
+    // existed simply ends here, and the sender is treated as not (yet)
+    // reporting an advertised API address (NodeTelemetry's defaults).
+    if (reader.remaining()) {
+        value.api_host = reader.string(512);
+        value.api_port = reader.u16();
     }
     if (!value.sequence)
         throw DecodeError("telemetry sequence must be nonzero");
@@ -200,7 +209,7 @@ NodeTelemetry TelemetryStore::refresh_local(
     const NodeInfo& info, std::string version, uint64_t cache_capacity, uint64_t cache_used,
     uint32_t storage_backends_online, uint32_t peers_known, uint32_t peers_active,
     uint64_t rpc_connections_created, uint64_t rpc_connections_reused,
-    uint64_t rpc_connections_canonical, NodePhase phase) {
+    uint64_t rpc_connections_canonical, NodePhase phase, std::string api_host, uint16_t api_port) {
     const auto now = Clock::now();
     const auto cpu_now = std::clock();
     const auto wall_seconds = std::chrono::duration<double>(now - previous_cpu_wall_).count();
@@ -236,6 +245,8 @@ NodeTelemetry TelemetryStore::refresh_local(
     telemetry.rpc_connections_reused = rpc_connections_reused;
     telemetry.rpc_connections_canonical = rpc_connections_canonical;
     telemetry.phase = phase;
+    telemetry.api_host = std::move(api_host);
+    telemetry.api_port = api_port;
     observe(telemetry, true);
     return telemetry;
 }

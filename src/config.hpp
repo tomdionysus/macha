@@ -198,6 +198,15 @@ struct CatalogueApiConfig {
     bool enabled{};
     std::string listen{"127.0.0.1"};
     uint16_t port{7438};
+    // Optional override for how this node's API is advertised to cluster
+    // peers (Status nodes[].api_host/api_port), distinct from listen/port
+    // above. Covers NAT/port-forwarding, where the bind address isn't what a
+    // peer should dial. Empty host defaults to this node's resolved RPC
+    // advertise address (network.advertise, or its own fallback) rather than
+    // `listen` above, since `listen` is conventionally a wildcard bind
+    // (0.0.0.0) and not itself dialable. Zero port defaults to `port` above.
+    std::string advertised_host;
+    uint16_t advertised_port{0};
     std::optional<std::filesystem::path> token_file;
     size_t max_request_bytes{8 * 1024 * 1024};
     size_t workers{16};

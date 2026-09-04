@@ -1,5 +1,56 @@
 # Current release
 
+## 0.23.8 — Bounded audio drift compensation for transcoded playback (development)
+
+- Transcoded audio's presentation clock (`StreamPipeline::audio_next_pts` in
+  `src/media_engine.cpp`) was a free-running sample counter, seeded from the
+  real source timestamp once at pipeline start and never re-anchored
+  afterward — unlike video, which re-derives its PTS from the real source
+  timestamp on every single frame. Any systematic mismatch between resampled
+  output sample count and real elapsed source duration (resampler rounding,
+  EAC3 frame timing, channel downmix) compounded without bound for the life
+  of the stream. Measured live against a real title (EAC3 5.1 -> AAC stereo):
+  ~0.4ms drift per second, extrapolating to hundreds of ms over a feature-length
+  film — matches user reports of audible desync a few minutes into playback.
+- Fix: `maintain_audio_drift_compensation()` periodically compares the
+  running produced-sample count against the expected count derived from the
+  current frame's real source PTS, and uses `swr_set_compensation()` to
+  gradually nudge the resample ratio back toward the source timeline (bounded
+  to roughly 1% speed adjustment per correction window) rather than either
+  leaving the drift unbounded or snapping to a corrected PTS (which would
+  produce an audible click).
+- Verified against the same real title: offset now oscillates within roughly
+  ±15ms across an 8-minute sample instead of growing monotonically, well
+  under the threshold where A/V desync becomes perceptible.
+- Known gap: no automated regression test exists yet for the real (non-stub)
+  transcode audio path — `macha-tests` links a stub media engine
+  (`src/media_metadata_stub.cpp`) for speed, and this fix is verified only by
+  live measurement against production content, not a deterministic CI case.
+  Building that harness is exactly the Phase 0 exit criterion already
+  described in `TODO/2026-09-03-playback-resilience-and-av-sync-plan.md`;
+  tracked there rather than duplicated here.
+
+## 0.23.7 — Per-node advertised API address fixes any-node Direct Play failover (development)
+
+- `GET /api/v1/status` now reports `api_host`/`api_port` on every entry in
+  `nodes[]`: where clients should reach that node's HTTP/catalogue API,
+  distinct from the existing `host`/`port`, which is the node's internal RPC
+  bind address and was never a reliable (or even necessarily correct-protocol)
+  address for REST calls. Any-node Direct Play failover was guessing peer
+  ports from the RPC bind address and landing on the wrong port; it now uses
+  this field instead.
+- New optional `catalogue.api.advertised_host` / `advertised_port` config
+  covers NAT/port-forwarding, mirroring the existing `network.advertise`
+  pattern for the RPC port. `advertised_host` defaults to this node's
+  resolved RPC advertise address (not the bound `listen`, which is
+  conventionally a wildcard bind and not itself dialable); `advertised_port`
+  defaults to the bound `port`. Distinct from the existing self-only
+  `connectivity.advertised` field, which covers this node's own
+  external/UPnP RPC-port connectivity, not peers' API addresses.
+- Carried over the existing gossip wire's trailing-optional-field pattern
+  (`NodeTelemetry`) so nodes mid-rollout on the previous version keep
+  interoperating; older peers simply don't report `api_host`/`api_port` yet.
+
 ## 0.23.6 — Safe distributed checkpoint and metadata-history compaction (development)
 
 - `MetadataReplica::compact_history_if_safe()` — an existing, tested local
