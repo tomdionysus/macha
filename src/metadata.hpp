@@ -196,6 +196,25 @@ struct MetadataAcceptance {
     auto operator<=>(const MetadataAcceptance&) const = default;
 };
 
+// Durable proof that every durably-known metadata participant has
+// acknowledged the same accepted-head hash as the new history ancestry
+// floor. `epoch` fingerprints the participant set the proposal was made
+// against (see MetadataManager) -- a membership change invalidates any
+// in-flight proposal by changing the epoch, never by trusting a smaller or
+// stale participant list. `participants` names exactly who this proof
+// covers. Reaching `Status::committed` is the *only* thing that may justify
+// calling MetadataReplica::compact_history_if_safe(); a proof that is
+// merely `acked`, or whose floor_hash does not match the replica's current
+// committed head, must never be used to justify anything.
+struct HistoryCheckpointProof {
+    enum class Status : uint8_t { acked = 1, committed = 2 };
+    Hash256 floor_hash{};
+    uint64_t floor_generation{};
+    Hash256 epoch{};
+    std::vector<NodeId> participants;
+    Status status{Status::acked};
+};
+
 struct MetadataHistoryEntry {
     enum class Body : uint8_t { full = 1, delta = 2 };
 
@@ -260,6 +279,8 @@ Bytes encode_metadata_acceptance(const MetadataAcceptance&);
 MetadataAcceptance decode_metadata_acceptance(std::span<const uint8_t>);
 Bytes encode_metadata_acceptance_set(const std::vector<MetadataAcceptance>&);
 std::vector<MetadataAcceptance> decode_metadata_acceptance_set(std::span<const uint8_t>);
+Bytes encode_history_checkpoint_proof(const HistoryCheckpointProof&);
+HistoryCheckpointProof decode_history_checkpoint_proof(std::span<const uint8_t>);
 Bytes encode_metadata_history_entry(const MetadataHistoryEntry&);
 MetadataHistoryEntry decode_metadata_history_entry(std::span<const uint8_t>);
 Bytes encode_metadata_delta(const MetadataDelta&);
@@ -344,6 +365,7 @@ class MetadataReplica {
     std::filesystem::path journal_p_;
     std::filesystem::path history_p_;
     std::filesystem::path heads_p_;
+    std::filesystem::path checkpoint_proof_p_;
     std::filesystem::path mutation_sequence_p_;
     std::filesystem::path recovery_p_;
     std::array<uint8_t, 32> key_;
@@ -360,6 +382,10 @@ class MetadataReplica {
     // ancestry and frame-location index needed to find them on demand.
     std::map<Hash256, HistoryIndexEntry> history_;
     std::map<Hash256, MetadataAcceptance> accepted_heads_;
+    // Only ever populated with a proof that has already validated against
+    // committed_ at load time (see load_checkpoint_proof()) -- nullopt means
+    // "no valid proof," never "assume the worst possible one."
+    std::optional<HistoryCheckpointProof> checkpoint_proof_;
     std::optional<MetadataHistoryEntry> pending_history_;
     bool pending_recovered_{};
     bool mutation_sequence_loaded_{};
@@ -395,6 +421,8 @@ class MetadataReplica {
     void load_history();
     void load_heads();
     void persist_heads_locked();
+    void load_checkpoint_proof();
+    void persist_checkpoint_proof_locked();
     void ensure_history_root(const MetadataRecord&);
     void migrate_legacy_head_locked();
     bool prune_accepted_heads_locked();
@@ -459,6 +487,27 @@ class MetadataReplica {
     // disk and startup RSS do not grow with lifetime mutation count.
     bool compact_history_if_safe(size_t record_threshold = 256,
                                  uint64_t byte_threshold = 64ULL * 1024 * 1024);
+
+    // The current durable checkpoint proof, whatever its status. A freshly
+    // constructed replica only ever loads one that already validated against
+    // its committed head at load time (status == committed AND floor_hash ==
+    // committed().hash -- see load_checkpoint_proof()); record_checkpoint_ack()
+    // can subsequently populate this with a merely-acked, not-yet-authoritative
+    // proposal. This accessor does not filter for authority: a caller that
+    // means to use the result to justify anything (e.g. the
+    // accepted_head_is_ancestor_locked() checkpoint-floor trust rule) must
+    // itself check status == committed AND floor_hash == committed().hash --
+    // never guess or fall back to a weaker check.
+    std::optional<HistoryCheckpointProof> checkpoint_proof() const;
+    // Durably record this replica's agreement to a proposal, before an RPC
+    // reply is sent. Always status == acked regardless of what the caller
+    // passes; supersedes any prior record for a different (floor_hash, epoch).
+    void record_checkpoint_ack(HistoryCheckpointProof proposal);
+    // Promote a matching acked record to committed. Returns false (no-op,
+    // nothing promoted) if there is no acked record for exactly this
+    // (floor_hash, epoch) -- e.g. it was never proposed here, or a different
+    // proposal superseded it.
+    bool record_checkpoint_commit(const Hash256& floor_hash, const Hash256& epoch);
 };
 std::string normalize_path(const std::string&);
 std::string parent_path(const std::string&);

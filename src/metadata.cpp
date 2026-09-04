@@ -23,7 +23,7 @@ constexpr std::array<uint8_t, 8> SM5{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'},
     SM12{'D', 'H', 'T', 'M', 'E', 'T', 'B', '2'}, SM13{'D', 'H', 'T', 'M', 'E', 'T', 'B', '3'},
     DM{'D', 'H', 'T', 'M', 'D', 'B', '0', '1'}, MJ{'D', 'H', 'T', 'M', 'J', 'N', 'L', '1'},
     MH{'D', 'H', 'T', 'M', 'H', 'S', 'T', '1'}, MA{'D', 'H', 'T', 'M', 'A', 'C', 'C', '1'},
-    MS{'D', 'H', 'T', 'M', 'S', 'E', 'Q', '1'};
+    MS{'D', 'H', 'T', 'M', 'S', 'E', 'Q', '1'}, CP{'D', 'H', 'T', 'M', 'C', 'K', 'P', '1'};
 constexpr uint8_t JOURNAL_PREPARE_FULL = 1, JOURNAL_PREPARE_DELTA = 2, JOURNAL_SEED_FULL = 3,
                   JOURNAL_COMMIT = 4;
 
@@ -1174,6 +1174,48 @@ MetadataAcceptance decode_metadata_acceptance(std::span<const uint8_t> data) {
     return value;
 }
 
+Bytes encode_history_checkpoint_proof(const HistoryCheckpointProof& input) {
+    if (input.floor_hash == Hash256{})
+        throw std::runtime_error("bad history checkpoint proof floor hash");
+    if (input.participants.size() > 1000000)
+        throw std::runtime_error("too many history checkpoint proof participants");
+    Writer writer;
+    writer.fixed(input.floor_hash.bytes);
+    writer.u64(input.floor_generation);
+    writer.fixed(input.epoch.bytes);
+    writer.u8(static_cast<uint8_t>(input.status));
+    writer.u32(static_cast<uint32_t>(input.participants.size()));
+    for (const auto& participant : input.participants)
+        writer.fixed(participant.bytes);
+    return writer.take();
+}
+
+HistoryCheckpointProof decode_history_checkpoint_proof(std::span<const uint8_t> data) {
+    Reader reader(data);
+    HistoryCheckpointProof value;
+    value.floor_hash.bytes = reader.fixed<32>();
+    value.floor_generation = reader.u64();
+    value.epoch.bytes = reader.fixed<32>();
+    const auto raw_status = reader.u8();
+    if (raw_status != static_cast<uint8_t>(HistoryCheckpointProof::Status::acked) &&
+        raw_status != static_cast<uint8_t>(HistoryCheckpointProof::Status::committed))
+        throw DecodeError("bad history checkpoint proof status");
+    value.status = static_cast<HistoryCheckpointProof::Status>(raw_status);
+    const auto count = reader.u32();
+    if (count > 1000000)
+        throw DecodeError("too many history checkpoint proof participants");
+    value.participants.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        NodeId participant;
+        participant.bytes = reader.fixed<16>();
+        value.participants.push_back(participant);
+    }
+    reader.finish();
+    if (value.floor_hash == Hash256{})
+        throw DecodeError("bad history checkpoint proof floor hash");
+    return value;
+}
+
 Bytes encode_metadata_acceptance_set(const std::vector<MetadataAcceptance>& values) {
     if (values.size() > 1000000)
         throw std::runtime_error("too many metadata accepted heads");
@@ -1649,6 +1691,7 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
     : p_(r / "metadata" / "current.meta"), committed_p_(r / "metadata" / "committed.meta"),
       checkpoint_p_(r / "metadata" / "checkpoint.meta"), journal_p_(r / "metadata" / "journal.log"),
       history_p_(r / "metadata" / "history.log"), heads_p_(r / "metadata" / "heads.meta"),
+      checkpoint_proof_p_(r / "metadata" / "checkpoint-proof.meta"),
       mutation_sequence_p_(r / "metadata" / "mutation-sequence.meta"),
       recovery_p_(r / "metadata" / "recovery.required"), key_(k),
       accept_pristine_genesis_authority_(accept_pristine_genesis_authority),
@@ -1682,6 +1725,7 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
                 pending_recovered_ = cur_.hash != committed_.hash;
                 ensure_history_root(committed_);
                 load_heads();
+                load_checkpoint_proof();
                 // A checkpoint loaded while recovery.required exists may have
                 // originated from the persistent metadata cache. Never manufacture
                 // legacy acceptance for it. Only heads.meta carried from a later
@@ -1714,6 +1758,7 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
             pending_recovered_ = cur_.hash != committed_.hash;
             ensure_history_root(committed_);
             load_heads();
+            load_checkpoint_proof();
             migrate_legacy_head_locked();
             refresh_materialized_head_locked();
             return;
@@ -1738,6 +1783,7 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
             load_history();
             ensure_history_root(committed_);
             load_heads();
+            load_checkpoint_proof();
             migrate_legacy_head_locked();
             refresh_materialized_head_locked();
             return;
@@ -1764,6 +1810,7 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
         load_history();
         ensure_history_root(committed_);
         load_heads();
+        load_checkpoint_proof();
         migrate_legacy_head_locked();
         refresh_materialized_head_locked();
 
@@ -1784,7 +1831,8 @@ void MetadataReplica::recover_from_seed(const MetadataRecord& seed, const std::s
     durable_replace_file(recovery_p_, reason);
 
     std::vector<std::filesystem::path> quarantined;
-    for (const auto& path : {checkpoint_p_, journal_p_, history_p_, heads_p_, p_, committed_p_}) {
+    for (const auto& path :
+         {checkpoint_p_, journal_p_, history_p_, heads_p_, checkpoint_proof_p_, p_, committed_p_}) {
         if (auto moved = quarantine_metadata_file(path, stamp))
             quarantined.push_back(*moved);
     }
@@ -1795,6 +1843,7 @@ void MetadataReplica::recover_from_seed(const MetadataRecord& seed, const std::s
     load_history();
     ensure_history_root(seed);
     load_heads();
+    load_checkpoint_proof();
     // The cache seed is deliberately *not* accepted. It is useful material for
     // read-only diagnosis/reconstruction, but cannot stand in for the durable
     // acceptance evidence which was lost with the primary metadata state.
@@ -2445,6 +2494,80 @@ void MetadataReplica::persist_heads_locked() {
     }
 }
 
+void MetadataReplica::load_checkpoint_proof() {
+    checkpoint_proof_.reset();
+    if (!std::filesystem::exists(checkpoint_proof_p_))
+        return;
+    try {
+        std::ifstream stream(checkpoint_proof_p_, std::ios::binary);
+        if (!stream)
+            throw std::runtime_error("cannot open");
+        Bytes bytes(std::istreambuf_iterator<char>(stream), {});
+        Reader reader(bytes);
+        auto magic = reader.raw(8);
+        if (!std::equal(magic.begin(), magic.end(), CP.begin()))
+            throw std::runtime_error("bad metadata checkpoint proof file header");
+        auto nonce = reader.fixed<12>();
+        auto tag = reader.fixed<16>();
+        auto ciphertext = reader.bytes();
+        reader.finish();
+        auto proof =
+            decode_history_checkpoint_proof(aes_gcm_open(key_, nonce, tag, ciphertext, CP));
+        // A proof is only ever trusted once it validates against the current
+        // committed head -- committed_ is already loaded by this point in
+        // construction. A stale/mismatched/merely-acked proof is simply not
+        // kept; it must never be used to justify anything (see the class
+        // comment on HistoryCheckpointProof).
+        if (proof.status == HistoryCheckpointProof::Status::committed &&
+            proof.floor_hash == committed_.hash)
+            checkpoint_proof_ = std::move(proof);
+    } catch (const std::exception& error) {
+        // A corrupt or unreadable proof file is exactly equivalent to no
+        // proof at all -- never fail startup over it, and never guess.
+        Log::warn("metadata checkpoint proof file " + checkpoint_proof_p_.string() +
+                  " ignored: " + std::string(error.what()));
+    }
+}
+
+void MetadataReplica::persist_checkpoint_proof_locked() {
+    if (!checkpoint_proof_)
+        return;
+    auto plaintext = encode_history_checkpoint_proof(*checkpoint_proof_);
+    auto sealed = aes_gcm_seal(key_, plaintext, CP);
+    Writer writer;
+    writer.raw(CP);
+    writer.fixed(sealed.nonce);
+    writer.fixed(sealed.tag);
+    writer.bytes(sealed.ciphertext);
+    writefile(checkpoint_proof_p_, writer.data());
+}
+
+std::optional<HistoryCheckpointProof> MetadataReplica::checkpoint_proof() const {
+    std::lock_guard lock(m_);
+    return checkpoint_proof_;
+}
+
+void MetadataReplica::record_checkpoint_ack(HistoryCheckpointProof proposal) {
+    std::lock_guard durable_lock(durable_mutation_m_);
+    proposal.status = HistoryCheckpointProof::Status::acked;
+    std::lock_guard lock(m_);
+    // A different (floor_hash, epoch) supersedes whatever was recorded
+    // before -- only ever one proposal in flight is tracked at a time.
+    checkpoint_proof_ = std::move(proposal);
+    persist_checkpoint_proof_locked();
+}
+
+bool MetadataReplica::record_checkpoint_commit(const Hash256& floor_hash, const Hash256& epoch) {
+    std::lock_guard durable_lock(durable_mutation_m_);
+    std::lock_guard lock(m_);
+    if (!checkpoint_proof_ || checkpoint_proof_->floor_hash != floor_hash ||
+        checkpoint_proof_->epoch != epoch)
+        return false;
+    checkpoint_proof_->status = HistoryCheckpointProof::Status::committed;
+    persist_checkpoint_proof_locked();
+    return true;
+}
+
 bool MetadataReplica::prune_accepted_heads_locked() {
     bool changed = false;
     for (auto it = accepted_heads_.begin(); it != accepted_heads_.end();) {
@@ -2479,12 +2602,33 @@ bool MetadataReplica::accepted_head_is_ancestor_locked(const Hash256& ancestor,
     // post-genesis record. This lets a pristine replica adopt an established
     // cluster head without advertising genesis as a rootless sibling, and lets
     // established replicas ignore a late genesis certificate from a joiner.
-    // No other rootless head receives this treatment.
     const auto genesis = genesis_metadata();
-    if (ancestor != genesis.hash)
-        return false;
-    auto materialized = materialized_locked(descendant);
-    return materialized && materialized->record.generation > genesis.generation;
+    if (ancestor == genesis.hash) {
+        auto materialized = materialized_locked(descendant);
+        return materialized && materialized->record.generation > genesis.generation;
+    }
+
+    // A history-checkpoint proof this replica itself durably committed is
+    // exactly the same shape of fact as genesis: at the moment it was
+    // recorded, every durably-known cluster participant -- this replica
+    // included -- had proven `ancestor` was the cluster's sole accepted head
+    // (see HistoryCheckpointProof, MetadataManager::attempt_history_checkpoint).
+    // A node that goes offline right after compacting to that floor, while
+    // its peers later compact further still, can no longer physically prove
+    // the edge from its own floor to whatever the cluster's current head has
+    // become -- the connecting entries are gone everywhere. Trust its own
+    // committed floor as a universal ancestor of anything that now
+    // materializes at a later generation, exactly as genesis is trusted.
+    // Deliberately narrower than "any rootless/previous_known=false record":
+    // an ordinary imported full record that merely lacks a cached predecessor
+    // (import_history()) or a legacy migration root (ensure_history_root())
+    // carries no such cluster-wide proof and must never be trusted this way.
+    if (checkpoint_proof_ && checkpoint_proof_->status == HistoryCheckpointProof::Status::committed &&
+        checkpoint_proof_->floor_hash == ancestor) {
+        auto materialized = materialized_locked(descendant);
+        return materialized && materialized->record.generation > checkpoint_proof_->floor_generation;
+    }
+    return false;
 }
 
 void MetadataReplica::migrate_legacy_head_locked() {

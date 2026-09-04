@@ -591,6 +591,10 @@ const char* message_type_name(MessageType type) noexcept {
         return "get_torrent_jobs";
     case MessageType::torrent_job_action:
         return "torrent_job_action";
+    case MessageType::propose_history_floor:
+        return "propose_history_floor";
+    case MessageType::commit_history_floor:
+        return "commit_history_floor";
     case MessageType::ok:
         return "ok";
     case MessageType::error:

@@ -138,10 +138,20 @@ class MetadataManager {
                                    std::span<const uint8_t> delta, FrameType);
     std::vector<std::pair<NodeInfo, MetadataAcceptance>> discover_accepted_heads(
         const std::vector<NodeInfo>&, FrameType);
+    // Full-roster, abort-on-any-miss sibling of discover_accepted_heads(). Used
+    // only by attempt_history_checkpoint(): a compaction proposal must never
+    // proceed against an incomplete or uncertain view of the cluster. Returns
+    // nullopt (not a partial result) the moment any participant is missing,
+    // errors, or does not recognise the request.
+    std::optional<std::vector<std::pair<NodeInfo, MetadataAcceptance>>>
+    discover_accepted_heads_required(const std::vector<NodeInfo>&, FrameType);
     bool replicate_accepted_head(const NodeInfo&, const MetadataRecord&,
                                  const MetadataAcceptance&, FrameType);
     void ensure_accepted_head_durable(const std::vector<NodeInfo>&, const MetadataRecord&,
                                       size_t, FrameType);
+    bool propose_history_floor_on(const NodeInfo&, const HistoryCheckpointProof&, FrameType);
+    bool commit_history_floor_on(const NodeInfo&, const Hash256& floor_hash, const Hash256& epoch,
+                                 FrameType);
 
     MetadataRecord mutate_impl(
         const std::function<void(MetadataSnapshot&, MetadataDelta*)>&, bool exact_delta,
@@ -183,5 +193,17 @@ class MetadataManager {
     // this view; ordinary reads must use snapshot_view()/available_snapshot_view().
     std::optional<MetadataSnapshotView> retention_release_view() const;
     void repair_once();
+    // One propose/ack/commit round toward safely re-rooting local history.
+    // Gated internally on local size thresholds, a single local accepted
+    // head, and every durably-known participant being currently, directly
+    // reachable (mirrors Membership::all_known_reachable()'s existing use as
+    // the destructive-GC fence). A no-op most of the time: it returns
+    // immediately unless compaction is actually due. Driven by the same
+    // maintenance cycle as repair_once(). Thresholds default to
+    // compact_history_if_safe()'s own defaults and exist as parameters for
+    // the same reason that method's do: so tests can force an otherwise
+    // rare, size-gated round deterministically.
+    void attempt_history_checkpoint(size_t record_threshold = 256,
+                                    uint64_t byte_threshold = 64ULL * 1024 * 1024);
 };
 } // namespace macha

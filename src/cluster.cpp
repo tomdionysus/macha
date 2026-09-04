@@ -692,6 +692,15 @@ std::vector<MetadataAcceptance> NodeRuntime::metadata_heads() const {
     return metadata_replica().accepted_head_certificates();
 }
 
+bool NodeRuntime::accept_history_checkpoint_proposal(const HistoryCheckpointProof& proposal) {
+    metadata_replica().record_checkpoint_ack(proposal);
+    return true;
+}
+
+bool NodeRuntime::commit_history_checkpoint(const Hash256& floor_hash, const Hash256& epoch) {
+    return metadata_replica().record_checkpoint_commit(floor_hash, epoch);
+}
+
 RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcMessage& request) {
     try {
         // Health/control must never depend on storage I/O. Capacity is refreshed
@@ -970,6 +979,18 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             auto acceptance = decode_metadata_acceptance(request.payload);
             Writer writer;
             writer.u8(accept_metadata_commit(acceptance));
+            return {MessageType::bool_reply, writer.take()};
+        }
+        case MessageType::propose_history_floor: {
+            auto proposal = decode_history_checkpoint_proof(request.payload);
+            Writer writer;
+            writer.u8(accept_history_checkpoint_proposal(proposal));
+            return {MessageType::bool_reply, writer.take()};
+        }
+        case MessageType::commit_history_floor: {
+            auto commit = decode_history_checkpoint_proof(request.payload);
+            Writer writer;
+            writer.u8(commit_history_checkpoint(commit.floor_hash, commit.epoch));
             return {MessageType::bool_reply, writer.take()};
         }
         case MessageType::seed_metadata:

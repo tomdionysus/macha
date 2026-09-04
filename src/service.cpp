@@ -1151,12 +1151,25 @@ void Service::loop(std::stop_token stop) {
             if (!busy)
                 (void)node_.retention_store().compact_if_needed(4096);
 
-            // Do not re-root metadata ancestry from a local stability snapshot.
-            // Exact accepted-head identity must be durably proven across the
-            // complete cluster before history can be discarded. Generation-only
-            // status allowed a returning accepted branch to outlive the common
-            // ancestor on every replica. History compaction remains disabled
-            // until that stronger protocol exists.
+            // Metadata ancestry is only ever re-rooted once a durable,
+            // cluster-wide proof establishes the exact same accepted-head
+            // hash as every durably-known participant's ancestry floor --
+            // see MetadataManager::attempt_history_checkpoint() and
+            // HistoryCheckpointProof. The prior generation-only status check
+            // allowed a returning accepted branch to outlive the common
+            // ancestor on every replica; this protocol replaces it. A no-op
+            // most ticks: it returns immediately unless local size
+            // thresholds are actually due, and aborts silently -- retrying
+            // next cycle -- unless every participant is currently reachable
+            // and already agrees on a single head.
+            if (!busy) {
+                try {
+                    metadata_->attempt_history_checkpoint();
+                } catch (const std::exception& error) {
+                    Log::debug("maintenance: history checkpoint attempt failed: " +
+                               std::string(error.what()));
+                }
+            }
 
             // Packed DATA tombstones are physical dead space. Compact one
             // victim pack per backend at a time; unlike the old whole-store
