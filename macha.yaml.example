@@ -351,6 +351,14 @@ catalogue:
     keep_alive_max_requests: 100
     keep_alive_idle_timeout_ms: 15000
 
+    # Lifetime of a signed artwork capability URL (?exp=...&sig=...) embedded
+    # in catalogue responses, letting a client load artwork via a plain
+    # <img src> without a bearer header. Artwork is content-addressed/immutable
+    # and lower-stakes than a playback session, so this deliberately outlives
+    # a typical browsing session; an expired URL is recovered by re-fetching
+    # the catalogue item, which the client already does on navigation.
+    artwork_capability_ttl_ms: 86400000
+
 # Persistent host-side ingest. Jobs may point at a regular file or recursively
 # import a directory (for example, a temporarily mounted USB disk). The source
 # path must be beneath one of source_roots unless it is an internal acquisition

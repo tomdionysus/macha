@@ -1,5 +1,27 @@
 # Current release
 
+## 0.23.4 — Signed artwork capability URLs (development)
+
+- Embed a signed, short-lived capability URL (`?exp=...&sig=...`, HMAC'd with
+  the cluster auth key) directly on each artwork reference in catalogue
+  responses (`GET /api/v1/catalogue/items`, `/items/{id}`, `/search`),
+  alongside the existing bare `id`/`role`/`mime_type` fields. This lets a
+  client load artwork via a plain `<img src>` without attaching a bearer
+  header, the same way playback stream/subtitle URLs already carry their own
+  embedded authorization rather than requiring a separate header. Unlike the
+  session-scoped stream token, artwork has no session to anchor a validity
+  window to, so the expiry is explicit and carried in the URL; default TTL is
+  24h, configurable via `catalogue.api.artwork_capability_ttl_ms` — long
+  enough that normal browsing/caching isn't disrupted, with an expired URL
+  recovered by simply re-fetching the catalogue item. The existing
+  header-authenticated `GET /api/v1/catalogue/artwork/{id}` endpoint is
+  unchanged and still works with a bearer token; the signature is verified
+  (not just the URL shape) before the request is ever exempted from that
+  check, so an unsigned request to the same path still requires the ordinary
+  bearer token when one is configured. Artwork responses also now carry
+  `Cache-Control: public, max-age=<ttl>, immutable`, since the id is a
+  content hash and the bytes it names never change.
+
 ## 0.23.3 — HTTP keep-alive, honest Status telemetry, and metadata/startup reliability (development)
 
 - Implement bounded HTTP/1.1 keep-alive for the catalogue/media API server
