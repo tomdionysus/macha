@@ -84,6 +84,8 @@ class HttpServer {
     void run(std::stop_token);
     void worker(std::stop_token);
     void handle_client(int);
+    bool handle_one_request(int fd, int send_flags, bool is_continuation, size_t requests_served);
+    bool queue_has_backlog();
     void close_queued_clients();
 
   public:

@@ -31,9 +31,11 @@
 #include "test_support.hpp"
 #include "torrent.hpp"
 #include "replica_selector.hpp"
+#include <algorithm>
 #include <arpa/inet.h>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -42,6 +44,7 @@
 #include <iomanip>
 #include <iostream>
 #include <latch>
+#include <map>
 #include <mutex>
 #include <netinet/in.h>
 #include <openssl/crypto.h>
@@ -431,5 +434,73 @@ inline std::string raw_http_get(uint16_t port, std::string_view path) {
     return response;
 }
 
+// Raw request/response helpers for keep-alive scenarios, where raw_http_get's
+// send-Connection-close-and-read-to-EOF shape does not apply: the caller keeps
+// the socket open and drives it request by request.
+struct RawHttpResponse {
+    int status{};
+    std::map<std::string, std::string> headers; // lowercased keys
+    std::string body;
+};
+
+inline void raw_http_send(int fd, std::string_view request) {
+    size_t sent = 0;
+    while (sent < request.size()) {
+        auto n = send(fd, request.data() + sent, request.size() - sent, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) throw std::runtime_error("http test send failed");
+        sent += static_cast<size_t>(n);
+    }
+}
+
+inline RawHttpResponse raw_http_read_response(int fd) {
+    std::string input;
+    std::array<char, 8192> buffer{};
+    size_t header_end;
+    while ((header_end = input.find("\r\n\r\n")) == std::string::npos) {
+        auto n = recv(fd, buffer.data(), buffer.size(), 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) throw std::runtime_error("http test response truncated before headers");
+        input.append(buffer.data(), static_cast<size_t>(n));
+    }
+
+    RawHttpResponse response;
+    std::istringstream head(input.substr(0, header_end));
+    std::string status_line;
+    std::getline(head, status_line);
+    {
+        std::istringstream status_stream(status_line);
+        std::string http_version;
+        status_stream >> http_version >> response.status;
+    }
+    std::string line;
+    while (std::getline(head, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        auto colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string key = line.substr(0, colon);
+        for (auto& c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        std::string value = line.substr(colon + 1);
+        while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) value.erase(value.begin());
+        response.headers[key] = value;
+    }
+
+    size_t content_length = 0;
+    if (auto found = response.headers.find("content-length"); found != response.headers.end())
+        content_length = static_cast<size_t>(std::stoull(found->second));
+    response.body = input.substr(header_end + 4);
+    while (response.body.size() < content_length) {
+        auto n = recv(fd, buffer.data(), std::min(buffer.size(), content_length - response.body.size()), 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) throw std::runtime_error("http test response body truncated");
+        response.body.append(buffer.data(), static_cast<size_t>(n));
+    }
+    return response;
+}
+
+inline RawHttpResponse raw_http_exchange(int fd, std::string_view request) {
+    raw_http_send(fd, request);
+    return raw_http_read_response(fd);
+}
 
 } // namespace macha::test_support

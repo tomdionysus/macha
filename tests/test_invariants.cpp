@@ -571,6 +571,89 @@ MACHA_TEST("invariants", test_rpc_membership_is_online_while_local_state_recover
     recovering.stop();
 }
 
+MACHA_TEST("invariants", test_status_shows_recovering_peer_phase_without_fabricated_zero_capacity) {
+    TestCluster cluster(ConfigProfile::isolated);
+    auto recovering_config = cluster.node_config("status-recovering-node");
+    auto peer_config = cluster.node_config("status-recovering-peer");
+
+    TestGate recovery_gate;
+    NodeRuntime recovering(recovering_config, cluster.keys(), [&](std::string_view stage) {
+        if (stage == "data-storage" || stage == "control-storage")
+            recovery_gate.enter_and_wait();
+    });
+    struct ReleaseGate {
+        TestGate& gate;
+        ~ReleaseGate() {
+            gate.open();
+        }
+    } release{recovery_gate};
+
+    recovering.start();
+    REQUIRE(recovery_gate.wait_for_entries(2));
+    CHECK(recovering.readiness().control_plane_online);
+    CHECK(!recovering.readiness().local_state_ready);
+
+    NodeRuntime peer(peer_config, cluster.keys());
+    peer.start();
+    REQUIRE(peer.wait_local_state_ready(10s));
+
+    const Endpoint recovering_endpoint{"127.0.0.1", recovering_config.port};
+    const auto ping = peer.call(recovering_endpoint, MessageType::ping);
+    CHECK(ping.message.type == MessageType::ok);
+
+    // Let the peer directly gossip with the still-recovering node so it
+    // publishes -- and the peer observes -- fresh telemetry that truthfully
+    // reflects its real, non-ready phase rather than nothing at all.
+    REQUIRE(wait_until(
+        [&] {
+            const auto views = peer.telemetry().views(std::chrono::milliseconds(60000));
+            return std::any_of(views.begin(), views.end(), [&](const TelemetryView& view) {
+                return view.telemetry.node_id == recovering.node_id() &&
+                       view.telemetry.phase != NodePhase::ready;
+            });
+        },
+        10s));
+
+    ClusterStatusService status(peer);
+    HttpRequest request;
+    request.method = "GET";
+    request.path = "/api/v1/status";
+    auto response = status.handle(request);
+    REQUIRE(response.status == 200);
+    auto root = Json::parse(
+        std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
+    const auto* nodes = root.find("nodes");
+    REQUIRE(nodes != nullptr);
+    bool found = false;
+    for (const auto& value : nodes->asArray()) {
+        if (value.find("id")->asString() != to_string(recovering.node_id()))
+            continue;
+        found = true;
+        // Still control-plane reachable -- genuinely true, not a lie.
+        CHECK(value.find("state")->asString() == "online");
+        CHECK(value.find("phase")->asString() == "recovering");
+        // This is the exact "green with fabricated numbers" incident: a
+        // fresh-but-not-yet-ready sample's zero capacity/usage must not be
+        // presented as an authoritative current measurement.
+        CHECK(!value.find("storage")->find("available")->asBool());
+    }
+    CHECK(found);
+
+    const auto* cluster_json = root.find("cluster");
+    REQUIRE(cluster_json != nullptr);
+    bool saw_condition = false;
+    for (const auto& condition : cluster_json->find("conditions")->asArray())
+        if (condition.asString() == "one or more online nodes are still recovering")
+            saw_condition = true;
+    CHECK(saw_condition);
+    CHECK(cluster_json->find("health")->asString() != "healthy");
+
+    recovery_gate.open();
+    REQUIRE(recovering.wait_local_state_ready(10s));
+    peer.stop();
+    recovering.stop();
+}
+
 MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     TestNode fixture("status-membership");
     auto& config = fixture.config();
@@ -749,6 +832,106 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     CHECK(cluster->find("metadata_write_available")->asBool());
 }
 
+MACHA_TEST("invariants", test_status_marks_stale_peer_telemetry_as_unavailable_not_live) {
+    TestNode fixture("status-stale-telemetry");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.hydration.enabled = false;
+    config.catalogue.scanner.enabled = false;
+    // This test needs telemetry to go stale (>5s, the status API's hardcoded
+    // freshness floor) while the peer remains membership-online, so its
+    // dead_after must outlast that wait -- unlike most tests here it is not
+    // tuned small.
+    config.dead_after = 60s;
+    auto& node = fixture.start();
+    auto& metadata = fixture.metadata();
+    metadata.snapshot();
+
+    NodeInfo peer;
+    peer.id = random_node_id();
+    peer.host = "10.44.1.201";
+    peer.port = 7437;
+    peer.failure_domain = "test-lab";
+    peer.capacity = 4ULL * 1024 * 1024 * 1024;
+    peer.used = 1024ULL * 1024 * 1024;
+    peer.metadata_generation = node.metadata_replica().generation();
+    peer.seen_unix_ms = unix_ms();
+    node.membership().observe(peer, true);
+
+    NodeTelemetry peer_telemetry;
+    peer_telemetry.node_id = peer.id;
+    peer_telemetry.boot_id = random_node_id();
+    peer_telemetry.sequence = 1;
+    peer_telemetry.observed_unix_ms = unix_ms();
+    peer_telemetry.host = peer.host;
+    peer_telemetry.failure_domain = peer.failure_domain;
+    peer_telemetry.port = peer.port;
+    peer_telemetry.storage_capacity = peer.capacity;
+    peer_telemetry.storage_used = 2ULL * 1024 * 1024 * 1024;
+    peer_telemetry.cache_capacity = 1024;
+    peer_telemetry.cache_used = 512;
+    peer_telemetry.metadata_generation = peer.metadata_generation;
+    peer_telemetry.storage_backends_online = 1;
+    peer_telemetry.uptime_ms = 60000;
+    peer_telemetry.rss_bytes = 123456;
+    node.telemetry().observe(peer_telemetry, true);
+
+    ClusterStatusService status(node);
+    status.attach_metadata(metadata);
+    HttpRequest request;
+    request.method = "GET";
+    request.path = "/api/v1/status";
+
+    auto find_peer = [&](const Json& root) -> const Json* {
+        const auto* nodes = root.find("nodes");
+        REQUIRE(nodes != nullptr);
+        for (const auto& value : nodes->asArray())
+            if (value.find("id")->asString() == to_string(peer.id))
+                return &value;
+        return nullptr;
+    };
+
+    auto fresh_response = status.handle(request);
+    REQUIRE(fresh_response.status == 200);
+    auto fresh_root = Json::parse(std::string(
+        reinterpret_cast<const char*>(fresh_response.body.data()), fresh_response.body.size()));
+    const auto* fresh_peer = find_peer(fresh_root);
+    REQUIRE(fresh_peer != nullptr);
+    CHECK(fresh_peer->find("telemetry_freshness")->asString() == "live");
+    CHECK(fresh_peer->find("storage")->find("available")->asBool());
+    CHECK(fresh_peer->find("storage")->find("used_bytes")->asUInt64() == peer_telemetry.storage_used);
+    REQUIRE(fresh_peer->find("runtime")->find("rss_bytes") != nullptr);
+    CHECK(fresh_peer->find("runtime")->find("rss_bytes")->asUInt64() == peer_telemetry.rss_bytes);
+
+    // The Status API's telemetry freshness floor is a hardcoded 5s minimum
+    // (ClusterStatusService::status_response's fresh_for), independent of any
+    // configured heartbeat, and TelemetryStore has no clock-injection seam.
+    // This genuinely waits for the sample to age past it.
+    std::this_thread::sleep_for(5200ms);
+
+    auto stale_response = status.handle(request);
+    REQUIRE(stale_response.status == 200);
+    auto stale_root = Json::parse(std::string(
+        reinterpret_cast<const char*>(stale_response.body.data()), stale_response.body.size()));
+    const auto* stale_peer = find_peer(stale_root);
+    REQUIRE(stale_peer != nullptr);
+    // Still control-plane reachable via membership -- that part isn't a lie.
+    CHECK(stale_peer->find("state")->asString() == "online");
+    CHECK(stale_peer->find("telemetry_freshness")->asString() == "stale");
+    // But a stale sample's resource/runtime figures must not be presented as
+    // current: this is the exact "makes up numbers" complaint being fixed.
+    CHECK(!stale_peer->find("storage")->find("available")->asBool());
+    CHECK(stale_peer->find("storage")->find("used_bytes")->isNull());
+    CHECK(stale_peer->find("runtime")->find("rss_bytes") == nullptr);
+
+    // The aggregate must also stop treating this node's stale numbers as
+    // authoritative, rather than silently freezing the old "available" flag.
+    const auto* cluster = stale_root.find("cluster");
+    REQUIRE(cluster != nullptr);
+    CHECK(!cluster->find("storage_online")->find("available")->asBool());
+}
+
 MACHA_TEST("invariants", test_status_excludes_retired_identity_from_live_cluster_health) {
     TestNode fixture("status-retired-identity");
     auto& config = fixture.config();
@@ -870,6 +1053,58 @@ MACHA_TEST("invariants", test_status_collects_connected_peer_telemetry_without_c
     CHECK(status.find("cluster")->find("storage_online")->find("available")->asBool());
 
     second.stop();
+    first.stop();
+}
+
+MACHA_TEST("invariants", test_status_marks_stopped_peer_offline_within_dead_after) {
+    TestCluster cluster(ConfigProfile::isolated);
+    const auto first_port = free_port();
+    const auto second_port = free_port();
+    auto first_config =
+        cluster.node_config("status-offline-first", first_port, {{"127.0.0.1", second_port}});
+    auto second_config =
+        cluster.node_config("status-offline-second", second_port, {{"127.0.0.1", first_port}});
+    first_config.catalogue.api.enabled = true;
+    first_config.catalogue.api.port = free_port();
+    second_config.catalogue.api.enabled = true;
+    second_config.catalogue.api.port = free_port();
+
+    Service first(first_config, cluster.keys());
+    Service second(second_config, cluster.keys());
+    first.start();
+    second.start();
+    (void)first.filesystem();
+    (void)second.filesystem();
+    const auto second_id = second.node().node_id();
+
+    REQUIRE(wait_until(
+        [&] {
+            return first.node().membership().active().size() == 2 &&
+                   second.node().membership().active().size() == 2;
+        },
+        5s));
+
+    auto second_state = [&]() -> std::string {
+        const auto response = raw_http_get(first_config.catalogue.api.port, "/api/v1/status");
+        const auto body_at = response.find("\r\n\r\n");
+        REQUIRE(body_at != std::string::npos);
+        const auto status = Json::parse(response.substr(body_at + 4));
+        const auto* nodes = status.find("nodes");
+        REQUIRE(nodes != nullptr);
+        for (const auto& node : nodes->asArray())
+            if (node.find("id")->asString() == to_string(second_id))
+                return node.find("state")->asString();
+        return "missing";
+    };
+    // Establish a real online-to-offline transition rather than a
+    // coincidental default, since no existing test drives a peer offline and
+    // checks the Status endpoint itself.
+    REQUIRE(second_state() == "online");
+
+    second.stop();
+
+    REQUIRE(wait_until([&] { return second_state() == "offline"; }, 5s));
+
     first.stop();
 }
 
@@ -2177,6 +2412,169 @@ MACHA_TEST("invariants", test_http_slow_client_cannot_pin_worker_indefinitely) {
 
     ::close(slow);
     ::close(fast);
+    server.stop();
+}
+
+MACHA_TEST("invariants", test_http_keep_alive_reuses_connection_for_sequential_requests) {
+    CatalogueApiConfig config;
+    config.enabled = true;
+    config.listen = "127.0.0.1";
+    config.port = free_port();
+    config.workers = 2;
+    config.max_queued_connections = 4;
+
+    HttpServer server(config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
+    server.start();
+    REQUIRE(wait_until([&] { return server.bound_port() == config.port; }, 2s));
+
+    const int fd = connect_idle(config.port);
+    timeval timeout{2, 0};
+    REQUIRE(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+    const std::string request = "GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    // Two sequential requests over the same, never-reconnected socket.
+    auto first = raw_http_exchange(fd, request);
+    CHECK(first.status == 200);
+    CHECK(first.headers["connection"] == "keep-alive");
+
+    auto second = raw_http_exchange(fd, request);
+    CHECK(second.status == 200);
+    CHECK(second.headers["connection"] == "keep-alive");
+
+    ::close(fd);
+    server.stop();
+}
+
+MACHA_TEST("invariants", test_http_keep_alive_respects_connection_close_request_header) {
+    CatalogueApiConfig config;
+    config.enabled = true;
+    config.listen = "127.0.0.1";
+    config.port = free_port();
+    config.workers = 2;
+    config.max_queued_connections = 4;
+
+    HttpServer server(config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
+    server.start();
+    REQUIRE(wait_until([&] { return server.bound_port() == config.port; }, 2s));
+
+    const int fd = connect_idle(config.port);
+    timeval timeout{2, 0};
+    REQUIRE(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+    const std::string request = "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+    auto response = raw_http_exchange(fd, request);
+    CHECK(response.status == 200);
+    CHECK(response.headers["connection"] == "close");
+
+    char probe;
+    CHECK(::recv(fd, &probe, 1, 0) == 0); // server closed as requested
+
+    ::close(fd);
+    server.stop();
+}
+
+MACHA_TEST("invariants", test_http_keep_alive_idle_timeout_closes_connection) {
+    CatalogueApiConfig config;
+    config.enabled = true;
+    config.listen = "127.0.0.1";
+    config.port = free_port();
+    config.workers = 2;
+    config.max_queued_connections = 4;
+    config.keep_alive_idle_timeout = 100ms;
+
+    HttpServer server(config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
+    server.start();
+    REQUIRE(wait_until([&] { return server.bound_port() == config.port; }, 2s));
+
+    const int fd = connect_idle(config.port);
+    timeval timeout{2, 0};
+    REQUIRE(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+    const std::string request = "GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    auto response = raw_http_exchange(fd, request);
+    CHECK(response.headers["connection"] == "keep-alive");
+
+    // Do not send another request. A silent keep-alive connection must not
+    // pin its worker past the configured idle allowance.
+    std::this_thread::sleep_for(400ms);
+    char probe;
+    CHECK(::recv(fd, &probe, 1, 0) == 0);
+
+    ::close(fd);
+    server.stop();
+}
+
+MACHA_TEST("invariants", test_http_keep_alive_max_requests_forces_close) {
+    CatalogueApiConfig config;
+    config.enabled = true;
+    config.listen = "127.0.0.1";
+    config.port = free_port();
+    config.workers = 2;
+    config.max_queued_connections = 4;
+    config.keep_alive_max_requests = 2;
+
+    HttpServer server(config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
+    server.start();
+    REQUIRE(wait_until([&] { return server.bound_port() == config.port; }, 2s));
+
+    const int fd = connect_idle(config.port);
+    timeval timeout{2, 0};
+    REQUIRE(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+    const std::string request = "GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    auto first = raw_http_exchange(fd, request);
+    CHECK(first.headers["connection"] == "keep-alive");
+    auto second = raw_http_exchange(fd, request);
+    // The 2nd of 2 allowed requests must force close even though the client
+    // is willing to continue.
+    CHECK(second.headers["connection"] == "close");
+
+    char probe;
+    CHECK(::recv(fd, &probe, 1, 0) == 0);
+
+    ::close(fd);
+    server.stop();
+}
+
+MACHA_TEST("invariants", test_http_keep_alive_sheds_connection_under_backlog) {
+    CatalogueApiConfig config;
+    config.enabled = true;
+    config.listen = "127.0.0.1";
+    config.port = free_port();
+    config.workers = 1;
+    config.max_queued_connections = 4;
+    config.keep_alive_idle_timeout = 5s; // must be pre-empted by backlog, not idle expiry
+
+    HttpServer server(config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
+    server.start();
+    REQUIRE(wait_until([&] { return server.bound_port() == config.port; }, 2s));
+
+    const int first_fd = connect_idle(config.port);
+    timeval timeout{2, 0};
+    REQUIRE(setsockopt(first_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+    const std::string request = "GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    auto first = raw_http_exchange(first_fd, request);
+    CHECK(first.headers["connection"] == "keep-alive");
+
+    // Queue a second connection's request behind the sole, now-idle-eligible
+    // worker. Give the accept thread time to enqueue it before the first
+    // connection's next request is decided.
+    const int second_fd = connect_idle(config.port);
+    raw_http_send(second_fd, request);
+    std::this_thread::sleep_for(200ms);
+
+    auto second_on_first = raw_http_exchange(first_fd, request);
+    // Backlog must win over the client's own keep-alive preference so the
+    // worker is released for the connection already waiting.
+    CHECK(second_on_first.headers["connection"] == "close");
+
+    REQUIRE(setsockopt(second_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+    auto queued_response = raw_http_read_response(second_fd);
+    CHECK(queued_response.status == 200);
+
+    ::close(first_fd);
+    ::close(second_fd);
     server.stop();
 }
 

@@ -283,6 +283,11 @@ void parse_catalogue(const YAML::Node& root, Config& c) {
                 milliseconds(api["client_io_timeout_ms"], "catalogue.api.client_io_timeout_ms");
         if (api["stream_chunk_bytes"])
             c.catalogue.api.stream_chunk_bytes = yaml_size(api["stream_chunk_bytes"]);
+        if (api["keep_alive_max_requests"])
+            c.catalogue.api.keep_alive_max_requests = api["keep_alive_max_requests"].as<size_t>();
+        if (api["keep_alive_idle_timeout_ms"])
+            c.catalogue.api.keep_alive_idle_timeout =
+                milliseconds(api["keep_alive_idle_timeout_ms"], "catalogue.api.keep_alive_idle_timeout_ms");
     }
     if (auto scanner = catalogue["scanner"]) {
         if (scanner["enabled"])
@@ -535,6 +540,9 @@ Config load_yaml_config(const std::filesystem::path& path) {
         c.log_level = parse_log_level(root["log_level"].as<std::string>());
     if (root["ffmpeg_log_level"])
         c.ffmpeg_log_level = parse_ffmpeg_log_level(root["ffmpeg_log_level"].as<std::string>());
+    if (root["service_startup_timeout_ms"])
+        c.service_startup_timeout =
+            milliseconds(root["service_startup_timeout_ms"], "service_startup_timeout_ms");
 
     auto storage = root["storage"];
     if (!storage || !storage.IsMap())

@@ -17,6 +17,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <ctime>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -33,6 +34,10 @@ std::chrono::milliseconds maintenance_background_interval(const MaintenanceConfi
 class Service {
   public:
     using MaintenanceStageHook = std::function<void(std::string_view)>;
+    // Test-only interception point for a detected startup stall (see
+    // wait_services_ready()). Production leaves this empty and terminates the
+    // process instead; a test can observe the stall without killing itself.
+    using StartupStallHandler = std::function<void(std::string_view diagnostic)>;
 
   private:
     NodeRuntime node_;
@@ -62,6 +67,7 @@ class Service {
     mutable std::mutex startup_mutex_;
     std::condition_variable startup_cv_;
     std::string startup_error_;
+    StartupStallHandler startup_stall_handler_;
 
     std::jthread maintenance_;
     std::mutex maintenance_wait_mutex_;
@@ -87,6 +93,7 @@ class Service {
 
     void initialise_services(std::stop_token);
     void wait_services_ready();
+    std::string describe_readiness_stall() const;
     HttpResponse handle_http(const HttpRequest&);
     bool capability_request(const HttpRequest&);
     void loop(std::stop_token);
@@ -98,7 +105,8 @@ class Service {
 
   public:
     Service(Config, ClusterKeys, NodeRuntime::StartupStageHook startup_stage_hook = {},
-            MaintenanceStageHook maintenance_stage_hook = {});
+            MaintenanceStageHook maintenance_stage_hook = {},
+            StartupStallHandler startup_stall_handler = {});
     ~Service();
     void start();
     void request_stop();

@@ -2470,6 +2470,161 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
     s1.stop();
 }
 
+MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_reconciliation) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+
+    auto c1 = config_for(cluster.path() / "concurrent-reconcile-n1", cluster.keyfile(), p1,
+                         {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "concurrent-reconcile-n2", cluster.keyfile(), p2,
+                         {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 2;
+    c1.min_write_replicas = c2.min_write_replicas = 1;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = false;
+    c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
+    c1.ingest.enabled = c2.ingest.enabled = false;
+    c1.torrent.enabled = c2.torrent.enabled = false;
+
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+    s2.start();
+    (void)s1.filesystem();
+    (void)s2.filesystem();
+    REQUIRE(wait_until(
+        [&] {
+            return s1.node().membership().active().size() >= 2 &&
+                   s2.node().membership().active().size() >= 2 &&
+                   s1.node().metadata_replica().committed_generation() > 1 &&
+                   s1.node().metadata_replica().committed().hash ==
+                       s2.node().metadata_replica().committed().hash;
+        },
+        10s));
+
+    // Create a genuine two-head divergence on node 1 alone, bypassing RPC, via
+    // the same locally-authored-sibling pattern as
+    // test_service_same_generation_sibling_notice_triggers_reconciliation.
+    const auto base = s1.node().metadata_replica().committed();
+    auto make_sibling = [&](NodeRuntime& node, const std::string& path) {
+        auto snapshot = decode_snapshot(base.payload);
+        FsEntry entry;
+        entry.type = EntryType::directory;
+        entry.mode = 0755;
+        entry.uid = getuid();
+        entry.gid = getgid();
+        snapshot.entries[path] = entry;
+        ++snapshot.mutation_sequences[node.node_id()];
+
+        MetadataRecord sibling;
+        sibling.generation = base.generation + 1;
+        sibling.previous = base.hash;
+        sibling.payload = encode_snapshot(snapshot);
+        sibling.hash = metadata_hash(sibling.generation, sibling.previous, sibling.payload);
+        REQUIRE(node.metadata_replica().store_commit(sibling));
+        MetadataAcceptance acceptance;
+        acceptance.generation = sibling.generation;
+        acceptance.hash = sibling.hash;
+        acceptance.required = 1;
+        acceptance.replicas = {node.node_id()};
+        REQUIRE(node.accept_metadata_commit(acceptance));
+        return sibling;
+    };
+
+    const auto left = make_sibling(s1.node(), "/left-concurrent");
+    const auto right = make_sibling(s1.node(), "/right-concurrent");
+    REQUIRE(right.generation == left.generation);
+    REQUIRE(right.hash != left.hash);
+    REQUIRE(s1.node().metadata_replica().accepted_heads().size() == 2);
+
+    const auto history_before = s1.node().metadata_replica().diagnostics().history_records;
+
+    // Several concurrent foreground reads all observe the same divergence.
+    // Before the reconciliation_mutex_ fix, each could independently merge
+    // and publish its own commit; this asserts exactly one is produced.
+    constexpr int reader_count = 8;
+    std::vector<std::thread> readers;
+    std::vector<MetadataRecord> results(reader_count);
+    readers.reserve(reader_count);
+    for (int i = 0; i < reader_count; ++i)
+        readers.emplace_back([&, i] { results[i] = s1.metadata_manager().read_record(); });
+    for (auto& reader : readers)
+        reader.join();
+
+    const auto history_after = s1.node().metadata_replica().diagnostics().history_records;
+    CHECK(history_after - history_before == 1);
+    CHECK(s1.node().metadata_replica().accepted_heads().size() == 1);
+    for (const auto& record : results)
+        CHECK(record.hash == results.front().hash);
+
+    s2.stop();
+    s1.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_service_startup_stall_terminates_within_configured_timeout) {
+    TestCluster cluster;
+    auto c1 = config_for(cluster.path() / "stalled-startup", cluster.keyfile(), free_port());
+    c1.service_startup_timeout = 200ms;
+    c1.catalogue.scanner.enabled = false;
+    c1.catalogue.api.enabled = false;
+    c1.ingest.enabled = false;
+    c1.torrent.enabled = false;
+
+    // Stall local-state readiness forever -- simulating the "readiness never
+    // completes and never fails" internal stall this fix targets -- using the
+    // same stage-gating pattern as
+    // test_control_plane_and_status_api_are_online_while_backends_recover.
+    // The injected StartupStallHandler lets the test observe the timeout
+    // firing without the process actually terminating.
+    TestGate stall_gate;
+    std::atomic_bool handler_called{false};
+    std::string diagnostic;
+    Service service(
+        c1, cluster.keys(),
+        [&](std::string_view stage) {
+            if (stage == "data-storage")
+                stall_gate.enter_and_wait();
+        },
+        {},
+        [&](std::string_view value) {
+            diagnostic = std::string(value);
+            handler_called.store(true, std::memory_order_release);
+        });
+    struct ReleaseGate {
+        TestGate& gate;
+        ~ReleaseGate() {
+            gate.open();
+        }
+    } release{stall_gate};
+
+    service.start();
+    REQUIRE(stall_gate.wait_for_entries(1, 5s));
+
+    const auto started = Clock::now();
+    bool threw = false;
+    try {
+        (void)service.filesystem();
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    const auto elapsed = Clock::now() - started;
+
+    CHECK(threw);
+    CHECK(handler_called.load(std::memory_order_acquire));
+    // Must resolve close to the configured bound, not hang indefinitely --
+    // the direct regression check for the previously-unbounded wait.
+    CHECK(elapsed >= 150ms);
+    CHECK(elapsed < 5s);
+    CHECK(diagnostic.find("data_storage=recovering") != std::string::npos);
+
+    // Let the still-stalled initialise_services() thread proceed so ordinary
+    // shutdown can join it cleanly rather than hanging on the same stall.
+    stall_gate.open();
+    service.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_bounded_runs) {
     TestCluster cluster;
     const auto& keys = cluster.keys();

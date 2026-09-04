@@ -890,6 +890,12 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
     }
 
     const size_t need = node_.config().metadata_min_write_replicas;
+    // Only the merge-and-publish branch below needs serializing: concurrent
+    // foreground reads that all observe a divergence must not each mint their
+    // own reconciliation commit for it. Acquired lazily on first observing
+    // more than one head, and re-checked immediately after acquiring it, since
+    // another caller may have already reconciled while this one waited.
+    std::optional<std::unique_lock<std::mutex>> reconciliation_lock;
     for (;;) {
         auto heads = node_.metadata_replica().accepted_heads();
         if (heads.empty())
@@ -914,6 +920,11 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             // accepted head here; maybe_reconfigure() performs the explicit
             // transition commit at max(old_floor, new_floor) before any write.
             return cache_record(selected, materialized->snapshot);
+        }
+
+        if (!reconciliation_lock) {
+            reconciliation_lock.emplace(reconciliation_mutex_);
+            continue; // re-read heads now that we hold the lock; may already be resolved
         }
 
         if (compatible_replicas(nodes).size() < need)

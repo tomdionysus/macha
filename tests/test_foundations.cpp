@@ -214,6 +214,23 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     REQUIRE(telemetry_set.size() == 1);
     CHECK(telemetry_set.front() == telemetry);
 
+    telemetry.phase = NodePhase::recovering;
+    CHECK(decode_node_telemetry(encode_node_telemetry(telemetry)) == telemetry);
+    auto recovering_set = decode_telemetry_set(encode_telemetry_set({telemetry}));
+    REQUIRE(recovering_set.size() == 1);
+    CHECK(recovering_set.front().phase == NodePhase::recovering);
+
+    // A record encoded before this field existed simply ends one byte
+    // earlier. It must decode as "ready" (NodeTelemetry's default) rather
+    // than fail or silently pick a different phase.
+    auto truncated = encode_node_telemetry(telemetry);
+    REQUIRE(!truncated.empty());
+    truncated.pop_back();
+    auto legacy = decode_node_telemetry(truncated);
+    CHECK(legacy.phase == NodePhase::ready);
+    CHECK(legacy.sequence == telemetry.sequence);
+    CHECK(legacy.rpc_connections_reused == telemetry.rpc_connections_reused);
+
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);

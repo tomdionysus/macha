@@ -233,6 +233,20 @@ previously writable view immediately if fewer than
 `metadata_min_write_replicas` active replicas remain, but never promotes to
 writable merely from peer connectivity.
 
+A telemetry sample only feeds `storage`/`cache`/`runtime` figures once it is
+both fresh (within the freshness window) and self-reported `ready`; a stale
+sample, or a fresh one whose sender reports itself `starting`/`recovering`,
+falls back to the durable last-known figures exactly as if no telemetry
+existed. `state` (`online`/`offline`/`retired`) reflects membership/control-plane
+reachability, which is not itself a lie during a node's own local recovery;
+the separate `phase` field (`starting`, `recovering`, `ready`, or `unknown`
+without trustworthy telemetry) is the truthful signal for whether an online
+peer's numbers can be trusted yet. This is what stops a node's own in-progress
+recovery — which legitimately reports zero capacity/usage before its local
+storage is ready — from briefly looking like real data loss in the cluster
+aggregate; `cluster.conditions` reports "one or more online nodes are still
+recovering" for that window instead.
+
 Metadata availability logging is transition-only and canonical, for example `metadata availability changed state=writable previous=read-only reason="metadata write durability floor available"`. Routine negative checkpoint acknowledgements are silent because they are normal convergence decisions; transport/checkpoint exceptions remain diagnostic.
 
 `POST /api/v1/status/connectivity/check` and the node-specific equivalent perform diagnostic connectivity checks without changing cluster configuration. State-changing administrative operations belong under `/api/v1/manage`.

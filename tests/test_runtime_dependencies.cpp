@@ -235,6 +235,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "    max_queued_connections: 33\n"
             << "    client_io_timeout_ms: 45000\n"
             << "    stream_chunk_bytes: 64K\n"
+            << "    keep_alive_max_requests: 42\n"
+            << "    keep_alive_idle_timeout_ms: 9000\n"
             << "  scanner:\n"
             << "    enabled: true\n"
             << "    interval_ms: 60000\n"
@@ -407,6 +409,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(yc.catalogue.api.max_queued_connections == 33);
     CHECK(yc.catalogue.api.client_io_timeout == 45000ms);
     CHECK(yc.catalogue.api.stream_chunk_bytes == 64ULL * 1024);
+    CHECK(yc.catalogue.api.keep_alive_max_requests == 42);
+    CHECK(yc.catalogue.api.keep_alive_idle_timeout == 9000ms);
     CHECK(yc.catalogue.scanner.enabled);
     CHECK(yc.catalogue.scanner.interval == 60000ms);
     CHECK(yc.catalogue.scanner.rescan_debounce == 12000ms);

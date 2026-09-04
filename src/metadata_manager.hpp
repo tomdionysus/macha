@@ -67,6 +67,11 @@ struct MetadataHistoryTransferDiagnostics {
 class MetadataManager {
     NodeRuntime& node_;
     std::mutex mutation_mutex_;
+    // Guards only the multi-head merge-and-publish branch of read_group().
+    // Kept separate from mutation_mutex_ because mutate_impl() already holds
+    // mutation_mutex_ across its whole body while calling read_group()
+    // internally; reusing mutation_mutex_ here would self-deadlock on that path.
+    std::mutex reconciliation_mutex_;
     mutable std::mutex cache_mutex_;
     std::optional<MetadataRecord> cache_;
     Clock::time_point cache_until_{};

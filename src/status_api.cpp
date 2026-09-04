@@ -10,6 +10,25 @@
 namespace macha {
 namespace {
 
+// Ranked so a worse condition can only escalate reported health, never let a
+// later, milder check downgrade it back.
+enum class HealthSeverity { healthy, degraded, recovering, critical };
+
+std::string_view health_name(HealthSeverity severity) {
+    switch (severity) {
+    case HealthSeverity::healthy: return "healthy";
+    case HealthSeverity::degraded: return "degraded";
+    case HealthSeverity::recovering: return "recovering";
+    case HealthSeverity::critical: return "critical";
+    }
+    return "unknown";
+}
+
+void escalate(HealthSeverity& health, HealthSeverity candidate) {
+    if (candidate > health)
+        health = candidate;
+}
+
 PersistedNodeStatus persisted(const NodeTelemetry& telemetry) {
     PersistedNodeStatus out;
     out.boot_id = telemetry.boot_id;
@@ -130,6 +149,45 @@ Json identity_reset_json(const IdentityAssociationReset& reset) {
     return Json(std::move(out));
 }
 
+// A live telemetry sample that is stale (older than the caller's freshness
+// window) must be treated exactly like having no live sample at all for
+// numeric purposes: a sample can be arbitrarily old, and presenting its
+// resource/runtime figures as current would fabricate data. "authoritative"
+// means a genuinely fresh, current measurement exists.
+struct EffectiveNodeTelemetry {
+    bool authoritative{};
+    uint64_t storage_capacity{};
+    uint64_t storage_used{};
+    uint64_t cache_capacity{};
+    uint64_t cache_used{};
+    uint32_t storage_backends_online{};
+};
+
+EffectiveNodeTelemetry effective_telemetry(const NodeTelemetry* live, bool stale,
+                                           const PersistedNodeStatus& durable,
+                                           bool telemetry_known) {
+    EffectiveNodeTelemetry out;
+    // A fresh (non-stale) sample is only authoritative once the sender itself
+    // reports "ready": a node mid-recovery legitimately publishes fresh
+    // zero-valued capacity/usage, and presenting that as a current
+    // measurement is indistinguishable from a real empty node.
+    out.authoritative = live && !stale && live->phase == NodePhase::ready;
+    if (out.authoritative) {
+        out.storage_capacity = live->storage_capacity;
+        out.storage_used = live->storage_used;
+        out.cache_capacity = live->cache_capacity;
+        out.cache_used = live->cache_used;
+        out.storage_backends_online = live->storage_backends_online;
+    } else if (telemetry_known) {
+        out.storage_capacity = durable.storage_capacity;
+        out.storage_used = durable.storage_used;
+        out.cache_capacity = durable.cache_capacity;
+        out.cache_used = durable.cache_used;
+        out.storage_backends_online = durable.storage_backends_online;
+    }
+    return out;
+}
+
 Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeInfo* member,
                const NodeTelemetry* live, uint64_t live_age_ms, bool online, bool stale,
                bool retired, bool telemetry_known, bool metadata_replica,
@@ -139,6 +197,11 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
     node["state"] = retired ? "retired" : (online ? "online" : "offline");
     node["telemetry_freshness"] =
         live ? (stale ? "stale" : "live") : (telemetry_known ? "last_known" : "unavailable");
+    // The node's own reported startup phase, using the same vocabulary as
+    // this API's local root.startup.phase. Only trustworthy (fresh and, for
+    // the sender, self-reported ready/recovering/starting) telemetry can
+    // answer this; otherwise it is honestly "unknown" rather than assumed.
+    node["phase"] = (live && !stale) ? std::string(node_phase_name(live->phase)) : "unknown";
     node["observed_at_unix_ms"] =
         live ? live->observed_unix_ms
              : (telemetry_known ? durable.observed_unix_ms
@@ -154,35 +217,30 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         member ? member->metadata_generation
                : (live ? live->metadata_generation : durable.metadata_generation);
 
-    const auto storage_capacity =
-        live ? live->storage_capacity
-             : (telemetry_known ? durable.storage_capacity : (member ? member->capacity : 0));
-    const auto storage_used = live ? live->storage_used : durable.storage_used;
-    const auto cache_capacity = live ? live->cache_capacity : durable.cache_capacity;
-    const auto cache_used = live ? live->cache_used : durable.cache_used;
+    const auto effective = effective_telemetry(live, stale, durable, telemetry_known);
+    const bool telemetry_available = effective.authoritative || telemetry_known;
+    const auto storage_capacity_for_roles =
+        telemetry_available ? effective.storage_capacity : (member ? member->capacity : 0);
     node["storage"] =
-        live || telemetry_known
-            ? bytes_pair(storage_used, storage_capacity)
+        telemetry_available
+            ? bytes_pair(effective.storage_used, effective.storage_capacity)
             : unavailable_bytes(member ? std::optional<uint64_t>(member->capacity) : std::nullopt);
     node["cache"] =
-        live || telemetry_known ? bytes_pair(cache_used, cache_capacity) : unavailable_bytes();
+        telemetry_available ? bytes_pair(effective.cache_used, effective.cache_capacity) : unavailable_bytes();
     node["storage_backends_online"] =
-        live || telemetry_known
-            ? Json(static_cast<uint64_t>(live ? live->storage_backends_online
-                                              : durable.storage_backends_online))
-            : Json(nullptr);
+        telemetry_available ? Json(static_cast<uint64_t>(effective.storage_backends_online)) : Json(nullptr);
 
     Json::Array roles;
-    if (storage_capacity)
+    if (storage_capacity_for_roles)
         roles.emplace_back("storage");
-    if (cache_capacity)
+    if (telemetry_available && effective.cache_capacity)
         roles.emplace_back("cache");
     if (metadata_replica)
         roles.emplace_back("metadata-replica");
     node["roles"] = std::move(roles);
 
     Json::Object runtime;
-    if (live && online) {
+    if (effective.authoritative && online) {
         runtime["uptime_ms"] = live->uptime_ms;
         runtime["rss_bytes"] = live->rss_bytes;
         runtime["process_cpu_percent"] =
@@ -329,8 +387,17 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         known = metadata->node_status; // Read-only compatibility with early SM9 checkpoints.
     for (const auto& telemetry : node_.telemetry().persisted())
         known[telemetry.node_id] = persisted(telemetry);
+    // A stale, or fresh-but-still-recovering, live view must not clobber the
+    // durable/last-known record with itself: only a genuinely fresh AND ready
+    // observation should become the new "last known" baseline. Otherwise a
+    // node's numbers would never actually fall back to anything different
+    // once its telemetry goes stale, and a node's own in-progress recovery
+    // (which legitimately reports zero capacity/usage while not yet ready)
+    // would overwrite its last known-good figures with that same zero within
+    // this very call.
     for (const auto& [id, view] : live)
-        known[id] = persisted(view.telemetry);
+        if (view.fresh && view.telemetry.phase == NodePhase::ready)
+            known[id] = persisted(view.telemetry);
     for (const auto& member : membership_all)
         merge_membership(known[member.id], member);
 
@@ -340,8 +407,12 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
             telemetry_known.insert(id);
     for (const auto& telemetry : node_.telemetry().persisted())
         telemetry_known.insert(telemetry.node_id);
-    for (const auto& [id, _] : live)
-        telemetry_known.insert(id);
+    // Mirror the fresh-and-ready gate above: "known" here means a genuinely
+    // trustworthy durable/last-known source exists, not merely that some
+    // telemetry (however stale or still-recovering) was once observed.
+    for (const auto& [id, view] : live)
+        if (view.fresh && view.telemetry.phase == NodePhase::ready)
+            telemetry_known.insert(id);
 
     // Operational resets are locally durable before their optional metadata
     // audit. Merge both sources so Status reflects retirement immediately.
@@ -361,6 +432,7 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     bool known_storage_available = true, online_storage_available = true;
     bool known_cache_available = true, online_cache_available = true;
     size_t known_nodes = 0, online_nodes = 0;
+    bool online_node_recovering = false;
     Json::Array nodes;
     for (const auto& [id, durable] : known) {
         if (only && id != *only)
@@ -405,34 +477,39 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         }
         ++known_nodes;
 
-        const bool has_telemetry = current || telemetry_known.contains(id);
+        const auto effective = effective_telemetry(current, stale, durable, telemetry_known.contains(id));
+        const bool telemetry_available = effective.authoritative || telemetry_known.contains(id);
         const auto storage_capacity =
-            current ? current->storage_capacity
-                    : (has_telemetry ? durable.storage_capacity : (member ? member->capacity : 0));
-        const auto storage_used = current ? current->storage_used : durable.storage_used;
-        const auto cache_capacity = current ? current->cache_capacity : durable.cache_capacity;
-        const auto cache_used = current ? current->cache_used : durable.cache_used;
+            telemetry_available ? effective.storage_capacity : (member ? member->capacity : 0);
         known_capacity += storage_capacity;
-        known_storage_available = known_storage_available && has_telemetry;
-        known_cache_available = known_cache_available && has_telemetry;
-        if (has_telemetry) {
-            known_used += storage_used;
-            known_cache_capacity += cache_capacity;
-            known_cache_used += cache_used;
+        known_storage_available = known_storage_available && telemetry_available;
+        known_cache_available = known_cache_available && telemetry_available;
+        if (telemetry_available) {
+            known_used += effective.storage_used;
+            known_cache_capacity += effective.cache_capacity;
+            known_cache_used += effective.cache_used;
         }
         if (online) {
             ++online_nodes;
             online_capacity += storage_capacity;
-            online_storage_available = online_storage_available && has_telemetry;
-            online_cache_available = online_cache_available && has_telemetry;
-            if (has_telemetry) {
-                online_used += storage_used;
-                online_cache_capacity += cache_capacity;
-                online_cache_used += cache_used;
+            online_storage_available = online_storage_available && telemetry_available;
+            online_cache_available = online_cache_available && telemetry_available;
+            if (telemetry_available) {
+                online_used += effective.storage_used;
+                online_cache_capacity += effective.cache_capacity;
+                online_cache_used += effective.cache_used;
             }
+            // Self's own readiness is already reported synchronously and
+            // exactly via `readiness` above; this signal exists to surface a
+            // *remote* peer's recovery, which has no other synchronous
+            // source. Self's own published telemetry can briefly lag its own
+            // readiness transition, so including it here would just be a
+            // redundant, racier duplicate of the existing local check.
+            if (id != node_.node_id() && current && !stale && current->phase != NodePhase::ready)
+                online_node_recovering = true;
         }
         nodes.push_back(node_json(id, durable, member, current, age, online, stale, false,
-                                  has_telemetry, metadata_replica, identity_reset));
+                                  telemetry_available, metadata_replica, identity_reset));
     }
 
     if (only) {
@@ -465,35 +542,37 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     const bool metadata_write_available = metadata_availability == MetadataAvailability::writable;
 
     const auto readiness = node_.readiness();
-    std::string health = "healthy";
+    HealthSeverity health = HealthSeverity::healthy;
     Json::Array conditions;
     if (readiness.failed) {
-        health = "critical";
+        escalate(health, HealthSeverity::critical);
         conditions.emplace_back("local startup recovery failed");
     } else if (!readiness.local_state_ready || !metadata_manager) {
-        health = "recovering";
+        escalate(health, HealthSeverity::recovering);
         conditions.emplace_back(readiness.local_state_ready ? "local services are starting"
                                                             : "local state is recovering");
     } else if (!metadata_read_available) {
-        health = "critical";
+        escalate(health, HealthSeverity::critical);
         conditions.emplace_back("metadata unavailable");
     } else if (!metadata_write_available) {
-        health = "degraded";
+        escalate(health, HealthSeverity::degraded);
         conditions.emplace_back("metadata read-only");
     }
     if (online_nodes < known_nodes) {
-        if (health == "healthy")
-            health = "degraded";
+        escalate(health, HealthSeverity::degraded);
         conditions.emplace_back("one or more known nodes are offline");
     }
+    if (online_node_recovering) {
+        escalate(health, HealthSeverity::degraded);
+        conditions.emplace_back("one or more online nodes are still recovering");
+    }
     if (online_capacity < known_capacity) {
-        if (health == "healthy")
-            health = "degraded";
+        escalate(health, HealthSeverity::degraded);
         conditions.emplace_back("some known durable capacity is unavailable");
     }
 
     Json::Object cluster;
-    cluster["health"] = health;
+    cluster["health"] = std::string(health_name(health));
     cluster["conditions"] = std::move(conditions);
     cluster["nodes_known"] = static_cast<uint64_t>(known_nodes);
     cluster["nodes_online"] = static_cast<uint64_t>(online_nodes);

@@ -1,5 +1,59 @@
 # Current release
 
+## 0.23.3 — HTTP keep-alive, honest Status telemetry, and metadata/startup reliability (development)
+
+- Implement bounded HTTP/1.1 keep-alive for the catalogue/media API server
+  instead of closing every connection: reused connections are bounded by
+  configurable `keep_alive_max_requests` and `keep_alive_idle_timeout_ms`,
+  yield early under accept-queue backlog so a busy or idle keep-alive
+  connection cannot starve a waiting new connection, and always close rather
+  than reuse when a request body was not fully drained from the wire.
+- Stop presenting stale peer telemetry as current: `/api/v1/status` now
+  treats a live sample older than the freshness window exactly as if no live
+  sample existed for `storage`/`cache`/`runtime` figures (falling back to
+  durable last-known data, or explicit unavailability), rather than showing
+  arbitrarily old RSS/CPU/load/capacity numbers as authoritative merely
+  because a sample was once observed.
+- Add a truthful per-node `phase` (`starting`, `recovering`, `ready`) to
+  telemetry so a node's own in-progress local recovery — which legitimately
+  reports zero capacity/usage before its storage is ready — is no longer
+  indistinguishable on the wire from a genuinely empty node. A recovering
+  peer now reports `state: "online"` (control-plane reachable, which is
+  true) with `phase: "recovering"` and non-authoritative storage/cache
+  figures instead of fabricated-looking zero, and `cluster.conditions`
+  reports "one or more online nodes are still recovering" for that window.
+  This directly fixes the 0.23.1 rolling-deployment incident where Status
+  reported all nodes green with plausible load figures while nodes were
+  stopped or 80-100 seconds into recovery.
+- Serialize foreground metadata-head reconciliation (`MetadataManager::read_group()`)
+  behind a dedicated `reconciliation_mutex_`, re-checked after acquisition, so
+  concurrent reads observing the same accepted-head divergence produce at
+  most one merge commit instead of each independently publishing its own.
+  Unlike the write/repair paths, ordinary reads previously took no lock at
+  all here; under real operational churn (node restarts/reconnects) this let
+  redundant, mostly `Body::full` reconciliation commits accumulate on every
+  concurrent read during a divergence window, which is the direct cause of a
+  live node's metadata history growing from 37MB to 20.9GB in under a week.
+  The underlying divergence-tolerant merge/history-fetch machinery is
+  unchanged; only concurrent access to the merge-and-publish step is now
+  serialized.
+- Bound `Service::wait_services_ready()`, which previously waited on local
+  startup with no timeout at all: a rare (reproduced at roughly 1-in-30
+  startups under stress) internal stall below the readiness/subsystem
+  construction path — one that neither completes nor throws — could hang a
+  node forever with no diagnostic and no way for the process supervisor to
+  intervene, since systemd's `Restart=on-failure` only ever triggers once a
+  process actually exits. Add configurable `service_startup_timeout_ms`
+  (default 120000); on timeout, log the last-known per-subsystem readiness
+  state and terminate the process outright rather than attempt an ordinary
+  exception unwind, which would try to join a startup thread that may be
+  permanently blocked and hang identically in `stop()`. Restart-driven
+  recovery replay on the next boot is what actually resolves the stalled
+  state. The root cause of the underlying rare stall itself — a suspected
+  lock or lost wakeup somewhere in subsystem construction/start — was not
+  pinned down and remains open; this bounds its worst-case impact rather than
+  eliminating it.
+
 ## 0.23.1 — bounded FUSE recovery failure (development)
 
 - Stop terminal asynchronous publication failures from being immediately

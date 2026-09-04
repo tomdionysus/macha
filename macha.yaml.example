@@ -21,6 +21,13 @@ log_level: INFO
 # QUIET, PANIC, FATAL, ERROR, WARN, INFO, VERBOSE, DEBUG or TRACE. Default: ERROR.
 ffmpeg_log_level: ERROR
 
+# Bound on local-state readiness and subsystem startup. If this never
+# resolves (neither ready nor a clean failure) within the window, it is
+# treated as a suspected internal stall: the process logs known readiness
+# state and terminates so the service supervisor (systemd Restart=on-failure)
+# can bring up a fresh instance, rather than hanging forever. Default: 120000.
+service_startup_timeout_ms: 120000
+
 # Linux/glibc process-memory bound. Apply one allocator arena per RPi core by
 # default instead of glibc's much larger CPU-derived allowance. This prevents
 # short-lived codec threads from ratcheting retained process memory after each
@@ -335,6 +342,14 @@ catalogue:
     max_queued_connections: 128
     client_io_timeout_ms: 30000
     stream_chunk_bytes: 256K
+
+    # HTTP/1.1 keep-alive. A connection is reused for up to
+    # keep_alive_max_requests before the server forces "Connection: close";
+    # it is also closed early if it sits idle longer than
+    # keep_alive_idle_timeout_ms waiting for the next request, or if other
+    # connections are queued waiting for a worker.
+    keep_alive_max_requests: 100
+    keep_alive_idle_timeout_ms: 15000
 
 # Persistent host-side ingest. Jobs may point at a regular file or recursively
 # import a directory (for example, a temporarily mounted USB disk). The source

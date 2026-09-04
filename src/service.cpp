@@ -5,6 +5,7 @@
 #include "log.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <limits>
@@ -86,8 +87,10 @@ void log_slow_stage(std::string_view stage, Clock::time_point started,
 } // namespace
 
 Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook startup_stage_hook,
-                 MaintenanceStageHook maintenance_stage_hook)
+                 MaintenanceStageHook maintenance_stage_hook,
+                 StartupStallHandler startup_stall_handler)
     : node_(std::move(config), keys, std::move(startup_stage_hook)), cluster_status_(node_),
+      startup_stall_handler_(std::move(startup_stall_handler)),
       maintenance_stage_hook_(std::move(maintenance_stage_hook)) {
     cluster_status_.attach_convergence_diagnostics(
         [this] { return metadata_convergence_.diagnostics(); });
@@ -146,16 +149,58 @@ bool Service::capability_request(const HttpRequest& request) {
     return streaming_->capability_request(request);
 }
 
+std::string Service::describe_readiness_stall() const {
+    const auto readiness = node_.readiness();
+    auto phase = [](bool ready) { return ready ? "ready" : "recovering"; };
+    return std::string("readiness: control_plane=") +
+          (readiness.control_plane_online ? "ready" : "starting") +
+          " data_storage=" + phase(readiness.data_storage_ready) +
+          " control_storage=" + phase(readiness.control_storage_ready) +
+          " cache=" + phase(readiness.cache_ready) +
+          " retention=" + phase(readiness.retention_ready) +
+          " metadata=" + phase(readiness.metadata_ready) +
+          " local_state=" + phase(readiness.local_state_ready) +
+          " failed=" + (readiness.failed ? "true" : "false");
+}
+
 void Service::wait_services_ready() {
     if (services_ready_.load(std::memory_order_acquire))
         return;
     std::unique_lock lock(startup_mutex_);
-    startup_cv_.wait(lock, [this] {
+    const bool signalled = startup_cv_.wait_for(lock, node_.config().service_startup_timeout, [this] {
         return services_ready_.load(std::memory_order_acquire) ||
                startup_failed_.load(std::memory_order_acquire);
     });
-    if (!services_ready_.load(std::memory_order_acquire))
+    if (services_ready_.load(std::memory_order_acquire))
+        return;
+    lock.unlock();
+    if (signalled)
         throw std::runtime_error(startup_error_.empty() ? "server startup failed" : startup_error_);
+
+    // Local-state readiness/subsystem construction neither completed nor
+    // threw within the configured bound: a suspected internal stall (a lock
+    // or lost wakeup somewhere below this point), not a clean, catchable
+    // failure. The startup thread may be permanently blocked and can never
+    // safely be joined, so ordinary exception unwinding here -- which would
+    // destruct this Service and try to join it in stop() -- is not safe.
+    // Terminate the process outright and rely on the service supervisor
+    // (systemd Restart=on-failure in production) to bring up a fresh,
+    // unstuck instance; recovery replay on the next boot is what actually
+    // resolves the stalled state, not this process limping on.
+    const auto diagnostic = describe_readiness_stall();
+    const auto message = "service startup stalled after " +
+                         std::to_string(node_.config().service_startup_timeout.count()) +
+                         "ms; " + diagnostic + "; terminating for restart";
+    Log::error(message);
+    if (startup_stall_handler_) {
+        // Test-only: observe the stall without killing the test process. The
+        // underlying startup thread is still stuck; the caller is
+        // responsible for releasing whatever it gated on before this Service
+        // is destroyed, or its own join in stop() will hang the same way.
+        startup_stall_handler_(diagnostic);
+        throw std::runtime_error(message);
+    }
+    std::_Exit(1);
 }
 
 void Service::initialise_services(std::stop_token stop) {
