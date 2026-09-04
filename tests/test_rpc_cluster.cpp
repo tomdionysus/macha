@@ -4071,4 +4071,258 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
     s1.stop();
 }
 
+MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_round_compacts_across_cluster) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto p1 = free_port();
+    auto p2 = free_port();
+
+    auto c1 = config_for(cluster.path() / "checkpoint-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "checkpoint-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }));
+
+    s1.filesystem().mkdir("/a", 0755, getuid(), getgid());
+    REQUIRE(wait_until([&] {
+        try {
+            return s2.filesystem().getattr("/a").type == EntryType::directory;
+        } catch (...) {
+            return false;
+        }
+    }));
+    s2.filesystem().mkdir("/b", 0755, getuid(), getgid());
+    REQUIRE(wait_until([&] {
+        try {
+            return s1.filesystem().getattr("/b").type == EntryType::directory;
+        } catch (...) {
+            return false;
+        }
+    }));
+
+    // Direct reachability, not merely gossip, must be established before the
+    // round's gate opens -- mirrors the destructive-GC fence.
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().all_known_reachable() &&
+               s2.node().membership().all_known_reachable();
+    }));
+
+    CHECK(s1.node().metadata_replica().diagnostics().history_records >= 3);
+
+    // s1 proposes; both nodes ack; s1 commits and compacts locally within
+    // this one call. s2 only has a committed proof so far -- it re-roots its
+    // own history.log on its own next attempt, exactly as production relies
+    // on the next maintenance tick to do.
+    s1.metadata_manager().attempt_history_checkpoint(1, 1);
+    CHECK(s1.node().metadata_replica().diagnostics().history_records == 1);
+    auto proof1 = s1.node().metadata_replica().checkpoint_proof();
+    REQUIRE(proof1.has_value());
+    CHECK(proof1->status == HistoryCheckpointProof::Status::committed);
+
+    REQUIRE(wait_until([&] {
+        s2.metadata_manager().attempt_history_checkpoint(1, 1);
+        return s2.node().metadata_replica().diagnostics().history_records == 1;
+    }));
+    auto proof2 = s2.node().metadata_replica().checkpoint_proof();
+    REQUIRE(proof2.has_value());
+    CHECK(proof2->status == HistoryCheckpointProof::Status::committed);
+    CHECK(proof2->floor_hash == proof1->floor_hash);
+    CHECK(proof2->epoch == proof1->epoch);
+
+    // Compaction must never be observable through ordinary reads.
+    CHECK(s1.filesystem().getattr("/a").type == EntryType::directory);
+    CHECK(s1.filesystem().getattr("/b").type == EntryType::directory);
+    CHECK(s2.filesystem().getattr("/a").type == EntryType::directory);
+    CHECK(s2.filesystem().getattr("/b").type == EntryType::directory);
+
+    s2.stop();
+    s1.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_concurrent_proposers_converge) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto p1 = free_port();
+    auto p2 = free_port();
+
+    auto c1 = config_for(cluster.path() / "concurrent-checkpoint-n1", cluster.keyfile(), p1,
+                         {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "concurrent-checkpoint-n2", cluster.keyfile(), p2,
+                         {{"127.0.0.1", p1}});
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }));
+    s1.filesystem().mkdir("/concurrent", 0755, getuid(), getgid());
+    REQUIRE(wait_until([&] {
+        try {
+            return s2.filesystem().getattr("/concurrent").type == EntryType::directory;
+        } catch (...) {
+            return false;
+        }
+    }));
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().all_known_reachable() &&
+               s2.node().membership().all_known_reachable();
+    }));
+
+    // Both nodes independently observe the same single accepted head and
+    // propose at the same time. The protocol is leaderless and idempotent by
+    // (floor_hash, epoch) identity -- neither proposal should conflict with
+    // or corrupt the other, and both replicas must converge on exactly the
+    // same committed proof.
+    std::thread t1([&] { s1.metadata_manager().attempt_history_checkpoint(1, 1); });
+    std::thread t2([&] { s2.metadata_manager().attempt_history_checkpoint(1, 1); });
+    t1.join();
+    t2.join();
+
+    // Whichever proposer's commit broadcast lost the race, its own next
+    // attempt still converges via the identical (floor_hash, epoch) acked
+    // locally by the other's proposal.
+    REQUIRE(wait_until([&] {
+        s1.metadata_manager().attempt_history_checkpoint(1, 1);
+        s2.metadata_manager().attempt_history_checkpoint(1, 1);
+        return s1.node().metadata_replica().diagnostics().history_records == 1 &&
+               s2.node().metadata_replica().diagnostics().history_records == 1;
+    }));
+
+    auto proof1 = s1.node().metadata_replica().checkpoint_proof();
+    auto proof2 = s2.node().metadata_replica().checkpoint_proof();
+    REQUIRE(proof1.has_value());
+    REQUIRE(proof2.has_value());
+    CHECK(proof1->floor_hash == proof2->floor_hash);
+    CHECK(proof1->epoch == proof2->epoch);
+    CHECK(s1.node().metadata_replica().committed().hash == proof1->floor_hash);
+    CHECK(s2.node().metadata_replica().committed().hash == proof2->floor_hash);
+
+    s2.stop();
+    s1.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_aborts_when_a_participant_is_unreachable) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto p1 = free_port();
+    auto p2 = free_port();
+
+    auto c1 = config_for(cluster.path() / "unreachable-checkpoint-n1", cluster.keyfile(), p1,
+                         {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "unreachable-checkpoint-n2", cluster.keyfile(), p2,
+                         {{"127.0.0.1", p1}});
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }));
+    s1.filesystem().mkdir("/unreachable", 0755, getuid(), getgid());
+    REQUIRE(wait_until([&] {
+        try {
+            return s2.filesystem().getattr("/unreachable").type == EntryType::directory;
+        } catch (...) {
+            return false;
+        }
+    }));
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().all_known_reachable() &&
+               s2.node().membership().all_known_reachable();
+    }));
+
+    // A durably-known participant that cannot be reached at all -- not just
+    // one that disagrees -- must abort the round outright rather than
+    // compact against an incomplete view of the cluster.
+    // discover_accepted_heads_required()'s required-response semantics are
+    // exactly what is under test here, independent of the time-based
+    // all_known_reachable() gate.
+    s2.stop();
+    s1.metadata_manager().attempt_history_checkpoint(1, 1);
+    CHECK(s1.node().metadata_replica().diagnostics().history_records > 1);
+    CHECK(!s1.node().metadata_replica().checkpoint_proof().has_value());
+
+    s1.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_recovers_after_crash_between_ack_and_commit) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto p1 = free_port();
+    auto p2 = free_port();
+
+    auto c1 = config_for(cluster.path() / "crash-checkpoint-n1", cluster.keyfile(), p1,
+                         {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "crash-checkpoint-n2", cluster.keyfile(), p2,
+                         {{"127.0.0.1", p1}});
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }));
+    s1.filesystem().mkdir("/crash", 0755, getuid(), getgid());
+    REQUIRE(wait_until([&] {
+        try {
+            return s2.filesystem().getattr("/crash").type == EntryType::directory;
+        } catch (...) {
+            return false;
+        }
+    }));
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().all_known_reachable() &&
+               s2.node().membership().all_known_reachable();
+    }));
+
+    // Simulate a proposer crashing after collecting every ack but before
+    // broadcasting the commit: hand-install a merely-acked proof on s2 for
+    // exactly the (floor_hash, epoch) a real round would have produced,
+    // without ever committing or compacting it.
+    const auto floor = s1.node().metadata_replica().accepted_heads();
+    REQUIRE(floor.size() == 1);
+    HistoryCheckpointProof stranded;
+    stranded.floor_hash = floor.front().hash;
+    stranded.floor_generation = floor.front().generation;
+    stranded.epoch.bytes[0] = 0x99;
+    stranded.participants = {s1.node().node_id(), s2.node().node_id()};
+    s2.node().metadata_replica().record_checkpoint_ack(stranded);
+    CHECK(s2.node().metadata_replica().checkpoint_proof()->status ==
+         HistoryCheckpointProof::Status::acked);
+    // A stranded ack alone -- never promoted to committed -- must never by
+    // itself cause s2's own history to be re-rooted. record_checkpoint_ack()
+    // only ever records the durable ack; it never calls
+    // compact_history_if_safe() as a side effect, and nothing else has
+    // called it here either.
+    CHECK(s2.node().metadata_replica().diagnostics().history_records > 1);
+
+    // The next real maintenance cycle re-proposes a fresh (floor_hash,
+    // epoch) from scratch -- cheap to re-ack since the floor is unchanged --
+    // and completes normally, superseding the stranded record.
+    REQUIRE(wait_until([&] {
+        s1.metadata_manager().attempt_history_checkpoint(1, 1);
+        return s1.node().metadata_replica().diagnostics().history_records == 1;
+    }));
+    REQUIRE(wait_until([&] {
+        s2.metadata_manager().attempt_history_checkpoint(1, 1);
+        return s2.node().metadata_replica().diagnostics().history_records == 1;
+    }));
+    auto proof2 = s2.node().metadata_replica().checkpoint_proof();
+    REQUIRE(proof2.has_value());
+    CHECK(proof2->status == HistoryCheckpointProof::Status::committed);
+    CHECK(proof2->epoch != stranded.epoch);
+
+    s2.stop();
+    s1.stop();
+}
+
 } // namespace

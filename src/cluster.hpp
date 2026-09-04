@@ -228,6 +228,12 @@ class NodeRuntime {
     bool store_metadata_commit(const MetadataHistoryEntry&);
     bool accept_metadata_commit(const MetadataAcceptance&);
     std::vector<MetadataAcceptance> metadata_heads() const;
+    // RPC-side of MetadataManager::attempt_history_checkpoint()'s
+    // propose/commit round. Thin pass-throughs to MetadataReplica, mirroring
+    // store_metadata_commit()/accept_metadata_commit() -- NodeRuntime has no
+    // reference to MetadataManager, so dispatch goes directly to the replica.
+    bool accept_history_checkpoint_proposal(const HistoryCheckpointProof&);
+    bool commit_history_checkpoint(const Hash256& floor_hash, const Hash256& epoch);
     void announce_metadata_generation(uint64_t);
     void enqueue_fetched(const ObjectId&, std::span<const uint8_t>, bool promote);
     void reconfigure_local(const Config&);

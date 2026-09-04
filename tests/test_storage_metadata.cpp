@@ -929,6 +929,240 @@ MACHA_FAST_TEST("storage_metadata", test_pristine_joiner_adopts_compacted_cluste
     CHECK(established_heads.front().hash == established.hash);
 }
 
+MACHA_FAST_TEST("storage_metadata", test_history_checkpoint_proof_only_trusted_once_committed) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "checkpoint-proof-ack";
+
+    NodeId a{}, b{};
+    a.bytes[15] = 1;
+    b.bytes[15] = 2;
+
+    MetadataReplica replica(path, keys.storage);
+    CHECK(!replica.checkpoint_proof().has_value());
+
+    HistoryCheckpointProof proposal;
+    proposal.floor_hash = replica.committed().hash;
+    proposal.floor_generation = replica.committed().generation;
+    proposal.epoch.bytes[0] = 0x11;
+    proposal.participants = {a, b};
+
+    // Committing before any ack for this exact (floor_hash, epoch) is refused.
+    CHECK(!replica.record_checkpoint_commit(proposal.floor_hash, proposal.epoch));
+    CHECK(!replica.checkpoint_proof().has_value());
+
+    replica.record_checkpoint_ack(proposal);
+    // The ack is durably visible, but only ever as `acked` -- callers that
+    // gate on authority (compact_history_if_safe() and the
+    // accepted_head_is_ancestor_locked() checkpoint-floor trust rule) must
+    // check status == committed themselves; this accessor does not filter.
+    auto acked = replica.checkpoint_proof();
+    REQUIRE(acked.has_value());
+    CHECK(acked->status == HistoryCheckpointProof::Status::acked);
+
+    // A commit for the right floor but a different epoch (a membership
+    // change mid-round) is refused: no acked record matches it exactly.
+    auto other_epoch = proposal.epoch;
+    other_epoch.bytes[1] = 0x99;
+    CHECK(!replica.record_checkpoint_commit(proposal.floor_hash, other_epoch));
+    CHECK(replica.checkpoint_proof()->status == HistoryCheckpointProof::Status::acked);
+
+    REQUIRE(replica.record_checkpoint_commit(proposal.floor_hash, proposal.epoch));
+    auto proof = replica.checkpoint_proof();
+    REQUIRE(proof.has_value());
+    CHECK(proof->status == HistoryCheckpointProof::Status::committed);
+    CHECK(proof->floor_hash == proposal.floor_hash);
+    CHECK(proof->epoch == proposal.epoch);
+}
+
+MACHA_FAST_TEST("storage_metadata", test_history_checkpoint_proof_reload_validates_against_committed) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "checkpoint-proof-reload";
+    NodeId a{};
+    a.bytes[15] = 1;
+
+    MetadataRecord committed_at_commit;
+    {
+        MetadataReplica replica(path, keys.storage);
+        committed_at_commit = replica.committed();
+        HistoryCheckpointProof proposal;
+        proposal.floor_hash = committed_at_commit.hash;
+        proposal.floor_generation = committed_at_commit.generation;
+        proposal.epoch.bytes[0] = 0x42;
+        proposal.participants = {a};
+        replica.record_checkpoint_ack(proposal);
+        REQUIRE(replica.record_checkpoint_commit(proposal.floor_hash, proposal.epoch));
+    }
+    {
+        // A restart must validate the proof before using it: it still
+        // matches the current committed head here, so it survives.
+        MetadataReplica reopened(path, keys.storage);
+        auto proof = reopened.checkpoint_proof();
+        REQUIRE(proof.has_value());
+        CHECK(proof->status == HistoryCheckpointProof::Status::committed);
+        CHECK(proof->floor_hash == committed_at_commit.hash);
+    }
+
+    // Advance committed_ past the proof's floor via an ordinary mutation.
+    {
+        MetadataReplica replica(path, keys.storage);
+        auto snapshot = decode_snapshot(replica.committed().payload);
+        FsEntry directory;
+        directory.type = EntryType::directory;
+        directory.mode = 0755;
+        snapshot.entries["/advanced"] = directory;
+        MetadataRecord advanced;
+        advanced.generation = replica.committed().generation + 1;
+        advanced.previous = replica.committed().hash;
+        advanced.payload = encode_snapshot(snapshot);
+        advanced.hash = metadata_hash(advanced.generation, advanced.previous, advanced.payload);
+        REQUIRE(replica.store_commit(advanced));
+        REQUIRE(replica.accept_commit({advanced.generation, advanced.hash, 0, {}}));
+    }
+    {
+        // The proof's floor_hash no longer matches committed_ -- a restart
+        // must never trust it, not even partially.
+        MetadataReplica reopened(path, keys.storage);
+        CHECK(!reopened.checkpoint_proof().has_value());
+    }
+}
+
+MACHA_FAST_TEST("storage_metadata", test_history_checkpoint_proof_corrupt_file_ignored_on_restart) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "checkpoint-proof-corrupt";
+    NodeId a{};
+    a.bytes[15] = 1;
+
+    MetadataRecord committed_at_commit;
+    {
+        MetadataReplica replica(path, keys.storage);
+        committed_at_commit = replica.committed();
+        HistoryCheckpointProof proposal;
+        proposal.floor_hash = committed_at_commit.hash;
+        proposal.floor_generation = committed_at_commit.generation;
+        proposal.epoch.bytes[0] = 0x07;
+        proposal.participants = {a};
+        replica.record_checkpoint_ack(proposal);
+        REQUIRE(replica.record_checkpoint_commit(proposal.floor_hash, proposal.epoch));
+    }
+    const auto proof_path = path / "metadata" / "checkpoint-proof.meta";
+    REQUIRE(std::filesystem::exists(proof_path));
+    {
+        std::ofstream corrupt(proof_path, std::ios::binary | std::ios::trunc);
+        corrupt << "not a valid checkpoint proof file";
+    }
+
+    MetadataReplica reopened(path, keys.storage);
+    CHECK(!reopened.checkpoint_proof().has_value());
+    // A corrupt, unrelated proof file must never disturb ordinary replica
+    // startup or state.
+    CHECK(reopened.committed().hash == committed_at_commit.hash);
+}
+
+MACHA_FAST_TEST("storage_metadata",
+                test_returning_node_adopts_head_beyond_pruned_ancestry_only_with_committed_proof) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+
+    NodeId a{}, b{};
+    a.bytes[15] = 1;
+    b.bytes[15] = 2;
+
+    const auto genesis = genesis_metadata();
+    auto floor_snapshot = decode_snapshot(genesis.payload);
+    floor_snapshot.metadata_write_replicas_required = 2;
+    FsEntry directory;
+    directory.type = EntryType::directory;
+    directory.mode = 0755;
+    floor_snapshot.entries["/floor"] = directory;
+
+    MetadataRecord floor;
+    floor.generation = genesis.generation + 1;
+    floor.previous = genesis.hash;
+    floor.payload = encode_snapshot(floor_snapshot);
+    floor.hash = metadata_hash(floor.generation, floor.previous, floor.payload);
+    const MetadataAcceptance floor_accept{floor.generation, floor.hash, 2, {a, b}};
+
+    // A later cluster head descending from `floor` via mutations this node
+    // never witnessed, itself already compacted a second time on the peer
+    // side: its recorded direct predecessor is some further intermediate
+    // record this node never had either, not `floor` itself. This is the
+    // real gap -- history_is_ancestor_locked() already walks a single
+    // compacted hop's *direct* previous hash even when previous_known is
+    // false (see its own comment), so a one-hop-removed compacted root is
+    // not actually the unresolvable case. Two hops (an intermediate this
+    // node never received, itself pruned away too) is.
+    Hash256 pruned_intermediate{};
+    pruned_intermediate.bytes[0] = 0x77;
+    auto beyond_snapshot = floor_snapshot;
+    beyond_snapshot.entries["/beyond"] = directory;
+    MetadataRecord beyond;
+    beyond.generation = floor.generation + 5;
+    beyond.previous = pruned_intermediate;
+    beyond.payload = encode_snapshot(beyond_snapshot);
+    beyond.hash = metadata_hash(beyond.generation, beyond.previous, beyond.payload);
+    const MetadataAcceptance beyond_accept{beyond.generation, beyond.hash, 2, {a, b}};
+
+    MetadataHistoryEntry beyond_compacted_root;
+    beyond_compacted_root.generation = beyond.generation;
+    beyond_compacted_root.previous = beyond.previous;
+    beyond_compacted_root.hash = beyond.hash;
+    beyond_compacted_root.previous_known = false;
+    beyond_compacted_root.body = MetadataHistoryEntry::Body::full;
+    beyond_compacted_root.payload.assign(beyond.payload.begin(), beyond.payload.end());
+
+    // Negative case: a replica with no checkpoint proof for `floor` must
+    // never silently adopt `beyond` on generation alone -- that is exactly
+    // the defect a prior incident was caused by. It stays genuinely
+    // divergent, awaiting real reconciliation.
+    {
+        MetadataReplica replica(t.path() / "no-proof", keys.storage);
+        REQUIRE(replica.store_commit(floor));
+        REQUIRE(replica.accept_commit(floor_accept));
+        REQUIRE(replica.import_history(beyond_compacted_root));
+        REQUIRE(replica.accept_commit(beyond_accept));
+        auto heads = replica.accepted_heads();
+        CHECK(heads.size() == 2);
+        CHECK(!replica.history_common_ancestor(floor.hash, beyond.hash).has_value());
+    }
+
+    // Positive case: a replica that itself durably committed a checkpoint
+    // proof for exactly `floor` trusts it as a universal ancestor of
+    // anything that now materialises at a later generation, exactly like
+    // genesis -- because reaching that proof already required every then-
+    // known participant, including this replica, to agree floor was the
+    // cluster's sole accepted head.
+    {
+        MetadataReplica replica(t.path() / "with-proof", keys.storage);
+        REQUIRE(replica.store_commit(floor));
+        REQUIRE(replica.accept_commit(floor_accept));
+
+        HistoryCheckpointProof proposal;
+        proposal.floor_hash = floor.hash;
+        proposal.floor_generation = floor.generation;
+        proposal.epoch.bytes[0] = 0x5A;
+        proposal.participants = {a, b};
+        replica.record_checkpoint_ack(proposal);
+        REQUIRE(replica.record_checkpoint_commit(proposal.floor_hash, proposal.epoch));
+
+        REQUIRE(replica.import_history(beyond_compacted_root));
+        REQUIRE(replica.accept_commit(beyond_accept));
+        auto heads = replica.accepted_heads();
+        REQUIRE(heads.size() == 1);
+        CHECK(heads.front().hash == beyond.hash);
+    }
+}
+
 MACHA_FAST_TEST("storage_metadata", test_manual_causal_metadata_repair_requires_strict_dominance) {
     NodeId a{}, b{};
     a.bytes[15] = 1;
