@@ -822,6 +822,178 @@ void MetadataManager::ensure_accepted_head_durable(
         throw MetadataNotReady("metadata acceptance certificate durability floor unavailable");
 }
 
+std::optional<std::vector<std::pair<NodeInfo, MetadataAcceptance>>>
+MetadataManager::discover_accepted_heads_required(const std::vector<NodeInfo>& nodes,
+                                                   FrameType frame_type) {
+    std::vector<std::pair<NodeInfo, MetadataAcceptance>> out;
+    for (const auto& owner : nodes) {
+        try {
+            std::vector<MetadataAcceptance> heads;
+            if (owner.id == node_.node_id()) {
+                heads = node_.metadata_heads();
+            } else {
+                auto reply = node_.call(owner, MessageType::get_metadata_heads, {}, frame_type);
+                if (reply.message.type != MessageType::metadata_heads_reply)
+                    return std::nullopt;
+                heads = decode_metadata_acceptance_set(reply.message.payload);
+            }
+            for (auto& head : heads)
+                out.emplace_back(owner, std::move(head));
+        } catch (const std::exception& error) {
+            Log::debug("metadata head survey (required) " + owner.host + ": " + error.what());
+            return std::nullopt;
+        }
+    }
+    return out;
+}
+
+bool MetadataManager::propose_history_floor_on(const NodeInfo& owner,
+                                               const HistoryCheckpointProof& proposal,
+                                               FrameType frame_type) {
+    if (owner.id == node_.node_id()) {
+        node_.metadata_replica().record_checkpoint_ack(proposal);
+        return true;
+    }
+    try {
+        const auto encoded = encode_history_checkpoint_proof(proposal);
+        return bool_reply(
+            node_.call(owner, MessageType::propose_history_floor, encoded, frame_type));
+    } catch (const std::exception& error) {
+        Log::debug("history checkpoint proposal " + owner.host + ": " + error.what());
+        return false;
+    }
+}
+
+bool MetadataManager::commit_history_floor_on(const NodeInfo& owner, const Hash256& floor_hash,
+                                              const Hash256& epoch, FrameType frame_type) {
+    if (owner.id == node_.node_id())
+        return node_.metadata_replica().record_checkpoint_commit(floor_hash, epoch);
+    try {
+        HistoryCheckpointProof commit_message;
+        commit_message.floor_hash = floor_hash;
+        commit_message.epoch = epoch;
+        commit_message.status = HistoryCheckpointProof::Status::committed;
+        const auto encoded = encode_history_checkpoint_proof(commit_message);
+        return bool_reply(
+            node_.call(owner, MessageType::commit_history_floor, encoded, frame_type));
+    } catch (const std::exception& error) {
+        Log::debug("history checkpoint commit " + owner.host + ": " + error.what());
+        return false;
+    }
+}
+
+void MetadataManager::attempt_history_checkpoint(size_t record_threshold,
+                                                 uint64_t byte_threshold) {
+    // The round reads and depends on accepted-head/committed state exactly
+    // like read_group()/repair_once() do, and repair_once() already holds
+    // mutation_mutex_ across its own full network round trip. Match that
+    // shape: serialise against a concurrent foreground mutation for the
+    // whole round rather than just the final local compaction step.
+    std::unique_lock mutation_lock(mutation_mutex_);
+
+    const auto diagnostics = node_.metadata_replica().diagnostics();
+    if (diagnostics.history_records < record_threshold &&
+        diagnostics.history_file_bytes < byte_threshold)
+        return;
+    if (node_.metadata_replica().recovery_required())
+        return;
+
+    // Gate: only ever attempt this with exactly one local accepted head, and
+    // only once every durably-known participant is currently, directly
+    // reachable -- mirrors the one other irreversible, cluster-wide-consensus
+    // decision this codebase already makes this way (destructive object GC).
+    auto local_heads = node_.metadata_replica().accepted_heads();
+    if (local_heads.size() != 1)
+        return;
+    if (!node_.membership().all_known_reachable())
+        return;
+    const auto floor_hash_candidate = local_heads.front().hash;
+
+    auto participants = node_.membership().all();
+    if (participants.empty())
+        return;
+    std::sort(participants.begin(), participants.end(),
+              [](const NodeInfo& a, const NodeInfo& b) { return a.id < b.id; });
+
+    // epoch fingerprints exactly this participant set. A membership change
+    // mid-round changes the epoch on the next attempt, which invalidates any
+    // in-flight proposal automatically -- no separate membership-version
+    // bookkeeping needed.
+    Writer epoch_writer;
+    for (const auto& participant : participants)
+        epoch_writer.fixed(participant.id.bytes);
+    const auto epoch = sha256(epoch_writer.take());
+
+    // Survey: require every participant to answer, and every participant to
+    // report exactly one accepted head, identical to this node's own.
+    auto surveyed = discover_accepted_heads_required(participants, FrameType::control);
+    if (!surveyed)
+        return;
+    std::map<NodeId, std::vector<MetadataAcceptance>> by_node;
+    for (auto& [owner, acceptance] : *surveyed)
+        by_node[owner.id].push_back(std::move(acceptance));
+    if (by_node.size() != participants.size())
+        return; // A participant reported no heads at all -- not settled yet.
+
+    std::optional<Hash256> floor_hash;
+    uint64_t floor_generation = 0;
+    for (const auto& [id, heads] : by_node) {
+        if (heads.size() != 1)
+            return; // That participant has not itself converged to one head.
+        if (!floor_hash) {
+            floor_hash = heads.front().hash;
+            floor_generation = heads.front().generation;
+        } else if (heads.front().hash != *floor_hash) {
+            return; // Participants disagree -- not settled yet.
+        }
+    }
+    if (!floor_hash || *floor_hash != floor_hash_candidate)
+        return;
+
+    HistoryCheckpointProof proposal;
+    proposal.floor_hash = *floor_hash;
+    proposal.floor_generation = floor_generation;
+    proposal.epoch = epoch;
+    proposal.participants.reserve(participants.size());
+    for (const auto& participant : participants)
+        proposal.participants.push_back(participant.id);
+    proposal.status = HistoryCheckpointProof::Status::acked;
+
+    // Propose + durable ack: every participant must ack before anyone
+    // commits. Abort outright on the first failure; the next maintenance
+    // cycle re-proposes the identical (floor_hash, epoch), which is cheap to
+    // re-ack since the content is unchanged.
+    for (const auto& owner : participants) {
+        if (!propose_history_floor_on(owner, proposal, FrameType::control))
+            return;
+    }
+
+    // Commit locally first. If even the local commit is refused (a stale
+    // proposal already superseded it), do not broadcast a commit no one
+    // durably acked.
+    if (!node_.metadata_replica().record_checkpoint_commit(*floor_hash, epoch))
+        return;
+
+    for (const auto& owner : participants) {
+        if (owner.id == node_.node_id())
+            continue;
+        // Best-effort from here: a participant that misses this broadcast
+        // simply remains at `acked` and adopts the commit on the next
+        // maintenance cycle, via an identical re-proposal -- see the class
+        // comment on HistoryCheckpointProof.
+        (void)commit_history_floor_on(owner, *floor_hash, epoch, FrameType::control);
+    }
+
+    // Only ever compact once *this* replica's own proof is committed.
+    // compact_history_if_safe() re-validates its own preconditions
+    // independently -- this protocol is an added prerequisite gate, not a
+    // replacement for them.
+    if (node_.metadata_replica().compact_history_if_safe(record_threshold, byte_threshold))
+        Log::info("metadata history checkpoint committed and compacted floor_generation=" +
+                  std::to_string(floor_generation) + " floor_hash=" + to_string(*floor_hash) +
+                  " participants=" + std::to_string(participants.size()));
+}
+
 MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
                                            FrameType frame_type) {
     auto nodes = compatible_replicas(replica_nodes(replicas));

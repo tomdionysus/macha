@@ -1,5 +1,31 @@
 # Current release
 
+## 0.23.6 — Safe distributed checkpoint and metadata-history compaction (development)
+
+- `MetadataReplica::compact_history_if_safe()` — an existing, tested local
+  primitive that re-roots `history.log` at the sole committed accepted head —
+  is now actually called in production, gated behind a new cluster-wide
+  distributed checkpoint protocol. Previously it had zero callers: a
+  generation-only safety check was known to be unsafe (a returning accepted
+  branch could outlive the common ancestor on every replica), so history
+  compaction stayed permanently disabled and `history.log` grew without
+  bound.
+- New leaderless propose → durable-ack → commit → prune round
+  (`MetadataManager::attempt_history_checkpoint()`, new `propose_history_floor`
+  / `commit_history_floor` RPCs, new durable `checkpoint-proof.meta` per
+  replica). Compaction only fires once every durably-known participant has
+  durably acknowledged the exact same accepted-head hash as the new ancestry
+  floor — mirrors the existing `all_known_reachable()` gate already used for
+  destructive object GC. A restart only ever trusts a proof that still
+  validates against the replica's current committed head.
+- A returning node whose own compaction floor has since been pruned
+  everywhere else in the cluster (peers compacted further while it was
+  unreachable) now converges automatically instead of getting stuck
+  advertising an unmergeable rootless sibling forever.
+- No client-visible behavior change. Existing nodes with multi-gigabyte
+  `history.log` files (from the previously-unbounded retention) shrink back
+  to a single root record once the cluster completes its first round.
+
 ## 0.23.5 — Cluster-wide ingest/torrent job visibility and control (development)
 
 - `GET /api/v1/ingest/jobs` and `GET /api/v1/torrents/jobs` (list and

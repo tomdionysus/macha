@@ -57,6 +57,8 @@ enum class MessageType : uint16_t {
     ingest_job_action = 34,
     get_torrent_jobs = 35,
     torrent_job_action = 36,
+    propose_history_floor = 37,
+    commit_history_floor = 38,
     ok = 100,
     error = 101,
     members_reply = 102,
