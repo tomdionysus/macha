@@ -206,6 +206,13 @@ struct CatalogueApiConfig {
     size_t stream_chunk_bytes{256 * 1024};
     size_t keep_alive_max_requests{100};
     std::chrono::milliseconds keep_alive_idle_timeout{15000};
+    // Lifetime of a signed artwork capability URL embedded in catalogue
+    // responses (GET .../artwork/{id}?exp=...&sig=...), which lets a client
+    // load artwork via a plain <img src> without a bearer header. Artwork is
+    // content-addressed/immutable and lower-stakes than a playback session,
+    // so this deliberately outlives a typical browsing session; the intended
+    // recovery for an expired URL is simply re-fetching the catalogue item.
+    std::chrono::milliseconds artwork_capability_ttl{std::chrono::hours(24)};
 };
 
 struct CatalogueTmdbConfig {
