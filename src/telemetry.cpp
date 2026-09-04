@@ -71,6 +71,7 @@ void encode(Writer& writer, const NodeTelemetry& value) {
     writer.u64(value.rpc_connections_created);
     writer.u64(value.rpc_connections_reused);
     writer.u64(value.rpc_connections_canonical);
+    writer.u8(static_cast<uint8_t>(value.phase));
 }
 
 NodeTelemetry decode(Reader& reader) {
@@ -98,11 +99,29 @@ NodeTelemetry decode(Reader& reader) {
     value.rpc_connections_created = reader.u64();
     value.rpc_connections_reused = reader.u64();
     value.rpc_connections_canonical = reader.u64();
+    // Optional trailing field: a record encoded before this field existed
+    // simply ends here, and is treated as "ready" (NodeTelemetry's default)
+    // rather than perpetually "recovering".
+    if (reader.remaining()) {
+        const auto phase = reader.u8();
+        if (phase > static_cast<uint8_t>(NodePhase::ready))
+            throw DecodeError("invalid telemetry node phase");
+        value.phase = static_cast<NodePhase>(phase);
+    }
     if (!value.sequence)
         throw DecodeError("telemetry sequence must be nonzero");
     return value;
 }
 } // namespace
+
+std::string_view node_phase_name(NodePhase phase) {
+    switch (phase) {
+    case NodePhase::starting: return "starting";
+    case NodePhase::recovering: return "recovering";
+    case NodePhase::ready: return "ready";
+    }
+    return "unknown";
+}
 
 Bytes encode_node_telemetry(const NodeTelemetry& value) {
     Writer writer;
@@ -181,7 +200,7 @@ NodeTelemetry TelemetryStore::refresh_local(
     const NodeInfo& info, std::string version, uint64_t cache_capacity, uint64_t cache_used,
     uint32_t storage_backends_online, uint32_t peers_known, uint32_t peers_active,
     uint64_t rpc_connections_created, uint64_t rpc_connections_reused,
-    uint64_t rpc_connections_canonical) {
+    uint64_t rpc_connections_canonical, NodePhase phase) {
     const auto now = Clock::now();
     const auto cpu_now = std::clock();
     const auto wall_seconds = std::chrono::duration<double>(now - previous_cpu_wall_).count();
@@ -216,6 +235,7 @@ NodeTelemetry TelemetryStore::refresh_local(
     telemetry.rpc_connections_created = rpc_connections_created;
     telemetry.rpc_connections_reused = rpc_connections_reused;
     telemetry.rpc_connections_canonical = rpc_connections_canonical;
+    telemetry.phase = phase;
     observe(telemetry, true);
     return telemetry;
 }

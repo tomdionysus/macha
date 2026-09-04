@@ -231,6 +231,12 @@ void NodeRuntime::mark_ready(ReadyBit bit) {
     if (all_local_state_ready() && !ready_unix_ms_.load(std::memory_order_relaxed))
         ready_unix_ms_.store(unix_ms(), std::memory_order_release);
     readiness_cv_.notify_all();
+    // Telemetry's reported phase must not lag actual readiness by up to the
+    // ordinary 5s sampling interval: a peer (or this node's own first sample,
+    // published as soon as the control plane starts) would otherwise keep
+    // reporting "recovering" for that whole window after actually becoming
+    // ready.
+    signal_telemetry_refresh();
 }
 
 void NodeRuntime::mark_recovery_failed(std::string error) {
@@ -241,6 +247,7 @@ void NodeRuntime::mark_recovery_failed(std::string error) {
     }
     ready_bits_.fetch_or(static_cast<uint32_t>(ready_failed), std::memory_order_release);
     readiness_cv_.notify_all();
+    signal_telemetry_refresh();
 }
 
 bool NodeRuntime::all_local_state_ready() const noexcept {
@@ -1014,9 +1021,24 @@ void NodeRuntime::refresh_telemetry() {
         storage_backends_online = static_cast<uint32_t>(local_->online_backends());
     const auto peers_known = telemetry_peers_known_.load(std::memory_order_relaxed);
     const auto peers_active = telemetry_peers_active_.load(std::memory_order_relaxed);
+
+    // Mirror the local root.startup.phase vocabulary (see
+    // ClusterStatusService::status_response) so a peer observing this node's
+    // telemetry can tell a genuinely current measurement (ready) from one
+    // whose zeroed capacity/usage above is only a recovery artefact, rather
+    // than treating every fresh sample as authoritative. A failed node is
+    // reported as "recovering" here: telemetry has no separate wire state for
+    // it, and a caller can always query this node's own Status root for the
+    // precise "failed" detail.
+    const auto local_readiness = readiness();
+    const auto phase = local_readiness.failed         ? NodePhase::recovering
+                        : local_readiness.local_state_ready ? NodePhase::ready
+                        : local_readiness.control_plane_online ? NodePhase::recovering
+                                                                : NodePhase::starting;
+
     telemetry_.refresh_local(info, std::string(kServerVersion), cache_capacity, cache_used,
                              storage_backends_online, peers_known, peers_active, 0, 0,
-                             peers_active > 0 ? peers_active - 1 : 0);
+                             peers_active > 0 ? peers_active - 1 : 0, phase);
 }
 
 void NodeRuntime::signal_telemetry_refresh() {

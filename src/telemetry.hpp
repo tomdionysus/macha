@@ -11,9 +11,20 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace macha {
+
+// Mirrors the local-node "startup.phase" vocabulary already reported by the
+// Status API's root object (ClusterStatusService::status_response), so a peer
+// observed via telemetry and this node's own startup phase read the same way.
+// "ready" is the default: a legacy sender/record that predates this field, or
+// one truncated on decode, reports itself as ready rather than perpetually
+// "recovering", preserving prior behavior for anything that omits it.
+enum class NodePhase : uint8_t { starting, recovering, ready };
+
+std::string_view node_phase_name(NodePhase);
 
 struct NodeTelemetry {
     NodeId node_id{};
@@ -39,6 +50,7 @@ struct NodeTelemetry {
     uint64_t rpc_connections_created{};
     uint64_t rpc_connections_reused{};
     uint64_t rpc_connections_canonical{};
+    NodePhase phase{NodePhase::ready};
 
     auto operator<=>(const NodeTelemetry&) const = default;
 };
@@ -79,7 +91,7 @@ class TelemetryStore {
                                 uint64_t cache_used, uint32_t storage_backends_online,
                                 uint32_t peers_known, uint32_t peers_active,
                                 uint64_t rpc_connections_created, uint64_t rpc_connections_reused,
-                                uint64_t rpc_connections_canonical);
+                                uint64_t rpc_connections_canonical, NodePhase phase);
     void observe(NodeTelemetry, bool direct = false);
     void apply_identity_reset(const IdentityAssociationReset&);
     std::optional<NodeTelemetry> local() const;

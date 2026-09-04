@@ -204,6 +204,8 @@ struct CatalogueApiConfig {
     size_t max_queued_connections{128};
     std::chrono::milliseconds client_io_timeout{30000};
     size_t stream_chunk_bytes{256 * 1024};
+    size_t keep_alive_max_requests{100};
+    std::chrono::milliseconds keep_alive_idle_timeout{15000};
 };
 
 struct CatalogueTmdbConfig {
@@ -390,6 +392,11 @@ struct Config {
     StreamingConfig streaming;
     HydrationConfig hydration;
     RuntimeConfig runtime;
+    // Bound on Service::wait_services_ready(). Local-state readiness and
+    // subsystem construction/start are expected to complete or throw well
+    // inside this window; a wait that never resolves either way is treated as
+    // a suspected internal stall rather than left to hang indefinitely.
+    std::chrono::milliseconds service_startup_timeout{120000};
 
     std::filesystem::path key_file;
     std::optional<std::filesystem::path> mount_path;
