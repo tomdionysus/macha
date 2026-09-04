@@ -43,6 +43,8 @@ PersistedNodeStatus persisted(const NodeTelemetry& telemetry) {
     out.cache_used = telemetry.cache_used;
     out.metadata_generation = telemetry.metadata_generation;
     out.storage_backends_online = telemetry.storage_backends_online;
+    out.api_host = telemetry.api_host;
+    out.api_port = telemetry.api_port;
     return out;
 }
 
@@ -216,6 +218,18 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
     node["metadata_generation"] =
         member ? member->metadata_generation
                : (live ? live->metadata_generation : durable.metadata_generation);
+
+    // Where other clients should reach this node's HTTP API - distinct from
+    // host/port above, which is the RPC bind address and not necessarily the
+    // right port (or even protocol) for a REST call. Omitted entirely rather
+    // than reported as empty/0 when unknown, so older or API-less peers in a
+    // mixed cluster are simply not discovered rather than guessed at.
+    const auto& api_host = live ? live->api_host : durable.api_host;
+    const auto api_port = live ? live->api_port : durable.api_port;
+    if (!api_host.empty() && api_port) {
+        node["api_host"] = api_host;
+        node["api_port"] = static_cast<uint64_t>(api_port);
+    }
 
     const auto effective = effective_telemetry(live, stale, durable, telemetry_known);
     const bool telemetry_available = effective.authoritative || telemetry_known;
