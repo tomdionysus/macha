@@ -144,9 +144,11 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
 }
 
 bool Service::capability_request(const HttpRequest& request) {
-    if (!services_ready_.load(std::memory_order_acquire) || !streaming_)
+    if (!services_ready_.load(std::memory_order_acquire))
         return false;
-    return streaming_->capability_request(request);
+    if (streaming_ && streaming_->capability_request(request))
+        return true;
+    return catalogue_api_ && catalogue_api_->capability_request(request);
 }
 
 std::string Service::describe_readiness_stall() const {
@@ -248,7 +250,8 @@ void Service::initialise_services(std::stop_token stop) {
             },
             [scanner_ptr = scanner.get()](const std::vector<std::string>& media_ids) {
                 return scanner_ptr->request_media_profiles(media_ids);
-            });
+            },
+            node_.config().catalogue.api.artwork_capability_ttl);
         auto manage_api = std::make_unique<ManageApi>(node_, *metadata, *fs, *catalogue,
                                                       *catalogue_hints, *scanner);
         auto streaming = std::make_unique<PlaybackManager>(

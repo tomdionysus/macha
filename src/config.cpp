@@ -288,6 +288,9 @@ void parse_catalogue(const YAML::Node& root, Config& c) {
         if (api["keep_alive_idle_timeout_ms"])
             c.catalogue.api.keep_alive_idle_timeout =
                 milliseconds(api["keep_alive_idle_timeout_ms"], "catalogue.api.keep_alive_idle_timeout_ms");
+        if (api["artwork_capability_ttl_ms"])
+            c.catalogue.api.artwork_capability_ttl =
+                milliseconds(api["artwork_capability_ttl_ms"], "catalogue.api.artwork_capability_ttl_ms");
     }
     if (auto scanner = catalogue["scanner"]) {
         if (scanner["enabled"])

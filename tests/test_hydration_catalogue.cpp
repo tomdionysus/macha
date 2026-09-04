@@ -8,6 +8,25 @@ using namespace macha::test_support;
 
 namespace {
 
+// The real query parser lives inside http.cpp's anonymous namespace; this is
+// a small test-local equivalent for splitting a signed artwork URL's query
+// string. Values here are always hex digits or decimal numbers, so no
+// percent-decoding is needed.
+std::map<std::string, std::string, std::less<>> parse_test_query(std::string_view query) {
+    std::map<std::string, std::string, std::less<>> out;
+    size_t pos = 0;
+    while (pos <= query.size()) {
+        auto amp = query.find('&', pos);
+        auto part = query.substr(pos, amp == std::string_view::npos ? query.size() - pos : amp - pos);
+        auto eq = part.find('=');
+        out[std::string(part.substr(0, eq))] =
+            eq == std::string_view::npos ? "" : std::string(part.substr(eq + 1));
+        if (amp == std::string_view::npos) break;
+        pos = amp + 1;
+    }
+    return out;
+}
+
 MACHA_TEST("hydration_catalogue", test_hydration_scheduler_and_prediction) {
     auto make_id = [](uint8_t value) {
         Bytes bytes(32, value);
@@ -2827,6 +2846,154 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_effective_artwork_is_displa
     auto stored = service.catalogue().get(track.id);
     REQUIRE(stored.has_value());
     CHECK(stored->artwork.empty());
+}
+
+MACHA_TEST("hydration_catalogue", test_catalogue_artwork_url_is_signed_and_capability_exempt) {
+    TestService fixture("catalogue-artwork-signed-url");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.hydration.enabled = false;
+    auto& service = fixture.start();
+
+    CatalogueItem album;
+    album.id = "album:signed-url-test";
+    album.kind = CatalogueKind::album;
+    album.title = "Signed URL Album";
+    album = service.catalogue().upsert(album);
+    const Bytes cover_bytes{0x01, 0x02, 0x03, 0x04};
+    const auto cover =
+        service.catalogue().put_artwork(album.id, "cover", "image/png", cover_bytes, album.revision);
+
+    CatalogueApi api(service.catalogue(), service.catalogue_hints());
+    const auto response = api.handle({.method = "GET",
+                                      .path = "/api/v1/catalogue/items/album%3Asigned-url-test",
+                                      .query = {},
+                                      .headers = {},
+                                      .body = {}});
+    REQUIRE(response.status == 200);
+    const auto json = Json::parse(std::string(response.body.begin(), response.body.end()));
+    const auto* artwork = json.find("artwork");
+    REQUIRE(artwork && artwork->isArray());
+    REQUIRE(artwork->asArray().size() == 1);
+    const auto& entry = artwork->asArray().front();
+    const auto* url_value = entry.find("url");
+    REQUIRE(url_value);
+    const auto url = url_value->asString();
+
+    // The URL is directly usable: it carries its own path, id and query.
+    const auto question = url.find('?');
+    REQUIRE(question != std::string::npos);
+    HttpRequest signed_request;
+    signed_request.method = "GET";
+    signed_request.path = url.substr(0, question);
+    signed_request.query = parse_test_query(url.substr(question + 1));
+
+    // capability_request() -- what HttpServer consults to decide whether to
+    // skip the ordinary bearer check -- must recognize this exact request.
+    CHECK(api.capability_request(signed_request));
+
+    const auto fetched = api.handle(signed_request);
+    REQUIRE(fetched.status == 200);
+    CHECK(fetched.body == cover_bytes);
+    REQUIRE(fetched.headers.contains("Cache-Control"));
+    CHECK(fetched.headers.at("Cache-Control").find("immutable") != std::string::npos);
+
+    // A bare, unsigned request to the same path must NOT be granted the
+    // exemption -- otherwise artwork would become unconditionally public
+    // regardless of a configured bearer token, defeating the point.
+    HttpRequest unsigned_request;
+    unsigned_request.method = "GET";
+    unsigned_request.path = signed_request.path;
+    CHECK(!api.capability_request(unsigned_request));
+}
+
+MACHA_TEST("hydration_catalogue", test_catalogue_artwork_capability_rejects_tampered_or_expired) {
+    TestService fixture("catalogue-artwork-tampered-url");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.hydration.enabled = false;
+    auto& service = fixture.start();
+
+    CatalogueItem album;
+    album.id = "album:tampered-url-test";
+    album.kind = CatalogueKind::album;
+    album.title = "Tampered URL Album";
+    album = service.catalogue().upsert(album);
+    const Bytes cover_bytes{0x05, 0x06, 0x07, 0x08};
+    const auto cover =
+        service.catalogue().put_artwork(album.id, "cover", "image/png", cover_bytes, album.revision);
+
+    CatalogueApi api(service.catalogue(), service.catalogue_hints());
+    const auto response = api.handle({.method = "GET",
+                                      .path = "/api/v1/catalogue/items/album%3Atampered-url-test",
+                                      .query = {},
+                                      .headers = {},
+                                      .body = {}});
+    REQUIRE(response.status == 200);
+    const auto json = Json::parse(std::string(response.body.begin(), response.body.end()));
+    const auto url = json.find("artwork")->asArray().front().find("url")->asString();
+    const auto question = url.find('?');
+    REQUIRE(question != std::string::npos);
+    const auto path = url.substr(0, question);
+    const auto query = parse_test_query(url.substr(question + 1));
+    REQUIRE(query.contains("exp"));
+    REQUIRE(query.contains("sig"));
+
+    auto request_with = [&](std::map<std::string, std::string, std::less<>> q) {
+        HttpRequest request;
+        request.method = "GET";
+        request.path = path;
+        request.query = std::move(q);
+        return request;
+    };
+
+    // Genuinely valid first, so the rest of this test is meaningful.
+    CHECK(api.capability_request(request_with(query)));
+
+    auto tampered_sig = query;
+    tampered_sig["sig"][0] = (tampered_sig["sig"][0] == '0') ? '1' : '0';
+    CHECK(!api.capability_request(request_with(tampered_sig)));
+
+    auto tampered_exp = query;
+    tampered_exp["exp"] = std::to_string(std::stoull(tampered_exp["exp"]) + 1);
+    CHECK(!api.capability_request(request_with(tampered_exp)));
+
+    // A *correctly signed* but expired URL must still be rejected -- expiry
+    // itself is enforced, not just signature validity. Get a genuinely valid
+    // signature for a past expiry by minting one through the real signing
+    // path with a near-zero TTL and letting it lapse, rather than
+    // hand-duplicating the HMAC construction here.
+    CatalogueApi short_lived_api(service.catalogue(), service.catalogue_hints(), {}, {}, 1ms);
+    const auto short_lived_response =
+        short_lived_api.handle({.method = "GET",
+                                .path = "/api/v1/catalogue/items/album%3Atampered-url-test",
+                                .query = {},
+                                .headers = {},
+                                .body = {}});
+    REQUIRE(short_lived_response.status == 200);
+    const auto short_lived_json = Json::parse(
+        std::string(short_lived_response.body.begin(), short_lived_response.body.end()));
+    const auto short_lived_url =
+        short_lived_json.find("artwork")->asArray().front().find("url")->asString();
+    const auto short_lived_question = short_lived_url.find('?');
+    REQUIRE(short_lived_question != std::string::npos);
+    HttpRequest expired_request;
+    expired_request.method = "GET";
+    expired_request.path = short_lived_url.substr(0, short_lived_question);
+    expired_request.query = parse_test_query(short_lived_url.substr(short_lived_question + 1));
+    std::this_thread::sleep_for(20ms);
+    CHECK(!api.capability_request(expired_request));
+
+    auto missing_sig = query;
+    missing_sig.erase("sig");
+    CHECK(!api.capability_request(request_with(missing_sig)));
+
+    HttpRequest bare;
+    bare.method = "GET";
+    bare.path = path;
+    CHECK(!api.capability_request(bare));
 }
 
 MACHA_TEST("hydration_catalogue", test_catalogue_root_ready_without_local_artwork) {

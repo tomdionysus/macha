@@ -2,6 +2,7 @@
 #include "catalogue_api.hpp"
 #include "macha_version.hpp"
 
+#include "crypto.hpp"
 #include "log.hpp"
 #include "json.hpp"
 
@@ -62,20 +63,77 @@ std::string optional_number(const std::optional<int32_t>& value) {
     return value ? std::to_string(*value) : "null";
 }
 
-std::string artwork_json(const std::vector<CatalogueArtwork>& artwork) {
+// Signs/verifies artwork capability URLs so catalogue responses can embed a
+// ready-to-use, already-authorized <img src> without a bearer header, the
+// same way playback stream/subtitle URLs carry their own embedded secret
+// rather than requiring a separate Authorization header. Unlike the
+// session-scoped stream token (whose validity window is the session's own
+// lifecycle), artwork has no session to lean on, so the expiry is explicit
+// and carried in the URL alongside the signature.
+struct ArtworkUrlContext {
+    const ClusterKeys& keys;
+    std::chrono::milliseconds ttl;
+};
+
+std::array<uint8_t, 32> artwork_capability_mac(const ClusterKeys& keys, std::string_view id,
+                                               uint64_t expires_unix_ms) {
+    std::string material = "macha-artwork-capability-v1";
+    material.push_back('\0');
+    material.append(id);
+    material.push_back('\0');
+    material.append(std::to_string(expires_unix_ms));
+    return hmac_sha256(keys.auth,
+                       {reinterpret_cast<const uint8_t*>(material.data()), material.size()});
+}
+
+std::string signed_artwork_url(const ArtworkUrlContext& ctx, std::string_view id) {
+    const auto expires = unix_ms() + static_cast<uint64_t>(ctx.ttl.count());
+    const auto mac = artwork_capability_mac(ctx.keys, id, expires);
+    return "/api/v1/catalogue/artwork/" + std::string(id) + "?exp=" + std::to_string(expires) +
+          "&sig=" + hex(mac);
+}
+
+// Only a valid, unexpired signature grants the exemption -- an unsigned
+// request to this same path still requires the ordinary bearer token when
+// one is configured, exactly as before this feature existed.
+bool artwork_capability_valid(const ClusterKeys& keys, std::string_view id,
+                              const std::map<std::string, std::string, std::less<>>& query) {
+    auto exp_it = query.find("exp");
+    auto sig_it = query.find("sig");
+    if (exp_it == query.end() || sig_it == query.end())
+        return false;
+    uint64_t expires = 0;
+    const auto& exp_text = exp_it->second;
+    auto [end, ec] = std::from_chars(exp_text.data(), exp_text.data() + exp_text.size(), expires);
+    if (ec != std::errc{} || end != exp_text.data() + exp_text.size())
+        return false;
+    if (unix_ms() >= expires)
+        return false;
+    auto provided = unhex(sig_it->second);
+    if (!provided)
+        return false;
+    const auto expected = artwork_capability_mac(keys, id, expires);
+    return provided->size() == expected.size() &&
+          constant_time_equal(*provided, expected);
+}
+
+std::string artwork_json(const std::vector<CatalogueArtwork>& artwork,
+                         const ArtworkUrlContext& urls) {
     std::string out = "[";
     for (size_t i = 0; i < artwork.size(); ++i) {
         if (i) out += ',';
         const auto& art = artwork[i];
-        out += "{\"role\":" + json_escape(art.role) + ",\"id\":" +
-               json_escape(to_string(art.id)) + ",\"mime_type\":" +
-               json_escape(art.mime_type) + "}";
+        const auto id_hex = to_string(art.id);
+        out += "{\"role\":" + json_escape(art.role) + ",\"id\":" + json_escape(id_hex) +
+               ",\"mime_type\":" + json_escape(art.mime_type) + ",\"url\":" +
+               json_escape(signed_artwork_url(urls, id_hex)) + "}";
     }
     out += ']';
     return out;
 }
 
-std::string item_json(const CatalogueItem& item, const CatalogueSnapshot& snapshot) {
+std::string item_json(const CatalogueItem& item, const CatalogueSnapshot& snapshot,
+                      const ArtworkUrlContext& urls) {
     std::string out = "{";
     out += "\"id\":" + json_escape(item.id);
     out += ",\"kind\":" + json_escape(catalogue_kind_name(item.kind));
@@ -105,19 +163,19 @@ std::string item_json(const CatalogueItem& item, const CatalogueSnapshot& snapsh
         if (i) out += ',';
         out += json_escape(item.media_ids[i]);
     }
-    out += "],\"artwork\":" + artwork_json(item.artwork);
-    out += ",\"effective_artwork\":" + artwork_json(effective_catalogue_artwork(snapshot, item));
+    out += "],\"artwork\":" + artwork_json(item.artwork, urls);
+    out += ",\"effective_artwork\":" + artwork_json(effective_catalogue_artwork(snapshot, item), urls);
     out += ",\"revision\":" + std::to_string(item.revision);
     out += ",\"updated_ns\":" + std::to_string(item.updated_ns) + "}";
     return out;
 }
 
-std::string items_json(const std::vector<CatalogueItem>& items,
-                       const CatalogueSnapshot& snapshot) {
+std::string items_json(const std::vector<CatalogueItem>& items, const CatalogueSnapshot& snapshot,
+                       const ArtworkUrlContext& urls) {
     std::string out = "{\"items\":[";
     for (size_t i = 0; i < items.size(); ++i) {
         if (i) out += ',';
-        out += item_json(items[i], snapshot);
+        out += item_json(items[i], snapshot, urls);
     }
     out += "]}";
     return out;
@@ -320,7 +378,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             std::optional<std::string_view> parent;
             if (auto it = request.query.find("parent"); it != request.query.end()) parent = it->second;
             auto snapshot = catalogue_.snapshot_view();
-            return json(200, items_json(catalogue_.list(kind, parent), *snapshot));
+            return json(200, items_json(catalogue_.list(kind, parent), *snapshot,
+                                        {catalogue_.cluster_keys(), artwork_capability_ttl_}));
         }
 
         if (request.method == "GET" && request.path == "/api/v1/catalogue/search") {
@@ -333,7 +392,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                     return error(400, "bad_limit", "limit must be 0..1000");
             }
             auto snapshot = catalogue_.snapshot_view();
-            return json(200, items_json(catalogue_.search(q->second, limit), *snapshot));
+            return json(200, items_json(catalogue_.search(q->second, limit), *snapshot,
+                                        {catalogue_.cluster_keys(), artwork_capability_ttl_}));
         }
 
         constexpr std::string_view media_prefix = "/api/v1/catalogue/media/";
@@ -421,7 +481,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 auto item = catalogue_.get(id);
                 if (!item) return error(404, "not_found", "catalogue item not found");
                 auto snapshot = catalogue_.snapshot_view();
-                auto response = json(200, item_json(*item, *snapshot));
+                auto response = json(200, item_json(*item, *snapshot,
+                                                    {catalogue_.cluster_keys(), artwork_capability_ttl_}));
                 response.headers["ETag"] = "\"rev-" + std::to_string(item->revision) + "\"";
                 return response;
             }
@@ -430,7 +491,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 auto item = parse_item(id, request.body);
                 auto saved = catalogue_.upsert(std::move(item), expected_revision(request));
                 auto snapshot = catalogue_.snapshot_view();
-                auto response = json(existing ? 200 : 201, item_json(saved, *snapshot));
+                auto response = json(existing ? 200 : 201, item_json(saved, *snapshot,
+                                                    {catalogue_.cluster_keys(), artwork_capability_ttl_}));
                 response.headers["ETag"] = "\"rev-" + std::to_string(saved.revision) + "\"";
                 return response;
             }
@@ -450,7 +512,14 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             std::copy(decoded->begin(), decoded->end(), id.bytes.begin());
             auto artwork = catalogue_.artwork(id);
             if (!artwork) return error(404, "not_found", "artwork not found");
-            return {200, std::move(artwork->mime_type), {}, std::move(artwork->bytes)};
+            // The id is a content hash: identical bytes forever, so this is
+            // genuinely immutable, not just cacheable for a while.
+            const auto max_age =
+                std::chrono::duration_cast<std::chrono::seconds>(artwork_capability_ttl_).count();
+            std::map<std::string, std::string, std::less<>> headers{
+                {"Cache-Control", "public, max-age=" + std::to_string(max_age) + ", immutable"}};
+            return {200, std::move(artwork->mime_type), std::move(headers),
+                   std::move(artwork->bytes)};
         }
 
         return error(404, "not_found", "endpoint not found");
@@ -461,5 +530,12 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
     }
 }
 
+bool CatalogueApi::capability_request(const HttpRequest& request) const {
+    constexpr std::string_view artwork_prefix = "/api/v1/catalogue/artwork/";
+    if (request.method != "GET" || !request.path.starts_with(artwork_prefix))
+        return false;
+    const auto id = url_decode(std::string_view(request.path).substr(artwork_prefix.size()));
+    return artwork_capability_valid(catalogue_.cluster_keys(), id, request.query);
+}
 
 } // namespace macha
