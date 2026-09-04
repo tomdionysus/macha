@@ -51,6 +51,11 @@ struct NodeTelemetry {
     uint64_t rpc_connections_reused{};
     uint64_t rpc_connections_canonical{};
     NodePhase phase{NodePhase::ready};
+    // Where other nodes should reach this node's HTTP API — distinct from
+    // host/port above, which is the RPC bind address. Empty/zero means the
+    // sender doesn't run (or hasn't yet reported) an advertised API address.
+    std::string api_host;
+    uint16_t api_port{};
 
     auto operator<=>(const NodeTelemetry&) const = default;
 };
@@ -91,7 +96,8 @@ class TelemetryStore {
                                 uint64_t cache_used, uint32_t storage_backends_online,
                                 uint32_t peers_known, uint32_t peers_active,
                                 uint64_t rpc_connections_created, uint64_t rpc_connections_reused,
-                                uint64_t rpc_connections_canonical, NodePhase phase);
+                                uint64_t rpc_connections_canonical, NodePhase phase,
+                                std::string api_host, uint16_t api_port);
     void observe(NodeTelemetry, bool direct = false);
     void apply_identity_reset(const IdentityAssociationReset&);
     std::optional<NodeTelemetry> local() const;

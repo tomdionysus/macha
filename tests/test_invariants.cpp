@@ -755,6 +755,11 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
         CHECK(value.find("telemetry_freshness")->asString() == "unavailable");
         CHECK(value.find("host")->asString() == peer.host);
         CHECK(value.find("port")->asUInt64() == peer.port);
+        // No telemetry has been observed for this peer yet (membership alone
+        // makes it visible), so its advertised API address is genuinely
+        // unknown and must be omitted rather than guessed at.
+        CHECK(value.find("api_host") == nullptr);
+        CHECK(value.find("api_port") == nullptr);
         const auto* storage = value.find("storage");
         REQUIRE(storage != nullptr);
         CHECK(!storage->find("available")->asBool());
@@ -791,6 +796,8 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     peer_telemetry.cache_used = 0;
     peer_telemetry.metadata_generation = peer.metadata_generation;
     peer_telemetry.storage_backends_online = 1;
+    peer_telemetry.api_host = "10.44.1.51";
+    peer_telemetry.api_port = 7438;
     node.telemetry().observe(peer_telemetry, true);
 
     response = status.handle(request);
@@ -805,6 +812,10 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
             continue;
         found = true;
         CHECK(value.find("telemetry_freshness")->asString() == "live");
+        // Now that this peer has gossiped telemetry, its advertised API
+        // address (distinct from host/port, its RPC bind address) is known.
+        CHECK(value.find("api_host")->asString() == "10.44.1.51");
+        CHECK(value.find("api_port")->asUInt64() == 7438);
         const auto* storage = value.find("storage");
         REQUIRE(storage != nullptr);
         CHECK(storage->find("available")->asBool());
@@ -830,6 +841,108 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     REQUIRE(cluster != nullptr);
     CHECK(cluster->find("metadata_availability")->asString() == "writable");
     CHECK(cluster->find("metadata_write_available")->asBool());
+}
+
+// Self's own advertised API endpoint: distinct from `connectivity.advertised`
+// (that node's own RPC-port UPnP/external-IP connectivity) and computed
+// straight from config rather than gossiped, so it needs its own coverage of
+// the default-to-bound-address and explicit-override paths, plus the
+// no-catalogue-API case.
+MACHA_TEST("invariants", test_status_reports_self_advertised_api_endpoint) {
+    {
+        TestNode fixture("status-api-endpoint-default");
+        auto& config = fixture.config();
+        config.replication = 1;
+        config.metadata_min_write_replicas = 1;
+        config.hydration.enabled = false;
+        config.catalogue.scanner.enabled = false;
+        // A wildcard API bind, as every real deployed node uses: the default
+        // must resolve to the node's real advertised RPC host, never to this
+        // undialable "0.0.0.0" listen address.
+        config.advertise_host = "10.44.1.60";
+        config.catalogue.api.enabled = true;
+        config.catalogue.api.listen = "0.0.0.0";
+        config.catalogue.api.port = 19991;
+        auto& node = fixture.start();
+        REQUIRE(wait_until([&] { return node.telemetry().local().has_value(); }, 5s));
+
+        ClusterStatusService status(node);
+        HttpRequest request;
+        request.method = "GET";
+        request.path = "/api/v1/status";
+        auto response = status.handle(request);
+        REQUIRE(response.status == 200);
+        auto root = Json::parse(std::string(
+            reinterpret_cast<const char*>(response.body.data()), response.body.size()));
+        const auto* nodes = root.find("nodes");
+        REQUIRE(nodes != nullptr);
+        REQUIRE(nodes->asArray().size() == 1);
+        const auto& self_node = nodes->asArray().front();
+        // No advertised override configured: api_host defaults to the
+        // resolved RPC advertise host (never the wildcard listen address
+        // above), api_port to the bound port. Always well-defined.
+        CHECK(self_node.find("api_host")->asString() == "10.44.1.60");
+        CHECK(self_node.find("api_port")->asUInt64() == 19991);
+    }
+    {
+        TestNode fixture("status-api-endpoint-override");
+        auto& config = fixture.config();
+        config.replication = 1;
+        config.metadata_min_write_replicas = 1;
+        config.hydration.enabled = false;
+        config.catalogue.scanner.enabled = false;
+        config.catalogue.api.enabled = true;
+        config.catalogue.api.listen = "127.0.0.1";
+        config.catalogue.api.port = 19992;
+        config.catalogue.api.advertised_host = "media-node-2.example.net";
+        config.catalogue.api.advertised_port = 443;
+        auto& node = fixture.start();
+        REQUIRE(wait_until([&] { return node.telemetry().local().has_value(); }, 5s));
+
+        ClusterStatusService status(node);
+        HttpRequest request;
+        request.method = "GET";
+        request.path = "/api/v1/status";
+        auto response = status.handle(request);
+        REQUIRE(response.status == 200);
+        auto root = Json::parse(std::string(
+            reinterpret_cast<const char*>(response.body.data()), response.body.size()));
+        const auto* nodes = root.find("nodes");
+        REQUIRE(nodes != nullptr);
+        REQUIRE(nodes->asArray().size() == 1);
+        const auto& self_node = nodes->asArray().front();
+        // Advertised override present: takes priority over bound listen/port
+        // (covers NAT/port-forwarding).
+        CHECK(self_node.find("api_host")->asString() == "media-node-2.example.net");
+        CHECK(self_node.find("api_port")->asUInt64() == 443);
+    }
+    {
+        TestNode fixture("status-api-endpoint-disabled");
+        auto& config = fixture.config();
+        config.replication = 1;
+        config.metadata_min_write_replicas = 1;
+        config.hydration.enabled = false;
+        config.catalogue.scanner.enabled = false;
+        config.catalogue.api.enabled = false;
+        auto& node = fixture.start();
+        REQUIRE(wait_until([&] { return node.telemetry().local().has_value(); }, 5s));
+
+        ClusterStatusService status(node);
+        HttpRequest request;
+        request.method = "GET";
+        request.path = "/api/v1/status";
+        auto response = status.handle(request);
+        REQUIRE(response.status == 200);
+        auto root = Json::parse(std::string(
+            reinterpret_cast<const char*>(response.body.data()), response.body.size()));
+        const auto* nodes = root.find("nodes");
+        REQUIRE(nodes != nullptr);
+        REQUIRE(nodes->asArray().size() == 1);
+        const auto& self_node = nodes->asArray().front();
+        // No catalogue API runs on this node: nothing to advertise.
+        CHECK(self_node.find("api_host") == nullptr);
+        CHECK(self_node.find("api_port") == nullptr);
+    }
 }
 
 MACHA_TEST("invariants", test_status_marks_stale_peer_telemetry_as_unavailable_not_live) {

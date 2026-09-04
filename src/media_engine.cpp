@@ -604,6 +604,13 @@ struct StreamPipeline {
     int audio_input_rate{};
     int64_t audio_next_pts{};
     bool audio_pts_initialized{};
+    // Running total of resampler output samples ever pushed into `fifo`, and
+    // its value the last time drift compensation was (re)computed. Both are
+    // absolute counters from stream start, independent of the encoder's own
+    // frame-size-chunked consumption, so they stay directly comparable to a
+    // source-PTS-derived expected sample count regardless of FIFO batching.
+    int64_t audio_produced_samples{};
+    int64_t audio_last_compensation_samples{};
 
     // Stream-copy timestamp repair is performed after rescaling into the
     // muxer's actual output timebase. That is important: rescaling can itself
@@ -890,6 +897,37 @@ void encode_audio_available(StreamPipeline& pipe, AVFormatContext* output, AVPac
     }
 }
 
+// Audio's presentation clock is a free-running sample counter (see
+// audio_next_pts below), seeded from the source once and never otherwise
+// re-anchored, unlike video which re-anchors to its source PTS every single
+// frame. Left alone, any systematic mismatch between resampled output sample
+// count and real elapsed source duration -- resampler rounding, EAC3 frame
+// timing, channel downmix -- compounds without bound for the life of the
+// stream. This nudges the resample ratio gradually back toward the source
+// timeline instead, rather than snapping (which would produce an audible
+// click) or leaving the drift to grow indefinitely.
+void maintain_audio_drift_compensation(StreamPipeline& pipe, int64_t source_pts) {
+    if (source_pts == AV_NOPTS_VALUE || !pipe.swr) return;
+    const auto expected_samples =
+        av_rescale_q(source_pts, pipe.input_stream->time_base, pipe.encoder->time_base);
+    // Recomputing more often than the previous correction's own distance just
+    // churns swr's compensation schedule without giving it time to act.
+    const int64_t check_interval = pipe.encoder->sample_rate;
+    if (pipe.audio_produced_samples - pipe.audio_last_compensation_samples < check_interval)
+        return;
+    pipe.audio_last_compensation_samples = pipe.audio_produced_samples;
+
+    const int64_t drift = pipe.audio_produced_samples - expected_samples;
+    if (!drift) return;
+    // Bound the correction rate to about 1% of the sample rate per
+    // check_interval (roughly one second): enough to close a multi-hundred-ms
+    // drift within a handful of seconds, well under the few-percent threshold
+    // where a resample-rate nudge becomes audible as a pitch shift.
+    const int64_t max_correction = std::max<int64_t>(1, pipe.encoder->sample_rate / 100);
+    const int64_t sample_delta = std::clamp<int64_t>(-drift, -max_correction, max_correction);
+    swr_set_compensation(pipe.swr, static_cast<int>(sample_delta), static_cast<int>(check_interval));
+}
+
 void ensure_audio_resampler(StreamPipeline& pipe, const AVFrame* decoded) {
     if (pipe.swr) return;
     auto input_rate = decoded->sample_rate > 0 ? decoded->sample_rate : pipe.decoder->sample_rate;
@@ -924,9 +962,15 @@ void process_audio_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame*
     ensure_audio_resampler(pipe, decoded);
     auto input_rate = decoded->sample_rate > 0 ? decoded->sample_rate : pipe.decoder->sample_rate;
     if (!pipe.audio_pts_initialized) {
-        if (source_pts != AV_NOPTS_VALUE)
+        if (source_pts != AV_NOPTS_VALUE) {
             pipe.audio_next_pts = av_rescale_q(source_pts, pipe.input_stream->time_base,
                                                pipe.encoder->time_base);
+            // Seed both counters from the same origin as audio_next_pts (which
+            // may be nonzero on a mid-file seek), so later drift comparisons
+            // measure real drift rather than the seek offset itself.
+            pipe.audio_produced_samples = pipe.audio_next_pts;
+            pipe.audio_last_compensation_samples = pipe.audio_next_pts;
+        }
         pipe.audio_pts_initialized = true;
     }
     auto max_samples = static_cast<int>(av_rescale_rnd(
@@ -952,6 +996,8 @@ void process_audio_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame*
         else rc = 0;
     }
     av_require(rc, "resample audio frame");
+    pipe.audio_produced_samples += converted->nb_samples;
+    maintain_audio_drift_compensation(pipe, source_pts);
     encode_audio_available(pipe, output, encoded, false);
 }
 

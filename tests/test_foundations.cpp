@@ -209,6 +209,8 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     telemetry.peers_known = 3;
     telemetry.peers_active = 2;
     telemetry.rpc_connections_reused = 7;
+    telemetry.api_host = "10.44.1.50";
+    telemetry.api_port = 7438;
     CHECK(decode_node_telemetry(encode_node_telemetry(telemetry)) == telemetry);
     auto telemetry_set = decode_telemetry_set(encode_telemetry_set({telemetry}));
     REQUIRE(telemetry_set.size() == 1);
@@ -220,14 +222,33 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     REQUIRE(recovering_set.size() == 1);
     CHECK(recovering_set.front().phase == NodePhase::recovering);
 
-    // A record encoded before this field existed simply ends one byte
-    // earlier. It must decode as "ready" (NodeTelemetry's default) rather
-    // than fail or silently pick a different phase.
-    auto truncated = encode_node_telemetry(telemetry);
-    REQUIRE(!truncated.empty());
-    truncated.pop_back();
-    auto legacy = decode_node_telemetry(truncated);
+    auto full = encode_node_telemetry(telemetry);
+    // api_host/api_port are the newest trailing fields: a string length
+    // prefix + content, then a u16 port.
+    const size_t api_fields_bytes = 4 + telemetry.api_host.size() + 2;
+    REQUIRE(full.size() > api_fields_bytes + 1);
+
+    // A record encoded before api_host/api_port existed simply ends earlier,
+    // right after phase. It must decode as "not reported" (empty/0) rather
+    // than fail or silently pick up truncated bytes as a host/port.
+    auto pre_api = full;
+    pre_api.resize(pre_api.size() - api_fields_bytes);
+    auto legacy_no_api = decode_node_telemetry(pre_api);
+    CHECK(legacy_no_api.phase == NodePhase::recovering);
+    CHECK(legacy_no_api.api_host.empty());
+    CHECK(legacy_no_api.api_port == 0);
+    CHECK(legacy_no_api.sequence == telemetry.sequence);
+
+    // A record encoded before phase (and so also before api_host/api_port)
+    // existed ends one byte earlier still. It must decode as "ready"
+    // (NodeTelemetry's default) rather than fail or silently pick a
+    // different phase.
+    auto pre_phase = full;
+    pre_phase.resize(pre_phase.size() - api_fields_bytes - 1);
+    auto legacy = decode_node_telemetry(pre_phase);
     CHECK(legacy.phase == NodePhase::ready);
+    CHECK(legacy.api_host.empty());
+    CHECK(legacy.api_port == 0);
     CHECK(legacy.sequence == telemetry.sequence);
     CHECK(legacy.rpc_connections_reused == telemetry.rpc_connections_reused);
 

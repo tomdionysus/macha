@@ -1105,9 +1105,27 @@ void NodeRuntime::refresh_telemetry() {
                         : local_readiness.control_plane_online ? NodePhase::recovering
                                                                 : NodePhase::starting;
 
+    // Advertised API address for cluster peers (Status nodes[].api_host/
+    // api_port); empty/0 when this node runs no catalogue API, letting peers
+    // correctly treat it as unreported rather than guessing. Defaults to
+    // `info.host` -- this node's already-resolved RPC advertise address --
+    // rather than catalogue.api.listen: the API, like RPC, conventionally
+    // binds a wildcard address (0.0.0.0), which is not itself dialable by a
+    // peer, so falling back to the raw listen address would readvertise that
+    // wildcard instead of a real endpoint.
+    std::string api_host;
+    uint16_t api_port = 0;
+    if (cfg_.catalogue.api.enabled) {
+        api_host = cfg_.catalogue.api.advertised_host.empty() ? info.host
+                                                               : cfg_.catalogue.api.advertised_host;
+        api_port = cfg_.catalogue.api.advertised_port ? cfg_.catalogue.api.advertised_port
+                                                       : cfg_.catalogue.api.port;
+    }
+
     telemetry_.refresh_local(info, std::string(kServerVersion), cache_capacity, cache_used,
                              storage_backends_online, peers_known, peers_active, 0, 0,
-                             peers_active > 0 ? peers_active - 1 : 0, phase);
+                             peers_active > 0 ? peers_active - 1 : 0, phase, std::move(api_host),
+                             api_port);
 }
 
 void NodeRuntime::signal_telemetry_refresh() {

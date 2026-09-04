@@ -1,10 +1,18 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-09-03
+Last updated: 2026-09-04
 
 This is the authoritative, ordered backlog. Detailed plans and UAT records in
 this directory remain evidence; completed work belongs in `COMPLETED.md` and is
 not repeated here. Work top-to-bottom unless new evidence changes the order.
+
+2026-09-04: started a pass to reconcile this file against actual shipped code,
+since several 0.23.x releases landed after items here were written and this
+file was not always updated in step. Items are being re-verified against
+current source (not just changelog titles) as they are touched, moved to
+`COMPLETED.md` when confirmed done, and reworded when partially done. This
+pass is incremental, not exhaustive — an unmarked item has not necessarily
+been re-checked yet.
 
 The governing laws are:
 
@@ -27,16 +35,24 @@ one causal programme rather than treating each symptom separately.
   boundaries and timestamp repair. Add deterministic long-enough regressions
   for monotonic timestamps and bounded accumulated A/V drift. Diagnostics must
   be aggregate and low-overhead.
-- [ ] **2. Remove per-request connection setup from Status and streaming.** The
-  server currently emits `Connection: close`; on poor Wi-Fi this makes every
-  Status call and HLS fragment pay connection setup and magnifies transient
-  packet loss. Implement bounded HTTP keep-alive/reuse, cancellation, idle
-  expiry and slow-client isolation.
-- [ ] **3. Split lightweight status from expensive diagnostics.** Ordinary
-  Status must use a recent coherent snapshot and never synchronously collect
-  expensive subsystem state. Report server generation time so clients can
-  distinguish server delay from network delay; represent unavailable peer or
-  storage samples explicitly, never as zero.
+- [x] **2. Remove per-request connection setup from Status and streaming.**
+  Done in 0.23.3: `http.cpp` now negotiates HTTP/1.1 keep-alive by default,
+  with bounded `keep_alive_max_requests`/`keep_alive_idle_timeout`, and only
+  falls back to `Connection: close` on an explicit request, protocol/version
+  mismatch, or backlog pressure. Verified directly against current
+  `src/http.cpp` on 2026-09-04, not just the changelog title. Move this entry
+  to `COMPLETED.md` on the next full backlog pass.
+- [ ] **3. Split lightweight status from expensive diagnostics.** Re-verified
+  2026-09-04: still open. `ClusterStatusService::status_response` (in
+  `src/status_api.cpp`) unconditionally computes and includes the full
+  `diagnostics` object on every ordinary `/api/v1/status` call — there is no
+  opt-in/expensive split yet. `generated_at_unix_ms` exists but is a
+  timestamp, not a server-side generation duration, so a client still cannot
+  distinguish server compute time from network delay. Represent
+  unavailable peer/storage samples explicitly (this part looks done via
+  `unavailable_bytes()`/`telemetry_freshness` — worth confirming against the
+  0.23.1 "Correct aggregated Status truthfulness" item in P1 above, which may
+  be the same gap tracked twice).
 - [ ] **4. Make transformed output bandwidth-aware.** Auto negotiation selected
   H.264/AAC but, without a client maximum bitrate, CRF output expanded a roughly
   5 Mbps source to bursts around 7–12 Mbps. Define a conservative poor-network
@@ -121,6 +137,12 @@ absorbed here rather than separate active programmes.
   reachability-aware racing/fallback, expiry and deduplication by node identity.
   Integrate UPnP/external-IP discovery. Test poor Wi-Fi, partitions, NAT without
   hairpin, endpoint changes, simultaneous dial and commit interruption.
+- [ ] Revisit UPnP/external-address discovery sources generally (currently only
+  wired to the RPC port's `network.advertise`/`connectivity.advertised`); when
+  this happens, fold in the 0.23.7 per-node advertised API endpoint
+  (`catalogue.api.advertised_host`/`advertised_port`, `nodes[].api_host`/
+  `api_port`) added for any-node Direct Play failover, which today is a static
+  config-only override with no UPnP/external-IP probing of its own.
 - [ ] Make client/API failover preserve one logical operation: reuse session
   idempotency keys, reconcile ambiguous POST results, fail over endpoints, and
   never turn transient transport loss into a misleading 404 or duplicate lease.
@@ -168,6 +190,16 @@ absorbed here rather than separate active programmes.
   identity separate from immutable content hashes.
 - [ ] Update clients to consume immutable profiles and send a useful bandwidth
   ceiling plus a persistent logical-viewer/session identity.
+- [ ] Make signed artwork capability URLs actually cacheable. `exp`/`sig` are
+  recomputed fresh on every `/items`/`/items/{id}` catalogue call, so the same
+  artwork object gets a different query string (and therefore a different full
+  URL, which browsers key their cache on) every time — the existing 24h
+  `Cache-Control: public, max-age=86400, immutable` on the artwork endpoint
+  never gets consulted, and posters are re-fetched over the network on every
+  page load. Fix by quantizing `exp` to a coarser bucket (e.g. top of the next
+  hour/day) so `sig` becomes a pure function of `(artwork_id, quantized_exp)`;
+  repeated fetches within that window then return an identical URL. No
+  client-side change needed. Found 2026-09-04 via `macha-client-b8`.
 
 ## P2 — Diagnostics and repeatable proof
 

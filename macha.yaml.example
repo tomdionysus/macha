@@ -334,6 +334,14 @@ catalogue:
     enabled: true
     listen: 127.0.0.1
     port: 7438
+    # Optional: how this node advertises its API to cluster peers (exposed on
+    # every node in /api/v1/status's nodes[] as api_host/api_port), distinct
+    # from listen/port above. Set when NAT/port-forwarding means peers can't
+    # reach this node at its bind address. advertised_host defaults to this
+    # node's network.advertise (not listen, which is conventionally a
+    # wildcard bind); advertised_port defaults to this port.
+    # advertised_host: media-node-2.example.net
+    # advertised_port: 7438
     # token_file: /etc/macha-api.token
     max_request_bytes: 8M
 

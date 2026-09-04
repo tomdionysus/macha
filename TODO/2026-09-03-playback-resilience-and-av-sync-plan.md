@@ -56,6 +56,24 @@ Exit: the failure is reproducible and measuring it does not alter playback.
 
 ## Phase 1 — One presentation timeline
 
+2026-09-05 partial progress: shipped bounded resampler-based drift
+compensation for transcoded audio (0.23.8) after live-reproducing a real
+desync report (Apollo 13, EAC3 5.1 source) and measuring the free-running
+audio clock's actual drift rate against a re-anchored-every-frame video
+clock. Verified by live measurement (offset now oscillates within ~±15ms
+over 8 minutes, was growing unbounded before) rather than by a deterministic
+regression, since no harness exists yet for the real (non-stub) transcode
+path -- that harness is still this phase's stated exit-criterion prerequisite
+and remains outstanding. Also live-diagnosed a separate, likely larger
+contributor to the same user reports: a client-side race
+(`PlaybackCoordinator.degrade()` not checking for an in-flight seek mutation)
+that creates two independent transcode pipelines on restart/seek, each
+restarting its own audio+video PTS from zero -- tracked in
+`TODO/2026-08-31-cluster-any-node-playback-failover.md` (client-owned, not
+fixed in this pass). The remaining items below (session-relative origin,
+codec delay/priming, generation-replacement monotonicity, and the
+Direct/Remux/Transcode regression harness itself) are still open.
+
 - Define one session-relative presentation origin and explicitly map every
   source stream onto it.
 - Apply seek offsets, input start time, codec delay, AAC priming/drain and
