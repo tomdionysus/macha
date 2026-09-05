@@ -36,14 +36,45 @@ std::optional<HlsVodPlan> reseek_hls_vod(const HlsVodPlan& prepared,
         requested_seek.count() / 1000.0, 0.0,
         std::max(0.0, prepared.source_duration_seconds - 0.001));
 
-    if (!prepared.video_random_access_points.empty()) {
+    if (prepared.playback.mode == PlaybackMode::transcode) {
+        // Transcode lays down its own GOP structure via fixed_vod_durations
+        // regardless of source keyframes, so -- unlike the remux/copy branch
+        // below -- it only needs one nearby keyframe to avoid fully decoding
+        // (not just skipping) every source frame between the landing
+        // keyframe and an exact frame-accurate target: costly on slow
+        // software decoders and unnecessary precision for a viewer rather
+        // than a nonlinear editor. indexed_plan's whole-file segment-density
+        // check doesn't apply here and can spuriously reject an otherwise
+        // perfectly usable seek point if any other part of a long file has a
+        // sparser GOP (see nearest_keyframe_at_or_after).
+        double actual_seek = requested_seconds;
+        if (!prepared.video_random_access_points.empty()) {
+            if (const double snapped = media_vod::nearest_keyframe_at_or_after(
+                    prepared.video_random_access_points, requested_seconds);
+                snapped >= 0.0)
+                actual_seek = snapped;
+        }
+        // Round UP, not to nearest: actual_seek may be a real keyframe
+        // timestamp, and llround can round a fractional-millisecond
+        // keyframe timestamp down. Reconstructing microseconds from that
+        // truncated value later (run_pipeline) then lands
+        // avformat_seek_file's AVSEEK_FLAG_BACKWARD search one keyframe
+        // *earlier* than intended -- a full GOP's worth of avoidable decode.
+        result.playback.seek = std::chrono::milliseconds(
+            static_cast<int64_t>(std::ceil(actual_seek * 1000.0)));
+        result.segment_durations = fixed_vod_durations(prepared.source_duration_seconds,
+                                                       actual_seek,
+                                                       prepared.seek_segment_seconds);
+    } else if (!prepared.video_random_access_points.empty()) {
         auto indexed = media_vod::indexed_plan(prepared.video_random_access_points,
                                                prepared.source_duration_seconds,
                                                requested_seconds,
                                                prepared.seek_segment_seconds);
         if (!indexed) return std::nullopt;
+        // Same rounding hazard as above: indexed->actual_seek_seconds is a
+        // real keyframe timestamp.
         result.playback.seek = std::chrono::milliseconds(
-            static_cast<int64_t>(std::llround(indexed->actual_seek_seconds * 1000.0)));
+            static_cast<int64_t>(std::ceil(indexed->actual_seek_seconds * 1000.0)));
         result.segment_durations = std::move(indexed->segment_durations);
     } else {
         result.playback.seek = std::chrono::milliseconds(
