@@ -27,6 +27,7 @@ struct MediaSegmentStore::Impl {
     std::vector<double> vod_segment_durations;
     bool finished{};
     bool cancelled{};
+    bool superseded{};
     std::string error;
     uint64_t highest_requested{};
     size_t max_ahead{8};
@@ -223,7 +224,8 @@ std::optional<Bytes> MediaSegmentStore::wait_object(std::string_view name,
     std::unique_lock lock(impl_->mutex);
     if (!impl_->vod_segment_durations.empty() && index >= impl_->vod_segment_durations.size()) return {};
     const auto ready = [&] {
-        return impl_->cancelled || !impl_->error.empty() || index < impl_->segments.size() || impl_->finished;
+        return impl_->cancelled || impl_->superseded || !impl_->error.empty() ||
+               index < impl_->segments.size() || impl_->finished;
     };
     if (timeout.count() > 0) impl_->cv.wait_for(lock, timeout, ready);
     else impl_->cv.wait(lock, ready);
@@ -266,6 +268,12 @@ MediaSegmentStore::Snapshot MediaSegmentStore::snapshot() const {
 void MediaSegmentStore::cancel() {
     std::lock_guard lock(impl_->mutex);
     impl_->cancelled = true;
+    impl_->cv.notify_all();
+}
+
+void MediaSegmentStore::mark_superseded(bool superseded) {
+    std::lock_guard lock(impl_->mutex);
+    impl_->superseded = superseded;
     impl_->cv.notify_all();
 }
 

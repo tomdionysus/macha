@@ -2127,6 +2127,20 @@ struct PlaybackManager::Impl {
             prepare_transformed_vod(*replacement, trace);
         }
         ResourceReservation resource_reservation;
+        // start_pipeline() below can block for several seconds (up to
+        // streaming.startup_timeout_ms) waiting for the replacement's first
+        // fragment, and stop_pipeline(*old) -- which fully cancels old's
+        // segment store and wakes anything blocked in its wait_object() --
+        // does not run until after that completes. Without this, an
+        // in-flight request for a not-yet-produced segment on the
+        // superseded generation (e.g. client read-ahead) stays parked for
+        // that whole window instead of getting a prompt 404. Mark old as
+        // superseded up front so such requests wake immediately; this is
+        // reversible (unlike stop_pipeline's real cancel()), so on failure
+        // below we clear it and old keeps serving normally as the still-
+        // active session.
+        auto old_active = active_engine(*old);
+        if (old_active) old_active->segments()->mark_superseded(true);
         try {
             resource_reservation = reserve_resources(*replacement, old->id);
             start_pipeline(*replacement, trace);
@@ -2145,6 +2159,7 @@ struct PlaybackManager::Impl {
                 resource_reservation = {};
             }
         } catch (...) {
+            if (old_active) old_active->segments()->mark_superseded(false);
             stop_pipeline(*replacement);
             if (resource_reservation.video || resource_reservation.audio)
                 rollback_resources(*replacement, resource_reservation);
