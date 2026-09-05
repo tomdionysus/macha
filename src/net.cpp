@@ -595,6 +595,8 @@ const char* message_type_name(MessageType type) noexcept {
         return "propose_history_floor";
     case MessageType::commit_history_floor:
         return "commit_history_floor";
+    case MessageType::session_sync:
+        return "session_sync";
     case MessageType::ok:
         return "ok";
     case MessageType::error:
@@ -629,6 +631,8 @@ const char* message_type_name(MessageType type) noexcept {
         return "torrent_jobs_reply";
     case MessageType::torrent_job_action_reply:
         return "torrent_job_action_reply";
+    case MessageType::session_sync_reply:
+        return "session_sync_reply";
     }
     return "unknown";
 }

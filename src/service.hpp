@@ -12,6 +12,7 @@
 #include "media_catalogue.hpp"
 #include "media_information.hpp"
 #include "playback.hpp"
+#include "session_api.hpp"
 #include "status_api.hpp"
 #include "torrent.hpp"
 #include <atomic>
@@ -42,6 +43,7 @@ class Service {
   private:
     NodeRuntime node_;
     ClusterStatusService cluster_status_;
+    SessionApi session_api_;
     std::unique_ptr<HttpServer> catalogue_http_;
 
     std::unique_ptr<DistributedStore> store_;

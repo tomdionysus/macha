@@ -59,6 +59,7 @@ enum class MessageType : uint16_t {
     torrent_job_action = 36,
     propose_history_floor = 37,
     commit_history_floor = 38,
+    session_sync = 39,
     ok = 100,
     error = 101,
     members_reply = 102,
@@ -75,7 +76,8 @@ enum class MessageType : uint16_t {
     ingest_jobs_reply = 113,
     ingest_job_action_reply = 114,
     torrent_jobs_reply = 115,
-    torrent_job_action_reply = 116
+    torrent_job_action_reply = 116,
+    session_sync_reply = 117
 };
 
 // Transport priority is a property of the frame type itself. There is no

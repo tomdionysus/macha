@@ -251,6 +251,10 @@ void validate(Config& config) {
         throw std::runtime_error("streaming.video_decoder_threads must be 1..16");
     if (config.streaming.session_idle < std::chrono::seconds(30))
         throw std::runtime_error("streaming.session_idle_ms must be >= 30000");
+    if (config.session.anonymous_ttl < std::chrono::minutes(1))
+        throw std::runtime_error("session.anonymous_ttl_ms must be >= 60000");
+    if (!config.session.max_sessions || config.session.max_sessions > 1'000'000)
+        throw std::runtime_error("session.max_sessions must be 1..1000000");
     if (config.streaming.pipeline_idle < std::chrono::seconds(10))
         throw std::runtime_error("streaming.pipeline_idle_ms must be >= 10000");
     if (config.streaming.startup_timeout < std::chrono::milliseconds(1000) ||
