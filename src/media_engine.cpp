@@ -604,13 +604,6 @@ struct StreamPipeline {
     int audio_input_rate{};
     int64_t audio_next_pts{};
     bool audio_pts_initialized{};
-    // Running total of resampler output samples ever pushed into `fifo`, and
-    // its value the last time drift compensation was (re)computed. Both are
-    // absolute counters from stream start, independent of the encoder's own
-    // frame-size-chunked consumption, so they stay directly comparable to a
-    // source-PTS-derived expected sample count regardless of FIFO batching.
-    int64_t audio_produced_samples{};
-    int64_t audio_last_compensation_samples{};
 
     // Stream-copy timestamp repair is performed after rescaling into the
     // muxer's actual output timebase. That is important: rescaling can itself
@@ -897,37 +890,6 @@ void encode_audio_available(StreamPipeline& pipe, AVFormatContext* output, AVPac
     }
 }
 
-// Audio's presentation clock is a free-running sample counter (see
-// audio_next_pts below), seeded from the source once and never otherwise
-// re-anchored, unlike video which re-anchors to its source PTS every single
-// frame. Left alone, any systematic mismatch between resampled output sample
-// count and real elapsed source duration -- resampler rounding, EAC3 frame
-// timing, channel downmix -- compounds without bound for the life of the
-// stream. This nudges the resample ratio gradually back toward the source
-// timeline instead, rather than snapping (which would produce an audible
-// click) or leaving the drift to grow indefinitely.
-void maintain_audio_drift_compensation(StreamPipeline& pipe, int64_t source_pts) {
-    if (source_pts == AV_NOPTS_VALUE || !pipe.swr) return;
-    const auto expected_samples =
-        av_rescale_q(source_pts, pipe.input_stream->time_base, pipe.encoder->time_base);
-    // Recomputing more often than the previous correction's own distance just
-    // churns swr's compensation schedule without giving it time to act.
-    const int64_t check_interval = pipe.encoder->sample_rate;
-    if (pipe.audio_produced_samples - pipe.audio_last_compensation_samples < check_interval)
-        return;
-    pipe.audio_last_compensation_samples = pipe.audio_produced_samples;
-
-    const int64_t drift = pipe.audio_produced_samples - expected_samples;
-    if (!drift) return;
-    // Bound the correction rate to about 1% of the sample rate per
-    // check_interval (roughly one second): enough to close a multi-hundred-ms
-    // drift within a handful of seconds, well under the few-percent threshold
-    // where a resample-rate nudge becomes audible as a pitch shift.
-    const int64_t max_correction = std::max<int64_t>(1, pipe.encoder->sample_rate / 100);
-    const int64_t sample_delta = std::clamp<int64_t>(-drift, -max_correction, max_correction);
-    swr_set_compensation(pipe.swr, static_cast<int>(sample_delta), static_cast<int>(check_interval));
-}
-
 void ensure_audio_resampler(StreamPipeline& pipe, const AVFrame* decoded) {
     if (pipe.swr) return;
     auto input_rate = decoded->sample_rate > 0 ? decoded->sample_rate : pipe.decoder->sample_rate;
@@ -950,6 +912,21 @@ void ensure_audio_resampler(StreamPipeline& pipe, const AVFrame* decoded) {
                              pipe.encoder->sample_rate, input_layout.get(), input_format,
                              input_rate, 0, nullptr);
     av_require(rc, "configure audio resampler");
+    // Audio's presentation clock would otherwise be a free-running sample
+    // counter, seeded from the source once (see audio_next_pts below) and
+    // never re-anchored, unlike video which re-anchors to its source PTS
+    // every single frame. Any systematic mismatch between resampled output
+    // sample count and real elapsed source duration -- resampler rounding,
+    // EAC3 frame timing, channel downmix -- would then compound without
+    // bound for the life of the stream. `async=1` enables libswresample's own
+    // built-in correction (the same machinery behind ffmpeg's `-async 1` /
+    // the `aresample` filter's default): fill/trim (inject silence or drop
+    // samples) to track the real PTS fed via swr_next_pts() below. This is
+    // deliberately NOT combined with a `max_soft_comp` stretch/squeeze
+    // (which defaults to 0/disabled and must stay that way) -- a resample-
+    // ratio nudge changes pitch, and any audible pitch shift is a strictly
+    // worse failure mode than a small, silent fill/trim.
+    av_require(av_opt_set_double(pipe.swr, "async", 1, 0), "enable resampler fill/trim compensation");
     av_require(swr_init(pipe.swr), "open audio resampler");
     pipe.audio_input_rate = input_rate;
 }
@@ -962,16 +939,26 @@ void process_audio_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame*
     ensure_audio_resampler(pipe, decoded);
     auto input_rate = decoded->sample_rate > 0 ? decoded->sample_rate : pipe.decoder->sample_rate;
     if (!pipe.audio_pts_initialized) {
-        if (source_pts != AV_NOPTS_VALUE) {
+        if (source_pts != AV_NOPTS_VALUE)
             pipe.audio_next_pts = av_rescale_q(source_pts, pipe.input_stream->time_base,
                                                pipe.encoder->time_base);
-            // Seed both counters from the same origin as audio_next_pts (which
-            // may be nonzero on a mid-file seek), so later drift comparisons
-            // measure real drift rather than the seek offset itself.
-            pipe.audio_produced_samples = pipe.audio_next_pts;
-            pipe.audio_last_compensation_samples = pipe.audio_next_pts;
-        }
         pipe.audio_pts_initialized = true;
+    }
+    // Prime libswresample's own fill/trim compensation (enabled via `async=1`
+    // in ensure_audio_resampler) with the real source PTS for this frame, in
+    // the 1/(in_rate*out_rate) unit swr_next_pts requires. That's a unit
+    // fraction (numerator 1) and so cannot be reduced by any GCD of
+    // in_rate/out_rate -- gcd(1, N) is always 1 -- so building it as a single
+    // AVRational{1, in_rate*out_rate} risks overflowing the 32-bit
+    // denominator field for common same-rate audio (e.g. 48kHz -> 48kHz
+    // alone exceeds INT32_MAX). Avoid ever forming that AVRational: rescale
+    // into the safe, small 1/in_rate unit first, then scale up to
+    // 1/(in_rate*out_rate) by an ordinary int64 multiply -- the same pattern
+    // ffmpeg's own af_aresample.c uses.
+    if (source_pts != AV_NOPTS_VALUE) {
+        const auto in_rate_samples =
+            av_rescale_q(source_pts, pipe.input_stream->time_base, AVRational{1, input_rate});
+        swr_next_pts(pipe.swr, in_rate_samples * pipe.encoder->sample_rate);
     }
     auto max_samples = static_cast<int>(av_rescale_rnd(
         swr_get_delay(pipe.swr, input_rate) + decoded->nb_samples,
@@ -996,8 +983,6 @@ void process_audio_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame*
         else rc = 0;
     }
     av_require(rc, "resample audio frame");
-    pipe.audio_produced_samples += converted->nb_samples;
-    maintain_audio_drift_compensation(pipe, source_pts);
     encode_audio_available(pipe, output, encoded, false);
 }
 
