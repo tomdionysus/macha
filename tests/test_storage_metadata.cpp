@@ -977,6 +977,53 @@ MACHA_FAST_TEST("storage_metadata", test_history_checkpoint_proof_only_trusted_o
     CHECK(proof->epoch == proposal.epoch);
 }
 
+MACHA_FAST_TEST("storage_metadata", test_history_checkpoint_ack_refuses_a_floor_this_replica_has_already_superseded) {
+    // Regression: a proposer whose own survey of the cluster was already
+    // stale by the time this ack arrives (e.g. it fell behind and proposed a
+    // floor every other replica had already moved past) must not be able to
+    // extract an ack for a floor this replica no longer holds as its single
+    // accepted head. Acking unconditionally let the stale proposer alone
+    // durably commit and compact its own history to that stale floor,
+    // discarding the only shared ancestry other replicas still needed for
+    // ordinary two-parent reconciliation -- with no automatic recovery
+    // possible afterward (observed live: three nodes permanently stuck on
+    // "divergent metadata heads have no known common ancestor").
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "checkpoint-ack-stale-floor";
+
+    NodeId a{}, b{};
+    a.bytes[15] = 1;
+    b.bytes[15] = 2;
+
+    MetadataReplica replica(path, keys.storage);
+    const auto genuine_head = replica.committed().hash;
+
+    HistoryCheckpointProof stale;
+    stale.floor_hash = sha256(Bytes{1, 2, 3}); // not this replica's accepted head
+    stale.floor_generation = replica.committed().generation;
+    stale.epoch.bytes[0] = 0x33;
+    stale.participants = {a, b};
+
+    CHECK(!replica.record_checkpoint_ack(stale));
+    CHECK(!replica.checkpoint_proof().has_value());
+
+    // A genuine proposal for this replica's actual current head still acks
+    // normally -- the fix rejects a mismatched floor, not every proposal.
+    HistoryCheckpointProof genuine;
+    genuine.floor_hash = genuine_head;
+    genuine.floor_generation = replica.committed().generation;
+    genuine.epoch.bytes[0] = 0x34;
+    genuine.participants = {a, b};
+    CHECK(replica.record_checkpoint_ack(genuine));
+    auto acked = replica.checkpoint_proof();
+    REQUIRE(acked.has_value());
+    CHECK(acked->status == HistoryCheckpointProof::Status::acked);
+    CHECK(acked->floor_hash == genuine_head);
+}
+
 MACHA_FAST_TEST("storage_metadata", test_history_checkpoint_proof_reload_validates_against_committed) {
     TempDir t;
     auto keyfile = t.path() / "key";
@@ -1218,6 +1265,88 @@ MACHA_FAST_TEST("storage_metadata", test_manual_causal_metadata_repair_requires_
     const auto equal_record = record_for(42, equal_clock, 40);
     CHECK(!plan_causally_dominant_metadata_repair(left, left_snapshot,
                                                    equal_record, equal_clock));
+}
+
+MACHA_FAST_TEST("storage_metadata",
+                test_manual_conflict_preserving_repair_handles_concurrent_in_place_change) {
+    FsEntry directory;
+    directory.type = EntryType::directory;
+    directory.mode = 0755;
+    FsEntry file_left;
+    file_left.type = EntryType::file;
+    file_left.mode = 0644;
+    file_left.size = 100;
+    auto file_right = file_left;
+    file_right.size = 200;
+
+    auto base_snapshot = decode_snapshot(genesis_metadata().payload);
+    base_snapshot.metadata_write_replicas_required = 2;
+    base_snapshot.entries["/unchanged"] = directory;
+
+    auto left_snapshot = base_snapshot;
+    left_snapshot.entries["/disputed"] = file_left;
+    auto right_snapshot = base_snapshot;
+    right_snapshot.entries["/disputed"] = file_right;
+
+    auto record_for = [](uint64_t generation, const MetadataSnapshot& snapshot,
+                         uint8_t previous_seed) {
+        MetadataRecord record;
+        record.generation = generation;
+        record.previous.bytes[0] = previous_seed;
+        record.payload = encode_snapshot(snapshot);
+        record.hash = metadata_hash(record.generation, record.previous, record.payload);
+        return record;
+    };
+    const auto left = record_for(50, left_snapshot, 10);
+    const auto right = record_for(50, right_snapshot, 20);
+
+    // Concurrent, neither dominates: causal-dominance repair must refuse this
+    // pair (that refusal is exactly what routes an operator to the
+    // conflict-preserving repair instead).
+    CHECK(!plan_causally_dominant_metadata_repair(left, left_snapshot, right, right_snapshot));
+
+    auto plan = plan_conflict_preserving_metadata_repair(left, left_snapshot, right, right_snapshot);
+    REQUIRE(plan.has_value());
+    CHECK(plan->left_head == left.hash);
+    CHECK(plan->right_head == right.hash);
+    CHECK(plan->conflicts_created == 1);
+    CHECK(plan->record.generation == 51);
+    CHECK(plan->record.previous == std::min(left.hash, right.hash));
+    REQUIRE(valid_metadata_record(plan->record));
+
+    const auto repaired = decode_snapshot(plan->record.payload);
+    // The identical entry reconciles normally; the genuinely disputed one is
+    // held out of the namespace (not silently resolved to either side) and
+    // recorded as a first-class conflict preserving both alternatives.
+    CHECK(repaired.entries.at("/unchanged") == directory);
+    CHECK(!repaired.entries.contains("/disputed"));
+    REQUIRE(repaired.conflicts.size() == 1);
+    const auto& conflict = repaired.conflicts.begin()->second;
+    CHECK(conflict.kind == MetadataConflictKind::namespace_entry);
+    CHECK(conflict.key == "/disputed");
+    CHECK(!conflict.base_entry.has_value());
+    REQUIRE(conflict.left_entry.has_value());
+    REQUIRE(conflict.right_entry.has_value());
+    CHECK(*conflict.left_entry == file_left);
+    CHECK(*conflict.right_entry == file_right);
+    REQUIRE(repaired.merge_parents.size() == 1);
+    CHECK(repaired.merge_parents.front() == std::max(left.hash, right.hash));
+
+    // Refuses outright when the two heads differ by more than in-place
+    // changes: an empty base also disables the rename/move-collision
+    // detection that a real common ancestor would drive, so an add/remove
+    // asymmetry is not safe for this code path to arbitrate.
+    auto right_with_extra = right_snapshot;
+    right_with_extra.entries["/right-only"] = directory;
+    const auto right_extra_record = record_for(50, right_with_extra, 20);
+    CHECK(!plan_conflict_preserving_metadata_repair(left, left_snapshot, right_extra_record,
+                                                    right_with_extra));
+
+    auto left_with_extra = left_snapshot;
+    left_with_extra.entries["/left-only"] = directory;
+    const auto left_extra_record = record_for(50, left_with_extra, 10);
+    CHECK(!plan_conflict_preserving_metadata_repair(left_extra_record, left_with_extra, right,
+                                                    right_snapshot));
 }
 
 MACHA_FAST_TEST("storage_metadata", test_metadata_recovery_cache_seed_is_not_accepted_authority) {

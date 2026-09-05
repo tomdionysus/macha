@@ -850,10 +850,8 @@ MetadataManager::discover_accepted_heads_required(const std::vector<NodeInfo>& n
 bool MetadataManager::propose_history_floor_on(const NodeInfo& owner,
                                                const HistoryCheckpointProof& proposal,
                                                FrameType frame_type) {
-    if (owner.id == node_.node_id()) {
-        node_.metadata_replica().record_checkpoint_ack(proposal);
-        return true;
-    }
+    if (owner.id == node_.node_id())
+        return node_.metadata_replica().record_checkpoint_ack(proposal);
     try {
         const auto encoded = encode_history_checkpoint_proof(proposal);
         return bool_reply(

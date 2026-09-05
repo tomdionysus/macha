@@ -66,6 +66,89 @@ void print_plan(const MetadataManualRepairPlan& plan) {
               << " dominant=" << to_string(plan.dominant_head)
               << " subsumed=" << to_string(plan.subsumed_head) << '\n';
 }
+
+MetadataConflictPreservingRepairPlan conflict_repair_plan(MetadataReplica& replica) {
+    auto heads = replica.accepted_heads();
+    if (heads.size() != 2)
+        throw std::runtime_error("manual conflict-preserving repair requires exactly two accepted heads");
+    if (replica.history_common_ancestor(heads[0].hash, heads[1].hash))
+        throw std::runtime_error("heads have a common ancestor; use ordinary reconciliation");
+    const auto left = decode_snapshot(heads[0].payload);
+    const auto right = decode_snapshot(heads[1].payload);
+    auto plan = plan_conflict_preserving_metadata_repair(heads[0], left, heads[1], right);
+    if (!plan)
+        throw std::runtime_error(
+            "heads have entries absent from one another; conflict-preserving repair only "
+            "covers entries changed in place on both sides -- refusing rather than risk "
+            "misclassifying an add/remove/rename");
+    return *plan;
+}
+
+void print_conflict_plan(const MetadataConflictPreservingRepairPlan& plan) {
+    std::cout << "conflict_repair generation=" << plan.record.generation
+              << " hash=" << to_string(plan.record.hash)
+              << " primary=" << to_string(plan.record.previous)
+              << " left=" << to_string(plan.left_head) << " right=" << to_string(plan.right_head)
+              << " conflicts_created=" << plan.conflicts_created << '\n';
+}
+
+void print_entry(std::string_view label, const FsEntry& entry) {
+    std::cout << "  " << label << ": type=" << (entry.type == EntryType::directory ? "dir" : "file")
+              << " mode=" << std::oct << entry.mode << std::dec << " uid=" << entry.uid
+              << " gid=" << entry.gid << " size=" << entry.size << " mtime_ns=" << entry.mtime_ns
+              << " version=" << entry.version << " extents=" << entry.extents.size();
+    for (const auto& extent : entry.extents)
+        std::cout << " [offset=" << extent.offset << " length=" << extent.length
+                  << " hole=" << extent.hole << " id=" << to_string(extent.id) << ']';
+    std::cout << '\n';
+}
+
+// Read-only, additive to the causal-merge machinery above: prints exactly
+// which namespace paths differ between two accepted heads, field by field,
+// rather than only the aggregate counts the ordinary report prints. Intended
+// for a concurrent (neither-dominates) divergence, where the causal-merge
+// plan refuses to run and an operator needs to see precisely what is at
+// stake before deciding how to proceed by hand.
+void diff_heads(MetadataReplica& replica) {
+    auto heads = replica.accepted_heads();
+    if (heads.size() != 2)
+        throw std::runtime_error("--diff-heads requires exactly two accepted heads");
+    const auto left_snapshot = decode_snapshot(heads[0].payload);
+    const auto right_snapshot = decode_snapshot(heads[1].payload);
+    std::cout << "diff left=" << to_string(heads[0].hash) << " right=" << to_string(heads[1].hash)
+              << '\n';
+    for (const auto& [path, entry] : left_snapshot.entries) {
+        const auto found = right_snapshot.entries.find(path);
+        if (found == right_snapshot.entries.end()) {
+            std::cout << "left_only path=" << path << '\n';
+            print_entry("left", entry);
+        } else if (found->second != entry) {
+            std::cout << "changed path=" << path << '\n';
+            print_entry("left", entry);
+            print_entry("right", found->second);
+        }
+    }
+    for (const auto& [path, entry] : right_snapshot.entries) {
+        if (!left_snapshot.entries.contains(path)) {
+            std::cout << "right_only path=" << path << '\n';
+            print_entry("right", entry);
+        }
+    }
+    if (left_snapshot.catalogue_root != right_snapshot.catalogue_root)
+        std::cout << "catalogue_root differs left="
+                  << (left_snapshot.catalogue_root ? to_string(*left_snapshot.catalogue_root) : "none")
+                  << " right="
+                  << (right_snapshot.catalogue_root ? to_string(*right_snapshot.catalogue_root) : "none")
+                  << '\n';
+    for (const auto& [origin, sequence] : left_snapshot.mutation_sequences) {
+        const auto found = right_snapshot.mutation_sequences.find(origin);
+        std::cout << "mutation_origin=" << to_string(origin) << " left_sequence=" << sequence
+                  << " right_sequence=" << (found != right_snapshot.mutation_sequences.end()
+                                                ? std::to_string(found->second)
+                                                : "absent")
+                  << '\n';
+    }
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -75,7 +158,11 @@ int main(int argc, char** argv) {
                      "       macha-metadata-repair --stage-causal-merge STATE_PATH KEY_FILE\n"
                      "       macha-metadata-repair --accept-causal-merge STATE_PATH KEY_FILE WITNESS...\n"
                      "       macha-metadata-repair --export-acceptance STATE_PATH KEY_FILE HASH FILE\n"
-                     "       macha-metadata-repair --import-acceptance STATE_PATH KEY_FILE FILE\n";
+                     "       macha-metadata-repair --import-acceptance STATE_PATH KEY_FILE FILE\n"
+                     "       macha-metadata-repair --diff-heads STATE_PATH KEY_FILE\n"
+                     "       macha-metadata-repair --plan-conflict-merge STATE_PATH KEY_FILE\n"
+                     "       macha-metadata-repair --stage-conflict-merge STATE_PATH KEY_FILE\n"
+                     "       macha-metadata-repair --accept-conflict-merge STATE_PATH KEY_FILE WITNESS...\n";
         return 2;
     }
     try {
@@ -110,6 +197,39 @@ int main(int argc, char** argv) {
                           << " hash=" << to_string(acceptance.hash)
                           << " required=" << acceptance.required
                           << " witnesses=" << acceptance.replicas.size() << '\n';
+                return 0;
+            }
+            if (action == "--diff-heads") {
+                diff_heads(replica);
+                return 0;
+            }
+            if (action == "--plan-conflict-merge" || action == "--stage-conflict-merge" ||
+                action == "--accept-conflict-merge") {
+                auto plan = conflict_repair_plan(replica);
+                print_conflict_plan(plan);
+                if (action == "--plan-conflict-merge") return 0;
+                if (action == "--stage-conflict-merge") {
+                    if (!replica.store_commit(plan.record))
+                        throw std::runtime_error("failed to durably stage manual repair commit");
+                    std::cout << "staged=true\n";
+                    return 0;
+                }
+                const auto snapshot = decode_snapshot(plan.record.payload);
+                const auto required = snapshot.metadata_write_replicas_required;
+                std::vector<NodeId> witnesses;
+                for (int i = key_index + 1; i < argc; ++i)
+                    witnesses.push_back(parse_node_id(argv[i]));
+                std::sort(witnesses.begin(), witnesses.end());
+                witnesses.erase(std::unique(witnesses.begin(), witnesses.end()), witnesses.end());
+                if (!required || witnesses.size() < required)
+                    throw std::runtime_error("insufficient distinct witnesses for repair policy");
+                if (!replica.history_contains(plan.record.hash))
+                    throw std::runtime_error("repair commit has not been staged on this replica");
+                MetadataAcceptance acceptance{plan.record.generation, plan.record.hash,
+                                              required, std::move(witnesses)};
+                if (!replica.accept_commit(acceptance))
+                    throw std::runtime_error("failed to accept manual repair commit");
+                std::cout << "accepted=true\n";
                 return 0;
             }
             auto plan = repair_plan(replica);
