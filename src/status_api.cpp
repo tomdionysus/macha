@@ -338,6 +338,7 @@ void ClusterStatusService::persist_local_status() {
         node_.activity_idle_for(FrameType::read_ahead) < idle_before_persist)
         return;
     node_.telemetry().persist();
+    node_.sessions().persist();
 }
 
 void ClusterStatusService::persistence_loop(std::stop_token stop) {

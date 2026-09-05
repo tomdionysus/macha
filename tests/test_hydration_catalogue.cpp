@@ -2554,7 +2554,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
                                        .path = "/api/v1/catalogue/status",
                                        .query = {},
                                        .headers = {},
-                                       .body = {}});
+                                       .body = {}, .session = {}});
     REQUIRE(status_response.status == 200);
     auto status_json = Json::parse(std::string(status_response.body.begin(),
                                                status_response.body.end()));
@@ -2801,7 +2801,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_effective_artwork_is_displa
                                             .path = "/api/v1/catalogue/items/track%3Aapi-test",
                                             .query = {},
                                             .headers = {},
-                                            .body = {}});
+                                            .body = {}, .session = {}});
     REQUIRE(track_response.status == 200);
     const auto track_json =
         Json::parse(std::string(track_response.body.begin(), track_response.body.end()));
@@ -2817,7 +2817,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_effective_artwork_is_displa
                                              .path = "/api/v1/catalogue/items/artist%3Aapi-test",
                                              .query = {},
                                              .headers = {},
-                                             .body = {}});
+                                             .body = {}, .session = {}});
     REQUIRE(artist_response.status == 200);
     const auto artist_json =
         Json::parse(std::string(artist_response.body.begin(), artist_response.body.end()));
@@ -2830,7 +2830,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_effective_artwork_is_displa
                                         .path = "/api/v1/catalogue/artwork/" + to_string(cover.id),
                                         .query = {},
                                         .headers = {},
-                                        .body = {}});
+                                        .body = {}, .session = {}});
     REQUIRE(artwork_response.status == 200);
     CHECK(artwork_response.body == cover_bytes);
 
@@ -2841,7 +2841,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_api_effective_artwork_is_displa
                                     .query = {},
                                     .headers = {{"if-match", "\"rev-" +
                                                               std::to_string(track.revision) + "\""}},
-                                    .body = track_response.body});
+                                    .body = track_response.body, .session = {}});
     REQUIRE(put_response.status == 200);
     auto stored = service.catalogue().get(track.id);
     REQUIRE(stored.has_value());
@@ -2870,7 +2870,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_artwork_url_is_signed_and_capab
                                       .path = "/api/v1/catalogue/items/album%3Asigned-url-test",
                                       .query = {},
                                       .headers = {},
-                                      .body = {}});
+                                      .body = {}, .session = {}});
     REQUIRE(response.status == 200);
     const auto json = Json::parse(std::string(response.body.begin(), response.body.end()));
     const auto* artwork = json.find("artwork");
@@ -2930,7 +2930,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_artwork_capability_rejects_tamp
                                       .path = "/api/v1/catalogue/items/album%3Atampered-url-test",
                                       .query = {},
                                       .headers = {},
-                                      .body = {}});
+                                      .body = {}, .session = {}});
     REQUIRE(response.status == 200);
     const auto json = Json::parse(std::string(response.body.begin(), response.body.end()));
     const auto url = json.find("artwork")->asArray().front().find("url")->asString();
@@ -2971,7 +2971,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_artwork_capability_rejects_tamp
                                 .path = "/api/v1/catalogue/items/album%3Atampered-url-test",
                                 .query = {},
                                 .headers = {},
-                                .body = {}});
+                                .body = {}, .session = {}});
     REQUIRE(short_lived_response.status == 200);
     const auto short_lived_json = Json::parse(
         std::string(short_lived_response.body.begin(), short_lived_response.body.end()));
@@ -3359,13 +3359,13 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
                                      .path = "/api/v1/catalogue/items/show%3Adoes-not-exist/metadata",
                                      .query = {},
                                      .headers = {},
-                                     .body = {}});
+                                     .body = {}, .session = {}});
     CHECK(missing_clear.status == 404);
     auto status_response = api.handle({.method = "GET",
                                        .path = "/api/v1/catalogue/status",
                                        .query = {},
                                        .headers = {},
-                                       .body = {}});
+                                       .body = {}, .session = {}});
     CHECK(status_response.status == 200);
     std::string status_body(status_response.body.begin(), status_response.body.end());
     CHECK(status_body.find("\"ready\":true") != std::string::npos);
@@ -3376,7 +3376,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
                                        .path = "/api/v1/catalogue/search",
                                        .query = {{"q", "pilot"}},
                                        .headers = {},
-                                       .body = {}});
+                                       .body = {}, .session = {}});
     CHECK(search_response.status == 200);
     std::string search_body(search_response.body.begin(), search_response.body.end());
     CHECK(search_body.find("episode:test:1:1") != std::string::npos);
@@ -3388,7 +3388,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
                                       .path = "/api/v1/catalogue/items/show%3Atest/metadata",
                                       .query = {},
                                       .headers = {{"if-match", "\"rev-" + std::to_string(show.revision + 1) + "\""}},
-                                      .body = {}});
+                                      .body = {}, .session = {}});
     // The poster replacement did not mutate the copy of `show`; use the current
     // revision if the optimistic request raced a catalogue refresh.
     if (clear_response.status == 409) {
@@ -3398,7 +3398,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
                                      .path = "/api/v1/catalogue/items/show%3Atest/metadata",
                                      .query = {},
                                      .headers = {{"if-match", "\"rev-" + std::to_string(current_show->revision) + "\""}},
-                                     .body = {}});
+                                     .body = {}, .session = {}});
     }
     CHECK(clear_response.status == 204);
     CHECK(!s3.catalogue().get(show.id).has_value());

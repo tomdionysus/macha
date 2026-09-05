@@ -90,7 +90,7 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
                  MaintenanceStageHook maintenance_stage_hook,
                  StartupStallHandler startup_stall_handler)
     : node_(std::move(config), keys, std::move(startup_stage_hook)), cluster_status_(node_),
-      startup_stall_handler_(std::move(startup_stall_handler)),
+      session_api_(node_), startup_stall_handler_(std::move(startup_stall_handler)),
       maintenance_stage_hook_(std::move(maintenance_stage_hook)) {
     cluster_status_.attach_convergence_diagnostics(
         [this] { return metadata_convergence_.diagnostics(); });
@@ -98,7 +98,11 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
         catalogue_http_ = std::make_unique<HttpServer>(
             node_.config().catalogue.api,
             [this](const HttpRequest& request) { return handle_http(request); },
-            [this](const HttpRequest& request) { return capability_request(request); });
+            [this](const HttpRequest& request) { return capability_request(request); },
+            [this](std::string_view token) -> std::optional<SessionIdentity> {
+                auto session = node_.sessions().validate(token);
+                return session ? std::optional(session_identity(*session)) : std::nullopt;
+            });
     }
 }
 
@@ -122,6 +126,11 @@ Service::~Service() {
 HttpResponse Service::handle_http(const HttpRequest& request) {
     if (request.path == "/api/v1/status" || request.path.starts_with("/api/v1/status/"))
         return cluster_status_.handle(request);
+    // Session creation/introspection must work while local services are
+    // still recovering, same reasoning as Status above -- the control plane
+    // is already online long before local storage/metadata finish recovery.
+    if (request.path == "/api/v1/session")
+        return session_api_.handle(request);
 
     if (!services_ready_.load(std::memory_order_acquire)) {
         if (startup_failed_.load(std::memory_order_acquire)) {
@@ -144,6 +153,10 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
 }
 
 bool Service::capability_request(const HttpRequest& request) {
+    // Session creation is the one route reachable with no bearer token at
+    // all, and (like Status) must be exempt regardless of local readiness.
+    if (SessionApi::capability_request(request))
+        return true;
     if (!services_ready_.load(std::memory_order_acquire))
         return false;
     if (streaming_ && streaming_->capability_request(request))

@@ -27,6 +27,10 @@ struct HttpRequest {
     std::map<std::string, std::string, std::less<>> query;
     std::map<std::string, std::string, std::less<>> headers;
     Bytes body;
+    // Set by HttpServer once the bearer token has been validated against the
+    // cluster session store. Absent for exempt routes (session creation,
+    // signed streaming/asset capability URLs).
+    std::optional<SessionIdentity> session;
 };
 
 class HttpBodySource {
@@ -61,10 +65,14 @@ HttpResponse http_error(int status, std::string_view code, std::string_view mess
 std::string http_url_decode(std::string_view value);
 
 class HttpServer {
+  public:
+    using SessionAuthenticator = std::function<std::optional<SessionIdentity>(std::string_view)>;
+
+  private:
     CatalogueApiConfig config_;
     std::function<HttpResponse(const HttpRequest&)> handler_;
     std::function<bool(const HttpRequest&)> bearer_exempt_;
-    std::optional<std::string> bearer_token_;
+    SessionAuthenticator authenticate_;
     std::jthread accept_thread_;
     std::vector<std::jthread> workers_;
     std::atomic_bool running_{};
@@ -90,7 +98,8 @@ class HttpServer {
 
   public:
     HttpServer(CatalogueApiConfig, std::function<HttpResponse(const HttpRequest&)>,
-               std::function<bool(const HttpRequest&)> bearer_exempt = {});
+               std::function<bool(const HttpRequest&)> bearer_exempt = {},
+               SessionAuthenticator authenticate = {});
     ~HttpServer();
     void start();
     void request_stop();
