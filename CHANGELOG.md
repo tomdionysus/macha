@@ -1,5 +1,47 @@
 # Current release
 
+## 0.23.9 — Fix audible pitch shift introduced by 0.23.8's drift correction (development)
+
+- 0.23.8's `swr_set_compensation()`-based correction genuinely worked (bounded
+  drift as measured), but the correction mechanism itself was wrong: nudging
+  the resample ratio changes pitch, and no bound on that rate is small enough
+  to be inaudible to a sensitive listener — reported live as an unacceptable,
+  clearly audible pitch shift. That mechanism has been removed entirely
+  (`maintain_audio_drift_compensation()`, `swr_set_compensation()`, and its
+  supporting counters are gone).
+- Replacement: enable libswresample's own built-in correction directly
+  (`av_opt_set_double(swr, "async", 1, 0)` plus `swr_next_pts()` fed the real
+  source PTS each frame) — the same machinery behind ffmpeg's own `-async 1`
+  and the `aresample` filter's default behaviour. This corrects by injecting
+  silence or dropping samples (`swr_inject_silence()`/`swr_drop_output()`),
+  never by changing the resample ratio: `max_soft_comp` (the opt-in
+  pitch-bending stretch/squeeze path) is left at its disabled default and is
+  never touched by this code, so a pitch shift is structurally not possible
+  through this path.
+- This replacement had its own near-miss during development: an initial
+  attempt tried to avoid overflowing `swr_next_pts()`'s required
+  `AVRational{1, in_rate*out_rate}` denominator by dividing it by
+  `gcd(in_rate, out_rate)` — but that unit is a unit fraction (numerator 1)
+  and a unit fraction cannot be reduced by any GCD (`gcd(1, N)` is always 1).
+  The result was silently ~48000x too coarse for the common 48kHz -> 48kHz
+  case, which made libswresample believe it was catastrophically far ahead
+  and drop nearly all audio (measured: 5 packets survived an 8-minute
+  capture). Caught in local verification before reaching any node clients
+  actually watch on. Fixed by rescaling into the safe `1/in_rate` unit first,
+  then multiplying by `out_rate` as plain `int64_t` arithmetic — never
+  constructing the overflow-prone `AVRational` at all, matching the pattern
+  ffmpeg's own `libavfilter/af_aresample.c` uses.
+- Re-verified against the same real title after the fix: audio packet count
+  and duration are healthy across a full 8-minute capture (no dropped audio),
+  and the audio/video offset still oscillates within roughly ±15ms instead of
+  growing unbounded — same drift-correction quality as 0.23.8's measurement,
+  now via a mechanism that cannot shift pitch.
+- Same known gap as 0.23.8: no automated regression test yet for the real
+  (non-stub) transcode audio path; both this fix and the incident it fixes
+  were only caught by live measurement and live listening, not CI. Building
+  that harness (Phase 0 of the resilience plan) would have caught both the
+  pitch shift and the near-total-silence regression before either shipped.
+
 ## 0.23.8 — Bounded audio drift compensation for transcoded playback (development)
 
 - Transcoded audio's presentation clock (`StreamPipeline::audio_next_pts` in
