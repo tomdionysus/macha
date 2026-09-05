@@ -138,6 +138,13 @@ class MediaSegmentStore {
     void note_requested(uint64_t index);
     Snapshot snapshot() const;
     void cancel();
+    // Mark (or clear) this store as superseded by a replacement generation.
+    // Unlike cancel(), this only wakes wait_object() callers blocked on a
+    // not-yet-produced segment -- it does not stop production or set
+    // finished/error, and is reversible: if the replacement attempt that
+    // called this fails before taking over, clearing it restores normal
+    // long-poll behaviour for a store that remains the active generation.
+    void mark_superseded(bool superseded);
     // Reserve this store's bounded resident capacity as viewer ownership before
     // exposing the pipeline. False means admission must fail cleanly.
     bool attach_memory_ledger(RetainedMemoryLedger&);

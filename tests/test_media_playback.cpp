@@ -187,6 +187,56 @@ MACHA_TEST("media_playback", test_media_segment_store_backpressure_and_spill) {
     CHECK(retained.stats().used_bytes == 0);
 }
 
+MACHA_TEST("media_playback", test_media_segment_store_supersede_wakes_stale_waiter_reversibly) {
+    // Regression for a seek/generation-replacement stall: a request blocked
+    // in wait_object() on a not-yet-produced segment of a superseded
+    // generation must wake promptly (rather than only once the replacement
+    // pipeline's own startup completes), and marking superseded is
+    // reversible so a replacement attempt that fails leaves the still-active
+    // store's normal long-poll behaviour intact.
+    TempDir t;
+    auto store = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill", 4000ms,
+                                                      std::vector<double>{4.0, 4.0, 4.0, 4.0, 4.0});
+    REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
+    REQUIRE(store->publish_segment(Bytes(16, 0x10), 4.0));
+
+    std::atomic_bool first_wait_returned{};
+    std::optional<Bytes> first_wait_result;
+    std::jthread first_waiter([&] {
+        store->note_requested(4);
+        first_wait_result = store->wait_object("segment-000004.m4s", {});
+        first_wait_returned.store(true);
+    });
+    std::this_thread::sleep_for(50ms);
+    CHECK(!first_wait_returned.load());
+
+    store->mark_superseded(true);
+    for (int i = 0; i < 100 && !first_wait_returned.load(); ++i) std::this_thread::sleep_for(10ms);
+    first_waiter.join();
+    CHECK(first_wait_returned.load());
+    CHECK(!first_wait_result.has_value());
+    auto superseded_state = store->snapshot();
+    CHECK(superseded_state.error.empty());
+    CHECK(!superseded_state.finished);
+
+    // A replacement that later fails clears superseded, restoring normal
+    // long-poll blocking for the still-active generation.
+    store->mark_superseded(false);
+    std::atomic_bool second_wait_returned{};
+    std::jthread second_waiter([&] {
+        second_wait_returned.store(store->wait_object("segment-000004.m4s", {}).has_value());
+    });
+    std::this_thread::sleep_for(50ms);
+    CHECK(!second_wait_returned.load());
+
+    REQUIRE(store->publish_segment(Bytes(16, 0x11), 4.0));
+    REQUIRE(store->publish_segment(Bytes(16, 0x12), 4.0));
+    REQUIRE(store->publish_segment(Bytes(16, 0x13), 4.0));
+    REQUIRE(store->publish_segment(Bytes(16, 0x14), 4.0));
+    second_waiter.join();
+    CHECK(second_wait_returned.load());
+}
+
 MACHA_TEST("media_playback", test_http_server_serves_streams_concurrently) {
     CatalogueApiConfig config;
     config.enabled = true;

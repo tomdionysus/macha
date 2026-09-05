@@ -1,5 +1,38 @@
 # Current release
 
+## 0.23.10 — Fix seek/generation-replacement stall on stale segment requests (development)
+
+- Live-diagnosed via a real seek into Apollo 13 on a running node: a segment
+  request against a superseded generation (e.g. client read-ahead, or a
+  request already in flight when a seek arrives) could block for the full
+  duration of the *replacement* pipeline's startup (`streaming.startup_timeout_ms`,
+  15s default) before returning its 404. `update_session`'s seek path starts
+  the replacement pipeline synchronously before stopping the old one (by
+  design, to avoid a resource-accounting race -- see the ordering comment at
+  the `stop_pipeline`/`start_pipeline` call site), and only `stop_pipeline(old)`
+  wakes anything blocked in `MediaSegmentStore::wait_object()` on the old
+  generation's store via `cancel()`. Nothing woke those waiters earlier.
+- Fixed by adding `MediaSegmentStore::mark_superseded(bool)`, a lighter,
+  reversible signal distinct from `cancel()`: it wakes `wait_object()` callers
+  blocked on a not-yet-produced segment (so they get a prompt 404 `not_ready`)
+  without stopping production or setting `finished`/`error`. `update_session`
+  now marks the old generation's store superseded immediately, before
+  attempting to start the replacement pipeline; if that attempt then fails,
+  it is cleared again so the still-active old session keeps its normal
+  long-poll behaviour. This does not change the existing resource-handover
+  ordering/invariant at all -- `stop_pipeline(old)` still only runs once the
+  replacement is confirmed.
+- Added a regression test exercising `mark_superseded`'s wake and reversal
+  behaviour directly against `MediaSegmentStore`.
+- Not yet confirmed whether this was the cause of a separately reported live
+  symptom (apparent ~1-2s A/V offset partway through a title) -- reproducing
+  that report during investigation showed a seek triggering this exact stall
+  cascading into the client's failover logic and losing playback position,
+  but it was not established whether a real seek/PATCH occurred in that
+  specific live report versus continuous playback simply outrunning
+  real-time production. This fix addresses the confirmed stall either way;
+  whether it resolves the original report remains to be observed live.
+
 ## 0.23.9 — Fix audible pitch shift introduced by 0.23.8's drift correction (development)
 
 - 0.23.8's `swr_set_compensation()`-based correction genuinely worked (bounded
