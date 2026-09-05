@@ -1,5 +1,41 @@
 # Current release
 
+## 0.23.11 — Snap transcode seeks to source keyframes, cutting seek startup cost (development)
+
+- Live-measured a seek deep into a transcoded HEVC Main10 title costing
+  ~7s to first fragment versus ~2s from position zero. Root cause: for
+  transcode (unlike remux), a seek lands on the nearest source keyframe but
+  then fully *decodes* (not just skips) every frame between that keyframe
+  and the exact frame-accurate requested position, purely so encoding can
+  start at that exact frame -- a viewer does not need that precision, and it
+  can cost a full GOP's worth of software HEVC decode on slow hardware.
+- Fixed by snapping the transcode seek itself to the nearest keyframe at or
+  after the target (`media_vod::nearest_keyframe_at_or_after`), in both the
+  cold-session-creation path and the interactive PATCH-seek fast path
+  (`reseek_hls_vod`). Deliberately does not reuse remux's `indexed_plan`
+  for this: that function also validates keyframe density across the
+  *entire remaining file*, which is irrelevant to transcode (it lays down
+  its own GOP structure regardless) and was observed to silently reject the
+  snap -- with no error, just silently falling back to the old frame-accurate
+  behaviour -- whenever any other part of a long file had a sparser GOP.
+- Second bug caught only via live measurement showing no improvement despite
+  correct-looking code: the keyframe's timestamp was rounded to milliseconds
+  with `llround` (nearest), which can round a fractional-millisecond
+  keyframe timestamp *down*; reconstructing microseconds from that
+  truncated value then made the container seek land one keyframe *earlier*
+  than intended -- a full extra GOP decoded for nothing. Fixed by rounding
+  up (`ceil`) instead, everywhere a keyframe timestamp (not a raw user
+  seek request) is converted to milliseconds.
+- Verified live: ~7s reduced to ~4s for a fresh seek on quiet hardware
+  (position zero remains ~2-2.5s). A residual ~1.7s gap versus position
+  zero remains unexplained and is left for follow-up, rather than guessed
+  at -- a stream-info/container-seek timing diagnostic was added
+  (`media playback pipeline seek timing`) to help isolate it.
+- Also fixes the interactive PATCH-seek case, though live measurement there
+  was confounded by CPU contention between the old (still-encoding) and new
+  pipeline during handover on constrained hardware -- a separate, likely
+  larger effect for real-world scrubbing, not addressed here.
+
 ## 0.23.10 — Fix seek/generation-replacement stall on stale segment requests (development)
 
 - Live-diagnosed via a real seek into Apollo 13 on a running node: a segment

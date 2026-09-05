@@ -81,4 +81,14 @@ bool requires_seek_index_materialisation(std::string_view input_format_name) {
     return format_token(input_format_name, "matroska") || format_token(input_format_name, "webm");
 }
 
+double nearest_keyframe_at_or_after(std::span<const double> keyframe_seconds,
+                                    double requested_seek_seconds) {
+    double best = -1.0;
+    for (const double seconds : keyframe_seconds) {
+        if (seconds + kTimestampEpsilon < requested_seek_seconds) continue;
+        if (best < 0.0 || seconds < best) best = seconds;
+    }
+    return best;
+}
+
 } // namespace macha::media_vod

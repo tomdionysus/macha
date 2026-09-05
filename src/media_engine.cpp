@@ -382,18 +382,14 @@ void materialise_deferred_seek_index(AVFormatContext* format, int video_stream,
                std::to_string(before) + " entries_after=" + std::to_string(after));
 }
 
-std::vector<double> indexed_vod_durations(AVFormatContext* format, int video_stream,
-                                          double duration_seconds, double requested_seek_seconds,
-                                          double segment_seconds, double& actual_seek_seconds,
-                                          std::vector<double>* reusable_keyframes = nullptr) {
-    if (video_stream < 0 || video_stream >= static_cast<int>(format->nb_streams)) return {};
+std::vector<double> video_keyframe_seconds(AVFormatContext* format, int video_stream) {
+    std::vector<double> keyframes;
+    if (video_stream < 0 || video_stream >= static_cast<int>(format->nb_streams)) return keyframes;
     auto* stream = format->streams[video_stream];
     const int entries = avformat_index_get_entries_count(stream);
-    if (entries <= 0) return {};
+    if (entries <= 0) return keyframes;
 
     const int64_t input_start_us = format->start_time == AV_NOPTS_VALUE ? 0 : format->start_time;
-
-    std::vector<double> keyframes;
     keyframes.reserve(static_cast<size_t>(entries));
     for (int i = 0; i < entries; ++i) {
         const auto* entry = avformat_index_get_entry(stream, i);
@@ -404,7 +400,15 @@ std::vector<double> indexed_vod_durations(AVFormatContext* format, int video_str
         if (!keyframes.empty() && seconds <= keyframes.back() + 0.0005) continue;
         keyframes.push_back(seconds);
     }
+    return keyframes;
+}
 
+std::vector<double> indexed_vod_durations(AVFormatContext* format, int video_stream,
+                                          double duration_seconds, double requested_seek_seconds,
+                                          double segment_seconds, double& actual_seek_seconds,
+                                          std::vector<double>* reusable_keyframes = nullptr) {
+    auto keyframes = video_keyframe_seconds(format, video_stream);
+    if (keyframes.empty()) return {};
     auto plan = media_vod::indexed_plan(keyframes, duration_seconds, requested_seek_seconds,
                                         segment_seconds);
     if (!plan) return {};
@@ -1077,7 +1081,11 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
     InputContext input(source, MediaReadPurpose::playback, &cancelled,
                        probe_bytes, analyze_duration, startup_timeout);
     auto* in = input.get();
+    const auto stream_info_started = Clock::now();
     auto stream_info_rc = avformat_find_stream_info(in, nullptr);
+    const auto stream_info_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    Clock::now() - stream_info_started)
+                                    .count();
     if (stream_info_rc < 0 && input.timed_out())
         throw std::runtime_error("playback pipeline timed out while reading stream information");
     av_require(stream_info_rc, "read stream information");
@@ -1095,11 +1103,29 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
     const int64_t input_start_us = in->start_time == AV_NOPTS_VALUE ? 0 : in->start_time;
     const int64_t seek_target_us = input_start_us +
         av_rescale_q(plan.seek.count(), AVRational{1, 1000}, AV_TIME_BASE_Q);
+    int64_t seek_ms = 0;
     if (plan.seek.count() > 0) {
+        const auto seek_started = Clock::now();
         av_require(avformat_seek_file(in, -1, std::numeric_limits<int64_t>::min(), seek_target_us,
                                      std::numeric_limits<int64_t>::max(), AVSEEK_FLAG_BACKWARD),
                    "seek media");
+        seek_ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - seek_started)
+                     .count();
     }
+    // Diagnostic: isolates container stream-info re-discovery and the
+    // actual container seek (this pipeline opens its own fresh
+    // InputContext, separate from the one used during VOD planning's
+    // keyframe snap, so a Matroska file's Cues materialisation and any
+    // remote extent fetch for the target region are paid again here even
+    // after landing exactly on a keyframe) from decode work, so a remaining
+    // gap between a seek=0 and a keyframe-snapped seek>0 startup can be
+    // attributed correctly rather than guessed at. A known residual gap
+    // remains after the keyframe-snap and rounding fixes (~1.7s measured on
+    // corvus-gbni-2); this log is left in place to help isolate it later.
+    Log::debug("media playback pipeline seek timing media=" + source.media_id +
+              " seek_target_ms=" + std::to_string(plan.seek.count()) +
+              " stream_info_ms=" + std::to_string(stream_info_ms) +
+              " container_seek_ms=" + std::to_string(seek_ms));
 
     AVFormatContext* raw_out = nullptr;
     const auto output_rc =
@@ -1448,8 +1474,15 @@ class LibavMediaEngine final : public MediaEngine {
                     format, result.playback.video_stream, source_duration_seconds, requested_seek,
                     target, actual_seek, &result.video_random_access_points);
                 if (!result.segment_durations.empty()) {
+                    // actual_seek is a real keyframe's timestamp. Round UP to
+                    // milliseconds, never to nearest: llround can round a
+                    // fractional-millisecond keyframe timestamp down, and
+                    // reconstructing microseconds from that truncated value
+                    // later (run_pipeline) then lands avformat_seek_file's
+                    // AVSEEK_FLAG_BACKWARD search one keyframe *earlier* than
+                    // intended -- a full GOP's worth of avoidable decode.
                     result.playback.seek = std::chrono::milliseconds(
-                        static_cast<int64_t>(std::llround(actual_seek * 1000.0)));
+                        static_cast<int64_t>(std::ceil(actual_seek * 1000.0)));
                 } else {
                     Log::debug("media VOD planner rejected unusable remux keyframe index media=" +
                                source.media_id + " entries=" +
@@ -1475,10 +1508,45 @@ class LibavMediaEngine final : public MediaEngine {
                     segment = gop / fps;
                 }
                 result.seek_segment_seconds = segment;
+                // A frame-accurate seek forces the decode loop to fully
+                // decode (not just skip) every source frame between the
+                // landing keyframe and the exact target before any output
+                // can be produced, purely so encoding can start at that
+                // exact frame. A viewer (not a nonlinear editor) does not
+                // need that precision, and on slow software decode (e.g.
+                // HEVC Main10 on ARM) it can add several seconds to startup.
+                // Snap to the nearest keyframe at or after the target
+                // instead (see nearest_keyframe_at_or_after for why this
+                // can't reuse indexed_plan directly) so encoding can start
+                // immediately once the seek lands; falls back to the
+                // unsnapped position if the index is missing or the target
+                // is past the last keyframe. Populating
+                // video_random_access_points here also lets
+                // reseek_hls_vod's fast PATCH-seek path reuse this same
+                // keyframe list without reopening/reprobing the source (it
+                // still goes through indexed_plan there, which is fine: a
+                // single already-known-good starting keyframe plus modest
+                // remaining runtime rarely trips the density check that
+                // burned the whole-file case here).
+                materialise_deferred_seek_index(format, result.playback.video_stream, requested_seek);
+                if (input.timed_out())
+                    throw std::runtime_error("VOD planning timed out while loading video seek index");
+                auto keyframes = video_keyframe_seconds(format, result.playback.video_stream);
+                double actual_seek = requested_seek;
+                if (const double snapped =
+                        media_vod::nearest_keyframe_at_or_after(keyframes, requested_seek);
+                    snapped >= 0.0)
+                    actual_seek = snapped;
+                result.video_random_access_points = keyframes;
                 result.segment_durations =
-                    fixed_vod_durations(source_duration_seconds, requested_seek, segment);
+                    fixed_vod_durations(source_duration_seconds, actual_seek, segment);
+                // Round UP, not to nearest -- see the identical comment on
+                // the remux branch above for why: actual_seek may be a real
+                // keyframe timestamp, and rounding it down here would make
+                // run_pipeline's seek land one keyframe earlier than
+                // intended.
                 result.playback.seek = std::chrono::milliseconds(
-                    static_cast<int64_t>(std::llround(requested_seek * 1000.0)));
+                    static_cast<int64_t>(std::ceil(actual_seek * 1000.0)));
             }
         } else {
             result.segment_durations =

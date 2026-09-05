@@ -352,6 +352,41 @@ MACHA_TEST("media_playback", test_reseek_hls_vod_reuses_prepared_random_access_s
     REQUIRE(!transcode_seek->segment_durations.empty());
     CHECK(std::abs(transcode_seek->segment_durations.front() - 4.0) < 0.0005);
 
+    // Regression: a transcode plan whose keyframe index is known (e.g.
+    // captured during the initial VOD plan) should snap forward to the
+    // nearest keyframe instead of staying frame-accurate -- avoiding the
+    // decode-then-discard cost of landing mid-GOP -- even when a sparse gap
+    // elsewhere in the file would make indexed_plan's whole-file
+    // segment-density check reject the plan outright. That check is
+    // remux-only: transcode lays down its own GOP structure via
+    // fixed_vod_durations regardless of source keyframes.
+    // The keyframe timestamp below (62.5274s) is deliberately not a round
+    // number of milliseconds: llround(62527.4) rounds DOWN to 62527ms, which
+    // reconstructs to microseconds *before* the real keyframe's PTS and
+    // makes avformat_seek_file's AVSEEK_FLAG_BACKWARD search land one
+    // keyframe early -- a real regression caught live (see CHANGELOG). Must
+    // round up (ceil) to 62528ms instead, guaranteeing the reconstructed
+    // target is never before the keyframe it names.
+    HlsVodPlan transcode_with_keyframes;
+    transcode_with_keyframes.playback.mode = PlaybackMode::transcode;
+    transcode_with_keyframes.playback.video = MediaTransform::transcode;
+    transcode_with_keyframes.source_duration_seconds = 7200.0;
+    transcode_with_keyframes.seek_segment_seconds = 4.0;
+    transcode_with_keyframes.reusable_seek = true;
+    transcode_with_keyframes.video_random_access_points = {0.0, 30.0, 60.0, 62.5274, 6000.0};
+
+    auto snapped_seek = reseek_hls_vod(transcode_with_keyframes, 61s);
+    REQUIRE(snapped_seek.has_value());
+    CHECK(snapped_seek->playback.seek == 62528ms);
+    REQUIRE(!snapped_seek->segment_durations.empty());
+    CHECK(std::abs(snapped_seek->segment_durations.front() - 4.0) < 0.0005);
+
+    // Seeking past the last known keyframe falls back to the unsnapped
+    // position rather than failing.
+    auto past_last_keyframe = reseek_hls_vod(transcode_with_keyframes, 6500s);
+    REQUIRE(past_last_keyframe.has_value());
+    CHECK(past_last_keyframe->playback.seek == 6500s);
+
     HlsVodPlan unavailable;
     CHECK(!reseek_hls_vod(unavailable, 10s).has_value());
 }
