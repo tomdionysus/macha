@@ -400,6 +400,21 @@ struct FuseDirtyRange {
     auto operator<=>(const FuseDirtyRange&) const = default;
 };
 
+// A durable namespace operation stuck on a non-retryable backend error. The
+// worker never abandons one of these automatically (see fuse_frontend.cpp's
+// namespace_loop() for why); an operator who has independently confirmed it
+// is safe to drop can do so explicitly via
+// FuseFrontend::skip_blocked_namespace_operation(sequence).
+struct BlockedNamespaceOperation {
+    uint64_t sequence{};
+    std::string kind;
+    std::string path;
+    std::string secondary_path; // rename's destination, otherwise empty
+    int error_code{};
+    std::string error_message;
+    std::chrono::milliseconds blocked_for{};
+};
+
 // Bounded local frontend for the kernel-facing filesystem. FUSE callbacks enter
 // this object, never MetadataManager/DistributedStore directly. Distributed
 // namespace/data publication is queued behind the local inode/namespace state.
@@ -555,6 +570,15 @@ class FuseFrontend final : public HydrationHintProvider {
     std::vector<FuseDirtyRange> dirty_ranges(uint64_t inode) const;
     FuseFrontendStatus status() const;
     FuseFrontendDiagnostics diagnostics() const noexcept;
+    // The namespace operation the publication worker is currently wedged on,
+    // if any (see BlockedNamespaceOperation).
+    std::optional<BlockedNamespaceOperation> blocked_namespace_operation() const;
+    // Operator escape hatch: abandon the operation the worker is currently
+    // blocked on. The caller must name the exact sequence number (from
+    // blocked_namespace_operation()) to guard against skipping the wrong one
+    // if it changed between query and action. Returns false if there is no
+    // matching blocked operation right now.
+    bool skip_blocked_namespace_operation(uint64_t sequence);
     bool wait_for_idle(std::chrono::milliseconds timeout = std::chrono::seconds(10));
     void stop();
 };
