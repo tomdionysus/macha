@@ -636,6 +636,16 @@ struct FuseFrontend::State {
     bool namespace_inflight{};
     uint64_t namespace_inflight_sequence{};
     size_t namespace_inflight_operations{};
+    // Operator escape hatch for a namespace op stuck on a non-retryable
+    // backend error (see the namespace_loop() comment on why this is never
+    // automatic): the worker records what it is currently wedged on here,
+    // and an operator can explicitly name that exact sequence number to
+    // abandon it and let the queue proceed. Guarded by namespace_queue_mutex.
+    std::optional<NamespaceOp> namespace_blocked_op;
+    int namespace_blocked_error_code{};
+    std::string namespace_blocked_error_message;
+    Clock::time_point namespace_blocked_since;
+    uint64_t namespace_skip_requested_sequence{};
     std::jthread namespace_worker;
     struct DataQueueItem {
         std::shared_ptr<Inode> inode;
@@ -2195,6 +2205,20 @@ struct FuseFrontend::State {
         return false;
     }
 
+    static std::string_view namespace_op_kind_name(NamespaceOp::Kind kind) {
+        switch (kind) {
+        case NamespaceOp::Kind::mkdir: return "mkdir";
+        case NamespaceOp::Kind::create: return "create";
+        case NamespaceOp::Kind::rmdir: return "rmdir";
+        case NamespaceOp::Kind::unlink: return "unlink";
+        case NamespaceOp::Kind::rename: return "rename";
+        case NamespaceOp::Kind::chmod: return "chmod";
+        case NamespaceOp::Kind::chown: return "chown";
+        case NamespaceOp::Kind::utimens: return "utimens";
+        }
+        return "unknown";
+    }
+
     static bool contains_inode(const std::vector<uint64_t>& ids, uint64_t id) {
         return std::find(ids.begin(), ids.end(), id) != ids.end();
     }
@@ -2665,6 +2689,34 @@ struct FuseFrontend::State {
             std::shared_ptr<const MetadataSnapshot> published_snapshot;
             std::chrono::milliseconds backoff{50};
             while (!published_prefix && !stop.stop_requested() && !stopping.load()) {
+                bool skip_requested = false;
+                {
+                    std::lock_guard lock(namespace_queue_mutex);
+                    if (namespace_skip_requested_sequence &&
+                        namespace_skip_requested_sequence == batch.front().sequence) {
+                        namespace_skip_requested_sequence = 0;
+                        namespace_blocked_op.reset();
+                        skip_requested = true;
+                    }
+                }
+                if (skip_requested) {
+                    // An operator has explicitly abandoned this operation after
+                    // it wedged on a non-retryable backend error. Retire it
+                    // without claiming its effect was achieved -- the affected
+                    // inodes keep their recorded backend_error -- and let the
+                    // rest of the batch (and queue) proceed.
+                    const NamespaceOp abandoned = batch.front();
+                    const std::array<NamespaceOp, 1> abandoned_span{abandoned};
+                    journal_namespace_done(abandoned_span);
+                    release_namespace_references(abandoned_span);
+                    Log::warn("FUSE async namespace publication operator-skipped seq=" +
+                             std::to_string(abandoned.sequence));
+                    batch.erase(batch.begin());
+                    if (batch.empty())
+                        break;
+                    backoff = std::chrono::milliseconds{50};
+                    continue;
+                }
                 try {
                     // FUSE namespace publication is loader/convenience work.
                     // Its batches are explicitly bounded and execute away from
@@ -2736,19 +2788,34 @@ struct FuseFrontend::State {
                         errored.insert(errored.end(), blocked.removed.begin(),
                                        blocked.removed.end());
                         mark_backend_error(errored, error);
+                        {
+                            std::lock_guard lock(namespace_queue_mutex);
+                            if (!namespace_blocked_op ||
+                                namespace_blocked_op->sequence != blocked.sequence)
+                                namespace_blocked_since = Clock::now();
+                            namespace_blocked_op = blocked;
+                            namespace_blocked_error_code = error;
+                            namespace_blocked_error_message = e.what();
+                        }
                         Log::error("FUSE async namespace publication blocked seq=" +
                                    std::to_string(blocked.sequence) + " error=" + e.what());
                     } else {
                         Log::debug("FUSE async namespace publication retry seq=" +
                                    std::to_string(batch.front().sequence) + " error=" + e.what());
                     }
-                    // Never retire or skip an acknowledged durable namespace op.
-                    // A non-retryable backend error has no automatic conflict
-                    // resolver today; preserve ordering and keep retrying at a
-                    // bounded cadence rather than claiming convergence.
+                    // Never retire or skip an acknowledged durable namespace op
+                    // automatically -- a non-retryable backend error has no
+                    // automatic conflict resolver today, so preserve ordering
+                    // and keep retrying at a bounded cadence rather than
+                    // claiming convergence. An operator who has independently
+                    // confirmed it is safe may explicitly abandon it via
+                    // skip_blocked_namespace_operation(), handled at the top
+                    // of this loop.
                     std::unique_lock wait_lock(namespace_queue_mutex);
-                    namespace_cv.wait_for(wait_lock, stop, backoff,
-                                          [&] { return stopping.load(); });
+                    namespace_cv.wait_for(wait_lock, stop, backoff, [&] {
+                        return stopping.load() ||
+                              namespace_skip_requested_sequence == batch.front().sequence;
+                    });
                     backoff = std::min(backoff * 2, std::chrono::milliseconds(5000));
                 }
             }
@@ -5664,6 +5731,32 @@ bool FuseFrontend::wait_for_idle(std::chrono::milliseconds timeout) {
     auto current = status();
     return !current.broker_pending && !current.pending_namespace && !current.pending_data &&
            !current.active_data;
+}
+
+std::optional<BlockedNamespaceOperation> FuseFrontend::blocked_namespace_operation() const {
+    std::lock_guard lock(state_->namespace_queue_mutex);
+    if (!state_->namespace_blocked_op)
+        return std::nullopt;
+    const auto& op = *state_->namespace_blocked_op;
+    BlockedNamespaceOperation out;
+    out.sequence = op.sequence;
+    out.kind = std::string(State::namespace_op_kind_name(op.kind));
+    out.path = op.from;
+    out.secondary_path = op.kind == State::NamespaceOp::Kind::rename ? op.to : std::string{};
+    out.error_code = state_->namespace_blocked_error_code;
+    out.error_message = state_->namespace_blocked_error_message;
+    out.blocked_for = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - state_->namespace_blocked_since);
+    return out;
+}
+
+bool FuseFrontend::skip_blocked_namespace_operation(uint64_t sequence) {
+    std::lock_guard lock(state_->namespace_queue_mutex);
+    if (!state_->namespace_blocked_op || state_->namespace_blocked_op->sequence != sequence)
+        return false;
+    state_->namespace_skip_requested_sequence = sequence;
+    state_->namespace_cv.notify_all();
+    return true;
 }
 
 std::vector<HydrationHint> FuseFrontend::hints() {

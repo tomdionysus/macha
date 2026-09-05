@@ -464,6 +464,7 @@ class MetadataReplica {
     bool legacy_write_api_allowed_locked() const;
     void set_legacy_committed_head_locked(const MetadataRecord&);
     void refresh_materialized_head_locked();
+    bool refresh_materialized_head_in_memory_locked();
     MetadataHistoryEntry history_for_current(std::span<const uint8_t> delta = {});
     std::shared_ptr<const MetadataMaterialization>
     cache_materialization_locked(const MetadataRecord&,
@@ -475,6 +476,7 @@ class MetadataReplica {
     std::optional<Hash256> history_common_ancestor_locked(const Hash256&, const Hash256&) const;
     void compact_if_needed();
     void reset_checkpoint(const MetadataRecord&);
+    void reset_checkpoint_journal_locked();
     void recover_from_seed(const MetadataRecord&, const std::string&);
 
   public:

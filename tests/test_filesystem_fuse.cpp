@@ -2490,6 +2490,68 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_commits_largest_valid_namespace
     CHECK(service.filesystem().getattr("/after").type == EntryType::directory);
 }
 
+MACHA_TEST("filesystem_fuse",
+          test_fuse_namespace_operator_skip_unwedges_a_non_retryable_backend_error) {
+    // A queued mkdir whose path is concurrently occupied by a conflicting
+    // FILE entry can never be reconciled as "already achieved" (type
+    // mismatch), so it hits a genuine, permanent EEXIST on every replay --
+    // exactly the wedge this fix adds an escape hatch for.
+    TestService fixture("fuse-namespace-operator-skip");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.fuse.publication_quiet = 30s;
+    config.fuse.suspend_loader_for_tests = true;
+    config.catalogue.api.enabled = true;
+    config.catalogue.api.listen = "127.0.0.1";
+    config.catalogue.api.port = free_port();
+    auto& service = fixture.start();
+
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        service.filesystem().store().foreground_activity(1);
+        frontend->mkdir("/wedge", 0755, getuid(), getgid());
+        frontend->stop();
+    }
+    service.filesystem().create_file("/wedge", 0644, getuid(), getgid());
+
+    auto replay = config.fuse;
+    replay.publication_quiet = 0ms;
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    service.attach_fuse_frontend(recovered);
+
+    REQUIRE(wait_until([&] { return recovered->blocked_namespace_operation().has_value(); }, 10s));
+    auto blocked = recovered->blocked_namespace_operation();
+    REQUIRE(blocked.has_value());
+    CHECK(blocked->kind == "mkdir");
+    CHECK(blocked->path == "/wedge");
+    CHECK(blocked->error_code == EEXIST);
+
+    // The GET route surfaces the same thing over HTTP.
+    const auto get_response = raw_http_get(
+        config.catalogue.api.port, "/api/v1/manage/filesystem/blocked-namespace-operation",
+        bearer_header(service));
+    CHECK(get_response.find("HTTP/1.1 200") != std::string::npos);
+    const auto get_body_at = get_response.find("\r\n\r\n");
+    REQUIRE(get_body_at != std::string::npos);
+    const auto get_json = Json::parse(get_response.substr(get_body_at + 4));
+    CHECK(get_json.find("sequence")->asUInt64() == blocked->sequence);
+    CHECK(get_json.find("kind")->asString() == "mkdir");
+    CHECK(get_json.find("path")->asString() == "/wedge");
+
+    // Naming the wrong sequence must refuse, not skip whatever is blocked.
+    CHECK(!recovered->skip_blocked_namespace_operation(blocked->sequence + 1));
+    CHECK(recovered->blocked_namespace_operation().has_value());
+
+    CHECK(service.skip_blocked_namespace_operation(blocked->sequence));
+    REQUIRE(recovered->wait_for_idle(10s));
+    CHECK(!recovered->blocked_namespace_operation().has_value());
+
+    // The abandoned mkdir must never be claimed as achieved: the file placed
+    // concurrently is exactly what survives.
+    CHECK(service.filesystem().getattr("/wedge").type == EntryType::file);
+}
+
 MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_trims_torn_tail) {
     TestService fixture("fuse-journal-torn-tail");
     auto& config = fixture.config();

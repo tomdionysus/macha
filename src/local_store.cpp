@@ -1595,7 +1595,10 @@ void LocalStore::scan(std::stop_token stop) {
         try {
             const auto baseline = durability_domain_->complete_mutation();
             durability_domain_->await_durable(baseline, DurabilityUrgency::immediate);
-            last_mutation_generation_ = std::max(last_mutation_generation_, baseline);
+            {
+                std::lock_guard lock(m_);
+                last_mutation_generation_ = std::max(last_mutation_generation_, baseline);
+            }
         } catch (const std::exception& ex) {
             scan_failed_.store(true, std::memory_order_release);
             accounting_cv_.notify_all();

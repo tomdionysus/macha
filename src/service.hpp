@@ -6,6 +6,7 @@
 #include "catalogue_hints.hpp"
 #include "convergence_demand.hpp"
 #include "filesystem.hpp"
+#include "fuse_frontend.hpp"
 #include "hydration.hpp"
 #include "ingest.hpp"
 #include "manage_api.hpp"
@@ -27,8 +28,6 @@
 #include <vector>
 
 namespace macha {
-
-class FuseFrontend;
 
 std::chrono::milliseconds maintenance_background_interval(const MaintenanceConfig&);
 
@@ -62,6 +61,7 @@ class Service {
     std::unique_ptr<CatalogueApi> catalogue_api_;
     std::unique_ptr<ManageApi> manage_api_;
     std::unique_ptr<PlaybackManager> streaming_;
+    std::weak_ptr<FuseFrontend> fuse_frontend_;
 
     std::jthread startup_;
     std::atomic_bool services_ready_{};
@@ -159,5 +159,7 @@ class Service {
         return metadata_convergence_.diagnostics();
     }
     void attach_fuse_frontend(std::weak_ptr<FuseFrontend>);
+    std::optional<BlockedNamespaceOperation> blocked_namespace_operation() const;
+    bool skip_blocked_namespace_operation(uint64_t sequence);
 };
 } // namespace macha

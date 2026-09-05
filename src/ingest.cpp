@@ -1148,8 +1148,10 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
         job.updated_unix_ms = now_ms();
         {
             std::lock_guard lock(mutex_);
-            jobs_[id] = job;
-            save_state_locked();
+            if (auto it = jobs_.find(id); it != jobs_.end()) {
+                it->second = job;
+                save_state_locked();
+            }
         }
         if (job.state == IngestJobState::cataloguing)
             Log::info("ingest copied id=" + id + " files=" + std::to_string(job.files_completed) +
@@ -1161,8 +1163,10 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
         if (stop.stop_requested()) {
             job.updated_unix_ms = now_ms();
             std::lock_guard lock(mutex_);
-            jobs_[id] = job;
-            try { save_state_locked(); } catch (...) {}
+            if (auto it = jobs_.find(id); it != jobs_.end()) {
+                it->second = job;
+                try { save_state_locked(); } catch (...) {}
+            }
             return;
         }
         job.state = IngestJobState::failed;
@@ -1171,8 +1175,10 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
         job.eta_seconds.reset();
         job.updated_unix_ms = now_ms();
         std::lock_guard lock(mutex_);
-        jobs_[id] = job;
-        try { save_state_locked(); } catch (...) {}
+        if (auto it = jobs_.find(id); it != jobs_.end()) {
+            it->second = job;
+            try { save_state_locked(); } catch (...) {}
+        }
         Log::warn("ingest failed id=" + id + ": " + e.what());
     }
 }
@@ -1188,9 +1194,11 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
     job.updated_unix_ms = now_ms();
     {
         std::lock_guard lock(mutex_);
-        auto control = jobs_[job.id].state;
-        if (control == IngestJobState::paused || control == IngestJobState::cancelled) return false;
-        jobs_[job.id] = job;
+        auto it = jobs_.find(job.id);
+        if (it == jobs_.end() || it->second.state == IngestJobState::paused ||
+            it->second.state == IngestJobState::cancelled)
+            return false;
+        it->second = job;
         save_state_locked();
     }
 
@@ -1209,8 +1217,10 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
             if (stop.stop_requested()) return false;
             {
                 std::lock_guard lock(mutex_);
-                auto state = jobs_[job.id].state;
-                if (state == IngestJobState::paused || state == IngestJobState::cancelled) return false;
+                auto it = jobs_.find(job.id);
+                if (it == jobs_.end() || it->second.state == IngestJobState::paused ||
+                    it->second.state == IngestJobState::cancelled)
+                    return false;
             }
             if (ec) {
                 scan_incomplete = true;
@@ -1330,9 +1340,11 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
     job.updated_unix_ms = now_ms();
     {
         std::lock_guard lock(mutex_);
-        const auto control = jobs_[job.id].state;
-        if (control == IngestJobState::paused || control == IngestJobState::cancelled) return false;
-        jobs_[job.id] = job;
+        auto it = jobs_.find(job.id);
+        if (it == jobs_.end() || it->second.state == IngestJobState::paused ||
+            it->second.state == IngestJobState::cancelled)
+            return false;
+        it->second = job;
         save_state_locked();
     }
     return true;
@@ -1477,8 +1489,10 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
                 refresh_progress(job);
             }
             std::lock_guard lock(mutex_);
-            jobs_[job.id] = job;
-            save_state_locked();
+            if (auto it = jobs_.find(job.id); it != jobs_.end()) {
+                it->second = job;
+                save_state_locked();
+            }
             return false;
         }
 
@@ -1509,10 +1523,11 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
             sample_start_bytes = job.bytes_completed;
             job.updated_unix_ms = now_ms();
             std::lock_guard lock(mutex_);
-            const auto control = jobs_[job.id].state;
-            if (control == IngestJobState::paused || control == IngestJobState::cancelled)
-                job.state = control;
-            jobs_[job.id] = job;
+            auto it = jobs_.find(job.id);
+            if (it == jobs_.end()) return false;
+            if (it->second.state == IngestJobState::paused || it->second.state == IngestJobState::cancelled)
+                job.state = it->second.state;
+            it->second = job;
             save_state_locked();
             if (job.state != IngestJobState::importing) return false;
         }
@@ -1523,8 +1538,10 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
         refresh_progress(job);
         job.updated_unix_ms = now_ms();
         std::lock_guard lock(mutex_);
-        jobs_[job.id] = job;
-        save_state_locked();
+        if (auto it = jobs_.find(job.id); it != jobs_.end()) {
+            it->second = job;
+            save_state_locked();
+        }
         return false;
     }
 
@@ -1572,9 +1589,11 @@ bool IngestManager::import_job(IngestJob& job, std::stop_token stop) {
     job.error.clear();
     {
         std::lock_guard lock(mutex_);
-        const auto control = jobs_[job.id].state;
-        if (control == IngestJobState::paused || control == IngestJobState::cancelled) return false;
-        jobs_[job.id] = job;
+        auto it = jobs_.find(job.id);
+        if (it == jobs_.end() || it->second.state == IngestJobState::paused ||
+            it->second.state == IngestJobState::cancelled)
+            return false;
+        it->second = job;
         save_state_locked();
     }
 
@@ -1586,17 +1605,21 @@ bool IngestManager::import_job(IngestJob& job, std::stop_token stop) {
         job.updated_unix_ms = now_ms();
         {
             std::lock_guard lock(mutex_);
-            const auto control = jobs_[job.id].state;
-            if (control == IngestJobState::paused || control == IngestJobState::cancelled) return false;
-            jobs_[job.id] = job;
+            auto it = jobs_.find(job.id);
+            if (it == jobs_.end() || it->second.state == IngestJobState::paused ||
+                it->second.state == IngestJobState::cancelled)
+                return false;
+            it->second = job;
             save_state_locked();
         }
         if (!copy_file(job, file, stop)) return false;
         job.updated_unix_ms = now_ms();
         {
             std::lock_guard lock(mutex_);
-            jobs_[job.id] = job;
-            save_state_locked();
+            if (auto it = jobs_.find(job.id); it != jobs_.end()) {
+                it->second = job;
+                save_state_locked();
+            }
         }
     }
     return true;
@@ -1609,8 +1632,10 @@ void IngestManager::set_blocked(IngestJob& job, std::string error) {
     job.eta_seconds.reset();
     job.updated_unix_ms = now_ms();
     std::lock_guard lock(mutex_);
-    jobs_[job.id] = job;
-    save_state_locked();
+    if (auto it = jobs_.find(job.id); it != jobs_.end()) {
+        it->second = job;
+        save_state_locked();
+    }
 }
 
 void IngestManager::cleanup_partials(const IngestJob& job) {

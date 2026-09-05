@@ -597,6 +597,79 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
     CHECK(rerooted.historical(reconciliation.hash)->payload == reconciliation.payload);
 }
 
+MACHA_FAST_TEST("storage_metadata",
+               test_accept_commit_refreshes_checkpoint_on_both_repair_and_ordinary_paths) {
+    // accept_commit() used to update committed_/cur_ and write the full
+    // checkpoint (reset_checkpoint) in one step, always under `m_`. It now
+    // splits that into an in-memory update under `m_`
+    // (refresh_materialized_head_in_memory_locked) and the actual checkpoint
+    // persist() after `m_` is released, on both of accept_commit()'s
+    // checkpoint-refreshing call sites. This is a same-behavior refactor:
+    // this test pins the observable result (checkpoint reflects the new
+    // head, reload survives) rather than the lock scope itself, which a
+    // wall-clock race cannot reliably isolate here -- the checkpoint write
+    // is a small fraction of accept_commit()'s total cost even at large
+    // payload sizes, dominated by unrelated off-lock materialization. The
+    // lock-scope change is verified by code review (mirrors the same
+    // off-lock-write/on-lock-bookkeeping pattern import_history() already
+    // uses for write_history_frame) plus the full existing concurrency
+    // suite (rpc_cluster, storage_metadata) passing unchanged.
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "checkpoint-refresh-paths";
+
+    const auto genesis = genesis_metadata();
+    FsEntry directory;
+    directory.type = EntryType::directory;
+    directory.mode = 0755;
+    auto make_child = [&](const MetadataRecord& parent, std::string name) {
+        auto snapshot = decode_snapshot(parent.payload);
+        snapshot.metadata_write_replicas_required = 1;
+        snapshot.entries[std::move(name)] = directory;
+        MetadataRecord record;
+        record.generation = parent.generation + 1;
+        record.previous = parent.hash;
+        record.payload = encode_snapshot(snapshot);
+        record.hash = metadata_hash(record.generation, record.previous, record.payload);
+        return record;
+    };
+    const auto child = make_child(genesis, "/child");
+    const auto grandchild = make_child(child, "/grandchild");
+
+    NodeId a{};
+    a.bytes[15] = 1;
+
+    MetadataReplica replica(path, keys.storage);
+    REQUIRE(replica.store_commit(child));
+    // Ordinary accept branch: no existing heads, so this exercises the
+    // "changed" path at the bottom of accept_commit().
+    REQUIRE(replica.accept_commit(MetadataAcceptance{child.generation, child.hash, 1, {a}}));
+    CHECK(replica.committed().hash == child.hash);
+    {
+        // Reopening forces a fresh load from the on-disk checkpoint --
+        // proves persist() actually landed, not just the in-memory update.
+        MetadataReplica reopened(path, keys.storage);
+        CHECK(reopened.committed().hash == child.hash);
+    }
+
+    REQUIRE(replica.store_commit(grandchild));
+    // Accepting a direct descendant of the current sole head prunes child
+    // (now an ancestor, not a head) from accepted_heads_ and moves the
+    // preferred materialized head -- and its checkpoint -- forward again.
+    REQUIRE(
+        replica.accept_commit(MetadataAcceptance{grandchild.generation, grandchild.hash, 1, {a}}));
+    auto heads = replica.accepted_heads();
+    REQUIRE(heads.size() == 1);
+    CHECK(heads.front().hash == grandchild.hash);
+    CHECK(replica.committed().hash == grandchild.hash);
+    {
+        MetadataReplica reopened(path, keys.storage);
+        CHECK(reopened.committed().hash == grandchild.hash);
+    }
+}
+
 MACHA_FAST_TEST("storage_metadata", test_merge_delta_primary_may_precede_merge_generation) {
     TempDir t;
     auto keyfile = t.path() / "key";
