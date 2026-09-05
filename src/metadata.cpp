@@ -1684,6 +1684,33 @@ std::optional<MetadataManualRepairPlan> plan_causally_dominant_metadata_repair(
     return MetadataManualRepairPlan{std::move(repair), dominant_record.hash,
                                     subsumed_record.hash};
 }
+
+std::optional<MetadataConflictPreservingRepairPlan> plan_conflict_preserving_metadata_repair(
+    const MetadataRecord& left_record, const MetadataSnapshot& left,
+    const MetadataRecord& right_record, const MetadataSnapshot& right) {
+    for (const auto& [path, _] : left.entries)
+        if (!right.entries.contains(path))
+            return {};
+    for (const auto& [path, _] : right.entries)
+        if (!left.entries.contains(path))
+            return {};
+
+    const auto& primary = left_record.hash < right_record.hash ? left_record : right_record;
+    const auto& secondary = left_record.hash < right_record.hash ? right_record : left_record;
+
+    auto merged =
+        merge_metadata_snapshots(MetadataSnapshot{}, left, right, left_record.hash, right_record.hash);
+    merged.snapshot.metadata_voters.clear();
+    merged.snapshot.merge_parents = {secondary.hash};
+
+    MetadataRecord repair;
+    repair.generation = std::max(left_record.generation, right_record.generation) + 1;
+    repair.previous = primary.hash;
+    repair.payload = encode_snapshot(merged.snapshot);
+    repair.hash = metadata_hash(repair.generation, repair.previous, repair.payload);
+    return MetadataConflictPreservingRepairPlan{std::move(repair), left_record.hash,
+                                                right_record.hash, merged.conflicts_created};
+}
 MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32> k,
                                  std::optional<MetadataRecord> recovery_seed,
                                  bool accept_pristine_genesis_authority,
@@ -2547,14 +2574,22 @@ std::optional<HistoryCheckpointProof> MetadataReplica::checkpoint_proof() const 
     return checkpoint_proof_;
 }
 
-void MetadataReplica::record_checkpoint_ack(HistoryCheckpointProof proposal) {
+bool MetadataReplica::record_checkpoint_ack(HistoryCheckpointProof proposal) {
     std::lock_guard durable_lock(durable_mutation_m_);
     proposal.status = HistoryCheckpointProof::Status::acked;
     std::lock_guard lock(m_);
+    // Refuse to ack a floor this replica has already moved past. This is the
+    // same single-accepted-head invariant compact_history_if_safe() itself
+    // requires before compacting; enforcing it here too closes the window
+    // where a proposer's own survey was already stale by the time this ack
+    // arrives.
+    if (accepted_heads_.size() != 1 || !accepted_heads_.contains(proposal.floor_hash))
+        return false;
     // A different (floor_hash, epoch) supersedes whatever was recorded
     // before -- only ever one proposal in flight is tracked at a time.
     checkpoint_proof_ = std::move(proposal);
     persist_checkpoint_proof_locked();
+    return true;
 }
 
 bool MetadataReplica::record_checkpoint_commit(const Hash256& floor_hash, const Hash256& epoch) {

@@ -695,8 +695,7 @@ std::vector<MetadataAcceptance> NodeRuntime::metadata_heads() const {
 }
 
 bool NodeRuntime::accept_history_checkpoint_proposal(const HistoryCheckpointProof& proposal) {
-    metadata_replica().record_checkpoint_ack(proposal);
-    return true;
+    return metadata_replica().record_checkpoint_ack(proposal);
 }
 
 bool NodeRuntime::commit_history_checkpoint(const Hash256& floor_hash, const Hash256& epoch) {

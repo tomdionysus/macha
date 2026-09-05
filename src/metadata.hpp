@@ -256,6 +256,32 @@ std::optional<MetadataManualRepairPlan> plan_causally_dominant_metadata_repair(
     const MetadataRecord&, const MetadataSnapshot&,
     const MetadataRecord&, const MetadataSnapshot&);
 
+struct MetadataConflictPreservingRepairPlan {
+    MetadataRecord record;
+    Hash256 left_head{};
+    Hash256 right_head{};
+    size_t conflicts_created{};
+};
+
+// Offline/manual recovery only, for the concurrent case
+// plan_causally_dominant_metadata_repair() refuses (neither head dominates)
+// once the common ancestor has been discarded, so the ordinary three-way
+// merge in merge_metadata_snapshots() has no base to run against. Merges
+// with a deliberately empty base rather than a fabricated one: every path
+// with an identical value on both sides reconciles regardless of base
+// (equal values short-circuit before base is ever consulted), and every path
+// that differs becomes a durable first-class conflict exactly as ordinary
+// reconciliation would record it -- both alternatives are preserved for
+// explicit resolution, never silently discarded.
+// Refuses (returns nullopt) if either head has a path the other lacks: an
+// empty base also disables merge_metadata_snapshots()'s rename/move-collision
+// detection (which walks the base to tell a rename from two independent
+// creates at different paths), so this is only sound when the two heads
+// differ solely by entries changed in place, never by adds or removes.
+std::optional<MetadataConflictPreservingRepairPlan> plan_conflict_preserving_metadata_repair(
+    const MetadataRecord&, const MetadataSnapshot&,
+    const MetadataRecord&, const MetadataSnapshot&);
+
 enum class CatalogueDelta : uint8_t { unchanged = 0, clear = 1, set = 2 };
 
 // Compact deterministic mutation from one canonical metadata snapshot to the
@@ -506,9 +532,18 @@ class MetadataReplica {
     // never guess or fall back to a weaker check.
     std::optional<HistoryCheckpointProof> checkpoint_proof() const;
     // Durably record this replica's agreement to a proposal, before an RPC
-    // reply is sent. Always status == acked regardless of what the caller
-    // passes; supersedes any prior record for a different (floor_hash, epoch).
-    void record_checkpoint_ack(HistoryCheckpointProof proposal);
+    // reply is sent. Returns false (and records nothing) if this replica's own
+    // accepted-head set is not exactly {floor_hash} right now -- e.g. it has
+    // already advanced past the proposed floor via an ordinary peer commit
+    // received concurrently with the round. Acking a stale floor unconditionally
+    // let a proposer that had itself fallen behind convince every other replica
+    // to durably agree to a floor those replicas had already superseded, so the
+    // proposer alone compacted its own history to that stale point -- silently
+    // discarding the only remaining shared ancestry other replicas needed for
+    // ordinary two-parent reconciliation, with no automatic recovery possible
+    // afterward. On success, always status == acked regardless of what the
+    // caller passes; supersedes any prior record for a different (floor_hash, epoch).
+    bool record_checkpoint_ack(HistoryCheckpointProof proposal);
     // Promote a matching acked record to committed. Returns false (no-op,
     // nothing promoted) if there is no acked record for exactly this
     // (floor_hash, epoch) -- e.g. it was never proposed here, or a different

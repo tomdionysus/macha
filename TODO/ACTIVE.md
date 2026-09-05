@@ -218,13 +218,25 @@ home network and an offsite node, this is not a hypothetical exposure.
   before reading any of the actual data — e.g. a 4-byte field in `metadata.cpp`
   can trigger a multi-hundred-MB allocation from one small malicious or
   corrupt message. Cap reservations to the remaining message size.
-- [ ] **`NodeRuntime::accept_history_checkpoint_proposal()` accepts
-  unconditionally.** (`cluster.cpp`) Any peer holding the shared cluster key
-  can force a durable checkpoint ack with no validation at the RPC layer.
-  Safety currently rests entirely on `compact_history_if_safe()` re-validating
-  independently afterward — this is the least-validated RPC feeding the one
-  mechanism that permanently destroys metadata history; it deserves its own
-  check, not reliance on a downstream safety net alone.
+- [x] **`NodeRuntime::accept_history_checkpoint_proposal()` accepted
+  unconditionally — fixed in 0.24.0, and confirmed as the live root cause of
+  a real production incident, not just a theoretical gap.** A lagging replica
+  (proposer) whose own survey was already stale got an unconditional ack from
+  every other participant for a floor they had already moved past, then
+  durably committed and compacted *itself* to that stale floor — discarding
+  the only remaining shared ancestry needed for ordinary two-parent
+  reconciliation, with no automatic recovery possible afterward (this is
+  exactly what produced a live "divergent metadata heads have no known common
+  ancestor" outage across all 3 production nodes on 2026-09-05, confirmed via
+  cross-node journalctl timing evidence). Fixed by making
+  `MetadataReplica::record_checkpoint_ack()` validate the proposal's
+  `floor_hash` against this replica's own current single accepted head before
+  acking (`bool` return, `false` on mismatch), applied uniformly to both the
+  RPC path and the local-owner path in `propose_history_floor_on()`. Regression:
+  `test_history_checkpoint_ack_refuses_a_floor_this_replica_has_already_superseded`.
+  This prevents recurrence; it does not retroactively restore ancestry already
+  discarded on the currently-stuck cluster — see the deployment/operator
+  decision this requires, communicated separately.
 - [ ] **Unsigned identity-reset tombstones accepted from any peer.**
   `membership.cpp` checks only `epoch >= existing` before evicting a roster
   entry and tearing down routes for it.
