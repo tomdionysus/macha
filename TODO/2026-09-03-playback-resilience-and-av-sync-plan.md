@@ -56,23 +56,34 @@ Exit: the failure is reproducible and measuring it does not alter playback.
 
 ## Phase 1 — One presentation timeline
 
-2026-09-05 partial progress: shipped bounded resampler-based drift
-compensation for transcoded audio (0.23.8) after live-reproducing a real
+2026-09-05 partial progress, corrected after a live regression: shipped
+bounded drift compensation for transcoded audio after live-reproducing a real
 desync report (Apollo 13, EAC3 5.1 source) and measuring the free-running
 audio clock's actual drift rate against a re-anchored-every-frame video
-clock. Verified by live measurement (offset now oscillates within ~±15ms
-over 8 minutes, was growing unbounded before) rather than by a deterministic
-regression, since no harness exists yet for the real (non-stub) transcode
-path -- that harness is still this phase's stated exit-criterion prerequisite
-and remains outstanding. Also live-diagnosed a separate, likely larger
-contributor to the same user reports: a client-side race
-(`PlaybackCoordinator.degrade()` not checking for an in-flight seek mutation)
-that creates two independent transcode pipelines on restart/seek, each
-restarting its own audio+video PTS from zero -- tracked in
-`TODO/2026-08-31-cluster-any-node-playback-failover.md` (client-owned, not
-fixed in this pass). The remaining items below (session-relative origin,
-codec delay/priming, generation-replacement monotonicity, and the
-Direct/Remux/Transcode regression harness itself) are still open.
+clock. The first attempt (0.23.8, `swr_set_compensation()`-based resample-
+ratio nudging) measured well (offset bounded to ~±15ms over 8 minutes) but
+was wrong: any resample-ratio change shifts pitch, and it was reported live
+as an unacceptable, clearly audible artifact. Replaced (0.23.9) with
+libswresample's own built-in fill/trim correction (`async=1` +
+`swr_next_pts()`), which corrects by injecting silence or dropping samples
+and never touches the resample ratio (`max_soft_comp` stays at its disabled
+default) -- pitch shift is structurally not possible through this path. That
+replacement itself briefly regressed to near-total audio loss during
+development (a unit-fraction/GCD math error) before being caught in local
+verification, ahead of reaching either node real viewers use. Both incidents
+were only caught by live measurement/live listening, not CI, because no
+harness exists yet for the real (non-stub) transcode path -- that harness is
+still this phase's stated exit-criterion prerequisite and remains
+outstanding; building it earlier would very likely have caught both. Also
+live-diagnosed a separate, likely larger contributor to the same user
+reports: a client-side race (`PlaybackCoordinator.degrade()` not checking for
+an in-flight seek mutation) that creates two independent transcode pipelines
+on restart/seek, each restarting its own audio+video PTS from zero -- fixed
+client-side, tracked in
+`TODO/2026-08-31-cluster-any-node-playback-failover.md`. The remaining items
+below (session-relative origin, codec delay/priming, generation-replacement
+monotonicity, and the Direct/Remux/Transcode regression harness itself) are
+still open.
 
 - Define one session-relative presentation origin and explicitly map every
   source stream onto it.
