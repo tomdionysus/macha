@@ -52,6 +52,64 @@ class CoalescingProbeMediaEngine final : public MediaEngine {
     unsigned probes() const { return probes_.load(); }
 };
 
+// Mirrors FakeMediaEngine for probe/HLS start, but extract_webvtt_segment
+// blocks on a gate so a test can hold a session's subtitle_cache mutex open
+// for as long as needed while exercising other playback operations.
+class GatedSubtitleMediaEngine final : public MediaEngine {
+    TestGate& gate_;
+    mutable std::mutex mutex_;
+    std::vector<PlaybackPlan> started_plans_;
+  public:
+    explicit GatedSubtitleMediaEngine(TestGate& gate) : gate_(gate) {}
+    MediaEngineStatus status() const override {
+        return {true, "fake", "gated-subtitle", true, true};
+    }
+    MediaProbeResult probe(const MediaSource&, std::chrono::milliseconds = {}) override {
+        MediaProbeResult result;
+        result.format = "mov,mp4,m4a,3gp,3g2,mj2";
+        result.duration_seconds = 60.0;
+        result.bitrate = 4'000'000;
+        result.streams.push_back(MediaStreamInfo{0, MediaStreamType::video, "h264", "High", "", 1920, 1080, 0, 0, 8, true, false, 3'700'000});
+        result.streams.push_back(MediaStreamInfo{1, MediaStreamType::audio, "aac", "LC", "eng", 0, 0, 2, 48000, 0, true, false, 192'000});
+        result.streams.push_back(MediaStreamInfo{2, MediaStreamType::subtitle, "subrip", "", "eng", 0, 0, 0, 0, 0, false, false});
+        return result;
+    }
+    HlsVodPlan prepare_hls_vod(const MediaSource&, const PlaybackPlan& plan, double duration_seconds,
+                               std::chrono::milliseconds segment_duration, bool,
+                               std::chrono::milliseconds = {}) override {
+        HlsVodPlan vod;
+        vod.playback = plan;
+        const double segment = segment_duration.count() / 1000.0;
+        vod.source_duration_seconds = duration_seconds;
+        vod.seek_segment_seconds = segment;
+        vod.reusable_seek = true;
+        double left = duration_seconds - plan.seek.count() / 1000.0;
+        while (left > segment + 0.001) { vod.segment_durations.push_back(segment); left -= segment; }
+        vod.segment_durations.push_back(std::max(0.001, left));
+        return vod;
+    }
+    std::unique_ptr<MediaEngineSession> start_hls(const MediaSource&, const HlsVodPlan& vod_plan,
+                                                  std::chrono::milliseconds segment_duration,
+                                                  size_t max_ahead_segments, uint64_t memory_limit,
+                                                  const std::filesystem::path& spill_directory) override {
+        {
+            std::lock_guard lock(mutex_);
+            started_plans_.push_back(vod_plan.playback);
+        }
+        auto store = std::make_shared<MediaSegmentStore>(max_ahead_segments, memory_limit,
+                                                         spill_directory, segment_duration,
+                                                         vod_plan.segment_durations);
+        REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
+        REQUIRE(store->publish_segment(Bytes{'s', 'e', 'g'}, 4.0));
+        return std::make_unique<FakeMediaEngineSession>(std::move(store));
+    }
+    std::string extract_webvtt_segment(const MediaSource&, int, std::chrono::milliseconds,
+                                       std::chrono::milliseconds, std::chrono::milliseconds) override {
+        gate_.enter_and_wait();
+        return "WEBVTT\n\n00:00.000 --> 00:01.000\nsubtitle\n";
+    }
+};
+
 class PriorityMediaInformationEngine final : public MediaEngine {
     bool cancel_first_{};
     mutable std::mutex mutex_;
@@ -1300,6 +1358,103 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
     REQUIRE(playback.handle(remove).status == 204);
     second = playback.handle(create);
     REQUIRE(second.status == 201);
+
+    playback.stop();
+    service.stop();
+}
+
+MACHA_TEST("media_playback", test_status_does_not_block_on_a_contended_subtitle_cache) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/subtitled.mp4", 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write("/media/subtitled.mp4", true);
+    auto bytes = pattern(65549);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    const auto media_id = file_media_id(service.filesystem().getattr("/media/subtitled.mp4"));
+
+    TestGate gate;
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback";
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             std::make_unique<GatedSubtitleMediaEngine>(gate));
+    playback.start();
+
+    Json::Object preferences{{"mode", "remux"}, {"subtitle_stream", 2}};
+    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
+    auto text = Json(std::move(root)).dump();
+    HttpRequest create;
+    create.method = "POST";
+    create.path = "/api/v1/playback/sessions";
+    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    create.body.assign(text.begin(), text.end());
+    auto created = playback.handle(create);
+    REQUIRE(created.status == 201);
+    auto created_json = Json::parse(std::string(created.body.begin(), created.body.end()));
+    const auto subtitle_url = created_json.find("stream")->find("subtitle_url")->asString();
+    const auto subtitle_base = subtitle_url.substr(0, subtitle_url.rfind('/'));
+
+    // Hold this session's subtitle_cache mutex open for the whole test by
+    // blocking inside extract_webvtt_segment, exactly as a slow real
+    // extraction would. Before the fix this alone was enough to stall
+    // status() (and therefore create/patch/delete/cleanup, which all take
+    // the same global session mutex) for as long as the gate stayed shut.
+    HttpResponse segment_response;
+    std::jthread segment_request([&] {
+        HttpRequest segment;
+        segment.method = "GET";
+        segment.path = subtitle_base + "/segment-0.vtt";
+        segment_response = playback.handle(segment);
+    });
+    REQUIRE(gate.wait_for_entries(1));
+
+    HttpRequest status_request;
+    status_request.method = "GET";
+    status_request.path = "/api/v1/playback/status";
+    const auto status_started = Clock::now();
+    auto status_response = playback.handle(status_request);
+    const auto status_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - status_started);
+    REQUIRE(status_response.status == 200);
+    // status() must not block on the subtitle_cache mutex the gated request
+    // is still holding: the per-session read is try_lock, so a busy session
+    // just contributes nothing to this snapshot instead of stalling status()
+    // (and, via the global mutex, every other playback operation) for as
+    // long as the gate stays shut.
+    CHECK(status_elapsed < 500ms);
+    auto status_json = Json::parse(std::string(status_response.body.begin(), status_response.body.end()));
+    CHECK(status_json.find("sessions")->asUInt64() == 1);
+    CHECK(status_json.find("subtitle_cache_entries")->asUInt64() == 0);
+
+    // A second, unrelated session-mutating call must also not be stuck
+    // behind the global mutex while the gate is held.
+    HttpRequest second_create;
+    second_create.method = "POST";
+    second_create.path = "/api/v1/playback/sessions";
+    second_create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    second_create.body.assign(text.begin(), text.end());
+    const auto second_started = Clock::now();
+    auto second_created = playback.handle(second_create);
+    const auto second_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - second_started);
+    REQUIRE(second_created.status == 201);
+    CHECK(second_elapsed < 500ms);
+
+    gate.open();
+    segment_request.join();
+    REQUIRE(segment_response.status == 200);
+    CHECK(segment_response.content_type.starts_with("text/vtt"));
 
     playback.stop();
     service.stop();

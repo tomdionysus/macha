@@ -1,5 +1,20 @@
 # Current release
 
+## 0.24.2 — Fix status() blocking on a contended subtitle-cache lock (development)
+
+- Fixed `PlaybackManager::status()` taking each session's subtitle-cache
+  mutex while still holding the global session mutex, and doing so with a
+  blocking lock: a single slow WebVTT extraction on one session could stall
+  `status()` and, transitively via the global mutex, every other playback
+  operation (create/patch/delete/cleanup). The per-session subtitle-cache
+  read now happens after the global mutex is released and is `try_lock`-only,
+  so a busy session simply contributes a stale/zero count to that snapshot
+  instead of blocking. Regression test:
+  `test_status_does_not_block_on_a_contended_subtitle_cache`
+  (`tests/test_media_playback.cpp`). Separately confirmed, on code review,
+  that `public_stream_response` does not hold the global mutex across libav
+  work as previously suspected -- see `TODO/ACTIVE.md` item 2.
+
 ## 0.24.1 — Fix false-consensus metadata history compaction, add conflict-preserving manual repair (development)
 
 - Fixed a real production incident: `NodeRuntime::accept_history_checkpoint_proposal()`
