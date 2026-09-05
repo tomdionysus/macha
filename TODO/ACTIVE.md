@@ -206,10 +206,11 @@ home network and an offsite node, this is not a hypothetical exposure.
   behind the same token as read access. Add at least a read-only vs.
   destructive role split and gate the destructive `manage_api.cpp`/
   `catalogue_api.cpp` routes on it.
-- [ ] **Non-constant-time bearer token comparison.** `http.cpp` compares the
-  bearer token with plain `std::string !=`, while `constant_time_equal`
-  already exists and is used correctly for the RPC handshake and the artwork
-  capability MAC two files away. Use it here too.
+- [x] **Non-constant-time bearer token comparison — already closed as a side
+  effect of 0.24.0.** `http.cpp` no longer holds or compares a raw bearer
+  token; `SessionManager::validate()` hashes the presented token (SHA-256)
+  before any lookup, so the untrusted byte comparison this item warned about
+  no longer exists. Confirmed by code audit 2026-09-05. See `COMPLETED.md`.
 - [ ] **Unbounded JSON recursion depth.** `json.cpp`'s recursive-descent parser
   has no depth limit. Combined with the 8 MiB body cap, a deeply nested body
   on any POST/PUT can exhaust the stack. Add a depth limit.

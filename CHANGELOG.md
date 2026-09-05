@@ -1,5 +1,42 @@
 # Current release
 
+## 0.24.3 — Fix ingest job resurrection, a metadata data race, and a wedged FUSE namespace queue (development)
+
+- Fixed cleared ingest jobs resurrecting: seven sites in `src/ingest.cpp` read
+  or wrote `jobs_[job.id]` via `operator[]`, which default-constructs a fresh
+  `queued` job if an operator's `clear()` had already erased a terminal job
+  while its worker was still inside `process_job()`/`plan_job()`/
+  `copy_file()`/`import_job()` -- silently re-inserting a job the operator
+  just removed. All seven now use `find()` and treat "already gone" the same
+  as cancelled. Regression:
+  `test_cleared_ingest_job_does_not_resurrect_while_worker_finishes`.
+- Fixed a genuine data race on `LocalStore::last_mutation_generation_`:
+  `scan()` wrote it outside `m_` while `durability_barrier()` read it under
+  `m_`. The write now happens under the same lock.
+- Fixed `MetadataReplica::accept_commit()` writing the full committed
+  snapshot to the checkpoint file (`reset_checkpoint`, potentially hundreds
+  of MB) while holding the replica's global mutex, on the metadata RPC path
+  -- every other reader/writer needing only that mutex would queue up behind
+  one slow fsync. The checkpoint write now happens after the mutex is
+  released, serialized only against other durable-mutation writers, mirroring
+  the same off-lock-write/on-lock-bookkeeping pattern `import_history()`
+  already used for `write_history_frame`. Regression:
+  `test_accept_commit_refreshes_checkpoint_on_both_repair_and_ordinary_paths`.
+- Added an operator escape hatch for a FUSE namespace operation wedged on a
+  non-retryable backend error: the publication worker previously retried the
+  same operation forever on a 5s backoff with the entire queue blocked behind
+  it, and no way to skip it. New `GET/POST
+  /api/v1/manage/filesystem/blocked-namespace-operation[/skip]` routes (via
+  new `FuseFrontend::blocked_namespace_operation()`/
+  `skip_blocked_namespace_operation()`) let an operator who has independently
+  confirmed it is safe explicitly abandon the exact stuck operation by
+  sequence number, without falsely claiming its effect was achieved. This
+  never happens automatically. Regression:
+  `test_fuse_namespace_operator_skip_unwedges_a_non_retryable_backend_error`.
+  Surfaced live during a `rm -rf` recovery on the production cluster; the
+  actual root cause of that incident was operator error (an interrupted
+  `rm -rf /mnt/machamedia`, recovered from ext4 backups), not a Macha bug.
+
 ## 0.24.2 — Fix status() blocking on a contended subtitle-cache lock (development)
 
 - Fixed `PlaybackManager::status()` taking each session's subtitle-cache

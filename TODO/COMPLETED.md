@@ -28,6 +28,14 @@ Last updated: 2026-09-05
 - [x] Coordinated the client-side contract with the Macha UI Work session in
   parallel; verified end-to-end against a live running node (create → gated
   route with/without token → introspect → revoke → post-revoke rejection).
+- [x] Closed the separately-logged "non-constant-time bearer token comparison"
+  P0 security item as a side effect of this rework: `http.cpp` no longer holds
+  or compares a raw bearer token at all (the old `bearer_token_`/`read_token()`
+  plain `!=` compare was removed entirely). `SessionManager::validate()`
+  (`src/session.cpp`) hashes the presented token with SHA-256 before any
+  lookup and does a `std::map` lookup on the digest, matching the plan's
+  original design reasoning — confirmed by code audit on 2026-09-05, no fix
+  needed.
 
 Evidence: `CHANGELOG.md` 0.24.0.
 

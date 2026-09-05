@@ -2792,9 +2792,9 @@ void MetadataReplica::set_legacy_committed_head_locked(const MetadataRecord& rec
     persist_heads_locked();
 }
 
-void MetadataReplica::refresh_materialized_head_locked() {
+bool MetadataReplica::refresh_materialized_head_in_memory_locked() {
     if (accepted_heads_.empty())
-        return;
+        return false;
     std::optional<MetadataRecord> selected;
     for (const auto& [hash, _] : accepted_heads_) {
         auto record = historical_locked(hash);
@@ -2805,7 +2805,7 @@ void MetadataReplica::refresh_materialized_head_locked() {
             selected = std::move(record);
     }
     if (!selected || selected->hash == committed_.hash)
-        return;
+        return false;
 
     // `committed_` is now only the locally materialised preferred accepted head
     // used by legacy callers and the fast read cache. Authority lives in the
@@ -2815,7 +2815,12 @@ void MetadataReplica::refresh_materialized_head_locked() {
     cur_ = committed_;
     pending_history_.reset();
     pending_recovered_ = false;
-    reset_checkpoint(committed_);
+    return true;
+}
+
+void MetadataReplica::refresh_materialized_head_locked() {
+    if (refresh_materialized_head_in_memory_locked())
+        reset_checkpoint(committed_);
 }
 
 void MetadataReplica::ensure_history_root(const MetadataRecord& record) {
@@ -3350,12 +3355,24 @@ bool MetadataReplica::accept_commit(const MetadataAcceptance& input) {
         (void)materialized(parent);
 
     std::lock_guard durable(durable_mutation_m_);
-    std::lock_guard lock(m_);
+    std::unique_lock lock(m_);
     auto materialized = materialized_locked(value.hash);
     if (!materialized || materialized->record.generation != value.generation)
         return false;
     if (!acceptance_matches_record_policy_locked(value, *materialized))
         return false;
+
+    // A materialized-head change requires writing the full committed snapshot
+    // to the checkpoint file (`reset_checkpoint`), potentially hundreds of MB
+    // on a large catalogue. That write must never happen while `m_` is held --
+    // this runs on the metadata RPC path, and every other reader/writer that
+    // only needs `m_` (status, ordinary reads, other accept_commit calls that
+    // don't touch this head) would otherwise stall behind one slow fsync.
+    // `durable_mutation_m_` (already held for this whole call) remains the
+    // serialization boundary against other durable-mutation writers, matching
+    // the same off-lock-write/on-lock-bookkeeping pattern `import_history()`
+    // already uses for `write_history_frame`.
+    std::optional<MetadataRecord> pending_checkpoint;
 
     bool changed = false;
     // An accepted ancestor remains valid evidence, but it is no longer a head.
@@ -3371,8 +3388,13 @@ bool MetadataReplica::accept_commit(const MetadataAcceptance& input) {
     if (incoming_is_ancestor) {
         if (accepted_heads_.erase(value.hash)) {
             persist_heads_locked();
-            refresh_materialized_head_locked();
+            if (refresh_materialized_head_in_memory_locked()) {
+                reset_checkpoint_journal_locked();
+                pending_checkpoint = committed_;
+            }
         }
+        lock.unlock();
+        if (pending_checkpoint) persist(checkpoint_p_, *pending_checkpoint);
         return true;
     }
 
@@ -3411,8 +3433,13 @@ bool MetadataReplica::accept_commit(const MetadataAcceptance& input) {
     changed = prune_accepted_heads_locked() || changed;
     if (changed) {
         persist_heads_locked();
-        refresh_materialized_head_locked();
+        if (refresh_materialized_head_in_memory_locked()) {
+            reset_checkpoint_journal_locked();
+            pending_checkpoint = committed_;
+        }
     }
+    lock.unlock();
+    if (pending_checkpoint) persist(checkpoint_p_, *pending_checkpoint);
     return true;
 }
 
@@ -3576,11 +3603,15 @@ MetadataReplica::materialized(const Hash256& hash) const {
                                                : std::shared_ptr<const MetadataMaterialization>{};
 }
 
-void MetadataReplica::reset_checkpoint(const MetadataRecord& record) {
-    persist(checkpoint_p_, record);
+void MetadataReplica::reset_checkpoint_journal_locked() {
     writefile(journal_p_, {});
     journal_records_ = 0;
     journal_bytes_ = 0;
+}
+
+void MetadataReplica::reset_checkpoint(const MetadataRecord& record) {
+    persist(checkpoint_p_, record);
+    reset_checkpoint_journal_locked();
 }
 
 void MetadataReplica::compact_if_needed() {

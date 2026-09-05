@@ -2435,6 +2435,72 @@ MACHA_TEST("hydration_catalogue", test_ingest_catalogue_feedback_and_external_cl
     ingest.stop();
 }
 
+MACHA_TEST("hydration_catalogue", test_cleared_ingest_job_does_not_resurrect_while_worker_finishes) {
+    // A job the worker is still inside process_job() for can reach a terminal
+    // state (cancel() writes it directly, regardless of whether the worker
+    // has noticed yet) and be clear()-ed by a client while the worker is
+    // still mid-copy. The worker's own per-iteration control checks used to
+    // read state via jobs_[job.id], which default-constructs and re-inserts
+    // a fresh "queued" job if clear() already erased it -- silently
+    // resurrecting a job the operator just removed. Those checks now use
+    // find() and treat "already gone" the same as cancelled.
+    TestService fixture("node");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.catalogue.scanner.enabled = false;
+    config.ingest.enabled = false;
+
+    auto& service = fixture.start();
+
+    const auto source_root = fixture.path() / "external-import";
+    std::filesystem::create_directories(source_root);
+    const auto media = source_root / "Slow Import Movie 2024.mkv";
+    {
+        std::ofstream out(media, std::ios::binary);
+        auto bytes = pattern(32 * 1024 * 1024);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+    }
+
+    IngestConfig ingest_config;
+    ingest_config.enabled = true;
+    ingest_config.staging_path = fixture.path() / "staging";
+    ingest_config.source_roots = {source_root};
+    // Small enough that the copy loop takes many real iterations, giving the
+    // test a wide window to cancel+clear while the worker is still inside
+    // copy_file()'s per-chunk loop.
+    ingest_config.copy_chunk_bytes = 256;
+    ingest_config.checkpoint_bytes = 4096;
+    IngestManager ingest(service.node(), service.filesystem(), service.catalogue_hints(),
+                         ingest_config);
+    ingest.start();
+    const auto job_id = ingest.submit_path(source_root);
+
+    REQUIRE(wait_until([&] {
+        auto job = ingest.job(job_id);
+        return job && job->state == IngestJobState::importing;
+    }, 10s));
+
+    // cancel() writes the terminal state into the map immediately, without
+    // waiting for the worker to notice -- exactly the window that used to
+    // let clear() erase the job out from under a still-running worker.
+    REQUIRE(ingest.cancel(job_id));
+    REQUIRE(ingest.clear(job_id));
+    CHECK(!ingest.job(job_id).has_value());
+
+    // Give the worker's still-in-flight process_job() every chance to finish
+    // its current chunk, hit one of the per-iteration control checks, and
+    // (pre-fix) resurrect the job. It must stay gone.
+    std::this_thread::sleep_for(200ms);
+    CHECK(!ingest.job(job_id).has_value());
+    REQUIRE(wait_until([&] { return !ingest.job(job_id).has_value(); }, 2s));
+    CHECK(ingest.jobs().empty());
+
+    ingest.stop();
+    CHECK(!ingest.job(job_id).has_value());
+}
+
 MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh) {
     TestCluster cluster;
     const auto& keys = cluster.keys();

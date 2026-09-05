@@ -2,8 +2,10 @@
 #include "service.hpp"
 #include "diagnostics.hpp"
 #include "fuse_frontend.hpp"
+#include "json.hpp"
 #include "log.hpp"
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
@@ -107,6 +109,7 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
 }
 
 void Service::attach_fuse_frontend(std::weak_ptr<FuseFrontend> frontend) {
+    fuse_frontend_ = frontend;
     if (!frontend.use_count()) {
         cluster_status_.detach_fuse_diagnostics();
         return;
@@ -117,6 +120,16 @@ void Service::attach_fuse_frontend(std::weak_ptr<FuseFrontend> frontend) {
             return std::optional<FuseFrontendDiagnostics>{};
         return std::optional<FuseFrontendDiagnostics>{shared->diagnostics()};
     });
+}
+
+std::optional<BlockedNamespaceOperation> Service::blocked_namespace_operation() const {
+    auto frontend = fuse_frontend_.lock();
+    return frontend ? frontend->blocked_namespace_operation() : std::nullopt;
+}
+
+bool Service::skip_blocked_namespace_operation(uint64_t sequence) {
+    auto frontend = fuse_frontend_.lock();
+    return frontend && frontend->skip_blocked_namespace_operation(sequence);
 }
 
 Service::~Service() {
@@ -147,6 +160,44 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
     if (request.path.starts_with("/api/v1/ingest/") ||
         request.path.starts_with("/api/v1/torrents/"))
         return acquisition_api_->handle(request);
+    constexpr std::string_view blocked_namespace_op_path =
+        "/api/v1/manage/filesystem/blocked-namespace-operation";
+    if (request.path == blocked_namespace_op_path) {
+        if (request.method != "GET")
+            return http_error(405, "method", "GET required");
+        auto blocked = blocked_namespace_operation();
+        if (!blocked)
+            return http_error(404, "not_found",
+                              "no namespace operation is currently blocked");
+        Json::Object out{{"sequence", blocked->sequence},
+                         {"kind", blocked->kind},
+                         {"path", blocked->path},
+                         {"error_code", blocked->error_code},
+                         {"error_message", blocked->error_message},
+                         {"blocked_for_ms", static_cast<uint64_t>(blocked->blocked_for.count())}};
+        if (!blocked->secondary_path.empty())
+            out["destination_path"] = blocked->secondary_path;
+        return http_json(200, Json(std::move(out)).dump());
+    }
+    if (request.path == std::string(blocked_namespace_op_path) + "/skip") {
+        if (request.method != "POST")
+            return http_error(405, "method", "POST required");
+        auto it = request.query.find("sequence");
+        uint64_t sequence = 0;
+        if (it == request.query.end() || it->second.empty())
+            return http_error(400, "missing_sequence", "sequence query parameter is required");
+        auto [end, ec] = std::from_chars(it->second.data(), it->second.data() + it->second.size(),
+                                         sequence);
+        if (ec != std::errc{} || end != it->second.data() + it->second.size())
+            return http_error(400, "bad_sequence", "sequence must be a non-negative integer");
+        // Operator confirms the exact sequence number from a prior GET so a
+        // race where the wedge changed underneath them fails closed instead
+        // of silently abandoning a different operation.
+        if (!skip_blocked_namespace_operation(sequence))
+            return http_error(409, "not_blocked",
+                              "no namespace operation with this sequence is currently blocked");
+        return {204, "application/json; charset=utf-8", {}, {}};
+    }
     if (request.path.starts_with("/api/v1/manage"))
         return manage_api_->handle(request);
     return catalogue_api_->handle(request);
