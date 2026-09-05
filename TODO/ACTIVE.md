@@ -58,22 +58,23 @@ one causal programme rather than treating each symptom separately.
   path — both the 0.23.8 and 0.23.9 defects were only caught by live
   measurement/listening, not CI. Building that harness remains this phase's
   stated exit-criterion prerequisite.
-- [ ] **2. Split lightweight status from expensive diagnostics, and fix a
-  concrete lock-contention bug found in this audit.** `ClusterStatusService::status_response`
-  (`src/status_api.cpp`) still unconditionally computes and includes the full
-  `diagnostics` object on every ordinary `/api/v1/status` call — no opt-in/expensive
-  split yet. More importantly: **`PlaybackManager::status()` holds the global
-  session mutex while taking each session's subtitle-cache mutex, and
-  `public_stream_response` holds that same global mutex across a full libav
-  open/probe/seek/demux bounded only by `probe_timeout` (20s default)**
-  (`src/playback.cpp`, confirmed directly in the 2026-09-05 code audit). A
-  single slow subtitle segment or cold probe therefore blocks the entire
-  playback API — status, create, patch, delete and the cleanup thread — for up
-  to 20 seconds. This is a strong, previously-undiagnosed candidate for the
-  "intermittent Status latency" symptom this whole programme was named for;
-  verify it live before assuming the diagnostics-payload-size theory is the
-  whole story. Fix by narrowing the lock scope so no libav or per-session I/O
-  runs under the global mutex.
+- [ ] **2. Split lightweight status from expensive diagnostics.**
+  `ClusterStatusService::status_response` (`src/status_api.cpp`) still
+  unconditionally computes and includes the full `diagnostics` object on
+  every ordinary `/api/v1/status` call — no opt-in/expensive split yet.
+  (The other half of this item — `PlaybackManager::status()` holding the
+  global session mutex while taking each session's subtitle-cache mutex —
+  was confirmed and fixed in 0.24.2: `status()` no longer takes any
+  per-session subtitle-cache lock while holding the global mutex, and that
+  per-session lock is now `try_lock`-only so one busy session's cache can't
+  block a `status()` call at all, only make its own count best-effort.
+  Regression test: `test_status_does_not_block_on_a_contended_subtitle_cache`
+  in `tests/test_media_playback.cpp`. Separately, the audit's claim that
+  `public_stream_response` holds the global mutex across a full libav
+  open/probe/seek/demux was re-checked against current code on 2026-09-05
+  and is **not accurate** — all such work in both `public_stream_response`
+  and `probe_source`/`resolve_session` already runs with the global mutex
+  released.)
 - [x] **3. Remove per-request connection setup from Status and streaming.**
   Confirmed shipped in 0.23.3 and moved to `COMPLETED.md`.
 - [ ] **4. Make transformed output bandwidth-aware.** Auto negotiation selected

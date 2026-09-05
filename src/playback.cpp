@@ -2198,14 +2198,26 @@ struct PlaybackManager::Impl {
             pipeline_idle = config.pipeline_idle;
             cached_probes = probe_cache.size();
             cached_probe_bytes = probe_cache_bytes;
-            for (const auto& [_, session] : sessions) {
+            active_sessions.reserve(sessions.size());
+            for (const auto& [_, session] : sessions)
                 active_sessions.push_back(session);
-                std::lock_guard subtitle_lock(session->subtitle_cache->mutex);
+        }
+        // Per-session subtitle-cache and segment-store reads happen with the
+        // global session mutex already released: each only needs that one
+        // session's own lock, and serializing them behind the global mutex
+        // would let contention on any single session's subtitle cache (e.g. a
+        // slow WebVTT extraction, see public_stream_response) stall every
+        // other playback operation -- create/patch/delete/cleanup all take
+        // the same global mutex -- for as long as that one lock is held.
+        // The per-session lock itself is best-effort (try_lock): a session
+        // mid-extraction just contributes stale/zero counts for this status
+        // call rather than making status() block on it too.
+        for (const auto& session : active_sessions) {
+            if (std::unique_lock subtitle_lock(session->subtitle_cache->mutex, std::try_to_lock);
+                subtitle_lock.owns_lock()) {
                 cached_subtitle_segments += session->subtitle_cache->segments.size();
                 cached_subtitle_bytes += session->subtitle_cache->bytes;
             }
-        }
-        for (const auto& session : active_sessions) {
             auto active = active_engine(*session);
             if (!active)
                 continue;
