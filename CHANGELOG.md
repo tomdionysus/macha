@@ -1,5 +1,44 @@
 # Current release
 
+## 0.24.1 — Fix false-consensus metadata history compaction, add conflict-preserving manual repair (development)
+
+- Fixed a real production incident: `NodeRuntime::accept_history_checkpoint_proposal()`
+  acked a history-compaction floor proposal unconditionally, with no check that
+  the acking replica had actually reached that floor itself. A lagging replica
+  (offsite, higher latency) proposed compacting to its own stale floor; two
+  already-more-advanced replicas both acked it anyway, manufacturing a false
+  3/3 consensus. The lagging replica then compacted to that stale point,
+  permanently discarding the only bridging history connecting it to the rest
+  of the cluster's current state -- leaving every node with two accepted
+  metadata heads and no common ancestor, and the catalogue fully unavailable
+  cluster-wide. `MetadataReplica::record_checkpoint_ack()` now refuses to ack
+  a floor unless it exactly matches the replica's own current single accepted
+  head; `compact_history_if_safe()`'s own local safety check can no longer be
+  fed a false premise by a peer.
+- Added `plan_conflict_preserving_metadata_repair()` and three new
+  `macha-metadata-repair` actions (`--plan-conflict-merge`,
+  `--stage-conflict-merge`, `--accept-conflict-merge`) for the case the
+  existing causal-dominance repair explicitly refuses: two heads with no
+  common ancestor where neither strictly dominates the other (concurrent
+  divergence). Reuses the existing three-way `merge_metadata_snapshots()`
+  with a deliberately empty base -- every entry identical on both sides
+  reconciles regardless of base, and any entry that actually differs becomes
+  a durable first-class conflict (both alternatives preserved, nothing
+  destroyed or silently chosen) exactly as ordinary reconciliation would
+  record it. Refuses outright if either head has an entry the other lacks,
+  since an empty base also disables the rename/move-collision detection a
+  real common ancestor would drive.
+- Added `macha-metadata-repair --diff-heads` to print exactly which
+  namespace paths differ between two accepted heads, field by field, instead
+  of only the aggregate counts the existing report prints.
+- Used the above to recover the live 3-node cluster from the incident:
+  restored 1545 of 1546 namespace entries immediately; the one entry that
+  had genuinely diverged (a single in-progress ingest, one replica's copy a
+  strict continuation of the other's) was preserved as an explicit conflict
+  rather than guessed at. No media data was lost -- DATA extents are a
+  separate storage class from the metadata/namespace layer this incident
+  affected, and were confirmed untouched on disk throughout.
+
 ## 0.24.0 — Cluster session/auth subsystem, replacing the old viewer-session headers (development)
 
 - Added a real `/api/v1/session` REST resource: `POST` mints a bearer-token
