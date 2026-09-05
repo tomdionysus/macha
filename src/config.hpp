@@ -393,6 +393,13 @@ struct RuntimeConfig {
     uint64_t loader_memory_reserve_bytes{64ULL * 1024 * 1024};
 };
 
+struct SessionConfig {
+    // No sliding renewal in v1 -- a session is valid for this long from
+    // creation, then the client must POST /api/v1/session again.
+    std::chrono::milliseconds anonymous_ttl{std::chrono::hours(24 * 30)};
+    size_t max_sessions{4096};
+};
+
 struct Config {
     std::filesystem::path state_path;
     std::vector<StorageBackendConfig> storage_backends;
@@ -408,6 +415,7 @@ struct Config {
     StreamingConfig streaming;
     HydrationConfig hydration;
     RuntimeConfig runtime;
+    SessionConfig session;
     // Bound on Service::wait_services_ready(). Local-state readiness and
     // subsystem construction/start are expected to complete or throw well
     // inside this window; a wait that never resolves either way is treated as

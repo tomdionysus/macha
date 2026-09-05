@@ -37,7 +37,8 @@ MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_cou
         return !current.scheduled && current.runs_scheduled == current.runs_completed;
     }));
 
-    const auto response = raw_http_get(config.catalogue.api.port, "/api/v1/status");
+    const auto response =
+        raw_http_get(config.catalogue.api.port, "/api/v1/status", bearer_header(service));
     CHECK(response.find("HTTP/1.1 200") != std::string::npos);
     const auto body_at = response.find("\r\n\r\n");
     REQUIRE(body_at != std::string::npos);
@@ -152,7 +153,8 @@ MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_cou
     CHECK(!convergence->find("scheduled")->asBool());
 
     service.attach_fuse_frontend({});
-    const auto detached_response = raw_http_get(config.catalogue.api.port, "/api/v1/status");
+    const auto detached_response =
+        raw_http_get(config.catalogue.api.port, "/api/v1/status", bearer_header(service));
     const auto detached_body_at = detached_response.find("\r\n\r\n");
     REQUIRE(detached_body_at != std::string::npos);
     const auto detached = Json::parse(detached_response.substr(detached_body_at + 4));

@@ -722,7 +722,7 @@ struct PlaybackManager::Impl {
         std::string_view item_id, std::string_view media_id,
         const ClientCapabilities& caps, const PlaybackPreferences& prefs,
         const std::optional<int64_t>& seek_ms,
-        std::string_view viewer_session_key) const {
+        std::string_view session_id) const {
         std::ostringstream canonical;
         canonical << "v1|item=" << item_id << "|media=" << media_id << "|containers=";
         for (const auto& value : caps.containers) canonical << value << ',';
@@ -741,26 +741,24 @@ struct PlaybackManager::Impl {
                   << "|pal=" << prefs.audio_language
                   << "|psl=" << prefs.subtitle_language
                   << "|seek=" << seek_ms.value_or(0)
-                  << "|viewer=" << viewer_session_key;
+                  << "|session=" << session_id;
         const auto text = canonical.str();
         return to_string(sha256({reinterpret_cast<const uint8_t*>(text.data()), text.size()}));
     }
 
     HttpResponse creation_response(const Session& session, std::string trace,
-                                   std::string_view idempotency_key = {},
-                                   std::string_view idempotency_status = {},
-                                   std::string_view viewer_session_key = {}) const {
+                                   std::string_view idempotency_status = {}) const {
         auto payload = session_json(session);
         payload["trace_id"] = trace;
         auto response = http_json(201, payload.dump());
         response.headers["Location"] = "/api/v1/playback/sessions/" + session.id;
         response.headers["X-Macha-Playback-Trace"] = std::move(trace);
-        if (!idempotency_key.empty()) {
-            response.headers["Idempotency-Key"] = std::string(idempotency_key);
+        // Unlike the retired Idempotency-Key/Macha-Viewer-Session echoes (pure
+        // restatements of what the client already sent), this conveys new
+        // information the client cannot otherwise infer: whether its request
+        // created a session or joined/replayed an existing one.
+        if (!idempotency_status.empty())
             response.headers["X-Macha-Idempotency"] = std::string(idempotency_status);
-        }
-        if (!viewer_session_key.empty())
-            response.headers["Macha-Viewer-Session"] = std::string(viewer_session_key);
         return response;
     }
 
@@ -795,12 +793,6 @@ struct PlaybackManager::Impl {
         return {};
     }
 
-    static bool valid_client_key(std::string_view key) {
-        return !key.empty() && key.size() <= 256 &&
-               std::all_of(key.begin(), key.end(), [](unsigned char c) {
-                   return c >= 0x21 && c <= 0x7e;
-               });
-    }
 
     bool plan_supported(const PlaybackPlan& plan) const {
         if (!engine) return plan.video != MediaTransform::transcode && plan.audio != MediaTransform::transcode;
@@ -1832,6 +1824,11 @@ struct PlaybackManager::Impl {
 
     HttpResponse create(const HttpRequest& request) {
         if (!config.enabled) return http_error(503, "streaming_disabled", "streaming is disabled");
+        // Unreachable in production -- this route is not in capability_request's
+        // exempt list, so HttpServer has already rejected an unauthenticated
+        // request with 401 -- but cheap to check and matches this project's
+        // fail-loudly style elsewhere.
+        if (!request.session) return http_error(401, "unauthorized", "a valid session bearer token is required");
         auto trace = hex_token(4);
         auto request_started = Clock::now();
         Log::info("playback[" + trace + "] session create start");
@@ -1853,51 +1850,28 @@ struct PlaybackManager::Impl {
         }
         auto media = media_id.empty() ? item_media(item_id) : std::vector<std::string>{media_id};
         std::string idempotency_key;
-        if (auto it = request.headers.find("idempotency-key"); it != request.headers.end())
-            idempotency_key = it->second;
-        else if (auto it = request.headers.find("Idempotency-Key"); it != request.headers.end())
+        if (auto it = request.query.find("idempotency_key"); it != request.query.end())
             idempotency_key = it->second;
         if (idempotency_key.size() > 256 ||
             std::any_of(idempotency_key.begin(), idempotency_key.end(), [](unsigned char c) {
                 return c < 0x21 || c > 0x7e;
             }))
             return http_error(400, "bad_idempotency_key",
-                              "Idempotency-Key must be 1..256 visible ASCII characters");
-
-        std::string viewer_session_key;
-        if (auto value = root.find("viewer_session_id"); value && value->isString())
-            viewer_session_key = value->asString();
-        auto read_viewer_header = [&](std::string_view name) -> std::string {
-            if (auto it = request.headers.find(std::string(name)); it != request.headers.end())
-                return it->second;
-            return {};
-        };
-        auto header_key = read_viewer_header("macha-viewer-session");
-        if (header_key.empty()) header_key = read_viewer_header("Macha-Viewer-Session");
-        if (header_key.empty()) header_key = read_viewer_header("x-macha-viewer-session");
-        if (header_key.empty()) header_key = read_viewer_header("X-Macha-Viewer-Session");
-        if (!header_key.empty() && !viewer_session_key.empty() &&
-            header_key != viewer_session_key)
-            return http_error(400, "bad_viewer_session",
-                              "viewer session header and JSON field disagree");
-        if (!header_key.empty()) viewer_session_key = std::move(header_key);
-        if (!viewer_session_key.empty() && !valid_client_key(viewer_session_key))
-            return http_error(400, "bad_viewer_session",
-                              "Macha-Viewer-Session must be 1..256 visible ASCII characters");
+                              "idempotency_key must be 1..256 visible ASCII characters");
 
         std::string fingerprint;
         std::shared_ptr<IdempotentCreation> idempotent;
         bool idempotent_owner = false;
         if (!idempotency_key.empty()) {
             fingerprint = creation_fingerprint(item_id, media_id, caps, prefs, seek_ms,
-                                               viewer_session_key);
+                                               request.session->id);
             {
                 std::lock_guard lock(mutex);
                 auto it = idempotent_creations.find(idempotency_key);
                 if (it != idempotent_creations.end() &&
                     it->second->fingerprint != fingerprint)
                     return http_error(409, "idempotency_conflict",
-                                      "Idempotency-Key was already used for a different playback request");
+                                      "idempotency_key was already used for a different playback request");
                 if (it == idempotent_creations.end()) {
                     idempotent = std::make_shared<IdempotentCreation>();
                     idempotent->fingerprint = fingerprint;
@@ -1933,13 +1907,10 @@ struct PlaybackManager::Impl {
                     existing->touched = Clock::now();
                     signal_cleanup_locked();
                 }
-                return creation_response(*existing, trace, idempotency_key, "replayed",
-                                         existing->logical_session
-                                             ? existing->logical_session->client_key
-                                             : std::string{});
+                return creation_response(*existing, trace, "replayed");
             }
         }
-        auto logical_session = logical_session_for(viewer_session_key);
+        auto logical_session = logical_session_for(request.session->id);
         std::unique_lock logical_operation(logical_session->operation_mutex);
         std::shared_ptr<Session> previous;
         {
@@ -2020,8 +1991,7 @@ struct PlaybackManager::Impl {
             std::error_code ec;
             std::filesystem::remove_all(previous->generation_dir, ec);
         }
-        return creation_response(*session, trace, idempotency_key,
-                                 idempotent ? "created" : "", viewer_session_key);
+        return creation_response(*session, trace, idempotent ? "created" : "");
     }
 
     HttpResponse get_session(std::string_view id) {

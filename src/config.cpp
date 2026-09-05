@@ -487,6 +487,16 @@ void parse_runtime(const YAML::Node& root, Config& c) {
             yaml_size(runtime["loader_memory_reserve_bytes"]);
 }
 
+void parse_session(const YAML::Node& root, Config& c) {
+    auto session = root["session"];
+    if (!session)
+        return;
+    if (session["anonymous_ttl_ms"])
+        c.session.anonymous_ttl = milliseconds(session["anonymous_ttl_ms"], "session.anonymous_ttl_ms");
+    if (session["max_sessions"])
+        c.session.max_sessions = session["max_sessions"].as<size_t>();
+}
+
 void parse_hydration_engine(const YAML::Node& engines, const char* name,
                             HydrationEngineConfig& engine) {
     auto node = engines[name];
@@ -612,6 +622,7 @@ Config load_yaml_config(const std::filesystem::path& path) {
     parse_streaming(root, c);
     parse_hydration(root, c);
     parse_runtime(root, c);
+    parse_session(root, c);
 
     if (auto bootstrap = root["bootstrap"]) {
         if (!bootstrap.IsSequence())

@@ -62,6 +62,16 @@ struct NodeIdHash {
     size_t operator()(const NodeId&) const noexcept;
 };
 
+// Minimal per-request view attached to an authenticated HttpRequest by
+// HttpServer once its bearer token has been validated against the cluster
+// session store (see session.hpp). Deliberately excludes version/revoked/
+// expiry bookkeeping that ordinary route handlers have no business touching.
+struct SessionIdentity {
+    std::string id;
+    Hash256 token_hash{};
+    std::vector<std::string> roles;
+};
+
 std::string hex(std::span<const uint8_t>);
 std::optional<Bytes> unhex(const std::string&);
 std::string to_string(const NodeId&);

@@ -403,7 +403,8 @@ class BlockingHttpBody final : public HttpBodySource {
     }
 };
 
-inline std::string raw_http_get(uint16_t port, std::string_view path) {
+inline std::string raw_http_get(uint16_t port, std::string_view path,
+                                const std::map<std::string, std::string>& headers = {}) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) throw std::runtime_error("http test socket failed");
     sockaddr_in address{};
@@ -414,7 +415,10 @@ inline std::string raw_http_get(uint16_t port, std::string_view path) {
         close(fd);
         throw std::runtime_error("http test connect failed");
     }
-    auto request = "GET " + std::string(path) + " HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    auto request = "GET " + std::string(path) + " HTTP/1.1\r\nHost: 127.0.0.1\r\n";
+    for (const auto& [key, value] : headers)
+        request += key + ": " + value + "\r\n";
+    request += "Connection: close\r\n\r\n";
     size_t sent = 0;
     while (sent < request.size()) {
         auto n = send(fd, request.data() + sent, request.size() - sent, 0);
@@ -432,6 +436,16 @@ inline std::string raw_http_get(uint16_t port, std::string_view path) {
     }
     close(fd);
     return response;
+}
+
+// Every non-exempt API route now requires a live session bearer token (see
+// SessionApi / HttpServer's SessionAuthenticator). Mint one directly against
+// the node under test rather than through HTTP, so callers exercising an
+// unrelated route don't also need to drive session creation by hand.
+inline std::map<std::string, std::string> bearer_header(Service& service) {
+    auto minted = service.node().sessions().create({"anonymous"});
+    REQUIRE(minted.has_value());
+    return {{"Authorization", "Bearer " + minted->bearer_token}};
 }
 
 // Raw request/response helpers for keep-alive scenarios, where raw_http_get's

@@ -149,6 +149,8 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
                cfg_.state_path / "membership" / "known-nodes.bin"),
       public_connectivity_(cfg_, id_, Endpoint{members_.self().host, members_.self().port}),
       telemetry_(id_, cfg_.state_path / "telemetry" / "last-known.bin"),
+      sessions_(cfg_.session.anonymous_ttl, cfg_.session.max_sessions,
+               cfg_.state_path / "sessions" / "sessions.bin"),
       client_(
           keys_, [this] { return members_.self(); },
           [this](const NodeInfo& peer) {
@@ -737,6 +739,13 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
                     apply_identity_reset(reset);
             return {MessageType::identity_resets_reply, encode_identity_resets(identity_resets())};
         }
+        case MessageType::session_sync: {
+            if (!request.payload.empty())
+                for (const auto& session : decode_sessions(request.payload))
+                    apply_session(session);
+            const auto gossip_ttl = std::max(cfg_.dead_after * 2, std::chrono::milliseconds(60000));
+            return {MessageType::session_sync_reply, encode_sessions(sessions_.recent(gossip_ttl, 64))};
+        }
         case MessageType::have_object: {
             Reader reader(request.payload);
             ObjectId id{reader.fixed<32>()};
@@ -1165,6 +1174,19 @@ void NodeRuntime::telemetry_loop(std::stop_token stop) {
         } catch (const std::exception& error) {
             Log::debug("telemetry refresh skipped: " + std::string(error.what()));
         }
+        // Session mutations are already pushed synchronously to every reachable
+        // peer (propagate_session), so this is only the self-healing backstop
+        // for a peer that was briefly unreachable at mutation time, piggybacked
+        // on the existing periodic gossip tick rather than a dedicated thread.
+        try {
+            sessions_.prune_expired(unix_ms());
+            auto values = sessions_.recent(gossip_ttl, 64);
+            if (!values.empty())
+                (void)client_.broadcast_best_effort(
+                    {MessageType::session_sync, encode_sessions(values)}, FrameType::speculative);
+        } catch (const std::exception& error) {
+            Log::debug("session gossip skipped: " + std::string(error.what()));
+        }
         handled_demand = demand;
         cpu_reporter.tick();
         std::unique_lock lock(telemetry_wait_mutex_);
@@ -1205,6 +1227,27 @@ void NodeRuntime::propagate_identity_reset(const IdentityAssociationReset& reset
                     apply_identity_reset(learned);
         } catch (const std::exception& error) {
             Log::debug("identity reset propagation to " + peer.host + ": " + error.what());
+        }
+    }
+}
+
+bool NodeRuntime::apply_session(const AuthSession& session) {
+    return sessions_.apply(session);
+}
+
+void NodeRuntime::propagate_session(const AuthSession& session) {
+    (void)apply_session(session);
+    const auto payload = encode_sessions({session});
+    for (const auto& peer : members_.active()) {
+        if (peer.id == id_)
+            continue;
+        try {
+            auto reply = call(peer, MessageType::session_sync, payload);
+            if (reply.message.type == MessageType::session_sync_reply)
+                for (const auto& learned : decode_sessions(reply.message.payload))
+                    apply_session(learned);
+        } catch (const std::exception& error) {
+            Log::debug("session sync propagation to " + peer.host + ": " + error.what());
         }
     }
 }

@@ -482,6 +482,7 @@ MACHA_TEST("media_playback", test_playback_probe_failure_is_stage_specific) {
     HttpRequest request;
     request.method = "POST";
     request.path = "/api/v1/playback/sessions";
+    request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     request.body.assign(text.begin(), text.end());
     auto response = playback.handle(request);
     REQUIRE(response.status == 503);
@@ -530,7 +531,8 @@ MACHA_TEST("media_playback", test_immutable_media_profile_survives_cold_playback
         HttpRequest request;
         request.method = "POST";
         request.path = "/api/v1/playback/sessions";
-        request.headers["idempotency-key"] = media_id;
+        request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+        request.query["idempotency_key"] = media_id;
         request.body.assign(text.begin(), text.end());
         return request;
     };
@@ -653,7 +655,8 @@ MACHA_TEST("media_playback", test_concurrent_immutable_profile_misses_coalesce) 
     HttpRequest request;
     request.method = "POST";
     request.path = "/api/v1/playback/sessions";
-    request.headers["idempotency-key"] = "coalesced-create-1";
+    request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    request.query["idempotency_key"] = "coalesced-create-1";
     request.body.assign(text.begin(), text.end());
     HttpResponse first, second;
     std::jthread a([&] { first = playback.handle(request); });
@@ -746,7 +749,8 @@ MACHA_TEST("media_playback", test_failed_idempotent_creation_releases_joiners_an
     HttpRequest request;
     request.method = "POST";
     request.path = "/api/v1/playback/sessions";
-    request.headers["idempotency-key"] = "failing-create-1";
+    request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    request.query["idempotency_key"] = "failing-create-1";
     request.body.assign(text.begin(), text.end());
 
     HttpResponse first, second;
@@ -822,7 +826,8 @@ MACHA_TEST("media_playback", test_profile_endpoint_pending_does_not_gate_session
     HttpRequest create;
     create.method = "POST";
     create.path = "/api/v1/playback/sessions";
-    create.headers["idempotency-key"] = "pending-profile-create";
+    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    create.query["idempotency_key"] = "pending-profile-create";
     create.body.assign(text.begin(), text.end());
     auto admitted = playback.handle(create);
     REQUIRE(admitted.status == 201);
@@ -880,7 +885,8 @@ MACHA_TEST("media_playback", test_unavailable_profile_queue_uses_media_engine_fa
     HttpRequest create;
     create.method = "POST";
     create.path = "/api/v1/playback/sessions";
-    create.headers["idempotency-key"] = "unavailable-profile-fallback";
+    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    create.query["idempotency_key"] = "unavailable-profile-fallback";
     create.body.assign(text.begin(), text.end());
 
     auto admitted = playback.handle(create);
@@ -939,7 +945,8 @@ MACHA_TEST("media_playback", test_failed_profile_job_retry_falls_back_and_replay
     HttpRequest create;
     create.method = "POST";
     create.path = "/api/v1/playback/sessions";
-    create.headers["idempotency-key"] = "failed-profile-retry";
+    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    create.query["idempotency_key"] = "failed-profile-retry";
     create.body.assign(text.begin(), text.end());
 
     auto admitted = playback.handle(create);
@@ -1224,6 +1231,7 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
     HttpRequest create;
     create.method = "POST";
     create.path = "/api/v1/playback/sessions";
+    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     create.body.assign(text.begin(), text.end());
     auto first = playback.handle(create);
     REQUIRE(first.status == 201);
@@ -1337,6 +1345,7 @@ MACHA_TEST("media_playback", test_attached_picture_audio_direct_play) {
     HttpRequest request;
     request.method = "POST";
     request.path = "/api/v1/playback/sessions";
+    request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     request.body.assign(text.begin(), text.end());
     auto response = playback.handle(request);
     REQUIRE(response.status == 201);
@@ -1402,6 +1411,7 @@ MACHA_TEST("media_playback", test_forced_direct_bypasses_client_capabilities) {
     HttpRequest direct_create;
     direct_create.method = "POST";
     direct_create.path = "/api/v1/playback/sessions";
+    direct_create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     direct_create.body.assign(direct_text.begin(), direct_text.end());
     auto direct_created = playback.handle(direct_create);
     REQUIRE(direct_created.status == 201);
@@ -1445,6 +1455,7 @@ MACHA_TEST("media_playback", test_forced_direct_bypasses_client_capabilities) {
     HttpRequest remux_create;
     remux_create.method = "POST";
     remux_create.path = "/api/v1/playback/sessions";
+    remux_create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     remux_create.body.assign(remux_text.begin(), remux_text.end());
     auto remux_created = playback.handle(remux_create);
     REQUIRE(remux_created.status == 201);
@@ -1519,6 +1530,7 @@ MACHA_TEST("media_playback", test_concurrent_transcode_admission_is_reserved) {
         HttpRequest request;
         request.method = "POST";
         request.path = "/api/v1/playback/sessions";
+        request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
         request.body.assign(text.begin(), text.end());
         return request;
     };
@@ -1587,8 +1599,8 @@ MACHA_TEST("media_playback", test_logical_viewer_keeps_one_transcode_entitlement
         HttpRequest request;
         request.method = "POST";
         request.path = "/api/v1/playback/sessions";
-        request.headers["Macha-Viewer-Session"] = std::move(viewer);
-        request.headers["Idempotency-Key"] = std::move(attempt);
+        request.session = SessionIdentity{.id = viewer, .roles = {"anonymous"}};
+        request.query["idempotency_key"] = std::move(attempt);
         request.body.assign(text.begin(), text.end());
         return playback.handle(request);
     };
@@ -1603,7 +1615,6 @@ MACHA_TEST("media_playback", test_logical_viewer_keeps_one_transcode_entitlement
 
     auto first = create("transcode", "ui-player-1", "logical-attempt-1");
     REQUIRE(first.status == 201);
-    CHECK(first.headers.at("Macha-Viewer-Session") == "ui-player-1");
     auto first_json = Json::parse(std::string(first.body.begin(), first.body.end()));
     const auto session_id = first_json.find("session_id")->asString();
     CHECK(status().find("video_transcodes")->asUInt64() == 1);
@@ -1754,6 +1765,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     HttpRequest initial_seek;
     initial_seek.method = "POST";
     initial_seek.path = "/api/v1/playback/sessions";
+    initial_seek.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     initial_seek.body.assign(initial_seek_text.begin(), initial_seek_text.end());
     auto initial_seek_response = playback.handle(initial_seek);
     REQUIRE(initial_seek_response.status == 201);
@@ -1837,6 +1849,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     HttpRequest create;
     create.method = "POST";
     create.path = "/api/v1/playback/sessions";
+    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     create.body.assign(create_text.begin(), create_text.end());
     auto created = playback.handle(create);
     REQUIRE(created.status == 201);
@@ -2028,6 +2041,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     HttpRequest unsupported;
     unsupported.method = "POST";
     unsupported.path = "/api/v1/playback/sessions";
+    unsupported.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     unsupported.body.assign(unsupported_text.begin(), unsupported_text.end());
     CHECK(playback.handle(unsupported).status == 400);
 
@@ -2105,6 +2119,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     HttpRequest second;
     second.method = "POST";
     second.path = "/api/v1/playback/sessions";
+    second.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     second.body.assign(second_text.begin(), second_text.end());
     auto limited = playback.handle(second);
     CHECK(limited.status == 429);
@@ -2121,6 +2136,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     HttpRequest path_create;
     path_create.method = "POST";
     path_create.path = "/api/v1/playback/sessions";
+    path_create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     path_create.body.assign(path_text.begin(), path_text.end());
     auto path_created = playback.handle(path_create);
     REQUIRE(path_created.status == 201);

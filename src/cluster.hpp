@@ -11,6 +11,7 @@
 #include "public_connectivity.hpp"
 #include "retention.hpp"
 #include "retained_memory.hpp"
+#include "session.hpp"
 #include "storage_pool.hpp"
 #include "telemetry.hpp"
 
@@ -85,6 +86,7 @@ class NodeRuntime {
     Membership members_;
     PublicConnectivity public_connectivity_;
     TelemetryStore telemetry_;
+    SessionManager sessions_;
     RpcClient client_;
     RpcServer server_;
 
@@ -217,6 +219,14 @@ class NodeRuntime {
     const TelemetryStore& telemetry() const {
         return telemetry_;
     }
+    SessionManager& sessions() {
+        return sessions_;
+    }
+    const SessionManager& sessions() const {
+        return sessions_;
+    }
+    bool apply_session(const AuthSession&);
+    void propagate_session(const AuthSession&);
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
     RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType);

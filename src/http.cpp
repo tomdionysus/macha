@@ -12,7 +12,6 @@
 #include <chrono>
 #include <cerrno>
 #include <cstring>
-#include <fstream>
 #include <netdb.h>
 #include <poll.h>
 #include <sstream>
@@ -66,18 +65,6 @@ std::string reason(int status) {
     default: return "OK";
     }
 }
-
-std::optional<std::string> read_token(const std::optional<std::filesystem::path>& path) {
-    if (!path) return {};
-    std::ifstream file(*path);
-    if (!file) throw std::runtime_error("cannot open catalogue API token file");
-    std::string token;
-    std::getline(file, token);
-    while (!token.empty() && std::isspace(static_cast<unsigned char>(token.back()))) token.pop_back();
-    if (token.empty()) throw std::runtime_error("catalogue API token file is empty");
-    return token;
-}
-
 
 void set_client_io_timeout(int fd, std::chrono::milliseconds timeout) {
     timeval value{};
@@ -163,9 +150,10 @@ std::string http_url_decode(std::string_view value) {
 
 HttpServer::HttpServer(CatalogueApiConfig config,
                        std::function<HttpResponse(const HttpRequest&)> handler,
-                       std::function<bool(const HttpRequest&)> bearer_exempt)
+                       std::function<bool(const HttpRequest&)> bearer_exempt,
+                       SessionAuthenticator authenticate)
     : config_(std::move(config)), handler_(std::move(handler)),
-      bearer_exempt_(std::move(bearer_exempt)), bearer_token_(read_token(config_.token_file)) {}
+      bearer_exempt_(std::move(bearer_exempt)), authenticate_(std::move(authenticate)) {}
 
 HttpServer::~HttpServer() { stop(); }
 
@@ -444,13 +432,21 @@ bool HttpServer::handle_one_request(int fd, int send_flags, bool is_continuation
         read_body = true;
 
         const bool exempt = bearer_exempt_ && bearer_exempt_(request);
-        if (bearer_token_ && !exempt) {
-            auto authorization = request.headers.find("authorization");
-            const std::string expected = "Bearer " + *bearer_token_;
-            if (authorization == request.headers.end() || authorization->second != expected)
-                response = http_error(401, "unauthorized", "bearer token required");
-            else
+        if (authenticate_ && !exempt) {
+            std::string_view token;
+            if (auto it = request.headers.find("authorization"); it != request.headers.end()) {
+                static constexpr std::string_view prefix = "Bearer ";
+                const std::string_view value = it->second;
+                if (value.substr(0, prefix.size()) == prefix)
+                    token = value.substr(prefix.size());
+            }
+            auto identity = !token.empty() ? authenticate_(token) : std::nullopt;
+            if (!identity) {
+                response = http_error(401, "unauthorized", "a valid session bearer token is required");
+            } else {
+                request.session = std::move(identity);
                 response = handler_(request);
+            }
         } else {
             response = handler_(request);
         }
@@ -468,9 +464,9 @@ bool HttpServer::handle_one_request(int fd, int send_flags, bool is_continuation
         keep_alive = false; // prefer serving a waiting new connection
 
     response.headers.try_emplace("Access-Control-Allow-Origin", "*");
-    response.headers.try_emplace("Access-Control-Allow-Headers", "Authorization, Content-Type, If-Match, Range, Idempotency-Key, Macha-Viewer-Session");
+    response.headers.try_emplace("Access-Control-Allow-Headers", "Authorization, Content-Type, If-Match, Range");
     response.headers.try_emplace("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS");
-    response.headers.try_emplace("Access-Control-Expose-Headers", "Accept-Ranges, Content-Length, Content-Range, Location, Retry-After, Idempotency-Key, X-Macha-Idempotency, Macha-Viewer-Session");
+    response.headers.try_emplace("Access-Control-Expose-Headers", "Accept-Ranges, Content-Length, Content-Range, Location, Retry-After");
     response.headers.try_emplace("Accept-Ranges", response.stream ? "bytes" : "none");
 
     std::ostringstream out;

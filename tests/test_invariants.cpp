@@ -457,7 +457,8 @@ MACHA_TEST("invariants", test_status_api_precedes_control_plane_startup) {
     } release{control_gate};
     REQUIRE(control_gate.wait_for_entries(1));
 
-    const auto response = raw_http_get(config.catalogue.api.port, "/api/v1/status");
+    const auto response =
+        raw_http_get(config.catalogue.api.port, "/api/v1/status", bearer_header(service));
     CHECK(response.find("HTTP/1.1 200") != std::string::npos);
     const auto body_at = response.find("\r\n\r\n");
     REQUIRE(body_at != std::string::npos);
@@ -500,7 +501,8 @@ MACHA_TEST("invariants", test_control_plane_and_status_api_are_online_while_back
     service.start();
     REQUIRE(recovery_gate.wait_for_entries(2));
 
-    const auto status_response = raw_http_get(config.catalogue.api.port, "/api/v1/status");
+    const auto status_response =
+        raw_http_get(config.catalogue.api.port, "/api/v1/status", bearer_header(service));
     CHECK(status_response.find("HTTP/1.1 200") != std::string::npos);
     const auto body_at = status_response.find("\r\n\r\n");
     REQUIRE(body_at != std::string::npos);
@@ -515,13 +517,15 @@ MACHA_TEST("invariants", test_control_plane_and_status_api_are_online_while_back
     CHECK(!status.find("diagnostics")->find("data_store")->find("available")->asBool());
     CHECK(!service.ready());
 
-    const auto ordinary = raw_http_get(config.catalogue.api.port, "/api/v1/catalogue/status");
+    const auto ordinary = raw_http_get(config.catalogue.api.port, "/api/v1/catalogue/status",
+                                       bearer_header(service));
     CHECK(ordinary.find("HTTP/1.1 503") != std::string::npos);
     CHECK(ordinary.find("service_recovering") != std::string::npos);
 
     recovery_gate.open();
     REQUIRE(wait_until([&] { return service.ready(); }, 10s));
-    const auto ready_response = raw_http_get(config.catalogue.api.port, "/api/v1/status");
+    const auto ready_response =
+        raw_http_get(config.catalogue.api.port, "/api/v1/status", bearer_header(service));
     const auto ready_body_at = ready_response.find("\r\n\r\n");
     REQUIRE(ready_body_at != std::string::npos);
     auto ready_status = Json::parse(ready_response.substr(ready_body_at + 4));
@@ -1143,7 +1147,8 @@ MACHA_TEST("invariants", test_status_collects_connected_peer_telemetry_without_c
         },
         10s));
 
-    const auto response = raw_http_get(first_config.catalogue.api.port, "/api/v1/status");
+    const auto response =
+        raw_http_get(first_config.catalogue.api.port, "/api/v1/status", bearer_header(first));
     CHECK(response.find("HTTP/1.1 200") != std::string::npos);
     const auto body_at = response.find("\r\n\r\n");
     REQUIRE(body_at != std::string::npos);
@@ -1198,7 +1203,8 @@ MACHA_TEST("invariants", test_status_marks_stopped_peer_offline_within_dead_afte
         5s));
 
     auto second_state = [&]() -> std::string {
-        const auto response = raw_http_get(first_config.catalogue.api.port, "/api/v1/status");
+        const auto response =
+            raw_http_get(first_config.catalogue.api.port, "/api/v1/status", bearer_header(first));
         const auto body_at = response.find("\r\n\r\n");
         REQUIRE(body_at != std::string::npos);
         const auto status = Json::parse(response.substr(body_at + 4));

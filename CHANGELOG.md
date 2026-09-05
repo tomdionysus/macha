@@ -1,5 +1,51 @@
 # Current release
 
+## 0.24.0 — Cluster session/auth subsystem, replacing the old viewer-session headers (development)
+
+- Added a real `/api/v1/session` REST resource: `POST` mints a bearer-token
+  session (anonymous-only for now, empty credentials), `GET` introspects the
+  caller's own session, `DELETE` revokes it. The minted token is now required
+  as `Authorization: Bearer <token>` on every API call except the
+  already-self-authenticating signed streaming/asset capability URLs. This
+  closes a standing gap where auth was optional whenever `token_file` was
+  unset -- there is no more "disabled" state; every non-exempt request now
+  needs a live session.
+- Sessions are small (id + roles + timestamps), cluster-replicated: a create
+  or revoke is pushed synchronously to every reachable peer
+  (`NodeRuntime::propagate_session`), with a periodic best-effort gossip
+  backstop for anything a peer missed while unreachable, modelled on the
+  existing `TelemetryStore` gossip shape rather than `Membership`'s
+  tombstone-only pattern (sessions need real expiry and deletion). Each node
+  holds its own full replica in memory, so a local bearer-token lookup is
+  always O(1) with no network round trip -- there is no separate cache layer,
+  a pushed mutation *is* the cache invalidation everywhere else. Persisted to
+  local disk (best-effort, alongside the existing telemetry checkpoint) so a
+  restarted node doesn't need every client to re-authenticate.
+- Built with two extension seams for later work: a `CredentialValidator`
+  interface (only an anonymous validator exists today; real credentials are a
+  drop-in replacement) and a `session_has_role()` helper (not yet wired into
+  any route -- per-route/action role gating is still a separate future step).
+- Retired the ad hoc `Macha-Viewer-Session`/`X-Macha-Viewer-Session` headers
+  and `viewer_session_id` body field: playback's "logical viewer" correlation
+  (replacing an in-flight session instead of stacking a second stream) is now
+  tied 1:1 to the authenticated session, which also closes a minor spoofing
+  gap (the old idempotency fingerprint trusted an arbitrary client-supplied
+  key). A client wanting several independent concurrent viewers now mints one
+  anonymous session per viewer.
+- Moved playback session creation's `Idempotency-Key` from a request header
+  to an `idempotency_key` query parameter on `POST /api/v1/playback/sessions`.
+  The response no longer echoes the key back, but still reports
+  `X-Macha-Idempotency: created|replayed`, since that value carries real
+  information the client can't otherwise infer.
+- Fixed during joint live testing with the client: `SessionManager::create()`
+  never actually checked `max_sessions` -- only `apply()` (the gossip-received
+  path) did. A client bug (a proactive-refresh timer whose delay silently
+  overflowed on a ~30-day TTL) caused a real re-mint storm against a live dev
+  node; the server handled the load fine but would have grown its local
+  session replica without bound had the storm run longer. `create()` now
+  returns `std::nullopt` (surfaced as `429 too_many_sessions`) once the local
+  cap is reached.
+
 ## 0.23.11 — Snap transcode seeks to source keyframes, cutting seek startup cost (development)
 
 - Live-measured a seek deep into a transcoded HEVC Main10 title costing

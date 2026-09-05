@@ -1,6 +1,149 @@
 # Completed and tested
 
-Last updated: 2026-09-03
+Last updated: 2026-09-05
+
+## Cluster session/auth subsystem, `/api/v1/session` — 0.24.0
+
+- [x] Shipped `POST/GET/DELETE /api/v1/session`: anonymous-only bearer-token
+  session creation, introspection and revocation. Every non-exempt API route
+  now requires `Authorization: Bearer <token>` — this closes the
+  previously-logged "auth optional when `token_file` unset" P0 security gap
+  as a side effect of replacing the mechanism entirely.
+- [x] Sessions are cluster-replicated (push-on-mutation plus periodic gossip
+  backstop, modelled on `TelemetryStore`) and persisted locally, with each
+  node's own in-memory replica doubling as its O(1) lookup cache — no
+  separate cache layer, so a pushed mutation is the invalidation.
+- [x] Retired `Macha-Viewer-Session`/`X-Macha-Viewer-Session`/
+  `viewer_session_id` in favour of the authenticated session id for playback
+  logical-viewer correlation, and moved playback's `Idempotency-Key` from a
+  request header to an `idempotency_key` query parameter.
+- [x] Built extension seams for later work, not yet used: `CredentialValidator`
+  (real, non-anonymous credentials) and `session_has_role()` (per-route/action
+  role gating — still not wired into any route).
+- [x] Fixed during joint live testing: `create()` didn't enforce
+  `max_sessions` (only the gossip `apply()` path did) — a client-side timer
+  bug caused a real re-mint storm against a live dev node. `create()` now
+  returns `nullopt`/`429 too_many_sessions` at capacity; regression test
+  `test_session_create_enforces_max_sessions` added.
+- [x] Coordinated the client-side contract with the Macha UI Work session in
+  parallel; verified end-to-end against a live running node (create → gated
+  route with/without token → introspect → revoke → post-revoke rejection).
+
+Evidence: `CHANGELOG.md` 0.24.0.
+
+2026-09-05: backfilled the eight releases (0.23.4–0.23.11) that shipped after
+this ledger's previous update, found stale during a full backlog
+reprioritisation pass. Full detail for each remains in `CHANGELOG.md`; entries
+below are intentionally brief pointers rather than re-narrated detail.
+
+## Snap transcode seeks to source keyframes — 0.23.11
+
+- [x] Fixed a seek deep into a transcoded title costing ~7s to first fragment
+  by snapping the transcode seek to the nearest source keyframe
+  (`media_vod::nearest_keyframe_at_or_after`), without reusing remux's
+  whole-file density-checked `indexed_plan`, which was observed to silently
+  reject the snap on long files with any sparser GOP elsewhere.
+- [x] Fixed a rounding bug (`llround` → `ceil` on the keyframe timestamp) that
+  was making the container seek land one keyframe early, discarding a full
+  extra GOP for nothing. Verified live: ~7s → ~4s. A residual ~1.7s gap vs.
+  position-zero remains unexplained and is intentionally left open — tracked
+  under playback P0 item 1 above via the `media playback pipeline seek timing`
+  diagnostic added to isolate it.
+
+Evidence: `CHANGELOG.md` 0.23.11.
+
+## Fix seek/generation-replacement stall on stale segment requests — 0.23.10
+
+- [x] Fixed a segment request against a superseded playback generation
+  blocking for the full 15s `streaming.startup_timeout_ms` before returning
+  404, via a reversible `MediaSegmentStore::mark_superseded(bool)` signal
+  distinct from the irreversible `cancel()`.
+- [x] Not confirmed as the cause of a separately reported ~1-2s live A/V
+  offset symptom — that investigation continued into the audio-drift work
+  above.
+
+Evidence: `CHANGELOG.md` 0.23.10.
+
+## Fix audible pitch shift from drift correction, and the drift fix itself — 0.23.8/0.23.9
+
+- [x] 0.23.8 shipped bounded audio drift compensation for transcoded playback
+  (`audio_next_pts` re-anchoring), measured live at ~0.4ms drift/second before
+  the fix.
+- [x] 0.23.9 replaced 0.23.8's `swr_set_compensation()` mechanism (which
+  worked but caused an audible pitch shift, since nudging the resample ratio
+  changes pitch) with libswresample's own `async=1` + `swr_next_pts()`
+  correction, which injects/drops samples rather than changing the ratio.
+  Verified: healthy audio over 8 minutes, drift within ±15ms.
+- [x] Known gap carried forward: no automated regression harness yet for the
+  real (non-stub) transcode audio path — tracked under playback P0 item 1
+  above.
+
+Evidence: `CHANGELOG.md` 0.23.8, 0.23.9.
+
+## Per-node advertised API address for any-node Direct Play failover — 0.23.7
+
+- [x] `/api/v1/status` now reports `api_host`/`api_port` per node, distinct
+  from the internal RPC bind address, fixing failover guessing the wrong port.
+- [x] Added optional `catalogue.api.advertised_host`/`advertised_port` for
+  NAT/port-forwarding. Static config-only for now — UPnP/external-IP probing
+  of this endpoint remains open under P1 above.
+
+Evidence: `CHANGELOG.md` 0.23.7.
+
+## Safe distributed checkpoint and metadata-history compaction — 0.23.6
+
+- [x] `MetadataReplica::compact_history_if_safe()` — an existing, already-tested
+  primitive with zero production callers — is now actually invoked, via a
+  leaderless propose → durable-ack → commit → prune round gated on every
+  durably-known participant acknowledging the same accepted-head hash
+  (mirroring the existing `all_known_reachable()` gate used for destructive
+  object GC). Unbounded `history.log` growth (the direct cause of a prior
+  37MB → 20.9GB blowup) is fixed; a returning node whose floor was pruned
+  elsewhere now converges automatically.
+- [x] No client-visible behaviour change. Confirmed directly against
+  `src/metadata.cpp` during the 2026-09-05 code audit as real and complete,
+  not just a changelog claim — see the still-open byte-bounded-cache/shedding
+  follow-up under the structural-safety P0 tier above.
+
+Evidence: `CHANGELOG.md` 0.23.6.
+
+## Cluster-wide ingest/torrent job visibility and control — 0.23.5
+
+- [x] `GET /api/v1/ingest/jobs` and `/api/v1/torrents/jobs` now answer with
+  every job in the cluster (on-demand RPC survey, not replication), each
+  tagged with its owning `node_id`; an unreachable peer is skipped rather than
+  failing the whole request.
+- [x] `POST .../jobs/{id}/{pause,resume,retry,cancel,clear}` forwards to the
+  owning node when the receiving node doesn't have the job locally, preserving
+  404-vs-409 semantics cluster-wide.
+
+Evidence: `CHANGELOG.md` 0.23.5.
+
+## Signed artwork capability URLs — 0.23.4
+
+- [x] Catalogue responses embed a signed, short-lived capability URL
+  (`?exp=&sig=`, HMAC'd with the cluster auth key) on each artwork reference,
+  letting a client use a plain `<img src>` without a bearer header. Default
+  TTL 24h. Note: the URL is not yet actually cache-friendly — see the P2
+  catalogue item above about `exp`/`sig` needing to be quantized so repeated
+  fetches produce an identical URL.
+
+Evidence: `CHANGELOG.md` 0.23.4.
+
+## Remove per-request connection setup from Status and streaming — 0.23.3
+
+- [x] `http.cpp` negotiates HTTP/1.1 keep-alive by default, with bounded
+  `keep_alive_max_requests`/`keep_alive_idle_timeout`, falling back to
+  `Connection: close` only on explicit request, protocol/version mismatch, or
+  backlog pressure. Verified directly against current `src/http.cpp`.
+- [x] Also shipped in 0.23.3: truthful per-node `phase` (fixing the rolling-
+  deployment incident where recovering nodes reported fabricated-looking
+  healthy zeros) and serialized foreground metadata-head reconciliation
+  (fixing a live 37MB → 20.9GB metadata-history blowup in under a week). The
+  *aggregation* half of Status truthfulness was later found still open — see
+  the P1 item above.
+
+Evidence: `CHANGELOG.md` 0.23.3.
 
 ## Bounded terminal FUSE recovery failure
 
