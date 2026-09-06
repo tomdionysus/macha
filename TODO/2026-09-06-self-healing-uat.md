@@ -343,9 +343,67 @@ the next boot was silent.
   and tail quarantined, checkpoint/history/heads untouched, replica usable.
 - suite 348/348.
 
-## Discipline 4 — compact history out of the hot path
+## Discipline 4 — compact history out of the hot path (0.32.0)
 
-_(pending)_
+### Measuring first (2026-09-06 23:30, gbni-2, `macha-metadata-dump --stats`)
+
+The plan was written on the morning's premise — 270k tombstones making
+15 MB snapshots. The tool built for this discipline says what the
+production head (gen 9903) actually was:
+
+```
+snapshot: encoded_bytes=2319777 entries=1744 (files=269 directories=1475) extents=36083 tombstones=439 conflicts=116
+bytes:    entries=1958969 (of which extents=1768067, paths+attrs=190902) tombstones=24584 conflicts=335749 other=475
+conflicts: namespace_entry=49 catalogue_root=67 identical_alternatives=0 distinct_head_pairs=112
+per_entry_bytes=1330 per_entry_bytes_excluding_extents=316
+```
+
+So: 76% extent tables (the data map — 36,083 × 49 B, not compressible
+without a manifest redesign), **14% standing conflicts nobody knew about**,
+1% tombstones (GC consumes them after `garbage_grace`). The plan's per-node
+retirement log is not justified by the data and was not built; the
+acceptance "≤ 1 KB × live entries" is met excluding extents (316 B) and is
+not meaningful including them.
+
+What *was* costing: every merge delta carried the whole conflict set
+(`history_body=delta history_bytes=335961`, twice in three hours), and 4 of
+es-1's last 5 reconciliations were **full frames of 5.4–7.7 MB** each
+(`history_body=full history_bytes=7749233`), replicated to every node and
+across the WAN — because the merge canonicalises tombstones by ObjectId,
+the primary parent's vector was in append order, and DLT5/6 could not
+express a reorder, so `metadata_delta()` gave up.
+
+### After (0.32.0, deployed 2026-09-06 23:55–23:57 to all three nodes)
+
+The first ordinary mutation on gbni-1 (one `.srt` rsync'd at 23:58):
+
+```
+diagnostics.metadata: conflicts 116 → 10, conflicts_superseded=106, tombstones=439
+metadata mutate mode=delta delta_bytes=162 snapshot_bytes=2261657
+```
+
+106 of the 116 were decided long ago — 49 media paths one writer had since
+republished, 67 catalogue roots the scanner had moved past — and left the
+snapshot in one commit. The 10 that remain are genuine: e.g.
+`/Music/Avicii/Stories/08 City Lights.mp3` left = 15,601,728 B v5, right =
+12,845,056 B v4 (two writers, two different partial generations). The API
+lists them with both alternatives; resolving one:
+
+```
+POST /api/v1/manage/metadata/conflicts/4fd3a5e9…/resolve?choice=left  → 204
+POST … same id again                                                   → 409 not_standing
+diagnostics.metadata: conflicts=9 conflicts_resolved=1
+/mnt/machamedia/Music/Avicii/Stories/08 City Lights.mp3  15601728 bytes
+```
+
+Snapshot on gbni-2 after that: `encoded_bytes=2261698 conflicts=10
+conflicts_bytes=277468` (the ten survivors are the big ones — alternatives
+with extent tables). A same-content rule (same bytes at the same path,
+differing only in version/mtime, as two rsync writers of duplicate media
+produce) was added the same night so those never become conflicts again.
+
+_(merge-delta sizes under DLT7 and the reconciliation body type are
+measured in the closing run below, which produces the merges.)_
 
 ## The demonstrative run
 

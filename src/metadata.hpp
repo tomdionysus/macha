@@ -342,6 +342,10 @@ struct MetadataDelta {
 bool garbage_is_canonical(const std::vector<GarbageRef>&);
 // Sort into canonical order (stable; equal ids keep their relative order).
 void canonicalise_garbage(std::vector<GarbageRef>&);
+// Same bytes at the same path: type, mode, ownership, size and extents equal
+// (mtime/ctime/version may differ). Two writers publishing the same media are
+// not in conflict.
+bool same_content(const FsEntry&, const FsEntry&);
 // Drop every standing conflict whose subject has since been mutated: a
 // namespace_entry conflict whose path no longer holds the common-ancestor
 // value, or a catalogue_root conflict once the root moved on. The later

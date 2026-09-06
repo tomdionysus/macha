@@ -31,6 +31,11 @@ retirement log is not justified by the data and is not built.
   is pruned at the next commit and at every merge
   (`prune_superseded_conflicts`, `MetadataMergeResult::conflicts_superseded`,
   reconciliation log line gains `superseded=N standing=N`).
+- **Same bytes are not a conflict.** Two branches that wrote the same
+  content to the same path (type, mode, ownership, size and extents equal;
+  mtime/version may differ — two rsync writers publishing duplicate media)
+  merge to the deterministic lesser representation instead of a conflict,
+  and a pre-0.32 record of that shape settles the same way at pruning.
 - **Conflicts are visible and resolvable.** `diagnostics.metadata.{conflicts,
   namespace_conflicts, catalogue_conflicts, tombstones, conflicts_superseded,
   conflicts_resolved}`; `GET /api/v1/manage/metadata/conflicts` lists the

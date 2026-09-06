@@ -470,6 +470,11 @@ void canonicalise_garbage(std::vector<GarbageRef>& garbage) {
                      [](const GarbageRef& a, const GarbageRef& b) { return a.id < b.id; });
 }
 
+bool same_content(const FsEntry& a, const FsEntry& b) {
+    return a.type == b.type && a.mode == b.mode && a.uid == b.uid && a.gid == b.gid &&
+           a.size == b.size && a.extents == b.extents;
+}
+
 size_t prune_superseded_conflicts(MetadataSnapshot& snapshot) {
     size_t pruned = 0;
     for (auto it = snapshot.conflicts.begin(); it != snapshot.conflicts.end();) {
@@ -482,6 +487,16 @@ size_t prune_superseded_conflicts(MetadataSnapshot& snapshot) {
             // The merge installs the common-ancestor value at the path; while
             // it is still there nobody has decided. Anything else is a decision.
             superseded = live != conflict.base_entry;
+            // Two alternatives with the same bytes are not a decision anyone
+            // needs to make (a pre-0.32 merge recorded these); settle them
+            // exactly as the merge now does.
+            if (!superseded && conflict.left_entry && conflict.right_entry &&
+                same_content(*conflict.left_entry, *conflict.right_entry)) {
+                snapshot.entries[conflict.key] = (*conflict.left_entry < *conflict.right_entry)
+                                                     ? *conflict.left_entry
+                                                     : *conflict.right_entry;
+                superseded = true;
+            }
         } else if (conflict.kind == MetadataConflictKind::catalogue_root) {
             superseded = snapshot.catalogue_root != conflict.base_catalogue_root;
         }
@@ -1650,12 +1665,13 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
             continue;
         }
 
-        // Independently creating the same directory is semantically compatible
-        // even though wall-clock ctime/mtime differ. Use the deterministic lesser
-        // representation so every reconciler produces the same commit hash.
-        if (!b && l && r && l->type == EntryType::directory && r->type == EntryType::directory &&
-            l->mode == r->mode && l->uid == r->uid && l->gid == r->gid && l->size == r->size &&
-            l->extents == r->extents) {
+        // Independently creating the same directory, or writing the same
+        // bytes to the same file (two rsync writers publishing duplicate
+        // media, 2026-09-06), is semantically compatible even though
+        // wall-clock ctime/mtime and the version counter differ. Use the
+        // deterministic lesser representation so every reconciler produces
+        // the same commit hash.
+        if (l && r && same_content(*l, *r)) {
             install_entry(path, (*l < *r) ? l : r);
             continue;
         }
