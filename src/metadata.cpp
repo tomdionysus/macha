@@ -3,6 +3,7 @@
 #include "codec.hpp"
 #include "durable_file.hpp"
 #include "log.hpp"
+#include "startup_progress.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
@@ -544,6 +545,7 @@ Bytes encode_snapshot(const MetadataSnapshot& s) {
     return w.take();
 }
 MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
+    note_startup_progress();
     Reader r(d);
     auto m = r.raw(8);
     const bool v5 = std::equal(m.begin(), m.end(), SM5.begin());
@@ -1050,6 +1052,7 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
 }
 
 void apply_metadata_delta_in_place(MetadataSnapshot& out, const MetadataDelta& delta) {
+    note_startup_progress();
     for (const auto& [node, sequence] : delta.mutation_sequences) {
         auto it = out.mutation_sequences.find(node);
         if (it != out.mutation_sequences.end() && sequence < it->second)

@@ -80,6 +80,12 @@ void parse_network(const YAML::Node& root, Config& c) {
         c.connect_timeout = milliseconds(n["connect_timeout_ms"], "connect_timeout_ms");
     if (n["max_frame_size"])
         c.max_frame_size = yaml_size(n["max_frame_size"]);
+    if (n["control_no_progress_deadline_ms"])
+        c.control_no_progress_deadline =
+            milliseconds(n["control_no_progress_deadline_ms"], "control_no_progress_deadline_ms");
+    if (n["data_no_progress_deadline_ms"])
+        c.data_no_progress_deadline =
+            milliseconds(n["data_no_progress_deadline_ms"], "data_no_progress_deadline_ms");
     if (n["control_stall_notice_ms"])
         c.control_stall_notice =
             milliseconds(n["control_stall_notice_ms"], "control_stall_notice_ms");
@@ -228,6 +234,28 @@ void parse_fuse(const YAML::Node& root, Config& c) {
     if (f["recovery_commit_workers"]) c.fuse.recovery_commit_workers = f["recovery_commit_workers"].as<size_t>();
     if (f["foreground_commit_workers"]) c.fuse.foreground_commit_workers = f["foreground_commit_workers"].as<size_t>();
     if (f["publication_quiet_ms"]) c.fuse.publication_quiet = milliseconds(f["publication_quiet_ms"], "fuse.publication_quiet_ms");
+    if (f["publication_retry_initial_backoff_ms"])
+        c.fuse.publication_retry.initial_backoff =
+            milliseconds(f["publication_retry_initial_backoff_ms"], "fuse.publication_retry_initial_backoff_ms");
+    if (f["publication_retry_max_backoff_ms"])
+        c.fuse.publication_retry.max_backoff =
+            milliseconds(f["publication_retry_max_backoff_ms"], "fuse.publication_retry_max_backoff_ms");
+    if (f["publication_retry_window_ms"])
+        c.fuse.publication_retry.failure_window =
+            milliseconds(f["publication_retry_window_ms"], "fuse.publication_retry_window_ms");
+    if (f["publication_retry_max_failures"])
+        c.fuse.publication_retry.max_failures_in_window = f["publication_retry_max_failures"].as<size_t>();
+    if (f["namespace_retry_initial_backoff_ms"])
+        c.fuse.namespace_retry.initial_backoff =
+            milliseconds(f["namespace_retry_initial_backoff_ms"], "fuse.namespace_retry_initial_backoff_ms");
+    if (f["namespace_retry_max_backoff_ms"])
+        c.fuse.namespace_retry.max_backoff =
+            milliseconds(f["namespace_retry_max_backoff_ms"], "fuse.namespace_retry_max_backoff_ms");
+    if (f["namespace_retry_window_ms"])
+        c.fuse.namespace_retry.failure_window =
+            milliseconds(f["namespace_retry_window_ms"], "fuse.namespace_retry_window_ms");
+    if (f["namespace_retry_max_failures"])
+        c.fuse.namespace_retry.max_failures_in_window = f["namespace_retry_max_failures"].as<size_t>();
     if (f["viewer_weight"]) c.fuse.viewer_weight = f["viewer_weight"].as<size_t>();
     if (f["loader_weight"]) c.fuse.loader_weight = f["loader_weight"].as<size_t>();
     if (f["publication_quantum_bytes"])
@@ -567,6 +595,9 @@ Config load_yaml_config(const std::filesystem::path& path) {
     if (root["service_startup_timeout_ms"])
         c.service_startup_timeout =
             milliseconds(root["service_startup_timeout_ms"], "service_startup_timeout_ms");
+    if (root["service_startup_no_progress_ms"])
+        c.service_startup_no_progress =
+            milliseconds(root["service_startup_no_progress_ms"], "service_startup_no_progress_ms");
 
     auto storage = root["storage"];
     if (!storage || !storage.IsMap())

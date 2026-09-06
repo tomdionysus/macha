@@ -171,5 +171,8 @@ class Service {
     void attach_fuse_frontend(std::weak_ptr<FuseFrontend>);
     std::optional<BlockedNamespaceOperation> blocked_namespace_operation() const;
     bool skip_blocked_namespace_operation(uint64_t sequence);
+    std::vector<ParkedPublication> parked_publications() const;
+    bool retry_parked_publication(uint64_t inode);
+    bool abandon_parked_publication(uint64_t inode);
 };
 } // namespace macha

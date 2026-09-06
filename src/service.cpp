@@ -4,6 +4,7 @@
 #include "fuse_frontend.hpp"
 #include "json.hpp"
 #include "log.hpp"
+#include "startup_progress.hpp"
 #include "supervised.hpp"
 #include <algorithm>
 #include <charconv>
@@ -135,6 +136,21 @@ bool Service::skip_blocked_namespace_operation(uint64_t sequence) {
     return frontend && frontend->skip_blocked_namespace_operation(sequence);
 }
 
+std::vector<ParkedPublication> Service::parked_publications() const {
+    auto frontend = fuse_frontend_.lock();
+    return frontend ? frontend->parked_publications() : std::vector<ParkedPublication>{};
+}
+
+bool Service::retry_parked_publication(uint64_t inode) {
+    auto frontend = fuse_frontend_.lock();
+    return frontend && frontend->retry_parked_publication(inode);
+}
+
+bool Service::abandon_parked_publication(uint64_t inode) {
+    auto frontend = fuse_frontend_.lock();
+    return frontend && frontend->abandon_parked_publication(inode);
+}
+
 Service::~Service() {
     stop();
 }
@@ -201,6 +217,51 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
                               "no namespace operation with this sequence is currently blocked");
         return {204, "application/json; charset=utf-8", {}, {}};
     }
+    constexpr std::string_view parked_path = "/api/v1/manage/filesystem/parked-publications";
+    if (request.path == parked_path) {
+        if (request.method != "GET")
+            return http_error(405, "method", "GET required");
+        Json::Array items;
+        for (const auto& parked : parked_publications()) {
+            items.push_back(Json(Json::Object{
+                {"inode", parked.inode},
+                {"path", parked.path},
+                {"error_code", parked.error_code},
+                {"error_message", parked.error_message},
+                {"attempts", static_cast<uint64_t>(parked.attempts)},
+                {"failing_for_ms", static_cast<uint64_t>(parked.failing_for.count())},
+                {"parked_for_ms", static_cast<uint64_t>(parked.parked_for.count())},
+                {"pending_bytes", parked.pending_bytes}}));
+        }
+        return http_json(200, Json(Json::Object{{"parked", std::move(items)}}).dump());
+    }
+    if (request.path.starts_with(std::string(parked_path) + "/")) {
+        if (request.method != "POST")
+            return http_error(405, "method", "POST required");
+        // /parked-publications/<inode>/retry | /abandon
+        const auto rest = request.path.substr(parked_path.size() + 1);
+        const auto slash = rest.find('/');
+        if (slash == std::string::npos)
+            return http_error(404, "not_found", "expected /parked-publications/{inode}/retry|abandon");
+        uint64_t inode = 0;
+        const auto id = rest.substr(0, slash);
+        auto [end, ec] = std::from_chars(id.data(), id.data() + id.size(), inode);
+        if (ec != std::errc{} || end != id.data() + id.size())
+            return http_error(400, "bad_inode", "inode must be a non-negative integer");
+        const auto action = rest.substr(slash + 1);
+        bool ok = false;
+        if (action == "retry")
+            ok = retry_parked_publication(inode);
+        else if (action == "abandon")
+            ok = abandon_parked_publication(inode);
+        else
+            return http_error(404, "not_found", "action must be retry or abandon");
+        if (!ok)
+            return http_error(409, "not_parked",
+                              "no parked publication for this inode, or it cannot be "
+                              "abandoned while writes are still landing");
+        return {204, "application/json; charset=utf-8", {}, {}};
+    }
     if (request.path.starts_with("/api/v1/manage"))
         return manage_api_->handle(request);
     return catalogue_api_->handle(request);
@@ -235,11 +296,36 @@ std::string Service::describe_readiness_stall() const {
 void Service::wait_services_ready() {
     if (services_ready_.load(std::memory_order_acquire))
         return;
+    // Discipline 2: the gate fires on *no progress*, not on elapsed time. A
+    // slow recovery that keeps ticking startup_progress() (frames parsed,
+    // deltas applied, journal records read, readiness stages) is left alone;
+    // one that has not ticked for service_startup_no_progress is a stall. An
+    // absolute ceiling is honoured only when configured.
+    const auto& config = node_.config();
+    const auto started = Clock::now();
+    auto last_progress_at = started;
+    auto last_progress = startup_progress();
+    bool signalled = false;
     std::unique_lock lock(startup_mutex_);
-    const bool signalled = startup_cv_.wait_for(lock, node_.config().service_startup_timeout, [this] {
-        return services_ready_.load(std::memory_order_acquire) ||
-               startup_failed_.load(std::memory_order_acquire);
-    });
+    for (;;) {
+        signalled = startup_cv_.wait_for(lock, std::chrono::seconds(1), [this] {
+            return services_ready_.load(std::memory_order_acquire) ||
+                   startup_failed_.load(std::memory_order_acquire);
+        });
+        if (signalled)
+            break;
+        const auto now = Clock::now();
+        if (const auto progress = startup_progress(); progress != last_progress) {
+            last_progress = progress;
+            last_progress_at = now;
+        }
+        if (config.service_startup_no_progress.count() > 0 &&
+            now - last_progress_at >= config.service_startup_no_progress)
+            break;
+        if (config.service_startup_timeout.count() > 0 &&
+            now - started >= config.service_startup_timeout)
+            break;
+    }
     if (services_ready_.load(std::memory_order_acquire))
         return;
     lock.unlock();
@@ -257,9 +343,16 @@ void Service::wait_services_ready() {
     // unstuck instance; recovery replay on the next boot is what actually
     // resolves the stalled state, not this process limping on.
     const auto diagnostic = describe_readiness_stall();
-    const auto message = "service startup stalled after " +
-                         std::to_string(node_.config().service_startup_timeout.count()) +
-                         "ms; " + diagnostic + "; terminating for restart";
+    const auto message =
+        "service startup stalled: no recovery progress for " +
+        std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                           Clock::now() - last_progress_at)
+                           .count()) +
+        "ms (gate " + std::to_string(config.service_startup_no_progress.count()) +
+        "ms, ceiling " + std::to_string(config.service_startup_timeout.count()) + "ms, elapsed " +
+        std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started)
+                           .count()) +
+        "ms); " + diagnostic + "; terminating for restart";
     Log::error(message);
     if (startup_stall_handler_) {
         // Test-only: observe the stall without killing the test process. The
