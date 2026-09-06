@@ -50,13 +50,17 @@ current at every checkpoint; a fresh session reads only this and the plan.
   `durable[key]` bookkeeping when touching the barrier next.
 - [x] **Discipline 2 — one work-item retry policy + no-progress startup gate.** DONE: 0.30.0 on all nodes (`bb3697c`), UAT 2a/2b/2c recorded in `2026-09-06-self-healing-uat.md` (pass: 254 retries at 10/s → 16 retries then park at 22.8 s; operator retry drains; RPC deadline fires at 30 s; startup ceiling removed). gbni-1 config back on shipped defaults.
 - [x] **Discipline 3 — resolve-on-recovery + journal fuzz fixture.** DONE: 0.31.0 on all nodes (`21ebe79`), UAT recorded (pass: gbni-1 23→5→0 boot WARNs, journal 132 MB→8 B, spool 183 MB→0; es-1 22,997 pending ops / 6 GB / 218 MB journal resolved in one boot, second boot silent).
-- [ ] Discipline 4 — compact tombstones/conflicts out of snapshots (+ DLT7).
-- [ ] UAT record: `TODO/2026-09-XX-self-healing-uat.md` with before/after
-  evidence per discipline; the demonstrative run is two concurrent rsync
-  writers (gbni-1 and es-1 from their `/mnt/diskA`) with rolling restarts of
-  every node mid-publication, showing no wedges, no re-sent extents, bounded
-  retries visible in Status, sub-10 s restarts, and snapshot sizes
-  proportional to the namespace.
+- [x] **Discipline 4 — compact history out of the hot path (+ DLT7).** DONE: 0.32.0 on all nodes (`27c1903`, `96c3413`); measured-first scope (no retirement log); conflicts 116 → 9, merge delta 335,961 B → 277 B, no full-frame reconciliations.
+- [x] **UAT record complete**: `2026-09-06-self-healing-uat.md`, all four disciplines + the closing demonstrative run (2026-09-07 00:08–00:22: two concurrent writers, five rolling restarts incl. a writer, 0 ERROR, 1 WARN, 0 wedges, 277-byte merge delta). **PROGRAMME COMPLETE.**
+
+## Programme status: COMPLETE (2026-09-07 00:25)
+
+Nothing is in flight. A wake-up that reads this file should: verify all
+three nodes are `active` with 0 boot WARNs and journals at 8 bytes, and
+otherwise stop — the scheduled job (`61c413f7`) can be deleted. Follow-ups
+are filed in the UAT file's last section (present-content skip on writer
+restart; journal compaction while busy; compact extent encoding; the 9
+standing conflicts need a human via the manage API).
 
 ## Discipline 1 — working notes
 

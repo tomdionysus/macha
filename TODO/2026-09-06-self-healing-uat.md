@@ -405,9 +405,67 @@ produce) was added the same night so those never become conflicts again.
 _(merge-delta sizes under DLT7 and the reconciliation body type are
 measured in the closing run below, which produces the merges.)_
 
-## The demonstrative run
+## The demonstrative run (2026-09-07 00:08–00:22, 0.32.0 on all nodes)
 
-_(pending: two concurrent rsync writers, gbni-1 and es-1 from their own
-`/mnt/diskA`, rolling restarts of every node mid-publication; no wedges, no
-re-sent extents, bounded retries visible in Status, sub-10 s restarts,
-snapshot sizes proportional to the namespace.)_
+Script: `final-run.sh` (session scratch; the shape is below). Two writers
+at once, each rsync'ing from its own read-only `/mnt/diskA`:
+
+- gbni-1 → `/mnt/machamedia/UAT/final/gbni-1/`: *Jurassic Park* 2,115,421,676 B
+  + *Prometheus* 2,136,029,979 B (local disk, ~8 MB/s publish);
+- es-1 → `…/final/es-1/`: *Idiocracy* 1,051,957,331 B + *Dog Soldiers*
+  1,373,380,284 B (over the ~50 Mbps WAN);
+
+and five `systemctl restart macha.service` while both were publishing:
+gbni-2 at +2:27, es-1 at +4:13, **gbni-1 (a writer) at +5:59**, gbni-2
+at +8:13, es-1 at +10:29. Every node was back in 1–2 s
+(`Started` → `local services ready`: 00:10:55→56, 01:12:41→43,
+00:14:27→29, 00:16:41→42, 01:18:57→59). Both spools drained by 00:21:55,
+13.5 minutes after the first byte.
+
+Result, from each node's journal over the whole window:
+
+| | gbni-1 (writer) | gbni-2 (replica) | es-1 (writer, restarted twice) |
+|---|---|---|---|
+| ERROR / WARN | 0 / 1 | 0 / 0 | 0 / 0 |
+| durability re-derived after peer restart | `reasserted=355 absent=0` ×2 | — | `present=355/355` ×2 |
+| quorum unavailable / replays / parked / abandoned | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| publication retries (backed off) | 4 | 0 | 0 |
+| RPC no-progress cancellations / skipped journal frames | 0 / 0 | 0 / 0 | 0 / 0 |
+| metadata mutations | 11, all `mode=delta` | — | 9, all `mode=delta` |
+| reconciliation | `history_body=delta history_bytes=277 conflicts=0 standing=9` | same | same |
+
+The one WARN is gbni-1's own restart mid-publication: `recovered durable
+FUSE operations pending=16221 namespace=0 inodes=2` — it resumed both
+files from its spool and finished them (a writer restart still re-sends
+from its last durable checkpoint; the present-content skip plan is the
+follow-up, unchanged since discipline 1). All four files are at their
+exact source size on gbni-2. Snapshot after the run: 2,339,893 B for 1,753
+entries / 37,681 extents (the four new files' extent tables are the
+growth), 9 standing conflicts (the operator's), 439 tombstones; history
+`frames=108 full=6 delta=102 anomalies=0`.
+
+Against the plan's acceptance list:
+
+- **no wedges** — five restarts, two of them of a writer, zero
+  `quorum unavailable`, zero parked, zero abandoned, every node ready in
+  ≤ 2 s; before the programme one peer restart stranded every in-flight
+  publication forever;
+- **no re-sent extents on a peer restart** — 355 extents on es-1 re-stamped
+  twice, `absent=0`, none re-put;
+- **bounded retries visible in Status** — 4 backed-off retries on gbni-1,
+  each logged with its delay, `parked_publications=0`;
+- **sub-10 s restarts** — 1–2 s;
+- **compact history** — the reconciliation was a **277-byte delta**
+  (335,961 bytes, or a 5–8 MB full frame, on 2026-09-06), every mutation a
+  delta, and the snapshot's size is its entries.
+
+**Verdict: the programme's four disciplines hold together under the load
+and the restarts that produced six P0s in one afternoon on 2026-09-06.**
+
+What is deliberately left (all filed, none blocking):
+- writer-restart re-send (present-content skip);
+- journal compaction while busy (journal resets only when idle;
+  `max_operation_journal_bytes` bounds it);
+- extent tables are 79% of the snapshot — a compact contiguous-extent
+  encoding could roughly halve it; not a habit, an optimisation;
+- the 9 standing conflicts want a human (two different rips at one path).
