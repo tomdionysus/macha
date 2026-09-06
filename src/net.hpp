@@ -60,6 +60,12 @@ enum class MessageType : uint16_t {
     propose_history_floor = 37,
     commit_history_floor = 38,
     session_sync = 39,
+    have_objects = 40,
+    // 0.27.0: the immutable record for a history hash as a self-contained
+    // full-body entry, materialized by the serving peer (get_metadata_history_entry
+    // returns the peer's *stored* frame, which may be exactly the delta the
+    // caller cannot replay). Reply: metadata_history_entry_reply.
+    get_metadata_history_record = 41,
     ok = 100,
     error = 101,
     members_reply = 102,
@@ -77,7 +83,8 @@ enum class MessageType : uint16_t {
     ingest_job_action_reply = 114,
     torrent_jobs_reply = 115,
     torrent_job_action_reply = 116,
-    session_sync_reply = 117
+    session_sync_reply = 117,
+    have_objects_reply = 118
 };
 
 // Transport priority is a property of the frame type itself. There is no

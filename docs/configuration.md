@@ -9,10 +9,11 @@ The 0.18 storage schema is intentionally incompatible with the old top-level sto
 ```yaml
 state_path: /var/lib/macha
 key_file: /etc/macha.key
-mount_path: /srv/media
+fuse:
+  mount_path: /srv/media
 ```
 
-`state_path` contains node identity, namespace metadata state, maintenance state and—unless overridden—the metadata control-object store. `key_file` must contain the same secret material on every node in a cluster.
+`state_path` contains node identity, namespace metadata state, maintenance state and—unless overridden—the metadata control-object store. `key_file` must contain the same secret material on every node in a cluster. `fuse.mount_path` is optional; omit it to run without a FUSE mount.
 
 A fresh state namespace is required. Non-empty unversioned state is refused.
 
@@ -92,6 +93,8 @@ dht:
   read_ahead: 3
   metadata_cache_ms: 250
   metadata_materialization_cache_bytes: 128M
+  retention_check_batch_size: 2000
+  retention_check_concurrency: 8
 ```
 
 - `replicas`: desired converged authoritative DATA copies.
@@ -102,6 +105,8 @@ dht:
 - `data_inflight_bytes`: node-wide byte budget for blocking DATA object reads, writes, and transfers.
 - `data_viewer_reserve_bytes`: non-borrowable headroom inside that budget for foreground playback and read-ahead. Loader and speculative work remain work-conserving within the rest of the budget, but cannot consume this reserve. It must be smaller than `data_inflight_bytes`, and the difference must fit at least one `extent_size` object.
 - `metadata_materialization_cache_bytes`: bounded process-memory budget for decoded metadata snapshots and their immutable records. Historical payloads remain in `history.log` and are read on demand. The default is `128M`.
+- `retention_check_batch_size`: extent IDs per `have_objects` presence-check RPC issued while planning a DATA retention claim (e.g. accepting a metadata publication). Must fit within `network.max_frame_size` (32 bytes/id plus a small header).
+- `retention_check_concurrency`: maximum `have_objects` batches in flight at once, across all peers combined, from a single retention claim. Bounds fan-out against any one peer for an arbitrarily large publication.
 
 Replica policy should be identical across the cluster and changed as a coordinated cluster operation. `metadata_min_write_replicas: 2` means any two active nodes, not two preselected nodes.
 

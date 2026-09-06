@@ -5,6 +5,7 @@
 #include "crypto.hpp"
 #include "fuse_journal.hpp"
 #include "log.hpp"
+#include "supervised.hpp"
 #include "macos_unicode.hpp"
 
 #include <algorithm>
@@ -1731,8 +1732,12 @@ struct FuseFrontend::State {
         }
         case JournalRecord::namespace_done: {
             const auto sequence = reader.u64();
+            // Normally done implies published -- but an operator can abandon
+            // an operation wedged on a non-retryable backend error (see
+            // skip_blocked_namespace_operation()), which retires it as done
+            // without ever publishing it. Only require that the sequence is a
+            // known op and not already retired.
             if (!recovery.namespace_ops.contains(sequence) ||
-                !recovery.namespace_published.contains(sequence) ||
                 !recovery.namespace_done.insert(sequence).second)
                 throw DecodeError("invalid FUSE namespace completion marker");
             break;
@@ -4331,7 +4336,9 @@ struct FuseFrontend::State {
 
         // Local write durability is independent of distributed publication. It
         // must be available before broker write workers can accept callbacks.
-        durability_worker = std::jthread([this](std::stop_token stop) { durability_loop(stop); });
+        durability_worker = std::jthread([this](std::stop_token stop) {
+            run_supervised("fuse-durability", [this, stop] { durability_loop(stop); });
+        });
 
         // Guarantee at least one independent worker for each operation class,
         // then distribute the remaining budget toward reads/writes/lookups.
@@ -4348,10 +4355,14 @@ struct FuseFrontend::State {
             ++workers;
         }
 
-        namespace_worker = std::jthread([this](std::stop_token stop) { namespace_loop(stop); });
+        namespace_worker = std::jthread([this](std::stop_token stop) {
+            run_supervised("fuse-namespace", [this, stop] { namespace_loop(stop); });
+        });
         data_workers.reserve(config.commit_workers);
         for (size_t i = 0; i < config.commit_workers; ++i)
-            data_workers.emplace_back([this](std::stop_token stop) { data_loop(stop); });
+            data_workers.emplace_back([this](std::stop_token stop) {
+                run_supervised("fuse-data", [this, stop] { data_loop(stop); });
+            });
 
         // Recovery is reconstructed before worker startup so kernel-visible state
         // is complete before the frontend is exposed. Resume asynchronous

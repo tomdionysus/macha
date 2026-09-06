@@ -4,6 +4,7 @@
 
 #include "json.hpp"
 #include "log.hpp"
+#include "supervised.hpp"
 
 #include <algorithm>
 #include <array>
@@ -167,8 +168,12 @@ void HttpServer::start() {
     const auto worker_count = std::max<size_t>(1, config_.workers);
     workers_.reserve(worker_count);
     for (size_t i = 0; i < worker_count; ++i)
-        workers_.emplace_back([this](std::stop_token stop) { worker(stop); });
-    accept_thread_ = std::jthread([this](std::stop_token stop) { run(stop); });
+        workers_.emplace_back([this](std::stop_token stop) {
+            run_supervised("http-worker", [this, stop] { worker(stop); });
+        });
+    accept_thread_ = std::jthread([this](std::stop_token stop) {
+        run_supervised("http-accept", [this, stop] { run(stop); });
+    });
     std::unique_lock lock(startup_mutex_);
     startup_cv_.wait(lock, [this] { return startup_complete_; });
     if (!startup_error_.empty()) {

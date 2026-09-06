@@ -3,4 +3,17 @@
 #include <string_view>
 namespace macha {
 inline constexpr std::string_view kServerVersion{"@PROJECT_VERSION@"};
+
+// Build-identity stamp for the subsystem plugin ABI (see subsystem_abi.hpp):
+// version plus commit, so a skewed build (same version, different commit) is
+// still caught, not just a version bump.
+inline constexpr std::string_view kBuildCommit{"@MACHA_BUILD_COMMIT@"};
+inline constexpr std::string_view kBuildIdentity{"@PROJECT_VERSION@+@MACHA_BUILD_COMMIT@"};
+
+// Default Config::plugin_path when unset: this build's private plugin
+// directory under CMAKE_INSTALL_PREFIX at configure time. A compile-time
+// constant, not derived from the running executable's own location -- this
+// is a private library directory (see CMakeLists.txt's MACHA_PLUGIN_INSTALL_DIR),
+// not necessarily anywhere near where the executable itself was installed.
+inline constexpr std::string_view kDefaultPluginDir{"@MACHA_PLUGIN_INSTALL_DIR_FULL@"};
 }

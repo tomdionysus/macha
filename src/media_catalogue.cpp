@@ -4,6 +4,7 @@
 
 #include "crypto.hpp"
 #include "log.hpp"
+#include "supervised.hpp"
 #include "macha_version.hpp"
 #include "media_metadata.hpp"
 #include "media_information.hpp"
@@ -2477,7 +2478,9 @@ void CatalogueScanner::start() {
     if (!config_.enabled || worker_.joinable()) return;
     http_->reset_stop();
     hints_.requeue_processing();
-    worker_ = std::jthread([this](std::stop_token stop) { loop(stop); });
+    worker_ = std::jthread([this](std::stop_token stop) {
+        run_supervised("catalogue-scanner", [this, stop] { loop(stop); });
+    });
 }
 void CatalogueScanner::request_stop() {
     if (worker_.joinable()) worker_.request_stop();

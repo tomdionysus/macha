@@ -2552,6 +2552,77 @@ MACHA_TEST("filesystem_fuse",
     CHECK(service.filesystem().getattr("/wedge").type == EntryType::file);
 }
 
+MACHA_TEST("filesystem_fuse",
+          test_fuse_journal_replays_operator_skipped_op_without_a_published_marker) {
+    // skip_blocked_namespace_operation() journals a namespace_done marker for
+    // an operation that was never published (that is the whole point -- it
+    // never succeeded). A crash immediately after or a later restart must
+    // replay that "done without published" marker cleanly rather than
+    // treating it as corrupt journal state: a node that abandoned a wedged
+    // operation once must not crash-loop on every subsequent startup.
+    TestService fixture("fuse-skip-then-restart");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.fuse.publication_quiet = 30s;
+    config.fuse.suspend_loader_for_tests = true;
+    auto& service = fixture.start();
+
+    // A second, never-skipped wedge queued behind the first keeps the journal
+    // from fully quiescing/compacting once the first is resolved -- matching
+    // the real incident, where other unresolved queue state meant the
+    // abandoned op's journal record was still there to replay on the next
+    // restart. Without this, the journal ends up fully "done" and the
+    // specific bug (replaying a lone namespace_done with no namespace_published)
+    // never gets exercised.
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        service.filesystem().store().foreground_activity(1);
+        frontend->mkdir("/wedge", 0755, getuid(), getgid());
+        frontend->mkdir("/wedge2", 0755, getuid(), getgid());
+        frontend->stop();
+    }
+    service.filesystem().create_file("/wedge", 0644, getuid(), getgid());
+    service.filesystem().create_file("/wedge2", 0644, getuid(), getgid());
+
+    auto replay = config.fuse;
+    replay.publication_quiet = 0ms;
+    uint64_t skipped_sequence = 0;
+    {
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+        service.attach_fuse_frontend(recovered);
+        REQUIRE(wait_until([&] { return recovered->blocked_namespace_operation().has_value(); }, 10s));
+        auto blocked = recovered->blocked_namespace_operation();
+        REQUIRE(blocked.has_value());
+        REQUIRE(blocked->path == "/wedge");
+        skipped_sequence = blocked->sequence;
+        REQUIRE(recovered->skip_blocked_namespace_operation(skipped_sequence));
+        // The second wedge (/wedge2) is deliberately left unresolved: wait
+        // for it to become the new blocked op rather than for full idle,
+        // which this queue can never reach.
+        REQUIRE(wait_until([&] {
+            auto next = recovered->blocked_namespace_operation();
+            return next && next->path == "/wedge2";
+        }, 10s));
+        recovered->stop();
+    }
+
+    // This is the exact scenario that used to crash-loop: a fresh restart
+    // replaying a journal that contains a namespace_done record for the
+    // skipped sequence with no namespace_published ever recorded for it.
+    auto restarted = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    service.attach_fuse_frontend(restarted);
+    REQUIRE(wait_until([&] {
+        auto blocked = restarted->blocked_namespace_operation();
+        return blocked && blocked->path == "/wedge2";
+    }, 10s));
+    CHECK(service.filesystem().getattr("/wedge").type == EntryType::file);
+    CHECK(service.filesystem().getattr("/wedge2").type == EntryType::file);
+    REQUIRE(restarted->skip_blocked_namespace_operation(restarted->blocked_namespace_operation()->sequence));
+    REQUIRE(restarted->wait_for_idle(10s));
+    restarted->stop();
+}
+
 MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_trims_torn_tail) {
     TestService fixture("fuse-journal-torn-tail");
     auto& config = fixture.config();

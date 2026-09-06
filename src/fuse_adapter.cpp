@@ -8,6 +8,7 @@
 #include "diagnostics.hpp"
 #include "fuse_frontend.hpp"
 #include "log.hpp"
+#include "supervised.hpp"
 #include "macos_unicode.hpp"
 
 #include <algorithm>
@@ -575,6 +576,7 @@ int run_fuse(FileSystem& filesystem, CacheHydrator& hydrator,
     std::atomic_bool mount_seen{true};
 
     std::jthread mount_watchdog([&](std::stop_token stop) {
+      run_supervised("fuse-mount-watchdog", [&] {
         size_t consecutive_misses = 0;
         size_t consecutive_probe_errors = 0;
         constexpr size_t missing_threshold = 3;
@@ -622,6 +624,7 @@ int run_fuse(FileSystem& filesystem, CacheHydrator& hydrator,
             fuse_session_exit(session);
             return;
         }
+      });
     });
 
     Log::debug("shutdown: entering bounded FUSE main loop");

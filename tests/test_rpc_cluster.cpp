@@ -1090,6 +1090,87 @@ MACHA_TEST("rpc_cluster", test_rpc_health_and_control_not_starved_by_data) {
     server.stop();
 }
 
+MACHA_TEST("rpc_cluster", test_have_objects_flood_does_not_delay_unrelated_control_rpc) {
+    // Governing invariant from the 2026-09-06 retention-check-batching
+    // incident: a flood of retention-check traffic (have_object/have_objects)
+    // must never be able to delay an unrelated control-plane message,
+    // unconditionally -- not "should usually hold," under an
+    // adversarial-sized batch. have_objects (like have_object and
+    // retain_objects before it) always uses a data-lane FrameType
+    // (loader/speculative), which RpcServer routes to data_workers_ --  a
+    // pool entirely separate from the fast_control_workers_/control_workers_
+    // pools that service ping/members/put_control_object/etc regardless of
+    // frame type. This test proves that separation holds even when every
+    // data worker is simultaneously blocked servicing have_objects.
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto port = free_port();
+
+    NodeInfo server_info;
+    server_info.id = random_node_id();
+    server_info.host = "127.0.0.1";
+    server_info.port = port;
+    server_info.failure_domain = "server-site";
+
+    TestGate data_workers_gate;
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (request.type == MessageType::have_objects) {
+                data_workers_gate.enter_and_wait();
+                Writer writer;
+                writer.u32(0);
+                return RpcMessage{MessageType::have_objects_reply, writer.take()};
+            }
+            if (request.type == MessageType::members)
+                return RpcMessage{MessageType::members_reply, {}};
+            if (request.type == MessageType::ping)
+                return RpcMessage{MessageType::ok, {}};
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {});
+    server.start();
+
+    NodeInfo client_info;
+    client_info.id = random_node_id();
+    client_info.host = "127.0.0.1";
+    client_info.port = free_port();
+    client_info.failure_domain = "client-site";
+
+    RpcClient client(
+        keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 500ms,
+        100ms, 2s);
+    Endpoint endpoint{"127.0.0.1", port};
+
+    // Occupy every data worker with have_objects requests, exactly the shape
+    // an adversarially large retain_data() batch produces. Health and
+    // membership must remain prompt regardless.
+    std::vector<AsyncRpc> bulk;
+    for (int i = 0; i < 8; ++i)
+        bulk.push_back(
+            client.call_async(endpoint, MessageType::have_objects, Bytes{}, FrameType::loader));
+    REQUIRE(data_workers_gate.wait_for_entries(6));
+
+    auto started = Clock::now();
+    auto health = client.call(endpoint, MessageType::ping, {}, 20ms);
+    CHECK(health.message.type == MessageType::ok);
+    CHECK(Clock::now() - started < 150ms);
+
+    started = Clock::now();
+    auto control = client.call(endpoint, MessageType::members, {}, 20ms);
+    CHECK(control.message.type == MessageType::members_reply);
+    CHECK(Clock::now() - started < 150ms);
+
+    data_workers_gate.open();
+    for (auto& rpc : bulk) {
+        REQUIRE(rpc.wait_for(1s) == std::future_status::ready);
+        CHECK(rpc.get().message.type == MessageType::have_objects_reply);
+    }
+
+    client.stop();
+    server.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_rpc_health_not_starved_by_slow_control_handlers) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
@@ -4139,6 +4220,76 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_round_compacts_across
     CHECK(s1.filesystem().getattr("/b").type == EntryType::directory);
     CHECK(s2.filesystem().getattr("/a").type == EntryType::directory);
     CHECK(s2.filesystem().getattr("/b").type == EntryType::directory);
+
+    s2.stop();
+    s1.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_unreconstructable_accepted_head_is_repaired_live_from_a_peer) {
+    // 2026-09-06: a head the local replica cannot replay must be repaired
+    // over the wire from a peer that can still materialize it -- while the
+    // node keeps running. Exercises get_metadata_history_record end to end:
+    // MetadataManager::repair_unreconstructable_heads() -> peer's
+    // MetadataReplica::full_history_record() -> local reanchor_history().
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto p1 = free_port();
+    auto p2 = free_port();
+    auto c1 = config_for(cluster.path() / "repair-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "repair-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }));
+    s1.filesystem().mkdir("/a", 0755, getuid(), getgid());
+    REQUIRE(wait_until([&] {
+        try {
+            return s2.filesystem().getattr("/a").type == EntryType::directory;
+        } catch (...) {
+            return false;
+        }
+    }));
+
+    auto& replica = s2.node().metadata_replica();
+    auto certificates = replica.accepted_head_certificates();
+    REQUIRE(certificates.size() == 1);
+    const auto head = certificates.front().hash;
+    CHECK(s1.node().metadata_replica().history_contains(head));
+
+    // Break the head on s2 exactly the way the incident presented: the
+    // replica confirms it cannot reconstruct it, excludes it and flags it.
+    replica.set_force_unreconstructable_for_tests(
+        [head](const Hash256& hash) { return hash == head; });
+    (void)replica.accepted_heads();
+    REQUIRE(wait_until([&] {
+        return replica.unreconstructable_heads() == std::vector<Hash256>{head};
+    }));
+    // Lift the simulated fault; the flag (30s cooldown) persists on its own,
+    // so only the repair path can clear it inside this test's window.
+    replica.set_force_unreconstructable_for_tests({});
+
+    REQUIRE(wait_until([&] {
+        (void)s2.metadata_manager().repair_unreconstructable_heads();
+        return replica.unreconstructable_heads().empty();
+    }));
+    CHECK(replica.accepted_heads().size() == 1);
+    CHECK(replica.accepted_heads().front().hash == head);
+    CHECK(s2.filesystem().getattr("/a").type == EntryType::directory);
+
+    // The wire call itself, independently of the driver.
+    Writer request;
+    request.fixed(head.bytes);
+    auto reply = s2.node().call(s1.node().membership().self(),
+                                MessageType::get_metadata_history_record, request.take(),
+                                FrameType::control);
+    REQUIRE(reply.message.type == MessageType::metadata_history_entry_reply);
+    auto served = decode_metadata_history_entry(reply.message.payload);
+    CHECK(served.hash == head);
+    CHECK(served.body == MetadataHistoryEntry::Body::full);
 
     s2.stop();
     s1.stop();

@@ -5,6 +5,7 @@
 #include "crypto.hpp"
 #include "json.hpp"
 #include "log.hpp"
+#include "supervised.hpp"
 #include "macha_version.hpp"
 
 #include <algorithm>
@@ -785,7 +786,9 @@ void TorrentManager::save_state_locked() const {
 void TorrentManager::start() {
     if (!config_.enabled || worker_.joinable()) return;
     restore_jobs();
-    worker_ = std::jthread([this](std::stop_token stop) { loop(stop); });
+    worker_ = std::jthread([this](std::stop_token stop) {
+        run_supervised("torrent", [this, stop] { loop(stop); });
+    });
 }
 
 void TorrentManager::request_stop() {

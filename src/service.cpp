@@ -4,6 +4,7 @@
 #include "fuse_frontend.hpp"
 #include "json.hpp"
 #include "log.hpp"
+#include "supervised.hpp"
 #include <algorithm>
 #include <charconv>
 #include <cmath>
@@ -92,10 +93,13 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
                  MaintenanceStageHook maintenance_stage_hook,
                  StartupStallHandler startup_stall_handler)
     : node_(std::move(config), keys, std::move(startup_stage_hook)), cluster_status_(node_),
+      subsystems_(node_.config().plugin_path.value_or(std::filesystem::path{}),
+                 SubsystemContext{&node_.config()}),
       session_api_(node_), startup_stall_handler_(std::move(startup_stall_handler)),
       maintenance_stage_hook_(std::move(maintenance_stage_hook)) {
     cluster_status_.attach_convergence_diagnostics(
         [this] { return metadata_convergence_.diagnostics(); });
+    cluster_status_.attach_subsystem_diagnostics([this] { return subsystems_.statuses(); });
     if (node_.config().catalogue.api.enabled) {
         catalogue_http_ = std::make_unique<HttpServer>(
             node_.config().catalogue.api,
@@ -360,8 +364,9 @@ void Service::initialise_services(std::stop_token stop) {
         // ordinary maintenance without scheduling redundant metadata work.
         metadata_convergence_.request(node_.known_metadata_generation());
         node_.set_service_event_callback([this](ServiceEvent event) { signal_maintenance(event); });
-        maintenance_ =
-            std::jthread([this](std::stop_token maintenance_stop) { loop(maintenance_stop); });
+        maintenance_ = std::jthread([this](std::stop_token maintenance_stop) {
+            run_supervised("service-maintenance", [this, maintenance_stop] { loop(maintenance_stop); });
+        });
 
         services_ready_.store(true, std::memory_order_release);
         startup_cv_.notify_all();
@@ -383,11 +388,14 @@ void Service::start() {
     // operators can observe startup even before the cluster listener or any
     // durable backend begins recovery.
     cluster_status_.start();
+    subsystems_.start();
     if (catalogue_http_)
         catalogue_http_->start();
 
     node_.start();
-    startup_ = std::jthread([this](std::stop_token stop) { initialise_services(stop); });
+    startup_ = std::jthread([this](std::stop_token stop) {
+        run_supervised("service-startup", [this, stop] { initialise_services(stop); });
+    });
 }
 
 void Service::request_stop() {
@@ -442,6 +450,8 @@ void Service::stop() {
     if (hydration_)
         hydration_->stop();
     cluster_status_.detach_metadata();
+    cluster_status_.detach_subsystem_diagnostics();
+    subsystems_.stop();
     cluster_status_.stop();
     if (catalogue_http_)
         catalogue_http_->stop();
@@ -1226,6 +1236,18 @@ void Service::loop(std::stop_token stop) {
             // thresholds are actually due, and aborts silently -- retrying
             // next cycle -- unless every participant is currently reachable
             // and already agrees on a single head.
+            // An accepted head this replica cannot replay locally is excluded
+            // from reads (MetadataReplica cooldown) and re-anchored here from
+            // any peer that can still materialize it -- the live alternative
+            // to the old restart-and-quarantine path. A no-op unless a head
+            // is actually flagged.
+            try {
+                (void)metadata_->repair_unreconstructable_heads();
+            } catch (const std::exception& error) {
+                Log::debug("maintenance: metadata head repair failed: " +
+                           std::string(error.what()));
+            }
+
             if (!busy) {
                 try {
                     metadata_->attempt_history_checkpoint();

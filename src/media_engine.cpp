@@ -3,6 +3,7 @@
 #include "subtitle_text.hpp"
 
 #include "log.hpp"
+#include "supervised.hpp"
 #include "media_timestamps.hpp"
 #include "media_vod.hpp"
 
@@ -1350,7 +1351,9 @@ class LibavSession final : public MediaEngineSession {
           store_(std::make_shared<MediaSegmentStore>(max_ahead_segments, memory_limit,
                                                      std::move(spill_directory), segment_duration,
                                                      vod_plan_.segment_durations)) {
-        worker_ = std::jthread([this](std::stop_token stop) { run(stop); });
+        worker_ = std::jthread([this](std::stop_token stop) {
+            run_supervised("media-engine-session", [this, stop] { run(stop); });
+        });
     }
 
     ~LibavSession() override { stop(); }
@@ -1735,11 +1738,18 @@ class LibavMediaEngine final : public MediaEngine {
 
 };
 
-} // namespace
-
-std::unique_ptr<MediaEngine> make_libav_media_engine(const StreamingConfig& config) {
+std::unique_ptr<MediaEngine> make_libav_media_engine_impl(const StreamingConfig& config) {
     return std::make_unique<LibavMediaEngine>(config);
 }
 
+// Registers this FFmpeg-backed implementation into macha_core's factory slot
+// (see media_engine_common.cpp) as soon as this translation unit is linked
+// into an executable, before main() runs.
+struct MediaEngineRegistration {
+    MediaEngineRegistration() { set_media_engine_factory(make_libav_media_engine_impl); }
+};
+const MediaEngineRegistration media_engine_registration;
+
+} // namespace
 
 } // namespace macha

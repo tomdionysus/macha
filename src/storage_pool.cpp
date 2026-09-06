@@ -756,6 +756,11 @@ StoragePool::rebalance_step(uint64_t budget_bytes, size_t operation_budget,
             if (!store)
                 continue;
             try {
+                // Unlike has_on()'s candidate probe (protected by retain_on's
+                // downstream re-verify), nothing re-checks this decision: a
+                // corrupt "preferred" copy must not be counted as a valid
+                // holder, or the last genuinely-valid copy elsewhere can be
+                // deleted as a believed-redundant duplicate.
                 if (store->valid(id)) {
                     holders.push_back({backend, store});
                     estimated = std::max(estimated, store->stored_size(id));

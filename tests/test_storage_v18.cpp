@@ -509,6 +509,67 @@ MACHA_TEST("storage_v18", test_pack_compaction_waits_for_preopen_reader_lease) {
     CHECK(store.get(live_id) == std::optional<Bytes>{live});
 }
 
+MACHA_TEST("storage_v18", test_has_is_a_cheap_presence_check_not_a_decrypt) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+
+    LocalStoreOptions options;
+    options.limit = 64ULL * 1024 * 1024;
+    options.pack_threshold = 256 * 1024;
+    options.pack_target_size = 1024 * 1024;
+    LocalStore store(t.path() / "store", options, keys.storage);
+
+    // Loose (above pack_threshold) and packed (below it) objects exercise the
+    // two different presence-check code paths.
+    auto loose = pattern(512 * 1024, 0x71);
+    auto loose_id = object_id(loose);
+    auto packed = pattern(64 * 1024, 0x72);
+    auto packed_id = object_id(packed);
+    REQUIRE(store.put(loose_id, loose));
+    REQUIRE(store.put(packed_id, packed));
+    REQUIRE(!store.is_packed(loose_id));
+    REQUIRE(store.is_packed(packed_id));
+
+    std::atomic_bool loose_read{false};
+    std::atomic_bool packed_read{false};
+    store.set_before_loose_read_for_tests([&](const ObjectId&) { loose_read = true; });
+    store.set_before_packed_read_for_tests([&](const ObjectId&) { packed_read = true; });
+
+    // The regression this guards against: has() silently going back through
+    // get()/valid() (a full read, AES-GCM decrypt and integrity check) instead
+    // of the cheap index/stat-only path. Assert on the actual decrypt-path
+    // hook firing, not just on the returned boolean, so a revert is caught
+    // even if it happens to still return the right answer.
+    CHECK(store.has(loose_id));
+    CHECK(store.has(packed_id));
+    CHECK(!loose_read.load());
+    CHECK(!packed_read.load());
+
+    // Confirm the hooks actually work: a real read must still fire them.
+    CHECK(store.get(loose_id).has_value());
+    CHECK(store.get(packed_id).has_value());
+    CHECK(loose_read.load());
+    CHECK(packed_read.load());
+
+    CHECK(!store.has(ObjectId{}));
+
+    // A loose write is temp-file-then-rename, so a real object is never
+    // observed partially written; a zero-byte file only happens after
+    // external corruption/truncation and must not be reported present.
+    auto truncated = pattern(512 * 1024, 0x73);
+    auto truncated_id = object_id(truncated);
+    REQUIRE(store.put(truncated_id, truncated));
+    REQUIRE(store.has(truncated_id));
+    {
+        std::ofstream truncate(store.object_path(truncated_id),
+                              std::ios::binary | std::ios::trunc);
+        REQUIRE(truncate.good());
+    }
+    CHECK(!store.has(truncated_id));
+}
+
 MACHA_TEST("storage_v18", test_metadata_control_store_is_independent_of_data_quota) {
     TestNode fixture("metadata-priority");
     auto& config = fixture.config();
@@ -835,6 +896,68 @@ MACHA_TEST("storage_v18", test_min_write_floor_publishes_then_repair_converges_t
     }, 5s));
     REQUIRE(second.node().local_store().get(id).has_value());
     CHECK(*second.node().local_store().get(id) == data);
+}
+
+MACHA_HEAVY_TEST("storage_v18", test_retain_data_batches_a_large_publication_within_bounded_time) {
+    // Reproduces the 2026-09-06 incident at test scale: a single metadata
+    // publication whose delta references thousands of DATA extents (the real
+    // incident was tens of thousands; this test uses fewer so setup -- which
+    // this test does not exercise the fix for -- doesn't dominate runtime).
+    // Before
+    // batching, retain_data() checked candidate presence with one
+    // has_on()/have_object round trip (a full local decrypt, or a real
+    // network RPC) per (extent, candidate) pair, serially, on the thread that
+    // also drives metadata-publication acceptance -- this is exactly what
+    // pinned a CPU core and froze publication for minutes. min_write_replicas
+    // == replication == 2 here so every extent's floor requires checking
+    // *both* nodes, exercising both the local cheap-presence path and the
+    // batched remote have_objects RPC path.
+    TestCluster cluster(ConfigProfile::isolated);
+    const auto a_port = free_port();
+    const auto b_port = free_port();
+    auto a_config =
+        storage_node_config(cluster, "retain-a", a_port, 64ULL * 1024 * 1024, 2, 1, {}, 2);
+    auto b_config = storage_node_config(cluster, "retain-b", b_port, 64ULL * 1024 * 1024, 2, 1,
+                                        {{"127.0.0.1", a_port}}, 2);
+    StorageClusterNode a(std::move(a_config), cluster.keys());
+    StorageClusterNode b(std::move(b_config), cluster.keys());
+    a.start();
+    b.start();
+    REQUIRE(wait_until([&] {
+        return a.node().membership().active().size() == 2 &&
+               b.node().membership().active().size() == 2;
+    }, 5s));
+
+    constexpr size_t extents = 3000;
+    std::vector<ObjectId> ids;
+    ids.reserve(extents);
+    for (size_t i = 0; i < extents; ++i) {
+        auto data = pattern(256, static_cast<uint8_t>(i));
+        data[0] ^= static_cast<uint8_t>(i >> 8);
+        const auto id = object_id(data);
+        // Placement directly through each node's own LocalStore, bypassing
+        // DistributedStore::put()'s network replication and (via
+        // put_deferred) an immediate per-object fsync barrier: setup only
+        // needs both replicas visible on disk, exactly as an already
+        // fully-replicated foreground write would be by the time a
+        // publication naming it is accepted. What this test times is
+        // retain_data() itself, not getting these objects onto disk.
+        REQUIRE(a.node().local_store().put_deferred(id, data));
+        REQUIRE(b.node().local_store().put_deferred(id, data));
+        ids.push_back(id);
+    }
+    CHECK(a.node().local_store().has(ids.front()));
+    CHECK(b.node().local_store().has(ids.front()));
+
+    const RetentionDot dot{a.node().node_id(), 1};
+    const auto started = std::chrono::steady_clock::now();
+    CHECK(a.store().retain_data(ids, dot));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    // Batched presence checks complete in a handful of have_objects round
+    // trips regardless of extent count; this bound is far looser than that to
+    // stay robust on slow/loaded CI hardware, but comfortably catches a
+    // regression back to one round trip (of any kind) per extent.
+    CHECK(elapsed < 10s);
 }
 
 MACHA_TEST("storage_v18", test_catalogue_metadata_ignores_full_data_quota_and_artwork_uses_data_fallback) {
