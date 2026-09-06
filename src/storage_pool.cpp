@@ -584,6 +584,38 @@ bool StoragePool::has(const ObjectId& id) const {
     return false;
 }
 
+std::optional<StoragePool::DurabilityToken> StoragePool::reassert_durable(const ObjectId& id) {
+    for (const auto& backend : ranked(id)) {
+        std::shared_ptr<LocalStore> store;
+        std::filesystem::path path;
+        uint64_t backend_instance = 0;
+        uint64_t domain = 0;
+        {
+            std::lock_guard lock(backend->mutex);
+            if (!backend->online || !backend->store || !backend->durability_domain ||
+                !backend->instance_id)
+                continue;
+            store = backend->store;
+            path = backend->cfg.path;
+            backend_instance = backend->instance_id;
+            domain = backend->durability_domain->id();
+        }
+        try {
+            if (!store->has(id))
+                continue;
+            // Anything this incarnation wrote reaches disk before the token is
+            // handed out; what a previous incarnation wrote is on disk by
+            // construction, since the index was rebuilt from the packs.
+            store->durability_barrier();
+            return DurabilityToken{domain, store->durable_generation(), backend_instance};
+        } catch (const std::exception& error) {
+            Log::warn("storage durability reassertion failed " + path.string() + ": " +
+                      error.what());
+        }
+    }
+    return {};
+}
+
 bool StoragePool::valid(const ObjectId& id) const {
     for (const auto& backend : ranked(id)) {
         std::shared_ptr<LocalStore> store;

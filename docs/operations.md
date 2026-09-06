@@ -235,6 +235,24 @@ The practical consequences for an operator:
   libtorrent refused to start the node. It now starts, reports the subsystem
   `unavailable`, and serves everything else.
 
+## Durability tokens and restarts
+
+A publication proves that its extents reached the write floor with placement
+tokens: `(node, durability epoch, domain, generation, backend instance)`. The
+epoch is fresh for every process and the backend instance for every reopen,
+so a token can only be *checked* by the incarnation that issued it. Since
+0.29.0 a token that outlived its incarnation is not a failure: the writer's
+barrier sends the object ids to the peer, the peer answers from its disk —
+an object present after a restart is durable, because the pack index is
+rebuilt from the packs on open and the probe flushes the current incarnation
+before replying — and hands out fresh tokens. Journal evidence on the writer:
+`object durability re-derived after incarnation change reasserted=N absent=M
+peers=P`; on the peer: `object durability re-derived after epoch change
+present=N/M`. Only `absent` objects cost anything: they are re-put from a
+local copy if one exists, otherwise the generation is replayed from the FUSE
+spool (`FUSE async data publication replay …`). Restarting a node therefore
+no longer strands publications in flight on other nodes.
+
 ## Cluster status and telemetry
 
 `GET /api/v1/status` merges two deliberately different telemetry planes:
