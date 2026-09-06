@@ -2413,6 +2413,262 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_conflict_resolution_is_not_res
     CHECK(merged.snapshot.entries.contains("/unrelated"));
 }
 
+MACHA_FAST_TEST("storage_metadata", test_metadata_merge_delta_preserves_standing_conflicts) {
+    // Regression for the 2026-09-06 "local metadata delta rejected; retrying
+    // full record" storm. When both parents of a reconciliation carry the same
+    // unresolved conflict, the merge leaves the conflict set unchanged and
+    // metadata_delta() left replace_conflicts unset. DLT6 cannot say
+    // "unchanged": the decoder reads the empty list back as "replace with
+    // nothing", the replay loses the standing conflict, the reconstruction no
+    // longer matches the record, and every replica -- local and peer -- fell
+    // back to a 15 MB full snapshot for every conflict-free merge.
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto origin = random_node_id();
+
+    const auto genesis = genesis_metadata();
+    auto base = decode_snapshot(genesis.payload);
+    base.metadata_voters.clear();
+    base.metadata_write_replicas_required = 1;
+    base.retention_baseline_complete = true;
+    MetadataConflict standing;
+    standing.kind = MetadataConflictKind::namespace_entry;
+    standing.key = "/standing";
+    standing.left_head = sha256(pattern(31));
+    standing.right_head = sha256(pattern(32));
+    const auto standing_id = metadata_conflict_id(standing);
+    base.conflicts.emplace(standing_id, standing);
+
+    FsEntry directory;
+    directory.type = EntryType::directory;
+    directory.mode = 0755;
+    auto left = base;
+    left.mutation_sequences[origin] = 1;
+    left.entries["/left"] = directory;
+    auto right = base;
+    right.entries["/right"] = directory;
+
+    MetadataRecord base_record;
+    base_record.generation = genesis.generation + 1;
+    base_record.previous = genesis.hash;
+    base_record.payload = encode_snapshot(base);
+    base_record.hash =
+        metadata_hash(base_record.generation, base_record.previous, base_record.payload);
+    auto make_child = [&](const MetadataSnapshot& snapshot) {
+        MetadataRecord record;
+        record.generation = base_record.generation + 1;
+        record.previous = base_record.hash;
+        record.payload = encode_snapshot(snapshot);
+        record.hash = metadata_hash(record.generation, record.previous, record.payload);
+        return record;
+    };
+    const auto left_record = make_child(left);
+    const auto right_record = make_child(right);
+    REQUIRE(left_record.hash != right_record.hash);
+
+    auto merged =
+        merge_metadata_snapshots(base, left, right, left_record.hash, right_record.hash);
+    CHECK(merged.conflicts_created == 0);
+    REQUIRE(merged.snapshot.conflicts.contains(standing_id));
+    merged.snapshot.merge_parents = {right_record.hash};
+
+    MetadataRecord merge;
+    merge.generation = left_record.generation + 1;
+    merge.previous = left_record.hash;
+    merge.payload = encode_snapshot(merged.snapshot);
+    merge.hash = metadata_hash(merge.generation, merge.previous, merge.payload);
+
+    auto delta = metadata_delta(left, merged.snapshot);
+    REQUIRE(delta.has_value());
+    const auto encoded = encode_metadata_delta(*delta);
+    REQUIRE(encoded.size() >= 8);
+    CHECK(encoded[7] == '6');
+    const auto replayed = apply_metadata_delta(left, decode_metadata_delta(encoded));
+    CHECK(replayed.conflicts.contains(standing_id));
+    CHECK(encode_snapshot(replayed) == merge.payload);
+
+    // The replica's own exact-reconstruction check is what rejected these.
+    MetadataReplica replica(t.path() / "standing-conflict", keys.storage);
+    REQUIRE(replica.store_commit(base_record));
+    REQUIRE(replica.store_commit(left_record));
+    REQUIRE(replica.store_commit(right_record));
+    REQUIRE(replica.store_commit(merge, encoded));
+    const auto stored = replica.history_entry(merge.hash);
+    REQUIRE(stored.has_value());
+    CHECK(stored->body == MetadataHistoryEntry::Body::delta);
+    REQUIRE(replica.historical(merge.hash).has_value());
+    CHECK(replica.historical(merge.hash)->payload == merge.payload);
+}
+
+MACHA_FAST_TEST("storage_metadata", test_metadata_delta_child_of_merge_commit_reconstructs) {
+    // The first ordinary mutation after a reconciliation clears merge_parents.
+    // DLT6 expresses that replacement, so the write must not need a full
+    // snapshot -- and, with a standing conflict on the merge commit, the
+    // delta has to carry the conflict set along with the cleared parents.
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto origin = random_node_id();
+
+    const auto genesis = genesis_metadata();
+    auto parent = decode_snapshot(genesis.payload);
+    parent.metadata_voters.clear();
+    parent.metadata_write_replicas_required = 1;
+    parent.retention_baseline_complete = true;
+    MetadataConflict standing;
+    standing.kind = MetadataConflictKind::namespace_entry;
+    standing.key = "/standing";
+    standing.left_head = sha256(pattern(41));
+    standing.right_head = sha256(pattern(42));
+    const auto standing_id = metadata_conflict_id(standing);
+    parent.conflicts.emplace(standing_id, standing);
+    parent.merge_parents = {sha256(pattern(77))};
+
+    MetadataRecord parent_record;
+    parent_record.generation = genesis.generation + 1;
+    parent_record.previous = genesis.hash;
+    parent_record.payload = encode_snapshot(parent);
+    parent_record.hash = metadata_hash(parent_record.generation, parent_record.previous,
+                                       parent_record.payload);
+
+    auto child = parent;
+    child.merge_parents.clear();
+    child.mutation_sequences[origin] = 1;
+    FsEntry file;
+    file.type = EntryType::file;
+    file.mode = 0644;
+    file.version = 1;
+    child.entries["/after-merge"] = file;
+
+    MetadataRecord child_record;
+    child_record.generation = parent_record.generation + 1;
+    child_record.previous = parent_record.hash;
+    child_record.payload = encode_snapshot(child);
+    child_record.hash =
+        metadata_hash(child_record.generation, child_record.previous, child_record.payload);
+
+    auto delta = metadata_delta(parent, child);
+    REQUIRE(delta.has_value());
+    const auto encoded = encode_metadata_delta(*delta);
+    REQUIRE(encoded.size() >= 8);
+    CHECK(encoded[7] == '6');
+    const auto replayed = apply_metadata_delta(parent, decode_metadata_delta(encoded));
+    CHECK(replayed.merge_parents.empty());
+    CHECK(replayed.conflicts.contains(standing_id));
+    CHECK(encode_snapshot(replayed) == child_record.payload);
+
+    const auto path = t.path() / "delta-after-merge";
+    {
+        MetadataReplica replica(path, keys.storage);
+        REQUIRE(replica.store_commit(parent_record));
+        REQUIRE(replica.store_commit(child_record, encoded));
+        const auto stored = replica.history_entry(child_record.hash);
+        REQUIRE(stored.has_value());
+        CHECK(stored->body == MetadataHistoryEntry::Body::delta);
+    }
+    // Cold replay walks the delta over the merge-commit anchor and checks the
+    // reconstructed merge_parents against the indexed ones.
+    MetadataReplica reopened(path, keys.storage);
+    REQUIRE(reopened.historical(child_record.hash).has_value());
+    CHECK(reopened.historical(child_record.hash)->payload == child_record.payload);
+}
+
+MACHA_FAST_TEST("storage_metadata", test_metadata_delta_tombstone_edits_are_linear) {
+    // gbni-1, 2026-09-06: replaying one reconciliation delta (45-65k tombstone
+    // upserts against ~270k tombstones) took minutes because every erase and
+    // upsert scanned the whole garbage vector, and the node crash-looped on
+    // its 120 s startup budget. The indexed replacement must keep the exact
+    // old semantics -- checked against a naive reference on a small input --
+    // and finish a large input in bounded time.
+    auto make_id = [](uint64_t n) {
+        ObjectId id{};
+        for (int b = 0; b < 8; ++b)
+            id.bytes[static_cast<size_t>(b)] = static_cast<uint8_t>((n >> (8 * b)) & 0xff);
+        return id;
+    };
+    auto tombstone = [&](uint64_t n, int64_t retired) {
+        GarbageRef ref;
+        ref.id = make_id(n);
+        ref.retired_at_ns = retired;
+        return ref;
+    };
+    auto naive_apply = [](MetadataSnapshot& out, const MetadataDelta& delta) {
+        for (const auto& id : delta.erase_garbage)
+            std::erase_if(out.garbage, [&](const GarbageRef& g) { return g.id == id; });
+        for (const auto& garbage : delta.upsert_garbage) {
+            auto it = std::find_if(out.garbage.begin(), out.garbage.end(),
+                                   [&](const GarbageRef& v) { return v.id == garbage.id; });
+            if (it == out.garbage.end())
+                out.garbage.push_back(garbage);
+            else
+                *it = garbage;
+        }
+    };
+    auto build = [&](uint64_t count, uint64_t edits, MetadataSnapshot& before,
+                     MetadataDelta& delta) {
+        before = decode_snapshot(genesis_metadata().payload);
+        before.garbage.reserve(count);
+        for (uint64_t i = 0; i < count; ++i)
+            before.garbage.push_back(tombstone(i, static_cast<int64_t>(i) + 1));
+        // A duplicate id, so "erase removes every copy" is exercised too.
+        before.garbage.push_back(tombstone(7, 700));
+        for (uint64_t i = 0; i < edits; ++i) {
+            delta.erase_garbage.push_back(make_id(i * 10 + 7));          // existing, incl. id 7
+            delta.upsert_garbage.push_back(tombstone(i * 10 + 3, -1));    // replace in place
+            delta.upsert_garbage.push_back(tombstone(count + i, 5));      // append
+        }
+    };
+
+    {
+        MetadataSnapshot before;
+        MetadataDelta delta;
+        build(2000, 60, before, delta);
+        auto expected = before;
+        naive_apply(expected, delta);
+        const auto actual = apply_metadata_delta(before, delta);
+        REQUIRE(actual.garbage.size() == expected.garbage.size());
+        CHECK(actual.garbage == expected.garbage);
+    }
+
+    {
+        constexpr uint64_t count = 200000;
+        constexpr uint64_t edits = 20000;
+        MetadataSnapshot before;
+        MetadataDelta delta;
+        build(count, edits, before, delta);
+        const auto started = std::chrono::steady_clock::now();
+        const auto after = apply_metadata_delta(before, delta);
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        // The scanning version needs ~10^10 comparisons here; 10 s is a
+        // generous bound for the indexed one on a loaded test host.
+        CHECK(elapsed < 10s);
+        CHECK(after.garbage.size() == count + 1 - (edits + 1) + edits);
+        CHECK(std::none_of(after.garbage.begin(), after.garbage.end(),
+                           [&](const GarbageRef& g) { return g.id == make_id(7); }));
+        // Retained tombstones keep their relative order (ids were inserted in
+        // index order, so decoded indexes must still ascend); appended ones
+        // follow in delta order.
+        auto index_of = [](const ObjectId& id) {
+            uint64_t n = 0;
+            for (int b = 7; b >= 0; --b)
+                n = (n << 8) | id.bytes[static_cast<size_t>(b)];
+            return n;
+        };
+        REQUIRE(after.garbage.size() > edits);
+        size_t order_violations = 0;
+        for (uint64_t i = 1; i + edits < after.garbage.size(); ++i)
+            if (index_of(after.garbage[i - 1].id) >= index_of(after.garbage[i].id))
+                ++order_violations;
+        CHECK(order_violations == 0);
+        for (uint64_t i = 0; i < edits; ++i)
+            CHECK(after.garbage[after.garbage.size() - edits + i].id == make_id(count + i));
+        CHECK(after.garbage[3].retired_at_ns == -1);
+    }
+}
+
 MACHA_FAST_TEST("storage_metadata", test_metadata_divergent_renames_become_conflicts) {
     const auto genesis = genesis_metadata();
     auto base = decode_snapshot(genesis.payload);

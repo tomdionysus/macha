@@ -2547,6 +2547,25 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
         },
         10s));
 
+    // The first write after a reconciliation used to be forced to a full
+    // snapshot because DLT5 could not clear the merge commit's merge_parents.
+    // DLT6 can, so it must stay a compact delta over the merge commit.
+    auto merge_heads = s1.node().metadata_replica().accepted_heads();
+    REQUIRE(merge_heads.size() == 1);
+    const auto merge_head = merge_heads.front();
+    const auto merge_entry = s1.node().metadata_replica().history_entry(merge_head.hash);
+    REQUIRE(merge_entry.has_value());
+    REQUIRE(merge_entry->merge_parents.size() == 1);
+
+    s1.filesystem().mkdir("/after-merge", 0755, getuid(), getgid());
+    auto after_heads = s1.node().metadata_replica().accepted_heads();
+    REQUIRE(after_heads.size() == 1);
+    const auto after_entry = s1.node().metadata_replica().history_entry(after_heads.front().hash);
+    REQUIRE(after_entry.has_value());
+    CHECK(after_entry->previous == merge_head.hash);
+    CHECK(after_entry->merge_parents.empty());
+    CHECK(after_entry->body == MetadataHistoryEntry::Body::delta);
+
     s2.stop();
     s1.stop();
 }

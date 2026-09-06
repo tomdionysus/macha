@@ -129,6 +129,79 @@ None of these came from a TODO/FIXME comment — there are none anywhere in
 `src/` or `tests/`. Each was independently verified against current source,
 not inferred from docs. All are small and isolated; none require design work.
 
+- [ ] **FUSE data publication can wedge permanently on `object durability
+  quorum unavailable before publication` (live, gbni-1 and es-1, 2026-09-06)
+  — root cause not yet proven; instrumentation shipped in 0.28.3.** After the
+  day's restarts, three recovered inodes on gbni-1 retried
+  `required=1 durable=0` on the same object ids for the whole life of each
+  process (~2/s each, `fuse_frontend.cpp` retries with a fixed 100 ms sleep
+  and no backoff), occupying publication workers while 14.5 GB sat in the
+  spool and the WAN socket idled — the actual reason bulk writes "felt
+  slow". What the code allows: the writer's `durability_batch_` is cleared
+  only after a *successful* barrier (`filesystem.cpp`), and
+  `publication->writer` is reused across retries, so a requirement naming a
+  peer's `durability_epoch` (`cluster.cpp:143`, fresh per process) outlives
+  that peer's restart and every later barrier is refused with `storage
+  durability epoch changed`. The first failures preceded any peer restart,
+  and the failure lines carried no per-replica detail even with the 0.28.3
+  logging, which means those requirements had an *empty* replica list —
+  where that comes from is the open question. Next: read the
+  `replica=… outcome=…` detail on the next occurrence; then (a) on a
+  permanent refusal, drop the stale requirement and re-put the object from
+  the spool (the WAL) instead of retrying the same batch, (b) exponential
+  backoff on publication retries, (c) a peer-side presence check on epoch
+  mismatch so a clean restart doesn't force a re-put.
+  - [ ] Related hot loop: during startup recovery the frontend spins on
+    `FUSE namespace advanced during data publication` at ~40/s before the
+    namespace is even up (seen in every crash-loop attempt on gbni-1).
+  - [ ] **FUSE journal can hold two inodes on one path** (gbni-1: 11240 vs
+    7270 on `/TV/Big.Mistakes.S01E01…mkv`, a create-over of a file whose
+    previous inode still had pending data). 0.28.3 resolves it at recovery
+    instead of exiting, and re-journals the loser; find why the displacing
+    op did not clear the old path (`unlink`/`rename` journal the descriptor
+    *before* clearing `current_path` and rely on the op record at replay),
+    and add the hand-built-journal test.
+  - [ ] Startup budget: `service_startup_timeout_ms` defaults to 120 s and
+    turns any slow-but-progressing recovery into an infinite crash loop
+    (eight times on gbni-1 today). Either make it scale with journal/history
+    size, or only fire when recovery makes no progress. gbni-1 carries a
+    temporary 1800000 in its config.
+- [ ] **A FUSE mount can stop adopting the cluster namespace (live, gbni-1,
+  2026-09-06) — root cause fixed in 0.28.2, three related gaps still open.**
+  The mount sat two hours behind its own replica: a namespace op published
+  before a restart was recovered as "unconfirmed", its effect had since been
+  overwritten, and `refresh_namespace_if_stale()` refused every newer view
+  while any op was unconfirmed. 0.28.2 retires published ops at recovery
+  and confirms live ones by generation (`NamespaceOp::published_generation`),
+  and exposes `namespace_refreshed_revision`/`namespace_available_revision`
+  plus `FUSE namespace refresh deferred reason=…` so staleness is visible.
+  The `stat` 0-bytes-on-two-nodes finding in the next item is plausibly the
+  same mechanism (a mount holding a pre-publication entry): rechecked
+  2026-09-06 15:50 before the 0.28.2 rollout, all three mounts already
+  agreed on 2421711002 bytes after the day's restarts, which is what a stale
+  mount (not stale data) predicts. The op that wedged gbni-1 was
+  `seq=149 kind=chmod` on an 'Allo 'Allo episode. Still open:
+  - [ ] Adoption is also refused while any op is *queued or in flight*
+    (`fuse_frontend.cpp` `namespace-queue`/`queue-race` deferrals). An op
+    retrying on a retryable backend error (write floor unavailable, peer
+    down) therefore blinds the mount to every remote change for as long as
+    the retry lasts. Replace the global gate with per-path protection: skip
+    only the paths touched by pending ops (`snapshot_path_shadowed()` in the
+    recovery path already has the exact rule), adopt everything else, and
+    re-run adoption when the pending set changes.
+  - [ ] A crash between `apply_namespace_backend()` returning and the
+    `namespace_published` journal marker re-publishes the op on recovery
+    unless `namespace_effect_confirmed()` happens to see it; a re-published
+    `mkdir` gets EEXIST, which is non-retryable, which wedges the queue
+    behind an operator skip. Journal the marker before reporting success,
+    or treat EEXIST-with-matching-entry as achieved.
+  - [ ] `unlink`/rename-over/truncate do not abandon the inode's queued data
+    publication (`journal_data_abandoned` is only reached from
+    `abandon_corrupt_data`), so a file created, spooled and removed before
+    its extents ship still pushes every extent over the WAN. Retire
+    unpublished `data_ops` when an inode loses its last path and has no
+    writable handles, and drop its spool. (Raised by the operator during
+    the 2026-09-06 investigation; confirmed against the code.)
 - [ ] **`rm -rf` on a FUSE-mounted directory fails with "directory not empty"
   and has no effect, and `stat()` of the identical path returns a different
   size on different nodes (live findings, 2026-09-06) — likely one root
@@ -492,6 +565,13 @@ plausible contributor to "the mount feels slow with a big library" if that's
 ever reported, and is worth fixing opportunistically rather than waiting for
 that report.
 
+- [ ] **Every merge delta carries the whole standing conflict set (~305 KB on
+  the cluster today, growing with the set).** DLT6 has no presence flags, so
+  after 0.28.2 `metadata_delta()` must send `replace_conflicts` whenever
+  `merge_parents` changes. Fix is a DLT7 with a flags byte — see
+  `2026-09-06-dlt7-presence-flags-for-branch-topology.md`. Not urgent: it
+  replaced a 15 MB full snapshot per merge, but it's ~100 merges/day × 3
+  replicas of pure history growth.
 - [ ] **`readdir` is O(entire namespace).** `fuse_frontend.cpp` iterates *all*
   paths under the global namespace mutex, taking each inode's mutex, for every
   directory listing — same pattern duplicated in `rmdir` and twice in

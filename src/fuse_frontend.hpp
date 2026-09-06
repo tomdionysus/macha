@@ -392,6 +392,11 @@ struct FuseFrontendDiagnostics {
     uint64_t inode_count{};
     uint64_t peak_inode_count{};
     uint64_t reclaimed_inode_count{};
+    // Namespace revision the mount last adopted versus the newest one the
+    // MetadataManager has decoded. refreshed < available means the mount is
+    // showing an older namespace than this node already holds.
+    uint64_t namespace_refreshed_revision{};
+    uint64_t namespace_available_revision{};
 };
 
 struct FuseDirtyRange {

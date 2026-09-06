@@ -418,6 +418,22 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
     return finish(success >= floor, floor);
 }
 
+namespace {
+
+// error_reply() encodes a single string; anything else is reported by type.
+std::string reply_error_text(const RpcReply& reply) {
+    if (reply.message.type == MessageType::error) {
+        try {
+            Reader reader(reply.message.payload);
+            return reader.string();
+        } catch (...) {
+        }
+    }
+    return "reply type " + std::to_string(static_cast<int>(reply.message.type));
+}
+
+} // namespace
+
 bool DistributedStore::durability_barrier(const DurabilityBatch& batch, FrameType frame_type) {
     if (batch.empty())
         return true;
@@ -476,43 +492,83 @@ bool DistributedStore::durability_barrier(const DurabilityBatch& batch, FrameTyp
         }
     }
 
+    // Why each replica did or did not count, for the failure line below. A
+    // bare "required=1 durable=0" spun gbni-1 for half an hour on 2026-09-06
+    // with nothing saying which peer, or whether it was the epoch, the
+    // barrier, or the transport that said no.
+    std::map<ReplicaKey, std::string> outcome;
     std::map<ReplicaKey, uint64_t> durable;
     for (const auto& replica : wanted) {
-        if (replica.id != n_.node_id() || replica.epoch != n_.durability_epoch())
+        if (replica.id != n_.node_id())
             continue;
+        const ReplicaKey key{replica.id, replica.epoch, replica.domain, replica.backend_instance};
+        if (replica.epoch != n_.durability_epoch()) {
+            outcome[key] = "local-epoch-changed";
+            continue;
+        }
         try {
             n_.local_store().durability_barrier(
                 {replica.domain, replica.generation, replica.backend_instance},
                 DurabilityUrgency::batchable);
-            durable[{replica.id, replica.epoch, replica.domain, replica.backend_instance}] =
-                replica.generation;
+            durable[key] = replica.generation;
+            outcome[key] = "local-durable";
         } catch (const std::exception& error) {
             Log::warn("local storage durability barrier failed: " + std::string(error.what()));
+            outcome[key] = std::string("local-barrier-failed: ") + error.what();
         }
     }
 
     for (auto& item : pending) {
+        const ReplicaKey key{item.replica.id, item.replica.epoch, item.replica.domain,
+                             item.replica.backend_instance};
         try {
-            if (item.rpc && item.rpc->get().message.type == MessageType::ok) {
-                durable[{item.replica.id, item.replica.epoch, item.replica.domain,
-                         item.replica.backend_instance}] = item.replica.generation;
+            if (!item.rpc) {
+                outcome[key] = "remote-not-sent";
+                continue;
             }
+            auto reply = item.rpc->get();
+            if (reply.message.type == MessageType::ok) {
+                durable[key] = item.replica.generation;
+                outcome[key] = "remote-durable";
+            } else {
+                outcome[key] = "remote-refused: " + reply_error_text(reply);
+            }
+        } catch (const std::exception& error) {
+            outcome[key] = std::string("remote-transport: ") + error.what();
         } catch (...) {
+            outcome[key] = "remote-transport: unknown";
         }
+    }
+    for (const auto& replica : wanted) {
+        if (replica.id == n_.node_id())
+            continue;
+        const ReplicaKey key{replica.id, replica.epoch, replica.domain, replica.backend_instance};
+        if (!outcome.contains(key))
+            outcome[key] = peers.contains(replica.id) ? "remote-not-sent" : "peer-unknown";
     }
 
     for (const auto& requirement : batch.requirements) {
         size_t count = 0;
+        std::string detail;
         for (const auto& replica : requirement.replicas) {
-            const auto found = durable.find(
-                {replica.id, replica.epoch, replica.domain, replica.backend_instance});
+            const ReplicaKey key{replica.id, replica.epoch, replica.domain,
+                                 replica.backend_instance};
+            const auto found = durable.find(key);
             if (found != durable.end() && found->second >= replica.generation)
                 ++count;
+            if (Log::enabled(LogLevel::debug)) {
+                const auto seen = outcome.find(key);
+                detail += " replica=" + to_string(replica.id).substr(0, 12) +
+                          " epoch=" + to_string(replica.epoch).substr(0, 8) +
+                          " gen=" + std::to_string(replica.generation) + " outcome=\"" +
+                          (seen == outcome.end() ? std::string("unexamined") : seen->second) +
+                          "\"";
+            }
         }
         if (count < requirement.required) {
             Log::debug("object durability quorum unavailable id=" + to_string(requirement.id) +
                        " required=" + std::to_string(requirement.required) +
-                       " durable=" + std::to_string(count));
+                       " durable=" + std::to_string(count) + detail);
             return false;
         }
     }

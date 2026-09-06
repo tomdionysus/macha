@@ -313,8 +313,11 @@ struct MetadataDelta {
     std::vector<GarbageRef> upsert_garbage;
     std::map<NodeId, PersistedNodeStatus> upsert_node_status;
     std::map<std::string, IdentityAssociationReset, std::less<>> upsert_identity_resets;
-    // Reconciliation-only replacements. Ordinary mutations leave these unset
-    // and retain the rolling-compatible DLT5 encoding.
+    // Whole-set replacements for the branch topology. Ordinary mutations leave
+    // both unset and retain the rolling-compatible DLT5 encoding; a merge, a
+    // conflict resolution, or the first write after a merge sets *both* (the
+    // DLT6 wire format has no presence flags, so one cannot be sent without
+    // the other -- encode_metadata_delta() refuses the attempt).
     std::optional<std::vector<Hash256>> replace_merge_parents;
     std::optional<std::map<std::string, MetadataConflict, std::less<>>>
         replace_conflicts;

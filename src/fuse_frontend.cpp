@@ -501,6 +501,13 @@ struct FuseFrontend::State {
         // Namespace identities displaced by this operation (e.g. rename-over).
         // They remain valid for already-open handles but no longer own a published path.
         std::vector<uint64_t> removed;
+        // Local metadata generation observed once the backend had durably
+        // applied this op (in-memory only). A decoded view at or past it
+        // contains the effect or whatever legitimately superseded it, so it is
+        // the confirmation criterion; checking that the *effect* is still
+        // visible wedged gbni-1's mount for two hours on 2026-09-06 when a
+        // later change overwrote it.
+        uint64_t published_generation{};
     };
 
     enum class JournalRecord : uint8_t {
@@ -695,6 +702,9 @@ struct FuseFrontend::State {
 
     std::mutex refresh_mutex;
     std::atomic_uint64_t refreshed_namespace_revision{};
+    // Last available revision for which a deferred adoption was logged, so a
+    // mount that keeps declining the same view says so once, not per request.
+    std::atomic_uint64_t namespace_refresh_deferred_logged_revision{};
 
     std::atomic_uint64_t timed_out_requests{};
     std::atomic_uint64_t merged_publications{};
@@ -2210,6 +2220,18 @@ struct FuseFrontend::State {
         return false;
     }
 
+    // A published op is retired once a decoded view at or past the generation
+    // it was committed in is available: that view holds the effect or whatever
+    // legitimately superseded it, and either way adopting it cannot resurrect
+    // an unlink/rename or hide a mkdir/create. Effect visibility stays as the
+    // fast path for a view that lags the commit (e.g. after a reconciliation
+    // survey failed and the mutation returned without refreshing the cache).
+    static bool namespace_op_confirmed(const NamespaceOp& op, const MetadataSnapshotView& view) {
+        if (op.published_generation && view.generation >= op.published_generation)
+            return true;
+        return namespace_effect_confirmed(op, *view.snapshot);
+    }
+
     static std::string_view namespace_op_kind_name(NamespaceOp::Kind kind) {
         switch (kind) {
         case NamespaceOp::Kind::mkdir: return "mkdir";
@@ -2735,6 +2757,7 @@ struct FuseFrontend::State {
                     while (published_prefix < batch.size() &&
                            namespace_effect_confirmed(batch[published_prefix], *before.snapshot))
                         ++published_prefix;
+                    uint64_t published_generation = before.generation;
 
                     if (published_prefix < batch.size()) {
                         namespace_publication_attempts.fetch_add(1, std::memory_order_relaxed);
@@ -2763,7 +2786,9 @@ struct FuseFrontend::State {
                             published_prefix += result.applied;
                             prefix_failure_code = result.failure_code;
                             prefix_failure_message = std::move(result.failure_message);
-                            published_snapshot = fs.local_snapshot_view().snapshot;
+                            const auto after = fs.local_snapshot_view();
+                            published_snapshot = after.snapshot;
+                            published_generation = after.generation;
                         }
                     } else {
                         published_snapshot = std::move(before.snapshot);
@@ -2771,6 +2796,8 @@ struct FuseFrontend::State {
 
                     if (!published_prefix)
                         throw std::logic_error("namespace batch made no progress");
+                    for (size_t i = 0; i < published_prefix; ++i)
+                        batch[i].published_generation = published_generation;
                     const auto prefix = std::span<const NamespaceOp>(batch).first(published_prefix);
                     for (const auto& op : prefix)
                         namespace_success(op, published_snapshot.get());
@@ -2831,7 +2858,7 @@ struct FuseFrontend::State {
                 if (auto available = fs.available_snapshot_view()) {
                     confirmed =
                         std::all_of(prefix.begin(), prefix.end(), [&](const NamespaceOp& op) {
-                            return namespace_effect_confirmed(op, *available->snapshot);
+                            return namespace_op_confirmed(op, *available);
                         });
                 }
                 if (confirmed) {
@@ -3633,15 +3660,24 @@ struct FuseFrontend::State {
     void reconcile_recovery(JournalRecovery& recovery, const MetadataSnapshot& snapshot) {
         // A backend mutation may have committed immediately before the process
         // stopped, after its durable "published" marker but before the local
-        // journal could retire it.  Only retire work once the immutable decoded
-        // metadata snapshot actually demonstrates the accepted effect.
+        // journal could retire it. The marker is written only after the
+        // backend reported the mutation durable at the metadata write floor,
+        // which always includes this node's own replica -- so the effect is in
+        // local history whether or not the current head still shows it. An op
+        // whose effect has since been overwritten (a peer's write, a
+        // reconciliation, a later local op) must be retired here too: parking
+        // it as "unconfirmed" left refresh_namespace_if_stale() refusing every
+        // newer view, and the mount fell two hours behind its own replica.
         std::vector<NamespaceOp> confirmed_namespace;
         for (const auto& [sequence, op] : recovery.namespace_ops) {
             if (recovery.namespace_done.contains(sequence) ||
                 !recovery.namespace_published.contains(sequence))
                 continue;
             if (!namespace_effect_confirmed(op, snapshot))
-                continue;
+                Log::info("FUSE recovery retiring published namespace op whose effect is no "
+                          "longer visible seq=" + std::to_string(op.sequence) +
+                          " kind=" + std::string(namespace_op_kind_name(op.kind)) +
+                          " from=" + op.from + (op.to.empty() ? "" : " to=" + op.to));
             confirmed_namespace.push_back(op);
         }
         if (!confirmed_namespace.empty()) {
@@ -4035,10 +4071,47 @@ struct FuseFrontend::State {
             if (!inode->current_path.empty()) {
                 const auto key = canonical_path(inode->current_path);
                 auto existing = paths.find(key);
-                if (existing != paths.end() && existing->second->id != inode->id)
-                    throw std::runtime_error(
-                        "FUSE journal recovery produced duplicate namespace path " + key);
-                paths[key] = inode;
+                if (existing != paths.end() && existing->second->id != inode->id) {
+                    // Two inodes resolve to one path. Throwing here made the
+                    // process exit and systemd restart it every 7 s, forever,
+                    // on gbni-1 (2026-09-06, /TV/Big.Mistakes.S01E01…mkv):
+                    // the journal is durable, so the collision is
+                    // deterministic and the node can never come back. Resolve
+                    // it the way a live rename-over would: a journaled inode
+                    // outranks one seeded from the snapshot, and between two
+                    // journaled ones the later namespace sequence owns the
+                    // path. The loser keeps its data (detached, like any
+                    // displaced inode) and is re-journaled without the path so
+                    // the next recovery is clean.
+                    auto holder = existing->second;
+                    const bool holder_journaled = recovery.inodes.contains(holder->id);
+                    const bool inode_wins =
+                        !holder_journaled ||
+                        inode->namespace_sequence > holder->namespace_sequence;
+                    auto winner = inode_wins ? inode : holder;
+                    auto loser = inode_wins ? holder : inode;
+                    Log::warn("FUSE journal recovery: two inodes resolve to one path; keeping "
+                              "the newer path=" + key + " kept_inode=" +
+                              std::to_string(winner->id) + " kept_seq=" +
+                              std::to_string(winner->namespace_sequence) + " detached_inode=" +
+                              std::to_string(loser->id) + " detached_seq=" +
+                              std::to_string(loser->namespace_sequence) + " detached_journaled=" +
+                              (recovery.inodes.contains(loser->id) ? "yes" : "no"));
+                    {
+                        std::lock_guard loser_lock(loser->mutex);
+                        loser->current_path.clear();
+                        loser->published_path.reset();
+                        if (recovery.inodes.contains(loser->id)) {
+                            std::lock_guard admission(journal_admission_mutex);
+                            journal_inode_locked(loser);
+                        }
+                    }
+                    // Whichever lost is still registered below by id -- its
+                    // data ops may reference it -- just without a path.
+                    paths[key] = winner;
+                } else {
+                    paths[key] = inode;
+                }
             }
             inodes[id] = inode;
             note_inode_inserted_locked();
@@ -4090,12 +4163,23 @@ struct FuseFrontend::State {
             request_data_publication(inode);
     }
 
-    void confirm_namespace_from_snapshot(const MetadataSnapshot& snapshot) {
+    std::string describe_unconfirmed_head() {
+        std::lock_guard queue_lock(namespace_queue_mutex);
+        if (namespace_unconfirmed.empty())
+            return "head=none";
+        const auto& op = namespace_unconfirmed.front();
+        return "head_seq=" + std::to_string(op.sequence) +
+               " head_kind=" + std::string(namespace_op_kind_name(op.kind)) +
+               " head_from=" + op.from + (op.to.empty() ? "" : " head_to=" + op.to) +
+               " head_published_generation=" + std::to_string(op.published_generation);
+    }
+
+    void confirm_namespace_from_snapshot(const MetadataSnapshotView& view) {
         std::vector<NamespaceOp> confirmed;
         {
             std::lock_guard queue_lock(namespace_queue_mutex);
             for (const auto& op : namespace_unconfirmed) {
-                if (!namespace_effect_confirmed(op, snapshot))
+                if (!namespace_op_confirmed(op, view))
                     break;
                 confirmed.push_back(op);
             }
@@ -4204,8 +4288,25 @@ struct FuseFrontend::State {
     void refresh_namespace_if_stale() {
         const auto current_revision = refreshed_namespace_revision.load(std::memory_order_acquire);
         const bool pending_confirmation = have_unconfirmed_namespace();
-        if (fs.available_namespace_revision() <= current_revision && !pending_confirmation)
+        const auto available_revision = fs.available_namespace_revision();
+        if (available_revision <= current_revision && !pending_confirmation)
             return;
+
+        // Every reason a newer decoded view is *not* adopted says so, once per
+        // revision. Without this a mount that has quietly stopped adopting is
+        // indistinguishable from an idle cluster (gbni-1, 2026-09-06: the
+        // manager's view held six directories the mount never showed).
+        auto deferred = [&](const std::string& reason, uint64_t view_revision = 0) {
+            if (available_revision <= current_revision)
+                return;
+            if (namespace_refresh_deferred_logged_revision.exchange(available_revision) ==
+                available_revision)
+                return;
+            Log::debug("FUSE namespace refresh deferred reason=" + reason +
+                       " available_revision=" + std::to_string(available_revision) +
+                       " view_revision=" + std::to_string(view_revision) +
+                       " refreshed_revision=" + std::to_string(current_revision));
+        };
 
         // A metadata-generation notice is only evidence that a newer snapshot
         // exists somewhere in the cluster. It is not permission for a kernel
@@ -4218,13 +4319,17 @@ struct FuseFrontend::State {
             // Local FUSE namespace operations are already reflected optimistically
             // in paths/inodes. Do not race a backend publication with a snapshot
             // adoption; a subsequent namespace-facing request will retry.
-            if (namespace_inflight || !namespace_queue.empty())
+            if (namespace_inflight || !namespace_queue.empty()) {
+                deferred("namespace-queue");
                 return;
+            }
         }
 
         const auto available = fs.available_snapshot_view();
-        if (!available)
+        if (!available) {
+            deferred("no-view");
             return;
+        }
         const auto& view = *available;
         const auto& snapshot = *view.snapshot;
 
@@ -4232,14 +4337,19 @@ struct FuseFrontend::State {
         // First observe the effect in MetadataManager's immutable decoded view.
         // This prevents a concurrently available older view from resurrecting a
         // rename/unlink or hiding a locally acknowledged mkdir/create.
-        confirm_namespace_from_snapshot(snapshot);
+        confirm_namespace_from_snapshot(view);
         confirm_data_from_snapshot(snapshot);
-        if (have_unconfirmed_namespace())
+        if (have_unconfirmed_namespace()) {
+            deferred("unconfirmed " + describe_unconfirmed_head(), view.namespace_revision);
             return;
-        if (view.namespace_revision <= refreshed_namespace_revision.load(std::memory_order_acquire))
+        }
+        if (view.namespace_revision <= refreshed_namespace_revision.load(std::memory_order_acquire)) {
+            deferred("view-not-newer", view.namespace_revision);
             return;
+        }
 
         std::vector<uint64_t> detached;
+        size_t adopted_new = 0;
         {
             std::lock_guard lock(namespace_mutex);
             {
@@ -4248,8 +4358,10 @@ struct FuseFrontend::State {
             // before releasing namespace_mutex, so observing a non-empty queue
             // here means this snapshot predates accepted local state.
             std::lock_guard queue_lock(namespace_queue_mutex);
-            if (namespace_inflight || !namespace_queue.empty() || !namespace_unconfirmed.empty())
+            if (namespace_inflight || !namespace_queue.empty() || !namespace_unconfirmed.empty()) {
+                deferred("queue-race", view.namespace_revision);
                 return;
+            }
         }
             std::set<std::string, std::less<>> seen;
             for (const auto& [path, entry] : snapshot.entries) {
@@ -4266,6 +4378,7 @@ struct FuseFrontend::State {
                 paths[key] = inode;
                 inodes[inode->id] = std::move(inode);
                 note_inode_inserted_locked();
+                ++adopted_new;
                 continue;
             }
             auto inode = found->second;
@@ -4328,6 +4441,12 @@ struct FuseFrontend::State {
         }
         for (auto id : detached)
             reclaim_inode_if_quiescent(id);
+        if (Log::enabled(LogLevel::debug))
+            Log::debug("FUSE namespace adopted revision=" + std::to_string(view.namespace_revision) +
+                       " generation=" + std::to_string(view.generation) +
+                       " entries=" + std::to_string(snapshot.entries.size()) +
+                       " new=" + std::to_string(adopted_new) +
+                       " detached=" + std::to_string(detached.size()));
     }
 
     void start() {
@@ -5727,6 +5846,8 @@ FuseFrontendDiagnostics FuseFrontend::diagnostics() const noexcept {
         state_->inode_count.load(std::memory_order_relaxed),
         state_->peak_inode_count.load(std::memory_order_relaxed),
         state_->reclaimed_inode_count.load(std::memory_order_relaxed),
+        state_->refreshed_namespace_revision.load(std::memory_order_acquire),
+        state_->fs.available_namespace_revision(),
     };
 }
 

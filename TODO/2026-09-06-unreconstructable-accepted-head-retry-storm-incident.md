@@ -104,22 +104,29 @@ delta.
 
 ## Not fixed, worth doing
 
-- **`WARN local metadata delta rejected; retrying full record generation=N`**
-  precedes every reconciliation on the merging node (es-1 and gbni-2 logs,
-  every merge). `MetadataManager::store_commit_on()`'s local branch calls
-  `MetadataReplica::store_commit(record, delta)`, it returns false, and the
-  fallback writes the full 15 MB snapshot -- while the same delta is
-  accepted by peers via `import_history()`. This is why history.log grew to
-  25 GB on gbni-2 and why the merging node never hit the bug on its own
-  merges. Root cause not yet identified (the round trip
-  `encode_snapshot_for_delta(delta, parent+delta)` must equal
-  `encode_snapshot(merged)` on peers, since they hash-verify it; the local
-  rejection is therefore not the payload comparison -- most likely the
-  `materialized(previous)` call for a primary parent that is itself
-  evicted-and-unreconstructable under the old predicate, which 0.27.0 would
-  then also cure. Verify on the live cluster: the WARN should stop appearing
-  after 0.27.0, and `macha-metadata-dump` should show merges as deltas on
-  the merging node.)
+- ~~**`WARN local metadata delta rejected; retrying full record generation=N`**~~
+  **Fixed in 0.28.2.** The guess above (evicted parent, cured by 0.27.0) was
+  wrong: the WARN kept firing on the 0.28.0 processes. What the 24 h journal
+  on gbni-1 actually showed was a perfect split -- every
+  `histories reconciled ... history_body=delta conflicts=0` was preceded by
+  the WARN, no `conflicts=1` or `full` one ever was -- and
+  `macha-metadata-dump --all` showed *peer* copies of those merges stored as
+  15 MB `full` frames too (gen 8725, 8728 on gbni-1), so "accepted by peers"
+  was also wrong; peer rejection just logs at DEBUG. Cause: DLT6 encodes
+  `replace_merge_parents`/`replace_conflicts` as bare lists, and the decoder
+  reads an absent set back as "replace with nothing". A merge whose parents
+  share an unresolved conflict changes `merge_parents` but not `conflicts`,
+  so `metadata_delta()` sent only the former, the replay dropped the
+  standing conflict, and the exact-reconstruction check rejected it on every
+  replica. `metadata_delta()` now sets both or neither and the encoder
+  refuses one without the other
+  (`test_metadata_merge_delta_preserves_standing_conflicts`). The same
+  release also stops forcing the first write after a merge into a full
+  snapshot (`clear_merge_parent_topology`, a DLT5-era rule: 42 of 212
+  commits on gbni-1 in one day, 3-32 s each) --
+  `test_metadata_delta_child_of_merge_commit_reconstructs` and the tail of
+  `test_service_same_generation_sibling_notice_triggers_reconciliation`.
+  `MetadataReplica::store_commit()` now logs the rejection reason at DEBUG.
 - `import_history_from_peer()` fast path trusting `history_contains()` as
   "materializable" (flagged in the 0.26.1 write-up). Less urgent now that a
   head that turns out unreplayable is repaired live rather than wedging the

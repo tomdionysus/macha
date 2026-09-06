@@ -727,14 +727,19 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
         encode_identity_reset(w, reset);
     }
     if (v6) {
-        const auto& parents = delta.replace_merge_parents.value_or(std::vector<Hash256>{});
+        // DLT6 has no presence flags: whatever is written here is what the
+        // decoder installs, so a delta that replaces one set must also carry
+        // the other or the replay silently empties it (see metadata_delta()).
+        if (!delta.replace_merge_parents || !delta.replace_conflicts)
+            throw std::invalid_argument(
+                "DLT6 metadata delta must replace both merge parents and conflicts");
+        const auto& parents = *delta.replace_merge_parents;
         if (parents.size() > 64)
             throw std::runtime_error("too many metadata delta merge parents");
         w.u32(static_cast<uint32_t>(parents.size()));
         for (const auto& parent : parents)
             w.fixed(parent.bytes);
-        const auto& conflicts = delta.replace_conflicts.value_or(
-            std::map<std::string, MetadataConflict, std::less<>>{});
+        const auto& conflicts = *delta.replace_conflicts;
         if (conflicts.size() > 1000000)
             throw std::runtime_error("too many metadata delta conflicts");
         w.u32(static_cast<uint32_t>(conflicts.size()));
@@ -902,10 +907,18 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
         return {};
 
     MetadataDelta delta;
-    if (before.merge_parents != after.merge_parents)
+    // Both or neither. DLT6 carries the merge-parent and conflict sets as
+    // plain lists with no presence flag, so its decoder reads an absent set
+    // back as "replace with nothing". Sending only the one that changed made
+    // every conflict-free reconciliation (parents sharing an unresolved
+    // conflict, merge leaving it in place) replay to a snapshot without that
+    // conflict: the exact-reconstruction check rejected the delta on every
+    // replica and each one fell back to a full snapshot -- the 2026-09-06
+    // "local metadata delta rejected; retrying full record" storm.
+    if (before.merge_parents != after.merge_parents || before.conflicts != after.conflicts) {
         delta.replace_merge_parents = after.merge_parents;
-    if (before.conflicts != after.conflicts)
         delta.replace_conflicts = after.conflicts;
+    }
     for (const auto& [node, sequence] : before.mutation_sequences) {
         auto it = after.mutation_sequences.find(node);
         if (it == after.mutation_sequences.end() || it->second < sequence)
@@ -1063,16 +1076,33 @@ void apply_metadata_delta_in_place(MetadataSnapshot& out, const MetadataDelta& d
         out.catalogue_root = delta.catalogue_root;
         break;
     }
-    for (const auto& id : delta.erase_garbage) {
-        std::erase_if(out.garbage, [&](const GarbageRef& garbage) { return garbage.id == id; });
+    // Tombstone edits are indexed, not scanned. The former per-id
+    // std::erase_if / std::find_if over the whole vector was quadratic, and a
+    // reconciliation delta on a tombstone-heavy namespace (gbni-1, 2026-09-06:
+    // ~270k tombstones, merge deltas carrying 45-65k of them) took minutes per
+    // frame to replay -- longer than the 120 s startup budget, so the node
+    // crash-looped in MetadataReplica::load_heads(). Semantics are unchanged:
+    // every tombstone whose id is erased goes (duplicates included), retained
+    // tombstones keep their order, an upsert replaces the first tombstone with
+    // that id in place, and a new one is appended in delta order.
+    if (!delta.erase_garbage.empty()) {
+        const std::set<ObjectId> erased(delta.erase_garbage.begin(), delta.erase_garbage.end());
+        std::erase_if(out.garbage,
+                      [&](const GarbageRef& garbage) { return erased.contains(garbage.id); });
     }
-    for (const auto& garbage : delta.upsert_garbage) {
-        auto it = std::find_if(out.garbage.begin(), out.garbage.end(),
-                               [&](const GarbageRef& value) { return value.id == garbage.id; });
-        if (it == out.garbage.end())
-            out.garbage.push_back(garbage);
-        else
-            *it = garbage;
+    if (!delta.upsert_garbage.empty()) {
+        std::map<ObjectId, size_t> first_index;
+        for (size_t i = 0; i < out.garbage.size(); ++i)
+            first_index.emplace(out.garbage[i].id, i);
+        for (const auto& garbage : delta.upsert_garbage) {
+            auto found = first_index.find(garbage.id);
+            if (found == first_index.end()) {
+                first_index.emplace(garbage.id, out.garbage.size());
+                out.garbage.push_back(garbage);
+            } else {
+                out.garbage[found->second] = garbage;
+            }
+        }
     }
     for (const auto& [node, status] : delta.upsert_node_status)
         out.node_status[node] = status;
@@ -3514,8 +3544,12 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
         } else {
             auto parent = materialized(entry_value.previous);
             if (!parent ||
-                !metadata_delta_succession_valid(parent->record.generation, record.generation))
+                !metadata_delta_succession_valid(parent->record.generation, record.generation)) {
+                Log::debug("metadata delta body rejected generation=" +
+                           std::to_string(record.generation) +
+                           (parent ? " reason=succession" : " reason=parent-not-materialized"));
                 return false;
+            }
             auto snapshot = *parent->snapshot;
             apply_metadata_delta_in_place(snapshot, decode_metadata_delta(entry_value.payload));
             MetadataRecord value;
@@ -3532,8 +3566,17 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
     if (!reconstructed || reconstructed->record.generation != record.generation ||
         reconstructed->record.previous != record.previous ||
         reconstructed->record.hash != record.hash ||
-        reconstructed->record.payload != record.payload)
+        reconstructed->record.payload != record.payload) {
+        // The caller's fallback is a full body, so this is the only trace a
+        // non-reconstructing delta leaves. Say which check it failed.
+        if (entry_value.body == MetadataHistoryEntry::Body::delta)
+            Log::debug("metadata delta body rejected generation=" +
+                       std::to_string(record.generation) + " reason=" +
+                       (!reconstructed ? "no-reconstruction"
+                        : reconstructed->record.payload != record.payload ? "payload-mismatch"
+                                                                           : "identity-mismatch"));
         return false;
+    }
     auto frame = encode_history_frame(entry_value);
 
     std::lock_guard durable(durable_mutation_m_);

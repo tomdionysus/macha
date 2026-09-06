@@ -1,5 +1,125 @@
 # Current release
 
+## 0.28.3 — Linear tombstone replay; a node could not start after 0.28.2 (development)
+
+Found by 0.28.2 itself. Until this morning a conflict-free merge delta was
+always rejected and stored as a 15 MB full snapshot, so cold replay never
+applied one. 0.28.2 made those deltas replayable — and gbni-1, restarted a
+few hours later with two accepted heads whose chains contained merge deltas,
+never came up again: `service startup stalled after 120000ms …
+metadata=recovering`, eight times in a row. `gdb` put the recovery thread in
+`MetadataReplica::load_heads → materialized_locked →
+apply_metadata_delta_in_place` for the whole 120 s.
+
+- **Cause.** `apply_metadata_delta_in_place()` ran `std::erase_if` per erased
+  tombstone id and `std::find_if` per upserted one over the entire garbage
+  vector. This namespace has ~1,600 files and ~270,000 tombstones (that's
+  what the 15 MB snapshots are), and a reconciliation unions both branches'
+  tombstones, so its delta carries 45–65 k of them: ~10¹⁰ comparisons per
+  frame on a Pi, i.e. minutes, versus a 120 s startup budget.
+- **Fix.** Erases go through a set, upserts through an id→index map: one pass
+  each. Semantics are unchanged (all tombstones with an erased id go,
+  retained order is preserved, an upsert replaces the first match in place,
+  new ones append in delta order) and the exact-reconstruction checks that
+  gate every stored delta still hold byte-for-byte.
+- Regression: `storage_metadata/test_metadata_delta_tombstone_edits_are_linear`
+  — a 200 k-tombstone snapshot with a 60 k-edit delta must replay in bounded
+  time and match a naive reference on the same edits.
+- **Second start blocker, hidden behind the first.** Once the replay was
+  fast, gbni-1 came up, then exited two seconds later, every 7 s:
+  `FUSE journal recovery produced duplicate namespace path
+  /TV/Big.Mistakes.S01E01…mkv`, thrown from `initialise_namespace()` on a
+  durable journal — so deterministic, and the node could never return.
+  Recovery now resolves two inodes on one path the way a live rename-over
+  does (a journaled inode outranks a snapshot-seeded one; between journaled
+  ones the later namespace sequence wins; the loser is detached, keeps its
+  data ops, and is re-journaled without the path), logging both at WARN.
+  On gbni-1 the WARN named the pair: `kept_inode=11240 seq=3803` (the file
+  as re-written this afternoon) versus `detached_inode=7270 seq=2758` (the
+  same path's earlier inode, still holding a 398 MB unpublished spool from
+  03:56) — a create-over whose displaced inode kept the path in its journal
+  descriptor. Why the displacing op did not transform it at recovery is not
+  yet known. No unit test yet: the collision needs a hand-built journal, and
+  the live journal (backed up) is the reproduction.
+- Operational note: gbni-1 was brought back with a temporary
+  `service_startup_timeout_ms: 1800000` in `/etc/macha/macha.yaml` (backup
+  `macha.yaml.bak-20260906-startup`); remove once 0.28.3 is on the node.
+  Its FUSE journal is backed up as `/etc/macha/fuse-operations.log.bak-20260906-dup`.
+
+## 0.28.2 — Compact deltas for merges and the write after them (development)
+
+`WARN local metadata delta rejected; retrying full record generation=N` had
+been firing on every node for days, and the 0.27.0 theory that it was an
+evicted parent did not survive contact with the 0.28.0 processes. The 24 h
+journal on gbni-1 split perfectly: every `histories reconciled …
+history_body=delta conflicts=0` was preceded by the WARN, no `conflicts=1`
+or `full` reconciliation ever was. `macha-metadata-dump --all` then showed
+the same merges stored as 15 MB `full` frames on the *peers* too — peer
+rejection only logs at DEBUG, which is why the incident note believed peers
+accepted them.
+
+- **Cause.** DLT6 writes `replace_merge_parents` and `replace_conflicts` as
+  bare lists, and the decoder reads an absent set back as "replace with
+  nothing". A reconciliation whose parents share an unresolved conflict
+  changes `merge_parents` but leaves `conflicts` as they were, so
+  `metadata_delta()` sent only the former; the replay dropped the standing
+  conflict, the exact-reconstruction check in `MetadataReplica::store_commit()`
+  failed, and every replica — local and remote — fell back to the full
+  snapshot. With a standing conflict set (the cluster has had one for days)
+  that was every conflict-free merge, ~60 a day, 15 MB × 3 replicas each.
+- **Fix.** `metadata_delta()` sets both replacements or neither, and
+  `encode_metadata_delta()` refuses a DLT6 delta carrying only one. No wire
+  format change; every DLT6 body already on disk was accepted only because
+  it reconstructed correctly, so it stays valid.
+- **Also.** The first ordinary write after a merge was forced to a full
+  snapshot (`clear_merge_parent_topology`, a DLT5-era rule from 0.19.0 that
+  predates DLT6 being able to clear `merge_parents`). On gbni-1 that was 42
+  of 212 commits in one day at 3–32 s each, on the FUSE write path, plus a
+  15 MB frame per replica. It is now a compact delta, for both the diffing
+  and the exact-delta (`mutate_delta`) callers.
+- `MetadataReplica::store_commit()` logs why a delta body was rejected at
+  DEBUG (`parent-not-materialized`, `succession`, `payload-mismatch`,
+  `identity-mismatch`) — the full-body fallback used to leave no trace.
+
+### FUSE mount could stop adopting the cluster namespace, permanently
+
+Seen on gbni-1 while verifying the above: six directories created on es-1
+were in gbni-1's replica, in its `MetadataManager` decoded view and in
+`GET /api/v1/manage/filesystem?path=/`, but never on `/mnt/machamedia`, for
+two hours and across three restarts. Every namespace queue counter was clean.
+
+- **Cause.** `refresh_namespace_if_stale()` refuses to adopt a newer view
+  while any published namespace op is *unconfirmed*, and confirmation meant
+  "the op's effect is visible in the current snapshot". A recovered op whose
+  effect had since been overwritten (a peer's write, a reconciliation, a
+  later local op) could therefore never confirm, and one such op blocked
+  adoption of everything, forever. The instrumented build said so in six
+  seconds: `FUSE namespace refresh deferred reason=unconfirmed`. On rollout
+  the recovery log named the culprits: gbni-1 `seq=149 kind=chmod`, and
+  es-1 — which nobody had suspected — `seq=1170 kind=create`, each parked
+  on a 20–40 k-op data backlog. Two of three mounts were stale.
+- **Fix.** A published marker means the backend held the op durable at the
+  metadata write floor, which always includes this node's replica, so
+  recovery now retires every published op (logging at INFO the ones whose
+  effect is no longer visible, with sequence/kind/path). Live confirmation is
+  now "a decoded view at or past the generation the op was committed in is
+  available" (`NamespaceOp::published_generation`), with effect visibility
+  kept only as the fast path for a lagging view.
+- **Observability.** `refresh_namespace_if_stale()` logs each deferral
+  reason once per revision (`namespace-queue`, `no-view`, `unconfirmed` with
+  the head op's identity, `view-not-newer`, `queue-race`) and each adoption
+  (`FUSE namespace adopted revision=… generation=… new=… detached=…`);
+  `/api/v1/status` `filesystem` diagnostics gain
+  `namespace_refreshed_revision` / `namespace_available_revision` —
+  refreshed < available is the definition of a stale mount.
+- Regression:
+  `filesystem_fuse/test_fuse_recovery_retires_published_namespace_op_whose_effect_was_superseded`.
+- Tests: `storage_metadata/test_metadata_merge_delta_preserves_standing_conflicts`
+  and `…/test_metadata_delta_child_of_merge_commit_reconstructs` (both fail
+  before the fix at exactly the conflict check);
+  `rpc_cluster/test_service_same_generation_sibling_notice_triggers_reconciliation`
+  now also asserts the write after the merge is stored as a delta.
+
 ## 0.28.1 — Say when a subsystem plugin loads (development)
 
 Found by deploying 0.28.0: the successful load was the only outcome the

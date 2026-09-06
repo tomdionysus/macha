@@ -3212,6 +3212,74 @@ MACHA_TEST("filesystem_fuse",
               EntryType::directory);
 }
 
+MACHA_TEST("filesystem_fuse",
+           test_fuse_recovery_retires_published_namespace_op_whose_effect_was_superseded) {
+    // gbni-1, 2026-09-06: a namespace op published before a restart was
+    // recovered into namespace_unconfirmed, its effect had since been
+    // overwritten, and confirmation-by-visibility could never succeed -- so
+    // refresh_namespace_if_stale() declined every newer view and the mount sat
+    // two hours behind its own replica (six directories the manager listed
+    // that the mount never showed). The published marker means the backend
+    // held the op durable at the write floor; whatever the head shows now is
+    // that effect or its legitimate successor, so recovery must retire it.
+    TestService fixture("fuse-recovery-superseded-published-op");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.fuse.publication_quiet = 30s;
+    config.fuse.suspend_loader_for_tests = true;
+    auto& service = fixture.start();
+
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        service.filesystem().store().foreground_activity(1);
+        frontend->mkdir("/superseded", 0755, getuid(), getgid());
+        frontend->stop();
+    }
+
+    // The op did reach the backend (commit it out of band, as the backend
+    // would have), and its published marker made it to the journal.
+    {
+        FilesystemNamespaceMutation mutation;
+        mutation.kind = FilesystemNamespaceMutation::Kind::mkdir;
+        mutation.from = "/superseded";
+        mutation.mode = 0755;
+        mutation.uid = getuid();
+        mutation.gid = getgid();
+        const std::array<FilesystemNamespaceMutation, 1> committed{mutation};
+        REQUIRE(service.filesystem().apply_namespace_batch(committed).applied == 1);
+    }
+    const auto spool_dir = config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
+    const auto journal = config.fuse.operation_journal_path.value_or(spool_dir / "operations.log");
+    append_fuse_journal_test_records(journal, fuse_namespace_markers(4, 1, 2));
+
+    // Then the effect was overwritten before the frontend came back, and the
+    // rest of the cluster kept moving.
+    service.filesystem().rmdir("/superseded");
+    service.filesystem().mkdir("/external", 0755, getuid(), getgid());
+
+    auto replay = config.fuse;
+    replay.publication_quiet = 0ms;
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    REQUIRE(recovered->wait_for_idle(20s));
+    const auto status = recovered->status();
+    CHECK(status.pending_namespace == 0);
+    CHECK(status.namespace_operations_recovered == 0);
+    CHECK(status.namespace_publication_attempts == 0);
+    CHECK(std::filesystem::file_size(journal) == 8);
+
+    // The mount must not be stale: the cluster's directory is visible, and the
+    // superseded one is not resurrected.
+    CHECK(recovered->getattr("/external").type == EntryType::directory);
+    bool superseded_gone = false;
+    try {
+        (void)recovered->getattr("/superseded");
+    } catch (const FsError& e) {
+        superseded_gone = e.code() == ENOENT;
+    }
+    CHECK(superseded_gone);
+}
+
 MACHA_TEST("filesystem_fuse", test_fuse_namespace_recovery_survives_partial_done_marker_group) {
     TestService fixture("fuse-namespace-partial-done-group");
     auto& config = fixture.config();

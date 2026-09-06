@@ -888,8 +888,17 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             const auto required_generation = reader.u64();
             const auto backend_instance = reader.u64();
             reader.finish();
-            if (expected_epoch != durability_epoch_)
+            if (expected_epoch != durability_epoch_) {
+                // The requester holds a placement token from a previous
+                // incarnation of this process. Nothing here can make that
+                // token true again; the requester must re-put the object.
+                Log::debug("object durability barrier refused: epoch changed expected=" +
+                           to_string(expected_epoch).substr(0, 8) +
+                           " current=" + to_string(durability_epoch_).substr(0, 8) +
+                           " domain=" + std::to_string(domain) +
+                           " generation=" + std::to_string(required_generation));
                 return error_reply("storage durability epoch changed");
+            }
             try {
                 local_store().durability_barrier({domain, required_generation, backend_instance},
                                                  DurabilityUrgency::batchable);

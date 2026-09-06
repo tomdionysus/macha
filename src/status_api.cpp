@@ -921,6 +921,12 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                     values->namespace_operations_published;
                 filesystem_diagnostics["namespace_operations_confirmed"] =
                     values->namespace_operations_confirmed;
+                // The mount is stale exactly when refreshed < available. Both
+                // are exposed so an operator can see it without a rebuild.
+                filesystem_diagnostics["namespace_refreshed_revision"] =
+                    values->namespace_refreshed_revision;
+                filesystem_diagnostics["namespace_available_revision"] =
+                    values->namespace_available_revision;
                 filesystem_diagnostics["journal_append_batches"] = values->journal_append_batches;
                 filesystem_diagnostics["journal_records_appended"] =
                     values->journal_records_appended;
