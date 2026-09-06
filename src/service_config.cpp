@@ -40,7 +40,8 @@ void Service::reload_config() {
     scanner_->reconfigure(updated.catalogue.scanner);
     hydration_->reconfigure(updated.hydration, updated.read_ahead_extents);
     ingest_->reconfigure(updated.ingest);
-    torrents_->reconfigure(updated.torrent);
+    if (auto torrents = registry_.torrent())
+        torrents->reconfigure(updated.torrent);
     if (streaming_restart_required)
         Log::warn("streaming enable/buffer/probe/path/codec changes require restart; live limits were reloaded");
     streaming_->reconfigure(updated.streaming);

@@ -1,12 +1,52 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
 #include "acquisition_api.hpp"
+#include "subsystem_abi.hpp"
+#include "subsystem_registry.hpp"
+
+#ifdef MACHA_TEST_TORRENT_PLUGIN
+#include <dlfcn.h>
+#endif
 
 using namespace macha;
 using namespace std::chrono_literals;
 using namespace macha::test_support;
 
 namespace {
+
+#ifdef MACHA_TEST_TORRENT_PLUGIN
+// Loads the real libmacha-torrent module the way SubsystemSupervisor does --
+// dlopen, entry symbol, build-identity check -- and owns both the handle and
+// the Subsystem so they are torn down in the right order (the instance must
+// be gone before the library is unmapped).
+class LoadedTorrentPlugin {
+    void* handle_{};
+    std::unique_ptr<Subsystem> subsystem_;
+
+  public:
+    explicit LoadedTorrentPlugin(const SubsystemContext& context) {
+        handle_ = ::dlopen(MACHA_TEST_TORRENT_PLUGIN, RTLD_NOW | RTLD_LOCAL);
+        REQUIRE(handle_ != nullptr);
+        auto* symbol = ::dlsym(handle_, kSubsystemEntrySymbol);
+        REQUIRE(symbol != nullptr);
+        const auto* entry = reinterpret_cast<SubsystemEntryFunction>(symbol)();
+        REQUIRE(entry != nullptr);
+        REQUIRE(entry->build_identity == kBuildIdentity);
+        subsystem_ = entry->create(context);
+        REQUIRE(subsystem_ != nullptr);
+    }
+
+    ~LoadedTorrentPlugin() {
+        subsystem_.reset();
+        if (handle_) ::dlclose(handle_);
+    }
+
+    LoadedTorrentPlugin(const LoadedTorrentPlugin&) = delete;
+    LoadedTorrentPlugin& operator=(const LoadedTorrentPlugin&) = delete;
+
+    Subsystem& subsystem() { return *subsystem_; }
+};
+#endif
 
 // The real query parser lives inside http.cpp's anonymous namespace; this is
 // a small test-local equivalent for splitting a signed artwork URL's query
@@ -2221,6 +2261,62 @@ MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_persistence_coa
     CHECK(*ready_delay == 0ms);
 }
 
+// A node with no torrent plugin loaded -- not built, not installed, or
+// faulted and between restarts -- must answer honestly rather than assuming
+// the engine is there. This needs no plugin at all, which is the point.
+MACHA_TEST("hydration_catalogue", test_acquisition_api_without_a_torrent_plugin_reports_it_absent) {
+    TestNode fixture("torrent-absent");
+    fixture.prepare();
+    fixture.start();
+
+    CatalogueHintQueue hints(fixture.config().state_path / "catalogue-hints");
+    IngestConfig ingest_config;
+    ingest_config.enabled = true;
+    ingest_config.staging_path = fixture.path() / "staging";
+    IngestManager ingest(fixture.node(), fixture.filesystem(), hints, ingest_config);
+
+    TorrentConfig torrent_config;
+    torrent_config.enabled = true; // configured on, but nothing provides it.
+    TorrentSearchManager search(torrent_config);
+    SubsystemRegistry registry;
+    AcquisitionApi acquisition(ingest, registry, search);
+
+    HttpRequest status_request;
+    status_request.method = "GET";
+    status_request.path = "/api/v1/torrents/status";
+    const auto status = acquisition.handle(status_request);
+    REQUIRE(status.status == 200);
+    const auto status_body =
+        Json::parse(std::string(status.body.begin(), status.body.end()));
+    CHECK(status_body.find("build_available")->asBool() == false);
+    CHECK(status_body.find("enabled")->asBool() == false);
+
+    // Every endpoint that needs the engine says so, rather than crashing on a
+    // null capability or pretending the job list is empty.
+    for (const auto& [method, path] :
+         std::vector<std::pair<std::string, std::string>>{
+             {"GET", "/api/v1/torrents/jobs"},
+             {"POST", "/api/v1/torrents/jobs"},
+             {"GET", "/api/v1/torrents/jobs/whatever"},
+             {"POST", "/api/v1/torrents/jobs/whatever/pause"}}) {
+        HttpRequest request;
+        request.method = method;
+        request.path = path;
+        const auto response = acquisition.handle(request);
+        CHECK(response.status == 503);
+    }
+
+    // Search is core's own Torznab client, so it stays available.
+    HttpRequest search_request;
+    search_request.method = "GET";
+    search_request.path = "/api/v1/torrents/search";
+    CHECK(acquisition.handle(search_request).status == 400); // missing q, not 503.
+}
+
+// Only meaningful in a build that produced the plugin: without libtorrent
+// there is no download engine to load, and the capability is absent by
+// design rather than differently compiled.
+#ifdef MACHA_TEST_TORRENT_PLUGIN
 MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_intent) {
     TestNode fixture("torrent-recovery");
     fixture.prepare();
@@ -2314,14 +2410,30 @@ MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_int
     torrent_config.dht = false;
     torrent_config.pex = false;
     torrent_config.lsd = false;
-    TorrentManager torrents(fixture.node(), ingest, torrent_config, state_path);
+
+    // The download engine is a plugin as of 0.28.0, so this loads the real
+    // libmacha-torrent.so through the real entry symbol rather than linking
+    // TorrentManager into the test binary. The Subsystem is driven directly
+    // instead of through a SubsystemSupervisor because this case depends on
+    // acting on state restored from jobs.json *before* the polling worker
+    // starts, which a supervisor (which starts it immediately) would not
+    // allow.
+    Config plugin_config = fixture.node().config();
+    plugin_config.torrent = torrent_config;
+    plugin_config.state_path = state_path;
+    SubsystemRegistry registry;
+    LoadedTorrentPlugin plugin(SubsystemContext{&plugin_config, &fixture.node(), &ingest,
+                                                &registry});
+    auto torrents_owner = registry.torrent();
+    REQUIRE(torrents_owner);
+    auto& torrents = *torrents_owner;
 
     auto failed_ingest = ingest.job("ingest-retry");
     REQUIRE(failed_ingest.has_value());
     CHECK(failed_ingest->state == IngestJobState::failed);
 
     TorrentSearchManager search(torrent_config);
-    AcquisitionApi acquisition(ingest, torrents, search);
+    AcquisitionApi acquisition(ingest, registry, search);
     HttpRequest retry_request;
     retry_request.method = "POST";
     retry_request.path = "/api/v1/torrents/jobs/torrent-retry/retry";
@@ -2348,16 +2460,17 @@ MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_int
     REQUIRE(paused.has_value());
     CHECK(paused->state == TorrentJobState::paused);
 
-    // When libtorrent is present, start() restores a live paused handle and the
-    // worker immediately samples it. The explicit Macha pause must remain
-    // authoritative even if libtorrent still reports its pre-pause state.
-    torrents.start();
+    // start() restores a live paused handle and the worker immediately
+    // samples it. The explicit Macha pause must remain authoritative even if
+    // libtorrent still reports its pre-pause state.
+    plugin.subsystem().start();
     std::this_thread::sleep_for(750ms);
     paused = torrents.job("torrent-pause");
     REQUIRE(paused.has_value());
     CHECK(paused->state == TorrentJobState::paused);
-    torrents.stop();
+    plugin.subsystem().stop();
 }
+#endif // MACHA_TEST_TORRENT_PLUGIN
 
 MACHA_TEST("hydration_catalogue", test_ingest_catalogue_feedback_and_external_clear_cleanup) {
     TestService fixture("node");

@@ -42,10 +42,13 @@ class Service {
   private:
     NodeRuntime node_;
     ClusterStatusService cluster_status_;
-    // No subsystem plugin exists yet (see
-    // TODO/2026-09-05-subsystem-plugin-isolation-plan.md, Phase 1/2) -- this
-    // just wires the loader up so Status reports an honest empty list rather
-    // than nothing at all, and so Phase 1/2 have nothing left to wire here.
+    // Torrent runs as a plugin (Phase 1 of
+    // TODO/2026-09-05-subsystem-plugin-isolation-plan.md); FUSE has not
+    // migrated yet. `registry_` is where a loaded plugin publishes what it
+    // provides, and it outlives `subsystems_` deliberately: declared first,
+    // destroyed last, so a subsystem being torn down can still withdraw
+    // itself.
+    SubsystemRegistry registry_;
     SubsystemSupervisor subsystems_;
     SessionApi session_api_;
     std::unique_ptr<HttpServer> catalogue_http_;
@@ -60,7 +63,6 @@ class Service {
     std::unique_ptr<CatalogueScanner> scanner_;
     std::unique_ptr<HydrationManager> hydration_;
     std::unique_ptr<IngestManager> ingest_;
-    std::unique_ptr<TorrentManager> torrents_;
     std::unique_ptr<TorrentSearchManager> torrent_search_;
     std::unique_ptr<AcquisitionApi> acquisition_api_;
     std::unique_ptr<CatalogueApi> catalogue_api_;
@@ -149,9 +151,12 @@ class Service {
         wait_services_ready();
         return *ingest_;
     }
-    TorrentManager& torrents() {
+    // Null when no torrent plugin is loaded here, or while a faulted one is
+    // between restarts. Callers hold the returned pointer for the duration of
+    // their use of it; see SubsystemRegistry.
+    std::shared_ptr<TorrentService> torrents() {
         wait_services_ready();
-        return *torrents_;
+        return registry_.torrent();
     }
     AcquisitionApi& acquisition_api() {
         wait_services_ready();

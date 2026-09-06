@@ -3954,6 +3954,10 @@ MACHA_HEAVY_TEST("rpc_cluster", test_three_node_cluster) {
     }
 }
 
+// Needs the real libmacha-torrent plugin, which only exists in a build where
+// libtorrent was found; without it the node has no download engine at all
+// and there is nothing here to assert.
+#ifdef MACHA_TEST_PLUGIN_DIR
 MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
@@ -3986,6 +3990,10 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
     c1.ingest.enabled = c2.ingest.enabled = true;
     c1.ingest.source_roots = {source_dir};
     c1.torrent.enabled = c2.torrent.enabled = true;
+    // The download engine is a plugin: load the one this build produced, so
+    // the test exercises the real dlopen/build-identity/factory path rather
+    // than anything linked into the test binary.
+    c1.plugin_path = c2.plugin_path = MACHA_TEST_PLUGIN_DIR;
 
     Service s1(c1, keys);
     Service s2(c2, keys);
@@ -4013,12 +4021,19 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
         },
         5s));
 
-    REQUIRE(TorrentManager::build_available());
-    const auto torrent_id = s1.torrents().add(
+    // The engine is supplied by the libmacha-torrent plugin the Service
+    // dlopens from this build's plugin directory, so a non-null handle here
+    // is also the assertion that the whole load path worked.
+    // Each plugin's first construction runs on its own supervised lifecycle
+    // thread, so the capability appears shortly after the service reports
+    // ready rather than synchronously with it.
+    std::shared_ptr<TorrentService> s1_torrents;
+    REQUIRE(wait_until([&] { return (s1_torrents = s1.torrents()) != nullptr; }, 5s));
+    const auto torrent_id = s1_torrents->add(
         "magnet:?xt=urn:btih:3333333333333333333333333333333333333333&dn=Test");
     // A torrent job has no equivalent fast-fail path (add() only creates the
     // libtorrent session entry), so pausing it immediately is reliable.
-    REQUIRE(s1.torrents().pause(torrent_id));
+    REQUIRE(s1_torrents->pause(torrent_id));
 
     auto get = [](AcquisitionApi& api, const std::string& path) {
         HttpRequest request;
@@ -4151,6 +4166,7 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
     }
     s1.stop();
 }
+#endif // MACHA_TEST_PLUGIN_DIR
 
 MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_round_compacts_across_cluster) {
     TestCluster cluster;

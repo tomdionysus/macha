@@ -197,12 +197,14 @@ not inferred from docs. All are small and isolated; none require design work.
   (~30 sites), `macha_core` as a shared library, the `Subsystem`/plugin ABI,
   and `SubsystemSupervisor` (`dlopen` + version-checked load + backed-off
   retry + disable-after-N-failures), verified against real fault-injecting
-  `.so`/`.dylib` test plugins. This item does not close yet: no subsystem has
-  actually migrated onto the interface, so `FuseFrontend`'s constructor is
-  still exactly as unprotected as it was — Phase 1 (Torrent) and Phase 2
-  (FUSE) are the part that actually fixes the live-incident class described
-  above. Single binary, single process throughout, no separate OS
-  processes/IPC (considered and rejected).
+  `.so`/`.dylib` test plugins. 0.28.0 shipped Phase 1: BitTorrent acquisition
+  is now a real `dlopen`'d module (`libmacha-torrent`), reached through
+  `TorrentService`/`SubsystemRegistry`, absent-or-faulted per node at runtime.
+  This item still does not close: `FuseFrontend`'s constructor — the one that
+  actually crash-looped es-1 — is exactly as unprotected as it was until
+  Phase 2 moves FUSE into its own plugin and off the main thread. Single
+  binary, single process throughout, no separate OS processes/IPC (considered
+  and rejected).
 - [ ] **Terminal durability poisoning is never cleared.** `fuse_frontend.cpp`
   sets `durability_poisoned = true` on any exception during the durability
   batch and nothing ever resets it — one transient fsync failure disables all
