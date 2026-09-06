@@ -130,6 +130,14 @@ inline Config config_for(const std::filesystem::path& path, const std::filesyste
     // policy is tested with explicit limits; ordinary functional tests must not
     // depend on the host's /tmp mount size.
     c.fuse.spool_reserve_free = 0;
+    // Production retry discipline backs off to 30 s; a test that provokes a
+    // transient failure must not wait that out. Same budget shape, fast.
+    c.fuse.publication_retry = RetryPolicy{100, std::chrono::minutes(30),
+                                           std::chrono::milliseconds(20),
+                                           std::chrono::milliseconds(200)};
+    c.fuse.namespace_retry = RetryPolicy{200, std::chrono::minutes(30),
+                                         std::chrono::milliseconds(20),
+                                         std::chrono::milliseconds(200)};
     c.hydration.enabled = false;
     c.dead_after = 500ms;
     c.connect_timeout = 500ms;

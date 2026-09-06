@@ -2143,54 +2143,79 @@ AsyncRpc RpcClient::call_async(const NodeInfo& node, MessageType type,
 }
 
 RpcReply RpcClient::call(const Endpoint& endpoint, MessageType type,
-                         std::span<const uint8_t> payload, std::chrono::milliseconds stall_notice) {
-    return call(endpoint, type, payload, default_frame_type(type), stall_notice);
+                         std::span<const uint8_t> payload, std::chrono::milliseconds stall_notice,
+                         std::chrono::milliseconds no_progress_deadline) {
+    return call(endpoint, type, payload, default_frame_type(type), stall_notice,
+                no_progress_deadline);
 }
 
 RpcReply RpcClient::call(const NodeInfo& node, MessageType type, std::span<const uint8_t> payload,
-                         std::chrono::milliseconds stall_notice) {
-    return call(node, type, payload, default_frame_type(type), stall_notice);
+                         std::chrono::milliseconds stall_notice,
+                         std::chrono::milliseconds no_progress_deadline) {
+    return call(node, type, payload, default_frame_type(type), stall_notice, no_progress_deadline);
 }
+
+namespace {
+
+// Shared wait loop for the two synchronous call() overloads: log a stall
+// notice, and past the no-progress deadline cancel the request and fail it
+// with a transient error the caller retries under its own policy. Before
+// discipline 2 a control call could sit "active while peer health is
+// monitored" for minutes (150-230 s accept_metadata_commit, 2026-09-06).
+RpcReply wait_for_reply(AsyncRpc& async, std::string_view peer, MessageType type,
+                        FrameType frame_type, Clock::time_point call_started,
+                        std::chrono::milliseconds stall_notice,
+                        std::chrono::milliseconds no_progress_deadline) {
+    if (stall_notice.count() <= 0 && no_progress_deadline.count() <= 0)
+        return async.get();
+    auto poll = stall_notice.count() > 0 ? stall_notice : no_progress_deadline;
+    if (no_progress_deadline.count() > 0)
+        poll = std::min(poll, no_progress_deadline);
+    while (async.wait_for(poll) != std::future_status::ready) {
+        const auto idle = async.idle_for();
+        if (no_progress_deadline.count() > 0 && idle >= no_progress_deadline) {
+            async.cancel();
+            const auto text = std::string("RPC made no progress for ") +
+                              std::to_string(idle.count()) + " ms (" + frame_type_name(frame_type) +
+                              ") peer=" + std::string(peer) + " message=" +
+                              message_type_name(type) +
+                              " age_ms=" + std::to_string(elapsed_ms(call_started)) +
+                              "; cancelled for retry";
+            Log::debug(text);
+            throw std::runtime_error(text);
+        }
+        if (stall_notice.count() > 0 && idle >= stall_notice) {
+            Log::debug(std::string("RPC stalled (") + frame_type_name(frame_type) + ") peer=" +
+                       std::string(peer) + " message=" + message_type_name(type) +
+                       " age_ms=" + std::to_string(elapsed_ms(call_started)) +
+                       " no_progress_ms=" + std::to_string(idle.count()) +
+                       (no_progress_deadline.count() > 0
+                            ? "; deadline_ms=" + std::to_string(no_progress_deadline.count())
+                            : "; request remains active while peer health is monitored"));
+        }
+    }
+    return async.get();
+}
+
+} // namespace
 
 RpcReply RpcClient::call(const Endpoint& endpoint, MessageType type,
                          std::span<const uint8_t> payload, FrameType frame_type,
-                         std::chrono::milliseconds stall_notice) {
+                         std::chrono::milliseconds stall_notice,
+                         std::chrono::milliseconds no_progress_deadline) {
     const auto call_started = Clock::now();
     auto async = call_async(endpoint, type, payload, frame_type);
-    if (stall_notice.count() <= 0)
-        return async.get();
-
-    while (async.wait_for(stall_notice) != std::future_status::ready) {
-        const auto idle = async.idle_for();
-        if (idle >= stall_notice) {
-            Log::debug(std::string("RPC stalled (") + frame_type_name(frame_type) +
-                       ") peer=" + endpoint_key(endpoint) + " message=" + message_type_name(type) +
-                       " age_ms=" + std::to_string(elapsed_ms(call_started)) +
-                       " no_progress_ms=" + std::to_string(idle.count()) +
-                       "; request remains active while peer health is monitored");
-        }
-    }
-    return async.get();
+    return wait_for_reply(async, endpoint_key(endpoint), type, frame_type, call_started,
+                          stall_notice, no_progress_deadline);
 }
 
 RpcReply RpcClient::call(const NodeInfo& node, MessageType type, std::span<const uint8_t> payload,
-                         FrameType frame_type, std::chrono::milliseconds stall_notice) {
+                         FrameType frame_type, std::chrono::milliseconds stall_notice,
+                         std::chrono::milliseconds no_progress_deadline) {
     const auto call_started = Clock::now();
     auto async = call_async(node, type, payload, frame_type);
-    if (stall_notice.count() <= 0)
-        return async.get();
-
-    while (async.wait_for(stall_notice) != std::future_status::ready) {
-        const auto idle = async.idle_for();
-        if (idle >= stall_notice) {
-            Log::debug(std::string("RPC stalled (") + frame_type_name(frame_type) + ") peer=" +
-                       to_string(node.id).substr(0, 12) + " message=" + message_type_name(type) +
-                       " age_ms=" + std::to_string(elapsed_ms(call_started)) +
-                       " no_progress_ms=" + std::to_string(idle.count()) +
-                       "; request remains active while peer health is monitored");
-        }
-    }
-    return async.get();
+    return wait_for_reply(async, to_string(node.id).substr(0, 12), type, frame_type,
+                          call_started, stall_notice, no_progress_deadline);
 }
 
 void RpcClient::close_endpoint(const Endpoint& endpoint, const std::string& reason) {

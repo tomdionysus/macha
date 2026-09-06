@@ -927,6 +927,11 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                     values->namespace_refreshed_revision;
                 filesystem_diagnostics["namespace_available_revision"] =
                     values->namespace_available_revision;
+                // Files whose publication exhausted its retry budget; details
+                // and actions under /api/v1/manage/filesystem/parked-publications.
+                filesystem_diagnostics["parked_publications"] = values->parked_publications;
+                filesystem_diagnostics["publication_retries_backed_off"] =
+                    values->publication_retries_backed_off;
                 filesystem_diagnostics["journal_append_batches"] = values->journal_append_batches;
                 filesystem_diagnostics["journal_records_appended"] =
                     values->journal_records_appended;

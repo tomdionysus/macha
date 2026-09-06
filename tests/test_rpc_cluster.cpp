@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
+#include "startup_progress.hpp"
 
 using namespace macha;
 using namespace std::chrono_literals;
@@ -1234,6 +1235,80 @@ MACHA_TEST("rpc_cluster", test_rpc_health_not_starved_by_slow_control_handlers) 
     REQUIRE(slow2.wait_for(1s) == std::future_status::ready);
     CHECK(slow1.get().message.type == MessageType::bool_reply);
     CHECK(slow2.get().message.type == MessageType::bool_reply);
+
+    client.stop();
+    server.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_rpc_call_fails_after_no_progress_deadline) {
+    // Discipline 2: a control call that makes no progress must fail with a
+    // transient error after the deadline instead of "remaining active while
+    // peer health is monitored" indefinitely. A call that is merely slow but
+    // finishes inside the deadline is unaffected, and a zero deadline keeps
+    // the old wait-forever behaviour.
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto port = free_port();
+
+    NodeInfo server_info;
+    server_info.id = random_node_id();
+    server_info.host = "127.0.0.1";
+    server_info.port = port;
+    server_info.failure_domain = "server-site";
+
+    TestGate stuck_gate;
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (request.type == MessageType::have_object) {
+                stuck_gate.enter_and_wait();
+                return RpcMessage{MessageType::bool_reply, Bytes{1}};
+            }
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {});
+    server.start();
+
+    NodeInfo client_info;
+    client_info.id = random_node_id();
+    client_info.host = "127.0.0.1";
+    client_info.port = free_port();
+    client_info.failure_domain = "client-site";
+    RpcClient client(
+        keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 500ms,
+        100ms, 2s);
+    Endpoint endpoint{"127.0.0.1", port};
+
+    // Stuck: the handler never answers; the deadline turns that into a
+    // transient error naming the message and the elapsed silence.
+    auto started = Clock::now();
+    std::string error;
+    try {
+        (void)client.call(endpoint, MessageType::have_object, Bytes{1}, 50ms, 300ms);
+    } catch (const std::exception& e) {
+        error = e.what();
+    }
+    const auto waited = Clock::now() - started;
+    CHECK(!error.empty());
+    CHECK(error.find("no progress") != std::string::npos);
+    CHECK(error.find("have_object") != std::string::npos);
+    CHECK(error.find("cancelled for retry") != std::string::npos);
+    CHECK(waited >= 250ms);
+    CHECK(waited < 2s);
+
+    // Slow-but-answering: finishes inside the deadline, no error.
+    std::thread releaser([&] {
+        REQUIRE(stuck_gate.wait_for_entries(2, 5s));
+        std::this_thread::sleep_for(150ms);
+        stuck_gate.open();
+    });
+    auto reply = client.call(endpoint, MessageType::have_object, Bytes{2}, 50ms, 2s);
+    CHECK(reply.message.type == MessageType::bool_reply);
+    releaser.join();
+
+    // Zero deadline: healthy replies still come back straight away.
+    auto pong = client.call(endpoint, MessageType::ping, {}, 50ms, 0ms);
+    CHECK(pong.message.type == MessageType::ok);
 
     client.stop();
     server.stop();
@@ -2721,6 +2796,69 @@ MACHA_TEST("rpc_cluster", test_service_startup_stall_terminates_within_configure
 
     // Let the still-stalled initialise_services() thread proceed so ordinary
     // shutdown can join it cleanly rather than hanging on the same stall.
+    stall_gate.open();
+    service.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_service_startup_gate_waits_while_recovery_progresses) {
+    // Discipline 2: the startup gate must not kill a recovery that is slow
+    // but progressing (gbni-1 crash-looped eight times on a 120 s elapsed
+    // gate during a 5-minute replay on 2026-09-06), and must still kill one
+    // that has genuinely stopped.
+    TestCluster cluster;
+    auto c1 = config_for(cluster.path() / "progressing-startup", cluster.keyfile(), free_port());
+    c1.service_startup_timeout = 0ms;            // no absolute ceiling
+    c1.service_startup_no_progress = 1200ms;     // gate on silence only
+    c1.catalogue.scanner.enabled = false;
+    c1.catalogue.api.enabled = false;
+    c1.ingest.enabled = false;
+    c1.torrent.enabled = false;
+
+    TestGate stall_gate;
+    std::atomic_bool handler_called{false};
+    Service service(
+        c1, cluster.keys(),
+        [&](std::string_view stage) {
+            if (stage == "data-storage")
+                stall_gate.enter_and_wait();
+        },
+        {},
+        [&](std::string_view) { handler_called.store(true, std::memory_order_release); });
+    struct ReleaseGate {
+        TestGate& gate;
+        ~ReleaseGate() {
+            gate.open();
+        }
+    } release{stall_gate};
+
+    service.start();
+    REQUIRE(stall_gate.wait_for_entries(1, 5s));
+
+    // Keep "recovery" ticking from outside for 3 s: the gate must stay quiet.
+    std::atomic_bool ticking{true};
+    std::thread ticker([&] {
+        while (ticking.load(std::memory_order_acquire)) {
+            note_startup_progress();
+            std::this_thread::sleep_for(100ms);
+        }
+    });
+    std::thread waiter([&] {
+        try {
+            (void)service.filesystem();
+        } catch (const std::exception&) {
+        }
+    });
+    std::this_thread::sleep_for(3s);
+    CHECK(!handler_called.load(std::memory_order_acquire));
+
+    // Silence: the gate fires within roughly the no-progress window.
+    ticking.store(false, std::memory_order_release);
+    ticker.join();
+    const auto silent_since = Clock::now();
+    REQUIRE(wait_until([&] { return handler_called.load(std::memory_order_acquire); }, 10s));
+    CHECK(Clock::now() - silent_since >= 1000ms);
+    waiter.join();
+
     stall_gate.open();
     service.stop();
 }

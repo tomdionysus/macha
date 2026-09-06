@@ -33,6 +33,22 @@ Rename is also the move primitive. It changes namespace metadata, including a di
 
 Unmatched hint paths are migrated with management-initiated namespace renames, while their immutable media identities remain unchanged.
 
+### Parked publications
+
+A FUSE write whose publication keeps failing transiently is retried with
+exponential backoff and, once it exhausts its retry budget (see
+`fuse.publication_retry_*` in the configuration guide), is parked: its bytes
+stay in the spool and journal and it leaves the loader queue so the rest of
+the cluster keeps publishing.
+
+- `GET /api/v1/manage/filesystem/parked-publications` → `{"parked": [{inode, path, error_code, error_message, attempts, failing_for_ms, parked_for_ms, pending_bytes}]}`
+- `POST /api/v1/manage/filesystem/parked-publications/{inode}/retry` — reset the retry budget and re-queue the publication (`204`; `404` if that inode is not parked).
+- `POST /api/v1/manage/filesystem/parked-publications/{inode}/abandon` — drop the unpublished generation from the spool, exactly as a corrupt spool record is dropped (`204`; `404` if not parked).
+
+`diagnostics.filesystem.parked_publications` and
+`diagnostics.filesystem.publication_retries_backed_off` in `GET /api/v1/status`
+carry the counts.
+
 ## Management root and cluster identity associations
 
 `GET /api/v1/manage` is the stable root for management capabilities. Existing catalogue and MachaDFS management resources remain beneath this prefix, and future privileged administrative actions should be added here rather than creating unrelated top-level mutation APIs.

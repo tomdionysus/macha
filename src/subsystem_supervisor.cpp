@@ -142,8 +142,7 @@ void SubsystemSupervisor::start(SubsystemContext context) {
 }
 
 void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
-    auto backoff = policy_.initial_backoff;
-    std::deque<Clock::time_point> recent_failures;
+    RetryState retry;
 
     while (!stop.stop_requested()) {
         {
@@ -192,7 +191,7 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
                 entry.state = SubsystemState::running;
                 entry.instance = std::move(instance);
             }
-            backoff = policy_.initial_backoff; // a clean start resets backoff.
+            retry.succeeded(); // a clean start resets backoff.
 
             std::unique_lock lock(entry.mutex);
             entry.cv.wait(lock, stop, [] { return false; });
@@ -211,21 +210,18 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
         }
 
         Log::error("subsystem '" + entry.name + "' failed to start: " + fault);
-        const auto now = Clock::now();
         {
             std::lock_guard lock(entry.mutex);
             entry.last_fault = fault;
             ++entry.restart_count;
         }
-        recent_failures.push_back(now);
-        while (!recent_failures.empty() && now - recent_failures.front() > policy_.failure_window)
-            recent_failures.pop_front();
 
-        if (recent_failures.size() > policy_.max_failures_in_window) {
+        const auto delay = retry.failed(policy_);
+        if (!delay) {
             std::lock_guard lock(entry.mutex);
             entry.state = SubsystemState::disabled;
             Log::error("subsystem '" + entry.name + "' disabled after " +
-                      std::to_string(recent_failures.size()) +
+                      std::to_string(retry.failures_in_window()) +
                       " failed start attempts; needs an operator");
             return;
         }
@@ -235,8 +231,7 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
             entry.state = SubsystemState::faulted;
         }
         std::unique_lock lock(entry.mutex);
-        entry.cv.wait_for(lock, stop, backoff, [] { return false; });
-        backoff = std::min(policy_.max_backoff, backoff * 2);
+        entry.cv.wait_for(lock, stop, *delay, [] { return false; });
     }
 }
 

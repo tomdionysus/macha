@@ -3,6 +3,7 @@
 
 #include "ffmpeg_log.hpp"
 #include "log.hpp"
+#include "retry_policy.hpp"
 #include "types.hpp"
 #include <chrono>
 #include <filesystem>
@@ -122,6 +123,21 @@ struct FuseConfig {
     // imports to remain permanently single-threaded.
     size_t foreground_commit_workers{1};
     std::chrono::milliseconds publication_quiet{5000};
+    // Retry discipline for one file's data publication (discipline 2 of the
+    // self-healing plan). Backoff starts small so a namespace race resolves
+    // in a blink, caps so a peer outage costs at most one attempt per
+    // ceiling, and a file that keeps failing is parked for an operator
+    // (Status `parked_publications`, manage `parked-publications`) instead
+    // of retrying forever. Defaults: 250 ms → 30 s, park after more than
+    // 100 failures within 30 minutes (~45 min of failing).
+    RetryPolicy publication_retry{100, std::chrono::minutes(30), std::chrono::milliseconds(250),
+                                  std::chrono::seconds(30)};
+    // Same discipline for a namespace operation failing retryably (write
+    // floor unavailable, peer down). Past the budget it is reported as
+    // blocked (manage `blocked-namespace-operation`) and keeps trying at the
+    // ceiling, so a cleared cause still resolves it without an operator.
+    RetryPolicy namespace_retry{200, std::chrono::minutes(30), std::chrono::milliseconds(50),
+                                std::chrono::seconds(5)};
     // Relative service weights while genuine viewer traffic and loader
     // publication are both runnable. Capacity is work conserving: either
     // class may borrow all of it while the other is idle.
@@ -423,7 +439,14 @@ struct Config {
     // subsystem construction/start are expected to complete or throw well
     // inside this window; a wait that never resolves either way is treated as
     // a suspected internal stall rather than left to hang indefinitely.
-    std::chrono::milliseconds service_startup_timeout{120000};
+    // Startup gate (discipline 2). The process is terminated for its
+    // supervisor when local-state recovery has made *no progress* (see
+    // startup_progress.hpp) for `service_startup_no_progress`; an absolute
+    // ceiling `service_startup_timeout` is also honoured when non-zero, and is
+    // off by default since 0.30 -- a slow but progressing recovery must never
+    // become a crash loop.
+    std::chrono::milliseconds service_startup_no_progress{120000};
+    std::chrono::milliseconds service_startup_timeout{0};
 
     std::filesystem::path key_file;
     // Directory SubsystemSupervisor scans for subsystem plugins (.so/.dylib).
@@ -469,6 +492,14 @@ struct Config {
     // RPC; 0 disables the corresponding stalled-request DEBUG message.
     std::chrono::milliseconds control_stall_notice{5000};
     std::chrono::milliseconds data_stall_notice{120000};
+    // Discipline 2: a call that has made no progress for this long fails
+    // with a transient error the caller retries under its own policy,
+    // instead of "remaining active while peer health is monitored" for
+    // minutes (150-230 s accept_metadata_commit stalls, 2026-09-06). Zero
+    // disables. Data-lane transfers keep their own stall/spill logic, so the
+    // data deadline is off by default.
+    std::chrono::milliseconds control_no_progress_deadline{30000};
+    std::chrono::milliseconds data_no_progress_deadline{0};
     std::chrono::milliseconds metadata_cache{250};
     // Logical byte budget for immutable metadata records plus their decoded
     // snapshots. Durable history payloads remain disk-backed outside it.

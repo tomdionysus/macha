@@ -5,6 +5,7 @@
 
 #include "codec.hpp"
 #include "log.hpp"
+#include "startup_progress.hpp"
 #include "macha_version.hpp"
 #include "supervised.hpp"
 
@@ -230,6 +231,7 @@ NodeRuntime::~NodeRuntime() {
 }
 
 void NodeRuntime::mark_ready(ReadyBit bit) {
+    note_startup_progress();
     ready_bits_.fetch_or(static_cast<uint32_t>(bit), std::memory_order_release);
     if (all_local_state_ready() && !ready_unix_ms_.load(std::memory_order_relaxed))
         ready_unix_ms_.store(unix_ms(), std::memory_order_release);
@@ -527,32 +529,43 @@ std::chrono::milliseconds NodeRuntime::stall_notice_for(MessageType type) const 
     return cfg_.control_stall_notice;
 }
 
+std::chrono::milliseconds NodeRuntime::no_progress_deadline_for(MessageType type) const {
+    if (type == MessageType::get_object || type == MessageType::put_object ||
+        type == MessageType::put_object_deferred || type == MessageType::object_durability_barrier)
+        return cfg_.data_no_progress_deadline;
+    return cfg_.control_no_progress_deadline;
+}
+
 RpcReply NodeRuntime::call(const NodeInfo& node, MessageType type,
                            std::span<const uint8_t> payload) {
     if (outbound_calls_stopped_.load(std::memory_order_acquire))
         throw std::runtime_error("node is stopping; outbound RPC is unavailable");
-    return client_.call(node, type, payload, stall_notice_for(type));
+    return client_.call(node, type, payload, stall_notice_for(type),
+                        no_progress_deadline_for(type));
 }
 
 RpcReply NodeRuntime::call(const Endpoint& endpoint, MessageType type,
                            std::span<const uint8_t> payload) {
     if (outbound_calls_stopped_.load(std::memory_order_acquire))
         throw std::runtime_error("node is stopping; outbound RPC is unavailable");
-    return client_.call(endpoint, type, payload, stall_notice_for(type));
+    return client_.call(endpoint, type, payload, stall_notice_for(type),
+                        no_progress_deadline_for(type));
 }
 
 RpcReply NodeRuntime::call(const NodeInfo& node, MessageType type, std::span<const uint8_t> payload,
                            FrameType frame_type) {
     if (outbound_calls_stopped_.load(std::memory_order_acquire))
         throw std::runtime_error("node is stopping; outbound RPC is unavailable");
-    return client_.call(node, type, payload, frame_type, stall_notice_for(type));
+    return client_.call(node, type, payload, frame_type, stall_notice_for(type),
+                        no_progress_deadline_for(type));
 }
 
 RpcReply NodeRuntime::call(const Endpoint& endpoint, MessageType type,
                            std::span<const uint8_t> payload, FrameType frame_type) {
     if (outbound_calls_stopped_.load(std::memory_order_acquire))
         throw std::runtime_error("node is stopping; outbound RPC is unavailable");
-    return client_.call(endpoint, type, payload, frame_type, stall_notice_for(type));
+    return client_.call(endpoint, type, payload, frame_type, stall_notice_for(type),
+                        no_progress_deadline_for(type));
 }
 
 AsyncRpc NodeRuntime::call_async(const NodeInfo& node, MessageType type,

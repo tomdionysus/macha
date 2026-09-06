@@ -48,7 +48,7 @@ current at every checkpoint; a fresh session reads only this and the plan.
   `transient=yes outcome="remote-reasserted"` line per run — a re-stamped
   requirement counted as not-yet-durable once; harmless, look at the
   `durable[key]` bookkeeping when touching the barrier next.
-- [ ] **Discipline 2 — one work-item retry policy + no-progress startup gate.** NEXT.
+- [ ] **Discipline 2 — one work-item retry policy + no-progress startup gate.** CODE COMPLETE as 0.30.0 (all five steps + tests + CHANGELOG + docs); full suite run, deploy and UAT still to do — see "Discipline 2 — status" below.
 - [ ] Discipline 3 — resolve-on-recovery + journal fuzz fixture.
 - [ ] Discipline 4 — compact tombstones/conflicts out of snapshots (+ DLT7).
 - [ ] UAT record: `TODO/2026-09-XX-self-healing-uat.md` with before/after
@@ -129,7 +129,55 @@ works; namespace op exhausting its budget parks; startup gate does not fire
 while the progress counter moves (simulate slow replay) and does fire when
 it stops; RPC no-progress deadline returns within bound.
 
-## Next
+## Discipline 2 — status (0.30.0, code complete 2026-09-06 late evening)
+
+Landed (see CHANGELOG 0.30.0 for the full list):
+1. `src/retry_policy.hpp` — `RetryPolicy` + `RetryState`; supervisor adopts it.
+2. FUSE data loop: per-inode `publication_retry` backoff, `Inode::parked`,
+   `admit_deferred` skips backed-off inodes, `parked_publications()` /
+   `retry_parked_publication()` / `abandon_parked_publication()`; Status
+   `diagnostics.filesystem.parked_publications` +
+   `publication_retries_backed_off`; manage API
+   `GET /api/v1/manage/filesystem/parked-publications`,
+   `POST .../{inode}/retry|abandon`. Config `fuse.publication_retry_*`.
+3. Namespace loop: `fuse.namespace_retry_*` budget; exhaustion → EAGAIN
+   `namespace_blocked_op`, keeps retrying at ceiling (ordered queue, no park).
+4. Startup gate: `startup_progress.hpp` counter ticked by journal parse,
+   delta apply, snapshot decode, storage scan, `mark_ready`;
+   `service_startup_no_progress_ms` (120 s), `service_startup_timeout_ms` now 0.
+5. RPC: `RpcClient::call(..., stall_notice, no_progress_deadline)`;
+   `network.control_no_progress_deadline_ms` 30 s / `data_..._ms` 0.
+Tests passing in isolation: `publication_backs_off_then_parks`,
+`service_startup_gate_waits_while_recovery_progresses`,
+`rpc_call_fails_after_no_progress_deadline`, plus all discipline-1 tests.
+
+Remaining for discipline 2:
+- [ ] Full suite green (known load-flakes: `replacement_node_recovers`,
+  `mutual_bootstrap_prunes_cross_dial`, `status_collects_connected_peer_telemetry`
+  — rerun in isolation before calling them failures).
+- [ ] Commit 0.30.0.
+- [ ] Deploy gbni-1 → gbni-2 → es-1. On gbni-1 remove the temp
+  `service_startup_timeout_ms: 1800000` from `/etc/macha/macha.yaml` (the
+  gate is now progress-based; backup exists as `macha.yaml.bak-20260906-startup`).
+- [ ] UAT A (parking): start an rsync of one multi-GB file on gbni-1; on
+  es-1 make one of its extents unpublishable-but-transient (e.g. `chmod 000`
+  a backend dir briefly is too blunt — preferred: set a tiny budget on gbni-1
+  via config `publication_retry_max_failures: 5`, restart es-1 repeatedly
+  during the barrier, or block gbni-1→es-1 data lane with an nftables rule
+  for >5 attempts) → expect `FUSE data publication parked` WARN, the inode
+  in `parked-publications`, other rsync files still completing at full rate;
+  then `POST .../retry` → completes. Record before/after in the UAT file.
+- [ ] UAT B (startup gate): restart gbni-1 with its big journal and a
+  120 s no-progress gate → boots in one attempt with `startup progress`
+  lines; previously crash-looped 8× on the elapsed gate.
+- [ ] UAT C (RPC deadline): grep for `RPC made no progress` after a peer
+  restart mid-commit — should be seconds, not 150–230 s, and the caller's
+  retry succeeds.
+- [ ] Brief "Macha UI Work" (SendMessage) on the new status fields and the
+  parked-publications routes.
+- [ ] Update UAT file, memory, commit, then tell the operator `/compact` is safe.
+
+## Next (original discipline-2 plan, kept for reference)
 
 Start Discipline 2 from the design notes above: (1) `retry_policy.hpp`
 (`RetryPolicy` + `RetryState`), adopt in `SubsystemSupervisor`; (2) FUSE data

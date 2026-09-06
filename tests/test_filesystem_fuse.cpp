@@ -1992,6 +1992,68 @@ MACHA_TEST("filesystem_fuse", test_fuse_retryable_publication_failure_preserves_
     frontend->stop();
 }
 
+MACHA_TEST("filesystem_fuse", test_fuse_publication_backs_off_then_parks_for_operator) {
+    // Discipline 2 of the self-healing plan. A publication that keeps failing
+    // retryably must not retry forever at a fixed interval (a doomed inode ran
+    // at ~35/s for hours on 2026-09-06): it backs off, and past its budget it
+    // is parked -- visible, actionable, and not poisoning the inode. Here the
+    // write floor can never be met (two replicas required, one node), so
+    // every attempt fails with a retryable error.
+    TestService fixture("fuse-publication-park");
+    auto& config = fixture.config();
+    config.replication = 2;
+    config.min_write_replicas = 2;
+    config.metadata_min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 0ms;
+    config.fuse.publication_retry = RetryPolicy{3, 60s, 5ms, 20ms};
+
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto handle = frontend->create("/parked.bin", 0644, getuid(), getgid(), true, true, false);
+    const auto payload = pattern(64 * 1024 + 3, 44);
+    REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
+    frontend->release(handle.inode, true);
+
+    // More than max_failures_in_window (3) failures park it; with 5-20 ms
+    // backoff that is well under a second.
+    REQUIRE(wait_until([&] { return frontend->diagnostics().parked_publications == 1; }, 10s));
+    auto parked = frontend->parked_publications();
+    REQUIRE(parked.size() == 1);
+    CHECK(parked.front().inode == handle.inode);
+    CHECK(parked.front().path == "/parked.bin");
+    CHECK(parked.front().attempts == 4);
+    CHECK(parked.front().pending_bytes == payload.size());
+    CHECK(frontend->diagnostics().publication_retries_backed_off == 3);
+
+    // Parked is quiet and not poisoned: no further attempts, and the file is
+    // still readable through the mount.
+    const auto failures_at_park = frontend->status().backend_failures;
+    std::this_thread::sleep_for(150ms);
+    CHECK(frontend->status().backend_failures == failures_at_park);
+    CHECK(frontend->status().pending_data == 0);
+    Bytes back(payload.size());
+    REQUIRE(frontend->read(handle.inode, 0, back) == back.size());
+    CHECK(back == payload);
+
+    // Operator retry: budget reset, attempts resume, and it parks again.
+    REQUIRE(frontend->retry_parked_publication(handle.inode));
+    CHECK(frontend->diagnostics().parked_publications == 0);
+    REQUIRE(wait_until([&] { return frontend->diagnostics().parked_publications == 1; }, 10s));
+    CHECK(frontend->status().backend_failures > failures_at_park);
+
+    // Operator abandon: the dirty generation is dropped and nothing is parked.
+    CHECK(!frontend->retry_parked_publication(handle.inode + 1000));
+    REQUIRE(frontend->abandon_parked_publication(handle.inode));
+    CHECK(frontend->parked_publications().empty());
+    CHECK(frontend->diagnostics().parked_publications == 0);
+    CHECK(frontend->getattr("/parked.bin").size == 0);
+    REQUIRE(frontend->wait_for_idle(5s));
+    frontend->stop();
+}
+
 MACHA_TEST("filesystem_fuse", test_fuse_terminal_recovery_failure_is_not_readmitted) {
     TestService fixture("fuse-terminal-recovery-failure");
     auto& config = fixture.config();

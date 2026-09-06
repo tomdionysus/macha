@@ -397,6 +397,10 @@ struct FuseFrontendDiagnostics {
     // showing an older namespace than this node already holds.
     uint64_t namespace_refreshed_revision{};
     uint64_t namespace_available_revision{};
+    // Files parked after exhausting their publication retry budget; details
+    // via FuseFrontend::parked_publications().
+    uint64_t parked_publications{};
+    uint64_t publication_retries_backed_off{};
 };
 
 struct FuseDirtyRange {
@@ -418,6 +422,21 @@ struct BlockedNamespaceOperation {
     int error_code{};
     std::string error_message;
     std::chrono::milliseconds blocked_for{};
+};
+
+// A file whose data publication exhausted its retry budget (config
+// fuse.publication_retry). The bytes stay in the durable spool; nothing is
+// lost and nothing retries until an operator either retries it (the budget
+// is reset) or abandons the generation (the spool is retired).
+struct ParkedPublication {
+    uint64_t inode{};
+    std::string path;
+    int error_code{};
+    std::string error_message;
+    size_t attempts{};
+    std::chrono::milliseconds failing_for{};
+    std::chrono::milliseconds parked_for{};
+    uint64_t pending_bytes{};
 };
 
 // Bounded local frontend for the kernel-facing filesystem. FUSE callbacks enter
@@ -584,6 +603,11 @@ class FuseFrontend final : public HydrationHintProvider {
     // if it changed between query and action. Returns false if there is no
     // matching blocked operation right now.
     bool skip_blocked_namespace_operation(uint64_t sequence);
+    // Files whose data publication is parked after exhausting its retry
+    // budget (see ParkedPublication), and the two operator actions on them.
+    std::vector<ParkedPublication> parked_publications() const;
+    bool retry_parked_publication(uint64_t inode);
+    bool abandon_parked_publication(uint64_t inode);
     bool wait_for_idle(std::chrono::milliseconds timeout = std::chrono::seconds(10));
     void stop();
 };

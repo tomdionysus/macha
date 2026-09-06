@@ -161,6 +161,7 @@ class NodeRuntime {
     void signal_telemetry_refresh();
     void telemetry_loop(std::stop_token);
     std::chrono::milliseconds stall_notice_for(MessageType) const;
+    std::chrono::milliseconds no_progress_deadline_for(MessageType) const;
 
   public:
     NodeRuntime(Config, ClusterKeys, StartupStageHook startup_stage_hook = {});

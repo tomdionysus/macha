@@ -4,6 +4,8 @@
 #include "codec.hpp"
 #include "crypto.hpp"
 #include "fuse_journal.hpp"
+#include "retry_policy.hpp"
+#include "startup_progress.hpp"
 #include "log.hpp"
 #include "supervised.hpp"
 #include "macos_unicode.hpp"
@@ -381,6 +383,17 @@ struct FuseFrontend::State {
         uint64_t accounted_publication_operation_bytes{};
         uint64_t accounted_operation_metadata_bytes{};
         std::optional<int> backend_error;
+        // Discipline 2: retry state for this inode's data publication and,
+        // once the budget is spent, why it is parked. Parked is not poisoned:
+        // reads and new writes keep working; only publication waits for an
+        // operator (retry resets the budget, abandon retires the spool).
+        RetryState publication_retry;
+        struct Parked {
+            int error_code{};
+            std::string error_message;
+            Clock::time_point since{};
+        };
+        std::optional<Parked> parked;
         uint64_t journal_epoch{};
         uint64_t unconfirmed_data_sequence{};
         uint64_t unconfirmed_publication_bytes{};
@@ -757,6 +770,11 @@ struct FuseFrontend::State {
     std::atomic_uint64_t namespace_operations_batched{};
     std::atomic_uint64_t namespace_operations_published{};
     std::atomic_uint64_t namespace_operations_confirmed{};
+    std::atomic_uint64_t parked_publications{};
+    std::atomic_uint64_t publication_retries_backed_off{};
+    // Earliest time a backed-off inode becomes due again (steady-clock ns
+    // since epoch; 0 = none). The data loop sleeps to it when idle.
+    std::atomic<int64_t> deferred_retry_due_ns{0};
     std::atomic_uint64_t journal_append_batches{};
     std::atomic_uint64_t journal_records_appended{};
     std::atomic_uint64_t journal_durability_barriers{};
@@ -1674,6 +1692,7 @@ struct FuseFrontend::State {
 
     void parse_journal_record(JournalRecovery& recovery, std::span<const uint8_t> payload,
                               size_t frame_offset) {
+        note_startup_progress();
         Reader reader(payload);
         const auto raw_type = reader.u8();
         if (raw_type < static_cast<uint8_t>(JournalRecord::inode) ||
@@ -2584,6 +2603,19 @@ struct FuseFrontend::State {
             request_data_publication(inode);
     }
 
+    // Records when the earliest backed-off inode becomes due; the idle data
+    // loop sleeps to it and re-admits (see data_loop()).
+    void note_deferred_due(Clock::time_point due) {
+        const auto ns = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(due.time_since_epoch()).count());
+        auto current = deferred_retry_due_ns.load(std::memory_order_relaxed);
+        while ((current == 0 || ns < current) &&
+               !deferred_retry_due_ns.compare_exchange_weak(current, ns,
+                                                            std::memory_order_acq_rel)) {
+        }
+        data_cv.notify_all();
+    }
+
     void admit_deferred() {
         std::vector<std::shared_ptr<Inode>> candidates;
         {
@@ -2592,24 +2624,38 @@ struct FuseFrontend::State {
             for (const auto& [_, inode] : inodes)
                 candidates.push_back(inode);
         }
-        std::lock_guard queue_lock(data_queue_mutex);
-        for (const auto& inode : candidates) {
-            if (data_queue.size() >= config.max_pending_operations)
-                break;
-            std::lock_guard inode_lock(inode->mutex);
-            if (inode->backend_error) {
+        std::optional<Clock::time_point> earliest_due;
+        const auto now = Clock::now();
+        {
+            std::lock_guard queue_lock(data_queue_mutex);
+            for (const auto& inode : candidates) {
+                if (data_queue.size() >= config.max_pending_operations)
+                    break;
+                std::lock_guard inode_lock(inode->mutex);
+                if (inode->backend_error || inode->parked) {
+                    inode->data_deferred = false;
+                    continue;
+                }
+                if (!inode->data_deferred || inode->data_enqueue_pending || inode->data_queued ||
+                    inode->data_running || inode->unconfirmed_data_entry)
+                    continue;
+                // Backed off: stays deferred until its due time.
+                if (!inode->publication_retry.due(now)) {
+                    const auto due = inode->publication_retry.due_at();
+                    if (!earliest_due || due < *earliest_due)
+                        earliest_due = due;
+                    continue;
+                }
                 inode->data_deferred = false;
-                continue;
+                inode->data_queued = true;
+                const bool recovered =
+                    inode->published_data_sequence < inode->recovery_data_sequence;
+                data_queue.push_back({inode, recovered});
             }
-            if (!inode->data_deferred || inode->data_enqueue_pending || inode->data_queued ||
-                inode->data_running || inode->unconfirmed_data_entry)
-                continue;
-            inode->data_deferred = false;
-            inode->data_queued = true;
-            const bool recovered = inode->published_data_sequence < inode->recovery_data_sequence;
-            data_queue.push_back({inode, recovered});
+            data_cv.notify_all();
         }
-        data_cv.notify_all();
+        if (earliest_due)
+            note_deferred_due(*earliest_due);
     }
 
     void mark_backend_error(const std::vector<uint64_t>& affected, int error) {
@@ -2714,7 +2760,8 @@ struct FuseFrontend::State {
             std::optional<int> prefix_failure_code;
             std::string prefix_failure_message;
             std::shared_ptr<const MetadataSnapshot> published_snapshot;
-            std::chrono::milliseconds backoff{50};
+            RetryState retry;
+            bool budget_reported = false;
             while (!published_prefix && !stop.stop_requested() && !stopping.load()) {
                 bool skip_requested = false;
                 {
@@ -2741,7 +2788,8 @@ struct FuseFrontend::State {
                     batch.erase(batch.begin());
                     if (batch.empty())
                         break;
-                    backoff = std::chrono::milliseconds{50};
+                    retry.reset();
+                    budget_reported = false;
                     continue;
                 }
                 try {
@@ -2843,12 +2891,41 @@ struct FuseFrontend::State {
                     // confirmed it is safe may explicitly abandon it via
                     // skip_blocked_namespace_operation(), handled at the top
                     // of this loop.
+                    //
+                    // Discipline 2: the cadence is the shared RetryPolicy. A
+                    // retryable error that outlives its budget is surfaced as
+                    // blocked (same operator surface as a non-retryable one)
+                    // but keeps trying at the ceiling, so a cause that clears
+                    // still resolves it without anyone acting.
+                    auto delay = retry.failed(config.namespace_retry);
+                    if (!delay) {
+                        delay = config.namespace_retry.max_backoff;
+                        if (retryable && !budget_reported) {
+                            budget_reported = true;
+                            const auto& blocked = batch.front();
+                            {
+                                std::lock_guard lock(namespace_queue_mutex);
+                                if (!namespace_blocked_op ||
+                                    namespace_blocked_op->sequence != blocked.sequence)
+                                    namespace_blocked_since = Clock::now();
+                                namespace_blocked_op = blocked;
+                                namespace_blocked_error_code = EAGAIN;
+                                namespace_blocked_error_message =
+                                    "retry budget exhausted: " + std::string(e.what());
+                            }
+                            Log::error("FUSE async namespace publication blocked after " +
+                                       std::to_string(retry.total_failures()) +
+                                       " retryable failures seq=" +
+                                       std::to_string(blocked.sequence) + " error=" + e.what() +
+                                       "; still retrying every " +
+                                       std::to_string(delay->count()) + " ms");
+                        }
+                    }
                     std::unique_lock wait_lock(namespace_queue_mutex);
-                    namespace_cv.wait_for(wait_lock, stop, backoff, [&] {
+                    namespace_cv.wait_for(wait_lock, stop, *delay, [&] {
                         return stopping.load() ||
                               namespace_skip_requested_sequence == batch.front().sequence;
                     });
-                    backoff = std::min(backoff * 2, std::chrono::milliseconds(5000));
                 }
             }
 
@@ -2966,7 +3043,7 @@ struct FuseFrontend::State {
         data_cv.notify_all();
     }
 
-    void abandon_corrupt_data(const std::shared_ptr<Inode>& inode, std::string_view reason) {
+    void abandon_data(const std::shared_ptr<Inode>& inode, std::string_view reason) {
         uint64_t target = 0;
         size_t retired = 0;
         {
@@ -3015,7 +3092,7 @@ struct FuseFrontend::State {
         }
         if (journal_idle && spool_clean)
             reset_journal_if_idle();
-        Log::warn("dropped corrupt FUSE spool generation inode=" + std::to_string(inode->id) +
+        Log::warn("dropped FUSE spool generation inode=" + std::to_string(inode->id) +
                   " sequence=" + std::to_string(target) + " reason=" + std::string(reason));
         data_cv.notify_all();
     }
@@ -3061,7 +3138,7 @@ struct FuseFrontend::State {
                 spool_error = inode->recovery_spool_error;
             }
             if (spool_error) {
-                abandon_corrupt_data(inode, *spool_error);
+                abandon_data(inode, *spool_error);
                 return true;
             }
         }
@@ -3235,7 +3312,7 @@ struct FuseFrontend::State {
                     if (pread_exact(publication->replay_spool.get(), {buffer.data(), chunk},
                                     op.spool_offset + publication->operation_offset) != chunk) {
                         if (publication->recovered) {
-                            abandon_corrupt_data(inode, "short read from FUSE write spool");
+                            abandon_data(inode, "short read from FUSE write spool");
                             return true;
                         }
                         throw FsError(EIO, "short read from FUSE write spool");
@@ -3249,7 +3326,7 @@ struct FuseFrontend::State {
                         if (checksum_index >= op.spool_hashes.size() ||
                             sha256(std::span<const uint8_t>{buffer.data(), chunk}) !=
                                 op.spool_hashes[checksum_index]) {
-                            abandon_corrupt_data(inode, "payload checksum mismatch");
+                            abandon_data(inode, "payload checksum mismatch");
                             return true;
                         }
                     }
@@ -3457,6 +3534,26 @@ struct FuseFrontend::State {
                 std::unique_lock lock(data_queue_mutex);
                 while (!stop.stop_requested() && !stopping.load()) {
                     if (data_queue.empty()) {
+                        // Backed-off inodes are not in the queue. Sleep to the
+                        // earliest due time and re-admit; otherwise wait for
+                        // new work.
+                        const auto due_ns = deferred_retry_due_ns.load(std::memory_order_acquire);
+                        if (due_ns) {
+                            const Clock::time_point due{std::chrono::nanoseconds(due_ns)};
+                            if (Clock::now() >= due) {
+                                lock.unlock();
+                                deferred_retry_due_ns.store(0, std::memory_order_release);
+                                admit_deferred();
+                                lock.lock();
+                                continue;
+                            }
+                            data_cv.wait_until(lock, stop, due, [&] {
+                                return stopping.load() || !data_queue.empty() ||
+                                       deferred_retry_due_ns.load(std::memory_order_acquire) !=
+                                           due_ns;
+                            });
+                            continue;
+                        }
                         data_cv.wait(lock, stop,
                                      [&] { return stopping.load() || !data_queue.empty(); });
                         continue;
@@ -3581,22 +3678,64 @@ struct FuseFrontend::State {
                 // the provisional writer and its cursor so the next attempt
                 // replays this generation from the WAL.
                 const auto* fs_error = dynamic_cast<const FsError*>(&e);
-                const bool replay = fs_error && fs_error->code() == ESTALE;
+                const int code = fs_error ? fs_error->code() : EIO;
+                const bool replay = fs_error && code == ESTALE;
                 retry = replay || retryable_backend_error(e);
-                // A terminal failure poisons the inode until an operator acts;
-                // that is never a debug-level event.
                 const auto line = std::string("FUSE async data publication ") +
                                   (replay ? "replay" : retry ? "retry" : "failed") +
                                   " inode=" + std::to_string(inode->id) + " error=" + e.what();
-                if (retry)
-                    Log::debug(line);
-                else
-                    Log::warn(line);
                 if (replay) {
                     std::lock_guard lock(inode->mutex);
                     inode->data_publication.reset();
                 }
-                if (!retry) {
+                if (retry) {
+                    // Discipline 2: a retry is backed off per inode and
+                    // budgeted; past the budget the file is parked for an
+                    // operator instead of retrying forever (a doomed inode
+                    // ran at ~35/s for hours on 2026-09-06).
+                    std::optional<std::chrono::milliseconds> delay;
+                    std::string path;
+                    size_t attempts = 0;
+                    std::chrono::milliseconds failing_for{};
+                    {
+                        std::lock_guard lock(inode->mutex);
+                        const auto now = Clock::now();
+                        delay = inode->publication_retry.failed(config.publication_retry, now);
+                        attempts = inode->publication_retry.total_failures();
+                        failing_for = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - inode->publication_retry.first_failure());
+                        path = inode->current_path;
+                        if (!delay) {
+                            inode->parked = Inode::Parked{code, e.what(), now};
+                            inode->data_publication.reset();
+                        }
+                    }
+                    if (delay) {
+                        publication_retries_backed_off.fetch_add(1, std::memory_order_relaxed);
+                        note_deferred_due(Clock::now() + *delay);
+                        Log::debug(line + " retry_in_ms=" + std::to_string(delay->count()) +
+                                   " attempts=" + std::to_string(attempts));
+                    } else {
+                        parked_publications.fetch_add(1, std::memory_order_relaxed);
+                        retry = false; // not readmitted; not poisoned either.
+                        Log::warn("FUSE data publication parked inode=" +
+                                  std::to_string(inode->id) + " path=" + path +
+                                  " attempts=" + std::to_string(attempts) +
+                                  " failing_for_ms=" + std::to_string(failing_for.count()) +
+                                  " error=" + e.what() +
+                                  "; retry or abandon via manage/filesystem/parked-publications");
+                    }
+                } else {
+                    // A terminal failure poisons the inode until an operator
+                    // acts; that is never a debug-level event.
+                    Log::warn(line);
+                }
+                bool parked_now = false;
+                {
+                    std::lock_guard lock(inode->mutex);
+                    parked_now = inode->parked.has_value();
+                }
+                if (!retry && !parked_now) {
                     int code = EIO;
                     if (const auto* fs_error = dynamic_cast<const FsError*>(&e))
                         code = fs_error->code();
@@ -3613,12 +3752,14 @@ struct FuseFrontend::State {
                 // writer keeps a failed pipelined extent at its queue head, so
                 // retry cannot create a manifest hole or repeat earlier WAL
                 // input. Completion and terminal errors discard the cursor.
-                if (completed || inode->backend_error)
+                if (completed)
+                    inode->publication_retry.succeeded();
+                if (completed || inode->backend_error || inode->parked)
                     inode->data_publication.reset();
                 refresh_retained_owners_locked(*inode);
                 const bool still_requested =
                     inode->requested_data_sequence > inode->published_data_sequence;
-                if (inode->backend_error) {
+                if (inode->backend_error || inode->parked) {
                     // Terminal failures remain visible on the affected inode,
                     // but are not runnable work. In particular, do not let
                     // admit_deferred() immediately feed a poisoned recovered
@@ -3640,8 +3781,6 @@ struct FuseFrontend::State {
                 (void)weighted_loader.finished(Clock::now(), viewer_active());
             }
             data_cv.notify_all();
-            if (retry)
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             admit_deferred();
             reclaim_inode_if_quiescent(inode->id);
         }
@@ -5897,6 +6036,8 @@ FuseFrontendDiagnostics FuseFrontend::diagnostics() const noexcept {
         state_->reclaimed_inode_count.load(std::memory_order_relaxed),
         state_->refreshed_namespace_revision.load(std::memory_order_acquire),
         state_->fs.available_namespace_revision(),
+        state_->parked_publications.load(std::memory_order_relaxed),
+        state_->publication_retries_backed_off.load(std::memory_order_relaxed),
     };
 }
 
@@ -5937,6 +6078,87 @@ bool FuseFrontend::skip_blocked_namespace_operation(uint64_t sequence) {
         return false;
     state_->namespace_skip_requested_sequence = sequence;
     state_->namespace_cv.notify_all();
+    return true;
+}
+
+std::vector<ParkedPublication> FuseFrontend::parked_publications() const {
+    std::vector<ParkedPublication> out;
+    const auto now = Clock::now();
+    std::lock_guard lock(state_->namespace_mutex);
+    for (const auto& [id, inode] : state_->inodes) {
+        std::lock_guard inode_lock(inode->mutex);
+        if (!inode->parked)
+            continue;
+        ParkedPublication item;
+        item.inode = id;
+        item.path = inode->current_path;
+        item.error_code = inode->parked->error_code;
+        item.error_message = inode->parked->error_message;
+        item.attempts = inode->publication_retry.total_failures();
+        item.failing_for = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - inode->publication_retry.first_failure());
+        item.parked_for =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - inode->parked->since);
+        for (const auto& op : inode->data_ops)
+            if (op.kind == State::DataOp::Kind::write && op.sequence > inode->published_data_sequence)
+                item.pending_bytes += op.length;
+        out.push_back(std::move(item));
+    }
+    return out;
+}
+
+bool FuseFrontend::retry_parked_publication(uint64_t id) {
+    std::shared_ptr<State::Inode> inode;
+    {
+        std::lock_guard lock(state_->namespace_mutex);
+        auto found = state_->inodes.find(id);
+        if (found == state_->inodes.end())
+            return false;
+        inode = found->second;
+    }
+    {
+        std::lock_guard inode_lock(inode->mutex);
+        if (!inode->parked)
+            return false;
+        inode->parked.reset();
+        inode->publication_retry.reset();
+        inode->data_deferred = true;
+    }
+    state_->parked_publications.fetch_sub(1, std::memory_order_relaxed);
+    Log::info("FUSE data publication retry requested by operator inode=" + std::to_string(id));
+    state_->admit_deferred();
+    return true;
+}
+
+bool FuseFrontend::abandon_parked_publication(uint64_t id) {
+    std::shared_ptr<State::Inode> inode;
+    {
+        std::lock_guard lock(state_->namespace_mutex);
+        auto found = state_->inodes.find(id);
+        if (found == state_->inodes.end())
+            return false;
+        inode = found->second;
+    }
+    {
+        std::lock_guard inode_lock(inode->mutex);
+        if (!inode->parked || inode->durability_pending)
+            return false;
+    }
+    try {
+        state_->abandon_data(inode, "abandoned by operator");
+    } catch (const std::exception& error) {
+        Log::warn("FUSE data publication abandon failed inode=" + std::to_string(id) + ": " +
+                  error.what());
+        return false;
+    }
+    {
+        std::lock_guard inode_lock(inode->mutex);
+        inode->parked.reset();
+        inode->publication_retry.reset();
+        inode->data_deferred = false;
+    }
+    state_->parked_publications.fetch_sub(1, std::memory_order_relaxed);
+    Log::info("FUSE data publication abandoned by operator inode=" + std::to_string(id));
     return true;
 }
 

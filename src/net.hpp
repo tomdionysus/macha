@@ -385,14 +385,20 @@ class RpcClient {
     AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
     AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType);
     AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType);
+    // `no_progress_deadline`: fail the call (cancelling it) once it has made
+    // no progress for this long; zero waits indefinitely as before.
     RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t>,
-                  std::chrono::milliseconds stall_notice);
+                  std::chrono::milliseconds stall_notice,
+                  std::chrono::milliseconds no_progress_deadline = {});
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t>,
-                  std::chrono::milliseconds stall_notice);
+                  std::chrono::milliseconds stall_notice,
+                  std::chrono::milliseconds no_progress_deadline = {});
     RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType,
-                  std::chrono::milliseconds stall_notice);
+                  std::chrono::milliseconds stall_notice,
+                  std::chrono::milliseconds no_progress_deadline = {});
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType,
-                  std::chrono::milliseconds stall_notice);
+                  std::chrono::milliseconds stall_notice,
+                  std::chrono::milliseconds no_progress_deadline = {});
     RpcStats stats() const;
     void broadcast(const RpcMessage&);
     size_t broadcast_best_effort(const RpcMessage&, FrameType);

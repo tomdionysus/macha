@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "retry_policy.hpp"
 #include "subsystem.hpp"
 
 #include <chrono>
@@ -19,16 +20,11 @@ struct SubsystemStatus {
     std::string last_fault;
 };
 
-// How aggressively a failing subsystem is retried before being disabled.
-// Production defaults are conservative; tests override them to keep a
-// fault-injection run fast and deterministic instead of waiting on
-// multi-second backoff for real.
-struct SubsystemRetryPolicy {
-    size_t max_failures_in_window{5};
-    std::chrono::milliseconds failure_window{std::chrono::minutes(10)};
-    std::chrono::milliseconds initial_backoff{std::chrono::seconds(1)};
-    std::chrono::milliseconds max_backoff{std::chrono::seconds(60)};
-};
+// How aggressively a failing subsystem is retried before being disabled: the
+// one RetryPolicy every retried work item shares (retry_policy.hpp). The
+// defaults here are the production ones; tests override them to keep a
+// fault-injection run fast and deterministic.
+using SubsystemRetryPolicy = RetryPolicy;
 
 // Owns the lifecycle of every subsystem loaded as a plugin: discovers
 // .so/.dylib files in `plugin_dir`, dlopens each, checks its build-identity

@@ -2,6 +2,7 @@
 #include "local_store.hpp"
 #include "codec.hpp"
 #include "log.hpp"
+#include "startup_progress.hpp"
 #include "supervised.hpp"
 #include <algorithm>
 #include <cerrno>
@@ -1600,6 +1601,7 @@ void LocalStore::scan(std::stop_token stop) {
         for (auto it = std::filesystem::recursive_directory_iterator(root, error);
              !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
             if (stop.stop_requested()) return;
+            note_startup_progress(); // an 80 s scan of a big store is progress, not a stall.
             if (!it->is_regular_file()) continue;
             auto name = it->path().filename().string();
             if (name.find(".tmp") != std::string::npos || name.starts_with(".compact-")) {

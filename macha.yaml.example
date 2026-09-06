@@ -25,12 +25,18 @@ log_level: INFO
 # QUIET, PANIC, FATAL, ERROR, WARN, INFO, VERBOSE, DEBUG or TRACE. Default: ERROR.
 ffmpeg_log_level: ERROR
 
-# Bound on local-state readiness and subsystem startup. If this never
-# resolves (neither ready nor a clean failure) within the window, it is
-# treated as a suspected internal stall: the process logs known readiness
-# state and terminates so the service supervisor (systemd Restart=on-failure)
-# can bring up a fresh instance, rather than hanging forever. Default: 120000.
-service_startup_timeout_ms: 120000
+# Startup gate. Local-state recovery (journal replay, metadata materialisation,
+# storage accounting) may take as long as it takes, as long as it keeps
+# making progress. Only when recovery has been silent — no journal record
+# parsed, no delta applied, no object scanned, no stage reached — for
+# service_startup_no_progress_ms is the process treated as internally stalled:
+# it logs known readiness state and terminates so the service supervisor
+# (systemd Restart=on-failure) brings up a fresh instance. Default: 120000.
+# service_startup_timeout_ms is an optional absolute ceiling on top of that;
+# 0 (the default) disables it, so a slow but progressing recovery can never
+# become a crash loop.
+service_startup_no_progress_ms: 120000
+service_startup_timeout_ms: 0
 
 # Linux/glibc process-memory bound. Apply one allocator arena per RPi core by
 # default instead of glibc's much larger CPU-derived allowance. This prevents
@@ -135,6 +141,23 @@ fuse:
   # DataOp/checksum history plus one concurrent publication snapshot.
   max_operation_metadata_bytes: 64M
 
+  # Retry budgets. A publication (or namespace operation) that keeps failing
+  # backs off exponentially between attempts; once it has failed
+  # max_failures times inside window_ms it is *parked* — kept on disk, shown
+  # in status and GET /api/v1/manage/filesystem/parked-publications, and left
+  # for an operator to retry or abandon — so one poisoned file can never hold
+  # the loader queue or spin the log forever. The namespace queue cannot be
+  # parked (it is ordered), so on exhaustion it surfaces the blocking
+  # operation in status and keeps trying at the ceiling backoff.
+  publication_retry_max_failures: 100
+  publication_retry_window_ms: 1800000
+  publication_retry_initial_backoff_ms: 250
+  publication_retry_max_backoff_ms: 30000
+  namespace_retry_max_failures: 200
+  namespace_retry_window_ms: 1800000
+  namespace_retry_initial_backoff_ms: 50
+  namespace_retry_max_backoff_ms: 5000
+
   # Aggregate local write-back and recovery bounds. max_spool_bytes is the
   # durable burst/backlog budget, not an ENOSPC threshold: admission is fast
   # below half occupancy, then progressively tracks measured publication speed
@@ -178,6 +201,13 @@ network:
   # DEBUG observability only. These never cancel a healthy RPC; 0 disables.
   control_stall_notice_ms: 5000
   data_stall_notice_ms: 120000
+  # A call that has made no progress (no bytes either way) for this long is
+  # cancelled and fails with a transient error its caller retries under its
+  # own retry policy, instead of waiting on the peer indefinitely. 0 disables.
+  # Data transfers have their own stall/spill handling, so the data lane
+  # deadline is off by default.
+  control_no_progress_deadline_ms: 30000
+  data_no_progress_deadline_ms: 0
 
   # Optional public ingress discovery. When a UPnP IGD mapping succeeds, Macha
   # advertises the gateway's external address and mapped port to cluster peers.

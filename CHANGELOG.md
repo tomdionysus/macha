@@ -1,5 +1,59 @@
 # Current release
 
+## 0.30.0 — "Not yet" never becomes "forever": retry budgets, parking, progress gates (development)
+
+Discipline 2 of `TODO/2026-09-06-self-healing-disciplines-plan.md`. Every
+"try again later" in the daemon now has either a budget or a progress
+condition, so a fault that does not clear cannot hold a queue, a thread or a
+restart loop indefinitely. The proven cases from 2026-09-06: a FUSE
+publication retried the same refused barrier ~35/s for hours; gbni-1 was
+killed by the 120 s startup gate eight times in a row while replaying a
+5-minute journal; `accept_metadata_commit` calls sat "active while peer
+health is monitored" for 150–230 s.
+
+- **`RetryPolicy` / `RetryState`** (`retry_policy.hpp`): one shared budget
+  shape — `max_failures_in_window`, `failure_window`, exponential
+  `initial_backoff`→`max_backoff` — used by the subsystem supervisor (whose
+  `SubsystemRetryPolicy` is now an alias) and everything below.
+- **FUSE data publication backs off, then parks.** Each inode carries its
+  own `RetryState`; a transient failure re-queues it after a per-inode
+  backoff (the fixed 100 ms sleep is gone, and `admit_deferred` skips inodes
+  still backed off so others publish at full speed). When the budget
+  (`fuse.publication_retry_*`, default 100 failures in 30 min) is exhausted
+  the inode is **parked**: bytes stay in spool+journal, it leaves the loader
+  queue, one `WARN` line is logged. Operators see it in
+  `diagnostics.filesystem.parked_publications` and
+  `GET /api/v1/manage/filesystem/parked-publications`, and resolve it with
+  `POST .../{inode}/retry` or `.../{inode}/abandon`.
+- **FUSE namespace loop** uses the same budget (`fuse.namespace_retry_*`)
+  instead of a fixed 50 ms→5 s ladder; because the queue is ordered it
+  cannot park, so on exhaustion it reports the blocking operation as
+  `EAGAIN` in `namespace_blocked_op` and keeps retrying at the ceiling.
+- **ENOENT during publication is re-derived, not assumed.** A publication
+  that finds its inode unnamed retries while the namespace still has a
+  rename queued/in flight for it or the decoded view still shows the path,
+  and is terminal only when the file is genuinely gone. (Fixes the 1-in-4
+  `recovers_ordered_mutations` failure where a rename the loop had not
+  learned yet poisoned the inode.)
+- **Startup gate on progress, not elapsed time.** Journal parsing, delta
+  application, snapshot decode, storage accounting and readiness stages tick
+  `note_startup_progress()`; `Service::wait_services_ready` kills the process
+  only when that counter is silent for `service_startup_no_progress_ms`
+  (120 s). `service_startup_timeout_ms` is now an optional ceiling and
+  defaults to 0.
+- **RPC no-progress deadline.** `RpcClient::call` takes a
+  `no_progress_deadline`; `NodeRuntime` applies
+  `network.control_no_progress_deadline_ms` (30 s) to control calls and
+  `data_no_progress_deadline_ms` (0, off) to object transfers. Past it the
+  request is cancelled and fails with `RPC made no progress for N ms ...;
+  cancelled for retry`, which callers already treat as transient.
+- Tests: `test_fuse_publication_backs_off_then_parks_for_operator`,
+  `test_service_startup_gate_waits_while_recovery_progresses`,
+  `test_rpc_call_fails_after_no_progress_deadline`; `config_for` now sets
+  fast retry budgets for the suite.
+- Renamed `FuseFrontend::abandon_corrupt_data` → `abandon_data` (it is also
+  the operator abandon path now).
+
 ## 0.29.0 — Durability is re-derived from disk, not asserted from a dead token (development)
 
 Discipline 1 of `TODO/2026-09-06-self-healing-disciplines-plan.md`. The
