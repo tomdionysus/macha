@@ -123,6 +123,20 @@ Keep teardown active until UAT proves that seek, quality changes, disconnects,
 supersession, failure and failover cannot leak physical encoders or produce
 `transcode limit reached` for one viewer.
 
+## P0 — Self-healing disciplines (2026-09-06)
+
+Execute [the self-healing disciplines plan](2026-09-06-self-healing-disciplines-plan.md).
+One afternoon of ordinary load surfaced six P0 defects, each hidden behind the
+previous, all instances of four habits: trusting bookkeeping over re-derivable
+truth (durability epochs, effect-visibility confirmation), retries that turn
+"not yet" into "forever" (three hot loops, undeadlined RPCs, a startup gate
+that kills progress), recovery that refuses instead of resolving, and
+snapshots that carry retirement history. In order: re-derive-don't-assert
+(durability probe), one work-item retry policy + no-progress startup gate,
+resolve-on-recovery with a journal fuzz fixture, then compact tombstones and
+conflicts out of the snapshot. The plan absorbs the durability-wedge,
+duplicate-path, startup-budget and DLT7 items below.
+
 ## P0 — Verified correctness defects (found 2026-09-05, code-audit-confirmed)
 
 None of these came from a TODO/FIXME comment — there are none anywhere in
