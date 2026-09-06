@@ -258,6 +258,9 @@ constexpr bool metadata_delta_succession_valid(uint64_t parent_generation,
 struct MetadataMergeResult {
     MetadataSnapshot snapshot;
     size_t conflicts_created{};
+    // Standing conflicts dropped because a later mutation had already
+    // replaced the subject they were about (see prune_superseded_conflicts()).
+    size_t conflicts_superseded{};
 };
 
 struct MetadataManualRepairPlan {
@@ -314,16 +317,37 @@ struct MetadataDelta {
     std::map<NodeId, PersistedNodeStatus> upsert_node_status;
     std::map<std::string, IdentityAssociationReset, std::less<>> upsert_identity_resets;
     // Whole-set replacements for the branch topology. Ordinary mutations leave
-    // both unset and retain the rolling-compatible DLT5 encoding; a merge, a
-    // conflict resolution, or the first write after a merge sets *both* (the
-    // DLT6 wire format has no presence flags, so one cannot be sent without
-    // the other -- encode_metadata_delta() refuses the attempt).
+    // both unset and retain the rolling-compatible DLT5 encoding. DLT7 carries
+    // a presence flag for each, so a merge or a conflict resolution sends only
+    // the set that changed (a conflict-free merge no longer carries the whole
+    // standing conflict set -- 336 KB on the cluster, 2026-09-06). DLT6 has no
+    // flags: a DLT6 body must replace both or neither, and encode_metadata_delta()
+    // emits DLT7 whenever only one is set.
     std::optional<std::vector<Hash256>> replace_merge_parents;
     std::optional<std::map<std::string, MetadataConflict, std::less<>>>
         replace_conflicts;
+    // DLT7: after the tombstone edits are applied the tombstone vector is
+    // sorted by ObjectId (see garbage_is_canonical()). Reconciliation always
+    // produces that order, while historical snapshots carry append order and
+    // pre-DLT7 deltas could not express the reordering -- so every merge whose
+    // primary parent had an append-ordered vector fell back to a full
+    // snapshot frame (5-8 MB per replica, 4 of 5 reconciliations, 2026-09-06).
+    bool canonical_garbage{};
     CatalogueDelta catalogue{CatalogueDelta::unchanged};
     std::optional<ObjectId> catalogue_root;
 };
+
+// True when `garbage` is strictly ordered by ObjectId (no duplicates): the
+// canonical order every DLT7-era snapshot keeps.
+bool garbage_is_canonical(const std::vector<GarbageRef>&);
+// Sort into canonical order (stable; equal ids keep their relative order).
+void canonicalise_garbage(std::vector<GarbageRef>&);
+// Drop every standing conflict whose subject has since been mutated: a
+// namespace_entry conflict whose path no longer holds the common-ancestor
+// value, or a catalogue_root conflict once the root moved on. The later
+// mutation *is* the resolution; carrying the record (~3 KB each) in every
+// snapshot and every merge delta afterwards is habit D. Returns the count.
+size_t prune_superseded_conflicts(MetadataSnapshot&);
 Bytes encode_snapshot(const MetadataSnapshot&);
 MetadataSnapshot decode_snapshot(std::span<const uint8_t>);
 Bytes encode_metadata_record(const MetadataRecord&);

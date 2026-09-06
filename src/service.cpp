@@ -217,6 +217,76 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
                               "no namespace operation with this sequence is currently blocked");
         return {204, "application/json; charset=utf-8", {}, {}};
     }
+    // Discipline 4: standing metadata conflicts, listed and resolved here so
+    // a set nobody knew about cannot silently persist (116 of them, 336 KB
+    // in every snapshot and every merge delta, on 2026-09-06).
+    constexpr std::string_view conflicts_path = "/api/v1/manage/metadata/conflicts";
+    if (request.path == conflicts_path) {
+        if (request.method != "GET")
+            return http_error(405, "method", "GET required");
+        auto view = metadata_manager().available_snapshot_view();
+        if (!view)
+            return http_error(503, "metadata_unavailable", "metadata snapshot not yet available");
+        const auto describe = [](const std::optional<FsEntry>& entry) {
+            if (!entry)
+                return Json(nullptr);
+            return Json(Json::Object{
+                {"type", entry->type == EntryType::directory ? "directory" : "file"},
+                {"size", entry->size},
+                {"mtime_ns", static_cast<uint64_t>(entry->mtime_ns)},
+                {"version", entry->version},
+                {"extents", static_cast<uint64_t>(entry->extents.size())}});
+        };
+        const auto describe_root = [](const std::optional<ObjectId>& root) {
+            return root ? Json(to_string(*root)) : Json(nullptr);
+        };
+        Json::Array items;
+        for (const auto& [id, conflict] : view->snapshot->conflicts) {
+            Json::Object item{
+                {"id", id},
+                {"kind", conflict.kind == MetadataConflictKind::namespace_entry
+                             ? "namespace_entry"
+                             : "catalogue_root"},
+                {"key", conflict.key},
+                {"left_head", hex(conflict.left_head.bytes)},
+                {"right_head", hex(conflict.right_head.bytes)}};
+            if (conflict.kind == MetadataConflictKind::namespace_entry) {
+                item["base"] = describe(conflict.base_entry);
+                item["left"] = describe(conflict.left_entry);
+                item["right"] = describe(conflict.right_entry);
+            } else {
+                item["base"] = describe_root(conflict.base_catalogue_root);
+                item["left"] = describe_root(conflict.left_catalogue_root);
+                item["right"] = describe_root(conflict.right_catalogue_root);
+            }
+            items.push_back(Json(std::move(item)));
+        }
+        return http_json(200, Json(Json::Object{{"generation", view->generation},
+                                                {"conflicts", std::move(items)}})
+                                  .dump());
+    }
+    if (request.path.starts_with(std::string(conflicts_path) + "/")) {
+        if (request.method != "POST")
+            return http_error(405, "method", "POST required");
+        // /conflicts/<id>/resolve?choice=left|right|base
+        const auto rest = request.path.substr(conflicts_path.size() + 1);
+        const auto slash = rest.find('/');
+        if (slash == std::string::npos || rest.substr(slash + 1) != "resolve")
+            return http_error(404, "not_found", "expected /conflicts/{id}/resolve");
+        const auto id = rest.substr(0, slash);
+        auto choice = request.query.find("choice");
+        if (choice == request.query.end() ||
+            (choice->second != "left" && choice->second != "right" && choice->second != "base"))
+            return http_error(400, "bad_choice", "choice query parameter must be left, right or base");
+        try {
+            if (!metadata_manager().resolve_conflict(id, choice->second))
+                return http_error(409, "not_standing",
+                                  "no conflict with this id is standing (superseded or already resolved)");
+        } catch (const MetadataNotReady& e) {
+            return http_error(503, "metadata_unavailable", e.what());
+        }
+        return {204, "application/json; charset=utf-8", {}, {}};
+    }
     constexpr std::string_view parked_path = "/api/v1/manage/filesystem/parked-publications";
     if (request.path == parked_path) {
         if (request.method != "GET")

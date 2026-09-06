@@ -337,10 +337,11 @@ int metadata_delta_version(std::span<const uint8_t> data) {
     static constexpr std::array<uint8_t, 7> prefix{'D', 'H', 'T', 'M', 'D', 'L', 'T'};
     if (data.size() < 8 || !std::equal(prefix.begin(), prefix.end(), data.begin()))
         return 0;
-    if (data[7] < '1' || data[7] > '6')
+    if (data[7] < '1' || data[7] > '7')
         return 0;
     return static_cast<int>(data[7] - '0');
 }
+
 
 Bytes encode_snapshot_for_delta(std::span<const uint8_t> delta, const MetadataSnapshot& snapshot) {
     switch (metadata_delta_version(delta)) {
@@ -356,6 +357,7 @@ Bytes encode_snapshot_for_delta(std::span<const uint8_t> delta, const MetadataSn
     case 4:
     case 5:
     case 6:
+    case 7:
         return encode_snapshot(snapshot);
     default:
         throw DecodeError("bad metadata delta");
@@ -455,6 +457,43 @@ std::optional<std::filesystem::path> quarantine_metadata_file(const std::filesys
     return quarantine;
 }
 } // namespace
+
+bool garbage_is_canonical(const std::vector<GarbageRef>& garbage) {
+    for (size_t i = 1; i < garbage.size(); ++i)
+        if (!(garbage[i - 1].id < garbage[i].id))
+            return false;
+    return true;
+}
+
+void canonicalise_garbage(std::vector<GarbageRef>& garbage) {
+    std::stable_sort(garbage.begin(), garbage.end(),
+                     [](const GarbageRef& a, const GarbageRef& b) { return a.id < b.id; });
+}
+
+size_t prune_superseded_conflicts(MetadataSnapshot& snapshot) {
+    size_t pruned = 0;
+    for (auto it = snapshot.conflicts.begin(); it != snapshot.conflicts.end();) {
+        const auto& conflict = it->second;
+        bool superseded = false;
+        if (conflict.kind == MetadataConflictKind::namespace_entry) {
+            std::optional<FsEntry> live;
+            if (auto found = snapshot.entries.find(conflict.key); found != snapshot.entries.end())
+                live = found->second;
+            // The merge installs the common-ancestor value at the path; while
+            // it is still there nobody has decided. Anything else is a decision.
+            superseded = live != conflict.base_entry;
+        } else if (conflict.kind == MetadataConflictKind::catalogue_root) {
+            superseded = snapshot.catalogue_root != conflict.base_catalogue_root;
+        }
+        if (superseded) {
+            it = snapshot.conflicts.erase(it);
+            ++pruned;
+        } else {
+            ++it;
+        }
+    }
+    return pruned;
+}
 Bytes encode_snapshot(const MetadataSnapshot& s) {
     Writer w;
     // SM11 introduced branch topology/conflicts. SM12 additionally persists
@@ -687,9 +726,19 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
     // reconstructs with the current canonical snapshot encoder.
     static constexpr std::array<uint8_t, 8> magic_v5{'D', 'H', 'T', 'M', 'D', 'L', 'T', '5'};
     static constexpr std::array<uint8_t, 8> magic_v6{'D', 'H', 'T', 'M', 'D', 'L', 'T', '6'};
-    const bool v6 = delta.replace_merge_parents.has_value() || delta.replace_conflicts.has_value();
+    static constexpr std::array<uint8_t, 8> magic_v7{'D', 'H', 'T', 'M', 'D', 'L', 'T', '7'};
+    const bool topology =
+        delta.replace_merge_parents.has_value() || delta.replace_conflicts.has_value();
+    // DLT7 whenever DLT5/6 cannot say it: one topology set without the other,
+    // or a canonical tombstone order. Both sets together still encode as DLT6
+    // so a mixed-version cluster keeps its cheap merges during a rolling
+    // upgrade; a pre-0.32 peer that receives DLT7 rejects it and the sender's
+    // full-record fallback covers the gap.
+    const bool v7 = delta.canonical_garbage ||
+                    (delta.replace_merge_parents.has_value() != delta.replace_conflicts.has_value());
+    const bool v6 = !v7 && topology;
     Writer w;
-    w.raw(v6 ? magic_v6 : magic_v5);
+    w.raw(v7 ? magic_v7 : v6 ? magic_v6 : magic_v5);
     w.u32(delta.mutation_sequences.size());
     for (const auto& [node, sequence] : delta.mutation_sequences) {
         w.fixed(node.bytes);
@@ -728,19 +777,28 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
         w.string(key);
         encode_identity_reset(w, reset);
     }
-    if (v6) {
-        // DLT6 has no presence flags: whatever is written here is what the
-        // decoder installs, so a delta that replaces one set must also carry
-        // the other or the replay silently empties it (see metadata_delta()).
-        if (!delta.replace_merge_parents || !delta.replace_conflicts)
-            throw std::invalid_argument(
-                "DLT6 metadata delta must replace both merge parents and conflicts");
+    if (v7) {
+        uint8_t flags = 0;
+        if (delta.replace_merge_parents)
+            flags |= 0x01;
+        if (delta.replace_conflicts)
+            flags |= 0x02;
+        if (delta.canonical_garbage)
+            flags |= 0x04;
+        w.u8(flags);
+    }
+    if (v6 && (!delta.replace_merge_parents || !delta.replace_conflicts))
+        throw std::invalid_argument(
+            "DLT6 metadata delta must replace both merge parents and conflicts");
+    if (delta.replace_merge_parents) {
         const auto& parents = *delta.replace_merge_parents;
         if (parents.size() > 64)
             throw std::runtime_error("too many metadata delta merge parents");
         w.u32(static_cast<uint32_t>(parents.size()));
         for (const auto& parent : parents)
             w.fixed(parent.bytes);
+    }
+    if (delta.replace_conflicts) {
         const auto& conflicts = *delta.replace_conflicts;
         if (conflicts.size() > 1000000)
             throw std::runtime_error("too many metadata delta conflicts");
@@ -760,6 +818,7 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
     static constexpr std::array<uint8_t, 8> magic_v4{'D', 'H', 'T', 'M', 'D', 'L', 'T', '4'};
     static constexpr std::array<uint8_t, 8> magic_v5{'D', 'H', 'T', 'M', 'D', 'L', 'T', '5'};
     static constexpr std::array<uint8_t, 8> magic_v6{'D', 'H', 'T', 'M', 'D', 'L', 'T', '6'};
+    static constexpr std::array<uint8_t, 8> magic_v7{'D', 'H', 'T', 'M', 'D', 'L', 'T', '7'};
     Reader r(data);
     auto got = r.raw(magic_v1.size());
     const bool v1 = std::equal(got.begin(), got.end(), magic_v1.begin());
@@ -767,7 +826,10 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
     const bool v3 = std::equal(got.begin(), got.end(), magic_v3.begin());
     const bool v4 = std::equal(got.begin(), got.end(), magic_v4.begin());
     const bool v5 = std::equal(got.begin(), got.end(), magic_v5.begin());
-    const bool v6 = std::equal(got.begin(), got.end(), magic_v6.begin());
+    const bool v7 = std::equal(got.begin(), got.end(), magic_v7.begin());
+    // DLT7 is DLT6 plus a flags byte; everything before the topology sets is
+    // shared, so treat v7 as v6 for the common prefix.
+    const bool v6 = v7 || std::equal(got.begin(), got.end(), magic_v6.begin());
     if (!v1 && !v2 && !v3 && !v4 && !v5 && !v6)
         throw DecodeError("bad metadata delta");
     MetadataDelta delta;
@@ -870,7 +932,16 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
                 throw DecodeError("bad metadata delta identity reset key");
         }
     }
-    if (v6) {
+    bool read_parents = v6, read_conflicts = v6;
+    if (v7) {
+        const auto flags = r.u8();
+        if (flags & ~0x07U)
+            throw DecodeError("bad metadata delta flags");
+        read_parents = flags & 0x01U;
+        read_conflicts = flags & 0x02U;
+        delta.canonical_garbage = flags & 0x04U;
+    }
+    if (read_parents) {
         const auto parent_count = r.u32();
         if (parent_count > 64)
             throw DecodeError("too many metadata delta merge parents");
@@ -879,7 +950,8 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
         for (uint32_t i = 0; i < parent_count; ++i)
             parents.push_back(Hash256{r.fixed<32>()});
         delta.replace_merge_parents = std::move(parents);
-
+    }
+    if (read_conflicts) {
         const auto conflict_count = r.u32();
         if (conflict_count > 1000000)
             throw DecodeError("too many metadata delta conflicts");
@@ -909,18 +981,14 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
         return {};
 
     MetadataDelta delta;
-    // Both or neither. DLT6 carries the merge-parent and conflict sets as
-    // plain lists with no presence flag, so its decoder reads an absent set
-    // back as "replace with nothing". Sending only the one that changed made
-    // every conflict-free reconciliation (parents sharing an unresolved
-    // conflict, merge leaving it in place) replay to a snapshot without that
-    // conflict: the exact-reconstruction check rejected the delta on every
-    // replica and each one fell back to a full snapshot -- the 2026-09-06
-    // "local metadata delta rejected; retrying full record" storm.
-    if (before.merge_parents != after.merge_parents || before.conflicts != after.conflicts) {
+    // Each topology set independently: DLT7 has a presence flag per set, so a
+    // conflict-free merge carries its new merge_parents and nothing of the
+    // standing conflict set. (DLT6 could not say "unchanged" and the encoder
+    // still refuses to emit one set without the other in that format.)
+    if (before.merge_parents != after.merge_parents)
         delta.replace_merge_parents = after.merge_parents;
+    if (before.conflicts != after.conflicts)
         delta.replace_conflicts = after.conflicts;
-    }
     for (const auto& [node, sequence] : before.mutation_sequences) {
         auto it = after.mutation_sequences.find(node);
         if (it == after.mutation_sequences.end() || it->second < sequence)
@@ -974,13 +1042,12 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
         if (after_garbage[i - 1]->id == after_garbage[i]->id)
             return {};
 
-    // The current delta grammar can erase or replace an existing tombstone and
-    // append a new one, but it cannot reorder retained tombstones. Reconciliation
-    // canonicalises its union by ObjectId, while historical snapshots may carry
-    // append order. Treat such a transition as non-compact instead of emitting a
-    // delta which is semantically equivalent but reconstructs different canonical
-    // bytes (and therefore a different immutable record hash).
-    size_t target = 0;
+    // The DLT5/6 grammar can erase or replace an existing tombstone and append
+    // a new one, but it cannot reorder retained tombstones, while reconciliation
+    // canonicalises its union by ObjectId and historical snapshots carry append
+    // order. DLT7 sorts the vector after applying the edits, so whenever the
+    // target order is canonical the delta is expressible regardless of the
+    // source order; only a non-canonical target still needs the old check.
     const auto contains_id = [](const std::vector<const GarbageRef*>& sorted,
                                 const ObjectId& id) {
         const auto found = std::lower_bound(
@@ -990,24 +1057,32 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
             });
         return found != sorted.end() && (*found)->id == id;
     };
-    for (const auto& garbage : before.garbage) {
-        if (!contains_id(after_garbage, garbage.id))
-            continue;
-        if (target >= after.garbage.size() || after.garbage[target].id != garbage.id)
+    const bool garbage_changed =
+        before.garbage.size() != after.garbage.size() ||
+        !std::equal(before.garbage.begin(), before.garbage.end(), after.garbage.begin());
+    if (garbage_changed && garbage_is_canonical(after.garbage)) {
+        delta.canonical_garbage = true;
+    } else if (garbage_changed) {
+        size_t target = 0;
+        for (const auto& garbage : before.garbage) {
+            if (!contains_id(after_garbage, garbage.id))
+                continue;
+            if (target >= after.garbage.size() || after.garbage[target].id != garbage.id)
+                return {};
+            ++target;
+        }
+        // Newly-created tombstones are emitted below in sorted ObjectId order
+        // and apply_metadata_delta_in_place() appends them in that order.
+        for (const auto* garbage : after_garbage) {
+            if (contains_id(before_garbage, garbage->id))
+                continue;
+            if (target >= after.garbage.size() || after.garbage[target].id != garbage->id)
+                return {};
+            ++target;
+        }
+        if (target != after.garbage.size())
             return {};
-        ++target;
     }
-    // Newly-created tombstones are emitted below in sorted ObjectId order and
-    // apply_metadata_delta_in_place() appends them in that order.
-    for (const auto* garbage : after_garbage) {
-        if (contains_id(before_garbage, garbage->id))
-            continue;
-        if (target >= after.garbage.size() || after.garbage[target].id != garbage->id)
-            return {};
-        ++target;
-    }
-    if (target != after.garbage.size())
-        return {};
 
     size_t bi = 0, ai = 0;
     while (bi < before_garbage.size() || ai < after_garbage.size()) {
@@ -1107,6 +1182,8 @@ void apply_metadata_delta_in_place(MetadataSnapshot& out, const MetadataDelta& d
             }
         }
     }
+    if (delta.canonical_garbage)
+        canonicalise_garbage(out.garbage);
     for (const auto& [node, status] : delta.upsert_node_status)
         out.node_status[node] = status;
     for (const auto& [key, reset] : delta.upsert_identity_resets) {
@@ -1678,6 +1755,11 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
         }
     }
 
+    // A conflict recorded by an earlier merge whose subject one branch has
+    // since rewritten is decided; keeping it (and shipping it in every merge
+    // delta) is habit D. New conflicts from this merge sit at their base
+    // value and are untouched by this.
+    result.conflicts_superseded = prune_superseded_conflicts(out);
     out.merge_parents.clear();
     return result;
 }

@@ -111,6 +111,10 @@ class MetadataManager {
     std::atomic_uint64_t history_transfers_{};
     std::atomic_uint64_t history_entries_submitted_{};
     std::atomic_uint64_t history_peak_in_flight_{};
+    // Discipline 4: conflicts that left the snapshot because a later
+    // mutation decided them, and ones an operator resolved explicitly.
+    std::atomic_uint64_t conflicts_superseded_{};
+    std::atomic_uint64_t conflicts_resolved_{};
 
     std::optional<NodeInfo> node_info(const NodeId&) const;
     std::vector<NodeInfo> replica_nodes(const std::vector<NodeId>&) const;
@@ -188,6 +192,18 @@ class MetadataManager {
             history_peak_in_flight_.load(std::memory_order_relaxed),
         };
     }
+    uint64_t conflicts_superseded() const noexcept {
+        return conflicts_superseded_.load(std::memory_order_relaxed);
+    }
+    uint64_t conflicts_resolved() const noexcept {
+        return conflicts_resolved_.load(std::memory_order_relaxed);
+    }
+    // Operator resolution of one standing conflict: install the chosen
+    // alternative ("left", "right" or "base") for its subject and drop the
+    // record, in one metadata commit. Returns false when no conflict with
+    // that id stands (already superseded, resolved, or never existed);
+    // throws std::invalid_argument for an unknown choice.
+    bool resolve_conflict(const std::string& id, std::string_view choice);
     void note_replica_validation(bool available, std::string_view reason = {}) {
         publish_replica_state(available, reason);
     }
