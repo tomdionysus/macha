@@ -222,8 +222,19 @@ Tests: dlt7_presence_flags_round_trip, merge_over_append_ordered_tombstones_is_a
 superseded_conflicts_leave_the_snapshot (+2 updated) pass.
 
 Remaining:
-- [ ] Full suite; commit; deploy all three (DLT7 is a wire format: deploy
-  together, gbni-2 → gbni-1 → es-1, quickly).
+- [x] Suite 351/351; committed `27c1903` + `96c3413` (same-content rule);
+  deployed to all three (23:55–23:57, and again 01:1x with the same-content
+  rule). First mutation: conflicts 116 → 10 (`conflicts_superseded=106`);
+  API resolve of one → 9 (`conflicts_resolved=1`). Recorded in UAT file.
+- [~] Closing run IN FLIGHT (started ~01:20 from
+  `/Users/tom/.claude/jobs/6aee47b8/tmp/final-run.sh`, output
+  `final-run.out`, per-node logs `final-{gbni-1,gbni-2,es-1}.log` in the
+  same dir): gbni-1 rsyncs Jurassic Park + Prometheus (2.1 GB each) to
+  `/mnt/machamedia/UAT/final/gbni-1/`, es-1 rsyncs Idiocracy + Dog Soldiers
+  (1.05 + 1.37 GB) to `…/final/es-1/`; restarts at +90 s gbni-2, +3 m es-1,
+  +4.5 m gbni-1, +6.5 m gbni-2, +8.5 m es-1; waits for both spools to drain;
+  prints counts. If this session is gone, read `final-run.out` and write the
+  "demonstrative run" section of the UAT file from it.
 - [ ] UAT before/after: (1) `--stats` on gbni-2 after the first merge under
   0.32.0 → conflicts should drop toward 0 as superseded (49 namespace ones
   whose paths were republished + 67 catalogue ones) — expect `superseded=N`
