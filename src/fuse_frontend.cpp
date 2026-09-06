@@ -3310,8 +3310,10 @@ struct FuseFrontend::State {
                 completed_diagnostics.new_extent_puts + completed_diagnostics.rebuild_put_extents,
                 std::memory_order_relaxed);
         } catch (const FsError& e) {
-            if (e.code() == EAGAIN ||
-                (e.code() == ENOENT && publication_path_may_still_appear(inode)))
+            // Only ENOENT is re-derived here; an EAGAIN keeps its own message
+            // (spool throttle, memory admission, ...) so the retry line says
+            // what actually blocked.
+            if (e.code() == ENOENT && publication_path_may_still_appear(inode))
                 throw FsError(EAGAIN, "FUSE namespace advanced during data publication");
             throw;
         }
