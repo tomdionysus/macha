@@ -241,9 +241,107 @@ the progress counter ticking — no kill; ticking stops — killed inside 2 s).
 - `rpc_cluster/test_rpc_call_fails_after_no_progress_deadline`
 - suite 345/345
 
-## Discipline 3 — recover by resolving
+## Discipline 3 — recover by resolving (0.31.0)
 
-_(pending)_
+### Before (2026-09-06, 0.30.0 — the same on every boot since Sep 4/5)
+
+Every start replays the same durable state, so anything recovery refuses
+it refuses on every boot. Both writer nodes had been carrying this for
+days:
+
+gbni-1, boot 21:50:42 (0.30.0) — 23 `WARN` lines in the first 20 s:
+```
+21:50:45 WARN FUSE journal recovery accepted data completion without published prefix inode=904 sequence=1496 frame_offset=21387307
+… ×20 (inodes 904…1901, 11340, 11351 — the same twenty frames, every boot)
+21:50:47 WARN recovered durable FUSE operations pending=702 namespace=0 inodes=2
+21:50:47 WARN FUSE async data publication failed inode=922 error=missing
+21:50:47 WARN FUSE async data publication failed inode=5806 error=missing
+```
+`/etc/macha/fuse-operations.log` 131,912,072 bytes (re-parsed on every
+boot); `/mnt/diskB/spool/inode-922.spool` 183,038,542 bytes dated Sep 5
+11:43 and `inode-5806.spool` 689 bytes — the whole of gbni-1's steady-state
+`spool_bytes=183039231`.
+
+es-1, boot 22:03:21 CEST (0.30.0):
+```
+22:03:25 WARN FUSE journal recovery accepted data completion without published prefix inode=6435 sequence=65909 frame_offset=178282110
+22:03:26 WARN recovered durable FUSE operations pending=22997 namespace=0 inodes=1
+22:03:26 WARN FUSE async data publication failed inode=2333 error=missing
+```
+journal 218,767,658 bytes; `/mnt/diskB/spool/inode-2333.spool`
+**6,028,175,014 bytes dated Sep 4 17:55** — 22,997 pending write
+operations for a file that had left the namespace two days earlier.
+
+Mechanism: the file was written through FUSE and then removed (or renamed
+over) cluster-side before its data published. On each boot
+`resume_recovered_data` republishes it, `open_write` answers `ENOENT`,
+`publication_path_may_still_appear()` correctly says no, and the loop's
+terminal branch poisoned the inode "until an operator acts" — with no
+operator action defined. The pending operations kept
+`durable_pending_operations > 0`, so the journal could never reset and
+grew without bound, and its twenty benign done-without-published frames
+were re-warned each start.
+
+### After (0.31.0, first boot 2026-09-06 22:52 gbni-1 / 23:53 CEST es-1)
+
+Nothing was done on either node except installing 0.31.0 and restarting.
+
+gbni-1, first boot — 5 `WARN` lines (was 23):
+```
+22:52:27 Started … 22:52:29 local services ready
+22:52:31 WARN recovered durable FUSE operations pending=702 namespace=0 inodes=2 skipped_frames=0 done_without_published=20
+22:52:31 WARN dropped FUSE spool generation inode=5806 sequence=2 reason=file is no longer in the namespace
+22:52:31 WARN FUSE data publication abandoned inode=5806 last_path=/TV/Altered.Carbon.S02…/[TGx]Downloaded from torrentgalaxy.to .txt unpublished_bytes=689 reason=file is no longer in the namespace
+22:52:31 WARN dropped FUSE spool generation inode=922 sequence=1400 reason=file is no longer in the namespace
+22:52:31 WARN FUSE data publication abandoned inode=922 last_path=/TV/Allo Allo 1984 Season 4 to 6 …/Allo Allo 1984 Season 5/32 - Allo Allo S5e05 - Enter Denise.mkv unpublished_bytes=183038542 …
+```
+Immediately after: `/etc/macha/fuse-operations.log` **8 bytes** (was
+131,912,072), `inode-922.spool` and `inode-5806.spool` gone (the two
+`*.orphan.*` files from Sep 1–2 are untouched, as designed).
+
+es-1, first boot — 3 `WARN` lines (was 3, but different ones):
+```
+23:53:07 Started … 23:53:11 local services ready
+23:53:15 WARN recovered durable FUSE operations pending=22997 namespace=0 inodes=1 skipped_frames=0 done_without_published=1
+23:53:15 WARN dropped FUSE spool generation inode=2333 sequence=22997 reason=file is no longer in the namespace
+23:53:15 WARN FUSE data publication abandoned inode=2333 last_path=/TV/Ted Lasso/Ted.Lasso.S03.COMPLETE…/Ted.Lasso.S03E12.So.Long.Farewell.1080p.ATVP.WEB-DL… unpublished_bytes=6028175014 …
+```
+journal **8 bytes** (was 218,767,658); `/mnt/diskB/spool` empty (was
+6.0 GB); 22,997 operations retired in one journaled abandonment.
+
+**Second boot of each node: 0 `WARN`/`ERROR` lines**, ready in 2 s
+(gbni-1 22:53:53→55; es-1 23:54:13→15), journal still 8 bytes.
+
+What was abandoned, checked against the live namespace from gbni-2's
+mount: `/TV/Ted Lasso/` does not exist at all, and `…/Allo Allo 1984
+Season 5/` has no `S5e05` file — both trees were removed by the operator
+after the writes were accepted and before they published. The abandoned
+bytes were writes to files that no longer exist; nothing visible changed.
+The `last_path` in the WARN is exactly what an operator needs to confirm
+that.
+
+**Verdict: pass.** A condition recovery could not resolve was re-raised on
+every boot for two to three days, holding 6 GB of spool and a 218 MB
+journal on es-1; 0.31.0 resolved it once, journaled the resolution, and
+the next boot was silent.
+
+### Tests
+
+- `filesystem_fuse/test_fuse_journal_fuzz_every_frame_mutation_still_starts`
+  — 9 frames × {truncate after, drop, duplicate, corrupt} = 36 restarts,
+  the frontend starts every time; mid-journal corruption quarantines the
+  tail and counts the bytes.
+- `filesystem_fuse/test_fuse_recovery_abandons_publication_for_file_removed_from_namespace`
+  — the 922/2333 case: first boot abandons, journal resets, second boot
+  reports nothing.
+- `filesystem_fuse/test_fuse_durable_journal_skips_unbacked_data_done`
+  (was `…_rejects_…`: a marker with no operation behind it is skipped).
+- `filesystem_fuse/test_fuse_journal_frame_scanner_exhaustive_tail_model`
+  (mid-journal corruption is reported, not thrown).
+- `storage_metadata/test_metadata_journal_mid_frame_corruption_truncates_not_reseeds`
+  — one flipped byte in the first of two journal frames: journal truncated
+  and tail quarantined, checkpoint/history/heads untouched, replica usable.
+- suite 348/348.
 
 ## Discipline 4 — compact history out of the hot path
 

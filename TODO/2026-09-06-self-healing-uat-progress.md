@@ -49,7 +49,7 @@ current at every checkpoint; a fresh session reads only this and the plan.
   requirement counted as not-yet-durable once; harmless, look at the
   `durable[key]` bookkeeping when touching the barrier next.
 - [x] **Discipline 2 — one work-item retry policy + no-progress startup gate.** DONE: 0.30.0 on all nodes (`bb3697c`), UAT 2a/2b/2c recorded in `2026-09-06-self-healing-uat.md` (pass: 254 retries at 10/s → 16 retries then park at 22.8 s; operator retry drains; RPC deadline fires at 30 s; startup ceiling removed). gbni-1 config back on shipped defaults.
-- [ ] Discipline 3 — resolve-on-recovery + journal fuzz fixture.
+- [x] **Discipline 3 — resolve-on-recovery + journal fuzz fixture.** DONE: 0.31.0 on all nodes (`21ebe79`), UAT recorded (pass: gbni-1 23→5→0 boot WARNs, journal 132 MB→8 B, spool 183 MB→0; es-1 22,997 pending ops / 6 GB / 218 MB journal resolved in one boot, second boot silent).
 - [ ] Discipline 4 — compact tombstones/conflicts out of snapshots (+ DLT7).
 - [ ] UAT record: `TODO/2026-09-XX-self-healing-uat.md` with before/after
   evidence per discipline; the demonstrative run is two concurrent rsync
@@ -194,7 +194,26 @@ defaults (no `publication_retry_*`, no `service_startup_timeout_ms`).
   discipline 3 (resolve on recovery).
 - [ ] Update UAT file + memory, commit, tell the operator `/compact` is safe.
 
-## Discipline 3 — CODE COMPLETE as 0.31.0 (2026-09-06 ~22:55); full suite, deploy, UAT pending
+## Next — Discipline 4: compact history out of the hot path (+ DLT7)
+
+Read the plan doc's discipline-4 section (`### 4.`) first. Evidence to
+reproduce: snapshot size vs namespace size (270k tombstones → 15 MB
+snapshots for 1,600 files per the plan). Start by measuring on-box:
+`macha-metadata-dump` on each node (memory `project-metadata-forensics`)
+for tombstone/conflict counts and encoded snapshot bytes; capture as the
+"before". Then design per the plan: tombstones/conflicts leave the snapshot
+once every replica has acknowledged the generation (or after a bounded
+horizon), DLT7 delta format folded in, tests, CHANGELOG 0.32.0, deploy,
+UAT = snapshot bytes proportional to live entries, sub-second decode, both
+rsync writers running with rolling restarts (the "demonstrative run" in the
+UAT file closes the programme).
+
+Also carried forward (not blocking): the `cmake` plugin identity mismatch
+ERROR the test suite prints (`libmacha-torrent` built at 0.27.0) — rebuild
+the plugin locally when convenient; and journal compaction while busy
+(journal only resets when idle; bounded by `max_operation_journal_bytes`).
+
+## Discipline 3 — DONE as 0.31.0 (deployed 22:51–23:54; record kept)
 
 Landed: all seven plan items below (fuse_journal scanner `corrupt_frame_offset`;
 `load_journal` skip+count / quarantine tail; `initialise_namespace` drops
