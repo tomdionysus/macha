@@ -48,7 +48,7 @@ current at every checkpoint; a fresh session reads only this and the plan.
   `transient=yes outcome="remote-reasserted"` line per run — a re-stamped
   requirement counted as not-yet-durable once; harmless, look at the
   `durable[key]` bookkeeping when touching the barrier next.
-- [ ] **Discipline 2 — one work-item retry policy + no-progress startup gate.** CODE COMPLETE as 0.30.0 (all five steps + tests + CHANGELOG + docs); full suite run, deploy and UAT still to do — see "Discipline 2 — status" below.
+- [x] **Discipline 2 — one work-item retry policy + no-progress startup gate.** DONE: 0.30.0 on all nodes (`bb3697c`), UAT 2a/2b/2c recorded in `2026-09-06-self-healing-uat.md` (pass: 254 retries at 10/s → 16 retries then park at 22.8 s; operator retry drains; RPC deadline fires at 30 s; startup ceiling removed). gbni-1 config back on shipped defaults.
 - [ ] Discipline 3 — resolve-on-recovery + journal fuzz fixture.
 - [ ] Discipline 4 — compact tombstones/conflicts out of snapshots (+ DLT7).
 - [ ] UAT record: `TODO/2026-09-XX-self-healing-uat.md` with before/after
@@ -151,7 +151,13 @@ Tests passing in isolation: `publication_backs_off_then_parks`,
 `service_startup_gate_waits_while_recovery_progresses`,
 `rpc_call_fails_after_no_progress_deadline`, plus all discipline-1 tests.
 
-Remaining for discipline 2:
+Discipline 2 is complete (all items below done 21:50; kept as the record of
+what was run and where the on-box artefacts are: `/root/uat/d2-before.sh`,
+`d2-after.sh`, `*.out`, `*-isolated.log` on gbni-1; UAT files under
+`/mnt/machamedia/UAT/d2-before/`, `d2-after/` — leave them, they are part
+of the namespace now). gbni-1's `/etc/macha/macha.yaml` is back to shipped
+defaults (no `publication_retry_*`, no `service_startup_timeout_ms`).
+
 - [x] Full suite green 345/345; committed `bb3697c` (0.30.0).
 - [x] Deployed 0.30.0 to gbni-2 (21:01), es-1 (22:03 CEST), gbni-1 (21:03;
   booted in 3 s). gbni-1 config: temp `service_startup_timeout_ms: 1800000`
@@ -188,7 +194,36 @@ Remaining for discipline 2:
   discipline 3 (resolve on recovery).
 - [ ] Update UAT file + memory, commit, tell the operator `/compact` is safe.
 
-## Next (original discipline-2 plan, kept for reference)
+## Next — Discipline 3: recover by resolving (+ journal fuzz fixture)
+
+Read the plan doc's discipline-3 section first. Known live cases to drive
+the design (all reproducible on the cluster today):
+- Every boot on gbni-1 logs `FUSE async data publication failed inode=5806
+  error=missing` and `inode=922 …` (WARN, 3× each since 19:24); es-1 logs
+  the same for `inode=2333`, plus `FUSE journal recovery accepted data
+  completion without published prefix inode=6435 sequence=65909` and
+  `recovered durable FUSE operations pending=22997 namespace=0 inodes=1`.
+  These are journal entries whose spool bytes are gone: recovery re-raises
+  them on every start instead of resolving them once (tombstone the
+  generation, or re-derive from the namespace whether the file is already
+  published). Start by reading the recovery path in `fuse_frontend.cpp`
+  (`replay_data_quantum`, the journal loader, `abandon_data`) and
+  `metadata.cpp` `load_heads` / quarantine handling (memory
+  `project-metadata-forensics` has the quarantine locations).
+- Metadata quarantines from 2026-09-06 (see memory) — recovery that refuses
+  a head instead of merging/resolving it.
+Steps: (1) enumerate every `throw`/refuse in the FUSE journal recovery and
+`MetadataReplica` load paths and classify resolve-vs-refuse; (2) resolve
+each (drop-with-tombstone, re-derive, or quarantine-and-continue with a
+status field), never re-raise on the next boot; (3) journal fuzz fixture:
+truncate/corrupt/duplicate frames of a real journal copy
+(`/etc/macha/fuse-operations.log.bak-20260906-dup` on gbni-1 is 129 MB —
+copy a slice, don't move it) and assert recovery converges with no
+repeated WARN across two boots; (4) CHANGELOG 0.31.0, docs, tests; deploy;
+UAT = two boots of each node show zero repeated recovery WARNs and no
+quarantine growth, with both rsync writers running.
+
+## (original discipline-2 plan, kept for reference)
 
 Start Discipline 2 from the design notes above: (1) `retry_policy.hpp`
 (`RetryPolicy` + `RetryState`), adopt in `SubsystemSupervisor`; (2) FUSE data

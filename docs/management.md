@@ -42,8 +42,8 @@ stay in the spool and journal and it leaves the loader queue so the rest of
 the cluster keeps publishing.
 
 - `GET /api/v1/manage/filesystem/parked-publications` → `{"parked": [{inode, path, error_code, error_message, attempts, failing_for_ms, parked_for_ms, pending_bytes}]}`
-- `POST /api/v1/manage/filesystem/parked-publications/{inode}/retry` — reset the retry budget and re-queue the publication (`204`; `404` if that inode is not parked).
-- `POST /api/v1/manage/filesystem/parked-publications/{inode}/abandon` — drop the unpublished generation from the spool, exactly as a corrupt spool record is dropped (`204`; `404` if not parked).
+- `POST /api/v1/manage/filesystem/parked-publications/{inode}/retry` — reset the retry budget and re-queue the publication (`204`; `409 not_parked` if that inode is not parked).
+- `POST /api/v1/manage/filesystem/parked-publications/{inode}/abandon` — drop the unpublished generation from the spool, exactly as a corrupt spool record is dropped (`204`; `409 not_parked` if not parked).
 
 `diagnostics.filesystem.parked_publications` and
 `diagnostics.filesystem.publication_retries_backed_off` in `GET /api/v1/status`

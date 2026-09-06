@@ -168,17 +168,78 @@ GET /api/v1/manage/filesystem/parked-publications
 diagnostics.filesystem: parked_publications=2 publication_retries_backed_off=16
 ```
 
-_(rest of the run — a second rsync publishing to completion while the two
-stay parked, then `POST …/16565/retry` and `…/18307/retry` releasing them —
-pending.)_
+Then, with both inodes parked, a second rsync (`Ghostbusters.1984…mkv`,
+3,697,566,500 bytes) into the same directory at 21:06:57 → 21:10:52; it
+published normally while the parked pair sat in the spool — full size on
+gbni-2 at 21:16, `data_publications_completed` 2 → 4 — while gbni-2's copy
+of the parked `d2-after/Blade.Runner…mp4` stayed at **0 bytes**. One
+`POST …/parked-publications/16565/retry` (`204`, log `FUSE data publication
+retry requested by operator inode=16565`) at 21:14:33 released the first;
+by 21:34 `parked_publications=1`, `spool_bytes` had fallen to exactly the
+second inode's 3.5 GB. `POST …/18307/retry` at 21:35 released the second
+(a second POST for the same inode answers `409 not_parked`). By 21:50:21:
+`parked_publications=0 data_publications_completed=5 spool_bytes=183039231`
+(the pre-run baseline), and all three files at full size on gbni-2 —
+`d2-before/Blade.Runner…` 3,348,105,554 at 21:22, `d2-after/Blade.Runner…`
+3,348,105,554 at 21:42, `Ghostbusters…` 3,697,566,500 at 21:16. Zero
+`ERROR` lines for the whole run. gbni-1's UAT-only budget was then removed
+and it restarted onto the shipped defaults (ready in 2 s, 21:50:44).
+
+**Verdict: pass.** A publication that keeps failing now costs a handful of
+logged, spaced attempts and then a visible parked item that the rest of the
+cluster publishes around, instead of an unbounded 10–35/s loop; the
+operator can release or abandon it through the API.
 
 ### 2b. RPC no-progress deadline
 
-_(pending)_
+Before (0.29.0): the plan doc's 150–230 s `accept_metadata_commit` stalls
+of 2026-09-06 afternoon, and during the before-run above es-1 logged
+`RPC stalled (control) peer=377ce5b1bd86 message=members … no_progress_ms=30000;
+request remains active while peer health is monitored` — the call had no
+deadline of its own; only `dead_after` ending the session freed it.
+
+After (0.30.0), during the after-run's isolation, gbni-2:
+
+```
+21:05:03 DEBUG RPC stalled (control) peer=377ce5b1bd86 message=members age_ms=5000 no_progress_ms=5000; deadline_ms=30000
+… every 5 s …
+21:05:28 DEBUG RPC made no progress for 30000 ms (control) peer=377ce5b1bd86 message=members age_ms=30000; cancelled for retry
+21:05:28 DEBUG bootstrap: RPC made no progress for 30000 ms (control) … cancelled for retry
+21:05:32 DEBUG peer 10.44.1.50:7437 liveness failure: health could not be established before dead_after
+```
+
+and es-1 the same ladder to `deadline_ms=30000` (there `dead_after` won the
+race by a few hundred ms and closed the session first). The stall notice
+now names the deadline it is counting down to, the call fails with a
+distinct transient error, and the caller (bootstrap) retries under its own
+policy. The case the deadline exists for — a peer that answers heartbeats
+but never answers the call, which `dead_after` can never catch — cannot be
+injected on the live cluster without a code hook; it is what
+`rpc_cluster/test_rpc_call_fails_after_no_progress_deadline` exercises
+(handler parks on a gate, call fails inside 300 ms with the same message).
 
 ### 2c. Startup gate
 
-_(pending)_
+Before (0.28.2, morning of 2026-09-06): gbni-1 crash-looped eight times on
+the 120 s elapsed gate while replaying a five-minute journal; unwedged by
+hand with `service_startup_timeout_ms: 1800000` in its config.
+
+After (0.30.0): that override is removed from gbni-1's config; the gate is
+`service_startup_no_progress_ms: 120000` and elapsed time is not a
+criterion (`service_startup_timeout_ms` defaults to 0). gbni-1 booted
+0.30.0 in 3 s (`21:03:50 Started` → `21:03:53 local services ready`, after
+replaying its 132 MB journal, which 0.28.3 had already made linear), so the
+gate is not stressed on today's cluster; the slow-but-progressing case is
+proven by `rpc_cluster/test_service_startup_gate_waits_while_recovery_progresses`
+(recovery held at the `data-storage` stage for 3 s under a 1.2 s gate with
+the progress counter ticking — no kill; ticking stops — killed inside 2 s).
+
+### Tests
+
+- `filesystem_fuse/test_fuse_publication_backs_off_then_parks_for_operator`
+- `rpc_cluster/test_service_startup_gate_waits_while_recovery_progresses`
+- `rpc_cluster/test_rpc_call_fails_after_no_progress_deadline`
+- suite 345/345
 
 ## Discipline 3 — recover by resolving
 
