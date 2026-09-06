@@ -28,6 +28,10 @@ struct SubsystemPluginEntry {
     // example a partial deploy -- and must be refused rather than loaded:
     // the ABI is not guaranteed compatible.
     std::string_view build_identity;
+    // Returning no instance (rather than throwing) means "this node is
+    // configured not to run this capability" -- the supervisor reports
+    // `unavailable` and does not retry. Throwing means the attempt failed and
+    // is subject to the backoff/disable policy.
     std::unique_ptr<Subsystem> (*create)(const SubsystemContext&);
 };
 

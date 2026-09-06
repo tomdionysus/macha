@@ -192,6 +192,49 @@ then speculative maintenance. Durable FUSE spool publication uses the loader
 class even when its journal records were reconstructed after restart. Recovery
 provenance affects replay validation and cache policy, not scheduling priority.
 
+## Subsystem plugins
+
+Optional subsystems ship as `dlopen`'d modules rather than being compiled into
+the server. Today that is BitTorrent acquisition
+(`<libdir>/macha/plugins/libmacha-torrent.so`); FUSE is still linked into the
+executable. The directory scanned is `plugin_path`, which defaults to this
+build's private plugin directory, and every module is checked against the
+running core's build stamp (project version plus git commit) before it is
+called — a plugin from a different build is refused and logged rather than
+loaded.
+
+The practical consequences for an operator:
+
+- **Deploy the plugins with the binary.** A node that receives only a new
+  `macha` and `libmacha_core` silently loses every capability whose plugin was
+  not copied across, and a node that receives only a new plugin refuses to
+  load it on the build stamp. Copy `bin/macha`, `lib/macha/libmacha_core.*`
+  and `lib/macha/plugins/` together, and verify hashes across nodes for all
+  of them, not just the executable.
+- **Read the state from `GET /api/v1/status`**, in the always-present
+  `subsystems` block. Each entry is named for the plugin file it came from
+  (`libmacha-torrent`), so the name says which file to look for on disk, and
+  carries `state` (`unavailable`, `starting`, `running`, `faulted`,
+  `restarting`, `disabled`), `restart_count` and `last_fault`.
+  `unavailable` and `disabled` are different facts and matter:
+
+  | state | meaning | action |
+  |---|---|---|
+  | `unavailable` | No plugin file, or the plugin declined to start because this node is configured not to run it (`torrent.enabled: false`). | None; this is the configured outcome. Install the plugin or turn the setting on if it was meant to run. |
+  | `running` | Loaded and started. | None. |
+  | `faulted` | The last construct/start attempt threw; it is being retried with backoff. | Read `last_fault`; if it persists it becomes `disabled`. |
+  | `disabled` | Too many failures in the window, or refused at load (build-stamp mismatch, unreadable file). | Needs an operator: fix the cause and restart the process. Nothing retries automatically. |
+
+- **A faulted subsystem does not take the node down.** Metadata, RPC, the HTTP
+  API and playback keep running; the capability itself is withdrawn while it
+  is not running, so `/api/v1/torrents/*` answers 503 rather than failing in
+  an unhelpful way. `/api/v1/torrents/search` is served by core and keeps
+  working regardless.
+- **Enabling a capability whose plugin is missing is no longer a config
+  error.** Before 0.28.0, `torrent.enabled: true` on a build without
+  libtorrent refused to start the node. It now starts, reports the subsystem
+  `unavailable`, and serves everything else.
+
 ## Cluster status and telemetry
 
 `GET /api/v1/status` merges two deliberately different telemetry planes:

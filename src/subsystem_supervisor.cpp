@@ -38,21 +38,31 @@ struct SubsystemSupervisor::Entry {
 
     std::jthread lifecycle;
 
-    ~Entry() {
-        if (handle)
-            ::dlclose(handle);
-    }
+    // Deliberately no dlclose. Unmapping a plugin's code invalidates anything
+    // of it that outlives the Subsystem instance -- a shared_ptr's deleter
+    // and control block, a vtable, a std::function -- and core legitimately
+    // holds such references (SubsystemRegistry hands out
+    // std::shared_ptr<TorrentService>, whose destructor lives in the plugin).
+    // Closing the library on supervisor stop crashed
+    // rpc_cluster/test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node
+    // in exactly that way: the last shared_ptr released after the unmap.
+    // Restarting a faulted subsystem re-creates the instance from the library
+    // that is still loaded, so nothing needs the unload; loading a *new build*
+    // of a plugin without restarting the process is explicitly out of scope
+    // (see the plan's "Risks and open questions").
 };
 
-SubsystemSupervisor::SubsystemSupervisor(std::filesystem::path plugin_dir, SubsystemContext context,
+SubsystemSupervisor::SubsystemSupervisor(std::filesystem::path plugin_dir,
                                          SubsystemRetryPolicy policy)
-    : plugin_dir_(std::move(plugin_dir)), context_(context), policy_(policy) {}
+    : plugin_dir_(std::move(plugin_dir)), policy_(policy) {}
 
 SubsystemSupervisor::~SubsystemSupervisor() {
     stop();
 }
 
-void SubsystemSupervisor::start() {
+void SubsystemSupervisor::start(SubsystemContext context) {
+    context_ = context;
+
     std::error_code discovery_error;
     if (!std::filesystem::is_directory(plugin_dir_, discovery_error))
         return;
@@ -88,12 +98,14 @@ void SubsystemSupervisor::start() {
             // /usr/bin/ld.so on Debian/RPi OS) that happen to match the
             // extension filter. That is an expected, harmless occurrence,
             // not a broken deployment -- log it quietly and don't report a
-            // fake "subsystem" for it at all (entry's destructor dlcloses
-            // the handle when it goes out of scope below).
+            // fake "subsystem" for it at all. Unloading is safe here, unlike
+            // for a real plugin (see Entry): nothing of this library was ever
+            // called, so nothing can hold a reference into it.
             Log::debug("subsystem plugin candidate '" + entry->name +
                       "' has no entry symbol '" + kSubsystemEntrySymbol +
                       "', skipping as not a macha plugin: " +
                       (symbol_error ? symbol_error : "symbol resolved to null"));
+            ::dlclose(entry->handle);
             continue;
         }
 
@@ -140,19 +152,41 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
         }
 
         std::unique_ptr<Subsystem> instance;
+        bool declined = false;
         std::string fault;
         try {
             instance = entry.plugin->create(context_);
-            if (!instance)
-                throw std::runtime_error("plugin factory returned no subsystem instance");
-            instance->start();
+            if (instance)
+                instance->start();
+            else
+                declined = true;
         } catch (const std::exception& e) {
             fault = e.what();
         } catch (...) {
             fault = "unknown exception";
         }
 
+        if (declined) {
+            // The plugin loaded and its factory ran, but this node is
+            // configured not to run the capability (e.g. torrent.enabled is
+            // false). That is a deliberate operator choice, not a fault: no
+            // instance, no retry, no backoff, and Status says `unavailable`
+            // rather than `disabled`.
+            Log::info("subsystem plugin '" + entry.name +
+                      "' loaded but its capability is not enabled on this node path=" +
+                      entry.plugin_path.string());
+            std::lock_guard lock(entry.mutex);
+            entry.state = SubsystemState::unavailable;
+            return;
+        }
+
         if (fault.empty()) {
+            // Every terminal outcome of a load says so at INFO. Without this
+            // the successful case was the only silent one, so confirming that
+            // a deployed plugin was actually picked up meant inspecting
+            // /proc/<pid>/maps -- see docs/operations.md, "Subsystem plugins".
+            Log::info("subsystem plugin '" + entry.name + "' loaded and running path=" +
+                      entry.plugin_path.string());
             {
                 std::lock_guard lock(entry.mutex);
                 entry.state = SubsystemState::running;

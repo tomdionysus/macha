@@ -95,7 +95,7 @@ ctest --test-dir build --output-on-failure
 ```
 
 Review the configure output. A full build should report FUSE support, UPnP
-port mapping and BitTorrent acquisition as enabled.
+port mapping and the BitTorrent acquisition plugin as enabled.
 
 ## Install and configure
 
@@ -108,9 +108,16 @@ sudo cmake --install build
 With the `/usr` prefix, this installs:
 
 - `/usr/bin/macha`
+- `/usr/lib/macha/libmacha_core.so`
+- `/usr/lib/macha/plugins/libmacha-torrent.so` (when libtorrent was found)
 - `/usr/lib/systemd/system/macha.service`
 - `/etc/macha/macha.yaml.example`
 - `/etc/macha/macha.yaml`
+
+`libmacha_core` and the plugin directory are part of the deployment, not
+optional extras: an upgrade that copies only the executable leaves the node
+running against the old core, or without the capabilities whose plugins were
+not copied. See [Subsystem plugins](operations.md#subsystem-plugins).
 
 The installer prints the actual configuration and service paths. An existing
 `macha.yaml` is always preserved during reinstall or upgrade.

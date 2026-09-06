@@ -93,8 +93,7 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
                  MaintenanceStageHook maintenance_stage_hook,
                  StartupStallHandler startup_stall_handler)
     : node_(std::move(config), keys, std::move(startup_stage_hook)), cluster_status_(node_),
-      subsystems_(node_.config().plugin_path.value_or(std::filesystem::path{}),
-                 SubsystemContext{&node_.config()}),
+      subsystems_(node_.config().plugin_path.value_or(std::filesystem::path{})),
       session_api_(node_), startup_stall_handler_(std::move(startup_stall_handler)),
       maintenance_stage_hook_(std::move(maintenance_stage_hook)) {
     cluster_status_.attach_convergence_diagnostics(
@@ -306,11 +305,9 @@ void Service::initialise_services(std::stop_token stop) {
                                                             node_.config().read_ahead_extents);
         auto ingest = std::make_unique<IngestManager>(
             node_, *fs, *catalogue_hints, node_.config().ingest, media_information.get());
-        auto torrents = std::make_unique<TorrentManager>(node_, *ingest, node_.config().torrent,
-                                                         node_.config().state_path);
         auto torrent_search = std::make_unique<TorrentSearchManager>(node_.config().torrent);
         auto acquisition_api =
-            std::make_unique<AcquisitionApi>(*ingest, *torrents, *torrent_search);
+            std::make_unique<AcquisitionApi>(*ingest, registry_, *torrent_search);
         auto catalogue_api = std::make_unique<CatalogueApi>(
             *catalogue, *catalogue_hints,
             [scanner_ptr = scanner.get()](const std::vector<std::string>& media_ids) {
@@ -342,7 +339,6 @@ void Service::initialise_services(std::stop_token stop) {
         scanner_ = std::move(scanner);
         hydration_ = std::move(hydration);
         ingest_ = std::move(ingest);
-        torrents_ = std::move(torrents);
         torrent_search_ = std::move(torrent_search);
         acquisition_api_ = std::move(acquisition_api);
         catalogue_api_ = std::move(catalogue_api);
@@ -354,7 +350,10 @@ void Service::initialise_services(std::stop_token stop) {
 
         media_information_->start();
         ingest_->start();
-        torrents_->start();
+        // Only now: a subsystem plugin's context hands out references to the
+        // services above (the torrent plugin needs IngestManager), and none
+        // of them existed when this Service was constructed.
+        subsystems_.start(SubsystemContext{&node_.config(), &node_, ingest_.get(), &registry_});
         streaming_->start();
         scanner_->start();
         hydration_->start();
@@ -388,7 +387,6 @@ void Service::start() {
     // operators can observe startup even before the cluster listener or any
     // durable backend begins recovery.
     cluster_status_.start();
-    subsystems_.start();
     if (catalogue_http_)
         catalogue_http_->start();
 
@@ -403,8 +401,6 @@ void Service::request_stop() {
         startup_.request_stop();
     if (fs_)
         fs_->request_io_cancellation();
-    if (torrents_)
-        torrents_->request_stop();
     if (ingest_)
         ingest_->request_stop();
     if (scanner_)
@@ -439,8 +435,10 @@ void Service::stop() {
     request_stop();
     if (startup_.joinable())
         startup_.join();
-    if (torrents_)
-        torrents_->stop();
+    // Before ingest: a subsystem plugin holds references to the services
+    // below it (the torrent plugin submits completed downloads to ingest), so
+    // every plugin instance must be destroyed while they are all still alive.
+    subsystems_.stop();
     if (ingest_)
         ingest_->stop();
     if (scanner_)
@@ -451,7 +449,6 @@ void Service::stop() {
         hydration_->stop();
     cluster_status_.detach_metadata();
     cluster_status_.detach_subsystem_diagnostics();
-    subsystems_.stop();
     cluster_status_.stop();
     if (catalogue_http_)
         catalogue_http_->stop();

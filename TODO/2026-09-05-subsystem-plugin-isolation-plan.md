@@ -229,15 +229,38 @@ kernel mount handle alive across the owning code being torn down and rebuilt.
   problem (peer telemetry folding), not this node's own subsystem state.
   Currently always empty — nothing has migrated onto the interface yet.
 
-## Phase 1 — Torrent as a plugin
+## Phase 1 — Torrent as a plugin (shipped in 0.28.0)
 
-- [ ] Split `torrent.cpp` and its libtorrent linkage into `libmacha-torrent`;
-  remove the inline `MACHA_HAVE_LIBTORRENT` branches.
-- [ ] `Service` addresses Torrent only through `Subsystem`/`SubsystemContext`;
-  `AcquisitionApi`/`IngestManager` handle `unavailable` cleanly.
-- [ ] Regression: constructor-throw and loop-throw fault injection, confirm
-  core stays fully up and Status reports `torrent: faulted` correctly;
-  confirm existing torrent test suite passes unchanged in behaviour.
+- [x] Split `torrent.cpp` and its libtorrent linkage into `libmacha-torrent`;
+  remove the inline `MACHA_HAVE_LIBTORRENT` branches. The split is not
+  engine/no-engine but core/plugin by *dependency*: the job value types, the
+  API and wire JSON, the URI sanitisers and the Torznab search client touch
+  no libtorrent and stay in `macha_core` (`torrent_common.cpp`), so search
+  still works on a node with no plugin. `torrent_manager.cpp` and
+  `torrent_plugin.cpp` are the module.
+- [x] `Service` addresses Torrent only through `Subsystem`/`SubsystemContext`;
+  `AcquisitionApi` handles `unavailable` cleanly (503, and
+  `/torrents/status` answers `build_available` from the runtime fact).
+  One thing the plan didn't anticipate: `Subsystem` alone is not enough --
+  core needs the subsystem's *own* interface too. Hence `SubsystemRegistry`
+  and the abstract `TorrentService`, with lookups returning a `shared_ptr`
+  so a restart cannot dangle a caller already inside a handler.
+- [x] Regression: `hydration_catalogue/test_torrent_failed_ingest_retry_and_pause_intent`
+  (real dlopen, Subsystem driven directly),
+  `rpc_cluster/test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node`
+  (full Service, plugin loaded from the build tree),
+  `hydration_catalogue/test_acquisition_api_without_a_torrent_plugin_reports_it_absent`,
+  `subsystem_supervisor/test_subsystem_supervisor_reports_a_declining_plugin_as_unavailable`.
+- Learned here, and it applies to Phase 2 as much as this one: **do not
+  `dlclose`**. Core holds `shared_ptr`s whose deleter and control block live
+  in the plugin, so unmapping on supervisor stop is a use-after-unmap; the
+  rpc_cluster test above segfaulted on exactly that before handles were kept
+  for the process lifetime.
+- Still open from this phase: a *loop*-throw (as opposed to construct/start)
+  fault-injection case. `SubsystemSupervisor` has no detection for a
+  subsystem's own background thread dying after a successful start (noted in
+  `subsystem_supervisor.hpp`); now that a real subsystem has migrated, that
+  can finally be designed against one.
 
 ## Phase 2 — FUSE as a plugin
 
