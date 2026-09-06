@@ -42,8 +42,13 @@ current at every checkpoint; a fresh session reads only this and the plan.
 ## Phase status
 
 - [x] Baseline: 0.28.3 on all nodes; plan committed (`273a5c4`).
-- [ ] **Discipline 1 — re-derive, don't assert (durability probe).** IN PROGRESS.
-- [ ] Discipline 2 — one work-item retry policy + no-progress startup gate.
+- [x] **Discipline 1 — re-derive, don't assert (durability probe).** DONE:
+  0.29.0 on all nodes (core `0888fe4ffff8`), UAT runs 1+2 recorded in
+  `2026-09-06-self-healing-uat.md` (pass). Loose end noted there: one
+  `transient=yes outcome="remote-reasserted"` line per run — a re-stamped
+  requirement counted as not-yet-durable once; harmless, look at the
+  `durable[key]` bookkeeping when touching the barrier next.
+- [ ] **Discipline 2 — one work-item retry policy + no-progress startup gate.** NEXT.
 - [ ] Discipline 3 — resolve-on-recovery + journal fuzz fixture.
 - [ ] Discipline 4 — compact tombstones/conflicts out of snapshots (+ DLT7).
 - [ ] UAT record: `TODO/2026-09-XX-self-healing-uat.md` with before/after
@@ -87,11 +92,56 @@ is re-derived from the decoded namespace view instead of poisoning the inode
 (`publication_path_may_still_appear()`), race test 0/40, terminal test 0/10,
 suite 341/341. Committed locally as 0.29.0.
 
+## Discipline 2 — design notes (written while waiting on discipline 1's UAT)
+
+Code facts gathered:
+- `SubsystemRetryPolicy` (`subsystem_supervisor.hpp:26`): max_failures_in_window,
+  failure_window, initial_backoff, max_backoff. Generalise to `RetryPolicy` in
+  a new `retry_policy.hpp` with a small `RetryState` (consecutive failures,
+  window deque, next_due) and `next_delay()` / `exhausted()`; the supervisor
+  keeps its behaviour by adopting it.
+- FUSE data loop retry: `fuse_frontend.cpp` ~3643 `if (retry) sleep 100ms` —
+  fixed. Add `Inode::publication_retry` (RetryState) reset on success; delay
+  = policy.next_delay(); on exhaustion → `inode->parked = {error, attempts,
+  first/last failure}` and `backend_error` stays unset (parked ≠ poisoned);
+  Status gets `filesystem.parked[]` (inode, path, error, attempts, since);
+  manage API: `POST /api/v1/manage/filesystem/parked/{inode}/retry|abandon`.
+- FUSE namespace loop: has 50 ms→5 s backoff (`:2851`) but no park except the
+  operator skip on non-retryable errors; keep, and add the same park for a
+  *retryable* error that exhausts the budget (blocked-op API already exists —
+  extend it to list parked namespace ops).
+- Startup: `Service::wait_services_ready` waits `service_startup_timeout`
+  (`config.hpp:426`, default 120 s) then `_Exit(1)`. Replace with a
+  no-progress gate: `NodeRuntime` exposes a monotonic `recovery_progress()`
+  (bytes/frames/heads counters incremented by `recover_state` stages and by
+  `MetadataReplica` load/materialise and the FUSE journal loader); the wait
+  loop wakes every second and only kills when the counter has not moved for
+  `service_startup_no_progress_ms` (default 120000). Keep
+  `service_startup_timeout_ms` as an absolute ceiling (default 0 = none).
+- RPC deadline: `net.cpp` "remains active while peer health is monitored" at
+  ~2170/2190; add `rpc_no_progress_deadline` (default 30 s) for control-lane
+  calls → fail with a distinct transient error.
+- Log-rate rule: one line per backoff step.
+
+Tests to write: FUSE publication against a peer refusing one object forever
+→ parks within budget, other inodes unaffected, Status shows it, retry-now
+works; namespace op exhausting its budget parks; startup gate does not fire
+while the progress counter moves (simulate slow replay) and does fire when
+it stops; RPC no-progress deadline returns within bound.
+
 ## Next
 
-Discipline 1 step 5 (deploy 0.29.0 to all three, then the live UAT below),
-checkpoint here, then start Discipline 2 (RetryPolicy + no-progress startup
-gate).
+Start Discipline 2 from the design notes above: (1) `retry_policy.hpp`
+(`RetryPolicy` + `RetryState`), adopt in `SubsystemSupervisor`; (2) FUSE data
+loop backoff + park (`Inode::publication_retry`, `parked` state, Status
+`filesystem.parked[]`, manage retry/abandon); (3) namespace loop park on
+budget exhaustion; (4) startup no-progress gate (`recovery_progress()`
+counter, `service_startup_no_progress_ms`); (5) RPC control-lane no-progress
+deadline; tests for each; deploy; UAT = a peer refusing one object forever
+(simulate by removing it on the peer after a restart) parks one inode within
+budget while the rest of the cluster keeps publishing at full rate, and a
+copy of gbni-1's 2026-09-06 state starts under the gate. Then brief the
+"Macha UI Work" agent on the new Status/manage fields.
 
 First live run (19:26): es-1's 6 s restart landed exactly on a barrier →
 `remote-transport: send: Broken pipe` → the writer treated it as lost and
@@ -101,6 +151,16 @@ keeps its own message. 342/342 after. gbni-1 is still publishing Pulp
 Fiction (13.9 GB spool, ~8 MB/s) which holds the spool at the 16 GiB
 ceiling and throttles any other writer there — rerun the UAT once that
 spool has retired (spool_bytes on gbni-1 drops by ~13.9 GB).
+
+**Evidence already captured (19:43, real workload):** gbni-1
+`object durability re-derived after incarnation change reasserted=260
+absent=0 peers=1`; es-1 `re-derived after epoch change present=260/260
+expected=5b5b16ca current=714c3b85` — Pulp Fiction's 260 extents on es-1
+re-stamped after es-1's restart, none re-sent. Recorded in
+`2026-09-06-self-healing-uat.md` (run 1). Run 2 (clean, final cut, 2001: A
+Space Odyssey, three spaced es-1 restarts) still to do after the deploy job
+finishes (it waits for Pulp Fiction's spool to retire, then installs on
+gbni-1 → gbni-2 → es-1).
 
 Live UAT script for step 5:
 1. On gbni-1: `nice -n 10 ionice -c3 rsync -a --inplace <one multi-GB file
