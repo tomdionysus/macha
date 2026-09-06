@@ -194,6 +194,78 @@ defaults (no `publication_retry_*`, no `service_startup_timeout_ms`).
   discipline 3 (resolve on recovery).
 - [ ] Update UAT file + memory, commit, tell the operator `/compact` is safe.
 
+## Discipline 3 — CODE COMPLETE as 0.31.0 (2026-09-06 ~22:55); full suite, deploy, UAT pending
+
+Landed: all seven plan items below (fuse_journal scanner `corrupt_frame_offset`;
+`load_journal` skip+count / quarantine tail; `initialise_namespace` drops
+undescribed-inode ops with journaled markers; path-collision loser really
+re-journaled; ENOENT-terminal → `abandon_data` + `publications_abandoned`;
+metadata journal truncate-at-bad-frame, history skip-frame; status fields;
+docs/operations.md "What recovery resolves on its own"; CHANGELOG 0.31.0).
+New tests pass in isolation: `journal_fuzz_every_frame_mutation_still_starts`
+(9 frames × 4 mutations), `recovery_abandons_publication_for_file_removed_from_namespace`,
+`durable_journal_skips_unbacked_data_done`, `frame_scanner_exhaustive_tail_model`,
+`metadata_journal_mid_frame_corruption_truncates_not_reseeds`.
+
+UAT plan (before evidence already captured in the finding list below):
+- Before: gbni-1 boot 21:50 = 2× `publication failed … error=missing` +
+  20× `accepted data completion without published prefix` WARNs; journal
+  132 MB (`/etc/macha/fuse-operations.log`), spool 183 MB (inode-922) +
+  689 B (inode-5806). es-1 boot 22:03 CEST = 1× missing (inode 2333) + 1×
+  without-published; journal 178 MB, spool 6.0 GB.
+- After (first 0.31.0 boot): expect `FUSE data publication abandoned inode=922
+  …` / `5806` / `2333`, `dropped FUSE spool generation …`, spool → 0,
+  journal reset to 8 bytes once idle (`publications_abandoned` in status).
+  Second boot: zero recovery WARNs, journal 8 bytes. Record boot WARN
+  counts + sizes before/after for both nodes in the UAT file.
+- Note for the UAT: the abandoned bytes are files the operator removed
+  from the namespace after writing them (unpublished writes to since-deleted
+  files); nothing visible is lost. Say so explicitly.
+
+## Discipline 3 — findings (kept)
+
+Findings that fix the scope (all verified on-box):
+- gbni-1 spool = inode-922 (183 MB, since Sep 5) + inode-5806; es-1 spool =
+  inode-2333 (6.0 GB, since Sep 4). Their files left the namespace; every
+  boot `resume_recovered_data` → `open_write` → ENOENT "missing" → terminal
+  → `backend_error` poison. They pin `durable_pending_operations` > 0 so the
+  journal never resets (132 MB / 178 MB, re-parsed every boot, and the ~20
+  benign `accepted data completion without published prefix` WARNs re-raise
+  each time).
+- `load_journal` throws on any semantic inconsistency (duplicate/non-monotonic
+  marker, marker without op, unknown type) → process exits → systemd loop.
+  Mid-journal checksum mismatch: same. `initialise_namespace` throws on an op
+  whose inode has no descriptor.
+- 0.28.3's path-collision "re-journal the loser" is a no-op: the loser's
+  `journal_epoch` already equals the current epoch so `journal_inode_locked`
+  returns early → the collision is re-resolved every boot.
+- `MetadataReplica::load_journal`: a mid-journal auth/semantic failure →
+  `recover_from_seed` quarantines *every* metadata file. `load_history`
+  mid-file failure → same.
+
+Plan (each with a test):
+1. FUSE journal parse: a frame that does not fit the state so far is skipped
+   and counted (`journal_recovery_skipped_frames`), never fatal; duplicate
+   inode descriptor → last wins; "done without published" → DEBUG + count.
+2. Mid-journal checksum corruption → quarantine tail to `<journal>.corrupt.<ts>`,
+   truncate, count bytes; scanner reports `corrupt_frame_offset` instead of
+   throwing.
+3. `initialise_namespace`: op with no descriptor → drop with journaled
+   done/abandoned markers (`recovery_dropped_operations`), spool preserved
+   as orphan. Path-collision loser really re-journals.
+4. Terminal ENOENT publication (file gone from namespace) → `abandon_data`
+   (journaled, spool retired, `publications_abandoned`), not poison — fixes
+   922/5806/2333 on the first 0.31.0 boot; journal resets after.
+5. Metadata journal: mid-journal failure → truncate at that offset with
+   quarantined tail (chain semantics), keep checkpoint/history; history:
+   skip the bad frame, count, continue.
+6. Fuzz fixture test: every frame × {truncate, drop, duplicate, corrupt} →
+   frontend starts; plus the removed-file abandon test (two boots, second
+   clean); metadata mid-journal corruption test.
+7. Status fields + docs + CHANGELOG 0.31.0; deploy; UAT = before/after boot
+   logs on gbni-1 and es-1 (WARN count, journal size, spool bytes), second
+   boot clean.
+
 ## Next — Discipline 3: recover by resolving (+ journal fuzz fixture)
 
 Read the plan doc's discipline-3 section first. Known live cases to drive

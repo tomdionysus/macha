@@ -556,6 +556,11 @@ struct FuseFrontend::State {
         uint64_t max_inode{};
         uint64_t max_namespace_sequence{};
         size_t pending_operations{};
+        // Discipline 3 bookkeeping: frames the loader could not fit into the
+        // state so far (skipped, never fatal) and completions that arrived
+        // without the redundant published proof (legitimate; counted only).
+        size_t skipped_frames{};
+        size_t done_without_published{};
     };
 
     struct BrokerTask {
@@ -772,6 +777,11 @@ struct FuseFrontend::State {
     std::atomic_uint64_t namespace_operations_confirmed{};
     std::atomic_uint64_t parked_publications{};
     std::atomic_uint64_t publication_retries_backed_off{};
+    // Discipline 3: recovery resolves instead of refusing; these say how often.
+    std::atomic_uint64_t journal_recovery_skipped_frames{};
+    std::atomic_uint64_t journal_recovery_quarantined_bytes{};
+    std::atomic_uint64_t recovery_dropped_operations{};
+    std::atomic_uint64_t publications_abandoned{};
     // Earliest time a backed-off inode becomes due again (steady-clock ns
     // since epoch; 0 = none). The data loop sleeps to it when idle.
     std::atomic<int64_t> deferred_retry_due_ns{0};
@@ -1720,9 +1730,10 @@ struct FuseFrontend::State {
             recovery.max_inode = std::max(recovery.max_inode, inode.id);
             recovery.max_namespace_sequence =
                 std::max(recovery.max_namespace_sequence, inode.namespace_sequence);
-            if (recovery.inodes.contains(inode.id))
-                throw DecodeError("duplicate FUSE journal inode descriptor");
-            recovery.inodes.emplace(inode.id, std::move(inode));
+            // A descriptor is re-journaled when recovery changes an inode's
+            // paths (path-collision loser) — the newest one describes the
+            // inode. Formerly "duplicate descriptor" was fatal.
+            recovery.inodes.insert_or_assign(inode.id, std::move(inode));
             break;
         }
         case JournalRecord::namespace_op: {
@@ -1809,10 +1820,14 @@ struct FuseFrontend::State {
 
             auto published = recovery.data_published.find(inode);
             if (published == recovery.data_published.end() || published->second.first < sequence) {
-                Log::warn("FUSE journal recovery accepted data completion without published "
-                          "prefix inode=" +
-                          std::to_string(inode) + " sequence=" + std::to_string(sequence) +
-                          " frame_offset=" + std::to_string(frame_offset));
+                // Legitimate (see above) and, on a journal that has not reset
+                // for days, repeated on every boot: one DEBUG line each and a
+                // count in the recovery summary, not twenty WARNs per start.
+                ++recovery.done_without_published;
+                Log::debug("FUSE journal recovery accepted data completion without published "
+                           "prefix inode=" +
+                           std::to_string(inode) + " sequence=" + std::to_string(sequence) +
+                           " frame_offset=" + std::to_string(frame_offset));
             }
             recovery.data_done[inode] = sequence;
             break;
@@ -1876,6 +1891,15 @@ struct FuseFrontend::State {
             JournalRecovery recovery;
             uint64_t position = journal_magic.size();
             uint64_t last_good = position;
+            // Discipline 3: a frame that cannot be fitted into the state so
+            // far is skipped and counted, never fatal. Every such throw in
+            // parse_journal_record() names a deterministic situation (a
+            // duplicated marker, a marker whose operation was dropped, a
+            // record type this build does not know) whose resolution is
+            // "ignore this frame"; refusing to start instead put the node in
+            // a systemd restart loop with a journal that would never change.
+            std::map<std::string, std::pair<size_t, uint64_t>> skipped_reasons;
+            std::optional<uint64_t> corrupt_at;
             while (position < file_size) {
                 if (file_size - position < 4)
                     break;
@@ -1901,19 +1925,66 @@ struct FuseFrontend::State {
                 if (sha256(payload) != expected) {
                     if (position + frame_size == file_size)
                         break;
-                    throw std::runtime_error("FUSE operation journal checksum mismatch");
+                    // Durable middle-of-journal corruption. Nothing after it
+                    // can be trusted to be what the writer meant, but nothing
+                    // before it is in doubt either: quarantine the tail for
+                    // diagnosis and start from the good prefix. Spool bytes
+                    // whose operations were in the tail are preserved as
+                    // orphans by validate_recovery_spools().
+                    corrupt_at = position;
+                    break;
                 }
 
-                parse_journal_record(recovery, payload, static_cast<size_t>(position));
+                try {
+                    parse_journal_record(recovery, payload, static_cast<size_t>(position));
+                } catch (const std::exception& error) {
+                    auto& entry = skipped_reasons[error.what()];
+                    if (!entry.first)
+                        entry.second = position;
+                    ++entry.first;
+                    ++recovery.skipped_frames;
+                }
                 position += frame_size;
                 last_good = position;
+            }
+            for (const auto& [reason, detail] : skipped_reasons)
+                Log::warn("FUSE journal recovery skipped frames reason=\"" + reason +
+                          "\" count=" + std::to_string(detail.first) +
+                          " first_offset=" + std::to_string(detail.second));
+            journal_recovery_skipped_frames.fetch_add(recovery.skipped_frames,
+                                                      std::memory_order_relaxed);
+            if (corrupt_at) {
+                const auto quarantine = journal_path.string() + ".corrupt." +
+                                        std::to_string(unix_ms()) + "." + std::to_string(getpid());
+                ScopedFd target(::open(quarantine.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600));
+                if (target.get() < 0)
+                    throw FsError(errno, "cannot quarantine corrupt FUSE operation journal tail");
+                Bytes buffer(256 * 1024);
+                for (uint64_t offset = *corrupt_at; offset < file_size;) {
+                    const auto chunk =
+                        static_cast<size_t>(std::min<uint64_t>(buffer.size(), file_size - offset));
+                    if (!pread_exact({buffer.data(), chunk}, offset))
+                        throw FsError(EIO, "cannot read corrupt FUSE operation journal tail");
+                    write_exact(target.get(), {buffer.data(), chunk});
+                    offset += chunk;
+                }
+                fsync_fd(target.get(), "cannot sync quarantined FUSE operation journal tail");
+                journal_recovery_quarantined_bytes.fetch_add(file_size - *corrupt_at,
+                                                             std::memory_order_relaxed);
+                Log::warn("FUSE operation journal checksum mismatch before EOF; quarantined the "
+                          "tail and recovering the prefix offset=" +
+                          std::to_string(*corrupt_at) +
+                          " bytes=" + std::to_string(file_size - *corrupt_at) +
+                          " quarantine=" + quarantine);
             }
             if (last_good != file_size) {
                 if (::ftruncate(fd, static_cast<off_t>(last_good)) != 0)
                     throw FsError(errno, "cannot trim torn FUSE operation journal tail");
                 fsync_fd(fd, "cannot sync trimmed FUSE operation journal");
-                Log::warn("trimmed incomplete FUSE operation journal tail bytes=" +
-                          std::to_string(file_size - last_good));
+                sync_directory(journal_dir);
+                if (!corrupt_at)
+                    Log::warn("trimmed incomplete FUSE operation journal tail bytes=" +
+                              std::to_string(file_size - last_good));
             }
             if (::close(fd) != 0)
                 throw FsError(errno, "cannot close FUSE operation journal after recovery");
@@ -3681,6 +3752,40 @@ struct FuseFrontend::State {
                 const int code = fs_error ? fs_error->code() : EIO;
                 const bool replay = fs_error && code == ESTALE;
                 retry = replay || retryable_backend_error(e);
+                // Discipline 3: ENOENT that survived
+                // publication_path_may_still_appear() means the file is no
+                // longer in the accepted namespace — these bytes have no
+                // destination and never will. Poisoning the inode "until an
+                // operator acts" left gbni-1 (inode 922, 183 MB) and es-1
+                // (inode 2333, 6 GB) re-raising the same failure on every
+                // boot for days while the journal could never reset. The
+                // deterministic resolution is the one a corrupt spool gets:
+                // journal the abandonment, retire the spool, move on.
+                bool abandoned = false;
+                if (!retry && fs_error && code == ENOENT) {
+                    try {
+                        std::string path;
+                        uint64_t bytes = 0;
+                        {
+                            std::lock_guard lock(inode->mutex);
+                            path = inode->published_path.value_or(inode->current_path);
+                            for (const auto& op : inode->data_ops)
+                                if (op.kind == DataOp::Kind::write)
+                                    bytes += op.length;
+                        }
+                        abandon_data(inode, "file is no longer in the namespace");
+                        abandoned = true;
+                        publications_abandoned.fetch_add(1, std::memory_order_relaxed);
+                        Log::warn("FUSE data publication abandoned inode=" +
+                                  std::to_string(inode->id) + " last_path=" + path +
+                                  " unpublished_bytes=" + std::to_string(bytes) +
+                                  " reason=file is no longer in the namespace");
+                    } catch (const FsError&) {
+                        // Newly accepted writes are still reaching the spool;
+                        // abandonment is retried once they have settled.
+                        retry = true;
+                    }
+                }
                 const auto line = std::string("FUSE async data publication ") +
                                   (replay ? "replay" : retry ? "retry" : "failed") +
                                   " inode=" + std::to_string(inode->id) + " error=" + e.what();
@@ -3688,7 +3793,9 @@ struct FuseFrontend::State {
                     std::lock_guard lock(inode->mutex);
                     inode->data_publication.reset();
                 }
-                if (retry) {
+                if (abandoned) {
+                    // Resolved above; nothing pending remains on this inode.
+                } else if (retry) {
                     // Discipline 2: a retry is backed off per inode and
                     // budgeted; past the budget the file is parked for an
                     // operator instead of retrying forever (a doomed inode
@@ -3735,13 +3842,15 @@ struct FuseFrontend::State {
                     std::lock_guard lock(inode->mutex);
                     parked_now = inode->parked.has_value();
                 }
-                if (!retry && !parked_now) {
+                if (!retry && !parked_now && !abandoned) {
                     int code = EIO;
                     if (const auto* fs_error = dynamic_cast<const FsError*>(&e))
                         code = fs_error->code();
                     std::lock_guard lock(inode->mutex);
                     inode->backend_error = code;
                 }
+                if (abandoned)
+                    completed = true; // the generation is gone; nothing to run.
             }
 
             {
@@ -4163,6 +4272,79 @@ struct FuseFrontend::State {
                 needed.insert(inode);
         }
 
+        // Discipline 3: an operation whose inode was never described cannot
+        // be replayed, and the journal is durable, so refusing to start here
+        // refused forever. Retire those operations now with journaled
+        // markers (so the next boot does not see them again), count them,
+        // and leave any spool bytes for validate_recovery_spools() to
+        // preserve as an orphan — never replayed, never silently lost.
+        {
+            std::vector<uint64_t> undescribed;
+            for (auto id : needed)
+                if (!recovery.inodes.contains(id))
+                    undescribed.push_back(id);
+            for (auto id : undescribed) {
+                size_t dropped = 0;
+                std::vector<NamespaceOp> namespace_dropped;
+                for (auto& [sequence, op] : recovery.namespace_ops) {
+                    if (recovery.namespace_done.contains(sequence))
+                        continue;
+                    const bool references =
+                        std::find(op.affected.begin(), op.affected.end(), id) !=
+                            op.affected.end() ||
+                        std::find(op.removed.begin(), op.removed.end(), id) != op.removed.end();
+                    if (!references)
+                        continue;
+                    namespace_dropped.push_back(op);
+                    recovery.namespace_done.insert(sequence);
+                }
+                if (!namespace_dropped.empty()) {
+                    journal_namespace_done(namespace_dropped);
+                    dropped += namespace_dropped.size();
+                }
+                auto operations = recovery.data_ops.find(id);
+                if (operations != recovery.data_ops.end()) {
+                    const auto done = recovery.data_done[id];
+                    const auto pending = static_cast<size_t>(std::count_if(
+                        operations->second.begin(), operations->second.end(),
+                        [&](const DataOp& op) { return op.sequence > done; }));
+                    if (pending) {
+                        (void)journal_data_abandoned(id, operations->second.back().sequence,
+                                                     pending);
+                        dropped += pending;
+                    }
+                    recovery.data_ops.erase(operations);
+                    recovery.data_done.erase(id);
+                    recovery.data_history_inodes.erase(id);
+                }
+                needed.erase(id);
+                recovery_dropped_operations.fetch_add(dropped, std::memory_order_relaxed);
+                Log::warn("FUSE journal recovery dropped operations for an inode without a "
+                          "descriptor inode=" +
+                          std::to_string(id) + " operations=" + std::to_string(dropped) +
+                          "; any spool bytes are preserved as an orphan");
+            }
+            // The dropped namespace operations may have been the only thing
+            // naming other inodes; recompute what is still needed.
+            if (!undescribed.empty()) {
+                std::set<uint64_t> still_needed;
+                for (const auto& [sequence, op] : recovery.namespace_ops) {
+                    if (recovery.namespace_done.contains(sequence))
+                        continue;
+                    still_needed.insert(op.affected.begin(), op.affected.end());
+                    still_needed.insert(op.removed.begin(), op.removed.end());
+                }
+                for (const auto& [inode, operations] : recovery.data_ops) {
+                    const auto done = recovery.data_done[inode];
+                    if (std::any_of(operations.begin(), operations.end(),
+                                    [&](const DataOp& op) { return op.sequence > done; }))
+                        still_needed.insert(inode);
+                }
+                needed = std::move(still_needed);
+                validate_recovery_spools(recovery);
+            }
+        }
+
         std::map<std::string, uint64_t, std::less<>> descriptor_by_published_path;
         std::map<uint64_t, RecoveryPaths> recovered_paths;
         for (auto id : needed) {
@@ -4290,6 +4472,11 @@ struct FuseFrontend::State {
                         loser->current_path.clear();
                         loser->published_path.reset();
                         if (recovery.inodes.contains(loser->id)) {
+                            // The loser was stamped with the current epoch
+                            // above, which made this re-journal a no-op in
+                            // 0.28.3 and the collision a fixture of every
+                            // boot. Force the descriptor out.
+                            loser->journal_epoch = std::numeric_limits<uint64_t>::max();
                             std::lock_guard admission(journal_admission_mutex);
                             journal_inode_locked(loser);
                         }
@@ -4330,7 +4517,10 @@ struct FuseFrontend::State {
                       std::to_string(durable_pending_operations.load(std::memory_order_relaxed)) +
                       " namespace=" +
                       std::to_string(namespace_queue.size() + namespace_unconfirmed.size()) +
-                      " inodes=" + std::to_string(needed.size()));
+                      " inodes=" + std::to_string(needed.size()) +
+                      " skipped_frames=" + std::to_string(recovery.skipped_frames) +
+                      " done_without_published=" +
+                      std::to_string(recovery.done_without_published));
         }
         reset_journal_if_idle();
     }
@@ -6038,6 +6228,10 @@ FuseFrontendDiagnostics FuseFrontend::diagnostics() const noexcept {
         state_->fs.available_namespace_revision(),
         state_->parked_publications.load(std::memory_order_relaxed),
         state_->publication_retries_backed_off.load(std::memory_order_relaxed),
+        state_->journal_recovery_skipped_frames.load(std::memory_order_relaxed),
+        state_->journal_recovery_quarantined_bytes.load(std::memory_order_relaxed),
+        state_->recovery_dropped_operations.load(std::memory_order_relaxed),
+        state_->publications_abandoned.load(std::memory_order_relaxed),
     };
 }
 

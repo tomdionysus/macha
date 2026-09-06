@@ -1,5 +1,58 @@
 # Current release
 
+## 0.31.0 — Recovery resolves, it does not refuse (development)
+
+Discipline 3 of `TODO/2026-09-06-self-healing-disciplines-plan.md`. Local
+durable state is replayed on every start, so anything recovery *refuses*
+it refuses forever: the node either restarts in a loop or re-raises the
+same fault on every boot. Found on the cluster on 2026-09-06: gbni-1
+(inode 922, 183 MB) and es-1 (inode 2333, 6 GB) had a recovered
+publication whose file had left the namespace — `error=missing` on every
+boot, the inode poisoned, the spool kept, and the operation journal pinned
+open at 132 MB / 178 MB and re-parsed each start, with twenty benign
+`accepted data completion without published prefix` WARNs each time.
+
+- **FUSE operation journal loader never refuses a frame.** A frame that
+  does not fit the state so far — duplicated marker, marker whose
+  operation is gone, non-monotonic sequence, unknown record type, undecodable
+  payload — is skipped and counted (`journal_recovery_skipped_frames`), with
+  one `WARN` per distinct reason. A re-journaled inode descriptor now
+  replaces the earlier one instead of being a fatal duplicate. A checksum
+  failure before EOF (durable middle-of-journal corruption) quarantines the
+  tail to `<journal>.corrupt.<ts>.<pid>`, truncates, and starts from the
+  good prefix (`journal_recovery_quarantined_bytes`); spool bytes whose
+  operations were in the tail are preserved as orphans. `done` markers
+  without the redundant `published` proof are DEBUG and a count in the
+  recovery summary line, not a WARN each.
+- **Operations for an inode with no descriptor** are retired with journaled
+  `namespace_done` / `data_abandoned` markers and counted
+  (`recovery_dropped_operations`); the spool is preserved as an orphan.
+  Formerly fatal.
+- **A publication whose file is no longer in the namespace is abandoned**
+  (journaled, spool retired, `publications_abandoned`, one `WARN` with the
+  last path and unpublished bytes) instead of poisoning the inode until an
+  operator acts. Nothing an operator could do with it existed anyway; now
+  the journal can reset once the rest of the backlog drains.
+- **Path-collision loser is really re-journaled.** 0.28.3's fix stamped the
+  loser with the current epoch before re-journaling it, so the re-journal
+  was a no-op and the collision was re-resolved on every boot.
+- **Metadata journal:** a frame that fails authentication or does not fit
+  the CAS chain anywhere in the file ends the replayable prefix — the tail
+  is quarantined and truncated like a torn append — instead of throwing out
+  of the constructor and quarantining *every* metadata file (checkpoint,
+  history, heads) over one frame. **Metadata history:** a frame that cannot
+  be authenticated or decoded is skipped and counted; dependent heads are
+  repaired live from peers as before.
+- Status: `diagnostics.filesystem.{journal_recovery_skipped_frames,
+  journal_recovery_quarantined_bytes, recovery_dropped_operations,
+  publications_abandoned}`.
+- Tests: `test_fuse_journal_fuzz_every_frame_mutation_still_starts` (every
+  frame × truncate/drop/duplicate/corrupt, the frontend starts each time),
+  `test_fuse_recovery_abandons_publication_for_file_removed_from_namespace`
+  (second boot is clean), `test_fuse_durable_journal_skips_unbacked_data_done`
+  (was `..._rejects_...`), `test_metadata_journal_mid_frame_corruption_truncates_not_reseeds`;
+  the scanner model test now expects `corrupt_frame_offset`.
+
 ## 0.30.0 — "Not yet" never becomes "forever": retry budgets, parking, progress gates (development)
 
 Discipline 2 of `TODO/2026-09-06-self-healing-disciplines-plan.md`. Every

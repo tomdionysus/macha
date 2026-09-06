@@ -2812,19 +2812,21 @@ MACHA_FAST_TEST("filesystem_fuse", test_fuse_journal_frame_scanner_exhaustive_ta
     }
 
     // The same checksum failure cannot be dismissed as a torn append when a
-    // later complete frame exists; that is durable middle-of-journal corruption.
+    // later complete frame exists; that is durable middle-of-journal
+    // corruption. The scanner reports where, keeps the good prefix, and
+    // leaves the tail to the caller (quarantined by the frontend).
     {
         auto bytes = prefix;
         bytes.insert(bytes.end(), invalid_eof.begin(), invalid_eof.end());
         bytes.insert(bytes.end(), first.begin(), first.end());
-        bool rejected = false;
-        try {
-            (void)scan_fuse_journal_frames(bytes, header.size(),
-                                           [](std::span<const uint8_t>, size_t) {});
-        } catch (const std::runtime_error&) {
-            rejected = true;
-        }
-        CHECK(rejected);
+        size_t records = 0;
+        const auto scan = scan_fuse_journal_frames(
+            bytes, header.size(), [&](std::span<const uint8_t>, size_t) { ++records; });
+        CHECK(records == 1);
+        REQUIRE(scan.corrupt_frame_offset.has_value());
+        CHECK(*scan.corrupt_frame_offset == first_end);
+        CHECK(scan.last_good == first_end);
+        CHECK(scan.discarded_tail == invalid_eof.size() + first.size());
     }
 
     // Fully valid framing consumes both records and reports no tail loss.
@@ -3524,7 +3526,7 @@ MACHA_TEST("filesystem_fuse",
     }
 }
 
-MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_rejects_unbacked_data_done) {
+MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_skips_unbacked_data_done) {
     TestService fixture("fuse-journal-unbacked-done");
     auto& config = fixture.config();
     config.replication = 1;
@@ -3545,14 +3547,12 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_rejects_unbacked_data_do
     done.u64(1);
     append_fuse_journal_test_record(journal, done.data());
 
-    bool rejected = false;
-    try {
-        auto should_fail = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
-        should_fail->stop();
-    } catch (const std::exception&) {
-        rejected = true;
-    }
-    CHECK(rejected);
+    // Discipline 3: a completion marker with no operation behind it retires
+    // nothing, so it is skipped and counted; refusing to start over it put
+    // the node in a restart loop it could never leave.
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    CHECK(recovered->diagnostics().journal_recovery_skipped_frames == 1);
+    recovered->stop();
 }
 
 MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_drops_only_inode_with_missing_spool) {
@@ -4093,6 +4093,231 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_namespace_refresh_is_demand_dri
             missing = e.code() == ENOENT;
         }
         CHECK(missing);
+    }
+}
+
+// ---- Discipline 3: recovery resolves, it does not refuse ---------------------
+
+struct JournalFrame {
+    size_t offset{};
+    size_t size{};
+};
+
+std::vector<JournalFrame> fuse_journal_frames(const Bytes& bytes) {
+    std::vector<JournalFrame> frames;
+    const auto scan = scan_fuse_journal_frames(
+        bytes, 8, [&](std::span<const uint8_t> payload, size_t offset) {
+            frames.push_back({offset, 4 + payload.size() + 32});
+        });
+    REQUIRE(scan.discarded_tail == 0);
+    REQUIRE(!scan.corrupt_frame_offset.has_value());
+    return frames;
+}
+
+Bytes read_all_bytes(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE(in.good());
+    std::vector<char> raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    return Bytes(raw.begin(), raw.end());
+}
+
+void write_all_bytes(const std::filesystem::path& path, const Bytes& bytes) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    REQUIRE(out.good());
+    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    REQUIRE(out.good());
+}
+
+void restore_directory(const std::filesystem::path& from, const std::filesystem::path& to) {
+    std::filesystem::remove_all(to);
+    std::filesystem::copy(from, to, std::filesystem::copy_options::recursive);
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_journal_fuzz_every_frame_mutation_still_starts) {
+    // The plan's acceptance for discipline 3: truncate the journal at every
+    // frame boundary, drop any frame, duplicate any frame, corrupt any
+    // frame — and the frontend starts every time. Before 0.31.0 a
+    // duplicated marker, a marker whose operation was dropped, or a
+    // checksum failure before EOF was fatal, and because the journal is
+    // durable, fatal on every restart after that.
+    TestService fixture("fuse-journal-fuzz");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 30s;
+    config.fuse.suspend_loader_for_tests = true;
+
+    auto& service = fixture.start();
+    service.filesystem().mkdir("/fz-seeded", 0755, getuid(), getgid());
+    uint64_t inode_a = 0;
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        service.filesystem().store().foreground_activity(1);
+        frontend->mkdir("/fz", 0755, getuid(), getgid());
+        auto a = frontend->create("/fz/a.bin", 0600, getuid(), getgid(), true, true, false);
+        inode_a = a.inode;
+        const auto bytes_a = pattern(48 * 1024, 71);
+        REQUIRE(frontend->write(inode_a, 0, bytes_a) == bytes_a.size());
+        frontend->release(inode_a, true);
+        frontend->rename("/fz/a.bin", "/fz/b.bin", false);
+        frontend->mkdir("/fz/sub", 0755, getuid(), getgid());
+        auto c = frontend->create("/fz-seeded/c.bin", 0600, getuid(), getgid(), true, true, false);
+        const auto bytes_c = pattern(8 * 1024, 72);
+        REQUIRE(frontend->write(c.inode, 0, bytes_c) == bytes_c.size());
+        frontend->release(c.inode, true);
+        frontend->stop();
+    }
+
+    const auto spool_dir = config.state_path / "fuse-spool";
+    const auto journal = spool_dir / "operations.log";
+    // Add the marker kinds the loader must also tolerate losing/duplicating:
+    // a namespace published marker for the first op and a data completion
+    // for a.bin's first write.
+    {
+        Writer done;
+        done.u8(7); // JournalRecord::data_done
+        done.u64(inode_a);
+        done.u64(1);
+        const std::array<Bytes, 2> records{fuse_namespace_marker(4, 1), done.take()};
+        append_fuse_journal_test_records(journal, records);
+    }
+
+    const auto pristine = read_all_bytes(journal);
+    const auto frames = fuse_journal_frames(pristine);
+    REQUIRE(frames.size() >= 6);
+    const auto pristine_spool = fixture.path() / "spool-pristine";
+    std::filesystem::copy(spool_dir, pristine_spool, std::filesystem::copy_options::recursive);
+
+    size_t variants = 0;
+    auto run_variant = [&](const std::string& name, const Bytes& bytes,
+                           const std::function<void(FuseFrontend&)>& check) {
+        restore_directory(pristine_spool, spool_dir);
+        write_all_bytes(journal, bytes);
+        std::shared_ptr<FuseFrontend> frontend;
+        try {
+            frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        } catch (const std::exception& e) {
+            const auto message = name + ": frontend refused to start: " + e.what();
+            ::macha::test::check(false, message.c_str(), __FILE__, __LINE__);
+            return;
+        }
+        check(*frontend);
+        frontend->stop();
+        ++variants;
+    };
+
+    for (size_t i = 0; i < frames.size(); ++i) {
+        const auto& frame = frames[i];
+        const auto label = "frame " + std::to_string(i) + " of " + std::to_string(frames.size());
+
+        Bytes truncated(pristine.begin(),
+                        pristine.begin() + static_cast<ptrdiff_t>(frame.offset + frame.size));
+        // Recovery may append to the journal (re-journaled descriptors,
+        // markers for dropped operations), so only the start is asserted.
+        run_variant("truncate after " + label, truncated, [&](FuseFrontend&) {
+            CHECK(std::filesystem::file_size(journal) >= 8);
+        });
+
+        Bytes dropped = pristine;
+        dropped.erase(dropped.begin() + static_cast<ptrdiff_t>(frame.offset),
+                      dropped.begin() + static_cast<ptrdiff_t>(frame.offset + frame.size));
+        run_variant("drop " + label, dropped, [&](FuseFrontend&) {});
+
+        Bytes duplicated = pristine;
+        duplicated.insert(duplicated.begin() + static_cast<ptrdiff_t>(frame.offset + frame.size),
+                          pristine.begin() + static_cast<ptrdiff_t>(frame.offset),
+                          pristine.begin() + static_cast<ptrdiff_t>(frame.offset + frame.size));
+        run_variant("duplicate " + label, duplicated, [&](FuseFrontend&) {});
+
+        Bytes corrupted = pristine;
+        corrupted[frame.offset + 4] ^= 0x5a;
+        run_variant("corrupt " + label, corrupted, [&](FuseFrontend& frontend) {
+            const bool last = i + 1 == frames.size();
+            const auto status = frontend.diagnostics();
+            if (last) {
+                // EOF checksum failure is a torn append: trimmed, not quarantined.
+                CHECK(status.journal_recovery_quarantined_bytes == 0);
+            } else {
+                CHECK(status.journal_recovery_quarantined_bytes == pristine.size() - frame.offset);
+                bool quarantined = false;
+                for (const auto& entry : std::filesystem::directory_iterator(spool_dir))
+                    if (entry.path().filename().string().find("operations.log.corrupt.") == 0)
+                        quarantined = true;
+                CHECK(quarantined);
+            }
+        });
+    }
+    CHECK(variants == frames.size() * 4);
+
+    // Sanity: the pristine journal itself still recovers everything.
+    restore_directory(pristine_spool, spool_dir);
+    write_all_bytes(journal, pristine);
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    CHECK(recovered->inode_for_path("/fz/b.bin").has_value());
+    CHECK(recovered->inode_for_path("/fz/sub").has_value());
+    CHECK(recovered->diagnostics().journal_recovery_skipped_frames == 0);
+    recovered->stop();
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_recovery_abandons_publication_for_file_removed_from_namespace) {
+    // gbni-1 inode 922 (183 MB) and es-1 inode 2333 (6 GB), 2026-09-06: a
+    // recovered publication whose file had left the namespace failed with
+    // ENOENT on every boot, poisoned the inode "until an operator acts",
+    // kept the spool bytes and pinned the journal open. Discipline 3: the
+    // first boot abandons it (journaled), the second boot sees nothing.
+    TestService fixture("fuse-recovery-removed-file");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 30s;
+
+    auto& service = fixture.start();
+    service.filesystem().create_file("/gone.bin", 0600, getuid(), getgid());
+    uint64_t inode = 0;
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto handle = frontend->open("/gone.bin", true, true, false, false);
+        inode = handle.inode;
+        const auto payload = pattern(256 * 1024, 73);
+        REQUIRE(frontend->write(inode, 0, payload) == payload.size());
+        service.filesystem().store().foreground_activity(1);
+        frontend->release(inode, true);
+        frontend->stop();
+    }
+    const auto spool_dir = config.state_path / "fuse-spool";
+    const auto journal = spool_dir / "operations.log";
+    const auto spool = spool_dir / ("inode-" + std::to_string(inode) + ".spool");
+    REQUIRE(std::filesystem::exists(spool));
+    REQUIRE(std::filesystem::file_size(spool) == 256 * 1024);
+    REQUIRE(std::filesystem::file_size(journal) > 8);
+
+    // The file leaves the accepted namespace while the write is unpublished.
+    service.filesystem().unlink("/gone.bin");
+
+    config.fuse.publication_quiet = 0ms;
+    {
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        REQUIRE(recovered->wait_for_idle(10s));
+        const auto diagnostics = recovered->diagnostics();
+        CHECK(diagnostics.publications_abandoned == 1);
+        CHECK(diagnostics.parked_publications == 0);
+        CHECK(recovered->status().pending_data == 0);
+        CHECK(!recovered->inode_for_path("/gone.bin").has_value());
+        recovered->stop();
+    }
+    // Resolved once: the spool is gone and the journal has reset.
+    CHECK(!std::filesystem::exists(spool) || std::filesystem::file_size(spool) == 0);
+    CHECK(std::filesystem::file_size(journal) == 8);
+    {
+        auto again = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        REQUIRE(again->wait_for_idle(10s));
+        CHECK(again->diagnostics().publications_abandoned == 0);
+        CHECK(again->status().pending_data == 0);
+        again->stop();
     }
 }
 
