@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "durability_domain.hpp"
 #include "diagnostics.hpp"
+#include "supervised.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -61,7 +62,9 @@ DurabilityDomain::DurabilityDomain(uint64_t id, std::filesystem::path representa
     if (batch_window_ < std::chrono::milliseconds::zero())
         throw std::runtime_error("durability batch window cannot be negative");
     add_representative(std::move(representative));
-    worker_ = std::jthread([this](std::stop_token stop) { loop(stop); });
+    worker_ = std::jthread([this](std::stop_token stop) {
+        run_supervised("durability-domain", [this, stop] { loop(stop); });
+    });
 }
 
 DurabilityDomain::~DurabilityDomain() {

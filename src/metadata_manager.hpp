@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -72,6 +73,18 @@ class MetadataManager {
     // mutation_mutex_ across its whole body while calling read_group()
     // internally; reusing mutation_mutex_ here would self-deadlock on that path.
     std::mutex reconciliation_mutex_;
+    // An observed peer certificate that this replica cannot accept (its
+    // record fails to materialize locally) is rejected fresh on every single
+    // read_group() call otherwise -- read_group() runs on essentially every
+    // ordinary metadata read cluster-wide, and unlike MetadataReplica's own
+    // accepted-head reconstruction (which has its own cooldown, see
+    // unreconstructable_head_retry_at_ in metadata.hpp), this rejection path
+    // is a separate call (MetadataReplica::accept_commit()'s own early
+    // materialize check, not accepted_heads()) and was not covered by that
+    // fix. Bounds the resulting "ignoring metadata head without a valid
+    // acceptance certificate" log volume the same way.
+    mutable std::mutex unacceptable_head_mutex_;
+    mutable std::map<Hash256, Clock::time_point> unacceptable_head_retry_at_;
     mutable std::mutex cache_mutex_;
     std::optional<MetadataRecord> cache_;
     Clock::time_point cache_until_{};
@@ -205,5 +218,13 @@ class MetadataManager {
     // rare, size-gated round deterministically.
     void attempt_history_checkpoint(size_t record_threshold = 256,
                                     uint64_t byte_threshold = 64ULL * 1024 * 1024);
+    // Live repair for accepted heads the local replica has flagged as
+    // unreconstructable (MetadataReplica::unreconstructable_heads()): ask each
+    // reachable peer for the record as a self-contained full body
+    // (get_metadata_history_record) and re-anchor it locally
+    // (MetadataReplica::reanchor_history()). No restart, no quarantine. Driven
+    // by the maintenance cycle; a no-op when nothing is flagged. Returns the
+    // number of heads repaired this call.
+    size_t repair_unreconstructable_heads(FrameType frame_type = FrameType::control);
 };
 } // namespace macha

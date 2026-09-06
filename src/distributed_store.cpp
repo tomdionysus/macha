@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <set>
 #include <tuple>
@@ -550,6 +551,10 @@ bool DistributedStore::retain_on(const NodeInfo& target, RetentionClass object_c
                 n_.config().extent_size);
             if (!resource)
                 return false;
+            // Unlike has_on()'s candidate probe, this is the actual retention
+            // commit: it must not record a durability claim over content that
+            // turns out to be corrupt, so it deliberately stays on the full
+            // verified path rather than the cheap presence check.
             const bool present = object_class == RetentionClass::data
                                      ? n_.local_store().valid(id)
                                      : n_.control_store().valid(id);
@@ -597,48 +602,41 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
     std::map<NodeId, NodeInfo> node_info;
     std::map<NodeId, std::vector<ObjectId>> batches;
     std::map<ObjectId, std::vector<NodeInfo>> candidates_by_object;
+    for (const auto& id : ids)
+        candidates_by_object.emplace(id, ranked(id));
 
-    for (const auto& id : ids) {
-        auto candidates = ranked(id);
-        candidates_by_object.emplace(id, candidates);
-        std::vector<NodeInfo> selected;
-        selected.reserve(floor);
-        for (const auto& candidate : candidates) {
-            if (selected.size() >= floor)
-                break;
-            bool present = false;
-            try {
-                present = has_on(candidate, id);
-            } catch (...) {
-                present = false;
-            }
-            if (present)
-                selected.push_back(candidate);
-        }
+    // Batched, concurrent candidate-presence scan (the O(N) serial
+    // has_on()-per-candidate loop this exists to remove). Preference order and
+    // the per-object floor requirement are identical to the serial form.
+    auto selected_by_object = select_present_batched(candidates_by_object, floor);
 
-        if (selected.size() < floor) {
-            // A metadata-only mutation may be the first operation on this object
-            // after old placement disappeared. Re-establish the ordinary DATA
-            // durability floor before creating the new causal claim.
+    std::vector<ObjectId> short_ids;
+    for (const auto& id : ids)
+        if (selected_by_object[id].size() < floor)
+            short_ids.push_back(id);
+
+    if (!short_ids.empty()) {
+        // A metadata-only mutation may be the first operation on an object
+        // after its old placement disappeared. Re-establish the ordinary DATA
+        // durability floor before creating the new causal claim. This only
+        // touches objects the batched scan above already found short, so it
+        // stays a rare, per-object serial path rather than the common one.
+        std::map<ObjectId, std::vector<NodeInfo>> rescan_candidates;
+        for (const auto& id : short_ids) {
             auto data = get(id, 0, FrameType::speculative);
             if (!data || !put(id, *data))
                 return false;
-            candidates = ranked(id);
+            auto candidates = ranked(id);
             candidates_by_object[id] = candidates;
-            selected.clear();
-            for (const auto& candidate : candidates) {
-                if (selected.size() >= floor)
-                    break;
-                bool present = false;
-                try {
-                    present = has_on(candidate, id);
-                } catch (...) {
-                    present = false;
-                }
-                if (present)
-                    selected.push_back(candidate);
-            }
+            rescan_candidates.emplace(id, std::move(candidates));
         }
+        auto rescanned = select_present_batched(rescan_candidates, floor);
+        for (auto& [id, selected] : rescanned)
+            selected_by_object[id] = std::move(selected);
+    }
+
+    for (const auto& id : ids) {
+        auto& selected = selected_by_object[id];
         if (selected.size() < floor) {
             Log::debug("DATA retention placement unavailable id=" + to_string(id) +
                        " required=" + std::to_string(floor) +
@@ -1227,6 +1225,169 @@ DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_
     return data;
 }
 
+std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::batched_have_objects(
+    const std::map<NodeId, NodeInfo>& node_info,
+    const std::map<NodeId, std::vector<ObjectId>>& ids_by_node) {
+    std::map<NodeId, std::map<ObjectId, bool>> results;
+
+    // Local node: cheap presence check, no RPC, no chunking/concurrency needed.
+    if (auto self = ids_by_node.find(n_.node_id()); self != ids_by_node.end()) {
+        auto& out = results[n_.node_id()];
+        for (const auto& id : self->second) {
+            auto resource = n_.data_resources().acquire(
+                DataWorkContext(FrameType::loader, n_.config().extent_size),
+                n_.config().extent_size);
+            out[id] = resource && n_.local_store().has(id);
+        }
+    }
+
+    const size_t batch_size = std::max<size_t>(1, n_.config().retention_check_batch_size);
+    const size_t max_concurrency = std::max<size_t>(1, n_.config().retention_check_concurrency);
+
+    struct Chunk {
+        NodeId node;
+        std::vector<ObjectId> ids;
+    };
+    std::deque<Chunk> chunks;
+    for (const auto& [node_id, ids] : ids_by_node) {
+        if (node_id == n_.node_id())
+            continue;
+        for (size_t offset = 0; offset < ids.size(); offset += batch_size) {
+            const size_t end = std::min(ids.size(), offset + batch_size);
+            chunks.push_back({node_id, std::vector<ObjectId>(ids.begin() + static_cast<long>(offset),
+                                                              ids.begin() + static_cast<long>(end))});
+        }
+    }
+
+    struct InFlight {
+        NodeId node;
+        std::vector<ObjectId> ids;
+        AsyncRpc rpc;
+    };
+    std::vector<InFlight> in_flight;
+    in_flight.reserve(max_concurrency);
+
+    auto fail_chunk = [&](const NodeId& node, const std::vector<ObjectId>& ids) {
+        auto& out = results[node];
+        for (const auto& id : ids)
+            out.emplace(id, false);
+    };
+
+    auto launch = [&](Chunk chunk) {
+        auto found = node_info.find(chunk.node);
+        if (found == node_info.end()) {
+            fail_chunk(chunk.node, chunk.ids);
+            return;
+        }
+        Writer writer;
+        writer.u32(static_cast<uint32_t>(chunk.ids.size()));
+        for (const auto& id : chunk.ids)
+            writer.fixed(id.bytes);
+        try {
+            auto rpc = n_.call_async(found->second, MessageType::have_objects, writer.data(),
+                                     FrameType::loader);
+            in_flight.push_back({chunk.node, std::move(chunk.ids), std::move(rpc)});
+        } catch (const std::exception& error) {
+            Log::debug("retention presence batch peer=" + found->second.host +
+                       " error=" + error.what());
+            fail_chunk(chunk.node, chunk.ids);
+        }
+    };
+
+    const auto deadline = std::max(n_.config().dead_after, n_.config().connect_timeout);
+    while (!chunks.empty() || !in_flight.empty()) {
+        while (!chunks.empty() && in_flight.size() < max_concurrency) {
+            launch(std::move(chunks.front()));
+            chunks.pop_front();
+        }
+        if (in_flight.empty())
+            break;
+        auto& item = in_flight.front();
+        bool ok = false;
+        std::vector<bool> present(item.ids.size(), false);
+        try {
+            if (item.rpc.wait_for(deadline) != std::future_status::ready) {
+                item.rpc.abort();
+            } else {
+                auto reply = item.rpc.get();
+                if (reply.message.type == MessageType::have_objects_reply) {
+                    Reader reader(reply.message.payload);
+                    if (reader.u32() == item.ids.size()) {
+                        for (size_t i = 0; i < item.ids.size(); ++i)
+                            present[i] = reader.u8() != 0;
+                        reader.finish();
+                        ok = true;
+                    }
+                }
+            }
+        } catch (const std::exception& error) {
+            Log::debug("retention presence batch peer=" +
+                       (node_info.contains(item.node) ? node_info.at(item.node).host : "") +
+                       " error=" + error.what());
+        }
+        auto& out = results[item.node];
+        for (size_t i = 0; i < item.ids.size(); ++i)
+            out[item.ids[i]] = ok && present[i];
+        in_flight.erase(in_flight.begin());
+    }
+    return results;
+}
+
+std::map<ObjectId, std::vector<NodeInfo>> DistributedStore::select_present_batched(
+    const std::map<ObjectId, std::vector<NodeInfo>>& candidates_by_object, size_t floor) {
+    std::map<ObjectId, std::vector<NodeInfo>> selected;
+    std::map<ObjectId, size_t> next_index;
+    std::vector<ObjectId> pending;
+    pending.reserve(candidates_by_object.size());
+    for (const auto& [id, candidates] : candidates_by_object) {
+        selected[id];
+        next_index[id] = 0;
+        if (!candidates.empty())
+            pending.push_back(id);
+    }
+
+    while (!pending.empty()) {
+        std::map<NodeId, NodeInfo> node_info;
+        std::map<NodeId, std::vector<ObjectId>> ids_by_node;
+        std::vector<ObjectId> next_pending;
+        for (const auto& id : pending) {
+            auto& sel = selected[id];
+            if (sel.size() >= floor)
+                continue;
+            auto& idx = next_index[id];
+            const auto& candidates = candidates_by_object.at(id);
+            if (idx >= candidates.size())
+                continue;
+            const auto& candidate = candidates[idx];
+            ++idx;
+            node_info[candidate.id] = candidate;
+            ids_by_node[candidate.id].push_back(id);
+            next_pending.push_back(id);
+        }
+        if (ids_by_node.empty())
+            break;
+
+        auto results = batched_have_objects(node_info, ids_by_node);
+        for (const auto& [node_id, ids] : ids_by_node) {
+            const auto& node = node_info.at(node_id);
+            const auto found = results.find(node_id);
+            for (const auto& id : ids) {
+                const bool present =
+                    found != results.end() && found->second.contains(id) && found->second.at(id);
+                if (present)
+                    selected[id].push_back(node);
+            }
+        }
+
+        pending = std::move(next_pending);
+        std::erase_if(pending, [&](const ObjectId& id) {
+            return selected[id].size() >= floor ||
+                   next_index[id] >= candidates_by_object.at(id).size();
+        });
+    }
+    return selected;
+}
+
 bool DistributedStore::has_on(const NodeInfo& target, const ObjectId& id) {
     if (target.id == n_.node_id()) {
         auto resource = n_.data_resources().acquire(
@@ -1234,7 +1395,10 @@ bool DistributedStore::has_on(const NodeInfo& target, const ObjectId& id) {
             n_.config().extent_size);
         if (!resource)
             return false;
-        return n_.local_store().valid(id);
+        // Presence-only: this is a candidate-selection probe, not the retention
+        // commit. A full decrypt here is exactly the scaling cliff this exists
+        // to remove; the actual durability claim (retain_on) still verifies.
+        return n_.local_store().has(id);
     }
     Writer writer;
     writer.fixed(id.bytes);
@@ -1510,6 +1674,10 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 n_.config().extent_size);
             if (!resource)
                 return std::nullopt;
+            // Unlike has_on()'s local branch, this decides whether a *repair
+            // push* target already holds a healthy copy, with no downstream
+            // re-verification step -- a corrupt-but-present local object must
+            // not be counted as satisfying placement, or it never gets healed.
             return n_.local_store().valid(id);
         }
         if (!reserve_operation() || yielded())
@@ -1709,6 +1877,10 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                     n_.config().extent_size);
                 if (!resource)
                     break;
+                // No downstream re-verification follows this decision (unlike
+                // has_on()'s callers): a corrupt local copy must not be
+                // treated as "already own it, skip the pull", or a locally
+                // rotted object this node should own is never re-fetched.
                 local_valid = n_.local_store().valid(id);
             }
             if ((!everywhere && !should_own(id)) || local_valid) {

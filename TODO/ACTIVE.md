@@ -129,18 +129,80 @@ None of these came from a TODO/FIXME comment — there are none anywhere in
 `src/` or `tests/`. Each was independently verified against current source,
 not inferred from docs. All are small and isolated; none require design work.
 
-- [ ] **Data race on `LocalStore::last_mutation_generation_`.** `scan()`
-  writes it outside `m_` (`src/local_store.cpp`, lock begins after the write);
-  `durability_barrier()` reads it under `m_`. Non-atomic `uint64_t` racing
-  between the background scan thread and any caller — undefined behaviour.
-  Make it atomic or move the write under the lock.
-- [ ] **Cleared ingest jobs can resurrect.** Six sites in `src/ingest.cpp` do
-  unguarded `jobs_[job.id].state` / `jobs_[job.id] = job`, which
-  default-constructs a fresh `queued` job if `clear()` erased a terminal job
-  while a worker was still inside `process_job`. The worker then re-inserts
-  and re-persists a job the operator already cleared. One nearby loop already
-  guards the equivalent case with `find()` first — apply the same guard at all
-  six sites.
+- [ ] **`rm -rf` on a FUSE-mounted directory fails with "directory not empty"
+  and has no effect, and `stat()` of the identical path returns a different
+  size on different nodes (live findings, 2026-09-06) — likely one root
+  cause, not two.**
+  - Original report: `rm -rf /mnt/machamedia/*` on `corvus-gbni-1` neither
+    deletes anything nor reports a sensible per-entry error — it fails
+    outright with ENOTEMPTY, which should not be possible for a plain
+    recursive delete of files/directories the caller can already
+    `readdir`/`stat`.
+  - Corroborating finding, found independently while verifying the 0.25.0
+    deploy across all three nodes: `stat` on the exact same path
+    (`/mnt/machamedia/TV/Chernobyl (2019)/Chernobyl (2019) - S01E01 -
+    1.23.45 (1080p BluRay x265 Silence).mkv`) returns the correct size
+    (2421711002 bytes) on `corvus-gbni-1` but **0 bytes on both
+    `corvus-gbni-2` and `corvus-es-1`**, reproducibly and stably (rechecked
+    twice, ~15s apart, unchanged) — not a transient post-restart race.
+    Meanwhile every node's own `/api/v1/status` reports the cluster as fully
+    converged: identical `metadata_generation` (7552) on all three, quorum
+    validated, health "healthy". So the shared/replicated metadata layer
+    believes it agrees, but each node's own FUSE-facing view of at least
+    this file's attributes does not actually agree — pointing at namespace/
+    attribute *projection* inside `FuseFrontend`/`FileSystem` (turning
+    replicated metadata into a local `getattr`/`readdir` view), not at
+    metadata replication/consensus itself, which the aggregate numbers say
+    is fine.
+  - This was found by chance while spot-checking a handful of files during
+    deploy verification, not a systematic sweep — treat "affects at least
+    one file across at least two nodes" as a floor, not a ceiling, on how
+    widespread this is.
+  - All three nodes were freshly restarted onto 0.25.0 within the same ~90
+    minute window this was found in, but nothing in 0.25.0 touches metadata/
+    namespace/getattr code (it only added `run_supervised`, the shared
+    `macha_core` build, and the subsystem-plugin scaffolding) — a restart is
+    much more likely to have *surfaced* a pre-existing local-view bug (by
+    forcing every node to rebuild its namespace projection from scratch)
+    than to have introduced one, but this has not been confirmed against a
+    pre-0.25.0 baseline and shouldn't be assumed either way.
+  - Not yet root-caused. First places to look: whatever `getattr`/`readdir`/
+    `unlink`/`rmdir` return for entries with in-flight or already-completed
+    namespace mutations, and specifically why a freshly-restarted node's
+    rebuilt local view would disagree with another node's for the same
+    replicated metadata generation (the P1 scaling item on `readdir` being
+    O(entire namespace) touches the same frontend code, but this is a
+    correctness bug, not a performance one). Needs a minimal repro (a small
+    directory tree, known contents, compare `stat`/`readdir` output across
+    all three nodes, then delete it) before guessing further.
+
+- [x] **Data race on `LocalStore::last_mutation_generation_` — fixed in 0.24.3.**
+  `scan()`'s write moved under `m_`, matching `durability_barrier()`'s read.
+- [x] **Cleared ingest jobs can resurrect — fixed in 0.24.3.** Seven sites
+  (one more than originally scoped) in `src/ingest.cpp` switched from
+  unguarded `jobs_[job.id]` to `find()`-guarded access, matching the pattern
+  `should_pause_or_cancel()` already used. Regression:
+  `test_cleared_ingest_job_does_not_resurrect_while_worker_finishes`.
+- [ ] **A hard failure in one subsystem takes down the entire macha process
+  (new, found 2026-09-05 live incident) — foundation shipped in 0.25.0,
+  FUSE/Torrent migration still open.** `FuseFrontend`'s durable-journal
+  replay throws `DecodeError` on any unexpected record, uncaught, which
+  crashes the whole node — including its unrelated metadata/RPC/API roles —
+  not just the local FUSE mount. Lived this directly: a 0.24.3 bug in
+  `skip_blocked_namespace_operation()`'s journal bookkeeping (fixed in 0.24.4)
+  crash-looped `corvus-es-1` 49 times because journal replay runs in the
+  constructor with no isolation. 0.25.0 shipped the mechanism (Phase 0 of
+  [subsystem crash isolation via a plugin architecture](2026-09-05-subsystem-plugin-isolation-plan.md)):
+  a mandatory `run_supervised` thread-entry guard on every subsystem thread
+  (~30 sites), `macha_core` as a shared library, the `Subsystem`/plugin ABI,
+  and `SubsystemSupervisor` (`dlopen` + version-checked load + backed-off
+  retry + disable-after-N-failures), verified against real fault-injecting
+  `.so`/`.dylib` test plugins. This item does not close yet: no subsystem has
+  actually migrated onto the interface, so `FuseFrontend`'s constructor is
+  still exactly as unprotected as it was — Phase 1 (Torrent) and Phase 2
+  (FUSE) are the part that actually fixes the live-incident class described
+  above. Single binary, single process throughout, no separate OS
+  processes/IPC (considered and rejected).
 - [ ] **Terminal durability poisoning is never cleared.** `fuse_frontend.cpp`
   sets `durability_poisoned = true` on any exception during the durability
   batch and nothing ever resets it — one transient fsync failure disables all
@@ -152,10 +214,13 @@ not inferred from docs. All are small and isolated; none require design work.
   cancellation, and runs from the `FuseFrontend` constructor before
   `fuse_mount`. A node whose metadata replica never becomes available hangs
   indefinitely with only a debug log line to show for it.
-- [ ] **Wedged namespace queue on a non-retryable error.** A non-retryable
-  namespace error never skips or retires its operation (`fuse_frontend.cpp`)
-  — it retries forever on a 5s backoff, on the single namespace worker, with
-  no operator escape hatch.
+- [x] **Wedged namespace queue on a non-retryable error — escape hatch added
+  in 0.24.3 (fixed forward in 0.24.4).** New `GET/POST
+  /api/v1/manage/filesystem/blocked-namespace-operation[/skip]` lets an
+  operator explicitly abandon a wedged operation by exact sequence number;
+  never automatic. Surfaced live: the 0.24.3 version of this fix itself had a
+  journal-bookkeeping bug that crash-looped a node on restart — see the new
+  "hard failure takes down the whole process" item above, fixed in 0.24.4.
 - [ ] **FUSE-mounted reads never register as viewer demand.**
   `FuseFrontend::note_viewer_activity()` is declared, documented as "called by
   the kernel adapter before viewer-critical open/read callbacks", and defined
@@ -268,16 +333,70 @@ valid evidence, but do not prove the end-to-end invariants.
   decrypted history/materialisation cache is actually bounded by bytes (not
   just entry count) and sheds under pressure — `metadata_materialization_cache_bytes`
   exists as a config default but this audit did not verify live shedding
-  behaviour end-to-end. Also newly found: `MetadataReplica::accept_commit()`
-  holds the global replica mutex `m_` across `persist()`, writing the entire
-  snapshot payload (potentially hundreds of MB) to disk, on the single
-  metadata RPC worker — this is a real latency/contention hazard for exactly
-  the kind of "intermittent Status latency" this backlog is chasing elsewhere.
-  Narrow that lock scope.
-- [ ] Remove serial remote `has_on` checks from metadata mutation critical
-  sections. Preserve retention-before-acceptance with batched, bounded checks
-  away from control and viewer work.
-- [ ] Make catalogue metadata clearing asynchronous and bounded. The observed
+  behaviour end-to-end. `MetadataReplica::accept_commit()` holding the global
+  replica mutex `m_` across `persist()` (writing the entire snapshot payload,
+  potentially hundreds of MB, on the single metadata RPC worker) is fixed in
+  0.24.3: the checkpoint write now happens after `m_` is released, serialized
+  only against other durable-mutation writers, mirroring the same
+  off-lock-write/on-lock-bookkeeping pattern `import_history()` already used
+  for `write_history_frame`.
+- [ ] **Serial remote/local `has_on` checks in `retain_data` — confirmed as
+  a live incident, not a theoretical scaling cliff, 2026-09-06. Phases 0-2
+  implemented and tested 2026-09-06; Phase 3 (real-hardware UAT) still
+  open.** A bulk movies rsync to `corvus-es-1` (with a concurrent `rm -rf`
+  attempt) froze data publication entirely (`data_publication_bytes_committed`
+  and `metadata_generation` unchanged across three 15s samples), pinned the
+  single maintenance thread near 100% CPU for minutes
+  (`Service::retain_metadata_publication` → `DistributedStore::retain_data`'s
+  serial per-extent `has_on` loop, each call either a full local decrypt+hash
+  or a synchronous control-plane RPC), and produced a hard `retention claim
+  ... control RPC deadline exceeded` against an unrelated peer — a direct
+  governing-law-3 violation (control traffic starved by loader-class work).
+  Full root-cause trace, evidence and phased fix (including a correction the
+  test suite caught mid-implementation: `rebalance_step`/`repair_step`'s
+  presence checks could *not* safely move to the cheap path the way
+  `has_on()`'s could, since they have no downstream re-verification step) in
+  [retention-check batching and a cheap local presence check](2026-09-06-retention-check-batching-and-cheap-presence-plan.md).
+  This absorbs and supersedes the P1 "Scaling cliffs" `LocalStore::valid()`
+  item below, which is retracted as "not yet urgent" by this incident.
+  Remaining work: Phase 3 UAT against the real three-node cluster.
+- [ ] **Short-circuit unlink of an in-flight (not yet published) write —
+  raised 2026-09-06, during the `has_on` incident above.** Confirmed against
+  the actual code: `FuseFrontend::unlink()` (`fuse_frontend.cpp:4627`) only
+  detaches the pathname from `state_->paths`; it does not touch the inode's
+  `data_ops`/`durability_pending`/`unconfirmed_data_entry` state. The
+  `refresh_namespace_if_stale()` comment confirms this is deliberate today:
+  "Open handles and dirty state retain the detached inode object." So an
+  unlinked-but-still-publishing file's data keeps flowing through the full
+  pipeline (spool → durability → distributed publish → retention) to
+  completion, and only afterward does it become ordinary garbage eligible
+  for the `garbage_grace` GC pass — wasted CPU/disk/network for content that
+  is already known, at unlink time, to be moot. Wanted behaviour: on unlink
+  of a dirty inode, (1) stop scheduling further publication work for it,
+  (2) reclaim its spool bytes immediately rather than waiting through
+  durability+publish+grace, (3) ensure the eventual durable history records
+  "never existed" rather than "created then deleted," so retention/GC never
+  has to process those extents at all, not even later. Valuable but not a
+  substitute for the `has_on` batching fix above — a pure bulk-write
+  workload with zero deletes still hits that wall regardless of this item.
+- [ ] **Catalogue does not react to a committed unlink — raised 2026-09-06,
+  same discussion.** When a namespace unlink is actually durably committed/
+  synced (not the short-circuit-unlink case above, which is about aborting
+  publication early — this is about the ordinary case where a real file is
+  genuinely removed), nothing today notifies the catalogue layer to check
+  whether that removal affects any catalogue item. `manage_api.cpp`'s
+  `DELETE /api/v1/manage/filesystem` handler calls `hints_.erase_prefix(path)`
+  (line ~805) on that one path, but that only clears scanner *hints*, not
+  catalogue items, and the ordinary FUSE `unlink()` path
+  (`fuse_frontend.cpp:4627`) has no catalogue awareness at all. Wanted
+  behaviour: on commit, determine whether any catalogue item's full set of
+  referenced files is now empty, and if so remove or update that item —
+  **not** a naive "unlink one file -> delete the catalogue item," since (a)
+  two namespace paths can reference the same underlying file, and (b) a
+  single catalogue item may legitimately reference more than one file (e.g.
+  multiple quality variants/parts). The invariant to hold: the catalogue
+  (and therefore the Movies/TV UI) must never continue showing an item that
+  no longer has any surviving backing file — no phantom library entries. The observed
   `DELETE /api/v1/catalogue/items/{id}/metadata` hangs because its HTTP handler
   currently performs `repair_once()`, materialises and copies the complete
   catalogue, repeatedly scans all items to discover descendants, walks all
@@ -377,12 +496,13 @@ that report.
   `rename`. `FileSystem::NamespaceIndex` already has a parent→children index
   the frontend doesn't use for this. This is the single worst scaling property
   found in the codebase audit.
-- [ ] **`LocalStore::valid()` is used as a cheap presence check but does a
-  full read + AES-GCM decrypt + SHA-256.** Called as a presence check by
-  `StoragePool::valid`, `StoragePool::rebalance_step` (once per backend per
-  object), `DistributedStore::has_on`, `retain_data` (per candidate per object,
-  on the metadata publication path) and `repair_step`. Needs a cheap
-  existence-only path that doesn't pay for a full decrypt.
+- [x] **`LocalStore::valid()` is used as a cheap presence check but does a
+  full read + AES-GCM decrypt + SHA-256 — retracted from "not yet urgent,"
+  promoted to P0 by a live incident on 2026-09-06.** See the P0 structural
+  section above and
+  [retention-check batching and a cheap local presence check](2026-09-06-retention-check-batching-and-cheap-presence-plan.md)
+  for the confirmed root cause and phased fix. No longer tracked separately
+  here.
 - [ ] **SHA-256 plus a heap allocation inside a `std::sort` comparator.**
   `placement.cpp`'s `fallback_score()` allocates and hashes twice per
   comparison, and `StoragePool::ranked()` — hit on every put/get/has/valid/
@@ -513,3 +633,9 @@ work needed for any of these.
 - [ ] For every deployment, synchronise the complete source tree and all CMake
   inputs, configure after synchronisation, build nodes in parallel, and verify
   installed versions and byte-identical hashes on identical RPi hardware.
+- [ ] **Breaking config change pending deploy (2026-09-05): `mount_path` moved
+  to `fuse.mount_path`.** Top-level `mount_path` is now a hard startup error
+  ("obsolete configuration key: mount_path (moved to fuse.mount_path)") rather
+  than silently ignored. Every node's `macha.yaml` (Corvus GBNI-1, GBNI-2,
+  ES-1, MacBook Pro) must move its `mount_path:` line under `fuse:` before the
+  next deploy of this build, or the node will refuse to start.

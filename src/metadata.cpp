@@ -2405,11 +2405,13 @@ void MetadataReplica::load_history() {
                 if (!entry_value.previous_known || entry_value.generation <= 1)
                     throw DecodeError("metadata delta history has no predecessor");
                 auto parent = history_.find(entry_value.previous);
-                // Merge commits are numbered after their newest parent, while
-                // the deterministic primary parent is selected by hash. The
-                // primary can therefore be more than one generation behind.
+                // See metadata_delta_succession_valid(): merge commits are
+                // numbered after their newest parent while the primary parent
+                // is selected by hash, so the primary can be many generations
+                // behind. Readers must apply the identical rule.
                 if (parent == history_.end() ||
-                    parent->second.generation >= entry_value.generation)
+                    !metadata_delta_succession_valid(parent->second.generation,
+                                                     entry_value.generation))
                     throw DecodeError("metadata delta history predecessor missing or invalid");
                 (void)decode_metadata_delta(entry_value.payload);
             } else {
@@ -2417,8 +2419,20 @@ void MetadataReplica::load_history() {
             }
 
             auto index = index_history_entry(entry_value, offset, 4 + length);
-            if (!history_.emplace(entry_value.hash, std::move(index)).second)
-                throw DecodeError("duplicate metadata history record");
+            if (auto existing = history_.find(entry_value.hash); existing != history_.end()) {
+                // reanchor_history() appends a full-body frame for a hash that
+                // is already indexed, superseding a frame that could not be
+                // replayed. The hash binds generation/previous/payload, so a
+                // same-identity duplicate is never ambiguous: prefer the
+                // self-contained full body. Anything else is corruption.
+                if (existing->second.generation != entry_value.generation ||
+                    existing->second.previous != entry_value.previous)
+                    throw DecodeError("duplicate metadata history record with conflicting identity");
+                if (entry_value.body == MetadataHistoryEntry::Body::full)
+                    existing->second = std::move(index);
+            } else {
+                history_.emplace(entry_value.hash, std::move(index));
+            }
         } catch (const std::exception& error) {
             if (final_frame && std::string_view(error.what()) == "AES-GCM authentication failed") {
                 trailing_problem = "final frame failed AES-GCM authentication";
@@ -2484,8 +2498,33 @@ void MetadataReplica::load_heads() {
             decode_metadata_acceptance_set(aes_gcm_open(key_, nonce, tag, ciphertext, MA));
         for (auto& value : values) {
             auto reconstructed = materialized_locked(value.hash);
-            if (!reconstructed || reconstructed->record.generation != value.generation)
-                throw std::runtime_error("accepted metadata head is not reconstructible");
+            if (!reconstructed) {
+                // Formerly a throw, which sent the constructor down the
+                // recovery-seed path: every metadata file quarantined -- up to
+                // tens of GB of perfectly valid history -- over one head that
+                // could not be replayed locally (2026-09-06). The certificate
+                // is durable evidence that the cluster accepted this head; the
+                // record itself is immutable and any peer that can materialize
+                // it can supply it. Keep the certificate, flag the head so
+                // readers skip it (accepted_heads() cooldown), say exactly
+                // what is wrong, and let MetadataManager::
+                // repair_unreconstructable_heads() re-anchor it live.
+                const auto reason = diagnose_unreconstructable_locked(value.hash);
+                Log::error("metadata accepted head is not reconstructible locally; keeping it "
+                           "for live repair from peers hash=" +
+                           hex(value.hash.bytes) + " generation=" +
+                           std::to_string(value.generation) + " reason=" + reason);
+                unreconstructable_head_retry_at_[value.hash] =
+                    Clock::now() + unreconstructable_retry_cooldown;
+                accepted_heads_.emplace(value.hash, std::move(value));
+                continue;
+            }
+            // The record hash binds its generation, so a materialized record
+            // disagreeing with its own certificate is a forged/corrupt
+            // certificate, not a missing dependency -- still fatal.
+            if (reconstructed->record.generation != value.generation)
+                throw std::runtime_error("accepted metadata head certificate generation does "
+                                         "not match its record");
             if (!acceptance_matches_record_policy_locked(value, *reconstructed))
                 throw std::runtime_error("accepted metadata head policy does not match commit");
             accepted_heads_.emplace(value.hash, std::move(value));
@@ -2795,11 +2834,28 @@ void MetadataReplica::set_legacy_committed_head_locked(const MetadataRecord& rec
 bool MetadataReplica::refresh_materialized_head_in_memory_locked() {
     if (accepted_heads_.empty())
         return false;
+    // See unreconstructable_head_retry_at_'s declaration: bound how often a
+    // still-broken hash re-throws, rather than re-attempting and re-raising on
+    // every single call -- the volume of callers that reach this function
+    // (every one of them, on a cluster with more than one accepted head, on
+    // every read) is exactly what turns one narrow reconstruction failure into
+    // an unbounded tight loop.
+    const auto now = Clock::now();
+    std::erase_if(unreconstructable_head_retry_at_, [&](const auto& item) {
+        return !accepted_heads_.contains(item.first);
+    });
     std::optional<MetadataRecord> selected;
     for (const auto& [hash, _] : accepted_heads_) {
+        if (auto found = unreconstructable_head_retry_at_.find(hash);
+            found != unreconstructable_head_retry_at_.end() && now < found->second)
+            continue; // Confirmed broken recently; skip the attempt entirely.
         auto record = historical_locked(hash);
-        if (!record)
-            throw std::runtime_error("accepted metadata head cannot be reconstructed");
+        if (!record) {
+            const auto reason = flag_unreconstructable_locked(hash, now, "materialized head refresh");
+            throw std::runtime_error("accepted metadata head cannot be reconstructed hash=" +
+                                     hex(hash.bytes) + " reason=" + reason);
+        }
+        unreconstructable_head_retry_at_.erase(hash);
         if (!selected || record->generation > selected->generation ||
             (record->generation == selected->generation && record->hash > selected->hash))
             selected = std::move(record);
@@ -2915,6 +2971,8 @@ std::shared_ptr<const MetadataMaterialization> MetadataReplica::cache_materializ
 
 std::shared_ptr<const MetadataMaterialization>
 MetadataReplica::materialized_locked(const Hash256& target) const {
+    if (force_unreconstructable_for_tests_ && force_unreconstructable_for_tests_(target))
+        return {};
     historical_requests_.fetch_add(1, std::memory_order_relaxed);
     auto found = history_.find(target);
     if (found == history_.end())
@@ -2988,7 +3046,7 @@ MetadataReplica::materialized_locked(const Hash256& target) const {
         try {
             const auto child = read_history_entry(*it);
             if (child.previous != working_record.hash ||
-                child.generation != working_record.generation + 1)
+                !metadata_delta_succession_valid(working_record.generation, child.generation))
                 return {};
             const auto delta = decode_metadata_delta(child.payload);
             apply_metadata_delta_in_place(working_snapshot, delta);
@@ -3171,6 +3229,179 @@ std::optional<MetadataHistoryLinks> MetadataReplica::history_links(const Hash256
                                 found->second.merge_parents, found->second.body};
 }
 
+std::optional<MetadataHistoryEntry> MetadataReplica::full_history_record(
+    const Hash256& hash) const {
+    auto value = materialized(hash);
+    if (!value)
+        return {};
+    MetadataHistoryEntry entry;
+    entry.generation = value->record.generation;
+    entry.previous = value->record.previous;
+    entry.hash = value->record.hash;
+    entry.previous_known = entry.generation > 1 && entry.previous != Hash256{} &&
+                           history_contains(entry.previous);
+    entry.merge_parents = value->snapshot->merge_parents;
+    entry.body = MetadataHistoryEntry::Body::full;
+    entry.payload.assign(value->record.payload.begin(), value->record.payload.end());
+    return entry;
+}
+
+std::vector<Hash256> MetadataReplica::unreconstructable_heads() const {
+    std::lock_guard lock(m_);
+    std::vector<Hash256> out;
+    for (const auto& [hash, _] : unreconstructable_head_retry_at_)
+        if (accepted_heads_.contains(hash))
+            out.push_back(hash);
+    return out;
+}
+
+std::string MetadataReplica::flag_unreconstructable_locked(const Hash256& hash,
+                                                            Clock::time_point now,
+                                                            std::string_view context) const {
+    const bool first_failure = !unreconstructable_head_retry_at_.contains(hash);
+    unreconstructable_head_retry_at_[hash] = now + unreconstructable_retry_cooldown;
+    const auto reason = diagnose_unreconstructable_locked(hash);
+    if (first_failure) {
+        uint64_t generation = 0;
+        if (auto head = accepted_heads_.find(hash); head != accepted_heads_.end())
+            generation = head->second.generation;
+        Log::warn("metadata accepted head cannot be reconstructed locally; excluded from reads "
+                  "pending live repair hash=" +
+                  hex(hash.bytes) + " generation=" + std::to_string(generation) +
+                  " during=" + std::string(context) + " reason=" + reason);
+    }
+    return reason;
+}
+
+std::string MetadataReplica::diagnose_unreconstructable_locked(const Hash256& target) const {
+    const auto describe = [](const HistoryIndexEntry& entry) {
+        return "gen=" + std::to_string(entry.generation) + " hash=" + hex(entry.hash.bytes) +
+               " body=" +
+               std::string(entry.body == MetadataHistoryEntry::Body::delta ? "delta" : "full");
+    };
+    auto found = history_.find(target);
+    if (found == history_.end())
+        return "not in local history index";
+    std::vector<HistoryIndexEntry> chain;
+    std::set<Hash256> seen;
+    HistoryIndexEntry cursor = found->second;
+    while (cursor.body == MetadataHistoryEntry::Body::delta) {
+        if (!seen.insert(cursor.hash).second)
+            return "delta chain cycle at " + describe(cursor);
+        if (!cursor.previous_known)
+            return "delta " + describe(cursor) + " has no known predecessor";
+        chain.push_back(cursor);
+        auto parent = history_.find(cursor.previous);
+        if (parent == history_.end())
+            return "delta " + describe(cursor) + " primary parent hash=" +
+                   hex(cursor.previous.bytes) + " absent from local history";
+        if (!metadata_delta_succession_valid(parent->second.generation, cursor.generation))
+            return "delta " + describe(cursor) + " violates succession over parent gen=" +
+                   std::to_string(parent->second.generation);
+        cursor = parent->second;
+    }
+    try {
+        (void)read_history_entry(cursor);
+    } catch (const std::exception& error) {
+        return "anchor frame " + describe(cursor) + " unreadable: " + error.what();
+    }
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        try {
+            (void)read_history_entry(*it);
+        } catch (const std::exception& error) {
+            return "delta frame " + describe(*it) + " unreadable: " + error.what();
+        }
+    }
+    return "delta replay from anchor " + describe(cursor) + " over " +
+           std::to_string(chain.size()) + " frame(s) does not reproduce the record hash";
+}
+
+bool MetadataReplica::reanchor_history(const MetadataHistoryEntry& entry_value) {
+    if (entry_value.body != MetadataHistoryEntry::Body::full || !entry_value.generation ||
+        entry_value.hash == Hash256{} || entry_value.merge_parents.size() > 64)
+        return false;
+    MetadataRecord record;
+    record.generation = entry_value.generation;
+    record.previous = entry_value.previous;
+    record.hash = entry_value.hash;
+    record.payload = entry_value.payload;
+    if (!valid_metadata_record(record))
+        return false;
+    std::shared_ptr<const MetadataSnapshot> snapshot;
+    try {
+        snapshot = std::make_shared<const MetadataSnapshot>(decode_snapshot(record.payload));
+    } catch (...) {
+        return false;
+    }
+    if (snapshot->merge_parents != entry_value.merge_parents)
+        return false;
+
+    auto entry = entry_value;
+    std::lock_guard durable(durable_mutation_m_);
+    uint64_t file_offset;
+    {
+        std::lock_guard lock(m_);
+        if (auto existing = history_.find(entry.hash); existing != history_.end()) {
+            if (existing->second.generation != entry.generation ||
+                existing->second.previous != entry.previous)
+                return false; // Same hash, different identity: refuse to touch it.
+            if (materialized_locked(entry.hash)) {
+                // Nothing to repair (a transient failure, or a peer already
+                // re-anchored it); just lift the exclusion.
+                unreconstructable_head_retry_at_.erase(entry.hash);
+                return true;
+            }
+        }
+        entry.previous_known = entry.generation > 1 && entry.previous != Hash256{} &&
+                               history_.contains(entry.previous);
+        file_offset = history_bytes_;
+    }
+    auto frame = encode_history_frame(entry);
+    write_history_frame(frame);
+
+    std::lock_guard lock(m_);
+    const bool superseded = history_.contains(entry.hash);
+    history_[entry.hash] = index_history_entry(entry, file_offset, frame.size());
+    ++history_records_;
+    history_bytes_ += frame.size();
+    materialized_history_.erase(entry.hash);
+    auto value = cache_materialization_locked(record, snapshot);
+    unreconstructable_head_retry_at_.erase(entry.hash);
+
+    if (auto head = accepted_heads_.find(entry.hash); head != accepted_heads_.end()) {
+        // Verify against the record just validated and cached -- not a fresh
+        // reconstruction, which is exactly what was failing a moment ago.
+        if (!acceptance_matches_record_policy_locked(head->second, *value)) {
+            // load_heads() treats this as fatal for a reconstructible head; for
+            // a repaired one the honest outcome is the same as the old
+            // quarantine, narrowed to this one certificate.
+            Log::error("metadata accepted head certificate does not match its repaired record; "
+                       "dropping the certificate hash=" +
+                       hex(entry.hash.bytes) + " generation=" +
+                       std::to_string(head->second.generation));
+            accepted_heads_.erase(head);
+            persist_heads_locked();
+        }
+    }
+    Log::info(std::string("metadata history re-anchored ") +
+              (superseded ? "superseding unreplayable frame" : "with new record") +
+              " hash=" + hex(entry.hash.bytes) + " generation=" +
+              std::to_string(entry.generation) + " bytes=" + std::to_string(frame.size()));
+    if (prune_accepted_heads_locked())
+        persist_heads_locked();
+    // This head is repaired regardless of whether *another* flagged head
+    // makes the materialized-head refresh throw; that one has its own flag
+    // and cooldown and must not turn a successful durable repair into a
+    // reported failure.
+    try {
+        refresh_materialized_head_locked();
+    } catch (const std::exception& error) {
+        Log::debug("metadata materialized head refresh deferred after re-anchor: " +
+                   std::string(error.what()));
+    }
+    return true;
+}
+
 bool MetadataReplica::import_history(const MetadataHistoryEntry& entry_value) {
     if (!entry_value.generation || entry_value.hash == Hash256{} ||
         entry_value.merge_parents.size() > 64)
@@ -3181,7 +3412,8 @@ bool MetadataReplica::import_history(const MetadataHistoryEntry& entry_value) {
         if (!entry.previous_known)
             return false;
         parent = materialized(entry.previous);
-        if (!parent || parent->record.generation >= entry.generation)
+        if (!parent ||
+            !metadata_delta_succession_valid(parent->record.generation, entry.generation))
             return false;
     } else if (entry.previous_known && entry.previous != Hash256{} &&
                !history_contains(entry.previous)) {
@@ -3281,7 +3513,8 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
                 record, std::make_shared<const MetadataSnapshot>(decode_snapshot(record.payload)));
         } else {
             auto parent = materialized(entry_value.previous);
-            if (!parent || parent->record.generation >= record.generation)
+            if (!parent ||
+                !metadata_delta_succession_valid(parent->record.generation, record.generation))
                 return false;
             auto snapshot = *parent->snapshot;
             apply_metadata_delta_in_place(snapshot, decode_metadata_delta(entry_value.payload));
@@ -3460,12 +3693,33 @@ std::vector<MetadataRecord> MetadataReplica::accepted_heads() const {
         for (const auto& [hash, _] : accepted_heads_)
             hashes.push_back(hash);
     }
+    // See unreconstructable_head_retry_at_'s declaration. This is the hottest
+    // path into that failure mode -- called on essentially every metadata
+    // read/reconciliation attempt across the cluster -- so a broken head here
+    // must degrade to "temporarily excluded from the accepted set" rather than
+    // a hard throw: every caller already treats accepted_heads()'s size (0, 1,
+    // or >1) as the signal for "not ready" / "converged" / "needs
+    // reconciliation," so quietly narrowing the set lets the replica keep
+    // making progress on whichever heads *are* reconstructable -- including
+    // recovering, for callers that require exactly one head, once a broken
+    // second head is excluded -- instead of every caller failing outright.
+    const auto now = Clock::now();
     std::vector<MetadataRecord> out;
     out.reserve(hashes.size());
     for (const auto& hash : hashes) {
+        {
+            std::lock_guard lock(m_);
+            auto found = unreconstructable_head_retry_at_.find(hash);
+            if (found != unreconstructable_head_retry_at_.end() && now < found->second)
+                continue;
+        }
         auto value = materialized(hash);
-        if (!value)
-            throw std::runtime_error("accepted metadata head cannot be reconstructed");
+        std::lock_guard lock(m_);
+        if (!value) {
+            (void)flag_unreconstructable_locked(hash, now, "accepted head enumeration");
+            continue;
+        }
+        unreconstructable_head_retry_at_.erase(hash);
         out.push_back(value->record);
     }
     return out;
@@ -3500,6 +3754,15 @@ std::optional<MetadataRecord> MetadataReplica::historical(const Hash256& hash) c
 
 std::shared_ptr<const MetadataMaterialization>
 MetadataReplica::materialized(const Hash256& hash) const {
+    {
+        std::function<bool(const Hash256&)> forced;
+        {
+            std::lock_guard lock(m_);
+            forced = force_unreconstructable_for_tests_;
+        }
+        if (forced && forced(hash))
+            return {};
+    }
     historical_requests_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard computation(materialization_compute_m_);
 
@@ -3567,7 +3830,7 @@ MetadataReplica::materialized(const Hash256& hash) const {
         for (auto it = delta_indexes.rbegin(); it != delta_indexes.rend(); ++it) {
             const auto child = read_history_entry(*it);
             if (child.previous != working_record.hash ||
-                child.generation != working_record.generation + 1)
+                !metadata_delta_succession_valid(working_record.generation, child.generation))
                 return {};
             const auto delta = decode_metadata_delta(child.payload);
             apply_metadata_delta_in_place(working_snapshot, delta);

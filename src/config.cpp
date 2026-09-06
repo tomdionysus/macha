@@ -133,6 +133,10 @@ void parse_dht(const YAML::Node& root, Config& c) {
     }
     if (d["min_write_replicas"])
         c.min_write_replicas = d["min_write_replicas"].as<size_t>();
+    if (d["retention_check_batch_size"])
+        c.retention_check_batch_size = d["retention_check_batch_size"].as<size_t>();
+    if (d["retention_check_concurrency"])
+        c.retention_check_concurrency = d["retention_check_concurrency"].as<size_t>();
     if (d["write_stall_ms"])
         c.write_stall = milliseconds(d["write_stall_ms"], "dht.write_stall_ms");
     if (d["extent_size"])
@@ -205,6 +209,7 @@ void parse_filesystem(const YAML::Node& root, Config& c) {
 void parse_fuse(const YAML::Node& root, Config& c) {
     auto f = root["fuse"];
     if (!f) return;
+    if (f["mount_path"]) c.fuse.mount_path = std::filesystem::path(f["mount_path"].as<std::string>());
     if (f["allow_other"]) c.fuse.allow_other = f["allow_other"].as<bool>();
     if (f["spool_path"])
         c.fuse.spool_path = std::filesystem::path(f["spool_path"].as<std::string>());
@@ -538,6 +543,8 @@ Config load_yaml_config(const std::filesystem::path& path) {
 
     if (root["verbose"])
         throw std::runtime_error("obsolete configuration key: verbose");
+    if (root["mount_path"])
+        throw std::runtime_error("obsolete configuration key: mount_path (moved to fuse.mount_path)");
     if (auto network = root["network"]) {
         if (network["control_timeout_ms"])
             throw std::runtime_error("obsolete configuration key: network.control_timeout_ms");
@@ -551,8 +558,8 @@ Config load_yaml_config(const std::filesystem::path& path) {
         c.state_path = root["state_path"].as<std::string>();
     if (root["key_file"])
         c.key_file = root["key_file"].as<std::string>();
-    if (root["mount_path"])
-        c.mount_path = root["mount_path"].as<std::string>();
+    if (root["plugin_path"])
+        c.plugin_path = root["plugin_path"].as<std::string>();
     if (root["log_level"])
         c.log_level = parse_log_level(root["log_level"].as<std::string>());
     if (root["ffmpeg_log_level"])
@@ -642,6 +649,7 @@ void print_usage(const char* executable) {
         << "--metadata-cache MS  --replicas N  --metadata-min-write-replicas N  --min-write-replicas N\n"
         << "--write-stall MS  --extent-size SIZE\n"
         << "--read-ahead N  --mount PATH  --state-path PATH  --cache-path PATH --cache-blocks N\n"
+        << "--plugin-path PATH\n"
         << "--log-level LEVEL  (ALL|DEBUG|INFO|WARN|ERROR; default INFO)\n"
         << "--ffmpeg-log-level LEVEL  (QUIET|PANIC|FATAL|ERROR|WARN|INFO|VERBOSE|DEBUG|TRACE; default ERROR)  --help\n";
 }
@@ -680,12 +688,14 @@ Config parse_config(int argc, char** argv) {
             config.state_path = need(i, "--state-path");
         } else if (option == "--key-file") {
             config.key_file = need(i, "--key-file");
+        } else if (option == "--plugin-path") {
+            config.plugin_path = need(i, "--plugin-path");
         } else if (option == "--cache-path") {
             config.cache.path = need(i, "--cache-path");
         } else if (option == "--cache-blocks") {
             config.cache.max_blocks = parse_unsigned(need(i, "--cache-blocks"), "cache blocks");
         } else if (option == "--mount") {
-            config.mount_path = need(i, "--mount");
+            config.fuse.mount_path = need(i, "--mount");
         } else if (option == "--listen") {
             config.listen_host = need(i, "--listen");
         } else if (option == "--advertise") {

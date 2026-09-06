@@ -251,6 +251,33 @@ Metadata availability logging is transition-only and canonical, for example `met
 
 `POST /api/v1/status/connectivity/check` and the node-specific equivalent perform diagnostic connectivity checks without changing cluster configuration. State-changing administrative operations belong under `/api/v1/manage`.
 
+## Unreconstructable accepted metadata heads
+
+An accepted head whose record cannot be replayed from local `history.log`
+(missing ancestry, an unreadable frame, a chain that does not reproduce the
+record hash) is no longer a restart-and-quarantine event. The replica keeps
+the durable acceptance certificate, excludes that head from reads for a
+30-second cooldown at a time, and logs one line naming the exact break:
+
+```
+WARN metadata accepted head cannot be reconstructed locally; excluded from reads pending live repair hash=… generation=… during=… reason=…
+ERROR metadata accepted head is not reconstructible locally; keeping it for live repair from peers hash=… generation=… reason=…   (at startup)
+```
+
+Maintenance then repairs it live: each reachable peer is asked for the record
+as a self-contained full body (`get_metadata_history_record`) and the head is
+re-anchored in place (`INFO metadata history re-anchored … ` followed by
+`INFO metadata accepted head repaired from peer …`). No operator action is
+needed unless no peer can materialize the record either, in which case the
+`WARN`/`DEBUG metadata head repair:` lines say so on every maintenance cycle.
+
+`macha-metadata-dump KEY_FILE HISTORY_LOG [HEADS_META] [--all]` is a
+read-only forensic decoder for a stopped node's or a quarantined
+(`*.corrupt.<timestamp>`) metadata directory. It never constructs a replica,
+so it cannot trigger recovery. It decodes every history frame, reports
+anomalies, and for each accepted head walks the delta chain with the
+production succession rule and states where materialization would fail.
+
 ## Manual metadata ancestry repair
 
 `macha-metadata-repair` is an offline recovery tool, not a daemon maintenance

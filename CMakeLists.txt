@@ -7,11 +7,84 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.24.3 LANGUAGES CXX)
+project(macha VERSION 0.27.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# macha_core is a shared library so that it, the macha executable and every
+# future dlopen'd subsystem plugin (see TODO/2026-09-05-subsystem-plugin-isolation-plan.md)
+# share exactly one copy of its classes and global/static state -- linking it
+# statically into more than one of those would duplicate that state, which is
+# a correctness hazard, not a style question. Executables that link it locate
+# it at a path relative to themselves at runtime (see INSTALL_RPATH below) so
+# installation is not tied to a fixed prefix.
+if(APPLE)
+    set(MACHA_RPATH_ORIGIN "@loader_path")
+else()
+    set(MACHA_RPATH_ORIGIN "$ORIGIN")
+endif()
+
+# A subsystem plugin (see TODO/2026-09-05-subsystem-plugin-isolation-plan.md)
+# is always built from the same source tree, same commit, in the same CMake
+# invocation as macha_core -- never distributed or versioned independently --
+# so a plugin whose embedded build stamp doesn't match core's own is a build
+# skew (e.g. a partial rsync deploy), not a supported "different build"
+# scenario, and must be refused rather than loaded. MACHA_BUILD_COMMIT gives
+# that stamp real precision: it changes on every commit, not just on a version
+# bump, catching skew a version-number comparison alone would miss.
+find_package(Git QUIET)
+set(MACHA_BUILD_COMMIT "unknown")
+if(Git_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --short=12 HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE MACHA_BUILD_COMMIT_OUTPUT
+        RESULT_VARIABLE MACHA_BUILD_COMMIT_RESULT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+    if(MACHA_BUILD_COMMIT_RESULT EQUAL 0 AND MACHA_BUILD_COMMIT_OUTPUT)
+        set(MACHA_BUILD_COMMIT "${MACHA_BUILD_COMMIT_OUTPUT}")
+    endif()
+endif()
+
+# Needed early: macha_core and every plugin are private shared libraries, not
+# public system libraries, so they install under their own subdirectory of
+# the standard libdir (e.g. /usr/lib/macha/), never into bindir alongside the
+# executables -- mixing .so files into a directory that's on PATH and
+# conventionally executable-only is exactly the kind of thing that trips up
+# package managers and anyone auditing what's in bin.
+include(GNUInstallDirs)
+# Deliberately "lib/macha", not "${CMAKE_INSTALL_LIBDIR}/macha": on Debian
+# and derivatives (e.g. Raspberry Pi OS), GNUInstallDirs resolves
+# CMAKE_INSTALL_LIBDIR to a multiarch path (lib/aarch64-linux-gnu, etc), which
+# is the right convention for a public system library that might need to
+# coexist with other architectures' copies side by side, but macha_core is
+# private (nothing outside this project links it) and only ever one arch per
+# install -- multiarch nesting would just make this directory needlessly
+# hard to find/document for no actual benefit.
+set(MACHA_PRIVATE_LIBDIR "lib/macha" CACHE STRING
+    "Directory macha_core installs to (private shared library, not a public system one)")
+set(MACHA_PLUGIN_INSTALL_DIR "${MACHA_PRIVATE_LIBDIR}/plugins" CACHE STRING
+    "Directory subsystem plugins install to and Config::plugin_path defaults to")
+# The default baked into the binary must be an absolute path good for however
+# this build is actually installed (CMAKE_INSTALL_PREFIX at configure time),
+# not something computed from the running executable's own location --
+# that's what led to the bindir mistake above in the first place.
+if(IS_ABSOLUTE "${MACHA_PLUGIN_INSTALL_DIR}")
+    set(MACHA_PLUGIN_INSTALL_DIR_FULL "${MACHA_PLUGIN_INSTALL_DIR}")
+else()
+    set(MACHA_PLUGIN_INSTALL_DIR_FULL "${CMAKE_INSTALL_PREFIX}/${MACHA_PLUGIN_INSTALL_DIR}")
+endif()
+# Relative hop from an installed executable (bindir) to the private libdir,
+# for INSTALL_RPATH, computed between full paths so it's correct regardless
+# of how many path segments CMAKE_INSTALL_BINDIR/LIBDIR actually are on this
+# platform (e.g. Debian multiarch's lib/<triplet>).
+file(RELATIVE_PATH MACHA_BINDIR_TO_PRIVATE_LIBDIR
+     "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}"
+     "${CMAKE_INSTALL_PREFIX}/${MACHA_PRIVATE_LIBDIR}")
 
 configure_file(src/version.hpp.in ${CMAKE_CURRENT_BINARY_DIR}/generated/macha_version.hpp @ONLY)
 
@@ -151,6 +224,10 @@ set(MACHA_CORE_SOURCES
     src/config_base.cpp
     src/process_allocator.cpp
     src/log.cpp
+    src/supervised.cpp
+    src/subsystem.cpp
+    src/subsystem_supervisor.cpp
+    src/media_metadata_registry.cpp
     src/ffmpeg_log_base.cpp
     src/diagnostics.cpp
     src/telemetry.cpp
@@ -198,12 +275,12 @@ set(MACHA_CORE_SOURCES
     src/service.cpp
 )
 
-add_library(macha_core STATIC ${MACHA_CORE_SOURCES})
+add_library(macha_core SHARED ${MACHA_CORE_SOURCES})
 target_include_directories(macha_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(macha_core PUBLIC
-    OpenSSL::Crypto Threads::Threads ${MACHA_CURL_TARGET})
+    OpenSSL::Crypto Threads::Threads ${MACHA_CURL_TARGET} ${CMAKE_DL_LIBS})
 if(MACHA_MINIUPNPC_TARGET)
     target_link_libraries(macha_core PUBLIC ${MACHA_MINIUPNPC_TARGET})
     target_compile_definitions(macha_core PUBLIC MACHA_HAVE_MINIUPNPC=1)
@@ -232,8 +309,17 @@ endif()
 
 add_executable(macha-metadata-repair tools/metadata_inspect.cpp)
 target_link_libraries(macha-metadata-repair PRIVATE macha_core)
+add_executable(macha-metadata-dump tools/metadata_history_dump.cpp)
+target_link_libraries(macha-metadata-dump PRIVATE macha_core)
+# libmacha_core installs to its own private libdir, not bindir (see
+# MACHA_PRIVATE_LIBDIR above) -- this rpath is the relative hop from an
+# installed executable's bindir to it, so it resolves regardless of prefix.
+set_target_properties(macha-metadata-repair macha-metadata-dump PROPERTIES
+    INSTALL_RPATH "${MACHA_RPATH_ORIGIN}/${MACHA_BINDIR_TO_PRIVATE_LIBDIR}"
+    BUILD_WITH_INSTALL_RPATH FALSE)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(macha-metadata-repair PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(macha-metadata-dump PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 if(MACHA_BUILD_SERVER)
@@ -245,6 +331,9 @@ if(MACHA_BUILD_SERVER)
         src/media_metadata_ffmpeg.cpp
         src/service_config.cpp)
     target_link_libraries(macha PRIVATE macha_core ${MACHA_YAML_TARGET} PkgConfig::LIBAV)
+    set_target_properties(macha PROPERTIES
+        INSTALL_RPATH "${MACHA_RPATH_ORIGIN}/${MACHA_BINDIR_TO_PRIVATE_LIBDIR}"
+        BUILD_WITH_INSTALL_RPATH FALSE)
 
     set(MACHA_FUSE_FOUND OFF)
     if(MACHA_ENABLE_FUSE)
@@ -312,15 +401,26 @@ if(MACHA_BUILD_TESTS)
     include(CTest)
     enable_testing()
 
+    # Real dlopen'd plugins exercising SubsystemSupervisor end to end (see
+    # TODO/2026-09-05-subsystem-plugin-isolation-plan.md), not in-process
+    # mocks. Each is a MODULE library -- never linked into an executable,
+    # only ever dlopen'd -- and links macha_core so it shares the same
+    # Subsystem/SubsystemPluginEntry types and build-identity stamp.
+    foreach(plugin_name IN ITEMS test_plugin_ok test_plugin_faulting test_plugin_mismatched_abi
+                                test_plugin_no_entry_symbol)
+        add_library(${plugin_name} MODULE tests/plugins/${plugin_name}.cpp)
+        target_link_libraries(${plugin_name} PRIVATE macha_core)
+        set_target_properties(${plugin_name} PROPERTIES PREFIX "")
+    endforeach()
+
     # The portable suite owns all dependency-free behavioural tests. Concrete
     # yaml-cpp/libav adapter tests are registered separately below only when
     # those development dependencies are available. Both use the same runner.
     add_executable(macha-tests
         tests/main.cpp
         tests/test_framework.cpp
-        src/media_engine_stub.cpp
-        src/media_metadata_stub.cpp
         tests/test_foundations.cpp
+        tests/test_subsystem_supervisor.cpp
         tests/test_storage_metadata.cpp
         tests/test_storage_v18.cpp
         tests/test_rpc_cluster.cpp
@@ -332,7 +432,13 @@ if(MACHA_BUILD_TESTS)
         tests/test_models.cpp)
     target_link_libraries(macha-tests PRIVATE macha_core)
     target_compile_definitions(macha-tests PRIVATE
-        MACHA_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        MACHA_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        MACHA_TEST_PLUGIN_OK="$<TARGET_FILE:test_plugin_ok>"
+        MACHA_TEST_PLUGIN_FAULTING="$<TARGET_FILE:test_plugin_faulting>"
+        MACHA_TEST_PLUGIN_MISMATCHED_ABI="$<TARGET_FILE:test_plugin_mismatched_abi>"
+        MACHA_TEST_PLUGIN_NO_ENTRY_SYMBOL="$<TARGET_FILE:test_plugin_no_entry_symbol>")
+    add_dependencies(macha-tests test_plugin_ok test_plugin_faulting test_plugin_mismatched_abi
+        test_plugin_no_entry_symbol)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(macha-tests PRIVATE -Wall -Wextra -Wpedantic)
         if(MACHA_WARNINGS_AS_ERRORS)
@@ -439,7 +545,21 @@ set(MACHA_CONFIG_EXAMPLE "${MACHA_CONFIG_DIR}/macha.yaml.example")
 if(TARGET macha)
     install(TARGETS macha RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
-install(TARGETS macha-metadata-repair RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS macha-metadata-repair macha-metadata-dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+# macha_core is SHARED (see the add_library(macha_core SHARED ...) comment
+# above), but it is a private library, not a public system one -- it installs
+# under its own subdirectory of the standard libdir (MACHA_PRIVATE_LIBDIR),
+# never into bindir alongside the executables. LIBRARY covers Linux/macOS
+# .so/.dylib; RUNTIME is the Windows .dll case, kept for completeness even
+# though no Windows target exists today.
+install(TARGETS macha_core
+        LIBRARY DESTINATION ${MACHA_PRIVATE_LIBDIR}
+        RUNTIME DESTINATION ${MACHA_PRIVATE_LIBDIR})
+# Subsystem plugins (none ship yet -- see
+# TODO/2026-09-05-subsystem-plugin-isolation-plan.md Phase 1/2) install here;
+# create it empty now so operators/packaging know where that is even before
+# the first plugin exists.
+install(DIRECTORY DESTINATION ${MACHA_PLUGIN_INSTALL_DIR})
 
 if(MACHA_INSTALL_SYSTEMD)
     if(NOT UNIX)

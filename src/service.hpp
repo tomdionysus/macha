@@ -42,6 +42,11 @@ class Service {
   private:
     NodeRuntime node_;
     ClusterStatusService cluster_status_;
+    // No subsystem plugin exists yet (see
+    // TODO/2026-09-05-subsystem-plugin-isolation-plan.md, Phase 1/2) -- this
+    // just wires the loader up so Status reports an honest empty list rather
+    // than nothing at all, and so Phase 1/2 have nothing left to wire here.
+    SubsystemSupervisor subsystems_;
     SessionApi session_api_;
     std::unique_ptr<HttpServer> catalogue_http_;
 

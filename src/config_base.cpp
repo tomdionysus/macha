@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "config.hpp"
+#include "macha_version.hpp"
 
 #include <algorithm>
 #include <array>
@@ -80,6 +81,12 @@ void validate(Config& config) {
         throw std::runtime_error("dht.replicas must be <= 31");
     if (config.read_ahead_extents > 64)
         throw std::runtime_error("read-ahead must be <= 64");
+    if (!config.retention_check_batch_size || !config.retention_check_concurrency)
+        throw std::runtime_error(
+            "dht.retention_check_batch_size and dht.retention_check_concurrency must be nonzero");
+    if (config.retention_check_batch_size * 32 + 4 > config.max_frame_size)
+        throw std::runtime_error(
+            "dht.retention_check_batch_size must fit one have_objects request within max_frame_size");
     if (config.connect_timeout.count() < 100 || config.metadata_cache.count() < 0)
         throw std::runtime_error("invalid network/cache timeout");
     if (config.upnp.discovery_timeout < std::chrono::milliseconds(100) ||
@@ -440,6 +447,8 @@ Endpoint parse_endpoint(const std::string& value, uint16_t default_port) {
 Config normalize_config(Config c) {
     if (c.metadata_store.path.empty() && !c.state_path.empty())
         c.metadata_store.path = c.state_path / "metadata-objects";
+    if (!c.plugin_path && !kDefaultPluginDir.empty())
+        c.plugin_path = std::filesystem::path(kDefaultPluginDir);
     validate(c);
     return c;
 }

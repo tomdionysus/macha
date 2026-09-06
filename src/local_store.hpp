@@ -103,6 +103,7 @@ class LocalStore {
     mutable std::map<ObjectId, std::weak_ptr<std::mutex>> object_mutexes_;
     uint64_t reserved_write_bytes_{};
     std::function<void(const ObjectId&)> before_loose_write_for_tests_;
+    std::function<void(const ObjectId&)> before_loose_read_for_tests_;
     std::function<void(const ObjectId&)> before_packed_read_for_tests_;
     std::function<void(const ObjectId&)> before_packed_write_for_tests_;
     std::function<void()> before_pack_compaction_for_tests_;
@@ -185,7 +186,13 @@ class LocalStore {
     uint64_t durable_generation() const;
     uint64_t durability_domain_id() const noexcept;
     std::optional<Bytes> get(const ObjectId&) const;
-    bool has(const ObjectId&) const;
+    // Cheap presence check: an in-memory index hit for a packed object, or a
+    // single stat() for a loose one. Confirms the on-disk size is non-zero
+    // (loose writes are temp-file + rename, so a real object is never
+    // observed partially written; zero bytes only happens post-corruption)
+    // but never decrypts or verifies content. Callers that need to know the
+    // payload is genuinely intact must use get()/valid() instead.
+    bool has(const ObjectId&) const noexcept;
     bool valid(const ObjectId&) const noexcept;
     bool remove(const ObjectId&);
     bool remove_if_older_than(const ObjectId&, std::chrono::milliseconds);
@@ -205,6 +212,10 @@ class LocalStore {
     void set_before_packed_read_for_tests(std::function<void(const ObjectId&)> hook) {
         std::lock_guard lock(m_);
         before_packed_read_for_tests_ = std::move(hook);
+    }
+    void set_before_loose_read_for_tests(std::function<void(const ObjectId&)> hook) {
+        std::lock_guard lock(m_);
+        before_loose_read_for_tests_ = std::move(hook);
     }
     void set_before_packed_write_for_tests(std::function<void(const ObjectId&)> hook) {
         std::lock_guard lock(m_);

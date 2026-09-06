@@ -7,6 +7,7 @@
 #include "log.hpp"
 #include "media_catalogue.hpp"
 #include "media_information.hpp"
+#include "supervised.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -673,7 +674,9 @@ void IngestManager::save_state_locked() const {
 
 void IngestManager::start() {
     if (!config_.enabled || worker_.joinable()) return;
-    worker_ = std::jthread([this](std::stop_token stop) { loop(stop); });
+    worker_ = std::jthread([this](std::stop_token stop) {
+        run_supervised("ingest", [this, stop] { loop(stop); });
+    });
 }
 
 void IngestManager::request_stop() {

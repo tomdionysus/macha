@@ -230,10 +230,12 @@ void apply_format_audio_metadata(AVFormatContext* format, std::string_view path,
 
 } // namespace
 
-void apply_embedded_music_metadata(FileSystem& fs, std::string_view path, const FsEntry& entry,
-                                   MediaProbe& probe,
-                                   std::vector<LocalArtworkCandidate>& artwork,
-                                   size_t max_artwork_bytes) {
+namespace {
+
+void apply_embedded_music_metadata_impl(FileSystem& fs, std::string_view path, const FsEntry& entry,
+                                        MediaProbe& probe,
+                                        std::vector<LocalArtworkCandidate>& artwork,
+                                        size_t max_artwork_bytes) {
     auto handle = fs.open_read(entry, std::string(path), false, FrameType::read_ahead);
     AudioMetadataRead state{std::move(handle), entry.size, 0};
     constexpr int buffer_size = 64 * 1024;
@@ -263,7 +265,7 @@ void apply_embedded_music_metadata(FileSystem& fs, std::string_view path, const 
     apply_format_audio_metadata(input.get(), path, probe, artwork, max_artwork_bytes);
 }
 
-std::optional<MediaProbe> embedded_music_metadata_from_host(const std::filesystem::path& path) {
+std::optional<MediaProbe> embedded_music_metadata_from_host_impl(const std::filesystem::path& path) {
     AVFormatContext* format = nullptr;
     const auto opened = avformat_open_input(&format, path.string().c_str(), nullptr, nullptr);
     AvInputContextOwner input(format, opened >= 0);
@@ -277,5 +279,18 @@ std::optional<MediaProbe> embedded_music_metadata_from_host(const std::filesyste
     apply_format_audio_metadata(input.get(), probe.path, probe, ignored_artwork, 0);
     return probe;
 }
+
+// Registers this FFmpeg-backed implementation into macha_core's provider slot
+// (see media_metadata_registry.cpp) as soon as this translation unit is
+// linked into an executable, before main() runs.
+struct EmbeddedMusicMetadataRegistration {
+    EmbeddedMusicMetadataRegistration() {
+        set_embedded_music_metadata_provider(
+            {apply_embedded_music_metadata_impl, embedded_music_metadata_from_host_impl});
+    }
+};
+const EmbeddedMusicMetadataRegistration embedded_music_metadata_registration;
+
+} // namespace
 
 } // namespace macha

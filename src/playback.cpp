@@ -5,6 +5,7 @@
 #include "crypto.hpp"
 #include "json.hpp"
 #include "log.hpp"
+#include "supervised.hpp"
 #include "macha_version.hpp"
 #include "media_information.hpp"
 
@@ -2413,9 +2414,12 @@ void PlaybackManager::start() {
     if (!impl_->engine) throw std::runtime_error("streaming media engine is unavailable");
     auto status = impl_->engine->status();
     if (!status.available) throw std::runtime_error("streaming media engine is unavailable");
-    impl_->cleanup_thread = std::jthread([this](std::stop_token stop) { impl_->cleanup(stop); });
-    impl_->profile_publish_thread =
-        std::jthread([this](std::stop_token stop) { impl_->publish_profiles(stop); });
+    impl_->cleanup_thread = std::jthread([this](std::stop_token stop) {
+        run_supervised("playback-cleanup", [this, stop] { impl_->cleanup(stop); });
+    });
+    impl_->profile_publish_thread = std::jthread([this](std::stop_token stop) {
+        run_supervised("playback-profile-publish", [this, stop] { impl_->publish_profiles(stop); });
+    });
     impl_->started = true;
     Log::info("streaming enabled engine=" + status.backend + " version=" + status.version +
               " h264_encoder=" + std::string(status.h264_encoder ? "yes" : "no") +

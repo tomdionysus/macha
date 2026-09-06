@@ -4,6 +4,7 @@
 #include "codec.hpp"
 #include "diagnostics.hpp"
 #include "log.hpp"
+#include "supervised.hpp"
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -320,6 +321,8 @@ bool is_bulk_message(MessageType type) {
 bool is_priority_data_message(MessageType type) {
     switch (type) {
     case MessageType::have_object:
+    case MessageType::have_objects:
+    case MessageType::have_objects_reply:
     case MessageType::retain_objects:
     case MessageType::delete_object:
     case MessageType::get_metadata:
@@ -332,6 +335,7 @@ bool is_priority_data_message(MessageType type) {
     case MessageType::put_control_object:
     case MessageType::get_metadata_identity:
     case MessageType::get_metadata_history_entry:
+    case MessageType::get_metadata_history_record:
     case MessageType::has_metadata_history_entry:
     case MessageType::put_metadata_history_entry:
     case MessageType::get_metadata_heads:
@@ -571,6 +575,8 @@ const char* message_type_name(MessageType type) noexcept {
         return "identity_resets";
     case MessageType::get_metadata_history_entry:
         return "get_metadata_history_entry";
+    case MessageType::get_metadata_history_record:
+        return "get_metadata_history_record";
     case MessageType::has_metadata_history_entry:
         return "has_metadata_history_entry";
     case MessageType::put_metadata_history_entry:
@@ -597,6 +603,8 @@ const char* message_type_name(MessageType type) noexcept {
         return "commit_history_floor";
     case MessageType::session_sync:
         return "session_sync";
+    case MessageType::have_objects:
+        return "have_objects";
     case MessageType::ok:
         return "ok";
     case MessageType::error:
@@ -633,6 +641,8 @@ const char* message_type_name(MessageType type) noexcept {
         return "torrent_job_action_reply";
     case MessageType::session_sync_reply:
         return "session_sync_reply";
+    case MessageType::have_objects_reply:
+        return "have_objects_reply";
     }
     return "unknown";
 }
@@ -659,7 +669,8 @@ FrameType default_frame_type(MessageType type) noexcept {
         return FrameType::foreground;
     if (type == MessageType::get_control_object || type == MessageType::put_control_object ||
         type == MessageType::telemetry || type == MessageType::have_object ||
-        type == MessageType::retain_objects || type == MessageType::delete_object)
+        type == MessageType::have_objects || type == MessageType::retain_objects ||
+        type == MessageType::delete_object)
         return FrameType::speculative;
     return FrameType::control;
 }
@@ -1534,8 +1545,12 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         peer_ = channel_.client_handshake(lane);
         channel_.set_io_timeout(std::chrono::milliseconds(0));
         peer_observer_(peer_);
-        reader_ = std::jthread([this](std::stop_token stop) { reader_loop(stop); });
-        writer_ = std::jthread([this](std::stop_token stop) { writer_loop(stop); });
+        reader_ = std::jthread([this](std::stop_token stop) {
+            run_supervised("net-peer-reader", [this, stop] { reader_loop(stop); });
+        });
+        writer_ = std::jthread([this](std::stop_token stop) {
+            run_supervised("net-peer-writer", [this, stop] { writer_loop(stop); });
+        });
     }
 
     ~PeerConnection() {
@@ -1718,7 +1733,9 @@ RpcClient::RpcClient(ClusterKeys keys, std::function<NodeInfo()> local,
       heartbeat_(heartbeat), dead_after_(dead_after), max_frame_size_(max_frame_size),
       retained_memory_(retained_memory) {
     validate_frame_limit(max_frame_size_);
-    health_thread_ = std::jthread([this](std::stop_token stop) { health_loop(stop); });
+    health_thread_ = std::jthread([this](std::stop_token stop) {
+        run_supervised("net-health", [this, stop] { health_loop(stop); });
+    });
 }
 
 RpcClient::~RpcClient() {
@@ -2899,7 +2916,9 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
     }
 
     void start_writer() {
-        writer = std::jthread([this](std::stop_token stop) { writer_loop(stop); });
+        writer = std::jthread([this](std::stop_token stop) {
+            run_supervised("net-rpc-writer", [this, stop] { writer_loop(stop); });
+        });
     }
 
     void notify(const RpcMessage& message) {
@@ -3352,17 +3371,25 @@ void RpcServer::start() {
     metadata_workers_.reserve(execution_limits_.metadata_workers);
     data_workers_.reserve(data_worker_count);
     for (size_t i = 0; i < fast_control_worker_count; ++i)
-        fast_control_workers_.emplace_back(
-            [this](std::stop_token stop) { fast_control_worker_loop(stop); });
+        fast_control_workers_.emplace_back([this](std::stop_token stop) {
+            run_supervised("net-rpc-fast-control-worker", [this, stop] { fast_control_worker_loop(stop); });
+        });
     for (size_t i = 0; i < control_worker_count; ++i)
-        control_workers_.emplace_back([this](std::stop_token stop) { control_worker_loop(stop); });
+        control_workers_.emplace_back([this](std::stop_token stop) {
+            run_supervised("net-rpc-control-worker", [this, stop] { control_worker_loop(stop); });
+        });
     for (size_t i = 0; i < execution_limits_.metadata_workers; ++i)
-        metadata_workers_.emplace_back(
-            [this](std::stop_token stop) { metadata_worker_loop(stop); });
+        metadata_workers_.emplace_back([this](std::stop_token stop) {
+            run_supervised("net-rpc-metadata-worker", [this, stop] { metadata_worker_loop(stop); });
+        });
     for (size_t i = 0; i < data_worker_count; ++i)
-        data_workers_.emplace_back([this](std::stop_token stop) { data_worker_loop(stop); });
+        data_workers_.emplace_back([this](std::stop_token stop) {
+            run_supervised("net-rpc-data-worker", [this, stop] { data_worker_loop(stop); });
+        });
 
-    accept_thread_ = std::jthread([this](std::stop_token stop) { accept_loop(stop); });
+    accept_thread_ = std::jthread([this](std::stop_token stop) {
+        run_supervised("net-rpc-accept", [this, stop] { accept_loop(stop); });
+    });
 }
 
 void RpcServer::stop() {
@@ -3495,8 +3522,9 @@ void RpcServer::accept_loop(std::stop_token stop) {
                 sessions_.push_back(session);
                 registered = true;
             }
-            session->reader =
-                std::jthread([this, raw = session.get()](std::stop_token) { session_loop(raw); });
+            session->reader = std::jthread([this, raw = session.get()](std::stop_token) {
+                run_supervised("net-rpc-session", [this, raw] { session_loop(raw); });
+            });
         } catch (...) {
             pre_auth_sessions_.fetch_sub(1, std::memory_order_acq_rel);
             if (registered) {

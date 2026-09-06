@@ -9,7 +9,11 @@
 
 state_path: /var/lib/macha
 key_file: /etc/macha.key
-mount_path: /srv/media
+
+# Directory scanned for subsystem plugins (.so/.dylib). Defaults to this
+# build's private plugin directory (e.g. /usr/lib/macha/plugins) when
+# omitted. Uncomment only to override that default.
+# plugin_path: /opt/macha/plugins
 
 # ALL, DEBUG, INFO, WARN or ERROR. Default: INFO.
 # ALL includes expensive per-object/FUSE/payload/extent/write trace output; DEBUG is low-volume operational diagnosis.
@@ -85,6 +89,9 @@ filesystem:
 # asynchronous workers. Timeouts deliberately remain well below macFUSE's own
 # daemon timeout; a request fails to the kernel rather than hanging the mount.
 fuse:
+  # Filesystem path to mount at. If omitted, Macha runs without a FUSE mount.
+  mount_path: /srv/media
+
   allow_other: false
 
   # Durable FUSE admission state can be placed independently of state_path.
@@ -223,6 +230,15 @@ dht:
   # Process-memory ceiling for decoded metadata snapshots. Durable history
   # payloads stay disk-backed and are loaded only when required.
   metadata_materialization_cache_bytes: 128M
+  # A DATA retention claim (e.g. accepting a metadata publication) checks
+  # candidate placement in have_objects batches of this many extent IDs per
+  # peer, not one have_object RPC per extent. Must fit within
+  # network.max_frame_size (32 bytes/id plus a small header).
+  retention_check_batch_size: 2000
+  # Bound on simultaneous have_objects batches in flight, across all peers
+  # combined, from a single retention claim -- caps fan-out against any one
+  # peer no matter how large the publication.
+  retention_check_concurrency: 8
 
 # Speculative cache hydration. Hint engines are independent and their priorities
 # are merged by a weighted-fair scheduler. Ordered runs stay sequential: a next

@@ -26,9 +26,9 @@ int main(int argc, char** argv) {
                               std::to_string(allocator.arena_max));
         macha::configure_ffmpeg_logging(config.ffmpeg_log_level);
         auto keys = macha::load_cluster_keys(config.key_file);
-        if (config.mount_path) {
-            macha::prepare_fuse_mountpoint(*config.mount_path, config.fuse);
-            std::filesystem::create_directories(*config.mount_path);
+        if (config.fuse.mount_path) {
+            macha::prepare_fuse_mountpoint(*config.fuse.mount_path, config.fuse);
+            std::filesystem::create_directories(*config.fuse.mount_path);
         }
 
         sigset_t service_signals;
@@ -38,7 +38,7 @@ int main(int argc, char** argv) {
 #ifdef SIGHUP
         sigaddset(&service_signals, SIGHUP);
 #endif
-        if (!config.mount_path) {
+        if (!config.fuse.mount_path) {
             const int blocked = pthread_sigmask(SIG_BLOCK, &service_signals, nullptr);
             if (blocked != 0)
                 throw std::runtime_error("cannot block service signals: " +
@@ -48,9 +48,9 @@ int main(int argc, char** argv) {
         macha::Service service(config, keys);
         service.start();
 
-        if (config.mount_path) {
+        if (config.fuse.mount_path) {
             int rc = macha::run_fuse(
-                service.filesystem(), service.hydration().hydrator(), *config.mount_path,
+                service.filesystem(), service.hydration().hydrator(), *config.fuse.mount_path,
                 config.fuse, [&service] { service.request_stop(); },
                 [&service](std::weak_ptr<macha::FuseFrontend> frontend) {
                     service.attach_fuse_frontend(std::move(frontend));

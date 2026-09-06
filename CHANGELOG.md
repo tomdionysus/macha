@@ -1,5 +1,285 @@
 # Current release
 
+## 0.27.0 — Root cause of "accepted metadata head cannot be reconstructed", fixed; broken heads now repaired live instead of quarantined (development)
+
+The 0.26.1/0.26.2 outage was bounded but not explained. This release pins the
+cause from the quarantined on-disk state of every affected node, removes it,
+and changes what a node does if a head ever fails to reconstruct again for
+any other reason. Protocol addition (one new control message), hence the
+minor bump; older peers reject the new message by resetting the connection,
+which the caller treats as "that peer cannot serve it" -- mixed-version
+clusters keep working, they just cannot repair *from* an old peer.
+
+- **Root cause (confirmed on disk, three occurrences).** A reconciliation
+  merge commit is numbered `max(parents)+1` with the lower-hash parent as its
+  primary (`MetadataManager::read_group()`), so its delta body legitimately
+  sits several generations above that parent. Every history *writer*
+  (`store_commit`, `import_history`, `load_history`) accepted that, and the
+  existing test `test_merge_delta_primary_may_precede_merge_generation`
+  encoded it as allowed -- but both *reconstruction walks*
+  (`materialized_locked()` and `materialized()`) required exactly `parent+1`.
+  The writer's own validation never noticed because it applied the delta to
+  the parent straight from the materialization cache. Result: a merge commit
+  durably written, hash-verified, readable only while it stayed in the
+  64-entry cache, and permanently unreconstructable the moment it was
+  evicted -- and since it was an accepted head, every reconciliation that
+  could have folded it away had to materialize it first. Evidence: es-1's
+  and gbni-1's quarantines both hold head `5e6ae738…` gen **8010** as a
+  delta over parent `37d691c7…` gen **8004**; gbni-2's 2026-09-04 quarantine
+  (25 GB) holds the identical shape (head 4969 → delta gen 4964 over gen
+  4957, 22 such frames). The old test passed only because the reopened
+  checkpoint happened to *be* the merge head, which seeded the cache.
+- **Fix.** One succession rule, one implementation:
+  `metadata_delta_succession_valid(parent, child)` (`metadata.hpp`), used by
+  all three writers and both readers. The record hash binds the generation,
+  so the walk only ever needed monotonicity. Every existing quarantined
+  history on the cluster is fully reconstructible under it (verified with
+  the new `macha-metadata-dump` tool below: `anomalies=0`, every head
+  `reconstructible=yes`).
+  Regression test: `test_merge_delta_with_generation_gap_reconstructs_after_cache_eviction_and_reopen`
+  fails on 0.26.x at the very first `accept_commit` of the merge with a
+  1-byte materialization cache.
+- **Startup no longer throws the replica away over one head.**
+  `MetadataReplica::load_heads()` used to throw on any unreconstructable
+  certificate, sending the constructor down the recovery-seed path:
+  `checkpoint.meta`/`history.log`/`heads.meta`/… all quarantined (450 MB on
+  es-1, 830 MB on gbni-1, 25 GB on gbni-2) and the node reseeded from the
+  persistent cache. Now the certificate is kept, the head is flagged
+  (excluded from reads via the 0.26.1 cooldown), and one `ERROR` names the
+  exact break (`diagnose_unreconstructable_locked()`: not indexed / parent
+  absent / succession violated / cycle / unreadable frame / replay hash
+  mismatch). A certificate whose *materialized* generation disagrees with it
+  is still fatal -- that is a forged certificate, not a missing dependency.
+- **Live repair, no restart.** New maintenance step
+  `MetadataManager::repair_unreconstructable_heads()`: for each flagged head,
+  ask each reachable peer for the record as a self-contained full body
+  (`get_metadata_history_record = 41` → `MetadataReplica::
+  full_history_record()`; the existing `get_metadata_history_entry` returns
+  the peer's *stored* frame, which may be exactly the delta the caller cannot
+  replay) and `MetadataReplica::reanchor_history()` it: append a full frame,
+  re-point the index at it (history is append-only; `load_history()` now
+  prefers a full frame over a same-identity delta rather than throwing
+  "duplicate"), re-verify the acceptance certificate against the repaired
+  record, clear the flag. A repair is reported as such even if a *different*
+  flagged head still makes the materialized-head refresh throw.
+  Tests: `test_unreconstructable_accepted_head_is_kept_at_startup_and_reanchored_live`
+  (startup flagging, re-anchor of an absent head, refusal of a forged record,
+  in-place supersession of an indexed frame, restart preferring the full
+  frame) and `rpc_cluster/test_unreconstructable_accepted_head_is_repaired_live_from_a_peer`
+  (the wire path end to end).
+- **Diagnosis and the throw message.** `accepted metadata head cannot be
+  reconstructed` now carries `hash=… reason=…`; the first failure of an
+  episode logs one `WARN … excluded from reads pending live repair` with the
+  same diagnosis. Both retry sites share the cooldown constant instead of
+  duplicating it.
+- **`macha-metadata-dump`** (`tools/metadata_history_dump.cpp`, installed
+  next to `macha-metadata-repair`): read-only forensic decoder that never
+  constructs a `MetadataReplica`, so it can examine a quarantined
+  `*.corrupt.<ts>` directory: decodes `heads.meta`, walks every `history.log`
+  frame, reports anomalies and legitimate generation-gap deltas, and for each
+  accepted head walks the delta chain with the production predicate and
+  names where materialization would fail. This is how the root cause was
+  proven.
+- Not changed, documented for the next person: `WARN local metadata delta
+  rejected; retrying full record generation=N` precedes every reconciliation
+  on the merging node -- the merging node stores each merge as a 15 MB *full*
+  snapshot while shipping the compact delta to its peers. That is why
+  history.log reached 25 GB on gbni-2. Separate issue; see
+  `TODO/2026-09-06-unreconstructable-accepted-head-retry-storm-incident.md`.
+
+## 0.26.2 — Bound the second, separate retry storm from the same 0.26.1 failure mode (development)
+
+Found while writing up 0.26.1's own follow-up notes, not by further live
+reproduction: a *second*, independent code path hits the same "cannot accept
+this peer's metadata certificate" condition and was not covered by 0.26.1's
+fix.
+
+- `MetadataManager::read_group()`'s peer-certificate-survey loop
+  (`metadata_manager.cpp`) calls `NodeRuntime::accept_metadata_commit()` for
+  every observed peer head on *every* call -- i.e. on essentially every
+  ordinary metadata read cluster-wide, same as `accepted_heads()`. When a
+  certificate's underlying record can't be materialized locally,
+  `MetadataReplica::accept_commit()` rejects it via its own early
+  materialize check -- a completely separate code path from
+  `accepted_heads()`/`refresh_materialized_head_in_memory_locked()`, and
+  therefore untouched by 0.26.1's cooldown. This produced the `ignoring
+  metadata head without a valid acceptance certificate` WARN (also seen
+  during the 0.26.1 incident, interleaved with the other one) on every call,
+  unthrottled.
+- Fix: the same 30-second per-hash cooldown pattern, applied to this path
+  (`unacceptable_head_retry_at_`, `MetadataManager`): a hash recently
+  confirmed unacceptable is skipped outright on subsequent calls -- no
+  repeated peer-import RPCs, no repeated rejection warning -- until the
+  cooldown expires.
+- Testing gap, disclosed rather than papered over: unlike 0.26.1's fix, this
+  one has no dedicated regression test. `read_group()` requires a real
+  multi-node RPC harness to exercise (`discover_accepted_heads()` makes
+  actual network calls), and building that harness wasn't done here. Full
+  test suite passes unchanged; this fix is verified by code reading and the
+  same live incident's log evidence, not by a new automated test.
+
+## 0.26.1 — Bound retry storms from an unreconstructable accepted metadata head (development)
+
+Fixes a live 2026-09-06 incident found while stress-testing 0.26.0 with
+deliberate concurrent multi-origin writes (movies from one node, TV from
+another, into the same namespace at once): `corvus-es-1` and `corvus-gbni-1`
+both fully stalled -- zero metadata mutations, zero object writes -- for
+over 5 hours with no self-recovery, spinning `WARN media information
+publication failed: ... accepted metadata head cannot be reconstructed` and
+similar at 2-47 times/second.
+
+- Root cause: `MetadataReplica::refresh_materialized_head_in_memory_locked()`
+  and `MetadataReplica::accepted_heads()` both throw the instant any entry in
+  the node's accepted-head set fails to reconstruct from local history, with
+  no backoff. `accepted_heads()` alone is on the hottest path in the system
+  -- called on essentially every metadata read, conflict reconciliation,
+  catalogue publication, and checkpoint-maintenance tick -- so once one head
+  became unreconstructable, every caller cluster-wide re-attempted and
+  re-threw immediately, forever. The exact mechanism that made that one head
+  unreconstructable was not conclusively pinned down (the likely trigger is
+  a stalled `has_metadata_history_entry` RPC observed in the logs seconds
+  before the stall began, interacting with peer history-import under the
+  concurrent-write load) -- both known insertion paths into the accepted-head
+  set (`store_commit`, `import_history`) were independently verified to
+  already guard correctly against the specific chain-hole corruption that
+  was the first suspect.
+- Fix: both functions now rate-limit reconstruction attempts to once per 30
+  seconds per hash. Within that window a still-broken head is treated as
+  temporarily absent from the accepted set rather than a hard failure --
+  callers that need exactly one head can converge on whichever other head is
+  healthy, and ordinary reads keep serving the last good committed state
+  instead of throwing on every call. This bounds the failure mode (one
+  narrow reconstruction gap can no longer become an unbounded tight retry
+  loop); it does not by itself explain or prevent whatever originally causes
+  a head to become unreconstructable.
+- Note for anyone who hits this: the fix only covers the runtime retry path.
+  `MetadataReplica`'s constructor (`load_heads()`) re-validates every
+  persisted accepted-head certificate at startup and is unaffected by this
+  change -- a node restarted while still carrying the same broken head on
+  disk will very likely fall into its existing recovery-seed fallback
+  (quarantining the broken `history.log`/`heads.meta`, resuming from the
+  last separately-cached committed snapshot in `recovery_required` mode)
+  rather than simply resuming. `recovery_required` clears itself
+  automatically on the first metadata read that completes by reconciling
+  against a healthy peer (`MetadataManager::read_record_uncached()` calls
+  `mark_recovered()` unconditionally on success) -- no manual repair step
+  should be needed, but expect a one-time reset-and-resync, not a silent
+  restart.
+- Regression: `storage_metadata/test_unreconstructable_accepted_head_is_rate_limited_not_hammered`
+  forces a real accepted head unreconstructable via a new test-only hook
+  (`MetadataReplica::set_force_unreconstructable_for_tests`) and proves
+  reconstruction is attempted once, not on every subsequent call.
+
+## 0.26.0 — Batch and cheapen DATA retention-check presence probes, fixing a serial-decrypt/RPC scaling cliff (development)
+
+Fixes the live 2026-09-06 `corvus-es-1` incident: a bulk movie rsync froze
+data publication for minutes, pinned the maintenance thread near 100% CPU,
+and produced a hard control-RPC timeout against an unrelated peer. Root
+cause, evidence and phased fix are in
+`TODO/2026-09-06-retention-check-batching-and-cheap-presence-plan.md`.
+
+- `DistributedStore::retain_data()`'s per-extent candidate-presence scan --
+  previously one `has_on()`/`have_object` round trip (a full local AES-GCM
+  decrypt, or a synchronous network RPC) per (extent, candidate) pair, run
+  serially on the thread that also drives metadata-publication acceptance --
+  is now batched: candidates are grouped by node into a new `have_objects`
+  wire message covering many extent IDs per request, and independent
+  per-node batches run concurrently. Selection order and the
+  `min_write_replicas` floor are unchanged; only the shape of how presence
+  gets checked does. New `dht.retention_check_batch_size` (default 2000) and
+  `dht.retention_check_concurrency` (default 8) config keys bound batch size
+  and fan-out so an arbitrarily large publication cannot turn into an
+  unbounded fan-out against one peer.
+- `LocalStore::has()` -- already a cheap presence probe (an index lookup for
+  packed objects, a single `stat()` for loose ones, never a decrypt) -- is
+  now used for `has_on()`'s local candidate check instead of the
+  full-decrypt `valid()`. It is also now `noexcept` and treats a zero-byte
+  loose file as absent. This is safe specifically because the actual
+  retention commit (`retain_on`/`retain_objects`) always re-verifies before
+  persisting a claim; `rebalance_step`'s and `repair_step`'s presence checks
+  have no equivalent downstream re-verification and deliberately stay on the
+  full-decrypt path, so a corrupt replica still can't be counted as healthy
+  placement.
+- **Protocol addition:** `MessageType::have_objects`/`have_objects_reply`
+  (wire values 40/118). An older peer mid-rollout answers it as an
+  unrecognized message and the caller falls back to the pre-existing
+  per-extent `have_object` path for that peer -- degraded speed during a
+  rolling upgrade, not a correctness or availability issue.
+
+## 0.25.0 — Foundation for subsystem crash isolation: a mandatory thread guard, a shared macha_core, and a dlopen'd plugin loader (development)
+
+Phase 0 of `TODO/2026-09-05-subsystem-plugin-isolation-plan.md`, the design
+response to 0.24.4's `corvus-es-1` crash-loop (an uncaught exception during
+`FuseFrontend` construction took the entire node down, not just the FUSE
+mount). Single binary, single process throughout -- no separate OS processes
+or IPC. No subsystem has migrated onto the new interface yet (Torrent/FUSE
+plugin migration is Phase 1/2); this release only lays the foundation.
+
+- Added `run_supervised()`, the mandatory entry point for every
+  subsystem-owned thread: it catches any exception (including non-`std::exception`
+  throws) at the top of the thread body and logs instead of letting it
+  escape. An exception escaping a `std::jthread`/`std::thread` lambda calls
+  `std::terminate()` directly -- it never reaches any caller's `catch`, so
+  this could not have been fixed by wrapping `main()` more carefully. Applied
+  to all ~30 background thread/worker-pool construction sites across the
+  codebase; a new regression test
+  (`foundations/test_every_subsystem_thread_is_run_supervised`) scans every
+  `src/*.cpp` and fails if a future thread construction bypasses it.
+- `macha_core` is now a shared library (`libmacha_core`), not a static one,
+  so it, the `macha` executable and every future subsystem plugin share
+  exactly one copy of its classes and global/static state. Fixed the two
+  link seams this broke (`make_libav_media_engine`,
+  `apply_embedded_music_metadata`/`embedded_music_metadata_from_host`): the
+  real FFmpeg-backed implementations now register themselves into
+  `macha_core` at static-init time instead of being resolved as unresolved
+  symbols by whichever executable links them, which only worked when
+  `macha_core` was static. `media_engine_stub.cpp`/`media_metadata_stub.cpp`
+  are removed -- their no-op behaviour is now `macha_core`'s own default
+  when nothing registers a real implementation.
+- Added the `Subsystem`/`SubsystemContext` interface and a versioned plugin
+  ABI (`subsystem_abi.hpp`): a plugin exports one `macha_subsystem_entry()`
+  symbol carrying a build-identity stamp (project version + git commit) that
+  must match the running core's own before it is ever constructed -- a
+  plugin built against a different core revision (a partial deploy) is
+  refused at load time, not run with an incompatible ABI.
+- Added `SubsystemSupervisor`: discovers `.so`/`.dylib` plugins in a
+  configured directory, and keeps each one's construction/start attempt
+  behind a backed-off retry loop that disables itself after too many
+  failures in a window rather than crash-looping forever -- the general
+  fix for the exact failure class that crash-looped `corvus-es-1`. Verified
+  with real `dlopen`'d fault-injection plugins (`tests/plugins/`), not
+  in-process mocks: a plugin whose `start()` always throws is retried,
+  faulted and disabled without the test process itself going down; a
+  plugin with a mismatched build identity is refused outright.
+- Added `plugin_path` to `Config`/`config.yaml` (default: the directory
+  containing the running executable), and a `subsystems` block to
+  `GET /api/v1/status` reporting each loaded subsystem's name/state/restart
+  count -- currently always empty, since nothing has migrated onto the
+  interface yet.
+- **Breaking config change:** top-level `mount_path` moved to
+  `fuse.mount_path`, ahead of FUSE's own migration to this interface in a
+  later phase. A top-level `mount_path` now fails startup with an explicit
+  obsolete-key error instead of being silently ignored. Every deployed
+  node's `macha.yaml` needs this key moved before upgrading.
+
+## 0.24.4 — Fix a crash-loop introduced by 0.24.3's namespace-skip escape hatch (development)
+
+- Fixed a same-night regression in 0.24.3's `skip_blocked_namespace_operation()`:
+  it journals a `namespace_done` marker for an operation that was
+  deliberately abandoned without ever being published, but the durable
+  journal's replay validator required every `namespace_done` to have a prior
+  `namespace_published` record for that sequence -- a real invariant for the
+  ordinary success path, but one the new operator-skip path never satisfies
+  by design. The very next process restart replayed that record, threw
+  `DecodeError("invalid FUSE namespace completion marker")`, and crashed;
+  because the record is durable, every subsequent restart hit the same
+  failure, crash-looping indefinitely. Surfaced live in production on
+  `corvus-es-1` (49 restarts before diagnosis) after deploying 0.24.3.
+  Fixed by no longer requiring `namespace_published` for `namespace_done`
+  during recovery, since "abandoned without publishing" is now a legitimate
+  terminal state alongside "confirmed published." Regression:
+  `test_fuse_journal_replays_operator_skipped_op_without_a_published_marker`.
+
 ## 0.24.3 — Fix ingest job resurrection, a metadata data race, and a wedged FUSE namespace queue (development)
 
 - Fixed cleared ingest jobs resurrecting: seven sites in `src/ingest.cpp` read

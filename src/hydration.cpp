@@ -6,6 +6,7 @@
 #include "distributed_store.hpp"
 #include "filesystem.hpp"
 #include "log.hpp"
+#include "supervised.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -505,9 +506,13 @@ void CacheHydrator::start() {
     fetch_workers_.reserve(workers);
     try {
         for (size_t i = 0; i < workers; ++i)
-            fetch_workers_.emplace_back([this](std::stop_token stop) { fetch_loop(stop); });
+            fetch_workers_.emplace_back([this](std::stop_token stop) {
+                run_supervised("hydration-fetch", [this, stop] { fetch_loop(stop); });
+            });
         std::lock_guard lock(mutex_);
-        worker_ = std::jthread([this](std::stop_token stop) { loop(stop); });
+        worker_ = std::jthread([this](std::stop_token stop) {
+            run_supervised("hydration", [this, stop] { loop(stop); });
+        });
     } catch (...) {
         request_stop();
         for (auto& fetch : fetch_workers_)

@@ -743,6 +743,288 @@ MACHA_FAST_TEST("storage_metadata", test_merge_delta_primary_may_precede_merge_g
     CHECK(reopened.history_is_ancestor(newer.hash, merge.hash));
 }
 
+MACHA_FAST_TEST("storage_metadata",
+                test_merge_delta_with_generation_gap_reconstructs_after_cache_eviction_and_reopen) {
+    // 2026-09-06 root cause (three real occurrences, confirmed from the
+    // quarantined on-disk state of every affected node): a reconciliation
+    // merge commit is numbered max(parents)+1 with the lower-hash parent as
+    // its primary, so its delta body legitimately sits more than one
+    // generation above that parent. store_commit()/import_history()/
+    // load_history() all accept that -- and the test above proves the head
+    // reads back -- but only because the reopened checkpoint *is* the merge
+    // and seeds the materialization cache. Both reconstruction walks demanded
+    // exactly parent+1, so the instant the merge left the cache (committed
+    // moved to a different branch, other reconstructions churned the cache)
+    // it became permanently unreconstructable: every reconciliation that
+    // could fold it away had to materialize it first, the cluster wedged,
+    // and a restart quarantined the entire history.
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "merge-delta-generation-gap-evicted";
+
+    NodeId a{}, b{};
+    a.bytes[15] = 1;
+    b.bytes[15] = 2;
+    FsEntry directory;
+    directory.type = EntryType::directory;
+    directory.mode = 0755;
+    const auto genesis = genesis_metadata();
+
+    auto older_snapshot = decode_snapshot(genesis.payload);
+    older_snapshot.metadata_write_replicas_required = 2;
+    older_snapshot.entries["/older"] = directory;
+    MetadataRecord older;
+    older.generation = 10;
+    older.previous = genesis.hash;
+    older.payload = encode_snapshot(older_snapshot);
+    older.hash = metadata_hash(older.generation, older.previous, older.payload);
+
+    MetadataRecord newer;
+    MetadataSnapshot newer_snapshot;
+    for (size_t attempt = 0; attempt < 256; ++attempt) {
+        newer_snapshot = decode_snapshot(genesis.payload);
+        newer_snapshot.metadata_write_replicas_required = 2;
+        newer_snapshot.entries["/newer-" + std::to_string(attempt)] = directory;
+        newer.generation = 20;
+        newer.previous = genesis.hash;
+        newer.payload = encode_snapshot(newer_snapshot);
+        newer.hash = metadata_hash(newer.generation, newer.previous, newer.payload);
+        if (older.hash < newer.hash)
+            break;
+    }
+    REQUIRE(older.hash < newer.hash);
+
+    MetadataRecord merge;
+    auto merged_snapshot = older_snapshot;
+    merged_snapshot.entries.insert(newer_snapshot.entries.begin(), newer_snapshot.entries.end());
+    merged_snapshot.merge_parents = {newer.hash};
+    merge.generation = newer.generation + 1;
+    merge.previous = older.hash;
+    merge.payload = encode_snapshot(merged_snapshot);
+    merge.hash = metadata_hash(merge.generation, merge.previous, merge.payload);
+    auto delta = metadata_delta(older_snapshot, merged_snapshot);
+    REQUIRE(delta.has_value());
+    const auto encoded_delta = encode_metadata_delta(*delta);
+
+    // A concurrent, unrelated branch that races ahead of the merge -- exactly
+    // the incident: `committed` moves to this head, the merge stays accepted
+    // (neither is the other's ancestor) and nothing pins it in the cache.
+    MetadataRecord divergent;
+    auto divergent_snapshot = newer_snapshot;
+    divergent_snapshot.entries["/divergent"] = directory;
+    divergent.generation = 30;
+    divergent.previous = newer.hash;
+    divergent.payload = encode_snapshot(divergent_snapshot);
+    divergent.hash = metadata_hash(divergent.generation, divergent.previous, divergent.payload);
+
+    {
+        // A one-byte materialization budget: nothing but the pinned
+        // current/committed head survives in the cache, so every other
+        // read must genuinely reconstruct from history.log.
+        MetadataReplica replica(path, keys.storage, {}, true, 1);
+        REQUIRE(replica.store_commit(older));
+        REQUIRE(replica.accept_commit({older.generation, older.hash, 2, {a, b}}));
+        REQUIRE(replica.store_commit(newer));
+        REQUIRE(replica.accept_commit({newer.generation, newer.hash, 2, {a, b}}));
+        REQUIRE(replica.store_commit(merge, encoded_delta));
+        REQUIRE(replica.accept_commit({merge.generation, merge.hash, 2, {a, b}}));
+        auto entry = replica.history_entry(merge.hash);
+        REQUIRE(entry.has_value());
+        REQUIRE(entry->body == MetadataHistoryEntry::Body::delta);
+
+        REQUIRE(replica.store_commit(divergent));
+        REQUIRE(replica.accept_commit({divergent.generation, divergent.hash, 2, {a, b}}));
+        CHECK(replica.committed().hash == divergent.hash);
+        // Any further materialization evicts the now-unpinned merge.
+        REQUIRE(replica.materialized(divergent.hash));
+
+        // Live: the merge must still reconstruct from disk once evicted.
+        auto reconstructed = replica.materialized(merge.hash);
+        REQUIRE(reconstructed);
+        CHECK(reconstructed->record.hash == merge.hash);
+        CHECK(reconstructed->record.payload == merge.payload);
+        CHECK(replica.accepted_heads().size() == 2);
+    }
+
+    // Restart: must not throw (which quarantined the whole replica in the
+    // incident) and must still see both heads.
+    MetadataReplica reopened(path, keys.storage, {}, true, 1);
+    const auto heads = reopened.accepted_heads();
+    REQUIRE(heads.size() == 2);
+    auto reconstructed = reopened.materialized(merge.hash);
+    REQUIRE(reconstructed);
+    CHECK(reconstructed->record.payload == merge.payload);
+    CHECK(reopened.history_is_ancestor(older.hash, merge.hash));
+    CHECK(reopened.history_is_ancestor(newer.hash, merge.hash));
+}
+
+MACHA_FAST_TEST("storage_metadata",
+                test_unreconstructable_accepted_head_is_kept_at_startup_and_reanchored_live) {
+    // The other half of the 2026-09-06 fix. Whatever makes an accepted head
+    // unreplayable locally, the response must be (a) do not throw the whole
+    // replica away at startup, (b) say exactly what is wrong, (c) accept a
+    // self-contained full record from a peer and re-anchor the head in place
+    // -- live, with no restart and no quarantine.
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto source_path = t.path() / "reanchor-source";
+    const auto target_path = t.path() / "reanchor-target";
+
+    NodeId a{}, b{};
+    a.bytes[15] = 1;
+    b.bytes[15] = 2;
+    FsEntry directory;
+    directory.type = EntryType::directory;
+    directory.mode = 0755;
+    const auto genesis = genesis_metadata();
+
+    auto older_snapshot = decode_snapshot(genesis.payload);
+    older_snapshot.metadata_write_replicas_required = 2;
+    older_snapshot.entries["/older"] = directory;
+    MetadataRecord older;
+    older.generation = 10;
+    older.previous = genesis.hash;
+    older.payload = encode_snapshot(older_snapshot);
+    older.hash = metadata_hash(older.generation, older.previous, older.payload);
+
+    MetadataRecord newer;
+    MetadataSnapshot newer_snapshot;
+    for (size_t attempt = 0; attempt < 256; ++attempt) {
+        newer_snapshot = decode_snapshot(genesis.payload);
+        newer_snapshot.metadata_write_replicas_required = 2;
+        newer_snapshot.entries["/newer-" + std::to_string(attempt)] = directory;
+        newer.generation = 20;
+        newer.previous = genesis.hash;
+        newer.payload = encode_snapshot(newer_snapshot);
+        newer.hash = metadata_hash(newer.generation, newer.previous, newer.payload);
+        if (older.hash < newer.hash)
+            break;
+    }
+    REQUIRE(older.hash < newer.hash);
+
+    MetadataRecord merge;
+    auto merged_snapshot = older_snapshot;
+    merged_snapshot.entries.insert(newer_snapshot.entries.begin(), newer_snapshot.entries.end());
+    merged_snapshot.merge_parents = {newer.hash};
+    merge.generation = newer.generation + 1;
+    merge.previous = older.hash;
+    merge.payload = encode_snapshot(merged_snapshot);
+    merge.hash = metadata_hash(merge.generation, merge.previous, merge.payload);
+    auto delta = metadata_delta(older_snapshot, merged_snapshot);
+    REQUIRE(delta.has_value());
+    const auto encoded_delta = encode_metadata_delta(*delta);
+
+    MetadataRecord divergent;
+    auto divergent_snapshot = newer_snapshot;
+    divergent_snapshot.entries["/divergent"] = directory;
+    divergent.generation = 30;
+    divergent.previous = newer.hash;
+    divergent.payload = encode_snapshot(divergent_snapshot);
+    divergent.hash = metadata_hash(divergent.generation, divergent.previous, divergent.payload);
+
+    // Source: a healthy replica holding both heads (the merge as a delta).
+    MetadataReplica source(source_path, keys.storage, {}, true, 1);
+    REQUIRE(source.store_commit(older));
+    REQUIRE(source.accept_commit({older.generation, older.hash, 2, {a, b}}));
+    REQUIRE(source.store_commit(newer));
+    REQUIRE(source.accept_commit({newer.generation, newer.hash, 2, {a, b}}));
+    REQUIRE(source.store_commit(merge, encoded_delta));
+    REQUIRE(source.accept_commit({merge.generation, merge.hash, 2, {a, b}}));
+    REQUIRE(source.store_commit(divergent));
+    REQUIRE(source.accept_commit({divergent.generation, divergent.hash, 2, {a, b}}));
+    REQUIRE(source.accepted_heads().size() == 2);
+
+    // Target: identical except it never received the merge's history frame,
+    // then finds itself with the source's certificate set naming the merge.
+    {
+        MetadataReplica target(target_path, keys.storage, {}, true, 1);
+        REQUIRE(target.store_commit(older));
+        REQUIRE(target.accept_commit({older.generation, older.hash, 2, {a, b}}));
+        REQUIRE(target.store_commit(newer));
+        REQUIRE(target.accept_commit({newer.generation, newer.hash, 2, {a, b}}));
+        REQUIRE(target.store_commit(divergent));
+        REQUIRE(target.accept_commit({divergent.generation, divergent.hash, 2, {a, b}}));
+        CHECK(target.committed().hash == divergent.hash);
+    }
+    std::filesystem::copy_file(source_path / "metadata" / "heads.meta",
+                               target_path / "metadata" / "heads.meta",
+                               std::filesystem::copy_options::overwrite_existing);
+
+    // (a) Startup keeps the certificate and flags the head instead of
+    // throwing (which quarantined every metadata file before).
+    MetadataReplica target(target_path, keys.storage, {}, true, 1);
+    CHECK(!target.recovery_required());
+    REQUIRE(target.accepted_head_certificates().size() == 2);
+    CHECK(target.accepted_heads().size() == 1); // merge excluded from reads
+    auto flagged = target.unreconstructable_heads();
+    REQUIRE(flagged.size() == 1);
+    CHECK(flagged.front() == merge.hash);
+    CHECK(!target.materialized(merge.hash));
+
+    // (c) A peer serves the record as a self-contained full body and the
+    // target re-anchors it in place.
+    auto served = source.full_history_record(merge.hash);
+    REQUIRE(served.has_value());
+    CHECK(served->body == MetadataHistoryEntry::Body::full);
+    CHECK(served->merge_parents == std::vector<Hash256>{newer.hash});
+    REQUIRE(target.reanchor_history(*served));
+    CHECK(target.unreconstructable_heads().empty());
+    CHECK(target.accepted_heads().size() == 2);
+    auto repaired = target.materialized(merge.hash);
+    REQUIRE(repaired);
+    CHECK(repaired->record.payload == merge.payload);
+    CHECK(target.history_is_ancestor(older.hash, merge.hash));
+
+    // Garbage is refused: a full body whose hash does not bind its content.
+    auto forged = *served;
+    forged.generation += 1;
+    CHECK(!target.reanchor_history(forged));
+
+    // Re-anchoring over an *indexed* but unreplayable frame supersedes it in
+    // place, and a restart prefers the full frame over the older delta.
+    {
+        // Simulate the incident's shape, not a replica that lies forever:
+        // reconstruction fails for the enumeration that flags the head and
+        // for the repair's own pre-check, then the re-anchored frame reads.
+        size_t forced = 0;
+        source.set_force_unreconstructable_for_tests([&](const Hash256& hash) {
+            return hash == merge.hash && ++forced <= 2;
+        });
+        REQUIRE(source.accepted_heads().size() == 1);
+        REQUIRE(source.unreconstructable_heads() == std::vector<Hash256>{merge.hash});
+        MetadataHistoryEntry full;
+        full.generation = merge.generation;
+        full.previous = merge.previous;
+        full.hash = merge.hash;
+        full.previous_known = true;
+        full.merge_parents = {newer.hash};
+        full.body = MetadataHistoryEntry::Body::full;
+        full.payload.assign(merge.payload.begin(), merge.payload.end());
+        const auto before = source.diagnostics().history_records;
+        REQUIRE(source.reanchor_history(full));
+        CHECK(source.diagnostics().history_records == before + 1);
+        source.set_force_unreconstructable_for_tests({});
+        auto entry = source.history_entry(merge.hash);
+        REQUIRE(entry.has_value());
+        CHECK(entry->body == MetadataHistoryEntry::Body::full);
+        CHECK(source.unreconstructable_heads().empty());
+        CHECK(source.accepted_heads().size() == 2);
+    }
+    MetadataReplica reopened_source(source_path, keys.storage, {}, true, 1);
+    CHECK(reopened_source.accepted_heads().size() == 2);
+    auto reopened_entry = reopened_source.history_entry(merge.hash);
+    REQUIRE(reopened_entry.has_value());
+    CHECK(reopened_entry->body == MetadataHistoryEntry::Body::full);
+    REQUIRE(reopened_source.materialized(merge.hash));
+    MetadataReplica reopened_target(target_path, keys.storage, {}, true, 1);
+    CHECK(reopened_target.accepted_heads().size() == 2);
+    CHECK(reopened_target.unreconstructable_heads().empty());
+}
+
 MACHA_FAST_TEST("storage_metadata", test_full_fallback_boundary_heals_when_parent_arrives) {
     TempDir t;
     auto keyfile = t.path() / "key";
@@ -896,6 +1178,103 @@ MACHA_FAST_TEST("storage_metadata", test_compacted_direct_predecessor_cannot_res
     const auto heads = reopened.accepted_heads();
     REQUIRE(heads.size() == 1);
     CHECK(heads.front().hash == child.hash);
+}
+
+MACHA_FAST_TEST("storage_metadata",
+               test_unreconstructable_accepted_head_is_rate_limited_not_hammered) {
+    // 2026-09-06 concurrent-write stress test incident: once an accepted head
+    // failed to reconstruct, every caller up the stack (checkpoint
+    // maintenance, catalogue publication, conflict reconciliation, ordinary
+    // reads) re-attempted and re-threw immediately, with no backoff -- one
+    // narrow reconstruction failure turned into an unbounded tight retry loop
+    // that pinned a thread for hours under load. The exact original trigger
+    // was not conclusively pinned down; this proves the fix regardless of
+    // cause: a still-broken head does not re-attempt reconstruction or
+    // re-throw on every single call once its cooldown is set.
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "unreconstructable-head-backoff";
+
+    const auto genesis = genesis_metadata();
+    FsEntry directory;
+    directory.type = EntryType::directory;
+    directory.mode = 0755;
+    auto make_child = [&](const MetadataRecord& parent, std::string name) {
+        auto snapshot = decode_snapshot(parent.payload);
+        snapshot.entries[std::move(name)] = directory;
+        MetadataRecord record;
+        record.generation = parent.generation + 1;
+        record.previous = parent.hash;
+        record.payload = encode_snapshot(snapshot);
+        record.hash = metadata_hash(record.generation, record.previous, record.payload);
+        return record;
+    };
+    // Three genuine siblings forked from genesis -- each accept_commit() below
+    // is a real, independent conflicting-branch acceptance, not a no-op.
+    const auto head_a = make_child(genesis, "/a");
+    const auto head_b = make_child(genesis, "/b");
+    const auto head_c = make_child(genesis, "/c");
+
+    MetadataReplica replica(path, keys.storage);
+    REQUIRE(replica.store_commit(head_a));
+    REQUIRE(replica.accept_commit(MetadataAcceptance{head_a.generation, head_a.hash, 0, {}}));
+    REQUIRE(replica.accepted_heads().size() == 1);
+
+    // head_a is genuinely fine right now; force it to report as
+    // unreconstructable from here on, simulating the incident's failure mode
+    // directly rather than needing to reproduce its unconfirmed root cause.
+    size_t reconstruct_attempts = 0;
+    replica.set_force_unreconstructable_for_tests([&](const Hash256& hash) {
+        if (hash != head_a.hash)
+            return false;
+        ++reconstruct_attempts;
+        return true;
+    });
+
+    REQUIRE(replica.store_commit(head_b));
+    bool threw = false;
+    try {
+        replica.accept_commit(MetadataAcceptance{head_b.generation, head_b.hash, 0, {}});
+    } catch (const std::exception& error) {
+        threw = true;
+        CHECK(std::string(error.what()).find("cannot be reconstructed") != std::string::npos);
+    }
+    CHECK(threw); // The first occurrence still surfaces -- unchanged behaviour.
+    CHECK(reconstruct_attempts == 1);
+
+    // A second, distinct fork accepted moments later -- exactly the shape of
+    // repeated real calls under load -- must not re-attempt reconstructing
+    // the still-broken head_a or re-throw because of it. This is the fix.
+    REQUIRE(replica.store_commit(head_c));
+    bool threw_again = false;
+    try {
+        REQUIRE(replica.accept_commit(MetadataAcceptance{head_c.generation, head_c.hash, 0, {}}));
+    } catch (const std::exception&) {
+        threw_again = true;
+    }
+    CHECK(!threw_again);
+    CHECK(reconstruct_attempts == 1); // Not retried again within the cooldown.
+
+    // accepted_heads() is the hottest path into this failure mode -- called on
+    // essentially every metadata read/reconciliation attempt cluster-wide --
+    // and must likewise stay quiet under repeated calls, returning the
+    // reconstructable heads rather than throwing.
+    for (int i = 0; i < 5; ++i) {
+        std::vector<MetadataRecord> heads;
+        bool heads_threw = false;
+        try {
+            heads = replica.accepted_heads();
+        } catch (const std::exception&) {
+            heads_threw = true;
+        }
+        CHECK(!heads_threw);
+        REQUIRE(heads.size() == 2);
+        for (const auto& head : heads)
+            CHECK(head.hash != head_a.hash);
+    }
+    CHECK(reconstruct_attempts == 1);
 }
 
 MACHA_FAST_TEST("storage_metadata", test_history_transfer_follows_only_materialization_dependencies) {

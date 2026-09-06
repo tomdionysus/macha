@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "fuse_mountpoint.hpp"
+#include "macha_version.hpp"
 #include "miniupnpc_compat.hpp"
 #include "test_backend_support.hpp"
 #include "retained_memory.hpp"
+
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <regex>
 
 using namespace macha;
 using namespace std::chrono_literals;
@@ -992,6 +998,89 @@ MACHA_FAST_TEST("foundations", test_retained_memory_ledger_restores_durable_over
 }
 
 } // namespace
+
+MACHA_TEST("foundations", test_every_subsystem_thread_is_run_supervised) {
+    // An exception escaping a std::jthread/std::thread lambda does not reach
+    // any caller's try/catch -- it calls std::terminate() and aborts the
+    // whole process. run_supervised() is the one place that boundary is
+    // guarded (see src/supervised.hpp). This scans every src/*.cpp for a raw
+    // thread/worker-pool construction site and fails if run_supervised does
+    // not appear within the next couple of lines, so a new thread can't be
+    // added later that silently bypasses the guard.
+    const std::regex site_pattern(R"(std::jthread\(\[|emplace_back\([^)]*stop_token)");
+    const std::filesystem::path src_dir = std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "src";
+    std::vector<std::string> unguarded;
+
+    for (const auto& entry : std::filesystem::directory_iterator(src_dir)) {
+        if (entry.path().extension() != ".cpp")
+            continue;
+        // The guard's own implementation is exempt: it does not call itself.
+        if (entry.path().filename() == "supervised.cpp")
+            continue;
+
+        std::ifstream file(entry.path());
+        REQUIRE(file.is_open());
+        std::vector<std::string> lines;
+        for (std::string line; std::getline(file, line);)
+            lines.push_back(std::move(line));
+
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (!std::regex_search(lines[i], site_pattern))
+                continue;
+            bool guarded = false;
+            for (size_t j = i; j < lines.size() && j < i + 3; ++j) {
+                if (lines[j].find("run_supervised") != std::string::npos) {
+                    guarded = true;
+                    break;
+                }
+            }
+            if (!guarded)
+                unguarded.push_back(entry.path().filename().string() + ":" +
+                                    std::to_string(i + 1) + ": " + lines[i]);
+        }
+    }
+
+    if (!unguarded.empty()) {
+        std::cerr << unguarded.size() << " thread construction site(s) bypass run_supervised:\n";
+        for (const auto& site : unguarded)
+            std::cerr << "  " << site << "\n";
+    }
+    REQUIRE(unguarded.empty());
+}
+
+namespace {
+Config minimal_valid_config() {
+    Config config;
+    config.state_path = "/tmp/does-not-need-to-exist-for-this-test";
+    config.key_file = "/tmp/does-not-need-to-exist-for-this-test.key";
+    config.storage_backends.push_back({.path = "/tmp/does-not-need-to-exist-for-this-test/data",
+                                       .limit = 1});
+    return config;
+}
+} // namespace
+
+MACHA_TEST("foundations", test_normalize_config_defaults_plugin_path_to_the_build_default) {
+    // The default is a compile-time constant (this build's private plugin
+    // directory under CMAKE_INSTALL_PREFIX, see MACHA_PLUGIN_INSTALL_DIR in
+    // CMakeLists.txt) -- deliberately not derived from the running
+    // executable's own location, which is bindir, not a place private
+    // libraries/plugins belong.
+    auto normalized = normalize_config(minimal_valid_config());
+    if (kDefaultPluginDir.empty()) {
+        CHECK(!normalized.plugin_path.has_value());
+    } else {
+        REQUIRE(normalized.plugin_path.has_value());
+        CHECK(*normalized.plugin_path == std::filesystem::path(kDefaultPluginDir));
+    }
+}
+
+MACHA_TEST("foundations", test_normalize_config_preserves_an_explicit_plugin_path) {
+    auto config = minimal_valid_config();
+    config.plugin_path = "/opt/macha/plugins";
+    auto normalized = normalize_config(config);
+    REQUIRE(normalized.plugin_path.has_value());
+    CHECK(*normalized.plugin_path == std::filesystem::path("/opt/macha/plugins"));
+}
 
 MACHA_TEST("foundations", test_fuse_mountpoint_preflight_refuses_unrelated_filesystem) {
 #if defined(__linux__) || defined(__APPLE__)

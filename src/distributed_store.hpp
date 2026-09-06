@@ -92,6 +92,24 @@ class DistributedStore {
                                   FrameType = FrameType::control);
     bool retain_on(const NodeInfo&, RetentionClass, const std::vector<ObjectId>&,
                    const RetentionDot&);
+    // Batched, bounded-concurrency replacement for a per-(object, candidate)
+    // serial have_object scan. For every object, walks its candidate list in
+    // preference order accumulating up to `floor` present nodes, but checks
+    // presence in node-grouped have_objects round trips (many ids per peer per
+    // round) instead of one RPC/decrypt per (object, candidate) pair. Selection
+    // order and the floor requirement are unchanged from the serial form; only
+    // the shape of how presence gets checked changes.
+    std::map<ObjectId, std::vector<NodeInfo>>
+    select_present_batched(const std::map<ObjectId, std::vector<NodeInfo>>& candidates_by_object,
+                           size_t floor);
+    // One round of batched_have_objects: checks presence of every (node, ids)
+    // pair in ids_by_node, answering the local node's entries directly (cheap
+    // presence check, no RPC) and the rest via chunked have_objects RPCs, at
+    // most retention_check_concurrency chunks in flight at once across every
+    // peer combined.
+    std::map<NodeId, std::map<ObjectId, bool>>
+    batched_have_objects(const std::map<NodeId, NodeInfo>& node_info,
+                        const std::map<NodeId, std::vector<ObjectId>>& ids_by_node);
     ObjectData get_from(const NodeInfo&, const ObjectId&, FrameType,
                         const std::shared_ptr<SharedFetch>&,
                         Clock::time_point deadline, std::atomic_bool* cancelled,

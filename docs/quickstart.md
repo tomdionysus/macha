@@ -27,7 +27,6 @@ Create `demo/node1.yaml`:
 ```yaml
 state_path: demo/node1/state
 key_file: demo/cluster.key
-mount_path: demo/node1/mount
 
 storage:
   data:
@@ -62,6 +61,7 @@ dht:
   extent_size: 4M
 
 fuse:
+  mount_path: demo/node1/mount
   unmount_if_mounted: true
 
 catalogue:
@@ -80,7 +80,6 @@ Create `demo/node2.yaml`:
 ```yaml
 state_path: demo/node2/state
 key_file: demo/cluster.key
-mount_path: demo/node2/mount
 
 storage:
   data:
@@ -118,6 +117,7 @@ bootstrap:
   - 127.0.0.1:7437
 
 fuse:
+  mount_path: demo/node2/mount
   unmount_if_mounted: true
 
 catalogue:
