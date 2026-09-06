@@ -421,6 +421,61 @@ bool MetadataManager::import_history_from_peer(const NodeInfo& owner, const Hash
     return local.history_contains(target);
 }
 
+size_t MetadataManager::repair_unreconstructable_heads(FrameType frame_type) {
+    auto& local = node_.metadata_replica();
+    const auto broken = local.unreconstructable_heads();
+    if (broken.empty())
+        return 0;
+    std::vector<NodeInfo> peers;
+    for (auto& peer : compatible_replicas(node_.membership().active()))
+        if (peer.id != node_.node_id())
+            peers.push_back(std::move(peer));
+    if (peers.empty()) {
+        Log::debug("metadata head repair: " + std::to_string(broken.size()) +
+                   " unreconstructable head(s) flagged but no peer is reachable");
+        return 0;
+    }
+
+    size_t repaired = 0;
+    for (const auto& hash : broken) {
+        bool done = false;
+        for (const auto& owner : peers) {
+            try {
+                Writer request;
+                request.fixed(hash.bytes);
+                auto reply = node_.call(owner, MessageType::get_metadata_history_record,
+                                        request.take(), frame_type);
+                if (reply.message.type != MessageType::metadata_history_entry_reply) {
+                    Log::debug("metadata head repair: " + owner.host + " cannot serve hash=" +
+                               hex(hash.bytes));
+                    continue;
+                }
+                auto entry = decode_metadata_history_entry(reply.message.payload);
+                if (entry.hash != hash || entry.body != MetadataHistoryEntry::Body::full) {
+                    Log::warn("metadata head repair: " + owner.host +
+                              " returned a mismatched record for hash=" + hex(hash.bytes));
+                    continue;
+                }
+                if (!local.reanchor_history(entry)) {
+                    Log::warn("metadata head repair: record from " + owner.host +
+                              " rejected locally hash=" + hex(hash.bytes));
+                    continue;
+                }
+                Log::info("metadata accepted head repaired from peer " + owner.host +
+                          " hash=" + hex(hash.bytes) + " generation=" +
+                          std::to_string(entry.generation));
+                done = true;
+                break;
+            } catch (const std::exception& error) {
+                Log::debug("metadata head repair: " + owner.host + ": " + error.what());
+            }
+        }
+        if (done)
+            ++repaired;
+    }
+    return repaired;
+}
+
 bool MetadataManager::push_history_to_peer(const NodeInfo& owner, const Hash256& target,
                                             FrameType frame_type) {
     auto& local = node_.metadata_replica();
@@ -1019,6 +1074,16 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
     // replace its current head; it merely stores the immutable DAG material and
     // the acceptance certificate. This is the central 0.19 semantic boundary.
     for (const auto& [hash, head] : observed) {
+        // See unacceptable_head_retry_at_'s declaration: a hash this replica
+        // recently confirmed it cannot accept is skipped outright -- no
+        // repeated import RPCs, no repeated rejection -- rather than
+        // re-attempted on every single read_group() call.
+        {
+            std::lock_guard lock(unacceptable_head_mutex_);
+            auto found = unacceptable_head_retry_at_.find(hash);
+            if (found != unacceptable_head_retry_at_.end() && Clock::now() < found->second)
+                continue;
+        }
         auto& local = node_.metadata_replica();
         std::vector<NodeInfo> history_sources = head.owners;
         for (const auto& certificate : head.certificates) {
@@ -1044,10 +1109,19 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         bool accepted = false;
         for (const auto& certificate : head.certificates)
             accepted = node_.accept_metadata_commit(certificate) || accepted;
-        if (!accepted)
+        if (!accepted) {
+            constexpr auto retry_cooldown = std::chrono::seconds(30);
+            {
+                std::lock_guard lock(unacceptable_head_mutex_);
+                unacceptable_head_retry_at_[hash] = Clock::now() + retry_cooldown;
+            }
             Log::warn("ignoring metadata head without a valid acceptance certificate hash=" +
                       to_string(hash));
-        else {
+        } else {
+            {
+                std::lock_guard lock(unacceptable_head_mutex_);
+                unacceptable_head_retry_at_.erase(hash);
+            }
             // Installing this certificate may have exposed a second head whose
             // common ancestry crosses a compacted boundary. Revisit the now-
             // local head so the lightweight, rootless-only healer can request

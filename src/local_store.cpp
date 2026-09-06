@@ -2,6 +2,7 @@
 #include "local_store.hpp"
 #include "codec.hpp"
 #include "log.hpp"
+#include "supervised.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -298,13 +299,23 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
     if (mode_ == LocalStoreMode::ephemeral) {
         durability_domain_.reset();
         scan_thread_ = std::jthread([this](std::stop_token stop) {
-            try { scan(stop); }
-            catch (const std::exception& error) {
-                scan_failed_.store(true, std::memory_order_release);
-                accounting_cv_.notify_all();
-                Log::warn("storage accounting scan failed path=" + root_.string() +
-                          " error=" + error.what());
-            }
+            run_supervised("local-store-scan", [this, stop] {
+                try {
+                    scan(stop);
+                } catch (const std::exception& error) {
+                    scan_failed_.store(true, std::memory_order_release);
+                    accounting_cv_.notify_all();
+                    Log::warn("storage accounting scan failed path=" + root_.string() +
+                              " error=" + error.what());
+                    throw;
+                } catch (...) {
+                    scan_failed_.store(true, std::memory_order_release);
+                    accounting_cv_.notify_all();
+                    Log::warn("storage accounting scan failed path=" + root_.string() +
+                              " error=<unknown>");
+                    throw;
+                }
+            });
         });
         return;
     }
@@ -327,13 +338,23 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
                    " used=" + std::to_string(used_.load(std::memory_order_relaxed)));
     } else {
         scan_thread_ = std::jthread([this](std::stop_token stop) {
-            try { scan(stop); }
-            catch (const std::exception& error) {
-                scan_failed_.store(true, std::memory_order_release);
-                accounting_cv_.notify_all();
-                Log::warn("storage accounting scan failed path=" + root_.string() +
-                          " error=" + error.what());
-            }
+            run_supervised("local-store-scan", [this, stop] {
+                try {
+                    scan(stop);
+                } catch (const std::exception& error) {
+                    scan_failed_.store(true, std::memory_order_release);
+                    accounting_cv_.notify_all();
+                    Log::warn("storage accounting scan failed path=" + root_.string() +
+                              " error=" + error.what());
+                    throw;
+                } catch (...) {
+                    scan_failed_.store(true, std::memory_order_release);
+                    accounting_cv_.notify_all();
+                    Log::warn("storage accounting scan failed path=" + root_.string() +
+                              " error=<unknown>");
+                    throw;
+                }
+            });
         });
     }
 }
@@ -1038,8 +1059,10 @@ std::optional<Bytes> LocalStore::get(const ObjectId& id) const {
     if (packed_.contains(id))
         return get_packed_locked(id, lock);
     const auto p = path(id);
+    const auto before_read = before_loose_read_for_tests_;
     lock.unlock();
     if (!std::filesystem::exists(p)) return {};
+    if (before_read) before_read(id);
     auto encoded = rf(p);
     Reader r(encoded);
     auto magic = r.raw(M.size());
@@ -1060,15 +1083,21 @@ std::optional<Bytes> LocalStore::get(const ObjectId& id) const {
     return plain;
 }
 
-bool LocalStore::has(const ObjectId& id) const {
-    auto object_lock = object_mutex(id);
-    std::lock_guard object_guard(*object_lock);
-    {
-        std::lock_guard lock(m_);
-        if (packed_.contains(id))
-            return true;
+bool LocalStore::has(const ObjectId& id) const noexcept {
+    try {
+        auto object_lock = object_mutex(id);
+        std::lock_guard object_guard(*object_lock);
+        {
+            std::lock_guard lock(m_);
+            if (packed_.contains(id))
+                return true;
+        }
+        std::error_code error;
+        const auto size = std::filesystem::file_size(path(id), error);
+        return !error && size > 0;
+    } catch (...) {
+        return false;
     }
-    return std::filesystem::exists(path(id));
 }
 
 bool LocalStore::valid(const ObjectId& id) const noexcept {

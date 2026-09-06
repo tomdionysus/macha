@@ -105,4 +105,16 @@ std::string media_stream_type_name(MediaStreamType type) {
     return "other";
 }
 
+namespace {
+MediaEngineFactory g_media_engine_factory = nullptr;
+}
+
+void set_media_engine_factory(MediaEngineFactory factory) {
+    g_media_engine_factory = factory;
+}
+
+std::unique_ptr<MediaEngine> make_libav_media_engine(const StreamingConfig& config) {
+    return g_media_engine_factory ? g_media_engine_factory(config) : nullptr;
+}
+
 } // namespace macha

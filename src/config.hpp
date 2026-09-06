@@ -78,6 +78,9 @@ struct FuseOperationTimeouts {
 };
 
 struct FuseConfig {
+    // Filesystem path to mount at. No mount is attempted when unset.
+    std::optional<std::filesystem::path> mount_path;
+
     // Expose a FUSE mount to users other than the process that mounted it.
     bool allow_other{};
 
@@ -423,7 +426,13 @@ struct Config {
     std::chrono::milliseconds service_startup_timeout{120000};
 
     std::filesystem::path key_file;
-    std::optional<std::filesystem::path> mount_path;
+    // Directory SubsystemSupervisor scans for subsystem plugins (.so/.dylib).
+    // Defaults to this build's private plugin directory when unset (a
+    // compile-time constant, see normalize_config()/kDefaultPluginDir and
+    // MACHA_PLUGIN_INSTALL_DIR in CMakeLists.txt) -- deliberately not derived
+    // from the running executable's own location, which is bindir, not where
+    // a private library/plugin belongs.
+    std::optional<std::filesystem::path> plugin_path;
     std::optional<std::filesystem::path> config_file;
     std::string listen_host{"0.0.0.0"};
     std::string advertise_host;
@@ -435,6 +444,15 @@ struct Config {
     size_t replication{3};
     size_t metadata_min_write_replicas{2};
     size_t min_write_replicas{1};
+    // retain_data()'s candidate-presence scan batches many extent IDs into one
+    // have_objects RPC per peer per round instead of one have_object RPC per
+    // (extent, candidate) pair. batch_size bounds ids per wire message (also
+    // keeps it well under max_frame_size); concurrency bounds how many such
+    // batches may be in flight at once across all peers combined, so an
+    // arbitrarily large publication cannot turn into an unbounded fan-out
+    // against any one peer.
+    size_t retention_check_batch_size{2000};
+    size_t retention_check_concurrency{8};
     std::chrono::milliseconds write_stall{2500};
     size_t extent_size{16 * 1024 * 1024};
     // End-to-end DATA object admission. Lower classes may use only the

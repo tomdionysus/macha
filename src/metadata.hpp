@@ -3,6 +3,7 @@
 #include "crypto.hpp"
 #include <atomic>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -238,6 +239,22 @@ struct MetadataHistoryEntry {
 std::vector<Hash256> metadata_history_materialization_dependencies(
     const MetadataHistoryEntry&);
 
+// The single succession rule for a delta-body history entry over its primary
+// parent, shared by every writer (store_commit, import_history, load_history)
+// and every reader (both materialization walks). A reconciliation merge is
+// numbered max(parents)+1 with the lower-hash parent as its primary, so a
+// legitimate delta can sit many generations above its parent; the record hash
+// binds the generation, so the walk needs only monotonicity. Writers and
+// readers once encoded this rule separately and disagreed (writers accepted
+// parent<child, readers demanded parent+1): a merge commit was durably written,
+// hash-verified, and unreadable the moment it left the materialization cache --
+// the 2026-09-06 "accepted metadata head cannot be reconstructed" outage. Keep
+// exactly one implementation.
+constexpr bool metadata_delta_succession_valid(uint64_t parent_generation,
+                                               uint64_t child_generation) noexcept {
+    return parent_generation < child_generation;
+}
+
 struct MetadataMergeResult {
     MetadataSnapshot snapshot;
     size_t conflicts_created{};
@@ -414,6 +431,36 @@ class MetadataReplica {
     // ancestry and frame-location index needed to find them on demand.
     std::map<Hash256, HistoryIndexEntry> history_;
     std::map<Hash256, MetadataAcceptance> accepted_heads_;
+    // An accepted head that fails to reconstruct is exceptional -- normally a
+    // narrow, transient race -- and every caller up the stack (checkpoint
+    // maintenance, catalogue publication, conflict reconciliation, ordinary
+    // reads) treats it as such by catching and logging. Without a cooldown,
+    // every one of those callers re-attempts and re-throws immediately, and
+    // under sustained concurrent-write load that call volume turns one
+    // recoverable glitch into an unbounded tight retry loop pinning a thread
+    // indefinitely (see the 2026-09-06 concurrent-write stress test incident).
+    // This bounds how often reconstruction is actually retried (and the
+    // exception actually re-raised) per hash; between attempts the hash is
+    // treated as temporarily absent from the accepted set rather than as a
+    // hard failure, so the replica keeps serving its last good committed
+    // state instead of wedging.
+    mutable std::map<Hash256, Clock::time_point> unreconstructable_head_retry_at_;
+    static constexpr std::chrono::seconds unreconstructable_retry_cooldown{30};
+    // Record a confirmed reconstruction failure for `hash`: arms the cooldown
+    // and, on the first failure of an episode, logs one WARN naming the exact
+    // break in the local chain (see diagnose_unreconstructable_locked()).
+    // Returns that diagnosis so the caller's exception can carry it.
+    std::string flag_unreconstructable_locked(const Hash256& hash, Clock::time_point now,
+                                              std::string_view context) const;
+    // Walk `hash`'s delta chain exactly as materialized_locked() does and name
+    // the first thing that stops it: not indexed, parent absent, succession
+    // rule violated, cycle, unreadable frame, or replay hash mismatch.
+    std::string diagnose_unreconstructable_locked(const Hash256& hash) const;
+    // Test-only: force historical_locked()/materialized_locked() to report a
+    // specific hash as unreconstructable without needing to fabricate genuine
+    // on-disk corruption or a dependency-chain hole, so the retry-cooldown
+    // behaviour above can be exercised directly and deterministically.
+    mutable std::function<bool(const Hash256&)> force_unreconstructable_for_tests_;
     // Only ever populated with a proof that has already validated against
     // committed_ at load time (see load_checkpoint_proof()) -- nullopt means
     // "no valid proof," never "assume the worst possible one."
@@ -502,6 +549,26 @@ class MetadataReplica {
     bool remember_current_committed(uint64_t, const Hash256&);
     std::optional<MetadataHistoryEntry> history_entry(const Hash256&) const;
     std::optional<MetadataHistoryLinks> history_links(const Hash256&) const;
+    // The immutable record for `hash` as a self-contained full-body history
+    // entry, materialized locally -- what a peer needs to re-anchor a head it
+    // has indexed but can no longer reconstruct (its own stored frame may be
+    // the very delta it cannot replay). nullopt if this replica cannot
+    // materialize it either.
+    std::optional<MetadataHistoryEntry> full_history_record(const Hash256&) const;
+    // Live repair of an accepted head this replica cannot reconstruct: append
+    // `entry` (a full body whose hash/generation/previous match the local
+    // index entry, or a brand-new record) as a new full anchor and point the
+    // index at it, superseding the unreplayable frame in place. History is
+    // append-only, so the old frame stays on disk; load_history() prefers the
+    // full frame when it meets both. Clears the head's cooldown, re-verifies
+    // its acceptance certificate against the repaired record, and refreshes
+    // the materialized head. Returns true when the head is reconstructible
+    // afterwards (including when it already was), false when `entry` is not
+    // a valid full record for that hash.
+    bool reanchor_history(const MetadataHistoryEntry& entry);
+    // Accepted heads currently flagged as unreconstructable (in cooldown, or
+    // carried over from load_heads()). The live-repair driver pulls these.
+    std::vector<Hash256> unreconstructable_heads() const;
     bool import_history(const MetadataHistoryEntry&);
     bool history_contains(const Hash256&) const;
     bool store_commit(const MetadataRecord&, std::span<const uint8_t> delta = {});
@@ -551,6 +618,10 @@ class MetadataReplica {
     // (floor_hash, epoch) -- e.g. it was never proposed here, or a different
     // proposal superseded it.
     bool record_checkpoint_commit(const Hash256& floor_hash, const Hash256& epoch);
+    void set_force_unreconstructable_for_tests(std::function<bool(const Hash256&)> hook) {
+        std::lock_guard lock(m_);
+        force_unreconstructable_for_tests_ = std::move(hook);
+    }
 };
 std::string normalize_path(const std::string&);
 std::string parent_path(const std::string&);

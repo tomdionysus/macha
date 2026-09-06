@@ -3,6 +3,7 @@
 
 #include "json.hpp"
 #include "log.hpp"
+#include "supervised.hpp"
 
 #include <algorithm>
 #include <map>
@@ -302,6 +303,17 @@ void ClusterStatusService::attach_convergence_diagnostics(
     convergence_diagnostics_ = std::move(provider);
 }
 
+void ClusterStatusService::attach_subsystem_diagnostics(
+    std::function<std::vector<SubsystemStatus>()> provider) {
+    std::lock_guard lock(operational_diagnostics_mutex_);
+    subsystem_diagnostics_ = std::move(provider);
+}
+
+void ClusterStatusService::detach_subsystem_diagnostics() {
+    std::lock_guard lock(operational_diagnostics_mutex_);
+    subsystem_diagnostics_ = {};
+}
+
 ClusterStatusService::~ClusterStatusService() {
     stop();
 }
@@ -309,7 +321,9 @@ ClusterStatusService::~ClusterStatusService() {
 void ClusterStatusService::start() {
     if (persistence_.joinable())
         return;
-    persistence_ = std::jthread([this](std::stop_token stop) { persistence_loop(stop); });
+    persistence_ = std::jthread([this](std::stop_token stop) {
+        run_supervised("status-persistence", [this, stop] { persistence_loop(stop); });
+    });
 }
 
 void ClusterStatusService::request_stop() {
@@ -645,6 +659,24 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     root["startup"] = std::move(startup);
     root["nodes"] = std::move(nodes);
     root["connectivity"] = public_connectivity_json(node_.public_connectivity_status());
+
+    std::function<std::vector<SubsystemStatus>()> subsystem_provider;
+    {
+        std::lock_guard lock(operational_diagnostics_mutex_);
+        subsystem_provider = subsystem_diagnostics_;
+    }
+    Json::Array subsystems;
+    if (subsystem_provider) {
+        for (const auto& status : subsystem_provider()) {
+            Json::Object entry;
+            entry["name"] = status.name;
+            entry["state"] = std::string(subsystem_state_name(status.state));
+            entry["restart_count"] = static_cast<uint64_t>(status.restart_count);
+            entry["last_fault"] = status.last_fault.empty() ? Json(nullptr) : Json(status.last_fault);
+            subsystems.push_back(std::move(entry));
+        }
+    }
+    root["subsystems"] = std::move(subsystems);
 
     // Process-lifetime aggregate diagnostics are read directly from local
     // atomics. They create no sampling loop, persistence work, or gossip load.

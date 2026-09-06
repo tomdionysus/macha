@@ -193,6 +193,19 @@ class MediaEngine {
         std::chrono::milliseconds range_end, std::chrono::milliseconds timeline_origin = {}) = 0;
 };
 
+// The real (FFmpeg-backed) implementation lives in media_engine.cpp, which is
+// only linked into executables that carry an FFmpeg dependency (macha,
+// macha-tests-runtime); macha_core itself stays FFmpeg-free so the fast unit
+// test suite does not need FFmpeg development files installed. Previously
+// this was a link seam left for the final executable to resolve, which relied
+// on macha_core being a static library; now that macha_core is shared (see
+// CMakeLists.txt), it must resolve its own symbols, so the real
+// implementation instead registers itself into macha_core at static-init
+// time via set_media_engine_factory(). With nothing registered,
+// make_libav_media_engine() returns nullptr -- the same behaviour the old
+// media_engine_stub.cpp default provided.
+using MediaEngineFactory = std::unique_ptr<MediaEngine> (*)(const StreamingConfig&);
+void set_media_engine_factory(MediaEngineFactory);
 std::unique_ptr<MediaEngine> make_libav_media_engine(const StreamingConfig&);
 
 // Derive a new transformed VOD generation from an already prepared plan.

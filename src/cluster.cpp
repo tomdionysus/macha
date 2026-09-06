@@ -6,6 +6,7 @@
 #include "codec.hpp"
 #include "log.hpp"
 #include "macha_version.hpp"
+#include "supervised.hpp"
 
 #include <algorithm>
 #include <fstream>
@@ -436,21 +437,29 @@ void NodeRuntime::start() {
               std::to_string(server_.bound_port()) + " domain=" + members_.self().failure_domain +
               " state=recovering");
 
-    telemetry_worker_ = std::jthread([this](std::stop_token stop) { telemetry_loop(stop); });
-    local_writer_ = std::jthread([this](std::stop_token stop) { local_writer_loop(stop); });
-    maintenance_ = std::jthread([this](std::stop_token stop) { loop(stop); });
-    storage_recovery_ = std::jthread([this](std::stop_token stop) { recover_storage(stop); });
-    state_recovery_ = std::jthread([this](std::stop_token stop) { recover_state(stop); });
+    telemetry_worker_ = std::jthread([this](std::stop_token stop) {
+        run_supervised("cluster-telemetry", [this, stop] { telemetry_loop(stop); });
+    });
+    local_writer_ = std::jthread([this](std::stop_token stop) {
+        run_supervised("cluster-local-writer", [this, stop] { local_writer_loop(stop); });
+    });
+    maintenance_ = std::jthread([this](std::stop_token stop) {
+        run_supervised("cluster-maintenance", [this, stop] { loop(stop); });
+    });
+    storage_recovery_ = std::jthread([this](std::stop_token stop) {
+        run_supervised("cluster-storage-recovery", [this, stop] { recover_storage(stop); });
+    });
+    state_recovery_ = std::jthread([this](std::stop_token stop) {
+        run_supervised("cluster-state-recovery", [this, stop] { recover_state(stop); });
+    });
     connectivity_worker_ = std::jthread([this](std::stop_token stop) {
-        if (stop.stop_requested())
-            return;
-        try {
+        run_supervised("cluster-connectivity", [this, stop] {
+            if (stop.stop_requested())
+                return;
             (void)refresh_public_connectivity(false);
             if (cfg_.connectivity_check.enabled && !stop.stop_requested())
                 (void)public_connectivity_.probe(false);
-        } catch (const std::exception& error) {
-            Log::debug("startup connectivity refresh unavailable: " + std::string(error.what()));
-        }
+        });
     });
 }
 
@@ -754,11 +763,49 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
                 DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
             if (!resource)
                 return error_reply("DATA resource admission busy or stopping");
-            // Replica-presence RPCs are durability decisions, not directory
-            // existence probes. Authenticate/decrypt/hash the object before
-            // allowing repair or write-floor logic to count this replica.
+            // This single-object probe is shared by repair/rebalance placement
+            // logic that has no separate re-verification step before trusting
+            // "yes, already present" -- unlike the batched have_objects below,
+            // which is used only by retain_data()'s candidate selection, where
+            // retain_objects always re-verifies before persisting a claim.
+            // Authenticate/decrypt/hash here so a corrupt remote replica is
+            // never counted as healthy placement.
             writer.u8(local_store().valid(id));
             return {MessageType::bool_reply, writer.take()};
+        }
+        case MessageType::have_objects: {
+            Reader reader(request.payload);
+            const auto count = reader.u32();
+            if (!count || count > 200000)
+                return error_reply("invalid presence batch count");
+            std::vector<ObjectId> ids;
+            ids.reserve(count);
+            for (uint32_t i = 0; i < count; ++i) {
+                ObjectId id;
+                id.bytes = reader.fixed<32>();
+                ids.push_back(id);
+            }
+            reader.finish();
+            // Unlike have_object above, this batched form is used exclusively
+            // by retain_data()'s candidate-selection scan (DistributedStore::
+            // select_present_batched), never by repair/rebalance. A "present"
+            // answer here only makes a node a *candidate*; retain_objects
+            // still fully verifies before persisting a retain_batch claim on
+            // it, so a stale/corrupt local copy is caught there, not lost.
+            // That downstream re-verification is what makes it safe for this
+            // one caller to skip the per-object decrypt at candidate-selection
+            // scale. One admission charge for the whole batch, not one per
+            // id, since this no longer does per-object I/O worth separately
+            // metering against the DATA budget ordinary reads/writes consume.
+            auto resource = data_resources_.try_acquire(
+                DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
+            if (!resource)
+                return error_reply("DATA resource admission busy or stopping");
+            Writer writer;
+            writer.u32(count);
+            for (const auto& id : ids)
+                writer.u8(local_store().has(id));
+            return {MessageType::have_objects_reply, writer.take()};
         }
         case MessageType::get_object: {
             Reader reader(request.payload);
@@ -920,6 +967,21 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             auto entry = metadata_replica().history_entry(hash);
             if (!entry)
                 return error_reply("metadata history entry unavailable");
+            return {MessageType::metadata_history_entry_reply,
+                    encode_metadata_history_entry(*entry)};
+        }
+        case MessageType::get_metadata_history_record: {
+            // Live repair of a peer's unreconstructable accepted head: serve the
+            // record materialized here as a full body, whatever frame shape this
+            // replica happens to store it in. See MetadataManager::
+            // repair_unreconstructable_heads().
+            Reader reader(request.payload);
+            Hash256 hash;
+            hash.bytes = reader.fixed<32>();
+            reader.finish();
+            auto entry = metadata_replica().full_history_record(hash);
+            if (!entry)
+                return error_reply("metadata history record unavailable");
             return {MessageType::metadata_history_entry_reply,
                     encode_metadata_history_entry(*entry)};
         }
