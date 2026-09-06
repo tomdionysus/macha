@@ -2114,9 +2114,8 @@ void MetadataReplica::load_journal() {
             ciphertext = envelope.bytes();
             envelope.finish();
         } catch (const std::exception& error) {
-            throw std::runtime_error("metadata journal " + journal_p_.string() +
-                                     " offset=" + std::to_string(offset) +
-                                     ": malformed encrypted frame: " + error.what());
+            trailing_problem = std::string("malformed encrypted frame: ") + error.what();
+            break;
         }
 
         Bytes plaintext;
@@ -2128,15 +2127,21 @@ void MetadataReplica::load_journal() {
             // length extended while the final ciphertext/tag is only partially
             // durable. No later frame can depend on an unauthenticated final
             // frame. Preserve those bytes for diagnosis and replay only the
-            // authenticated prefix. Authentication failure anywhere except EOF
-            // remains fatal: silently skipping a middle frame would break the
-            // metadata chain and could roll the namespace backwards.
-            if (final_frame && std::string_view(error.what()) == "AES-GCM authentication failed") {
+            // authenticated prefix.
+            //
+            // Discipline 3: the same holds anywhere in the file. The journal
+            // is a CAS chain after the checkpoint, so nothing after a frame
+            // that cannot be authenticated (or, below, that does not fit the
+            // chain) can be applied either; the durable prefix is exactly the
+            // state of a crash before that append. Formerly a middle-frame
+            // failure threw, and the constructor answered by quarantining
+            // *every* metadata file — checkpoint, history, heads — over one
+            // bad frame.
+            if (final_frame && std::string_view(error.what()) == "AES-GCM authentication failed")
                 trailing_problem = "final frame failed AES-GCM authentication";
-                break;
-            }
-            throw std::runtime_error("metadata journal " + journal_p_.string() +
-                                     " offset=" + std::to_string(offset) + ": " + error.what());
+            else
+                trailing_problem = std::string("frame failed authentication: ") + error.what();
+            break;
         }
 
         try {
@@ -2241,8 +2246,13 @@ void MetadataReplica::load_journal() {
                 throw std::runtime_error("unknown record type " + std::to_string(kind));
             }
         } catch (const std::exception& error) {
-            throw std::runtime_error("metadata journal " + journal_p_.string() +
-                                     " offset=" + std::to_string(offset) + ": " + error.what());
+            // See the authentication comment above: a record that does not
+            // fit the chain ends the replayable prefix; it and everything
+            // after it are quarantined below, and the replica starts from
+            // the state before it. cur_/committed_ are only assigned after a
+            // record validates, so nothing partial is left behind.
+            trailing_problem = std::string("record does not fit the chain: ") + error.what();
+            break;
         }
 
         offset += 4 + length;
@@ -2376,6 +2386,8 @@ void MetadataReplica::load_history() {
     uint64_t offset = 0;
     uint64_t valid = 0;
     std::string trailing_problem;
+    size_t skipped = 0;
+    std::string first_skipped;
 
     // Recovery is deliberately streaming: history can span many namespace
     // generations, so startup RSS is bounded by one history frame rather than
@@ -2471,14 +2483,28 @@ void MetadataReplica::load_history() {
                 trailing_problem = "final frame failed AES-GCM authentication";
                 break;
             }
-            throw std::runtime_error("metadata history " + history_p_.string() +
-                                     " offset=" + std::to_string(offset) + ": " + error.what());
+            // Discipline 3: history entries are independent, hash-indexed
+            // records; one that cannot be authenticated or decoded is skipped
+            // (anything that depended on it fails its own predecessor check
+            // and is skipped too) and the heads that need it are repaired
+            // live from peers. Formerly fatal, which quarantined every
+            // metadata file over one frame.
+            ++skipped;
+            if (skipped == 1)
+                first_skipped = "offset=" + std::to_string(offset) + ": " + error.what();
+            offset += 4 + length;
+            valid = offset;
+            continue;
         }
 
         offset += 4 + length;
         valid = offset;
         ++history_records_;
     }
+    if (skipped)
+        Log::warn("metadata history skipped frames that could not be replayed path=" +
+                  history_p_.string() + " count=" + std::to_string(skipped) + " first=" +
+                  first_skipped + "; dependent heads are repaired live from peers");
 
     if (valid != file_size) {
         if (trailing_problem.empty())

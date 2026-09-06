@@ -401,6 +401,14 @@ struct FuseFrontendDiagnostics {
     // via FuseFrontend::parked_publications().
     uint64_t parked_publications{};
     uint64_t publication_retries_backed_off{};
+    // Discipline 3: what recovery resolved rather than refused. Frames the
+    // journal loader skipped, bytes quarantined after mid-journal corruption,
+    // operations dropped for an inode with no descriptor, and publications
+    // abandoned because their file left the namespace.
+    uint64_t journal_recovery_skipped_frames{};
+    uint64_t journal_recovery_quarantined_bytes{};
+    uint64_t recovery_dropped_operations{};
+    uint64_t publications_abandoned{};
 };
 
 struct FuseDirtyRange {

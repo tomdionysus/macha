@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <optional>
 #include <span>
 
 namespace macha {
@@ -17,6 +18,11 @@ inline constexpr uint32_t fuse_journal_max_record = 16U * 1024U * 1024U;
 struct FuseJournalScanResult {
     size_t last_good{};
     size_t discarded_tail{};
+    // Set when a complete frame before EOF failed its checksum: durable
+    // middle-of-journal corruption rather than a torn append. The scan stops
+    // there (last_good is that frame's offset) and the caller decides what
+    // to do with the tail; discipline 3 quarantines it and starts anyway.
+    std::optional<size_t> corrupt_frame_offset;
 };
 
 using FuseJournalRecordConsumer =

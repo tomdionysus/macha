@@ -58,10 +58,11 @@ FuseJournalScanResult scan_fuse_journal_frames(std::span<const uint8_t> bytes,
             // A crash can expose the final append at its full logical length
             // while tail sectors were not durably written. An EOF checksum
             // failure is therefore a torn append. Corruption before a later
-            // frame is not a crash tail and remains fatal.
+            // frame is not a crash tail: report it so the caller can
+            // quarantine everything from here rather than refuse to start.
             if (position + frame_size == bytes.size())
                 break;
-            throw std::runtime_error("FUSE operation journal checksum mismatch");
+            return {last_good, bytes.size() - last_good, position};
         }
 
         consume(payload, position);
@@ -69,7 +70,7 @@ FuseJournalScanResult scan_fuse_journal_frames(std::span<const uint8_t> bytes,
         last_good = position;
     }
 
-    return {last_good, bytes.size() - last_good};
+    return {last_good, bytes.size() - last_good, std::nullopt};
 }
 
 } // namespace macha
