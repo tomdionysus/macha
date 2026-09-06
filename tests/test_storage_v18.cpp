@@ -690,6 +690,11 @@ class StorageClusterNode {
     // on-disk state gets a fresh durability epoch and fresh backend instance
     // ids, exactly what a peer sees after `systemctl restart`.
     void restart() {
+        stop();
+        start();
+    }
+    // Take the node down and leave it down: what a peer sees mid-restart.
+    void stop() {
         REQUIRE(node_);
         catalogue_.reset();
         metadata_.reset();
@@ -698,7 +703,6 @@ class StorageClusterNode {
             node_->stop();
         node_.reset();
         started_ = false;
-        start();
     }
     NodeRuntime& node() { REQUIRE(node_); return *node_; }
     DistributedStore& store() { REQUIRE(store_); return *store_; }
@@ -1029,6 +1033,51 @@ MACHA_TEST("storage_v18", test_durability_barrier_rederives_placement_after_peer
     CHECK(restamped);
     // And the ordinary path from here on: no probe needed, still durable.
     CHECK(a.store().durability_barrier(batch));
+}
+
+MACHA_TEST("storage_v18", test_durability_barrier_treats_an_unreachable_peer_as_transient) {
+    // A peer that is down is not a peer that lost the object. The barrier
+    // must fail without naming the object as unsatisfiable, so the writer
+    // retries the barrier later instead of re-sending bytes the peer still
+    // holds (the first live run of 0.29.0 re-put extents on a Broken pipe).
+    TestCluster cluster(ConfigProfile::isolated);
+    const auto a_port = free_port();
+    const auto b_port = free_port();
+    auto a_config = storage_node_config(cluster, "down-a", a_port, 64ULL * 1024 * 1024, 2, 1, {}, 2);
+    auto b_config = storage_node_config(cluster, "down-b", b_port, 64ULL * 1024 * 1024, 2, 1,
+                                        {{"127.0.0.1", a_port}}, 2);
+    StorageClusterNode a(std::move(a_config), cluster.keys());
+    StorageClusterNode b(std::move(b_config), cluster.keys());
+    a.start();
+    b.start();
+    REQUIRE(wait_until([&] {
+        return a.node().membership().active().size() == 2 &&
+               b.node().membership().active().size() == 2;
+    }, 5s));
+
+    const auto data = pattern(64 * 1024, 93);
+    DistributedStore::DurabilityBatch batch;
+    (void)a.store().put_deferred(data, batch);
+    REQUIRE(a.store().durability_barrier(batch));
+
+    b.stop();
+    std::vector<ObjectId> unsatisfiable;
+    CHECK(!a.store().durability_barrier(batch, FrameType::loader, &unsatisfiable));
+    CHECK(unsatisfiable.empty());
+
+    // Back up with a new incarnation: the same batch is now re-derived. The
+    // RPC client re-dials a peer it just failed against on its own schedule,
+    // so the first barrier after the restart may still be transient.
+    b.start();
+    REQUIRE(wait_until([&] {
+        return a.node().membership().active().size() == 2 &&
+               b.node().membership().active().size() == 2;
+    }, 10s));
+    REQUIRE(wait_until([&] {
+        unsatisfiable.clear();
+        return a.store().durability_barrier(batch, FrameType::loader, &unsatisfiable);
+    }, 30s));
+    CHECK(unsatisfiable.empty());
 }
 
 MACHA_TEST("storage_v18", test_durability_barrier_reports_objects_a_restarted_peer_lost) {
