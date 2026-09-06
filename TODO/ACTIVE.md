@@ -123,7 +123,14 @@ Keep teardown active until UAT proves that seek, quality changes, disconnects,
 supersession, failure and failover cannot leak physical encoders or produce
 `transcode limit reached` for one viewer.
 
-## P0 — Self-healing disciplines (2026-09-06)
+## DONE (2026-09-07) — Self-healing disciplines (2026-09-06)
+
+Executed as 0.29.0 → 0.32.0; evidence per discipline and the closing
+two-writer / rolling-restart run in
+[`2026-09-06-self-healing-uat.md`](2026-09-06-self-healing-uat.md).
+Follow-ups filed there (present-content skip on writer restart, journal
+compaction while busy, compact extent encoding, 9 standing conflicts for a
+human). Original brief kept below for the record.
 
 Execute [the self-healing disciplines plan](2026-09-06-self-healing-disciplines-plan.md).
 One afternoon of ordinary load surfaced six P0 defects, each hidden behind the
