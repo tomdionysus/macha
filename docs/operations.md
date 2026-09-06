@@ -78,6 +78,37 @@ startup removes only a mount identified as Macha before any service startup, ver
 
 Preserve the FUSE spool/journal when diagnosing recovery errors. A missing journal-referenced byte range is a data-safety fault.
 
+### What recovery resolves on its own
+
+Recovery never refuses to start over the *contents* of the journal; only a
+missing or unreadable journal header is fatal. Everything else has a
+deterministic resolution, is applied once, journaled so the next start does
+not see it again, logged at `WARN` with one line per situation, and counted
+under `diagnostics.filesystem` in `GET /api/v1/status`:
+
+| situation | resolution | counter |
+|---|---|---|
+| a frame that does not fit the state so far (duplicated marker, marker whose operation is gone, non-monotonic sequence, unknown record type, undecodable payload) | skipped | `journal_recovery_skipped_frames` |
+| a checksum failure before EOF (middle-of-journal corruption) | the tail from that frame is copied to `<journal>.corrupt.<ts>.<pid>` and truncated; the prefix is recovered; spools for operations in the tail are preserved as orphans | `journal_recovery_quarantined_bytes` |
+| an incomplete or checksum-invalid final frame (torn append) | trimmed | — |
+| an operation whose inode has no descriptor | retired with journaled `done`/`abandoned` markers; its spool is preserved as an orphan | `recovery_dropped_operations` |
+| a spool shorter than its journal, or missing | that generation is abandoned; the file keeps its last published content | — (`dropped FUSE spool generation` line) |
+| a publication whose file is no longer in the accepted namespace | abandoned (journaled, spool retired) — live or recovered | `publications_abandoned` |
+| two inodes resolving to one path | the newer keeps the path; the other is re-journaled without it | — |
+
+A non-zero counter after a restart is worth a look at the `WARN` lines it
+came with, but it is not an outage: the node is up and the rest of the
+backlog is publishing. The quarantined tail and `*.orphan.*` spool files are
+kept (within `fuse.max_orphan_bytes`) for diagnosis and can be deleted once
+understood.
+
+The metadata journal follows the same rule: a frame that fails
+authentication or does not fit the CAS chain ends the replayable prefix —
+that tail is quarantined and truncated like a torn append, and the replica
+starts from the state before it. A metadata history frame that cannot be
+authenticated or decoded is skipped (`metadata history skipped frames`) and
+any accepted head that needed it is repaired live from peers.
+
 FUSE spool pressure is normal backpressure, not a capacity fault. Below half of
 `fuse.max_spool_bytes` a copy may burst at local disk speed. Above that point
 the frontend publishes durable prefixes and progressively paces new admission

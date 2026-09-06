@@ -1846,6 +1846,86 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_recovery_cache_seed_is_not_acc
     CHECK(!reopened.acceptance(cached.hash).has_value());
 }
 
+MACHA_FAST_TEST("storage_metadata", test_metadata_journal_mid_frame_corruption_truncates_not_reseeds) {
+    // Discipline 3: one unauthenticatable frame in the middle of the journal
+    // used to throw out of load_journal(), and the constructor answered by
+    // quarantining every metadata file (checkpoint, history, heads) and
+    // falling back to a cache seed — or failing outright without one. The
+    // journal is a CAS chain: the durable prefix before the bad frame is
+    // exactly a crash before that append. Keep it, quarantine the tail,
+    // start normally.
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto genesis = genesis_metadata();
+    const auto path = t.path() / "mid-journal-corruption";
+
+    auto snapshot = decode_snapshot(genesis.payload);
+    FsEntry dir;
+    dir.type = EntryType::directory;
+    dir.mode = 0755;
+    snapshot.entries["/first"] = dir;
+    MetadataRecord first;
+    first.generation = genesis.generation + 1;
+    first.previous = genesis.hash;
+    first.payload = encode_snapshot(snapshot);
+    first.hash = metadata_hash(first.generation, first.previous, first.payload);
+
+    snapshot.entries["/second"] = dir;
+    MetadataRecord second;
+    second.generation = first.generation + 1;
+    second.previous = first.hash;
+    second.payload = encode_snapshot(snapshot);
+    second.hash = metadata_hash(second.generation, second.previous, second.payload);
+
+    const auto journal = path / "metadata" / "journal.log";
+    uint64_t first_frame_end = 0;
+    {
+        MetadataReplica replica(path, keys.storage);
+        MetadataRecord observed;
+        REQUIRE(replica.cas(genesis.generation, genesis.hash, first.payload, &observed));
+        first_frame_end = std::filesystem::file_size(journal);
+        REQUIRE(first_frame_end > 4);
+        REQUIRE(replica.cas(first.generation, first.hash, second.payload, &observed));
+        CHECK(replica.current().hash == second.hash);
+    }
+    REQUIRE(std::filesystem::file_size(journal) > first_frame_end);
+
+    // Flip a ciphertext byte inside the first frame; a complete, valid frame
+    // follows it, so this is not a torn tail.
+    {
+        std::fstream file(journal, std::ios::binary | std::ios::in | std::ios::out);
+        REQUIRE(file.good());
+        file.seekp(static_cast<std::streamoff>(first_frame_end / 2));
+        char byte{};
+        file.seekg(static_cast<std::streamoff>(first_frame_end / 2));
+        file.read(&byte, 1);
+        byte ^= 0x5a;
+        file.seekp(static_cast<std::streamoff>(first_frame_end / 2));
+        file.write(&byte, 1);
+        file.flush();
+        REQUIRE(file.good());
+    }
+
+    MetadataReplica reopened(path, keys.storage);
+    CHECK(!reopened.recovery_required());
+    CHECK(reopened.current().hash == genesis.hash);
+    CHECK(reopened.committed().hash == genesis.hash);
+    CHECK(std::filesystem::file_size(journal) == 0);
+    CHECK(std::filesystem::exists(path / "metadata" / "checkpoint.meta"));
+    bool quarantined = false;
+    for (const auto& entry : std::filesystem::directory_iterator(path / "metadata"))
+        if (entry.path().filename().string().find("journal.log.corrupt.") == 0)
+            quarantined = true;
+    CHECK(quarantined);
+
+    // And the replica is usable: the same mutation applies again.
+    MetadataRecord observed;
+    REQUIRE(reopened.cas(genesis.generation, genesis.hash, first.payload, &observed));
+    CHECK(observed.hash == first.hash);
+}
+
 MACHA_FAST_TEST("storage_metadata", test_metadata_conflict_alternatives_are_gc_roots) {
     MetadataSnapshot snapshot;
     const auto effective_root = object_id(pattern(101));
