@@ -152,30 +152,41 @@ Tests passing in isolation: `publication_backs_off_then_parks`,
 `rpc_call_fails_after_no_progress_deadline`, plus all discipline-1 tests.
 
 Remaining for discipline 2:
-- [ ] Full suite green (known load-flakes: `replacement_node_recovers`,
-  `mutual_bootstrap_prunes_cross_dial`, `status_collects_connected_peer_telemetry`
-  — rerun in isolation before calling them failures).
-- [ ] Commit 0.30.0.
-- [ ] Deploy gbni-1 → gbni-2 → es-1. On gbni-1 remove the temp
-  `service_startup_timeout_ms: 1800000` from `/etc/macha/macha.yaml` (the
-  gate is now progress-based; backup exists as `macha.yaml.bak-20260906-startup`).
-- [ ] UAT A (parking): start an rsync of one multi-GB file on gbni-1; on
-  es-1 make one of its extents unpublishable-but-transient (e.g. `chmod 000`
-  a backend dir briefly is too blunt — preferred: set a tiny budget on gbni-1
-  via config `publication_retry_max_failures: 5`, restart es-1 repeatedly
-  during the barrier, or block gbni-1→es-1 data lane with an nftables rule
-  for >5 attempts) → expect `FUSE data publication parked` WARN, the inode
-  in `parked-publications`, other rsync files still completing at full rate;
-  then `POST .../retry` → completes. Record before/after in the UAT file.
-- [ ] UAT B (startup gate): restart gbni-1 with its big journal and a
-  120 s no-progress gate → boots in one attempt with `startup progress`
-  lines; previously crash-looped 8× on the elapsed gate.
-- [ ] UAT C (RPC deadline): grep for `RPC made no progress` after a peer
-  restart mid-commit — should be seconds, not 150–230 s, and the caller's
-  retry succeeds.
-- [ ] Brief "Macha UI Work" (SendMessage) on the new status fields and the
-  parked-publications routes.
-- [ ] Update UAT file, memory, commit, then tell the operator `/compact` is safe.
+- [x] Full suite green 345/345; committed `bb3697c` (0.30.0).
+- [x] Deployed 0.30.0 to gbni-2 (21:01), es-1 (22:03 CEST), gbni-1 (21:03;
+  booted in 3 s). gbni-1 config: temp `service_startup_timeout_ms: 1800000`
+  removed; **UAT-only small budget added** under `fuse:` —
+  `publication_retry_max_failures: 8`, `..._initial_backoff_ms: 250`,
+  `..._max_backoff_ms: 5000` (backup `macha.yaml.bak-20260906-d2`). **Remove
+  those three keys after the UAT** (restore the 100-in-30-min default).
+- [x] UAT 2a before (0.29.0): `/root/uat/d2-before.sh` on gbni-1 — 90 s
+  `nft reject` isolation; 254 retries at a flat 10/s. Recorded in UAT file.
+- [~] UAT 2a after (0.30.0): `/root/uat/d2-after.sh` on gbni-1, log in
+  `/root/uat/d2-after.out`. Isolation phase done: 16 retries, exponential
+  backoff, both in-flight inodes (16565, 18307) parked at attempt 9 after
+  22.8 s, listed by the API. Script continues: rsync 2 (Ghostbusters) must
+  publish while parked, then it POSTs retry for the FIRST parked inode only
+  → **after it finishes, POST retry for the other inode too** (both should
+  drain; check `parked_publications=0`, spool retires). Record in UAT file.
+- [ ] UAT 2b (RPC deadline): before evidence = es-1 0.29.0 `RPC stalled
+  (control) … members … no_progress_ms=30000 … remains active` during the
+  before-run (bounded only by dead_after), plus the 150–230 s
+  `accept_metadata_commit` stalls from the plan doc. After: on gbni-1 add an
+  `nft` **drop** (not reject) rule on *input* from 10.44.1.51 tcp dport 7437
+  for ~60 s (do this only after d2-after.sh has finished — don't overlap
+  faults) → gbni-2 should log `RPC made no progress for ~30000 ms (control)
+  … cancelled for retry` and its next call succeed after the rule is removed.
+- [ ] UAT 2c (startup gate): gbni-1 boots in 3 s now (journal replay linear
+  since 0.28.3), so the gate is not stressed live; record that the elapsed
+  ceiling is gone from config, `service_startup_no_progress_ms` governs, and
+  cite `test_service_startup_gate_waits_while_recovery_progresses`.
+- [x] Briefed "Macha UI Work" (msg 1e0c2bbd) on the parked-publications
+  routes and status fields.
+- [ ] Pre-existing WARNs seen on every boot (not 0.30.0): `FUSE async data
+  publication failed inode=5806|922 error=missing` on gbni-1, `inode=2333`
+  on es-1 — spool data missing for old journal entries; candidate for
+  discipline 3 (resolve on recovery).
+- [ ] Update UAT file + memory, commit, tell the operator `/compact` is safe.
 
 ## Next (original discipline-2 plan, kept for reference)
 

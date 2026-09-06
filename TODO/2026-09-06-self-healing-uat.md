@@ -93,7 +93,90 @@ publication, and it does not re-send a byte.
   after the ENOENT re-derivation; was 1/4 failing)
 - `filesystem_fuse/test_fuse_terminal_recovery_failure_is_not_readmitted` (0/10)
 
-## Discipline 2 — one work-item policy
+## Discipline 2 — one work-item policy (0.30.0)
+
+Three habits in one discipline: a retry with no budget, a wait with no
+progress condition, and a startup gate on elapsed time. Each has its own
+before/after below.
+
+### 2a. Publication retry — before (2026-09-06 20:59–21:02, 0.29.0 on gbni-1)
+
+Scenario (`/root/uat/d2-before.sh` on gbni-1): `rsync --inplace` of
+`Blade.Runner.2049…mp4` (3.3 GB) into `/mnt/machamedia/UAT/d2-before/`;
+45 s in, an `nft` rule rejects every outbound connection from gbni-1 to
+both peers' RPC port for 90 s, then is removed. The cluster is otherwise
+untouched (no peer is restarted).
+
+Observed: for the first 64 s the in-flight barrier waited on the peers
+(nothing logged). Once membership marked them dead the publication failed
+with `quorum unavailable … outcome="remote-not-sent"` and the writer
+retried it on the fixed 100 ms sleep — **a flat 10 attempts/s, 254 retries
+of the same inode in the remaining 26 s**, 550 log lines in the window,
+peak 21 lines/s. There is no backoff, no budget, no operator signal: had
+the rule stayed, so would the loop, forever, at 10/s, holding one of the
+publication slots and burying the log. (This is the same loop that ran at
+~35/s for a day on *Pulp Fiction* under 0.28.3.) When the rule was removed
+the next attempt succeeded and the file published normally.
+
+```
+21:01:31 DEBUG object durability quorum unavailable id=63716277… required=1 durable=0 transient=yes replica=333c0e3f20fa outcome="remote-not-sent"
+21:01:31 DEBUG FUSE async data publication retry inode=16565 error=object durability quorum unavailable before publication
+… ×254, 10/s, until 21:01:57
+```
+
+### 2a. Publication retry — after (2026-09-06 21:04–, 0.30.0 on all nodes)
+
+Same scenario (`/root/uat/d2-after.sh`), same file, same 90 s `nft reject`
+isolation of gbni-1 from both peers, with gbni-1 configured for a small
+budget so the park is reachable inside the window
+(`publication_retry_max_failures: 8`, backoff 250 ms → 5 s; the shipped
+default is 100 failures in 30 min, 250 ms → 30 s). Two publications were in
+flight when the peers went dead: the after-run's copy (inode 18307) and the
+before-run's copy, which gbni-1's 0.30.0 restart had re-published from its
+spool (inode 16565).
+
+Observed: **16 retries in the whole window instead of 254**, each one
+logged with its backoff and attempt count, both inodes backing off
+independently, and both parked with one `WARN` each 22.8 s after their
+first failure:
+
+```
+21:06:27 DEBUG FUSE async data publication retry inode=16565 error=object durability quorum unavailable before publication retry_in_ms=250 attempts=1
+21:06:27 DEBUG … inode=16565 … retry_in_ms=500 attempts=2
+21:06:28 DEBUG … inode=18307 … retry_in_ms=250 attempts=1
+21:06:28 DEBUG … inode=16565 … retry_in_ms=1000 attempts=3
+21:06:29 DEBUG … inode=16565 … retry_in_ms=2000 attempts=4
+21:06:31 DEBUG … inode=16565 … retry_in_ms=4000 attempts=5
+21:06:35 DEBUG … inode=16565 … retry_in_ms=5000 attempts=6
+21:06:40 DEBUG … inode=16565 … retry_in_ms=5000 attempts=7
+21:06:45 DEBUG … inode=16565 … retry_in_ms=5000 attempts=8
+21:06:50 WARN FUSE data publication parked inode=16565 path=/UAT/d2-before/Blade.Runner.2049…mp4 attempts=9 failing_for_ms=22758 error=object durability quorum unavailable before publication
+21:06:50 WARN FUSE data publication parked inode=18307 path=/UAT/d2-after/Blade.Runner.2049…mp4 attempts=9 failing_for_ms=22757 error=…
+```
+
+89 log lines in the window (550 before). After the rule was removed the
+parked inodes stayed parked — that is the point: the fault may have
+cleared, but nine failures in 23 s is the operator's call, not a reason to
+spin — and the API showed them:
+
+```
+GET /api/v1/manage/filesystem/parked-publications
+{"parked":[{"inode":16565,"path":"/UAT/d2-before/Blade.Runner.2049…mp4","error_code":5,
+  "error_message":"object durability quorum unavailable before publication","attempts":9,
+  "failing_for_ms":29606,"parked_for_ms":6848,"pending_bytes":3348105554},
+ {"inode":18307,"path":"/UAT/d2-after/Blade.Runner.2049…mp4", … "attempts":9, …}]}
+diagnostics.filesystem: parked_publications=2 publication_retries_backed_off=16
+```
+
+_(rest of the run — a second rsync publishing to completion while the two
+stay parked, then `POST …/16565/retry` and `…/18307/retry` releasing them —
+pending.)_
+
+### 2b. RPC no-progress deadline
+
+_(pending)_
+
+### 2c. Startup gate
 
 _(pending)_
 
