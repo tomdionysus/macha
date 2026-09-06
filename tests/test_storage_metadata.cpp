@@ -2676,6 +2676,41 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_superseded_conflicts_leave_the
     CHECK(later.conflicts_created == 0);
     CHECK(later.conflicts_superseded == 1);
     CHECK(later.snapshot.conflicts.size() == 1);
+
+    // Same bytes on both sides (two writers publishing duplicate media):
+    // the merge settles it deterministically instead of recording a
+    // conflict, and a pre-0.32 record of that shape settles at pruning.
+    auto dup_base = dlt7_base_snapshot();
+    auto dup_left = dup_base;
+    auto dup_right = dup_base;
+    FsEntry same = file;
+    same.extents.push_back({0, 10, object_id(pattern(90)), false});
+    same.version = 4;
+    same.mtime_ns = 100;
+    dup_left.entries["/dup.mkv"] = same;
+    same.version = 7;
+    same.mtime_ns = 200;
+    dup_right.entries["/dup.mkv"] = same;
+    auto dup = merge_metadata_snapshots(dup_base, dup_left, dup_right, sha256(pattern(85)),
+                                        sha256(pattern(86)));
+    CHECK(dup.conflicts_created == 0);
+    CHECK(dup.snapshot.conflicts.empty());
+    REQUIRE(dup.snapshot.entries.contains("/dup.mkv"));
+    CHECK(dup.snapshot.entries.at("/dup.mkv").extents == same.extents);
+
+    MetadataConflict legacy;
+    legacy.kind = MetadataConflictKind::namespace_entry;
+    legacy.key = "/dup.mkv";
+    legacy.left_head = sha256(pattern(85));
+    legacy.right_head = sha256(pattern(86));
+    legacy.left_entry = dup_left.entries.at("/dup.mkv");
+    legacy.right_entry = dup_right.entries.at("/dup.mkv");
+    auto with_legacy = dup_base; // base value (absent) still installed
+    with_legacy.conflicts.emplace(metadata_conflict_id(legacy), legacy);
+    CHECK(prune_superseded_conflicts(with_legacy) == 1);
+    CHECK(with_legacy.conflicts.empty());
+    REQUIRE(with_legacy.entries.contains("/dup.mkv"));
+    CHECK(same_content(with_legacy.entries.at("/dup.mkv"), *legacy.left_entry));
 }
 
 MACHA_FAST_TEST("storage_metadata", test_metadata_conflict_resolution_is_not_resurrected_by_merge) {
