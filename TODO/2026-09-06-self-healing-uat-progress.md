@@ -93,6 +93,15 @@ Discipline 1 step 5 (deploy 0.29.0 to all three, then the live UAT below),
 checkpoint here, then start Discipline 2 (RetryPolicy + no-progress startup
 gate).
 
+First live run (19:26): es-1's 6 s restart landed exactly on a barrier →
+`remote-transport: send: Broken pipe` → the writer treated it as lost and
+replayed the file from the spool. Fixed: transient outcomes are never
+reported as unsatisfiable (`transient=yes|no` on the failure line); EAGAIN
+keeps its own message. 342/342 after. gbni-1 is still publishing Pulp
+Fiction (13.9 GB spool, ~8 MB/s) which holds the spool at the 16 GiB
+ceiling and throttles any other writer there — rerun the UAT once that
+spool has retired (spool_bytes on gbni-1 drops by ~13.9 GB).
+
 Live UAT script for step 5:
 1. On gbni-1: `nice -n 10 ionice -c3 rsync -a --inplace <one multi-GB file
    from /mnt/diskA> /mnt/machamedia/<dir>/` (source read-only).

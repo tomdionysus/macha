@@ -46,6 +46,14 @@ in-flight publication elsewhere that had already touched it.
   genuinely gone from the accepted namespace (which
   `test_fuse_terminal_recovery_failure_is_not_readmitted` still requires).
   Terminal publication failures now log at WARN, not DEBUG.
+- **Transient is not lost.** The first live run re-put — then replayed from
+  the spool — a file's extents because the barrier ran during the six
+  seconds es-1 was restarting and got `send: Broken pipe`. A barrier now
+  reports an id as unsatisfiable only when every failed replica answered
+  *definitively* (absent after probe, unknown peer, reopened local backend);
+  transport failures, a peer mid-restart and a pre-0.29 peer are "ask
+  again". `test_durability_barrier_treats_an_unreachable_peer_as_transient`;
+  the failure line carries `transient=yes|no`.
 
 ## 0.28.3 — Linear tombstone replay; a node could not start after 0.28.2 (development)
 

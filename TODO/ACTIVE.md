@@ -143,9 +143,11 @@ None of these came from a TODO/FIXME comment — there are none anywhere in
 `src/` or `tests/`. Each was independently verified against current source,
 not inferred from docs. All are small and isolated; none require design work.
 
-- [ ] **FUSE data publication can wedge permanently on `object durability
-  quorum unavailable before publication` (live, gbni-1 and es-1, 2026-09-06)
-  — root cause not yet proven; instrumentation shipped in 0.28.3.** After the
+- [x] **FUSE data publication can wedge permanently on `object durability
+  quorum unavailable before publication` — proven and fixed in 0.29.0
+  (discipline 1: the barrier probes the restarted peer with the object ids
+  and re-stamps the batch; see `2026-09-06-self-healing-uat.md`).** History
+  of the finding, kept for the record: After the
   day's restarts, three recovered inodes on gbni-1 retried
   `required=1 durable=0` on the same object ids for the whole life of each
   process (~2/s each, `fuse_frontend.cpp` retries with a fixed 100 ms sleep

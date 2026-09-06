@@ -665,17 +665,32 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
                   " peers=" + std::to_string(probe_ids.size()));
     }
 
+    // A requirement is reported as unsatisfiable -- "re-put this object" --
+    // only when every replica that failed did so definitively (the peer says
+    // it no longer holds the object, or is unknown). A transport failure, a
+    // peer mid-restart, or a pre-0.29 peer that cannot be probed is "ask
+    // again", never "re-send": on the first live run a Broken pipe at the
+    // instant of a restart re-put extents the peer still had.
+    const auto definitive = [](const std::string& text) {
+        return text.starts_with("remote-refused: epoch changed; object absent") ||
+               text == "peer-unknown" || text == "local-epoch-changed" ||
+               text.starts_with("local-barrier-failed");
+    };
+    bool all_durable = true;
     for (const auto& requirement : batch.requirements) {
         size_t count = 0;
+        bool transient = false;
         std::string detail;
         for (const auto& replica : requirement.replicas) {
             const ReplicaKey key{replica.id, replica.epoch, replica.domain,
                                  replica.backend_instance};
             const auto found = durable.find(key);
+            const auto seen = outcome.find(key);
             if (found != durable.end() && found->second >= replica.generation)
                 ++count;
+            else if (seen == outcome.end() || !definitive(seen->second))
+                transient = true;
             if (Log::enabled(LogLevel::debug)) {
-                const auto seen = outcome.find(key);
                 detail += " replica=" + to_string(replica.id).substr(0, 12) +
                           " epoch=" + to_string(replica.epoch).substr(0, 8) +
                           " gen=" + std::to_string(replica.generation) + " outcome=\"" +
@@ -686,13 +701,15 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
         if (count < requirement.required) {
             Log::debug("object durability quorum unavailable id=" + to_string(requirement.id) +
                        " required=" + std::to_string(requirement.required) +
-                       " durable=" + std::to_string(count) + detail);
-            if (!unsatisfiable)
+                       " durable=" + std::to_string(count) +
+                       (transient ? " transient=yes" : " transient=no") + detail);
+            all_durable = false;
+            if (!unsatisfiable || transient)
                 return false;
             unsatisfiable->push_back(requirement.id);
         }
     }
-    return !unsatisfiable || unsatisfiable->empty();
+    return all_durable;
 }
 
 
