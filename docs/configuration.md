@@ -17,6 +17,19 @@ fuse:
 
 A fresh state namespace is required. Non-empty unversioned state is refused.
 
+```yaml
+service_startup_no_progress_ms: 120000
+service_startup_timeout_ms: 0
+```
+
+Startup is gated on **progress**, not elapsed time. Journal replay, metadata
+materialisation and storage accounting each tick a process-wide progress
+counter as they work; the process is terminated for its supervisor (systemd
+`Restart=on-failure`) only when that counter has not moved for
+`service_startup_no_progress_ms`. `service_startup_timeout_ms` is an optional
+absolute ceiling on top and is off by default, so a five-minute replay on a
+small node never turns into a crash loop.
+
 ## Runtime memory bound
 
 ```yaml
@@ -122,9 +135,20 @@ network:
   dead_after_ms: 30000
   connect_timeout_ms: 2500
   max_frame_size: 256K
+  control_no_progress_deadline_ms: 30000
+  data_no_progress_deadline_ms: 0
 ```
 
-`advertise` must be reachable by peers. `failure_domain` should be identical for nodes that share the same physical/site failure boundary.
+`advertise` must be reachable by peers.
+
+`control_no_progress_deadline_ms` bounds how long a synchronous control-lane
+call may sit with no bytes moving in either direction before it is cancelled
+and fails with a transient `RPC made no progress ...; cancelled for retry`
+error. Callers retry under their own retry policy, so a peer that accepted a
+request and then wedged costs one deadline per attempt rather than an
+indefinite wait. `data_no_progress_deadline_ms` does the same for object
+transfers and is off (`0`) by default because those already have their own
+stall/spill handling. `failure_domain` should be identical for nodes that share the same physical/site failure boundary.
 
 Bootstrap entries are discovery seeds:
 
@@ -199,6 +223,36 @@ waits, quantum/yield counts, and peak admitted publication bytes beneath
 `diagnostics.filesystem`.
 The same object reports pending/peak write-request bytes and fixed extent
 executor worker, queue, active and peak counts.
+
+### Retry budgets and parking
+
+```yaml
+fuse:
+  publication_retry_max_failures: 100
+  publication_retry_window_ms: 1800000
+  publication_retry_initial_backoff_ms: 250
+  publication_retry_max_backoff_ms: 30000
+  namespace_retry_max_failures: 200
+  namespace_retry_window_ms: 1800000
+  namespace_retry_initial_backoff_ms: 50
+  namespace_retry_max_backoff_ms: 5000
+```
+
+A data publication that fails with a transient error is re-queued after an
+exponential backoff (`initial_backoff` doubling up to `max_backoff`); the
+backoff is per inode, so other files keep publishing at full speed. When one
+inode has failed `max_failures` times inside `window_ms` it is **parked**: its
+bytes stay in the spool and journal, it leaves the loader queue, the daemon
+logs one `WARN` line, `diagnostics.filesystem.parked_publications` counts it,
+and `GET /api/v1/manage/filesystem/parked-publications` lists it with the
+last error, attempt count and how long it has been failing. An operator
+resolves it with `POST .../parked-publications/<inode>/retry` (fresh budget)
+or `POST .../parked-publications/<inode>/abandon` (drops the unpublished
+generation, exactly as a corrupt spool record would be dropped). Parking is
+never applied to definitive failures — those are handled at once — nor to the
+namespace queue, which is ordered and therefore cannot skip an entry: on
+budget exhaustion it reports the blocking operation as `EAGAIN` in
+`namespace_blocked_op` and keeps retrying at the ceiling backoff.
 
 The remaining FUSE worker/timeout fields bound local kernel-facing work. They do not turn `fsync()` into a promise of cluster-wide convergence; accepted local state is made crash-recoverable first and distributed publication continues asynchronously.
 
