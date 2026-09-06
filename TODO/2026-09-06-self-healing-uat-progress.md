@@ -194,7 +194,53 @@ defaults (no `publication_retry_*`, no `service_startup_timeout_ms`).
   discipline 3 (resolve on recovery).
 - [ ] Update UAT file + memory, commit, tell the operator `/compact` is safe.
 
-## Next — Discipline 4: compact history out of the hot path (+ DLT7)
+## Discipline 4 — CODE COMPLETE as 0.32.0 (2026-09-07 ~00:30); suite, deploy, UAT pending
+
+Measurement first (`macha-metadata-dump --stats`, new `--stats` mode, run on
+gbni-2's live head gen 9903 at 23:30): encoded 2,319,777 B = entries
+1,958,969 (extents 1,768,067 for 36,083 extents; paths+attrs 190,902),
+**116 conflicts 335,749 B** (49 namespace_entry on media paths both
+writers republished, 67 catalogue_root; 112 distinct head pairs; 0 identical
+alternatives), 439 tombstones 24,584 B. Merge deltas = 335,961 B each
+(the whole conflict set); reconciliations 23:22–23:27: 3 full frames
+(7.7/6.4/5.4 MB) + 2 deltas; es-1 last 5: 4 full. Cause of full frames:
+merge canonicalises tombstones by id, primary parent in append order,
+DLT5/6 cannot reorder → `metadata_delta` nullopt → full snapshot.
+Tombstones are 1% and GC'd → the plan's per-node retirement log is NOT
+built (say so in the UAT).
+
+Landed: DLT7 (flags: merge_parents / conflicts presence, canonical
+garbage), `garbage_is_canonical`/`canonicalise_garbage`/
+`prune_superseded_conflicts` (metadata.hpp), mutate_impl canonicalises +
+prunes, merge prunes (`conflicts_superseded`), reconciliation log
+`superseded= standing=`, `MetadataManager::resolve_conflict`, status
+`diagnostics.metadata.{conflicts,namespace_conflicts,catalogue_conflicts,
+tombstones,conflicts_superseded,conflicts_resolved}`, manage API
+`GET /api/v1/manage/metadata/conflicts`, `POST …/{id}/resolve?choice=`,
+docs (management.md, metadata.md), CHANGELOG 0.32.0, version 0.32.0.
+Tests: dlt7_presence_flags_round_trip, merge_over_append_ordered_tombstones_is_a_delta,
+superseded_conflicts_leave_the_snapshot (+2 updated) pass.
+
+Remaining:
+- [ ] Full suite; commit; deploy all three (DLT7 is a wire format: deploy
+  together, gbni-2 → gbni-1 → es-1, quickly).
+- [ ] UAT before/after: (1) `--stats` on gbni-2 after the first merge under
+  0.32.0 → conflicts should drop toward 0 as superseded (49 namespace ones
+  whose paths were republished + 67 catalogue ones) — expect `superseded=N`
+  in the `histories reconciled` line; (2) merge delta bytes: grep
+  `history_body=delta history_bytes=` → hundreds of bytes, and no
+  `history_body=full` reconciliations; (3) snapshot encoded bytes −336 KB;
+  (4) any conflict that stays: list via the API, resolve one with
+  `choice=right` (newer write) and show it gone.
+- [ ] Demonstrative closing run (UAT file's last section): two concurrent
+  rsync writers (gbni-1 + es-1, distinct dirs under /mnt/machamedia/UAT/final/)
+  with rolling restarts of all nodes mid-publication; report: no wedges,
+  reasserted/absent counts, parked=0, boot WARNs 0, merge delta sizes,
+  snapshot bytes.
+- [ ] Brief "Macha UI Work" on the conflicts API + status fields.
+- [ ] Update UAT file, memory, commit; tell the operator `/compact` is safe.
+
+## (original) Next — Discipline 4: compact history out of the hot path (+ DLT7)
 
 Read the plan doc's discipline-4 section (`### 4.`) first. Evidence to
 reproduce: snapshot size vs namespace size (270k tombstones → 15 MB

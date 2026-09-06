@@ -7,18 +7,22 @@
 // way MetadataReplica::materialized_locked() does so a reconstruction failure
 // can be pinned to the precise frame that breaks the chain.
 //
-//   macha-metadata-dump <cluster.key> <history.log> [heads.meta] [--all]
+//   macha-metadata-dump <cluster.key> <history.log> [heads.meta] [--all] [--stats]
 //
 // Prints one line per anomalous history frame (delta whose parent is absent
 // or whose generation is not parent+1, duplicate hash, undecodable frame),
 // a summary, and for every accepted head in heads.meta the delta chain walk
 // with the exact point at which materialization would fail. --all prints
-// every frame.
+// every frame. --stats materializes each reconstructible head and prints
+// what its snapshot is made of (entries, extents, tombstones, conflicts,
+// node status) and how many encoded bytes each part accounts for -- the
+// measurement behind discipline 4 of the self-healing plan.
 #include "codec.hpp"
 #include "crypto.hpp"
 #include "metadata.hpp"
 
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <set>
@@ -33,6 +37,7 @@ constexpr std::array<uint8_t, 8> MH{'D', 'H', 'T', 'M', 'H', 'S', 'T', '1'},
 
 struct Frame {
     uint64_t offset{};
+    uint64_t length{}; // encrypted frame bytes after the 4-byte length prefix
     uint64_t generation{};
     Hash256 previous{}, hash{};
     bool previous_known{};
@@ -69,10 +74,13 @@ int main(int argc, char** argv) {
         return 2;
     }
     bool all = false;
+    bool stats = false;
     std::string heads_path;
     for (int i = 3; i < argc; ++i) {
         if (std::string(argv[i]) == "--all")
             all = true;
+        else if (std::string(argv[i]) == "--stats")
+            stats = true;
         else
             heads_path = argv[i];
     }
@@ -100,6 +108,7 @@ int main(int argc, char** argv) {
                     static_cast<std::streamsize>(length));
         Frame frame;
         frame.offset = offset;
+        frame.length = length;
         std::string note;
         try {
             Reader envelope(frame_bytes);
@@ -221,6 +230,108 @@ int main(int argc, char** argv) {
         }
         std::cout << "  chain length=" << chain.size() << " reconstructible=" << (ok ? "yes" : "NO")
                   << '\n';
+        if (!ok || !stats)
+            continue;
+
+        // Materialize exactly as the replica would, then attribute the
+        // encoded bytes to each part of the snapshot by re-encoding with
+        // that part removed.
+        auto load = [&](const Frame& frame) {
+            std::ifstream in(history_path, std::ios::binary);
+            in.seekg(static_cast<std::streamoff>(frame.offset + 4));
+            Bytes bytes(frame.length);
+            in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            Reader envelope(bytes);
+            auto nonce = envelope.fixed<12>();
+            auto tag = envelope.fixed<16>();
+            auto ciphertext = envelope.bytes();
+            envelope.finish();
+            return decode_metadata_history_entry(aes_gcm_open(key, nonce, tag, ciphertext, MH));
+        };
+        MetadataSnapshot snapshot;
+        try {
+            snapshot = decode_snapshot(load(cursor).payload);
+            for (auto it = chain.rbegin(); it != chain.rend(); ++it)
+                apply_metadata_delta_in_place(snapshot, decode_metadata_delta(load(*it).payload));
+        } catch (const std::exception& error) {
+            std::cout << "  stats unavailable: " << error.what() << '\n';
+            continue;
+        }
+        size_t files = 0, directories = 0, extents = 0, holes = 0;
+        for (const auto& [path, value] : snapshot.entries) {
+            if (value.type == EntryType::directory)
+                ++directories;
+            else
+                ++files;
+            extents += value.extents.size();
+            for (const auto& extent : value.extents)
+                holes += extent.hole ? 1 : 0;
+        }
+        const auto full = encode_snapshot(snapshot).size();
+        auto without = [&](const std::function<void(MetadataSnapshot&)>& strip) {
+            MetadataSnapshot copy = snapshot;
+            strip(copy);
+            return full - encode_snapshot(copy).size();
+        };
+        const auto garbage_bytes = without([](MetadataSnapshot& c) { c.garbage.clear(); });
+        const auto conflict_bytes = without([](MetadataSnapshot& c) { c.conflicts.clear(); });
+        const auto node_status_bytes = without([](MetadataSnapshot& c) { c.node_status.clear(); });
+        const auto extent_bytes = without([](MetadataSnapshot& c) {
+            for (auto& [path, value] : c.entries)
+                value.extents.clear();
+        });
+        const auto entry_bytes = without([](MetadataSnapshot& c) { c.entries.clear(); });
+        std::cout << "  snapshot: encoded_bytes=" << full << " entries=" << snapshot.entries.size()
+                  << " (files=" << files << " directories=" << directories << ") extents=" << extents
+                  << " holes=" << holes << " tombstones=" << snapshot.garbage.size()
+                  << " conflicts=" << snapshot.conflicts.size()
+                  << " node_status=" << snapshot.node_status.size()
+                  << " identity_resets=" << snapshot.identity_resets.size()
+                  << " mutation_sequences=" << snapshot.mutation_sequences.size()
+                  << " merge_parents=" << snapshot.merge_parents.size() << '\n';
+        std::cout << "  bytes: entries=" << entry_bytes << " (of which extents=" << extent_bytes
+                  << ", paths+attrs=" << (entry_bytes - extent_bytes) << ") tombstones="
+                  << garbage_bytes << " conflicts=" << conflict_bytes
+                  << " node_status=" << node_status_bytes << " other="
+                  << (full - entry_bytes - garbage_bytes - conflict_bytes - node_status_bytes)
+                  << '\n';
+        if (!snapshot.conflicts.empty()) {
+            size_t namespace_kind = 0, identical = 0, both_files = 0, one_side_absent = 0,
+                   with_base = 0;
+            std::map<std::string, size_t> by_heads;
+            for (const auto& [id, conflict] : snapshot.conflicts) {
+                if (conflict.kind == MetadataConflictKind::namespace_entry)
+                    ++namespace_kind;
+                if (conflict.left_entry && conflict.right_entry &&
+                    *conflict.left_entry == *conflict.right_entry)
+                    ++identical;
+                if (conflict.left_entry && conflict.right_entry)
+                    ++both_files;
+                else
+                    ++one_side_absent;
+                if (conflict.base_entry)
+                    ++with_base;
+                ++by_heads[h(conflict.left_head) + "/" + h(conflict.right_head)];
+            }
+            std::cout << "  conflicts: namespace_entry=" << namespace_kind
+                      << " both_alternatives_present=" << both_files
+                      << " one_side_absent=" << one_side_absent << " identical_alternatives="
+                      << identical << " with_base=" << with_base
+                      << " distinct_head_pairs=" << by_heads.size() << '\n';
+            size_t shown = 0;
+            for (const auto& [id, conflict] : snapshot.conflicts) {
+                if (shown++ >= 5)
+                    break;
+                std::cout << "    " << id << " key=" << conflict.key
+                          << " left=" << (conflict.left_entry ? std::to_string(conflict.left_entry->size) + "B/" + std::to_string(conflict.left_entry->extents.size()) + "x" : "absent")
+                          << " right=" << (conflict.right_entry ? std::to_string(conflict.right_entry->size) + "B/" + std::to_string(conflict.right_entry->extents.size()) + "x" : "absent")
+                          << " base=" << (conflict.base_entry ? "yes" : "no") << '\n';
+            }
+        }
+        if (!snapshot.entries.empty())
+            std::cout << "  per_entry_bytes=" << full / snapshot.entries.size()
+                      << " per_entry_bytes_excluding_extents="
+                      << (full - extent_bytes) / snapshot.entries.size() << '\n';
     }
     return 0;
 }

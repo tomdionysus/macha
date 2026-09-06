@@ -709,6 +709,26 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         metadata_diagnostics["accepted_head_persistence_failures"] =
             values.accepted_head_persistence_failures;
     }
+    // Discipline 4: standing conflicts are visible here and listed/resolved
+    // under /api/v1/manage/metadata/conflicts; superseded/resolved are
+    // process-lifetime counters of conflicts that left the snapshot.
+    if (metadata) {
+        uint64_t namespace_conflicts = 0, catalogue_conflicts = 0;
+        for (const auto& [id, conflict] : metadata->conflicts) {
+            if (conflict.kind == MetadataConflictKind::namespace_entry)
+                ++namespace_conflicts;
+            else
+                ++catalogue_conflicts;
+        }
+        metadata_diagnostics["conflicts"] = static_cast<uint64_t>(metadata->conflicts.size());
+        metadata_diagnostics["namespace_conflicts"] = namespace_conflicts;
+        metadata_diagnostics["catalogue_conflicts"] = catalogue_conflicts;
+        metadata_diagnostics["tombstones"] = static_cast<uint64_t>(metadata->garbage.size());
+    }
+    if (metadata_manager) {
+        metadata_diagnostics["conflicts_superseded"] = metadata_manager->conflicts_superseded();
+        metadata_diagnostics["conflicts_resolved"] = metadata_manager->conflicts_resolved();
+    }
     diagnostics["metadata"] = std::move(metadata_diagnostics);
 
     const auto rpc = node_.rpc_server_work_stats();

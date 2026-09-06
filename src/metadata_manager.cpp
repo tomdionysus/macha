@@ -1234,6 +1234,8 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
                 reconciliation_delta = std::move(encoded);
         }
         (void)publish_commit(nodes, reconciliation, reconciliation_delta, frame_type);
+        if (merged.conflicts_superseded)
+            conflicts_superseded_.fetch_add(merged.conflicts_superseded, std::memory_order_relaxed);
         Log::info("metadata histories reconciled generation=" +
                   std::to_string(reconciliation.generation) +
                   " history_body=" +
@@ -1243,6 +1245,8 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
                                      ? reconciliation.payload.size()
                                      : reconciliation_delta.size()) +
                   " conflicts=" + std::to_string(merged.conflicts_created) +
+                  " superseded=" + std::to_string(merged.conflicts_superseded) +
+                  " standing=" + std::to_string(merged.snapshot.conflicts.size()) +
                   " remaining_heads=" + std::to_string(heads.size() - 1));
         // accept_commit() removes accepted ancestors from the local head set. The
         // loop therefore naturally folds any remaining divergent heads into the
@@ -1685,6 +1689,25 @@ MetadataRecord MetadataManager::mutate_impl(
         if (exact_delta)
             supplied_delta.mutation_sequences[origin] = *sequence;
 
+        // Discipline 4. Keep the tombstone vector in canonical order so the
+        // next reconciliation's union is a delta, not a 5-8 MB full frame
+        // (DLT7 sorts after applying the edits, so the replay matches), and
+        // drop conflicts this mutation has just decided by rewriting their
+        // subject.
+        const bool resorted = !garbage_is_canonical(snapshot.garbage);
+        if (resorted)
+            canonicalise_garbage(snapshot.garbage);
+        const auto superseded = prune_superseded_conflicts(snapshot);
+        if (superseded)
+            conflicts_superseded_.fetch_add(superseded, std::memory_order_relaxed);
+        if (exact_delta) {
+            if (resorted || !supplied_delta.upsert_garbage.empty() ||
+                !supplied_delta.erase_garbage.empty())
+                supplied_delta.canonical_garbage = true;
+            if (superseded)
+                supplied_delta.replace_conflicts = snapshot.conflicts;
+        }
+
         auto payload = encode_snapshot(snapshot);
         if (payload == current.payload)
             return cache_record(current,
@@ -1703,15 +1726,12 @@ MetadataRecord MetadataManager::mutate_impl(
             // An exact caller describes only its own edit; the branch topology
             // it inherited is settled here. The first write after a
             // reconciliation leaves the merge commit's merge_parents behind
-            // (cleared above), and DLT6 carries that set and the conflict set
-            // together or not at all. Until 0.28.2 this write was forced to a
-            // full snapshot instead -- 3-30 s and 15 MB per replica on the
-            // cluster, after every one of ~100 merges a day.
-            if (clear_merge_parent_topology || delta->replace_merge_parents ||
-                delta->replace_conflicts) {
+            // (cleared above). Until 0.28.2 this write was forced to a full
+            // snapshot instead -- 3-30 s and 15 MB per replica on the cluster,
+            // after every one of ~100 merges a day; until 0.32.0 (DLT7) it
+            // also had to carry the whole standing conflict set.
+            if (clear_merge_parent_topology)
                 delta->replace_merge_parents = snapshot.merge_parents;
-                delta->replace_conflicts = snapshot.conflicts;
-            }
         } else {
             delta = metadata_delta(*before, snapshot);
         }
@@ -1791,6 +1811,36 @@ MetadataRecord MetadataManager::mutate_delta(
     return mutate_impl(
         [&](MetadataSnapshot& snapshot, MetadataDelta* delta) { mutate(snapshot, *delta); }, true,
         retries);
+}
+
+bool MetadataManager::resolve_conflict(const std::string& id, std::string_view choice) {
+    if (choice != "left" && choice != "right" && choice != "base")
+        throw std::invalid_argument("conflict resolution choice must be left, right or base");
+    bool resolved = false;
+    mutate([&](MetadataSnapshot& snapshot) {
+        auto found = snapshot.conflicts.find(id);
+        if (found == snapshot.conflicts.end())
+            return;
+        const auto conflict = found->second;
+        if (conflict.kind == MetadataConflictKind::namespace_entry) {
+            const auto& chosen = choice == "left"    ? conflict.left_entry
+                                 : choice == "right" ? conflict.right_entry
+                                                     : conflict.base_entry;
+            if (chosen)
+                snapshot.entries[conflict.key] = *chosen;
+            else
+                snapshot.entries.erase(conflict.key);
+        } else if (conflict.kind == MetadataConflictKind::catalogue_root) {
+            snapshot.catalogue_root = choice == "left"    ? conflict.left_catalogue_root
+                                      : choice == "right" ? conflict.right_catalogue_root
+                                                          : conflict.base_catalogue_root;
+        }
+        snapshot.conflicts.erase(found);
+        resolved = true;
+    });
+    if (resolved)
+        conflicts_resolved_.fetch_add(1, std::memory_order_relaxed);
+    return resolved;
 }
 
 void MetadataManager::repair_once() {

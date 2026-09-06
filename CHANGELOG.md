@@ -1,5 +1,49 @@
 # Current release
 
+## 0.32.0 — Compact history out of the hot path: DLT7, canonical tombstones, conflicts that leave (development)
+
+Discipline 4 of `TODO/2026-09-06-self-healing-disciplines-plan.md`, scoped
+by measurement rather than by the plan's premise. `macha-metadata-dump
+--stats` (new) on the production head, 2026-09-06 23:30: 2,319,777 encoded
+bytes = entries 1,958,969 (of which extent tables 1,768,067 for 36,083
+extents; paths+attrs 190,902), **116 standing conflicts 335,749**,
+439 tombstones 24,584. Every merge delta carried the whole conflict set
+(335,961-byte "deltas"), and 4 of the last 5 reconciliations were 5–8 MB
+full frames. Tombstones were 1% and are consumed by GC; the plan's per-node
+retirement log is not justified by the data and is not built.
+
+- **DLT7 metadata delta.** A flags byte gives `merge_parents` and
+  `conflicts` independent presence, so a conflict-free merge carries its
+  new parents and nothing of the standing conflict set (hundreds of bytes,
+  not 336 KB); the first write after a merge likewise. Both-sets-changed
+  still encodes as DLT6 so a rolling upgrade keeps cheap merges; a pre-0.32
+  peer receiving DLT7 falls back to the full record as before.
+- **Canonical tombstone order.** DLT7's third flag sorts the tombstone
+  vector by ObjectId after applying the edits. Reconciliation always
+  produced that order while the primary parent's vector was in append
+  order, and pre-DLT7 deltas could not reorder retained tombstones — the
+  cause of the full-frame reconciliations. `MetadataManager` canonicalises
+  the vector on every mutation (one-time re-sort of a legacy snapshot, then
+  stays sorted), so merges are deltas.
+- **Superseded conflicts leave the snapshot.** A namespace conflict whose
+  path no longer holds the common-ancestor value, or a catalogue-root
+  conflict once the root moved on, is decided by that later mutation and
+  is pruned at the next commit and at every merge
+  (`prune_superseded_conflicts`, `MetadataMergeResult::conflicts_superseded`,
+  reconciliation log line gains `superseded=N standing=N`).
+- **Conflicts are visible and resolvable.** `diagnostics.metadata.{conflicts,
+  namespace_conflicts, catalogue_conflicts, tombstones, conflicts_superseded,
+  conflicts_resolved}`; `GET /api/v1/manage/metadata/conflicts` lists the
+  standing set with both alternatives; `POST …/conflicts/{id}/resolve?choice=left|right|base`
+  installs one and drops the record in a single commit.
+- `macha-metadata-dump --stats` materialises each reconstructible head and
+  attributes its encoded bytes to entries/extents/tombstones/conflicts,
+  with a conflict classification.
+- Tests: `test_metadata_dlt7_presence_flags_round_trip`,
+  `test_metadata_merge_over_append_ordered_tombstones_is_a_delta`,
+  `test_metadata_superseded_conflicts_leave_the_snapshot`; the two DLT6
+  tests now expect DLT7 without the conflict set.
+
 ## 0.31.0 — Recovery resolves, it does not refuse (development)
 
 Discipline 3 of `TODO/2026-09-06-self-healing-disciplines-plan.md`. Local

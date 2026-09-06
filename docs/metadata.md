@@ -67,7 +67,34 @@ than stop-and-wait. This keeps ping, membership, ordinary control work, and
 foreground object service independent of reconstruction, encoding, filesystem
 I/O, and metadata durability latency.
 
-The remaining metadata work is conflict inspection/resolution APIs and long-term history/retention compaction policy. Catalogue trees already use semantic three-way item merges, with genuine collisions retained as first-class conflicts.
+Catalogue trees use semantic three-way item merges, with genuine collisions retained as first-class conflicts.
+
+## What a snapshot carries, and what leaves it
+
+A snapshot's size is a function of the live namespace: the production head
+on 2026-09-06 was 2.3 MB, of which 85% was the 1,744 entries (three
+quarters of that their extent tables), 1% retirement tombstones, and — until
+0.32.0 — 14% standing conflicts. Three rules keep it that way:
+
+- **Tombstones** (`garbage`) are consumed by the maintenance sweep after
+  `maintenance.garbage_grace` and then erased from metadata; the vector is
+  kept in canonical ObjectId order (DLT7) so a reconciliation's union is an
+  ordinary delta rather than a full snapshot frame.
+- **Conflicts** leave the snapshot when decided: a later write to (or
+  removal of) the conflicted path, or a later catalogue root, supersedes the
+  record at the next commit and at every merge; an operator can also resolve
+  one explicitly through `GET/POST /api/v1/manage/metadata/conflicts` (see
+  the management guide). The standing count is in
+  `diagnostics.metadata.conflicts`.
+- **Merge deltas carry only what changed.** DLT7 gives `merge_parents` and
+  `conflicts` independent presence flags, so a conflict-free reconciliation
+  is a few hundred bytes of history on each replica.
+
+`macha-metadata-dump <key> history.log heads.meta --stats` prints the
+composition of each accepted head (entries, extents, tombstones, conflicts,
+and the encoded bytes each accounts for).
+
+The remaining metadata work is long-term history compaction policy.
 
 ## Migration from 0.18
 
