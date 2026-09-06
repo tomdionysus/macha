@@ -136,7 +136,14 @@ class DistributedStore {
                       std::atomic_bool* cancelled = nullptr);
     bool put_deferred(const ObjectId&, std::span<const uint8_t>, DurabilityBatch&, FrameType,
                       std::atomic_bool* cancelled = nullptr);
-    bool durability_barrier(const DurabilityBatch&, FrameType = FrameType::loader);
+    // True when every requirement in `batch` has reached its durability floor.
+    // A replica whose placement token died with a peer's process or backend
+    // incarnation is re-derived by probing the peer with the object ids and
+    // the batch is re-stamped in place, so the next call is ordinary; ids a
+    // peer no longer holds are appended to `unsatisfiable` (if given) and the
+    // caller must re-put them.
+    bool durability_barrier(DurabilityBatch&, FrameType = FrameType::loader,
+                            std::vector<ObjectId>* unsatisfiable = nullptr);
     // Publication liveness barrier. Every referenced object touched by a metadata
     // mutation acquires a causal retention claim before that metadata commit may
     // be accepted. DATA uses dht.min_write_replicas; CONTROL uses the supplied

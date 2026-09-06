@@ -686,6 +686,20 @@ class StorageClusterNode {
         metadata_ = std::make_unique<MetadataManager>(*node_);
         catalogue_ = std::make_unique<CatalogueManager>(*node_, *store_, *metadata_);
     }
+    // A process restart in miniature: a fresh NodeRuntime over the same
+    // on-disk state gets a fresh durability epoch and fresh backend instance
+    // ids, exactly what a peer sees after `systemctl restart`.
+    void restart() {
+        REQUIRE(node_);
+        catalogue_.reset();
+        metadata_.reset();
+        store_.reset();
+        if (started_)
+            node_->stop();
+        node_.reset();
+        started_ = false;
+        start();
+    }
     NodeRuntime& node() { REQUIRE(node_); return *node_; }
     DistributedStore& store() { REQUIRE(store_); return *store_; }
     MetadataManager& metadata() { REQUIRE(metadata_); return *metadata_; }
@@ -958,6 +972,101 @@ MACHA_HEAVY_TEST("storage_v18", test_retain_data_batches_a_large_publication_wit
     // stay robust on slow/loaded CI hardware, but comfortably catches a
     // regression back to one round trip (of any kind) per extent.
     CHECK(elapsed < 10s);
+}
+
+MACHA_TEST("storage_v18", test_durability_barrier_rederives_placement_after_peer_restart) {
+    // Discipline 1 of the self-healing plan. gbni-1, 2026-09-06: a 13.9 GB
+    // publication had placed extents on es-1; es-1 restarted; every barrier
+    // afterwards was refused with "storage durability epoch changed" and
+    // retried forever, because the batch named a token that died with es-1's
+    // process. The bytes were on es-1's disk the whole time. A barrier must
+    // re-derive the token from the peer's disk and re-stamp the batch, and
+    // it must do so without re-sending a byte.
+    TestCluster cluster(ConfigProfile::isolated);
+    const auto a_port = free_port();
+    const auto b_port = free_port();
+    auto a_config = storage_node_config(cluster, "epoch-a", a_port, 64ULL * 1024 * 1024, 2, 1, {}, 2);
+    auto b_config = storage_node_config(cluster, "epoch-b", b_port, 64ULL * 1024 * 1024, 2, 1,
+                                        {{"127.0.0.1", a_port}}, 2);
+    StorageClusterNode a(std::move(a_config), cluster.keys());
+    StorageClusterNode b(std::move(b_config), cluster.keys());
+    a.start();
+    b.start();
+    REQUIRE(wait_until([&] {
+        return a.node().membership().active().size() == 2 &&
+               b.node().membership().active().size() == 2;
+    }, 5s));
+
+    const auto data = pattern(64 * 1024, 91);
+    DistributedStore::DurabilityBatch batch;
+    const auto id = a.store().put_deferred(data, batch);
+    REQUIRE(!batch.empty());
+    REQUIRE(b.node().local_store().has(id));
+    const auto old_epoch = b.node().durability_epoch();
+    REQUIRE(a.store().durability_barrier(batch));
+
+    b.restart();
+    REQUIRE(b.node().durability_epoch() != old_epoch);
+    REQUIRE(wait_until([&] {
+        return a.node().membership().active().size() == 2 &&
+               b.node().membership().active().size() == 2;
+    }, 10s));
+    REQUIRE(b.node().local_store().has(id));
+
+    // The dead token is re-derived, not re-sent: the barrier succeeds and the
+    // batch now names b's new epoch, with the object still present exactly
+    // once on b.
+    std::vector<ObjectId> unsatisfiable;
+    CHECK(a.store().durability_barrier(batch, FrameType::loader, &unsatisfiable));
+    CHECK(unsatisfiable.empty());
+    bool restamped = false;
+    for (const auto& requirement : batch.requirements)
+        for (const auto& replica : requirement.replicas)
+            if (replica.id == b.node().node_id()) {
+                CHECK(replica.epoch == b.node().durability_epoch());
+                restamped = replica.epoch == b.node().durability_epoch();
+            }
+    CHECK(restamped);
+    // And the ordinary path from here on: no probe needed, still durable.
+    CHECK(a.store().durability_barrier(batch));
+}
+
+MACHA_TEST("storage_v18", test_durability_barrier_reports_objects_a_restarted_peer_lost) {
+    // The one case a probe cannot fix: the peer restarted *and* no longer
+    // holds the object. The barrier must say which ids, so the writer can
+    // re-put them, rather than fail opaquely.
+    TestCluster cluster(ConfigProfile::isolated);
+    const auto a_port = free_port();
+    const auto b_port = free_port();
+    auto a_config = storage_node_config(cluster, "lost-a", a_port, 64ULL * 1024 * 1024, 2, 1, {}, 2);
+    auto b_config = storage_node_config(cluster, "lost-b", b_port, 64ULL * 1024 * 1024, 2, 1,
+                                        {{"127.0.0.1", a_port}}, 2);
+    StorageClusterNode a(std::move(a_config), cluster.keys());
+    StorageClusterNode b(std::move(b_config), cluster.keys());
+    a.start();
+    b.start();
+    REQUIRE(wait_until([&] {
+        return a.node().membership().active().size() == 2 &&
+               b.node().membership().active().size() == 2;
+    }, 5s));
+
+    const auto data = pattern(64 * 1024, 92);
+    DistributedStore::DurabilityBatch batch;
+    const auto id = a.store().put_deferred(data, batch);
+    REQUIRE(a.store().durability_barrier(batch));
+
+    b.restart();
+    REQUIRE(wait_until([&] {
+        return a.node().membership().active().size() == 2 &&
+               b.node().membership().active().size() == 2;
+    }, 10s));
+    REQUIRE(b.node().local_store().remove(id));
+    REQUIRE(!b.node().local_store().has(id));
+
+    std::vector<ObjectId> unsatisfiable;
+    CHECK(!a.store().durability_barrier(batch, FrameType::loader, &unsatisfiable));
+    REQUIRE(unsatisfiable.size() == 1);
+    CHECK(unsatisfiable.front() == id);
 }
 
 MACHA_TEST("storage_v18", test_catalogue_metadata_ignores_full_data_quota_and_artwork_uses_data_fallback) {

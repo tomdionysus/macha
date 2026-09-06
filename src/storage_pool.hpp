@@ -100,6 +100,12 @@ class StoragePool {
     void durability_barrier(const DurabilityToken&,
                             DurabilityUrgency = DurabilityUrgency::batchable);
     bool durability_covered(const DurabilityToken&) const;
+    // Re-derive a placement token for an object this pool already holds: the
+    // answer to a durability question whose previous token died with a
+    // process or backend incarnation. Flushes the holding backend first so
+    // "present" implies "durable" for the current incarnation. Empty when no
+    // online backend has the object.
+    std::optional<DurabilityToken> reassert_durable(const ObjectId&);
     std::optional<Bytes> get(const ObjectId&) const;
     bool has(const ObjectId&) const;
     bool valid(const ObjectId&) const;

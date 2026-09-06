@@ -887,17 +887,54 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             const auto domain = reader.u64();
             const auto required_generation = reader.u64();
             const auto backend_instance = reader.u64();
+            // 0.29: an optional trailing id list turns a refusal into a probe.
+            std::vector<ObjectId> probe_ids;
+            if (reader.remaining()) {
+                const auto count = reader.u32();
+                if (count > 4096)
+                    return error_reply("too many durability probe ids");
+                probe_ids.reserve(count);
+                for (uint32_t i = 0; i < count; ++i)
+                    probe_ids.push_back(ObjectId{reader.fixed<32>()});
+            }
             reader.finish();
             if (expected_epoch != durability_epoch_) {
                 // The requester holds a placement token from a previous
-                // incarnation of this process. Nothing here can make that
-                // token true again; the requester must re-put the object.
-                Log::debug("object durability barrier refused: epoch changed expected=" +
-                           to_string(expected_epoch).substr(0, 8) +
-                           " current=" + to_string(durability_epoch_).substr(0, 8) +
-                           " domain=" + std::to_string(domain) +
-                           " generation=" + std::to_string(required_generation));
-                return error_reply("storage durability epoch changed");
+                // incarnation of this process. Nothing can make that token
+                // true again -- but the *objects* may well be on disk, and
+                // that is the fact the requester actually needs. With ids,
+                // answer from the disk and hand out fresh tokens (discipline
+                // 1 of the self-healing plan: re-derive, don't assert).
+                // Without ids (a pre-0.29 requester), refuse as before.
+                if (probe_ids.empty()) {
+                    Log::debug("object durability barrier refused: epoch changed expected=" +
+                               to_string(expected_epoch).substr(0, 8) +
+                               " current=" + to_string(durability_epoch_).substr(0, 8) +
+                               " domain=" + std::to_string(domain) +
+                               " generation=" + std::to_string(required_generation));
+                    return error_reply("storage durability epoch changed");
+                }
+                Writer reply;
+                reply.fixed(durability_epoch_.bytes);
+                std::vector<std::pair<ObjectId, StoragePool::DurabilityToken>> present;
+                present.reserve(probe_ids.size());
+                for (const auto& id : probe_ids)
+                    if (auto token = local_store().reassert_durable(id))
+                        present.emplace_back(id, *token);
+                reply.u32(static_cast<uint32_t>(present.size()));
+                for (const auto& [id, token] : present) {
+                    reply.fixed(id.bytes);
+                    reply.u64(token.domain);
+                    reply.u64(token.generation);
+                    reply.u64(token.backend_instance);
+                }
+                Log::info("object durability re-derived after epoch change present=" +
+                          std::to_string(present.size()) + "/" +
+                          std::to_string(probe_ids.size()) + " expected=" +
+                          to_string(expected_epoch).substr(0, 8) +
+                          " current=" + to_string(durability_epoch_).substr(0, 8));
+                members_.storage(local_store().used(), local_store().limit());
+                return {MessageType::ok, reply.take()};
             }
             try {
                 local_store().durability_barrier({domain, required_generation, backend_instance},

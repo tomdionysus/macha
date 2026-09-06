@@ -1,5 +1,52 @@
 # Current release
 
+## 0.29.0 — Durability is re-derived from disk, not asserted from a dead token (development)
+
+Discipline 1 of `TODO/2026-09-06-self-healing-disciplines-plan.md`. The
+proven 2026-09-06 wedge: gbni-1 had placed 13 extents of a 13.9 GB file on
+es-1; es-1 was restarted; from then on every barrier gbni-1 ran was refused
+with `storage durability epoch changed` and retried, at ~35/s, forever — the
+batch named a placement token that died with es-1's process, while the bytes
+sat on es-1's disk the whole time. Restarting *any* node did this to every
+in-flight publication elsewhere that had already touched it.
+
+- **Wire.** `object_durability_barrier` accepts an optional trailing list of
+  object ids. On an epoch mismatch *with* ids the peer no longer refuses: it
+  checks each id on its own disk (`StoragePool::reassert_durable`), flushes
+  the holding backend on its current incarnation, and replies with the
+  present ids and fresh `(epoch, domain, generation, backend_instance)`
+  tokens. Without ids (a pre-0.29 requester) it refuses as before.
+- **Client.** `DistributedStore::durability_barrier(DurabilityBatch&)` —
+  now non-const — probes every peer whose replica answered `epoch changed`
+  (and re-derives locally when its own backend was reopened), re-stamps the
+  batch in place so the next barrier is ordinary, and reports only the ids a
+  peer genuinely no longer holds through the new `unsatisfiable` out-param.
+  One INFO line per re-derivation on each side.
+- **Writer.** `WriteHandle::commit()` re-puts an unsatisfiable extent from a
+  local copy when there is one, and otherwise fails with `ESTALE`, which the
+  FUSE frontend treats as "discard the provisional writer and replay this
+  generation from the spool" — the WAL is the one place the bytes are
+  guaranteed to be. The same dead batch is never retried.
+- Durability contract, written down: an object present on a node after a
+  restart is durable — the pack index is rebuilt from disk on open and the
+  probe flushes the current incarnation before answering. See
+  `docs/operations.md`, "Durability tokens and restarts".
+- Tests: `storage_v18/test_durability_barrier_rederives_placement_after_peer_restart`
+  (restart a peer; barrier succeeds; batch carries the new epoch; nothing
+  re-sent) and `…_reports_objects_a_restarted_peer_lost`. The test harness
+  gained `StorageClusterNode::restart()`.
+- **Same discipline, FUSE side.** A data publication that hits ENOENT used to
+  decide "race or dead file?" from the inode's own bookkeeping, and could
+  poison the inode as terminal while a rename it had not yet learned about
+  was landing — one run in four of
+  `test_fuse_durable_journal_recovers_ordered_mutations`, the extra barrier
+  work having widened an old window. It now re-derives the answer: retry
+  while any namespace op is in flight/queued/unconfirmed or the inode's
+  `published_path` exists in the decoded view; terminal only when the file is
+  genuinely gone from the accepted namespace (which
+  `test_fuse_terminal_recovery_failure_is_not_readmitted` still requires).
+  Terminal publication failures now log at WARN, not DEBUG.
+
 ## 0.28.3 — Linear tombstone replay; a node could not start after 0.28.2 (development)
 
 Found by 0.28.2 itself. Until this morning a conflict-free merge delta was

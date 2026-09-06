@@ -1299,8 +1299,7 @@ CatalogueArtwork CatalogueManager::stage_artwork_deferred(
     return art;
 }
 
-bool CatalogueManager::artwork_durability_barrier(
-    const DistributedStore::DurabilityBatch& batch) {
+bool CatalogueManager::artwork_durability_barrier(DistributedStore::DurabilityBatch& batch) {
     return store_.durability_barrier(batch, FrameType::speculative);
 }
 

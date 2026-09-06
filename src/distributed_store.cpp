@@ -434,7 +434,8 @@ std::string reply_error_text(const RpcReply& reply) {
 
 } // namespace
 
-bool DistributedStore::durability_barrier(const DurabilityBatch& batch, FrameType frame_type) {
+bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType frame_type,
+                                          std::vector<ObjectId>* unsatisfiable) {
     if (batch.empty())
         return true;
 
@@ -547,6 +548,123 @@ bool DistributedStore::durability_barrier(const DurabilityBatch& batch, FrameTyp
             outcome[key] = peers.contains(replica.id) ? "remote-not-sent" : "peer-unknown";
     }
 
+    // Discipline 1 of the self-healing plan: a refusal because a peer's
+    // process or backend incarnation changed means "your token is dead", not
+    // "your bytes are gone". Ask again with the object ids; the peer answers
+    // from its disk with fresh tokens, and the batch is re-stamped in place so
+    // the next barrier is ordinary. Restarting es-1 on 2026-09-06 otherwise
+    // left gbni-1 asking the same dead question about a 13.9 GB file forever.
+    const auto key_of = [](const DurableReplica& replica) {
+        return ReplicaKey{replica.id, replica.epoch, replica.domain, replica.backend_instance};
+    };
+    std::set<ReplicaKey> stale_remote;
+    std::set<ReplicaKey> stale_local;
+    for (const auto& [key, text] : outcome) {
+        if (text == "remote-refused: storage durability epoch changed")
+            stale_remote.insert(key);
+        else if (text == "local-epoch-changed" || text.starts_with("local-barrier-failed"))
+            stale_local.insert(key);
+    }
+    if (!stale_remote.empty() || !stale_local.empty()) {
+        size_t reasserted = 0;
+        size_t absent = 0;
+        // Local: the backend was reopened under us. Same answer, no RPC.
+        for (auto& requirement : batch.requirements) {
+            for (auto& replica : requirement.replicas) {
+                if (!stale_local.contains(key_of(replica)))
+                    continue;
+                if (auto token = n_.local_store().reassert_durable(requirement.id)) {
+                    replica = {n_.node_id(), n_.durability_epoch(), token->domain,
+                               token->generation, token->backend_instance};
+                    durable[key_of(replica)] = replica.generation;
+                    outcome[key_of(replica)] = "local-reasserted";
+                    ++reasserted;
+                } else {
+                    ++absent;
+                }
+            }
+        }
+        // Remote: one probe per peer carrying every id that named a dead token.
+        std::map<NodeId, std::vector<ObjectId>> probe_ids;
+        std::map<NodeId, DurableReplica> probe_token;
+        for (const auto& requirement : batch.requirements) {
+            for (const auto& replica : requirement.replicas) {
+                if (!stale_remote.contains(key_of(replica)))
+                    continue;
+                probe_ids[replica.id].push_back(requirement.id);
+                probe_token.emplace(replica.id, replica);
+            }
+        }
+        for (auto& [peer_id, ids] : probe_ids) {
+            const auto found = peers.find(peer_id);
+            if (found == peers.end())
+                continue;
+            std::sort(ids.begin(), ids.end());
+            ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+            std::map<ObjectId, DurableReplica> fresh;
+            std::string probe_outcome;
+            try {
+                for (size_t offset = 0; offset < ids.size(); offset += 4096) {
+                    const auto& token = probe_token.at(peer_id);
+                    Writer payload;
+                    payload.fixed(token.epoch.bytes);
+                    payload.u64(token.domain);
+                    payload.u64(token.generation);
+                    payload.u64(token.backend_instance);
+                    const auto end = std::min(ids.size(), offset + 4096);
+                    payload.u32(static_cast<uint32_t>(end - offset));
+                    for (size_t i = offset; i < end; ++i)
+                        payload.fixed(ids[i].bytes);
+                    auto reply = n_.call(found->second, MessageType::object_durability_barrier,
+                                         payload.data(), frame_type);
+                    if (reply.message.type != MessageType::ok) {
+                        probe_outcome = "probe-refused: " + reply_error_text(reply);
+                        break;
+                    }
+                    Reader reader(reply.message.payload);
+                    NodeId fresh_epoch{reader.fixed<16>()};
+                    const auto count = reader.u32();
+                    if (count > 4096)
+                        throw std::runtime_error("too many reasserted ids");
+                    for (uint32_t i = 0; i < count; ++i) {
+                        ObjectId id{reader.fixed<32>()};
+                        const auto domain = reader.u64();
+                        const auto generation = reader.u64();
+                        const auto instance = reader.u64();
+                        fresh[id] = {peer_id, fresh_epoch, domain, generation, instance};
+                    }
+                    reader.finish();
+                }
+            } catch (const std::exception& error) {
+                probe_outcome = std::string("probe-transport: ") + error.what();
+            }
+            for (auto& requirement : batch.requirements) {
+                for (auto& replica : requirement.replicas) {
+                    if (replica.id != peer_id || !stale_remote.contains(key_of(replica)))
+                        continue;
+                    if (!probe_outcome.empty()) {
+                        outcome[key_of(replica)] = probe_outcome;
+                        continue;
+                    }
+                    const auto it = fresh.find(requirement.id);
+                    if (it == fresh.end()) {
+                        outcome[key_of(replica)] =
+                            "remote-refused: epoch changed; object absent on peer after probe";
+                        ++absent;
+                        continue;
+                    }
+                    replica = it->second;
+                    durable[key_of(replica)] = replica.generation;
+                    outcome[key_of(replica)] = "remote-reasserted";
+                    ++reasserted;
+                }
+            }
+        }
+        Log::info("object durability re-derived after incarnation change reasserted=" +
+                  std::to_string(reasserted) + " absent=" + std::to_string(absent) +
+                  " peers=" + std::to_string(probe_ids.size()));
+    }
+
     for (const auto& requirement : batch.requirements) {
         size_t count = 0;
         std::string detail;
@@ -569,10 +687,12 @@ bool DistributedStore::durability_barrier(const DurabilityBatch& batch, FrameTyp
             Log::debug("object durability quorum unavailable id=" + to_string(requirement.id) +
                        " required=" + std::to_string(requirement.required) +
                        " durable=" + std::to_string(count) + detail);
-            return false;
+            if (!unsatisfiable)
+                return false;
+            unsatisfiable->push_back(requirement.id);
         }
     }
-    return true;
+    return !unsatisfiable || unsatisfiable->empty();
 }
 
 

@@ -1267,8 +1267,43 @@ void WriteHandle::commit() {
     }
     if (durability_ == WriteDurability::publication_generation && !durability_batch_.empty()) {
         const auto durability_started = Clock::now();
-        if (!fs_.store().durability_barrier(durability_batch_, work_context_.frame_type()))
-            fail(EIO, "object durability quorum unavailable before publication");
+        std::vector<ObjectId> unsatisfiable;
+        if (!fs_.store().durability_barrier(durability_batch_, work_context_.frame_type(),
+                                            &unsatisfiable)) {
+            // The barrier re-derives dead placement tokens itself; what is
+            // left here is an object a peer genuinely no longer holds. Re-put
+            // it from a local copy when there is one, else tell the caller the
+            // generation must be replayed from its own WAL (ESTALE): this
+            // writer cannot recover the bytes. Never retry the same batch.
+            bool reput_all = !unsatisfiable.empty();
+            for (const auto& id : unsatisfiable) {
+                const auto data = fs_.node().local_store().get(id);
+                if (!data) {
+                    reput_all = false;
+                    break;
+                }
+                std::erase_if(durability_batch_.requirements,
+                              [&](const auto& requirement) { return requirement.id == id; });
+                if (!fs_.store().put_deferred(id, *data, durability_batch_,
+                                              work_context_.frame_type(), &fs_.io_cancelled_)) {
+                    reput_all = false;
+                    break;
+                }
+            }
+            if (!reput_all)
+                fail(unsatisfiable.empty() ? EIO : ESTALE,
+                     unsatisfiable.empty()
+                         ? "object durability quorum unavailable before publication"
+                         : "object durability lost on a peer and no local copy; "
+                           "publication must be replayed");
+            Log::info("write stage id=" + std::to_string(diagnostic_id_) + " path=" + path_ +
+                      " re-put " + std::to_string(unsatisfiable.size()) +
+                      " extent(s) a peer no longer held");
+            unsatisfiable.clear();
+            if (!fs_.store().durability_barrier(durability_batch_, work_context_.frame_type(),
+                                                &unsatisfiable))
+                fail(EIO, "object durability quorum unavailable after re-put");
+        }
         durability_batch_.clear();
         const auto durability_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - durability_started);

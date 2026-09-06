@@ -3020,6 +3020,34 @@ struct FuseFrontend::State {
         data_cv.notify_all();
     }
 
+    // ENOENT from a data publication is either a race with a namespace
+    // mutation the backend applied a moment before this inode learned its
+    // new published_path, or a file genuinely gone from the accepted
+    // namespace (removed cluster-side while this node was down). Re-derive
+    // which from the truth, not from the inode's own bookkeeping: retry while
+    // any namespace work is still moving or the path is present in the
+    // decoded view; otherwise it is terminal. Poisoning the inode in the
+    // first case failed one test run in four on 2026-09-06; retrying in the
+    // second would be the unbounded recovery loop the terminal path exists
+    // to prevent.
+    bool publication_path_may_still_appear(const std::shared_ptr<Inode>& inode) {
+        {
+            std::lock_guard queue_lock(namespace_queue_mutex);
+            if (namespace_inflight || !namespace_queue.empty() || !namespace_unconfirmed.empty())
+                return true;
+        }
+        std::optional<std::string> path;
+        {
+            std::lock_guard lock(inode->mutex);
+            path = inode->published_path;
+        }
+        if (!path)
+            return true; // retired by the next attempt, never terminal.
+        if (auto available = fs.available_snapshot_view())
+            return snapshot_has_path(*available->snapshot, *path);
+        return true;
+    }
+
     bool replay_data_quantum(const std::shared_ptr<Inode>& inode,
                              const std::shared_ptr<DataPublication>& publication) {
         auto& snapshot = publication->snapshot;
@@ -3105,12 +3133,18 @@ struct FuseFrontend::State {
             // once, immediately before metadata publication. Crash-recovery
             // replay deliberately bypasses cache admission so a large backlog
             // cannot evict the useful working set merely by being replayed.
-            publication->writer = fs.open_write(
-                *snapshot.published_path, false,
-                config.write_through_cache && !publication->recovered,
-                WriteDurability::publication_generation,
-                config.publication_pipeline_bytes,
-                DataWorkContext(FrameType::loader, config.publication_quantum_bytes));
+            try {
+                publication->writer = fs.open_write(
+                    *snapshot.published_path, false,
+                    config.write_through_cache && !publication->recovered,
+                    WriteDurability::publication_generation,
+                    config.publication_pipeline_bytes,
+                    DataWorkContext(FrameType::loader, config.publication_quantum_bytes));
+            } catch (const FsError& e) {
+                if (e.code() == ENOENT && publication_path_may_still_appear(inode))
+                    throw FsError(EAGAIN, "FUSE namespace advanced before data publication opened");
+                throw;
+            }
             publication->initialized = true;
         }
 
@@ -3276,12 +3310,9 @@ struct FuseFrontend::State {
                 completed_diagnostics.new_extent_puts + completed_diagnostics.rebuild_put_extents,
                 std::memory_order_relaxed);
         } catch (const FsError& e) {
-            if (e.code() == ENOENT || e.code() == EAGAIN) {
-                std::lock_guard lock(inode->mutex);
-                if (inode->published_path != snapshot.published_path ||
-                    inode->namespace_sequence > snapshot.required_namespace_sequence)
-                    throw FsError(EAGAIN, "FUSE namespace advanced during data publication");
-            }
+            if (e.code() == EAGAIN ||
+                (e.code() == ENOENT && publication_path_may_still_appear(inode)))
+                throw FsError(EAGAIN, "FUSE namespace advanced during data publication");
             throw;
         }
         auto committed = publication->writer->committed_entry();
@@ -3543,10 +3574,26 @@ struct FuseFrontend::State {
                     data_publication_yields.fetch_add(1, std::memory_order_relaxed);
             } catch (const std::exception& e) {
                 ++backend_failures;
-                retry = retryable_backend_error(e);
-                Log::debug(std::string("FUSE async data publication ") +
-                           (retry ? "retry" : "failed") + " inode=" + std::to_string(inode->id) +
-                           " error=" + e.what());
+                // ESTALE: the backend lost an extent's only durable copy and
+                // the writer holds no bytes to re-put. The spool does; drop
+                // the provisional writer and its cursor so the next attempt
+                // replays this generation from the WAL.
+                const auto* fs_error = dynamic_cast<const FsError*>(&e);
+                const bool replay = fs_error && fs_error->code() == ESTALE;
+                retry = replay || retryable_backend_error(e);
+                // A terminal failure poisons the inode until an operator acts;
+                // that is never a debug-level event.
+                const auto line = std::string("FUSE async data publication ") +
+                                  (replay ? "replay" : retry ? "retry" : "failed") +
+                                  " inode=" + std::to_string(inode->id) + " error=" + e.what();
+                if (retry)
+                    Log::debug(line);
+                else
+                    Log::warn(line);
+                if (replay) {
+                    std::lock_guard lock(inode->mutex);
+                    inode->data_publication.reset();
+                }
                 if (!retry) {
                     int code = EIO;
                     if (const auto* fs_error = dynamic_cast<const FsError*>(&e))
