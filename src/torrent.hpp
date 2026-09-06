@@ -5,16 +5,12 @@
 #include "ingest.hpp"
 #include "media_catalogue.hpp"
 
-#include <condition_variable>
 #include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <span>
-#include <stop_token>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace macha {
@@ -135,72 +131,51 @@ class TorrentSearchManager {
     std::optional<std::string> resolve(std::string_view acquisition_ref);
 };
 
-class TorrentManager {
-    struct Impl;
-
-    NodeRuntime& node_;
-    IngestManager& ingest_;
-    TorrentConfig config_;
-    std::filesystem::path state_file_;
-    mutable std::mutex mutex_;
-    std::condition_variable_any cv_;
-    std::map<std::string, TorrentJob, std::less<>> jobs_;
-    std::unique_ptr<Impl> impl_;
-    std::jthread worker_;
-
-    void load_state();
-    void save_state_locked() const;
-    void restore_jobs();
-    void loop(std::stop_token);
-    void update_jobs();
-    bool has_active_jobs_locked() const;
-    std::string add_impl(std::string uri, bool allow_fetch);
-
-    // NodeRuntime::set_torrent_bridge() handler bodies. Local-only -- never
-    // call the *_cluster_wide() methods from here, or a peer's survey would
-    // itself re-survey its own peers.
-    Bytes handle_jobs_query(std::span<const uint8_t> request_payload) const;
-    Bytes handle_job_action(std::span<const uint8_t> request_payload);
-    TorrentActionResult dispatch_action_cluster_wide(std::string_view id, std::string_view action);
-
+// Everything core is allowed to know about BitTorrent acquisition. The
+// implementation (TorrentManager, torrent_manager.hpp) and its libtorrent
+// linkage live in the libmacha-torrent plugin, not in macha_core: core holds
+// this interface, obtained from SubsystemRegistry::torrent(), and a node with
+// no plugin installed simply has no torrent capability at runtime rather than
+// a differently-compiled binary. See
+// TODO/2026-09-05-subsystem-plugin-isolation-plan.md.
+//
+// Lifecycle (start/stop/restart-on-fault) is not part of this interface --
+// that belongs to the plugin's Subsystem, which SubsystemSupervisor owns.
+class TorrentService {
   public:
-    TorrentManager(NodeRuntime&, IngestManager&, TorrentConfig,
-                   const std::filesystem::path& state_path);
-    ~TorrentManager();
+    virtual ~TorrentService() = default;
 
-    static bool build_available() noexcept;
-    void start();
-    void request_stop();
-    void stop();
-    void reconfigure(TorrentConfig);
-    bool enabled() const noexcept { return config_.enabled; }
+    virtual bool enabled() const noexcept = 0;
+    // Live configuration reload (Service::reload_config). Only the limits an
+    // implementation can change without a restart take effect.
+    virtual void reconfigure(TorrentConfig) = 0;
 
-    std::string add(std::string magnet_uri);
+    virtual std::string add(std::string magnet_uri) = 0;
     // Only use with a URI obtained from TorrentSearchManager::resolve().
-    std::string add_search_result(std::string acquisition_uri);
-    std::vector<TorrentJob> jobs() const;
-    std::optional<TorrentJob> job(std::string_view id) const;
-    bool pause(std::string_view id);
-    bool resume(std::string_view id);
-    bool retry(std::string_view id);
-    bool cancel(std::string_view id);
-    bool clear(std::string_view id);
+    virtual std::string add_search_result(std::string acquisition_uri) = 0;
+    virtual std::vector<TorrentJob> jobs() const = 0;
+    virtual std::optional<TorrentJob> job(std::string_view id) const = 0;
+    virtual bool pause(std::string_view id) = 0;
+    virtual bool resume(std::string_view id) = 0;
+    virtual bool retry(std::string_view id) = 0;
+    virtual bool cancel(std::string_view id) = 0;
+    virtual bool clear(std::string_view id) = 0;
 
     // Cluster-wide visibility: local jobs (this node's own jobs()), plus one
     // RPC survey per active peer. An unreachable/erroring peer is logged and
     // skipped, never fails the whole call.
-    std::vector<ClusterTorrentJob> jobs_cluster_wide() const;
+    virtual std::vector<ClusterTorrentJob> jobs_cluster_wide() const = 0;
     // Local job(id) first (zero added latency for the common owned-here
     // case); only surveys peers when the job is locally absent.
-    std::optional<ClusterTorrentJob> job_cluster_wide(std::string_view id) const;
+    virtual std::optional<ClusterTorrentJob> job_cluster_wide(std::string_view id) const = 0;
     // Each: local action first; only surveys peers when the job is locally
     // absent. The first peer reporting the job exists is authoritative,
     // preserving the local 404-vs-409 distinction cluster-wide.
-    TorrentActionResult pause_cluster_wide(std::string_view id);
-    TorrentActionResult resume_cluster_wide(std::string_view id);
-    TorrentActionResult retry_cluster_wide(std::string_view id);
-    TorrentActionResult cancel_cluster_wide(std::string_view id);
-    TorrentActionResult clear_cluster_wide(std::string_view id);
+    virtual TorrentActionResult pause_cluster_wide(std::string_view id) = 0;
+    virtual TorrentActionResult resume_cluster_wide(std::string_view id) = 0;
+    virtual TorrentActionResult retry_cluster_wide(std::string_view id) = 0;
+    virtual TorrentActionResult cancel_cluster_wide(std::string_view id) = 0;
+    virtual TorrentActionResult clear_cluster_wide(std::string_view id) = 0;
 };
 
 std::optional<std::string> sanitize_magnet_uri(std::string_view);

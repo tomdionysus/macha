@@ -47,8 +47,8 @@ struct SubsystemRetryPolicy {
 // designed against a real one than guessed at now.
 class SubsystemSupervisor {
   public:
-    SubsystemSupervisor(std::filesystem::path plugin_dir, SubsystemContext context,
-                       SubsystemRetryPolicy policy = {});
+    explicit SubsystemSupervisor(std::filesystem::path plugin_dir,
+                                 SubsystemRetryPolicy policy = {});
     ~SubsystemSupervisor();
 
     SubsystemSupervisor(const SubsystemSupervisor&) = delete;
@@ -57,7 +57,12 @@ class SubsystemSupervisor {
     // Discovers every plugin in the configured directory and starts each
     // one's supervised lifecycle thread. Safe to call when the directory
     // does not exist or holds no plugins -- that just means nothing loads.
-    void start();
+    //
+    // The context is supplied here rather than at construction because the
+    // references in it (IngestManager in particular) do not exist until
+    // Service::initialise_services has run, long after Service itself is
+    // constructed.
+    void start(SubsystemContext context);
 
     // Stops every running subsystem and joins their lifecycle threads.
     void stop();

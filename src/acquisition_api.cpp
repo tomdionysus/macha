@@ -118,17 +118,36 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             }
         }
 
+        // The download engine lives in the libmacha-torrent plugin, so its
+        // presence is a runtime fact, per node, that can also change while
+        // the process runs (a faulted subsystem is withdrawn until it
+        // restarts). Take one snapshot for this request rather than looking
+        // it up repeatedly and racing with a restart mid-handler.
+        const auto torrents = subsystems_.torrent();
+
         if (request.method == "GET" && request.path == "/api/v1/torrents/status") {
             Json::Object out;
-            out["enabled"] = torrents_.enabled();
-            out["build_available"] = TorrentManager::build_available();
+            out["enabled"] = torrents && torrents->enabled();
+            // Retains the pre-0.28.0 field name: it used to report whether
+            // libtorrent was compiled in, and now reports whether the plugin
+            // providing it is loaded and running here -- the same question a
+            // client was asking, answered at runtime.
+            out["build_available"] = torrents != nullptr;
             out["search_enabled"] = search_.enabled();
             return http_json(200, Json(std::move(out)).dump());
         }
 
+        // Search is served by core (a Torznab HTTP client, no libtorrent), so
+        // it keeps working on a node with no plugin installed; everything
+        // else under /torrents/ needs the engine itself.
+        if (!torrents && request.path.starts_with("/api/v1/torrents/") &&
+            request.path != "/api/v1/torrents/search")
+            return http_error(503, "unavailable",
+                              "torrent subsystem is not available on this node");
+
         if (request.method == "GET" && request.path == "/api/v1/torrents/jobs") {
             Json::Array jobs;
-            for (const auto& entry : torrents_.jobs_cluster_wide()) {
+            for (const auto& entry : torrents->jobs_cluster_wide()) {
                 auto item = torrent_job_api_json(entry.job);
                 item["node_id"] = to_string(entry.node_id);
                 jobs.push_back(std::move(item));
@@ -142,11 +161,11 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             const auto body = parse_body(request);
             std::string id;
             if (const auto* magnet = body.find("magnet"); magnet && magnet->isString()) {
-                id = torrents_.add(magnet->asString());
+                id = torrents->add(magnet->asString());
             } else if (const auto* ref = body.find("acquisition_ref"); ref && ref->isString()) {
                 auto uri = search_.resolve(ref->asString());
                 if (!uri) return http_error(404, "not_found", "torrent search result expired or not found");
-                id = torrents_.add_search_result(std::move(*uri));
+                id = torrents->add_search_result(std::move(*uri));
             } else {
                 return http_error(400, "bad_request", "magnet or acquisition_ref is required");
             }
@@ -183,7 +202,7 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
 
         if (auto target = job_action(request.path, "/api/v1/torrents/jobs/")) {
             if (request.method == "GET" && target->second.empty()) {
-                auto existing = torrents_.job_cluster_wide(target->first);
+                auto existing = torrents->job_cluster_wide(target->first);
                 if (!existing) return http_error(404, "not_found", "torrent job not found");
                 auto item = torrent_job_api_json(existing->job);
                 item["node_id"] = to_string(existing->node_id);
@@ -191,11 +210,11 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             }
             if (request.method == "POST") {
                 TorrentActionResult result;
-                if (target->second == "pause") result = torrents_.pause_cluster_wide(target->first);
-                else if (target->second == "resume") result = torrents_.resume_cluster_wide(target->first);
-                else if (target->second == "retry") result = torrents_.retry_cluster_wide(target->first);
-                else if (target->second == "cancel") result = torrents_.cancel_cluster_wide(target->first);
-                else if (target->second == "clear") result = torrents_.clear_cluster_wide(target->first);
+                if (target->second == "pause") result = torrents->pause_cluster_wide(target->first);
+                else if (target->second == "resume") result = torrents->resume_cluster_wide(target->first);
+                else if (target->second == "retry") result = torrents->retry_cluster_wide(target->first);
+                else if (target->second == "cancel") result = torrents->cancel_cluster_wide(target->first);
+                else if (target->second == "clear") result = torrents->clear_cluster_wide(target->first);
                 else return http_error(404, "not_found", "unknown torrent action");
                 if (!result.changed) return action_error(result.exists);
                 if (target->second == "clear") {

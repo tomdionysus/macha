@@ -230,10 +230,12 @@ void validate(Config& config) {
         throw std::runtime_error("ingest.blocked_retry_ms must be 500..600000");
     if (config.torrent.enabled && !config.ingest.enabled)
         throw std::runtime_error("torrent requires ingest.enabled");
-#ifndef MACHA_HAVE_LIBTORRENT
-    if (config.torrent.enabled)
-        throw std::runtime_error("torrent support was not built (libtorrent-rasterbar not found)");
-#endif
+    // Whether BitTorrent acquisition can actually run here is a runtime fact
+    // as of 0.28.0 -- the libmacha-torrent plugin is present or it isn't (see
+    // TODO/2026-09-05-subsystem-plugin-isolation-plan.md) -- so config
+    // validation no longer rejects torrent.enabled on a build without it.
+    // A node with the setting on and no plugin reports the subsystem as
+    // unavailable in Status and answers 503 on /api/v1/torrents/*.
     if (!config.torrent.max_active || config.torrent.max_active > 64)
         throw std::runtime_error("torrent.max_active must be 1..64");
     for (const auto& provider : config.torrent.search_providers) {

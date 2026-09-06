@@ -23,15 +23,25 @@ enum class SubsystemState {
 
 std::string_view subsystem_state_name(SubsystemState) noexcept;
 
+class IngestManager;
+class NodeRuntime;
+class SubsystemRegistry;
+
 // The narrow set of core references a subsystem actually needs, replacing
 // today's practice of handing out whatever concrete internal reference
-// happens to be convenient (see FuseFrontend/TorrentManager constructors).
-// Deliberately minimal: no subsystem has migrated onto this interface yet
-// (see TODO/2026-09-05-subsystem-plugin-isolation-plan.md, Phase 1/2) --
-// extend it with the specific references each migration actually needs, not
-// preemptively.
+// happens to be convenient (see the old FuseFrontend/TorrentManager
+// constructors). Extended only by what a migration actually needs: `node`
+// and `ingest` are here because the Torrent plugin (Phase 1) needs exactly
+// those two, and `registry` is where a plugin publishes the capability it
+// provides so core can reach it without knowing the concrete class.
+//
+// Every pointer is non-owning and outlives the supervisor: Service holds all
+// of them, and stops the supervisor before destroying any of them.
 struct SubsystemContext {
     const Config* config{};
+    NodeRuntime* node{};
+    IngestManager* ingest{};
+    SubsystemRegistry* registry{};
 };
 
 // Implemented by every subsystem that can run behind a SubsystemSupervisor,

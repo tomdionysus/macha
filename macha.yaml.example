@@ -407,9 +407,15 @@ ingest:
     # Cancelling an owned acquisition removes partial/staging payloads promptly.
     delete_owned_source_on_cancel: true
 
-# Optional BitTorrent acquisition. libtorrent-rasterbar >= 2.0 is detected at
-# build time. Completed torrents are submitted to the generic ingest engine;
-# torrent code does not write directly into the catalogue or Macha namespace.
+# Optional BitTorrent acquisition. The download engine is a subsystem plugin
+# (libmacha-torrent.so, installed under plugin_path above): libtorrent-rasterbar
+# >= 2.0 is detected at build time, but whether a given node can acquire is
+# decided at run time by whether that file is present. With enabled: true and
+# no plugin, the node reports the torrent subsystem as unavailable in
+# GET /api/v1/status and answers 503 on /api/v1/torrents/* -- torrent search,
+# which needs no engine, keeps working. Completed torrents are submitted to the
+# generic ingest engine; torrent code does not write directly into the
+# catalogue or Macha namespace.
 torrent:
   enabled: false
   max_active: 4

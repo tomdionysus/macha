@@ -1,5 +1,80 @@
 # Current release
 
+## 0.28.1 — Say when a subsystem plugin loads (development)
+
+Found by deploying 0.28.0: the successful load was the only outcome the
+supervisor did not log. Refusals, faults and non-plugin files each had a line;
+a plugin that loaded and started had none, so confirming that a freshly
+deployed `libmacha-torrent.so` had actually been picked up meant reading
+`/proc/<pid>/maps` — `GET /api/v1/status` needs an authenticated call, which
+is not what you reach for at 2am.
+
+- `SubsystemSupervisor` now logs `subsystem plugin '<name>' loaded and running
+  path=<file>` at INFO when a subsystem starts, including after a restart
+  following a fault, and `subsystem plugin '<name>' loaded but its capability
+  is not enabled on this node path=<file>` when a plugin declines. Every
+  terminal outcome of a load now has exactly one line.
+- Both are asserted in `subsystem_supervisor/test_subsystem_supervisor_loads_and_stops_a_real_plugin`
+  and `…_reports_a_declining_plugin_as_unavailable`.
+- Build fix carried from the 0.28.0 rollout: `subsystem_registry.cpp` used
+  `std::unique_lock` with only `<shared_mutex>` included. libc++ provides it
+  transitively, libstdc++ does not, so every cluster node failed to compile.
+
+## 0.28.0 — BitTorrent acquisition moves into a real plugin (`libmacha-torrent`) (development)
+
+Phase 1 of `TODO/2026-09-05-subsystem-plugin-isolation-plan.md`. The download
+engine and its whole libtorrent linkage now live in a `dlopen`'d module
+instead of inside `macha_core`, so whether a node can acquire over BitTorrent
+is a runtime fact — the plugin file is present or it isn't — rather than a
+property of how the binary was compiled. **Deployment change: installs now
+ship `<libdir>/macha/plugins/libmacha-torrent.so` alongside the executable
+and `libmacha_core`; a node that gets only the new binary loses torrent
+support until the plugin is copied too.**
+
+- **Split.** `torrent.cpp` became `torrent_common.cpp` (core: job value types,
+  the API/wire JSON, the URI sanitisers and the Torznab search client — none
+  of which touch libtorrent) and `torrent_manager.cpp` + `torrent_plugin.cpp`
+  (the plugin). Core addresses the engine through the new abstract
+  `TorrentService` (`torrent.hpp`) only; `TorrentManager` is no longer
+  nameable from core. The inline `MACHA_HAVE_LIBTORRENT` branches are gone:
+  the file only exists in a build where libtorrent was found.
+- **Capability lookup.** New `SubsystemRegistry` (`subsystem_registry.hpp`):
+  a plugin publishes what it provides, core looks it up. It hands out a
+  `std::shared_ptr`, not a reference, because a supervised subsystem is
+  destroyed and reconstructed in place on fault and an HTTP handler already
+  inside it must not be left holding a dangling pointer. `SubsystemContext`
+  gained the references the migration actually needs (`node`, `ingest`,
+  `registry`), and `SubsystemSupervisor::start()` now takes the context,
+  since none of those exist when `Service` is constructed.
+- **Absent is not broken.** A plugin factory that returns no instance now
+  means "this node is configured not to run this capability" (`torrent.enabled:
+  false`): Status reports `unavailable`, with no retry and no backoff, as
+  distinct from a plugin that threw. `/api/v1/torrents/*` answers 503 rather
+  than assuming the engine is there; `/torrents/search` keeps working, since
+  the Torznab client is core's own. `build_available` in
+  `/api/v1/torrents/status` keeps its name and now answers the runtime
+  question. Config validation no longer rejects `torrent.enabled` on a build
+  without libtorrent — that is no longer a build-time fact.
+- **No `dlclose`.** Unmapping a plugin invalidates everything of it that
+  outlives the instance — a `shared_ptr`'s deleter and control block, a
+  vtable, a `std::function`. Closing the library on supervisor stop segfaulted
+  `rpc_cluster/test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node`
+  on exactly that: the last `shared_ptr<TorrentService>` released after the
+  unmap. Handles are now kept for the process lifetime (a restart after a
+  fault re-creates the instance from the still-loaded library); loading a new
+  *build* of a plugin without restarting remains out of scope. A library with
+  no entry symbol is still closed immediately — nothing of it was ever called.
+- **Tests** load the real module through the real entry symbol, never a
+  linked-in `TorrentManager`: `hydration_catalogue/test_torrent_failed_ingest_retry_and_pause_intent`
+  drives the plugin's `Subsystem` directly (it must act on restored state
+  before the worker starts), `rpc_cluster/…_from_non_owning_node` goes through
+  a full `Service` with `plugin_path` pointed at the build tree, and new
+  `hydration_catalogue/test_acquisition_api_without_a_torrent_plugin_reports_it_absent`
+  and `subsystem_supervisor/test_subsystem_supervisor_reports_a_declining_plugin_as_unavailable`
+  cover the absent and declined paths.
+
+FUSE is unchanged and still linked into the executable; that is Phase 2.
+
 ## 0.27.0 — Root cause of "accepted metadata head cannot be reconstructed", fixed; broken heads now repaired live instead of quarantined (development)
 
 The 0.26.1/0.26.2 outage was bounded but not explained. This release pins the

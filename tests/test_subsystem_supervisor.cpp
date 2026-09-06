@@ -11,9 +11,10 @@
 // exception escape, that would show up as this test process crashing, not as
 // an ordinary CHECK failure.
 #include "subsystem_supervisor.hpp"
-#include "test_support.hpp"
+#include "test_backend_support.hpp" // ConcurrentCapturingLogger
 
 #include <fstream>
+#include <thread>
 
 using namespace macha;
 using namespace macha::test_support;
@@ -35,8 +36,11 @@ MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_loads_and_stops_a_r
     TempDir dir;
     copy_plugin(MACHA_TEST_PLUGIN_OK, dir.path());
 
-    SubsystemSupervisor supervisor(dir.path(), SubsystemContext{});
-    supervisor.start();
+    auto capture = std::make_shared<ConcurrentCapturingLogger>(LogLevel::info);
+    Log::set_logger(capture);
+
+    SubsystemSupervisor supervisor(dir.path());
+    supervisor.start(SubsystemContext{});
 
     REQUIRE(wait_until([&] {
         auto statuses = supervisor.statuses();
@@ -48,7 +52,21 @@ MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_loads_and_stops_a_r
     CHECK(statuses[0].name == "test_plugin_ok");
     CHECK(statuses[0].restart_count == 0);
 
+    // A successful load must say so at INFO, naming the file it came from:
+    // it is the only evidence an operator has that a deployed plugin was
+    // actually picked up (Status needs an authenticated API call).
+    bool announced = false;
+    for (const auto& [level, message] : capture->records()) {
+        if (level != LogLevel::info) continue;
+        if (message.find("test_plugin_ok") == std::string::npos) continue;
+        if (message.find("loaded and running") == std::string::npos) continue;
+        CHECK(message.find(dir.path().string()) != std::string::npos);
+        announced = true;
+    }
+    CHECK(announced);
+
     supervisor.stop();
+    Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
 }
 
 MACHA_TEST("subsystem_supervisor",
@@ -64,8 +82,8 @@ MACHA_TEST("subsystem_supervisor",
     policy.initial_backoff = 5ms;
     policy.max_backoff = 20ms;
 
-    SubsystemSupervisor supervisor(dir.path(), SubsystemContext{}, policy);
-    supervisor.start();
+    SubsystemSupervisor supervisor(dir.path(), policy);
+    supervisor.start(SubsystemContext{});
 
     // The whole point: this must be reached without the test process
     // crashing, even though the plugin's start() always throws.
@@ -83,12 +101,57 @@ MACHA_TEST("subsystem_supervisor",
     supervisor.stop();
 }
 
+MACHA_TEST("subsystem_supervisor",
+          test_subsystem_supervisor_reports_a_declining_plugin_as_unavailable) {
+    TempDir dir;
+    copy_plugin(MACHA_TEST_PLUGIN_DECLINING, dir.path());
+
+    // A factory that returns no instance means "this node is configured not
+    // to run this capability" (torrent.enabled: false, say). It must settle
+    // on unavailable and stay there -- not `faulted`, and above all not enter
+    // the retry loop, which would reconstruct nothing forever.
+    SubsystemRetryPolicy policy;
+    policy.max_failures_in_window = 2;
+    policy.initial_backoff = 5ms;
+    policy.max_backoff = 20ms;
+
+    auto capture = std::make_shared<ConcurrentCapturingLogger>(LogLevel::info);
+    Log::set_logger(capture);
+
+    SubsystemSupervisor supervisor(dir.path(), policy);
+    supervisor.start(SubsystemContext{});
+
+    REQUIRE(wait_until([&] {
+        auto statuses = supervisor.statuses();
+        return statuses.size() == 1 && statuses[0].state == SubsystemState::unavailable;
+    }, 5s));
+
+    std::this_thread::sleep_for(100ms); // long enough for several retries.
+    auto statuses = supervisor.statuses();
+    REQUIRE(statuses.size() == 1);
+    CHECK(statuses[0].state == SubsystemState::unavailable);
+    CHECK(statuses[0].restart_count == 0);
+    CHECK(statuses[0].last_fault.empty());
+
+    // Declining is also announced: silence here would leave an operator
+    // unable to tell "plugin present but switched off" from "plugin missing".
+    bool announced = false;
+    for (const auto& [level, message] : capture->records())
+        if (level == LogLevel::info && message.find("test_plugin_declining") != std::string::npos &&
+            message.find("not enabled on this node") != std::string::npos)
+            announced = true;
+    CHECK(announced);
+
+    supervisor.stop();
+    Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
+}
+
 MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_refuses_a_mismatched_plugin) {
     TempDir dir;
     copy_plugin(MACHA_TEST_PLUGIN_MISMATCHED_ABI, dir.path());
 
-    SubsystemSupervisor supervisor(dir.path(), SubsystemContext{});
-    supervisor.start();
+    SubsystemSupervisor supervisor(dir.path());
+    supervisor.start(SubsystemContext{});
 
     // Refused at discovery time, before any lifecycle thread or retry --
     // never given a chance to run at all.
@@ -106,8 +169,8 @@ MACHA_TEST("subsystem_supervisor",
     TempDir dir;
     copy_plugin(MACHA_TEST_PLUGIN_NO_ENTRY_SYMBOL, dir.path());
 
-    SubsystemSupervisor supervisor(dir.path(), SubsystemContext{});
-    supervisor.start();
+    SubsystemSupervisor supervisor(dir.path());
+    supervisor.start(SubsystemContext{});
 
     // Not reported as a subsystem at all -- a shared library that doesn't
     // export the entry symbol was never a macha plugin, so it must not
@@ -120,8 +183,8 @@ MACHA_TEST("subsystem_supervisor",
 
 MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_empty_directory_loads_nothing) {
     TempDir dir;
-    SubsystemSupervisor supervisor(dir.path(), SubsystemContext{});
-    supervisor.start();
+    SubsystemSupervisor supervisor(dir.path());
+    supervisor.start(SubsystemContext{});
     CHECK(supervisor.statuses().empty());
     supervisor.stop();
 }
@@ -129,8 +192,8 @@ MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_empty_directory_loa
 MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_missing_directory_loads_nothing) {
     TempDir dir;
     const auto missing = dir.path() / "does-not-exist";
-    SubsystemSupervisor supervisor(missing, SubsystemContext{});
-    supervisor.start();
+    SubsystemSupervisor supervisor(missing);
+    supervisor.start(SubsystemContext{});
     CHECK(supervisor.statuses().empty());
     supervisor.stop();
 }

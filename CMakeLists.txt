@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.27.0 LANGUAGES CXX)
+project(macha VERSION 0.28.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -226,6 +226,7 @@ set(MACHA_CORE_SOURCES
     src/log.cpp
     src/supervised.cpp
     src/subsystem.cpp
+    src/subsystem_registry.cpp
     src/subsystem_supervisor.cpp
     src/media_metadata_registry.cpp
     src/ffmpeg_log_base.cpp
@@ -265,7 +266,7 @@ set(MACHA_CORE_SOURCES
     src/acquisition_api.cpp
     src/media_catalogue.cpp
     src/ingest.cpp
-    src/torrent.cpp
+    src/torrent_common.cpp
     src/macos_unicode.cpp
     src/hydration.cpp
     src/filesystem.cpp
@@ -288,13 +289,6 @@ if(MACHA_MINIUPNPC_TARGET)
 else()
     message(STATUS "miniupnpc not found; UPnP port mapping unavailable at runtime")
 endif()
-if(MACHA_LIBTORRENT_TARGET)
-    target_link_libraries(macha_core PUBLIC ${MACHA_LIBTORRENT_TARGET})
-    target_compile_definitions(macha_core PUBLIC MACHA_HAVE_LIBTORRENT=1)
-    message(STATUS "BitTorrent acquisition enabled (${MACHA_LIBTORRENT_TARGET})")
-else()
-    message(STATUS "libtorrent-rasterbar >= 2.0 not found; building generic ingest without BitTorrent acquisition")
-endif()
 if(APPLE)
     find_library(MACHA_COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
     target_link_libraries(macha_core PUBLIC ${MACHA_COREFOUNDATION_FRAMEWORK})
@@ -305,6 +299,36 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     if(MACHA_WARNINGS_AS_ERRORS)
         target_compile_options(macha_core PRIVATE -Werror)
     endif()
+endif()
+
+# BitTorrent acquisition is a subsystem plugin, not part of macha_core: the
+# whole libtorrent linkage lives behind a dlopen boundary so that a node
+# without the plugin file simply has no torrent capability at runtime, and so
+# an ordinary fault in it degrades that subsystem rather than the process (see
+# TODO/2026-09-05-subsystem-plugin-isolation-plan.md, Phase 1). MODULE, not
+# SHARED: it is only ever dlopen'd, never linked against.
+set(MACHA_PLUGIN_BUILD_DIR "${CMAKE_BINARY_DIR}/plugins")
+if(MACHA_LIBTORRENT_TARGET)
+    add_library(macha-torrent MODULE src/torrent_manager.cpp src/torrent_plugin.cpp)
+    target_link_libraries(macha-torrent PRIVATE macha_core ${MACHA_LIBTORRENT_TARGET})
+    # From the installed plugin directory back to the private libdir holding
+    # libmacha_core, so the plugin resolves core wherever the prefix is.
+    file(RELATIVE_PATH MACHA_PLUGINDIR_TO_PRIVATE_LIBDIR
+         "${MACHA_PLUGIN_INSTALL_DIR_FULL}"
+         "${CMAKE_INSTALL_PREFIX}/${MACHA_PRIVATE_LIBDIR}")
+    set_target_properties(macha-torrent PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${MACHA_PLUGIN_BUILD_DIR}"
+        INSTALL_RPATH "${MACHA_RPATH_ORIGIN}/${MACHA_PLUGINDIR_TO_PRIVATE_LIBDIR}"
+        BUILD_WITH_INSTALL_RPATH FALSE)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(macha-torrent PRIVATE -Wall -Wextra -Wpedantic)
+        if(MACHA_WARNINGS_AS_ERRORS)
+            target_compile_options(macha-torrent PRIVATE -Werror)
+        endif()
+    endif()
+    message(STATUS "BitTorrent acquisition plugin enabled (${MACHA_LIBTORRENT_TARGET})")
+else()
+    message(STATUS "libtorrent-rasterbar >= 2.0 not found; the BitTorrent acquisition plugin will not be built")
 endif()
 
 add_executable(macha-metadata-repair tools/metadata_inspect.cpp)
@@ -407,7 +431,7 @@ if(MACHA_BUILD_TESTS)
     # only ever dlopen'd -- and links macha_core so it shares the same
     # Subsystem/SubsystemPluginEntry types and build-identity stamp.
     foreach(plugin_name IN ITEMS test_plugin_ok test_plugin_faulting test_plugin_mismatched_abi
-                                test_plugin_no_entry_symbol)
+                                test_plugin_no_entry_symbol test_plugin_declining)
         add_library(${plugin_name} MODULE tests/plugins/${plugin_name}.cpp)
         target_link_libraries(${plugin_name} PRIVATE macha_core)
         set_target_properties(${plugin_name} PROPERTIES PREFIX "")
@@ -436,9 +460,20 @@ if(MACHA_BUILD_TESTS)
         MACHA_TEST_PLUGIN_OK="$<TARGET_FILE:test_plugin_ok>"
         MACHA_TEST_PLUGIN_FAULTING="$<TARGET_FILE:test_plugin_faulting>"
         MACHA_TEST_PLUGIN_MISMATCHED_ABI="$<TARGET_FILE:test_plugin_mismatched_abi>"
-        MACHA_TEST_PLUGIN_NO_ENTRY_SYMBOL="$<TARGET_FILE:test_plugin_no_entry_symbol>")
+        MACHA_TEST_PLUGIN_NO_ENTRY_SYMBOL="$<TARGET_FILE:test_plugin_no_entry_symbol>"
+        MACHA_TEST_PLUGIN_DECLINING="$<TARGET_FILE:test_plugin_declining>")
     add_dependencies(macha-tests test_plugin_ok test_plugin_faulting test_plugin_mismatched_abi
-        test_plugin_no_entry_symbol)
+        test_plugin_no_entry_symbol test_plugin_declining)
+    # Tests that need the real torrent subsystem dlopen it from the build
+    # tree, exactly as production loads it from the install tree. Pointing a
+    # Service's plugin_path here also keeps a test process from loading a
+    # stale plugin out of the installed default directory.
+    if(TARGET macha-torrent)
+        target_compile_definitions(macha-tests PRIVATE
+            MACHA_TEST_TORRENT_PLUGIN="$<TARGET_FILE:macha-torrent>"
+            MACHA_TEST_PLUGIN_DIR="${MACHA_PLUGIN_BUILD_DIR}")
+        add_dependencies(macha-tests macha-torrent)
+    endif()
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(macha-tests PRIVATE -Wall -Wextra -Wpedantic)
         if(MACHA_WARNINGS_AS_ERRORS)
@@ -555,11 +590,13 @@ install(TARGETS macha-metadata-repair macha-metadata-dump RUNTIME DESTINATION ${
 install(TARGETS macha_core
         LIBRARY DESTINATION ${MACHA_PRIVATE_LIBDIR}
         RUNTIME DESTINATION ${MACHA_PRIVATE_LIBDIR})
-# Subsystem plugins (none ship yet -- see
-# TODO/2026-09-05-subsystem-plugin-isolation-plan.md Phase 1/2) install here;
-# create it empty now so operators/packaging know where that is even before
-# the first plugin exists.
+# Subsystem plugins install here (Config::plugin_path defaults to it). The
+# directory is created even when no plugin was built, so an operator can see
+# where one would go and a scan of it is simply empty.
 install(DIRECTORY DESTINATION ${MACHA_PLUGIN_INSTALL_DIR})
+if(TARGET macha-torrent)
+    install(TARGETS macha-torrent LIBRARY DESTINATION ${MACHA_PLUGIN_INSTALL_DIR})
+endif()
 
 if(MACHA_INSTALL_SYSTEMD)
     if(NOT UNIX)

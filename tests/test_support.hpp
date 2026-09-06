@@ -134,6 +134,12 @@ inline Config config_for(const std::filesystem::path& path, const std::filesyste
     c.dead_after = 500ms;
     c.connect_timeout = 500ms;
     c.bootstrap = std::move(bootstrap);
+    // plugin_path is deliberately left unset: an ordinary test wants no
+    // subsystem plugins at all, and loading them costs a dlopen of libtorrent
+    // and its dependencies in every one of the several hundred isolated test
+    // processes. A test that needs the real plugin points plugin_path at this
+    // build's MACHA_TEST_PLUGIN_DIR itself -- never at the installed default,
+    // which could hold a stale build.
 
     if (profile == ConfigProfile::functional) {
         c.replication = 3;
