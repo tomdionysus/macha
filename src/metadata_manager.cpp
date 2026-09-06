@@ -1698,11 +1698,22 @@ MetadataRecord MetadataManager::mutate_impl(
 
         Bytes delta_payload;
         std::optional<MetadataDelta> delta;
-        if (!clear_merge_parent_topology) {
-            if (exact_delta)
-                delta = std::move(supplied_delta);
-            else
-                delta = metadata_delta(*before, snapshot);
+        if (exact_delta) {
+            delta = std::move(supplied_delta);
+            // An exact caller describes only its own edit; the branch topology
+            // it inherited is settled here. The first write after a
+            // reconciliation leaves the merge commit's merge_parents behind
+            // (cleared above), and DLT6 carries that set and the conflict set
+            // together or not at all. Until 0.28.2 this write was forced to a
+            // full snapshot instead -- 3-30 s and 15 MB per replica on the
+            // cluster, after every one of ~100 merges a day.
+            if (clear_merge_parent_topology || delta->replace_merge_parents ||
+                delta->replace_conflicts) {
+                delta->replace_merge_parents = snapshot.merge_parents;
+                delta->replace_conflicts = snapshot.conflicts;
+            }
+        } else {
+            delta = metadata_delta(*before, snapshot);
         }
         if (delta) {
             auto encoded = encode_metadata_delta(*delta);
