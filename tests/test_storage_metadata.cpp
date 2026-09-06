@@ -2468,6 +2468,216 @@ MACHA_FAST_TEST("storage_metadata",
     CHECK(after_duplicate->record.payload == child.payload);
 }
 
+namespace {
+MetadataSnapshot dlt7_base_snapshot() {
+    auto base = decode_snapshot(genesis_metadata().payload);
+    base.metadata_voters.clear();
+    base.metadata_write_replicas_required = 1;
+    base.retention_baseline_complete = true;
+    return base;
+}
+
+GarbageRef tombstone(uint8_t salt) {
+    return GarbageRef{object_id(pattern(64, salt)), 1000 + salt, random_node_id()};
+}
+} // namespace
+
+MACHA_FAST_TEST("storage_metadata", test_metadata_dlt7_presence_flags_round_trip) {
+    // DLT7 carries a presence flag per topology set (and one for canonical
+    // tombstone order). Each combination must replay to exactly the target
+    // snapshot bytes, and the plain DLT5 case must stay DLT5.
+    auto parent = dlt7_base_snapshot();
+    MetadataConflict standing;
+    standing.kind = MetadataConflictKind::namespace_entry;
+    standing.key = "/standing";
+    standing.left_head = sha256(pattern(51));
+    standing.right_head = sha256(pattern(52));
+    parent.conflicts.emplace(metadata_conflict_id(standing), standing);
+    parent.merge_parents = {sha256(pattern(53))};
+    // Append (legacy) order: guaranteed non-canonical by reversing a sort.
+    parent.garbage = {tombstone(3), tombstone(1), tombstone(2)};
+    canonicalise_garbage(parent.garbage);
+    std::reverse(parent.garbage.begin(), parent.garbage.end());
+    REQUIRE(!garbage_is_canonical(parent.garbage));
+
+    const auto round_trip = [&](const MetadataSnapshot& after, char expected_version) {
+        auto delta = metadata_delta(parent, after);
+        REQUIRE(delta.has_value());
+        const auto encoded = encode_metadata_delta(*delta);
+        REQUIRE(encoded.size() >= 8);
+        if (encoded[7] != expected_version)
+            std::cout << "dlt7 round trip: got DLT" << encoded[7] << " expected DLT"
+                      << expected_version << " parents=" << delta->replace_merge_parents.has_value()
+                      << " conflicts=" << delta->replace_conflicts.has_value()
+                      << " canonical=" << delta->canonical_garbage << '\n';
+        CHECK(encoded[7] == expected_version);
+        const auto decoded = decode_metadata_delta(encoded);
+        CHECK(decoded.replace_merge_parents.has_value() == delta->replace_merge_parents.has_value());
+        CHECK(decoded.replace_conflicts.has_value() == delta->replace_conflicts.has_value());
+        CHECK(decoded.canonical_garbage == delta->canonical_garbage);
+        CHECK(encode_snapshot(apply_metadata_delta(parent, decoded)) == encode_snapshot(after));
+        return encoded.size();
+    };
+
+    // Nothing topological, tombstones untouched: DLT5 as before.
+    auto plain = parent;
+    plain.mutation_sequences[random_node_id()] = 1;
+    round_trip(plain, '5');
+
+    // Only merge_parents changed.
+    auto parents_only = parent;
+    parents_only.merge_parents.clear();
+    const auto parents_bytes = round_trip(parents_only, '7');
+    CHECK(parents_bytes < 512);
+
+    // Only conflicts changed.
+    auto conflicts_only = parent;
+    conflicts_only.conflicts.clear();
+    round_trip(conflicts_only, '7');
+
+    // Both changed: still DLT6, so a mixed-version cluster keeps its cheap
+    // merges through a rolling upgrade.
+    auto both = parent;
+    both.merge_parents.clear();
+    both.conflicts.clear();
+    round_trip(both, '6');
+
+    // Canonical tombstone order alone (a reconciliation's union over an
+    // append-ordered primary parent): expressible now, was a full snapshot.
+    auto canonical = parent;
+    canonicalise_garbage(canonical.garbage);
+    REQUIRE(garbage_is_canonical(canonical.garbage));
+    auto delta = metadata_delta(parent, canonical);
+    REQUIRE(delta.has_value());
+    CHECK(delta->canonical_garbage);
+    CHECK(delta->upsert_garbage.empty());
+    CHECK(delta->erase_garbage.empty());
+    round_trip(canonical, '7');
+
+    // Canonical order plus a new tombstone and an erased one.
+    auto edited = canonical;
+    edited.garbage.erase(edited.garbage.begin());
+    edited.garbage.push_back(tombstone(0));
+    canonicalise_garbage(edited.garbage);
+    round_trip(edited, '7');
+
+    // A hand-built DLT6 body with both lists still decodes to both sets.
+    MetadataDelta six;
+    six.replace_merge_parents = std::vector<Hash256>{};
+    six.replace_conflicts = std::map<std::string, MetadataConflict, std::less<>>{};
+    const auto six_encoded = encode_metadata_delta(six);
+    CHECK(six_encoded[7] == '6');
+    const auto six_decoded = decode_metadata_delta(six_encoded);
+    CHECK(six_decoded.replace_merge_parents.has_value());
+    CHECK(six_decoded.replace_conflicts.has_value());
+    CHECK(!six_decoded.canonical_garbage);
+}
+
+MACHA_FAST_TEST("storage_metadata", test_metadata_merge_over_append_ordered_tombstones_is_a_delta) {
+    // On the cluster (2026-09-06) 4 of 5 reconciliations were 5-8 MB full
+    // frames: the merge canonicalises the tombstone union by ObjectId while
+    // the primary parent's vector was in append order, and pre-DLT7 deltas
+    // could not reorder retained tombstones.
+    auto base = dlt7_base_snapshot();
+    base.garbage = {tombstone(9), tombstone(4), tombstone(7)};
+    canonicalise_garbage(base.garbage);
+    std::reverse(base.garbage.begin(), base.garbage.end());
+    FsEntry directory;
+    directory.type = EntryType::directory;
+    directory.mode = 0755;
+    auto left = base;
+    left.entries["/left"] = directory;
+    left.garbage.push_back(tombstone(2));
+    auto right = base;
+    right.entries["/right"] = directory;
+    right.garbage.push_back(tombstone(5));
+    REQUIRE(!garbage_is_canonical(left.garbage));
+
+    auto merged = merge_metadata_snapshots(base, left, right, sha256(pattern(61)),
+                                           sha256(pattern(62)));
+    CHECK(garbage_is_canonical(merged.snapshot.garbage));
+    CHECK(merged.snapshot.garbage.size() == 5);
+    merged.snapshot.merge_parents = {sha256(pattern(62))};
+
+    auto delta = metadata_delta(left, merged.snapshot);
+    REQUIRE(delta.has_value());
+    CHECK(delta->canonical_garbage);
+    const auto encoded = encode_metadata_delta(*delta);
+    CHECK(encoded[7] == '7');
+    CHECK(encoded.size() < encode_snapshot(merged.snapshot).size());
+    CHECK(encode_snapshot(apply_metadata_delta(left, decode_metadata_delta(encoded))) ==
+          encode_snapshot(merged.snapshot));
+}
+
+MACHA_FAST_TEST("storage_metadata", test_metadata_superseded_conflicts_leave_the_snapshot) {
+    // A conflict whose subject a later mutation rewrote is decided: the
+    // later write is the resolution. 116 such records (336 KB) stood in the
+    // production snapshot on 2026-09-06 -- 49 on media paths both writers had
+    // since republished, 67 on catalogue roots the scanner had long moved on
+    // from -- and rode along in every merge delta.
+    auto base = dlt7_base_snapshot();
+    FsEntry file;
+    file.type = EntryType::file;
+    file.mode = 0644;
+    file.size = 10;
+    file.version = 1;
+    base.entries["/song.mp3"] = file;
+    base.catalogue_root = object_id(pattern(70));
+
+    auto left = base;
+    left.entries["/song.mp3"].size = 20;
+    left.entries["/song.mp3"].version = 2;
+    left.catalogue_root = object_id(pattern(71));
+    auto right = base;
+    right.entries["/song.mp3"].size = 30;
+    right.entries["/song.mp3"].version = 2;
+    right.catalogue_root = object_id(pattern(72));
+
+    auto merged = merge_metadata_snapshots(base, left, right, sha256(pattern(81)),
+                                           sha256(pattern(82)));
+    REQUIRE(merged.conflicts_created == 2);
+    CHECK(merged.conflicts_superseded == 0);
+    REQUIRE(merged.snapshot.conflicts.size() == 2);
+    // The merge keeps the common-ancestor values visible.
+    CHECK(merged.snapshot.entries.at("/song.mp3").size == 10);
+    CHECK(merged.snapshot.catalogue_root == base.catalogue_root);
+
+    // Nothing decided yet: pruning is a no-op.
+    auto untouched = merged.snapshot;
+    CHECK(prune_superseded_conflicts(untouched) == 0);
+    CHECK(untouched.conflicts.size() == 2);
+
+    // A later write to the path decides the namespace conflict only.
+    auto rewritten = merged.snapshot;
+    rewritten.entries["/song.mp3"].size = 40;
+    rewritten.entries["/song.mp3"].version = 3;
+    CHECK(prune_superseded_conflicts(rewritten) == 1);
+    REQUIRE(rewritten.conflicts.size() == 1);
+    CHECK(rewritten.conflicts.begin()->second.kind == MetadataConflictKind::catalogue_root);
+
+    // Removing the path decides it too; a new catalogue root decides the other.
+    auto removed = merged.snapshot;
+    removed.entries.erase("/song.mp3");
+    removed.catalogue_root = object_id(pattern(73));
+    CHECK(prune_superseded_conflicts(removed) == 2);
+    CHECK(removed.conflicts.empty());
+
+    // And the next merge over a decided subject drops the stale record itself.
+    auto later_left = rewritten;
+    later_left.entries["/other"] = file;
+    auto later_right = rewritten;
+    later_right.entries["/another"] = file;
+    // Reintroduce the stale namespace conflict on both sides as a merge
+    // would have carried it, with the subject already rewritten.
+    for (auto* side : {&later_left, &later_right})
+        side->conflicts = merged.snapshot.conflicts;
+    auto later = merge_metadata_snapshots(rewritten, later_left, later_right,
+                                          sha256(pattern(83)), sha256(pattern(84)));
+    CHECK(later.conflicts_created == 0);
+    CHECK(later.conflicts_superseded == 1);
+    CHECK(later.snapshot.conflicts.size() == 1);
+}
+
 MACHA_FAST_TEST("storage_metadata", test_metadata_conflict_resolution_is_not_resurrected_by_merge) {
     const auto genesis = genesis_metadata();
     auto base = decode_snapshot(genesis.payload);
@@ -2564,7 +2774,12 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_merge_delta_preserves_standing
     REQUIRE(delta.has_value());
     const auto encoded = encode_metadata_delta(*delta);
     REQUIRE(encoded.size() >= 8);
-    CHECK(encoded[7] == '6');
+    // DLT7: only merge_parents changed, so the standing conflict set is not
+    // carried -- the delta is a few hundred bytes, not the conflict set.
+    CHECK(encoded[7] == '7');
+    CHECK(delta->replace_merge_parents.has_value());
+    CHECK(!delta->replace_conflicts.has_value());
+    CHECK(encoded.size() < 1024);
     const auto replayed = apply_metadata_delta(left, decode_metadata_delta(encoded));
     CHECK(replayed.conflicts.contains(standing_id));
     CHECK(encode_snapshot(replayed) == merge.payload);
@@ -2634,7 +2849,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_child_of_merge_commit_re
     REQUIRE(delta.has_value());
     const auto encoded = encode_metadata_delta(*delta);
     REQUIRE(encoded.size() >= 8);
-    CHECK(encoded[7] == '6');
+    CHECK(encoded[7] == '7');
+    CHECK(!delta->replace_conflicts.has_value());
     const auto replayed = apply_metadata_delta(parent, decode_metadata_delta(encoded));
     CHECK(replayed.merge_parents.empty());
     CHECK(replayed.conflicts.contains(standing_id));
@@ -3795,10 +4011,24 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_rejects_unrepresentable_
               [](const GarbageRef& a, const GarbageRef& b) { return a.id < b.id; });
     REQUIRE(reordered.garbage != before.garbage);
 
-    // DLT6 can erase, replace and append tombstones, but cannot reorder retained
-    // entries. Claiming this transition is compact would reconstruct a
-    // semantically equal but byte-different immutable record.
-    CHECK(!metadata_delta(before, reordered).has_value());
+    // DLT5/6 can erase, replace and append tombstones, but cannot reorder
+    // retained entries. A reordering *into* canonical ObjectId order is what
+    // DLT7 expresses (the delta sorts after applying its edits); any other
+    // reordering is still not compact, because claiming it were would
+    // reconstruct a semantically equal but byte-different immutable record.
+    auto canonical = metadata_delta(before, reordered);
+    REQUIRE(canonical.has_value());
+    CHECK(canonical->canonical_garbage);
+    CHECK(encode_snapshot(apply_metadata_delta(before, *canonical)) == encode_snapshot(reordered));
+
+    GarbageRef third{object_id(pattern(12289)), 30, random_node_id()};
+    auto three = reordered;
+    three.garbage.push_back(third);
+    canonicalise_garbage(three.garbage);
+    auto scrambled = three;
+    std::swap(scrambled.garbage[0], scrambled.garbage[2]);
+    REQUIRE(!garbage_is_canonical(scrambled.garbage));
+    CHECK(!metadata_delta(three, scrambled).has_value());
 }
 
 MACHA_TEST("storage_metadata", test_local_metadata_store_falls_back_from_invalid_delta) {

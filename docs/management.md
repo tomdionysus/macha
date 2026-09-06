@@ -49,6 +49,25 @@ the cluster keeps publishing.
 `diagnostics.filesystem.publication_retries_backed_off` in `GET /api/v1/status`
 carry the counts.
 
+## Metadata conflicts
+
+When two branches of the namespace changed the same path (or the catalogue
+root) differently and are reconciled, the merge keeps the common-ancestor
+value visible and records both alternatives as a first-class conflict. A
+conflict leaves the snapshot in one of two ways: a later mutation of its
+subject decides it (any write to or removal of the path, or a new catalogue
+root — the later write *is* the resolution, and the record is pruned at the
+next commit or merge), or an operator resolves it here.
+
+- `GET /api/v1/manage/metadata/conflicts` → `{"generation": N, "conflicts": [{id, kind: "namespace_entry"|"catalogue_root", key, left_head, right_head, base, left, right}]}` — for a namespace entry `base`/`left`/`right` are `{type, size, mtime_ns, version, extents}` or `null` (absent on that side); for a catalogue root they are object ids or `null`.
+- `POST /api/v1/manage/metadata/conflicts/{id}/resolve?choice=left|right|base` — installs that alternative for the subject and drops the record in one metadata commit (`204`; `409 not_standing` if the conflict is no longer standing; `400 bad_choice`).
+
+`diagnostics.metadata.{conflicts, namespace_conflicts, catalogue_conflicts}`
+in `GET /api/v1/status` are the standing counts;
+`conflicts_superseded` and `conflicts_resolved` count the ones that left the
+snapshot since this process started. `diagnostics.metadata.tombstones` is
+the retirement-tombstone count carried in the snapshot.
+
 ## Management root and cluster identity associations
 
 `GET /api/v1/manage` is the stable root for management capabilities. Existing catalogue and MachaDFS management resources remain beneath this prefix, and future privileged administrative actions should be added here rather than creating unrelated top-level mutation APIs.
