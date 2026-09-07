@@ -655,3 +655,48 @@ Also on record from this pass, not changed:
   operator's live TV playback; every later deploy restarted one node at a
   time, ≥ 5 min apart, after checking for playback activity, and three
   restarts were deferred by that check.
+
+## 0.32.17 deploy — the media profile answers with facts (2026-09-07 21:15–22:20)
+
+Deployed to gbni-1 (staged tree built on gbni-2, relayed via the operator
+workstation because gbni-2 has no layer-3 path) and es-1 (built in place,
+`-j2`, `nice`/`ionice`). All three carry the same binary
+(`dffbfd42ab6647652e11ba3576ff8c70`); gbni-2 restarted onto it too, but it
+is partitioned and cannot serve.
+
+Verified on gbni-1 and es-1: six catalogue titles each,
+`GET /api/v1/catalogue/media/<id>/profile` → 200 with schema 3 in every
+case, no `profile_unavailable`. Both priority classes observed as designed:
+`1:23:45` took 3.3 s on gbni-1 the first time (probe, then persist) and
+0.0 s on the next call; the same title answered in 0.0 s on es-1 without a
+local probe, so the persisted copy had propagated through the catalogue.
+
+Instruction contract re-checked on gbni-1 against the Dolby Vision title:
+facts report `matroska` / `matroska,webm`, hevc Main 10, 10-bit, level 153,
+`smpte2084`, `dolby_vision_profile=8`, eac3 Atmos 5.1, and
+`operations{direct, copy_into_fmp4{video,audio}, transcode_video,
+transcode_audio}` all true. `direct` and `remux` both copy hevc + eac3 at
+6 channels; `remux` with `audio: transcode` gives copy/hevc + aac stereo;
+`transcode` gives h264 + aac. A request with no mode is a 400. `operations`
+is computed on the answering node from that node's build against that
+file's streams — per node and per source, never cluster-wide.
+
+The import wrapper took `rc=11` on both writers at the restart and retried
+into attempt 4 on its own; both rsyncs are running again.
+
+### Open: gbni-2 is partitioned, and the error class is wrong for it
+
+gbni-2 is associated at −46 dBm with SSH working, but has no layer-3 path:
+it cannot reach the gateway, gbni-1, es-1 or the internet, and gbni-1
+cannot reach it either. An ARP flush did not recover it. Its catalogue is
+one item behind, `dd` of a film through its mount returns 0 bytes, and the
+profile endpoint answers `422 profile_failed — open media: Input/output
+error` for anything whose data is not already local.
+
+That answer is wrong in kind, not just in circumstance. "This node cannot
+reach the data" and "this file is corrupt" are currently the same 422. The
+first should tell a client to try another node; the second should tell it
+to stop. Proposed, not yet implemented: classify an unreadable-source EIO
+as a distinct retryable status, and keep `profile_failed` for a source that
+opened and would not parse. Deciding the status code and error name is an
+interface call, so it is held for the operator.
