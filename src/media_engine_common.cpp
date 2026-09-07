@@ -166,6 +166,10 @@ std::string hls_variant_stream_inf(const PlaybackPlan& plan, const MediaStreamIn
     return out;
 }
 
+const char* media_container_name(MediaContainer container) noexcept {
+    return container == MediaContainer::mpegts ? "mpegts" : "fmp4";
+}
+
 std::string playback_mode_name(PlaybackMode mode) {
     switch (mode) {
     case PlaybackMode::direct: return "direct";

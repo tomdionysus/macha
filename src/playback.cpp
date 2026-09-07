@@ -114,6 +114,7 @@ std::string file_mime(std::string_view name) {
     auto ext = extension(name);
     if (ext == ".m3u8") return "application/vnd.apple.mpegurl";
     if (ext == ".m4s" || ext == ".mp4") return "video/mp4";
+    if (ext == ".ts") return "video/mp2t";
     if (ext == ".vtt") return "text/vtt; charset=utf-8";
     return "application/octet-stream";
 }
@@ -243,6 +244,8 @@ struct ClientCapabilities {
     std::set<std::string> video_codecs{"h264"};
     std::set<std::string> audio_codecs{"aac", "mp3"};
     bool hls_fmp4{true};
+    // MPEG-TS HLS segments, for players that cannot take fragmented MP4.
+    bool hls_ts{false};
     std::optional<int> max_width;
     std::optional<int> max_height;
     // Listing "hevc" says the client has a decoder for the codec, not that
@@ -303,6 +306,7 @@ ClientCapabilities parse_capabilities(const Json* value) {
     read_string_set(value, "video_codecs", caps.video_codecs);
     read_string_set(value, "audio_codecs", caps.audio_codecs);
     if (auto hls = value->find("hls_fmp4"); hls && hls->isBool()) caps.hls_fmp4 = hls->asBool();
+    if (auto ts = value->find("hls_ts"); ts && ts->isBool()) caps.hls_ts = ts->asBool();
     caps.max_width = optional_int(value->find("max_width"));
     caps.max_height = optional_int(value->find("max_height"));
     if (caps.max_width && *caps.max_width <= 0) throw std::invalid_argument("capabilities.max_width must be positive");
@@ -335,6 +339,7 @@ std::string describe_capabilities(const ClientCapabilities& caps) {
     std::string out = "containers=" + join(caps.containers) + " video=" + join(caps.video_codecs) +
                       " audio=" + join(caps.audio_codecs) +
                       " hls_fmp4=" + (caps.hls_fmp4 ? "yes" : "no") +
+                      " hls_ts=" + (caps.hls_ts ? "yes" : "no") +
                       " bit_depth=" + std::to_string(caps.max_video_bit_depth) +
                       " hdr=" + (caps.hdr_transfers.empty() ? std::string("none") : join(caps.hdr_transfers));
     if (caps.max_width) out += " max_width=" + std::to_string(*caps.max_width);
@@ -444,7 +449,15 @@ PlaybackPlan negotiate(const MediaProbeResult& probe, std::string_view logical_p
         plan.mode = PlaybackMode::direct;
         return plan;
     }
-    if (!caps.hls_fmp4) throw std::invalid_argument("client cannot accept fragmented-MP4 HLS");
+    // Fragmented MP4 unless the client cannot take it and says it takes
+    // MPEG-TS instead (a 2017 TV's native HLS player, 2026-09-07).
+    if (caps.hls_fmp4) {
+        plan.container = MediaContainer::fmp4;
+    } else if (caps.hls_ts) {
+        plan.container = MediaContainer::mpegts;
+    } else {
+        throw std::invalid_argument("client cannot accept fragmented-MP4 or MPEG-TS HLS");
+    }
 
     const auto source_video_codec = video ? lower(video->codec) : std::string{};
     const auto source_audio_codec = audio ? lower(audio->codec) : std::string{};
@@ -584,7 +597,9 @@ Json preferences_json(const PlaybackPreferences& preferences) {
 
 Json output_json(const MediaProbeResult& probe, const PlaybackPlan& plan,
                  std::string_view source_format) {
-    Json::Object out{{"format", plan.mode == PlaybackMode::direct ? std::string(source_format) : "mp4"}};
+    Json::Object out{{"format", plan.mode == PlaybackMode::direct
+                                    ? std::string(source_format)
+                                    : std::string(media_container_name(plan.container))}};
 
     if (const auto* video = stream_at(probe, plan.video_stream); video && plan.video != MediaTransform::omit) {
         Json::Object value{{"source_stream", video->index},
@@ -852,7 +867,7 @@ struct PlaybackManager::Impl {
         for (const auto& value : caps.video_codecs) canonical << value << ',';
         canonical << "|audio=";
         for (const auto& value : caps.audio_codecs) canonical << value << ',';
-        canonical << "|hls=" << caps.hls_fmp4
+        canonical << "|hls=" << caps.hls_fmp4 << "|ts=" << caps.hls_ts
                   << "|cw=" << caps.max_width.value_or(-1)
                   << "|ch=" << caps.max_height.value_or(-1)
                   << "|mode=" << prefs.mode
@@ -1335,6 +1350,7 @@ struct PlaybackManager::Impl {
             << plan.video_codec << '|' << plan.audio_codec << '|'
             << (plan.target_height ? *plan.target_height : -1) << '|'
             << (plan.target_video_bitrate ? *plan.target_video_bitrate : 0) << '|'
+            << static_cast<int>(plan.container) << '|'
             // The seek position is deliberately not part of the key: a cached
             // plan is re-seeked on a hit (reseek_hls_vod), so a representation
             // change at a new position no longer re-opens and re-indexes the
@@ -1748,9 +1764,11 @@ struct PlaybackManager::Impl {
 
     static std::optional<uint64_t> segment_index(std::string_view name) {
         constexpr std::string_view prefix = "segment-";
-        constexpr std::string_view suffix = ".m4s";
-        if (!name.starts_with(prefix) || !name.ends_with(suffix)) return {};
-        auto number = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+        if (!name.starts_with(prefix)) return {};
+        std::string_view number = name.substr(prefix.size());
+        if (number.ends_with(".m4s")) number.remove_suffix(4);
+        else if (number.ends_with(".ts")) number.remove_suffix(3);
+        else return {};
         uint64_t index = 0;
         auto [end, ec] = std::from_chars(number.data(), number.data() + number.size(), index);
         if (ec != std::errc{} || end != number.data() + number.size()) return {};

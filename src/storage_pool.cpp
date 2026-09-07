@@ -1027,6 +1027,7 @@ LocalStoreDiagnostics StoragePool::diagnostics() const {
         total.loose_reaffirmation_fast_paths += current.loose_reaffirmation_fast_paths;
         total.loose_reaffirmation_full_validations +=
             current.loose_reaffirmation_full_validations;
+        total.presence_index_entries += current.presence_index_entries;
     }
     return total;
 }

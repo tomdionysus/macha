@@ -14,6 +14,15 @@ read ahead (UI session measurement: 30 fragments ≈ the 98 s).
   not_ready until the first fragment exists. Seeking is unchanged: PATCH
   seek_ms creates a new generation, and the client's timeline comes from
   the session's duration, not the playlist.
+- **MPEG-TS segments** for clients that cannot take fragmented MP4: a
+  client sending `hls_fmp4: false, hls_ts: true` gets `.ts` segments
+  (libavformat's `mpegts` muxer: Annex B H.264/HEVC, ADTS AAC, no init
+  segment, `output.format` `mpegts`, playlist version 3 without
+  `EXT-X-MAP`). The operator's 2017 Samsung TV plays HLS through Tizen's
+  native player, which rendered fMP4 video and dropped the muxed AAC even
+  with a correct `CODECS` line; direct play of the same title had sound.
+  Fragment boundaries are the same planned cuts as fMP4 (one segment per
+  flush before a keyframe).
 
 ## 0.32.13 — The writer keeps a copy and the second one is prompt; a background effort ceiling (development)
 

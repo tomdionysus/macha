@@ -25,6 +25,7 @@ struct MediaSegmentStore::Impl {
     std::shared_ptr<Bytes> init;
     std::vector<Segment> segments;
     std::vector<double> vod_segment_durations;
+    MediaContainer container{MediaContainer::fmp4};
     bool finished{};
     bool cancelled{};
     bool superseded{};
@@ -124,8 +125,10 @@ struct MediaSegmentStore::Impl {
 MediaSegmentStore::MediaSegmentStore(size_t max_ahead_segments, uint64_t memory_limit,
                                      std::filesystem::path spill_directory,
                                      std::chrono::milliseconds target_duration,
-                                     std::vector<double> vod_segment_durations)
+                                     std::vector<double> vod_segment_durations,
+                                     MediaContainer container)
     : impl_(std::make_unique<Impl>()) {
+    impl_->container = container;
     impl_->max_ahead = std::max<size_t>(2, max_ahead_segments);
     impl_->memory_limit = memory_limit;
     impl_->spill_directory = std::move(spill_directory);
@@ -136,6 +139,26 @@ MediaSegmentStore::MediaSegmentStore(size_t max_ahead_segments, uint64_t memory_
 }
 
 MediaSegmentStore::~MediaSegmentStore() = default;
+
+MediaContainer MediaSegmentStore::container() const noexcept {
+    return impl_->container;
+}
+
+namespace {
+// "segment-000123.m4s" / "segment-000123.ts" -> 123
+std::optional<uint64_t> segment_number(std::string_view name) {
+    constexpr std::string_view prefix = "segment-";
+    if (!name.starts_with(prefix)) return std::nullopt;
+    std::string_view rest = name.substr(prefix.size());
+    if (rest.ends_with(".m4s")) rest.remove_suffix(4);
+    else if (rest.ends_with(".ts")) rest.remove_suffix(3);
+    else return std::nullopt;
+    uint64_t index = 0;
+    auto [end, ec] = std::from_chars(rest.data(), rest.data() + rest.size(), index);
+    if (ec != std::errc{} || end != rest.data() + rest.size()) return std::nullopt;
+    return index;
+}
+} // namespace
 
 bool MediaSegmentStore::attach_memory_ledger(RetainedMemoryLedger& ledger) {
     std::lock_guard lock(impl_->mutex);
@@ -153,9 +176,11 @@ bool MediaSegmentStore::wait_ready(std::chrono::milliseconds timeout) {
     std::unique_lock lock(impl_->mutex);
     impl_->cv.wait_for(lock, timeout, [&] {
         return impl_->cancelled || !impl_->error.empty() ||
-               (impl_->init && !impl_->segments.empty()) || impl_->finished;
+               ((impl_->init || impl_->container == MediaContainer::mpegts) &&
+                !impl_->segments.empty()) ||
+               impl_->finished;
     });
-    return impl_->init && !impl_->segments.empty();
+    return (impl_->init || impl_->container == MediaContainer::mpegts) && !impl_->segments.empty();
 }
 
 std::string MediaSegmentStore::playlist() const {
@@ -176,13 +201,16 @@ std::string MediaSegmentStore::playlist() const {
     const size_t produced = std::min(impl_->segments.size(), durations.size());
     const bool complete = impl_->finished || produced == durations.size();
     std::ostringstream out;
-    out << "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:" << static_cast<int>(std::ceil(longest))
+    const bool mpegts = impl_->container == MediaContainer::mpegts;
+    out << "#EXTM3U\n#EXT-X-VERSION:" << (mpegts ? 3 : 7)
+        << "\n#EXT-X-TARGETDURATION:" << static_cast<int>(std::ceil(longest))
         << "\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:EVENT\n"
-        << "#EXT-X-INDEPENDENT-SEGMENTS\n"
-        << "#EXT-X-MAP:URI=\"init.mp4\"\n";
+        << "#EXT-X-INDEPENDENT-SEGMENTS\n";
+    if (!mpegts) out << "#EXT-X-MAP:URI=\"init.mp4\"\n";
     for (size_t i = 0; i < produced; ++i) {
         out << "#EXTINF:" << std::fixed << std::setprecision(3) << durations[i] << ",\n"
-            << "segment-" << std::setfill('0') << std::setw(6) << i << ".m4s\n";
+            << "segment-" << std::setfill('0') << std::setw(6) << i
+            << (mpegts ? ".ts" : ".m4s") << "\n";
     }
     if (complete) out << "#EXT-X-ENDLIST\n";
     return out.str();
@@ -197,13 +225,9 @@ std::optional<Bytes> MediaSegmentStore::object(std::string_view name) const {
             if (!impl_->init) return {};
             return *impl_->init;
         }
-        constexpr std::string_view prefix = "segment-";
-        constexpr std::string_view suffix = ".m4s";
-        if (!name.starts_with(prefix) || !name.ends_with(suffix)) return {};
-        auto number = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
-        uint64_t index = 0;
-        auto [end, ec] = std::from_chars(number.data(), number.data() + number.size(), index);
-        if (ec != std::errc{} || end != number.data() + number.size() || index >= impl_->segments.size()) return {};
+        const auto parsed = segment_number(name);
+        if (!parsed || *parsed >= impl_->segments.size()) return {};
+        const uint64_t index = *parsed;
         resident = impl_->segments[static_cast<size_t>(index)].memory;
         spill = impl_->segments[static_cast<size_t>(index)].spill;
     }
@@ -223,13 +247,9 @@ std::optional<Bytes> MediaSegmentStore::object(std::string_view name) const {
 
 std::optional<Bytes> MediaSegmentStore::wait_object(std::string_view name,
                                                     std::chrono::milliseconds timeout) const {
-    constexpr std::string_view prefix = "segment-";
-    constexpr std::string_view suffix = ".m4s";
-    if (!name.starts_with(prefix) || !name.ends_with(suffix)) return object(name);
-    auto number = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
-    uint64_t index = 0;
-    auto [end, ec] = std::from_chars(number.data(), number.data() + number.size(), index);
-    if (ec != std::errc{} || end != number.data() + number.size()) return {};
+    const auto parsed = segment_number(name);
+    if (!parsed) return object(name);
+    const uint64_t index = *parsed;
 
     std::unique_lock lock(impl_->mutex);
     if (!impl_->vod_segment_durations.empty() && index >= impl_->vod_segment_durations.size()) return {};
