@@ -1221,7 +1221,8 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                                     Clock::now() - stream_info_started)
                                     .count();
     if (stream_info_rc < 0 && input.timed_out())
-        throw std::runtime_error("playback pipeline timed out while reading stream information");
+        throw MediaError(MediaFailure::timed_out,
+                         "playback pipeline timed out while reading stream information");
     av_require(stream_info_rc, "read stream information");
     if (cancelled.load()) throw std::runtime_error("stream cancelled");
     // The deadline above is a startup guard only. Once the streams are known,
@@ -1670,7 +1671,8 @@ class LibavMediaEngine final : public MediaEngine {
         auto* format = input.get();
         auto rc = avformat_find_stream_info(format, nullptr);
         if (rc < 0 && input.timed_out())
-            throw std::runtime_error("VOD planning timed out while reading stream information");
+            throw MediaError(MediaFailure::timed_out,
+                             "VOD planning timed out while reading stream information");
         av_require(rc, "read stream information for VOD planning");
 
         if (result.playback.video != MediaTransform::omit &&
@@ -1680,7 +1682,8 @@ class LibavMediaEngine final : public MediaEngine {
             if (result.playback.video == MediaTransform::copy) {
                 materialise_deferred_seek_index(format, result.playback.video_stream, requested_seek);
                 if (input.timed_out())
-                    throw std::runtime_error("VOD planning timed out while loading video seek index");
+                    throw MediaError(MediaFailure::timed_out,
+                                     "VOD planning timed out while loading video seek index");
                 double actual_seek = requested_seek;
                 result.segment_durations = indexed_vod_durations(
                     format, result.playback.video_stream, source_duration_seconds, requested_seek,
@@ -1757,7 +1760,8 @@ class LibavMediaEngine final : public MediaEngine {
                 // burned the whole-file case here).
                 materialise_deferred_seek_index(format, result.playback.video_stream, requested_seek);
                 if (input.timed_out())
-                    throw std::runtime_error("VOD planning timed out while loading video seek index");
+                    throw MediaError(MediaFailure::timed_out,
+                                     "VOD planning timed out while loading video seek index");
                 auto keyframes = video_keyframe_seconds(format, result.playback.video_stream);
                 double actual_seek = requested_seek;
                 if (const double snapped =
@@ -1839,7 +1843,7 @@ class LibavMediaEngine final : public MediaEngine {
         if (!stream_ready()) {
             auto probe_rc = avformat_find_stream_info(format, nullptr);
             if (probe_rc < 0 && input.timed_out())
-                throw std::runtime_error("subtitle probe timed out after " +
+                throw MediaError(MediaFailure::timed_out, "subtitle probe timed out after " +
                                          std::to_string(config_.probe_timeout.count()) + " ms");
             av_require(probe_rc, "read subtitle stream information");
         }
