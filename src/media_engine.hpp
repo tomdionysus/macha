@@ -38,6 +38,12 @@ struct MediaStreamInfo {
     bool forced{};
     uint64_t bitrate{};
     bool attached_picture{};
+    // Codec level as the container reports it (H.264: 41 = 4.1; HEVC: 153 =
+    // 5.1), and the colour transfer name ("smpte2084" = PQ/HDR10 and Dolby
+    // Vision profile 8, "arib-std-b67" = HLG), for HLS CODECS strings and
+    // the HDR negotiation gate. Last, so positional initialisers keep working.
+    int level{};
+    std::string color_transfer{};
     auto operator<=>(const MediaStreamInfo&) const = default;
 };
 
@@ -215,6 +221,15 @@ std::optional<HlsVodPlan> reseek_hls_vod(const HlsVodPlan&,
                                          std::chrono::milliseconds requested_seek);
 
 std::string playback_mode_name(PlaybackMode);
+// RFC 6381 codec string for one stream of a plan ("avc1.640029",
+// "hvc1.2.4.L153.B0", "mp4a.40.2", "ec-3"); `transcoded` describes the
+// libx264/AAC output instead of the source stream.
+std::string hls_codec_string(std::string_view codec, const MediaStreamInfo* stream, bool transcoded);
+// The EXT-X-STREAM-INF line of the master playlist for a plan: BANDWIDTH,
+// CODECS and RESOLUTION, so the player creates its source buffers from what
+// the segments really carry instead of inferring it from the init segment.
+std::string hls_variant_stream_inf(const PlaybackPlan& plan, const MediaStreamInfo* video,
+                                   const MediaStreamInfo* audio, uint64_t source_bitrate);
 std::string media_stream_type_name(MediaStreamType);
 
 } // namespace macha

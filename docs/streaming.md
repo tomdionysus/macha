@@ -148,7 +148,9 @@ A browser can describe its actual capabilities:
     "audio_codecs": ["aac", "mp3"],
     "hls_fmp4": true,
     "max_width": 3840,
-    "max_height": 2160
+    "max_height": 2160,
+    "video_bit_depth": 10,
+    "hdr": ["smpte2084", "arib-std-b67"]
   },
   "preferences": {
     "mode": "auto",
@@ -160,6 +162,8 @@ A browser can describe its actual capabilities:
 ```
 
 Default capabilities are intentionally conservative: MP4, H.264, AAC/MP3 and fragmented-MP4 HLS. `mode` is `auto`, `direct`, `remux` or `transcode`. A forced mode fails rather than silently choosing another mode.
+
+Listing a video codec says the client has a decoder for it, not that its pipeline takes any sample depth or transfer function. `video_bit_depth` (8-16, default 8) is the deepest sample depth the client decodes and `hdr` lists the transfer functions it presents (`smpte2084` for PQ, `arib-std-b67` for HLG; the boolean `true` means both, absent means none). In `auto` mode a source deeper than that, or with an HDR transfer the client did not list, is transcoded to 8-bit SDR H.264 and is not offered as direct play; the response's per-stream `bit_depth`, `level` and `color_transfer` fields say why. Transformed sessions are served as a master playlist (`master.m3u8`, one `EXT-X-STREAM-INF` with `BANDWIDTH`, `CODECS` and `RESOLUTION`) pointing at the media playlist (`media.m3u8`), so a player creates its source buffers from what the fragments really carry.
 
 The response separates requested preferences, resolved playback, original source metadata and actual output metadata. The `/api/v1` schema is currently owned by Macha and Macha Client and may be changed in place while there are no third-party implementations. A representative response is:
 

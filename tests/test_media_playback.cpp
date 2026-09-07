@@ -393,6 +393,48 @@ MACHA_FAST_TEST("media_playback", test_media_vod_index_planning_rejects_partial_
     CHECK(std::abs(seeked->actual_seek_seconds - 62.0) < 0.0005);
 }
 
+MACHA_FAST_TEST("media_playback", test_hls_codec_strings_describe_the_fragments) {
+    MediaStreamInfo hevc10;
+    hevc10.codec = "hevc";
+    hevc10.profile = "Main 10";
+    hevc10.bit_depth = 10;
+    hevc10.level = 153;
+    hevc10.width = 1920;
+    hevc10.height = 802;
+    MediaStreamInfo eac3;
+    eac3.codec = "eac3";
+    MediaStreamInfo h264_high;
+    h264_high.codec = "h264";
+    h264_high.profile = "High";
+    h264_high.level = 41;
+
+    CHECK(hls_codec_string("hevc", &hevc10, false) == "hvc1.2.4.L153.B0");
+    CHECK(hls_codec_string("h264", &h264_high, false) == "avc1.640029");
+    CHECK(hls_codec_string("eac3", &eac3, false) == "ec-3");
+    CHECK(hls_codec_string("ac3", nullptr, false) == "ac-3");
+    CHECK(hls_codec_string("aac", nullptr, false) == "mp4a.40.2");
+    // The libx264/AAC transcode output is described, not the source.
+    CHECK(hls_codec_string("h264", &hevc10, true) == "avc1.640029");
+    CHECK(hls_codec_string("aac", &eac3, true) == "mp4a.40.2");
+
+    PlaybackPlan remux;
+    remux.video = MediaTransform::copy;
+    remux.audio = MediaTransform::copy;
+    remux.video_codec = "hevc";
+    remux.audio_codec = "eac3";
+    const auto remux_inf = hls_variant_stream_inf(remux, &hevc10, &eac3, 10'887'601);
+    CHECK(remux_inf == "#EXT-X-STREAM-INF:BANDWIDTH=10887601,CODECS=\"hvc1.2.4.L153.B0,ec-3\",RESOLUTION=1920x802");
+
+    PlaybackPlan transcode;
+    transcode.video = MediaTransform::transcode;
+    transcode.audio = MediaTransform::transcode;
+    transcode.video_codec = "h264";
+    transcode.audio_codec = "aac";
+    transcode.target_height = 720;
+    const auto transcode_inf = hls_variant_stream_inf(transcode, &hevc10, &eac3, 10'887'601);
+    CHECK(transcode_inf == "#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS=\"avc1.640029,mp4a.40.2\",RESOLUTION=1724x720");
+}
+
 MACHA_TEST("media_playback", test_reseek_hls_vod_reuses_prepared_random_access_state) {
     HlsVodPlan remux;
     remux.playback.mode = PlaybackMode::remux;
@@ -1528,6 +1570,123 @@ MACHA_TEST("media_playback", test_attached_picture_audio_direct_play) {
 
     playback.stop();
     service.stop();
+}
+
+namespace {
+// The Ratatouille case: HEVC Main 10, PQ transfer (Dolby Vision profile 8),
+// E-AC3 audio, in Matroska.
+class HdrFakeMediaEngine final : public FakeMediaEngine {
+  public:
+    MediaProbeResult probe(const MediaSource& source, std::chrono::milliseconds timeout = {}) override {
+        auto result = FakeMediaEngine::probe(source, timeout);
+        result.streams.clear();
+        MediaStreamInfo video;
+        video.index = 0;
+        video.type = MediaStreamType::video;
+        video.codec = "hevc";
+        video.profile = "Main 10";
+        video.width = 1920;
+        video.height = 802;
+        video.bit_depth = 10;
+        video.level = 153;
+        video.color_transfer = "smpte2084";
+        video.default_stream = true;
+        MediaStreamInfo audio;
+        audio.index = 1;
+        audio.type = MediaStreamType::audio;
+        audio.codec = "eac3";
+        audio.channels = 6;
+        audio.sample_rate = 48000;
+        audio.default_stream = true;
+        result.streams = {video, audio};
+        return result;
+    }
+};
+} // namespace
+
+MACHA_TEST("media_playback", test_auto_transcodes_hdr_10bit_unless_the_client_opts_in) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/dv.mkv", 0644, getuid(), getgid());
+    auto bytes = pattern(128 * 1024 + 17);
+    auto writer = service.filesystem().open_write("/media/dv.mkv", true);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto media_id = file_media_id(service.filesystem().getattr("/media/dv.mkv"));
+
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback";
+    streaming.startup_timeout = 2s;
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             std::make_unique<HdrFakeMediaEngine>());
+    playback.start();
+
+    const auto create = [&](Json::Object caps) {
+        Json::Object root{{"media_id", media_id}, {"capabilities", Json(std::move(caps))},
+                          {"preferences", Json(Json::Object{{"mode", "auto"}})}};
+        auto text = Json(std::move(root)).dump();
+        HttpRequest request;
+        request.method = "POST";
+        request.path = "/api/v1/playback/sessions";
+        request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+        request.body.assign(text.begin(), text.end());
+        auto response = playback.handle(request);
+        REQUIRE(response.status == 201);
+        return Json::parse(std::string(response.body.begin(), response.body.end()));
+    };
+    const auto hevc_caps = [] {
+        return Json::Object{{"containers", Json::Array{Json("mp4"), Json("mkv")}},
+                            {"video_codecs", Json::Array{Json("h264"), Json("hevc")}},
+                            {"audio_codecs", Json::Array{Json("aac"), Json("eac3")}},
+                            {"hls_fmp4", true}};
+    };
+
+    // "hevc" alone is a decoder claim; the 10-bit PQ samples are transcoded
+    // (and not offered direct) until the client says its pipeline takes them.
+    auto conservative = create(hevc_caps());
+    CHECK(conservative.find("mode")->asString() == "transcode");
+    auto master = playback.handle([&] {
+        HttpRequest r;
+        r.method = "GET";
+        r.path = conservative.find("stream")->find("url")->asString();
+        r.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+        return r;
+    }());
+    REQUIRE(master.status == 200);
+    REQUIRE(master.stream != nullptr);
+    Bytes master_bytes(static_cast<size_t>(master.content_length()));
+    REQUIRE(master.stream->read(0, master_bytes) == master_bytes.size());
+    const std::string master_text(master_bytes.begin(), master_bytes.end());
+    // The E-AC-3 audio the client listed is copied; only the video is
+    // re-encoded, and the master playlist says so.
+    if (master_text.find("#EXT-X-STREAM-INF:") == std::string::npos)
+        std::fprintf(stderr, "master playlist body:\n%s\n", master_text.c_str());
+    CHECK(master_text.find("#EXT-X-STREAM-INF:") != std::string::npos);
+    CHECK(master_text.find("CODECS=\"avc1.640029,ec-3\"") != std::string::npos);
+    CHECK(master_text.find("\nmedia.m3u8\n") != std::string::npos);
+
+    // A client that presents PQ at 10 bits gets the streams as they are.
+    // (Matroska is not a direct-play container, so this is a remux.)
+    auto opted_in = hevc_caps();
+    opted_in["video_bit_depth"] = 10;
+    opted_in["hdr"] = Json::Array{Json("smpte2084")};
+    auto capable = create(std::move(opted_in));
+    CHECK(capable.find("mode")->asString() == "remux");
+    auto streams = capable.find("source")->find("streams")->asArray();
+    REQUIRE(!streams.empty());
+    CHECK(streams.front().find("color_transfer")->asString() == "smpte2084");
+    CHECK(streams.front().find("level")->asInt64() == 153);
 }
 
 MACHA_TEST("media_playback", test_forced_direct_bypasses_client_capabilities) {

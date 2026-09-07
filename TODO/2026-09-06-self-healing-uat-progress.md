@@ -55,6 +55,40 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **0.32.11 DEPLOYED (es-1 17:37 CEST, gbni-1 ~16:40, gbni-2 16:43;
+  gbni-1's first gate skip was my own transcode probe's log lines).**
+  Probe (HEVC-capable client, Ratatouille): gbni-2 create 0.66 s / seek
+  0.76 s / mode=transcode 1.9 s / 720p 3.2 s / seek-in-transcode 6.1 s /
+  auto 4.0 s; es-1 1.2 / 1.6 / 2.2 / 3.1 / 3.9 / 4.4 s (UI baseline was
+  2.6-4.4 create, 5.6-9.2 seek, 7.7-13 other). x264 line
+  `encoder_threads=4 frame_threads=1`. The create is video-copy +
+  audio-transcode (E-AC-3→AAC) so the session still says
+  `mode=transcode`; 0.32.12 copies (E-)AC-3/Opus when listed → remux.
+- **0.32.12 (in test) — TV silent-audio + broken direct decode:** master
+  playlist with `EXT-X-STREAM-INF` CODECS/RESOLUTION/BANDWIDTH →
+  `media.m3u8`; caps `video_bit_depth` + `hdr` (transfer list or bool)
+  gate 10-bit/PQ/HLG sources out of copy/direct in `auto`; probe records
+  `level`/`color_transfer`; create log names video/audio transform+codec
+  and client caps at debug; audio copy for aac/ac3/eac3/opus. UI session
+  confirmed hls.js 1.6.18 fMP4 passthrough infers codecs from the init
+  segment — the master playlist is the fix.
+
+- **0.32.11 (commit `cefaa72`, suite 358/358) — viewer path.** (1)
+  `media_vod::indexed_plan`: fragments up to 90 s allowed (was 3× target
+  = 12 s, whole-file reject → every HEVC title transcoded); rejection log
+  now `keyframes= longest_gap_s=`. (2) x264 frame-threaded on all cores
+  (`streaming.video_encoder_threads`, 0 = all), `x264-params
+  rc-lookahead=8:sync-lookahead=0:sliced-threads=0` instead of
+  `tune=zerolatency`. (3) first transcode fragment 2 s
+  (`kStartupFragmentSeconds`, both copies of `fixed_vod_durations`). (4)
+  VOD plan cache key without seek; hit → `reseek_hls_vod`. Probe script
+  `/root/uat/patchprobe.py` (HEVC-capable caps, create → seek → mode →
+  quality → seek → auto) on gbni-2; baseline run hit 429 (someone else's
+  transcode). Deploy: spaced + playback-gated; gbni-2 had a viewer at
+  16:26 CEST. Verify: create returns `mode=remux` for the Ratatouille
+  title, PATCH seek < 1 s, forced transcode PATCH ≈ half of 5-13 s,
+  `libav interactive video codec … encoder_threads=4 frame_threads=1`.
+
 - **WAN control-lane starvation: CLOSED (25-min soak 16:13-16:38 CEST,
   0.32.10 on all three, imports running).** Mutations ≥100 ms: gbni-1
   p50 337 / p90 391 / max 391 ms; es-1 n=474 p50 615 / p90 698 / max

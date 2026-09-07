@@ -116,7 +116,7 @@ class FakeMediaEngineSession final : public MediaEngineSession {
     void stop() override { running_ = false; segments_->cancel(); }
 };
 
-class FakeMediaEngine final : public MediaEngine {
+class FakeMediaEngine : public MediaEngine {
     mutable std::mutex mutex_;
     std::vector<PlaybackPlan> started_plans_;
     std::atomic_uint probes_{};
@@ -130,10 +130,10 @@ class FakeMediaEngine final : public MediaEngine {
         result.format = "mov,mp4,m4a,3gp,3g2,mj2";
         result.duration_seconds = 60.0;
         result.bitrate = 4'000'000;
-        result.streams.push_back(MediaStreamInfo{0, MediaStreamType::video, "h264", "High", "", 1920, 1080, 0, 0, 8, true, false, 3'700'000});
-        result.streams.push_back(MediaStreamInfo{1, MediaStreamType::audio, "aac", "LC", "eng", 0, 0, 2, 48000, 0, true, false, 192'000});
-        result.streams.push_back(MediaStreamInfo{2, MediaStreamType::subtitle, "subrip", "", "eng", 0, 0, 0, 0, 0, false, false});
-        result.streams.push_back(MediaStreamInfo{3, MediaStreamType::subtitle, "hdmv_pgs_subtitle", "", "eng", 0, 0, 0, 0, 0, false, false});
+        result.streams.push_back(MediaStreamInfo{0, MediaStreamType::video, "h264", "High", "", 1920, 1080, 0, 0, 8, true, false, 3'700'000, false, 0, ""});
+        result.streams.push_back(MediaStreamInfo{1, MediaStreamType::audio, "aac", "LC", "eng", 0, 0, 2, 48000, 0, true, false, 192'000, false, 0, ""});
+        result.streams.push_back(MediaStreamInfo{2, MediaStreamType::subtitle, "subrip", "", "eng", 0, 0, 0, 0, 0, false, false, 0, false, 0, ""});
+        result.streams.push_back(MediaStreamInfo{3, MediaStreamType::subtitle, "hdmv_pgs_subtitle", "", "eng", 0, 0, 0, 0, 0, false, false, 0, false, 0, ""});
         return result;
     }
     HlsVodPlan prepare_hls_vod(const MediaSource&, const PlaybackPlan& plan, double duration_seconds,
