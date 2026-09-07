@@ -67,6 +67,12 @@ struct MaintenanceConfig {
     // minutes is deliberately long: a healthy settled media server should be
     // close to quiescent rather than continuously proving that it is settled.
     std::chrono::milliseconds no_progress_backoff{300000};
+    // Background effort ceiling: loader/speculative DATA leases (publication
+    // and repair, one extent each) active at once. 0 = half the hardware
+    // threads, minimum 1. Viewer work is never counted. Until 0.32.13 gbni-1
+    // (4 GB, undervolt-prone) needed an external CPU quota to stay up while
+    // publishing (2026-09-07).
+    size_t background_concurrency{0};
 };
 
 struct FuseOperationTimeouts {

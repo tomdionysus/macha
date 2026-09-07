@@ -3,6 +3,7 @@
 #include "codec.hpp"
 #include "log.hpp"
 #include "placement.hpp"
+#include "supervised.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -208,6 +209,18 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
     auto nodes = ranked(id);
     if (nodes.empty())
         return false;
+    // The writer keeps a copy of what it writes: the local store is the
+    // first replica tried, then placement order. Until 0.32.13 the order was
+    // placement alone, so an offsite writer's first (and, at a floor of 1,
+    // only) copy could be an upload across the WAN, its own viewers read
+    // it back across the WAN, and its publication rate was the link's
+    // (es-1, 2026-09-07). Repair still converges the copies onto the
+    // placement owners afterwards.
+    if (auto self = std::find_if(nodes.begin(), nodes.end(),
+                                 [&](const NodeInfo& node) { return node.id == n_.node_id(); });
+        self != nodes.end() && self != nodes.begin()) {
+        std::rotate(nodes.begin(), self, self + 1);
+    }
     const size_t target = std::min(n_.config().replication, nodes.size());
     const size_t floor = n_.config().min_write_replicas;
     // 0.18 makes foreground durability explicit: min_write_replicas is the
@@ -270,6 +283,8 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
             successful_replicas = std::move(coalesced);
             batch->add({id, required, successful_replicas});
         }
+        if (ok && success < target)
+            queue_prompt_replication(id);
         const auto elapsed =
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - operation_started);
         if (elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
@@ -1052,6 +1067,112 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
         return false;
     }
     return true;
+}
+
+DistributedStore::DistributedStore(NodeRuntime& n) : n_(n) {
+    prompt_thread_ = std::jthread([this](std::stop_token stop) {
+        run_supervised("prompt-replication", [this, stop] { prompt_replication_loop(stop); });
+    });
+}
+
+DistributedStore::~DistributedStore() {
+    if (prompt_thread_.joinable()) {
+        prompt_thread_.request_stop();
+        prompt_cv_.notify_all();
+        prompt_thread_.join();
+    }
+}
+
+DistributedStore::PromptReplicationStats DistributedStore::prompt_replication_stats() const {
+    PromptReplicationStats out;
+    {
+        std::lock_guard lock(const_cast<std::mutex&>(prompt_mutex_));
+        out.queued = prompt_queue_.size();
+    }
+    out.copies = prompt_copies_.load(std::memory_order_relaxed);
+    out.failures = prompt_failures_.load(std::memory_order_relaxed);
+    return out;
+}
+
+void DistributedStore::queue_prompt_replication(const ObjectId& id) {
+    {
+        std::lock_guard lock(prompt_mutex_);
+        if (!prompt_queued_.insert(id).second)
+            return;
+        prompt_queue_.push_back(id);
+    }
+    prompt_cv_.notify_one();
+}
+
+void DistributedStore::prompt_replication_loop(std::stop_token stop) {
+    // One object at a time: the local copy is read and pushed to the first
+    // placement owner that lacks it, as speculative DATA work (behind viewers
+    // and loaders in the arbiter, and counted against the background effort
+    // ceiling). Reaching `replication` beyond the second copy stays with the
+    // repair pass; this loop exists to close the single-copy window quickly.
+    std::deque<std::pair<ObjectId, Clock::time_point>> retry;
+    while (!stop.stop_requested()) {
+        std::optional<ObjectId> id;
+        {
+            std::unique_lock lock(prompt_mutex_);
+            prompt_cv_.wait(lock, stop, [&] {
+                return !prompt_queue_.empty() ||
+                       (!retry.empty() && retry.front().second <= Clock::now());
+            });
+            if (stop.stop_requested()) return;
+            if (!prompt_queue_.empty()) {
+                id = prompt_queue_.front();
+                prompt_queue_.pop_front();
+                prompt_queued_.erase(*id);
+            }
+        }
+        if (!id) {
+            if (!retry.empty() && retry.front().second <= Clock::now()) {
+                id = retry.front().first;
+                retry.pop_front();
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                continue;
+            }
+        }
+        try {
+            if (!n_.local_store().has(*id)) continue; // gone (deleted, or never local)
+            auto nodes = ranked(*id);
+            const size_t target = std::min(n_.config().replication, nodes.size());
+            if (target < 2) continue;
+            size_t holders = 1; // the local copy
+            std::optional<NodeInfo> destination;
+            for (const auto& node : nodes) {
+                if (node.id == n_.node_id()) continue;
+                bool present = false;
+                try {
+                    present = has_on(node, *id);
+                } catch (...) {
+                    present = false;
+                }
+                if (present) {
+                    if (++holders >= 2) break;
+                } else if (!destination) {
+                    destination = node;
+                }
+            }
+            if (holders >= 2 || !destination) continue;
+            auto data = n_.local_store().get(*id);
+            if (!data) continue;
+            if (put_on(*destination, *id, *data, false)) {
+                prompt_copies_.fetch_add(1, std::memory_order_relaxed);
+                n_.notify_storage_mutation();
+            } else {
+                prompt_failures_.fetch_add(1, std::memory_order_relaxed);
+                retry.emplace_back(*id, Clock::now() + std::chrono::seconds(30));
+            }
+        } catch (const std::exception& error) {
+            prompt_failures_.fetch_add(1, std::memory_order_relaxed);
+            Log::debug("prompt replication id=" + to_string(*id) + " error=" + error.what());
+            retry.emplace_back(*id, Clock::now() + std::chrono::seconds(30));
+        }
+        if (retry.size() > 4096) retry.pop_front();
+    }
 }
 
 bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,

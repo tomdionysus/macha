@@ -307,6 +307,7 @@ maintenance:
   busy_bandwidth_fraction: 0.0
   idle_bandwidth_fraction: 0.10
   cpu_target: 0.10
+  background_concurrency: 0
   initial_bandwidth: 32M
   max_bandwidth: 0B
   scrub_fraction: 0.02
@@ -314,6 +315,9 @@ maintenance:
   no_progress_backoff_ms: 300000
   garbage_grace_ms: 86400000
 ```
+
+`background_concurrency` is the node's background effort ceiling: how many loader or speculative DATA operations (publication and repair, one extent each) may hold an admission lease at once. `0` means half the hardware threads, minimum 1. Viewer work is never counted, so playback and read-ahead are unaffected; what it bounds is how much CPU (hashing, encryption) and I/O the node spends on its own import and repair traffic at once. The status API reports the ceiling and its use as `data_resources.background_limit` / `background_active` / `peak_background_active`.
+
 
 Maintenance performs DATA repair/rebalance/GC/scrub and catalogue control convergence/GC. Foreground media and mounted MachaDFS activity take priority.
 

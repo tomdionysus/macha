@@ -2270,10 +2270,22 @@ std::optional<MetadataSnapshotView> FileSystem::available_snapshot_view() const 
 
 std::pair<uint64_t, uint64_t> FileSystem::logical_capacity() const {
     auto ns = n_.membership().active();
+    // In the first seconds after a start the membership view can be empty
+    // or carry peers whose capacity has not been exchanged yet; statfs then
+    // answered 0 blocks and `df` showed a 0-byte filesystem (gbni-2,
+    // 2026-09-07). Fall back to this node's own store so the mount never
+    // reports less than what it can hold by itself.
+    const auto local_fallback = [&]() -> std::pair<uint64_t, uint64_t> {
+        const uint64_t limit = n_.local_store().limit();
+        const uint64_t used = std::min(limit, n_.local_store().used());
+        return {limit, used};
+    };
     if (ns.empty())
-        return {0, 0};
+        return local_fallback();
     const size_t r = std::max<size_t>(1, std::min(n_.config().replication, ns.size()));
     const uint64_t total = placement_logical_capacity(ns, r);
+    if (!total)
+        return local_fallback();
 
     __uint128_t physical_used = 0;
     for (const auto& node : ns)

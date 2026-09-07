@@ -509,6 +509,32 @@ MACHA_TEST("storage_v18", test_pack_compaction_waits_for_preopen_reader_lease) {
     CHECK(store.get(live_id) == std::optional<Bytes>{live});
 }
 
+MACHA_TEST("storage_v18", test_presence_index_warms_from_object_names_at_start) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    LocalStoreOptions options;
+    options.limit = 64ULL * 1024 * 1024;
+    options.pack_threshold = 0; // everything loose
+    std::vector<ObjectId> ids;
+    {
+        LocalStore store(t.path() / "store", options, keys.storage);
+        for (int i = 0; i < 12; ++i) {
+            auto data = pattern(64 * 1024, static_cast<uint8_t>(0x30 + i));
+            auto id = object_id(data);
+            REQUIRE(store.put(id, data));
+            ids.push_back(id);
+        }
+    }
+    // A fresh process learns what it holds from the directory names alone,
+    // so the first claim on each object after a restart does not stat it.
+    LocalStore reopened(t.path() / "store", options, keys.storage);
+    REQUIRE(wait_until([&] { return reopened.diagnostics().presence_index_entries == ids.size(); }, 5s));
+    for (const auto& id : ids) CHECK(reopened.has(id));
+    CHECK(!reopened.has(ObjectId{}));
+}
+
 MACHA_TEST("storage_v18", test_has_is_a_cheap_presence_check_not_a_decrypt) {
     TempDir t;
     auto keyfile = t.path() / "key";

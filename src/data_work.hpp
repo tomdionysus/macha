@@ -64,6 +64,10 @@ struct DataResourceStats {
     uint64_t loader_waits{};
     uint64_t speculative_waits{};
     uint64_t cancelled_waits{};
+    // Background effort ceiling and its use (loader + speculative leases).
+    uint64_t background_limit{};
+    uint64_t background_active{};
+    uint64_t peak_background_active{};
 };
 
 // Event-driven byte admission at blocking DATA resource boundaries. Lower
@@ -112,10 +116,17 @@ class DataResourceArbiter {
   private:
     uint64_t capacity_bytes_{};
     uint64_t viewer_reserve_bytes_{};
+    // Background effort ceiling: how many loader/speculative leases may be
+    // active at once. Each lease is one extent's worth of hashing,
+    // encryption and transfer, so this bounds the CPU that publication and
+    // repair can take between them; viewers are never counted. 0 = no limit.
+    uint64_t background_concurrency_{};
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     uint64_t used_bytes_{};
     uint64_t lower_used_bytes_{};
+    uint64_t lower_active_{};
+    uint64_t peak_lower_active_{};
     uint64_t peak_used_bytes_{};
     uint64_t waiting_viewers_{};
     uint64_t waiting_loaders_{};
@@ -140,7 +151,8 @@ class DataResourceArbiter {
     void release(FrameType frame_type, uint64_t bytes);
 
   public:
-    DataResourceArbiter(uint64_t capacity_bytes, uint64_t viewer_reserve_bytes);
+    DataResourceArbiter(uint64_t capacity_bytes, uint64_t viewer_reserve_bytes,
+                        uint64_t background_concurrency = 0);
     std::optional<Lease> acquire(const DataWorkContext& context, uint64_t bytes);
     std::optional<Lease> try_acquire(const DataWorkContext& context, uint64_t bytes);
     void stop();
@@ -148,8 +160,10 @@ class DataResourceArbiter {
 };
 
 inline DataResourceArbiter::DataResourceArbiter(uint64_t capacity_bytes,
-                                                uint64_t viewer_reserve_bytes)
-    : capacity_bytes_(capacity_bytes), viewer_reserve_bytes_(viewer_reserve_bytes) {
+                                                uint64_t viewer_reserve_bytes,
+                                                uint64_t background_concurrency)
+    : capacity_bytes_(capacity_bytes), viewer_reserve_bytes_(viewer_reserve_bytes),
+      background_concurrency_(background_concurrency) {
     if (!capacity_bytes_ || !viewer_reserve_bytes_ || viewer_reserve_bytes_ >= capacity_bytes_)
         throw std::invalid_argument("DATA resource capacity must exceed viewer reserve");
 }
@@ -160,6 +174,8 @@ inline bool DataResourceArbiter::available(FrameType frame_type, uint64_t bytes)
     if (viewer(frame_type))
         return true;
     if (waiting_viewers_)
+        return false;
+    if (background_concurrency_ && lower_active_ >= background_concurrency_)
         return false;
     const auto lower_capacity = capacity_bytes_ - viewer_reserve_bytes_;
     if (bytes > lower_capacity)
@@ -217,8 +233,11 @@ DataResourceArbiter::acquire(const DataWorkContext& context, uint64_t requested_
         return {};
     }
     used_bytes_ += bytes;
-    if (!viewer(frame_type))
+    if (!viewer(frame_type)) {
         lower_used_bytes_ += bytes;
+        ++lower_active_;
+        peak_lower_active_ = std::max(peak_lower_active_, lower_active_);
+    }
     peak_used_bytes_ = std::max(peak_used_bytes_, used_bytes_);
     if (viewer(frame_type))
         ++viewer_admissions_;
@@ -244,8 +263,11 @@ DataResourceArbiter::try_acquire(const DataWorkContext& context, uint64_t reques
     if (stopping_ || !available(frame_type, bytes))
         return {};
     used_bytes_ += bytes;
-    if (!viewer(frame_type))
+    if (!viewer(frame_type)) {
         lower_used_bytes_ += bytes;
+        ++lower_active_;
+        peak_lower_active_ = std::max(peak_lower_active_, lower_active_);
+    }
     peak_used_bytes_ = std::max(peak_used_bytes_, used_bytes_);
     if (viewer(frame_type))
         ++viewer_admissions_;
@@ -259,8 +281,10 @@ DataResourceArbiter::try_acquire(const DataWorkContext& context, uint64_t reques
 inline void DataResourceArbiter::release(FrameType frame_type, uint64_t bytes) {
     std::lock_guard lock(mutex_);
     used_bytes_ -= std::min(used_bytes_, bytes);
-    if (!viewer(frame_type))
+    if (!viewer(frame_type)) {
         lower_used_bytes_ -= std::min(lower_used_bytes_, bytes);
+        if (lower_active_) --lower_active_;
+    }
     cv_.notify_all();
 }
 
@@ -282,7 +306,8 @@ inline DataResourceStats DataResourceArbiter::stats() const {
     std::lock_guard lock(mutex_);
     return {capacity_bytes_, viewer_reserve_bytes_, used_bytes_, peak_used_bytes_,
             viewer_admissions_, loader_admissions_, speculative_admissions_,
-            viewer_waits_, loader_waits_, speculative_waits_, cancelled_waits_};
+            viewer_waits_, loader_waits_, speculative_waits_, cancelled_waits_,
+            background_concurrency_, lower_active_, peak_lower_active_};
 }
 
 } // namespace macha

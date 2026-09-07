@@ -85,6 +85,29 @@ MACHA_FAST_TEST("foundations", test_weighted_loader_service_is_work_conserving_a
     CHECK(cold_service.finished(start + 10025ms, true) == 475ms);
 }
 
+MACHA_TEST("foundations", test_data_resource_arbiter_background_effort_ceiling) {
+    // Byte capacity would admit four loader leases; the effort ceiling
+    // admits two at a time and never counts viewers.
+    DataResourceArbiter resources(64, 8, 2);
+    DataWorkContext loader(FrameType::loader, 1);
+    auto first = resources.try_acquire(loader, 1);
+    auto second = resources.try_acquire(loader, 1);
+    REQUIRE(first);
+    REQUIRE(second);
+    CHECK(!resources.try_acquire(loader, 1));
+    CHECK(!resources.try_acquire(DataWorkContext(FrameType::speculative, 1), 1));
+    auto viewer = resources.try_acquire(DataWorkContext(FrameType::foreground, 1), 1);
+    CHECK(viewer);
+    auto stats = resources.stats();
+    CHECK(stats.background_limit == 2);
+    CHECK(stats.background_active == 2);
+    CHECK(stats.peak_background_active == 2);
+    first.reset();
+    auto third = resources.try_acquire(loader, 1);
+    CHECK(third);
+    CHECK(resources.stats().background_active == 2);
+}
+
 MACHA_TEST("foundations", test_data_resource_arbiter_reserves_viewer_headroom) {
     DataResourceArbiter resources(4, 1);
     CHECK(!resources.acquire(DataWorkContext(FrameType::loader), 4));

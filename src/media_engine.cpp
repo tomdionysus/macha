@@ -1456,6 +1456,15 @@ class LibavMediaEngine final : public MediaEngine {
             info.channels = par->ch_layout.nb_channels;
             info.sample_rate = par->sample_rate;
             info.bit_depth = par->bits_per_raw_sample;
+            if (info.bit_depth <= 0 && par->codec_type == AVMEDIA_TYPE_VIDEO && par->format >= 0) {
+                // Matroska does not carry bits_per_raw_sample for HEVC; the
+                // pixel format does (yuv420p10le -> 10). Without this a
+                // 10-bit source reported no depth and the negotiation gate
+                // rested on the transfer alone (2026-09-07).
+                if (const auto* desc = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(par->format));
+                    desc && desc->nb_components > 0)
+                    info.bit_depth = desc->comp[0].depth;
+            }
             info.level = par->level > 0 ? par->level : 0;
             if (par->codec_type == AVMEDIA_TYPE_VIDEO && par->color_trc != AVCOL_TRC_UNSPECIFIED)
                 if (const char* transfer = av_color_transfer_name(par->color_trc))

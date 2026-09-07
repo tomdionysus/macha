@@ -1,5 +1,40 @@
 # Current release
 
+## 0.32.13 — The writer keeps a copy and the second one is prompt; a background effort ceiling (development)
+
+Operator decisions after the import findings (2026-09-07): keep
+`min_write_replicas: 1` but make "replicated" a matter of minutes, not of
+the repair cursor; give the daemon its own effort ceiling instead of an
+external CPU quota; stop cold claims after restarts; statfs must not read 0.
+
+- **Writer-local first copy.** `put_impl` tries the local store first, then
+  placement order. Placement alone could make an offsite writer's only copy
+  an upload across the WAN, its own viewers read it back across the WAN,
+  and its publication rate the link's. Repair still converges the copies
+  onto the placement owners afterwards.
+- **Prompt second copy.** A put that stopped at the floor queues its object;
+  one worker per node pushes it to the first placement owner lacking it, as
+  speculative DATA work behind viewers. Until now the extra copies waited
+  for the repair cursor, hours on a busy import, and a writer's death in
+  that window stranded its recent data (finding #6, 129 files).
+  `DistributedStore::prompt_replication_stats()` counts queued/copies/failures.
+- **Background effort ceiling.** `maintenance.background_concurrency`
+  (default half the hardware threads) bounds loader + speculative DATA
+  leases held at once, i.e. how many extents publication and repair are
+  hashing, encrypting or transferring together; viewers are never counted.
+  Status: `data_resources.background_limit/background_active/
+  peak_background_active`. gbni-1 no longer needs the systemd CPU quota.
+- **Presence index warmed at start.** `LocalStore` reads the object
+  directory names (no stat) into the presence set on start, so the first
+  claim on each large file after a restart is no longer a cold stat per
+  extent (2.6-16 s per quantum commit); `data_store.presence_index_entries`.
+- **statfs never reports 0.** `logical_capacity` falls back to the local
+  store's limit/used while the membership view is empty or has no
+  capacities (the first seconds after a start showed a 0-byte mount).
+- Probe: `bit_depth` is derived from the pixel format when the container
+  does not report it (Matroska HEVC), so a 10-bit source no longer relies
+  on the transfer alone for the negotiation gate.
+
 ## 0.32.12 — A master playlist that says what is in the fragments; 10-bit and HDR are not "hevc" (development)
 
 Operator report via the UI session (2026-09-07): on a 2016 Samsung TV
