@@ -1,5 +1,28 @@
 # Current release
 
+## 0.33.1 — Say which container was actually served (development)
+
+MPEG-TS turned out to be the only carriage a 2017 Samsung would play:
+copied HEVC black-screened in fragmented MP4 on its native player and was
+rejected outright through MediaSource, and copied E-AC-3 stuttered on one
+path and was rejected on the other. In MPEG-TS both stream copies play
+untouched. The container is therefore a decision worth making and worth
+being able to check (2026-09-07).
+
+- The session reports `output.container`: `fmp4` or `mpegts` for an HLS
+  session, the source's own container for a `direct` one. It was the one
+  instruction a client could ask for and never see confirmed, and the same
+  release found two modes being reported as something other than what was
+  performed, so a request is not evidence.
+- `operations` gains `copy_into_mpegts` beside `copy_into_fmp4`. The two
+  containers do not carry the same codecs: TS takes MPEG-2 video and
+  MP3/MP2 audio that fMP4 will not, fMP4 takes AV1 and Opus that TS will
+  not, and both take H.264, HEVC, AAC, AC-3 and E-AC-3.
+- A copy into MPEG-TS the container cannot carry is now refused up front,
+  as it already was for fragmented MP4, rather than failing in the muxer.
+- A VOD planning or subtitle deadline reports `source_read_timed_out`
+  instead of arriving with no reason attached.
+
 ## 0.33.0 — A mode must describe what it is doing (development)
 
 The operator's ruling on the legal permutations, enforced. `direct` and
