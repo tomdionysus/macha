@@ -1,5 +1,39 @@
 # Current release
 
+## 0.32.7 — A remote retention claim is not a re-read; commits go to the nearest replica first (development)
+
+The "WAN control-lane starvation" of the full-library import (195-284 s
+metadata mutations, `control RPC deadline exceeded`, reconnect churn,
+2026-09-07) measured on the live cluster: the link's queueing delay under
+load was ~30 ms on a 58 ms RTT, but gbni-2's `retain_objects` handler took
+up to 12.1 s per batch (avg 916 ms) and gbni-1's 35 KB commits took 9-12 s
+against sub-second small ones.
+
+- The replica-side `retain_objects` handler re-read, decrypted and hashed
+  every id in the claim batch (`valid()`), serially, inside the writer's
+  metadata mutation. A quantum commit re-claims every extent of its file,
+  so the replica re-read gigabytes per 32 MB quantum, and with its disk
+  saturated by the import that was minutes. It now checks index presence
+  (`has()`), as the local claim path has since 0.32.3, and takes no DATA
+  admission for the lookup. `have_object` (single, used by repair
+  placement) still verifies.
+- `publish_commit` ordered replicas after the local one by NodeId, which
+  sent every gbni-1 commit across the WAN to es-1 before the LAN replica,
+  and every es-1 commit to the undervolt-prone gbni-1. The transport now
+  keeps a smoothed CONTROL-lane round trip per peer
+  (`RpcClient::peer_latency`, exposed as
+  `rpc_transport.peer_latency_ms`), and `order_commit_replicas` puts the
+  local replica first, then measured peers nearest first, unmeasured last.
+- Instrumented: `metadata mutate` log lines carry `retention_ms` and
+  `publish_ms`; per-replica store/accept steps over 250 ms (or failing)
+  log `metadata commit store|accept replica=… ms=…`; status metadata
+  diagnostics gain `mutations`, `mutation_retention_ms_{total,max}` and
+  `mutation_publish_ms_{total,max}`.
+
+Still open in this area: congestion-aware pacing of the DATA lane against
+control-lane RTT (the link itself was not the bottleneck this time), and the
+retention journal growth of re-claiming whole files per quantum.
+
 ## 0.32.6 — Append-extents deltas, and the covered mountpoint is no longer a trap (development)
 
 Two findings from the full-library import (2026-09-07).

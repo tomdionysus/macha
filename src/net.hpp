@@ -6,7 +6,9 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <optional>
 #include <deque>
 #include <functional>
 #include <future>
@@ -315,6 +317,11 @@ class RpcClient {
     struct PeerHealth {
         unsigned failures{};
         Clock::time_point retry_after{};
+        // Smoothed round trip of successful CONTROL-lane calls on this
+        // endpoint (handler time included -- what a caller actually waits).
+        // Lets commit and claim fan-out prefer the near replica instead of
+        // NodeId order (gbni-1 crossed the WAN for every commit, 2026-09-07).
+        std::optional<double> control_latency_ms;
     };
 
     ClusterKeys keys_;
@@ -400,6 +407,9 @@ class RpcClient {
                   std::chrono::milliseconds stall_notice,
                   std::chrono::milliseconds no_progress_deadline = {});
     RpcStats stats() const;
+    // Smoothed CONTROL-lane round trip to a peer, if any call has completed.
+    std::optional<std::chrono::milliseconds> peer_latency(const NodeId&) const;
+    std::map<NodeId, std::chrono::milliseconds> peer_latencies() const;
     void broadcast(const RpcMessage&);
     size_t broadcast_best_effort(const RpcMessage&, FrameType);
     void invalidate_identity_association(const IdentityAssociationReset&);

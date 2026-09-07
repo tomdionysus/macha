@@ -778,11 +778,10 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
                 return error_reply("DATA resource admission busy or stopping");
             // This single-object probe is shared by repair/rebalance placement
             // logic that has no separate re-verification step before trusting
-            // "yes, already present" -- unlike the batched have_objects below,
-            // which is used only by retain_data()'s candidate selection, where
-            // retain_objects always re-verifies before persisting a claim.
-            // Authenticate/decrypt/hash here so a corrupt remote replica is
-            // never counted as healthy placement.
+            // "yes, already present". Authenticate/decrypt/hash here so a
+            // corrupt remote replica is never counted as healthy placement.
+            // (The batched have_objects below and retain_objects are
+            // presence checks since 0.32.7; see the note there.)
             writer.u8(local_store().valid(id));
             return {MessageType::bool_reply, writer.take()};
         }
@@ -803,11 +802,9 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
             // by retain_data()'s candidate-selection scan (DistributedStore::
             // select_present_batched), never by repair/rebalance. A "present"
             // answer here only makes a node a *candidate*; retain_objects
-            // still fully verifies before persisting a retain_batch claim on
-            // it, so a stale/corrupt local copy is caught there, not lost.
-            // That downstream re-verification is what makes it safe for this
-            // one caller to skip the per-object decrypt at candidate-selection
-            // scale. One admission charge for the whole batch, not one per
+            // then persists the claim against index presence (0.32.7), the
+            // same contract as the local claim path: a claim is not a
+            // re-read, the scrub is. One admission charge for the whole batch, not one per
             // id, since this no longer does per-object I/O worth separately
             // metering against the DATA budget ordinary reads/writes consume.
             auto resource = data_resources_.try_acquire(
@@ -980,14 +977,21 @@ RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcM
                 ids.push_back(id);
             }
             reader.finish();
+            // A retention claim says "this node holds the object". Until
+            // 0.32.7 this handler re-read, decrypted and hashed every id in
+            // the batch (valid()), serially, inside the writer's metadata
+            // mutation: a quantum commit re-claims every extent of its file,
+            // so a replica re-read gigabytes per 32 MB quantum (gbni-2:
+            // 12.1 s per batch; es-1 with its disk saturated: the 195-284 s
+            // mutations of 2026-09-07). The local side of retain_on() moved
+            // to index presence in 0.32.3 for the same reason; the bytes were
+            // verified when this node put them, every read authenticates
+            // them again, and the scrub campaign is where later corruption is
+            // found. No DATA admission either: there is no read buffer.
             for (const auto& id : ids) {
-                auto resource = data_resources_.try_acquire(
-                    DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
-                if (!resource)
-                    return error_reply("DATA resource admission busy or stopping");
                 const bool present = object_class == RetentionClass::data
-                                         ? local_store().valid(id)
-                                         : control_store().valid(id);
+                                         ? local_store().has(id)
+                                         : control_store().has(id);
                 if (!present)
                     return error_reply("retention object is not durably present");
             }

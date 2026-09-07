@@ -183,6 +183,23 @@ std::vector<NodeInfo> MetadataManager::replica_nodes(const std::vector<NodeId>& 
     return out;
 }
 
+std::vector<NodeInfo> order_commit_replicas(
+    std::vector<NodeInfo> replicas, const NodeId& local,
+    const std::function<std::optional<std::chrono::milliseconds>(const NodeId&)>& latency) {
+    const auto rank = [&](const NodeInfo& node) -> std::pair<int, int64_t> {
+        if (node.id == local)
+            return {0, 0};
+        const auto measured = latency ? latency(node.id) : std::nullopt;
+        if (measured)
+            return {1, measured->count()};
+        return {2, 0};
+    };
+    std::stable_sort(replicas.begin(), replicas.end(), [&](const NodeInfo& a, const NodeInfo& b) {
+        return rank(a) < rank(b);
+    });
+    return replicas;
+}
+
 std::vector<NodeInfo> MetadataManager::compatible_replicas(
     const std::vector<NodeInfo>& nodes) const {
     const auto required = static_cast<uint32_t>(node_.config().metadata_min_write_replicas);
@@ -746,19 +763,28 @@ MetadataManager::PublishedCommit MetadataManager::publish_commit(
     PublishedCommit out;
     out.record = record;
 
-    auto ordered = compatible;
-    std::stable_sort(ordered.begin(), ordered.end(), [&](const NodeInfo& a, const NodeInfo& b) {
-        return a.id == node_.node_id() && b.id != node_.node_id();
+    auto ordered = order_commit_replicas(compatible, node_.node_id(), [&](const NodeId& peer) {
+        return node_.peer_latency(peer);
     });
 
-    // Store the immutable commit independently on the fastest available
+    // Store the immutable commit independently on the nearest available
     // registered replicas until the configured durability floor is reached. A
     // receiver never compares it with its current head; it validates the commit
     // and durably appends it to the DAG. The caller's local replica is required
     // to participate so the operation can immediately continue from the commit.
+    const bool trace = Log::enabled(LogLevel::debug);
     for (const auto& owner : ordered) {
-        if (store_commit_on(owner, compact, record, frame_type))
+        const auto started = Clock::now();
+        const bool stored = store_commit_on(owner, compact, record, frame_type);
+        if (stored)
             out.stored_on.push_back(owner);
+        if (trace && owner.id != node_.node_id()) {
+            const auto ms = elapsed_ms(started);
+            if (ms >= 250 || !stored)
+                Log::debug("metadata commit store replica=" + owner.host +
+                           " stored=" + (stored ? "yes" : "no") + " ms=" + std::to_string(ms) +
+                           " generation=" + std::to_string(record.generation));
+        }
         if (out.stored_on.size() >= required)
             break;
     }
@@ -798,9 +824,21 @@ MetadataManager::PublishedCommit MetadataManager::publish_commit(
                 }
             }
         }
-        if (ancestry_ready && accept_commit_on(owner, out.acceptance, frame_type)) {
+        const auto accept_started = Clock::now();
+        const bool accepted_here =
+            ancestry_ready && accept_commit_on(owner, out.acceptance, frame_type);
+        if (accepted_here) {
             ++accepted;
             local_accepted = local_accepted || owner.id == node_.node_id();
+        }
+        if (trace && owner.id != node_.node_id()) {
+            const auto ms = elapsed_ms(accept_started);
+            if (ms >= 250 || !accepted_here)
+                Log::debug("metadata commit accept replica=" + owner.host +
+                           " accepted=" + (accepted_here ? "yes" : "no") +
+                           " ancestry_ready=" + (ancestry_ready ? "yes" : "no") +
+                           " ms=" + std::to_string(ms) +
+                           " generation=" + std::to_string(record.generation));
         }
     }
     if (!local_accepted)
@@ -1759,13 +1797,29 @@ MetadataRecord MetadataManager::mutate_impl(
                 delta_payload = std::move(encoded);
         }
 
+        uint64_t retention_ms = 0;
         if (publication_retention_) {
+            const auto retention_started = Clock::now();
             publication_retention_(MetadataPublicationContext{
                 origin, *sequence, current, snapshot, delta ? &*delta : nullptr});
+            retention_ms = elapsed_ms(retention_started);
         }
 
         try {
+            const auto publish_started = Clock::now();
             (void)publish_commit(active, proposed, delta_payload, FrameType::read_ahead);
+            const auto publish_ms = elapsed_ms(publish_started);
+            mutations_.fetch_add(1, std::memory_order_relaxed);
+            mutation_retention_ms_total_.fetch_add(retention_ms, std::memory_order_relaxed);
+            mutation_publish_ms_total_.fetch_add(publish_ms, std::memory_order_relaxed);
+            const auto raise = [](std::atomic_uint64_t& slot, uint64_t value) {
+                auto seen = slot.load(std::memory_order_relaxed);
+                while (value > seen &&
+                       !slot.compare_exchange_weak(seen, value, std::memory_order_relaxed)) {
+                }
+            };
+            raise(mutation_retention_ms_max_, retention_ms);
+            raise(mutation_publish_ms_max_, publish_ms);
 
             // A concurrent writer can durably accept a sibling of `proposed`
             // while this publication is in flight.  In that case the mutation
@@ -1797,6 +1851,8 @@ MetadataRecord MetadataManager::mutate_impl(
             const auto total_ms = elapsed_ms(total_started);
             if (total_ms >= 100 && Log::enabled(LogLevel::debug)) {
                 Log::debug("metadata mutate total_ms=" + std::to_string(total_ms) +
+                           " retention_ms=" + std::to_string(retention_ms) +
+                           " publish_ms=" + std::to_string(publish_ms) +
                            " mode=" + std::string(delta_payload.empty() ? "snapshot" : "delta") +
                            " delta_bytes=" + std::to_string(delta_payload.size()) +
                            " snapshot_bytes=" + std::to_string(proposed.payload.size()) +

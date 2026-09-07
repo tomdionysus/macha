@@ -275,6 +275,12 @@ class NodeRuntime {
     RpcStats rpc_stats() const {
         return client_.stats();
     }
+    std::optional<std::chrono::milliseconds> peer_latency(const NodeId& peer) const {
+        return client_.peer_latency(peer);
+    }
+    std::map<NodeId, std::chrono::milliseconds> peer_latencies() const {
+        return client_.peer_latencies();
+    }
     RpcServerWorkStats rpc_server_work_stats() const {
         return server_.work_stats();
     }

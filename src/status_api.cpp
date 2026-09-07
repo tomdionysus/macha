@@ -729,6 +729,14 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     if (metadata_manager) {
         metadata_diagnostics["conflicts_superseded"] = metadata_manager->conflicts_superseded();
         metadata_diagnostics["conflicts_resolved"] = metadata_manager->conflicts_resolved();
+        // Where a mutation's wall time goes since start: the pre-publication
+        // retention barrier and the commit fan-out (totals and maxima, ms).
+        const auto timing = metadata_manager->mutation_timing();
+        metadata_diagnostics["mutations"] = timing.mutations;
+        metadata_diagnostics["mutation_retention_ms_total"] = timing.retention_ms_total;
+        metadata_diagnostics["mutation_retention_ms_max"] = timing.retention_ms_max;
+        metadata_diagnostics["mutation_publish_ms_total"] = timing.publish_ms_total;
+        metadata_diagnostics["mutation_publish_ms_max"] = timing.publish_ms_max;
     }
     diagnostics["metadata"] = std::move(metadata_diagnostics);
 
@@ -758,6 +766,12 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     Json::Object transport_diagnostics;
     transport_diagnostics["connections_created"] = transport.connections_created;
     transport_diagnostics["connections_reused"] = transport.connections_reused;
+    // Smoothed CONTROL-lane round trip per peer (node id -> ms), the same
+    // measure commit fan-out uses to try the nearest replicas first.
+    Json::Object peer_latency;
+    for (const auto& [peer, latency] : node_.peer_latencies())
+        peer_latency[to_string(peer)] = static_cast<uint64_t>(latency.count());
+    transport_diagnostics["peer_latency_ms"] = std::move(peer_latency);
     transport_diagnostics["canonical_connections"] = transport.canonical_connections;
     diagnostics["rpc_transport"] = std::move(transport_diagnostics);
 

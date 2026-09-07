@@ -48,6 +48,16 @@ struct MetadataPublicationContext {
     const MetadataDelta* delta{};
 };
 
+// Replica order for commit fan-out: the local replica first (the caller must
+// continue from its own store), then peers by measured CONTROL-lane latency,
+// nearest first, with unmeasured peers last in their given order. Until
+// 0.32.7 the order after the local replica was NodeId order, which sent
+// every commit from gbni-1 across the WAN to es-1 before the LAN replica
+// gbni-2 (2026-09-07).
+std::vector<NodeInfo> order_commit_replicas(
+    std::vector<NodeInfo> replicas, const NodeId& local,
+    const std::function<std::optional<std::chrono::milliseconds>(const NodeId&)>& latency);
+
 struct MetadataClusterStatus {
     uint64_t generation{};
     uint64_t observed_unix_ms{};
@@ -123,6 +133,13 @@ class MetadataManager {
     // mutation decided them, and ones an operator resolved explicitly.
     std::atomic_uint64_t conflicts_superseded_{};
     std::atomic_uint64_t conflicts_resolved_{};
+    // Where a mutation's wall time goes: the pre-publication retention
+    // barrier and the commit fan-out. Totals and maxima since start.
+    std::atomic_uint64_t mutations_{};
+    std::atomic_uint64_t mutation_retention_ms_total_{};
+    std::atomic_uint64_t mutation_retention_ms_max_{};
+    std::atomic_uint64_t mutation_publish_ms_total_{};
+    std::atomic_uint64_t mutation_publish_ms_max_{};
 
     std::optional<NodeInfo> node_info(const NodeId&) const;
     std::vector<NodeInfo> replica_nodes(const std::vector<NodeId>&) const;
@@ -199,6 +216,20 @@ class MetadataManager {
             history_entries_submitted_.load(std::memory_order_relaxed),
             history_peak_in_flight_.load(std::memory_order_relaxed),
         };
+    }
+    struct MutationTiming {
+        uint64_t mutations{};
+        uint64_t retention_ms_total{};
+        uint64_t retention_ms_max{};
+        uint64_t publish_ms_total{};
+        uint64_t publish_ms_max{};
+    };
+    MutationTiming mutation_timing() const noexcept {
+        return {mutations_.load(std::memory_order_relaxed),
+                mutation_retention_ms_total_.load(std::memory_order_relaxed),
+                mutation_retention_ms_max_.load(std::memory_order_relaxed),
+                mutation_publish_ms_total_.load(std::memory_order_relaxed),
+                mutation_publish_ms_max_.load(std::memory_order_relaxed)};
     }
     uint64_t conflicts_superseded() const noexcept {
         return conflicts_superseded_.load(std::memory_order_relaxed);
