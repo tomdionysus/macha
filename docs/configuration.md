@@ -267,6 +267,7 @@ streaming:
   max_video_transcodes: 1
   max_audio_transcodes: 4
   video_decoder_threads: 2
+  video_encoder_threads: 0
   pipeline_idle_ms: 60000
   session_idle_ms: 1800000
 ```
@@ -277,6 +278,8 @@ logical session remains reconcilable until `session_idle_ms`; invalid or stale
 generation retries do not renew the physical lease. This bounds leaked
 transcode capacity after a client disappears on an unreliable network without
 shortening the logical session lifetime.
+
+`video_encoder_threads` sets the x264 frame-thread count per video transcode; `0` (the default) uses every hardware thread. Until 0.32.11 the encoder ran single-file in sliced-thread mode, at about real time for 1080p on the four-core nodes, so every representation change cost 5-13 s and a mid-file seek could not catch up. The first fragment of a transcode generation is 2 s (later ones the configured segment duration) so the request is answered after 2 s of encoding.
 
 `video_decoder_threads` bounds decoder parallelism per transformed video in the
 range 1–16. It defaults to two so viewer work can use otherwise-idle CPU without

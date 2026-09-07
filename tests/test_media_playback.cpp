@@ -360,12 +360,24 @@ MACHA_FAST_TEST("media_playback", test_media_vod_index_planning_rejects_partial_
     const std::vector<double> partial_with_several_starts{0.0, 4.0, 8.0, 12.0, 16.0};
     CHECK(!media_vod::indexed_plan(partial_with_several_starts, 120.0, 0.0, 4.0).has_value());
 
-    // Sparse but complete GOPs can still be remuxed when they remain within
-    // the deliberately generous 3x target-duration bound.
+    // Sparse but complete GOPs can still be remuxed: a fragment is as long as
+    // the source GOP makes it.
     std::vector<double> sparse_complete;
     for (double seconds = 0.0; seconds < 60.0; seconds += 10.0)
         sparse_complete.push_back(seconds);
     CHECK(media_vod::indexed_plan(sparse_complete, 60.0, 0.0, 4.0).has_value());
+
+    // Scene-cut encodes (x264/x265 defaults) leave keyframe gaps well past
+    // 3x the target fragment. Until 0.32.11 one such gap anywhere sent the
+    // whole file to a software transcode; a 40 s fragment is a long fragment,
+    // not an unusable index.
+    std::vector<double> scene_cut{0.0, 4.0, 44.0, 48.0, 52.0, 90.0, 94.0, 118.0};
+    auto scene_cut_plan = media_vod::indexed_plan(scene_cut, 120.0, 0.0, 4.0);
+    REQUIRE(scene_cut_plan.has_value());
+    CHECK(std::abs(scene_cut_plan->longest_segment_seconds - 40.0) < 0.0005);
+    // ... while a gap a viewer would wait minutes to seek across still is.
+    const std::vector<double> huge_gap{0.0, 4.0, 110.0, 114.0, 118.0};
+    CHECK(!media_vod::indexed_plan(huge_gap, 120.0, 0.0, 4.0).has_value());
 
     // One fragment is legitimate for genuinely short media; the regression
     // is accepting one fragment for a long presentation with an incomplete
@@ -407,8 +419,11 @@ MACHA_TEST("media_playback", test_reseek_hls_vod_reuses_prepared_random_access_s
     auto transcode_seek = reseek_hls_vod(transcode, 61s);
     REQUIRE(transcode_seek.has_value());
     CHECK(transcode_seek->playback.seek == 61s);
-    REQUIRE(!transcode_seek->segment_durations.empty());
-    CHECK(std::abs(transcode_seek->segment_durations.front() - 4.0) < 0.0005);
+    REQUIRE(transcode_seek->segment_durations.size() >= 2);
+    // A seek's first fragment is the short start-up fragment (2 s), so the
+    // generation answers after 2 s of encoding; the rest keep the target.
+    CHECK(std::abs(transcode_seek->segment_durations.front() - 2.0) < 0.0005);
+    CHECK(std::abs(transcode_seek->segment_durations[1] - 4.0) < 0.0005);
 
     // Regression: a transcode plan whose keyframe index is known (e.g.
     // captured during the initial VOD plan) should snap forward to the
@@ -437,7 +452,7 @@ MACHA_TEST("media_playback", test_reseek_hls_vod_reuses_prepared_random_access_s
     REQUIRE(snapped_seek.has_value());
     CHECK(snapped_seek->playback.seek == 62528ms);
     REQUIRE(!snapped_seek->segment_durations.empty());
-    CHECK(std::abs(snapped_seek->segment_durations.front() - 4.0) < 0.0005);
+    CHECK(std::abs(snapped_seek->segment_durations.front() - 2.0) < 0.0005);
 
     // Seeking past the last known keyframe falls back to the unsnapped
     // position rather than failing.

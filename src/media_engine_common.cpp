@@ -9,6 +9,10 @@
 
 namespace macha {
 namespace {
+// Keep in step with media_engine.cpp: a short first fragment so a seek's
+// generation answers after 2 s of encoding, not 4.
+constexpr double kStartupFragmentSeconds = 2.0;
+
 std::vector<double> fixed_vod_durations(double duration_seconds, double seek_seconds,
                                         double segment_seconds) {
     const double remaining = std::max(0.0, duration_seconds - seek_seconds);
@@ -16,6 +20,11 @@ std::vector<double> fixed_vod_durations(double duration_seconds, double seek_sec
         throw std::runtime_error("media duration is unavailable for VOD planning");
     std::vector<double> durations;
     double left = remaining;
+    const double first = std::min(segment_seconds, kStartupFragmentSeconds);
+    if (left > first + 0.001) {
+        durations.push_back(first);
+        left -= first;
+    }
     while (left > segment_seconds + 0.001) {
         durations.push_back(segment_seconds);
         left -= segment_seconds;
