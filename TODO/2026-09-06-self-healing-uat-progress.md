@@ -53,6 +53,23 @@ current at every checkpoint; a fresh session reads only this and the plan.
 - [x] **Discipline 4 — compact history out of the hot path (+ DLT7).** DONE: 0.32.0 on all nodes (`27c1903`, `96c3413`); measured-first scope (no retirement log); conflicts 116 → 9, merge delta 335,961 B → 277 B, no full-frame reconciliations.
 - [x] **UAT record complete**: `2026-09-06-self-healing-uat.md`, all four disciplines + the closing demonstrative run (2026-09-07 00:08–00:22: two concurrent writers, five rolling restarts incl. a writer, 0 ERROR, 1 WARN, 0 wedges, 277-byte merge delta). **PROGRAMME COMPLETE.**
 
+## Stress import IN PROGRESS (started 2026-09-07 00:40, operator-requested)
+
+Full libraries → real namespace roots, as the "new user imports two sites"
+test. `/root/uat/import-all.sh` on gbni-1 (pid 82252: Music → Movies → TV,
+6.1 TB / 15.5k files) and es-1 (pid 151383: Movies → TV, 2.4 TB / 6.3k
+files); one rsync at a time per node, `nice -n 10 ionice -c3`, `-a --inplace`,
+sources read-only, logs `/root/uat/import-{all,Music,Movies,TV}.log`,
+`import-all.rc` appears when a node finishes. Estimate ~9 days at 8 MB/s
+local / 6 MB/s WAN. **To stop: `kill <pid>` then `pkill -f "rsync -a --inplace /mnt/diskA"`
+on that node** (never touch other users' processes on es-1).
+Monitor: `/Users/tom/.claude/jobs/6aee47b8/tmp/import-check.sh` (one line
+per node); this session wakes every ~30 min to run it. Watch for: gbni-1
+RSS (4 GB box; snapshot heading to ~100 MB encoded), `mutate_max_ms`
+growth, `snapshot_bytes`, WARN/ERROR, parked/abandoned, conflicts count,
+full-frame reconciliations. Expected benign: conflicts for paths both
+libraries hold with different rips.
+
 ## Programme status: COMPLETE (2026-09-07 00:25)
 
 Nothing is in flight. A wake-up that reads this file should: verify all
