@@ -55,6 +55,37 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **0.32.8 verified (15:15 CEST):** node-c's barrier line named the
+  phase: `DATA retention barrier ids=3201 nodes=1 total_ms=16317
+  scan_ms=16048 short=0` then `total_ms=357 scan_ms=261` for the next
+  quantum — a cold-dentry `stat` per extent (~5 ms on the import-saturated
+  disk); the 4,096-entry verified-loose cache cannot hold a 16 GB file's
+  extents. Both writers have `min_write_replicas: 1` (floor 1 → nodes=1;
+  also why a writer's death strands data — finding #6 — and why a put is
+  "replicated" only after repair). node-e's 13 s `retention_ms` came with
+  93-byte deltas and *no* `DATA retention barrier` line → outside
+  `retain_data` (decode of the 5 MB parent snapshot? catalogue root diff?
+  CONTROL claim?). peer_latency_ms with ping-only sampling: node-c→node-d
+  113 ms, node-e→node-d 159 ms, node-d→node-c 4 ms — the wifi asymmetry is
+  real, not a metric artefact. node-c's 16 GB spool (one file recovered
+  after restart) drained at ~8 MB/s; node-e's second pass over Movies is
+  mostly dedupe (216k reused vs 658 put extents).
+- **0.32.9 (commit `4e9f60b`, suite 358/358 after a rerun — the first
+  run hit a Mac load average of 650 and failed 16 timing assertions):**
+  `LocalStore::has()` remembers loose objects this process installed or
+  stat'ed (unbounded set, forgotten on remove); the presence test now
+  models the crash case via a reopened store. `retain_metadata_publication`
+  logs `metadata retention barrier total_ms= decode_ms= collect_ms=
+  catalogue_ms= data_ms= control_ms= data_objects= control_objects=
+  outcome=` when ≥ 250 ms. **Deployed node-d 15:01, node-c 15:07; node-e
+  deferred — the playback gate found a live viewer on it (25 playback
+  lines in 3 min), so node-e stays on 0.32.8 until playback stops.**
+  Verification (node-c, 0.32.9): the phase line named the next culprit —
+  `metadata retention barrier total_ms=4286 decode_ms=13 collect_ms=1
+  catalogue_ms=25 data_ms=0 control_ms=4247 control_objects=65`: the
+  CONTROL claim for catalogue objects. node-e (still 0.32.8) shows the
+  expected cold-stat scan (`ids=2659 scan_ms=3392`) and a 33 s max.
+
 - **0.32.7 verified (14:40 CEST, 4 min of traffic):** node-d
   `retain_objects` handler 12,113 ms → **0 ms**; commit fan-out
   `publish_ms` ≤ 554 ms on all nodes. Remaining cost is the writer-side
