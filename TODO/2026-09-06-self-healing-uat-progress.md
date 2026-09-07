@@ -55,6 +55,20 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **Schema-2 profile build DEPLOYED: gbni-1 17:44, gbni-2 17:54, es-1
+  18:49 CEST (commit `cce1c9c`).** With the TV's capability list
+  (bit_depth 10, hdr none) the gate now fires: `video=transcode/h264
+  audio=transcode/aac`, CODECS `avc1.640029,mp4a.40.2`. Operator report
+  via UI session on the earlier hotfix build: direct play of Ratatouille
+  now has sound (CODECS fix proven on hardware), transcode still silent
+  through Tizen's *native* HLS player (`forceNativeHls`), master playlist
+  correct → leading hypothesis: Tizen 3 native player handles fMP4 HLS
+  partially. No TS fallback exists (`hls_fmp4=false` is refused for
+  non-direct). Next viewer items: (a) external fMP4-vs-TS stream test on
+  the TV, (b) MPEG-TS HLS output behind an `hls_ts` capability if (a)
+  confirms, (c) Dolby Vision profile gate (`dolby_vision` = list of
+  profiles; profile 8.1 = HDR10).
+
 - **Hotfixed 0.32.12 on all three (gbni-2 17:24, es-1 18:25 CEST, gbni-1
   17:28 — operator ordered the immediate restart).** Then the UI session's
   one-call check with the TV's exact list showed the gate cannot fire:
