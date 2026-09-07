@@ -1599,10 +1599,12 @@ std::optional<MetadataSnapshotView> MetadataManager::retention_release_view() co
 
 MetadataRecord MetadataManager::mutate_impl(
     const std::function<void(MetadataSnapshot&, MetadataDelta*)>& mutate, bool exact_delta,
-    size_t retries) {
+    size_t retries, std::optional<MetadataMutationIdentity> identity) {
     std::unique_lock lock(mutation_mutex_);
     const auto origin = node_.node_id();
     std::optional<uint64_t> sequence;
+    if (identity && !identity->sequence)
+        throw std::invalid_argument("metadata mutation identity sequence must be non-zero");
 
     for (size_t attempt = 0; attempt < retries; ++attempt) {
         const auto total_started = Clock::now();
@@ -1652,6 +1654,17 @@ MetadataRecord MetadataManager::mutate_impl(
             cache_record(current, std::make_shared<MetadataSnapshot>(std::move(snapshot)));
             return current;
         }
+        if (identity) {
+            auto clock = snapshot.mutation_sequences.find(identity->origin);
+            if (clock != snapshot.mutation_sequences.end() &&
+                clock->second >= identity->sequence) {
+                // Already accepted (by this process before a crash, or by a
+                // peer that merged it): the caller's work is done.
+                ensure_accepted_head_durable(active, current, need, FrameType::read_ahead);
+                cache_record(current, std::make_shared<MetadataSnapshot>(std::move(snapshot)));
+                return current;
+            }
+        }
         if (!sequence) {
             const uint64_t previous =
                 seen == snapshot.mutation_sequences.end() ? 0 : seen->second;
@@ -1688,6 +1701,11 @@ MetadataRecord MetadataManager::mutate_impl(
         snapshot.mutation_sequences[origin] = *sequence;
         if (exact_delta)
             supplied_delta.mutation_sequences[origin] = *sequence;
+        if (identity) {
+            snapshot.mutation_sequences[identity->origin] = identity->sequence;
+            if (exact_delta)
+                supplied_delta.mutation_sequences[identity->origin] = identity->sequence;
+        }
 
         // Discipline 4. Keep the tombstone vector in canonical order so the
         // next reconciliation's union is a delta, not a 5-8 MB full frame
@@ -1803,14 +1821,15 @@ MetadataRecord MetadataManager::mutate_impl(
 MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot&)>& mutate,
                                        size_t retries) {
     return mutate_impl(
-        [&](MetadataSnapshot& snapshot, MetadataDelta*) { mutate(snapshot); }, false, retries);
+        [&](MetadataSnapshot& snapshot, MetadataDelta*) { mutate(snapshot); }, false, retries, {});
 }
 
 MetadataRecord MetadataManager::mutate_delta(
-    const std::function<void(MetadataSnapshot&, MetadataDelta&)>& mutate, size_t retries) {
+    const std::function<void(MetadataSnapshot&, MetadataDelta&)>& mutate, size_t retries,
+    std::optional<MetadataMutationIdentity> identity) {
     return mutate_impl(
         [&](MetadataSnapshot& snapshot, MetadataDelta* delta) { mutate(snapshot, *delta); }, true,
-        retries);
+        retries, identity);
 }
 
 bool MetadataManager::resolve_conflict(const std::string& id, std::string_view choice) {
