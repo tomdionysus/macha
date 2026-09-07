@@ -55,6 +55,14 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **0.32.3 (commit `0820ecb`, suite 355/355; deployed node-d 03:46, node-e
+  04:49 CEST, node-c pending its build):** clean accounting checkpoints
+  trusted with packs / dirty checkpoint = estimate while the walk runs;
+  local retention claim = `has()`. node-e status 40 s+ timeout → 0.7 ms;
+  store online in 2.6 s vs a 32-min walk. Import restarted on node-e (pid
+  156042). Next: deploy node-c and restart its import; then watch the
+  batching effect and the WAN/metadata latency items.
+
 - **0.32.2 (deployed 03:15–03:17 node-c / 04:17 CEST node-e, commit `eb9f568`, suite 354/354):** identity namespace batches (one commit per
   batch instead of per op) + utimens survives async publication. Imports
   restarted on both writers (node-c pid 87771 Movies→TV→Music; node-e pid
