@@ -51,7 +51,7 @@ GET /api/v1/playback/media?item_id=<catalogue item>
 
 It returns, per media, the identity, path, size, `container`, `format`, `duration_ms`, `bitrate`, the full stream list, and an `operations` object describing what this node can do with that file: `direct` (always true), `copy_into_fmp4` with separate `video` and `audio` booleans, and `transcode_video` / `transcode_audio` reflecting the encoders present in this build. No session is created and no pipeline starts.
 
-The same facts are on the catalogue media profile (`GET /api/v1/catalogue/media/<macha id>`, `schema_version` 3) for any media with an immutable identity. That pre-session availability is intentional and guaranteed for `macha:` identities. The reading order is: the persisted profile if one exists, otherwise a foreground probe whose result is persisted for later readers; background profiling of unwatched media runs at a lower priority and yields to a viewer.
+The same facts are on the catalogue media profile (`GET /api/v1/catalogue/media/<macha id>/profile`, `schema_version` 3) for any media with an immutable identity. That pre-session availability is intentional and guaranteed for `macha:` identities: with no stored profile the endpoint produces one there and then, at foreground priority, and persists it. It answers `404` only when the media is not on this node and `422` when the file cannot be probed. The reading order is: the persisted profile if one exists, otherwise a foreground probe whose result is persisted for later readers; background profiling of unwatched media runs at a lower priority and yields to a viewer.
 
 An older stored profile that predates a fact (a schema below the current one, on a video stream) is treated as stale and regenerated on that media's next playback.
 
