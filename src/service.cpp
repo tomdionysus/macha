@@ -479,6 +479,16 @@ void Service::initialise_services(std::stop_token stop) {
             [scanner_ptr = scanner.get()](const std::vector<std::string>& media_ids) {
                 return scanner_ptr->request_media_profiles(media_ids);
             },
+            [information = media_information.get(), fs_ptr = fs.get()](const std::string& media_id)
+                -> std::optional<MediaProbeResult> {
+                // Facts on demand: resolve at foreground priority and persist,
+                // so a client asking what a file is never gets "not yet".
+                if (!information) return std::nullopt;
+                auto found = fs_ptr->find_media(media_id);
+                if (!found) return std::nullopt;
+                return information->resolve_playback(media_id, found->first, found->second,
+                                                     Clock::now() + std::chrono::seconds(30));
+            },
             node_.config().catalogue.api.artwork_capability_ttl);
         auto manage_api = std::make_unique<ManageApi>(node_, *metadata, *fs, *catalogue,
                                                       *catalogue_hints, *scanner);
