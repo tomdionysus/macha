@@ -1,5 +1,20 @@
 # Current release
 
+## 0.32.14 — The media playlist grows with the encoder (development)
+
+Operator's TV after a mode switch (2026-09-07): "preparing new stream"
+cleared in ~7 s, then black for 1 min 38 s. The media playlist was a VOD
+list of every planned fragment (1,517 for a feature) and a fragment request
+blocked until that fragment was encoded, so a native player that prefetches
+deeply waited on the encoder, ~3 s each, for as many fragments as it chose to
+read ahead (UI session measurement: 30 fragments ≈ the 98 s).
+
+- The media playlist is an EVENT list of the fragments that exist, closed
+  with ENDLIST once the generation has produced its last; it answers
+  not_ready until the first fragment exists. Seeking is unchanged: PATCH
+  seek_ms creates a new generation, and the client's timeline comes from
+  the session's duration, not the playlist.
+
 ## 0.32.13 — The writer keeps a copy and the second one is prompt; a background effort ceiling (development)
 
 Operator decisions after the import findings (2026-09-07): keep
