@@ -38,6 +38,7 @@ extern "C" {
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -474,6 +475,11 @@ class FragmentWriter {
     Bytes fragment_;
     std::deque<double> durations_;
     double fallback_duration_{};
+    size_t published_{};
+    // Planned boundaries that produced no fragment. Their media did not
+    // disappear: it is still in the next fragment, so the next published
+    // segment is that long and must say so.
+    size_t carried_boundaries_{};
     bool init_published_{};
     // MPEG-TS: no box parsing and no init segment; bytes accumulate into the
     // current fragment and cut() publishes it at the planned boundaries.
@@ -481,6 +487,24 @@ class FragmentWriter {
 
     void append(Bytes& target, const uint8_t* data, size_t size) {
         target.insert(target.end(), data, data + size);
+    }
+
+    // The length to publish for the fragment about to go out: its own planned
+    // segment, plus every planned boundary that produced no fragment of its
+    // own. A playlist that says 10 s for 20 s of media puts every later
+    // segment in the wrong place on the player's timeline.
+    double publish_duration() {
+        double total = 0.0;
+        for (size_t i = 0; i <= carried_boundaries_; ++i) {
+            if (durations_.empty()) {
+                total += fallback_duration_;
+                continue;
+            }
+            total += durations_.front();
+            durations_.pop_front();
+        }
+        carried_boundaries_ = 0;
+        return total;
     }
 
     void handle_box(std::string_view type, const uint8_t* data, size_t size) {
@@ -502,10 +526,9 @@ class FragmentWriter {
         if (!fragment_.empty()) {
             append(fragment_, data, size);
             if (type == "mdat") {
-                auto duration = durations_.empty() ? fallback_duration_ : durations_.front();
-                if (!durations_.empty()) durations_.pop_front();
-                if (!store_->publish_segment(std::move(fragment_), duration))
+                if (!store_->publish_segment(std::move(fragment_), publish_duration()))
                     throw std::runtime_error("stream cancelled");
+                ++published_;
                 fragment_.clear();
             }
             return;
@@ -548,6 +571,10 @@ class FragmentWriter {
           raw_fragments_(store_->container() == MediaContainer::mpegts) {}
 
     bool raw_fragments() const noexcept { return raw_fragments_; }
+    size_t published() const noexcept { return published_; }
+    // A planned boundary passed without producing a fragment. Its media joins
+    // the next one, so its length must join it too.
+    void carry_boundary() noexcept { ++carried_boundaries_; }
 
     int write(const uint8_t* data, int size) {
         if (raw_fragments_) {
@@ -563,10 +590,9 @@ class FragmentWriter {
     // previous cut is one self-contained segment.
     void cut() {
         if (!raw_fragments_ || fragment_.empty()) return;
-        auto duration = durations_.empty() ? fallback_duration_ : durations_.front();
-        if (!durations_.empty()) durations_.pop_front();
-        if (!store_->publish_segment(std::move(fragment_), duration))
+        if (!store_->publish_segment(std::move(fragment_), publish_duration()))
             throw std::runtime_error("stream cancelled");
+        ++published_;
         fragment_.clear();
     }
 
@@ -590,10 +616,9 @@ class FragmentWriter {
             init_published_ = true;
         }
         if (!fragment_.empty()) {
-            auto duration = durations_.empty() ? fallback_duration_ : durations_.front();
-            if (!durations_.empty()) durations_.pop_front();
-            if (!store_->publish_segment(std::move(fragment_), duration))
+            if (!store_->publish_segment(std::move(fragment_), publish_duration()))
                 throw std::runtime_error("stream cancelled");
+            ++published_;
             fragment_.clear();
         }
     }
@@ -811,11 +836,31 @@ void setup_audio_transcode(StreamPipeline& pipe, AVFormatContext* output) {
     auto* enc = pipe.encoder;
     enc->sample_rate = pipe.decoder->sample_rate > 0 ? pipe.decoder->sample_rate : 48000;
     enc->sample_fmt = AV_SAMPLE_FMT_FLTP;
-    av_channel_layout_default(&enc->ch_layout, 2);
+    // Keep the source's channel layout. AAC carries 5.1 perfectly well, and a
+    // client that asked for a codec change did not ask for a downmix: a 6ch
+    // source arriving as stereo because the container changed is a quality
+    // loss the client never instructed (2026-09-07). Fall back to stereo only
+    // if this encoder build will not take the source layout.
+    const int source_channels = pipe.decoder->ch_layout.nb_channels;
+    if (source_channels > 0)
+        av_require(av_channel_layout_copy(&enc->ch_layout, &pipe.decoder->ch_layout),
+                   "copy source channel layout");
+    else
+        av_channel_layout_default(&enc->ch_layout, 2);
     enc->time_base = AVRational{1, enc->sample_rate};
-    enc->bit_rate = 192000;
+    const auto bitrate_for = [](int channels) {
+        return static_cast<int64_t>(std::clamp(channels, 1, 8)) * 64000;
+    };
+    enc->bit_rate = bitrate_for(enc->ch_layout.nb_channels);
     if (output->oformat->flags & AVFMT_GLOBALHEADER) enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    av_require(avcodec_open2(enc, codec, nullptr), "open AAC encoder");
+    if (avcodec_open2(enc, codec, nullptr) < 0) {
+        Log::warn("libav AAC encoder refused the source channel layout channels=" +
+                  std::to_string(enc->ch_layout.nb_channels) + "; encoding stereo");
+        av_channel_layout_uninit(&enc->ch_layout);
+        av_channel_layout_default(&enc->ch_layout, 2);
+        enc->bit_rate = bitrate_for(2);
+        av_require(avcodec_open2(enc, codec, nullptr), "open AAC encoder");
+    }
     pipe.output_stream->time_base = enc->time_base;
     av_require(avcodec_parameters_from_context(pipe.output_stream->codecpar, enc), "export audio encoder parameters");
     pipe.output_stream->codecpar->codec_tag = 0;
@@ -1303,6 +1348,14 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
         auto packet = make_av_packet();
         auto encoded = make_av_packet();
         auto decoded = make_av_frame();
+        // See the early flush below: only meaningful while every stream is a
+        // copy, because a transcoded stream's first packet arrives from an
+        // encoder rather than from this loop.
+        std::set<int> started_streams;
+        bool moov_flushed =
+            mpegts || std::any_of(pipelines.begin(), pipelines.end(), [](const auto& p) {
+                return p->transform != MediaTransform::copy;
+            });
 
         try {
             while (!cancelled.load() && (rc = av_read_frame(in, packet.get())) >= 0) {
@@ -1330,10 +1383,34 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                     if (pipe.type == MediaStreamType::video) {
                         auto seconds = packet->pts == AV_NOPTS_VALUE ? 0.0 :
                                            packet->pts * av_q2d(pipe.output_stream->time_base);
-                        if ((packet->flags & AV_PKT_FLAG_KEY) != 0 && cuts.before_keyframe(seconds))
+                        if ((packet->flags & AV_PKT_FLAG_KEY) != 0 && cuts.before_keyframe(seconds)) {
+                            const auto before = writer.published();
                             cut_fragment(out);
+                            // A flush that writes the delayed moov produces no
+                            // moof: the media buffered up to here stays
+                            // buffered and joins the next fragment. Say so, or
+                            // the playlist places every later segment 10 s
+                            // early on the player's timeline (2026-09-07).
+                            if (writer.published() == before) writer.carry_boundary();
+                        }
                     }
                     write_mux_packet(out, packet.get());
+                    if (!moov_flushed) {
+                        started_streams.insert(pipe.output_stream->index);
+                        if (started_streams.size() == pipelines.size()) {
+                            // Every stream has a packet, so the (E-)AC-3
+                            // sample entry can be filled and the moov written.
+                            // Spending the moov flush here costs one fragment
+                            // boundary's worth of nothing; spending it at the
+                            // first real boundary costs that boundary.
+                            moov_flushed = true;
+                            const auto before = writer.published();
+                            cut_fragment(out);
+                            if (writer.published() != before)
+                                Log::warn("libav remux early moov flush produced a fragment media=" +
+                                          source.media_id);
+                        }
+                    }
                 } else {
                     if (packet->pts != AV_NOPTS_VALUE) packet->pts -= origin;
                     if (packet->dts != AV_NOPTS_VALUE) packet->dts -= origin;
