@@ -1771,7 +1771,17 @@ MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
         request.body.assign(text.begin(), text.end());
         auto response = playback.handle(request);
         REQUIRE(response.status == expect);
-        return Json::parse(std::string(response.body.begin(), response.body.end()));
+        auto parsed = Json::parse(std::string(response.body.begin(), response.body.end()));
+        // Release the slot: this test walks the whole permutation table and
+        // would otherwise hit the session limit rather than the contract.
+        if (const auto* id = parsed.find("session_id")) {
+            HttpRequest remove;
+            remove.method = "DELETE";
+            remove.path = "/api/v1/playback/sessions/" + id->asString();
+            remove.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+            playback.handle(remove);
+        }
+        return parsed;
     };
 
     // A transcode instruction re-encodes both streams and says what it served.
@@ -1794,8 +1804,9 @@ MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
     CHECK(remuxed.find("output")->find("video")->find("color_transfer")->asString() == "smpte2084");
     CHECK(remuxed.find("output")->find("audio")->find("codec")->asString() == "eac3");
 
-    // The mixture: copy the video, re-encode the audio.
-    auto mixed = instruct(Json::Object{{"mode", "remux"}, {"audio", "transcode"}});
+    // The mixture: copy the video, re-encode the audio. It is a transcode,
+    // because something is being re-encoded, and it says so in the request.
+    auto mixed = instruct(Json::Object{{"mode", "transcode"}, {"video", "copy"}});
     CHECK(mixed.find("mode")->asString() == "transcode");
     CHECK(mixed.find("output")->find("video")->find("transform")->asString() == "copy");
     CHECK(mixed.find("output")->find("audio")->find("transform")->asString() == "transcode");
@@ -1805,6 +1816,11 @@ MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
     CHECK(mixed.find("output")->find("audio")->find("channels")->asUInt64() == 6);
     CHECK(transcoded.find("output")->find("audio")->find("channels")->asUInt64() == 6);
 
+    // The other mixture: re-encode the video, copy the audio.
+    auto video_only = instruct(Json::Object{{"mode", "transcode"}, {"audio", "copy"}});
+    CHECK(video_only.find("output")->find("video")->find("transform")->asString() == "transcode");
+    CHECK(video_only.find("output")->find("audio")->find("transform")->asString() == "copy");
+
     // The segment container is instructed too.
     auto ts = instruct(Json::Object{{"mode", "transcode"}, {"container", "mpegts"}});
     CHECK(ts.find("output")->find("format")->asString() == "mpegts");
@@ -1813,9 +1829,27 @@ MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
     instruct(Json::Object{{"max_height", 720}}, 400);
     instruct(Json::Object{{"mode", "auto"}}, 400);
     instruct(Json::Object{{"mode", "remux"}, {"video", "copy"}, {"max_height", 720}}, 400);
+
+    // The mode has to describe what is being done. direct and remux copy
+    // every stream; transcode re-encodes at least one. A mode naming
+    // something it is not doing is refused, not reinterpreted (2026-09-07).
+    instruct(Json::Object{{"mode", "remux"}, {"audio", "transcode"}}, 400);
+    instruct(Json::Object{{"mode", "remux"}, {"video", "transcode"}}, 400);
+    instruct(Json::Object{{"mode", "remux"}, {"max_height", 720}}, 400);
+    instruct(Json::Object{{"mode", "direct"}, {"audio", "transcode"}}, 400);
+    instruct(Json::Object{{"mode", "direct"}, {"video", "transcode"}}, 400);
+    instruct(Json::Object{{"mode", "direct"}, {"max_height", 720}}, 400);
+    instruct(Json::Object{{"mode", "transcode"}, {"video", "copy"}, {"audio", "copy"}}, 400);
+
+    // And the legal permutations stay legal.
+    instruct(Json::Object{{"mode", "direct"}, {"video", "copy"}, {"audio", "copy"}});
+    instruct(Json::Object{{"mode", "remux"}, {"video", "copy"}, {"audio", "copy"}});
+    instruct(Json::Object{{"mode", "transcode"}, {"video", "transcode"}, {"audio", "transcode"}});
+    instruct(Json::Object{{"mode", "transcode"}, {"video", "copy"}, {"audio", "transcode"}});
+    instruct(Json::Object{{"mode", "transcode"}, {"video", "transcode"}, {"audio", "copy"}});
 }
 
-MACHA_TEST("media_playback", test_forced_direct_bypasses_client_capabilities) {
+MACHA_TEST("media_playback", test_direct_is_the_source_file_and_refuses_a_quality_change) {
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -1846,21 +1880,24 @@ MACHA_TEST("media_playback", test_forced_direct_bypasses_client_capabilities) {
                              std::move(fake_engine));
     playback.start();
 
-    // Direct is a byte-stream override. Deliberately claim that the client can
-    // decode none of the source container/codecs, cannot consume HLS, and has
-    // absurd resolution/bitrate limits. None of those negotiation constraints
-    // may reject an explicit Direct request.
-    Json::Object incompatible_caps{{"containers", Json::Array{Json("webm")}},
-                                   {"video_codecs", Json::Array{Json("vp9")}},
-                                   {"audio_codecs", Json::Array{Json("opus")}},
-                                   {"hls_fmp4", false},
-                                   {"max_width", 1},
-                                   {"max_height", 1}};
-    Json::Object direct_prefs{{"mode", "direct"},
-                              {"max_height", 1},
-                              {"max_bitrate", static_cast<uint64_t>(1)}};
+    // Direct hands over the source file untouched. A quality instruction is a
+    // re-encode, so pairing one with direct describes something direct is not
+    // doing and is refused rather than quietly ignored.
+    Json::Object illegal_prefs{{"mode", "direct"},
+                               {"max_height", 1},
+                               {"max_bitrate", static_cast<uint64_t>(1)}};
+    Json::Object illegal_root{{"media_id", media_id},
+                              {"preferences", Json(std::move(illegal_prefs))}};
+    auto illegal_text = Json(std::move(illegal_root)).dump();
+    HttpRequest illegal_create;
+    illegal_create.method = "POST";
+    illegal_create.path = "/api/v1/playback/sessions";
+    illegal_create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    illegal_create.body.assign(illegal_text.begin(), illegal_text.end());
+    CHECK(playback.handle(illegal_create).status == 400);
+
+    Json::Object direct_prefs{{"mode", "direct"}};
     Json::Object direct_root{{"media_id", media_id},
-                             {"capabilities", Json(std::move(incompatible_caps))},
                              {"preferences", Json(std::move(direct_prefs))}};
     auto direct_text = Json(std::move(direct_root)).dump();
     HttpRequest direct_create;
@@ -1897,15 +1934,9 @@ MACHA_TEST("media_playback", test_forced_direct_bypasses_client_capabilities) {
     remove_direct.path = "/api/v1/playback/sessions/" + direct_json.find("session_id")->asString();
     CHECK(playback.handle(remove_direct).status == 204);
 
-    // Auto still negotiates normally. Make MP4 direct-play incompatible while
-    // keeping fMP4 remux compatible: the session must start as remux, advertise
-    // Direct unconditionally, and honour an explicit switch to Direct.
-    Json::Object remux_caps{{"containers", Json::Array{Json("webm")}},
-                            {"video_codecs", Json::Array{Json("h264")}},
-                            {"audio_codecs", Json::Array{Json("aac")}},
-                            {"hls_fmp4", true}};
+    // A remux session advertises direct unconditionally and honours an
+    // explicit switch back to it.
     Json::Object remux_root{{"media_id", media_id},
-                            {"capabilities", Json(std::move(remux_caps))},
                             {"preferences", Json(Json::Object{{"mode", "remux"}})}};
     auto remux_text = Json(std::move(remux_root)).dump();
     HttpRequest remux_create;

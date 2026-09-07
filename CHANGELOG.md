@@ -1,5 +1,27 @@
 # Current release
 
+## 0.33.0 — A mode must describe what it is doing (development)
+
+The operator's ruling on the legal permutations, enforced. `direct` and
+`remux` copy every stream; `transcode` re-encodes at least one and may copy
+the other. Eleven of the twenty-seven mode/video/audio combinations were
+being accepted against that rule, and two of them came back reported as a
+mode other than the one requested (2026-09-07).
+
+- `remux` with a stream set to `transcode` is now `400`; it used to be
+  accepted and reported as a transcode. `transcode` with both streams
+  copied is now `400`; it used to be accepted and reported as a remux. A
+  session that names a mode it is not performing misleads everything
+  downstream of it, so the request is refused rather than reinterpreted.
+- `direct` with a stream set to `transcode`, or with `max_height` /
+  `max_bitrate`, is now `400`. Those were silently ignored.
+- `remux` with `max_height` / `max_bitrate` is now `400` for the same
+  reason: a quality change is a re-encode, and remux copies.
+- The mixture is asked for as `{"mode": "transcode", "video": "copy"}`.
+- The session's `options` no longer carry per-stream transforms or quality
+  into the question they ask about a *different* mode, which would have
+  answered "remux unavailable" for a session that had a `max_height` set.
+
 ## 0.32.19 — The first fragment is one segment, and a transcode is not a downmix (development)
 
 Two faults found by ffprobing what a remux actually emits, rather than
