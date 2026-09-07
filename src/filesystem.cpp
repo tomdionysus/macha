@@ -1759,10 +1759,9 @@ FilesystemNamespaceBatchResult FileSystem::apply_namespace_batch(
     if (operations.empty())
         throw std::invalid_argument("filesystem namespace batch is empty");
 
-    // Write handles are path-backed. Keep every successful rename in this
-    // transaction serialized with write commit, exactly as the former
-    // single-operation rename path did.
-    std::lock_guard handles(open_writes_mutex_);
+    // Write handles are path-backed: after the transaction, every successful
+    // rename re-points the open handles beneath it (under the registry lock,
+    // which is not held across the mutation itself -- see open_write()).
     FilesystemNamespaceBatchResult result;
     result.entries.resize(operations.size());
     result.record = m_.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
@@ -1804,6 +1803,7 @@ FilesystemNamespaceBatchResult FileSystem::apply_namespace_batch(
         result.applied = operations.size();
     }
 
+    std::lock_guard handles(open_writes_mutex_);
     for (size_t op_index = 0; op_index < result.applied; ++op_index) {
         const auto& op = operations[op_index];
         if (op.kind != FilesystemNamespaceMutation::Kind::rename || op.from == op.to)
@@ -2079,8 +2079,22 @@ std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool t
                                                     bool cache_puts, WriteDurability durability,
                                                     uint64_t publication_pipeline_bytes,
                                                     DataWorkContext work_context) {
-    // Serialize path lookup/registration with rename so an opening writer cannot
-    // miss a rename between resolving the entry and joining the handle registry.
+    // open_writes_mutex_ serializes path lookup/registration with rename's
+    // handle fix-up so an opening writer cannot miss a rename between
+    // resolving the entry and joining the registry. It is never held across
+    // a metadata mutation (0.32.4): truncation is a cluster round trip and
+    // ran under it, as did every commit, so all publications on a node were
+    // serialized behind one WAN-bound commit at a time.
+    if (trunc) {
+        auto existing = resolve_existing_path(p);
+        if (!existing)
+            fail(ENOENT, "missing");
+        auto current = getattr(*existing);
+        if (current.type != EntryType::file)
+            fail(EISDIR, "directory");
+        if (current.size)
+            truncate_file(*existing, 0);
+    }
     std::lock_guard handles(open_writes_mutex_);
     auto resolved = resolve_existing_path(p);
     if (!resolved)
@@ -2088,10 +2102,6 @@ std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool t
     auto e = getattr(*resolved);
     if (e.type != EntryType::file)
         fail(EISDIR, "directory");
-    if (trunc && e.size) {
-        truncate_file(*resolved, 0);
-        e = getattr(*resolved);
-    }
     auto handle =
         std::make_shared<WriteHandle>(*this, *resolved, e, trunc || !e.size, cache_puts,
                                       durability, publication_pipeline_bytes, work_context);
@@ -2160,8 +2170,16 @@ std::vector<WriteHandleDiagnostics> FileSystem::active_write_diagnostics(const s
 void FileSystem::commit_write(WriteHandle& handle, const FsEntry& expected, uint64_t z,
                               const std::vector<ExtentRef>& xs, FsEntry* out,
                               std::optional<int64_t> mtime_override) {
-    std::lock_guard handles(open_writes_mutex_);
-    commit_file(handle.path_, expected, z, xs, out, mtime_override);
+    // Snapshot the handle's current path under the registry lock and commit
+    // outside it. A rename that lands between the two moves the entry away
+    // from `path`: the mutation then finds no entry ("removed while open"),
+    // the caller retries, and by then rename's fix-up has updated path_.
+    std::string path;
+    {
+        std::lock_guard handles(open_writes_mutex_);
+        path = handle.path_;
+    }
+    commit_file(path, expected, z, xs, out, mtime_override);
 }
 void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint64_t z,
                              const std::vector<ExtentRef>& xs, FsEntry* out,

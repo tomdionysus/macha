@@ -1,5 +1,23 @@
 # Current release
 
+## 0.32.4 — Publications no longer serialize behind one WAN-bound commit (development)
+
+Fifth finding from the full-library import (2026-09-07 04:00, gbni-1):
+after 0.32.3 the store was fine but gbni-1 still published nine extents in
+ten minutes with a full spool; six of its eight publication threads sat on
+`FileSystem::open_writes_mutex_`, which `commit_write` (and `open_write`'s
+truncation, and every namespace batch) held across a whole cluster metadata
+commit — seconds each with the WAN in the path — so a node's publications
+committed one at a time regardless of `commit_workers`.
+
+- `open_writes_mutex_` now protects only the handle registry and each
+  handle's `path_`: `commit_write` snapshots the path under it and commits
+  outside; `open_write` truncates before taking it; `apply_namespace_batch`
+  runs its mutation first and re-points open handles under the lock after.
+  A rename that lands between a commit reading its path and the mutation is
+  caught by the commit's own entry check (`removed while open`), the caller
+  retries, and rename's fix-up has updated the path by then.
+
 ## 0.32.3 — A restart is not a write outage; a retention claim is not a re-read (development)
 
 Third and fourth findings from the full-library import (2026-09-07 04:17–04:45,
