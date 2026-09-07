@@ -1,5 +1,52 @@
 # Current release
 
+## 0.32.18 — A failure says which failure it was (development)
+
+A node that has lost its path to the cluster can still open its API and
+still fail to read a single byte of a film. Until now that came back
+indistinguishable from a corrupt file, so a client had no way to tell "ask
+another node" from "stop asking anyone" (2026-09-07, gbni-2 partitioned).
+
+- `MediaError` carries a `MediaFailure`: `unreadable` when this node could
+  not read the bytes, `unsupported` when the bytes were read and are not
+  media this build can demux, `timed_out` when reading missed the deadline.
+  libav flattens every read failure into `EIO`, so the underlying read error
+  is kept and preferred over libav's account of it.
+- The catalogue media profile, the playback facts endpoint and playback
+  stage failures all report a `reason` alongside the message:
+  `source_unreadable`, `source_unsupported`, `source_read_timed_out`. The
+  server states it and acts on none of it.
+- The facts endpoint no longer collapses a partly-readable item into a
+  `404`. It reports the media it could read and lists the rest under
+  `unavailable`, each with its own reason.
+
+## 0.32.17 — The catalogue media profile answers with facts, not 503 (development)
+
+The profile endpoint answered `503 profile_unavailable` whenever no profile
+had been persisted yet, which made "nobody has looked at this file" look
+like "this file is broken". The client's chooser reads that endpoint, so a
+title nobody had played was unplayable until a background worker got to it.
+
+- With no stored profile the endpoint now probes at foreground priority,
+  persists the result and returns it. `404` means the media is not on this
+  node; `422` means the file could not be probed.
+- Both priority classes hold: a profile already scanned is returned from
+  the persisted copy, and a viewer never waits on background work.
+
+## 0.32.16 — Remove client capabilities from the API (development)
+
+The server had been deciding how to play media on the client's behalf,
+which is not a server function. It reports what the media is and performs
+what it is told.
+
+- `negotiate()` becomes `plan_for(probe, preferences)`. `mode` is required
+  and must be `direct`, `remux` or `transcode`; there is no `auto`.
+- `ClientCapabilities` and every parser, description and warning built on
+  it are gone. The server does not ask what a client can play.
+- The media profile gains Dolby Vision profile and base-layer
+  compatibility (schema 3), so the client can choose on the facts that
+  actually decide the question.
+
 ## 0.32.15 — Matroska direct play, and a codec list per delivery path (development)
 
 The operator's TV decodes HEVC through its media element and fails it

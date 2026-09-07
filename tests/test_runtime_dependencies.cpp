@@ -738,3 +738,79 @@ MACHA_HEAVY_TEST("runtime_dependencies", test_embedded_music_metadata_and_artwor
 
 
 }
+
+MACHA_FAST_TEST("runtime_dependencies", test_probe_failure_reports_why_it_failed) {
+    // The engine says why it could not produce facts, and the reason survives
+    // to the client unchanged. "This node could not read the bytes" and "these
+    // bytes are not media" are different situations: the first may succeed on
+    // another node, the second will not succeed anywhere. Before this the two
+    // arrived identically and a partitioned node looked like a corrupt file
+    // (2026-09-07).
+    struct UnreachableInput : MediaInput {
+        uint64_t size() const override { return 8ULL * 1024 * 1024; }
+        size_t read(uint64_t, std::span<uint8_t>, Clock::time_point, std::atomic_bool*) override {
+            throw std::runtime_error("extent unavailable: no route to any replica");
+        }
+    };
+    struct BytesInput : MediaInput {
+        Bytes bytes;
+        uint64_t size() const override { return bytes.size(); }
+        size_t read(uint64_t offset, std::span<uint8_t> out, Clock::time_point,
+                    std::atomic_bool*) override {
+            if (offset >= bytes.size()) return 0;
+            const auto n = std::min<size_t>(out.size(), bytes.size() - offset);
+            std::copy_n(bytes.begin() + static_cast<ptrdiff_t>(offset), n, out.begin());
+            return n;
+        }
+    };
+
+    StreamingConfig streaming;
+    auto engine = make_libav_media_engine(streaming);
+    REQUIRE(engine != nullptr);
+
+    const auto probe_failure = [&](std::function<std::shared_ptr<MediaInput>()> open,
+                                   uint64_t size) {
+        MediaSource source;
+        source.media_id = "macha:test";
+        source.logical_path = "/Movies/test.mkv";
+        source.size = size;
+        source.open = [open](MediaReadPurpose) { return open(); };
+        std::optional<MediaFailure> failure;
+        try {
+            (void)engine->probe(source, 5000ms);
+        } catch (const MediaError& error) {
+            failure = error.failure();
+        } catch (const std::exception&) {
+        }
+        return failure;
+    };
+
+    const auto unreachable =
+        probe_failure([] { return std::make_shared<UnreachableInput>(); }, 8ULL * 1024 * 1024);
+    REQUIRE(unreachable.has_value());
+    CHECK(*unreachable == MediaFailure::unreadable);
+    CHECK(media_failure_name(*unreachable) == "source_unreadable");
+
+    auto garbage = std::make_shared<BytesInput>();
+    const std::string_view filler = "this is not media, it is only bytes\n";
+    while (garbage->bytes.size() < 512 * 1024)
+        garbage->bytes.insert(garbage->bytes.end(), filler.begin(), filler.end());
+    const auto unsupported = probe_failure([garbage] { return garbage; }, garbage->bytes.size());
+    REQUIRE(unsupported.has_value());
+    CHECK(*unsupported == MediaFailure::unsupported);
+    CHECK(media_failure_name(*unsupported) == "source_unsupported");
+
+    // A source with no reader at all is unreadable, not unparseable.
+    MediaSource headless;
+    headless.media_id = "macha:test";
+    headless.size = 1024;
+    std::optional<MediaFailure> headless_failure;
+    try {
+        (void)engine->probe(headless, 5000ms);
+    } catch (const MediaError& error) {
+        headless_failure = error.failure();
+    } catch (const std::exception&) {
+    }
+    REQUIRE(headless_failure.has_value());
+    CHECK(*headless_failure == MediaFailure::unreadable);
+}

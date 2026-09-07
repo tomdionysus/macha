@@ -62,6 +62,10 @@ struct HttpResponse {
 
 HttpResponse http_json(int status, std::string value);
 HttpResponse http_error(int status, std::string_view code, std::string_view message);
+// Same, plus a machine-readable reason the client can act on. Used where the
+// server states why it could not answer and leaves the decision to the client.
+HttpResponse http_error(int status, std::string_view code, std::string_view message,
+                        std::string_view reason);
 std::string http_url_decode(std::string_view value);
 
 class HttpServer {
