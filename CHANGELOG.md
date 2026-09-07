@@ -1,5 +1,33 @@
 # Current release
 
+## 0.32.11 — Remux is allowed to have long fragments; transcode uses the cores it has (development)
+
+Viewer path, measured first (2026-09-07, all three nodes, 24 h of logs):
+every VOD plan was a software transcode. Remux was tried for HEVC titles
+on HEVC-capable clients and rejected as `unusable-keyframe-index` although
+the Matroska cues were complete (1,533 entries on a 9 GB title). No Dolby
+Vision, HDR or HEVC exclusion exists; the rejection came from a
+segment-density rule.
+
+- **Remux keyframe rule.** `media_vod::indexed_plan` rejected the whole file
+  if any fragment exceeded 3x the target (12 s). Scene-cut x264/x265
+  encodes have such gaps routinely. A fragment is now as long as the
+  source GOP makes it, up to 90 s; only a tail over 90 s (the partial-index
+  case the rule was written for) or a gap over 90 s rejects. The planner's
+  rejection line now carries `keyframes=` and `longest_gap_s=`.
+- **x264 threading.** `thread_count` was never set and `tune=zerolatency`
+  switched x264 to sliced threading: about real time for 1080p CRF 20 on a
+  4-core node, so every representation change cost 5-13 s and a mid-file
+  seek could not catch up. Now frame-threaded across the hardware threads
+  (`streaming.video_encoder_threads`, 0 = all) with a short look-ahead.
+- **Short first fragment.** A transcode generation answers its request only
+  after its first fragment is encoded; that fragment is now 2 s (later
+  ones keep the segment duration), on every start and every seek.
+- **Plan cache across seeks.** The VOD plan cache key no longer includes
+  the seek position; a hit is re-seeked (`reseek_hls_vod`), so a
+  representation change at a new position no longer re-opens, re-probes and
+  re-indexes the container.
+
 ## 0.32.10 — CONTROL retention puts go together, to the nearest replica (development)
 
 0.32.9's phase line on gbni-1: `metadata retention barrier total_ms=4286

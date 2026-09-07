@@ -55,6 +55,27 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **WAN control-lane starvation: CLOSED (25-min soak 16:13-16:38 CEST,
+  0.32.10 on all three, imports running).** Mutations ≥100 ms: gbni-1
+  p50 337 / p90 391 / max 391 ms; es-1 n=474 p50 615 / p90 698 / max
+  1,079 ms; gbni-2 p50 289 / max 647. Retention avg 28-51 ms. **Zero**
+  `deadline exceeded` / `peer closed` lines. Was 195-284 s. Remaining
+  floor is the commit fan-out over a 60 ms link (~3 sequential round
+  trips ≈ 0.5-0.7 s) — pipelining store/history/accept is the next
+  step if it ever matters. Operator moved on to item 5 (viewer path).
+- **Viewer path (item 5) — measured first (17:00 CEST):** every VOD plan
+  on all three nodes in 24 h was `mode=transcode`; remux was tried and
+  rejected with `unusable-keyframe-index` on the two titles that carried
+  HEVC to an HEVC-capable client (Ratatouille: 1,533 cue entries
+  materialised, still rejected). The rule (`media_vod.cpp`
+  `kMaximumSegmentFactor=3`): any keyframe gap > 12 s anywhere in the
+  file rejects remux for the whole file. x265/x264 scene-cut encodes
+  have such gaps routinely. No DV/HDR/HEVC exclusion exists. Also found:
+  PATCH restarts the pipeline for every non-subtitle change (container
+  opened up to 3×, plan cache key includes the seek), the response waits
+  for a full 4 s segment to be *encoded*, and x264 runs `tune=zerolatency`
+  (sliced threads) with `thread_count` unset.
+
 - **0.32.10 DEPLOYED gbni-2 15:30, es-1 16:40 CEST; gbni-1 deferred by
   the playback gate (viewer active), retrying every 5 min.** es-1 on
   0.32.10, 7 min: 35 mutations, retention avg **121 ms** (was 5,217),

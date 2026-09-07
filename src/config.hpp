@@ -354,6 +354,10 @@ struct StreamingConfig {
     // Per transformed video. Combined with max_video_transcodes this is a
     // hard process-wide upper bound on concurrently requested decoder threads.
     size_t video_decoder_threads{2};
+    // x264 frame threads per video transcode; 0 uses every hardware thread.
+    // Until 0.32.11 the encoder ran sliced-threaded (tune=zerolatency) with
+    // no thread count set, at about real time on the 4-core nodes.
+    size_t video_encoder_threads{0};
     std::chrono::milliseconds session_idle{std::chrono::minutes(30)};
     // Reclaim an abandoned physical encoder while retaining the logical
     // session long enough for client retry/reconciliation.

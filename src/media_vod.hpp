@@ -11,6 +11,7 @@ namespace macha::media_vod {
 struct IndexedPlan {
     double actual_seek_seconds{};
     std::vector<double> segment_durations;
+    double longest_segment_seconds{};
 };
 
 // Build an immutable VOD segment plan from known random-access video points.

@@ -9,11 +9,19 @@ namespace {
 
 constexpr double kTimestampEpsilon = 0.0005;
 constexpr double kMinimumDuration = 0.001;
-// A remux plan is only useful if every advertised fragment is reasonably
-// close to the configured target. This is deliberately generous enough for
-// ordinary GOP variation while rejecting a partial index whose final entry is
-// followed by minutes of unindexed media.
-constexpr double kMaximumSegmentFactor = 3.0;
+// A remux fragment starts at a source keyframe, so its length is whatever
+// the encoder's GOP structure gives. Until 0.32.11 any fragment longer than
+// 3x the target (12 s) rejected remux for the whole file. Scene-cut x264/x265
+// encodes have such gaps routinely, so on the live cluster every HEVC title
+// went to a full software transcode (5-13 s setup per request, ~real-time
+// segments) although the client could play the stream as-is (2026-09-07).
+// HLS carries variable fragment lengths; the bound now only rejects what the
+// original check was written for: a partial index whose last entry is
+// followed by minutes of unindexed media (`kMaximumTailSeconds`), and
+// fragments so long that a seek would wait unreasonably
+// (`kMaximumFragmentSeconds`).
+constexpr double kMaximumFragmentSeconds = 90.0;
+constexpr double kMaximumTailSeconds = 90.0;
 
 bool format_token(std::string_view names, std::string_view wanted) {
     size_t begin = 0;
@@ -69,9 +77,14 @@ std::optional<IndexedPlan> indexed_plan(std::span<const double> keyframe_seconds
     result.segment_durations.push_back(
         std::max(kMinimumDuration, duration_seconds - starts.back()));
 
-    const double maximum_segment = target_segment_seconds * kMaximumSegmentFactor;
-    if (std::any_of(result.segment_durations.begin(), result.segment_durations.end(),
-                    [&](double duration) { return duration > maximum_segment + kTimestampEpsilon; }))
+    result.longest_segment_seconds =
+        *std::max_element(result.segment_durations.begin(), result.segment_durations.end());
+    const double maximum_segment =
+        std::max(kMaximumFragmentSeconds, target_segment_seconds * 3.0);
+    const double maximum_tail = std::max(kMaximumTailSeconds, target_segment_seconds * 3.0);
+    if (result.segment_durations.back() > maximum_tail + kTimestampEpsilon)
+        return std::nullopt;
+    if (result.longest_segment_seconds > maximum_segment + kTimestampEpsilon)
         return std::nullopt;
 
     return result;

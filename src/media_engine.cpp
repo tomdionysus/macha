@@ -331,6 +331,13 @@ int choose_width(const AVCodecParameters* input, int target_height) {
     return std::max(2, scaled & ~1);
 }
 
+// A transcode generation answers its request only once its first fragment
+// is encoded (wait_for_initial_fragment). The first fragment is short so
+// that wait is short: 2 s of encoding instead of 4 s, on every start and
+// every seek (the segmenter forces a keyframe at each planned cut, so the
+// encoder's 4 s GOP does not constrain it). Later fragments keep the target.
+constexpr double kStartupFragmentSeconds = 2.0;
+
 std::vector<double> fixed_vod_durations(double duration_seconds, double seek_seconds,
                                         double segment_seconds) {
     const double remaining = std::max(0.0, duration_seconds - seek_seconds);
@@ -338,6 +345,11 @@ std::vector<double> fixed_vod_durations(double duration_seconds, double seek_sec
         throw std::runtime_error("media duration is unavailable for VOD planning");
     std::vector<double> durations;
     double left = remaining;
+    const double first = std::min(segment_seconds, kStartupFragmentSeconds);
+    if (left > first + 0.001) {
+        durations.push_back(first);
+        left -= first;
+    }
     while (left > segment_seconds + 0.001) {
         durations.push_back(segment_seconds);
         left -= segment_seconds;
@@ -654,7 +666,7 @@ const AVCodec* h264_encoder() {
 
 void setup_video_transcode(StreamPipeline& pipe, AVFormatContext* input, AVFormatContext* output,
                            const PlaybackPlan& plan, std::chrono::milliseconds segment_duration,
-                           size_t decoder_threads) {
+                           size_t decoder_threads, size_t encoder_threads) {
     open_decoder(pipe, decoder_threads);
     const auto* codec = h264_encoder();
     if (!codec) throw std::runtime_error("H.264 encoder is unavailable in libavcodec");
@@ -681,17 +693,28 @@ void setup_video_transcode(StreamPipeline& pipe, AVFormatContext* input, AVForma
         enc->rc_buffer_size = std::min<int64_t>(std::numeric_limits<int>::max(), enc->bit_rate * 2);
     }
     if (output->oformat->flags & AVFMT_GLOBALHEADER) enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    // Frame threading across the node's cores. Until 0.32.11 thread_count
+    // was never set and x264 ran `tune=zerolatency`, which turns frame
+    // threading into sliced threading (x264's own note: a large throughput
+    // loss) to save a few frames of latency the viewer never sees behind a
+    // 4 s fragment: full-resolution CRF 20 ran at about real time on the
+    // 4-core nodes, so every representation change cost 5-13 s and a
+    // mid-file seek could not catch up (2026-09-07).
+    const auto hardware_threads = std::max(1U, std::thread::hardware_concurrency());
+    enc->thread_count = static_cast<int>(
+        encoder_threads ? std::min<size_t>(encoder_threads, 64) : hardware_threads);
+    enc->thread_type = FF_THREAD_FRAME;
     if (enc->priv_data) {
         // This encoder feeds an interactive fragmented stream, not an offline
-        // file. x264's ordinary look-ahead retains decoded frames and delays
-        // the first fragment for compression efficiency which the viewer
-        // cannot use. Zero-latency mode removes that queue while preserving
-        // frame threading and the selected bitrate/quality policy.
+        // file: keep the look-ahead short so the first fragment is not held
+        // back for compression efficiency, and no B-frames (max_b_frames=0
+        // above) so decode order is presentation order.
         if (std::string_view(codec->name) == "libx264") {
             av_require(av_opt_set(enc->priv_data, "preset", "veryfast", 0),
                        "set x264 realtime preset");
-            av_require(av_opt_set(enc->priv_data, "tune", "zerolatency", 0),
-                       "set x264 zero-latency mode");
+            av_require(av_opt_set(enc->priv_data, "x264-params",
+                                  "rc-lookahead=8:sync-lookahead=0:sliced-threads=0", 0),
+                       "set x264 interactive look-ahead");
         } else {
             (void)av_opt_set(enc->priv_data, "preset", "veryfast", 0);
         }
@@ -703,8 +726,8 @@ void setup_video_transcode(StreamPipeline& pipe, AVFormatContext* input, AVForma
                " decoder_threads=" + std::to_string(pipe.decoder->thread_count) +
                " encoder=" + std::string(codec->name ? codec->name : "unknown") +
                " encoder_threads=" + std::to_string(enc->thread_count) +
-               " zero_latency=" +
-               std::to_string(std::string_view(codec->name) == "libx264" ? 1 : 0));
+               " frame_threads=1 zero_latency=0 width=" + std::to_string(enc->width) +
+               " height=" + std::to_string(enc->height));
     pipe.output_stream->time_base = enc->time_base;
     pipe.output_stream->sample_aspect_ratio = enc->sample_aspect_ratio;
     av_require(avcodec_parameters_from_context(pipe.output_stream->codecpar, enc), "export video encoder parameters");
@@ -1069,7 +1092,8 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                   std::chrono::milliseconds segment_duration,
                   std::shared_ptr<MediaSegmentStore> store, std::atomic_bool& cancelled,
                   uint64_t probe_bytes, std::chrono::milliseconds analyze_duration,
-                  std::chrono::milliseconds startup_timeout, size_t video_decoder_threads) {
+                  std::chrono::milliseconds startup_timeout, size_t video_decoder_threads,
+                  size_t video_encoder_threads) {
     const auto& plan = vod_plan.playback;
     if (vod_plan.segment_durations.empty())
         throw std::runtime_error("VOD plan contains no media segments");
@@ -1161,7 +1185,7 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
             pipe->output_stream->sample_aspect_ratio = input_stream->sample_aspect_ratio;
         } else if (type == MediaStreamType::video) {
             setup_video_transcode(*pipe, in, out, plan, segment_duration,
-                                  video_decoder_threads);
+                                  video_decoder_threads, video_encoder_threads);
         } else {
             setup_audio_transcode(*pipe, out);
         }
@@ -1296,6 +1320,7 @@ class LibavSession final : public MediaEngineSession {
     std::chrono::milliseconds analyze_duration_{};
     std::chrono::milliseconds startup_timeout_{};
     size_t video_decoder_threads_{};
+    size_t video_encoder_threads_{};
     std::shared_ptr<MediaSegmentStore> store_;
     std::jthread worker_;
     std::atomic_bool cancelled_{};
@@ -1309,7 +1334,7 @@ class LibavSession final : public MediaEngineSession {
             if (stop.stop_requested()) cancelled_.store(true);
             run_pipeline(source_, vod_plan_, segment_duration_, store_, cancelled_,
                          probe_bytes_, analyze_duration_, startup_timeout_,
-                         video_decoder_threads_);
+                         video_decoder_threads_, video_encoder_threads_);
             if (cancelled_.load()) {
                 exit_code_.store(0);
             } else {
@@ -1344,10 +1369,12 @@ class LibavSession final : public MediaEngineSession {
                  size_t max_ahead_segments, uint64_t memory_limit,
                  std::filesystem::path spill_directory, uint64_t probe_bytes,
                  std::chrono::milliseconds analyze_duration,
-                 std::chrono::milliseconds startup_timeout, size_t video_decoder_threads)
+                 std::chrono::milliseconds startup_timeout, size_t video_decoder_threads,
+                 size_t video_encoder_threads)
         : source_(std::move(source)), vod_plan_(std::move(vod_plan)), segment_duration_(segment_duration),
           probe_bytes_(probe_bytes), analyze_duration_(analyze_duration),
           startup_timeout_(startup_timeout), video_decoder_threads_(video_decoder_threads),
+          video_encoder_threads_(video_encoder_threads),
           store_(std::make_shared<MediaSegmentStore>(max_ahead_segments, memory_limit,
                                                      std::move(spill_directory), segment_duration,
                                                      vod_plan_.segment_durations)) {
@@ -1487,9 +1514,24 @@ class LibavMediaEngine final : public MediaEngine {
                     result.playback.seek = std::chrono::milliseconds(
                         static_cast<int64_t>(std::ceil(actual_seek * 1000.0)));
                 } else {
+                    // Name the reason: how many entries, and the longest gap
+                    // between consecutive keyframes (the tail counts as a
+                    // gap), so an operator can tell a partial index from a
+                    // long-GOP encode without a debugger.
+                    const auto index_keyframes =
+                        video_keyframe_seconds(format, result.playback.video_stream);
+                    double longest_gap = 0.0;
+                    double previous = 0.0;
+                    for (const double seconds : index_keyframes) {
+                        longest_gap = std::max(longest_gap, seconds - previous);
+                        previous = seconds;
+                    }
+                    longest_gap = std::max(longest_gap, source_duration_seconds - previous);
                     Log::debug("media VOD planner rejected unusable remux keyframe index media=" +
                                source.media_id + " entries=" +
-                               std::to_string(avformat_index_get_entries_count(stream)));
+                               std::to_string(avformat_index_get_entries_count(stream)) +
+                               " keyframes=" + std::to_string(index_keyframes.size()) +
+                               " longest_gap_s=" + std::to_string(longest_gap));
                     if (!allow_video_transcode_fallback || !status_.h264_encoder)
                         throw std::runtime_error(
                             "remux VOD requires a usable video keyframe index; H.264 fallback is not permitted or unavailable");
@@ -1585,7 +1627,8 @@ class LibavMediaEngine final : public MediaEngine {
                                               segment_memory_bytes, spill_directory,
                                               config_.probe_bytes, config_.probe_analyze_duration,
                                               config_.startup_timeout,
-                                              config_.video_decoder_threads);
+                                              config_.video_decoder_threads,
+                                              config_.video_encoder_threads);
     }
 
     std::string extract_webvtt_segment(const MediaSource& source, int subtitle_stream,
