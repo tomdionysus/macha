@@ -1087,13 +1087,15 @@ struct FuseFrontend::State {
             bool rate_admitted = current < throttle_start;
             bool progress_admitted = false;
             Clock::time_point wake_at = Clock::time_point::max();
-            if (capacity_available && !rate_admitted &&
-                spool_publish_rate_bytes_per_second <= 0.0 &&
-                bytes <= spool_progress_credit_bytes) {
-                // No whole-file retirement sample exists yet. Pace strictly
-                // from successfully drained bounded publication work. This is
-                // the bootstrap path which prevents the 50% zero-rate dead
-                // zone without inventing capacity or a polling owner.
+            if (capacity_available && !rate_admitted && bytes <= spool_progress_credit_bytes) {
+                // Pace from successfully drained bounded publication work
+                // (quanta), whether or not a whole-file retirement sample
+                // exists. Until 0.32.5 the credit was consulted only before
+                // the first sample: while a multi-GB file published quantum
+                // by quantum nothing *retired*, the last small sample stood
+                // (46 KB/s on es-1, 2026-09-07) and the importer was paced to
+                // it -- 0.3 MB/s on a link and disk good for 8 -- although
+                // the spool was draining 32 MB at a time.
                 rate_admitted = true;
                 progress_admitted = true;
             } else if (capacity_available && !rate_admitted &&

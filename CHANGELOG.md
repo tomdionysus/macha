@@ -1,5 +1,24 @@
 # Current release
 
+## 0.32.5 — Spool pacing credits drained quanta, not only retired files (development)
+
+Sixth import finding (2026-09-07 10:30, es-1): while a multi-GB file
+published quantum by quantum nothing *retired* from the spool, so the
+whole-file retirement rate sample never refreshed; the last small sample
+(46 KB/s) stood and the importer's writes were paced to it — 0.3 MB/s on
+a link and disk good for 8 — although the spool drained 32 MB at a time.
+The drained-quantum credit (`note_spool_publication_progress`) was only
+consulted before the first sample existed.
+
+- `reserve_spool_bytes` admits against drained-quantum credit whenever
+  there is any, regardless of the rate sample; the rate path remains for
+  the rest.
+
+Also measured, not yet changed: each quantum commit of a large file
+re-sends the file's whole extent table in its metadata delta (105 KB per
+32 MB quantum for a 13.9 GB file; 124 MB of history per node in 35 min).
+An append-extents delta operation (DLT8) is the fix and is next.
+
 ## 0.32.4 — Publications no longer serialize behind one WAN-bound commit (development)
 
 Fifth finding from the full-library import (2026-09-07 04:00, gbni-1):
