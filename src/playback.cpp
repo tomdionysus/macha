@@ -560,9 +560,18 @@ Json output_json(const MediaProbeResult& probe, const PlaybackPlan& plan,
         if (plan.video == MediaTransform::copy) {
             if (!video->profile.empty()) value["profile"] = video->profile;
             if (video->bitrate) value["bitrate"] = video->bitrate;
+            if (video->bit_depth) value["bit_depth"] = video->bit_depth;
+            if (video->level) value["level"] = video->level;
+            if (!video->color_transfer.empty()) value["color_transfer"] = video->color_transfer;
+        } else if (plan.video == MediaTransform::transcode) {
+            // What the encoder actually emits, so a client can tell a
+            // downconverted PQ source from a gate that did nothing: 8-bit
+            // 4:2:0 H.264 High with an SDR transfer.
+            value["profile"] = "High";
+            value["bit_depth"] = 8;
+            value["color_transfer"] = "bt709";
+            if (plan.target_video_bitrate) value["bitrate"] = *plan.target_video_bitrate;
         }
-        if (plan.video == MediaTransform::transcode && plan.target_video_bitrate)
-            value["bitrate"] = *plan.target_video_bitrate;
         out["video"] = Json(std::move(value));
     }
 
