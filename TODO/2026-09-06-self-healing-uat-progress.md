@@ -55,6 +55,14 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **0.32.3 (commit `0820ecb`, suite 355/355; deployed gbni-2 03:46, es-1
+  04:49 CEST, gbni-1 pending its build):** clean accounting checkpoints
+  trusted with packs / dirty checkpoint = estimate while the walk runs;
+  local retention claim = `has()`. es-1 status 40 s+ timeout → 0.7 ms;
+  store online in 2.6 s vs a 32-min walk. Import restarted on es-1 (pid
+  156042). Next: deploy gbni-1 and restart its import; then watch the
+  batching effect and the WAN/metadata latency items.
+
 - **0.32.2 (deployed 03:15–03:17 gbni / 04:17 CEST es-1, commit `eb9f568`, suite 354/354):** identity namespace batches (one commit per
   batch instead of per op) + utimens survives async publication. Imports
   restarted on both writers (gbni-1 pid 87771 Movies→TV→Music; es-1 pid

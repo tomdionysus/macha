@@ -540,6 +540,32 @@ Also measured while here (for the next iteration, not fixed yet):
 - es-1 logs 25 `media information prune deferred: catalogue unavailable`
   WARNs in one boot minute — one line would do.
 
+### Iteration 3 — a restart was a write outage; status was unreachable (04:17–04:49 CEST, es-1)
+
+After the 0.32.2 restart es-1's `/api/v1/status` stopped answering
+(`http=000` after 40 s), its import made no progress and gbni-1's
+publications queued on the metadata mutation mutex. Stacks on es-1: all 16
+HTTP workers in `LocalStore::has` (via `CatalogueManager::status`), twelve
+`put_deferred` threads and the pack compactor in
+`LocalStore::wait_for_accounting`, one thread in `LocalStore::scan` walking
+`/mnt/diskB/objects` with `getdents64`, and a metadata mutation's retention
+step in `LocalStore::get → valid → retain_on` re-reading extents. The
+constructor forced a full walk of the object tree whenever packs existed,
+and every put waited for it: gbni-1's walk took 4 min 21 s (320 GB); es-1's
+had been running 32 minutes (826 GB, disk saturated by the import) and was
+still going. Every metadata commit's retention claim also did the full
+`valid()` re-read of each extent.
+
+Fix (0.32.3): a clean checkpoint is trusted with packs (dirty is persisted
+before the first mutation, so a torn pack tail can only sit behind a dirty
+checkpoint); a dirty checkpoint's figure is an estimate writes are admitted
+against while the walk reconciles; a local retention claim is `has()`.
+
+After, es-1 restart 04:49:00: `storage accounting restored path=/mnt/diskB
+used=828665503434`, `storage backend online /mnt/diskB elapsed_ms=2627
+accounting=ready`, `/api/v1/status` **200 in 0.7 ms**. gbni-2 the same
+(133 GB store, restored instantly).
+
 What is deliberately left from the programme itself (all filed, none blocking):
 - writer-restart re-send (present-content skip);
 - journal compaction while busy (journal resets only when idle;
