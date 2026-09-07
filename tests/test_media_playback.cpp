@@ -1821,9 +1821,20 @@ MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
     CHECK(video_only.find("output")->find("video")->find("transform")->asString() == "transcode");
     CHECK(video_only.find("output")->find("audio")->find("transform")->asString() == "copy");
 
-    // The segment container is instructed too.
+    // The segment container is instructed too, and the session reports the
+    // container it actually served: a request is not evidence of what was
+    // performed, and this was the one field a client could not verify.
     auto ts = instruct(Json::Object{{"mode", "transcode"}, {"container", "mpegts"}});
     CHECK(ts.find("output")->find("format")->asString() == "mpegts");
+    CHECK(ts.find("output")->find("container")->asString() == "mpegts");
+    auto ts_copy = instruct(Json::Object{{"mode", "remux"}, {"container", "mpegts"}});
+    CHECK(ts_copy.find("output")->find("container")->asString() == "mpegts");
+    CHECK(ts_copy.find("output")->find("video")->find("transform")->asString() == "copy");
+    CHECK(ts_copy.find("output")->find("audio")->find("transform")->asString() == "copy");
+    auto fmp4 = instruct(Json::Object{{"mode", "remux"}});
+    CHECK(fmp4.find("output")->find("container")->asString() == "fmp4");
+    auto direct_container = instruct(Json::Object{{"mode", "direct"}});
+    CHECK(direct_container.find("output")->find("container")->asString() == "matroska");
 
     // A mode is required, and a copy cannot also be a quality change.
     instruct(Json::Object{{"max_height", 720}}, 400);

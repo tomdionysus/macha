@@ -41,6 +41,8 @@ So "copy the video, re-encode the audio" is `{"mode": "transcode", "video": "cop
 
 A refusal names the rule. The server does not quietly reinterpret a mode into the one that would have worked, because a session that reports a mode it is not performing misleads everything downstream of it.
 
+The session reports the container it actually served in `output.container`: `fmp4` or `mpegts` for an HLS session, and the source's own container for a `direct` one. A request is not evidence of what was performed, so read it there.
+
 **What the server does not do.** It does not ask what the client can play, and there is no `capabilities` field. Whether a device can decode what it asked for is the client's business; the server reports the facts and carries out the instruction. A client that asks for `direct` on a file it cannot demux gets the file.
 
 ## Media facts
@@ -62,7 +64,9 @@ GET /api/v1/playback/media?media_id=<macha: or path: identity>
 GET /api/v1/playback/media?item_id=<catalogue item>
 ```
 
-It returns, per media, the identity, path, size, `container`, `format`, `duration_ms`, `bitrate`, the full stream list, and an `operations` object describing what this node can do with that file: `direct` (always true), `copy_into_fmp4` with separate `video` and `audio` booleans, and `transcode_video` / `transcode_audio` reflecting the encoders present in this build. No session is created and no pipeline starts.
+It returns, per media, the identity, path, size, `container`, `format`, `duration_ms`, `bitrate`, the full stream list, and an `operations` object describing what this node can do with that file: `direct` (always true), `copy_into_fmp4` and `copy_into_mpegts` each with separate `video` and `audio` booleans, and `transcode_video` / `transcode_audio` reflecting the encoders present in this build. No session is created and no pipeline starts.
+
+The two containers do not carry the same codecs. MPEG-TS predates the fMP4 arrangement and is where the carriage of these codecs was first defined, so it takes MPEG-2 video and MP3/MP2 audio that fMP4 will not, while fMP4 takes AV1 and Opus that TS will not. Both carry H.264, HEVC, AAC, AC-3 and E-AC-3. A player that refuses a codec in one container may accept the same bytes in the other, which is a client's decision to make from these two facts.
 
 `operations` is a fact, not a decision. It is answered by the node that received the request, from that node's build, about that one file, so it is per node and per source and must never be cached as a property of the cluster. Nodes on different builds legitimately give different answers, and the node the client will actually stream from is the only one whose answer matters.
 
