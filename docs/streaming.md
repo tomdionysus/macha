@@ -51,7 +51,23 @@ GET /api/v1/playback/media?item_id=<catalogue item>
 
 It returns, per media, the identity, path, size, `container`, `format`, `duration_ms`, `bitrate`, the full stream list, and an `operations` object describing what this node can do with that file: `direct` (always true), `copy_into_fmp4` with separate `video` and `audio` booleans, and `transcode_video` / `transcode_audio` reflecting the encoders present in this build. No session is created and no pipeline starts.
 
-The same facts are on the catalogue media profile (`GET /api/v1/catalogue/media/<macha id>/profile`, `schema_version` 3) for any media with an immutable identity. That pre-session availability is intentional and guaranteed for `macha:` identities: with no stored profile the endpoint produces one there and then, at foreground priority, and persists it. It answers `404` only when the media is not on this node and `422` when the file cannot be probed. The reading order is: the persisted profile if one exists, otherwise a foreground probe whose result is persisted for later readers; background profiling of unwatched media runs at a lower priority and yields to a viewer.
+`operations` is a fact, not a decision. It is answered by the node that received the request, from that node's build, about that one file, so it is per node and per source and must never be cached as a property of the cluster. Nodes on different builds legitimately give different answers, and the node the client will actually stream from is the only one whose answer matters.
+
+When one media of an item cannot be read, the others are still reported and the failures are listed separately in `unavailable`, each with its `media_id`, a `reason` and a message.
+
+## Why a request could not be answered
+
+Failures carry a `reason` so the client can tell situations apart that would otherwise look identical. The server states it and does nothing with it; deciding whether to ask another node, transcode from elsewhere, or stop, is the client's.
+
+| `reason` | meaning | what it implies |
+|---|---|---|
+| `source_unreadable` | this node could not read the file's bytes | the file may be perfectly good elsewhere: another node is worth asking |
+| `source_unsupported` | the bytes were read and are not media this build can demux | no node running this build will do better |
+| `source_read_timed_out` | reading did not finish inside the deadline | transient; a retry may succeed |
+
+`source_unsupported` is reported as `422`. The other two keep their transport-level status, `503` on the playback endpoints and `422` on the catalogue media profile, because whether they are worth retrying is a client judgement, not a server one.
+
+The same facts are on the catalogue media profile (`GET /api/v1/catalogue/media/<macha id>/profile`, `schema_version` 3) for any media with an immutable identity. That pre-session availability is intentional and guaranteed for `macha:` identities: with no stored profile the endpoint produces one there and then, at foreground priority, and persists it. It answers `404` only when the media is not on this node, and `422` with a `reason` when the file could not be probed. The reading order is: the persisted profile if one exists, otherwise a foreground probe whose result is persisted for later readers; background profiling of unwatched media runs at a lower priority and yields to a viewer.
 
 An older stored profile that predates a fact (a schema below the current one, on a video stream) is treated as stale and regenerated on that media's next playback.
 

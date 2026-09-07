@@ -13,7 +13,9 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace macha {
@@ -64,6 +66,32 @@ struct MediaProbeResult {
     uint64_t bitrate{};
     std::vector<MediaStreamInfo> streams;
     auto operator<=>(const MediaProbeResult&) const = default;
+};
+
+// Why the engine could not produce facts about a source. The server reports
+// this and does not act on it: "this node could not read the bytes" and "the
+// bytes are not media we can parse" are different situations for a client,
+// and only the client knows whether asking another node is worth doing.
+enum class MediaFailure : uint8_t {
+    // The source's bytes could not be read here. The file may be perfectly
+    // good and simply unreachable from this node, as happens when a partition
+    // cuts it off from the extents.
+    unreadable,
+    // The bytes were read and are not media this build can demux.
+    unsupported,
+    // Reading did not finish inside the caller's deadline.
+    timed_out,
+};
+
+std::string_view media_failure_name(MediaFailure) noexcept;
+
+class MediaError : public std::runtime_error {
+    MediaFailure failure_;
+
+  public:
+    MediaError(MediaFailure failure, const std::string& message)
+        : std::runtime_error(message), failure_(failure) {}
+    MediaFailure failure() const noexcept { return failure_; }
 };
 
 // A seekable immutable media view. Implementations may be backed by the DHT,

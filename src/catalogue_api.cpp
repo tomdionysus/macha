@@ -59,6 +59,16 @@ HttpResponse error(int status, std::string_view code, std::string_view message) 
                             json_escape(message) + "}");
 }
 
+// Same shape as error(), plus the engine's own account of why it could not
+// produce facts. The server states the reason; the client decides whether to
+// ask another node, transcode from somewhere else, or give up.
+HttpResponse media_error(int status, std::string_view code, std::string_view message,
+                         MediaFailure failure) {
+    return json(status, "{\"error\":" + json_escape(code) + ",\"message\":" +
+                            json_escape(message) + ",\"reason\":" +
+                            json_escape(media_failure_name(failure)) + "}");
+}
+
 std::string optional_number(const std::optional<int32_t>& value) {
     return value ? std::to_string(*value) : "null";
 }
@@ -417,6 +427,12 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 // profiling yields to it.
                 try {
                     profile = resolve_media_profile_(media_id);
+                } catch (const MediaError& e) {
+                    // Report which kind of failure this was and let the client
+                    // decide what to do with it. A source this node cannot read
+                    // may be perfectly good elsewhere; one that will not parse
+                    // will not parse anywhere.
+                    return media_error(422, "profile_failed", e.what(), e.failure());
                 } catch (const std::exception& e) {
                     return error(422, "profile_failed", e.what());
                 }
