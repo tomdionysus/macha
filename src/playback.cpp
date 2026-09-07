@@ -1214,7 +1214,11 @@ struct PlaybackManager::Impl {
             << plan.video_codec << '|' << plan.audio_codec << '|'
             << (plan.target_height ? *plan.target_height : -1) << '|'
             << (plan.target_video_bitrate ? *plan.target_video_bitrate : 0) << '|'
-            << plan.seek.count() << '|' << config.segment_duration.count() << '|'
+            // The seek position is deliberately not part of the key: a cached
+            // plan is re-seeked on a hit (reseek_hls_vod), so a representation
+            // change at a new position no longer re-opens and re-indexes the
+            // container (2026-09-07: three container opens per PATCH).
+            << config.segment_duration.count() << '|'
             << (session.preferences.mode != "remux" &&
                 session.capabilities.video_codecs.contains("h264"));
         return key.str();
@@ -1226,15 +1230,28 @@ struct PlaybackManager::Impl {
 
         const auto cache_key = vod_plan_key(session);
         {
-            std::lock_guard lock(mutex);
-            if (auto it = vod_plan_cache.find(cache_key); it != vod_plan_cache.end()) {
-                session.plan = it->second.playback;
-                session.vod_plan = it->second;
-                Log::debug("playback[" + std::string(trace) +
-                           "] VOD plan cache-hit media=" + session.source.media_id +
-                           " segments=" +
-                           std::to_string(session.vod_plan->segment_durations.size()));
-                return;
+            std::optional<HlsVodPlan> cached;
+            {
+                std::lock_guard lock(mutex);
+                if (auto it = vod_plan_cache.find(cache_key); it != vod_plan_cache.end())
+                    cached = it->second;
+            }
+            if (cached) {
+                const auto requested_seek = session.plan.seek;
+                auto reseeked = requested_seek == cached->playback.seek
+                                    ? std::optional<HlsVodPlan>(*cached)
+                                    : reseek_hls_vod(*cached, requested_seek);
+                if (reseeked) {
+                    session.plan = reseeked->playback;
+                    session.vod_plan = std::move(*reseeked);
+                    Log::debug("playback[" + std::string(trace) +
+                               "] VOD plan cache-hit media=" + session.source.media_id +
+                               " requested_ms=" + std::to_string(requested_seek.count()) +
+                               " aligned_ms=" + std::to_string(session.plan.seek.count()) +
+                               " segments=" +
+                               std::to_string(session.vod_plan->segment_durations.size()));
+                    return;
+                }
             }
         }
 
