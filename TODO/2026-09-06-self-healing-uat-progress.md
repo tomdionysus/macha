@@ -59,9 +59,11 @@ current at every checkpoint; a fresh session reads only this and the plan.
   04:49 CEST, node-c pending its build):** clean accounting checkpoints
   trusted with packs / dirty checkpoint = estimate while the walk runs;
   local retention claim = `has()`. node-e status 40 s+ timeout → 0.7 ms;
-  store online in 2.6 s vs a 32-min walk. Import restarted on node-e (pid
-  156042). Next: deploy node-c and restart its import; then watch the
-  batching effect and the WAN/metadata latency items.
+  store online in 2.6 s vs a 32-min walk. node-c deployed 03:50 (store
+  online in 309 ms vs 4 min 21 s; status 1.3 ms). Imports restarted: node-e
+  pid 156042, node-c pid 90309 (Movies→TV→Music). Next: watch the batching
+  effect and publication throughput; then the WAN/metadata latency items
+  (congestion-aware data-lane pacing; publish_commit replica order).
 
 - **0.32.2 (deployed 03:15–03:17 node-c / 04:17 CEST node-e, commit `eb9f568`, suite 354/354):** identity namespace batches (one commit per
   batch instead of per op) + utimens survives async publication. Imports
