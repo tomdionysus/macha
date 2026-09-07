@@ -59,6 +59,14 @@ struct MetadataClusterStatus {
     bool write_available{};
 };
 
+// See MetadataManager::mutate_delta(). `origin` is any NodeId-shaped key the
+// caller owns (a node's own id, or one derived from it for a sub-system);
+// `sequence` must increase across that caller's mutations.
+struct MetadataMutationIdentity {
+    NodeId origin{};
+    uint64_t sequence{};
+};
+
 struct MetadataHistoryTransferDiagnostics {
     uint64_t transfers{};
     uint64_t entries_submitted{};
@@ -172,7 +180,7 @@ class MetadataManager {
 
     MetadataRecord mutate_impl(
         const std::function<void(MetadataSnapshot&, MetadataDelta*)>&, bool exact_delta,
-        size_t retries);
+        size_t retries, std::optional<MetadataMutationIdentity> identity);
     void publish_replica_state(bool validated, std::string_view reason = {});
 
   public:
@@ -216,8 +224,15 @@ class MetadataManager {
     MetadataRecord mutate(const std::function<void(MetadataSnapshot&)>&, size_t retries = 8);
     // Fast path for callers that can describe the exact delta as they mutate the
     // decoded snapshot. Avoids retaining a second deep copy of the namespace.
+    // `identity`, when given, is an idempotency key in the snapshot's
+    // mutation-sequence clock: the mutation is applied only if
+    // mutation_sequences[identity.origin] < identity.sequence, and stamps that
+    // clock to identity.sequence when it is. A caller that must know after a
+    // crash whether its mutation took effect (the FUSE namespace loop's mixed
+    // batches) reads the clock instead of re-deriving per-operation effects.
     MetadataRecord mutate_delta(
-        const std::function<void(MetadataSnapshot&, MetadataDelta&)>&, size_t retries = 8);
+        const std::function<void(MetadataSnapshot&, MetadataDelta&)>&, size_t retries = 8,
+        std::optional<MetadataMutationIdentity> identity = {});
     // Snapshot at the last causal stability horizon. Retention release may use
     // this view; ordinary reads must use snapshot_view()/available_snapshot_view().
     std::optional<MetadataSnapshotView> retention_release_view() const;

@@ -532,6 +532,10 @@ struct FuseFrontend::State {
         data_published = 6,
         data_done = 7,
         data_abandoned = 8,
+        // A mixed namespace batch about to be published as one atomic
+        // metadata mutation, identified in the snapshot's mutation-sequence
+        // clock under this node's FUSE origin key by its first op sequence.
+        namespace_batch = 9,
     };
 
     struct JournalInode {
@@ -549,6 +553,8 @@ struct FuseFrontend::State {
         std::map<uint64_t, NamespaceOp> namespace_ops;
         std::set<uint64_t> namespace_published;
         std::set<uint64_t> namespace_done;
+        // first op sequence -> op count, for batches journaled before publish.
+        std::map<uint64_t, uint32_t> namespace_batches;
         std::map<uint64_t, std::vector<DataOp>> data_ops;
         std::map<uint64_t, std::pair<uint64_t, FsEntry>> data_published;
         std::map<uint64_t, uint64_t> data_done;
@@ -807,6 +813,7 @@ struct FuseFrontend::State {
             config.publication_pipeline_bytes =
                 std::min<uint64_t>(config.publication_quantum_bytes,
                                    static_cast<uint64_t>(fs.extent_size()) * 2);
+        fuse_namespace_origin = derive_fuse_namespace_origin(fs.node().node_id());
     }
 
     ~State() {
@@ -1300,6 +1307,22 @@ struct FuseFrontend::State {
 
     static bool namespace_batch_compatible(std::span<const NamespaceOp> current,
                                            const NamespaceOp& candidate) {
+        // 0.32.2: any run of operations batches. The batch is published as one
+        // atomic metadata mutation carrying an identity in the snapshot's
+        // mutation-sequence clock (journal_namespace_batch + fuse_namespace_origin),
+        // so after a crash the question "did this batch take effect?" is
+        // answered by the clock, never by re-deriving each op's effect from
+        // the final snapshot -- the reason renames and mixed kinds were kept
+        // singleton before. rsync's create / utimens / rename per file made
+        // that one metadata commit per op (~3/s cluster-wide) and every data
+        // publication waited behind the op naming its file (2026-09-07).
+        (void)current;
+        (void)candidate;
+        return true;
+    }
+
+    [[maybe_unused]] static bool namespace_batch_compatible_legacy(
+        std::span<const NamespaceOp> current, const NamespaceOp& candidate) {
         if (current.empty())
             return true;
         const auto is_delete = [](NamespaceOp::Kind kind) {
@@ -1638,6 +1661,15 @@ struct FuseFrontend::State {
         }
     }
 
+    void journal_namespace_batch(uint64_t first_sequence, size_t count) {
+        Writer payload;
+        payload.u8(static_cast<uint8_t>(JournalRecord::namespace_batch));
+        payload.u64(first_sequence);
+        payload.u32(static_cast<uint32_t>(count));
+        std::lock_guard lock(journal_mutex);
+        append_journal_record_locked(payload.data());
+    }
+
     void journal_namespace_published(std::span<const NamespaceOp> operations) {
         std::vector<Bytes> payloads;
         payloads.reserve(operations.size());
@@ -1737,7 +1769,7 @@ struct FuseFrontend::State {
         Reader reader(payload);
         const auto raw_type = reader.u8();
         if (raw_type < static_cast<uint8_t>(JournalRecord::inode) ||
-            raw_type > static_cast<uint8_t>(JournalRecord::data_abandoned))
+            raw_type > static_cast<uint8_t>(JournalRecord::namespace_batch))
             throw DecodeError("unknown FUSE journal record type");
         const auto type = static_cast<JournalRecord>(raw_type);
         switch (type) {
@@ -1861,6 +1893,14 @@ struct FuseFrontend::State {
                            " frame_offset=" + std::to_string(frame_offset));
             }
             recovery.data_done[inode] = sequence;
+            break;
+        }
+        case JournalRecord::namespace_batch: {
+            const auto first = reader.u64();
+            const auto count = reader.u32();
+            if (!first || !count || count > 65536)
+                throw DecodeError("invalid FUSE namespace batch record");
+            recovery.namespace_batches[first] = count; // a re-attempt re-journals; last wins
             break;
         }
         case JournalRecord::data_abandoned: {
@@ -2772,12 +2812,35 @@ struct FuseFrontend::State {
     }
 
     FilesystemNamespaceBatchResult
-    apply_namespace_backend(std::span<const NamespaceOp> operations) {
+    apply_namespace_backend(std::span<const NamespaceOp> operations,
+                            std::optional<MetadataMutationIdentity> identity = {},
+                            bool atomic = false) {
         std::vector<FilesystemNamespaceMutation> mutations;
         mutations.reserve(operations.size());
         for (const auto& op : operations)
             mutations.push_back(filesystem_namespace_mutation(op));
-        return fs.apply_namespace_batch(mutations);
+        return fs.apply_namespace_batch(mutations, identity, atomic);
+    }
+
+    // The FUSE namespace loop's idempotency key: a NodeId-shaped origin derived
+    // from this node's id, whose clock in MetadataSnapshot::mutation_sequences
+    // is advanced to a batch's first op sequence when that batch commits.
+    NodeId fuse_namespace_origin{};
+
+    static NodeId derive_fuse_namespace_origin(const NodeId& node) {
+        Writer w;
+        w.raw(std::array<uint8_t, 16>{'m', 'a', 'c', 'h', 'a', '-', 'f', 'u', 's', 'e', '-', 'n',
+                                      's', 'o', 'p', '1'});
+        w.fixed(node.bytes);
+        const auto digest = sha256(w.data());
+        NodeId out;
+        std::copy_n(digest.bytes.begin(), out.bytes.size(), out.bytes.begin());
+        return out;
+    }
+
+    uint64_t fuse_namespace_clock(const MetadataSnapshot& snapshot) const {
+        auto found = snapshot.mutation_sequences.find(fuse_namespace_origin);
+        return found == snapshot.mutation_sequences.end() ? 0 : found->second;
     }
 
     void namespace_success(const NamespaceOp& op, const MetadataSnapshot* snapshot = nullptr) {
@@ -2864,6 +2927,11 @@ struct FuseFrontend::State {
             std::shared_ptr<const MetadataSnapshot> published_snapshot;
             RetryState retry;
             bool budget_reported = false;
+            // Every batch is published under its identity (see
+            // namespace_batch_compatible); a batch a refused op turns back
+            // into a singleton falls back to per-op effect semantics.
+            bool identity_batch = true;
+            bool batch_journaled = false;
             while (!published_prefix && !stop.stop_requested() && !stopping.load()) {
                 bool skip_requested = false;
                 {
@@ -2901,9 +2969,18 @@ struct FuseFrontend::State {
                     // not a reason to stop namespace convergence indefinitely.
 
                     // A crash may leave an accepted effect without its local
-                    // marker. Retire only a leading already-achieved prefix so
-                    // operation order remains explicit for the remaining batch.
+                    // marker. An identity batch asks the snapshot's clock
+                    // whether the whole batch committed; a singleton falls back
+                    // to the per-op effect check (still valid for one op).
                     auto before = fs.local_snapshot_view();
+                    const MetadataMutationIdentity identity{fuse_namespace_origin,
+                                                            batch.front().sequence};
+                    // The clock answers for a whole identity batch; otherwise
+                    // a leading run of already-achieved ops is retired without
+                    // a commit (retiring on visible effect never re-applies
+                    // anything, so it is safe for every kind).
+                    if (identity_batch && fuse_namespace_clock(*before.snapshot) >= identity.sequence)
+                        published_prefix = batch.size();
                     while (published_prefix < batch.size() &&
                            namespace_effect_confirmed(batch[published_prefix], *before.snapshot))
                         ++published_prefix;
@@ -2911,18 +2988,52 @@ struct FuseFrontend::State {
 
                     if (published_prefix < batch.size()) {
                         namespace_publication_attempts.fetch_add(1, std::memory_order_relaxed);
+                        const auto remaining =
+                            std::span<const NamespaceOp>(batch).subspan(published_prefix);
+                        // A single op keeps the old per-op semantics (safe:
+                        // nothing intermediate to lose); two or more go as one
+                        // atomic mutation under the batch identity.
+                        const bool atomic = identity_batch && remaining.size() > 1;
                         FilesystemNamespaceBatchResult result;
                         try {
                             wait_for_weighted_loader_service();
                             try {
-                                result = apply_namespace_backend(
-                                    std::span<const NamespaceOp>(batch).subspan(published_prefix));
+                                if (atomic) {
+                                    if (!batch_journaled) {
+                                        journal_namespace_batch(identity.sequence, batch.size());
+                                        batch_journaled = true;
+                                    }
+                                    result = apply_namespace_backend(remaining, identity, true);
+                                } else {
+                                    result = apply_namespace_backend(remaining);
+                                }
                             } catch (...) {
                                 finish_weighted_loader_service();
                                 throw;
                             }
                             finish_weighted_loader_service();
                         } catch (const FsError& error) {
+                            if (atomic && !retryable_backend_error(error)) {
+                                // One op in the batch is refused (ENOENT,
+                                // EEXIST, ...): nothing was committed. Publish
+                                // the head of the remainder alone the old way
+                                // so the exact culprit is reported, and requeue
+                                // the rest in order.
+                                {
+                                    std::lock_guard lock(namespace_queue_mutex);
+                                    for (size_t i = batch.size(); i-- > published_prefix + 1;)
+                                        namespace_queue.push_front(batch[i]);
+                                    namespace_inflight_operations = published_prefix + 1;
+                                }
+                                batch.resize(published_prefix + 1);
+                                identity_batch = false;
+                                Log::debug("FUSE namespace batch refused atomically; retrying "
+                                           "head op alone seq=" +
+                                           std::to_string(batch.back().sequence) +
+                                           " error=" + error.what());
+                                published_prefix = 0;
+                                continue;
+                            }
                             if (!published_prefix)
                                 throw;
                             prefix_failure_code = error.code();
@@ -3469,6 +3580,13 @@ struct FuseFrontend::State {
             served += commit_preparation.bytes_processed;
             if (!commit_preparation.ready || served >= config.publication_quantum_bytes)
                 return yield_quantum();
+            {
+                // Publish the mtime this node currently shows, which includes
+                // any utimens applied after these writes (rsync sets times
+                // after the last write); see WriteHandle::set_committed_mtime.
+                std::lock_guard lock(inode->mutex);
+                publication->writer->set_committed_mtime(inode->visible.mtime_ns);
+            }
             publication->writer->commit();
             const auto completed_diagnostics = publication->writer->diagnostics();
             note_spool_publication_progress(publication->unreported_spool_progress);
@@ -4055,9 +4173,15 @@ struct FuseFrontend::State {
                 ++inode.visible.version;
                 break;
             case NamespaceOp::Kind::utimens:
-                inode.visible.mtime_ns = op.mtime_ns;
-                inode.visible.ctime_ns = op.ctime_ns;
-                ++inode.visible.version;
+                // Pending data operations were applied first; a utimens only
+                // wins over them if it was admitted after the last write
+                // (rsync's order: write, close, set times). Otherwise the
+                // later write's own timestamp is the truth.
+                if (op.ctime_ns >= inode.visible.ctime_ns) {
+                    inode.visible.mtime_ns = op.mtime_ns;
+                    inode.visible.ctime_ns = op.ctime_ns;
+                    ++inode.visible.version;
+                }
                 break;
             case NamespaceOp::Kind::mkdir:
             case NamespaceOp::Kind::create:
@@ -4429,8 +4553,6 @@ struct FuseFrontend::State {
             inode->visible = inode->base;
             if (!committed && descriptor.visible.type == inode->base.type)
                 inode->visible = descriptor.visible;
-            apply_pending_namespace_metadata(*inode, id, recovery);
-
             auto operations = recovery.data_ops.find(id);
             const auto done = recovery.data_done[id];
             if (operations != recovery.data_ops.end()) {
@@ -4449,6 +4571,12 @@ struct FuseFrontend::State {
                 }
             }
             apply_pending_data_metadata(*inode, inode->data_ops);
+            // After the data ops: a utimens admitted after the last write
+            // (rsync) must be what this node shows and what publication
+            // commits; applying it first and letting the write's timestamp
+            // overwrite it is why 474 imported files carried the wrong mtime
+            // on 2026-09-07 and would have been re-copied by the next pass.
+            apply_pending_namespace_metadata(*inode, id, recovery);
             rebuild_data_overlay_locked(*inode);
             refresh_retained_owners_locked(*inode);
             if (!inode->data_ops.empty()) {
@@ -4526,20 +4654,46 @@ struct FuseFrontend::State {
         if (!paths.contains(canonical_path("/")))
             throw std::runtime_error("FUSE frontend cannot initialise without namespace root");
 
+        // Batches journaled before publish whose identity the accepted
+        // snapshot's clock already covers committed atomically: their ops are
+        // published even if the crash lost the per-op markers. Never re-apply
+        // them (a create + rename re-applied would overwrite the final file).
+        const auto fuse_clock = fuse_namespace_clock(snapshot);
+        const auto committed_in_batch = [&](uint64_t sequence) {
+            auto batch = recovery.namespace_batches.upper_bound(sequence);
+            if (batch == recovery.namespace_batches.begin())
+                return false;
+            --batch;
+            return sequence < batch->first + batch->second && fuse_clock >= batch->first;
+        };
         size_t recovered_namespace_operations = 0;
+        size_t recovered_by_identity = 0;
         {
             std::lock_guard queue_lock(namespace_queue_mutex);
-            for (const auto& [sequence, op] : recovery.namespace_ops) {
+            for (const auto& [sequence, op_const] : recovery.namespace_ops) {
                 if (recovery.namespace_done.contains(sequence))
                     continue;
+                auto op = op_const;
                 retain_namespace_references_locked(op);
                 ++recovered_namespace_operations;
-                if (recovery.namespace_published.contains(sequence))
+                if (recovery.namespace_published.contains(sequence)) {
                     namespace_unconfirmed.push_back(op);
-                else
+                } else if (committed_in_batch(sequence)) {
+                    op.published_generation = view.generation;
+                    namespace_unconfirmed.push_back(op);
+                    ++recovered_by_identity;
+                } else {
                     namespace_queue.push_back(op);
+                }
             }
         }
+        if (recovered_by_identity)
+            Log::info("FUSE journal recovery: " + std::to_string(recovered_by_identity) +
+                      " namespace operations confirmed committed by batch identity clock=" +
+                      std::to_string(fuse_clock));
+        // A journal wiped while metadata kept the clock would otherwise make
+        // every new batch look already committed.
+        next_namespace_sequence = std::max<uint64_t>(next_namespace_sequence, fuse_clock + 1);
         namespace_operations_recovered.fetch_add(recovered_namespace_operations,
                                                  std::memory_order_relaxed);
         refreshed_namespace_revision.store(view.namespace_revision, std::memory_order_release);

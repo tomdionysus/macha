@@ -53,6 +53,23 @@ current at every checkpoint; a fresh session reads only this and the plan.
 - [x] **Discipline 4 — compact history out of the hot path (+ DLT7).** DONE: 0.32.0 on all nodes (`27c1903`, `96c3413`); measured-first scope (no retirement log); conflicts 116 → 9, merge delta 335,961 B → 277 B, no full-frame reconciliations.
 - [x] **UAT record complete**: `2026-09-06-self-healing-uat.md`, all four disciplines + the closing demonstrative run (2026-09-07 00:08–00:22: two concurrent writers, five rolling restarts incl. a writer, 0 ERROR, 1 WARN, 0 wedges, 277-byte merge delta). **PROGRAMME COMPLETE.**
 
+## Import iteration log (newest first)
+
+- **0.32.2 (in flight ~03:45):** identity namespace batches (one commit per
+  batch instead of per op) + utimens survives async publication. Suite,
+  deploy, restart imports pending. gbni-1 import order is now Movies → TV
+  → Music (`/root/uat/import-all.sh` edited). Next iteration candidates,
+  evidence in the UAT file "Iteration 2": WAN control-lane starvation
+  (195–284 s metadata mutations; congestion-aware data-lane pacing driven
+  by health RTT is the principled fix), `publish_commit` replica order by
+  proximity, viewer seek (mid-file segment >90 s via playback API), es-1
+  boot WARN storm. UI session is measuring real playback; reply to its
+  questions sent (msg d2e4bf11).
+- **0.32.1 (deployed 02:25–03:27):** write admission blocks instead of
+  EAGAIN. Imports restarted on both nodes after deploy.
+- **Iteration 1 (02:08–02:11):** gbni-1 import died at 30 % of Music on
+  EAGAIN; es-1 unaffected.
+
 ## Stress import IN PROGRESS (started 2026-09-07 00:40, operator-requested)
 
 Full libraries → real namespace roots, as the "new user imports two sites"

@@ -185,6 +185,7 @@ class PlaybackTracker;
     // overlay. Unchanged extents remain immutable references and are never
     // copied into the temporary file merely to discover they are unchanged.
     bool sparse_overlay_{};
+    std::optional<int64_t> committed_mtime_;
     struct ChangedRange {
         uint64_t begin{};
         uint64_t end{};
@@ -236,6 +237,16 @@ class PlaybackTracker;
     size_t write(uint64_t, std::span<const uint8_t>);
     void truncate(uint64_t);
     void commit();
+    // The mtime the next commit publishes for this file. The FUSE frontend
+    // sets it from the inode's current visible mtime so a utimens that was
+    // applied (and published) after the writes -- rsync's order -- is not
+    // overwritten by the asynchronous data publication's own timestamp,
+    // which made every imported file look modified to the next rsync pass
+    // (474 of 3,770 Music files on 2026-09-07).
+    void set_committed_mtime(int64_t mtime_ns) {
+        std::lock_guard lock(m_);
+        committed_mtime_ = mtime_ns;
+    }
     void drain_staging();
     WriteHandleDiagnostics diagnostics() const;
     FsEntry committed_entry() const { std::lock_guard lock(m_); return base_; }
@@ -323,7 +334,8 @@ class FileSystem {
     std::shared_ptr<const MetadataSnapshot> local_snapshot_cache_;
     MetadataSnapshot snap();
     void commit_write(WriteHandle&, const FsEntry&, uint64_t,
-                      const std::vector<ExtentRef>&, FsEntry*);
+                      const std::vector<ExtentRef>&, FsEntry*,
+                      std::optional<int64_t> mtime_override = {});
     static void require_parent(const MetadataSnapshot&, const std::string&);
     static std::optional<FsEntry> apply_namespace_mutation(
         MetadataSnapshot&, MetadataDelta&, const FilesystemNamespaceMutation&);
@@ -340,8 +352,13 @@ class FileSystem {
     void chmod(const std::string&, uint32_t);
     void chown(const std::string&, uint32_t, uint32_t, bool, bool);
     void utimens(const std::string&, int64_t);
+    // `atomic`: apply every operation or none (no committed prefix), so a
+    // caller with an `identity` can treat "identity clock advanced" as "the
+    // whole batch took effect". Without it a failing operation commits the
+    // largest valid prefix and is reported in the result, as before.
     FilesystemNamespaceBatchResult apply_namespace_batch(
-        std::span<const FilesystemNamespaceMutation>);
+        std::span<const FilesystemNamespaceMutation>,
+        std::optional<MetadataMutationIdentity> identity = {}, bool atomic = false);
     void truncate_file(const std::string&, uint64_t);
     std::shared_ptr<ReadHandle> open_read(const std::string&);
     // Open an already-resolved immutable metadata snapshot. Playback uses this
@@ -357,7 +374,8 @@ class FileSystem {
     std::optional<uint64_t> active_write_size(const std::string&);
     std::vector<WriteHandleDiagnostics> active_write_diagnostics(const std::string&);
     void commit_file(const std::string&, const FsEntry&, uint64_t,
-                     const std::vector<ExtentRef>&, FsEntry*);
+                     const std::vector<ExtentRef>&, FsEntry*,
+                     std::optional<int64_t> mtime_override = {});
     std::pair<uint64_t, uint64_t> logical_capacity() const;
     MetadataSnapshot local_snapshot() const;
     MetadataSnapshotView local_snapshot_view();

@@ -1315,7 +1315,7 @@ void WriteHandle::commit() {
 
     FsEntry committed;
     const auto metadata_started = Clock::now();
-    fs_.commit_write(*this, base_, logical_, extents_, &committed);
+    fs_.commit_write(*this, base_, logical_, extents_, &committed, committed_mtime_);
     const auto metadata_time =
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - metadata_started);
     base_ = std::move(committed);
@@ -1754,7 +1754,8 @@ std::optional<FsEntry> FileSystem::apply_namespace_mutation(
 }
 
 FilesystemNamespaceBatchResult FileSystem::apply_namespace_batch(
-    std::span<const FilesystemNamespaceMutation> operations) {
+    std::span<const FilesystemNamespaceMutation> operations,
+    std::optional<MetadataMutationIdentity> identity, bool atomic) {
     if (operations.empty())
         throw std::invalid_argument("filesystem namespace batch is empty");
 
@@ -1777,8 +1778,9 @@ FilesystemNamespaceBatchResult FileSystem::apply_namespace_batch(
                 // With no valid prefix there is nothing to publish. Preserve
                 // the old error behaviour and leave the durable queue head in
                 // place. Otherwise commit the largest valid prefix and report
-                // the blocking operation to the caller.
-                if (!result.applied)
+                // the blocking operation to the caller -- unless the caller
+                // asked for all-or-nothing.
+                if (!result.applied || atomic)
                     throw;
                 result.failure_code = error.code();
                 result.failure_message = error.what();
@@ -1793,7 +1795,14 @@ FilesystemNamespaceBatchResult FileSystem::apply_namespace_batch(
         delta.erase_entries.erase(
             std::unique(delta.erase_entries.begin(), delta.erase_entries.end()),
             delta.erase_entries.end());
-    });
+    }, 8, identity);
+    if (identity && !result.applied) {
+        // mutate_delta() found the identity clock already at or past this
+        // batch: an earlier attempt (or a peer's merge of it) committed the
+        // whole batch. Report it as fully applied; entries are resolved from
+        // the current snapshot by the caller if it needs them.
+        result.applied = operations.size();
+    }
 
     for (size_t op_index = 0; op_index < result.applied; ++op_index) {
         const auto& op = operations[op_index];
@@ -2149,12 +2158,14 @@ std::vector<WriteHandleDiagnostics> FileSystem::active_write_diagnostics(const s
 }
 
 void FileSystem::commit_write(WriteHandle& handle, const FsEntry& expected, uint64_t z,
-                              const std::vector<ExtentRef>& xs, FsEntry* out) {
+                              const std::vector<ExtentRef>& xs, FsEntry* out,
+                              std::optional<int64_t> mtime_override) {
     std::lock_guard handles(open_writes_mutex_);
-    commit_file(handle.path_, expected, z, xs, out);
+    commit_file(handle.path_, expected, z, xs, out, mtime_override);
 }
 void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint64_t z,
-                             const std::vector<ExtentRef>& xs, FsEntry* out) {
+                             const std::vector<ExtentRef>& xs, FsEntry* out,
+                             std::optional<int64_t> mtime_override) {
     auto q = normalize_path(p);
     FsEntry committed;
     m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
@@ -2193,7 +2204,9 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
         i->second.size = z;
         i->second.extents = xs;
         const auto now = wall_time_ns();
-        if (!explicit_mtime)
+        if (mtime_override)
+            i->second.mtime_ns = *mtime_override;
+        else if (!explicit_mtime)
             i->second.mtime_ns = now;
         i->second.ctime_ns = now;
         ++i->second.version;

@@ -497,6 +497,49 @@ es-1's own import saturated the WAN — the write floor W=2 waiting on a
 replica behind a congested link; and `slow-fuse op=truncate` bursts from
 rsync's create/truncate/rename pattern on thousands of small files.
 
+### Iteration 2 — namespace commits one op at a time; publication starved (02:30–03:30)
+
+After 0.32.1 gbni-1 showed `data_publications_started=114 completed=0`
+for minutes with all eight publication threads parked and the full 256 MB
+in-flight budget held. gdb: every thread in `replay_data_quantum` waiting on
+`namespace_cv` — for the namespace op that names its file. Status:
+`namespace_publication_batches=1677` for `namespace_operations_batched=1723`
+— **one op per metadata commit**, ~3/s cluster-wide, 1,690 Music ops queued.
+`namespace_batch_compatible()` only batched runs of one kind and never
+renames; rsync's create-temp / utimens / rename per file never batches.
+Reconciliation churn followed (8 merges in 2 min: every one of those
+commits raced es-1's).
+
+Fix (0.32.2): identity batches — see CHANGELOG. 73 rsync-pattern ops
+recover into one commit (test). Immediate mitigation: gbni-1's import
+reordered to Movies → TV → Music so watchable large media is not queued
+behind thousands of small-file ops.
+
+Second finding in the same window, from a read-only dry run over the
+already-imported Music (`rsync -ani /mnt/diskA/Music/ /mnt/machamedia/Music/`):
+**474 files `>f..t......`** — same size, wrong mtime — the next pass would
+re-copy them. Cause: the asynchronous data publication committed the
+write's timestamp over the utimens rsync had set after the writes
+(`commit_file`'s "explicit mtime" heuristic only sees a utimens applied
+while the handle is open; the FUSE writer opens after). Fixed in 0.32.2
+(explicit committed mtime from the inode; recovery order). The 83
+`.d..t` directories are dirs whose rsync run was killed before it set their
+times — expected, cheap on the next pass.
+
+Also measured while here (for the next iteration, not fixed yet):
+- metadata mutations of 195 s (es-1) and 284 s (gbni-1) — silent windows
+  with `retention claim peer=10.34.1.50 error=control RPC deadline exceeded`
+  and control-lane `peer closed`/reconnect churn: the control lane shares
+  the saturated WAN with the bulk data lane and gets no priority;
+- `publish_commit` tries replicas in NodeId order, not proximity — gbni-1
+  may try es-1 (WAN) before gbni-2 (LAN) for every commit;
+- viewer path via the playback API on gbni-2: session 6–9 s, transcode
+  segments at ~0.7 MB/s (CPU-bound), and a mid-file segment request that
+  did not return in 90 s for either film (seek); the UI session is
+  measuring the real player;
+- es-1 logs 25 `media information prune deferred: catalogue unavailable`
+  WARNs in one boot minute — one line would do.
+
 What is deliberately left from the programme itself (all filed, none blocking):
 - writer-restart re-send (present-content skip);
 - journal compaction while busy (journal resets only when idle;

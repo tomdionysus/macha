@@ -1,5 +1,39 @@
 # Current release
 
+## 0.32.2 — Namespace batches under an identity; utimens survives publication (development)
+
+Two more findings from the full-library import (2026-09-07 02:30–03:30):
+
+- **The namespace loop committed one operation per metadata commit.**
+  Renames and mixed kinds were singleton batches because, after a crash, a
+  batch's intermediate effects could not be proven from the final snapshot
+  (a re-applied create + rename would overwrite the real file with an empty
+  one). rsync's create-temp / utimens / rename per file therefore cost ~3
+  cluster-wide commits per file at ~3/s, and every data publication waited
+  behind the op naming its file: gbni-1 had 1,690 Music ops queued and eight
+  publication threads parked on them with the whole in-flight budget held.
+  Now every batch (up to `namespace_batch_operations` / `_bytes`) is
+  published as one **atomic** metadata mutation carrying an identity in the
+  snapshot's mutation-sequence clock (`MetadataMutationIdentity`: a
+  FUSE-derived origin key, value = the batch's first op sequence), journaled
+  as a `namespace_batch` record before publishing. Recovery and retry ask
+  the clock "did this batch commit?" instead of re-deriving per-op effects;
+  `mutate_delta()` applies an identity mutation only if the clock is behind
+  it. A batch one op refuses falls back to publishing its head op alone (the
+  old semantics) and requeues the rest. 73 recovered rsync-pattern ops now
+  publish in one commit (test), and `FileSystem::apply_namespace_batch`
+  gained `identity`/`atomic`.
+- **A utimens applied after the writes was overwritten by the asynchronous
+  publication's own timestamp** (474 of 3,770 imported Music files wrong,
+  so a second rsync pass would re-copy them). The FUSE publication now
+  passes the inode's current visible mtime to `WriteHandle::set_committed_mtime`,
+  and recovery applies pending data metadata before a pending utimens (which
+  wins only if it was admitted after the last write).
+- Tests: `test_fuse_namespace_loop_batches_rsync_pattern_into_few_commits`,
+  `test_fuse_namespace_batch_committed_before_crash_is_not_reapplied`,
+  `test_fuse_utimens_after_write_survives_async_publication`; journal
+  accounting in three batching tests updated for the identity record.
+
 ## 0.32.1 — A FUSE write waits for admission; it never returns EAGAIN (development)
 
 Found in the first hour of the full-library import (2026-09-07 02:11, gbni-1,

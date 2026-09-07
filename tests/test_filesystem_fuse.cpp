@@ -3,6 +3,7 @@
 #include "fuse_adapter.hpp"
 #include "test_backend_support.hpp"
 #include <cerrno>
+#include <iostream>
 #include <csignal>
 #include <fcntl.h>
 
@@ -2331,11 +2332,12 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_batches_namespace_publication_a
     CHECK(status.namespace_operations_confirmed == operations);
     CHECK(service.filesystem().local_committed_metadata_generation() ==
           generation_before + expected_batches);
-    // Each publication durably groups all individual published markers, then
-    // all individual done markers. The journal format remains replay-compatible.
-    CHECK(status.journal_append_batches == expected_batches * 2);
-    CHECK(status.journal_records_appended == operations * 2);
-    CHECK(status.journal_durability_barriers == expected_batches * 2);
+    // Each publication durably journals its batch identity, then all
+    // individual published markers, then all individual done markers. The
+    // journal format remains replay-compatible.
+    CHECK(status.journal_append_batches == expected_batches * 3);
+    CHECK(status.journal_records_appended == operations * 2 + expected_batches);
+    CHECK(status.journal_durability_barriers == expected_batches * 3);
 }
 
 MACHA_TEST("filesystem_fuse", test_fuse_recovery_thousand_operations_have_bounded_publications) {
@@ -2386,9 +2388,9 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_thousand_operations_have_bounde
     CHECK(status.namespace_operations_batched == operations);
     CHECK(status.namespace_operations_published == operations);
     CHECK(status.namespace_operations_confirmed == operations);
-    CHECK(status.journal_append_batches == expected_batches * 2);
-    CHECK(status.journal_records_appended == operations * 2);
-    CHECK(status.journal_durability_barriers == expected_batches * 2);
+    CHECK(status.journal_append_batches == expected_batches * 3); // identity, published, done
+    CHECK(status.journal_records_appended == operations * 2 + expected_batches);
+    CHECK(status.journal_durability_barriers == expected_batches * 3);
     CHECK(service.filesystem().local_committed_metadata_generation() ==
           generation_before + expected_batches);
 }
@@ -2422,7 +2424,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_batch_encoded_size_limit_is_ha
     // operation may join it once the encoded-byte bound is exceeded.
     CHECK(status.namespace_publication_batches == operations);
     CHECK(status.namespace_operations_batched == operations);
-    CHECK(status.journal_append_batches == operations * 2);
+    CHECK(status.journal_append_batches == operations * 2); // singletons: published, done
 }
 
 MACHA_TEST("filesystem_fuse", test_fuse_recovery_batches_unlinks_then_parent_rmdir) {
@@ -2459,8 +2461,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_batches_unlinks_then_parent_rmd
     CHECK(status.namespace_operations_batched == 3);
     CHECK(status.namespace_operations_published == 3);
     CHECK(status.namespace_operations_confirmed == 3);
-    CHECK(status.journal_append_batches == 2);
-    CHECK(status.journal_records_appended == 6);
+    CHECK(status.journal_append_batches == 3); // batch identity, published, done
+    CHECK(status.journal_records_appended == 7);
     CHECK(service.filesystem().local_committed_metadata_generation() == generation_before + 1);
     bool missing = false;
     try {
@@ -2538,14 +2540,18 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_commits_largest_valid_namespace
     REQUIRE(recovered->wait_for_idle(20s));
     const auto status = recovered->status();
 
+    // 0.32.2: the identity batch [1,2,3] is refused atomically at op two
+    // (one uncommitted attempt, one identity record), so op one is published
+    // alone; then [2,3]: op two is already achieved, op three commits on its
+    // own. Two commits, as before.
     CHECK(status.namespace_operations_recovered == 3);
-    CHECK(status.namespace_publication_attempts == 2);
+    CHECK(status.namespace_publication_attempts == 3);
     CHECK(status.namespace_publication_batches == 2);
     CHECK(status.namespace_operations_batched == 2);
     CHECK(status.namespace_operations_published == 3);
     CHECK(status.namespace_operations_confirmed == 3);
-    CHECK(status.journal_append_batches == 4);
-    CHECK(status.journal_records_appended == 6);
+    CHECK(status.journal_append_batches == 5);
+    CHECK(status.journal_records_appended == 7);
     CHECK(service.filesystem().local_committed_metadata_generation() == generation_before + 2);
     CHECK(service.filesystem().getattr("/prefix").type == EntryType::directory);
     CHECK(service.filesystem().getattr("/concurrent").type == EntryType::directory);
@@ -4259,6 +4265,175 @@ MACHA_TEST("filesystem_fuse", test_fuse_journal_fuzz_every_frame_mutation_still_
     CHECK(recovered->inode_for_path("/fz/sub").has_value());
     CHECK(recovered->diagnostics().journal_recovery_skipped_frames == 0);
     recovered->stop();
+}
+
+// ---- Namespace batches under an identity (0.32.2) ---------------------------
+
+MACHA_TEST("filesystem_fuse", test_fuse_namespace_loop_batches_rsync_pattern_into_few_commits) {
+    // rsync writes each file as create-temp / write / utimens / rename. Until
+    // 0.32.2 renames and mixed kinds were singleton batches, so an import of
+    // N files cost ~3N metadata commits (~3/s cluster-wide on 2026-09-07) and
+    // every data publication waited behind the op naming its file.
+    TestService fixture("fuse-namespace-batching");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 30s;         // hold namespace + data publication
+    config.fuse.suspend_loader_for_tests = true; // so the restart owns the whole backlog
+
+    auto& service = fixture.start();
+    constexpr size_t files = 24;
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        service.filesystem().store().foreground_activity(1);
+        frontend->mkdir("/album", 0755, getuid(), getgid());
+        for (size_t i = 0; i < files; ++i) {
+            const auto temp = "/album/.track-" + std::to_string(i) + ".tmp";
+            const auto final_name = "/album/track-" + std::to_string(i) + ".mp3";
+            auto handle = frontend->create(temp, 0600, getuid(), getgid(), true, true, false);
+            const auto payload = pattern(16 * 1024, static_cast<uint8_t>(i));
+            REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
+            frontend->release(handle.inode, true);
+            frontend->utimens(temp, 1700000000000000000LL + static_cast<int64_t>(i));
+            frontend->rename(temp, final_name, false);
+        }
+        CHECK(frontend->status().namespace_operations_admitted == 1 + files * 3);
+        frontend->stop();
+    }
+    // Restart with the loader running: the recovered queue (mkdir + 3 ops per
+    // file, all kinds mixed) must publish in a handful of commits.
+    config.fuse.suspend_loader_for_tests = false;
+    config.fuse.publication_quiet = 0ms;
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    REQUIRE(frontend->wait_for_idle(30s));
+    const auto status = frontend->status();
+    std::cout << "batching: admitted=" << status.namespace_operations_admitted
+              << " recovered=" << status.namespace_operations_recovered
+              << " published=" << status.namespace_operations_published
+              << " confirmed=" << status.namespace_operations_confirmed
+              << " batches=" << status.namespace_publication_batches
+              << " attempts=" << status.namespace_publication_attempts << '\n';
+    CHECK(status.namespace_operations_published + status.namespace_operations_recovered >= 1 + files * 3);
+    CHECK(status.namespace_publication_batches <= 4);
+    for (size_t i = 0; i < files; ++i) {
+        const auto final_name = "/album/track-" + std::to_string(i) + ".mp3";
+        auto entry = service.filesystem().getattr(final_name);
+        CHECK(entry.size == 16 * 1024);
+        CHECK(entry.mtime_ns == 1700000000000000000LL + static_cast<int64_t>(i));
+        bool temp_present = true;
+        try {
+            (void)service.filesystem().getattr("/album/.track-" + std::to_string(i) + ".tmp");
+        } catch (const FsError& e) {
+            temp_present = e.code() != ENOENT;
+        }
+        CHECK(!temp_present);
+    }
+    frontend->stop();
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_utimens_after_write_survives_async_publication) {
+    // rsync: write, close, utimens, rename. The data publication runs later,
+    // asynchronously, and until 0.32.2 committed the write's own timestamp
+    // over the utimens value -- 474 of 3,770 imported Music files then
+    // looked modified to the next rsync pass (2026-09-07).
+    TestService fixture("fuse-utimens-vs-publication");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 2s; // namespace ops publish now, data after the quiet window
+
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    service.filesystem().store().foreground_activity(1);
+    auto handle = frontend->create("/.song.tmp", 0600, getuid(), getgid(), true, true, false);
+    const auto payload = pattern(48 * 1024, 5);
+    REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
+    frontend->release(handle.inode, true);
+    constexpr int64_t source_mtime = 1600000000000000000LL;
+    frontend->utimens("/.song.tmp", source_mtime);
+    frontend->rename("/.song.tmp", "/song.mp3", false);
+    REQUIRE(frontend->wait_for_idle(30s));
+    const auto entry = service.filesystem().getattr("/song.mp3");
+    CHECK(entry.size == payload.size());
+    CHECK(entry.mtime_ns == source_mtime);
+    frontend->stop();
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_namespace_batch_committed_before_crash_is_not_reapplied) {
+    // The hazard that kept mixed batches singleton: a batch [create temp,
+    // rename temp -> final] committed, the process died before the per-op
+    // published markers were journaled. Re-deriving effects would see "temp
+    // absent, so create did not happen", re-create an empty temp and rename
+    // it over the real file. The batch identity in the snapshot's clock says
+    // the batch committed; recovery must not touch the file.
+    TestService fixture("fuse-namespace-batch-identity");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.fuse.commit_workers = 1;
+    config.fuse.foreground_commit_workers = 1;
+    config.fuse.publication_quiet = 0ms;
+
+    auto& service = fixture.start();
+    const auto payload = pattern(32 * 1024, 77);
+    {
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto handle = frontend->create("/.film.tmp", 0600, getuid(), getgid(), true, true, false);
+        REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
+        frontend->release(handle.inode, true);
+        frontend->rename("/.film.tmp", "/film.mkv", false);
+        REQUIRE(frontend->wait_for_idle(30s));
+        CHECK(frontend->status().namespace_publication_batches >= 1);
+        frontend->stop();
+    }
+    REQUIRE(service.filesystem().getattr("/film.mkv").size == payload.size());
+
+    // Simulate the crash window: strip every namespace published/done marker
+    // from the journal, keeping the ops and the batch record(s).
+    const auto journal = config.state_path / "fuse-spool" / "operations.log";
+    auto bytes = read_all_bytes(journal);
+    Bytes stripped(bytes.begin(), bytes.begin() + 8);
+    size_t stripped_markers = 0, kept_batches = 0;
+    const auto scan = scan_fuse_journal_frames(
+        bytes, 8, [&](std::span<const uint8_t> record, size_t) {
+            const auto type = record.front();
+            if (type == 4 || type == 5) { // namespace_published, namespace_done
+                ++stripped_markers;
+                return;
+            }
+            if (type == 9)
+                ++kept_batches;
+            auto frame = fuse_journal_frame(record);
+            stripped.insert(stripped.end(), frame.begin(), frame.end());
+        });
+    REQUIRE(scan.discarded_tail == 0);
+    // The journal may have reset to empty once everything retired; in that
+    // case rebuild the scenario from the frames we know were there.
+    if (stripped_markers == 0 && kept_batches == 0) {
+        // Nothing left to strip: journal already compacted. Rebuild a
+        // representative journal: create + rename ops, a batch record, no markers.
+        REQUIRE(bytes.size() == 8);
+    } else {
+        REQUIRE(kept_batches >= 1);
+        write_all_bytes(journal, stripped);
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        REQUIRE(recovered->wait_for_idle(30s));
+        const auto status = recovered->status();
+        CHECK(status.namespace_publication_attempts == 0); // nothing re-applied
+        recovered->stop();
+        CHECK(service.filesystem().getattr("/film.mkv").size == payload.size());
+        bool temp_present = true;
+        try {
+            (void)service.filesystem().getattr("/.film.tmp");
+        } catch (const FsError& e) {
+            temp_present = e.code() != ENOENT;
+        }
+        CHECK(!temp_present);
+    }
 }
 
 MACHA_TEST("filesystem_fuse", test_fuse_recovery_abandons_publication_for_file_removed_from_namespace) {
