@@ -7,6 +7,7 @@
 #include "supervised.hpp"
 #include "macha_version.hpp"
 #include "media_metadata.hpp"
+#include "media_containers.hpp"
 #include "media_information.hpp"
 
 #include <curl/curl.h>
@@ -273,13 +274,6 @@ std::string comparable_title(std::string_view value) {
     return out;
 }
 
-std::string extension(std::string_view path) {
-    auto slash = path.find_last_of('/');
-    auto dot = path.find_last_of('.');
-    if (dot == std::string_view::npos || (slash != std::string_view::npos && dot < slash)) return {};
-    return lower(std::string(path.substr(dot)));
-}
-
 std::string stem(std::string_view path) {
     auto slash = path.find_last_of('/');
     auto start = slash == std::string_view::npos ? 0 : slash + 1;
@@ -302,18 +296,6 @@ std::vector<std::string> components(std::string_view path) {
     return out;
 }
 
-bool video_extension(std::string_view ext) {
-    static const std::set<std::string, std::less<>> exts{
-        ".mkv", ".mp4", ".m4v", ".avi", ".mov", ".wmv", ".mpg", ".mpeg", ".ts", ".m2ts", ".webm"};
-    return exts.contains(ext);
-}
-
-bool audio_extension(std::string_view ext) {
-    static const std::set<std::string, std::less<>> exts{
-        ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".aiff", ".alac", ".wma"};
-    return exts.contains(ext);
-}
-
 std::optional<int32_t> year_from(std::string_view text);
 
 struct MusicMetadataReadResult {
@@ -326,7 +308,7 @@ std::optional<MusicMetadataReadResult> read_music_metadata_probe(FileSystem& fs,
                                                                   const FsEntry& entry,
                                                                   size_t max_artwork_bytes) {
     if (entry.type != EntryType::file || entry.size == 0 ||
-        !audio_extension(extension(path)))
+        !audio_extension(path_extension(path)))
         return {};
 
     MusicMetadataReadResult result;
@@ -620,7 +602,7 @@ class SemanticMovieCandidateGenerator final : public MediaProbeCandidateGenerato
     std::vector<MediaProbeCandidate> generate(const MediaProbeContext& context) const override {
         const auto path = context.path;
         const auto& entry = context.entry;
-        if (!video_extension(extension(path)) || episode_pattern(stem(path))) return {};
+        if (!video_extension(path_extension(path)) || episode_pattern(stem(path))) return {};
         auto core = strip_release_noise(stem(path));
         auto [without_edition, edition] = strip_movie_edition(core);
         core = std::move(without_edition);
@@ -687,7 +669,7 @@ class CompactMovieTitleCandidateGenerator final : public MediaProbeCandidateGene
     std::vector<MediaProbeCandidate> generate(const MediaProbeContext& context) const override {
         const auto path = context.path;
         const auto& entry = context.entry;
-        if (!video_extension(extension(path)) || episode_pattern(stem(path))) return {};
+        if (!video_extension(path_extension(path)) || episode_pattern(stem(path))) return {};
         const auto raw = stem(path);
         static const std::regex prefixed_compact(
             R"(^([a-z0-9]{2,12})-([a-z][a-z0-9]{5,})$)");
@@ -711,7 +693,7 @@ class LegacyMovieCandidateGenerator final : public MediaProbeCandidateGenerator 
     std::vector<MediaProbeCandidate> generate(const MediaProbeContext& context) const override {
         const auto path = context.path;
         const auto& entry = context.entry;
-        if (!video_extension(extension(path)) || episode_pattern(stem(path))) return {};
+        if (!video_extension(path_extension(path)) || episode_pattern(stem(path))) return {};
         auto probe = make_probe(path, entry, MediaProbeKind::movie);
         probe.year = year_from(stem(path));
         probe.title = movie_title_before_year(stem(path), probe.year);
@@ -726,7 +708,7 @@ class FilenameEpisodeCandidateGenerator final : public MediaProbeCandidateGenera
     std::vector<MediaProbeCandidate> generate(const MediaProbeContext& context) const override {
         const auto path = context.path;
         const auto& entry = context.entry;
-        if (!video_extension(extension(path))) return {};
+        if (!video_extension(path_extension(path))) return {};
         auto pattern = episode_pattern(stem(path));
         if (!pattern) return {};
         const auto prefix = strip_collection_ordinal(pattern->prefix);
@@ -785,7 +767,7 @@ class DirectoryEpisodeCandidateGenerator final : public MediaProbeCandidateGener
     std::vector<MediaProbeCandidate> generate(const MediaProbeContext& context) const override {
         const auto path = context.path;
         const auto& entry = context.entry;
-        if (!video_extension(extension(path))) return {};
+        if (!video_extension(path_extension(path))) return {};
         auto pattern = episode_pattern(stem(path));
         if (!pattern) return {};
         const auto parts = components(path);
@@ -828,7 +810,7 @@ class StructuredMusicCandidateGenerator final : public MediaProbeCandidateGenera
         const auto root = context.root;
         const auto path = context.path;
         const auto& entry = context.entry;
-        if (!audio_extension(extension(path))) return {};
+        if (!audio_extension(path_extension(path))) return {};
         auto probe = make_probe(path, entry, MediaProbeKind::track);
         auto title_candidate = stem(path);
         static const std::regex track_re(
@@ -2334,7 +2316,7 @@ MovieScanProvider::MovieScanProvider(HttpClient& http, CatalogueMovieProviderCon
 }
 
 bool MovieScanProvider::accepts_path(std::string_view path) const noexcept {
-    return video_extension(extension(path));
+    return video_extension(path_extension(path));
 }
 
 MediaProbeFile MovieScanProvider::probe_file(
@@ -2359,7 +2341,7 @@ TvScanProvider::TvScanProvider(HttpClient& http, CatalogueTvProviderConfig confi
 }
 
 bool TvScanProvider::accepts_path(std::string_view path) const noexcept {
-    return video_extension(extension(path));
+    return video_extension(path_extension(path));
 }
 
 MediaProbeFile TvScanProvider::probe_file(
@@ -2387,7 +2369,7 @@ MusicScanProvider::MusicScanProvider(HttpClient& http, CatalogueMusicProviderCon
 }
 
 bool MusicScanProvider::accepts_path(std::string_view path) const noexcept {
-    return audio_extension(extension(path));
+    return audio_extension(path_extension(path));
 }
 
 MediaProbeFile MusicScanProvider::probe_file(
