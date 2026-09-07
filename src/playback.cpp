@@ -7,6 +7,7 @@
 #include "log.hpp"
 #include "supervised.hpp"
 #include "macha_version.hpp"
+#include "media_containers.hpp"
 #include "media_information.hpp"
 
 #include <algorithm>
@@ -60,120 +61,15 @@ std::string lower(std::string value) {
     return value;
 }
 
-std::string extension(std::string_view path) {
-    auto slash = path.find_last_of('/');
-    auto dot = path.find_last_of('.');
-    if (dot == std::string_view::npos || (slash != std::string_view::npos && dot < slash)) return {};
-    return lower(std::string(path.substr(dot)));
-}
-
-std::string direct_mime(std::string_view path) {
-    auto ext = extension(path);
-    if (ext == ".mp4" || ext == ".m4v" || ext == ".mov") return "video/mp4";
-    if (ext == ".mkv") return "video/x-matroska";
-    if (ext == ".mka") return "audio/x-matroska";
-    if (ext == ".webm") return "video/webm";
-    if (ext == ".mp3") return "audio/mpeg";
-    if (ext == ".m4a") return "audio/mp4";
-    if (ext == ".flac") return "audio/flac";
-    if (ext == ".ogg" || ext == ".oga") return "audio/ogg";
-    return "application/octet-stream";
-}
-
-// The container token for a probed format name ("matroska,webm",
-// "mov,mp4,m4a,3gp,3g2,mj2", "mp3"). libavformat lists every name a demuxer
-// answers to, so a set is returned and the file name disambiguates.
-std::set<std::string> containers_from_format(std::string_view format) {
-    std::set<std::string> out;
-    size_t begin = 0;
-    while (begin <= format.size()) {
-        const auto end = format.find(',', begin);
-        const auto token = format.substr(begin, end == std::string_view::npos
-                                                    ? format.size() - begin
-                                                    : end - begin);
-        if (token == "matroska") out.insert("matroska");
-        else if (token == "webm") out.insert("webm");
-        else if (token == "mov" || token == "mp4" || token == "m4a") out.insert("mp4");
-        else if (token == "mp3") out.insert("mp3");
-        else if (token == "flac") out.insert("flac");
-        else if (token == "ogg") out.insert("ogg");
-        if (end == std::string_view::npos) break;
-        begin = end + 1;
-    }
-    return out;
-}
-
-std::string direct_container(std::string_view path) {
-    auto ext = extension(path);
-    if (ext == ".mp4" || ext == ".m4v" || ext == ".m4a" || ext == ".mov") return "mp4";
-    // Matroska is a byte-range serve like any other: a host whose media
-    // element demuxes it (a TV, a native player) can take the file as it is,
-    // which is the only path on some devices that decodes HEVC correctly
-    // (Samsung Tizen 3: HEVC works through the media element and fails
-    // through MSE, 2026-09-07). Browsers simply do not list the container.
-    if (ext == ".mkv" || ext == ".mka") return "matroska";
-    if (ext == ".webm") return "webm";
-    if (ext == ".mp3") return "mp3";
-    if (ext == ".flac") return "flac";
-    if (ext == ".ogg" || ext == ".oga") return "ogg";
-    return {};
-}
-
-// What the file actually is, not what it is called. The probed format wins
-// over the extension: a Matroska file named .mp4 must not be handed to a
-// client that advertised mp4 (the name is metadata, the container is fact).
-// The extension only disambiguates a format that names several containers
-// (matroska,webm) and stands in when the probe reported nothing.
+// The container vocabulary lives in media_containers.hpp; what remains here
+// is the two shapes playback asks it about -- a probe result and a stream.
 std::string source_container(const MediaProbeResult& probe, std::string_view path) {
-    const auto by_name = direct_container(path);
-    const auto probed = containers_from_format(probe.format);
-    if (probed.empty()) return by_name;
-    if (probed.contains(by_name)) return by_name;
-    return *probed.begin();
-}
-
-bool fmp4_video_copy_supported(std::string_view codec) {
-    return codec == "h264" || codec == "hevc" || codec == "av1";
-}
-
-bool fmp4_audio_copy_supported(std::string_view codec) {
-    // AAC and Opus have always worked; (E-)AC-3 needs the muxer to parse a
-    // packet before it can write the dac3/dec3 sample-entry box, which is
-    // what `delay_moov` does. Measured on this libavformat: without it the
-    // header write fails "Invalid argument" (the 503s of 2026-09-07 18:11),
-    // with it AC-3, E-AC-3, Opus and AAC all copy. The muxer sets the flag.
-    return codec == "aac" || codec == "ac3" || codec == "eac3" || codec == "opus";
-}
-
-// What an MPEG-TS segment can carry as a copy. TS predates the fMP4 HLS
-// arrangement and is where these codecs' carriage was first defined, so the
-// list is the older, wider one: it is the route by which a 2017 television
-// plays copied HEVC and E-AC-3 that it refuses in fMP4 (2026-09-07).
-bool mpegts_video_copy_supported(std::string_view codec) {
-    return codec == "h264" || codec == "hevc" || codec == "mpeg2video";
-}
-
-bool mpegts_audio_copy_supported(std::string_view codec) {
-    return codec == "aac" || codec == "ac3" || codec == "eac3" || codec == "mp3" ||
-           codec == "mp2";
+    return container_for_format(probe.format, path);
 }
 
 bool webvtt_subtitle_supported(const MediaStreamInfo& stream) {
-    if (stream.type != MediaStreamType::subtitle) return false;
-    const auto codec = lower(stream.codec);
-    static constexpr std::array<std::string_view, 6> codecs{
-        "ass", "mov_text", "ssa", "subrip", "text", "webvtt"
-    };
-    return std::find(codecs.begin(), codecs.end(), codec) != codecs.end();
-}
-
-std::string file_mime(std::string_view name) {
-    auto ext = extension(name);
-    if (ext == ".m3u8") return "application/vnd.apple.mpegurl";
-    if (ext == ".m4s" || ext == ".mp4") return "video/mp4";
-    if (ext == ".ts") return "video/mp2t";
-    if (ext == ".vtt") return "text/vtt; charset=utf-8";
-    return "application/octet-stream";
+    return stream.type == MediaStreamType::subtitle &&
+           webvtt_subtitle_codec_supported(stream.codec);
 }
 
 struct ByteRange {
@@ -2003,7 +1899,7 @@ struct PlaybackManager::Impl {
             return http_error(404, state.finished ? "not_found" : "not_ready",
                               state.finished ? "stream object not found" : "stream object not ready");
         }
-        return bytes_response(request, std::move(*object), file_mime(name));
+        return bytes_response(request, std::move(*object), segment_mime(name));
     }
 
     std::vector<std::string> item_media(std::string_view item_id) const {

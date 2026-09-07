@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
+#include "media_containers.hpp"
 #include "media_information.hpp"
 
 using namespace macha;
@@ -425,6 +426,7 @@ class HdrFakeMediaEngine final : public FakeMediaEngine {
         return result;
     }
 };
+
 } // namespace
 
 MACHA_TEST("media_playback", test_direct_play_serves_a_matroska_source) {
@@ -2703,6 +2705,73 @@ MACHA_FAST_TEST("media_playback", test_subtitle_text_normalisation) {
     CHECK(plain_ass_subtitle_text("0,0,Default,,0,0,0,,Hello, world") == "Hello, world");
     CHECK(plain_ass_subtitle_text("Dialogue: 0,0,Default,,0,0,0,,{\\i1}Hello{\\i0}\\Nworld") ==
           "Hello\nworld");
+}
+
+// The vocabulary is a table of facts about file formats, so it is tested as
+// one. The invariant that matters is the one that failed in the field: a file
+// the catalogue admits must be a file playback can name (2026-09-07).
+MACHA_FAST_TEST("media_playback", test_container_vocabulary_names_what_the_catalogue_admits) {
+    for (std::string_view ext : {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".wmv", ".mpg",
+                                 ".mpeg", ".ts", ".m2ts", ".webm"}) {
+        CHECK(video_extension(ext));
+        CHECK(!audio_extension(ext));
+        CHECK(!container_for_extension(std::string("film") + std::string(ext)).empty());
+    }
+    for (std::string_view ext : {".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav",
+                                 ".aiff", ".wma", ".mka", ".oga"}) {
+        CHECK(audio_extension(ext));
+        CHECK(!video_extension(ext));
+        CHECK(!container_for_extension(std::string("song") + std::string(ext)).empty());
+    }
+    // A name that states a codec rather than a container: admitted as audio,
+    // and left for the probe to name.
+    CHECK(audio_extension(".alac"));
+    CHECK(container_for_extension("song.alac").empty());
+    CHECK(!video_extension(".srt"));
+    CHECK(!audio_extension(".jpg"));
+
+    // The probed format wins over the name; the name only picks a member of a
+    // family the format names more than once.
+    CHECK(container_for_format("matroska,webm", "film.mkv") == "matroska");
+    CHECK(container_for_format("matroska,webm", "film.webm") == "webm");
+    CHECK(container_for_format("matroska,webm", "film.mp4") == "matroska");
+    CHECK(container_for_format("mov,mp4,m4a,3gp,3g2,mj2", "film.mp4") == "mp4");
+    CHECK(container_for_format("avi", "film.avi") == "avi");
+    CHECK(container_for_format("mpegts", "film.ts") == "mpegts");
+    // Nothing probed: the name stands in. Nothing either table knows: libav's
+    // own name for it, never the empty string.
+    CHECK(container_for_format("", "film.mkv") == "matroska");
+    CHECK(container_for_format("nut", "film.nut") == "nut");
+    CHECK(container_for_format("", "film.qqq").empty());
+
+    CHECK(direct_mime("film.avi") == "video/x-msvideo");
+    CHECK(direct_mime("film.mkv") == "video/x-matroska");
+    CHECK(direct_mime("song.mka") == "audio/x-matroska");
+    CHECK(direct_mime("film.qqq") == "application/octet-stream");
+    CHECK(segment_mime("index.m3u8") == "application/vnd.apple.mpegurl");
+    CHECK(segment_mime("seg7.m4s") == "video/mp4");
+    CHECK(segment_mime("seg7.ts") == "video/mp2t");
+
+    // The two containers do not carry the same codecs, and neither answers a
+    // question about the other kind of stream.
+    CHECK(fmp4_video_copy_supported("hevc"));
+    CHECK(fmp4_video_copy_supported("HEVC"));
+    CHECK(fmp4_video_copy_supported("av1"));
+    CHECK(!fmp4_video_copy_supported("mpeg2video"));
+    CHECK(!fmp4_video_copy_supported("aac"));
+    CHECK(mpegts_video_copy_supported("mpeg2video"));
+    CHECK(!mpegts_video_copy_supported("av1"));
+    CHECK(fmp4_audio_copy_supported("eac3"));
+    CHECK(fmp4_audio_copy_supported("opus"));
+    CHECK(!fmp4_audio_copy_supported("mp3"));
+    CHECK(mpegts_audio_copy_supported("mp3"));
+    CHECK(mpegts_audio_copy_supported("eac3"));
+    CHECK(!mpegts_audio_copy_supported("opus"));
+    CHECK(!mpegts_audio_copy_supported("h264"));
+
+    CHECK(webvtt_subtitle_codec_supported("subrip"));
+    CHECK(webvtt_subtitle_codec_supported("mov_text"));
+    CHECK(!webvtt_subtitle_codec_supported("dvd_subtitle"));
 }
 
 } // namespace

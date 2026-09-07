@@ -1,5 +1,30 @@
 # Current release
 
+## 0.33.2 — One file for the container vocabulary (development)
+
+Answering a client's question about `output.container` turned up a source
+this server serves and declines to name: the catalogue admits `.avi`,
+`.wmv`, `.mpg`, `.ts` and `.m2ts` as video, and the playback container
+table knew none of them, so a `direct` session on the six AVI files in the
+library reported `"container": ""` while happily serving the bytes. The
+two lists were the same truth written down twice, in two files, by two
+different pieces of work (2026-09-07).
+
+- New `src/media_containers.{hpp,cpp}` holds the vocabulary: which file
+  names are video and which audio, what container a name and a probed
+  format mean, the Content-Type for serving a source unchanged and for the
+  files a session generates, which codecs fMP4 and MPEG-TS each carry as a
+  copy, and which subtitle codecs convert to WebVTT. They are facts about
+  file formats, so nothing there takes an engine type, opens a file or
+  reads configuration. Adding a format is one row.
+- `output.container` and the facts entries now name AVI, ASF, MPEG-PS,
+  MPEG-TS, WAV, AIFF and ADTS sources. A format neither table knows is
+  reported under libav's own name for it rather than as the empty string,
+  so the field is never blank for a source that probed.
+- The catalogue now admits `.mka` and `.oga` as audio, which follows from
+  the two lists becoming one; playback already served both. No file in the
+  library has either extension.
+
 ## 0.33.1 — Say which container was actually served (development)
 
 MPEG-TS turned out to be the only carriage a 2017 Samsung would play:

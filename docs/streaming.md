@@ -41,7 +41,7 @@ So "copy the video, re-encode the audio" is `{"mode": "transcode", "video": "cop
 
 A refusal names the rule. The server does not quietly reinterpret a mode into the one that would have worked, because a session that reports a mode it is not performing misleads everything downstream of it.
 
-The session reports the container it actually served in `output.container`: `fmp4` or `mpegts` for an HLS session, and the source's own container for a `direct` one. A request is not evidence of what was performed, so read it there.
+The session reports the container it actually served in `output.container`: `fmp4` or `mpegts` for an HLS session, and the source's own container for a `direct` one. A request is not evidence of what was performed, so read it there. The `direct` vocabulary is the same one the facts endpoint uses for a source container, so the two are comparable.
 
 **What the server does not do.** It does not ask what the client can play, and there is no `capabilities` field. Whether a device can decode what it asked for is the client's business; the server reports the facts and carries out the instruction. A client that asks for `direct` on a file it cannot demux gets the file.
 
@@ -51,7 +51,7 @@ Facts come from one probe of the file, are persisted in the catalogue media prof
 
 | field | notes |
 |---|---|
-| `container` | the resolved container family: `mp4`, `matroska`, `webm`, `mp3`, `flac`, `ogg`. **Match on this**, not on `format`. |
+| `container` | the resolved container family: `matroska`, `webm`, `mp4`, `avi`, `asf`, `mpeg`, `mpegts`, `mp3`, `flac`, `ogg`, `adts`, `wav`, `aiff`. **Match on this**, not on `format`. A format the server does not know is reported under libavformat's own name for it, so the field is never empty for a source that probed. |
 | `format` | the raw libavformat demuxer name list, e.g. `matroska,webm`. It names every container that demuxer handles, so a Matroska file lists `webm` too; matching it directly is how a WebM-capable device ends up being handed a Matroska file. |
 | per stream | `index`, `type`, `codec`, `profile`, `language`, `width`, `height`, `channels`, `sample_rate`, `bit_depth`, `level`, `color_transfer`, `dolby_vision_profile`, `dolby_vision_compatibility`, `bitrate`, `default`, `forced`, `attached_picture` |
 
