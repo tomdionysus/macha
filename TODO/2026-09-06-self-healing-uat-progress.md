@@ -55,6 +55,15 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **0.32.4 (commit `f0760e9`, suite 355/355; deployed gbni-2 ~04:05, es-1
+  05:10 CEST, gbni-1 04:12):** `open_writes_mutex_` no longer spans
+  metadata mutations (commit_write / open_write truncate / namespace batch)
+  — publications were serialized one WAN-bound commit at a time. es-1's
+  rsync now runs with `--bwlimit=8000` (its disk was at 77 % iowait reading
+  17 MB/s into a capped spool; good-neighbour). Imports restarted: es-1 pid
+  157271, gbni-1 pid 91906. Verify next tick: gbni-1 extent puts per 10 min
+  (was 9), data_publications_completed rising, es-1 iowait.
+
 - **0.32.3 (commit `0820ecb`, suite 355/355; deployed gbni-2 03:46, es-1
   04:49 CEST, gbni-1 pending its build):** clean accounting checkpoints
   trusted with packs / dirty checkpoint = estimate while the walk runs;
