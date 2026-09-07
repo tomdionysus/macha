@@ -142,7 +142,10 @@ NodeId load_v18_node_id(const std::filesystem::path& state) {
 NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook startup_stage_hook)
     : cfg_(normalize_config(std::move(config))), keys_(keys), state_lock_(cfg_.state_path),
       id_(load_v18_node_id(cfg_.state_path)), durability_epoch_(random_node_id()),
-      data_resources_(cfg_.data_inflight_bytes, cfg_.data_viewer_reserve_bytes),
+      data_resources_(cfg_.data_inflight_bytes, cfg_.data_viewer_reserve_bytes,
+                      cfg_.maintenance.background_concurrency
+                          ? cfg_.maintenance.background_concurrency
+                          : std::max<size_t>(1, std::thread::hardware_concurrency() / 2)),
       retained_memory_(cfg_.runtime.retained_memory_bytes,
                        cfg_.runtime.control_memory_reserve_bytes,
                        cfg_.runtime.viewer_memory_reserve_bytes,

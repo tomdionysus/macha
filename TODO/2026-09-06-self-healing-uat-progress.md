@@ -55,6 +55,22 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **0.32.13 (in test) — operator decisions:** (2) keep
+  `min_write_replicas: 1`; writer-local first copy (`put_impl` tries the
+  local store first) + prompt second copy (per-node worker pushes
+  floor-only objects to the first placement owner as speculative work;
+  `prompt_replication_stats`). (3) `maintenance.background_concurrency`
+  (default cores/2) caps loader+speculative DATA leases in the arbiter —
+  replaces node-c's systemd CPUQuota, which I will remove at deploy.
+  (4) presence index warmed from object directory names at start
+  (`data_store.presence_index_entries`). (5) statfs falls back to the
+  local store while membership has no capacities. Also: bit depth from
+  pixel format; no 720p default (withdrawn after the UI session's
+  argument: playlist fix first, then measure). (6) at deploy raise import
+  caps: node-c 4000→6000, node-e 8000→12000 KB/s. Operator also: never
+  reference "example-old"; the domain is macha.foundation (backend repo
+  has none; other sessions told).
+
 - **Schema-2 profile build DEPLOYED: node-c 17:44, node-d 17:54, node-e
   18:49 CEST (commit `cce1c9c`).** With the TV's capability list
   (bit_depth 10, hdr none) the gate now fires: `video=transcode/h264

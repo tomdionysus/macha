@@ -2013,10 +2013,15 @@ MACHA_TEST("rpc_cluster", test_put_commits_at_floor_without_waiting_for_desired_
     CHECK(store.put(id, data));
     auto elapsed = Clock::now() - started;
     CHECK(elapsed < 500ms);
-    CHECK(stalled_owner_gate.entered() == 0);
     CHECK(node.local_store().has(id));
 
+    // The second copy is not the foreground's problem, but it is not left to
+    // the repair cursor either: the prompt-replication worker pushes the
+    // object to a placement owner right away (it is what the stalled fake
+    // owners receive, once their gate opens).
     stalled_owner_gate.open();
+    REQUIRE(wait_until([&] { return stalled_owner_gate.entered() >= 1; }, 10s));
+    REQUIRE(wait_until([&] { return store.prompt_replication_stats().copies >= 1; }, 10s));
     slow2_server.stop();
     slow1_server.stop();
 }

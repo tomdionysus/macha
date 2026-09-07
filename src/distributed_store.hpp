@@ -4,7 +4,9 @@
 #include "replica_selector.hpp"
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <functional>
+#include <thread>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -79,6 +81,21 @@ class DistributedStore {
     bool repair_push_complete_{};
     bool repair_pull_complete_{};
     std::atomic<double> network_bps_{};
+    // Prompt second copy. A put stops at min_write_replicas; until 0.32.13 the
+    // extra copies waited for the repair cursor to come round, which on a
+    // busy import was hours, and a writer's death in that window stranded
+    // its recent data (129 files, 2026-09-07). Objects that reached only
+    // the floor are queued here and pushed to the next placement owner by
+    // one worker, admitted as speculative DATA work behind viewers.
+    std::mutex prompt_mutex_;
+    std::condition_variable_any prompt_cv_;
+    std::deque<ObjectId> prompt_queue_;
+    std::set<ObjectId> prompt_queued_;
+    std::jthread prompt_thread_;
+    std::atomic_uint64_t prompt_copies_{};
+    std::atomic_uint64_t prompt_failures_{};
+    void queue_prompt_replication(const ObjectId&);
+    void prompt_replication_loop(std::stop_token);
     mutable std::mutex fetch_mutex_;
     std::map<ObjectId, std::weak_ptr<SharedFetch>> fetches_;
     ReplicaSelector replica_selector_;
@@ -122,7 +139,14 @@ class DistributedStore {
     void note_network(uint64_t, Clock::duration);
 
   public:
-    explicit DistributedStore(NodeRuntime& n) : n_(n) {}
+    explicit DistributedStore(NodeRuntime& n);
+    ~DistributedStore();
+    struct PromptReplicationStats {
+        uint64_t queued{};
+        uint64_t copies{};
+        uint64_t failures{};
+    };
+    PromptReplicationStats prompt_replication_stats() const;
     ObjectId put(std::span<const uint8_t>, std::atomic_bool* cancelled = nullptr);
     ObjectId put(std::span<const uint8_t>, FrameType, std::atomic_bool* cancelled = nullptr);
     bool put(const ObjectId&, std::span<const uint8_t>, std::atomic_bool* cancelled = nullptr);

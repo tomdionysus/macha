@@ -180,6 +180,8 @@ void parse_maintenance(const YAML::Node& root, Config& c) {
             parse_fraction(m["idle_bandwidth_fraction"], "idle_bandwidth_fraction");
     if (m["cpu_target"])
         c.maintenance.cpu_target = parse_fraction(m["cpu_target"], "cpu_target");
+    if (m["background_concurrency"])
+        c.maintenance.background_concurrency = m["background_concurrency"].as<size_t>();
     if (m["initial_bandwidth"])
         c.maintenance.initial_bandwidth = yaml_size(m["initial_bandwidth"]);
     if (m["max_bandwidth"])
