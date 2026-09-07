@@ -10,8 +10,12 @@ deeply waited on the encoder, ~3 s each, for as many fragments as it chose to
 read ahead (UI session measurement: 30 fragments ≈ the 98 s).
 
 - The media playlist is an EVENT list of the fragments that exist, closed
-  with ENDLIST once the generation has produced its last; it answers
-  not_ready until the first fragment exists. Seeking is unchanged: PATCH
+  with ENDLIST once the generation has produced its last. A request that
+  arrives before the first fragment exists is held (bounded by
+  `startup_timeout`) rather than answered 404: an HLS player reports a
+  failed playlist load as a network error, and a client that reads such
+  errors as node health would see every new generation start with a
+  spurious degradation signal. Seeking is unchanged: PATCH
   seek_ms creates a new generation, and the client's timeline comes from
   the session's duration, not the playlist.
 - **MPEG-TS segments** for clients that cannot take fragmented MP4: a

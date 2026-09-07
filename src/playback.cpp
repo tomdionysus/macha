@@ -1953,6 +1953,18 @@ struct PlaybackManager::Impl {
         }
         if (name == "media.m3u8") {
             auto playlist = store->playlist();
+            if (playlist.empty() && store->snapshot().error.empty()) {
+                // A growing playlist has nothing to say until its first
+                // fragment exists. Hold the request for that instead of
+                // answering 404: a player treats a failed playlist load as a
+                // network error, and a client that reads such errors as node
+                // health would see every new generation start with a spurious
+                // "this node is degrading" signal (UI session, 2026-09-07).
+                // The wait is bounded by the same startup timeout the session
+                // create uses, and the producer is already running.
+                store->wait_ready(config.startup_timeout);
+                playlist = store->playlist();
+            }
             auto state = store->snapshot();
             Log::debug("playback stream playlist session=" + session->id +
                        " generation=" + std::to_string(session->generation) +
