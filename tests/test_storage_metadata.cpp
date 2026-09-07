@@ -2573,6 +2573,73 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_dlt7_presence_flags_round_trip
     CHECK(!six_decoded.canonical_garbage);
 }
 
+MACHA_FAST_TEST("storage_metadata", test_metadata_dlt8_append_extents_delta) {
+    // A large file publishes one quantum at a time; each commit used to
+    // re-send the whole extent table (105 KB per 32 MB quantum for a
+    // 13.9 GB file, 124 MB of history per node in 35 min on 2026-09-07).
+    // DLT8 carries only the appended extents and the new attributes.
+    auto before = dlt7_base_snapshot();
+    FsEntry file;
+    file.type = EntryType::file;
+    file.mode = 0644;
+    file.version = 3;
+    file.size = 3000;
+    for (uint8_t i = 0; i < 3; ++i)
+        file.extents.push_back({i * 1000ULL, 1000, object_id(pattern(32, i)), false});
+    before.entries["/big.mkv"] = file;
+
+    auto after = before;
+    auto& grown = after.entries["/big.mkv"];
+    for (uint8_t i = 3; i < 5; ++i)
+        grown.extents.push_back({i * 1000ULL, 1000, object_id(pattern(32, i)), false});
+    grown.size = 5000;
+    grown.version = 4;
+    grown.mtime_ns = 777;
+    grown.ctime_ns = 778;
+
+    auto delta = metadata_delta(before, after);
+    REQUIRE(delta.has_value());
+    CHECK(delta->upsert_entries.empty());
+    REQUIRE(delta->append_entries.contains("/big.mkv"));
+    CHECK(delta->append_entries.at("/big.mkv").base_extents == 3);
+    CHECK(delta->append_entries.at("/big.mkv").extents.size() == 2);
+    const auto encoded = encode_metadata_delta(*delta);
+    REQUIRE(encoded.size() >= 8);
+    CHECK(encoded[7] == '8');
+    CHECK(encoded.size() < 256);
+    const auto decoded = decode_metadata_delta(encoded);
+    CHECK(decoded.append_entries.size() == 1);
+    CHECK(encode_snapshot(apply_metadata_delta(before, decoded)) == encode_snapshot(after));
+
+    // The same edit through the exact-delta helper.
+    MetadataDelta exact;
+    record_entry_change(exact, "/big.mkv", &before.entries.at("/big.mkv"), grown);
+    CHECK(exact.upsert_entries.empty());
+    CHECK(exact.append_entries.size() == 1);
+    CHECK(encode_snapshot(apply_metadata_delta(before, exact)) == encode_snapshot(after));
+
+    // A base that does not match (the file changed underneath) refuses to
+    // replay rather than producing a wrong table.
+    auto other = before;
+    other.entries["/big.mkv"].extents.pop_back();
+    bool refused = false;
+    try {
+        (void)apply_metadata_delta(other, decoded);
+    } catch (const DecodeError&) {
+        refused = true;
+    }
+    CHECK(refused);
+
+    // A rewrite (not an append) still goes as a whole entry, DLT5.
+    auto rewritten = before;
+    rewritten.entries["/big.mkv"].extents[0].id = object_id(pattern(32, 99));
+    auto rewrite_delta = metadata_delta(before, rewritten);
+    REQUIRE(rewrite_delta.has_value());
+    CHECK(rewrite_delta->append_entries.empty());
+    CHECK(rewrite_delta->upsert_entries.contains("/big.mkv"));
+    CHECK(encode_metadata_delta(*rewrite_delta)[7] == '5');
+}
+
 MACHA_FAST_TEST("storage_metadata", test_metadata_merge_over_append_ordered_tombstones_is_a_delta) {
     // On the cluster (2026-09-06) 4 of 5 reconciliations were 5-8 MB full
     // frames: the merge canonicalises the tombstone union by ObjectId while

@@ -2219,6 +2219,7 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
         }
         queue_garbage_batch(s, std::move(retiring), delta);
 
+        const FsEntry previous = i->second;
         i->second.size = z;
         i->second.extents = xs;
         const auto now = wall_time_ns();
@@ -2229,7 +2230,7 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
         i->second.ctime_ns = now;
         ++i->second.version;
         committed = i->second;
-        delta.upsert_entries[q] = committed;
+        record_entry_change(delta, q, &previous, committed);
     });
     if (out)
         *out = std::move(committed);

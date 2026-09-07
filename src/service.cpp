@@ -682,6 +682,16 @@ void Service::retain_metadata_publication(const MetadataPublicationContext& cont
         if (context.delta) {
             for (const auto& [_, entry] : context.delta->upsert_entries)
                 add_entry(entry);
+            // A DLT8 append carries only the new extents, but the semantic
+            // change is to the whole file: like the upsert it replaces, it
+            // needs a fresh retention dot on every extent the file now holds
+            // (a touch that carries no extents included), or a concurrent
+            // delete could release the inherited claim.
+            for (const auto& [path, _] : context.delta->append_entries) {
+                const auto found = context.proposed.entries.find(path);
+                if (found != context.proposed.entries.end())
+                    add_entry(found->second);
+            }
         } else {
             for (const auto& [path, entry] : context.proposed.entries) {
                 const auto found = before.entries.find(path);
