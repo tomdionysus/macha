@@ -521,6 +521,47 @@ const MediaStreamInfo* stream_at(const MediaProbeResult& probe, int index) {
     return nullptr;
 }
 
+// Advisory contradictions between an explicit mode and the client's own
+// capability list. The explicit modes stay an override (the operator's
+// escape hatch), so the server says what it noticed instead of refusing:
+// each entry names a stable code, the capability field concerned, and a
+// specific message. Auto never contradicts; the list is empty then.
+Json playback_warnings_json(const MediaProbeResult& probe, const PlaybackPlan& plan,
+                            const ClientCapabilities& caps, const PlaybackPreferences& prefs) {
+    Json::Array out;
+    const auto add = [&](std::string field, std::string message) {
+        out.emplace_back(Json::Object{{"code", "capability_contradiction"},
+                                      {"field", std::move(field)},
+                                      {"message", std::move(message)}});
+    };
+    const bool explicit_mode = prefs.mode == "direct" || prefs.mode == "remux";
+    if (!explicit_mode) return Json(std::move(out));
+    if (const auto* video = stream_at(probe, plan.video_stream);
+        video && plan.video == MediaTransform::copy) {
+        const auto codec = lower(video->codec);
+        if (!caps.video_codecs.contains(codec))
+            add("video_codecs", "the source video is " + codec +
+                                    ", which the client did not list as decodable");
+        if (video->bit_depth > 8 && caps.max_video_bit_depth < video->bit_depth)
+            add("video_bit_depth", "the source video is " + std::to_string(video->bit_depth) +
+                                       "-bit; the client advertised " +
+                                       std::to_string(caps.max_video_bit_depth));
+        const bool hdr = video->color_transfer == "smpte2084" ||
+                         video->color_transfer == "arib-std-b67";
+        if (hdr && !caps.hdr_transfers.contains(video->color_transfer))
+            add("hdr", "the source video uses the " + video->color_transfer +
+                           " transfer, which the client did not list");
+    }
+    if (const auto* audio = stream_at(probe, plan.audio_stream);
+        audio && plan.audio == MediaTransform::copy) {
+        const auto codec = lower(audio->codec);
+        if (!caps.audio_codecs.contains(codec))
+            add("audio_codecs", "the source audio is " + codec +
+                                    ", which the client did not list as decodable");
+    }
+    return Json(std::move(out));
+}
+
 std::string transform_name(MediaTransform transform) {
     switch (transform) {
     case MediaTransform::copy: return "copy";
@@ -1654,6 +1695,8 @@ struct PlaybackManager::Impl {
                          {"duration_ms", static_cast<uint64_t>(std::max(0.0, session.probe.duration_seconds) * 1000.0)},
                          {"seek_ms", static_cast<uint64_t>(std::max<int64_t>(0, session.plan.seek.count()))},
                          {"preferences", preferences_json(session.preferences)},
+                         {"warnings", playback_warnings_json(session.probe, session.plan,
+                                                             session.capabilities, session.preferences)},
                          {"selection", Json(std::move(selected))},
                          {"source", Json(std::move(source))},
                          {"output", output_json(session.probe, session.plan, session.probe.format)},

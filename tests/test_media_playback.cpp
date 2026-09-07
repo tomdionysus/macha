@@ -1718,6 +1718,31 @@ MACHA_TEST("media_playback", test_auto_transcodes_hdr_10bit_unless_the_client_op
     REQUIRE(!streams.empty());
     CHECK(streams.front().find("color_transfer")->asString() == "smpte2084");
     CHECK(streams.front().find("level")->asInt64() == 153);
+    CHECK(capable.find("warnings")->asArray().empty());
+
+    // An explicit direct request is honoured, and the response says what the
+    // server noticed: the client asked for samples it said it cannot decode.
+    Json::Object direct_root{{"media_id", media_id}, {"capabilities", Json(hevc_caps())},
+                             {"preferences", Json(Json::Object{{"mode", "direct"}})}};
+    auto direct_text = Json(std::move(direct_root)).dump();
+    HttpRequest direct_request;
+    direct_request.method = "POST";
+    direct_request.path = "/api/v1/playback/sessions";
+    direct_request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    direct_request.body.assign(direct_text.begin(), direct_text.end());
+    auto direct_response = playback.handle(direct_request);
+    REQUIRE(direct_response.status == 201);
+    auto direct_json = Json::parse(std::string(direct_response.body.begin(), direct_response.body.end()));
+    CHECK(direct_json.find("mode")->asString() == "direct");
+    auto warnings = direct_json.find("warnings")->asArray();
+    REQUIRE(warnings.size() == 2);
+    std::set<std::string> fields;
+    for (const auto& warning : warnings) {
+        CHECK(warning.find("code")->asString() == "capability_contradiction");
+        fields.insert(warning.find("field")->asString());
+    }
+    const std::set<std::string> expected_fields{"video_bit_depth", "hdr"};
+    CHECK(fields == expected_fields);
 }
 
 MACHA_TEST("media_playback", test_forced_direct_bypasses_client_capabilities) {
