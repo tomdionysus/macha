@@ -1,5 +1,24 @@
 # Current release
 
+## 0.32.1 — A FUSE write waits for admission; it never returns EAGAIN (development)
+
+Found in the first hour of the full-library import (2026-09-07 02:11, gbni-1,
+4 GB node): publication held 500 MB of the 768 MB process memory budget
+while 21,000 small-file operations were pending, six write admissions
+timed out at the 5 s request deadline, the mount returned `EAGAIN` to
+`write(2)`, and rsync — correctly — aborted the whole import
+(`write failed on "…/03 Eddie, Are You Kidding_.m4a": Resource temporarily
+unavailable (11)`). The budget would have been released moments later by
+publication completing.
+
+- The three FUSE admission waits (write-byte budget, operation-metadata
+  budget, process retained memory) are backpressure: a writer now waits,
+  in 200 ms slices so shutdown is still noticed (`EINTR`), until admitted.
+  The request's own time budget starts *after* admission. A wait longer
+  than 5 s logs one DEBUG line per 5 s naming the budget.
+- Counters: `write_admission_waits`, `process_memory_admission_waits`
+  (alongside the existing `operation_metadata_waits`).
+
 ## 0.32.0 — Compact history out of the hot path: DLT7, canonical tombstones, conflicts that leave (development)
 
 Discipline 4 of `TODO/2026-09-06-self-healing-disciplines-plan.md`, scoped

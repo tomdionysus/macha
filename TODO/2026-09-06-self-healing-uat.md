@@ -462,7 +462,42 @@ Against the plan's acceptance list:
 **Verdict: the programme's four disciplines hold together under the load
 and the restarts that produced six P0s in one afternoon on 2026-09-06.**
 
-What is deliberately left (all filed, none blocking):
+## The full-library import (started 2026-09-07 02:08, iterating)
+
+The operator's test: both nodes rsync their entire `/mnt/diskA` (gbni-1
+6.1 TB / 15,500 files; es-1 2.4 TB / 6,350 files) into the real namespace
+roots, concurrently — "the first thing a new user does". Judged on: secure,
+replicated, quick to access, stable, good neighbour; and on throughput
+against what the hardware could do. Sources are read-only throughout.
+
+### Iteration 1 — died at 30 % of Music on gbni-1 (02:11:45)
+
+`rsync: write failed on ".../03 Eddie, Are You Kidding_.m4a": Resource
+temporarily unavailable (11)`, then Movies and TV each died on their first
+write. es-1's import was unaffected.
+
+Cause (from `diagnostics.retained_memory` on gbni-1): publication held
+**524,288,000 B of the 768 MB process budget** (`owners.publication`),
+21,664 small-file data operations were pending, loader-class `waits=30`,
+`cancelled_waits=6`. Each FUSE write reserves loader-class memory before it
+copies the payload; that reservation waited at the 5 s request deadline and
+`reserve_process_memory` turned the timeout into `EAGAIN`. A blocking
+`write(2)` must never see EAGAIN; rsync treats it as fatal.
+
+Fix (0.32.1): the three admission waits block until admitted (interruptible
+by shutdown → `EINTR`), the request deadline starts after admission, waits
+over 5 s are logged. Tests `pending_write_payloads_are_byte_bounded`,
+`operation_metadata_backpressures_at_heap_bound`,
+`operation_metadata_retirement_wakes_blocked_writer` already specified the
+blocking contract and pass.
+
+Also seen in the same window, filed for the next iteration: metadata
+mutations of 15–21 s on gbni-1 (`metadata mutate total_ms=21735`) while
+es-1's own import saturated the WAN — the write floor W=2 waiting on a
+replica behind a congested link; and `slow-fuse op=truncate` bursts from
+rsync's create/truncate/rename pattern on thousands of small files.
+
+What is deliberately left from the programme itself (all filed, none blocking):
 - writer-restart re-send (present-content skip);
 - journal compaction while busy (journal resets only when idle;
   `max_operation_journal_bytes` bounds it);

@@ -777,6 +777,9 @@ struct FuseFrontend::State {
     std::atomic_uint64_t namespace_operations_confirmed{};
     std::atomic_uint64_t parked_publications{};
     std::atomic_uint64_t publication_retries_backed_off{};
+    // Write admission waited (backpressure) instead of failing; slices counted.
+    std::atomic_uint64_t write_admission_waits{};
+    std::atomic_uint64_t process_memory_admission_waits{};
     // Discipline 3: recovery resolves instead of refusing; these say how often.
     std::atomic_uint64_t journal_recovery_skipped_frames{};
     std::atomic_uint64_t journal_recovery_quarantined_bytes{};
@@ -845,11 +848,31 @@ struct FuseFrontend::State {
         operation_metadata_cv.notify_all();
     }
 
+    // Admission waits are backpressure, not errors. Until 0.32.1 each of the
+    // three waits below gave up at the request deadline and returned EAGAIN
+    // to the kernel; a blocking write(2) then failed in the application
+    // (rsync: "write failed ... Resource temporarily unavailable", the
+    // full-library import on gbni-1 died at 30 %, 2026-09-07) although the
+    // budget would have been released a moment later by publication
+    // completing. A writer waits, in slices so stop is noticed, until the
+    // budget admits it; the request's own deadline starts after admission.
+    static constexpr auto admission_slice = std::chrono::milliseconds(200);
+    static constexpr auto admission_notice = std::chrono::seconds(5);
+
+    void note_admission_wait(const char* what, Clock::time_point since, uint64_t bytes) {
+        const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - since);
+        if (waited >= admission_notice && waited.count() % 5000 < admission_slice.count())
+            Log::debug(std::string("FUSE ") + what + " admission waiting bytes=" +
+                       std::to_string(bytes) + " waited_ms=" + std::to_string(waited.count()) +
+                       "; backpressure from publication, not an error");
+    }
+
     std::unique_ptr<WriteRequestLease> reserve_operation_metadata(
-        uint64_t bytes, Clock::time_point deadline, const std::function<void()>& request_progress) {
+        uint64_t bytes, Clock::time_point, const std::function<void()>& request_progress) {
         if (bytes > config.max_operation_metadata_bytes)
             throw FsError(E2BIG, "single FUSE operation exceeds metadata byte limit");
         std::unique_lock lock(operation_metadata_mutex);
+        const auto since = Clock::now();
         while (operation_metadata_bytes > config.max_operation_metadata_bytes - bytes) {
             operation_metadata_waits.fetch_add(1, std::memory_order_relaxed);
             lock.unlock();
@@ -857,8 +880,8 @@ struct FuseFrontend::State {
             lock.lock();
             if (stopping.load(std::memory_order_relaxed))
                 throw FsError(EINTR, "FUSE operation metadata admission stopping");
-            if (operation_metadata_cv.wait_until(lock, deadline) == std::cv_status::timeout)
-                throw FsError(EAGAIN, "FUSE operation metadata admission saturated");
+            (void)operation_metadata_cv.wait_for(lock, admission_slice);
+            note_admission_wait("operation metadata", since, bytes);
         }
         operation_metadata_bytes += bytes;
         operation_metadata_bytes_diagnostic.store(operation_metadata_bytes,
@@ -874,12 +897,18 @@ struct FuseFrontend::State {
     }
 
     std::shared_ptr<RetainedMemoryLedger::Lease> reserve_process_memory(
-        MemoryClass memory_class, MemoryOwner owner, uint64_t bytes,
-        Clock::time_point deadline) {
-        auto lease = fs.node().retained_memory().acquire(memory_class, owner, bytes, deadline);
-        if (!lease)
-            throw FsError(EAGAIN, "process retained-memory admission saturated");
-        return std::make_shared<RetainedMemoryLedger::Lease>(std::move(*lease));
+        MemoryClass memory_class, MemoryOwner owner, uint64_t bytes, Clock::time_point) {
+        const auto since = Clock::now();
+        for (;;) {
+            auto lease = fs.node().retained_memory().acquire(memory_class, owner, bytes,
+                                                             Clock::now() + admission_slice);
+            if (lease)
+                return std::make_shared<RetainedMemoryLedger::Lease>(std::move(*lease));
+            if (stopping.load(std::memory_order_relaxed))
+                throw FsError(EINTR, "process retained-memory admission stopping");
+            process_memory_admission_waits.fetch_add(1, std::memory_order_relaxed);
+            note_admission_wait("process memory", since, bytes);
+        }
     }
 
     static void replace_accounted(std::atomic_uint64_t& total, uint64_t& accounted,
@@ -950,16 +979,18 @@ struct FuseFrontend::State {
         inode.accounted_operation_metadata_bytes = 0;
     }
 
-    std::shared_ptr<WriteRequestLease> reserve_write_request_bytes(
-        uint64_t bytes, Clock::time_point deadline) {
+    std::shared_ptr<WriteRequestLease> reserve_write_request_bytes(uint64_t bytes,
+                                                                   Clock::time_point) {
         if (bytes > config.max_pending_write_bytes)
             throw FsError(E2BIG, "single FUSE write exceeds pending byte limit");
         std::unique_lock lock(write_request_mutex);
+        const auto since = Clock::now();
         while (pending_write_request_bytes > config.max_pending_write_bytes - bytes) {
             if (stopping.load())
                 throw FsError(EINTR, "FUSE write admission stopping");
-            if (write_request_cv.wait_until(lock, deadline) == std::cv_status::timeout)
-                throw FsError(EAGAIN, "FUSE write byte admission saturated");
+            write_admission_waits.fetch_add(1, std::memory_order_relaxed);
+            (void)write_request_cv.wait_for(lock, admission_slice);
+            note_admission_wait("write byte", since, bytes);
         }
         // Stop can release an earlier request's lease and wake this waiter at
         // the same time. Capacity becoming available does not authorize a new
@@ -5744,6 +5775,10 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
             // capacity. Never hold an inode mutex across that wait: durability
             // and publication both need the inode in order to make progress.
             state_->reserve_spool_bytes(static_cast<uint64_t>(owned.size()));
+            // The waits above are backpressure; the request's own time budget
+            // covers the local work that follows them.
+            deadline = Clock::now() + timeout_for(FuseOperationClass::write);
+            check_deadline(deadline, cancelled);
             bool reservation_transferred = false;
 
             auto ticket = std::make_shared<State::DurabilityTicket>();
@@ -5880,6 +5915,7 @@ void FuseFrontend::truncate(uint64_t inode_id, uint64_t size) {
                  auto metadata_admission = state_->reserve_operation_metadata(
                      State::operation_metadata_charge(0), deadline,
                      [&] { state_->request_data_publication(inode); });
+                 deadline = Clock::now() + timeout_for(FuseOperationClass::write);
                  std::lock_guard lock(inode->mutex);
                  check_deadline(deadline, cancelled);
                  if (inode->visible.type != EntryType::file)
