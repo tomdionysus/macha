@@ -951,14 +951,18 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
     if (!required)
         return false;
 
+    const auto started = Clock::now();
     auto active = n_.membership().active();
     active.erase(std::remove_if(active.begin(), active.end(), [&](const NodeInfo& peer) {
         return peer.metadata_write_replicas_required != required;
     }), active.end());
     if (active.size() < required)
         return false;
-    std::stable_sort(active.begin(), active.end(), [&](const NodeInfo& a, const NodeInfo& b) {
-        return a.id == n_.node_id() && b.id != n_.node_id();
+    // Local first, then the nearest measured peer: this runs inside the
+    // writer's metadata mutation, and NodeId order sent gbni-1's every
+    // catalogue claim across the WAN (2026-09-07).
+    active = order_commit_replicas(active, n_.node_id(), [&](const NodeId& peer) {
+        return n_.peer_latency(peer);
     });
 
     std::vector<std::pair<ObjectId, Bytes>> graph;
@@ -972,47 +976,75 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
         graph.emplace_back(id, std::move(*bytes));
     }
 
-    auto put_control_on = [&](const NodeInfo& target, const ObjectId& id,
-                              std::span<const uint8_t> bytes) {
-        if (target.id == n_.node_id())
-            return n_.control_store().put(id, bytes);
-        Writer writer;
-        writer.fixed(id.bytes);
-        writer.bytes(bytes);
+    // Store the whole graph on one candidate with the puts in flight
+    // together: they are small (catalogue shards) and independent, and one
+    // round trip after another cost 65 x 65 ms = 4.2 s per mutation on the
+    // live cluster (`control_ms=4247 control_objects=65`).
+    auto put_graph_on = [&](const NodeInfo& target) {
+        if (target.id == n_.node_id()) {
+            for (const auto& [id, bytes] : graph)
+                if (!n_.control_store().put(id, bytes))
+                    return false;
+            return true;
+        }
+        std::vector<std::pair<AsyncRpc, size_t>> in_flight;
+        in_flight.reserve(graph.size());
+        const auto put_started = Clock::now();
         try {
-            auto started = Clock::now();
-            const auto reply = n_.call(target, MessageType::put_control_object,
-                                       writer.data(), FrameType::control);
-            const bool ok = reply.message.type == MessageType::ok;
-            if (ok)
-                note_network(bytes.size(), Clock::now() - started);
-            return ok;
+            for (const auto& [id, bytes] : graph) {
+                Writer writer;
+                writer.fixed(id.bytes);
+                writer.bytes(bytes);
+                in_flight.emplace_back(n_.call_async(target, MessageType::put_control_object,
+                                                     writer.data(), FrameType::control),
+                                       bytes.size());
+            }
         } catch (const std::exception& error) {
             Log::debug("CONTROL retention object store peer=" + target.host +
                        " error=" + error.what());
+            for (auto& [rpc, _] : in_flight)
+                rpc.cancel();
             return false;
         }
+        bool ok = true;
+        size_t bytes_sent = 0;
+        for (auto& [rpc, size] : in_flight) {
+            try {
+                if (rpc.get().message.type == MessageType::ok)
+                    bytes_sent += size;
+                else
+                    ok = false;
+            } catch (const std::exception& error) {
+                Log::debug("CONTROL retention object store peer=" + target.host +
+                           " error=" + error.what());
+                ok = false;
+            }
+        }
+        if (bytes_sent)
+            note_network(bytes_sent, Clock::now() - put_started);
+        return ok;
     };
 
     // Critical-path CONTROL publication scales with the configured metadata
     // write floor, not cluster membership. Background control repair may later
     // fan the immutable graph out to every node.
     size_t retained_count = 0;
+    size_t tried = 0;
     for (const auto& candidate : active) {
-        bool graph_present = true;
-        for (const auto& [id, bytes] : graph) {
-            if (!put_control_on(candidate, id, bytes)) {
-                graph_present = false;
-                break;
-            }
-        }
-        if (!graph_present)
+        ++tried;
+        if (!put_graph_on(candidate))
             continue;
         if (retain_on(candidate, RetentionClass::control, ids, dot))
             ++retained_count;
         if (retained_count >= required)
             break;
     }
+    const auto total_ms = elapsed_ms(started);
+    if (total_ms >= 250 && Log::enabled(LogLevel::debug))
+        Log::debug("CONTROL retention claim objects=" + std::to_string(ids.size()) +
+                   " required=" + std::to_string(required) + " tried=" + std::to_string(tried) +
+                   " retained=" + std::to_string(retained_count) +
+                   " total_ms=" + std::to_string(total_ms));
     if (retained_count < required) {
         Log::debug("CONTROL retention floor unavailable objects=" + std::to_string(ids.size()) +
                    " required=" + std::to_string(required) +

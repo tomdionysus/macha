@@ -48,16 +48,6 @@ struct MetadataPublicationContext {
     const MetadataDelta* delta{};
 };
 
-// Replica order for commit fan-out: the local replica first (the caller must
-// continue from its own store), then peers by measured CONTROL-lane latency,
-// nearest first, with unmeasured peers last in their given order. Until
-// 0.32.7 the order after the local replica was NodeId order, which sent
-// every commit from gbni-1 across the WAN to es-1 before the LAN replica
-// gbni-2 (2026-09-07).
-std::vector<NodeInfo> order_commit_replicas(
-    std::vector<NodeInfo> replicas, const NodeId& local,
-    const std::function<std::optional<std::chrono::milliseconds>(const NodeId&)>& latency);
-
 struct MetadataClusterStatus {
     uint64_t generation{};
     uint64_t observed_unix_ms{};

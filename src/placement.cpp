@@ -1,6 +1,27 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "placement.hpp"
 
+namespace macha {
+
+std::vector<NodeInfo> order_commit_replicas(
+    std::vector<NodeInfo> replicas, const NodeId& local,
+    const std::function<std::optional<std::chrono::milliseconds>(const NodeId&)>& latency) {
+    const auto rank = [&](const NodeInfo& node) -> std::pair<int, int64_t> {
+        if (node.id == local)
+            return {0, 0};
+        const auto measured = latency ? latency(node.id) : std::nullopt;
+        if (measured)
+            return {1, measured->count()};
+        return {2, 0};
+    };
+    std::stable_sort(replicas.begin(), replicas.end(), [&](const NodeInfo& a, const NodeInfo& b) {
+        return rank(a) < rank(b);
+    });
+    return replicas;
+}
+
+} // namespace macha
+
 #include "crypto.hpp"
 
 #include <algorithm>

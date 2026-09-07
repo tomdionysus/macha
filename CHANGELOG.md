@@ -1,5 +1,22 @@
 # Current release
 
+## 0.32.10 — CONTROL retention puts go together, to the nearest replica (development)
+
+0.32.9's phase line on gbni-1: `metadata retention barrier total_ms=4286
+decode_ms=13 collect_ms=1 catalogue_ms=25 data_ms=0 control_ms=4247
+control_objects=65`. `retain_control` stored the catalogue graph on each
+candidate one object per round trip, and after the local replica took the
+candidates in membership (NodeId) order, so gbni-1 pushed 65 small objects
+to es-1 across the WAN, 65 ms each, inside every catalogue mutation.
+
+- The candidate order is local first, then measured nearest
+  (`order_commit_replicas`, moved to placement.hpp so the store and the
+  metadata manager share it).
+- All puts to one candidate are issued together and awaited together:
+  one round trip per candidate instead of one per object.
+- `CONTROL retention claim objects=… required=… tried=… retained=…
+  total_ms=…` is logged at debug when the claim takes 250 ms or more.
+
 ## 0.32.9 — Presence is remembered, not stat'ed; the barrier names its phase (development)
 
 0.32.8's barrier line on gbni-1: `DATA retention barrier ids=3201 nodes=1

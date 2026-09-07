@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
+#include "placement.hpp"
 #include "startup_progress.hpp"
 
 using namespace macha;
