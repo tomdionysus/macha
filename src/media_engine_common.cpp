@@ -179,6 +179,15 @@ std::string playback_mode_name(PlaybackMode mode) {
     return "unknown";
 }
 
+std::string_view media_failure_name(MediaFailure failure) noexcept {
+    switch (failure) {
+    case MediaFailure::unreadable: return "source_unreadable";
+    case MediaFailure::unsupported: return "source_unsupported";
+    case MediaFailure::timed_out: return "source_read_timed_out";
+    }
+    return "source_unreadable";
+}
+
 std::string media_stream_type_name(MediaStreamType type) {
     switch (type) {
     case MediaStreamType::video: return "video";

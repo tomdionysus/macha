@@ -177,14 +177,27 @@ class ResourceLimitError final : public std::runtime_error {
 class PlaybackStageError final : public std::runtime_error {
     std::string trace_;
     std::string stage_;
+    // Set when the engine said why it could not read the source. The reason
+    // travels out to the client unchanged; the server does not act on it.
+    std::optional<MediaFailure> failure_;
 
   public:
-    PlaybackStageError(std::string trace, std::string stage, std::string message)
+    PlaybackStageError(std::string trace, std::string stage, std::string message,
+                       std::optional<MediaFailure> failure = std::nullopt)
         : std::runtime_error(std::move(message)), trace_(std::move(trace)),
-          stage_(std::move(stage)) {}
+          stage_(std::move(stage)), failure_(failure) {}
     const std::string& trace() const noexcept { return trace_; }
     const std::string& stage() const noexcept { return stage_; }
+    const std::optional<MediaFailure>& failure() const noexcept { return failure_; }
 };
+
+// Wraps a stage failure, carrying the engine's reason when there is one.
+PlaybackStageError stage_error(std::string trace, std::string stage, const std::exception& error) {
+    if (const auto* media = dynamic_cast<const MediaError*>(&error))
+        return PlaybackStageError(std::move(trace), std::move(stage), media->what(),
+                                  media->failure());
+    return PlaybackStageError(std::move(trace), std::move(stage), error.what());
+}
 
 std::optional<ByteRange> parse_range(const HttpRequest& request, uint64_t size) {
     auto it = request.headers.find("range");
@@ -940,7 +953,7 @@ struct PlaybackManager::Impl {
                 cache_probe(key, resolved);
                 return resolved;
             } catch (const std::exception& e) {
-                throw PlaybackStageError(std::string(trace), "probe", e.what());
+                throw stage_error(std::string(trace), "probe", e);
             }
         }
         if (lease.media_id.starts_with("macha:")) {
@@ -966,7 +979,7 @@ struct PlaybackManager::Impl {
                         } catch (const PlaybackStageError&) {
                             throw;
                         } catch (const std::exception& e) {
-                            throw PlaybackStageError(std::string(trace), "probe", e.what());
+                            throw stage_error(std::string(trace), "probe", e);
                         }
                         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                             Clock::now() - started_at).count();
@@ -1001,7 +1014,7 @@ struct PlaybackManager::Impl {
             } catch (const PlaybackStageError&) {
                 throw;
             } catch (const std::exception& e) {
-                throw PlaybackStageError(std::string(trace), "probe", e.what());
+                throw stage_error(std::string(trace), "probe", e);
             }
         }
 
@@ -1061,7 +1074,7 @@ struct PlaybackManager::Impl {
             complete_flight({}, std::current_exception());
             throw;
         } catch (const std::exception& e) {
-            auto error = std::make_exception_ptr(PlaybackStageError(std::string(trace), "probe", e.what()));
+            auto error = std::make_exception_ptr(stage_error(std::string(trace), "probe", e));
             complete_flight({}, error);
             std::rethrow_exception(error);
         }
@@ -1382,7 +1395,7 @@ struct PlaybackManager::Impl {
                 stop_pipeline(session);
                 std::error_code cleanup_ec;
                 std::filesystem::remove_all(session.generation_dir, cleanup_ec);
-                throw PlaybackStageError(std::string(trace), "pipeline_start", e.what());
+                throw stage_error(std::string(trace), "pipeline_start", e);
             }
             session.stream_url = prefix + "/" + std::to_string(session.generation) + "/master.m3u8";
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started_at).count();
@@ -2417,7 +2430,12 @@ struct PlaybackManager::Impl {
 
         const auto deadline = Clock::now() + config.probe_timeout;
         Json::Array reported;
+        // A media this node could not read is a fact too, and a different one
+        // from a media that does not exist. Report both, per media, and let
+        // the client decide whether another node is worth asking.
+        Json::Array unavailable;
         std::string last_error;
+        std::string last_reason;
         for (const auto& id : media_ids) {
             try {
                 auto lease = create_source(id);
@@ -2451,14 +2469,27 @@ struct PlaybackManager::Impl {
                     {"streams", Json(std::move(streams))},
                     {"operations", Json(std::move(operations))}};
                 reported.emplace_back(std::move(entry));
+            } catch (const MediaError& e) {
+                last_error = e.what();
+                last_reason = media_failure_name(e.failure());
+                unavailable.emplace_back(Json::Object{{"media_id", id},
+                                                      {"reason", last_reason},
+                                                      {"message", std::string(e.what())}});
             } catch (const std::exception& e) {
                 last_error = e.what();
+                unavailable.emplace_back(Json::Object{{"media_id", id},
+                                                      {"reason", std::string("not_found")},
+                                                      {"message", std::string(e.what())}});
             }
         }
-        if (reported.empty())
+        if (reported.empty()) {
+            if (!last_reason.empty())
+                return http_error(422, "facts_unavailable", last_error, last_reason);
             return http_error(404, "not_found",
                               last_error.empty() ? "media is not available" : last_error);
+        }
         Json::Object out{{"media", Json(std::move(reported))}};
+        if (!unavailable.empty()) out["unavailable"] = Json(std::move(unavailable));
         if (!item_id.empty()) out["item_id"] = item_id;
         return http_json(200, Json(std::move(out)).dump());
     }
@@ -2684,7 +2715,15 @@ HttpResponse PlaybackManager::handle(const HttpRequest& request) {
                           {"message", std::string(e.what())},
                           {"trace", e.trace()},
                           {"stage", e.stage()}};
-        auto response = http_json(503, Json(std::move(body)).dump());
+        // When the engine said why, say why. A source this node could not read
+        // is a different situation for the client than one it could not parse,
+        // and only the client can decide what to do about either.
+        int status = 503;
+        if (e.failure()) {
+            body["reason"] = std::string(media_failure_name(*e.failure()));
+            if (*e.failure() == MediaFailure::unsupported) status = 422;
+        }
+        auto response = http_json(status, Json(std::move(body)).dump());
         response.headers["X-Macha-Playback-Trace"] = e.trace();
         response.headers["X-Macha-Playback-Stage"] = e.stage();
         return response;

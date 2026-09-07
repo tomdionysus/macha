@@ -127,6 +127,15 @@ HttpResponse http_error(int status, std::string_view code, std::string_view mess
     return http_json(status, Json(std::move(root)).dump());
 }
 
+HttpResponse http_error(int status, std::string_view code, std::string_view message,
+                        std::string_view reason) {
+    Json::Object root;
+    root["error"] = Json::Object{{"code", std::string(code)},
+                                 {"message", std::string(message)},
+                                 {"reason", std::string(reason)}};
+    return http_json(status, Json(std::move(root)).dump());
+}
+
 std::string http_url_decode(std::string_view value) {
     std::string out;
     for (size_t i = 0; i < value.size(); ++i) {

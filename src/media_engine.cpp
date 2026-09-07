@@ -157,6 +157,10 @@ struct InputIoState {
     uint64_t offset{};
     std::atomic_bool* cancelled{};
     Clock::time_point deadline{};
+    // libav flattens every read failure into AVERROR(EIO), which cannot tell
+    // "this node cannot reach the extents" from "these bytes are not media".
+    // Keep the first underlying failure so the caller can report which it was.
+    std::string read_error;
 };
 
 bool input_aborted(const InputIoState& state) {
@@ -198,6 +202,7 @@ int input_read(void* opaque, uint8_t* buffer, int buffer_size) {
                   " offset=" + std::to_string(state.offset) +
                   " wanted=" + std::to_string(wanted) +
                   " error=" + error.what());
+        if (state.read_error.empty()) state.read_error = error.what();
         return AVERROR(EIO);
     } catch (...) {
         if (state.cancelled && state.cancelled->load()) return AVERROR_EXIT;
@@ -207,6 +212,7 @@ int input_read(void* opaque, uint8_t* buffer, int buffer_size) {
                   " offset=" + std::to_string(state.offset) +
                   " wanted=" + std::to_string(wanted) +
                   " error=unknown");
+        if (state.read_error.empty()) state.read_error = "unknown read failure";
         return AVERROR(EIO);
     }
 }
@@ -254,9 +260,19 @@ class InputContext {
                  uint64_t probe_bytes = 0, std::chrono::milliseconds analyze = {},
                  std::chrono::milliseconds wall_timeout = {}) {
         try {
-            if (!source.open) throw std::runtime_error("media source has no reader factory");
-            state_.input = source.open(purpose);
-            if (!state_.input) throw std::runtime_error("media source reader could not be opened");
+            if (!source.open)
+                throw MediaError(MediaFailure::unreadable, "media source has no reader factory");
+            try {
+                state_.input = source.open(purpose);
+            } catch (const MediaError&) {
+                throw;
+            } catch (const std::exception& error) {
+                throw MediaError(MediaFailure::unreadable,
+                                 std::string("open media source: ") + error.what());
+            }
+            if (!state_.input)
+                throw MediaError(MediaFailure::unreadable,
+                                 "media source reader could not be opened");
             state_.media_id = source.media_id;
             state_.purpose = purpose;
             state_.cancelled = cancelled;
@@ -287,8 +303,19 @@ class InputContext {
             int rc = avformat_open_input(&candidate, nullptr, nullptr, nullptr);
             format_ = candidate;
             if (rc < 0) {
-                if (timed_out()) throw std::runtime_error("media probe timed out while opening input");
-                throw std::runtime_error("open media: " + av_error(rc));
+                if (timed_out())
+                    throw MediaError(MediaFailure::timed_out,
+                                     "media probe timed out while opening input");
+                // A read that failed underneath is the truth; libav's EIO is
+                // only how that failure reached it.
+                if (!state_.read_error.empty())
+                    throw MediaError(MediaFailure::unreadable,
+                                     "read media: " + state_.read_error);
+                if (rc == AVERROR(ETIMEDOUT))
+                    throw MediaError(MediaFailure::timed_out, "open media: " + av_error(rc));
+                if (rc == AVERROR(EIO) || rc == AVERROR(EAGAIN) || rc == AVERROR_EXIT)
+                    throw MediaError(MediaFailure::unreadable, "open media: " + av_error(rc));
+                throw MediaError(MediaFailure::unsupported, "open media: " + av_error(rc));
             }
         } catch (...) {
             cleanup();
@@ -302,6 +329,8 @@ class InputContext {
     InputContext& operator=(const InputContext&) = delete;
 
     AVFormatContext* get() const { return format_; }
+    // Empty unless a read underneath libav failed; see InputIoState.
+    const std::string& read_error() const noexcept { return state_.read_error; }
     bool timed_out() const {
         return state_.deadline != Clock::time_point{} && Clock::now() >= state_.deadline;
     }
@@ -1474,10 +1503,17 @@ class LibavMediaEngine final : public MediaEngine {
                            config_.probe_analyze_duration, timeout);
         auto* format = input.get();
         auto probe_rc = avformat_find_stream_info(format, nullptr);
-        if (probe_rc < 0 && input.timed_out())
-            throw std::runtime_error("media probe timed out after " +
+        if (probe_rc < 0) {
+            if (input.timed_out())
+                throw MediaError(MediaFailure::timed_out,
+                                 "media probe timed out after " +
                                      std::to_string(timeout.count()) + " ms");
-        av_require(probe_rc, "read stream information");
+            if (!input.read_error().empty())
+                throw MediaError(MediaFailure::unreadable,
+                                 "read media: " + input.read_error());
+            throw MediaError(MediaFailure::unsupported,
+                             "read stream information: " + av_error(probe_rc));
+        }
 
         MediaProbeResult result;
         if (format->iformat && format->iformat->name) result.format = format->iformat->name;
