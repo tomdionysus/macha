@@ -337,7 +337,7 @@ int metadata_delta_version(std::span<const uint8_t> data) {
     static constexpr std::array<uint8_t, 7> prefix{'D', 'H', 'T', 'M', 'D', 'L', 'T'};
     if (data.size() < 8 || !std::equal(prefix.begin(), prefix.end(), data.begin()))
         return 0;
-    if (data[7] < '1' || data[7] > '7')
+    if (data[7] < '1' || data[7] > '8')
         return 0;
     return static_cast<int>(data[7] - '0');
 }
@@ -358,11 +358,13 @@ Bytes encode_snapshot_for_delta(std::span<const uint8_t> delta, const MetadataSn
     case 5:
     case 6:
     case 7:
+    case 8:
         return encode_snapshot(snapshot);
     default:
         throw DecodeError("bad metadata delta");
     }
 }
+
 
 void hash_u8(Sha256Hasher& hash, uint8_t value) {
     hash.update(std::span<const uint8_t>(&value, 1));
@@ -457,6 +459,35 @@ std::optional<std::filesystem::path> quarantine_metadata_file(const std::filesys
     return quarantine;
 }
 } // namespace
+
+namespace {
+bool extents_appended(const FsEntry& before, const FsEntry& after) {
+    return before.type == EntryType::file && after.type == EntryType::file &&
+           before.mode == after.mode && before.uid == after.uid && before.gid == after.gid &&
+           before.extents.size() < after.extents.size() &&
+           std::equal(before.extents.begin(), before.extents.end(), after.extents.begin());
+}
+} // namespace
+
+void record_entry_change(MetadataDelta& delta, const std::string& path, const FsEntry* before,
+                         const FsEntry& after) {
+    if (before && extents_appended(*before, after)) {
+        MetadataDelta::EntryAppend append;
+        append.size = after.size;
+        append.mtime_ns = after.mtime_ns;
+        append.ctime_ns = after.ctime_ns;
+        append.version = after.version;
+        append.base_extents = static_cast<uint32_t>(before->extents.size());
+        append.extents.assign(after.extents.begin() +
+                                  static_cast<ptrdiff_t>(before->extents.size()),
+                              after.extents.end());
+        delta.upsert_entries.erase(path);
+        delta.append_entries[path] = std::move(append);
+        return;
+    }
+    delta.append_entries.erase(path);
+    delta.upsert_entries[path] = after;
+}
 
 bool garbage_is_canonical(const std::vector<GarbageRef>& garbage) {
     for (size_t i = 1; i < garbage.size(); ++i)
@@ -742,18 +773,20 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
     static constexpr std::array<uint8_t, 8> magic_v5{'D', 'H', 'T', 'M', 'D', 'L', 'T', '5'};
     static constexpr std::array<uint8_t, 8> magic_v6{'D', 'H', 'T', 'M', 'D', 'L', 'T', '6'};
     static constexpr std::array<uint8_t, 8> magic_v7{'D', 'H', 'T', 'M', 'D', 'L', 'T', '7'};
+    static constexpr std::array<uint8_t, 8> magic_v8{'D', 'H', 'T', 'M', 'D', 'L', 'T', '8'};
     const bool topology =
         delta.replace_merge_parents.has_value() || delta.replace_conflicts.has_value();
+    const bool v8 = !delta.append_entries.empty();
     // DLT7 whenever DLT5/6 cannot say it: one topology set without the other,
     // or a canonical tombstone order. Both sets together still encode as DLT6
     // so a mixed-version cluster keeps its cheap merges during a rolling
     // upgrade; a pre-0.32 peer that receives DLT7 rejects it and the sender's
     // full-record fallback covers the gap.
-    const bool v7 = delta.canonical_garbage ||
+    const bool v7 = v8 || delta.canonical_garbage ||
                     (delta.replace_merge_parents.has_value() != delta.replace_conflicts.has_value());
     const bool v6 = !v7 && topology;
     Writer w;
-    w.raw(v7 ? magic_v7 : v6 ? magic_v6 : magic_v5);
+    w.raw(v8 ? magic_v8 : v7 ? magic_v7 : v6 ? magic_v6 : magic_v5);
     w.u32(delta.mutation_sequences.size());
     for (const auto& [node, sequence] : delta.mutation_sequences) {
         w.fixed(node.bytes);
@@ -823,6 +856,26 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
             encode_conflict(w, conflict);
         }
     }
+    if (v8) {
+        w.u32(static_cast<uint32_t>(delta.append_entries.size()));
+        for (const auto& [path, append] : delta.append_entries) {
+            if (delta.upsert_entries.contains(path))
+                throw std::invalid_argument("metadata delta appends and upserts the same path");
+            w.string(path);
+            w.u64(append.size);
+            w.i64(append.mtime_ns);
+            w.i64(append.ctime_ns);
+            w.u64(append.version);
+            w.u32(append.base_extents);
+            w.u32(static_cast<uint32_t>(append.extents.size()));
+            for (const auto& x : append.extents) {
+                w.u64(x.offset);
+                w.u64(x.length);
+                w.u8(x.hole);
+                w.fixed(x.id.bytes);
+            }
+        }
+    }
     return w.take();
 }
 
@@ -834,6 +887,7 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
     static constexpr std::array<uint8_t, 8> magic_v5{'D', 'H', 'T', 'M', 'D', 'L', 'T', '5'};
     static constexpr std::array<uint8_t, 8> magic_v6{'D', 'H', 'T', 'M', 'D', 'L', 'T', '6'};
     static constexpr std::array<uint8_t, 8> magic_v7{'D', 'H', 'T', 'M', 'D', 'L', 'T', '7'};
+    static constexpr std::array<uint8_t, 8> magic_v8{'D', 'H', 'T', 'M', 'D', 'L', 'T', '8'};
     Reader r(data);
     auto got = r.raw(magic_v1.size());
     const bool v1 = std::equal(got.begin(), got.end(), magic_v1.begin());
@@ -841,7 +895,9 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
     const bool v3 = std::equal(got.begin(), got.end(), magic_v3.begin());
     const bool v4 = std::equal(got.begin(), got.end(), magic_v4.begin());
     const bool v5 = std::equal(got.begin(), got.end(), magic_v5.begin());
-    const bool v7 = std::equal(got.begin(), got.end(), magic_v7.begin());
+    const bool v8 = std::equal(got.begin(), got.end(), magic_v8.begin());
+    // DLT8 is DLT7 plus a trailing append-entries section.
+    const bool v7 = v8 || std::equal(got.begin(), got.end(), magic_v7.begin());
     // DLT7 is DLT6 plus a flags byte; everything before the topology sets is
     // shared, so treat v7 as v6 for the common prefix.
     const bool v6 = v7 || std::equal(got.begin(), got.end(), magic_v6.begin());
@@ -980,6 +1036,35 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
         }
         delta.replace_conflicts = std::move(conflicts);
     }
+    if (v8) {
+        const auto count = r.u32();
+        if (count > 5000000)
+            throw DecodeError("too many metadata delta appends");
+        for (uint32_t i = 0; i < count; ++i) {
+            auto path = normalize_path(r.string());
+            MetadataDelta::EntryAppend append;
+            append.size = r.u64();
+            append.mtime_ns = r.i64();
+            append.ctime_ns = r.i64();
+            append.version = r.u64();
+            append.base_extents = r.u32();
+            const auto n = r.u32();
+            if (n > 10000000)
+                throw DecodeError("too many appended extents");
+            append.extents.reserve(n);
+            for (uint32_t k = 0; k < n; ++k) {
+                ExtentRef x;
+                x.offset = r.u64();
+                x.length = r.u64();
+                x.hole = r.u8() != 0;
+                x.id = ObjectId{r.fixed<32>()};
+                append.extents.push_back(x);
+            }
+            if (delta.upsert_entries.contains(path) ||
+                !delta.append_entries.emplace(std::move(path), std::move(append)).second)
+                throw DecodeError("duplicate metadata delta append path");
+        }
+    }
     r.finish();
     return delta;
 }
@@ -1022,8 +1107,10 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
     }
     for (const auto& [path, value] : after.entries) {
         auto it = before.entries.find(path);
-        if (it == before.entries.end() || it->second != value)
+        if (it == before.entries.end())
             delta.upsert_entries.emplace(path, value);
+        else if (it->second != value)
+            record_entry_change(delta, path, &it->second, value);
     }
 
     if (before.catalogue_root != after.catalogue_root) {
@@ -1157,6 +1244,18 @@ void apply_metadata_delta_in_place(MetadataSnapshot& out, const MetadataDelta& d
     }
     for (const auto& [path, value] : delta.upsert_entries)
         out.entries[normalize_path(path)] = value;
+    for (const auto& [path, append] : delta.append_entries) {
+        auto found = out.entries.find(normalize_path(path));
+        if (found == out.entries.end() || found->second.type != EntryType::file ||
+            found->second.extents.size() != append.base_extents)
+            throw DecodeError("metadata delta append base mismatch");
+        auto& entry = found->second;
+        entry.extents.insert(entry.extents.end(), append.extents.begin(), append.extents.end());
+        entry.size = append.size;
+        entry.mtime_ns = append.mtime_ns;
+        entry.ctime_ns = append.ctime_ns;
+        entry.version = append.version;
+    }
     switch (delta.catalogue) {
     case CatalogueDelta::unchanged:
         break;

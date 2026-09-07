@@ -1082,6 +1082,19 @@ MACHA_TEST("foundations", test_normalize_config_preserves_an_explicit_plugin_pat
     CHECK(*normalized.plugin_path == std::filesystem::path("/opt/macha/plugins"));
 }
 
+MACHA_TEST("foundations", test_fuse_mountpoint_preflight_counts_stray_entries) {
+    TempDir temp;
+    const auto covered = temp.path() / "mnt";
+    // Missing directory: created, empty, nothing stray.
+    CHECK(guard_covered_mountpoint(covered, false).stray_entries == 0);
+    CHECK(std::filesystem::is_directory(covered));
+    // Files written to the host directory while no mount covered it are
+    // reported, so an operator learns that the mount is hiding them.
+    std::ofstream(covered / "stray.mkv") << "not in macha";
+    std::filesystem::create_directory(covered / "Movies");
+    CHECK(guard_covered_mountpoint(covered, false).stray_entries == 2);
+}
+
 MACHA_TEST("foundations", test_fuse_mountpoint_preflight_refuses_unrelated_filesystem) {
 #if defined(__linux__) || defined(__APPLE__)
     TempDir temp;

@@ -35,7 +35,7 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 | node | ip | role | notes |
 |---|---|---|---|
-| node-c | 192.0.2.50 | writer, 4 GB | `/mnt/diskA` source; temp `service_startup_timeout_ms: 1800000` in config (remove when discipline 2 lands); FUSE journal backup `fuse-operations.log.bak-20260906-dup` |
+| node-c | 192.0.2.50 | writer, 4 GB, **undervolt-prone** | `/mnt/diskA` source; FUSE journal backup `fuse-operations.log.bak-20260906-dup`. Operator 2026-09-07: it shuts down from undervoltage under heavy load (went dark 04:13 a minute after restart + uncapped rsync). Policy: never build on it (build on node-d, ship `make install DESTDIR=` stage), rsync with `--bwlimit=8000` under nice/ionice, don't stack replay + build + import. |
 | node-d | 192.0.2.51 | replica, 16 GB | no diskA |
 | node-e | 198.18.34.50 | writer, 8 GB, offsite (CEST), shared with other users | `/mnt/diskA` source; WAN ≈ 50–60 Mbps via WireGuard/EC2 |
 
@@ -54,6 +54,42 @@ current at every checkpoint; a fresh session reads only this and the plan.
 - [x] **UAT record complete**: `2026-09-06-self-healing-uat.md`, all four disciplines + the closing demonstrative run (2026-09-07 00:08–00:22: two concurrent writers, five rolling restarts incl. a writer, 0 ERROR, 1 WARN, 0 wedges, 277-byte merge delta). **PROGRAMME COMPLETE.**
 
 ## Import iteration log (newest first)
+
+- **0.32.6 (DLT8 append-extents + finding #7 mountpoint guard; suite
+  357/357 after one flaky rerun):** deploy order node-d (build) → node-e
+  (nice build) → node-c (binaries staged on node-d, shipped, no build).
+  Import scripts on both writers replaced by the mount-guarded version
+  (`wait_mount` before every directory; node-c now `--bwlimit=8000` too).
+  Verify next ticks: (a) `mountpoint_immutable=true`, `mountpoint_stray_entries=0`
+  on all three in status; (b) node-e written-bytes ≈ 8 MB/s and, this time,
+  `pub` counters and spool actually moving with it; (c) history growth per
+  32 MB quantum ≈ 500 B not 105 KB (`hist=` MB in import-check).
+
+- **Finding #7 (13:25 CEST, node-e) — writes before the mount go to the
+  host disk.** node-e's 11:38 import restart began 25 s after the daemon;
+  the mount comes up ~30 s after start, so rsync's generator walked the
+  bare `/mnt/machamedia` directory and every write since went to the root
+  NVMe: **52.6 GB / 46 files under the covered dir**, hidden by the mount,
+  while Macha showed spool=0, pub=1/1 (the "it's not publishing" puzzle).
+  `fail_closed_mountpoint` only chmod'ed the dir after mounting, which
+  root ignores. Fix in 0.32.6: `prepare_fuse_mountpoint` counts stray
+  entries (ERROR log + `filesystem.mountpoint_stray_entries`) and sets the
+  immutable flag on the covered dir before services start (`chattr +i`
+  semantics, stops root, persists; `filesystem.mountpoint_immutable`);
+  proven on node-d that tmpfs/FUSE mount over an immutable dir works and
+  `touch` under it gets EPERM. **OPERATOR ACTION (deletion was refused
+  by my permission classifier):** on node-e remove the stray copies —
+  `mkdir -p /mnt/rootview && mount --bind / /mnt/rootview && rm -rf
+  /mnt/rootview/mnt/machamedia/Movies && umount /mnt/rootview` — they are
+  exact copies of `/mnt/diskA/Movies/*` written 11:38–13:30 CEST today.
+  node-c and node-d covered dirs verified empty. node-e's Movies import
+  therefore stands where pass one left it; pass two restarts from there.
+
+- **DLT8 first cut broke the retention barrier:** `retain_metadata_publication`
+  only read `upsert_entries`; two rpc_cluster tests (touch requires
+  retention; partition-delete defers GC) caught append records bypassing
+  it. Fixed: an append retains the whole resulting entry, like the upsert
+  it replaces.
 
 - **0.32.5 (commit `97dbac9`, suite 355/355; deployed node-d ~10:57, node-e
   11:38 CEST; node-c still down):** spool pacing admits against drained
