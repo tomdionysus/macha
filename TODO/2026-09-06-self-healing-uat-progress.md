@@ -55,6 +55,33 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **Viewer path, evening of 2026-09-07 (0.32.14/0.32.15, with the UI
+  session).** What the TV taught us, in order: (1) the silent transcode was
+  the **missing CODECS attribute** — `master.m3u8` returned the media
+  playlist, so hls.js could not derive a SourceBuffer config; fixed in
+  0.32.12 and confirmed on hardware (direct play regained sound).
+  (2) The 1m38s black screen was **playlist semantics**, not encoder speed:
+  a VOD list of 1,517 planned fragments let a prefetching player queue
+  against fragments that did not exist, each request blocking ~3 s on the
+  encoder. 0.32.14: EVENT playlist of produced fragments + ENDLIST, and the
+  request **holds** (bounded by `startup_timeout`) rather than 404 — a
+  failed playlist load reads as a network error and the client treats that
+  as node health. (3) MPEG-TS output (`hls_ts`) landed but is **not** the
+  TV fix: the UI session held the container constant and varied the player
+  (`forceNativeHls` off → hls.js), and audio worked; Tizen 3's *native* HLS
+  player drops muxed AAC from fMP4. TS stays, dormant, for hosts without
+  MSE. (4) That moved everything onto MSE, where this TV **fails HEVC**
+  while its media element decodes it, and `isTypeSupported` lies. 0.32.15:
+  `.mkv`/`.mka` are a real direct-play container (`matroska`, also `mkv`,
+  served `video/x-matroska`) — it had never been in `direct_container`, so
+  no token could have worked — plus `capabilities.hls_video_codecs` to
+  narrow codecs for HLS delivery only. (5) Explicit `direct` bypassed the
+  container check (by design: byte-stream override, operator escape hatch);
+  it now emits a `containers` entry in the session's `warnings` list.
+  Timings on the way: create 2.8-4.4 s → 0.58-0.88, PATCH seek 5.6-13 s →
+  0.79-1.84, forced transcode 7.6-13 s → 2.67-3.68.
+
+
 - **0.32.13 (in test) — operator decisions:** (2) keep
   `min_write_replicas: 1`; writer-local first copy (`put_impl` tries the
   local store first) + prompt second copy (per-node worker pushes
