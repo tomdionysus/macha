@@ -55,6 +55,17 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **Hotfixed 0.32.12 on all three (gbni-2 17:24, es-1 18:25 CEST, gbni-1
+  17:28 — operator ordered the immediate restart).** Then the UI session's
+  one-call check with the TV's exact list showed the gate cannot fire:
+  `source.video.bit_depth/color_transfer` were null because the session's
+  stream info comes from the **stored immutable media profile** (schema 1,
+  no level/transfer, zero depth). Fix (in test → deploy next): profile
+  schema 2 carries `level` + `color_transfer`; a schema-1 profile with a
+  video stream is invalid → regenerated on next playback and republished;
+  API reports schema 2. Until deployed the TV gets sound (CODECS) but the
+  copied DV stream (broken picture).
+
 - **0.32.12 rollout, twice wrong before right:** (1) GCC
   `-Werror=format-truncation` on the hex level `snprintf` failed the node
   builds; the chain's `grep error` swallowed the exit status and

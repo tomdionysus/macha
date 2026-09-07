@@ -55,10 +55,19 @@ struct CatalogueItem {
     auto operator<=>(const CatalogueItem&) const = default;
 };
 
+// Current stored media-profile schema; see CatalogueSnapshot::MediaProfile.
+inline constexpr uint32_t catalogue_media_profile_schema = 2;
+
 struct CatalogueSnapshot {
     std::map<std::string, CatalogueItem> items;
     struct MediaProfile {
-        uint32_t schema_version{1};
+        // Schema 2 (0.32.12) adds each stream's codec level and colour
+        // transfer. A schema-1 profile with a video stream is treated as
+        // stale by valid_catalogue_media_profile(): playback negotiation
+        // gates 10-bit/HDR sources on those fields, and a profile without
+        // them let a Dolby Vision title be copied to a client that could not
+        // decode it (2026-09-07).
+        uint32_t schema_version{catalogue_media_profile_schema};
         bool complete{true};
         MediaProbeResult probe;
         auto operator<=>(const MediaProfile&) const = default;

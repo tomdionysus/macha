@@ -1604,6 +1604,34 @@ class HdrFakeMediaEngine final : public FakeMediaEngine {
 };
 } // namespace
 
+MACHA_FAST_TEST("media_playback", test_schema1_video_profiles_are_stale_for_negotiation) {
+    CatalogueSnapshot::MediaProfile profile;
+    profile.probe.format = "matroska,webm";
+    profile.probe.duration_seconds = 6660.0;
+    MediaStreamInfo video;
+    video.index = 0;
+    video.type = MediaStreamType::video;
+    video.codec = "hevc";
+    video.profile = "Main 10";
+    MediaStreamInfo audio;
+    audio.index = 1;
+    audio.type = MediaStreamType::audio;
+    audio.codec = "eac3";
+    profile.probe.streams = {video, audio};
+
+    // Fresh profiles carry the depth/transfer signalling negotiation needs.
+    CHECK(profile.schema_version == 2);
+    CHECK(valid_catalogue_media_profile("macha:abc", profile));
+    // A profile stored before 0.32.12 does not, so it is regenerated: a
+    // stale one let a Dolby Vision title be copied to a client that could
+    // not decode it.
+    profile.schema_version = 1;
+    CHECK(!valid_catalogue_media_profile("macha:abc", profile));
+    // ... unless nothing in it is a video stream.
+    profile.probe.streams = {audio};
+    CHECK(valid_catalogue_media_profile("macha:abc", profile));
+}
+
 MACHA_TEST("media_playback", test_auto_transcodes_hdr_10bit_unless_the_client_opts_in) {
     TempDir t;
     auto keyfile = t.path() / "key";

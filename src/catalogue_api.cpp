@@ -194,13 +194,15 @@ Json media_profile_json(std::string_view media_id, const MediaProbeResult& profi
                            {"channels", stream.channels},
                            {"sample_rate", stream.sample_rate},
                            {"bit_depth", stream.bit_depth},
+                           {"level", stream.level},
+                           {"color_transfer", stream.color_transfer},
                            {"default", stream.default_stream},
                            {"forced", stream.forced},
                            {"bitrate", stream.bitrate},
                            {"attached_picture", stream.attached_picture}};
         streams.emplace_back(std::move(value));
     }
-    Json::Object out{{"schema_version", 1},
+    Json::Object out{{"schema_version", 2},
                      {"media_id", std::string(media_id)},
                      {"format", profile.format},
                      {"duration_ms", static_cast<uint64_t>(

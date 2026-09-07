@@ -203,6 +203,10 @@ void encode_media_profile(Writer& w, const CatalogueSnapshot::MediaProfile& prof
         w.u8(stream.forced);
         w.u64(stream.bitrate);
         w.u8(stream.attached_picture);
+        if (profile.schema_version >= 2) {
+            w.u32(static_cast<uint32_t>(std::max(0, stream.level)));
+            w.string(stream.color_transfer);
+        }
     }
 }
 
@@ -234,6 +238,10 @@ CatalogueSnapshot::MediaProfile decode_media_profile(Reader& r) {
         stream.forced = r.u8();
         stream.bitrate = r.u64();
         stream.attached_picture = r.u8();
+        if (profile.schema_version >= 2) {
+            stream.level = static_cast<int32_t>(r.u32());
+            stream.color_transfer = r.string(256);
+        }
         profile.probe.streams.push_back(std::move(stream));
     }
     return profile;
@@ -243,7 +251,8 @@ CatalogueSnapshot::MediaProfile decode_media_profile(Reader& r) {
 
 bool valid_catalogue_media_profile(
     std::string_view media_id, const CatalogueSnapshot::MediaProfile& profile) {
-    if (!media_id.starts_with("macha:") || profile.schema_version != 1 || !profile.complete ||
+    if (!media_id.starts_with("macha:") ||
+        (profile.schema_version != 1 && profile.schema_version != 2) || !profile.complete ||
         profile.probe.format.empty() || !std::isfinite(profile.probe.duration_seconds) ||
         profile.probe.duration_seconds < 0.0 || profile.probe.streams.empty())
         return false;
@@ -251,7 +260,14 @@ bool valid_catalogue_media_profile(
     for (const auto& stream : profile.probe.streams) {
         if (stream.index < 0 || !indexes.insert(stream.index).second || stream.codec.empty() ||
             stream.width < 0 || stream.height < 0 || stream.channels < 0 ||
-            stream.sample_rate < 0 || stream.bit_depth < 0)
+            stream.sample_rate < 0 || stream.bit_depth < 0 || stream.level < 0)
+            return false;
+        // A schema-1 profile knows nothing about a video stream's sample
+        // depth signalling or transfer; negotiation needs both, so such a
+        // profile is stale and is regenerated on the next playback (and
+        // republished). Audio-only profiles are unaffected.
+        if (profile.schema_version < 2 && stream.type == MediaStreamType::video &&
+            !stream.attached_picture)
             return false;
     }
     return true;
@@ -874,7 +890,7 @@ ResolvedMediaProfile CatalogueManager::resolve_media_profile(
 
     try {
         auto result = generate();
-        CatalogueSnapshot::MediaProfile profile{1, true, result};
+        CatalogueSnapshot::MediaProfile profile{catalogue_media_profile_schema, true, result};
         if (!valid_catalogue_media_profile(media_id, profile))
             throw std::runtime_error("generated immutable media profile is incomplete");
         finish(result);
@@ -886,7 +902,7 @@ ResolvedMediaProfile CatalogueManager::resolve_media_profile(
 }
 
 void CatalogueManager::put_media_profile(std::string media_id, MediaProbeResult probe) {
-    CatalogueSnapshot::MediaProfile profile{1, true, std::move(probe)};
+    CatalogueSnapshot::MediaProfile profile{catalogue_media_profile_schema, true, std::move(probe)};
     if (!valid_catalogue_media_profile(media_id, profile))
         throw std::invalid_argument("invalid immutable media profile");
     DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
@@ -913,7 +929,7 @@ void CatalogueManager::put_media_profiles(
     auto current = *current_snapshot();
     bool changed = false;
     for (auto& [media_id, probe] : profiles) {
-        CatalogueSnapshot::MediaProfile profile{1, true, std::move(probe)};
+        CatalogueSnapshot::MediaProfile profile{catalogue_media_profile_schema, true, std::move(probe)};
         if (!valid_catalogue_media_profile(media_id, profile)) continue;
         auto it = current.media_profiles.find(media_id);
         if (it != current.media_profiles.end() && it->second == profile) continue;
@@ -1320,7 +1336,7 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
     bool changed = false;
 
     for (const auto& [media_id, probe] : profiles) {
-        CatalogueSnapshot::MediaProfile profile{1, true, probe};
+        CatalogueSnapshot::MediaProfile profile{catalogue_media_profile_schema, true, probe};
         if (!valid_catalogue_media_profile(media_id, profile)) continue;
         auto it = current.media_profiles.find(media_id);
         if (it != current.media_profiles.end() && it->second == profile) continue;
