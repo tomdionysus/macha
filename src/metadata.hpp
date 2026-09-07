@@ -333,9 +333,29 @@ struct MetadataDelta {
     // primary parent had an append-ordered vector fell back to a full
     // snapshot frame (5-8 MB per replica, 4 of 5 reconciliations, 2026-09-06).
     bool canonical_garbage{};
+    // DLT8: a file whose extent table only grew (sequential publication of a
+    // large file, one quantum at a time) is carried as the appended extents
+    // plus its new attributes instead of the whole entry. A 13.9 GB file's
+    // 32 MB quantum commit was a ~105 KB delta re-sending 3,000+ extents
+    // (124 MB of history per node in 35 min, 2026-09-07); now ~500 B.
+    struct EntryAppend {
+        uint64_t size{};
+        int64_t mtime_ns{};
+        int64_t ctime_ns{};
+        uint64_t version{};
+        uint32_t base_extents{};        // extents the entry must already hold
+        std::vector<ExtentRef> extents; // appended after them
+    };
+    std::map<std::string, EntryAppend> append_entries;
     CatalogueDelta catalogue{CatalogueDelta::unchanged};
     std::optional<ObjectId> catalogue_root;
 };
+
+// Record `after` for `path` in `delta` as an append (when `before` exists
+// and its extents are a strict prefix of after's, attributes aside) or as a
+// whole-entry upsert otherwise.
+void record_entry_change(MetadataDelta& delta, const std::string& path, const FsEntry* before,
+                         const FsEntry& after);
 
 // True when `garbage` is strictly ordered by ObjectId (no duplicates): the
 // canonical order every DLT7-era snapshot keeps.

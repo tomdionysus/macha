@@ -178,6 +178,10 @@ fuse:
   # FUSE filesystem at mount_path. If true, remove that stale Macha mount and
   # verify it disappeared. Unrelated filesystems are always refused.
   unmount_if_mounted: true
+  # Make the host directory under mount_path immutable (chattr +i) before the
+  # services start, so nothing -- root included -- can write into it while the
+  # mount is absent or not yet up. Stray entries found there are logged and
+  # reported as filesystem.mountpoint_stray_entries.
   fail_closed_mountpoint: true
   watchdog_interval_ms: 1000
 

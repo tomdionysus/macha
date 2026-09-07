@@ -7,6 +7,7 @@
 #include "crypto.hpp"
 #include "diagnostics.hpp"
 #include "fuse_frontend.hpp"
+#include "fuse_mountpoint.hpp"
 #include "log.hpp"
 #include "supervised.hpp"
 #include "macos_unicode.hpp"
@@ -502,6 +503,11 @@ class CoveredMountpointGuard {
     bool protect() {
         if (fd_ < 0)
             return false;
+        // The immutable flag set at preparation already fails closed for
+        // every writer, root included, and makes chmod on the directory
+        // fail with EPERM; there is nothing left for the mode bits to do.
+        if (fuse_mountpoint_preparation().immutable)
+            return true;
         const auto fail_closed_mode = static_cast<mode_t>(original_mode_ & ~0222);
         if (::fchmod(fd_, fail_closed_mode) != 0)
             return false;

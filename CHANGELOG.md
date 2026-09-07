@@ -1,5 +1,38 @@
 # Current release
 
+## 0.32.6 — Append-extents deltas, and the covered mountpoint is no longer a trap (development)
+
+Two findings from the full-library import (2026-09-07).
+
+**DLT8 append-extents deltas.** Each 32 MB quantum commit of a large file
+re-sent the file's whole extent table (105 KB per quantum for a 13.9 GB file;
+124 MB of history per node in 35 min). A file whose extent table only grew is
+now carried as its new attributes plus the appended extents (~500 B), with
+the base extent count checked on apply. Whole-entry upserts remain for every
+other change, and DLT5-7 readers are unaffected until they see a DLT8 frame.
+The retention barrier (`retain_metadata_publication`) retains the whole
+resulting entry for an append, exactly as it did for the upsert it replaces,
+so a touch or a quantum still needs its fresh causal retention dot before the
+head advances (two rpc_cluster tests caught the first cut skipping it).
+
+**Seventh finding: writes before the mount go to the host disk.** The FUSE
+mount comes up only after local services (20-40 s after the daemon starts).
+An rsync launched 25 s after a restart walked the bare mountpoint directory
+and wrote 52 GB into a shared host's root disk, hidden by the mount once it
+arrived, while Macha reported an idle spool. `fail_closed_mountpoint` only
+cleared the directory's mode bits after mounting, which root ignores.
+
+- `prepare_fuse_mountpoint` now runs the guard before the services start:
+  it counts entries already under the covered directory (logged as an error,
+  exposed as `filesystem.mountpoint_stray_entries`) and sets the immutable
+  flag on it (Linux `chattr +i`; `filesystem.mountpoint_immutable`), which
+  stops root too and persists across restarts, so the pre-mount window is
+  closed for every later start. Verified on the cluster: a tmpfs and the
+  Macha mount both attach over an immutable directory; `touch` under it
+  fails with EPERM.
+- The post-mount mode guard skips chmod when the flag is in place (chmod on
+  an immutable inode fails, which would have refused the mount).
+
 ## 0.32.5 — Spool pacing credits drained quanta, not only retired files (development)
 
 Sixth import finding (2026-09-07 10:30, es-1): while a multi-GB file

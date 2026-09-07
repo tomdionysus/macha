@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "status_api.hpp"
 
+#include "fuse_mountpoint.hpp"
 #include "json.hpp"
 #include "log.hpp"
 #include "supervised.hpp"
@@ -961,6 +962,13 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                     values->recovery_dropped_operations;
                 filesystem_diagnostics["publications_abandoned"] =
                     values->publications_abandoned;
+                // The host directory under the mount: entries found there at
+                // startup are hidden by the mount, and whether the directory
+                // is immutable while no mount covers it.
+                filesystem_diagnostics["mountpoint_stray_entries"] =
+                    fuse_mountpoint_preparation().stray_entries;
+                filesystem_diagnostics["mountpoint_immutable"] =
+                    fuse_mountpoint_preparation().immutable;
                 filesystem_diagnostics["journal_append_batches"] = values->journal_append_batches;
                 filesystem_diagnostics["journal_records_appended"] =
                     values->journal_records_appended;
