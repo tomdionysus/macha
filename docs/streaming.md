@@ -28,7 +28,7 @@ So "copy the video, re-encode the audio" is `{"mode": "remux", "audio": "transco
 - a copy into a container that cannot carry that codec (fragmented MP4 carries H.264, HEVC and AV1 video, and AAC, AC-3, E-AC-3 and Opus audio);
 - a transcode when the node has no encoder for the target.
 
-**What the server does not refuse.** An instruction that contradicts the client's own advertised capabilities is performed, and the contradiction is reported. A client that asks for `direct` on a file it cannot demux gets the file. This is deliberate: the mode is the client's decision and the operator's escape hatch, so the server states what it noticed rather than overriding it. See `warnings` below.
+**What the server does not do.** It does not ask what the client can play, and there is no `capabilities` field. Whether a device can decode what it asked for is the client's business; the server reports the facts and carries out the instruction. A client that asks for `direct` on a file it cannot demux gets the file.
 
 ## Media facts
 
@@ -54,27 +54,6 @@ It returns, per media, the identity, path, size, `container`, `format`, `duratio
 The same facts are on the catalogue media profile (`GET /api/v1/catalogue/media/<macha id>`, `schema_version` 3) for any media with an immutable identity. That pre-session availability is intentional and guaranteed for `macha:` identities. The reading order is: the persisted profile if one exists, otherwise a foreground probe whose result is persisted for later readers; background profiling of unwatched media runs at a lower priority and yields to a viewer.
 
 An older stored profile that predates a fact (a schema below the current one, on a video stream) is treated as stale and regenerated on that media's next playback.
-
-## Capabilities
-
-`capabilities` remains in the request and is **advisory only**. It never changes what the server does. It is used to report contradictions between what was asked for and what the client said it could play:
-
-```json
-{
-  "capabilities": {
-    "containers": ["mp4", "matroska"],
-    "video_codecs": ["h264", "hevc"],
-    "hls_video_codecs": ["h264"],
-    "audio_codecs": ["aac", "eac3"],
-    "video_bit_depth": 10,
-    "hdr": ["smpte2084"]
-  }
-}
-```
-
-`hls_video_codecs` is for devices that decode more through their media element than through MediaSource; absent, it equals `video_codecs`. `hdr` lists the transfer functions the client presents (`true` means all of them).
-
-The session response carries a `warnings` array, empty when nothing contradicts. Each entry is `{"code": "capability_contradiction", "field": ..., "message": ...}` where `field` is one of `containers`, `video_codecs`, `hls_video_codecs`, `audio_codecs`, `video_bit_depth`, `hdr`. Warnings are advisory: they never change the status code or the stream.
 
 ## Media engine boundary
 
@@ -201,22 +180,11 @@ A transformed session may also include `seek_ms` in the initial POST. This is th
 }
 ```
 
-A browser can describe its actual capabilities:
+An instruction, with the optional stream and quality fields:
 
 ```json
 {
   "media_id": "path:/Movies/Example.mkv",
-  "capabilities": {
-    "containers": ["mp4"],
-    "video_codecs": ["h264"],
-    "audio_codecs": ["aac", "mp3"],
-    "hls_fmp4": true,
-    "hls_ts": false,
-    "max_width": 3840,
-    "max_height": 2160,
-    "video_bit_depth": 10,
-    "hdr": ["smpte2084", "arib-std-b67"]
-  },
   "preferences": {
     "mode": "remux",
     "audio": "transcode",
@@ -227,8 +195,6 @@ A browser can describe its actual capabilities:
   }
 }
 ```
-
-Default capabilities are intentionally conservative: MP4, H.264, AAC/MP3 and fragmented-MP4 HLS. They are advisory (see **Capabilities** above): they populate `warnings` and never change what the server does.
 
 `max_height` and `max_bitrate` are instructions, not capabilities: either one makes the video a re-encode, and combining either with `video: copy` is a `400`.
 
