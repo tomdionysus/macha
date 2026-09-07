@@ -55,6 +55,17 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **13:00 gbni-1 load mitigation.** After the relaunch macha itself ran at
+  360 % CPU (3.6 of 4 cores) hashing/encrypting the 3.2 GB spool backlog;
+  `vcgencmd get_throttled` = 0x50000 (under-voltage and throttling have
+  occurred since the 12:15 boot), 64.8 °C, one 12.5 s metadata mutation.
+  The rsync bwlimit bounds ingest, not the publication burst behind it.
+  Applied live, no restart: `systemctl set-property macha.service
+  CPUQuota=250%` (persistent drop-in) and import relaunched with
+  `BWLIMIT=4000`. **Engineering follow-up:** a per-node background-effort
+  budget (publication/hashing concurrency derived from a configured CPU
+  ceiling) so a power-limited node never has to be throttled from
+  outside; the priority law already keeps viewers ahead of loaders.
 - **13:54 CEST: operator removed the stray copies on es-1 (root disk 69.9 →
   17 GB) and left macha stopped; restarted by me.** Guard now reads
   `mountpoint_stray_entries=0`, immutable, on es-1 too. The waiting import
