@@ -410,13 +410,24 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             if (!media_id.starts_with("macha:"))
                 return error(400, "bad_media_id", "immutable macha media ID required");
             auto profile = catalogue_.media_profile(media_id);
+            if (!profile && resolve_media_profile_) {
+                // No stored profile: produce one now and persist it, rather
+                // than telling a client to come back. It is the same
+                // foreground path a session create uses, and background
+                // profiling yields to it.
+                try {
+                    profile = resolve_media_profile_(media_id);
+                } catch (const std::exception& e) {
+                    return error(422, "profile_failed", e.what());
+                }
+            }
             if (!profile) {
                 const auto accepted = request_media_profiles_
                                           ? request_media_profiles_({media_id})
                                           : 0;
                 if (!accepted)
-                    return error(503, "profile_unavailable",
-                                 "media profile is unavailable and could not be queued");
+                    return error(404, "not_found",
+                                 "media is not available on this node");
                 Json::Object pending{{"status", "pending"}, {"media_id", media_id}};
                 auto response = json(202, Json(std::move(pending)).dump());
                 response.headers["Retry-After"] = "1";

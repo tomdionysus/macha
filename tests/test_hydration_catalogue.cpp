@@ -3144,7 +3144,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_artwork_capability_rejects_tamp
     // signature for a past expiry by minting one through the real signing
     // path with a near-zero TTL and letting it lapse, rather than
     // hand-duplicating the HMAC construction here.
-    CatalogueApi short_lived_api(service.catalogue(), service.catalogue_hints(), {}, {}, 1ms);
+    CatalogueApi short_lived_api(service.catalogue(), service.catalogue_hints(), {}, {}, {}, 1ms);
     const auto short_lived_response =
         short_lived_api.handle({.method = "GET",
                                 .path = "/api/v1/catalogue/items/album%3Atampered-url-test",
