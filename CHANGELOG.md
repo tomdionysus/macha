@@ -1,5 +1,28 @@
 # Current release
 
+## 0.32.15 — Matroska direct play, and a codec list per delivery path (development)
+
+The operator's TV decodes HEVC through its media element and fails it
+through MediaSource, and `MediaSource.isTypeSupported` lies about it, so no
+client-side probe catches it. One capability list could not say "HEVC yes
+for the file, no for the HLS stream", and Matroska sources were never
+offered as direct play at all, so an HEVC episode in an mkv was remuxed
+into fMP4 and failed to decode (2026-09-07).
+
+- `direct_container` recognises `.mkv`/`.mka` as `matroska` (`mkv` and
+  `x-matroska` accepted as spellings), served as `video/x-matroska`. A
+  client that lists the container gets the file over byte ranges: no
+  remux, no transcode, no MSE.
+- `capabilities.hls_video_codecs` narrows the video codecs for HLS
+  delivery only; absent or empty it is `video_codecs`, so nothing changes
+  for existing clients. The transcode target check uses the same list.
+- An explicit `direct` request still hands over the source file whatever it
+  is (the client asked for the bytes; it is also the operator's escape
+  hatch), but the session's `warnings` list now carries a `containers`
+  entry when that file's container was never advertised. A client that sent
+  `direct` by default was getting raw Matroska it had not claimed to read,
+  and the failure surfaced only as a decode error.
+
 ## 0.32.14 — The media playlist grows with the encoder (development)
 
 Operator's TV after a mode switch (2026-09-07): "preparing new stream"

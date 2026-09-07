@@ -70,6 +70,8 @@ std::string extension(std::string_view path) {
 std::string direct_mime(std::string_view path) {
     auto ext = extension(path);
     if (ext == ".mp4" || ext == ".m4v" || ext == ".mov") return "video/mp4";
+    if (ext == ".mkv") return "video/x-matroska";
+    if (ext == ".mka") return "audio/x-matroska";
     if (ext == ".webm") return "video/webm";
     if (ext == ".mp3") return "audio/mpeg";
     if (ext == ".m4a") return "audio/mp4";
@@ -81,6 +83,12 @@ std::string direct_mime(std::string_view path) {
 std::string direct_container(std::string_view path) {
     auto ext = extension(path);
     if (ext == ".mp4" || ext == ".m4v" || ext == ".m4a" || ext == ".mov") return "mp4";
+    // Matroska is a byte-range serve like any other: a host whose media
+    // element demuxes it (a TV, a native player) can take the file as it is,
+    // which is the only path on some devices that decodes HEVC correctly
+    // (Samsung Tizen 3: HEVC works through the media element and fails
+    // through MSE, 2026-09-07). Browsers simply do not list the container.
+    if (ext == ".mkv" || ext == ".mka") return "matroska";
     if (ext == ".webm") return "webm";
     if (ext == ".mp3") return "mp3";
     if (ext == ".flac") return "flac";
@@ -242,6 +250,12 @@ HttpResponse ranged_response(const HttpRequest& request, uint64_t size, std::str
 struct ClientCapabilities {
     std::set<std::string> containers{"mp4"};
     std::set<std::string> video_codecs{"h264"};
+    // Video codecs the client decodes *in an HLS stream* (remux or
+    // transcode), when that is a narrower set than what its media element
+    // plays directly. A 2017 TV decodes HEVC through the media element and
+    // fails it through MediaSource, and one list could not say so
+    // (2026-09-07). Empty means "same as video_codecs".
+    std::set<std::string> hls_video_codecs;
     std::set<std::string> audio_codecs{"aac", "mp3"};
     bool hls_fmp4{true};
     // MPEG-TS HLS segments, for players that cannot take fragmented MP4.
@@ -299,11 +313,18 @@ std::optional<uint64_t> optional_u64(const Json* value) {
     return {};
 }
 
+// The codec set that applies to HLS delivery: hls_video_codecs when the
+// client narrowed it, otherwise its ordinary video_codecs.
+const std::set<std::string>& hls_video_codecs(const ClientCapabilities& caps) {
+    return caps.hls_video_codecs.empty() ? caps.video_codecs : caps.hls_video_codecs;
+}
+
 ClientCapabilities parse_capabilities(const Json* value) {
     ClientCapabilities caps;
     if (!value || !value->isObject()) return caps;
     read_string_set(value, "containers", caps.containers);
     read_string_set(value, "video_codecs", caps.video_codecs);
+    read_string_set(value, "hls_video_codecs", caps.hls_video_codecs);
     read_string_set(value, "audio_codecs", caps.audio_codecs);
     if (auto hls = value->find("hls_fmp4"); hls && hls->isBool()) caps.hls_fmp4 = hls->asBool();
     if (auto ts = value->find("hls_ts"); ts && ts->isBool()) caps.hls_ts = ts->asBool();
@@ -337,6 +358,9 @@ std::string describe_capabilities(const ClientCapabilities& caps) {
         return out;
     };
     std::string out = "containers=" + join(caps.containers) + " video=" + join(caps.video_codecs) +
+                      (caps.hls_video_codecs.empty()
+                           ? std::string{}
+                           : " hls_video=" + join(caps.hls_video_codecs)) +
                       " audio=" + join(caps.audio_codecs) +
                       " hls_fmp4=" + (caps.hls_fmp4 ? "yes" : "no") +
                       " hls_ts=" + (caps.hls_ts ? "yes" : "no") +
@@ -435,7 +459,15 @@ PlaybackPlan negotiate(const MediaProbeResult& probe, std::string_view logical_p
     }
 
     const auto source_container = direct_container(logical_path);
-    bool direct_container_ok = !source_container.empty() && caps.containers.contains(source_container);
+    const auto container_advertised = [&](const std::string& token) {
+        if (token.empty()) return false;
+        if (caps.containers.contains(token)) return true;
+        // Accept the spellings clients actually probe with.
+        if (token == "matroska") return caps.containers.contains("mkv") ||
+                                        caps.containers.contains("x-matroska");
+        return false;
+    };
+    bool direct_container_ok = container_advertised(source_container);
     bool video_direct = !video || (caps.video_codecs.contains(lower(video->codec)) &&
                                    video_samples_supported(*video, caps));
     bool audio_direct = !audio || caps.audio_codecs.contains(lower(audio->codec));
@@ -461,7 +493,7 @@ PlaybackPlan negotiate(const MediaProbeResult& probe, std::string_view logical_p
 
     const auto source_video_codec = video ? lower(video->codec) : std::string{};
     const auto source_audio_codec = audio ? lower(audio->codec) : std::string{};
-    bool video_copy = !video || (caps.video_codecs.contains(source_video_codec) &&
+    bool video_copy = !video || (hls_video_codecs(caps).contains(source_video_codec) &&
                                  fmp4_video_copy_supported(source_video_codec) &&
                                  video_samples_supported(*video, caps));
     // Audio the client lists can travel in fragmented MP4 as it is: AAC,
@@ -492,7 +524,7 @@ PlaybackPlan negotiate(const MediaProbeResult& probe, std::string_view logical_p
     }
     if (prefs.mode == "remux" && (!video_copy || !audio_copy))
         throw std::invalid_argument("requested remux requires copy-compatible video and AAC audio without quality conversion");
-    if (video && !video_copy && !caps.video_codecs.contains("h264"))
+    if (video && !video_copy && !hls_video_codecs(caps).contains("h264"))
         throw std::invalid_argument("client cannot decode the H.264 transcode target");
     if (audio && !audio_copy && !caps.audio_codecs.contains("aac"))
         throw std::invalid_argument("client cannot decode the AAC transcode target");
@@ -540,7 +572,8 @@ const MediaStreamInfo* stream_at(const MediaProbeResult& probe, int index) {
 // each entry names a stable code, the capability field concerned, and a
 // specific message. Auto never contradicts; the list is empty then.
 Json playback_warnings_json(const MediaProbeResult& probe, const PlaybackPlan& plan,
-                            const ClientCapabilities& caps, const PlaybackPreferences& prefs) {
+                            const ClientCapabilities& caps, const PlaybackPreferences& prefs,
+                            std::string_view logical_path) {
     Json::Array out;
     const auto add = [&](std::string field, std::string message) {
         out.emplace_back(Json::Object{{"code", "capability_contradiction"},
@@ -549,6 +582,20 @@ Json playback_warnings_json(const MediaProbeResult& probe, const PlaybackPlan& p
     };
     const bool explicit_mode = prefs.mode == "direct" || prefs.mode == "remux";
     if (!explicit_mode) return Json(std::move(out));
+    if (plan.mode == PlaybackMode::direct) {
+        // Explicit direct hands over the source file itself, whatever it is:
+        // the client asked for the bytes and takes responsibility (it is also
+        // the operator's escape hatch when a capability is wrong). Say so
+        // when the container was never advertised -- a client sending direct
+        // by default got raw Matroska it had not claimed to read, and the
+        // failure surfaced as an unexplained decode error (2026-09-07).
+        const auto container = direct_container(logical_path);
+        if (!container.empty() && !caps.containers.contains(container) &&
+            !(container == "matroska" && (caps.containers.contains("mkv") ||
+                                          caps.containers.contains("x-matroska"))))
+            add("containers", "the source is a " + container +
+                                  " file, which the client did not list as readable");
+    }
     if (const auto* video = stream_at(probe, plan.video_stream);
         video && plan.video == MediaTransform::copy) {
         const auto codec = lower(video->codec);
@@ -865,6 +912,8 @@ struct PlaybackManager::Impl {
         for (const auto& value : caps.containers) canonical << value << ',';
         canonical << "|video=";
         for (const auto& value : caps.video_codecs) canonical << value << ',';
+        canonical << "|hlsvideo=";
+        for (const auto& value : caps.hls_video_codecs) canonical << value << ',';
         canonical << "|audio=";
         for (const auto& value : caps.audio_codecs) canonical << value << ',';
         canonical << "|hls=" << caps.hls_fmp4 << "|ts=" << caps.hls_ts
@@ -1712,7 +1761,8 @@ struct PlaybackManager::Impl {
                          {"seek_ms", static_cast<uint64_t>(std::max<int64_t>(0, session.plan.seek.count()))},
                          {"preferences", preferences_json(session.preferences)},
                          {"warnings", playback_warnings_json(session.probe, session.plan,
-                                                             session.capabilities, session.preferences)},
+                                                             session.capabilities, session.preferences,
+                                                             session.source.logical_path)},
                          {"selection", Json(std::move(selected))},
                          {"source", Json(std::move(source))},
                          {"output", output_json(session.probe, session.plan, session.probe.format)},
