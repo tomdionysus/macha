@@ -1668,21 +1668,24 @@ MACHA_TEST("media_playback", test_auto_transcodes_hdr_10bit_unless_the_client_op
     Bytes master_bytes(static_cast<size_t>(master.content_length()));
     REQUIRE(master.stream->read(0, master_bytes) == master_bytes.size());
     const std::string master_text(master_bytes.begin(), master_bytes.end());
-    // The E-AC-3 audio the client listed is copied; only the video is
-    // re-encoded, and the master playlist says so.
+    // The master playlist declares the H.264 transcode and the AAC the
+    // E-AC-3 is transcoded to (only AAC is copied for now).
     if (master_text.find("#EXT-X-STREAM-INF:") == std::string::npos)
         std::fprintf(stderr, "master playlist body:\n%s\n", master_text.c_str());
     CHECK(master_text.find("#EXT-X-STREAM-INF:") != std::string::npos);
-    CHECK(master_text.find("CODECS=\"avc1.640029,ec-3\"") != std::string::npos);
+    CHECK(master_text.find("CODECS=\"avc1.640029,mp4a.40.2\"") != std::string::npos);
     CHECK(master_text.find("\nmedia.m3u8\n") != std::string::npos);
+    CHECK(conservative.find("output")->find("video")->find("transform")->asString() == "transcode");
+    CHECK(conservative.find("output")->find("video")->find("color_transfer")->asString() == "bt709");
 
-    // A client that presents PQ at 10 bits gets the streams as they are.
-    // (Matroska is not a direct-play container, so this is a remux.)
+    // A client that presents PQ at 10 bits gets the video as it is; the
+    // session is still labelled transcode for the audio alone.
     auto opted_in = hevc_caps();
     opted_in["video_bit_depth"] = 10;
     opted_in["hdr"] = Json::Array{Json("smpte2084")};
     auto capable = create(std::move(opted_in));
-    CHECK(capable.find("mode")->asString() == "remux");
+    CHECK(capable.find("output")->find("video")->find("transform")->asString() == "copy");
+    CHECK(capable.find("output")->find("video")->find("color_transfer")->asString() == "smpte2084");
     auto streams = capable.find("source")->find("streams")->asArray();
     REQUIRE(!streams.empty());
     CHECK(streams.front().find("color_transfer")->asString() == "smpte2084");
