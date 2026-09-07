@@ -827,40 +827,61 @@ void setup_video_transcode(StreamPipeline& pipe, AVFormatContext* input, AVForma
     // frame. Create/cache the scaler from actual AVFrame properties later.
 }
 
+// The channelConfiguration field of an AAC AudioSpecificConfig: the first
+// five bits are the object type, the next four the sampling frequency index,
+// the next four this. Zero means the layout is carried in a Program Config
+// Element instead, which is the arrangement Chrome refuses. Negative when
+// this output has no global header and the encoder therefore produced no
+// extradata to read.
+int aac_channel_configuration(const AVCodecContext* enc) noexcept {
+    if (!enc->extradata || enc->extradata_size < 2) return -1;
+    const auto bits = (static_cast<unsigned>(enc->extradata[0]) << 8) |
+                      static_cast<unsigned>(enc->extradata[1]);
+    return static_cast<int>((bits >> 3) & 0xf);
+}
+
 void setup_audio_transcode(StreamPipeline& pipe, AVFormatContext* output) {
     open_decoder(pipe);
     const auto* codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
     if (!codec) throw std::runtime_error("AAC encoder is unavailable in libavcodec");
-    pipe.encoder = avcodec_alloc_context3(codec);
-    if (!pipe.encoder) throw std::bad_alloc();
-    auto* enc = pipe.encoder;
-    enc->sample_rate = pipe.decoder->sample_rate > 0 ? pipe.decoder->sample_rate : 48000;
-    enc->sample_fmt = AV_SAMPLE_FMT_FLTP;
-    // Keep the source's channel layout. AAC carries 5.1 perfectly well, and a
-    // client that asked for a codec change did not ask for a downmix: a 6ch
-    // source arriving as stereo because the container changed is a quality
-    // loss the client never instructed (2026-09-07). Fall back to stereo only
-    // if this encoder build will not take the source layout.
     const int source_channels = pipe.decoder->ch_layout.nb_channels;
-    if (source_channels > 0)
-        av_require(av_channel_layout_copy(&enc->ch_layout, &pipe.decoder->ch_layout),
-                   "copy source channel layout");
-    else
-        av_channel_layout_default(&enc->ch_layout, 2);
-    enc->time_base = AVRational{1, enc->sample_rate};
     const auto bitrate_for = [](int channels) {
         return static_cast<int64_t>(std::clamp(channels, 1, 8)) * 64000;
     };
-    enc->bit_rate = bitrate_for(enc->ch_layout.nb_channels);
-    if (output->oformat->flags & AVFMT_GLOBALHEADER) enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    if (avcodec_open2(enc, codec, nullptr) < 0) {
-        Log::warn("libav AAC encoder refused the source channel layout channels=" +
-                  std::to_string(enc->ch_layout.nb_channels) + "; encoding stereo");
-        av_channel_layout_uninit(&enc->ch_layout);
-        av_channel_layout_default(&enc->ch_layout, 2);
-        enc->bit_rate = bitrate_for(2);
-        av_require(avcodec_open2(enc, codec, nullptr), "open AAC encoder");
+    // Keep the source's channel count. AAC carries 5.1 perfectly well, and a
+    // client that asked for a codec change did not ask for a downmix: a 6ch
+    // source arriving as stereo because the container changed is a quality
+    // loss the client never instructed (2026-09-07). Encode into AAC's
+    // standard layout for that many channels, because a non-standard one is
+    // described by a Program Config Element that Chrome will not parse
+    // (2026-09-08); see aac_standard_channel_layout.
+    const auto open_encoder = [&](const char* layout) -> int {
+        if (pipe.encoder) avcodec_free_context(&pipe.encoder);
+        pipe.encoder = avcodec_alloc_context3(codec);
+        if (!pipe.encoder) throw std::bad_alloc();
+        auto* enc = pipe.encoder;
+        enc->sample_rate = pipe.decoder->sample_rate > 0 ? pipe.decoder->sample_rate : 48000;
+        enc->sample_fmt = AV_SAMPLE_FMT_FLTP;
+        if (const int rc = av_channel_layout_from_string(&enc->ch_layout, layout); rc < 0) return rc;
+        enc->time_base = AVRational{1, enc->sample_rate};
+        enc->bit_rate = bitrate_for(enc->ch_layout.nb_channels);
+        if (output->oformat->flags & AVFMT_GLOBALHEADER) enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        if (const int rc = avcodec_open2(enc, codec, nullptr); rc < 0) return rc;
+        // An encoder that opened but described the layout in a Program Config
+        // Element is refused here rather than served to a client that cannot
+        // parse it. Stereo is always a standard configuration.
+        if (aac_channel_configuration(enc) == 0) return AVERROR(EINVAL);
+        return 0;
+    };
+
+    const auto* layout = aac_standard_channel_layout(source_channels > 0 ? source_channels : 2);
+    if (open_encoder(layout) < 0) {
+        Log::warn(std::string("libav AAC encoder would not encode a standard channel "
+                              "configuration layout=") + layout + " channels=" +
+                  std::to_string(source_channels) + "; encoding stereo");
+        av_require(open_encoder("stereo"), "open AAC encoder");
     }
+    auto* enc = pipe.encoder;
     pipe.output_stream->time_base = enc->time_base;
     av_require(avcodec_parameters_from_context(pipe.output_stream->codecpar, enc), "export audio encoder parameters");
     pipe.output_stream->codecpar->codec_tag = 0;

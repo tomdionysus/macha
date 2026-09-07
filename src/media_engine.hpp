@@ -27,6 +27,12 @@ enum class MediaTransform { copy, transcode, omit };
 // native HLS player rendered fMP4 video and dropped the muxed AAC, 2026-09-07).
 enum class MediaContainer : uint8_t { fmp4, mpegts };
 const char* media_container_name(MediaContainer) noexcept;
+
+// The AAC standard channel configuration for a channel count, named as a
+// libavutil channel layout. An encoder handed any other layout for that many
+// channels writes a Program Config Element and sets channelConfiguration 0 in
+// the AudioSpecificConfig, which Chrome's MP4 parser rejects outright.
+const char* aac_standard_channel_layout(int channels) noexcept;
 enum class PlaybackMode { direct, remux, transcode };
 enum class MediaReadPurpose { probe, playback, subtitle };
 
