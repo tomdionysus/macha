@@ -55,6 +55,18 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **0.32.6 DEPLOYED (commit `a2a8969`; gbni-2 12:41, gbni-1 12:42 via
+  binaries staged on gbni-2 — no build on gbni-1, es-1 13:44 CEST).**
+  Guard verified from the status API: `mountpoint_immutable=true` on all
+  three, `mountpoint_stray_entries` 0/0/**1** (es-1's hidden `Movies`
+  dir, see finding #7 — the daemon now reports it). Imports relaunched
+  with the mount-guarded script: gbni-1 pid 2158 (12:42, Movies→TV→Music,
+  bwlimit 8000), es-1 pid 164663 (13:44 CEST, Movies→TV). First check:
+  es-1 spool 160→204 MB and 804 journal records in 2 min — writes reach
+  Macha this time; root disk flat at 69.9 GB. gbni-1 spool 1.2 GB, load
+  0.3. **Loop STOPPED at operator request ("stop after this iteration")**;
+  resume with `/loop` + the same monitor prompt, or run
+  `/Users/tom/.claude/jobs/6aee47b8/tmp/import-check.sh` by hand.
 - **0.32.6 (DLT8 append-extents + finding #7 mountpoint guard; suite
   357/357 after one flaky rerun):** deploy order gbni-2 (build) → es-1
   (nice build) → gbni-1 (binaries staged on gbni-2, shipped, no build).
