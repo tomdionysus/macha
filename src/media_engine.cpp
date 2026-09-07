@@ -445,6 +445,9 @@ class FragmentWriter {
     std::deque<double> durations_;
     double fallback_duration_{};
     bool init_published_{};
+    // MPEG-TS: no box parsing and no init segment; bytes accumulate into the
+    // current fragment and cut() publishes it at the planned boundaries.
+    bool raw_fragments_{};
 
     void append(Bytes& target, const uint8_t* data, size_t size) {
         target.insert(target.end(), data, data + size);
@@ -511,15 +514,37 @@ class FragmentWriter {
     FragmentWriter(std::shared_ptr<MediaSegmentStore> store, std::chrono::milliseconds target,
                    const std::vector<double>& planned_durations)
         : store_(std::move(store)), durations_(planned_durations.begin(), planned_durations.end()),
-          fallback_duration_(std::max(0.001, target.count() / 1000.0)) {}
+          fallback_duration_(std::max(0.001, target.count() / 1000.0)),
+          raw_fragments_(store_->container() == MediaContainer::mpegts) {}
+
+    bool raw_fragments() const noexcept { return raw_fragments_; }
 
     int write(const uint8_t* data, int size) {
+        if (raw_fragments_) {
+            append(fragment_, data, static_cast<size_t>(size));
+            return size;
+        }
         pending_.insert(pending_.end(), data, data + size);
         parse();
         return size;
     }
 
+    // MPEG-TS fragment boundary: everything the muxer has written since the
+    // previous cut is one self-contained segment.
+    void cut() {
+        if (!raw_fragments_ || fragment_.empty()) return;
+        auto duration = durations_.empty() ? fallback_duration_ : durations_.front();
+        if (!durations_.empty()) durations_.pop_front();
+        if (!store_->publish_segment(std::move(fragment_), duration))
+            throw std::runtime_error("stream cancelled");
+        fragment_.clear();
+    }
+
     void finish() {
+        if (raw_fragments_) {
+            cut();
+            return;
+        }
         parse();
         if (!pending_.empty()) {
             if (!fragment_.empty()) {
@@ -582,6 +607,16 @@ int output_write(void* opaque, const uint8_t* buffer, int size) {
     } catch (...) {
         return AVERROR(EIO);
     }
+}
+
+// Close the current fragment before a keyframe: flush the muxer (an fMP4
+// moof/mdat pair, or the buffered TS packets) and, for MPEG-TS, publish the
+// bytes as one segment.
+void cut_fragment(AVFormatContext* output) {
+    av_require(av_write_frame(output, nullptr), "flush VOD fragment");
+    avio_flush(output->pb);
+    if (auto* writer = static_cast<FragmentWriter*>(output->pb->opaque))
+        writer->cut();
 }
 
 class OutputIo {
@@ -832,10 +867,8 @@ void encode_video_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame* 
         if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
         av_require(rc, "receive encoded video packet");
         auto seconds = encoded->pts == AV_NOPTS_VALUE ? 0.0 : encoded->pts * av_q2d(pipe.encoder->time_base);
-        if ((encoded->flags & AV_PKT_FLAG_KEY) != 0 && cuts.before_keyframe(seconds)) {
-            av_require(av_write_frame(output, nullptr), "flush VOD fragment");
-            avio_flush(output->pb);
-        }
+        if ((encoded->flags & AV_PKT_FLAG_KEY) != 0 && cuts.before_keyframe(seconds))
+            cut_fragment(output);
         av_packet_rescale_ts(encoded, pipe.encoder->time_base, pipe.output_stream->time_base);
         static_assert(AV_NOPTS_VALUE == kNoMediaTimestamp);
         const auto repairs_before = pipe.encoded_timestamps.repair_count();
@@ -1153,12 +1186,13 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
               " stream_info_ms=" + std::to_string(stream_info_ms) +
               " container_seek_ms=" + std::to_string(seek_ms));
 
+    const bool mpegts = plan.container == MediaContainer::mpegts;
     AVFormatContext* raw_out = nullptr;
     const auto output_rc =
-        avformat_alloc_output_context2(&raw_out, nullptr, "mp4", nullptr);
+        avformat_alloc_output_context2(&raw_out, nullptr, mpegts ? "mpegts" : "mp4", nullptr);
     AvOutputContextOwner output_owner(raw_out);
-    av_require(output_rc, "create fragmented MP4 muxer");
-    if (!output_owner) throw std::runtime_error("MP4 muxer is unavailable");
+    av_require(output_rc, mpegts ? "create MPEG-TS muxer" : "create fragmented MP4 muxer");
+    if (!output_owner) throw std::runtime_error("segment muxer is unavailable");
     auto* out = output_owner.get();
 
     std::vector<std::unique_ptr<StreamPipeline>> pipelines;
@@ -1206,14 +1240,16 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
         out->avoid_negative_ts = AVFMT_AVOID_NEG_TS_MAKE_ZERO;
 
         AvDictionaryOwner options;
-        av_require(av_dict_set(options.put(), "movflags",
-                               "frag_custom+empty_moov+default_base_moof+omit_tfhd_offset+negative_cts_offsets",
-                               0),
-                   "set fragmented MP4 options");
+        if (!mpegts) {
+            av_require(av_dict_set(options.put(), "movflags",
+                                   "frag_custom+empty_moov+default_base_moof+omit_tfhd_offset+negative_cts_offsets",
+                                   0),
+                       "set fragmented MP4 options");
+        }
         const bool has_video = std::any_of(pipelines.begin(), pipelines.end(), [](const auto& p) {
             return p->type == MediaStreamType::video;
         });
-        if (!has_video) {
+        if (!has_video && !mpegts) {
             av_require(av_dict_set(
                            options.put(), "frag_duration",
                            std::to_string(static_cast<int64_t>(segment_duration.count()) * 1000)
@@ -1222,7 +1258,7 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                        "set audio fragment duration");
         }
         int rc = avformat_write_header(out, options.put());
-        av_require(rc, "write fragmented MP4 header");
+        av_require(rc, mpegts ? "write MPEG-TS header" : "write fragmented MP4 header");
         avio_flush(out->pb);
 
         std::map<int, StreamPipeline*> by_input;
@@ -1258,10 +1294,8 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                     if (pipe.type == MediaStreamType::video) {
                         auto seconds = packet->pts == AV_NOPTS_VALUE ? 0.0 :
                                            packet->pts * av_q2d(pipe.output_stream->time_base);
-                        if ((packet->flags & AV_PKT_FLAG_KEY) != 0 && cuts.before_keyframe(seconds)) {
-                            av_require(av_write_frame(out, nullptr), "flush VOD fragment");
-                            avio_flush(out->pb);
-                        }
+                        if ((packet->flags & AV_PKT_FLAG_KEY) != 0 && cuts.before_keyframe(seconds))
+                            cut_fragment(out);
                     }
                     write_mux_packet(out, packet.get());
                 } else {
@@ -1301,7 +1335,8 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                 for (auto& pipe : pipelines)
                     if (pipe->transform == MediaTransform::transcode)
                         flush_encoder(*pipe, out, encoded.get());
-                av_require(av_write_trailer(out), "write fragmented MP4 trailer");
+                av_require(av_write_trailer(out), mpegts ? "write MPEG-TS trailer"
+                                                         : "write fragmented MP4 trailer");
                 avio_flush(out->pb);
                 writer.finish();
             }
@@ -1378,7 +1413,8 @@ class LibavSession final : public MediaEngineSession {
           video_encoder_threads_(video_encoder_threads),
           store_(std::make_shared<MediaSegmentStore>(max_ahead_segments, memory_limit,
                                                      std::move(spill_directory), segment_duration,
-                                                     vod_plan_.segment_durations)) {
+                                                     vod_plan_.segment_durations,
+                                                     vod_plan_.playback.container)) {
         worker_ = std::jthread([this](std::stop_token stop) {
             run_supervised("media-engine-session", [this, stop] { run(stop); });
         });

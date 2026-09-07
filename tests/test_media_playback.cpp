@@ -394,6 +394,31 @@ MACHA_FAST_TEST("media_playback", test_media_vod_index_planning_rejects_partial_
     CHECK(std::abs(seeked->actual_seek_seconds - 62.0) < 0.0005);
 }
 
+MACHA_TEST("media_playback", test_segment_store_mpegts_mode_has_no_init_and_ts_names) {
+    TempDir t;
+    auto store = std::make_shared<MediaSegmentStore>(4, 64 * 1024, t.path() / "spill", 4000ms,
+                                                     std::vector<double>{2.0, 4.0, 4.0},
+                                                     MediaContainer::mpegts);
+    CHECK(store->container() == MediaContainer::mpegts);
+    CHECK(store->playlist().empty());
+    // No init segment in MPEG-TS: the first fragment alone makes it ready.
+    REQUIRE(store->publish_segment(Bytes(188 * 3, 0x47), 2.0));
+    REQUIRE(store->wait_ready(10ms));
+    auto playlist = store->playlist();
+    CHECK(playlist.find("#EXT-X-VERSION:3") != std::string::npos);
+    CHECK(playlist.find("#EXT-X-MAP") == std::string::npos);
+    CHECK(playlist.find("segment-000000.ts") != std::string::npos);
+    CHECK(playlist.find(".m4s") == std::string::npos);
+    CHECK(playlist.find("#EXT-X-ENDLIST") == std::string::npos);
+    REQUIRE(store->object("segment-000000.ts").has_value());
+    CHECK(store->object("segment-000000.ts")->size() == 188 * 3);
+    CHECK(!store->object("segment-000000.m4s").has_value() == false); // both spellings map to index 0
+    REQUIRE(store->publish_segment(Bytes(188, 0x47), 4.0));
+    REQUIRE(store->publish_segment(Bytes(188, 0x47), 4.0));
+    store->finish();
+    CHECK(store->playlist().find("#EXT-X-ENDLIST") != std::string::npos);
+}
+
 MACHA_FAST_TEST("media_playback", test_hls_codec_strings_describe_the_fragments) {
     MediaStreamInfo hevc10;
     hevc10.codec = "hevc";
@@ -1657,11 +1682,14 @@ MACHA_TEST("media_playback", test_auto_transcodes_hdr_10bit_unless_the_client_op
     streaming.enabled = true;
     streaming.temp_path = t.path() / "playback";
     streaming.startup_timeout = 2s;
+    // Several transcode sessions coexist in this test (auto, forced direct,
+    // MPEG-TS); the default limit of one would answer 429 to the later ones.
+    streaming.max_video_transcodes = 4;
     PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
                              std::make_unique<HdrFakeMediaEngine>());
     playback.start();
 
-    const auto create = [&](Json::Object caps) {
+    const auto create = [&](Json::Object caps, int expect = 201) {
         Json::Object root{{"media_id", media_id}, {"capabilities", Json(std::move(caps))},
                           {"preferences", Json(Json::Object{{"mode", "auto"}})}};
         auto text = Json(std::move(root)).dump();
@@ -1671,7 +1699,7 @@ MACHA_TEST("media_playback", test_auto_transcodes_hdr_10bit_unless_the_client_op
         request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
         request.body.assign(text.begin(), text.end());
         auto response = playback.handle(request);
-        REQUIRE(response.status == 201);
+        REQUIRE(response.status == expect);
         return Json::parse(std::string(response.body.begin(), response.body.end()));
     };
     const auto hevc_caps = [] {
@@ -1744,6 +1772,39 @@ MACHA_TEST("media_playback", test_auto_transcodes_hdr_10bit_unless_the_client_op
     }
     const std::set<std::string> expected_fields{"video_bit_depth", "hdr"};
     CHECK(fields == expected_fields);
+
+    // A client that cannot take fragmented MP4 gets MPEG-TS segments when it
+    // says it takes them, and a plain refusal when it does not.
+    auto ts_caps = hevc_caps();
+    ts_caps["hls_fmp4"] = false;
+    ts_caps["hls_ts"] = true;
+    auto ts_session = create(std::move(ts_caps), 201);
+    CHECK(ts_session.find("mode")->asString() == "transcode");
+    CHECK(ts_session.find("output")->find("format")->asString() == "mpegts");
+    auto ts_master = playback.handle([&] {
+        HttpRequest r;
+        r.method = "GET";
+        r.path = ts_session.find("stream")->find("url")->asString();
+        r.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+        return r;
+    }());
+    REQUIRE(ts_master.status == 200);
+    Bytes ts_master_bytes(static_cast<size_t>(ts_master.content_length()));
+    REQUIRE(ts_master.stream->read(0, ts_master_bytes) == ts_master_bytes.size());
+    const std::string ts_master_text(ts_master_bytes.begin(), ts_master_bytes.end());
+    CHECK(ts_master_text.find("CODECS=\"avc1.640029,mp4a.40.2\"") != std::string::npos);
+
+    auto no_container = hevc_caps();
+    no_container["hls_fmp4"] = false;
+    Json::Object refused_root{{"media_id", media_id}, {"capabilities", Json(std::move(no_container))},
+                              {"preferences", Json(Json::Object{{"mode", "auto"}})}};
+    auto refused_text = Json(std::move(refused_root)).dump();
+    HttpRequest refused_request;
+    refused_request.method = "POST";
+    refused_request.path = "/api/v1/playback/sessions";
+    refused_request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    refused_request.body.assign(refused_text.begin(), refused_text.end());
+    CHECK(playback.handle(refused_request).status == 400);
 }
 
 MACHA_TEST("media_playback", test_forced_direct_bypasses_client_capabilities) {

@@ -20,6 +20,11 @@ namespace macha {
 
 enum class MediaStreamType { video, audio, subtitle, other };
 enum class MediaTransform { copy, transcode, omit };
+// Segment container of a transformed (HLS) session. Fragmented MP4 is the
+// default; MPEG-TS is offered to clients that cannot take fMP4 (a 2017 TV's
+// native HLS player rendered fMP4 video and dropped the muxed AAC, 2026-09-07).
+enum class MediaContainer : uint8_t { fmp4, mpegts };
+const char* media_container_name(MediaContainer) noexcept;
 enum class PlaybackMode { direct, remux, transcode };
 enum class MediaReadPurpose { probe, playback, subtitle };
 
@@ -77,6 +82,7 @@ struct MediaSource {
 
 struct PlaybackPlan {
     PlaybackMode mode{PlaybackMode::direct};
+    MediaContainer container{MediaContainer::fmp4};
     int video_stream{-1};
     int audio_stream{-1};
     int subtitle_stream{-1};
@@ -131,7 +137,9 @@ class MediaSegmentStore {
     MediaSegmentStore(size_t max_ahead_segments, uint64_t memory_limit,
                       std::filesystem::path spill_directory,
                       std::chrono::milliseconds target_duration,
-                      std::vector<double> vod_segment_durations = {});
+                      std::vector<double> vod_segment_durations = {},
+                      MediaContainer container = MediaContainer::fmp4);
+    MediaContainer container() const noexcept;
     ~MediaSegmentStore();
 
     MediaSegmentStore(const MediaSegmentStore&) = delete;
