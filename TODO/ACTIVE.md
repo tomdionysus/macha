@@ -712,6 +712,15 @@ work needed for any of these.
 
 ## P2 — Documentation hygiene (found 2026-09-05, backlog-adjacent but not code)
 
+- [ ] **Swagger/OpenAPI description of the HTTP API (operator request
+  2026-09-07, optional).** Publish an OpenAPI 3 document for `/api/v1/*`
+  (session, status, catalogue, playback, manage routes) and serve it from the
+  daemon (e.g. `/api/v1/openapi.json` plus a Swagger UI page, or generate the
+  document at build time from the route table so it cannot drift). The UI and
+  site sessions consume the API by reading `status_api.cpp`/`service.cpp`
+  today; a machine-readable contract would replace that. Nice-to-have, not
+  on the import/stability critical path.
+
 - [ ] `TODO/2026-09-03-playback-resilience-and-av-sync-plan.md` cites
   `TODO/2026-08-31-cluster-any-node-playback-failover.md` as tracking a
   client-side fix — that file does not exist anywhere in the repo. Either

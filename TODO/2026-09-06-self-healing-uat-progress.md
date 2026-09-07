@@ -55,6 +55,20 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **0.32.9 on es-1 too (16:20 CEST, after its viewer stopped).** es-1's
+  first phase line: `total_ms=4571 decode_ms=8 collect_ms=1
+  catalogue_ms=15 data_ms=0 control_ms=4546 control_objects=65` — the
+  DATA claim is now 0 ms on both writers; all that is left of the barrier
+  is the CONTROL claim of the catalogue graph.
+- **0.32.10 (commit pending → see git log; suite 358/358):**
+  `retain_control` stored 65 catalogue objects on each candidate one RPC
+  at a time and took candidates in NodeId order → 65 × 65 ms across the
+  WAN per catalogue mutation. Now local → measured-nearest order
+  (`order_commit_replicas` moved to placement.hpp) and all puts to a
+  candidate in flight together; `CONTROL retention claim objects= …
+  total_ms=` logged when ≥ 250 ms. Deploy spaced + playback-gated; verify
+  `control_ms` on both writers ≪ 1 s and mutate p90 well under 1 s.
+
 - **0.32.8 verified (15:15 CEST):** gbni-1's barrier line named the
   phase: `DATA retention barrier ids=3201 nodes=1 total_ms=16317
   scan_ms=16048 short=0` then `total_ms=357 scan_ms=261` for the next
