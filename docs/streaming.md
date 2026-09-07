@@ -6,27 +6,40 @@ There is no `auto` mode. `preferences.mode` is required on every session, and a 
 
 ## Modes
 
-1. **direct** — the original file over HTTP byte ranges, exactly as stored;
-2. **remux** — the elementary streams copied into an HLS container;
-3. **transcode** — the streams re-encoded (H.264 video, AAC audio) into an HLS container.
+1. **direct** — the original file over HTTP byte ranges, exactly as stored: no container change and no re-encode;
+2. **remux** — every elementary stream copied into an HLS container;
+3. **transcode** — at least one stream re-encoded (H.264 video, AAC audio) into an HLS container. An AAC encode keeps the source's channel layout: a codec change is not a downmix.
 
-`mode` is a shorthand for the per-stream instructions, which may be given directly and override it:
+The per-stream instructions name what happens to each stream:
 
 | field | values | meaning |
 |---|---|---|
 | `preferences.mode` | `direct`, `remux`, `transcode` | required |
-| `preferences.video` | `copy`, `transcode` | overrides the mode for the video stream |
-| `preferences.audio` | `copy`, `transcode` | overrides the mode for the audio stream |
+| `preferences.video` | `copy`, `transcode` | what happens to the video stream |
+| `preferences.audio` | `copy`, `transcode` | what happens to the audio stream |
 | `preferences.container` | `fmp4` (default), `mpegts` | HLS segment container |
 
-So "copy the video, re-encode the audio" is `{"mode": "remux", "audio": "transcode"}`, and the reported `mode` of the resulting session is `transcode` because a stream is being encoded.
+**The mode has to describe what is being done.** `direct` and `remux` copy every stream; `transcode` re-encodes at least one and may copy the other. `transcode` is the permissive mode, and it is how a mixture is asked for.
 
-**What the server refuses.** Only what is impossible, never what a client said it could not play:
+| mode | video | audio | |
+|---|---|---|---|
+| `direct` | `copy` | `copy` | the source file, untouched |
+| `remux` | `copy` | `copy` | repackaged, every stream copied |
+| `transcode` | `transcode` | `transcode` | both re-encoded |
+| `transcode` | `copy` | `transcode` | audio only re-encoded |
+| `transcode` | `transcode` | `copy` | video only re-encoded |
+
+So "copy the video, re-encode the audio" is `{"mode": "transcode", "video": "copy"}`. Omitting `video`/`audio` takes the mode's own default: copy for `direct` and `remux`, re-encode for `transcode`.
+
+**What the server refuses.** Only what is impossible or what misdescribes itself, never what a client said it could not play:
 
 - a missing or unknown `mode`, or an unknown `video`/`audio`/`container` value;
-- `video: copy` together with `max_height` below the source height, or with `max_bitrate` — a quality change is a re-encode by definition;
+- `direct` or `remux` with a stream set to `transcode`, or with `max_height`/`max_bitrate` — a quality change is a re-encode, and those modes copy;
+- `transcode` with both streams copied — nothing is being re-encoded, so it is a remux or a direct;
 - a copy into a container that cannot carry that codec (fragmented MP4 carries H.264, HEVC and AV1 video, and AAC, AC-3, E-AC-3 and Opus audio);
 - a transcode when the node has no encoder for the target.
+
+A refusal names the rule. The server does not quietly reinterpret a mode into the one that would have worked, because a session that reports a mode it is not performing misleads everything downstream of it.
 
 **What the server does not do.** It does not ask what the client can play, and there is no `capabilities` field. Whether a device can decode what it asked for is the client's business; the server reports the facts and carries out the instruction. A client that asks for `direct` on a file it cannot demux gets the file.
 
