@@ -55,6 +55,15 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **0.32.4 (commit `f0760e9`, suite 355/355; deployed node-d ~04:05, node-e
+  05:10 CEST, node-c 04:12):** `open_writes_mutex_` no longer spans
+  metadata mutations (commit_write / open_write truncate / namespace batch)
+  — publications were serialized one WAN-bound commit at a time. node-e's
+  rsync now runs with `--bwlimit=8000` (its disk was at 77 % iowait reading
+  17 MB/s into a capped spool; good-neighbour). Imports restarted: node-e pid
+  157271, node-c pid 91906. Verify next tick: node-c extent puts per 10 min
+  (was 9), data_publications_completed rising, node-e iowait.
+
 - **0.32.3 (commit `0820ecb`, suite 355/355; deployed node-d 03:46, node-e
   04:49 CEST, node-c pending its build):** clean accounting checkpoints
   trusted with packs / dirty checkpoint = estimate while the walk runs;
