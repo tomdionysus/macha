@@ -55,6 +55,14 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **Finding #6 (04:40, es-1, gbni-1 still down):** `media input read failed
+  … error=extent unavailable` ×129 and `catalogue hint gave up … failures=3`
+  ×43 on Music files gbni-1 wrote before it died: their only copy was on
+  gbni-1 (data floor 1; second replica is repair debt that had not
+  converged). Design items: push the second replica promptly after
+  publication (bounded delay, not "eventually"), and catalogue hint jobs
+  must re-queue when extents reappear rather than give up.
+
 - **INCIDENT 04:13 (gbni time):** gbni-1 went dark at the network level
   (no ARP/ping from its own LAN, cluster marks it offline) ~1 min after its
   0.32.4 restart and import relaunch (65k-op spool replay + two rsyncs for
