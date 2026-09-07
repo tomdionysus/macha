@@ -55,6 +55,13 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **13:54 CEST: operator removed the stray copies on es-1 (root disk 69.9 →
+  17 GB) and left macha stopped; restarted by me.** Guard now reads
+  `mountpoint_stray_entries=0`, immutable, on es-1 too. The waiting import
+  script had marked Movies "done" with rc=11 when the mount went away and
+  moved on to TV, so it was relaunched (pid 165238, Movies→TV) — the
+  script treats a non-zero rsync exit as the end of that directory; a
+  retry-the-directory rule would be a small improvement.
 - **0.32.6 DEPLOYED (commit `a2a8969`; gbni-2 12:41, gbni-1 12:42 via
   binaries staged on gbni-2 — no build on gbni-1, es-1 13:44 CEST).**
   Guard verified from the status API: `mountpoint_immutable=true` on all
