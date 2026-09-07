@@ -394,6 +394,27 @@ MACHA_FAST_TEST("media_playback", test_media_vod_index_planning_rejects_partial_
     CHECK(std::abs(seeked->actual_seek_seconds - 62.0) < 0.0005);
 }
 
+MACHA_TEST("media_playback", test_media_playlist_waits_for_the_first_fragment) {
+    TempDir t;
+    auto store = std::make_shared<MediaSegmentStore>(4, 64 * 1024, t.path() / "spill", 4000ms,
+                                                     std::vector<double>{2.0, 4.0});
+    // Nothing produced yet: the store has no playlist to give. The HTTP layer
+    // holds the request on wait_ready rather than answering 404, because a
+    // failed playlist load reads as a network error to an HLS player.
+    CHECK(store->playlist().empty());
+    std::jthread producer([&] {
+        std::this_thread::sleep_for(80ms);
+        store->publish_init(Bytes{'i', 'n', 'i', 't'});
+        store->publish_segment(Bytes(512, 0x21), 2.0);
+    });
+    CHECK(store->wait_ready(5s));
+    producer.join();
+    auto playlist = store->playlist();
+    CHECK(playlist.find("segment-000000.m4s") != std::string::npos);
+    CHECK(playlist.find("segment-000001.m4s") == std::string::npos);
+    CHECK(playlist.find("#EXT-X-ENDLIST") == std::string::npos);
+}
+
 MACHA_TEST("media_playback", test_segment_store_mpegts_mode_has_no_init_and_ts_names) {
     TempDir t;
     auto store = std::make_shared<MediaSegmentStore>(4, 64 * 1024, t.path() / "spill", 4000ms,
