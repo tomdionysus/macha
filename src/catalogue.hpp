@@ -56,17 +56,18 @@ struct CatalogueItem {
 };
 
 // Current stored media-profile schema; see CatalogueSnapshot::MediaProfile.
-inline constexpr uint32_t catalogue_media_profile_schema = 2;
+inline constexpr uint32_t catalogue_media_profile_schema = 3;
 
 struct CatalogueSnapshot {
     std::map<std::string, CatalogueItem> items;
     struct MediaProfile {
         // Schema 2 (0.32.12) adds each stream's codec level and colour
-        // transfer. A schema-1 profile with a video stream is treated as
-        // stale by valid_catalogue_media_profile(): playback negotiation
-        // gates 10-bit/HDR sources on those fields, and a profile without
-        // them let a Dolby Vision title be copied to a client that could not
-        // decode it (2026-09-07).
+        // transfer; schema 3 (0.32.16) adds its Dolby Vision profile and
+        // base-layer compatibility. The client instructs from these facts, so
+        // an older profile with a video stream is stale: it is regenerated on
+        // that media's next playback and republished. Reading one is what let
+        // a Dolby Vision title be handed to a decoder that could not take it
+        // (2026-09-07).
         uint32_t schema_version{catalogue_media_profile_schema};
         bool complete{true};
         MediaProbeResult probe;

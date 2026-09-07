@@ -1,16 +1,80 @@
 # Streaming
 
-The public playback API deals in media capabilities, playback plans and sessions. Finite transformed media uses immutable HLS VOD manifests with lazy fragment generation. Media probing, remuxing and transcoding run in-process through the FFmpeg libraries behind `MediaEngine`; no `ffmpeg` or `ffprobe` subprocess is launched.
+The playback API is instruction-based. **The server reports what a file is and performs what it is asked for; it does not choose.** A client reads the media facts, decides what to do with them against its own decoder, and instructs. Media probing, remuxing and transcoding run in-process through the FFmpeg libraries behind `MediaEngine`; no `ffmpeg` or `ffprobe` subprocess is launched.
+
+There is no `auto` mode. `preferences.mode` is required on every session, and a missing or unrecognised mode is `400`.
 
 ## Modes
 
-The resolver considers all media representations bound to a catalogue item and prefers the cheapest compatible plan:
+1. **direct** — the original file over HTTP byte ranges, exactly as stored;
+2. **remux** — the elementary streams copied into an HLS container;
+3. **transcode** — the streams re-encoded (H.264 video, AAC audio) into an HLS container.
 
-1. **direct** — serve the original logical Macha file with HTTP byte ranges;
-2. **remux** — stream-copy compatible elementary streams into fragmented-MP4 HLS;
-3. **transcode** — encode only streams that require conversion, then emit fragmented-MP4 HLS.
+`mode` is a shorthand for the per-stream instructions, which may be given directly and override it:
 
-The current transformed output is one HLS rendition using an `init.mp4` plus `.m4s` fragments. Adaptive bitrate is not implemented yet. Video is copied when the source can be represented in fMP4, the client reports the codec as supported, and no requested quality conversion is required. Audio is copied when AAC is acceptable. The current encode targets are H.264 video and AAC audio; negotiation fails rather than producing a codec the client did not advertise.
+| field | values | meaning |
+|---|---|---|
+| `preferences.mode` | `direct`, `remux`, `transcode` | required |
+| `preferences.video` | `copy`, `transcode` | overrides the mode for the video stream |
+| `preferences.audio` | `copy`, `transcode` | overrides the mode for the audio stream |
+| `preferences.container` | `fmp4` (default), `mpegts` | HLS segment container |
+
+So "copy the video, re-encode the audio" is `{"mode": "remux", "audio": "transcode"}`, and the reported `mode` of the resulting session is `transcode` because a stream is being encoded.
+
+**What the server refuses.** Only what is impossible, never what a client said it could not play:
+
+- a missing or unknown `mode`, or an unknown `video`/`audio`/`container` value;
+- `video: copy` together with `max_height` below the source height, or with `max_bitrate` — a quality change is a re-encode by definition;
+- a copy into a container that cannot carry that codec (fragmented MP4 carries H.264, HEVC and AV1 video, and AAC, AC-3, E-AC-3 and Opus audio);
+- a transcode when the node has no encoder for the target.
+
+**What the server does not refuse.** An instruction that contradicts the client's own advertised capabilities is performed, and the contradiction is reported. A client that asks for `direct` on a file it cannot demux gets the file. This is deliberate: the mode is the client's decision and the operator's escape hatch, so the server states what it noticed rather than overriding it. See `warnings` below.
+
+## Media facts
+
+Facts come from one probe of the file, are persisted in the catalogue media profile, and are reported identically wherever they appear:
+
+| field | notes |
+|---|---|
+| `container` | the resolved container family: `mp4`, `matroska`, `webm`, `mp3`, `flac`, `ogg`. **Match on this**, not on `format`. |
+| `format` | the raw libavformat demuxer name list, e.g. `matroska,webm`. It names every container that demuxer handles, so a Matroska file lists `webm` too; matching it directly is how a WebM-capable device ends up being handed a Matroska file. |
+| per stream | `index`, `type`, `codec`, `profile`, `language`, `width`, `height`, `channels`, `sample_rate`, `bit_depth`, `level`, `color_transfer`, `dolby_vision_profile`, `dolby_vision_compatibility`, `bitrate`, `default`, `forced`, `attached_picture` |
+
+`bit_depth` is derived from the pixel format when the container does not carry it. `color_transfer` is the transfer function name (`smpte2084` for PQ, `arib-std-b67` for HLG, absent for SDR or unread). The Dolby Vision fields appear only on a stream carrying a configuration record; compatibility `1` is HDR10-compatible, `2` is SDR, `4` is HLG.
+
+These facts are available **before** a session exists, which is what makes an instruction possible:
+
+```text
+GET /api/v1/playback/media?media_id=<macha: or path: identity>
+GET /api/v1/playback/media?item_id=<catalogue item>
+```
+
+It returns, per media, the identity, path, size, `container`, `format`, `duration_ms`, `bitrate`, the full stream list, and an `operations` object describing what this node can do with that file: `direct` (always true), `copy_into_fmp4` with separate `video` and `audio` booleans, and `transcode_video` / `transcode_audio` reflecting the encoders present in this build. No session is created and no pipeline starts.
+
+The same facts are on the catalogue media profile (`GET /api/v1/catalogue/media/<macha id>`, `schema_version` 3) for any media with an immutable identity. That pre-session availability is intentional and guaranteed for `macha:` identities. The reading order is: the persisted profile if one exists, otherwise a foreground probe whose result is persisted for later readers; background profiling of unwatched media runs at a lower priority and yields to a viewer.
+
+An older stored profile that predates a fact (a schema below the current one, on a video stream) is treated as stale and regenerated on that media's next playback.
+
+## Capabilities
+
+`capabilities` remains in the request and is **advisory only**. It never changes what the server does. It is used to report contradictions between what was asked for and what the client said it could play:
+
+```json
+{
+  "capabilities": {
+    "containers": ["mp4", "matroska"],
+    "video_codecs": ["h264", "hevc"],
+    "hls_video_codecs": ["h264"],
+    "audio_codecs": ["aac", "eac3"],
+    "video_bit_depth": 10,
+    "hdr": ["smpte2084"]
+  }
+}
+```
+
+`hls_video_codecs` is for devices that decode more through their media element than through MediaSource; absent, it equals `video_codecs`. `hdr` lists the transfer functions the client presents (`true` means all of them).
+
+The session response carries a `warnings` array, empty when nothing contradicts. Each entry is `{"code": "capability_contradiction", "field": ..., "message": ...}` where `field` is one of `containers`, `video_codecs`, `hls_video_codecs`, `audio_codecs`, `video_bit_depth`, `hdr`. Warnings are advisory: they never change the status code or the stream.
 
 ## Media engine boundary
 
@@ -24,9 +88,9 @@ Probe and subtitle readers are deliberately *not* registered with `PlaybackTrack
 
 Transformed output uses the MP4 muxer with fragmented-MP4 flags and a custom output `AVIOContext`. Top-level MP4 init and media fragments are published directly into `MediaSegmentStore`. The HTTP server reads playlists/fragments from that store. No temp directory is polled for readiness.
 
-Finite media is presented as HLS VOD. Before the transformed pipeline starts, the media engine prepares the complete segment-duration plan. The playlist is therefore complete and immutable from its first response, contains `#EXT-X-PLAYLIST-TYPE:VOD` and `#EXT-X-ENDLIST`, and never exposes a moving event/live edge. Fragment bytes remain lazy: a request for a valid future segment raises the producer demand watermark and waits for sequential generation to reach that fragment.
+A transformed session is served as a master playlist (`master.m3u8`: one `EXT-X-STREAM-INF` with `BANDWIDTH`, `CODECS` and `RESOLUTION`) pointing at a media playlist (`media.m3u8`). The media playlist is an `EXT-X-PLAYLIST-TYPE:EVENT` list of the fragments that exist, closed with `#EXT-X-ENDLIST` when the generation produces its last one; a request that arrives before the first fragment exists is held until it does, bounded by `startup_timeout_ms`, rather than answered `404`. Advertising fragments that have not been encoded lets a player queue against the encoder, which cost one 2017 television a 98-second black screen. Fragment bytes remain lazy: a request for a valid future fragment raises the producer demand watermark and waits.
 
-For stream-copy video, the VOD planner uses the demuxer's keyframe index and chooses random-access boundaries near `segment_duration_ms`. Matroska/WebM Cues are explicitly materialised through the demuxer's seek path before that index is inspected, because probing alone may expose only a partial early-file index. The resulting plan is rejected if any advertised fragment would be grossly larger than the configured target, preventing a partial index from turning the unindexed remainder of a movie into one fragment. A transformed seek is aligned to the first indexed keyframe at or after the requested position so the first advertised segment is independently decodable. If automatic remux has no usable keyframe index, it may fall back to H.264 video transcode only when the client advertised H.264 and the encoder is available; an explicitly forced `remux` still fails rather than silently changing mode. Transcoded video uses the encoder GOP cadence as its VOD boundary plan.
+For stream-copy video, the VOD planner uses the demuxer's keyframe index and chooses random-access boundaries near `segment_duration_ms`. Matroska/WebM Cues are explicitly materialised through the demuxer's seek path before that index is inspected, because probing alone may expose only a partial early-file index. The resulting plan is rejected if any advertised fragment would be grossly larger than the configured target, preventing a partial index from turning the unindexed remainder of a movie into one fragment. A transformed seek is aligned to the first indexed keyframe at or after the requested position so the first advertised segment is independently decodable. A remux whose keyframe index is unusable fails rather than silently changing mode. A fragment is as long as the source GOP makes it, up to 90 seconds; only a gap or tail beyond that rejects the plan, because scene-cut encodes routinely exceed a fixed multiple of the target. Transcoded video uses the encoder GOP cadence as its VOD boundary plan.
 
 Stream-copy timestamps are normalised only after rescaling into the MP4 stream's final muxer timebase. Missing PTS/DTS are synthesised conservatively and equal/backwards DTS values are advanced with a persistent per-stream timeline correction. Legitimate PTS-before-DTS composition offsets are preserved rather than clamped; fragmented MP4 is emitted with signed composition-time offsets enabled. Repairs that actually modify timestamps are logged with per-stream counters.
 
@@ -154,7 +218,9 @@ A browser can describe its actual capabilities:
     "hdr": ["smpte2084", "arib-std-b67"]
   },
   "preferences": {
-    "mode": "auto",
+    "mode": "remux",
+    "audio": "transcode",
+    "container": "fmp4",
     "max_height": 1080,
     "max_bitrate": 8000000,
     "audio_language": "eng"
@@ -162,9 +228,9 @@ A browser can describe its actual capabilities:
 }
 ```
 
-Default capabilities are intentionally conservative: MP4, H.264, AAC/MP3 and fragmented-MP4 HLS. `mode` is `auto`, `direct`, `remux` or `transcode`. A forced mode fails rather than silently choosing another mode.
+Default capabilities are intentionally conservative: MP4, H.264, AAC/MP3 and fragmented-MP4 HLS. They are advisory (see **Capabilities** above): they populate `warnings` and never change what the server does.
 
-Listing a video codec says the client has a decoder for it, not that its pipeline takes any sample depth or transfer function. `video_bit_depth` (8-16, default 8) is the deepest sample depth the client decodes and `hdr` lists the transfer functions it presents (`smpte2084` for PQ, `arib-std-b67` for HLG; the boolean `true` means both, absent means none). In `auto` mode a source deeper than that, or with an HDR transfer the client did not list, is transcoded to 8-bit SDR H.264 and is not offered as direct play; the response's per-stream `bit_depth`, `level` and `color_transfer` fields say why. An explicit `direct` or `remux` request is honoured as before; the response's `warnings` list (advisory, possibly empty) then names each contradiction between that choice and the client's own capabilities, as `{"code": "capability_contradiction", "field": "video_bit_depth" | "hdr" | "video_codecs" | "audio_codecs", "message": "..."}`. `containers` also gates direct play, and `matroska` (or `mkv`) enables it for `.mkv`/`.mka` sources: a host whose media element demuxes Matroska takes the file as it is over byte ranges, with no remux and no transcode. `hls_video_codecs` narrows the video codecs for HLS delivery only, when a client decodes more through its media element than through MediaSource (a 2017 TV decodes HEVC directly and fails it through MSE); it defaults to `video_codecs`. `hls_ts` says the client plays HLS with MPEG-TS segments; a client that sets `hls_fmp4` false and `hls_ts` true gets `.ts` segments (Annex B H.264/HEVC, ADTS AAC, no init segment, `output.format` `mpegts`) instead of fragmented MP4, which some older native players render without their muxed audio. Transformed sessions are served as a master playlist (`master.m3u8`, one `EXT-X-STREAM-INF` with `BANDWIDTH`, `CODECS` and `RESOLUTION`) pointing at the media playlist (`media.m3u8`), so a player creates its source buffers from what the fragments really carry.
+`max_height` and `max_bitrate` are instructions, not capabilities: either one makes the video a re-encode, and combining either with `video: copy` is a `400`.
 
 The response separates requested preferences, resolved playback, original source metadata and actual output metadata. The `/api/v1` schema is currently owned by Macha and Macha Client and may be changed in place while there are no third-party implementations. A representative response is:
 
@@ -177,7 +243,10 @@ The response separates requested preferences, resolved playback, original source
   "duration_ms": 5400000,
   "seek_ms": 0,
   "preferences": {
-    "mode": "auto",
+    "mode": "remux",
+    "video": null,
+    "audio": "transcode",
+    "container": "fmp4",
     "max_height": null,
     "max_bitrate": null,
     "audio_stream": null,
@@ -215,7 +284,7 @@ The response separates requested preferences, resolved playback, original source
 }
 ```
 
-`preferences.mode` records what the user selected, including `auto`; top-level `mode` is what negotiation actually resolved. `source.streams` describes the original elementary streams. `output.video`/`output.audio` describe the selected source stream, whether it is copied or transcoded, and the actual output codec/geometry/audio format. A CRF H.264 transcode has no fixed video bitrate and therefore omits `output.video.bitrate` unless an explicit target bitrate is in force. Returned stream URLs are relative to the API origin.
+`preferences` echoes the instruction as given; the top-level `mode` is what that instruction amounts to (a session with any stream being encoded reports `transcode`, whatever shorthand was used). `source.streams` describes the original elementary streams. `output.video`/`output.audio` describe the selected source stream, whether it is copied or transcoded, and the actual output codec/geometry/audio format. A CRF H.264 transcode has no fixed video bitrate and therefore omits `output.video.bitrate` unless an explicit target bitrate is in force. Returned stream URLs are relative to the API origin.
 
 ## Inspect, change and stop a session
 
