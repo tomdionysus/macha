@@ -55,6 +55,18 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **0.32.6 DEPLOYED (commit `a2a8969`; node-d 12:41, node-c 12:42 via
+  binaries staged on node-d — no build on node-c, node-e 13:44 CEST).**
+  Guard verified from the status API: `mountpoint_immutable=true` on all
+  three, `mountpoint_stray_entries` 0/0/**1** (node-e's hidden `Movies`
+  dir, see finding #7 — the daemon now reports it). Imports relaunched
+  with the mount-guarded script: node-c pid 2158 (12:42, Movies→TV→Music,
+  bwlimit 8000), node-e pid 164663 (13:44 CEST, Movies→TV). First check:
+  node-e spool 160→204 MB and 804 journal records in 2 min — writes reach
+  Macha this time; root disk flat at 69.9 GB. node-c spool 1.2 GB, load
+  0.3. **Loop STOPPED at operator request ("stop after this iteration")**;
+  resume with `/loop` + the same monitor prompt, or run
+  `/Users/maintainer/.claude/jobs/6aee47b8/tmp/import-check.sh` by hand.
 - **0.32.6 (DLT8 append-extents + finding #7 mountpoint guard; suite
   357/357 after one flaky rerun):** deploy order node-d (build) → node-e
   (nice build) → node-c (binaries staged on node-d, shipped, no build).
