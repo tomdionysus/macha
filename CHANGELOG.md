@@ -1,5 +1,33 @@
 # Current release
 
+## 0.32.12 — A master playlist that says what is in the fragments; 10-bit and HDR are not "hevc" (development)
+
+Operator report via the UI session (2026-09-07): on a 2016 Samsung TV
+(hls.js 1.6 over MSE on Chromium 47) a Dolby Vision profile 8 title broke
+decoding in direct play, and the transcode fallback played picture with no
+sound. Checked from the node: the transcode's init segment and fragments
+carry h264 + AAC LC, so the server produced audio; but the stream URL
+`master.m3u8` answered with the media playlist itself, so no `CODECS`
+attribute ever reached the player and it inferred the source-buffer codecs
+from the init segment. The TV's advertised capabilities were not logged
+anywhere, and it had listed `hevc` for a 10-bit PQ source.
+
+- `master.m3u8` is now a master playlist: `EXT-X-STREAM-INF` with
+  `BANDWIDTH`, `CODECS` (RFC 6381 strings from the negotiated plan and the
+  probed streams: `avc1.PPCCLL`, `hvc1.P.C.Lnnn.B0`, `mp4a.40.2`, `ac-3`,
+  `ec-3`, …) and `RESOLUTION`, pointing at `media.m3u8`.
+- Capabilities gain `video_bit_depth` (8-16, default 8) and `hdr`, a list
+  of transfer names the client presents (`smpte2084`, `arib-std-b67`; the
+  boolean `true` means both). In `auto`, a source deeper than that or with
+  an HDR transfer the client did not list is transcoded, and not offered as
+  direct play. The probe records `level` and `color_transfer` per stream and the
+  session response exposes them.
+- `session create complete` logs the negotiated video/audio transform and
+  codec; the client's capabilities are logged at debug.
+- Audio a client lists is copied when fragmented MP4 carries it as is: AAC,
+  AC-3, E-AC-3 and Opus. Only AAC was copied before, so an E-AC-3 title on
+  an HEVC-capable client was a "transcode" session for the audio alone.
+
 ## 0.32.11 — Remux is allowed to have long fragments; transcode uses the cores it has (development)
 
 Viewer path, measured first (2026-09-07, all three nodes, 24 h of logs):

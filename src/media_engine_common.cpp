@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <stdexcept>
 
 namespace macha {
@@ -93,6 +94,76 @@ std::optional<HlsVodPlan> reseek_hls_vod(const HlsVodPlan& prepared,
                                                        prepared.seek_segment_seconds);
     }
     return result;
+}
+
+std::string hls_codec_string(std::string_view codec, const MediaStreamInfo* stream, bool transcoded) {
+    if (transcoded) {
+        // The libx264 transcode: High profile, level chosen by the encoder
+        // for the resolution; 4.1 covers everything up to 1080p30/720p60.
+        if (codec == "h264") return "avc1.640029";
+        if (codec == "aac") return "mp4a.40.2";
+    }
+    if (codec == "h264") {
+        // avc1.PPCCLL: profile_idc, constraint flags, level_idc, in hex.
+        std::string profile = "64", constraints = "00";
+        if (stream) {
+            if (stream->profile.find("Baseline") != std::string::npos) { profile = "42"; constraints = "C0"; }
+            else if (stream->profile.find("Main") != std::string::npos) { profile = "4D"; constraints = "40"; }
+            else if (stream->profile.find("High 10") != std::string::npos) profile = "6E";
+            else if (stream->profile.find("High 4:2:2") != std::string::npos) profile = "7A";
+        }
+        const int level = stream && stream->level > 0 ? stream->level : 41;
+        char buffer[8];
+        std::snprintf(buffer, sizeof(buffer), "%02X", level);
+        return "avc1." + profile + constraints + buffer;
+    }
+    if (codec == "hevc") {
+        // hvc1.P.C.Lxxx.B0: general_profile_idc, compatibility flags, tier
+        // + level. Main = 1 (flags 6), Main 10 = 2 (flags 4).
+        const bool main10 = stream && (stream->bit_depth > 8 ||
+                                       stream->profile.find("10") != std::string::npos);
+        const int level = stream && stream->level > 0 ? stream->level : 153;
+        return std::string("hvc1.") + (main10 ? "2.4" : "1.6") + ".L" + std::to_string(level) + ".B0";
+    }
+    if (codec == "av1") return "av01.0.08M.08";
+    if (codec == "aac") return "mp4a.40.2";
+    if (codec == "ac3") return "ac-3";
+    if (codec == "eac3") return "ec-3";
+    if (codec == "mp3") return "mp4a.40.34";
+    if (codec == "opus") return "opus";
+    if (codec == "flac") return "flac";
+    return std::string(codec);
+}
+
+std::string hls_variant_stream_inf(const PlaybackPlan& plan, const MediaStreamInfo* video,
+                                   const MediaStreamInfo* audio, uint64_t source_bitrate) {
+    std::string codecs;
+    if (plan.video != MediaTransform::omit)
+        codecs = hls_codec_string(plan.video_codec, video, plan.video == MediaTransform::transcode);
+    if (plan.audio != MediaTransform::omit) {
+        if (!codecs.empty()) codecs += ',';
+        codecs += hls_codec_string(plan.audio_codec, audio, plan.audio == MediaTransform::transcode);
+    }
+    int width = video ? video->width : 0;
+    int height = video ? video->height : 0;
+    if (plan.video == MediaTransform::transcode && plan.target_height && video && video->height > 0 &&
+        *plan.target_height < video->height) {
+        height = *plan.target_height;
+        width = std::max(2, static_cast<int>(std::llround(static_cast<double>(video->width) *
+                                                          static_cast<double>(height) /
+                                                          static_cast<double>(video->height))) & ~1);
+    }
+    uint64_t bandwidth = source_bitrate;
+    if (plan.video == MediaTransform::transcode) {
+        bandwidth = plan.target_video_bitrate ? *plan.target_video_bitrate + 192000
+                                              : (height >= 1080 ? 8000000 : height >= 720 ? 5000000 : 2500000);
+    }
+    if (!bandwidth) bandwidth = 8000000;
+    std::string out = "#EXT-X-STREAM-INF:BANDWIDTH=" + std::to_string(bandwidth) +
+                      ",CODECS=\"" + codecs + "\"";
+    if (width > 0 && height > 0)
+        out += ",RESOLUTION=" + std::to_string(width) + "x" + std::to_string(height);
+    return out;
 }
 
 std::string playback_mode_name(PlaybackMode mode) {

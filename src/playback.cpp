@@ -92,6 +92,10 @@ bool fmp4_video_copy_supported(std::string_view codec) {
     return codec == "h264" || codec == "hevc" || codec == "av1";
 }
 
+bool fmp4_audio_copy_supported(std::string_view codec) {
+    return codec == "aac" || codec == "ac3" || codec == "eac3" || codec == "opus";
+}
+
 bool webvtt_subtitle_supported(const MediaStreamInfo& stream) {
     if (stream.type != MediaStreamType::subtitle) return false;
     const auto codec = lower(stream.codec);
@@ -236,6 +240,17 @@ struct ClientCapabilities {
     bool hls_fmp4{true};
     std::optional<int> max_width;
     std::optional<int> max_height;
+    // Listing "hevc" says the client has a decoder for the codec, not that
+    // its pipeline handles 10-bit samples or a PQ/HLG transfer. A 2016 TV
+    // played a Dolby Vision profile 8 title (HEVC Main 10, smpte2084)
+    // "direct" and broke decoding (2026-09-07). Until a client says
+    // otherwise, sources deeper than 8 bits or with an HDR transfer are
+    // transcoded to 8-bit SDR H.264.
+    int max_video_bit_depth{8};
+    // Transfer functions the client presents ("smpte2084", "arib-std-b67").
+    // On the wire either a list of names or the boolean `hdr: true`, which
+    // means both.
+    std::set<std::string> hdr_transfers;
 };
 
 struct PlaybackPreferences {
@@ -287,7 +302,49 @@ ClientCapabilities parse_capabilities(const Json* value) {
     caps.max_height = optional_int(value->find("max_height"));
     if (caps.max_width && *caps.max_width <= 0) throw std::invalid_argument("capabilities.max_width must be positive");
     if (caps.max_height && *caps.max_height <= 0) throw std::invalid_argument("capabilities.max_height must be positive");
+    if (auto depth = optional_int(value->find("video_bit_depth"))) {
+        if (*depth < 8 || *depth > 16) throw std::invalid_argument("capabilities.video_bit_depth must be 8-16");
+        caps.max_video_bit_depth = *depth;
+    }
+    if (auto hdr = value->find("hdr")) {
+        if (hdr->isBool()) {
+            if (hdr->asBool()) caps.hdr_transfers = {"smpte2084", "arib-std-b67"};
+        } else if (hdr->isArray()) {
+            read_string_set(value, "hdr", caps.hdr_transfers);
+        } else if (!hdr->isNull()) {
+            throw std::invalid_argument("capabilities.hdr must be a boolean or a list of transfer names");
+        }
+    }
     return caps;
+}
+
+std::string describe_capabilities(const ClientCapabilities& caps) {
+    const auto join = [](const std::set<std::string>& values) {
+        std::string out;
+        for (const auto& value : values) {
+            if (!out.empty()) out += ',';
+            out += value;
+        }
+        return out;
+    };
+    std::string out = "containers=" + join(caps.containers) + " video=" + join(caps.video_codecs) +
+                      " audio=" + join(caps.audio_codecs) +
+                      " hls_fmp4=" + (caps.hls_fmp4 ? "yes" : "no") +
+                      " bit_depth=" + std::to_string(caps.max_video_bit_depth) +
+                      " hdr=" + (caps.hdr_transfers.empty() ? std::string("none") : join(caps.hdr_transfers));
+    if (caps.max_width) out += " max_width=" + std::to_string(*caps.max_width);
+    if (caps.max_height) out += " max_height=" + std::to_string(*caps.max_height);
+    return out;
+}
+
+// Whether a client that decodes `video`'s codec can also take its samples
+// as they are: sample depth and transfer function are pipeline properties
+// (MSE source buffers, TV panels), separate from codec support.
+bool video_samples_supported(const MediaStreamInfo& video, const ClientCapabilities& caps) {
+    if (video.bit_depth > 8 && caps.max_video_bit_depth < video.bit_depth) return false;
+    const bool hdr_transfer =
+        video.color_transfer == "smpte2084" || video.color_transfer == "arib-std-b67";
+    return !hdr_transfer || caps.hdr_transfers.contains(video.color_transfer);
 }
 
 PlaybackPreferences parse_preferences(const Json* value, PlaybackPreferences current = {}) {
@@ -369,7 +426,8 @@ PlaybackPlan negotiate(const MediaProbeResult& probe, std::string_view logical_p
 
     const auto source_container = direct_container(logical_path);
     bool direct_container_ok = !source_container.empty() && caps.containers.contains(source_container);
-    bool video_direct = !video || caps.video_codecs.contains(lower(video->codec));
+    bool video_direct = !video || (caps.video_codecs.contains(lower(video->codec)) &&
+                                   video_samples_supported(*video, caps));
     bool audio_direct = !audio || caps.audio_codecs.contains(lower(audio->codec));
     bool size_direct = true;
     auto max_height = prefs.max_height ? prefs.max_height : caps.max_height;
@@ -386,8 +444,14 @@ PlaybackPlan negotiate(const MediaProbeResult& probe, std::string_view logical_p
     const auto source_video_codec = video ? lower(video->codec) : std::string{};
     const auto source_audio_codec = audio ? lower(audio->codec) : std::string{};
     bool video_copy = !video || (caps.video_codecs.contains(source_video_codec) &&
-                                 fmp4_video_copy_supported(source_video_codec));
-    bool audio_copy = !audio || (source_audio_codec == "aac" && caps.audio_codecs.contains("aac"));
+                                 fmp4_video_copy_supported(source_video_codec) &&
+                                 video_samples_supported(*video, caps));
+    // Audio the client lists can travel in fragmented MP4 as it is: AAC,
+    // (E-)AC-3 and Opus all have fMP4 sample entries. Until 0.32.12 only AAC
+    // was copied, so an E-AC-3 title on an HEVC-capable client still ended
+    // up a "transcode" session for the audio alone (2026-09-07).
+    bool audio_copy = !audio || (caps.audio_codecs.contains(source_audio_codec) &&
+                                 fmp4_audio_copy_supported(source_audio_codec));
     std::optional<int> target_height = max_height;
     if (video && caps.max_width && video->width > *caps.max_width && video->width > 0 && video->height > 0) {
         auto by_width = static_cast<int>(std::floor(static_cast<double>(video->height) *
@@ -439,6 +503,8 @@ Json stream_json(const MediaStreamInfo& stream) {
     if (stream.channels) out["channels"] = stream.channels;
     if (stream.sample_rate) out["sample_rate"] = stream.sample_rate;
     if (stream.bit_depth) out["bit_depth"] = stream.bit_depth;
+    if (stream.level) out["level"] = stream.level;
+    if (!stream.color_transfer.empty()) out["color_transfer"] = stream.color_transfer;
     if (stream.bitrate) out["bitrate"] = stream.bitrate;
     return Json(std::move(out));
 }
@@ -1790,6 +1856,27 @@ struct PlaybackManager::Impl {
         if (!active) return http_error(404, "not_found", "transformed stream is not active");
         auto store = active->segments();
         if (name == "master.m3u8") {
+            // A real master playlist. Until 0.32.12 this URL answered with
+            // the media playlist itself, so no CODECS attribute ever reached
+            // the player and hls.js had to infer the source-buffer codecs
+            // from the init segment -- on an old MSE that dropped the muxed
+            // audio silently (Samsung Tizen 3, 2026-09-07).
+            const MediaStreamInfo* video = nullptr;
+            const MediaStreamInfo* audio = nullptr;
+            for (const auto& stream : session->probe.streams) {
+                if (stream.index == session->plan.video_stream) video = &stream;
+                if (stream.index == session->plan.audio_stream) audio = &stream;
+            }
+            const auto variant = hls_variant_stream_inf(session->plan, video, audio,
+                                                        session->probe.bitrate);
+            std::string master = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n" +
+                                 variant + "\nmedia.m3u8\n";
+            Bytes bytes(master.begin(), master.end());
+            auto response = bytes_response(request, std::move(bytes), "application/vnd.apple.mpegurl");
+            response.headers["Cache-Control"] = "no-store";
+            return response;
+        }
+        if (name == "media.m3u8") {
             auto playlist = store->playlist();
             auto state = store->snapshot();
             Log::debug("playback stream playlist session=" + session->id +
@@ -2002,8 +2089,20 @@ struct PlaybackManager::Impl {
             idempotent->cv.notify_all();
         }
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - request_started).count();
+        // What was negotiated and from what: the transforms and codecs the
+        // viewer will get, and the capabilities it advertised. A TV that
+        // claimed hevc and got a silent transcode could not be diagnosed
+        // without either (2026-09-07).
         Log::info("playback[" + trace + "] session create complete id=" + session->id +
-                  " mode=" + playback_mode_name(session->plan.mode) + " elapsed_ms=" + std::to_string(elapsed));
+                  " mode=" + playback_mode_name(session->plan.mode) +
+                  " video=" + transform_name(session->plan.video) + "/" + session->plan.video_codec +
+                  " audio=" + transform_name(session->plan.audio) + "/" + session->plan.audio_codec +
+                  (session->plan.target_height
+                       ? " target_height=" + std::to_string(*session->plan.target_height)
+                       : std::string{}) +
+                  " elapsed_ms=" + std::to_string(elapsed));
+        Log::debug("playback[" + trace + "] client capabilities " +
+                   describe_capabilities(session->capabilities));
         if (previous && !previous->generation_dir.empty() &&
             previous->generation_dir != session->generation_dir) {
             std::error_code ec;
