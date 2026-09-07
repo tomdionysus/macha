@@ -283,34 +283,6 @@ HttpResponse ranged_response(const HttpRequest& request, uint64_t size, std::str
     return response;
 }
 
-struct ClientCapabilities {
-    std::set<std::string> containers{"mp4"};
-    std::set<std::string> video_codecs{"h264"};
-    // Video codecs the client decodes *in an HLS stream* (remux or
-    // transcode), when that is a narrower set than what its media element
-    // plays directly. A 2017 TV decodes HEVC through the media element and
-    // fails it through MediaSource, and one list could not say so
-    // (2026-09-07). Empty means "same as video_codecs".
-    std::set<std::string> hls_video_codecs;
-    std::set<std::string> audio_codecs{"aac", "mp3"};
-    bool hls_fmp4{true};
-    // MPEG-TS HLS segments, for players that cannot take fragmented MP4.
-    bool hls_ts{false};
-    std::optional<int> max_width;
-    std::optional<int> max_height;
-    // Listing "hevc" says the client has a decoder for the codec, not that
-    // its pipeline handles 10-bit samples or a PQ/HLG transfer. A 2016 TV
-    // played a Dolby Vision profile 8 title (HEVC Main 10, smpte2084)
-    // "direct" and broke decoding (2026-09-07). Until a client says
-    // otherwise, sources deeper than 8 bits or with an HDR transfer are
-    // transcoded to 8-bit SDR H.264.
-    int max_video_bit_depth{8};
-    // Transfer functions the client presents ("smpte2084", "arib-std-b67").
-    // On the wire either a list of names or the boolean `hdr: true`, which
-    // means both.
-    std::set<std::string> hdr_transfers;
-};
-
 struct PlaybackPreferences {
     // Required. The server performs what it is asked for and never chooses:
     // "direct" (the source object over byte ranges), "remux" (copy the
@@ -333,15 +305,6 @@ struct PlaybackPreferences {
     bool operator==(const PlaybackPreferences&) const = default;
 };
 
-void read_string_set(const Json* object, std::string_view key, std::set<std::string>& out) {
-    if (!object || !object->isObject()) return;
-    auto value = object->find(key);
-    if (!value || !value->isArray()) return;
-    out.clear();
-    for (const auto& element : value->asArray())
-        if (element.isString()) out.insert(lower(element.asString()));
-}
-
 std::optional<int> optional_int(const Json* value) {
     if (!value || value->isNull()) return {};
     try { return static_cast<int>(value->asInt64()); } catch (...) {}
@@ -357,74 +320,6 @@ std::optional<uint64_t> optional_u64(const Json* value) {
         if (n >= 0) return static_cast<uint64_t>(n);
     } catch (...) {}
     return {};
-}
-
-// The codec set that applies to HLS delivery: hls_video_codecs when the
-// client narrowed it, otherwise its ordinary video_codecs.
-const std::set<std::string>& hls_video_codecs(const ClientCapabilities& caps) {
-    return caps.hls_video_codecs.empty() ? caps.video_codecs : caps.hls_video_codecs;
-}
-
-ClientCapabilities parse_capabilities(const Json* value) {
-    ClientCapabilities caps;
-    if (!value || !value->isObject()) return caps;
-    read_string_set(value, "containers", caps.containers);
-    read_string_set(value, "video_codecs", caps.video_codecs);
-    read_string_set(value, "hls_video_codecs", caps.hls_video_codecs);
-    read_string_set(value, "audio_codecs", caps.audio_codecs);
-    if (auto hls = value->find("hls_fmp4"); hls && hls->isBool()) caps.hls_fmp4 = hls->asBool();
-    if (auto ts = value->find("hls_ts"); ts && ts->isBool()) caps.hls_ts = ts->asBool();
-    caps.max_width = optional_int(value->find("max_width"));
-    caps.max_height = optional_int(value->find("max_height"));
-    if (caps.max_width && *caps.max_width <= 0) throw std::invalid_argument("capabilities.max_width must be positive");
-    if (caps.max_height && *caps.max_height <= 0) throw std::invalid_argument("capabilities.max_height must be positive");
-    if (auto depth = optional_int(value->find("video_bit_depth"))) {
-        if (*depth < 8 || *depth > 16) throw std::invalid_argument("capabilities.video_bit_depth must be 8-16");
-        caps.max_video_bit_depth = *depth;
-    }
-    if (auto hdr = value->find("hdr")) {
-        if (hdr->isBool()) {
-            if (hdr->asBool()) caps.hdr_transfers = {"smpte2084", "arib-std-b67"};
-        } else if (hdr->isArray()) {
-            read_string_set(value, "hdr", caps.hdr_transfers);
-        } else if (!hdr->isNull()) {
-            throw std::invalid_argument("capabilities.hdr must be a boolean or a list of transfer names");
-        }
-    }
-    return caps;
-}
-
-std::string describe_capabilities(const ClientCapabilities& caps) {
-    const auto join = [](const std::set<std::string>& values) {
-        std::string out;
-        for (const auto& value : values) {
-            if (!out.empty()) out += ',';
-            out += value;
-        }
-        return out;
-    };
-    std::string out = "containers=" + join(caps.containers) + " video=" + join(caps.video_codecs) +
-                      (caps.hls_video_codecs.empty()
-                           ? std::string{}
-                           : " hls_video=" + join(caps.hls_video_codecs)) +
-                      " audio=" + join(caps.audio_codecs) +
-                      " hls_fmp4=" + (caps.hls_fmp4 ? "yes" : "no") +
-                      " hls_ts=" + (caps.hls_ts ? "yes" : "no") +
-                      " bit_depth=" + std::to_string(caps.max_video_bit_depth) +
-                      " hdr=" + (caps.hdr_transfers.empty() ? std::string("none") : join(caps.hdr_transfers));
-    if (caps.max_width) out += " max_width=" + std::to_string(*caps.max_width);
-    if (caps.max_height) out += " max_height=" + std::to_string(*caps.max_height);
-    return out;
-}
-
-// Whether a client that decodes `video`'s codec can also take its samples
-// as they are: sample depth and transfer function are pipeline properties
-// (MSE source buffers, TV panels), separate from codec support.
-bool video_samples_supported(const MediaStreamInfo& video, const ClientCapabilities& caps) {
-    if (video.bit_depth > 8 && caps.max_video_bit_depth < video.bit_depth) return false;
-    const bool hdr_transfer =
-        video.color_transfer == "smpte2084" || video.color_transfer == "arib-std-b67";
-    return !hdr_transfer || caps.hdr_transfers.contains(video.color_transfer);
 }
 
 PlaybackPreferences parse_preferences(const Json* value, PlaybackPreferences current = {}) {
@@ -605,74 +500,6 @@ const MediaStreamInfo* stream_at(const MediaProbeResult& probe, int index) {
     return nullptr;
 }
 
-// Advisory contradictions between an explicit mode and the client's own
-// capability list. The explicit modes stay an override (the operator's
-// escape hatch), so the server says what it noticed instead of refusing:
-// each entry names a stable code, the capability field concerned, and a
-// specific message. Auto never contradicts; the list is empty then.
-Json playback_warnings_json(const MediaProbeResult& probe, const PlaybackPlan& plan,
-                            const ClientCapabilities& caps, const PlaybackPreferences& prefs,
-                            std::string_view logical_path) {
-    Json::Array out;
-    const auto add = [&](std::string field, std::string message) {
-        out.emplace_back(Json::Object{{"code", "capability_contradiction"},
-                                      {"field", std::move(field)},
-                                      {"message", std::move(message)}});
-    };
-    // Every mode is an instruction now, so any contradiction between what was
-    // asked for and what the client advertised is worth reporting -- and only
-    // reporting: the capability lists never change what the server does.
-    (void)prefs;
-    if (plan.mode == PlaybackMode::direct) {
-        // Explicit direct hands over the source file itself, whatever it is:
-        // the client asked for the bytes and takes responsibility (it is also
-        // the operator's escape hatch when a capability is wrong). Say so
-        // when the container was never advertised -- a client sending direct
-        // by default got raw Matroska it had not claimed to read, and the
-        // failure surfaced as an unexplained decode error (2026-09-07).
-        const auto container = source_container(probe, logical_path);
-        if (!container.empty() && !caps.containers.contains(container) &&
-            !(container == "matroska" && (caps.containers.contains("mkv") ||
-                                          caps.containers.contains("x-matroska"))))
-            add("containers", "the source is a " + container +
-                                  " file, which the client did not list as readable");
-    }
-    if (const auto* video = stream_at(probe, plan.video_stream);
-        video && plan.video == MediaTransform::copy) {
-        const auto codec = lower(video->codec);
-        if (!caps.video_codecs.contains(codec))
-            add("video_codecs", "the source video is " + codec +
-                                    ", which the client did not list as decodable");
-        if (plan.mode != PlaybackMode::direct && caps.video_codecs.contains(codec) &&
-            !hls_video_codecs(caps).contains(codec))
-            add("hls_video_codecs", "the source video is " + codec +
-                                        ", which the client listed for direct playback but not for"
-                                        " HLS delivery");
-        if (!video_samples_supported(*video, caps)) {
-            if (video->bit_depth > 8 && caps.max_video_bit_depth < video->bit_depth)
-                add("video_bit_depth", "the source video is " + std::to_string(video->bit_depth) +
-                                           "-bit; the client advertised " +
-                                           std::to_string(caps.max_video_bit_depth));
-            if (!video->color_transfer.empty() &&
-                !caps.hdr_transfers.contains(video->color_transfer))
-                add("hdr", "the source video uses the " + video->color_transfer +
-                               " transfer, which the client did not list");
-        }
-    }
-    if (plan.video == MediaTransform::transcode && !hls_video_codecs(caps).contains("h264"))
-        add("video_codecs", "the transcode target is h264, which the client did not list");
-    if (plan.audio == MediaTransform::transcode && !caps.audio_codecs.contains("aac"))
-        add("audio_codecs", "the transcode target is aac, which the client did not list");
-    if (const auto* audio = stream_at(probe, plan.audio_stream);
-        audio && plan.audio == MediaTransform::copy) {
-        const auto codec = lower(audio->codec);
-        if (!caps.audio_codecs.contains(codec))
-            add("audio_codecs", "the source audio is " + codec +
-                                    ", which the client did not list as decodable");
-    }
-    return Json(std::move(out));
-}
-
 std::string transform_name(MediaTransform transform) {
     switch (transform) {
     case MediaTransform::copy: return "copy";
@@ -777,7 +604,6 @@ struct PlaybackManager::Impl {
         std::string id;
         std::string token;
         std::string item_id;
-        ClientCapabilities capabilities;
         PlaybackPreferences preferences;
         MediaSource source;
         FsEntry source_entry;
@@ -958,21 +784,14 @@ struct PlaybackManager::Impl {
 
     std::string creation_fingerprint(
         std::string_view item_id, std::string_view media_id,
-        const ClientCapabilities& caps, const PlaybackPreferences& prefs,
+        const PlaybackPreferences& prefs,
         const std::optional<int64_t>& seek_ms,
         std::string_view session_id) const {
         std::ostringstream canonical;
-        canonical << "v1|item=" << item_id << "|media=" << media_id << "|containers=";
-        for (const auto& value : caps.containers) canonical << value << ',';
-        canonical << "|video=";
-        for (const auto& value : caps.video_codecs) canonical << value << ',';
-        canonical << "|hlsvideo=";
-        for (const auto& value : caps.hls_video_codecs) canonical << value << ',';
-        canonical << "|audio=";
-        for (const auto& value : caps.audio_codecs) canonical << value << ',';
-        canonical << "|hls=" << caps.hls_fmp4 << "|ts=" << caps.hls_ts
-                  << "|cw=" << caps.max_width.value_or(-1)
-                  << "|ch=" << caps.max_height.value_or(-1)
+        canonical << "v2|item=" << item_id << "|media=" << media_id
+                  << "|video=" << prefs.video.value_or("-")
+                  << "|audio=" << prefs.audio.value_or("-")
+                  << "|container=" << prefs.container
                   << "|mode=" << prefs.mode
                   << "|ph=" << prefs.max_height.value_or(-1)
                   << "|pb=" << prefs.max_bitrate.value_or(0)
@@ -1460,7 +1279,7 @@ struct PlaybackManager::Impl {
             // container (2026-09-07: three container opens per PATCH).
             << config.segment_duration.count() << '|'
             << (session.preferences.mode != "remux" &&
-                session.capabilities.video_codecs.contains("h264"));
+                false);
         return key.str();
     }
 
@@ -1499,7 +1318,7 @@ struct PlaybackManager::Impl {
         auto prepared = engine->prepare_hls_vod(session.source, session.plan,
                                                 session.probe.duration_seconds, config.segment_duration,
                                                 session.preferences.mode != "remux" &&
-                                                    session.capabilities.video_codecs.contains("h264"),
+                                                    false,
                                                 config.probe_timeout);
         session.plan = prepared.playback;
         Log::debug("playback[" + std::string(trace) + "] VOD plan ready mode=" +
@@ -1577,7 +1396,7 @@ struct PlaybackManager::Impl {
     }
 
     std::shared_ptr<Session> resolve_session(std::string item_id, std::vector<std::string> media_ids,
-                                             ClientCapabilities capabilities, PlaybackPreferences preferences,
+                                             PlaybackPreferences preferences,
                                              std::string_view trace,
                                              std::string existing_id = {}, std::string existing_token = {}) {
         if (media_ids.empty()) throw std::runtime_error("no media representations are available");
@@ -1626,7 +1445,6 @@ struct PlaybackManager::Impl {
         session->id = existing_id.empty() ? hex_token(16) : std::move(existing_id);
         session->token = existing_token.empty() ? hex_token() : std::move(existing_token);
         session->item_id = std::move(item_id);
-        session->capabilities = std::move(capabilities);
         session->preferences = std::move(preferences);
         session->source_entry = best->lease.entry;
         session->source = media_source(best->lease);
@@ -1647,7 +1465,6 @@ struct PlaybackManager::Impl {
         session->id = old.id;
         session->token = old.token;
         session->item_id = old.item_id;
-        session->capabilities = old.capabilities;
         session->preferences = old.preferences;
         session->source = old.source;
         session->source_entry = old.source_entry;
@@ -1685,7 +1502,6 @@ struct PlaybackManager::Impl {
         session->id = old.id;
         session->token = old.token;
         session->item_id = old.item_id;
-        session->capabilities = old.capabilities;
         session->preferences = std::move(preferences);
         session->source = old.source;
         session->source_entry = old.source_entry;
@@ -1810,9 +1626,6 @@ struct PlaybackManager::Impl {
                          {"duration_ms", static_cast<uint64_t>(std::max(0.0, session.probe.duration_seconds) * 1000.0)},
                          {"seek_ms", static_cast<uint64_t>(std::max<int64_t>(0, session.plan.seek.count()))},
                          {"preferences", preferences_json(session.preferences)},
-                         {"warnings", playback_warnings_json(session.probe, session.plan,
-                                                             session.capabilities, session.preferences,
-                                                             session.source.logical_path)},
                          {"selection", Json(std::move(selected))},
                          {"source", Json(std::move(source))},
                          {"output", output_json(session.probe, session.plan, session.probe.format)},
@@ -2130,7 +1943,6 @@ struct PlaybackManager::Impl {
         if (auto v = root.find("item_id"); v && v->isString()) item_id = v->asString();
         if (auto v = root.find("media_id"); v && v->isString()) media_id = v->asString();
         if (item_id.empty() && media_id.empty()) return http_error(400, "bad_request", "item_id or media_id is required");
-        auto caps = parse_capabilities(root.find("capabilities"));
         auto prefs = parse_preferences(root.find("preferences"));
         std::optional<int64_t> seek_ms;
         if (auto seek = root.find("seek_ms")) {
@@ -2155,7 +1967,7 @@ struct PlaybackManager::Impl {
         std::shared_ptr<IdempotentCreation> idempotent;
         bool idempotent_owner = false;
         if (!idempotency_key.empty()) {
-            fingerprint = creation_fingerprint(item_id, media_id, caps, prefs, seek_ms,
+            fingerprint = creation_fingerprint(item_id, media_id, prefs, seek_ms,
                                                request.session->id);
             {
                 std::lock_guard lock(mutex);
@@ -2223,7 +2035,7 @@ struct PlaybackManager::Impl {
                 deterministic_id = std::move(credentials.first);
                 deterministic_token = std::move(credentials.second);
             }
-            session = resolve_session(item_id, std::move(media), std::move(caps), std::move(prefs), trace,
+            session = resolve_session(item_id, std::move(media), std::move(prefs), trace,
                                       std::move(deterministic_id), std::move(deterministic_token));
             session->logical_session = logical_session;
             if (previous) session->generation = previous->generation;
@@ -2288,8 +2100,6 @@ struct PlaybackManager::Impl {
                        ? " target_height=" + std::to_string(*session->plan.target_height)
                        : std::string{}) +
                   " elapsed_ms=" + std::to_string(elapsed));
-        Log::debug("playback[" + trace + "] client capabilities " +
-                   describe_capabilities(session->capabilities));
         if (previous && !previous->generation_dir.empty() &&
             previous->generation_dir != session->generation_dir) {
             std::error_code ec;
@@ -2393,7 +2203,7 @@ struct PlaybackManager::Impl {
                              ? (old->item_id.empty() ? std::vector<std::string>{old->source.media_id}
                                                      : item_media(old->item_id))
                              : std::vector<std::string>{media_override};
-            replacement = resolve_session(old->item_id, std::move(media), old->capabilities, prefs,
+            replacement = resolve_session(old->item_id, std::move(media), prefs,
                                           trace, old->id, old->token);
             replacement->logical_session = old->logical_session;
             replacement->generation = old->generation;
