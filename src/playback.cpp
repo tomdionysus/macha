@@ -422,8 +422,18 @@ PlaybackPlan plan_for(const MediaProbeResult& probe, const PlaybackPreferences& 
     plan.video_codec = video ? lower(video->codec) : std::string{};
     plan.audio_codec = audio ? lower(audio->codec) : std::string{};
 
-    // Direct is the source object itself over byte ranges.
+    // Direct is the source object itself over byte ranges: no container
+    // change and no re-encode. Asking for one alongside it describes something
+    // direct is not doing, so it is refused rather than quietly ignored.
     if (prefs.mode == "direct") {
+        if ((prefs.video && *prefs.video != "copy") || (prefs.audio && *prefs.audio != "copy"))
+            throw std::invalid_argument(
+                "direct serves the source file untouched and copies every stream: ask for "
+                "mode=transcode to re-encode one");
+        if (prefs.max_height || prefs.max_bitrate)
+            throw std::invalid_argument(
+                "direct serves the source file untouched: a quality instruction is a re-encode "
+                "and requires mode=transcode");
         plan.mode = PlaybackMode::direct;
         return plan;
     }
@@ -460,6 +470,22 @@ PlaybackPlan plan_for(const MediaProbeResult& probe, const PlaybackPreferences& 
                 "preferences.video=copy cannot be combined with preferences.max_bitrate");
         video_copy = false;
     }
+
+    // The mode has to describe what is actually being done. remux repackages
+    // and copies every stream; transcode re-encodes at least one and may copy
+    // the other. A mode that names something it is not doing is refused, not
+    // silently reinterpreted: until 0.32.20 a remux with a re-encoded stream
+    // came back reported as a transcode, and a transcode with both streams
+    // copied came back reported as a remux (2026-09-07).
+    const bool re_encoding = (video && !video_copy) || (audio && !audio_copy);
+    if (prefs.mode == "remux" && re_encoding)
+        throw std::invalid_argument(
+            "remux repackages and copies every stream: to re-encode one, ask for mode=transcode "
+            "with video=copy or audio=copy for the stream that is being copied");
+    if (prefs.mode == "transcode" && !re_encoding)
+        throw std::invalid_argument(
+            "transcode re-encodes at least one stream: to copy both into a new container, ask "
+            "for mode=remux");
 
     // What the segment container can physically carry. This is a fact about
     // the media and the muxer, not about the client.
@@ -1550,9 +1576,20 @@ struct PlaybackManager::Impl {
         Json::Object selected{{"video_stream", session.plan.video_stream},
                               {"audio_stream", session.plan.audio_stream},
                               {"subtitle_stream", session.plan.subtitle_stream}};
+        // What else this media could be asked for. Per-stream transforms and
+        // quality belong to the mode that was asked for, so they are dropped
+        // when asking about a different one: carrying max_height into a remux
+        // probe asks an illegal question and answers "remux is unavailable".
+        const auto without_mode_overrides = [](PlaybackPreferences preferences) {
+            preferences.video.reset();
+            preferences.audio.reset();
+            preferences.max_height.reset();
+            preferences.max_bitrate.reset();
+            return preferences;
+        };
         Json::Array modes{Json("direct")};
         for (const auto* candidate : {"remux", "transcode"}) {
-            auto preferences = session.preferences;
+            auto preferences = without_mode_overrides(session.preferences);
             preferences.mode = candidate;
             try {
                 const auto plan = plan_for(session.probe, preferences);
@@ -1564,7 +1601,10 @@ struct PlaybackManager::Impl {
             static constexpr std::array<int, 6> candidates{2160, 1440, 1080, 720, 480, 360};
             for (const auto height : candidates) {
                 if (height >= video->height) continue;
-                auto preferences = session.preferences;
+                // A quality change is a re-encode, so the question is only
+                // ever "could this be transcoded to that height".
+                auto preferences = without_mode_overrides(session.preferences);
+                preferences.mode = "transcode";
                 preferences.max_height = height;
                 try {
                     const auto plan = plan_for(session.probe, preferences);
