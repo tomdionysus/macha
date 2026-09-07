@@ -55,6 +55,32 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **0.32.7 (operator: "WAN control-lane starvation is paramount")** —
+  measured first (14:05-14:30): WAN RTT under load 58→60-87 ms (ss/ping
+  from both ends), so the link's queue was not the seconds. What was:
+  node-d `retain_objects` handler avg 916 ms, max **12,113 ms** per batch
+  (status `rpc_server.message_timings`), matching node-c's 12,467 ms
+  mutation (delta 34,791 B; small deltas 250-2,000 ms); the handler still
+  `valid()`-re-read every extent of every claimed file (a quantum re-claims
+  the whole file) — the remote twin of finding #3. And node-id order put
+  node-e (333c…) before node-d (6883…) for every node-c commit. Fix: has()
+  on the handler, no DATA admission; per-peer control-lane latency EWMA in
+  the transport; `order_commit_replicas` local→nearest→unmeasured; mutate
+  log line + status timing breakdown (`mutation_retention_ms_*`,
+  `mutation_publish_ms_*`, `rpc_transport.peer_latency_ms`). Verify after
+  deploy: node-d retain_objects handler_max ≪ 1 s; node-c mutate p90 well
+  under 1 s; `rpc_transport.peer_latency_ms` on node-c shows node-d at a
+  few ms and node-e at 60+ ms; a `metadata commit store replica=` line from
+  node-c names node-e only when node-d failed; node-e's nearest is whichever
+  node-c answers faster (expect node-d, the idle 16 GB box).
+  Remaining in this area: DATA-lane pacing against control RTT (not the
+  bottleneck today), retention-journal growth from whole-file re-claims.
+- **UI session report (14:20):** transcode generation setup on a 9 GB
+  HEVC/DV title costs 5-13 s per PATCH (server-side x264 full-res CRF 20,
+  4 threads, no reuse across preference-only changes; `auto` picks
+  transcode for an HEVC-capable client, DV/HDR suspected). Queued under
+  viewer-facing items; not this iteration.
+
 - **13:00 node-c load mitigation.** After the relaunch macha itself ran at
   360 % CPU (3.6 of 4 cores) hashing/encrypting the 3.2 GB spool backlog;
   `vcgencmd get_throttled` = 0x50000 (under-voltage and throttling have

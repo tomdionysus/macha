@@ -1804,12 +1804,20 @@ void RpcClient::dispatch_inbound_cancel(const NodeInfo& peer, uint64_t request_i
 }
 
 void RpcClient::observe_result(const std::string& connection_key, bool success,
-                               std::chrono::milliseconds) {
+                               std::chrono::milliseconds elapsed) {
     std::lock_guard lock(mutex_);
     auto& health = health_[connection_key];
     if (success) {
         health.failures = 0;
         health.retry_after = {};
+        static const std::string control_suffix =
+            std::string(":") + transport_lane_name(TransportLane::control);
+        if (connection_key.ends_with(control_suffix)) {
+            const auto sample = static_cast<double>(elapsed.count());
+            health.control_latency_ms = health.control_latency_ms
+                                            ? *health.control_latency_ms * 0.8 + sample * 0.2
+                                            : sample;
+        }
         return;
     }
 
@@ -1817,6 +1825,34 @@ void RpcClient::observe_result(const std::string& connection_key, bool success,
     auto shift = std::min(health.failures - 1, 4U);
     auto backoff = std::chrono::milliseconds(250 * (1U << shift));
     health.retry_after = Clock::now() + backoff;
+}
+
+std::map<NodeId, std::chrono::milliseconds> RpcClient::peer_latencies() const {
+    std::lock_guard lock(mutex_);
+    static const std::string control_suffix =
+        std::string(":") + transport_lane_name(TransportLane::control);
+    std::map<NodeId, std::chrono::milliseconds> out;
+    for (const auto& [key, health] : health_) {
+        if (!health.control_latency_ms || !key.ends_with(control_suffix))
+            continue;
+        const auto peer = endpoint_peers_.find(key.substr(0, key.size() - control_suffix.size()));
+        if (peer == endpoint_peers_.end())
+            continue;
+        const auto value = std::chrono::milliseconds(
+            static_cast<int64_t>(std::llround(*health.control_latency_ms)));
+        auto [slot, inserted] = out.emplace(peer->second, value);
+        if (!inserted && value < slot->second)
+            slot->second = value;
+    }
+    return out;
+}
+
+std::optional<std::chrono::milliseconds> RpcClient::peer_latency(const NodeId& peer) const {
+    auto all = peer_latencies();
+    const auto found = all.find(peer);
+    if (found == all.end())
+        return std::nullopt;
+    return found->second;
 }
 
 void RpcClient::reap_retired() {
