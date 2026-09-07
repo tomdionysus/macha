@@ -328,16 +328,30 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
         throw std::runtime_error("cannot open accounting state: " + std::string(strerror(errno)));
 
     // Packed indexes are deliberately derived from the authoritative append-only
-    // records at every start. If packs exist, reconcile physical accounting too;
-    // this prevents a stale clean accounting checkpoint from hiding a torn tail.
-    const bool have_packs = std::filesystem::directory_iterator(packs_) !=
-                            std::filesystem::directory_iterator();
-    if (!have_packs && restore_accounting()) {
+    // records at every start. A *clean* accounting checkpoint is trustworthy
+    // with packs too: ensure_accounting_dirty() persists "dirty" before the
+    // first mutation of a session, so a torn pack tail can only exist behind
+    // a dirty checkpoint. Until 0.32.3 any pack forced a full walk of the
+    // object tree on every start (4 min on gbni-1, 25+ min on es-1 under
+    // import load) with every put waiting for it -- a write outage after
+    // each restart. A dirty checkpoint is carried as an estimate while the
+    // walk reconciles; puts are admitted against it (the configured
+    // reserve_free headroom covers the bounded error) and the walk's total
+    // replaces it when done.
+    bool clean = false;
+    const bool restored = restore_accounting(&clean);
+    if (restored && clean) {
         accounting_trusted_.store(true, std::memory_order_release);
         scan_complete_.store(true, std::memory_order_release);
         Log::debug("storage accounting restored path=" + root_.string() +
                    " used=" + std::to_string(used_.load(std::memory_order_relaxed)));
     } else {
+        if (restored) {
+            accounting_estimate_.store(true, std::memory_order_release);
+            Log::info("storage accounting estimate path=" + root_.string() +
+                      " used=" + std::to_string(used_.load(std::memory_order_relaxed)) +
+                      " (dirty checkpoint; admitting writes while the scan reconciles)");
+        }
         scan_thread_ = std::jthread([this](std::stop_token stop) {
             run_supervised("local-store-scan", [this, stop] {
                 try {
@@ -402,7 +416,7 @@ void LocalStore::persist_accounting(uint64_t used, uint8_t operation, const Obje
         throw std::runtime_error("cannot sync accounting state: " + std::string(strerror(errno)));
 }
 
-bool LocalStore::restore_accounting() {
+bool LocalStore::restore_accounting(bool* clean) {
     std::optional<AccountingRecord> best;
     unsigned best_slot = 0;
     for (unsigned slot = 0; slot < 2; ++slot) {
@@ -415,10 +429,12 @@ bool LocalStore::restore_accounting() {
             best_slot = slot;
         }
     }
-    if (!best || best->operation == accounting_dirty) return false;
+    if (!best) return false;
     accounting_sequence_ = best->sequence;
     accounting_slot_ = best_slot;
     used_.store(best->used, std::memory_order_relaxed);
+    if (clean)
+        *clean = best->operation != accounting_dirty;
     return true;
 }
 
@@ -1572,7 +1588,7 @@ bool LocalStore::compact_packs_locked(std::unique_lock<std::mutex>& lock) {
 bool LocalStore::compact_packs(std::stop_token stop) {
     std::unique_lock pack_io_lock(pack_io_mutex_);
     std::unique_lock lock(m_);
-    if (!wait_for_accounting(lock, stop)) return false;
+    if (!wait_for_accounting(lock, stop, true)) return false;
     return compact_packs_locked(lock);
 }
 
@@ -1581,7 +1597,12 @@ void LocalStore::wait_for_accounting(std::unique_lock<std::mutex>& lock) const {
 }
 
 bool LocalStore::wait_for_accounting(std::unique_lock<std::mutex>& lock,
-                                     std::stop_token stop) const {
+                                     std::stop_token stop, bool exact) const {
+    // Ordinary puts/removes proceed on a checkpoint estimate; only callers
+    // that need the reconciled figure (compaction) wait for the walk.
+    if (!exact && accounting_estimate_.load(std::memory_order_acquire) &&
+        !scan_failed_.load(std::memory_order_acquire))
+        return true;
     std::stop_callback wake_waiter(stop, [this] { accounting_cv_.notify_all(); });
     accounting_cv_.wait(lock, [this, stop] {
         return scan_complete_.load(std::memory_order_acquire) ||
@@ -1640,7 +1661,14 @@ void LocalStore::scan(std::stop_token stop) {
     }
     {
         std::lock_guard lock(m_);
-        used_.store(total, std::memory_order_relaxed);
+        // Writes admitted against the estimate during the walk may or may
+        // not have been seen by it; keep the larger figure (over-counting is
+        // the safe direction, and bounded by what was written meanwhile).
+        const auto running = used_.load(std::memory_order_relaxed);
+        used_.store(accounting_estimate_.load(std::memory_order_acquire) ? std::max(total, running)
+                                                                          : total,
+                    std::memory_order_relaxed);
+        accounting_estimate_.store(false, std::memory_order_release);
         accounting_trusted_.store(true, std::memory_order_release);
         if (mode_ != LocalStoreMode::ephemeral) {
             accounting_dirty_ = true;

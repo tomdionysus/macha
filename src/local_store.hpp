@@ -118,6 +118,10 @@ class LocalStore {
     std::atomic_bool scan_complete_{};
     std::atomic_bool scan_failed_{};
     std::atomic_bool accounting_trusted_{};
+    // A dirty checkpoint's `used` is carried as an estimate while the
+    // reconciling scan runs, so puts and removes are admitted against it
+    // instead of waiting minutes for the walk (see the constructor).
+    std::atomic_bool accounting_estimate_{};
     int accounting_fd_{-1};
     uint64_t accounting_sequence_{};
     unsigned accounting_slot_{};
@@ -139,8 +143,9 @@ class LocalStore {
 
     std::filesystem::path path(const ObjectId&) const;
     void wait_for_accounting(std::unique_lock<std::mutex>&) const;
-    bool wait_for_accounting(std::unique_lock<std::mutex>&, std::stop_token) const;
-    bool restore_accounting();
+    bool wait_for_accounting(std::unique_lock<std::mutex>&, std::stop_token,
+                             bool exact = false) const;
+    bool restore_accounting(bool* clean);
     void persist_accounting(uint64_t used, uint8_t operation, const ObjectId&, uint64_t size,
                             bool durable);
     void ensure_accounting_dirty(std::unique_lock<std::mutex>&);

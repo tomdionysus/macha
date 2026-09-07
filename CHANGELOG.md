@@ -1,5 +1,32 @@
 # Current release
 
+## 0.32.3 — A restart is not a write outage; a retention claim is not a re-read (development)
+
+Third and fourth findings from the full-library import (2026-09-07 04:17–04:45,
+es-1): after a restart the object store walked its whole tree to reconcile
+accounting (4 min on gbni-1, 25+ min on es-1 with the import saturating
+the disk) and **every put waited for it** — the spool replay, the import
+and gbni-1's retention claims to es-1 all stalled, and gbni-1's data
+publications queued behind the metadata mutation waiting on that claim.
+Meanwhile every metadata mutation's retention step re-read, decrypted and
+hashed each extent it claimed, holding the store lock long enough that all
+16 HTTP workers sat in `LocalStore::has` and `/api/v1/status` did not
+answer for 40 s.
+
+- **Clean accounting checkpoints are trusted even when packs exist.**
+  `ensure_accounting_dirty()` persists "dirty" before the first mutation of
+  a session, so a torn pack tail can only sit behind a dirty checkpoint; the
+  "any pack forces a walk" rule was redundant. A dirty checkpoint's figure is
+  carried as an estimate while the walk reconciles in the background, and
+  puts/removes are admitted against it (`storage accounting estimate` log
+  line; the configured `reserve_free` headroom covers the bounded error);
+  only pack compaction waits for the exact figure. The walk's total replaces
+  the estimate, keeping the larger of the two.
+- **A local retention claim checks presence, not content.** `retain_on`
+  uses `has()` — the same contract discipline 1 wrote down for durability —
+  instead of the full `valid()` re-read of every extent; the scrub is where
+  later corruption is found.
+
 ## 0.32.2 — Namespace batches under an identity; utimens survives publication (development)
 
 Two more findings from the full-library import (2026-09-07 02:30–03:30):

@@ -744,13 +744,20 @@ bool DistributedStore::retain_on(const NodeInfo& target, RetentionClass object_c
                 n_.config().extent_size);
             if (!resource)
                 return false;
-            // Unlike has_on()'s candidate probe, this is the actual retention
-            // commit: it must not record a durability claim over content that
-            // turns out to be corrupt, so it deliberately stays on the full
-            // verified path rather than the cheap presence check.
+            // A retention claim says "this node holds the object". Until
+            // 0.32.3 it re-read, decrypted and hashed every extent here (the
+            // full valid() path) inside the metadata mutation: minutes per
+            // publication on a busy node, with the store mutex held for the
+            // duration so every HTTP request -- status and playback included
+            // -- queued behind it (es-1, 2026-09-07: 16 HTTP workers blocked
+            // in LocalStore::has, status unavailable for 40 s+). Presence in
+            // the index is the same contract discipline 1 wrote down for
+            // durability ("present after a restart is durable"): the bytes
+            // were verified when this node put them, and the scrub, not the
+            // retention claim, is where later corruption is found.
             const bool present = object_class == RetentionClass::data
-                                     ? n_.local_store().valid(id)
-                                     : n_.control_store().valid(id);
+                                     ? n_.local_store().has(id)
+                                     : n_.control_store().has(id);
             if (!present)
                 return false;
         }

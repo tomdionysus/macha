@@ -1854,6 +1854,79 @@ MACHA_TEST("invariants", test_accounting_dirty_marker_is_process_session_scoped)
 #endif
 }
 
+MACHA_TEST("invariants", test_clean_accounting_checkpoint_is_trusted_with_packs) {
+    // Until 0.32.3 the presence of any pack forced a full walk of the object
+    // tree on every start, with every put waiting for it (a write outage of
+    // minutes after each restart on the production nodes). A clean checkpoint
+    // is trustworthy with packs: "dirty" is persisted before the first
+    // mutation of a session, so a torn pack tail can only sit behind a dirty
+    // checkpoint.
+    TempDir t;
+    const auto keyfile = t.path() / "cluster.key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto root = t.path() / "objects";
+    // Objects at or below pack_threshold are packed.
+    const LocalStoreOptions packed{64ULL * 1024 * 1024, 0, 256 * 1024, 1024 * 1024};
+    const auto a = pattern(48 * 1024, 150);
+    const auto b = pattern(48 * 1024, 151);
+    uint64_t clean_used = 0;
+    {
+        LocalStore store(root, packed, keys.storage, LocalStoreMode::authoritative, {});
+        REQUIRE(wait_until([&] { return store.scan_complete(); }, 5s));
+        const auto generation = store.put_deferred(object_id(a), a);
+        REQUIRE(generation.has_value());
+        store.durability_barrier(*generation);
+        clean_used = store.used();
+        REQUIRE(clean_used > 0);
+    }
+    bool have_packs = false;
+    for (const auto& entry : std::filesystem::directory_iterator(root / "packs"))
+        have_packs = have_packs || entry.is_regular_file();
+    REQUIRE(have_packs);
+    {
+        // Clean shutdown above: no scan, accounting restored immediately.
+        LocalStore store(root, packed, keys.storage, LocalStoreMode::authoritative, {});
+        CHECK(store.scan_complete());
+        CHECK(store.used() == clean_used);
+        REQUIRE(store.get(object_id(a)).has_value());
+    }
+
+    // Unclean exit after a mutation: the checkpoint is dirty. The store must
+    // still admit a put before the walk completes, on the estimate.
+    const auto child = ::fork();
+    REQUIRE(child >= 0);
+    if (child == 0) {
+        try {
+            LocalStore store(root, packed, keys.storage, LocalStoreMode::authoritative, {});
+            if (!store.scan_complete())
+                _exit(20);
+            const auto generation = store.put_deferred(object_id(b), b);
+            if (!generation.has_value())
+                _exit(21);
+            store.durability_barrier(*generation);
+            _exit(0);
+        } catch (...) {
+            _exit(22);
+        }
+    }
+    int status = 0;
+    REQUIRE(::waitpid(child, &status, 0) == child);
+    REQUIRE(WIFEXITED(status));
+    REQUIRE(WEXITSTATUS(status) == 0);
+    {
+        LocalStore recovered(root, packed, keys.storage, LocalStoreMode::authoritative, {});
+        CHECK(recovered.used() >= clean_used); // the dirty checkpoint's estimate
+        const auto c = pattern(48 * 1024, 152);
+        // Admitted whether or not the walk has finished yet.
+        REQUIRE(recovered.put_deferred(object_id(c), c).has_value());
+        REQUIRE(wait_until([&] { return recovered.scan_complete(); }, 5s));
+        REQUIRE(recovered.get(object_id(b)).has_value());
+        REQUIRE(recovered.get(object_id(c)).has_value());
+        CHECK(recovered.used() > clean_used);
+    }
+}
+
 MACHA_TEST("invariants", test_unclean_accounting_recovery_establishes_durable_baseline) {
 #if defined(__linux__)
     TempDir t;
