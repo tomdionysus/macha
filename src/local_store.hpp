@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -109,6 +110,13 @@ class LocalStore {
     std::function<void()> before_pack_compaction_for_tests_;
     static constexpr size_t verified_loose_limit = 4096;
     mutable std::map<ObjectId, VerifiedLoose> verified_loose_;
+    // Loose objects known present: installed by this process or seen by a
+    // positive has() stat, forgotten on remove. has() answers from here
+    // before touching the disk. A quantum commit re-claims every extent of
+    // its file, and a cold dentry stat on a disk saturated by the import
+    // cost ~5 ms each: 3,201 extents took 16 s per commit (gbni-1,
+    // 2026-09-07). ~40 B per object; a 200k-object node spends ~8 MB.
+    mutable std::set<ObjectId> present_loose_;
     mutable std::deque<std::pair<uint64_t, ObjectId>> verified_loose_order_;
     mutable uint64_t verified_loose_sequence_{};
     std::atomic_uint64_t loose_reaffirmation_fast_paths_{};

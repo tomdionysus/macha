@@ -651,6 +651,30 @@ void Service::retain_metadata_publication(const MetadataPublicationContext& cont
     const RetentionDot dot{context.origin, context.sequence};
     std::vector<ObjectId> data;
     std::vector<ObjectId> control;
+    // Phase timing for the pre-publication barrier: on the live cluster
+    // (2026-09-07) mutations spent 9-15 s here while retain_data() itself
+    // reported nothing over 250 ms, so the seconds were in the collection
+    // step (a full parent snapshot decode, catalogue root diffs) or the
+    // CONTROL claim. Name the phase instead of guessing.
+    const auto barrier_started = Clock::now();
+    uint64_t decode_ms = 0, collect_ms = 0, catalogue_ms = 0, data_ms = 0, control_ms = 0;
+    const auto since_ms = [](Clock::time_point t) {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t).count());
+    };
+    const auto report = [&](const char* outcome) {
+        const auto total = since_ms(barrier_started);
+        if (total >= 250 && Log::enabled(LogLevel::debug))
+            Log::debug("metadata retention barrier total_ms=" + std::to_string(total) +
+                       " decode_ms=" + std::to_string(decode_ms) +
+                       " collect_ms=" + std::to_string(collect_ms) +
+                       " catalogue_ms=" + std::to_string(catalogue_ms) +
+                       " data_ms=" + std::to_string(data_ms) +
+                       " control_ms=" + std::to_string(control_ms) +
+                       " data_objects=" + std::to_string(data.size()) +
+                       " control_objects=" + std::to_string(control.size()) +
+                       " outcome=" + outcome);
+    };
 
     auto add_entry = [&](const FsEntry& entry) {
         if (entry.type != EntryType::file)
@@ -660,7 +684,10 @@ void Service::retain_metadata_publication(const MetadataPublicationContext& cont
                 data.push_back(extent.id);
     };
 
+    const auto decode_started = Clock::now();
     auto before = decode_snapshot(context.parent.payload);
+    decode_ms = since_ms(decode_started);
+    const auto collect_started = Clock::now();
     const bool establish_baseline =
         !before.retention_baseline_complete && context.proposed.retention_baseline_complete;
     if (establish_baseline) {
@@ -704,8 +731,10 @@ void Service::retain_metadata_publication(const MetadataPublicationContext& cont
             context.delta ? context.delta->catalogue != CatalogueDelta::unchanged
                           : before.catalogue_root != context.proposed.catalogue_root;
         if (catalogue_changed && context.proposed.catalogue_root) {
+            const auto catalogue_started = Clock::now();
             auto objects = catalogue_->retention_objects(before.catalogue_root,
                                                          context.proposed.catalogue_root);
+            catalogue_ms += since_ms(catalogue_started);
             data.insert(data.end(), objects.data.begin(), objects.data.end());
             control.insert(control.end(), objects.control.begin(), objects.control.end());
         }
@@ -729,12 +758,25 @@ void Service::retain_metadata_publication(const MetadataPublicationContext& cont
     data.erase(std::unique(data.begin(), data.end()), data.end());
     std::sort(control.begin(), control.end());
     control.erase(std::unique(control.begin(), control.end()), control.end());
+    collect_ms = since_ms(collect_started) - catalogue_ms;
 
-    if (!data.empty() && !store_->retain_data(data, dot))
+    const auto data_started = Clock::now();
+    const bool data_ok = data.empty() || store_->retain_data(data, dot);
+    data_ms = since_ms(data_started);
+    if (!data_ok) {
+        report("data-floor-unavailable");
         throw MetadataNotReady("DATA retention floor unavailable before metadata publication");
-    if (!control.empty() &&
-        !store_->retain_control(control, dot, context.proposed.metadata_write_replicas_required))
+    }
+    const auto control_started = Clock::now();
+    const bool control_ok =
+        control.empty() ||
+        store_->retain_control(control, dot, context.proposed.metadata_write_replicas_required);
+    control_ms = since_ms(control_started);
+    if (!control_ok) {
+        report("control-floor-unavailable");
         throw MetadataNotReady("CONTROL retention floor unavailable before metadata publication");
+    }
+    report("ok");
     signal_maintenance(ServiceEvent::storage);
 }
 

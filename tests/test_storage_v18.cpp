@@ -519,7 +519,9 @@ MACHA_TEST("storage_v18", test_has_is_a_cheap_presence_check_not_a_decrypt) {
     options.limit = 64ULL * 1024 * 1024;
     options.pack_threshold = 256 * 1024;
     options.pack_target_size = 1024 * 1024;
-    LocalStore store(t.path() / "store", options, keys.storage);
+    std::optional<LocalStore> store_holder;
+    store_holder.emplace(t.path() / "store", options, keys.storage);
+    auto& store = *store_holder;
 
     // Loose (above pack_threshold) and packed (below it) objects exercise the
     // two different presence-check code paths.
@@ -556,8 +558,12 @@ MACHA_TEST("storage_v18", test_has_is_a_cheap_presence_check_not_a_decrypt) {
     CHECK(!store.has(ObjectId{}));
 
     // A loose write is temp-file-then-rename, so a real object is never
-    // observed partially written; a zero-byte file only happens after
-    // external corruption/truncation and must not be reported present.
+    // observed partially written; a zero-byte file only happens after a
+    // crash (rename durable, data not) or external truncation. Since 0.32.9
+    // has() remembers what this process installed instead of stat'ing it
+    // again (3,201 cold stats took 16 s per quantum commit on a saturated
+    // disk), so the zero-byte file is caught where it can actually appear:
+    // by the next process to open the store, and by any read.
     auto truncated = pattern(512 * 1024, 0x73);
     auto truncated_id = object_id(truncated);
     REQUIRE(store.put(truncated_id, truncated));
@@ -567,7 +573,11 @@ MACHA_TEST("storage_v18", test_has_is_a_cheap_presence_check_not_a_decrypt) {
                               std::ios::binary | std::ios::trunc);
         REQUIRE(truncate.good());
     }
-    CHECK(!store.has(truncated_id));
+    CHECK(!store.valid(truncated_id));
+    store_holder.reset();
+    LocalStore reopened(t.path() / "store", options, keys.storage);
+    CHECK(!reopened.has(truncated_id));
+    CHECK(reopened.has(loose_id));
 }
 
 MACHA_TEST("storage_v18", test_metadata_control_store_is_independent_of_data_quota) {

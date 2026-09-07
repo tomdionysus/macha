@@ -564,6 +564,7 @@ void LocalStore::remember_verified_loose_locked(const ObjectId& id,
 
 void LocalStore::forget_verified_loose_locked(const ObjectId& id) const {
     verified_loose_.erase(id);
+    present_loose_.erase(id);
 }
 
 void LocalStore::select_active_pack_locked(uint64_t next_record_size) {
@@ -869,6 +870,7 @@ bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> d
         reserved_write_bytes_ -= need;
         used_.fetch_add(need, std::memory_order_relaxed);
         remember_verified_loose_locked(id, *installed_stamp);
+        present_loose_.insert(id);
         uint64_t generation = 0;
         if (!ephemeral && durability_domain_) {
             generation = durability_domain_->complete_mutation(p, p.parent_path());
@@ -1106,12 +1108,17 @@ bool LocalStore::has(const ObjectId& id) const noexcept {
         std::lock_guard object_guard(*object_lock);
         {
             std::lock_guard lock(m_);
-            if (packed_.contains(id))
+            if (packed_.contains(id) || present_loose_.contains(id))
                 return true;
         }
         std::error_code error;
         const auto size = std::filesystem::file_size(path(id), error);
-        return !error && size > 0;
+        const bool present = !error && size > 0;
+        if (present) {
+            std::lock_guard lock(m_);
+            present_loose_.insert(id);
+        }
+        return present;
     } catch (...) {
         return false;
     }

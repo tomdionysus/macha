@@ -1,5 +1,29 @@
 # Current release
 
+## 0.32.9 — Presence is remembered, not stat'ed; the barrier names its phase (development)
+
+0.32.8's barrier line on gbni-1: `DATA retention barrier ids=3201 nodes=1
+total_ms=16317 scan_ms=16048 short=0` for one quantum commit of a 16 GB
+file, and 357 ms for the next: the presence scan is a `stat` per extent,
+~5 ms each when the import has pushed the dentries out of the page cache.
+The bounded verified-loose cache (4,096 entries) could not hold the file.
+
+- `LocalStore` keeps an unbounded in-memory set of loose objects known
+  present (installed by this process, or seen by a positive `has()` stat;
+  forgotten on remove). `has()` answers from it before touching the disk.
+- `Service::retain_metadata_publication` logs its phases at debug when it
+  takes 250 ms or more: `metadata retention barrier total_ms= decode_ms=
+  collect_ms= catalogue_ms= data_ms= control_ms= data_objects=
+  control_objects= outcome=`. es-1 and gbni-1 both showed 9-15 s
+  `retention_ms` on 93-byte deltas with no `DATA retention barrier` line,
+  so the seconds are outside `retain_data()`; the next slow one says where.
+
+Observed while here, for the operator: both writers run
+`min_write_replicas: 1`, so a put is durable on one copy and the second is
+background repair. That is the mechanism of finding #6 (a writer's death
+strands its recent data) and it makes "replicated" a promise repair keeps
+later, not the write.
+
 ## 0.32.8 — The writer's retention barrier fans out in parallel and measures itself (development)
 
 After 0.32.7 the replica-side claim handler read 0 ms and commit fan-out

@@ -68,6 +68,11 @@ current at every checkpoint; a fresh session reads only this and the plan.
   **Topology (operator via UI session):** gbni-2 is on flaky wifi; gbni-1
   wired; es-1 remote. Latency is directional (toward gbni-2 slow, from it
   fast). Nearest = measured, never same-site.
+- **0.32.8 DEPLOYED (commit `4c84932`), spaced rolling restart with a
+  playback check before each: gbni-2 13:53, gbni-1 13:59 (staged
+  binaries), es-1 15:05 CEST; no viewer active at any of them.** gbni-1's
+  import took the mount blip as `rc=11` and re-ran Movies (attempt 2) —
+  the retry rule works. Verification sweep: next entry.
 - **0.32.8 (in test):** `retain_on` claims fan out concurrently; local
   presence checks drop the per-id 4 MB loader lease (thousands per
   quantum commit, queued behind the node's own publications); barrier
