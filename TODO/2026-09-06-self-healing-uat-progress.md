@@ -68,6 +68,11 @@ current at every checkpoint; a fresh session reads only this and the plan.
   **Topology (operator via UI session):** node-d is on flaky wifi; node-c
   wired; node-e remote. Latency is directional (toward node-d slow, from it
   fast). Nearest = measured, never same-site.
+- **0.32.8 DEPLOYED (commit `4c84932`), spaced rolling restart with a
+  playback check before each: node-d 13:53, node-c 13:59 (staged
+  binaries), node-e 15:05 CEST; no viewer active at any of them.** node-c's
+  import took the mount blip as `rc=11` and re-ran Movies (attempt 2) —
+  the retry rule works. Verification sweep: next entry.
 - **0.32.8 (in test):** `retain_on` claims fan out concurrently; local
   presence checks drop the per-id 4 MB loader lease (thousands per
   quantum commit, queued behind the node's own publications); barrier
