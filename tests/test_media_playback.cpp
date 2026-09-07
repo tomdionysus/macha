@@ -182,10 +182,9 @@ MACHA_TEST("media_playback", test_media_segment_store_backpressure_and_spill) {
     CHECK(retained.stats().owner_bytes[static_cast<size_t>(MemoryOwner::playback_segment)] ==
           2 * 1024);
     REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
-    const auto initial_playlist = store->playlist();
-    CHECK(initial_playlist.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
-    CHECK(initial_playlist.find("segment-000003.m4s") != std::string::npos);
-    CHECK(initial_playlist.find("#EXT-X-ENDLIST") != std::string::npos);
+    // No fragment yet: not ready (the HTTP layer answers not_ready, which a
+    // player retries), never a list of fragments that do not exist.
+    CHECK(store->playlist().empty());
 
     REQUIRE(store->publish_segment(Bytes(1024, 0x10), 4.0));
     REQUIRE(store->publish_segment(Bytes(1024, 0x11), 4.0));
@@ -222,11 +221,13 @@ MACHA_TEST("media_playback", test_media_segment_store_backpressure_and_spill) {
     CHECK(state.descriptor_bytes >= state.segment_count);
     CHECK(state.planned_segments == 4);
 
+    // The playlist grew with production and closed at the end: EVENT, every
+    // produced fragment, ENDLIST once finished.
     auto playlist = store->playlist();
-    CHECK(playlist == initial_playlist);
     CHECK(playlist.find("#EXT-X-MAP:URI=\"init.mp4\"") != std::string::npos);
-    CHECK(playlist.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
-    CHECK(playlist.find("#EXT-X-PLAYLIST-TYPE:EVENT") == std::string::npos);
+    CHECK(playlist.find("#EXT-X-PLAYLIST-TYPE:EVENT") != std::string::npos);
+    CHECK(playlist.find("#EXT-X-PLAYLIST-TYPE:VOD") == std::string::npos);
+    CHECK(playlist.find("segment-000000.m4s") != std::string::npos);
     CHECK(playlist.find("segment-000003.m4s") != std::string::npos);
     CHECK(playlist.find("#EXT-X-ENDLIST") != std::string::npos);
 

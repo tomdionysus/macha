@@ -162,19 +162,29 @@ std::string MediaSegmentStore::playlist() const {
     std::lock_guard lock(impl_->mutex);
     if (!impl_->error.empty()) return {};
     const auto& durations = impl_->vod_segment_durations;
-    if (durations.empty()) return {};
+    if (durations.empty() || impl_->segments.empty()) return {};
     double longest = 1.0;
     for (const auto duration : durations) longest = std::max(longest, duration);
+    // A growing EVENT playlist: only fragments that exist are advertised, and
+    // ENDLIST closes it once the generation has produced its last one. Until
+    // 0.32.14 this was a VOD list of every planned fragment, and a fragment
+    // request blocked until it was encoded; a native player that prefetches
+    // deeply then waited on the encoder for each of them -- a 98 s black
+    // screen on the operator's TV after a mode switch (2026-09-07). Seeking
+    // stays server-side (PATCH seek_ms creates a new generation), so the
+    // timeline the client shows still comes from the session's duration.
+    const size_t produced = std::min(impl_->segments.size(), durations.size());
+    const bool complete = impl_->finished || produced == durations.size();
     std::ostringstream out;
     out << "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:" << static_cast<int>(std::ceil(longest))
-        << "\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n"
+        << "\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:EVENT\n"
         << "#EXT-X-INDEPENDENT-SEGMENTS\n"
         << "#EXT-X-MAP:URI=\"init.mp4\"\n";
-    for (size_t i = 0; i < durations.size(); ++i) {
+    for (size_t i = 0; i < produced; ++i) {
         out << "#EXTINF:" << std::fixed << std::setprecision(3) << durations[i] << ",\n"
             << "segment-" << std::setfill('0') << std::setw(6) << i << ".m4s\n";
     }
-    out << "#EXT-X-ENDLIST\n";
+    if (complete) out << "#EXT-X-ENDLIST\n";
     return out.str();
 }
 
