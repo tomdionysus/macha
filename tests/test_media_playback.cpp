@@ -1799,6 +1799,11 @@ MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
     CHECK(mixed.find("mode")->asString() == "transcode");
     CHECK(mixed.find("output")->find("video")->find("transform")->asString() == "copy");
     CHECK(mixed.find("output")->find("audio")->find("transform")->asString() == "transcode");
+    // A codec change is not a downmix. The 5.1 source stays 5.1 through the
+    // AAC encode; it used to arrive as stereo because the encoder was fixed
+    // at two channels (2026-09-07).
+    CHECK(mixed.find("output")->find("audio")->find("channels")->asUInt64() == 6);
+    CHECK(transcoded.find("output")->find("audio")->find("channels")->asUInt64() == 6);
 
     // The segment container is instructed too.
     auto ts = instruct(Json::Object{{"mode", "transcode"}, {"container", "mpegts"}});
@@ -2519,7 +2524,11 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     CHECK(patched_json.find("output")->find("video")->find("transform")->asString() == "transcode");
     CHECK(patched_json.find("output")->find("video")->find("codec")->asString() == "h264");
     CHECK(patched_json.find("output")->find("audio")->find("transform")->asString() == "transcode");
-    CHECK(patched_json.find("output")->find("audio")->find("bitrate")->asUInt64() == 192000);
+    // A codec change is not a downmix: the source's channel layout survives
+    // the AAC encode, and the bitrate follows the layout rather than a fixed
+    // stereo assumption. This source is stereo.
+    CHECK(patched_json.find("output")->find("audio")->find("channels")->asUInt64() == 2);
+    CHECK(patched_json.find("output")->find("audio")->find("bitrate")->asUInt64() == 2 * 64000);
     auto hls_url = patched_json.find("stream")->find("url")->asString();
     auto subtitle_url = patched_json.find("stream")->find("subtitle_url")->asString();
 
