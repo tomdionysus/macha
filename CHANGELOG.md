@@ -27,9 +27,14 @@ anywhere, and it had listed `hevc` for a 10-bit PQ source.
   client can tell a downconverted PQ source from a gate that did nothing.
 - `session create complete` logs the negotiated video/audio transform and
   codec; the client's capabilities are logged at debug.
-- Audio a client lists is copied when fragmented MP4 carries it as is: AAC,
-  AC-3, E-AC-3 and Opus. Only AAC was copied before, so an E-AC-3 title on
-  an HEVC-capable client was a "transcode" session for the audio alone.
+- Audio copy stays AAC-only. A first cut of this release also copied AC-3,
+  E-AC-3 and Opus; the copied E-AC-3 made libavformat's fragmented MP4
+  muxer fail its header write (`Invalid argument`: the `dec3` box needs the
+  first packet parsed, i.e. `delay_moov`), and every session create from a
+  client listing `eac3`, the TV included, answered 503 for about an hour on
+  es-1 and gbni-2 (2026-09-07 17:17-18:30). (E-)AC-3/Opus copy returns once
+  the muxer path handles them; the UI session's two-capability-set check
+  (with and without `eac3`) is the acceptance test.
 
 ## 0.32.11 — Remux is allowed to have long fragments; transcode uses the cores it has (development)
 

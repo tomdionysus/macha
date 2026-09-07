@@ -93,7 +93,12 @@ bool fmp4_video_copy_supported(std::string_view codec) {
 }
 
 bool fmp4_audio_copy_supported(std::string_view codec) {
-    return codec == "aac" || codec == "ac3" || codec == "eac3" || codec == "opus";
+    // AAC only for now. Copying E-AC-3 made libavformat's fragmented MP4
+    // muxer fail its header write ("Invalid argument": the dec3 box needs
+    // the first packet parsed, i.e. delay_moov) and every create for a
+    // client listing eac3 answered 503 (es-1/gbni-2, 2026-09-07 18:11).
+    // (E-)AC-3 and Opus copy return once the muxer path handles them.
+    return codec == "aac";
 }
 
 bool webvtt_subtitle_supported(const MediaStreamInfo& stream) {

@@ -55,6 +55,21 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **0.32.12 rollout, twice wrong before right:** (1) GCC
+  `-Werror=format-truncation` on the hex level `snprintf` failed the node
+  builds; the chain's `grep error` swallowed the exit status and
+  reinstalled 0.32.11 on es-1 and gbni-2 (two pointless restarts). Chain
+  now checks `rc`. (2) The real 0.32.12 (es-1 18:11 CEST, gbni-2 17:17)
+  **broke session create for any client listing `eac3`** (503 `write
+  fragmented MP4 header: Invalid argument` — copied E-AC-3 needs
+  `delay_moov`); the TV lists eac3. gbni-1 (TV pinned to it, real viewer)
+  stayed on 0.32.11 by the playback gate — which protected it. Hotfix:
+  audio copy AAC-only, everything else kept. UI session confirmed on
+  gbni-2 the master playlist `#EXT-X-STREAM-INF:BANDWIDTH=10887601,
+  CODECS="hvc1.2.4.L153.B0,mp4a.40.2",RESOLUTION=1920x802` → media.m3u8,
+  and isolated the 503 to the eac3 entry alone (same client minus eac3 →
+  201). Deploy order: es-1, gbni-2 (broken now), then gbni-1 when quiet.
+
 - **Samsung Tizen 3 TV capability set (operator read it off the new
   "Playback support" card):** video h264/hevc/vp9; audio
   aac/opus/vorbis/ac3/eac3/mp3; containers mp4/webm/mp3/ogg; hls_fmp4
