@@ -145,6 +145,19 @@ bool fmp4_audio_copy_supported(std::string_view codec) {
     return codec == "aac" || codec == "ac3" || codec == "eac3" || codec == "opus";
 }
 
+// What an MPEG-TS segment can carry as a copy. TS predates the fMP4 HLS
+// arrangement and is where these codecs' carriage was first defined, so the
+// list is the older, wider one: it is the route by which a 2017 television
+// plays copied HEVC and E-AC-3 that it refuses in fMP4 (2026-09-07).
+bool mpegts_video_copy_supported(std::string_view codec) {
+    return codec == "h264" || codec == "hevc" || codec == "mpeg2video";
+}
+
+bool mpegts_audio_copy_supported(std::string_view codec) {
+    return codec == "aac" || codec == "ac3" || codec == "eac3" || codec == "mp3" ||
+           codec == "mp2";
+}
+
 bool webvtt_subtitle_supported(const MediaStreamInfo& stream) {
     if (stream.type != MediaStreamType::subtitle) return false;
     const auto codec = lower(stream.codec);
@@ -497,6 +510,14 @@ PlaybackPlan plan_for(const MediaProbeResult& probe, const PlaybackPreferences& 
         !fmp4_audio_copy_supported(source_audio_codec))
         throw std::invalid_argument("fragmented MP4 cannot carry a copied " + source_audio_codec +
                                     " audio stream; ask for preferences.audio=transcode");
+    if (video && video_copy && plan.container == MediaContainer::mpegts &&
+        !mpegts_video_copy_supported(source_video_codec))
+        throw std::invalid_argument("MPEG-TS cannot carry a copied " + source_video_codec +
+                                    " video stream; ask for preferences.video=transcode");
+    if (audio && audio_copy && plan.container == MediaContainer::mpegts &&
+        !mpegts_audio_copy_supported(source_audio_codec))
+        throw std::invalid_argument("MPEG-TS cannot carry a copied " + source_audio_codec +
+                                    " audio stream; ask for preferences.audio=transcode");
 
     plan.video = video ? (video_copy ? MediaTransform::copy : MediaTransform::transcode) : MediaTransform::omit;
     plan.audio = audio ? (audio_copy ? MediaTransform::copy : MediaTransform::transcode) : MediaTransform::omit;
@@ -563,10 +584,17 @@ Json preferences_json(const PlaybackPreferences& preferences) {
 }
 
 Json output_json(const MediaProbeResult& probe, const PlaybackPlan& plan,
-                 std::string_view source_format) {
-    Json::Object out{{"format", plan.mode == PlaybackMode::direct
-                                    ? std::string(source_format)
-                                    : std::string(media_container_name(plan.container))}};
+                 std::string_view source_format, std::string_view source_path) {
+    const bool direct = plan.mode == PlaybackMode::direct;
+    Json::Object out{{"format", direct ? std::string(source_format)
+                                       : std::string(media_container_name(plan.container))},
+                     // What the client is actually being handed, stated the
+                     // same way the facts endpoint states a source container.
+                     // A client can ask for mpegts; without this it has no way
+                     // to see that it got it, and tonight is the argument
+                     // against reading a request back as evidence (2026-09-07).
+                     {"container", direct ? source_container(probe, source_path)
+                                          : std::string(media_container_name(plan.container))}};
 
     if (const auto* video = stream_at(probe, plan.video_stream); video && plan.video != MediaTransform::omit) {
         Json::Object value{{"source_stream", video->index},
@@ -1684,7 +1712,8 @@ struct PlaybackManager::Impl {
                          {"preferences", preferences_json(session.preferences)},
                          {"selection", Json(std::move(selected))},
                          {"source", Json(std::move(source))},
-                         {"output", output_json(session.probe, session.plan, session.probe.format)},
+                         {"output", output_json(session.probe, session.plan, session.probe.format,
+                                                session.source.logical_path)},
                          {"stream", Json(std::move(stream))},
                          {"options", Json(std::move(options))}};
         if (!session.item_id.empty()) out["item_id"] = session.item_id;
@@ -2495,9 +2524,13 @@ struct PlaybackManager::Impl {
                 Json::Object copy_fmp4{
                     {"video", !video || fmp4_video_copy_supported(lower(video->codec))},
                     {"audio", !audio || fmp4_audio_copy_supported(lower(audio->codec))}};
+                Json::Object copy_mpegts{
+                    {"video", !video || mpegts_video_copy_supported(lower(video->codec))},
+                    {"audio", !audio || mpegts_audio_copy_supported(lower(audio->codec))}};
                 Json::Object operations{
                     {"direct", true},
                     {"copy_into_fmp4", Json(std::move(copy_fmp4))},
+                    {"copy_into_mpegts", Json(std::move(copy_mpegts))},
                     {"transcode_video", engine_state.h264_encoder},
                     {"transcode_audio", engine_state.aac_encoder}};
                 Json::Object entry{
