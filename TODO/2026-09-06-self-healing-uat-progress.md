@@ -55,9 +55,13 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
-- **0.32.2 (in flight ~03:45):** identity namespace batches (one commit per
-  batch instead of per op) + utimens survives async publication. Suite,
-  deploy, restart imports pending. node-c import order is now Movies → TV
+- **0.32.2 (deployed 03:15–03:17 node-c / 04:17 CEST node-e, commit `eb9f568`, suite 354/354):** identity namespace batches (one commit per
+  batch instead of per op) + utimens survives async publication. Imports
+  restarted on both writers (node-c pid 87771 Movies→TV→Music; node-e pid
+  154710 Movies→TV). Verify at the next check: namespace_publication_batches
+  growing far slower than namespace_operations_published on node-c, data
+  publications completing, `rsync -ani` dry run over Music showing no
+  `>f..t` lines for files imported after this deploy. node-c import order is now Movies → TV
   → Music (`/root/uat/import-all.sh` edited). Next iteration candidates,
   evidence in the UAT file "Iteration 2": WAN control-lane starvation
   (195–284 s metadata mutations; congestion-aware data-lane pacing driven
