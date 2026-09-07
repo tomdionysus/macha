@@ -1,5 +1,37 @@
 # Current release
 
+## 0.33.3 — AAC transcodes carry a channel configuration browsers can parse (development)
+
+A regression from 0.32.19, found by the UI session and reproduced on Silo
+S03E01. Keeping the source's channel layout on the AAC encoder was right in
+intent -- a codec change is not a downmix -- but it handed the encoder
+5.1(side), which is what E-AC-3 decodes to and is not one of AAC's standard
+channel configurations. The encoder then described the arrangement in a
+Program Config Element and set `channelConfiguration` to 0, a 26-byte
+AudioSpecificConfig with libavcodec's own comment string inside it.
+
+Chrome's MP4 parser rejects that config outright. Per the MSE spec the
+failed append ends the MediaSource with a decode error, every later append
+fails, and hls.js answers by rebuilding the MediaSource and retrying: the
+same 2.4 MB segment was refetched 58 times in 46 seconds behind a spinner.
+Safari and the television's native player never saw it, because they take
+E-AC-3 copied into MPEG-TS; every Chromium browser and WebView did, which
+means the web client and the Android/Google TV host (2026-09-08).
+
+- The AAC encoder is now opened with AAC's standard layout for the source's
+  channel count -- the surround pair at the back, not the side. The channel
+  count is unchanged and the resampler maps the source into it, so this is
+  a relabelling and not a downmix. Measured against libavcodec on the
+  cluster: `5.1` gives a five-byte config with `channelConfiguration` 6,
+  `5.1(side)` a 26-byte Program Config Element with 0.
+- An encoder that opens but still reports `channelConfiguration` 0 is
+  refused and reopened as stereo, so an unparseable configuration is never
+  served even from a build whose encoder disagrees with this table.
+- Seven channels have no standard configuration at all; they are carried as
+  7.1 with the eighth channel silent, which loses nothing.
+- A runtime test asks this build's own encoder for every channel count from
+  1 to 8 and fails if any answers with `channelConfiguration` 0.
+
 ## 0.33.2 — One file for the container vocabulary (development)
 
 Answering a client's question about `output.container` turned up a source
