@@ -1,5 +1,27 @@
 # Current release
 
+## 0.32.19 — The first fragment is one segment, and a transcode is not a downmix (development)
+
+Two faults found by ffprobing what a remux actually emits, rather than
+trusting the 201 (2026-09-07).
+
+- The fragmented MP4 muxer delays its `moov` until it has seen a packet of
+  every stream, because the (E-)AC-3 sample entry can only be filled from
+  one. The flush that writes that `moov` produces no `moof`: the media
+  buffered up to it stays buffered and joins the next fragment. That flush
+  was landing on the first planned segment boundary, so segment 0 carried
+  two segments of media while the playlist declared one, and every later
+  segment sat 10 s early on the player's timeline. The `moov` is now
+  flushed as soon as every stream has been written, which costs nothing,
+  and a boundary that produces no fragment carries its length into the
+  fragment that does, so the playlist cannot describe media that is not
+  there.
+- The AAC encoder was fixed at two channels and 192 kbit/s, so a 5.1 source
+  came back stereo whenever the audio was re-encoded. It now keeps the
+  source's channel layout, at 64 kbit/s per channel, falling back to stereo
+  only if the encoder refuses the layout. A client that asked for a codec
+  change did not ask for a downmix.
+
 ## 0.32.18 — A failure says which failure it was (development)
 
 A node that has lost its path to the cluster can still open its API and

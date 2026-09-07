@@ -582,9 +582,12 @@ Json output_json(const MediaProbeResult& probe, const PlaybackPlan& plan,
                            {"transform", transform_name(plan.audio)},
                            {"codec", plan.audio_codec}};
         if (plan.audio == MediaTransform::transcode) {
-            value["channels"] = 2;
+            // A codec change is not a downmix. The encoder keeps the source's
+            // channel layout, so report it rather than a stereo assumption.
+            const auto channels = audio->channels > 0 ? audio->channels : 2;
+            value["channels"] = channels;
             value["sample_rate"] = audio->sample_rate > 0 ? audio->sample_rate : 48000;
-            value["bitrate"] = static_cast<uint64_t>(192000);
+            value["bitrate"] = static_cast<uint64_t>(std::clamp(channels, 1, 8)) * 64000;
         } else {
             if (audio->channels) value["channels"] = audio->channels;
             if (audio->sample_rate) value["sample_rate"] = audio->sample_rate;
