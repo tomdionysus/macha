@@ -55,6 +55,16 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **0.32.10 DEPLOYED gbni-2 15:30, es-1 16:40 CEST; gbni-1 deferred by
+  the playback gate (viewer active), retrying every 5 min.** es-1 on
+  0.32.10, 7 min: 35 mutations, retention avg **121 ms** (was 5,217),
+  max 2,674; no CONTROL claim line ≥ 250 ms any more. What remains: the
+  DATA presence scan is still seconds *with the presence cache warm*
+  (`ids=3522 scan_ms=2643` on es-1; `ids=3201 scan_ms=8024` on gbni-1
+  at 0.32.9) → the per-id cost is not the stat; suspect
+  `LocalStore::object_mutex()` sweeping expired weak_ptrs on every call
+  (O(N) per call → O(N²) per batch). Next.
+
 - **0.32.9 on es-1 too (16:20 CEST, after its viewer stopped).** es-1's
   first phase line: `total_ms=4571 decode_ms=8 collect_ms=1
   catalogue_ms=15 data_ms=0 control_ms=4546 control_objects=65` — the

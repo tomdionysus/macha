@@ -573,3 +573,85 @@ What is deliberately left from the programme itself (all filed, none blocking):
 - extent tables are 79% of the snapshot — a compact contiguous-extent
   encoding could roughly halve it; not a habit, an optimisation;
 - the 9 standing conflicts want a human (two different rips at one path).
+
+### Iteration 4 — writes before the mount went to the host disk (13:25 CEST, es-1)
+
+es-1's 11:38 import restart began 25 s after the daemon; the mount comes up
+~30 s after start, so rsync's generator walked the bare `/mnt/machamedia`
+and every write since went to the root NVMe: 52.6 GB / 46 files hidden
+under the mount while Macha reported `spool=0`. `fail_closed_mountpoint`
+only cleared mode bits after mounting, which root ignores.
+
+Fix (0.32.6): `prepare_fuse_mountpoint` counts stray entries under the
+covered directory (ERROR log, `filesystem.mountpoint_stray_entries`) and
+sets the immutable flag on it before services start
+(`filesystem.mountpoint_immutable`; proven on gbni-2 that tmpfs/FUSE
+mount over an immutable directory works and `touch` under it is EPERM).
+The import scripts wait for the mount before every directory and re-run a
+directory whose rsync exits non-zero. The operator removed the stray
+copies; es-1's daemon reported `mountpoint_stray_entries=1` until then and
+0 after, verified from the status API by the UI session on all three nodes.
+
+### Iteration 5 — "WAN control-lane starvation", measured (operator priority, 14:05–15:50 CEST)
+
+Operator: "WAN control-lane starvation is paramount." The symptom on
+record: 195–284 s metadata mutations, `control RPC deadline exceeded`,
+reconnect churn. Measured first, from both ends of the link:
+
+| what | value |
+|---|---|
+| WAN RTT idle / under load (ping, `ss -ti`) | 58 ms / 60–87 ms |
+| gbni-2 `retain_objects` handler, per claim batch | avg 916 ms, **max 12,113 ms** |
+| gbni-1 mutation with a 35 KB delta / with a 200 B delta | 9–12.5 s / 0.25–2 s |
+| replica order for gbni-1's commits (NodeId order) | es-1 (WAN) before gbni-2 |
+
+The link's queue was ~30 ms of the seconds. The rest was inside Macha,
+one layer at a time, each layer instrumented before it was changed:
+
+1. **0.32.7 — a remote retention claim is not a re-read.** The
+   replica-side `retain_objects` handler still `valid()`-re-read every
+   extent of every claimed file, serially, inside the writer's mutation;
+   a quantum commit re-claims the whole file. Now `has()` with no DATA
+   admission (the local side has been so since 0.32.3). `publish_commit`
+   orders replicas local → measured-nearest (`peer_latency_ms` from the
+   transport) → unmeasured. After: gbni-2 handler **0 ms**, commit
+   fan-out ≤ 0.6 s everywhere; `retention_ms`/`publish_ms` on the mutate
+   line and `mutation_*` in status showed the rest was the writer's own
+   barrier (1 s steady, 4–15 s after restarts).
+2. **0.32.8 — the barrier fans out in parallel and names its phase.**
+   Per-node claims concurrently; no 4 MB loader lease per id for an index
+   lookup; `DATA retention barrier … scan_ms= short= fallback_claims=`.
+   `peer_latency_ms` samples heartbeat pings only — sampling every call
+   let payload/handler time make gbni-1 read its wireless neighbour at
+   114 ms against 4 ms the other way (the operator confirmed gbni-2 is on
+   flaky wifi: latency on this rig is directional by design).
+3. **0.32.9 — presence is remembered, not stat'ed.** The barrier line
+   read `ids=3201 scan_ms=16048` then `scan_ms=261`: a cold-dentry `stat`
+   per extent on the import-saturated disk, ~5 ms each. `LocalStore` now
+   keeps an in-memory set of loose objects it installed or has seen. The
+   whole barrier logs `decode/collect/catalogue/data/control` phases.
+4. **0.32.10 — CONTROL puts go together, to the nearest replica.** The
+   phase line on both writers: `control_ms=4247–4546 control_objects=65`,
+   all else < 30 ms. `retain_control` pushed the catalogue graph one
+   object per round trip to candidates in NodeId order (65 × 65 ms across
+   the WAN per catalogue mutation). Now local → nearest, all puts in
+   flight together.
+
+After (es-1, 0.32.10, first 7 min): 35 mutations, retention **avg 121 ms**
+(was 5,217), publish avg 556 ms; no `deadline exceeded` or `peer closed`
+since 0.32.7. The remaining per-mutation floor is the commit fan-out over a
+60 ms link (three sequential round trips ≈ 0.4–0.7 s) and a one-time
+cold-cache presence scan after each restart (2.6–8 s once per file).
+
+Also on record from this pass, not changed:
+- both writers run `min_write_replicas: 1`: a put is durable on one copy
+  and the second is background repair — the mechanism of finding #6, and
+  what "replicated" currently means at write time;
+- capacity placement gives the writer no guaranteed local copy of what it
+  publishes;
+- re-claiming every extent of a file per quantum grows the retention
+  journal ~N² over a large import;
+- the rolling restart for 0.32.7 (three nodes in two minutes) killed the
+  operator's live TV playback; every later deploy restarted one node at a
+  time, ≥ 5 min apart, after checking for playback activity, and three
+  restarts were deferred by that check.
