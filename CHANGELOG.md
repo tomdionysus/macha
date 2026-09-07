@@ -27,6 +27,13 @@ anywhere, and it had listed `hevc` for a 10-bit PQ source.
   client can tell a downconverted PQ source from a gate that did nothing.
 - `session create complete` logs the negotiated video/audio transform and
   codec; the client's capabilities are logged at debug.
+- Stored media profiles are schema 2, carrying each stream's `level` and
+  `color_transfer` (the catalogue media-profile API reports both). A
+  schema-1 profile with a video stream is treated as stale and regenerated
+  on its next playback, then republished: the gate compared against the
+  stored profile, which had neither field and a zero depth for the Dolby
+  Vision title, so a client claiming 10 bits and no HDR was handed the
+  copied stream (found by the UI session's one-call check, 2026-09-07).
 - Audio copy stays AAC-only. A first cut of this release also copied AC-3,
   E-AC-3 and Opus; the copied E-AC-3 made libavformat's fragmented MP4
   muxer fail its header write (`Invalid argument`: the `dec3` box needs the
