@@ -55,6 +55,15 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **0.32.5 (commit `97dbac9`, suite 355/355; deployed node-d ~10:57, node-e
+  11:38 CEST; node-c still down):** spool pacing admits against drained
+  quantum credit regardless of the stale whole-file rate sample (node-e's
+  rsync had collapsed to 0.3 MB/s while a 13.9 GB file published). node-e
+  import restarted pid 163043. Verify next tick: node-e written-bytes delta
+  ≈ 8 MB/s × 1800 s ≈ 14 GB per tick. Next engineering item: DLT8
+  append-extents delta (each quantum commit re-sends the whole extent
+  table: 105 KB/quantum, 124 MB history per node in 35 min).
+
 - **Finding #6 (04:40, node-e, node-c still down):** `media input read failed
   … error=extent unavailable` ×129 and `catalogue hint gave up … failures=3`
   ×43 on Music files node-c wrote before it died: their only copy was on
