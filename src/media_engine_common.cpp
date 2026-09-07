@@ -112,9 +112,9 @@ std::string hls_codec_string(std::string_view codec, const MediaStreamInfo* stre
             else if (stream->profile.find("High 10") != std::string::npos) profile = "6E";
             else if (stream->profile.find("High 4:2:2") != std::string::npos) profile = "7A";
         }
-        const int level = stream && stream->level > 0 ? stream->level : 41;
-        char buffer[8];
-        std::snprintf(buffer, sizeof(buffer), "%02X", level);
+        const int level = std::clamp(stream && stream->level > 0 ? stream->level : 41, 0, 255);
+        char buffer[16];
+        std::snprintf(buffer, sizeof(buffer), "%02X", static_cast<unsigned>(level));
         return "avc1." + profile + constraints + buffer;
     }
     if (codec == "hevc") {
