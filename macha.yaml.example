@@ -306,6 +306,9 @@ maintenance:
   busy_bandwidth_fraction: 0.0
   idle_bandwidth_fraction: 0.10
   cpu_target: 0.10
+  # Loader/speculative DATA operations (publication, repair; one extent
+  # each) active at once. 0 = half the hardware threads, minimum 1.
+  background_concurrency: 0
   initial_bandwidth: 32M
   max_bandwidth: 0B       # 0 = no configured cap; observed rate still applies.
   # Proactive physical integrity scrub is a scheduled campaign, not continuous

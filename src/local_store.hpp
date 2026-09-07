@@ -47,6 +47,8 @@ struct LocalStoreOptions {
 struct LocalStoreDiagnostics {
     uint64_t loose_reaffirmation_fast_paths{};
     uint64_t loose_reaffirmation_full_validations{};
+    // Loose objects the start-up presence walk found (0 until it finishes).
+    uint64_t presence_index_entries{};
 };
 
 class LocalStore {
@@ -123,6 +125,11 @@ class LocalStore {
     std::atomic_uint64_t loose_reaffirmation_full_validations_{};
     mutable std::condition_variable accounting_cv_;
     std::jthread scan_thread_;
+    // Fills present_loose_ from the object directory names at start (readdir
+    // only, no stat), so the first claim on each large file after a restart
+    // is not a cold stat per extent (2.6-16 s per quantum commit, 2026-09-07).
+    std::jthread presence_thread_;
+    std::atomic_uint64_t presence_index_entries_{};
     std::atomic_bool scan_complete_{};
     std::atomic_bool scan_failed_{};
     std::atomic_bool accounting_trusted_{};
@@ -165,6 +172,7 @@ class LocalStore {
     bool put_packed_locked(const ObjectId&, std::span<const uint8_t>, StoreWriteDurability,
                            uint64_t*, std::unique_lock<std::mutex>&);
     void scan(std::stop_token);
+    void warm_presence_index(std::stop_token);
     void rebuild_pack_index_locked(bool truncate_incomplete_tail);
     std::optional<Bytes> get_packed_locked(const ObjectId&,
                                            std::unique_lock<std::mutex>&) const;
@@ -243,7 +251,8 @@ class LocalStore {
     bool scan_complete() const { return scan_complete_.load(std::memory_order_acquire); }
     LocalStoreDiagnostics diagnostics() const noexcept {
         return {loose_reaffirmation_fast_paths_.load(std::memory_order_relaxed),
-                loose_reaffirmation_full_validations_.load(std::memory_order_relaxed)};
+                loose_reaffirmation_full_validations_.load(std::memory_order_relaxed),
+                presence_index_entries_.load(std::memory_order_relaxed)};
     }
 };
 NodeId load_or_create_node_id(const std::filesystem::path&);

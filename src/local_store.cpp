@@ -372,6 +372,9 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
             });
         });
     }
+    presence_thread_ = std::jthread([this](std::stop_token stop) {
+        run_supervised("local-store-presence", [this, stop] { warm_presence_index(stop); });
+    });
 }
 
 LocalStore::LocalStore(std::filesystem::path root, uint64_t limit,
@@ -381,6 +384,10 @@ LocalStore::LocalStore(std::filesystem::path root, uint64_t limit,
                  std::move(durability_domain)) {}
 
 LocalStore::~LocalStore() {
+    if (presence_thread_.joinable()) {
+        presence_thread_.request_stop();
+        presence_thread_.join();
+    }
     if (scan_thread_.joinable()) {
         scan_thread_.request_stop();
         scan_thread_.join();
@@ -1621,6 +1628,61 @@ bool LocalStore::wait_for_accounting(std::unique_lock<std::mutex>& lock,
     return true;
 }
 
+namespace {
+// "<64 hex>.obj" -> id; nullopt for anything else in the object tree.
+std::optional<ObjectId> object_id_from_file_name(std::string_view name) {
+    if (name.size() != 64 + 4 || !name.ends_with(".obj")) return std::nullopt;
+    ObjectId id;
+    for (size_t i = 0; i < 32; ++i) {
+        unsigned value = 0;
+        for (size_t nibble = 0; nibble < 2; ++nibble) {
+            const char c = name[i * 2 + nibble];
+            unsigned digit = 0;
+            if (c >= '0' && c <= '9') digit = static_cast<unsigned>(c - '0');
+            else if (c >= 'a' && c <= 'f') digit = static_cast<unsigned>(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') digit = static_cast<unsigned>(c - 'A' + 10);
+            else return std::nullopt;
+            value = (value << 4) | digit;
+        }
+        id.bytes[i] = static_cast<uint8_t>(value);
+    }
+    return id;
+}
+} // namespace
+
+void LocalStore::warm_presence_index(std::stop_token stop) {
+    const auto started = Clock::now();
+    std::error_code error;
+    std::vector<ObjectId> batch;
+    batch.reserve(4096);
+    uint64_t entries = 0;
+    const auto flush = [&] {
+        if (batch.empty()) return;
+        std::lock_guard lock(m_);
+        for (const auto& id : batch) present_loose_.insert(id);
+        entries += batch.size();
+        batch.clear();
+    };
+    // Directory names only: readdir supplies the file type, so nothing here
+    // stats an object. The scan (when it runs) does the same as it walks.
+    for (auto it = std::filesystem::recursive_directory_iterator(objects_, error);
+         !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
+        if (stop.stop_requested()) return;
+        if (it.depth() < 2) continue;
+        if (auto id = object_id_from_file_name(it->path().filename().string())) {
+            batch.push_back(*id);
+            if (batch.size() >= 4096) flush();
+        }
+    }
+    flush();
+    presence_index_entries_.store(entries, std::memory_order_relaxed);
+    Log::debug("storage presence index warmed path=" + root_.string() +
+               " objects=" + std::to_string(entries) + " elapsed_ms=" +
+               std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  Clock::now() - started).count()) +
+               (error ? " error=" + error.message() : std::string{}));
+}
+
 void LocalStore::scan(std::stop_token stop) {
     Log::debug("storage accounting scan begin path=" + root_.string());
     uint64_t total = 0;
@@ -1640,6 +1702,12 @@ void LocalStore::scan(std::stop_token stop) {
             std::error_code size_error;
             const auto size = it->file_size(size_error);
             if (!size_error) total += size;
+            if (root == objects_ && size > 0) {
+                if (auto id = object_id_from_file_name(name)) {
+                    std::lock_guard lock(m_);
+                    present_loose_.insert(*id);
+                }
+            }
         }
         if (error) break;
     }

@@ -788,6 +788,10 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     data_resource_diagnostics["viewer_waits"] = data_resource.viewer_waits;
     data_resource_diagnostics["loader_waits"] = data_resource.loader_waits;
     data_resource_diagnostics["speculative_waits"] = data_resource.speculative_waits;
+    // Background effort ceiling (maintenance.background_concurrency) and use.
+    data_resource_diagnostics["background_limit"] = data_resource.background_limit;
+    data_resource_diagnostics["background_active"] = data_resource.background_active;
+    data_resource_diagnostics["peak_background_active"] = data_resource.peak_background_active;
     data_resource_diagnostics["cancelled_waits"] = data_resource.cancelled_waits;
     diagnostics["data_resources"] = std::move(data_resource_diagnostics);
 
@@ -839,6 +843,7 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                 data_store.loose_reaffirmation_fast_paths;
             data_store_diagnostics["loose_reaffirmation_full_validations"] =
                 data_store.loose_reaffirmation_full_validations;
+            data_store_diagnostics["presence_index_entries"] = data_store.presence_index_entries;
         } catch (...) {
             // Readiness can transition while Status is assembled. Diagnostics
             // are observational and must never make the startup API fail.
