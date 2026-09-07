@@ -401,6 +401,7 @@ class HdrFakeMediaEngine final : public FakeMediaEngine {
   public:
     MediaProbeResult probe(const MediaSource& source, std::chrono::milliseconds timeout = {}) override {
         auto result = FakeMediaEngine::probe(source, timeout);
+        result.format = "matroska,webm";
         result.streams.clear();
         MediaStreamInfo video;
         video.index = 0;
@@ -455,9 +456,9 @@ MACHA_TEST("media_playback", test_matroska_direct_play_and_per_path_codec_lists)
                              std::make_unique<HdrFakeMediaEngine>());
     playback.start();
 
-    const auto create = [&](Json::Object caps) {
+    const auto create = [&](Json::Object caps, std::string mode = "direct") {
         Json::Object root{{"media_id", media_id}, {"capabilities", Json(std::move(caps))},
-                          {"preferences", Json(Json::Object{{"mode", "auto"}})}};
+                          {"preferences", Json(Json::Object{{"mode", mode}})}};
         auto text = Json(std::move(root)).dump();
         HttpRequest request;
         request.method = "POST";
@@ -472,6 +473,7 @@ MACHA_TEST("media_playback", test_matroska_direct_play_and_per_path_codec_lists)
     // A host whose media element demuxes Matroska and decodes 10-bit HEVC
     // gets the file itself: no remux, no transcode.
     Json::Object tv{{"containers", Json::Array{Json("mp4"), Json("matroska")}},
+                    {"hls_fmp4", true},
                     {"video_codecs", Json::Array{Json("h264"), Json("hevc")}},
                     {"audio_codecs", Json::Array{Json("aac"), Json("eac3")}},
                     {"hls_fmp4", true},
@@ -487,10 +489,19 @@ MACHA_TEST("media_playback", test_matroska_direct_play_and_per_path_codec_lists)
     narrowed["hls_video_codecs"] = Json::Array{Json("h264")};
     auto still_direct = create(narrowed);
     CHECK(still_direct.find("mode")->asString() == "direct");
+    // hls_video_codecs is advisory: it is reported against, never acted on.
+    auto narrowed_hls = narrowed;
+    auto remuxed = create(std::move(narrowed_hls), "remux");
+    CHECK(remuxed.find("mode")->asString() == "remux");
+    CHECK(remuxed.find("output")->find("video")->find("codec")->asString() == "hevc");
+    const auto remux_warnings = remuxed.find("warnings")->asArray();
+    CHECK(std::any_of(remux_warnings.begin(), remux_warnings.end(), [](const Json& w) {
+        return w.find("field")->asString() == "hls_video_codecs";
+    }));
 
     auto hls_only = narrowed;
     hls_only["containers"] = Json::Array{Json("mp4")}; // no matroska: must be HLS
-    auto transcoded = create(std::move(hls_only));
+    auto transcoded = create(std::move(hls_only), "transcode");
     CHECK(transcoded.find("mode")->asString() == "transcode");
     CHECK(transcoded.find("output")->find("video")->find("codec")->asString() == "h264");
     CHECK(transcoded.find("output")->find("video")->find("transform")->asString() == "transcode");
@@ -1706,7 +1717,8 @@ MACHA_TEST("media_playback", test_attached_picture_audio_direct_play) {
                               {"video_codecs", Json(std::move(video_codecs))},
                               {"audio_codecs", Json(std::move(audio_codecs))},
                               {"hls_fmp4", true}};
-    Json::Object root{{"media_id", media_id}, {"capabilities", Json(std::move(capabilities))}};
+    Json::Object root{{"media_id", media_id}, {"capabilities", Json(std::move(capabilities))},
+                      {"preferences", Json(Json::Object{{"mode", "direct"}})}};
     auto text = Json(std::move(root)).dump();
     HttpRequest request;
     request.method = "POST";
@@ -1726,7 +1738,7 @@ MACHA_TEST("media_playback", test_attached_picture_audio_direct_play) {
     service.stop();
 }
 
-MACHA_FAST_TEST("media_playback", test_schema1_video_profiles_are_stale_for_negotiation) {
+MACHA_FAST_TEST("media_playback", test_older_video_profiles_are_stale_and_regenerate) {
     CatalogueSnapshot::MediaProfile profile;
     profile.probe.format = "matroska,webm";
     profile.probe.duration_seconds = 6660.0;
@@ -1742,19 +1754,22 @@ MACHA_FAST_TEST("media_playback", test_schema1_video_profiles_are_stale_for_nego
     profile.probe.streams = {video, audio};
 
     // Fresh profiles carry the depth/transfer signalling negotiation needs.
-    CHECK(profile.schema_version == 2);
+    CHECK(profile.schema_version == catalogue_media_profile_schema);
     CHECK(valid_catalogue_media_profile("macha:abc", profile));
     // A profile stored before 0.32.12 does not, so it is regenerated: a
     // stale one let a Dolby Vision title be copied to a client that could
     // not decode it.
+    for (uint32_t older = 1; older < catalogue_media_profile_schema; ++older) {
+        profile.schema_version = older;
+        CHECK(!valid_catalogue_media_profile("macha:abc", profile));
+    }
     profile.schema_version = 1;
-    CHECK(!valid_catalogue_media_profile("macha:abc", profile));
     // ... unless nothing in it is a video stream.
     profile.probe.streams = {audio};
     CHECK(valid_catalogue_media_profile("macha:abc", profile));
 }
 
-MACHA_TEST("media_playback", test_auto_transcodes_hdr_10bit_unless_the_client_opts_in) {
+MACHA_TEST("media_playback", test_instructions_are_performed_and_contradictions_reported) {
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -1785,9 +1800,9 @@ MACHA_TEST("media_playback", test_auto_transcodes_hdr_10bit_unless_the_client_op
                              std::make_unique<HdrFakeMediaEngine>());
     playback.start();
 
-    const auto create = [&](Json::Object caps, int expect = 201) {
+    const auto create = [&](Json::Object caps, std::string mode = "transcode", int expect = 201) {
         Json::Object root{{"media_id", media_id}, {"capabilities", Json(std::move(caps))},
-                          {"preferences", Json(Json::Object{{"mode", "auto"}})}};
+                          {"preferences", Json(Json::Object{{"mode", mode}})}};
         auto text = Json(std::move(root)).dump();
         HttpRequest request;
         request.method = "POST";
@@ -1799,7 +1814,7 @@ MACHA_TEST("media_playback", test_auto_transcodes_hdr_10bit_unless_the_client_op
         return Json::parse(std::string(response.body.begin(), response.body.end()));
     };
     const auto hevc_caps = [] {
-        return Json::Object{{"containers", Json::Array{Json("mp4"), Json("mkv")}},
+        return Json::Object{{"containers", Json::Array{Json("mp4"), Json("fmp4")}},
                             {"video_codecs", Json::Array{Json("h264"), Json("hevc")}},
                             {"audio_codecs", Json::Array{Json("aac"), Json("eac3")}},
                             {"hls_fmp4", true}};
@@ -1836,7 +1851,7 @@ MACHA_TEST("media_playback", test_auto_transcodes_hdr_10bit_unless_the_client_op
     auto opted_in = hevc_caps();
     opted_in["video_bit_depth"] = 10;
     opted_in["hdr"] = Json::Array{Json("smpte2084")};
-    auto capable = create(std::move(opted_in));
+    auto capable = create(std::move(opted_in), "remux");
     CHECK(capable.find("output")->find("video")->find("transform")->asString() == "copy");
     CHECK(capable.find("output")->find("video")->find("color_transfer")->asString() == "smpte2084");
     auto streams = capable.find("source")->find("streams")->asArray();
@@ -1859,22 +1874,33 @@ MACHA_TEST("media_playback", test_auto_transcodes_hdr_10bit_unless_the_client_op
     REQUIRE(direct_response.status == 201);
     auto direct_json = Json::parse(std::string(direct_response.body.begin(), direct_response.body.end()));
     CHECK(direct_json.find("mode")->asString() == "direct");
+    // Explicit direct on a Matroska source this client never listed: the
+    // container joins the bit-depth and HDR contradictions.
     auto warnings = direct_json.find("warnings")->asArray();
-    REQUIRE(warnings.size() == 2);
+    REQUIRE(warnings.size() == 3);
     std::set<std::string> fields;
     for (const auto& warning : warnings) {
         CHECK(warning.find("code")->asString() == "capability_contradiction");
         fields.insert(warning.find("field")->asString());
     }
-    const std::set<std::string> expected_fields{"video_bit_depth", "hdr"};
+    const std::set<std::string> expected_fields{"containers", "video_bit_depth", "hdr"};
     CHECK(fields == expected_fields);
 
     // A client that cannot take fragmented MP4 gets MPEG-TS segments when it
     // says it takes them, and a plain refusal when it does not.
-    auto ts_caps = hevc_caps();
-    ts_caps["hls_fmp4"] = false;
-    ts_caps["hls_ts"] = true;
-    auto ts_session = create(std::move(ts_caps), 201);
+    // The segment container is instructed, not inferred from a capability.
+    Json::Object ts_root{{"media_id", media_id}, {"capabilities", Json(hevc_caps())},
+                         {"preferences", Json(Json::Object{{"mode", "transcode"},
+                                                           {"container", "mpegts"}})}};
+    auto ts_text = Json(std::move(ts_root)).dump();
+    HttpRequest ts_request;
+    ts_request.method = "POST";
+    ts_request.path = "/api/v1/playback/sessions";
+    ts_request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    ts_request.body.assign(ts_text.begin(), ts_text.end());
+    auto ts_response = playback.handle(ts_request);
+    REQUIRE(ts_response.status == 201);
+    auto ts_session = Json::parse(std::string(ts_response.body.begin(), ts_response.body.end()));
     CHECK(ts_session.find("mode")->asString() == "transcode");
     CHECK(ts_session.find("output")->find("format")->asString() == "mpegts");
     auto ts_master = playback.handle([&] {
@@ -1890,17 +1916,15 @@ MACHA_TEST("media_playback", test_auto_transcodes_hdr_10bit_unless_the_client_op
     const std::string ts_master_text(ts_master_bytes.begin(), ts_master_bytes.end());
     CHECK(ts_master_text.find("CODECS=\"avc1.640029,mp4a.40.2\"") != std::string::npos);
 
-    auto no_container = hevc_caps();
-    no_container["hls_fmp4"] = false;
-    Json::Object refused_root{{"media_id", media_id}, {"capabilities", Json(std::move(no_container))},
-                              {"preferences", Json(Json::Object{{"mode", "auto"}})}};
-    auto refused_text = Json(std::move(refused_root)).dump();
-    HttpRequest refused_request;
-    refused_request.method = "POST";
-    refused_request.path = "/api/v1/playback/sessions";
-    refused_request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    refused_request.body.assign(refused_text.begin(), refused_text.end());
-    CHECK(playback.handle(refused_request).status == 400);
+    // A mode is required: the server does not choose one.
+    Json::Object modeless_root{{"media_id", media_id}, {"capabilities", Json(hevc_caps())}};
+    auto modeless_text = Json(std::move(modeless_root)).dump();
+    HttpRequest modeless_request;
+    modeless_request.method = "POST";
+    modeless_request.path = "/api/v1/playback/sessions";
+    modeless_request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    modeless_request.body.assign(modeless_text.begin(), modeless_text.end());
+    CHECK(playback.handle(modeless_request).status == 400);
 }
 
 MACHA_TEST("media_playback", test_forced_direct_bypasses_client_capabilities) {
@@ -1993,7 +2017,8 @@ MACHA_TEST("media_playback", test_forced_direct_bypasses_client_capabilities) {
                             {"audio_codecs", Json::Array{Json("aac")}},
                             {"hls_fmp4", true}};
     Json::Object remux_root{{"media_id", media_id},
-                            {"capabilities", Json(std::move(remux_caps))}};
+                            {"capabilities", Json(std::move(remux_caps))},
+                            {"preferences", Json(Json::Object{{"mode", "remux"}})}};
     auto remux_text = Json(std::move(remux_root)).dump();
     HttpRequest remux_create;
     remux_create.method = "POST";
@@ -2387,7 +2412,8 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
                                 reopened_seek_json.find("session_id")->asString();
     CHECK(playback.handle(remove_reopened_seek).status == 204);
 
-    Json::Object create_root{{"media_id", media_id}};
+    Json::Object create_root{{"media_id", media_id},
+                             {"preferences", Json(Json::Object{{"mode", "direct"}})}};
     auto create_text = Json(std::move(create_root)).dump();
     HttpRequest create;
     create.method = "POST";
@@ -2413,7 +2439,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     CHECK(created_json.find("output")->find("audio")->find("transform")->asString() == "copy");
     CHECK(created_json.find("output")->find("audio")->find("bitrate")->asUInt64() == 192'000);
     REQUIRE(created_json.find("preferences") != nullptr);
-    CHECK(created_json.find("preferences")->find("mode")->asString() == "auto");
+    CHECK(created_json.find("preferences")->find("mode")->asString() == "direct");
     REQUIRE(created_json.find("options") != nullptr);
     auto options = created_json.find("options");
     REQUIRE(options->find("audio_streams") != nullptr);
@@ -2532,7 +2558,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     // 720p must rebuild the negotiated Auto session at 720p. Remux is not a
     // valid quality-preserving choice here, while Direct remains exposed as the
     // explicit byte-stream override and deliberately ignores quality constraints.
-    Json::Object quality_preferences{{"mode", "auto"}, {"max_height", 720}};
+    Json::Object quality_preferences{{"mode", "transcode"}, {"max_height", 720}};
     Json::Object quality_root{{"preferences", Json(std::move(quality_preferences))}};
     auto quality_text = Json(std::move(quality_root)).dump();
     HttpRequest quality;
@@ -2543,7 +2569,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     REQUIRE(quality_response.status == 200);
     auto quality_json = Json::parse(std::string(quality_response.body.begin(), quality_response.body.end()));
     CHECK(quality_json.find("mode")->asString() == "transcode");
-    CHECK(quality_json.find("preferences")->find("mode")->asString() == "auto");
+    CHECK(quality_json.find("preferences")->find("mode")->asString() == "transcode");
     CHECK(quality_json.find("preferences")->find("max_height")->asInt64() == 720);
     CHECK(quality_json.find("output")->find("video")->find("codec")->asString() == "h264");
     CHECK(quality_json.find("output")->find("video")->find("height")->asInt64() == 720);
@@ -2551,14 +2577,14 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     CHECK(std::any_of(quality_modes.begin(), quality_modes.end(), [](const Json& mode) {
         return mode.asString() == "direct";
     }));
-    CHECK(std::none_of(quality_modes.begin(), quality_modes.end(), [](const Json& mode) {
+    CHECK(std::any_of(quality_modes.begin(), quality_modes.end(), [](const Json& mode) {
         return mode.asString() == "remux";
     }));
     CHECK(std::any_of(quality_modes.begin(), quality_modes.end(), [](const Json& mode) {
         return mode.asString() == "transcode";
     }));
 
-    Json::Object restore_preferences{{"mode", "auto"}, {"max_height", Json(nullptr)},
+    Json::Object restore_preferences{{"mode", "direct"}, {"max_height", Json(nullptr)},
                                      {"max_bitrate", Json(nullptr)}};
     Json::Object restore_root{{"preferences", Json(std::move(restore_preferences))}};
     auto restore_text = Json(std::move(restore_root)).dump();
@@ -2586,7 +2612,14 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     unsupported.path = "/api/v1/playback/sessions";
     unsupported.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     unsupported.body.assign(unsupported_text.begin(), unsupported_text.end());
-    CHECK(playback.handle(unsupported).status == 400);
+    // Capabilities are advisory: the instruction is performed and the
+    // contradiction is reported, rather than refused.
+    // Capabilities are advisory: the instruction is not refused for
+    // contradicting them. (This node already holds its single transcode
+    // slot from the session above, so the refusal here is admission, not
+    // negotiation -- which is itself the point.)
+    auto unsupported_response = playback.handle(unsupported);
+    CHECK(unsupported_response.status == 429);
 
     Json::Object preferences{{"mode", "transcode"}, {"subtitle_stream", 2}};
     Json::Object patch_root{{"preferences", Json(std::move(preferences))}, {"seek_ms", 12000}};
@@ -2674,7 +2707,8 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
 
     // A playback lease is a snapshot, not a pathname alias. Replacing the file
     // after resolve must not switch bytes underneath an already-running direct stream.
-    Json::Object path_root{{"media_id", "path:/media/test.mp4"}};
+    Json::Object path_root{{"media_id", "path:/media/test.mp4"},
+                           {"preferences", Json(Json::Object{{"mode", "direct"}})}};
     auto path_text = Json(std::move(path_root)).dump();
     HttpRequest path_create;
     path_create.method = "POST";

@@ -80,6 +80,29 @@ std::string direct_mime(std::string_view path) {
     return "application/octet-stream";
 }
 
+// The container token for a probed format name ("matroska,webm",
+// "mov,mp4,m4a,3gp,3g2,mj2", "mp3"). libavformat lists every name a demuxer
+// answers to, so a set is returned and the file name disambiguates.
+std::set<std::string> containers_from_format(std::string_view format) {
+    std::set<std::string> out;
+    size_t begin = 0;
+    while (begin <= format.size()) {
+        const auto end = format.find(',', begin);
+        const auto token = format.substr(begin, end == std::string_view::npos
+                                                    ? format.size() - begin
+                                                    : end - begin);
+        if (token == "matroska") out.insert("matroska");
+        else if (token == "webm") out.insert("webm");
+        else if (token == "mov" || token == "mp4" || token == "m4a") out.insert("mp4");
+        else if (token == "mp3") out.insert("mp3");
+        else if (token == "flac") out.insert("flac");
+        else if (token == "ogg") out.insert("ogg");
+        if (end == std::string_view::npos) break;
+        begin = end + 1;
+    }
+    return out;
+}
+
 std::string direct_container(std::string_view path) {
     auto ext = extension(path);
     if (ext == ".mp4" || ext == ".m4v" || ext == ".m4a" || ext == ".mov") return "mp4";
@@ -96,17 +119,30 @@ std::string direct_container(std::string_view path) {
     return {};
 }
 
+// What the file actually is, not what it is called. The probed format wins
+// over the extension: a Matroska file named .mp4 must not be handed to a
+// client that advertised mp4 (the name is metadata, the container is fact).
+// The extension only disambiguates a format that names several containers
+// (matroska,webm) and stands in when the probe reported nothing.
+std::string source_container(const MediaProbeResult& probe, std::string_view path) {
+    const auto by_name = direct_container(path);
+    const auto probed = containers_from_format(probe.format);
+    if (probed.empty()) return by_name;
+    if (probed.contains(by_name)) return by_name;
+    return *probed.begin();
+}
+
 bool fmp4_video_copy_supported(std::string_view codec) {
     return codec == "h264" || codec == "hevc" || codec == "av1";
 }
 
 bool fmp4_audio_copy_supported(std::string_view codec) {
-    // AAC only for now. Copying E-AC-3 made libavformat's fragmented MP4
-    // muxer fail its header write ("Invalid argument": the dec3 box needs
-    // the first packet parsed, i.e. delay_moov) and every create for a
-    // client listing eac3 answered 503 (es-1/gbni-2, 2026-09-07 18:11).
-    // (E-)AC-3 and Opus copy return once the muxer path handles them.
-    return codec == "aac";
+    // AAC and Opus have always worked; (E-)AC-3 needs the muxer to parse a
+    // packet before it can write the dac3/dec3 sample-entry box, which is
+    // what `delay_moov` does. Measured on this libavformat: without it the
+    // header write fails "Invalid argument" (the 503s of 2026-09-07 18:11),
+    // with it AC-3, E-AC-3, Opus and AAC all copy. The muxer sets the flag.
+    return codec == "aac" || codec == "ac3" || codec == "eac3" || codec == "opus";
 }
 
 bool webvtt_subtitle_supported(const MediaStreamInfo& stream) {
@@ -276,7 +312,17 @@ struct ClientCapabilities {
 };
 
 struct PlaybackPreferences {
-    std::string mode{"auto"};
+    // Required. The server performs what it is asked for and never chooses:
+    // "direct" (the source object over byte ranges), "remux" (copy the
+    // streams into an HLS container) or "transcode" (re-encode them).
+    std::string mode;
+    // Per-stream overrides of that shorthand, "copy" or "transcode", so a
+    // client can ask for any mixture (copy the video, re-encode the audio)
+    // without the server inferring anything.
+    std::optional<std::string> video;
+    std::optional<std::string> audio;
+    // HLS segment container: "fmp4" (default) or "mpegts".
+    std::string container{"fmp4"};
     std::optional<int> max_height;
     std::optional<uint64_t> max_bitrate;
     std::optional<int> audio_stream;
@@ -384,6 +430,21 @@ bool video_samples_supported(const MediaStreamInfo& video, const ClientCapabilit
 PlaybackPreferences parse_preferences(const Json* value, PlaybackPreferences current = {}) {
     if (!value || !value->isObject()) return current;
     if (auto mode = value->find("mode"); mode && mode->isString()) current.mode = lower(mode->asString());
+    const auto transform_instruction = [](const Json* v, const char* what) -> std::optional<std::string> {
+        if (!v || v->isNull()) return std::nullopt;
+        if (!v->isString()) throw std::invalid_argument(std::string(what) + " must be a string");
+        auto value = lower(v->asString());
+        if (value != "copy" && value != "transcode")
+            throw std::invalid_argument(std::string(what) + " must be copy or transcode");
+        return value;
+    };
+    if (auto v = value->find("video")) current.video = transform_instruction(v, "preferences.video");
+    if (auto v = value->find("audio")) current.audio = transform_instruction(v, "preferences.audio");
+    if (auto v = value->find("container"); v && v->isString()) {
+        current.container = lower(v->asString());
+        if (current.container != "fmp4" && current.container != "mpegts")
+            throw std::invalid_argument("preferences.container must be fmp4 or mpegts");
+    }
     if (auto v = value->find("max_height")) current.max_height = optional_int(v);
     if (auto v = value->find("max_bitrate")) current.max_bitrate = optional_u64(v);
     if (auto v = value->find("audio_stream")) current.audio_stream = optional_int(v);
@@ -423,8 +484,11 @@ const MediaStreamInfo* select_stream(const MediaProbeResult& probe, MediaStreamT
     return first_stream(probe, type);
 }
 
-PlaybackPlan negotiate(const MediaProbeResult& probe, std::string_view logical_path,
-                       const ClientCapabilities& caps, const PlaybackPreferences& prefs) {
+// Execute the client's instruction against the media's facts. The client's
+// advertised capabilities are deliberately not a parameter: the server
+// reports what the media is and performs what it is asked for, it does not
+// choose (operator, 2026-09-07).
+PlaybackPlan plan_for(const MediaProbeResult& probe, const PlaybackPreferences& prefs) {
     auto video = first_stream(probe, MediaStreamType::video);
     auto audio = select_stream(probe, MediaStreamType::audio, prefs.audio_stream, prefs.audio_language);
     const MediaStreamInfo* subtitle = nullptr;
@@ -441,93 +505,64 @@ PlaybackPlan negotiate(const MediaProbeResult& probe, std::string_view logical_p
     plan.audio_stream = audio ? audio->index : -1;
     plan.subtitle_stream = subtitle ? subtitle->index : -1;
 
-    if (prefs.mode != "auto" && prefs.mode != "direct" && prefs.mode != "remux" && prefs.mode != "transcode")
-        throw std::invalid_argument("preferences.mode must be auto, direct, remux or transcode");
+    if (prefs.mode != "direct" && prefs.mode != "remux" && prefs.mode != "transcode")
+        throw std::invalid_argument(
+            "preferences.mode is required and must be direct, remux or transcode: the server "
+            "reports what the media is and performs what it is asked for, it does not choose");
     plan.video = video ? MediaTransform::copy : MediaTransform::omit;
     plan.audio = audio ? MediaTransform::copy : MediaTransform::omit;
     plan.video_codec = video ? lower(video->codec) : std::string{};
     plan.audio_codec = audio ? lower(audio->codec) : std::string{};
 
-    // Direct is an explicit byte-stream override, not a negotiated playback
-    // mode. The client has asked for the original media object and accepts
-    // responsibility for whether it can decode that object. Preserve probing
-    // and track metadata for the session API, but do not apply capability,
-    // resolution, bitrate or HLS constraints to this mode.
+    // Direct is the source object itself over byte ranges.
     if (prefs.mode == "direct") {
         plan.mode = PlaybackMode::direct;
         return plan;
     }
 
-    const auto source_container = direct_container(logical_path);
-    const auto container_advertised = [&](const std::string& token) {
-        if (token.empty()) return false;
-        if (caps.containers.contains(token)) return true;
-        // Accept the spellings clients actually probe with.
-        if (token == "matroska") return caps.containers.contains("mkv") ||
-                                        caps.containers.contains("x-matroska");
-        return false;
-    };
-    bool direct_container_ok = container_advertised(source_container);
-    bool video_direct = !video || (caps.video_codecs.contains(lower(video->codec)) &&
-                                   video_samples_supported(*video, caps));
-    bool audio_direct = !audio || caps.audio_codecs.contains(lower(audio->codec));
-    bool size_direct = true;
-    auto max_height = prefs.max_height ? prefs.max_height : caps.max_height;
-    if (video && max_height && video->height > *max_height) size_direct = false;
-    if (video && caps.max_width && video->width > *caps.max_width) size_direct = false;
-    bool bitrate_direct = !prefs.max_bitrate || !probe.bitrate || probe.bitrate <= *prefs.max_bitrate;
-    bool can_direct = direct_container_ok && video_direct && audio_direct && size_direct && bitrate_direct;
-    if (prefs.mode == "auto" && can_direct) {
-        plan.mode = PlaybackMode::direct;
-        return plan;
-    }
-    // Fragmented MP4 unless the client cannot take it and says it takes
-    // MPEG-TS instead (a 2017 TV's native HLS player, 2026-09-07).
-    if (caps.hls_fmp4) {
-        plan.container = MediaContainer::fmp4;
-    } else if (caps.hls_ts) {
-        plan.container = MediaContainer::mpegts;
-    } else {
-        throw std::invalid_argument("client cannot accept fragmented-MP4 or MPEG-TS HLS");
-    }
+    // HLS. The segment container is the client's instruction too; fMP4
+    // unless it asked for MPEG-TS.
+    plan.container = prefs.container == "mpegts" ? MediaContainer::mpegts : MediaContainer::fmp4;
 
     const auto source_video_codec = video ? lower(video->codec) : std::string{};
     const auto source_audio_codec = audio ? lower(audio->codec) : std::string{};
-    bool video_copy = !video || (hls_video_codecs(caps).contains(source_video_codec) &&
-                                 fmp4_video_copy_supported(source_video_codec) &&
-                                 video_samples_supported(*video, caps));
-    // Audio the client lists can travel in fragmented MP4 as it is: AAC,
-    // (E-)AC-3 and Opus all have fMP4 sample entries. Until 0.32.12 only AAC
-    // was copied, so an E-AC-3 title on an HEVC-capable client still ended
-    // up a "transcode" session for the audio alone (2026-09-07).
-    bool audio_copy = !audio || (caps.audio_codecs.contains(source_audio_codec) &&
-                                 fmp4_audio_copy_supported(source_audio_codec));
-    std::optional<int> target_height = max_height;
-    if (video && caps.max_width && video->width > *caps.max_width && video->width > 0 && video->height > 0) {
-        auto by_width = static_cast<int>(std::floor(static_cast<double>(video->height) *
-                                                    static_cast<double>(*caps.max_width) /
-                                                    static_cast<double>(video->width)));
-        by_width = std::max(2, by_width & ~1);
-        target_height = target_height ? std::min(*target_height, by_width) : by_width;
-    }
-    if (video && target_height && video->height > *target_height) {
+    // `mode` is the shorthand: remux copies both streams, transcode
+    // re-encodes both. `preferences.video` / `preferences.audio` override
+    // either one, which is how a client asks for the common mixture (copy
+    // the video, re-encode the audio) without the server inferring anything.
+    const bool transcode_shorthand = prefs.mode == "transcode";
+    bool video_copy = !video || !transcode_shorthand;
+    bool audio_copy = !audio || !transcode_shorthand;
+    if (video && prefs.video) video_copy = *prefs.video == "copy";
+    if (audio && prefs.audio) audio_copy = *prefs.audio == "copy";
+
+    // A quality instruction is a re-encode by definition.
+    if (video && prefs.max_height && video->height > *prefs.max_height) {
+        plan.target_height = *prefs.max_height;
+        if (video_copy && prefs.video && *prefs.video == "copy")
+            throw std::invalid_argument(
+                "preferences.video=copy cannot be combined with preferences.max_height below the "
+                "source height");
         video_copy = false;
-        plan.target_height = *target_height;
     }
-    if (prefs.max_bitrate) {
-        video_copy = false;
+    if (video && prefs.max_bitrate) {
         plan.target_video_bitrate = *prefs.max_bitrate;
+        if (video_copy && prefs.video && *prefs.video == "copy")
+            throw std::invalid_argument(
+                "preferences.video=copy cannot be combined with preferences.max_bitrate");
+        video_copy = false;
     }
-    if (prefs.mode == "transcode") {
-        if (video) video_copy = false;
-        if (audio) audio_copy = false;
-    }
-    if (prefs.mode == "remux" && (!video_copy || !audio_copy))
-        throw std::invalid_argument("requested remux requires copy-compatible video and AAC audio without quality conversion");
-    if (video && !video_copy && !hls_video_codecs(caps).contains("h264"))
-        throw std::invalid_argument("client cannot decode the H.264 transcode target");
-    if (audio && !audio_copy && !caps.audio_codecs.contains("aac"))
-        throw std::invalid_argument("client cannot decode the AAC transcode target");
+
+    // What the segment container can physically carry. This is a fact about
+    // the media and the muxer, not about the client.
+    if (video && video_copy && plan.container == MediaContainer::fmp4 &&
+        !fmp4_video_copy_supported(source_video_codec))
+        throw std::invalid_argument("fragmented MP4 cannot carry a copied " + source_video_codec +
+                                    " video stream; ask for preferences.video=transcode");
+    if (audio && audio_copy && plan.container == MediaContainer::fmp4 &&
+        !fmp4_audio_copy_supported(source_audio_codec))
+        throw std::invalid_argument("fragmented MP4 cannot carry a copied " + source_audio_codec +
+                                    " audio stream; ask for preferences.audio=transcode");
 
     plan.video = video ? (video_copy ? MediaTransform::copy : MediaTransform::transcode) : MediaTransform::omit;
     plan.audio = audio ? (audio_copy ? MediaTransform::copy : MediaTransform::transcode) : MediaTransform::omit;
@@ -555,6 +590,10 @@ Json stream_json(const MediaStreamInfo& stream) {
     if (stream.bit_depth) out["bit_depth"] = stream.bit_depth;
     if (stream.level) out["level"] = stream.level;
     if (!stream.color_transfer.empty()) out["color_transfer"] = stream.color_transfer;
+    if (stream.dolby_vision_profile) {
+        out["dolby_vision_profile"] = stream.dolby_vision_profile;
+        out["dolby_vision_compatibility"] = stream.dolby_vision_compatibility;
+    }
     if (stream.bitrate) out["bitrate"] = stream.bitrate;
     return Json(std::move(out));
 }
@@ -580,8 +619,10 @@ Json playback_warnings_json(const MediaProbeResult& probe, const PlaybackPlan& p
                                       {"field", std::move(field)},
                                       {"message", std::move(message)}});
     };
-    const bool explicit_mode = prefs.mode == "direct" || prefs.mode == "remux";
-    if (!explicit_mode) return Json(std::move(out));
+    // Every mode is an instruction now, so any contradiction between what was
+    // asked for and what the client advertised is worth reporting -- and only
+    // reporting: the capability lists never change what the server does.
+    (void)prefs;
     if (plan.mode == PlaybackMode::direct) {
         // Explicit direct hands over the source file itself, whatever it is:
         // the client asked for the bytes and takes responsibility (it is also
@@ -589,7 +630,7 @@ Json playback_warnings_json(const MediaProbeResult& probe, const PlaybackPlan& p
         // when the container was never advertised -- a client sending direct
         // by default got raw Matroska it had not claimed to read, and the
         // failure surfaced as an unexplained decode error (2026-09-07).
-        const auto container = direct_container(logical_path);
+        const auto container = source_container(probe, logical_path);
         if (!container.empty() && !caps.containers.contains(container) &&
             !(container == "matroska" && (caps.containers.contains("mkv") ||
                                           caps.containers.contains("x-matroska"))))
@@ -602,16 +643,26 @@ Json playback_warnings_json(const MediaProbeResult& probe, const PlaybackPlan& p
         if (!caps.video_codecs.contains(codec))
             add("video_codecs", "the source video is " + codec +
                                     ", which the client did not list as decodable");
-        if (video->bit_depth > 8 && caps.max_video_bit_depth < video->bit_depth)
-            add("video_bit_depth", "the source video is " + std::to_string(video->bit_depth) +
-                                       "-bit; the client advertised " +
-                                       std::to_string(caps.max_video_bit_depth));
-        const bool hdr = video->color_transfer == "smpte2084" ||
-                         video->color_transfer == "arib-std-b67";
-        if (hdr && !caps.hdr_transfers.contains(video->color_transfer))
-            add("hdr", "the source video uses the " + video->color_transfer +
-                           " transfer, which the client did not list");
+        if (plan.mode != PlaybackMode::direct && caps.video_codecs.contains(codec) &&
+            !hls_video_codecs(caps).contains(codec))
+            add("hls_video_codecs", "the source video is " + codec +
+                                        ", which the client listed for direct playback but not for"
+                                        " HLS delivery");
+        if (!video_samples_supported(*video, caps)) {
+            if (video->bit_depth > 8 && caps.max_video_bit_depth < video->bit_depth)
+                add("video_bit_depth", "the source video is " + std::to_string(video->bit_depth) +
+                                           "-bit; the client advertised " +
+                                           std::to_string(caps.max_video_bit_depth));
+            if (!video->color_transfer.empty() &&
+                !caps.hdr_transfers.contains(video->color_transfer))
+                add("hdr", "the source video uses the " + video->color_transfer +
+                               " transfer, which the client did not list");
+        }
     }
+    if (plan.video == MediaTransform::transcode && !hls_video_codecs(caps).contains("h264"))
+        add("video_codecs", "the transcode target is h264, which the client did not list");
+    if (plan.audio == MediaTransform::transcode && !caps.audio_codecs.contains("aac"))
+        add("audio_codecs", "the transcode target is aac, which the client did not list");
     if (const auto* audio = stream_at(probe, plan.audio_stream);
         audio && plan.audio == MediaTransform::copy) {
         const auto codec = lower(audio->codec);
@@ -633,6 +684,9 @@ std::string transform_name(MediaTransform transform) {
 
 Json preferences_json(const PlaybackPreferences& preferences) {
     Json::Object out{{"mode", preferences.mode},
+                     {"video", preferences.video ? Json(*preferences.video) : Json(nullptr)},
+                     {"audio", preferences.audio ? Json(*preferences.audio) : Json(nullptr)},
+                     {"container", preferences.container},
                      {"max_height", preferences.max_height ? Json(*preferences.max_height) : Json(nullptr)},
                      {"max_bitrate", preferences.max_bitrate ? Json(*preferences.max_bitrate) : Json(nullptr)},
                      {"audio_stream", preferences.audio_stream ? Json(*preferences.audio_stream) : Json(nullptr)},
@@ -1544,7 +1598,7 @@ struct PlaybackManager::Impl {
                 const auto profile_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     Clock::now() - profile_started).count();
                 const auto selection_started = Clock::now();
-                auto plan = negotiate(probe, lease.path, capabilities, preferences);
+                auto plan = plan_for(probe, preferences);
                 require_plan_supported(plan);
                 const auto selection_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     Clock::now() - selection_started).count();
@@ -1669,8 +1723,7 @@ struct PlaybackManager::Impl {
             auto preferences = session.preferences;
             preferences.mode = candidate;
             try {
-                const auto plan = negotiate(session.probe, session.source.logical_path,
-                                            session.capabilities, preferences);
+                const auto plan = plan_for(session.probe, preferences);
                 if (plan_supported(plan)) modes.emplace_back(candidate);
             } catch (...) {}
         }
@@ -1682,8 +1735,7 @@ struct PlaybackManager::Impl {
                 auto preferences = session.preferences;
                 preferences.max_height = height;
                 try {
-                    const auto plan = negotiate(session.probe, session.source.logical_path,
-                                                session.capabilities, preferences);
+                    const auto plan = plan_for(session.probe, preferences);
                     if (plan_supported(plan)) quality_heights.emplace_back(height);
                 } catch (...) {}
             }
@@ -1695,8 +1747,7 @@ struct PlaybackManager::Impl {
                 preferences.audio_stream = stream.index;
                 preferences.audio_language.clear();
                 try {
-                    const auto plan = negotiate(session.probe, session.source.logical_path,
-                                                session.capabilities, preferences);
+                    const auto plan = plan_for(session.probe, preferences);
                     if (plan_supported(plan)) audio_streams.emplace_back(stream_json(stream));
                 } catch (...) {}
             }
@@ -1705,8 +1756,7 @@ struct PlaybackManager::Impl {
                 preferences.subtitle_stream = stream.index;
                 preferences.subtitle_language.clear();
                 try {
-                    const auto plan = negotiate(session.probe, session.source.logical_path,
-                                                session.capabilities, preferences);
+                    const auto plan = plan_for(session.probe, preferences);
                     if (plan_supported(plan)) subtitle_streams.emplace_back(stream_json(stream));
                 } catch (...) {}
             }
@@ -2529,6 +2579,80 @@ struct PlaybackManager::Impl {
         return http_json(200, Json(std::move(out)).dump());
     }
 
+    // GET /api/v1/playback/media?media_id=...  (also accepts item_id)
+    // The server's half of the contract: what the media is, and what can be
+    // done with it, before any instruction is given. No session, no
+    // pipeline, no capability matching -- a client reads these facts and
+    // then tells the server what to do (operator, 2026-09-07).
+    HttpResponse media_facts(const HttpRequest& request) {
+        if (!config.enabled) return http_error(503, "streaming_disabled", "streaming is disabled");
+        if (!request.session)
+            return http_error(401, "unauthorized", "a valid session bearer token is required");
+        const auto find_query = [&](std::string_view key) {
+            auto it = request.query.find(key);
+            return it == request.query.end() ? std::string{} : it->second;
+        };
+        const auto media_id = find_query("media_id");
+        const auto item_id = find_query("item_id");
+        std::vector<std::string> media_ids;
+        if (!media_id.empty()) {
+            media_ids.push_back(media_id);
+        } else if (!item_id.empty()) {
+            media_ids = item_media(item_id);
+            if (media_ids.empty())
+                return http_error(404, "not_found", "no media representations for that item");
+        } else {
+            return http_error(400, "bad_request", "media_id or item_id is required");
+        }
+
+        const auto deadline = Clock::now() + config.probe_timeout;
+        Json::Array reported;
+        std::string last_error;
+        for (const auto& id : media_ids) {
+            try {
+                auto lease = create_source(id);
+                auto probe = probe_source(lease, "facts", deadline);
+                Json::Array streams;
+                for (const auto& stream : probe.streams) streams.emplace_back(stream_json(stream));
+                // What this media supports, as a fact about the media and the
+                // muxers, not about any client: direct is always the bytes;
+                // a copy into a container depends on what that container can
+                // carry; a transcode depends on the encoders being present.
+                const auto* video = first_stream(probe, MediaStreamType::video);
+                const auto* audio = first_stream(probe, MediaStreamType::audio);
+                const auto engine_state = engine ? engine->status() : MediaEngineStatus{};
+                Json::Object copy_fmp4{
+                    {"video", !video || fmp4_video_copy_supported(lower(video->codec))},
+                    {"audio", !audio || fmp4_audio_copy_supported(lower(audio->codec))}};
+                Json::Object operations{
+                    {"direct", true},
+                    {"copy_into_fmp4", Json(std::move(copy_fmp4))},
+                    {"transcode_video", engine_state.h264_encoder},
+                    {"transcode_audio", engine_state.aac_encoder}};
+                Json::Object entry{
+                    {"media_id", lease.media_id},
+                    {"path", lease.path},
+                    {"size", lease.entry.size},
+                    {"container", source_container(probe, lease.path)},
+                    {"format", probe.format},
+                    {"duration_ms",
+                     static_cast<uint64_t>(std::max(0.0, probe.duration_seconds) * 1000.0)},
+                    {"bitrate", probe.bitrate},
+                    {"streams", Json(std::move(streams))},
+                    {"operations", Json(std::move(operations))}};
+                reported.emplace_back(std::move(entry));
+            } catch (const std::exception& e) {
+                last_error = e.what();
+            }
+        }
+        if (reported.empty())
+            return http_error(404, "not_found",
+                              last_error.empty() ? "media is not available" : last_error);
+        Json::Object out{{"media", Json(std::move(reported))}};
+        if (!item_id.empty()) out["item_id"] = item_id;
+        return http_json(200, Json(std::move(out)).dump());
+    }
+
     HttpResponse handle_api(const HttpRequest& request) {
         if (request.path == "/api/v1/playback/status" && request.method == "GET") return status();
         if (request.path == "/api/v1/playback/sessions" && request.method == "POST") return create(request);
@@ -2541,6 +2665,8 @@ struct PlaybackManager::Impl {
             if (request.method == "DELETE") return erase_session(id);
             return http_error(405, "method", "GET, PATCH or DELETE required");
         }
+        if (request.path == "/api/v1/playback/media" && request.method == "GET")
+            return media_facts(request);
         if (request.path.starts_with("/api/v1/playback/stream/")) return public_stream_response(request);
         return http_error(404, "not_found", "endpoint not found");
     }

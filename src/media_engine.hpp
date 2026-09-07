@@ -49,6 +49,12 @@ struct MediaStreamInfo {
     // the HDR negotiation gate. Last, so positional initialisers keep working.
     int level{};
     std::string color_transfer{};
+    // Dolby Vision configuration record, when the stream carries one:
+    // profile (5, 7, 8, ...) and the base-layer compatibility id (1 =
+    // HDR10-compatible, 2 = SDR, 4 = HLG). A client needs both to know
+    // whether its decoder can take the stream (2026-09-07).
+    int dolby_vision_profile{};
+    int dolby_vision_compatibility{};
     auto operator<=>(const MediaStreamInfo&) const = default;
 };
 
