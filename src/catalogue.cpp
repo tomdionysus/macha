@@ -207,6 +207,10 @@ void encode_media_profile(Writer& w, const CatalogueSnapshot::MediaProfile& prof
             w.u32(static_cast<uint32_t>(std::max(0, stream.level)));
             w.string(stream.color_transfer);
         }
+        if (profile.schema_version >= 3) {
+            w.u32(static_cast<uint32_t>(std::max(0, stream.dolby_vision_profile)));
+            w.u32(static_cast<uint32_t>(std::max(0, stream.dolby_vision_compatibility)));
+        }
     }
 }
 
@@ -242,6 +246,10 @@ CatalogueSnapshot::MediaProfile decode_media_profile(Reader& r) {
             stream.level = static_cast<int32_t>(r.u32());
             stream.color_transfer = r.string(256);
         }
+        if (profile.schema_version >= 3) {
+            stream.dolby_vision_profile = static_cast<int32_t>(r.u32());
+            stream.dolby_vision_compatibility = static_cast<int32_t>(r.u32());
+        }
         profile.probe.streams.push_back(std::move(stream));
     }
     return profile;
@@ -251,8 +259,8 @@ CatalogueSnapshot::MediaProfile decode_media_profile(Reader& r) {
 
 bool valid_catalogue_media_profile(
     std::string_view media_id, const CatalogueSnapshot::MediaProfile& profile) {
-    if (!media_id.starts_with("macha:") ||
-        (profile.schema_version != 1 && profile.schema_version != 2) || !profile.complete ||
+    if (!media_id.starts_with("macha:") || profile.schema_version < 1 ||
+        profile.schema_version > catalogue_media_profile_schema || !profile.complete ||
         profile.probe.format.empty() || !std::isfinite(profile.probe.duration_seconds) ||
         profile.probe.duration_seconds < 0.0 || profile.probe.streams.empty())
         return false;
@@ -266,8 +274,8 @@ bool valid_catalogue_media_profile(
         // depth signalling or transfer; negotiation needs both, so such a
         // profile is stale and is regenerated on the next playback (and
         // republished). Audio-only profiles are unaffected.
-        if (profile.schema_version < 2 && stream.type == MediaStreamType::video &&
-            !stream.attached_picture)
+        if (profile.schema_version < catalogue_media_profile_schema &&
+            stream.type == MediaStreamType::video && !stream.attached_picture)
             return false;
     }
     return true;

@@ -15,6 +15,7 @@ extern "C" {
 #include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
 #include <libavutil/opt.h>
+#include <libavutil/dovi_meta.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/version.h>
 #include <libswresample/swresample.h>
@@ -1241,8 +1242,14 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
 
         AvDictionaryOwner options;
         if (!mpegts) {
+            // delay_moov: the (E-)AC-3 sample entry carries a dac3/dec3 box
+            // the muxer can only fill from a parsed packet, so writing moov
+            // at header time fails outright for those codecs. Delaying it
+            // until the first packets are seen is what makes an AC-3 or
+            // E-AC-3 stream copyable into fMP4 at all; it still precedes the
+            // first moof, so the init segment is published as before.
             av_require(av_dict_set(options.put(), "movflags",
-                                   "frag_custom+empty_moov+default_base_moof+omit_tfhd_offset+negative_cts_offsets",
+                                   "frag_custom+empty_moov+default_base_moof+omit_tfhd_offset+negative_cts_offsets+delay_moov",
                                    0),
                        "set fragmented MP4 options");
         }
@@ -1502,6 +1509,18 @@ class LibavMediaEngine final : public MediaEngine {
                     info.bit_depth = desc->comp[0].depth;
             }
             info.level = par->level > 0 ? par->level : 0;
+            if (par->codec_type == AVMEDIA_TYPE_VIDEO) {
+                for (int side = 0; side < par->nb_coded_side_data; ++side) {
+                    const auto& entry = par->coded_side_data[side];
+                    if (entry.type != AV_PKT_DATA_DOVI_CONF ||
+                        entry.size < static_cast<size_t>(sizeof(AVDOVIDecoderConfigurationRecord)))
+                        continue;
+                    const auto* dovi =
+                        reinterpret_cast<const AVDOVIDecoderConfigurationRecord*>(entry.data);
+                    info.dolby_vision_profile = dovi->dv_profile;
+                    info.dolby_vision_compatibility = dovi->dv_bl_signal_compatibility_id;
+                }
+            }
             if (par->codec_type == AVMEDIA_TYPE_VIDEO && par->color_trc != AVCOL_TRC_UNSPECIFIED)
                 if (const char* transfer = av_color_transfer_name(par->color_trc))
                     info.color_transfer = transfer;
