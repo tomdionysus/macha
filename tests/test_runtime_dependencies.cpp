@@ -3,6 +3,8 @@
 #include "process_allocator.hpp"
 
 extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/channel_layout.h>
 #include <libavutil/log.h>
 }
 
@@ -813,4 +815,54 @@ MACHA_FAST_TEST("runtime_dependencies", test_probe_failure_reports_why_it_failed
     }
     REQUIRE(headless_failure.has_value());
     CHECK(*headless_failure == MediaFailure::unreadable);
+}
+
+MACHA_FAST_TEST("runtime_dependencies", test_aac_encodes_a_standard_channel_configuration) {
+    // Asked of the real encoder in this build, because the defect was the
+    // encoder answering a legal request with something a browser will not
+    // parse. A channelConfiguration of 0 means the layout was described in a
+    // Program Config Element; Chrome's MP4 parser rejects that, the init
+    // segment fails to parse, MediaSource ends with a decode error, and the
+    // title is unplayable everywhere Chromium is the engine. Every 5.1 source
+    // transcoded to AAC hit it, because E-AC-3 decodes to 5.1(side)
+    // (2026-09-08).
+    const auto* codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
+    REQUIRE(codec != nullptr);
+    for (int channels = 1; channels <= 8; ++channels) {
+        const auto* layout = macha::aac_standard_channel_layout(channels);
+        REQUIRE(layout != nullptr);
+        auto* enc = avcodec_alloc_context3(codec);
+        REQUIRE(enc != nullptr);
+        enc->sample_rate = 48000;
+        enc->sample_fmt = AV_SAMPLE_FMT_FLTP;
+        enc->time_base = AVRational{1, enc->sample_rate};
+        // The extradata only exists when the muxer asked for a global header,
+        // which is what fragmented MP4 does and what carries the config a
+        // browser reads.
+        enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        REQUIRE(av_channel_layout_from_string(&enc->ch_layout, layout) == 0);
+        const bool opened = avcodec_open2(enc, codec, nullptr) == 0;
+        if (!opened) {
+            // A build whose AAC encoder refuses this many channels is a
+            // different situation from one that encodes them unparseably.
+            avcodec_free_context(&enc);
+            continue;
+        }
+        REQUIRE(enc->extradata != nullptr);
+        REQUIRE(enc->extradata_size >= 2);
+        const auto bits = (static_cast<unsigned>(enc->extradata[0]) << 8) |
+                          static_cast<unsigned>(enc->extradata[1]);
+        const int configuration = static_cast<int>((bits >> 3) & 0xf);
+        CHECK(configuration != 0);
+        // Seven channels have no standard configuration; they are carried as
+        // 7.1 with the eighth silent, so the count may round up but never down.
+        CHECK(enc->ch_layout.nb_channels >= channels);
+        avcodec_free_context(&enc);
+    }
+    // The mapping itself: every count names a layout, and the surround pair
+    // sits at the back, which is what makes it standard.
+    CHECK(std::string(macha::aac_standard_channel_layout(6)) == "5.1");
+    CHECK(std::string(macha::aac_standard_channel_layout(2)) == "stereo");
+    CHECK(std::string(macha::aac_standard_channel_layout(0)) == "stereo");
+    CHECK(std::string(macha::aac_standard_channel_layout(12)) == "7.1");
 }

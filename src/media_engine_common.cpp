@@ -170,6 +170,39 @@ const char* media_container_name(MediaContainer container) noexcept {
     return container == MediaContainer::mpegts ? "mpegts" : "fmp4";
 }
 
+// AAC defines a standard configuration for 1-6 and 8 channels, and every one
+// of them puts the surround pair at the back rather than the side. A layout
+// outside that set -- 5.1(side), which is what E-AC-3 decodes to, is the
+// common way in -- makes the encoder describe the arrangement in a Program
+// Config Element instead and set channelConfiguration 0.
+//
+// Chrome's MP4 parser refuses that config: the init segment fails to parse,
+// MediaSource ends with a decode error, and every append after it fails, so
+// the whole title is unplayable in any Chromium browser or WebView while
+// Safari and the television's native player are unaffected (measured on
+// Chrome 141, 2026-09-08). Measured against libavcodec on the cluster: "5.1"
+// yields a five-byte config with channelConfiguration 6, "5.1(side)" a
+// 26-byte Program Config Element with channelConfiguration 0.
+//
+// Naming the standard layout costs nothing audible. The resampler maps the
+// source's channels into it, so the channel count is unchanged and only the
+// labelling of the surround pair moves. Seven channels have no standard
+// configuration at all; 7.1 carries all seven and leaves the eighth silent,
+// which loses nothing.
+const char* aac_standard_channel_layout(int channels) noexcept {
+    switch (channels) {
+    case 1: return "mono";
+    case 2: return "stereo";
+    case 3: return "3.0";
+    case 4: return "4.0";
+    case 5: return "5.0";
+    case 6: return "5.1";
+    case 7: return "7.1";
+    default: break;
+    }
+    return channels >= 8 ? "7.1" : "stereo";
+}
+
 std::string playback_mode_name(PlaybackMode mode) {
     switch (mode) {
     case PlaybackMode::direct: return "direct";
