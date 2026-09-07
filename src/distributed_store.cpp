@@ -739,11 +739,6 @@ bool DistributedStore::retain_on(const NodeInfo& target, RetentionClass object_c
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     if (target.id == n_.node_id()) {
         for (const auto& id : ids) {
-            auto resource = n_.data_resources().acquire(
-                DataWorkContext(FrameType::loader, n_.config().extent_size),
-                n_.config().extent_size);
-            if (!resource)
-                return false;
             // A retention claim says "this node holds the object". Until
             // 0.32.3 it re-read, decrypted and hashed every extent here (the
             // full valid() path) inside the metadata mutation: minutes per
@@ -754,7 +749,9 @@ bool DistributedStore::retain_on(const NodeInfo& target, RetentionClass object_c
             // the index is the same contract discipline 1 wrote down for
             // durability ("present after a restart is durable"): the bytes
             // were verified when this node put them, and the scrub, not the
-            // retention claim, is where later corruption is found.
+            // retention claim, is where later corruption is found. (No DATA
+            // admission for an index lookup; the remote handler matches
+            // since 0.32.7.)
             const bool present = object_class == RetentionClass::data
                                      ? n_.local_store().has(id)
                                      : n_.control_store().has(id);

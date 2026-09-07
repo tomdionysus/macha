@@ -285,6 +285,14 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_frame_priority_and_variable_length) {
         client.call(endpoint, MessageType::put_object, Bytes{0x4c}, FrameType::loader, 2s);
     CHECK(loader_reply.message.type == MessageType::ok);
     CHECK(loader_reply.message.payload == Bytes{0x4c});
+    // The control-lane calls above leave a smoothed latency for the peer;
+    // commit fan-out orders replicas by it. Loopback: well under a second.
+    {
+        const auto latency = client.peer_latency(server_info.id);
+        REQUIRE(latency.has_value());
+        CHECK(*latency < 1000ms);
+        CHECK(client.peer_latencies().size() == 1);
+    }
     {
         std::lock_guard lock(order_mutex);
         order.clear();
@@ -3086,6 +3094,37 @@ MACHA_HEAVY_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_befo
     s3->stop();
     s2.stop();
     s1.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_commit_replicas_ordered_local_then_nearest) {
+    NodeInfo local, lan, wan, unknown;
+    local.id.bytes.fill(0x50);
+    lan.id.bytes.fill(0x70);
+    wan.id.bytes.fill(0x10); // lowest NodeId: first under the old ordering
+    unknown.id.bytes.fill(0x90);
+    local.host = "local";
+    lan.host = "lan";
+    wan.host = "wan";
+    unknown.host = "unknown";
+    const auto latency = [&](const NodeId& id) -> std::optional<std::chrono::milliseconds> {
+        if (id == lan.id)
+            return 2ms;
+        if (id == wan.id)
+            return 120ms;
+        return std::nullopt;
+    };
+    const auto ordered = order_commit_replicas({wan, unknown, lan, local}, local.id, latency);
+    REQUIRE(ordered.size() == 4);
+    CHECK(ordered[0].host == "local");
+    CHECK(ordered[1].host == "lan");
+    CHECK(ordered[2].host == "wan");
+    CHECK(ordered[3].host == "unknown");
+    // No measurements yet: the local replica still leads, the rest keep
+    // their given order.
+    const auto cold = order_commit_replicas({wan, lan, local}, local.id, {});
+    CHECK(cold[0].host == "local");
+    CHECK(cold[1].host == "wan");
+    CHECK(cold[2].host == "lan");
 }
 
 MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_cluster_healthy) {
