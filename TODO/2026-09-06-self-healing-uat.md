@@ -700,3 +700,57 @@ to stop. Proposed, not yet implemented: classify an unreadable-source EIO
 as a distinct retryable status, and keep `profile_failed` for a source that
 opened and would not parse. Deciding the status code and error name is an
 interface call, so it is held for the operator.
+
+## 0.32.19 / 0.33.0 — what a remux actually emits (2026-09-07 22:00–23:00)
+
+The client session asked for the emitted segments to be ffprobed rather
+than the 201 trusted. That found two faults in code that had passed every
+test, and a third came out of enforcing the operator's mode ruling.
+
+**The first fragment carried two segments.** The fragmented MP4 muxer
+delays its `moov` until it has seen a packet of every stream, because the
+(E-)AC-3 sample entry can only be filled from one. The flush that writes
+that `moov` emits no `moof`: the media buffered up to it stays buffered and
+joins the next fragment. That flush was landing on the first planned
+boundary, so segment 0 carried 20.8 s while the playlist declared 10.427,
+and every later segment sat a full segment early on the player's timeline.
+Measured on The Last of Us S02E07 through gbni-1:
+
+    before   seg0 0.000..20.812  seg1 20.770..31.239  seg2 31.197..41.666
+    after    seg0 0.000..10.301  seg1 10.260..20.812  seg2 20.770..31.239
+
+The `moov` is now flushed as soon as every stream has been written, which
+costs nothing, and a boundary that yields no fragment carries its length
+into the fragment that does. The second half matters more than the first:
+it makes the playlist unable to describe media that is not there, whatever
+future reason a cut has for not landing.
+
+**The AAC encoder was pinned to stereo.** A 5.1 source came back as two
+channels whenever the audio was re-encoded, at a fixed 192 kbit/s. It now
+keeps the source layout at 64 kbit/s per channel. A client that asked for a
+codec change did not ask for a downmix.
+
+**Eleven of 27 mode/video/audio permutations disagreed with the ruling.**
+Enumerated against a live node before and after. Two were the damaging
+ones: `remux` with a re-encoded stream was accepted and reported back as a
+transcode, and `transcode` with both streams copied was accepted and
+reported back as a remux — so the reported mode was not evidence of
+anything, which is the ground several hours of client-side diagnosis stood
+on. `direct` silently ignored `max_height` and `max_bitrate`. After
+0.33.0: 0 disagreements on gbni-2 and es-1.
+
+Eliminated by measurement, for the Samsung investigation: we write `hvc1`,
+not `hev1` (init segment bytes, offset 457, no `hev1` present), and `ec-3`
+for E-AC-3. MPEG-TS emission works with both streams copied — HEVC Main 10
+and E-AC-3 5.1 untouched, boundaries aligned with the fMP4 ones.
+
+**gbni-2 recovered by reboot.** Confirmed healthy afterwards: gateway,
+both peers and the internet reachable, catalogue caught up at the same
+metadata generation as its peers, profiles answering 200. Its dmesg also
+carries undervoltage events, so it may share gbni-1's power problem.
+
+Open, not chased tonight: `remux` on a cold cache occasionally answers 503
+"VOD planning timed out while loading video seek index" while it reads a
+Matroska file's cues across the network; the retry succeeds. It now carries
+a `source_read_timed_out` reason, but a first viewer on the WAN node may
+still wait out the probe timeout.
