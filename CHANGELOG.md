@@ -1,5 +1,34 @@
 # Current release
 
+## 0.32.8 — The writer's retention barrier fans out in parallel and measures itself (development)
+
+After 0.32.7 the replica-side claim handler read 0 ms and commit fan-out
+under 0.6 s on every node, and the `retention_ms` breakdown showed the
+remaining seconds inside the writer's own pre-publication barrier
+(`DistributedStore::retain_data`): ~1 s per quantum commit on gbni-1, 4.4 s
+on es-1, 6-15 s in the minutes after a restart.
+
+- The per-node claim RPCs (`retain_on`) run concurrently instead of one
+  round trip after another; on this cluster that is one 60-200 ms hop
+  instead of their sum.
+- The local presence checks in `batched_have_objects` and `has_on` no
+  longer take a 4 MB DATA loader lease per id: an index lookup owns no
+  buffer, and thousands of leases per quantum commit queued the barrier
+  behind the node's own publications.
+- `DATA retention barrier ids=… nodes=… total_ms=… scan_ms=… short=…
+  fallback_claims=… ok=…` is logged at debug when the barrier takes 250 ms
+  or more, so the next slow one names its phase.
+- `rpc_transport.peer_latency_ms` now samples only the heartbeat pings.
+  0.32.7 sampled every control call, so payload size and handler time made
+  gbni-1 see its wireless neighbour at 114 ms while the reverse direction
+  read 4 ms; ordering by a polluted measure sent commits to the remote site.
+
+Recorded, not changed: capacity placement does not guarantee the writer a
+local copy of what it publishes (`ranked(id)` is shard/capacity order), so a
+writer's put can be two remote replicas and its viewers read across the WAN;
+and re-claiming every extent of a file per quantum grows the retention
+journal quadratically over a large file's import.
+
 ## 0.32.7 — A remote retention claim is not a re-read; commits go to the nearest replica first (development)
 
 The "WAN control-lane starvation" of the full-library import (195-284 s

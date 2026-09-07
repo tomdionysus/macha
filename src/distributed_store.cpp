@@ -7,12 +7,18 @@
 #include <chrono>
 #include <cstring>
 #include <deque>
+#include <future>
 #include <limits>
 #include <set>
 #include <tuple>
 
 namespace macha {
 namespace {
+uint64_t elapsed_ms(Clock::time_point since) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - since).count());
+}
+
 bool read_aborted(Clock::time_point deadline, const std::atomic_bool* cancelled,
                   const std::function<bool()>& abort = {}) {
     return (cancelled && cancelled->load(std::memory_order_relaxed)) ||
@@ -796,6 +802,7 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
     // one fsync/RPC per object while preserving a per-object DATA durability
     // floor. Fallback single-object claims below handle a node disappearing
     // between planning and batch persistence.
+    const auto started = Clock::now();
     std::map<NodeId, NodeInfo> node_info;
     std::map<NodeId, std::vector<ObjectId>> batches;
     std::map<ObjectId, std::vector<NodeInfo>> candidates_by_object;
@@ -806,11 +813,28 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
     // has_on()-per-candidate loop this exists to remove). Preference order and
     // the per-object floor requirement are identical to the serial form.
     auto selected_by_object = select_present_batched(candidates_by_object, floor);
+    const auto scan_ms = elapsed_ms(started);
 
     std::vector<ObjectId> short_ids;
     for (const auto& id : ids)
         if (selected_by_object[id].size() < floor)
             short_ids.push_back(id);
+    const auto short_count = short_ids.size();
+    size_t fallback_claims = 0;
+    // Where the writer's retention barrier spends its time, when it is slow
+    // enough to matter (1-15 s per quantum commit on the live cluster,
+    // 2026-09-07): the presence scan, re-replication of short objects, the
+    // per-node claims, per-object fallbacks.
+    const auto report = [&](bool ok) {
+        const auto total = elapsed_ms(started);
+        if (total >= 250 && Log::enabled(LogLevel::debug))
+            Log::debug("DATA retention barrier ids=" + std::to_string(ids.size()) +
+                       " nodes=" + std::to_string(batches.size()) + " total_ms=" +
+                       std::to_string(total) + " scan_ms=" + std::to_string(scan_ms) +
+                       " short=" + std::to_string(short_count) +
+                       " fallback_claims=" + std::to_string(fallback_claims) +
+                       " ok=" + (ok ? "yes" : "no"));
+    };
 
     if (!short_ids.empty()) {
         // A metadata-only mutation may be the first operation on an object
@@ -821,8 +845,10 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
         std::map<ObjectId, std::vector<NodeInfo>> rescan_candidates;
         for (const auto& id : short_ids) {
             auto data = get(id, 0, FrameType::speculative);
-            if (!data || !put(id, *data))
+            if (!data || !put(id, *data)) {
+                report(false);
                 return false;
+            }
             auto candidates = ranked(id);
             candidates_by_object[id] = candidates;
             rescan_candidates.emplace(id, std::move(candidates));
@@ -838,6 +864,7 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
             Log::debug("DATA retention placement unavailable id=" + to_string(id) +
                        " required=" + std::to_string(floor) +
                        " present=" + std::to_string(selected.size()));
+            report(false);
             return false;
         }
         for (const auto& candidate : selected) {
@@ -846,15 +873,36 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
         }
     }
 
+    // One claim RPC per selected node, in parallel: the claims are
+    // independent, and serially each one cost a full round trip (60-200 ms
+    // to the remote and the wireless nodes on the live cluster) inside the
+    // writer's metadata mutation, for every quantum commit.
     std::map<ObjectId, std::set<NodeId>> claimed;
-    for (auto& [node_id, batch] : batches) {
-        auto found = node_info.find(node_id);
-        if (found == node_info.end())
-            continue;
-        if (!retain_on(found->second, RetentionClass::data, batch, dot))
-            continue;
-        for (const auto& id : batch)
-            claimed[id].insert(node_id);
+    {
+        std::vector<std::pair<NodeId, std::future<bool>>> claims;
+        claims.reserve(batches.size());
+        for (auto& [node_id, batch] : batches) {
+            auto found = node_info.find(node_id);
+            if (found == node_info.end())
+                continue;
+            const NodeInfo target = found->second;
+            const std::vector<ObjectId>* ids_ptr = &batch;
+            claims.emplace_back(node_id, std::async(std::launch::async, [this, target, ids_ptr, dot] {
+                return retain_on(target, RetentionClass::data, *ids_ptr, dot);
+            }));
+        }
+        for (auto& [node_id, result] : claims) {
+            bool ok = false;
+            try {
+                ok = result.get();
+            } catch (...) {
+                ok = false;
+            }
+            if (!ok)
+                continue;
+            for (const auto& id : batches[node_id])
+                claimed[id].insert(node_id);
+        }
     }
 
     for (const auto& id : ids) {
@@ -862,8 +910,10 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
         if (successful.size() >= floor)
             continue;
         const auto candidates = candidates_by_object.find(id);
-        if (candidates == candidates_by_object.end())
+        if (candidates == candidates_by_object.end()) {
+            report(false);
             return false;
+        }
         for (const auto& candidate : candidates->second) {
             if (successful.size() >= floor)
                 break;
@@ -875,6 +925,7 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
             } catch (...) {
                 present = false;
             }
+            ++fallback_claims;
             if (present && retain_on(candidate, RetentionClass::data, {id}, dot))
                 successful.insert(candidate.id);
         }
@@ -882,9 +933,11 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
             Log::debug("DATA retention floor unavailable id=" + to_string(id) +
                        " required=" + std::to_string(floor) +
                        " retained=" + std::to_string(successful.size()));
+            report(false);
             return false;
         }
     }
+    report(true);
     return true;
 }
 
@@ -1428,14 +1481,13 @@ std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::batched_have_object
     std::map<NodeId, std::map<ObjectId, bool>> results;
 
     // Local node: cheap presence check, no RPC, no chunking/concurrency needed.
+    // No DATA admission either: an index lookup owns no buffer, and taking a
+    // 4 MB loader lease per id (thousands per quantum commit) queued the
+    // writer's retention barrier behind its own publications.
     if (auto self = ids_by_node.find(n_.node_id()); self != ids_by_node.end()) {
         auto& out = results[n_.node_id()];
-        for (const auto& id : self->second) {
-            auto resource = n_.data_resources().acquire(
-                DataWorkContext(FrameType::loader, n_.config().extent_size),
-                n_.config().extent_size);
-            out[id] = resource && n_.local_store().has(id);
-        }
+        for (const auto& id : self->second)
+            out[id] = n_.local_store().has(id);
     }
 
     const size_t batch_size = std::max<size_t>(1, n_.config().retention_check_batch_size);
@@ -1587,14 +1639,9 @@ std::map<ObjectId, std::vector<NodeInfo>> DistributedStore::select_present_batch
 
 bool DistributedStore::has_on(const NodeInfo& target, const ObjectId& id) {
     if (target.id == n_.node_id()) {
-        auto resource = n_.data_resources().acquire(
-            DataWorkContext(FrameType::loader, n_.config().extent_size),
-            n_.config().extent_size);
-        if (!resource)
-            return false;
         // Presence-only: this is a candidate-selection probe, not the retention
         // commit. A full decrypt here is exactly the scaling cliff this exists
-        // to remove; the actual durability claim (retain_on) still verifies.
+        // to remove. No DATA admission for an index lookup.
         return n_.local_store().has(id);
     }
     Writer writer;

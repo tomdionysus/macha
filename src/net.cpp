@@ -1035,6 +1035,11 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         std::promise<RpcReply> promise;
         Clock::time_point started{Clock::now()};
         std::atomic<int64_t> last_progress_ns{steady_ns()};
+        // Only a ping's round trip feeds the peer latency estimate: every
+        // other call's elapsed time is mostly payload size and handler work
+        // (a 35 KB commit store, a retention batch), which made a LAN peer
+        // look 114 ms away while its own view of us was 4 ms (2026-09-07).
+        bool latency_sample{};
     };
 
     struct Outbound {
@@ -1054,7 +1059,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     InboundHandler inbound_handler_;
     InboundPromoter inbound_promoter_;
     InboundCanceller inbound_canceller_;
-    std::function<void(bool, std::chrono::milliseconds)> result_observer_;
+    std::function<void(bool, std::chrono::milliseconds, bool)> result_observer_;
     RetainedMemoryLedger* retained_memory_{};
 
     std::mutex admission_mutex_;
@@ -1117,7 +1122,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         }
         for (auto& [_, item] : pending) {
             result_observer_(false, std::chrono::duration_cast<std::chrono::milliseconds>(
-                                        Clock::now() - item->started));
+                                        Clock::now() - item->started), false);
             try {
                 item->promise.set_exception(rpc_error(text));
             } catch (...) {
@@ -1514,7 +1519,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                 }
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                     Clock::now() - pending->started);
-                result_observer_(true, elapsed);
+                result_observer_(true, elapsed, pending->latency_sample);
                 pending->promise.set_value({peer_, std::move(frame->message)});
                 finish_retire_if_drained();
             }
@@ -1532,7 +1537,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                    TransportLane lane, std::function<void(const NodeInfo&)> peer_observer,
                    std::function<void(uint64_t)> metadata_observer, InboundHandler inbound_handler,
                    InboundPromoter inbound_promoter, InboundCanceller inbound_canceller,
-                   std::function<void(bool, std::chrono::milliseconds)> result_observer,
+                   std::function<void(bool, std::chrono::milliseconds, bool)> result_observer,
                    RetainedMemoryLedger* retained_memory)
         : channel_(fd, keys, std::move(local), max_frame_size),
           peer_observer_(std::move(peer_observer)),
@@ -1582,6 +1587,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
 
         uint64_t id = 0;
         auto pending = std::make_shared<Pending>();
+        pending->latency_sample = type == MessageType::ping;
         auto future = pending->promise.get_future();
         {
             std::lock_guard admission(admission_mutex_);
@@ -1804,7 +1810,7 @@ void RpcClient::dispatch_inbound_cancel(const NodeInfo& peer, uint64_t request_i
 }
 
 void RpcClient::observe_result(const std::string& connection_key, bool success,
-                               std::chrono::milliseconds elapsed) {
+                               std::chrono::milliseconds elapsed, bool latency_sample) {
     std::lock_guard lock(mutex_);
     auto& health = health_[connection_key];
     if (success) {
@@ -1812,7 +1818,7 @@ void RpcClient::observe_result(const std::string& connection_key, bool success,
         health.retry_after = {};
         static const std::string control_suffix =
             std::string(":") + transport_lane_name(TransportLane::control);
-        if (connection_key.ends_with(control_suffix)) {
+        if (latency_sample && connection_key.ends_with(control_suffix)) {
             const auto sample = static_cast<double>(elapsed.count());
             health.control_latency_ms = health.control_latency_ms
                                             ? *health.control_latency_ms * 0.8 + sample * 0.2
@@ -2010,8 +2016,8 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
             [this](const NodeInfo& peer, uint64_t request_id) {
                 dispatch_inbound_cancel(peer, request_id);
             },
-            [this, retry_key](bool success, std::chrono::milliseconds elapsed) {
-                observe_result(retry_key, success, elapsed);
+            [this, retry_key](bool success, std::chrono::milliseconds elapsed, bool sample) {
+                observe_result(retry_key, success, elapsed, sample);
             }, retained_memory_);
         ++connections_created_;
 

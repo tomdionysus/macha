@@ -317,10 +317,11 @@ class RpcClient {
     struct PeerHealth {
         unsigned failures{};
         Clock::time_point retry_after{};
-        // Smoothed round trip of successful CONTROL-lane calls on this
-        // endpoint (handler time included -- what a caller actually waits).
-        // Lets commit and claim fan-out prefer the near replica instead of
-        // NodeId order (gbni-1 crossed the WAN for every commit, 2026-09-07).
+        // Smoothed round trip of the CONTROL-lane heartbeat pings to this
+        // endpoint (the health loop sends one per heartbeat; nothing else
+        // feeds it, so payload size and handler work do not distort it).
+        // Lets commit fan-out prefer the near replica instead of NodeId
+        // order (gbni-1 crossed the WAN for every commit, 2026-09-07).
         std::optional<double> control_latency_ms;
     };
 
@@ -366,7 +367,8 @@ class RpcClient {
                                                NodeId* actual, TransportLane);
     AsyncRpc call_async_known(const Endpoint&, const NodeId*, MessageType, std::span<const uint8_t>,
                               FrameType);
-    void observe_result(const std::string&, bool, std::chrono::milliseconds);
+    void observe_result(const std::string&, bool, std::chrono::milliseconds,
+                        bool latency_sample = false);
     void health_loop(std::stop_token);
     void close_endpoint(const Endpoint&, const std::string&);
     void set_inbound_handler(InboundHandler);

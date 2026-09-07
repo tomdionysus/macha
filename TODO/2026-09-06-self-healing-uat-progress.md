@@ -55,6 +55,40 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **0.32.7 verified (14:40 CEST, 4 min of traffic):** gbni-2
+  `retain_objects` handler 12,113 ms → **0 ms**; commit fan-out
+  `publish_ms` ≤ 554 ms on all nodes. Remaining cost is the writer-side
+  barrier: gbni-1 `retention_ms` ≈ 1,040-1,150 per quantum commit steady,
+  6.5 s / 14.7 s in the first minute after restart; es-1 4.4 s. No
+  control-lane deadline or peer-closed lines since the deploy.
+  **Rolling-restart incident:** the three 0.32.7 restarts landed inside
+  two minutes and killed the operator's live TV playback (UI session
+  report). Policy now: one node at a time, ≥5 min apart, check
+  `journalctl … | grep -c "playback\["` for the last 3 min first.
+  **Topology (operator via UI session):** gbni-2 is on flaky wifi; gbni-1
+  wired; es-1 remote. Latency is directional (toward gbni-2 slow, from it
+  fast). Nearest = measured, never same-site.
+- **0.32.8 (in test):** `retain_on` claims fan out concurrently; local
+  presence checks drop the per-id 4 MB loader lease (thousands per
+  quantum commit, queued behind the node's own publications); barrier
+  logs `DATA retention barrier ids= nodes= total_ms= scan_ms= short=
+  fallback_claims=` when ≥ 250 ms; `peer_latency_ms` samples heartbeat
+  pings only (0.32.7 sampled every control call — payload/handler time
+  made gbni-1 see gbni-2 at 114 ms vs 4 ms the other way). Recorded, not
+  changed: capacity placement gives the writer no guaranteed local copy;
+  whole-file re-claim per quantum grows the retention journal ~N² per
+  file. Verify after deploy: gbni-1 retention_ms per quantum ≪ 1 s and
+  the barrier line's phase split; peer_latency_ms toward gbni-2 from
+  gbni-1 in the tens of ms.
+
+- **0.32.7 DEPLOYED (commit `2b427ce`; gbni-2 13:27, gbni-1 13:31 via
+  staged binaries, es-1 14:34 CEST).** Both imports relaunched with the
+  retrying import script (a non-zero rsync exit now re-waits for the mount
+  and reruns the directory, up to 20 times; both nodes had skipped from
+  Movies to TV when the 0.32.7 restart took the mount away). gbni-1 pid
+  3393 (bwlimit 4000), es-1 pid 166386 (bwlimit 8000). First
+  `peer_latency_ms` from gbni-2 before the relaunch: es-1 81 ms, gbni-1
+  4 ms. Verification of the retention/mutation timings: next entry.
 - **0.32.7 (operator: "WAN control-lane starvation is paramount")** —
   measured first (14:05-14:30): WAN RTT under load 58→60-87 ms (ss/ping
   from both ends), so the link's queue was not the seconds. What was:
