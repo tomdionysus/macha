@@ -55,6 +55,14 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **INCIDENT 04:13 (gbni time):** gbni-1 went dark at the network level
+  (no ARP/ping from its own LAN, cluster marks it offline) ~1 min after its
+  0.32.4 restart and import relaunch (65k-op spool replay + two rsyncs for
+  a moment — a stale one survived the pkill). No console access from here;
+  if it does not reboot on its own it needs a power cycle by the operator.
+  es-1 + gbni-2 carry on (metadata floor 2 of 2 online). gbni-1's last
+  known state: 0.32.4 installed, import pid 91906 running Movies.
+
 - **0.32.4 (commit `f0760e9`, suite 355/355; deployed gbni-2 ~04:05, es-1
   05:10 CEST, gbni-1 04:12):** `open_writes_mutex_` no longer spans
   metadata mutations (commit_write / open_write truncate / namespace batch)
