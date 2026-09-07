@@ -21,7 +21,10 @@ anywhere, and it had listed `hevc` for a 10-bit PQ source.
   boolean `true` means both). In `auto`, a source deeper than that or with
   an HDR transfer the client did not list is transcoded, and not offered as
   direct play. The probe records `level` and `color_transfer` per stream and the
-  session response exposes them.
+  session response exposes them on the source streams; `output.video`
+  reports what is served (the copied stream's `bit_depth`/`level`/
+  `color_transfer`, or `High`/8-bit/`bt709` for the H.264 transcode), so a
+  client can tell a downconverted PQ source from a gate that did nothing.
 - `session create complete` logs the negotiated video/audio transform and
   codec; the client's capabilities are logged at debug.
 - Audio a client lists is copied when fragmented MP4 carries it as is: AAC,

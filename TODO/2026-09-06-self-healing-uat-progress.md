@@ -55,6 +55,19 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **Samsung Tizen 3 TV capability set (operator read it off the new
+  "Playback support" card):** video h264/hevc/vp9; audio
+  aac/opus/vorbis/ac3/eac3/mp3; containers mp4/webm/mp3/ogg; hls_fmp4
+  true; **video_bit_depth 10**; hdr empty (Chromium 47 has no
+  dynamic-range media query, so it can never claim HDR). Consequence: on
+  this set only the HDR half of the 0.32.12 gate catches Ratatouille (DV
+  profile 8, PQ); the depth check contributes nothing. A future client
+  change that trusts the panel for HDR would re-break it and look like a
+  server regression. **Next viewer item:** Dolby Vision is not HDR10 —
+  probe the DV configuration record (side data), expose
+  `dolby_vision_profile`, gate profiles 5/7 (FEL) behind a
+  `capabilities.dolby_vision` flag; profile 8.1 = HDR10-compatible.
+
 - **0.32.11 DEPLOYED (es-1 17:37 CEST, gbni-1 ~16:40, gbni-2 16:43;
   gbni-1's first gate skip was my own transcode probe's log lines).**
   Probe (HEVC-capable client, Ratatouille): gbni-2 create 0.66 s / seek
@@ -64,7 +77,12 @@ current at every checkpoint; a fresh session reads only this and the plan.
   `encoder_threads=4 frame_threads=1`. The create is video-copy +
   audio-transcode (E-AC-3→AAC) so the session still says
   `mode=transcode`; 0.32.12 copies (E-)AC-3/Opus when listed → remux.
-- **0.32.12 (in test) — TV silent-audio + broken direct decode:** master
+- **UI session's 0.32.11 table (client side, same title/caps as its
+  baseline):** create 0.58-0.88 s (was 2.8-4.4), PATCH seek 0.79-1.84 s
+  (was 5.6-13.0), forced transcode 2.67-3.68 s (was 7.6-13.0); output
+  shows video hevc copy + audio aac transcode → label `transcode`.
+- **0.32.12 (commit `63e13ce`, suite 360/360; deploying) — TV
+  silent-audio + broken direct decode:** master
   playlist with `EXT-X-STREAM-INF` CODECS/RESOLUTION/BANDWIDTH →
   `media.m3u8`; caps `video_bit_depth` + `hdr` (transfer list or bool)
   gate 10-bit/PQ/HLG sources out of copy/direct in `auto`; probe records
