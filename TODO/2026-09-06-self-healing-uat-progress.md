@@ -55,6 +55,14 @@ current at every checkpoint; a fresh session reads only this and the plan.
 
 ## Import iteration log (newest first)
 
+- **INCIDENT 04:13 (node-c time):** node-c went dark at the network level
+  (no ARP/ping from its own LAN, cluster marks it offline) ~1 min after its
+  0.32.4 restart and import relaunch (65k-op spool replay + two rsyncs for
+  a moment — a stale one survived the pkill). No console access from here;
+  if it does not reboot on its own it needs a power cycle by the operator.
+  node-e + node-d carry on (metadata floor 2 of 2 online). node-c's last
+  known state: 0.32.4 installed, import pid 91906 running Movies.
+
 - **0.32.4 (commit `f0760e9`, suite 355/355; deployed node-d ~04:05, node-e
   05:10 CEST, node-c 04:12):** `open_writes_mutex_` no longer spans
   metadata mutations (commit_write / open_write truncate / namespace batch)
