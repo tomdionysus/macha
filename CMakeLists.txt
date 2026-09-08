@@ -517,6 +517,9 @@ if(MACHA_BUILD_TESTS)
         # has to be linked into it -- without this the library does not link
         # at all (undefined __llvm_profile_runtime under Clang), which is why
         # this option had never produced a report.
+        # Every case runs in a forked child that leaves through std::_Exit, so
+        # the framework has to dump counters by hand; this tells it to.
+        target_compile_definitions(macha-tests PRIVATE MACHA_COVERAGE=1)
         if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
             target_compile_options(macha_core PRIVATE --coverage)
             target_link_options(macha_core PRIVATE --coverage)
@@ -562,6 +565,7 @@ if(MACHA_BUILD_TESTS)
             endif()
         endif()
         if(MACHA_TEST_COVERAGE)
+            target_compile_definitions(macha-tests-runtime PRIVATE MACHA_COVERAGE=1)
             if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
                 target_compile_options(macha-tests-runtime PRIVATE --coverage)
                 target_link_options(macha-tests-runtime PRIVATE --coverage)
