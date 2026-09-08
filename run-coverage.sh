@@ -52,6 +52,14 @@ profile_dir="$build_dir/coverage-profiles"
 rm -rf "$profile_dir"
 mkdir -p "$profile_dir"
 
+# GCC accumulates counters into .gcda across runs, so a stale set from an
+# earlier (perhaps filtered) run would be counted as though this run had
+# executed it. Reset them: a coverage report should describe the run that
+# produced it.
+if [ "$flavour" = gcc ]; then
+    find "$build_dir" -name '*.gcda' -delete 2>/dev/null
+fi
+
 # The test runner executes every case in an isolated child process, so the
 # profile filename must be per-process or the children overwrite each other
 # and the report describes whichever one happened to exit last.
