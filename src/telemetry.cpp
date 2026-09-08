@@ -73,8 +73,7 @@ void encode(Writer& writer, const NodeTelemetry& value) {
     writer.u64(value.rpc_connections_reused);
     writer.u64(value.rpc_connections_canonical);
     writer.u8(static_cast<uint8_t>(value.phase));
-    writer.string(value.api_host);
-    writer.u16(value.api_port);
+    writer.string(value.api_endpoint);
     writer.u32(value.cpu_cores);
 }
 
@@ -112,12 +111,19 @@ NodeTelemetry decode(Reader& reader) {
             throw DecodeError("invalid telemetry node phase");
         value.phase = static_cast<NodePhase>(phase);
     }
-    // Optional trailing fields: a record encoded before api_host/api_port
-    // existed simply ends here, and the sender is treated as not (yet)
-    // reporting an advertised API address (NodeTelemetry's defaults).
+    // Optional trailing field: a record encoded before the API endpoint
+    // existed simply ends here, and the sender is treated as not reporting
+    // one (NodeTelemetry's default).
+    //
+    // A record from a node that predates the endpoint replacing the old
+    // host/port pair puts a bare hostname here. That is not an endpoint and
+    // must not be treated as one -- a client concatenating a scheme onto it
+    // is the guessing this field exists to remove -- so anything without a
+    // scheme is read as "not reported".
     if (reader.remaining()) {
-        value.api_host = reader.string(512);
-        value.api_port = reader.u16();
+        value.api_endpoint = reader.string(512);
+        if (value.api_endpoint.find("://") == std::string::npos)
+            value.api_endpoint.clear();
     }
     // Optional trailing field: a record encoded before cpu_cores existed ends
     // here and reports no core count, which is the honest answer for a peer
@@ -217,7 +223,7 @@ NodeTelemetry TelemetryStore::refresh_local(
     const NodeInfo& info, std::string version, uint64_t cache_capacity, uint64_t cache_used,
     uint32_t storage_backends_online, uint32_t peers_known, uint32_t peers_active,
     uint64_t rpc_connections_created, uint64_t rpc_connections_reused,
-    uint64_t rpc_connections_canonical, NodePhase phase, std::string api_host, uint16_t api_port) {
+    uint64_t rpc_connections_canonical, NodePhase phase, std::string api_endpoint) {
     const auto now = Clock::now();
     const auto cpu_now = std::clock();
     const auto wall_seconds = std::chrono::duration<double>(now - previous_cpu_wall_).count();
@@ -253,8 +259,7 @@ NodeTelemetry TelemetryStore::refresh_local(
     telemetry.rpc_connections_reused = rpc_connections_reused;
     telemetry.rpc_connections_canonical = rpc_connections_canonical;
     telemetry.phase = phase;
-    telemetry.api_host = std::move(api_host);
-    telemetry.api_port = api_port;
+    telemetry.api_endpoint = std::move(api_endpoint);
     telemetry.cpu_cores = std::thread::hardware_concurrency();
     observe(telemetry, true);
     return telemetry;

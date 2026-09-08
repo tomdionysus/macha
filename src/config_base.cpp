@@ -264,6 +264,49 @@ void validate(Config& config) {
         throw std::runtime_error("session.anonymous_ttl_ms must be >= 60000");
     if (!config.session.max_sessions || config.session.max_sessions > 1'000'000)
         throw std::runtime_error("session.max_sessions must be 1..1000000");
+    // The advertised API endpoint is a URL: scheme, host, optional port, and
+    // deliberately no path. A proxy fronting a node at a subpath is not a
+    // supported deployment, and the failure it produces is silent -- a client
+    // that treats the value as an origin drops the path and 404s against a
+    // node that looks configured correctly.
+    if (!config.catalogue.api.advertised_endpoint.empty()) {
+        const auto& endpoint = config.catalogue.api.advertised_endpoint;
+        const auto scheme_end = endpoint.find("://");
+        if (scheme_end == std::string::npos)
+            throw std::runtime_error(
+                "catalogue.api.advertised_endpoint must be a URL including a scheme, "
+                "e.g. https://node.example:7438");
+        const auto scheme = endpoint.substr(0, scheme_end);
+        if (scheme != "http" && scheme != "https")
+            throw std::runtime_error("catalogue.api.advertised_endpoint scheme must be http or https");
+        const auto authority = endpoint.substr(scheme_end + 3);
+        if (authority.empty())
+            throw std::runtime_error("catalogue.api.advertised_endpoint must include a host");
+        if (authority.find('/') != std::string::npos)
+            throw std::runtime_error(
+                "catalogue.api.advertised_endpoint must not include a path: a proxy fronting "
+                "the API at a subpath is not supported");
+        if (authority.find('?') != std::string::npos || authority.find('#') != std::string::npos)
+            throw std::runtime_error(
+                "catalogue.api.advertised_endpoint must not include a query or fragment");
+        // An IPv6 literal has to be bracketed or the port cannot be told from
+        // the address.
+        const auto close = authority.find(']');
+        const auto host_part = authority.front() == '[' ? authority.substr(0, close + 1) : authority;
+        if (authority.front() == '[' && close == std::string::npos)
+            throw std::runtime_error(
+                "catalogue.api.advertised_endpoint has an unterminated IPv6 literal");
+        const auto port_sep = authority.find(':', authority.front() == '[' ? close : 0);
+        if (port_sep != std::string::npos) {
+            const auto port = authority.substr(port_sep + 1);
+            if (port.empty() ||
+                port.find_first_not_of("0123456789") != std::string::npos ||
+                std::stoul(port) == 0 || std::stoul(port) > 65535)
+                throw std::runtime_error("catalogue.api.advertised_endpoint has an invalid port");
+        }
+        if (host_part.empty() || host_part == "[]")
+            throw std::runtime_error("catalogue.api.advertised_endpoint must include a host");
+    }
     if (config.streaming.pipeline_idle < std::chrono::seconds(10))
         throw std::runtime_error("streaming.pipeline_idle_ms must be >= 10000");
     if (config.streaming.startup_timeout < std::chrono::milliseconds(1000) ||

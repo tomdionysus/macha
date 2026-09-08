@@ -1241,27 +1241,34 @@ void NodeRuntime::refresh_telemetry() {
                         : local_readiness.control_plane_online ? NodePhase::recovering
                                                                 : NodePhase::starting;
 
-    // Advertised API address for cluster peers (Status nodes[].api_host/
-    // api_port); empty/0 when this node runs no catalogue API, letting peers
-    // correctly treat it as unreported rather than guessing. Defaults to
-    // `info.host` -- this node's already-resolved RPC advertise address --
-    // rather than catalogue.api.listen: the API, like RPC, conventionally
-    // binds a wildcard address (0.0.0.0), which is not itself dialable by a
-    // peer, so falling back to the raw listen address would readvertise that
-    // wildcard instead of a real endpoint.
-    std::string api_host;
-    uint16_t api_port = 0;
+    // Advertised API endpoint for clients (Status nodes[].api_endpoint);
+    // empty when this node runs no catalogue API, letting a consumer treat it
+    // as unreported rather than guess. A configured endpoint is used as
+    // given -- it describes the outer address, which behind a TLS-terminating
+    // proxy differs from the bind in both scheme and port.
+    //
+    // The default is built from `info.host` -- this node's already-resolved
+    // RPC advertise address -- rather than catalogue.api.listen: the API, like
+    // RPC, conventionally binds a wildcard (0.0.0.0), which is not itself
+    // dialable, so falling back to the raw listen address would readvertise
+    // that wildcard instead of a real endpoint. A bare IPv6 literal is
+    // bracketed, since an unbracketed one cannot be parsed back out of a URL.
+    std::string api_endpoint;
     if (cfg_.catalogue.api.enabled) {
-        api_host = cfg_.catalogue.api.advertised_host.empty() ? info.host
-                                                               : cfg_.catalogue.api.advertised_host;
-        api_port = cfg_.catalogue.api.advertised_port ? cfg_.catalogue.api.advertised_port
-                                                       : cfg_.catalogue.api.port;
+        if (!cfg_.catalogue.api.advertised_endpoint.empty()) {
+            api_endpoint = cfg_.catalogue.api.advertised_endpoint;
+        } else {
+            auto host = info.host;
+            if (host.find(':') != std::string::npos && host.front() != '[')
+                host = "[" + host + "]";
+            api_endpoint = "http://" + host + ":" + std::to_string(cfg_.catalogue.api.port);
+        }
     }
 
     telemetry_.refresh_local(info, std::string(kServerVersion), cache_capacity, cache_used,
                              storage_backends_online, peers_known, peers_active, 0, 0,
-                             peers_active > 0 ? peers_active - 1 : 0, phase, std::move(api_host),
-                             api_port);
+                             peers_active > 0 ? peers_active - 1 : 0, phase,
+                             std::move(api_endpoint));
 }
 
 void NodeRuntime::signal_telemetry_refresh() {
