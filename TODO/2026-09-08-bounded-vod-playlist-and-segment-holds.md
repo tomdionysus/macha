@@ -44,10 +44,19 @@ record should not pretend otherwise. What justifies it is separate:
   `fragLoadError`, with its own retry policy and no failover consequence.
 
 What this change explicitly does **not** fix: the 43–47 s cold first segment
-on DTS/TrueHD sources. That is over every client timeout including hls.js's
-20 s `fragLoadingTimeOut`, so no amount of holding rescues it. It is tracked
-separately as its own P0 and is not a prerequisite for this work — but neither
-should this work be described as improving it.
+on DTS/TrueHD sources. That is over every client timeout, so no amount of
+holding rescues it. It is tracked separately as its own P0 and is not a
+prerequisite for this work — but neither should this work be described as
+improving it.
+
+**Retracted 2026-09-08, after this plan shipped.** That 43–47 s figure was
+confounded by node choice: the client had settled on the wireless node, whose
+read throughput is roughly a sixth of the wired one's. Re-measured on gbni-1
+with no server change, the same title's first segment is 3.5 s. There is no
+DTS/TrueHD decode problem, and the paragraph above should be read as a
+correctly-scoped disclaimer about a fault that turned out not to exist rather
+than as a description of one. The deadline reasoning it cites was separately
+wrong too — `fragLoadingTimeOut` is deprecated and inert; see phase 4.
 
 ## What 0.36.0 already established
 

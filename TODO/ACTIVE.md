@@ -88,89 +88,56 @@ The governing laws are:
   Design, phases and the corrections made during implementation are in
   [the plan](2026-09-08-bounded-vod-playlist-and-segment-holds.md), which
   also records that the motivating bug report was retracted in full and that
-  this work does not address the DTS/TrueHD cold-start latency below.
+  this work does not address the DTS/TrueHD cold-start latency below — which
+  has itself since been retracted in full; see the item below.
 
-- [ ] **DTS and TrueHD source audio make a cold transcode 40-60x slower —
-  client-measured 2026-09-08, not yet diagnosed.** Reported by the Macha UI
-  session from Chrome 151 on a 7.5 ms wired link to gbni-1, measuring its own
-  `hls-fragment-loading` -> `hls-fragment-loaded` interval for a single
-  segment GET, so the time is generation, not transfer. All rows are
-  `transcode` with video COPIED and audio transcoded to AAC, same node, same
-  client, within ~15 minutes:
-  - Clerks (E-AC-3 6ch): seg0 1,114 ms, first frame 4.3 s
-  - Django Unchained (DTS 6ch): seg0 **43,376 ms**, seg1 16,332 ms, first
-    frame 57.3 s; warm rerun minutes later seg0 9,529 ms
-  - Death Proof (TrueHD 6ch): seg0 **47,398 ms**, seg1 8,901 ms, ~65 s
-  The controls are what make this conclusive. Transcoding *video* is prompt:
-  Full Metal Jacket (HEVC 10-bit -> h264, AAC copied) seg0 717 ms; Army of
-  Darkness (mpeg4 -> h264, AC-3 -> AAC, both streams transcoded) seg0 328 ms.
-  So it is not audio transcoding in general, not the transcode path in
-  general, and not the container (both slow titles are Matroska, so are fast
-  comparators). It tracks the source audio codec. Transcoding a 10-bit HEVC
-  video stream is strictly more work than decoding an audio track and is 60x
-  faster.
-  Caveats recorded honestly: single samples per title (only Django measured
-  twice); the client cannot separate admission queueing, probe/seek-to-start,
-  decode and encode — they all land in one interval; gbni-1 may have had
-  import load, though the prompt titles in the same window control for a
-  node-wide slowdown.
-  The cold/warm gap (43.4 s -> 9.5 s) suggests a cost paid per-open rather
-  than per-frame, which points at probe/seek-to-start rather than steady-state
-  decode — a hypothesis, not a finding. This plausibly also explains the
-  ">90 s mid-file segment request" measured server-side on gbni-2 during the
-  import, which had been suspected of being a client-side reactivation bug;
-  on this evidence look here first.
-  This is a governing-law-2 violation and the viewer sees an unchanging
-  spinner throughout: the client's start watchdog deliberately does not bound
-  the hls.js path (hls.js owns fetching and its own error channel), so it is
-  invisible to client-side bounds. It must be fixed at the source, not
-  papered over with a client timeout.
+- [x] **DTS/TrueHD "40-60x slower cold transcode" — RETRACTED IN FULL
+  2026-09-08 by the session that raised it. There is no exotic-audio decode
+  problem.** Every measurement behind this item, both the original 0.36.0
+  cold-start figures and the steady-state throughput numbers added later the
+  same day, was confounded by which node served the session. The client's
+  endpoint registry had settled on gbni-2 — the wireless node, whose raw read
+  throughput is roughly 0.55 MB/s against gbni-1's 3.31 MB/s — and its
+  `EndpointBandwidth` never sampled media transfers, so the node carrying
+  essentially all the bytes was the one it measured least and had nothing to
+  deprioritise it with.
+  Re-run on gbni-1 after the client fixed endpoint selection, same build, no
+  server change: Django first frame 43.4 s -> 22.2 s -> **3.5 s**; Death Proof
+  25.6 s and 0.46x -> **2.5 s and 1.00x**; Inglourious Basterds 0.14x ->
+  **1.00x**; Full Metal Jacket 0.65x -> 0.95x. Headroom now builds on every
+  transcode (Django 9 -> 67 s, Death Proof 9 -> 62 s) instead of pinning at
+  zero. Nothing starves.
+  **The TrueHD audio anomaly is retracted with it.** Death Proof decoding
+  ~1.2 KB/s of audio against ~48 KB/s elsewhere was a symptom of a starved
+  pipeline, not a codec fault: on the re-run it decodes 502 KB in 20 s
+  (25 KB/s) with 479 video frames and zero drops. A pipeline delivering in
+  7-second bursts starves audio and video alike, and the comparison was
+  against titles that were not starving.
+  **Kept as a lesson rather than deleted.** The measurements were real; the
+  inferences on top of them kept landing on the server while the variable was
+  on the client. Every "same node, same client, within 15 minutes" control
+  cited here was assumed rather than recorded. The client now records which
+  node served each measurement, which is what would have caught it hours
+  earlier. Do not re-open this on the strength of the numbers above.
 
-  **Re-measured client-side against 0.36.1, 2026-09-08 (UI session).** Cold
-  start roughly halved — Django 43.4 s -> 22.2 s, Death Proof ~65 s -> 25.6 s
-  — but treat that cautiously: Django's warm rerun was already 9.5 s on
-  0.36.0, so some of it is likely cache warmth rather than any change. What is
-  new and worse is **steady-state production below realtime**, measured well
-  past cold start with no HTTP errors involved at all: Django 1.00x, Full
-  Metal Jacket 0.65x (5 s stalled in 30), Death Proof **0.46x** (9 s stalled
-  in 20). Death Proof is effectively unwatchable and is the operator's
-  "the video is choppy".
-  The **shape** matters more than the ratio: over 15 s at position ~221 s the
-  headroom trace runs 5.3 4.3 3.3 2.3 1.3 0.3 then pinned at 0 for ~7 s, then
-  11.7 s of media lands at once — roughly three 4.004 s segments arriving
-  together after a long silence, repeating. A uniformly 0.49x pipeline would
-  hand over a segment every ~8 s and hover near zero; producing nothing then
-  bursting looks like something serialising or batching per-segment work, or
-  one expensive step blocking several segments' output. Frame drops were 2 of
-  176 (1.1%), so the video decoder is healthy and this is not a decode limit.
-  **Ruled out as a cause: the segment-hold timeout.** gbni-1 logged zero
-  `reason=hold_timed_out` refusals across the measurement window, so the
-  bursts are not the 6000 ms hold expiring and the client backing off.
-  **Possible separate audio fault on the TrueHD path:** Death Proof decoded
-  10,911 bytes of audio in 9.2 s (~1.2 KB/s) against Django ~48 KB/s and Full
-  Metal Jacket ~57 KB/s — roughly 40x low, and far below what a 384 kb/s AAC
-  output should produce. Video is *copied* on that title, so all the cost is
-  audio: a TrueHD path both burning CPU and emitting almost nothing looks more
-  like per-frame failure than slowness, and the throughput fault and the
-  near-silence may be one bug. Nobody has listened to it, so the near-silence
-  is a measurement and not a confirmed symptom.
-
-  **Confirmed working, same session, recorded so it is not re-investigated:**
-  the bounded-hold contract behaved correctly throughout — segment 12 of a
-  post-seek generation answered 500 three times as a non-fatal
-  `fragLoadError` with `degradations: 0` and `failovers: 0`, and playback
-  continued. A beyond-window refusal returns in ~98 ms, so timing separates
-  held-then-expired from refused-immediately while only the status separates
-  not-ready from broken. The EXTINF fix is confirmed client-side: Full Metal
-  Jacket's plan is 1,748 segments summing to 6993.4 s, exactly the film's
-  duration, with segment 0 declaring 2 s and delivering 1.96 s.
-
-
-Execute the phased
-[playback resilience and A/V sync plan](2026-09-03-playback-resilience-and-av-sync-plan.md).
-This coalesces the newly observed audio drift, slow streaming, intermittent
-Status latency, choppy playback, cold admission, and poor-Wi-Fi behaviour into
-one causal programme rather than treating each symptom separately.
+- [ ] **gbni-2 serves reads at roughly a sixth of gbni-1 — measured
+  2026-09-08, not yet diagnosed.** Client-measured raw read rate with no
+  encoder in the path (forced Direct Play, then a plain 8 MB range read):
+  gbni-2 0.58 / 0.53 / 0.31 MB/s across three unrelated titles, against
+  gbni-1 at 3.31 MB/s. Identical across titles, so it is the node rather than
+  extent placement or any particular file.
+  This is the actual cause of everything attributed to codecs above, and it
+  bounds playback directly: a 21.1 GB / 153 min title needs ~2.3 MB/s of
+  source reads for realtime, so ~0.55 MB/s caps a transcode at about 0.24x
+  no matter how fast the encoder is.
+  gbni-2 is the wireless node
+  ([[project-cluster-topology]] records the link as flaky), so the first
+  question is whether this is simply Wi-Fi throughput or something in the
+  read path on that node. Worth separating with a plain network throughput
+  measurement between nodes before looking at storage. Note `cpu_cores` does
+  not help a client avoid it: all three nodes report 4 cores, and this is I/O,
+  not CPU, so the capacity axis the clients just built sees three identical
+  nodes.
 
 - [ ] **1. Correct A/V desynchronisation — partially shipped.** Bounded audio
   drift compensation shipped in 0.23.8/0.23.9 (libswresample `async=1` +
