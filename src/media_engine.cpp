@@ -724,6 +724,12 @@ struct StreamPipeline {
     MediaTimestampRepairState encoded_timestamps;
     bool encoded_repair_reported{};
     int64_t last_video_encoder_pts{AV_NOPTS_VALUE};
+    // Set once this pipeline has handed the muxer its first packet. A copied
+    // stream reaches the muxer from the demux loop, which can observe that
+    // directly; a transcoded one arrives from an encoder, so it has to record
+    // it here. Both are needed to know when the delayed moov can be written
+    // (see the early flush in run_pipeline).
+    bool output_started{};
 
     ~StreamPipeline() {
         if (fifo) av_audio_fifo_free(fifo);
@@ -963,8 +969,21 @@ void encode_video_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame* 
         if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
         av_require(rc, "receive encoded video packet");
         auto seconds = encoded->pts == AV_NOPTS_VALUE ? 0.0 : encoded->pts * av_q2d(pipe.encoder->time_base);
-        if ((encoded->flags & AV_PKT_FLAG_KEY) != 0 && cuts.before_keyframe(seconds))
+        if ((encoded->flags & AV_PKT_FLAG_KEY) != 0 && cuts.before_keyframe(seconds)) {
+            auto* writer = static_cast<FragmentWriter*>(output->pb->opaque);
+            const auto before = writer ? writer->published() : 0;
             cut_fragment(output);
+            // Exactly the hazard the remux path carries a boundary for
+            // (2026-09-07), in the branch that did not get the fix: the first
+            // flush writes the delayed moov and produces no moof, so this
+            // boundary's media stays buffered and joins the next fragment.
+            // Unsaid, the playlist calls a six-second fragment two seconds
+            // long and every later segment sits four seconds early on the
+            // player's timeline for the rest of the title -- and the plan's
+            // last duration is never consumed, so the session ends reporting
+            // a fragment-count mismatch it did not really have.
+            if (writer && writer->published() == before) writer->carry_boundary();
+        }
         av_packet_rescale_ts(encoded, pipe.encoder->time_base, pipe.output_stream->time_base);
         static_assert(AV_NOPTS_VALUE == kNoMediaTimestamp);
         const auto repairs_before = pipe.encoded_timestamps.repair_count();
@@ -986,6 +1005,7 @@ void encode_video_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame* 
         const auto duration = encoded->duration;
         const auto flags = encoded->flags;
         const int mux_rc = av_interleaved_write_frame(output, encoded);
+        if (mux_rc >= 0) pipe.output_started = true;
         if (mux_rc < 0) {
             Log::warn("libav mux rejected encoded video packet stream=" +
                       std::to_string(pipe.input_index) +
@@ -1042,6 +1062,7 @@ void encode_audio_available(StreamPipeline& pipe, AVFormatContext* output, AVPac
             encoded->stream_index = pipe.output_stream->index;
             encoded->pos = -1;
             av_require(av_interleaved_write_frame(output, encoded), "mux encoded audio packet");
+            pipe.output_started = true;
             avio_flush(output->pb);
             av_packet_unref(encoded);
         }
@@ -1370,14 +1391,21 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
         auto packet = make_av_packet();
         auto encoded = make_av_packet();
         auto decoded = make_av_frame();
-        // See the early flush below: only meaningful while every stream is a
-        // copy, because a transcoded stream's first packet arrives from an
-        // encoder rather than from this loop.
-        std::set<int> started_streams;
-        bool moov_flushed =
-            mpegts || std::any_of(pipelines.begin(), pipelines.end(), [](const auto& p) {
-                return p->transform != MediaTransform::copy;
-            });
+        // See the early flush below. MPEG-TS has no moov to delay, so there is
+        // nothing to spend; every other output does, and it must be spent
+        // before the first planned boundary rather than on it. This used to be
+        // disabled whenever any stream was transcoded, because the flush was
+        // driven from this demux loop and a transcoded stream's first packet
+        // arrives from an encoder instead -- so on transcode the moov was
+        // written at the first real boundary, consumed it, and merged
+        // fragments 0 and 1 into one double-length fragment. Each pipeline now
+        // records its own first muxed packet (`output_started`), which is true
+        // for both routes, so transcode gets the same early flush remux had.
+        bool moov_flushed = mpegts;
+        const auto all_streams_started = [&pipelines] {
+            return std::all_of(pipelines.begin(), pipelines.end(),
+                               [](const auto& p) { return p->output_started; });
+        };
 
         try {
             while (!cancelled.load() && (rc = av_read_frame(in, packet.get())) >= 0) {
@@ -1417,22 +1445,7 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                         }
                     }
                     write_mux_packet(out, packet.get());
-                    if (!moov_flushed) {
-                        started_streams.insert(pipe.output_stream->index);
-                        if (started_streams.size() == pipelines.size()) {
-                            // Every stream has a packet, so the (E-)AC-3
-                            // sample entry can be filled and the moov written.
-                            // Spending the moov flush here costs one fragment
-                            // boundary's worth of nothing; spending it at the
-                            // first real boundary costs that boundary.
-                            moov_flushed = true;
-                            const auto before = writer.published();
-                            cut_fragment(out);
-                            if (writer.published() != before)
-                                Log::warn("libav remux early moov flush produced a fragment media=" +
-                                          source.media_id);
-                        }
-                    }
+                    pipe.output_started = true;
                 } else {
                     if (packet->pts != AV_NOPTS_VALUE) packet->pts -= origin;
                     if (packet->dts != AV_NOPTS_VALUE) packet->dts -= origin;
@@ -1447,6 +1460,21 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                             process_audio_frame(pipe, out, decoded.get(), encoded.get());
                         av_frame_unref(decoded.get());
                     }
+                }
+                if (!moov_flushed && all_streams_started()) {
+                    // Every stream has handed the muxer a packet, so the
+                    // (E-)AC-3 sample entry can be filled and the moov
+                    // written. Spending the flush here costs one fragment
+                    // boundary's worth of nothing; spending it at the first
+                    // real boundary costs that boundary -- which is what made
+                    // a transcode's first fragment twice its planned length
+                    // and left the plan one fragment longer than the output.
+                    moov_flushed = true;
+                    const auto before = writer.published();
+                    cut_fragment(out);
+                    if (writer.published() != before)
+                        Log::warn("libav early moov flush produced a fragment media=" +
+                                  source.media_id);
                 }
                 av_packet_unref(packet.get());
             }

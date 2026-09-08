@@ -104,11 +104,31 @@ struct MediaSegmentStore::Impl {
 
     void mark_finished() {
         std::lock_guard lock(mutex);
-        if (!vod_segment_durations.empty() && segments.size() != vod_segment_durations.size()) {
-            if (error.empty())
-                error = "media pipeline produced " + std::to_string(segments.size()) +
-                        " fragments for a " + std::to_string(vod_segment_durations.size()) +
-                        " fragment VOD plan";
+        // Fragment count is not the invariant. A planned boundary can pass
+        // without producing a fragment -- the first flush of a fragmented MP4
+        // writes the delayed moov and no moof -- and its media and its length
+        // are then carried into the fragment that absorbed them. Counting made
+        // every such generation finish in an error state, which is worse than
+        // cosmetic: playlist() withholds a playlist entirely once an error is
+        // set, so a transcode that had in fact produced all of its media ended
+        // by serving an empty one.
+        //
+        // What must hold is that the generation published the media it planned
+        // to. publish_duration() consumes the plan as it publishes, so equal
+        // totals mean every planned length was accounted for by some fragment.
+        if (!vod_segment_durations.empty()) {
+            double planned = 0.0;
+            for (const auto duration : vod_segment_durations) planned += duration;
+            double published = 0.0;
+            for (const auto& segment : segments) published += segment.duration;
+            // One fragment's worth of slack: the tail is bounded by however
+            // much media the source really had, and a source that ends a
+            // little short of its container duration is ordinary.
+            const double tolerance = std::max(1.0, vod_segment_durations.back());
+            if (published + tolerance < planned && error.empty())
+                error = "media pipeline published " + std::to_string(published) +
+                        "s across " + std::to_string(segments.size()) + " fragments for a " +
+                        std::to_string(planned) + "s VOD plan";
         }
         finished = true;
         cv.notify_all();
@@ -189,7 +209,7 @@ std::string MediaSegmentStore::playlist() const {
     const auto& durations = impl_->vod_segment_durations;
     if (durations.empty() || impl_->segments.empty()) return {};
     double longest = 1.0;
-    for (const auto duration : durations) longest = std::max(longest, duration);
+    for (const auto& segment : impl_->segments) longest = std::max(longest, segment.duration);
     // A growing EVENT playlist: only fragments that exist are advertised, and
     // ENDLIST closes it once the generation has produced its last one. Until
     // 0.32.14 this was a VOD list of every planned fragment, and a fragment
@@ -198,6 +218,9 @@ std::string MediaSegmentStore::playlist() const {
     // screen on the operator's TV after a mode switch (2026-09-07). Seeking
     // stays server-side (PATCH seek_ms creates a new generation), so the
     // timeline the client shows still comes from the session's duration.
+    // Replacing this with a complete, closed list is planned and designed --
+    // see TODO/2026-09-08-bounded-vod-playlist-and-segment-holds.md -- and
+    // depends on bounded segment holds landing with it, which they have not.
     const size_t produced = std::min(impl_->segments.size(), durations.size());
     const bool complete = impl_->finished || produced == durations.size();
     std::ostringstream out;
@@ -207,8 +230,20 @@ std::string MediaSegmentStore::playlist() const {
         << "\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:EVENT\n"
         << "#EXT-X-INDEPENDENT-SEGMENTS\n";
     if (!mpegts) out << "#EXT-X-MAP:URI=\"init.mp4\"\n";
+    // EXTINF is what each fragment actually carries, not what the plan asked
+    // for. A planned boundary can pass without producing a fragment -- the
+    // first flush of a fragmented MP4 writes the delayed moov and no moof, so
+    // that boundary's media joins the next fragment, which is then longer than
+    // planned by exactly that much. Advertising the plan instead made a
+    // six-second first fragment claim two seconds, and since a player builds
+    // its seek map by accumulating EXTINF, every later fragment sat four
+    // seconds early on the timeline for the rest of the title. The producer
+    // already computes the true length (FragmentWriter::publish_duration,
+    // which carries an unproduced boundary's length into the fragment that
+    // absorbed its media); until now nothing read it.
     for (size_t i = 0; i < produced; ++i) {
-        out << "#EXTINF:" << std::fixed << std::setprecision(3) << durations[i] << ",\n"
+        out << "#EXTINF:" << std::fixed << std::setprecision(3) << impl_->segments[i].duration
+            << ",\n"
             << "segment-" << std::setfill('0') << std::setw(6) << i
             << (mpegts ? ".ts" : ".m4s") << "\n";
     }
