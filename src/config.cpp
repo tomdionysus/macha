@@ -305,10 +305,8 @@ void parse_catalogue(const YAML::Node& root, Config& c) {
             c.catalogue.api.listen = api["listen"].as<std::string>();
         if (api["port"])
             c.catalogue.api.port = api["port"].as<uint16_t>();
-        if (api["advertised_host"])
-            c.catalogue.api.advertised_host = api["advertised_host"].as<std::string>();
-        if (api["advertised_port"])
-            c.catalogue.api.advertised_port = api["advertised_port"].as<uint16_t>();
+        if (api["advertised_endpoint"])
+            c.catalogue.api.advertised_endpoint = api["advertised_endpoint"].as<std::string>();
         if (api["token_file"])
             c.catalogue.api.token_file = std::filesystem::path(api["token_file"].as<std::string>());
         if (api["max_request_bytes"])

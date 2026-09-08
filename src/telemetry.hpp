@@ -51,11 +51,13 @@ struct NodeTelemetry {
     uint64_t rpc_connections_reused{};
     uint64_t rpc_connections_canonical{};
     NodePhase phase{NodePhase::ready};
-    // Where other nodes should reach this node's HTTP API — distinct from
-    // host/port above, which is the RPC bind address. Empty/zero means the
-    // sender doesn't run (or hasn't yet reported) an advertised API address.
-    std::string api_host;
-    uint16_t api_port{};
+    // Where clients should reach this node's HTTP API, as a complete URL --
+    // distinct from host/port above, which is the RPC address and is never
+    // proxied. Empty means the sender doesn't run (or hasn't yet reported)
+    // an API endpoint. Carries a scheme precisely because the API may sit
+    // behind a TLS-terminating proxy while binding plain HTTP internally, so
+    // neither scheme nor port is derivable from anything else here.
+    std::string api_endpoint;
     // Hardware threads on this node. Zero means the sender did not report one,
     // which a consumer must treat as "no opinion" rather than as zero cores:
     // load1 and process_cpu_percent are both per-core quantities, and this
@@ -103,7 +105,7 @@ class TelemetryStore {
                                 uint32_t peers_known, uint32_t peers_active,
                                 uint64_t rpc_connections_created, uint64_t rpc_connections_reused,
                                 uint64_t rpc_connections_canonical, NodePhase phase,
-                                std::string api_host, uint16_t api_port);
+                                std::string api_endpoint);
     void observe(NodeTelemetry, bool direct = false);
     void apply_identity_reset(const IdentityAssociationReset&);
     std::optional<NodeTelemetry> local() const;

@@ -1,5 +1,43 @@
 # Current release
 
+## 0.36.4 — One API endpoint, stated rather than guessed (development)
+
+**Breaking, and not detectable by looking for a field.** `nodes[].api_host`
+and `nodes[].api_port` are removed from `/api/v1/status` and replaced by
+`nodes[].api_endpoint`, a complete URL. The absence of `api_host` is
+indistinguishable from an old node that never reported it, which is why this
+carries a version bump: clients cannot sniff for it.
+
+The pair could not express a scheme, so a client discovering peers had to
+invent one — `@macha/core` hardcoded `http://`. That is wrong in both
+directions on a TLS deployment: a browser on an HTTPS page blocks every
+discovered peer as mixed content, and a native client sends plaintext to a
+node the viewer deliberately put behind TLS.
+
+- `catalogue.api.advertised_host` and `advertised_port` become
+  `catalogue.api.advertised_endpoint`, a URL. `listen`/`port` are unchanged
+  and still describe the inner bind. The two are independent on purpose: with
+  a proxy terminating TLS in front of the API, Macha serves plain http on
+  `listen`:`port` while clients must be told `https://host:443`, and neither
+  the scheme nor the port of the outer address is derivable from the bind.
+- A path is rejected at startup with an explicit error. Fronting a node at a
+  subpath is not a supported deployment, and the failure it would otherwise
+  produce is silent — a client treating the endpoint as an origin drops the
+  path and 404s against a node that looks correctly configured, in the one
+  deployment that has a proxy.
+- Unset defaults to `http://` this node's resolved RPC advertise address and
+  the bound API port, so a node with nothing in front of it needs no
+  configuration. A bare IPv6 literal is bracketed, since an unbracketed one
+  cannot be parsed back out of a URL.
+- Telemetry from a node predating this puts a bare hostname in the field.
+  That is not an endpoint, so anything without a scheme decodes as "not
+  reported" rather than becoming a value a client would concatenate a guessed
+  scheme onto.
+
+`nodes[].host` and `nodes[].port` are untouched. They are the RPC address, a
+separate plane that is never proxied, and they have a live consumer in the
+identity-association reset.
+
 ## 0.36.3 — Status says how many cores a node has (development)
 
 `load1` and `process_cpu_percent` are both per-core quantities, and this
