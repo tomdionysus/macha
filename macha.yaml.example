@@ -512,6 +512,37 @@ streaming:
   max_ahead_segments: 8
   segment_memory_bytes: 64M
 
+  # Bounded segment holds. The media playlist is a complete VOD list served
+  # before any fragment exists, so a request for one that has not been produced
+  # yet is ordinary: the server holds it rather than answering 404. These bound
+  # that hold so control traffic stays serviceable.
+  #
+  # segment_hold_window is how far past the produced frontier a request may
+  # still be held, in fragments. It matches max_ahead_segments deliberately: a
+  # request inside it is one production is authorised to reach, and one outside
+  # it is one nothing is working toward. Beyond it the answer is an immediate
+  # retryable 503 rather than a wait.
+  segment_hold_window: 8
+  # Outstanding holds per session: one in flight plus one prefetch. A player
+  # that queues thirty fragment requests gets one hold and twenty-nine prompt
+  # refusals, rather than thirty sequential waits on the encoder.
+  max_session_holds: 2
+  # Outstanding holds across the whole node. Deliberately small: HttpServer
+  # runs a fixed worker pool shared with Status, catalogue and manage traffic,
+  # so a held request costs a worker for the whole of its wait and an unbounded
+  # number of them stops the node answering anything. Raise this substantially
+  # if HttpServer ever moves to an async runtime, where a hold costs a
+  # continuation instead of a thread.
+  max_concurrent_holds: 8
+  # How long a held request may wait before answering 503. This must stay
+  # under the client's own time-to-first-byte deadline: a held request sends no
+  # bytes, so a client that gives up first never receives the 503 at all and
+  # takes its timeout path instead, which retries hard and then fails. For
+  # hls.js that deadline is fragLoadPolicy.default.maxTimeToFirstByteMs =
+  # 10000 (NOT the deprecated and inert fragLoadingTimeOut = 20000), so 8000
+  # leaves margin for a WAN round trip to the offsite node.
+  segment_timeout_ms: 8000
+
   # Bound source inspection on distributed/slow media. probe_bytes and
   # probe_analyze_duration_ms limit libavformat analysis; probe_timeout_ms is a
   # wall-clock guard for the complete probe.

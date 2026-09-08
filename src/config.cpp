@@ -495,6 +495,15 @@ void parse_streaming(const YAML::Node& root, Config& c) {
         c.streaming.max_ahead_segments = streaming["max_ahead_segments"].as<size_t>();
     if (streaming["segment_memory_bytes"])
         c.streaming.segment_memory_bytes = yaml_size(streaming["segment_memory_bytes"]);
+    if (streaming["segment_hold_window"])
+        c.streaming.segment_hold_window = streaming["segment_hold_window"].as<size_t>();
+    if (streaming["max_session_holds"])
+        c.streaming.max_session_holds = streaming["max_session_holds"].as<size_t>();
+    if (streaming["max_concurrent_holds"])
+        c.streaming.max_concurrent_holds = streaming["max_concurrent_holds"].as<size_t>();
+    if (streaming["segment_timeout_ms"])
+        c.streaming.segment_timeout =
+            milliseconds(streaming["segment_timeout_ms"], "streaming.segment_timeout_ms");
     if (streaming["probe_bytes"])
         c.streaming.probe_bytes = yaml_size(streaming["probe_bytes"]);
     if (streaming["probe_analyze_duration_ms"])
