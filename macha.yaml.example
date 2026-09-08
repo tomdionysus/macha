@@ -473,6 +473,21 @@ torrent:
     #     api_key_file: /etc/macha-prowlarr.key
     #     max_results: 100
 
+# The web client this node serves at its root. Off until `root` names a
+# directory of built client assets. Any path that is not a file under that
+# directory is answered with `index`, because a single-page application owns
+# its own routing and a deep link has to reach it. Everything under /api stays
+# the server's, 404s included, so an API call never comes back as HTML.
+#
+# The client is served without a bearer token -- a browser has none until the
+# client has loaded and asked for one -- so `root` must contain only assets
+# meant to be public. Nothing outside it is reachable: a request cannot climb
+# out, and names beginning with a dot are refused.
+# web:
+#   enabled: true
+#   root: /var/lib/macha/web
+#   index: index.html
+
 # Playback API and media transformation. Macha links libavformat/libavcodec
 # directly and reads the pinned logical Macha file through a custom AVIOContext.
 # No ffmpeg/ffprobe subprocess or loopback media source is involved.

@@ -410,6 +410,20 @@ struct ConnectivityCheckConfig {
     std::chrono::milliseconds timeout{3000};
 };
 
+// The web client this node serves at its root. Off until a root directory
+// is named: a node with none keeps answering non-API paths with a 404, which
+// is what every node did before this existed.
+struct WebConfig {
+    bool enabled{true};
+    // Directory of built client assets. Only this directory is served, and
+    // only files within it -- no path from a request can climb out.
+    std::filesystem::path root;
+    // The document a client route resolves to. Served for any path that is
+    // not a file under `root`, which is what makes deep links work in a
+    // single-page application.
+    std::string index{"index.html"};
+};
+
 struct RuntimeConfig {
     // glibc otherwise permits a CPU-derived number of independent arenas,
     // allowing short-lived codec threads to ratchet retained process memory.
@@ -445,6 +459,7 @@ struct Config {
     HydrationConfig hydration;
     RuntimeConfig runtime;
     SessionConfig session;
+    WebConfig web;
     // Bound on Service::wait_services_ready(). Local-state readiness and
     // subsystem construction/start are expected to complete or throw well
     // inside this window; a wait that never resolves either way is treated as

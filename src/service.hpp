@@ -14,6 +14,7 @@
 #include "media_information.hpp"
 #include "playback.hpp"
 #include "session_api.hpp"
+#include "web_api.hpp"
 #include "status_api.hpp"
 #include "torrent.hpp"
 #include <atomic>
@@ -51,6 +52,7 @@ class Service {
     SubsystemRegistry registry_;
     SubsystemSupervisor subsystems_;
     SessionApi session_api_;
+    WebApi web_;
     std::unique_ptr<HttpServer> catalogue_http_;
 
     std::unique_ptr<DistributedStore> store_;

@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.34.0 LANGUAGES CXX)
+project(macha VERSION 0.35.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -264,6 +264,7 @@ set(MACHA_CORE_SOURCES
     src/catalogue_api.cpp
     src/manage_api.cpp
     src/session_api.cpp
+    src/web_api.cpp
     src/acquisition_api.cpp
     src/media_catalogue.cpp
     src/ingest.cpp
@@ -453,6 +454,7 @@ if(MACHA_BUILD_TESTS)
         tests/test_hydration_catalogue.cpp
         tests/test_media_playback.cpp
         tests/test_session.cpp
+        tests/test_web_api.cpp
         tests/test_invariants.cpp
         tests/test_models.cpp)
     target_link_libraries(macha-tests PRIVATE macha_core)

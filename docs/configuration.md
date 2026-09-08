@@ -356,6 +356,33 @@ Artwork fetched by providers is ordinary DATA. Catalogue manifest/shards are CON
 
 Streaming, ingest and BitTorrent configuration remain independent of the storage authority model. The complete set of fields is shown in [`../macha.yaml.example`](../macha.yaml.example).
 
+## Web client
+
+`web.root` names a directory of built web-client assets to serve at the server's root. It is unset by default, and a node with no `web.root` answers non-API paths exactly as before: `404`.
+
+```yaml
+web:
+  enabled: true
+  root: /var/lib/macha/web
+  index: index.html
+```
+
+| field | meaning |
+|---|---|
+| `enabled` | `true` by default; set `false` to stop serving a client whose `root` is still configured. |
+| `root` | Directory of built assets. Only this directory is served. |
+| `index` | The document served for any path that is not a file under `root`. Must be a file name inside `root`, not a path. Defaults to `index.html`. |
+
+A path that names a file under `root` is served as that file, with a content type from its extension, an `ETag`, and `Cache-Control: public, max-age=3600`. Every other path is answered with the index document under `Cache-Control: no-cache`, so a deep link like `/library/artist/x` reaches the client, which resolves the route itself once it has loaded. The index is revalidated on every load because it names the current asset bundle; without that a deploy stays invisible until the browser decides otherwise.
+
+**The API namespace is never served from here.** Everything under `/api` — not merely `/api/v1` — remains the server's, including its `404`s: a client asking for an endpoint that does not exist is told so in JSON rather than handed an HTML page its parser will choke on. Reserving the whole prefix means a later API version cannot be silently swallowed by the client's fallback.
+
+Client assets are served without a bearer token, since a browser has none until the client has loaded and asked for one. `root` must therefore contain only material meant to be public. Nothing outside it is reachable: request paths are checked one segment at a time and a segment that is empty, `.`, `..`, or begins with a dot is refused, so a request can neither climb out of the root nor read build leftovers such as `.env` or `.git`. A refused path falls through to the index rather than to a `404`, so probing cannot be used to learn whether a file exists.
+
+The client is served while local services are still recovering, because it is static files and depends on none of them. That is deliberate: the client loads and shows what `/api/v1/status` reports, rather than failing to load at all during a recovery.
+
+A node configured with a `root` that does not exist, or one with no index document, answers `503 web_client_unavailable` rather than `404` — a misconfigured node says so instead of pretending the route was never there, and starts serving as soon as the files appear, without a restart.
+
 ## Logging
 
 `log_level` accepts `ALL`, `DEBUG`, `INFO`, `WARN`, or `ERROR`. `ffmpeg_log_level` is an independent libav threshold and can be more verbose than the Macha application threshold.
