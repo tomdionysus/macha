@@ -534,14 +534,18 @@ streaming:
   # if HttpServer ever moves to an async runtime, where a hold costs a
   # continuation instead of a thread.
   max_concurrent_holds: 8
-  # How long a held request may wait before answering 503. This must stay
-  # under the client's own time-to-first-byte deadline: a held request sends no
-  # bytes, so a client that gives up first never receives the 503 at all and
-  # takes its timeout path instead, which retries hard and then fails. For
-  # hls.js that deadline is fragLoadPolicy.default.maxTimeToFirstByteMs =
-  # 10000 (NOT the deprecated and inert fragLoadingTimeOut = 20000), so 8000
-  # leaves margin for a WAN round trip to the offsite node.
-  segment_timeout_ms: 8000
+  # How long a held request may wait before answering. This must stay under
+  # the tightest time-to-first-byte deadline across the clients: a held request
+  # sends no bytes, so a client that gives up first never receives the answer
+  # at all and takes its timeout path instead, which retries hard and then
+  # fails. Known deadlines, each read from the shipped artifact rather than
+  # from documentation: hls.js 10000
+  # (fragLoadPolicy.default.maxTimeToFirstByteMs -- NOT the deprecated and
+  # inert fragLoadingTimeOut of 20000), expo-video 10000 (OkHttp default read
+  # timeout), React Native track player 8000 (media3
+  # DEFAULT_READ_TIMEOUT_MILLIS), iOS AVFoundation unknown. 6000 clears the
+  # tightest of those with margin for the WAN hop to the offsite node.
+  segment_timeout_ms: 6000
 
   # Bound source inspection on distributed/slow media. probe_bytes and
   # probe_analyze_duration_ms limit libavformat analysis; probe_timeout_ms is a
