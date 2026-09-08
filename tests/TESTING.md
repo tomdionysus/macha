@@ -46,6 +46,43 @@ cmake --build build -j
 
 The runner accepts normal test-runner arguments after the build directory, for example `./run-tests.sh build --serial` or `./run-tests.sh build --filter catalogue`.
 
+## Coverage
+
+`./run-coverage.sh` builds the tests instrumented, runs them, and prints a
+per-file report. It takes the same arguments the ordinary runner does:
+
+```sh
+./run-coverage.sh                                  # whole suite, build-coverage/
+./run-coverage.sh build-cov                        # a different build directory
+./run-coverage.sh build-cov -- --filter catalogue  # one group
+```
+
+The two toolchains this project builds under need entirely different
+machinery, and the script picks per compiler rather than asking you to:
+AppleClang/Clang writes a profile per process and is read back with
+`llvm-profdata`/`llvm-cov`, while GCC writes `.gcda` counters beside the
+objects and is read back with `gcov`. Neither `lcov` nor `gcovr` is installed
+on the cluster nodes, so the GCC summary is aggregated from plain `gcov`
+output rather than depending on a tool someone would have to install first.
+
+Two details that are easy to get wrong and are handled for you. The runner
+executes every case in an isolated child process, so under Clang the profile
+filename must be per-process (`%p`) or the children overwrite each other and
+the report describes whichever exited last. And the build defaults to `Debug`
+rather than the usual `Release`, because at `-O3` inlining makes a coverage
+report describe the optimiser's view rather than the code's; override with
+`MACHA_COVERAGE_BUILD_TYPE` if you want coverage of an optimised build.
+
+Case deadlines are scaled 3x by default (`MACHA_TEST_TIMEOUT_SCALE`), for the
+same reason the sanitizer build scales them: instrumentation is slower than an
+ordinary build, every deadline was chosen against an ordinary build, and a
+spurious timeout would hide the report the run existed to produce.
+
+`MACHA_TEST_COVERAGE=ON` is the underlying CMake option if you want to
+configure a coverage build yourself. Note it instruments `macha_core` and the
+test binaries only -- not the plugins -- since it is a per-target property
+rather than the whole-program one a sanitizer needs.
+
 ## Sanitizer builds
 
 `MACHA_SANITIZE` builds the whole tree -- `macha_core`, the executables, every

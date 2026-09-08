@@ -512,12 +512,19 @@ if(MACHA_BUILD_TESTS)
         endif()
     endif()
     if(MACHA_TEST_COVERAGE)
+        # macha_core needs the coverage flags at LINK time as well as compile
+        # time. It is a shared library, so the profile runtime it references
+        # has to be linked into it -- without this the library does not link
+        # at all (undefined __llvm_profile_runtime under Clang), which is why
+        # this option had never produced a report.
         if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
             target_compile_options(macha_core PRIVATE --coverage)
+            target_link_options(macha_core PRIVATE --coverage)
             target_compile_options(macha-tests PRIVATE --coverage)
             target_link_options(macha-tests PRIVATE --coverage)
         elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
             target_compile_options(macha_core PRIVATE -fprofile-instr-generate -fcoverage-mapping)
+            target_link_options(macha_core PRIVATE -fprofile-instr-generate)
             target_compile_options(macha-tests PRIVATE -fprofile-instr-generate -fcoverage-mapping)
             target_link_options(macha-tests PRIVATE -fprofile-instr-generate)
         else()
