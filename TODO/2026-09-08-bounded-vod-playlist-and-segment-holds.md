@@ -188,7 +188,7 @@ default.
 
 ## Phases
 
-- [ ] **1. One hold path.** `wait_object` waits for init as well as segment
+- [x] **1. One hold path.** `wait_object` waits for init as well as segment
   indices. Test: an init request issued before the first `moof` is held and
   then served, not 404'd.
 - [ ] **2. Complete playlist.** `PLAYLIST-TYPE:VOD`, all planned entries,

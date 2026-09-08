@@ -283,18 +283,37 @@ std::optional<Bytes> MediaSegmentStore::object(std::string_view name) const {
 std::optional<Bytes> MediaSegmentStore::wait_object(std::string_view name,
                                                     std::chrono::milliseconds timeout) const {
     const auto parsed = segment_number(name);
-    if (!parsed) return object(name);
-    const uint64_t index = *parsed;
+    // One hold path for anything a client can ask for, rather than a special
+    // case per object kind. init.mp4 waits exactly as a fragment does: a
+    // playlist served before anything has been published sends the client for
+    // the initialization fragment before the muxer has written it, and
+    // answering 404 for an object the playlist promises exists is the same
+    // defect for init as it was for a not-yet-produced segment. MPEG-TS has no
+    // init fragment at all, so there is nothing to wait for and a miss there
+    // is genuine.
+    const bool init_object =
+        !parsed && name == "init.mp4" && impl_->container != MediaContainer::mpegts;
+    if (!parsed && !init_object) return object(name);
+    const uint64_t index = parsed ? *parsed : 0;
 
     std::unique_lock lock(impl_->mutex);
-    if (!impl_->vod_segment_durations.empty() && index >= impl_->vod_segment_durations.size()) return {};
+    if (!init_object && !impl_->vod_segment_durations.empty() &&
+        index >= impl_->vod_segment_durations.size())
+        return {};
+    // The only thing that differs between object kinds is whether the object
+    // asked for is present yet. Everything that ends a wait -- cancellation,
+    // supersession, failure, the generation finishing -- is shared.
+    const auto present = [&] {
+        return init_object ? static_cast<bool>(impl_->init) : index < impl_->segments.size();
+    };
     const auto ready = [&] {
-        return impl_->cancelled || impl_->superseded || !impl_->error.empty() ||
-               index < impl_->segments.size() || impl_->finished;
+        return impl_->cancelled || impl_->superseded || !impl_->error.empty() || present() ||
+               impl_->finished;
     };
     if (timeout.count() > 0) impl_->cv.wait_for(lock, timeout, ready);
     else impl_->cv.wait(lock, ready);
-    if (index >= impl_->segments.size()) return {};
+    if (!present()) return {};
+    if (init_object) return *impl_->init;
     auto resident = impl_->segments[static_cast<size_t>(index)].memory;
     auto spill = impl_->segments[static_cast<size_t>(index)].spill;
     lock.unlock();

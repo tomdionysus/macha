@@ -1912,7 +1912,11 @@ struct PlaybackManager::Impl {
                            " segments_ready=" + std::to_string(state.segment_count));
             }
         } else {
-            object = store->object(name);
+            // Not a segment index: init.mp4 is held until the muxer publishes
+            // it, and any other name falls through to an immediate lookup
+            // inside wait_object. Which objects can be waited for is the
+            // store's decision, not the route's.
+            object = store->wait_object(name, {});
         }
         if (!object) {
             auto state = store->snapshot();
