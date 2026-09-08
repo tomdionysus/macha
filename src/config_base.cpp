@@ -274,6 +274,21 @@ void validate(Config& config) {
         throw std::runtime_error("streaming.segment_duration_ms must be 1000..20000");
     if (config.streaming.max_ahead_segments < 2 || config.streaming.max_ahead_segments > 120)
         throw std::runtime_error("streaming.max_ahead_segments must be 2..120");
+    if (config.streaming.segment_hold_window < 1 || config.streaming.segment_hold_window > 120)
+        throw std::runtime_error("streaming.segment_hold_window must be 1..120");
+    if (config.streaming.max_session_holds < 1 || config.streaming.max_session_holds > 64)
+        throw std::runtime_error("streaming.max_session_holds must be 1..64");
+    if (config.streaming.max_concurrent_holds < 1 || config.streaming.max_concurrent_holds > 4096)
+        throw std::runtime_error("streaming.max_concurrent_holds must be 1..4096");
+    // The upper bound is the client's patience, not ours. hls.js aborts a
+    // fragment that has sent no bytes after 10s
+    // (fragLoadPolicy.default.maxTimeToFirstByteMs), and a server that answers
+    // after the client has stopped listening has held a worker for nothing.
+    // The range stays wider than that because other clients have other
+    // deadlines; the default is what encodes ours.
+    if (config.streaming.segment_timeout < std::chrono::milliseconds(1000) ||
+        config.streaming.segment_timeout > std::chrono::seconds(20))
+        throw std::runtime_error("streaming.segment_timeout_ms must be 1000..20000");
     if (config.streaming.segment_memory_bytes < 4ULL * 1024 * 1024 ||
         config.streaming.segment_memory_bytes > 4ULL * 1024 * 1024 * 1024)
         throw std::runtime_error("streaming.segment_memory_bytes must be 4M..4G");

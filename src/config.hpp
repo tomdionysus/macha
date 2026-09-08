@@ -375,6 +375,42 @@ struct StreamingConfig {
     uint64_t probe_bytes{8ULL * 1024 * 1024};
     std::chrono::milliseconds probe_analyze_duration{5000};
     std::chrono::milliseconds probe_timeout{20000};
+    // Bounded segment holds. A complete VOD playlist promises media that does
+    // not exist yet, so a request for it is held rather than refused -- but
+    // only inside limits that keep control traffic serviceable.
+    //
+    // The window is not arbitrary: it is the distance max_ahead_segments
+    // already permits the producer to run ahead, so a request inside it is one
+    // production is authorised to reach, and a request outside it is one
+    // nothing is working toward.
+    size_t segment_hold_window{8};
+    // One in flight plus one prefetch.
+    size_t max_session_holds{2};
+    // Deliberately small because it is rationing a 16-thread worker pool, not
+    // because holds are expensive in themselves. Whoever moves HttpServer to
+    // an async runtime should revisit this: the constraint becomes memory and
+    // fairness, and the natural value is much larger. Steady-state playback on
+    // a 4-core node transcoding at roughly real time sits at the frontier
+    // often, so holds are the normal case rather than the exception and this
+    // cap will bind in ordinary use.
+    size_t max_concurrent_holds{8};
+    // Under hls.js's real deadline, with margin for WAN round trips.
+    //
+    // The number that governs is fragLoadPolicy.default.maxTimeToFirstByteMs,
+    // which is 10000. `fragLoadingTimeOut` (20000) looks like the relevant
+    // knob and is not: it is deprecated, and the compatibility shim migrates
+    // it only when it is set in user config, which our client does not do.
+    // This was verified by reading hls.js 1.6.18's source rather than its
+    // documentation, after an earlier 12000 was chosen against the 20000.
+    //
+    // Holding past that deadline is worse than not holding at all. A held
+    // request sends no bytes, so it trips the time-to-first-byte abort before
+    // the answer arrives; the client never sees the 503 and instead takes the
+    // timeout path -- 4 retries at 0ms delay, each timing out again -- so one
+    // held fragment becomes roughly five requests and then a fatal error. A
+    // 503 that arrives promptly is retried sensibly (6 attempts, 1s to 8s), so
+    // answering inside the deadline is the whole game.
+    std::chrono::milliseconds segment_timeout{8000};
 };
 
 struct HydrationEngineConfig {
