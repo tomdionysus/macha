@@ -188,6 +188,11 @@ class MediaSegmentStore {
     bool wait_ready(std::chrono::milliseconds timeout);
     std::string playlist() const;
     std::optional<Bytes> object(std::string_view name) const;
+    // Holds the request until the named object is published, the generation
+    // ends, or the timeout expires; a zero timeout waits indefinitely. Covers
+    // both fMP4 init publication and segment indices, so a caller does not
+    // have to know which kind of object it is asking for. Any other name is
+    // an immediate lookup.
     std::optional<Bytes> wait_object(std::string_view name, std::chrono::milliseconds timeout) const;
     void note_requested(uint64_t index);
     Snapshot snapshot() const;
