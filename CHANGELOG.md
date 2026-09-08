@@ -1,5 +1,25 @@
 # Current release
 
+## 0.33.4 — Naming a mode restates the whole transform (development)
+
+A session update naming only `mode` was refused for a contradiction the
+server assembled itself. The per-stream and quality instructions stored at
+creation outlived the mode they belonged to, so `{"mode":"direct"}` was
+judged against an `audio: transcode` the client had never sent in that
+request and answered "direct copies every stream". Because the client's
+chooser answers most of this library with transcode-and-copy-the-video,
+that was every session: the Direct and Remux controls failed for viewers
+nearly everywhere, and the failed update tore the session down and dropped
+them back to the browse screen (found by the UI session, 2026-09-08).
+
+- `mode` is the shorthand for the whole transform, so naming it now clears
+  `video`, `audio`, `max_height` and `max_bitrate` unless the same update
+  restates them. An update naming both sets both. This is the rule the
+  session already applied internally when asking what a different mode
+  would do, and it makes the shorthand mean the same thing regardless of
+  what the session was created as.
+- Creating a session is unaffected: there is nothing to clear.
+
 ## 0.33.3 — AAC transcodes carry a channel configuration browsers can parse (development)
 
 A regression from 0.32.19, found by the UI session and reproduced on Silo
