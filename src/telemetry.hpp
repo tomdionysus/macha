@@ -56,6 +56,12 @@ struct NodeTelemetry {
     // sender doesn't run (or hasn't yet reported) an advertised API address.
     std::string api_host;
     uint16_t api_port{};
+    // Hardware threads on this node. Zero means the sender did not report one,
+    // which a consumer must treat as "no opinion" rather than as zero cores:
+    // load1 and process_cpu_percent are both per-core quantities, and this
+    // cluster is deliberately non-uniform hardware, so comparing either
+    // between nodes without it compares nothing.
+    uint32_t cpu_cores{};
 
     auto operator<=>(const NodeTelemetry&) const = default;
 };

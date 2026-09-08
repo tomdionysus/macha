@@ -1,5 +1,28 @@
 # Current release
 
+## 0.36.3 — Status says how many cores a node has (development)
+
+`load1` and `process_cpu_percent` are both per-core quantities, and this
+cluster is deliberately non-uniform hardware. A `load1` of 2.67 is a
+struggling two-core box and an idle eight-core one, and a
+`process_cpu_percent` above 100 is that same fact stated the other way. Both
+numbers have been in the node payload for some time and neither could be
+compared between nodes.
+
+- `runtime.cpu_cores` now reports the node's hardware thread count, so a
+  consumer can divide by it and get figures that mean the same thing
+  everywhere. Requested by the web and React Native client sessions, which
+  want to stop handing a transcode to a node that is already saturated —
+  the client spent an afternoon routing every session to the slowest node in
+  the cluster and producing measurements that described the routing rather
+  than the server.
+- It is omitted from the payload when unknown rather than reported as zero,
+  so a consumer abstains instead of dividing by it.
+- On the wire it is an optional trailing telemetry field, so a node that has
+  not been upgraded yet simply does not report one. Every node is in that
+  position during a rolling upgrade, which is exactly when reading a core
+  count out of whatever bytes followed would matter.
+
 ## 0.36.2 — A complete playlist, and a wait that cannot wedge the node (development)
 
 Two changes that were made together but are independent of each other: the

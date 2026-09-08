@@ -240,6 +240,7 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     telemetry.rpc_connections_reused = 7;
     telemetry.api_host = "10.44.1.50";
     telemetry.api_port = 7438;
+    telemetry.cpu_cores = 8;
     CHECK(decode_node_telemetry(encode_node_telemetry(telemetry)) == telemetry);
     auto telemetry_set = decode_telemetry_set(encode_telemetry_set({telemetry}));
     REQUIRE(telemetry_set.size() == 1);
@@ -252,20 +253,36 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     CHECK(recovering_set.front().phase == NodePhase::recovering);
 
     auto full = encode_node_telemetry(telemetry);
-    // api_host/api_port are the newest trailing fields: a string length
-    // prefix + content, then a u16 port.
+    // cpu_cores is the newest trailing field: one u32.
+    const size_t cpu_cores_bytes = 4;
+    // api_host/api_port precede it: a string length prefix + content, then a
+    // u16 port.
     const size_t api_fields_bytes = 4 + telemetry.api_host.size() + 2;
-    REQUIRE(full.size() > api_fields_bytes + 1);
+    REQUIRE(full.size() > cpu_cores_bytes + api_fields_bytes + 1);
+
+    // A record encoded before cpu_cores existed ends right after api_port. It
+    // must decode as "not reported" -- zero, meaning no opinion -- rather than
+    // fail. Every node is briefly in this position during a rolling upgrade,
+    // which is exactly when a peer's core count would otherwise be read from
+    // whatever bytes happened to follow.
+    auto pre_cores = full;
+    pre_cores.resize(pre_cores.size() - cpu_cores_bytes);
+    auto legacy_no_cores = decode_node_telemetry(pre_cores);
+    CHECK(legacy_no_cores.cpu_cores == 0);
+    CHECK(legacy_no_cores.api_host == telemetry.api_host);
+    CHECK(legacy_no_cores.api_port == telemetry.api_port);
+    CHECK(legacy_no_cores.sequence == telemetry.sequence);
 
     // A record encoded before api_host/api_port existed simply ends earlier,
     // right after phase. It must decode as "not reported" (empty/0) rather
     // than fail or silently pick up truncated bytes as a host/port.
     auto pre_api = full;
-    pre_api.resize(pre_api.size() - api_fields_bytes);
+    pre_api.resize(pre_api.size() - cpu_cores_bytes - api_fields_bytes);
     auto legacy_no_api = decode_node_telemetry(pre_api);
     CHECK(legacy_no_api.phase == NodePhase::recovering);
     CHECK(legacy_no_api.api_host.empty());
     CHECK(legacy_no_api.api_port == 0);
+    CHECK(legacy_no_api.cpu_cores == 0);
     CHECK(legacy_no_api.sequence == telemetry.sequence);
 
     // A record encoded before phase (and so also before api_host/api_port)
@@ -273,11 +290,12 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     // (NodeTelemetry's default) rather than fail or silently pick a
     // different phase.
     auto pre_phase = full;
-    pre_phase.resize(pre_phase.size() - api_fields_bytes - 1);
+    pre_phase.resize(pre_phase.size() - cpu_cores_bytes - api_fields_bytes - 1);
     auto legacy = decode_node_telemetry(pre_phase);
     CHECK(legacy.phase == NodePhase::ready);
     CHECK(legacy.api_host.empty());
     CHECK(legacy.api_port == 0);
+    CHECK(legacy.cpu_cores == 0);
     CHECK(legacy.sequence == telemetry.sequence);
     CHECK(legacy.rpc_connections_reused == telemetry.rpc_connections_reused);
 
