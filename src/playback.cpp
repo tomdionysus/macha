@@ -246,7 +246,28 @@ std::optional<uint64_t> optional_u64(const Json* value) {
 
 PlaybackPreferences parse_preferences(const Json* value, PlaybackPreferences current = {}) {
     if (!value || !value->isObject()) return current;
-    if (auto mode = value->find("mode"); mode && mode->isString()) current.mode = lower(mode->asString());
+    if (auto mode = value->find("mode"); mode && mode->isString()) {
+        current.mode = lower(mode->asString());
+        // `mode` is the shorthand for the whole transform, so naming it
+        // restates the transform: the per-stream and quality instructions
+        // that belonged to the previous mode do not outlive it. An update
+        // naming both sets both, since these are read after the mode.
+        //
+        // Without this an update naming only `mode` was refused for a
+        // combination the server assembled itself out of the session's
+        // history: a session created as a transcode with the video copied
+        // answered `{"mode":"direct"}` with "direct copies every stream",
+        // against a request the client never made. Because the chooser's
+        // usual answer for this library is transcode-with-the-video-copied,
+        // that was every session, and the Direct and Remux controls failed
+        // for viewers on most of the library (2026-09-08). It is the same
+        // rule the session already applied when asking what a different mode
+        // would do; see without_mode_overrides.
+        current.video.reset();
+        current.audio.reset();
+        current.max_height.reset();
+        current.max_bitrate.reset();
+    }
     const auto transform_instruction = [](const Json* v, const char* what) -> std::optional<std::string> {
         if (!v || v->isNull()) return std::nullopt;
         if (!v->isString()) throw std::invalid_argument(std::string(what) + " must be a string");

@@ -1989,6 +1989,117 @@ MACHA_TEST("media_playback", test_direct_is_the_source_file_and_refuses_a_qualit
     service.stop();
 }
 
+MACHA_TEST("media_playback", test_naming_a_mode_restates_the_whole_transform) {
+    // `mode` is the shorthand for the whole transform, so an update naming it
+    // must not be judged against instructions from the mode it replaced. The
+    // client sent {"mode":"direct"} and was refused for copying-versus-
+    // re-encoding a stream it had not mentioned, because the session had been
+    // created as a transcode with the video copied -- which is what the
+    // chooser answers for most of this library, so Direct and Remux failed
+    // for viewers nearly everywhere (2026-09-08).
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/dv.mkv", 0644, getuid(), getgid());
+    auto bytes = pattern(128 * 1024 + 17);
+    auto writer = service.filesystem().open_write("/media/dv.mkv", true);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto media_id = file_media_id(service.filesystem().getattr("/media/dv.mkv"));
+
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback";
+    streaming.startup_timeout = 2s;
+    streaming.max_video_transcodes = 4;
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             std::make_unique<HdrFakeMediaEngine>());
+    playback.start();
+
+    const auto create = [&](Json::Object preferences) {
+        Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
+        auto text = Json(std::move(root)).dump();
+        HttpRequest request;
+        request.method = "POST";
+        request.path = "/api/v1/playback/sessions";
+        request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+        request.body.assign(text.begin(), text.end());
+        auto response = playback.handle(request);
+        REQUIRE(response.status == 201);
+        return Json::parse(std::string(response.body.begin(), response.body.end()));
+    };
+    const auto update = [&](const std::string& id, Json::Object preferences, int expect = 200) {
+        Json::Object root{{"preferences", Json(std::move(preferences))}};
+        auto text = Json(std::move(root)).dump();
+        HttpRequest request;
+        request.method = "PATCH";
+        request.path = "/api/v1/playback/sessions/" + id;
+        request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+        request.body.assign(text.begin(), text.end());
+        auto response = playback.handle(request);
+        REQUIRE(response.status == expect);
+        return Json::parse(std::string(response.body.begin(), response.body.end()));
+    };
+    const auto discard = [&](const std::string& id) {
+        HttpRequest remove;
+        remove.method = "DELETE";
+        remove.path = "/api/v1/playback/sessions/" + id;
+        remove.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+        playback.handle(remove);
+    };
+
+    // The mixture the chooser actually produces: transcode, video copied.
+    auto mixed = create(Json::Object{{"mode", "transcode"}, {"video", "copy"}});
+    CHECK(mixed.find("mode")->asString() == "transcode");
+    CHECK(mixed.find("output")->find("video")->find("transform")->asString() == "copy");
+    CHECK(mixed.find("output")->find("audio")->find("transform")->asString() == "transcode");
+    auto id = mixed.find("session_id")->asString();
+
+    // One field named, and it is obeyed: the per-stream instruction belonged
+    // to the mode that has just been replaced.
+    auto direct = update(id, Json::Object{{"mode", "direct"}});
+    CHECK(direct.find("mode")->asString() == "direct");
+    CHECK(direct.find("preferences")->find("video")->isNull());
+    CHECK(direct.find("preferences")->find("audio")->isNull());
+    id = direct.find("session_id")->asString();
+
+    auto remuxed = update(id, Json::Object{{"mode", "remux"}});
+    CHECK(remuxed.find("mode")->asString() == "remux");
+    CHECK(remuxed.find("output")->find("video")->find("transform")->asString() == "copy");
+    CHECK(remuxed.find("output")->find("audio")->find("transform")->asString() == "copy");
+    id = remuxed.find("session_id")->asString();
+
+    // An update that names both sets both: this drops only what the same
+    // update does not restate.
+    auto restated = update(id, Json::Object{{"mode", "transcode"}, {"audio", "copy"}});
+    CHECK(restated.find("mode")->asString() == "transcode");
+    CHECK(restated.find("output")->find("video")->find("transform")->asString() == "transcode");
+    CHECK(restated.find("output")->find("audio")->find("transform")->asString() == "copy");
+    discard(restated.find("session_id")->asString());
+
+    // A quality instruction belongs to the mode that was asked for too, and
+    // is refused outright under direct, so it cannot be allowed to outlive a
+    // transcode either.
+    auto capped = create(Json::Object{{"mode", "transcode"}, {"max_height", 720}});
+    CHECK(capped.find("preferences")->find("max_height")->asInt64() == 720);
+    auto uncapped = update(capped.find("session_id")->asString(), Json::Object{{"mode", "direct"}});
+    CHECK(uncapped.find("mode")->asString() == "direct");
+    CHECK(uncapped.find("preferences")->find("max_height")->isNull());
+    discard(uncapped.find("session_id")->asString());
+
+    playback.stop();
+    service.stop();
+}
+
 MACHA_TEST("media_playback", test_concurrent_transcode_admission_is_reserved) {
     TempDir t;
     auto keyfile = t.path() / "key";
