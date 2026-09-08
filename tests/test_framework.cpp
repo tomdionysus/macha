@@ -194,11 +194,41 @@ std::string read_capture(int fd) {
     return output;
 }
 
+// Coverage counters are written by an atexit handler, and a test child
+// deliberately never runs one: it leaves through std::_Exit, which is what
+// stops a forked child flushing buffers it inherited from the parent. So the
+// counters have to be dumped by hand, and reset on entry -- a child inherits
+// the parent's accumulated counts at fork(), and without a reset every case
+// would re-report the parent's startup as its own.
+//
+// Without this, every case in the suite contributes nothing at all and the
+// report reads 0% however many tests pass.
+#if defined(MACHA_COVERAGE)
+#if defined(__clang__)
+extern "C" void __llvm_profile_reset_counters(void);
+extern "C" int __llvm_profile_write_file(void);
+void coverage_reset() { __llvm_profile_reset_counters(); }
+void coverage_dump() { (void)__llvm_profile_write_file(); }
+#elif defined(__GNUC__)
+extern "C" void __gcov_reset(void);
+extern "C" void __gcov_dump(void);
+void coverage_reset() { __gcov_reset(); }
+void coverage_dump() { __gcov_dump(); }
+#else
+void coverage_reset() {}
+void coverage_dump() {}
+#endif
+#else
+void coverage_reset() {}
+void coverage_dump() {}
+#endif
+
 [[noreturn]] void child_run(const TestCase& test, std::size_t selection_index, int capture_fd) {
     if (::dup2(capture_fd, STDOUT_FILENO) < 0 || ::dup2(capture_fd, STDERR_FILENO) < 0)
         std::_Exit(125);
     if (capture_fd > STDERR_FILENO) ::close(capture_fd);
 
+    coverage_reset();
     child_failures.store(0, std::memory_order_relaxed);
     set_case_index(selection_index + 1);
     try {
@@ -218,6 +248,7 @@ std::string read_capture(int fd) {
 #endif
     std::cout.flush();
     std::cerr.flush();
+    coverage_dump();
     std::_Exit(child_failures.load(std::memory_order_relaxed) == 0 ? 0 : 1);
 }
 
