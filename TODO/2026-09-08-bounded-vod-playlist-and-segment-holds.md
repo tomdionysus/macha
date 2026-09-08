@@ -262,7 +262,7 @@ default.
   assert the 0.32.14 contract. They are not deleted — they are re-expressed
   against the mechanism that now guards the same incident: a deeply
   prefetching client must not be able to occupy the node.
-- [ ] **6. Full suite plus `test_transcode_timeline.cpp`, then deploy all
+- [x] **6. Full suite plus `test_transcode_timeline.cpp`, then deploy all
   three nodes** (operator chose all-at-once; the cluster is test-only).
 - [x] **7. Notify the four client sessions** of the contract change above.
 

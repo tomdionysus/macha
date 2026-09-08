@@ -394,14 +394,24 @@ struct StreamingConfig {
     // often, so holds are the normal case rather than the exception and this
     // cap will bind in ordinary use.
     size_t max_concurrent_holds{8};
-    // Under hls.js's real deadline, with margin for WAN round trips.
+    // Under the tightest client deadline, with margin.
     //
-    // The number that governs is fragLoadPolicy.default.maxTimeToFirstByteMs,
-    // which is 10000. `fragLoadingTimeOut` (20000) looks like the relevant
-    // knob and is not: it is deprecated, and the compatibility shim migrates
-    // it only when it is set in user config, which our client does not do.
-    // This was verified by reading hls.js 1.6.18's source rather than its
-    // documentation, after an earlier 12000 was chosen against the 20000.
+    // The rule: a held request sends no bytes, so the hold must be shorter
+    // than the client's time-to-first-byte deadline. Otherwise the client
+    // aborts first, never receives the status, and takes its timeout path --
+    // which is worse than not holding at all.
+    //
+    // Deadlines, each read out of the shipped artifact rather than from
+    // documentation, because documentation was wrong twice here:
+    //   hls.js 1.6.18   fragLoadPolicy.default.maxTimeToFirstByteMs  10000
+    //   expo-video      bare OkHttpClient default readTimeout        10000
+    //   RN track player media3 DEFAULT_READ_TIMEOUT_MILLIS            8000
+    //   iOS AVFoundation                                            unknown
+    // hls.js's `fragLoadingTimeOut` (20000) looks like the governing knob and
+    // is not -- it is deprecated, and its compatibility shim migrates it only
+    // when user config sets it, which no client here does. An earlier 12000
+    // was chosen against that inert 20000, and an 8000 against the 10000
+    // before the music path's 8000 was found and tied with it exactly.
     //
     // Holding past that deadline is worse than not holding at all. A held
     // request sends no bytes, so it trips the time-to-first-byte abort before
@@ -410,7 +420,7 @@ struct StreamingConfig {
     // held fragment becomes roughly five requests and then a fatal error. A
     // 503 that arrives promptly is retried sensibly (6 attempts, 1s to 8s), so
     // answering inside the deadline is the whole game.
-    std::chrono::milliseconds segment_timeout{8000};
+    std::chrono::milliseconds segment_timeout{6000};
 };
 
 struct HydrationEngineConfig {
