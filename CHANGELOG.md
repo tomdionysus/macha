@@ -1,5 +1,23 @@
 # Current release
 
+## 0.34.0 — The playback contract says what it did
+
+Collects the night's playback work into one release. Four defects, each
+found by comparing two sides' idea of the same fact rather than by reading
+either side alone, and each invisible for as long as one side stayed
+silent (2026-09-07/08).
+
+- A session and the facts endpoint name the container actually served, in
+  one vocabulary, for every source the catalogue admits -- see 0.33.2.
+- An AAC transcode carries a channel configuration a browser can parse,
+  which is what put 5.1 titles back on Chrome and on every Chromium
+  WebView -- see 0.33.3.
+- `mode` means the whole transform on an update as well as on creation, so
+  a client naming one field is not refused for a combination the server
+  assembled out of the session's history -- see 0.33.4.
+- A refusal says why (`reason`), and the mode table is enforced rather
+  than reinterpreted -- see 0.32.18 and 0.33.0.
+
 ## 0.33.4 — Naming a mode restates the whole transform (development)
 
 A session update naming only `mode` was refused for a contradiction the
