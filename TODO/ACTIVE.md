@@ -385,14 +385,45 @@ not inferred from docs. All are small and isolated; none require design work.
   whether this is intentional (FUSE is documented elsewhere as
   "loader/convenience traffic") or a real gap, and wire it up or remove the
   dead declaration.
-- [ ] **Flaky test needs a real fix, not another isolation-pass shrug.**
-  `hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`
-  has now failed under parallel-suite load and passed in isolation on at least
-  four separate occasions across this project's history (recorded in three
-  separate plan docs plus this session's own test runs). "Passes in isolation"
-  has been the accepted verdict every time; the actual race has never been
-  root-caused. Do that now rather than re-recording the same flake a fifth
-  time.
+- [ ] **Two load-dependent test flakes needing a real fix, not another
+  isolation-pass shrug — second one found 2026-09-08.**
+  - `hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`
+    has now failed under parallel-suite load and passed in isolation on at
+    least five separate occasions across this project's history (three plan
+    docs, plus runs on 2026-09-05 and again on 2026-09-08 during the bounded
+    VOD playlist work). "Passes in isolation" has been the accepted verdict
+    every time; the actual race has never been root-caused. It fails at
+    `test_hydration_catalogue.cpp:3827`, a `wait_until(..., 12s)` on superseded
+    objects being absent from both nodes' local stores.
+  - `invariants/test_status_collects_connected_peer_telemetry_without_client_fanout`
+    — **new, 2026-09-08.** Timed out at its full 60 s deadline once during a
+    full-suite run, then passed three times in `--serial` isolation at 277 ms,
+    275 ms and 526 ms, and passed every subsequent full-suite run that day
+    (five or more). Authorship was considered rather than assumed: it was first
+    seen on a working tree carrying the phase-1 `wait_object`/playback-route
+    changes, but the case builds two `Service` instances and never creates a
+    playback session, so neither changed code path is reachable from it. The
+    revert-and-reproduce cycle used for the aarch64 hang was deliberately *not*
+    run here, because against a flake this rare two green runs on a reverted
+    tree are indistinguishable from two green runs without the revert — the
+    experiment has almost no power at that sample size, and claiming it settled
+    anything would be false precision.
+
+  **Hypothesis worth testing before hunting two separate races (2026-09-08, a
+  hypothesis and not a finding).** These may be one problem. Both cases stand
+  up multiple `Service`/node instances on real ports, both end in a
+  deadline-bounded `wait_until` rather than an assertion, and both fail by
+  timing out rather than by asserting anything false. The one failing
+  full-suite run measured `wall=81741ms` against 33–37 s for the green runs on
+  the same machine that hour — roughly 2.2x slower overall, which is what
+  CPU starvation under `effective_parallelism` around 5 looks like. If the
+  deadlines in these multi-service cases were sized against an unloaded
+  machine, both would be timing bugs in the harness rather than races in the
+  code, and root-causing either one separately would find nothing. Check that
+  first: it is cheap, and it would explain why five investigations have ended
+  in "passes in isolation".
+
+  Do not record a sixth sighting in place of doing this.
 
 ## P0 — Security hardening for a network-exposed cluster
 
