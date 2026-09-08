@@ -262,6 +262,12 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         runtime["process_cpu_percent"] =
             static_cast<double>(live->process_cpu_milli_percent) / 1000.0;
         runtime["load1"] = static_cast<double>(live->load1_milli) / 1000.0;
+        // Only when known. load1 and process_cpu_percent are per-core, so a
+        // consumer needs this to compare them across non-uniform nodes -- and
+        // an absent field it can abstain on is safer than a zero it might
+        // divide by.
+        if (live->cpu_cores)
+            runtime["cpu_cores"] = static_cast<uint64_t>(live->cpu_cores);
         runtime["peers_known"] = static_cast<uint64_t>(live->peers_known);
         runtime["peers_active"] = static_cast<uint64_t>(live->peers_active);
         runtime["rpc_connections_created"] = live->rpc_connections_created;
