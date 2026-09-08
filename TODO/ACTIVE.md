@@ -126,6 +126,45 @@ The governing laws are:
   invisible to client-side bounds. It must be fixed at the source, not
   papered over with a client timeout.
 
+  **Re-measured client-side against 0.36.1, 2026-09-08 (UI session).** Cold
+  start roughly halved — Django 43.4 s -> 22.2 s, Death Proof ~65 s -> 25.6 s
+  — but treat that cautiously: Django's warm rerun was already 9.5 s on
+  0.36.0, so some of it is likely cache warmth rather than any change. What is
+  new and worse is **steady-state production below realtime**, measured well
+  past cold start with no HTTP errors involved at all: Django 1.00x, Full
+  Metal Jacket 0.65x (5 s stalled in 30), Death Proof **0.46x** (9 s stalled
+  in 20). Death Proof is effectively unwatchable and is the operator's
+  "the video is choppy".
+  The **shape** matters more than the ratio: over 15 s at position ~221 s the
+  headroom trace runs 5.3 4.3 3.3 2.3 1.3 0.3 then pinned at 0 for ~7 s, then
+  11.7 s of media lands at once — roughly three 4.004 s segments arriving
+  together after a long silence, repeating. A uniformly 0.49x pipeline would
+  hand over a segment every ~8 s and hover near zero; producing nothing then
+  bursting looks like something serialising or batching per-segment work, or
+  one expensive step blocking several segments' output. Frame drops were 2 of
+  176 (1.1%), so the video decoder is healthy and this is not a decode limit.
+  **Ruled out as a cause: the segment-hold timeout.** gbni-1 logged zero
+  `reason=hold_timed_out` refusals across the measurement window, so the
+  bursts are not the 6000 ms hold expiring and the client backing off.
+  **Possible separate audio fault on the TrueHD path:** Death Proof decoded
+  10,911 bytes of audio in 9.2 s (~1.2 KB/s) against Django ~48 KB/s and Full
+  Metal Jacket ~57 KB/s — roughly 40x low, and far below what a 384 kb/s AAC
+  output should produce. Video is *copied* on that title, so all the cost is
+  audio: a TrueHD path both burning CPU and emitting almost nothing looks more
+  like per-frame failure than slowness, and the throughput fault and the
+  near-silence may be one bug. Nobody has listened to it, so the near-silence
+  is a measurement and not a confirmed symptom.
+
+  **Confirmed working, same session, recorded so it is not re-investigated:**
+  the bounded-hold contract behaved correctly throughout — segment 12 of a
+  post-seek generation answered 500 three times as a non-fatal
+  `fragLoadError` with `degradations: 0` and `failovers: 0`, and playback
+  continued. A beyond-window refusal returns in ~98 ms, so timing separates
+  held-then-expired from refused-immediately while only the status separates
+  not-ready from broken. The EXTINF fix is confirmed client-side: Full Metal
+  Jacket's plan is 1,748 segments summing to 6993.4 s, exactly the film's
+  duration, with segment 0 declaring 2 s and delivering 1.96 s.
+
 
 Execute the phased
 [playback resilience and A/V sync plan](2026-09-03-playback-resilience-and-av-sync-plan.md).
@@ -475,6 +514,42 @@ Resume the
 [structural ingest/runtime remediation](2026-09-02-structural-ingest-runtime-remediation.md)
 after the immediate playback correctness blocker. Existing checkpoints remain
 valid evidence, but do not prove the end-to-end invariants.
+
+- [ ] **es-1 publication livelock starves RPC and takes the node out of the
+  cluster — found 2026-09-08, survives restart, not caught by the parking
+  discipline.** Measured on es-1 the same day:
+  retained-memory ledger capacity 768 MB with the `publication` owner holding
+  **508 MB** and `reclaimable_bytes` **0**; spool **1.72 GB** with
+  `spool_publish_rate_bytes_per_second` **0**;
+  `data_publication_inflight_bytes` 256 MB with `bytes_committed` and
+  `bytes_confirmed` both **0**; loader waits 6,258 against 6,249 cancelled.
+  The loop is self-sustaining: publication holds the memory and cannot confirm
+  without peer RPC, RPC reassembly cannot get memory from the same ledger
+  (`process retained-memory RPC reassembly saturated`), so peer channels drop
+  (`RPC session: peer closed`, `bootstrap: no canonical RPC route to peer`),
+  so publication still cannot confirm and the memory is never released.
+  Downstream: es-1's telemetry is ~18 minutes stale on both home nodes and
+  theirs on es-1; es-1 cannot fetch catalogue shards
+  (`catalogue shard unavailable for control repair: 254f541d…`, also failing
+  retention publication); and gbni-1 cannot read extents whose replica needs
+  es-1 (`media input read failed … error=extent unavailable` ->
+  `read media packet: Input/output error` -> a dead transcode generation).
+  **Not a network fault**: TCP to :7437 connects both ways and ping is 61 ms.
+  **Not caused by the 2026-09-08 deploy**: 49,680 saturation events on es-1
+  before 16:00 that day, first at 09:21; gbni-1 has zero ever and gbni-2 four,
+  from 2026-09-07.
+  **A restart does not clear it** — es-1 restarted at 16:01 and logged 1,653
+  more within 25 minutes, because publication resumes from the spool and
+  immediately re-consumes the ledger.
+  **`parked_publications` is 0**, so 0.30.0's retry-and-park discipline does
+  not catch this: that machinery parks work that *fails*, and this work never
+  fails, it simply never completes. That looks like a real gap in the
+  self-healing programme rather than a misconfiguration, and it is the reason
+  this is filed separately from the retained-memory bounds item below rather
+  than folded into it.
+  Not yet established: what the 1.72 GB of spool actually is, and whether that
+  content already exists elsewhere in the cluster. Establish that before
+  draining or clearing anything.
 
 - [ ] Finish process-wide retained-memory ownership bounds for decoded metadata,
   catalogue/profile state, reconciliation retries, RPC/reassembly, object
