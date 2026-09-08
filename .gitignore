@@ -4,3 +4,6 @@
 .DS_Store
 *.swp
 *.tmp
+
+# Claude Code personal settings (never commit: machine-local permission choices)
+.claude/settings.local.json
