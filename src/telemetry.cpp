@@ -7,6 +7,7 @@
 #include "log.hpp"
 
 #include <algorithm>
+#include <thread>
 #include <ctime>
 #include <fstream>
 #include <unistd.h>
@@ -74,6 +75,7 @@ void encode(Writer& writer, const NodeTelemetry& value) {
     writer.u8(static_cast<uint8_t>(value.phase));
     writer.string(value.api_host);
     writer.u16(value.api_port);
+    writer.u32(value.cpu_cores);
 }
 
 NodeTelemetry decode(Reader& reader) {
@@ -117,6 +119,12 @@ NodeTelemetry decode(Reader& reader) {
         value.api_host = reader.string(512);
         value.api_port = reader.u16();
     }
+    // Optional trailing field: a record encoded before cpu_cores existed ends
+    // here and reports no core count, which is the honest answer for a peer
+    // that cannot tell us. During a rolling upgrade every node is briefly in
+    // that position.
+    if (reader.remaining())
+        value.cpu_cores = reader.u32();
     if (!value.sequence)
         throw DecodeError("telemetry sequence must be nonzero");
     return value;
@@ -247,6 +255,7 @@ NodeTelemetry TelemetryStore::refresh_local(
     telemetry.phase = phase;
     telemetry.api_host = std::move(api_host);
     telemetry.api_port = api_port;
+    telemetry.cpu_cores = std::thread::hardware_concurrency();
     observe(telemetry, true);
     return telemetry;
 }
