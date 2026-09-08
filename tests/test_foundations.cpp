@@ -240,6 +240,7 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     telemetry.rpc_connections_reused = 7;
     telemetry.api_endpoint = "https://10.44.1.50:7438";
     telemetry.cpu_cores = 8;
+    telemetry.memory_total_bytes = 64ULL * 1024 * 1024 * 1024;
     CHECK(decode_node_telemetry(encode_node_telemetry(telemetry)) == telemetry);
     auto telemetry_set = decode_telemetry_set(encode_telemetry_set({telemetry}));
     REQUIRE(telemetry_set.size() == 1);
@@ -252,11 +253,22 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     CHECK(recovering_set.front().phase == NodePhase::recovering);
 
     auto full = encode_node_telemetry(telemetry);
-    // cpu_cores is the newest trailing field: one u32.
-    const size_t cpu_cores_bytes = 4;
+    // memory_total_bytes is the newest trailing field: one u64. cpu_cores
+    // precedes it as a u32.
+    const size_t memory_bytes_bytes = 8;
+    const size_t cpu_cores_bytes = 4 + memory_bytes_bytes;
     // The API endpoint precedes it: a string length prefix + content.
     const size_t api_fields_bytes = 4 + telemetry.api_endpoint.size();
     REQUIRE(full.size() > cpu_cores_bytes + api_fields_bytes + 1);
+
+    // A record encoded before physical memory existed ends right after
+    // cpu_cores, and must report none rather than fail.
+    auto pre_memory = full;
+    pre_memory.resize(pre_memory.size() - memory_bytes_bytes);
+    auto legacy_no_memory = decode_node_telemetry(pre_memory);
+    CHECK(legacy_no_memory.memory_total_bytes == 0);
+    CHECK(legacy_no_memory.cpu_cores == telemetry.cpu_cores);
+    CHECK(legacy_no_memory.api_endpoint == telemetry.api_endpoint);
 
     // A record encoded before cpu_cores existed ends right after the API
     // endpoint. It
@@ -268,6 +280,7 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     pre_cores.resize(pre_cores.size() - cpu_cores_bytes);
     auto legacy_no_cores = decode_node_telemetry(pre_cores);
     CHECK(legacy_no_cores.cpu_cores == 0);
+    CHECK(legacy_no_cores.memory_total_bytes == 0);
     CHECK(legacy_no_cores.api_endpoint == telemetry.api_endpoint);
     CHECK(legacy_no_cores.sequence == telemetry.sequence);
 
@@ -280,6 +293,7 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     CHECK(legacy_no_api.phase == NodePhase::recovering);
     CHECK(legacy_no_api.api_endpoint.empty());
     CHECK(legacy_no_api.cpu_cores == 0);
+    CHECK(legacy_no_api.memory_total_bytes == 0);
     CHECK(legacy_no_api.sequence == telemetry.sequence);
 
     // A record encoded before phase (and so also before the API endpoint)
@@ -292,6 +306,7 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     CHECK(legacy.phase == NodePhase::ready);
     CHECK(legacy.api_endpoint.empty());
     CHECK(legacy.cpu_cores == 0);
+    CHECK(legacy.memory_total_bytes == 0);
     CHECK(legacy.sequence == telemetry.sequence);
     CHECK(legacy.rpc_connections_reused == telemetry.rpc_connections_reused);
 
