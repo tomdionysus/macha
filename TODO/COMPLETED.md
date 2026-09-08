@@ -1,6 +1,132 @@
 # Completed and tested
 
-Last updated: 2026-09-05
+Last updated: 2026-09-08
+
+The 2026-09-08 entries below were ledgered by a pruning pass over
+`ACTIVE.md`, and cover only the items that pass removed from that file.
+0.24.1–0.35.0 is not otherwise ledgered here yet — see the documentation
+hygiene item in `ACTIVE.md`.
+
+## Self-healing disciplines — 0.29.0 → 0.32.0
+
+- [x] Executed the whole of
+  [the self-healing disciplines plan](2026-09-06-self-healing-disciplines-plan.md),
+  written after one afternoon of ordinary load surfaced six P0 defects, each
+  hidden behind the previous, all instances of four habits: trusting
+  bookkeeping over re-derivable truth, retries that turn "not yet" into
+  "forever", recovery that refuses instead of resolving, and snapshots that
+  carry retirement history.
+- [x] 0.29.0 — durability is re-derived from disk, not asserted from a dead
+  token. This closed the `object durability quorum unavailable before
+  publication` wedge: three recovered inodes on gbni-1 had retried
+  `required=1 durable=0` on the same object ids for the life of each process
+  while 14.5 GB sat in the spool and the WAN socket idled. The barrier now
+  probes the restarted peer with the object ids and re-stamps the batch, so
+  a requirement naming a dead `durability_epoch` no longer outlives that
+  peer's restart.
+- [x] 0.30.0 — "not yet" never becomes "forever": one `RetryPolicy` per work
+  item with backoff and a terminal parked outcome an operator resolves
+  (`parked_publications`, `manage/parked-publications`), replacing three hot
+  loops including the ~40/s spin on `FUSE namespace advanced during data
+  publication` during startup recovery. The 120 s `service_startup_timeout_ms`
+  elapsed-time gate — which turned a slow-but-progressing 5-minute replay into
+  an infinite crash loop eight times on gbni-1 — became a no-progress gate
+  (`startup_progress.hpp`, `service_startup_no_progress_ms`, absolute ceiling
+  now off by default). Regression:
+  `test_service_startup_gate_waits_while_recovery_progresses`.
+- [x] 0.31.0 — recovery resolves rather than refusing, with a journal fuzz
+  fixture (`test_fuse_journal_fuzz_every_frame_mutation_still_starts`).
+- [x] 0.32.0 — DLT7: a flags byte per topology set, so a merge delta no longer
+  has to resend the whole standing conflict set (~305 KB on the cluster, ~100
+  merges/day × 3 replicas of pure history growth) whenever `merge_parents`
+  changes. Plus canonical tombstones and conflicts compacted out of the
+  snapshot.
+- [x] Evidence per discipline, and the closing two-writer / rolling-restart
+  run, in [`2026-09-06-self-healing-uat.md`](2026-09-06-self-healing-uat.md).
+  Follow-ups filed there remain open and are indexed in `ACTIVE.md`.
+
+## Retention-check batching and cheap presence — 0.26.0, 0.32.7–0.32.10
+
+- [x] Root-caused and fixed the live incident where a bulk movies rsync to
+  `corvus-es-1` froze data publication entirely and pinned the maintenance
+  thread near 100% CPU for minutes: `DistributedStore::retain_data`'s serial
+  per-extent `has_on` loop, each call either a full local decrypt+hash or a
+  synchronous control-plane RPC, producing a hard `retention claim … control
+  RPC deadline exceeded` against an unrelated peer — a direct
+  governing-law-3 violation. Plan, root-cause trace and the correction the
+  test suite caught mid-implementation (`rebalance_step`/`repair_step`'s
+  presence checks could *not* move to the cheap path, having no downstream
+  re-verification) in
+  [retention-check batching and a cheap local presence check](2026-09-06-retention-check-batching-and-cheap-presence-plan.md).
+- [x] This subsumed the separately-filed scaling item that `LocalStore::valid()`
+  was used as a cheap presence check while doing a full read + AES-GCM decrypt
+  + SHA-256.
+- [x] Measured on the real three-node cluster during a live bulk import
+  (0.32.7 remote claims are `has()` not re-reads; 0.32.8 parallel barrier
+  fan-out; 0.32.9 presence remembered rather than `stat`'ed; 0.32.10 CONTROL
+  puts together to the nearest replica): es-1 retention avg 5,217 ms → 121 ms,
+  publish avg 556 ms, no `deadline exceeded` or `peer closed` since 0.32.7.
+  Numbers in [`2026-09-06-self-healing-uat.md`](2026-09-06-self-healing-uat.md).
+  The N² retention-journal growth that run also recorded stays open in
+  `ACTIVE.md`.
+
+## Correctness and security fixes — 0.24.1 → 0.24.4
+
+- [x] **`NodeRuntime::accept_history_checkpoint_proposal()` accepted
+  unconditionally — 0.24.1.** Confirmed as the live root cause of a real
+  outage, not a theoretical gap: a lagging proposer whose own survey was
+  already stale got an unconditional ack from every participant for a floor
+  they had moved past, then durably committed and compacted *itself* to that
+  stale floor, discarding the only shared ancestry two-parent reconciliation
+  had — which is exactly what produced "divergent metadata heads have no known
+  common ancestor" across all three nodes on 2026-09-05 (confirmed by
+  cross-node journalctl timing). `MetadataReplica::record_checkpoint_ack()`
+  now validates the proposal's `floor_hash` against this replica's own
+  accepted head before acking, on both the RPC and local-owner paths.
+  Regression:
+  `test_history_checkpoint_ack_refuses_a_floor_this_replica_has_already_superseded`.
+  This prevents recurrence; it did not retroactively restore ancestry already
+  discarded.
+- [x] **Data race on `LocalStore::last_mutation_generation_` — 0.24.3.**
+  `scan()`'s write moved under `m_`, matching `durability_barrier()`'s read.
+- [x] **Cleared ingest jobs could resurrect — 0.24.3.** Seven sites (one more
+  than originally scoped) in `src/ingest.cpp` moved from unguarded
+  `jobs_[job.id]` to `find()`-guarded access, matching what
+  `should_pause_or_cancel()` already did. Regression:
+  `test_cleared_ingest_job_does_not_resurrect_while_worker_finishes`.
+- [x] **`MetadataReplica::accept_commit()` held the global replica mutex
+  across `persist()` — 0.24.3.** Writing the entire snapshot payload
+  (potentially hundreds of MB) on the single metadata RPC worker. The
+  checkpoint write now happens after `m_` is released, serialized only against
+  other durable-mutation writers, mirroring the off-lock-write /
+  on-lock-bookkeeping pattern `import_history()` already used.
+- [x] **Wedged namespace queue on a non-retryable error — escape hatch in
+  0.24.3, fixed forward in 0.24.4.** `GET/POST
+  /api/v1/manage/filesystem/blocked-namespace-operation[/skip]` lets an
+  operator abandon a wedged operation by exact sequence number; never
+  automatic. The 0.24.3 version of this fix had a journal-bookkeeping bug that
+  crash-looped a node on restart — which is what put the subsystem crash
+  isolation item on the backlog.
+- [x] **Non-constant-time bearer token comparison — closed as a side effect of
+  0.24.0.** `http.cpp` no longer holds or compares a raw bearer token;
+  `SessionManager::validate()` hashes the presented token (SHA-256) before any
+  lookup, so the untrusted byte comparison no longer exists.
+
+## Breaking config change: `mount_path` moved to `fuse.mount_path` — 0.25.0
+
+- [x] Top-level `mount_path` became a hard startup error ("obsolete
+  configuration key: mount_path (moved to fuse.mount_path)") rather than
+  silently ignored. Every node's `macha.yaml` has since moved its line under
+  `fuse:` — all three cluster nodes run 0.34.0.
+
+## gbni-1 SSH unresponsiveness during builds — diagnosed, not a code defect
+
+- [x] "Node 50 loses SSH responsiveness with Macha active during a build" was
+  diagnosed as gbni-1 browning out under load (power/undervolt), not a Macha
+  scheduling or memory defect. It is now a standing operational rule rather
+  than an open investigation: never run `cmake --build` on gbni-1 — build on
+  gbni-2 and ship the staged `make install DESTDIR=` tree — and rate-cap its
+  rsync (`--bwlimit`, `nice -n 10 ionice -c3`).
 
 ## Cluster session/auth subsystem, `/api/v1/session` — 0.24.0
 
