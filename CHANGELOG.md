@@ -1,5 +1,25 @@
 # Current release
 
+## 0.36.6 — Status reports how much RAM a node has (development)
+
+`runtime.memory_total_bytes` joins `cpu_cores` in the node payload. The
+closest existing field was the wrong quantity by orders of magnitude:
+`rss_bytes` is this process's own resident set, a few hundred megabytes on a
+machine with tens of gigabytes, and under a label reading "memory" it would
+have been plausibly and badly wrong.
+
+- **Total, not available.** On Linux "available" is dominated by page cache,
+  so a node that has just served a large file looks starved while being
+  perfectly healthy — and serving large files is the entire workload here.
+- **Display only.** Nothing schedules or ranks on it, deliberately: total RAM
+  would prefer a large thrashing node over a small idle one.
+- Omitted when it cannot be determined, so a consumer renders "unknown"
+  rather than a node claiming to have no memory — the same rule `cpu_cores`
+  follows.
+- An optional trailing telemetry field, so a node that has not been upgraded
+  simply does not report one and needs no coordination during a rolling
+  upgrade.
+
 ## 0.36.5 — Coverage that measures something (development)
 
 `MACHA_TEST_COVERAGE` had been in `CMakeLists.txt` for some time and had never

@@ -64,6 +64,15 @@ struct NodeTelemetry {
     // cluster is deliberately non-uniform hardware, so comparing either
     // between nodes without it compares nothing.
     uint32_t cpu_cores{};
+    // Physical RAM on this node. Total rather than available: on Linux
+    // "available" is dominated by page cache, so a node that has just served a
+    // large file looks starved while being perfectly healthy -- and serving
+    // large files is the whole workload here. Zero means the sender could not
+    // determine it, which a consumer must render as unknown rather than as a
+    // node with no memory. Display only; nothing schedules or ranks on it,
+    // since total RAM would prefer a large thrashing node over a small idle
+    // one.
+    uint64_t memory_total_bytes{};
 
     auto operator<=>(const NodeTelemetry&) const = default;
 };
