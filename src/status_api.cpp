@@ -267,6 +267,11 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         // divide by.
         if (live->cpu_cores)
             runtime["cpu_cores"] = static_cast<uint64_t>(live->cpu_cores);
+        // Physical RAM, and only when known. rss_bytes above is this process's
+        // own resident set, which is a different quantity by orders of
+        // magnitude -- a consumer labelling either as "memory" wants this one.
+        if (live->memory_total_bytes)
+            runtime["memory_total_bytes"] = live->memory_total_bytes;
         runtime["peers_known"] = static_cast<uint64_t>(live->peers_known);
         runtime["peers_active"] = static_cast<uint64_t>(live->peers_active);
         runtime["rpc_connections_created"] = live->rpc_connections_created;

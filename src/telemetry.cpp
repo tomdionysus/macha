@@ -12,6 +12,9 @@
 #include <fstream>
 #include <unistd.h>
 #if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+#if defined(__APPLE__)
 #include <mach/mach.h>
 #endif
 
@@ -36,6 +39,24 @@ uint64_t resident_bytes() {
         return 0;
     const auto page_size = sysconf(_SC_PAGESIZE);
     return page_size > 0 ? resident_pages * static_cast<uint64_t>(page_size) : 0;
+#else
+    return 0;
+#endif
+}
+
+uint64_t physical_memory_bytes() {
+#if defined(__APPLE__)
+    uint64_t bytes = 0;
+    size_t size = sizeof(bytes);
+    if (sysctlbyname("hw.memsize", &bytes, &size, nullptr, 0) != 0)
+        return 0;
+    return bytes;
+#elif defined(__linux__)
+    const auto pages = sysconf(_SC_PHYS_PAGES);
+    const auto page_size = sysconf(_SC_PAGESIZE);
+    if (pages <= 0 || page_size <= 0)
+        return 0;
+    return static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
 #else
     return 0;
 #endif
@@ -75,6 +96,7 @@ void encode(Writer& writer, const NodeTelemetry& value) {
     writer.u8(static_cast<uint8_t>(value.phase));
     writer.string(value.api_endpoint);
     writer.u32(value.cpu_cores);
+    writer.u64(value.memory_total_bytes);
 }
 
 NodeTelemetry decode(Reader& reader) {
@@ -131,6 +153,10 @@ NodeTelemetry decode(Reader& reader) {
     // that position.
     if (reader.remaining())
         value.cpu_cores = reader.u32();
+    // Optional trailing field: a record encoded before physical memory existed
+    // ends here and reports none, which a consumer renders as unknown.
+    if (reader.remaining())
+        value.memory_total_bytes = reader.u64();
     if (!value.sequence)
         throw DecodeError("telemetry sequence must be nonzero");
     return value;
@@ -261,6 +287,7 @@ NodeTelemetry TelemetryStore::refresh_local(
     telemetry.phase = phase;
     telemetry.api_endpoint = std::move(api_endpoint);
     telemetry.cpu_cores = std::thread::hardware_concurrency();
+    telemetry.memory_total_bytes = physical_memory_bytes();
     observe(telemetry, true);
     return telemetry;
 }
