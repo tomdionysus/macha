@@ -297,6 +297,60 @@ MACHA_TEST("media_playback", test_media_segment_store_supersede_wakes_stale_wait
     CHECK(second_wait_returned.load());
 }
 
+MACHA_TEST("media_playback", test_media_segment_store_holds_an_init_request_until_it_is_published) {
+    // One hold path for anything a client can request -- Phase 1 of
+    // TODO/2026-09-08-bounded-vod-playlist-and-segment-holds.md. Once a
+    // complete playlist is served before anything has been published, the
+    // client asks for init.mp4 before the muxer has written the first moof.
+    // wait_object() used to return immediately for every non-segment name, so
+    // that request would have been answered 404 for an object the playlist
+    // promises exists.
+    TempDir t;
+    auto store = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill", 4000ms,
+                                                     std::vector<double>{4.0, 4.0});
+
+    // The immediate lookup misses -- this is exactly what the HTTP layer used
+    // to turn into a 404.
+    CHECK(!store->object("init.mp4").has_value());
+
+    std::atomic_bool init_returned{};
+    std::optional<Bytes> waited_init;
+    std::jthread waiter([&] {
+        waited_init = store->wait_object("init.mp4", {});
+        init_returned.store(true);
+    });
+    std::this_thread::sleep_for(50ms);
+    CHECK(!init_returned.load());
+
+    REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
+    waiter.join();
+    CHECK(init_returned.load());
+    REQUIRE(waited_init.has_value());
+    CHECK(std::string(waited_init->begin(), waited_init->end()) == "init");
+
+    // A generation that ends without ever publishing an init fragment releases
+    // the waiter rather than holding it for the life of the request.
+    auto broken = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill-broken",
+                                                      4000ms, std::vector<double>{4.0});
+    std::jthread breaker([&] { broken->fail("generation broke"); });
+    CHECK(!broken->wait_object("init.mp4", {}).has_value());
+    breaker.join();
+
+    // MPEG-TS has no init fragment, so that request must not hold: nothing
+    // could ever publish it. Timed, because the failure this guards against is
+    // a wait that only ends when the timeout does.
+    auto ts = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill-ts", 4000ms,
+                                                  std::vector<double>{4.0}, MediaContainer::mpegts);
+    const auto before = std::chrono::steady_clock::now();
+    CHECK(!ts->wait_object("init.mp4", 5s).has_value());
+    CHECK(std::chrono::steady_clock::now() - before < 1s);
+
+    // An unknown object is still an immediate miss, held by nothing.
+    const auto unknown_before = std::chrono::steady_clock::now();
+    CHECK(!store->wait_object("nonsense.bin", 5s).has_value());
+    CHECK(std::chrono::steady_clock::now() - unknown_before < 1s);
+}
+
 MACHA_TEST("media_playback", test_http_server_serves_streams_concurrently) {
     CatalogueApiConfig config;
     config.enabled = true;
