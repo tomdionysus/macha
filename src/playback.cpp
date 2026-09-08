@@ -3,6 +3,7 @@
 #include "diagnostics.hpp"
 
 #include "crypto.hpp"
+#include "segment_holds.hpp"
 #include "json.hpp"
 #include "log.hpp"
 #include "supervised.hpp"
@@ -621,6 +622,9 @@ struct PlaybackManager::Impl {
     FileSystem& fs;
     CatalogueManager& catalogue;
     StreamingConfig config;
+    // Node-global. The budget it enforces is a property of this process's
+    // worker pool, not of any one session.
+    SegmentHoldArbiter segment_holds{config.max_session_holds, config.max_concurrent_holds};
     std::shared_ptr<MediaEngine> engine;
     std::jthread cleanup_thread;
     std::jthread profile_publish_thread;
@@ -747,6 +751,53 @@ struct PlaybackManager::Impl {
                 (config.enabled ? make_libav_media_engine(config) : nullptr)),
           request_media_profiles(std::move(request_profiles)), media_information(information) {
         (void)api;
+    }
+
+    // A broken generation, as distinct from one that is merely not ready yet.
+    //
+    // 503, which is also what every intermediary emits when a service is
+    // genuinely down -- and that is deliberate. A dead node and a broken
+    // generation warrant the same conclusion from a client: this node cannot
+    // serve me, go elsewhere. Sharing the status with infrastructure is
+    // therefore harmless here, and it is what lets the hold have a status
+    // nothing else on the path can produce.
+    static HttpResponse stream_failed(std::string_view detail) {
+        return http_error(503, "stream_failed", detail);
+    }
+
+    // The refusal: not absent, just not made yet. Never 404 -- the playlist
+    // promises this object exists, a 404 invites an intermediary to cache the
+    // miss, and some players treat it as terminal.
+    //
+    // 500, which is the wrong status by the letter of the spec and the right
+    // one in practice. A client cannot read our JSON body on a fragment error:
+    // hls.js's XHR loader surfaces only `{code: xhr.status, text:
+    // xhr.statusText}`, the body is absent from the error event, and a header
+    // is reachable only through the raw XMLHttpRequest -- undocumented
+    // coupling that breaks if the default loader changes. So the status is the
+    // discriminator, and a discriminator readable only as a status has to be a
+    // status nothing else on the path can emit. 503 fails that test: every
+    // proxy, tunnel and load balancer emits it when a service is down, so a
+    // client classifying "503 means hold, stay on this node" would read a
+    // genuinely dead node as a healthy one and never fail over -- a silent,
+    // permanent stall. Misreading an infrastructure 500 as a hold costs a
+    // pointless retry instead. The two faults are not symmetric, and this
+    // picks the recoverable one. Both stay 5xx, because a 4xx stops hls.js
+    // retrying at all.
+    //
+    // Retry-After and no-store keep an intermediary from turning a transient
+    // answer into a durable one. hls.js ignores Retry-After on the fragment
+    // path -- it reads that header only in its content-steering loader -- so
+    // it is sent because it is correct, not because anything depends on it.
+    static HttpResponse segment_not_ready(std::string_view session, uint64_t index,
+                                          std::string_view reason) {
+        Log::debug("playback stream refused session=" + std::string(session) +
+                   " index=" + std::to_string(index) + " reason=" + std::string(reason));
+        auto response = http_error(500, "segment_not_ready",
+                                   "media is not ready yet, retry shortly", reason);
+        response.headers["Retry-After"] = "1";
+        response.headers["Cache-Control"] = "no-store";
+        return response;
     }
 
     std::string public_stream_prefix(const Session& session) const {
@@ -1867,19 +1918,13 @@ struct PlaybackManager::Impl {
             return response;
         }
         if (name == "media.m3u8") {
+            // No readiness gate. The playlist is complete from the moment the
+            // plan exists, so there is nothing to wait for -- the request that
+            // used to be held here is now the init and segment requests that
+            // follow it, which is the better channel for the wait: a fragment
+            // failure is fragLoadError rather than the levelLoadError a client
+            // weighs as node health.
             auto playlist = store->playlist();
-            if (playlist.empty() && store->snapshot().error.empty()) {
-                // A growing playlist has nothing to say until its first
-                // fragment exists. Hold the request for that instead of
-                // answering 404: a player treats a failed playlist load as a
-                // network error, and a client that reads such errors as node
-                // health would see every new generation start with a spurious
-                // "this node is degrading" signal (UI session, 2026-09-07).
-                // The wait is bounded by the same startup timeout the session
-                // create uses, and the producer is already running.
-                store->wait_ready(config.startup_timeout);
-                playlist = store->playlist();
-            }
             auto state = store->snapshot();
             Log::debug("playback stream playlist session=" + session->id +
                        " generation=" + std::to_string(session->generation) +
@@ -1887,7 +1932,7 @@ struct PlaybackManager::Impl {
                        " highest_requested=" + std::to_string(state.highest_requested) +
                        " finished=" + std::string(state.finished ? "true" : "false"));
             if (playlist.empty()) {
-                if (!state.error.empty()) return http_error(503, "stream_failed", state.error);
+                if (!state.error.empty()) return stream_failed(state.error);
                 return http_error(404, "not_ready", "playlist not ready");
             }
             Bytes bytes(playlist.begin(), playlist.end());
@@ -1895,32 +1940,58 @@ struct PlaybackManager::Impl {
             response.headers["Cache-Control"] = "no-store";
             return response;
         }
-        std::optional<Bytes> object;
-        if (auto index = segment_index(name)) {
-            // A VOD playlist is complete and immutable from first publication,
-            // so clients are allowed to ask for a valid future fragment. Demand
-            // wakes the sequential producer and this HTTP request waits for that
-            // fragment instead of returning a transient 404.
-            active->note_segment_requested(*index);
-            object = store->wait_object(name, {});
+        // A complete VOD playlist promises every fragment before any of them
+        // exists, so a request for one that has not been produced yet is
+        // ordinary rather than erroneous. It is held -- but only as an
+        // explicitly admitted resource, and only for media something is
+        // actually working toward.
+        const auto index = segment_index(name);
+        const bool holdable_init =
+            name == "init.mp4" && store->container() != MediaContainer::mpegts;
+
+        std::optional<Bytes> object = store->object(name);
+        if (!object && (index || holdable_init)) {
             auto state = store->snapshot();
+            if (!state.error.empty()) return stream_failed(state.error);
+            // Never promised: the playlist stops at the plan, and an index past
+            // it is a genuine miss rather than something to wait for.
+            if (index && state.planned_segments && *index >= state.planned_segments)
+                return http_error(404, "not_found", "stream object not found");
+            // Window. Beyond it nothing is working toward this fragment, so
+            // holding a worker for it would be waiting on work that has not
+            // been authorised to start.
+            if (index && *index >= state.segment_count + config.segment_hold_window)
+                return segment_not_ready(session->id, *index, "beyond_hold_window");
+            auto why = SegmentHoldArbiter::Refusal::budget_exhausted;
+            auto hold = segment_holds.try_acquire(session->id, &why);
+            if (!hold)
+                return segment_not_ready(session->id, index.value_or(0),
+                                         why == SegmentHoldArbiter::Refusal::session_limit
+                                             ? "session_hold_limit"
+                                             : "hold_budget_exhausted");
+            // Only now, admitted: noting an index we had declined to serve
+            // would drag the producer's authorised window forward on behalf of
+            // a request we refused.
+            if (index) active->note_segment_requested(*index);
+            object = store->wait_object(name, config.segment_timeout);
+            hold.reset();
+            state = store->snapshot();
             if (object) {
                 Log::debug("playback stream segment session=" + session->id +
                            " generation=" + std::to_string(session->generation) +
-                           " index=" + std::to_string(*index) +
+                           " index=" + std::to_string(index.value_or(0)) +
                            " bytes=" + std::to_string(object->size()) +
                            " segments_ready=" + std::to_string(state.segment_count));
             }
-        } else {
-            // Not a segment index: init.mp4 is held until the muxer publishes
-            // it, and any other name falls through to an immediate lookup
-            // inside wait_object. Which objects can be waited for is the
-            // store's decision, not the route's.
-            object = store->wait_object(name, {});
         }
         if (!object) {
             auto state = store->snapshot();
-            if (!state.error.empty()) return http_error(503, "stream_failed", state.error);
+            if (!state.error.empty()) return stream_failed(state.error);
+            // The playlist promised this object, so its absence is "not yet",
+            // never "not there". A 404 invites an intermediary to cache the
+            // miss and some players treat it as terminal.
+            if (index || holdable_init)
+                return segment_not_ready(session->id, index.value_or(0), "hold_timed_out");
             return http_error(404, state.finished ? "not_found" : "not_ready",
                               state.finished ? "stream object not found" : "stream object not ready");
         }
@@ -2688,6 +2759,11 @@ void PlaybackManager::reconfigure(StreamingConfig config) {
     impl_->config.startup_timeout = config.startup_timeout;
     impl_->config.segment_duration = config.segment_duration;
     impl_->config.max_ahead_segments = config.max_ahead_segments;
+    impl_->config.segment_hold_window = config.segment_hold_window;
+    impl_->config.max_session_holds = config.max_session_holds;
+    impl_->config.max_concurrent_holds = config.max_concurrent_holds;
+    impl_->config.segment_timeout = config.segment_timeout;
+    impl_->segment_holds.reconfigure(config.max_session_holds, config.max_concurrent_holds);
     impl_->signal_cleanup_locked();
 }
 

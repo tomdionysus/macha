@@ -207,47 +207,44 @@ std::string MediaSegmentStore::playlist() const {
     std::lock_guard lock(impl_->mutex);
     if (!impl_->error.empty()) return {};
     const auto& durations = impl_->vod_segment_durations;
-    if (durations.empty() || impl_->segments.empty()) return {};
+    if (durations.empty()) return {};
     double longest = 1.0;
-    for (const auto& segment : impl_->segments) longest = std::max(longest, segment.duration);
-    // A growing EVENT playlist: only fragments that exist are advertised, and
-    // ENDLIST closes it once the generation has produced its last one. Until
-    // 0.32.14 this was a VOD list of every planned fragment, and a fragment
-    // request blocked until it was encoded; a native player that prefetches
-    // deeply then waited on the encoder for each of them -- a 98 s black
-    // screen on the operator's TV after a mode switch (2026-09-07). Seeking
-    // stays server-side (PATCH seek_ms creates a new generation), so the
-    // timeline the client shows still comes from the session's duration.
-    // Replacing this with a complete, closed list is planned and designed --
-    // see TODO/2026-09-08-bounded-vod-playlist-and-segment-holds.md -- and
-    // depends on bounded segment holds landing with it, which they have not.
-    const size_t produced = std::min(impl_->segments.size(), durations.size());
-    const bool complete = impl_->finished || produced == durations.size();
+    for (const double duration : durations) longest = std::max(longest, duration);
+    // A complete, closed VOD list, served on the first fetch with no readiness
+    // gate. This is the spec-correct form for playback of a known-duration
+    // source -- we probed it -- and it is what comparable just-in-time servers
+    // do: compute the whole playlist from runtime and segment length before
+    // any segment exists, then make the wait for not-yet-produced media the
+    // server's problem. Two things follow from ENDLIST being here. A player
+    // stops polling entirely, so a generation costs one playlist fetch instead
+    // of hundreds, and with it go all the opportunities for a level-load
+    // failure to be read as node health. And a failure to produce a fragment
+    // now surfaces as fragLoadError, which has its own retry policy, rather
+    // than levelLoadError, which a client weighs as node health and which has
+    // promoted a live session off its node.
+    //
+    // EXTINF is the plan, necessarily. An unproduced fragment has no measured
+    // length, and a VOD playlist must be immutable across fetches, so a
+    // produced fragment cannot be described differently from an unproduced
+    // one. That is only honest because the plan now predicts the output
+    // exactly, one fragment per planned entry -- until the early-moov-flush
+    // fix the transcode path merged fragments 0 and 1 and a playlist written
+    // up front would have been wrong from its first line. Gated by
+    // tests/test_transcode_timeline.cpp, which measures every declared
+    // duration against the media the fragment really carries.
     std::ostringstream out;
     const bool mpegts = impl_->container == MediaContainer::mpegts;
     out << "#EXTM3U\n#EXT-X-VERSION:" << (mpegts ? 3 : 7)
         << "\n#EXT-X-TARGETDURATION:" << static_cast<int>(std::ceil(longest))
-        << "\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:EVENT\n"
+        << "\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n"
         << "#EXT-X-INDEPENDENT-SEGMENTS\n";
     if (!mpegts) out << "#EXT-X-MAP:URI=\"init.mp4\"\n";
-    // EXTINF is what each fragment actually carries, not what the plan asked
-    // for. A planned boundary can pass without producing a fragment -- the
-    // first flush of a fragmented MP4 writes the delayed moov and no moof, so
-    // that boundary's media joins the next fragment, which is then longer than
-    // planned by exactly that much. Advertising the plan instead made a
-    // six-second first fragment claim two seconds, and since a player builds
-    // its seek map by accumulating EXTINF, every later fragment sat four
-    // seconds early on the timeline for the rest of the title. The producer
-    // already computes the true length (FragmentWriter::publish_duration,
-    // which carries an unproduced boundary's length into the fragment that
-    // absorbed its media); until now nothing read it.
-    for (size_t i = 0; i < produced; ++i) {
-        out << "#EXTINF:" << std::fixed << std::setprecision(3) << impl_->segments[i].duration
-            << ",\n"
+    for (size_t i = 0; i < durations.size(); ++i) {
+        out << "#EXTINF:" << std::fixed << std::setprecision(3) << durations[i] << ",\n"
             << "segment-" << std::setfill('0') << std::setw(6) << i
             << (mpegts ? ".ts" : ".m4s") << "\n";
     }
-    if (complete) out << "#EXT-X-ENDLIST\n";
+    out << "#EXT-X-ENDLIST\n";
     return out.str();
 }
 

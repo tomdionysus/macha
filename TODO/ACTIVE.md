@@ -66,8 +66,17 @@ The governing laws are:
 
 ## P0 — Playback correctness and poor-network resilience
 
-- [ ] **Complete VOD playlist with bounded segment holds — planned
-  2026-09-08, not started.** Operator decision: serve a complete
+- [ ] **Complete VOD playlist with bounded segment holds — phases 1-5
+  shipped 2026-09-08, deploy and client notification outstanding.** Phases 1-5
+  of the plan are implemented and green (376/376 and 8/8 on macOS, twice):
+  one hold path covering init as well as segment indices, a complete closed
+  `PLAYLIST-TYPE:VOD` list served with no readiness gate and byte-identical
+  across fetches, the window/per-session/global admission policy as an
+  explicitly acquired `SegmentHoldArbiter::Hold`, the four new `streaming.*`
+  knobs documented in `macha.yaml.example` and `docs/streaming.md`, and the
+  three EVENT-contract regressions re-expressed rather than deleted. What
+  remains is phase 6's deploy to all three nodes and phase 7's notification of
+  the four client sessions. Operator decision: serve a complete
   `PLAYLIST-TYPE:VOD` list with `ENDLIST` immediately, and make the wait for
   not-yet-produced media the server's problem — held near the production
   frontier, refused with a retryable `503` beyond it, under a per-session

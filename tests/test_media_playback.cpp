@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
 #include "media_containers.hpp"
+#include "segment_holds.hpp"
 #include "media_information.hpp"
 
 using namespace macha;
@@ -8,6 +9,51 @@ using namespace std::chrono_literals;
 using namespace macha::test_support;
 
 namespace {
+
+// FakeMediaEngine with its store kept reachable, so a test can watch what a
+// refused request did (or did not) do to the producer, and can publish a
+// fragment while a request is held on it.
+class ObservableHlsMediaEngine final : public FakeMediaEngine {
+    mutable std::mutex store_mutex_;
+    std::shared_ptr<MediaSegmentStore> store_;
+
+  public:
+    std::unique_ptr<MediaEngineSession> start_hls(const MediaSource&, const HlsVodPlan& vod_plan,
+                                                  std::chrono::milliseconds segment_duration,
+                                                  size_t max_ahead_segments, uint64_t memory_limit,
+                                                  const std::filesystem::path& spill) override {
+        auto store = std::make_shared<MediaSegmentStore>(max_ahead_segments, memory_limit, spill,
+                                                         segment_duration,
+                                                         vod_plan.segment_durations);
+        REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
+        REQUIRE(store->publish_segment(Bytes{'s', 'e', 'g', '0'}, 4.0));
+        {
+            std::lock_guard lock(store_mutex_);
+            store_ = store;
+        }
+        return std::make_unique<FakeMediaEngineSession>(std::move(store));
+    }
+
+    std::shared_ptr<MediaSegmentStore> store() const {
+        std::lock_guard lock(store_mutex_);
+        return store_;
+    }
+};
+
+// Playback serves every payload as a range-capable stream rather than an
+// inline body, so a test that wants to read one has to drain it.
+std::string response_text(const HttpResponse& response) {
+    if (!response.stream) return std::string(response.body.begin(), response.body.end());
+    Bytes bytes(static_cast<size_t>(response.stream->size()));
+    size_t filled = 0;
+    while (filled < bytes.size()) {
+        const auto n = response.stream->read(filled, std::span(bytes).subspan(filled));
+        if (n == 0) break;
+        filled += n;
+    }
+    bytes.resize(filled);
+    return std::string(bytes.begin(), bytes.end());
+}
 
 class CoalescingProbeMediaEngine final : public MediaEngine {
     TestGate& gate_;
@@ -183,9 +229,15 @@ MACHA_TEST("media_playback", test_media_segment_store_backpressure_and_spill) {
     CHECK(retained.stats().owner_bytes[static_cast<size_t>(MemoryOwner::playback_segment)] ==
           2 * 1024);
     REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
-    // No fragment yet: not ready (the HTTP layer answers not_ready, which a
-    // player retries), never a list of fragments that do not exist.
-    CHECK(store->playlist().empty());
+    // The playlist is a plan and the plan exists, so it is complete before any
+    // fragment is: every planned entry, closed, from the first fetch. What
+    // stops a client queueing against the encoder is no longer withholding the
+    // list -- it is the admission policy on the fragment requests themselves.
+    const auto planned_playlist = store->playlist();
+    CHECK(!planned_playlist.empty());
+    CHECK(planned_playlist.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
+    CHECK(planned_playlist.find("segment-000003.m4s") != std::string::npos);
+    CHECK(planned_playlist.find("#EXT-X-ENDLIST") != std::string::npos);
 
     REQUIRE(store->publish_segment(Bytes(1024, 0x10), 4.0));
     REQUIRE(store->publish_segment(Bytes(1024, 0x11), 4.0));
@@ -222,12 +274,14 @@ MACHA_TEST("media_playback", test_media_segment_store_backpressure_and_spill) {
     CHECK(state.descriptor_bytes >= state.segment_count);
     CHECK(state.planned_segments == 4);
 
-    // The playlist grew with production and closed at the end: EVENT, every
-    // produced fragment, ENDLIST once finished.
+    // And production changed none of it. Backpressure, spill and the ledger
+    // are producer-side concerns; the playlist is a promise made up front and
+    // a VOD list may not be revised once a player has built a seek map from it.
     auto playlist = store->playlist();
+    CHECK(playlist == planned_playlist);
     CHECK(playlist.find("#EXT-X-MAP:URI=\"init.mp4\"") != std::string::npos);
-    CHECK(playlist.find("#EXT-X-PLAYLIST-TYPE:EVENT") != std::string::npos);
-    CHECK(playlist.find("#EXT-X-PLAYLIST-TYPE:VOD") == std::string::npos);
+    CHECK(playlist.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
+    CHECK(playlist.find("#EXT-X-PLAYLIST-TYPE:EVENT") == std::string::npos);
     CHECK(playlist.find("segment-000000.m4s") != std::string::npos);
     CHECK(playlist.find("segment-000003.m4s") != std::string::npos);
     CHECK(playlist.find("#EXT-X-ENDLIST") != std::string::npos);
@@ -295,6 +349,246 @@ MACHA_TEST("media_playback", test_media_segment_store_supersede_wakes_stale_wait
     REQUIRE(store->publish_segment(Bytes(16, 0x14), 4.0));
     second_waiter.join();
     CHECK(second_wait_returned.load());
+}
+
+MACHA_TEST("media_playback", test_segment_hold_arbiter_admits_within_limits_and_refuses_beyond_them) {
+    // Phase 3 of TODO/2026-09-08-bounded-vod-playlist-and-segment-holds.md. A
+    // hold is an explicitly admitted resource, so the limits are testable
+    // without a thread ever blocking -- which is the property that makes an
+    // async HttpServer an improvement here rather than a rewrite.
+    SegmentHoldArbiter arbiter(2, 3);
+    auto why = SegmentHoldArbiter::Refusal::budget_exhausted;
+
+    // One in flight plus one prefetch, per session.
+    auto first = arbiter.try_acquire("session-a", &why);
+    auto second = arbiter.try_acquire("session-a", &why);
+    REQUIRE(first.has_value());
+    REQUIRE(second.has_value());
+    CHECK(arbiter.outstanding("session-a") == 2);
+
+    // A third from the same session is refused, and refused for the right
+    // reason: this is the deeply prefetching player that queued thirty
+    // requests, not a node that has run out of room.
+    auto third = arbiter.try_acquire("session-a", &why);
+    CHECK(!third.has_value());
+    CHECK(why == SegmentHoldArbiter::Refusal::session_limit);
+
+    // Another session is unaffected by the first one's limit.
+    auto other = arbiter.try_acquire("session-b", &why);
+    REQUIRE(other.has_value());
+    CHECK(arbiter.outstanding() == 3);
+
+    // The global budget binds across sessions regardless of whose share is
+    // free: session-b is one under its own limit and still refused.
+    auto beyond = arbiter.try_acquire("session-b", &why);
+    CHECK(!beyond.has_value());
+    CHECK(why == SegmentHoldArbiter::Refusal::budget_exhausted);
+
+    // Releasing returns capacity to the node, not just to the session.
+    first->reset();
+    CHECK(arbiter.outstanding() == 2);
+    CHECK(arbiter.outstanding("session-a") == 1);
+    auto after_release = arbiter.try_acquire("session-b", &why);
+    CHECK(after_release.has_value());
+
+    // Release is idempotent, and a moved-from hold releases nothing twice.
+    first->reset();
+    CHECK(arbiter.outstanding() == 3);
+    {
+        auto moved = std::move(*second);
+        second.reset();
+        CHECK(arbiter.outstanding() == 3);
+    }
+    // Scope exit released the moved-to hold exactly once.
+    CHECK(arbiter.outstanding() == 2);
+    CHECK(arbiter.outstanding("session-a") == 0);
+}
+
+MACHA_TEST("media_playback", test_a_refused_segment_request_answers_at_once_and_never_advances_the_producer) {
+    // The refusal, end to end. Three things have to hold together: a request
+    // outside the window is answered immediately rather than held, it is a
+    // retryable 503 rather than a 404, and it does not drag the producer's
+    // authorised window forward on behalf of a request the node declined to
+    // serve.
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/film.mkv", 0644, getuid(), getgid());
+    auto bytes = pattern(64 * 1024);
+    auto writer = service.filesystem().open_write("/media/film.mkv", true);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto media_id = file_media_id(service.filesystem().getattr("/media/film.mkv"));
+
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback";
+    streaming.startup_timeout = 2s;
+    // Short enough that a test which reaches the deadline still finishes
+    // quickly; the point being measured is which requests reach it at all.
+    streaming.segment_timeout = 400ms;
+    streaming.segment_hold_window = 8;
+    auto engine = std::make_unique<ObservableHlsMediaEngine>();
+    auto* engine_ptr = engine.get();
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             std::move(engine));
+    playback.start();
+
+    Json::Object preferences{{"mode", "remux"}};
+    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
+    auto text = Json(std::move(root)).dump();
+    HttpRequest create;
+    create.method = "POST";
+    create.path = "/api/v1/playback/sessions";
+    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    create.body.assign(text.begin(), text.end());
+    auto created = playback.handle(create);
+    REQUIRE(created.status == 201);
+    auto created_json = Json::parse(std::string(created.body.begin(), created.body.end()));
+    const auto url = created_json.find("stream")->find("url")->asString();
+    const auto base = url.substr(0, url.rfind('/'));
+
+    auto get = [&](const std::string& object) {
+        HttpRequest request;
+        request.method = "GET";
+        request.path = base + "/" + object;
+        return playback.handle(request);
+    };
+
+    auto store = engine_ptr->store();
+    REQUIRE(store != nullptr);
+    REQUIRE(store->snapshot().segment_count == 1);
+    REQUIRE(store->snapshot().planned_segments == 15);
+
+    // Produced already: served with no admission at all.
+    auto produced = get("segment-000000.m4s");
+    CHECK(produced.status == 200);
+
+    // Beyond the window. The frontier is one fragment and the window is eight,
+    // so index 9 is one nothing is working toward.
+    const auto refused_at = Clock::now();
+    auto refused = get("segment-000009.m4s");
+    const auto refused_elapsed = Clock::now() - refused_at;
+    CHECK(refused.status == 500);
+    const auto refused_body = std::string(refused.body.begin(), refused.body.end());
+    CHECK(refused_body.find("segment_not_ready") != std::string::npos);
+    CHECK(refused_body.find("beyond_hold_window") != std::string::npos);
+    CHECK(refused.headers["Retry-After"] == "1");
+    CHECK(refused.headers["Cache-Control"] == "no-store");
+    // Immediately: it must not have been held, so it cannot have approached
+    // the segment timeout.
+    CHECK(refused_elapsed < 200ms);
+
+    // And the producer was never told about it. Noting an index we declined
+    // would authorise production to run toward a fragment we refused to serve.
+    CHECK(store->snapshot().highest_requested == 0);
+
+    // Past the end of the plan is a genuine miss: the playlist never promised
+    // it, so 404 is the honest answer rather than "come back later".
+    auto missing = get("segment-000099.m4s");
+    CHECK(missing.status == 404);
+    CHECK(store->snapshot().highest_requested == 0);
+
+    // Inside the window: held, and served when the fragment arrives.
+    std::jthread producer([&] {
+        std::this_thread::sleep_for(60ms);
+        // A distinguishable length: fragment 0 is four bytes, so a size of
+        // eleven can only be fragment 1.
+        store->publish_segment(Bytes(11, 0x31), 4.0);
+    });
+    auto held = get("segment-000001.m4s");
+    producer.join();
+    CHECK(held.status == 200);
+    // Segments are served as a stream rather than an inline body, so the
+    // length is what identifies which fragment came back.
+    CHECK(held.content_length() == 11);
+    // An admitted request is exactly the one that may move the frontier.
+    CHECK(store->snapshot().highest_requested == 1);
+
+    // A held request that reaches its deadline still answers retryably rather
+    // than as a missing object.
+    const auto timed_out_at = Clock::now();
+    auto timed_out = get("segment-000002.m4s");
+    const auto timed_out_elapsed = Clock::now() - timed_out_at;
+    CHECK(timed_out.status == 500);
+    CHECK(std::string(timed_out.body.begin(), timed_out.body.end()).find("segment_not_ready") !=
+          std::string::npos);
+    CHECK(timed_out_elapsed >= 300ms);
+}
+
+MACHA_TEST("media_playback", test_media_playlist_is_complete_and_closed_before_anything_is_published) {
+    // Phase 2 of TODO/2026-09-08-bounded-vod-playlist-and-segment-holds.md.
+    // The playlist is a plan, and the plan exists before any media does, so
+    // there is nothing to wait for: it is served complete and closed on the
+    // first fetch and does not change afterwards.
+    TempDir t;
+    const std::vector<double> plan{2.0, 4.0, 4.0, 3.5};
+    auto store = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill", 4000ms, plan);
+
+    // Nothing published at all -- no init fragment, no media.
+    auto state = store->snapshot();
+    REQUIRE(state.segment_count == 0);
+    REQUIRE(!state.init_ready);
+
+    const auto first = store->playlist();
+    REQUIRE(!first.empty());
+    CHECK(first.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
+    CHECK(first.find("#EXT-X-PLAYLIST-TYPE:EVENT") == std::string::npos);
+    CHECK(first.find("#EXT-X-ENDLIST") != std::string::npos);
+    CHECK(first.find("#EXT-X-MAP:URI=\"init.mp4\"") != std::string::npos);
+
+    // Every planned entry is advertised, including the three nothing has
+    // produced and the one nothing has even started.
+    for (int i = 0; i < 4; ++i) {
+        std::ostringstream name;
+        name << "segment-" << std::setfill('0') << std::setw(6) << i << ".m4s";
+        CHECK(first.find(name.str()) != std::string::npos);
+    }
+    CHECK(first.find("segment-000004.m4s") == std::string::npos);
+
+    // EXTINF is the plan -- an unproduced fragment has no measured length --
+    // and TARGETDURATION is the longest planned entry, rounded up.
+    CHECK(first.find("#EXTINF:2.000,") != std::string::npos);
+    CHECK(first.find("#EXTINF:3.500,") != std::string::npos);
+    CHECK(first.find("#EXT-X-TARGETDURATION:4\n") != std::string::npos);
+
+    // Byte-identical on every later fetch. A VOD playlist is immutable, and a
+    // player that built a seek map from the first fetch must not be able to
+    // find a different timeline underneath it later.
+    REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
+    CHECK(store->playlist() == first);
+    REQUIRE(store->publish_segment(Bytes(64, 0x10), 2.0));
+    CHECK(store->playlist() == first);
+
+    // Including when a fragment turns out longer than it was planned as. The
+    // playlist has already promised a length and cannot revise it; that is
+    // exactly why the plan has to predict the output, and why the transcode
+    // timeline harness measures declared against carried.
+    REQUIRE(store->publish_segment(Bytes(64, 0x11), 6.0));
+    CHECK(store->playlist() == first);
+
+    REQUIRE(store->publish_segment(Bytes(64, 0x12), 4.0));
+    REQUIRE(store->publish_segment(Bytes(64, 0x13), 3.5));
+    store->finish();
+    CHECK(store->snapshot().error.empty());
+    CHECK(store->playlist() == first);
+
+    // A generation that breaks still withholds the playlist rather than
+    // serving a promise it can no longer keep.
+    auto broken = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill-broken",
+                                                      4000ms, plan);
+    REQUIRE(!broken->playlist().empty());
+    broken->fail("generation broke");
+    CHECK(broken->playlist().empty());
 }
 
 MACHA_TEST("media_playback", test_media_segment_store_holds_an_init_request_until_it_is_published) {
@@ -531,25 +825,138 @@ MACHA_TEST("media_playback", test_direct_play_serves_a_matroska_source) {
     CHECK(session.find("source")->find("format")->asString() == "matroska,webm");
 }
 
-MACHA_TEST("media_playback", test_media_playlist_waits_for_the_first_fragment) {
+MACHA_TEST("media_playback", test_a_deeply_prefetching_client_cannot_occupy_the_node) {
+    // This case used to be test_media_playlist_waits_for_the_first_fragment,
+    // which asserted the 0.32.14 contract: withhold the playlist until a
+    // fragment exists, so a player cannot queue requests against an encoder
+    // that has produced nothing. The incident behind it was real -- a native
+    // player prefetched deeply, waited on the encoder for each request in
+    // turn, and cost a 2017 television a 98-second black screen -- but
+    // withholding the playlist was never what made that safe. It is re-expressed
+    // here against the mechanism that now guards it: the playlist is complete
+    // up front, and a client that asks for more than its share is refused
+    // promptly rather than held.
     TempDir t;
-    auto store = std::make_shared<MediaSegmentStore>(4, 64 * 1024, t.path() / "spill", 4000ms,
-                                                     std::vector<double>{2.0, 4.0});
-    // Nothing produced yet: the store has no playlist to give. The HTTP layer
-    // holds the request on wait_ready rather than answering 404, because a
-    // failed playlist load reads as a network error to an HLS player.
-    CHECK(store->playlist().empty());
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/series.mkv", 0644, getuid(), getgid());
+    auto bytes = pattern(64 * 1024);
+    auto writer = service.filesystem().open_write("/media/series.mkv", true);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto media_id = file_media_id(service.filesystem().getattr("/media/series.mkv"));
+
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback";
+    streaming.startup_timeout = 2s;
+    streaming.max_session_holds = 2;
+    streaming.max_concurrent_holds = 8;
+    streaming.segment_hold_window = 8;
+    // Long enough that the two admitted holds are still outstanding while the
+    // rest of the case runs, short enough that the case ends without them.
+    streaming.segment_timeout = 1500ms;
+    auto engine = std::make_unique<ObservableHlsMediaEngine>();
+    auto* engine_ptr = engine.get();
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             std::move(engine));
+    playback.start();
+
+    Json::Object preferences{{"mode", "remux"}};
+    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
+    auto text = Json(std::move(root)).dump();
+    HttpRequest create;
+    create.method = "POST";
+    create.path = "/api/v1/playback/sessions";
+    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    create.body.assign(text.begin(), text.end());
+    auto created = playback.handle(create);
+    REQUIRE(created.status == 201);
+    auto created_json = Json::parse(std::string(created.body.begin(), created.body.end()));
+    const auto url = created_json.find("stream")->find("url")->asString();
+    const auto base = url.substr(0, url.rfind('/'));
+
+    auto get = [&](const std::string& object) {
+        HttpRequest request;
+        request.method = "GET";
+        request.path = base + "/" + object;
+        return playback.handle(request);
+    };
+
+    // The playlist itself no longer waits for anything: complete, closed, and
+    // available before a second fragment exists.
+    auto playlist_response = get("media.m3u8");
+    REQUIRE(playlist_response.status == 200);
+    const auto playlist = response_text(playlist_response);
+    CHECK(playlist.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
+    CHECK(playlist.find("#EXT-X-ENDLIST") != std::string::npos);
+    CHECK(playlist.find("segment-000014.m4s") != std::string::npos);
+    // Which is exactly why a client may now ask for all of it at once.
+
+    // Two requests for fragments nothing has produced: both admitted, both
+    // held. That is this session's entire share -- one in flight, one prefetch.
+    HttpResponse first_hold;
+    HttpResponse second_hold;
+    std::jthread first([&] { first_hold = get("segment-000001.m4s"); });
+    std::jthread second([&] { second_hold = get("segment-000002.m4s"); });
+    std::this_thread::sleep_for(150ms);
+
+    // The third is refused, immediately, and says which limit it met. Before
+    // this mechanism existed, this was the request that joined a queue behind
+    // the encoder and the television went black.
+    const auto refused_at = Clock::now();
+    auto refused = get("segment-000003.m4s");
+    const auto refused_elapsed = Clock::now() - refused_at;
+    CHECK(refused.status == 500);
+    const auto refused_body = std::string(refused.body.begin(), refused.body.end());
+    CHECK(refused_body.find("segment_not_ready") != std::string::npos);
+    CHECK(refused_body.find("session_hold_limit") != std::string::npos);
+    CHECK(refused.headers["Retry-After"] == "1");
+    CHECK(refused_elapsed < 200ms);
+
+    // And the node is still answering control traffic while both holds are
+    // outstanding. This is the governing-law-3 gate: the reason the budget
+    // exists at all is that a held request costs a worker from a pool shared
+    // with Status and every other route.
+    HttpRequest status_request;
+    status_request.method = "GET";
+    status_request.path = "/api/v1/playback/status";
+    const auto status_at = Clock::now();
+    auto status_response = playback.handle(status_request);
+    const auto status_elapsed = Clock::now() - status_at;
+    CHECK(status_response.status == 200);
+    CHECK(status_elapsed < 300ms);
+
+    // The two holds reach their deadline and answer retryably rather than as
+    // missing objects.
+    first.join();
+    second.join();
+    CHECK(first_hold.status == 500);
+    CHECK(second_hold.status == 500);
+    CHECK(std::string(first_hold.body.begin(), first_hold.body.end()).find("segment_not_ready") !=
+          std::string::npos);
+
+    // Releasing them returned the session's share, so the client is admitted
+    // again rather than being locked out by its own earlier prefetch.
+    auto store = engine_ptr->store();
+    REQUIRE(store != nullptr);
     std::jthread producer([&] {
-        std::this_thread::sleep_for(80ms);
-        store->publish_init(Bytes{'i', 'n', 'i', 't'});
-        store->publish_segment(Bytes(512, 0x21), 2.0);
+        std::this_thread::sleep_for(60ms);
+        store->publish_segment(Bytes(11, 0x31), 4.0);
     });
-    CHECK(store->wait_ready(5s));
+    auto served = get("segment-000001.m4s");
     producer.join();
-    auto playlist = store->playlist();
-    CHECK(playlist.find("segment-000000.m4s") != std::string::npos);
-    CHECK(playlist.find("segment-000001.m4s") == std::string::npos);
-    CHECK(playlist.find("#EXT-X-ENDLIST") == std::string::npos);
+    CHECK(served.status == 200);
+    CHECK(served.content_length() == 11);
 }
 
 MACHA_TEST("media_playback", test_segment_store_mpegts_mode_has_no_init_and_ts_names) {
@@ -558,23 +965,32 @@ MACHA_TEST("media_playback", test_segment_store_mpegts_mode_has_no_init_and_ts_n
                                                      std::vector<double>{2.0, 4.0, 4.0},
                                                      MediaContainer::mpegts);
     CHECK(store->container() == MediaContainer::mpegts);
-    CHECK(store->playlist().empty());
-    // No init segment in MPEG-TS: the first fragment alone makes it ready.
+    // Complete and closed before anything is published here too: the container
+    // changes the names and the version, not the shape of the promise.
+    const auto planned_playlist = store->playlist();
+    CHECK(!planned_playlist.empty());
+    CHECK(planned_playlist.find("#EXT-X-VERSION:3") != std::string::npos);
+    CHECK(planned_playlist.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
+    CHECK(planned_playlist.find("segment-000002.ts") != std::string::npos);
+    CHECK(planned_playlist.find("#EXT-X-ENDLIST") != std::string::npos);
+    // No init segment in MPEG-TS: the first fragment alone makes it ready, and
+    // there is no init object for a client to be held on -- nothing could ever
+    // publish one, so that request is a genuine miss rather than an early one.
+    CHECK(!store->wait_object("init.mp4", 100ms).has_value());
     REQUIRE(store->publish_segment(Bytes(188 * 3, 0x47), 2.0));
     REQUIRE(store->wait_ready(10ms));
     auto playlist = store->playlist();
-    CHECK(playlist.find("#EXT-X-VERSION:3") != std::string::npos);
+    CHECK(playlist == planned_playlist);
     CHECK(playlist.find("#EXT-X-MAP") == std::string::npos);
     CHECK(playlist.find("segment-000000.ts") != std::string::npos);
     CHECK(playlist.find(".m4s") == std::string::npos);
-    CHECK(playlist.find("#EXT-X-ENDLIST") == std::string::npos);
     REQUIRE(store->object("segment-000000.ts").has_value());
     CHECK(store->object("segment-000000.ts")->size() == 188 * 3);
     CHECK(!store->object("segment-000000.m4s").has_value() == false); // both spellings map to index 0
     REQUIRE(store->publish_segment(Bytes(188, 0x47), 4.0));
     REQUIRE(store->publish_segment(Bytes(188, 0x47), 4.0));
     store->finish();
-    CHECK(store->playlist().find("#EXT-X-ENDLIST") != std::string::npos);
+    CHECK(store->playlist() == planned_playlist);
 }
 
 MACHA_FAST_TEST("media_playback", test_hls_codec_strings_describe_the_fragments) {

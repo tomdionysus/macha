@@ -162,13 +162,45 @@ async is what lifts it.
 
 ### The refusal
 
-- **`503`**, not `404`. The resource is not absent — the playlist promises it
-  exists — it is not ready. 404 invites an intermediary to cache it and some
-  players treat it as terminal.
+- **Not `404`.** The resource is not absent — the playlist promises it exists
+  — it is not ready. 404 invites an intermediary to cache it and some players
+  treat it as terminal.
 - `Retry-After: 1` and `Cache-Control: no-store`.
 - A distinct error code (`segment_not_ready`) from the existing
   `stream_failed`, so a client can tell "come back" from "this generation is
   broken".
+
+**Superseded during implementation, 2026-09-08.** This section originally said
+the refusal was `503`. It is **`500 segment_not_ready`**, and `stream_failed`
+keeps `503`. Two findings from the client sessions forced it, in order.
+
+First, the code cannot be read where it matters. hls.js's `XhrLoader` surfaces
+a failed fragment as `{code: xhr.status, text: xhr.statusText}` — the JSON body
+is absent from the error event and `response.data` is `undefined`. A header is
+no better: reachable only through `networkDetails`, the raw `XMLHttpRequest`,
+which is undocumented coupling that breaks outright if the default loader ever
+becomes `FetchLoader`. So the discriminator has to be the status code, which is
+the one field every loader reports identically.
+
+Second, given that, `503` is the wrong status to carry "hold". Every proxy,
+tunnel and load balancer emits `503` when a service is genuinely down. A client
+taught that `503` means "not made yet, stay on this node" reads a dead node as
+a healthy one and never fails over — silent, not self-correcting, and hardest
+to diagnose precisely where an intermediary makes it most likely. The inverse
+error, misreading an infrastructure `500` as a hold, costs one pointless retry.
+The faults are not symmetric. `500` is origin-generated in practice, so it is
+the status nothing else on the path emits.
+
+Checked rather than assumed: nothing currently fronts the nodes — all three
+serve `:7438` directly — but haproxy is installed and running on es-1, the
+WAN-facing node, with a stock config and no bound frontends. The hazard is one
+configuration change away rather than hypothetical.
+
+Both statuses stay in 5xx deliberately: hls.js's `retryForHttpStatus()` returns
+false for 4xx and status 0, so a 4xx would stop its retries outright. And
+`Retry-After` is inert on the fragment path — hls.js reads that header only in
+its content-steering loader, on 429 — so it is sent because it is correct HTTP,
+not because the design depends on it.
 
 ## Client contract change
 
@@ -191,23 +223,40 @@ default.
 - [x] **1. One hold path.** `wait_object` waits for init as well as segment
   indices. Test: an init request issued before the first `moof` is held and
   then served, not 404'd.
-- [ ] **2. Complete playlist.** `PLAYLIST-TYPE:VOD`, all planned entries,
+- [x] **2. Complete playlist.** `PLAYLIST-TYPE:VOD`, all planned entries,
   `ENDLIST`, served with no readiness gate; remove the `wait_ready` hold in the
   playlist route. Tests: a playlist fetched before any fragment exists is
   complete and closed; it is byte-identical on a later fetch.
-- [ ] **3. Admission policy and budget.** Window, per-session limit, global
+- [x] **3. Admission policy and budget.** Window, per-session limit, global
   budget, as an explicitly acquired and released token. Refusals do not
   advance `highest_requested`. Tests: within-window request holds and is
   served; beyond-window refuses immediately; a session at its hold limit
   refuses without waiting; budget exhaustion refuses without waiting; a
   released hold makes budget available again.
-- [ ] **4. Configuration.** `streaming.segment_timeout_ms` default 15000 ->
-  12000 (three target durations, the LL-HLS convention for how long a server
-  may hold, and under hls.js's 20 s `fragLoadingTimeOut` so we always answer
-  before the client gives up). New: `segment_hold_window`,
-  `max_session_holds`, `max_concurrent_holds`. Document in
-  `macha.yaml.example` and `docs/streaming.md`.
-- [ ] **5. Rewrite the three EVENT regressions.** `test_media_playlist_waits_
+- [x] **4. Configuration.** `streaming.segment_timeout_ms`, new at **8000**.
+  New: `segment_hold_window`, `max_session_holds`, `max_concurrent_holds`.
+  Documented in `macha.yaml.example` and `docs/streaming.md`.
+
+  Two corrections to what this phase originally said. There was no existing
+  `segment_timeout_ms` to change "15000 -> 12000"; the 15000 is
+  `startup_timeout_ms`, a different setting, left alone. And the 12000 was
+  chosen against hls.js's `fragLoadingTimeOut` of 20 s, which the UI session
+  then established is **deprecated and inert** -- the compatibility shim
+  migrates it only when it is set in user config, which the client does not
+  do. The deadline that actually governs is
+  `fragLoadPolicy.default.maxTimeToFirstByteMs`, 10 s, read out of hls.js
+  1.6.18's source. A 12 s hold therefore answers *after* the client has
+  already aborted: the request sends no bytes, trips the time-to-first-byte
+  abort, never receives the 503, and takes the timeout path instead -- 4
+  retries at 0 ms delay, each aborting again, so one held fragment becomes
+  ~5 requests over ~50 s and then goes fatal. That is worse than the
+  behaviour this plan replaces. 8000 fits under the real deadline with margin
+  for the ~63 ms WAN round trip to es-1. A 503 that arrives promptly is
+  retried sensibly (6 attempts, 1 s backing off to 8 s), so answering inside
+  the deadline is the whole game. `Retry-After` is inert on hls.js's fragment
+  path -- it is read only by the content-steering loader, on 429 -- so it is
+  sent because it is correct HTTP, not because anything here depends on it.
+- [x] **5. Rewrite the three EVENT regressions.** `test_media_playlist_waits_
   for_the_first_fragment`, `test_media_segment_store_backpressure_and_spill`
   and `test_segment_store_mpegts_mode_has_no_init_and_ts_names` currently
   assert the 0.32.14 contract. They are not deleted — they are re-expressed
@@ -215,7 +264,7 @@ default.
   prefetching client must not be able to occupy the node.
 - [ ] **6. Full suite plus `test_transcode_timeline.cpp`, then deploy all
   three nodes** (operator chose all-at-once; the cluster is test-only).
-- [ ] **7. Notify the four client sessions** of the contract change above.
+- [x] **7. Notify the four client sessions** of the contract change above.
 
 ## Exit criteria
 
