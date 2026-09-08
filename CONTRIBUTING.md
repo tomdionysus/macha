@@ -15,6 +15,10 @@ cmake --build build -j
 ./run-tests.sh build
 ```
 
+`-DMACHA_SANITIZE=address,undefined` (or `=thread`, separately) builds the
+whole tree under a sanitizer; see `tests/TESTING.md`. Changes to threading,
+lock ordering or ownership should be run under both before submitting.
+
 Changes to cluster, metadata, storage, crypto, transport or MachaDFS semantics need a regression or fault-injection test. Do not weaken quorum safety, object integrity, crash durability or foreground I/O behaviour to simplify an error path.
 
 ## Style

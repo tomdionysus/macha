@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.35.0 LANGUAGES CXX)
+project(macha VERSION 0.36.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -93,6 +93,34 @@ option(MACHA_ENABLE_FUSE "Build the FUSE mount adapter when available" ON)
 option(MACHA_BUILD_TESTS "Build tests" ON)
 option(MACHA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(MACHA_TEST_COVERAGE "Instrument the backend test build for source/branch coverage" OFF)
+
+# Sanitizers are a whole-program property, not a per-target one: macha_core is
+# a shared library that the executables link and every subsystem plugin
+# dlopen's, so instrumenting only some of those would leave the interposed
+# allocator and the shadow memory disagreeing across the boundary. These flags
+# therefore go on at directory scope, before any target exists, rather than
+# through target_compile_options like MACHA_TEST_COVERAGE does.
+set(MACHA_SANITIZE "" CACHE STRING
+    "Sanitizers to build with: empty (none), address, undefined, address,undefined, or thread")
+if(MACHA_SANITIZE)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        message(FATAL_ERROR "MACHA_SANITIZE requires GCC, Clang or AppleClang")
+    endif()
+    # ThreadSanitizer maintains its own shadow state for every memory access and
+    # cannot share a process with AddressSanitizer's; the compilers reject the
+    # combination too, but late and less legibly than this does.
+    if(MACHA_SANITIZE MATCHES "thread" AND MACHA_SANITIZE MATCHES "address")
+        message(FATAL_ERROR
+            "MACHA_SANITIZE=thread cannot be combined with address; build them separately")
+    endif()
+    # -g and a frame pointer are what turn a sanitizer report from an address
+    # into a stack trace naming the owning subsystem, which is the entire point
+    # of running one against this codebase's lock ordering.
+    add_compile_options(-fsanitize=${MACHA_SANITIZE} -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=${MACHA_SANITIZE})
+    message(STATUS "Sanitizers enabled: ${MACHA_SANITIZE}")
+endif()
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(MACHA_INSTALL_SYSTEMD_DEFAULT ON)
 else()
@@ -511,6 +539,7 @@ if(MACHA_BUILD_TESTS)
             tests/main.cpp
             tests/test_framework.cpp
             tests/test_runtime_dependencies.cpp
+            tests/test_transcode_timeline.cpp
             src/config.cpp
             src/ffmpeg_log.cpp
             src/media_engine.cpp

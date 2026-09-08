@@ -66,6 +66,59 @@ The governing laws are:
 
 ## P0 — Playback correctness and poor-network resilience
 
+- [ ] **Complete VOD playlist with bounded segment holds — planned
+  2026-09-08, not started.** Operator decision: serve a complete
+  `PLAYLIST-TYPE:VOD` list with `ENDLIST` immediately, and make the wait for
+  not-yet-produced media the server's problem — held near the production
+  frontier, refused with a retryable `503` beyond it, under a per-session
+  limit and a global budget that keeps control traffic serviceable on a
+  16-worker pool. Full design, phases and exit criteria in
+  [the plan](2026-09-08-bounded-vod-playlist-and-segment-holds.md).
+  Note the motivating bug report was retracted in full; the plan records why
+  the change is still wanted (spec-correct form, no playlist polling, failures
+  land in `fragLoadError` rather than the failover-triggering
+  `levelLoadError`) and states plainly that it does not address the
+  DTS/TrueHD latency below. Depends on the 0.36.0 early-`moov`-flush fix,
+  without which the plan and the output disagree and a playlist written
+  up-front is wrong from its first line.
+
+- [ ] **DTS and TrueHD source audio make a cold transcode 40-60x slower —
+  client-measured 2026-09-08, not yet diagnosed.** Reported by the Macha UI
+  session from Chrome 151 on a 7.5 ms wired link to gbni-1, measuring its own
+  `hls-fragment-loading` -> `hls-fragment-loaded` interval for a single
+  segment GET, so the time is generation, not transfer. All rows are
+  `transcode` with video COPIED and audio transcoded to AAC, same node, same
+  client, within ~15 minutes:
+  - Clerks (E-AC-3 6ch): seg0 1,114 ms, first frame 4.3 s
+  - Django Unchained (DTS 6ch): seg0 **43,376 ms**, seg1 16,332 ms, first
+    frame 57.3 s; warm rerun minutes later seg0 9,529 ms
+  - Death Proof (TrueHD 6ch): seg0 **47,398 ms**, seg1 8,901 ms, ~65 s
+  The controls are what make this conclusive. Transcoding *video* is prompt:
+  Full Metal Jacket (HEVC 10-bit -> h264, AAC copied) seg0 717 ms; Army of
+  Darkness (mpeg4 -> h264, AC-3 -> AAC, both streams transcoded) seg0 328 ms.
+  So it is not audio transcoding in general, not the transcode path in
+  general, and not the container (both slow titles are Matroska, so are fast
+  comparators). It tracks the source audio codec. Transcoding a 10-bit HEVC
+  video stream is strictly more work than decoding an audio track and is 60x
+  faster.
+  Caveats recorded honestly: single samples per title (only Django measured
+  twice); the client cannot separate admission queueing, probe/seek-to-start,
+  decode and encode — they all land in one interval; gbni-1 may have had
+  import load, though the prompt titles in the same window control for a
+  node-wide slowdown.
+  The cold/warm gap (43.4 s -> 9.5 s) suggests a cost paid per-open rather
+  than per-frame, which points at probe/seek-to-start rather than steady-state
+  decode — a hypothesis, not a finding. This plausibly also explains the
+  ">90 s mid-file segment request" measured server-side on gbni-2 during the
+  import, which had been suspected of being a client-side reactivation bug;
+  on this evidence look here first.
+  This is a governing-law-2 violation and the viewer sees an unchanging
+  spinner throughout: the client's start watchdog deliberately does not bound
+  the hls.js path (hls.js owns fetching and its own error channel), so it is
+  invisible to client-side bounds. It must be fixed at the source, not
+  papered over with a client timeout.
+
+
 Execute the phased
 [playback resilience and A/V sync plan](2026-09-03-playback-resilience-and-av-sync-plan.md).
 This coalesces the newly observed audio drift, slow streaming, intermittent
@@ -80,10 +133,22 @@ one causal programme rather than treating each symptom separately.
   timeline origin; codec delay/priming applied exactly once by one documented
   owner; monotonic DTS/PTS across encoder flush, fragment rollover and
   generation change; bounded correction of malformed inputs; Direct/Remux
-  regressions. No harness exists yet for the real (non-stub) transcode audio
-  path — both the 0.23.8 and 0.23.9 defects were only caught by live
-  measurement/listening, not CI. Building that harness remains this phase's
-  stated exit-criterion prerequisite.
+  regressions. **The harness prerequisite is met (2026-09-08).**
+  `tests/test_transcode_timeline.cpp` drives the real libav pipeline — no
+  injected engine — over a synthesized deterministic source longer than 90
+  seconds carrying a non-zero audio start, AAC priming and a seek, and
+  measures the published fragments back through libav rather than trusting
+  the pipeline's own bookkeeping. It gates: where each output stream starts,
+  how much media each carries, per-fragment declared-vs-actual duration, the
+  accumulated playlist timeline, and a clean finish. Two cases, ~10s total.
+  Measured state on that source: start gap 7ms, A/V span gap 53ms over 100s
+  — the drift compensation shipped in 0.23.9 holds. It found two real
+  defects on its first run (both ledgered under verified defects below).
+  What it deliberately does not cover: **pitch**. A resample-ratio change of
+  the kind 0.23.8 shipped keeps the timeline honest while changing how the
+  audio sounds, so it would pass. That remains a listening test, and the
+  harness says so in its own header rather than implying coverage it lacks.
+  Direct and Remux equivalents are not built yet.
 - [ ] **2. Split lightweight status from expensive diagnostics.**
   `ClusterStatusService::status_response` (`src/status_api.cpp`) still
   unconditionally computes and includes the full `diagnostics` object on
@@ -152,6 +217,34 @@ supersession, failure and failover cannot leak physical encoders or produce
 None of these came from a TODO/FIXME comment — there are none anywhere in
 `src/` or `tests/`. Each was independently verified against current source,
 not inferred from docs. All are small and isolated; none require design work.
+
+- [x] **Transcoded playlists declared the plan, not the media — found and
+  fixed 2026-09-08 by the new timeline harness, on its first run.**
+  `playlist()` emitted `#EXTINF` from `vod_segment_durations` (what was
+  planned) while `Segment::duration` (what was published) was written and
+  never read anywhere. The first flush of a fragmented MP4 writes the delayed
+  `moov` and no `moof`, so that boundary produces no fragment and its media
+  joins the next one: fragment 0 measured **6.0s of media while declaring
+  2.0s**, and since a player builds its seek map by accumulating `EXTINF`,
+  every later fragment sat **four seconds early on the timeline for the whole
+  title**. The remux path had been given a `carry_boundary()` call for exactly
+  this on 2026-09-07; the transcode branch never got one, and the carried
+  value was discarded by the playlist regardless. Fixed on both sides: the
+  transcode cut now carries an unproduced boundary (`media_engine.cpp`), and
+  the playlist advertises published durations (`media_segments.cpp`). Gated
+  by `test_transcoded_audio_and_video_carry_the_same_timeline` — reverting
+  either fix fails it. Not yet confirmed against a live client on the
+  cluster; the measurement is from the published fragments, not from a player.
+- [x] **Every completed transcode generation finished in an error state —
+  same run, same day.** `MediaSegmentStore::mark_finished()` compared
+  fragment *count* against plan entries, so a run that legitimately carried a
+  boundary (25 fragments for a 26-entry plan) was recorded as
+  `media pipeline produced 25 fragments for a 26 fragment VOD plan`. Not
+  cosmetic: `playlist()` withholds a playlist entirely once an error is set,
+  so a transcode that had in fact produced all of its media ended by serving
+  an **empty playlist**, and the session reported `exit_code=1`. Now compares
+  published media against planned media, which is the invariant
+  `publish_duration()` actually maintains.
 
 - [ ] **FUSE journal can hold two inodes on one path** (gbni-1: 11240 vs
   7270 on `/TV/Big.Mistakes.S01E01…mkv`, a create-over of a file whose
@@ -438,6 +531,49 @@ absorbed here rather than separate active programmes.
 
 ## P1 — Cluster connectivity, status and operations
 
+- [ ] **`test_storage_data_credit_reserves_viewer_headroom_and_control` hangs
+  on aarch64 — pre-existing on HEAD, confirmed not from the 0.36.0 work
+  (2026-09-08).** The case times out at its full 60 s deadline on both
+  gbni-2 and es-1, in the full suite and in `--serial` isolation, on a build
+  of current HEAD. It passes in 372/372 on macOS (arm64, AppleClang) and
+  passes in 52 ms on gbni-1's older build tree (2026-09-07 04:10), so it is
+  both platform- and revision-sensitive: something between that build and
+  HEAD broke it on aarch64/Linux. Authorship was established rather than
+  assumed — reverting `media_segments.cpp`, `media_engine.cpp` and
+  `test_framework.cpp` to HEAD on gbni-2 and rebuilding reproduced the hang
+  identically, so the 0.36.0 changes are not the cause. The delta therefore
+  falls in the 0.34.x/0.35.0 line.
+  The hang is early: the captured output stops after `node metadata ready
+  generation=1`, before any RPC result, and no `REQUIRE` failure is printed,
+  so the body blocks rather than asserting. The case covers DATA credit and
+  viewer headroom reservation — governing-law-1 territory — so a genuine hang
+  there is worth root-causing rather than filing as flake. It is *not* a
+  flake: it reproduces serially, every run, on two separate machines.
+  Note the live cluster has been running affected code since 0.35.0; 0.36.0
+  neither introduces nor worsens it.
+- [ ] **A powered-off node is reported `state: "online"` (live, 2026-09-08).**
+  While gbni-1 was physically dark — no ICMP response, incomplete ARP entry,
+  SSH `Host is down` — both surviving nodes' `/api/v1/status` listed it as
+  `"state": "online"`. es-1's own roster entry in the same document carried
+  `live_age_ms: 14061248` (~3.9 hours) while also labelled `online`. This is
+  direct live corroboration of the aggregation half of the Status
+  truthfulness item below: the per-sample freshness fix (0.23.3) is working
+  in that the age is reported honestly, but nothing folds that age into the
+  `state` the aggregate advertises. A node that has been unreachable for
+  hours should not read as `online` to an operator or a failover client.
+- [ ] **`metadata_quorum_validated` and `metadata_replica_set_validated`
+  report `false` with a fresh timestamp (2026-09-08, all three nodes,
+  post-0.36.0).** Observed alongside `metadata_quorum_available: true`,
+  `metadata_availability: "writable"`, `health: "healthy"`, `conditions: []`
+  and three replicas online with generations converging — i.e. the cluster is
+  demonstrably fine. The `*_validated_at_unix_ms` values were only ~20 s old,
+  so validation is running and returning false rather than never running.
+  Either the flag means something narrower than its name suggests, or it is
+  wrong; either way an operator reading Status cannot currently tell.
+  Possibly the same aggregation gap as the item above. Not a deploy blocker,
+  not yet diagnosed.
+
+
 - [ ] Support multiple advertised endpoints per durable node (LAN/WAN,
   IPv4/IPv6 and configured/discovered), multiple bootstrap candidates,
   reachability-aware racing/fallback, expiry and deduplication by node identity.
@@ -480,16 +616,30 @@ absorbed here rather than separate active programmes.
 - [ ] Diagnose `ingest failed: metadata acceptance certificate durability
   floor unavailable` failures on torrent ingest once the torrent has
   downloaded, which are also unaccountably slow.
-- [ ] **Add CI and a sanitizer build.** There is currently no CI configuration
-  of any kind in this repo (confirmed: no `.github/`, no CI file anywhere) and
-  no ASan/TSan/UBSan build option — every regression gate is a human manually
-  running `./run-tests.sh` before deploying. For a system running roughly 47
-  threads per mounted daemon with this much hand-reasoned lock ordering across
-  `net.cpp`/`metadata.cpp`/`playback.cpp`, this is the biggest single process
-  gap found in this audit. At minimum: a CI job that builds with
-  `-DMACHA_WARNINGS_AS_ERRORS=ON` and runs the full suite on every push, and a
-  TSan build variant to run periodically against the concurrency-heavy
-  subsystems.
+- [x] **Sanitizer build — shipped 2026-09-08. CI — declined by the operator,
+  not deferred.** `MACHA_SANITIZE` builds the whole tree (core, executables,
+  plugins, both test binaries) under `address`, `undefined`,
+  `address,undefined` or `thread`; whole-tree rather than per-target because
+  `macha_core` is a shared library the executables link and the plugins
+  `dlopen`, so partial instrumentation would leave the interposed allocator
+  and the shadow memory disagreeing across that boundary. `thread` combined
+  with `address` is refused at configure time. Case deadlines now scale
+  automatically under instrumentation (3x ASan, 10x TSan, `--timeout-scale` /
+  `MACHA_TEST_TIMEOUT_SCALE` to override), because the declared 30/60/120s
+  deadlines were chosen against an ordinary build and a spurious timeout would
+  hide the report the run existed to produce. Documented in
+  `tests/TESTING.md`; the LSan hook the runner already had is unchanged.
+  The CI half of this item was **declined by the operator on 2026-09-08** —
+  it is not a backlog item awaiting time. The gap it named is therefore real
+  and standing: every regression gate remains a human running
+  `./run-tests.sh` before deploying, and nothing runs TSan periodically
+  unless someone does. Do not re-file CI as an open item; the sanitizer build
+  is the part of it that was wanted.
+  - [ ] Still open, and now cheap: no TSan run has been made yet against the
+    concurrency-heavy subsystems (`net.cpp`/`metadata.cpp`/`playback.cpp`).
+    The ~47-thread hand-reasoned lock ordering that made this the audit's
+    biggest process gap is still unexercised by a sanitizer. ASan+UBSan
+    across the full suite is green as of 2026-09-08.
 
 ## P1 — Scaling cliffs (found 2026-09-05, not yet urgent at current 3-node/home scale)
 

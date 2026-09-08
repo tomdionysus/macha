@@ -3,7 +3,7 @@
 Macha deliberately separates the portable behavioural suite from the small set of tests that require build-time runtime adapters.
 
 - `macha-tests` is the default dependency-light suite. It exercises storage, metadata, RPC, clustering, MachaDFS/FUSE ordering and recovery, hydration, catalogue policy, playback planning, ingest, GC and other core behaviour without requiring yaml-cpp or FFmpeg. FUSE kernel mounting is not required: the FUSE journal/frontend tests exercise the adapter-independent filesystem contract directly.
-- `macha-tests-runtime` is built only when both yaml-cpp and the required FFmpeg/libav development libraries are available. It owns concrete YAML parsing, the libav log bridge and embedded libav media/tag/artwork extraction.
+- `macha-tests-runtime` is built only when both yaml-cpp and the required FFmpeg/libav development libraries are available. It owns concrete YAML parsing, the libav log bridge and embedded libav media/tag/artwork extraction, and the A/V timeline harness that drives the real transcode pipeline end to end.
 
 Both executables use the same `test_framework.hpp` runner. Cases self-register; the parent runner executes them in isolated child processes and schedules independent cases concurrently. Architecture regressions remain ordinary cases in `test_invariants.cpp` (or in the owning subsystem where the invariant is narrower), rather than becoming a separate testing framework.
 
@@ -17,7 +17,9 @@ The test implementation is split by the subsystem that owns the invariant:
 - `test_media_playback.cpp` — HTTP streaming, VOD planning, timestamps and playback negotiation using an injected media engine;
 - `test_invariants.cpp` — cross-component regressions whose failure requires a real topology/lifecycle;
 - `test_models.cpp` — cheap state/property coverage over production algorithms and durable formats;
-- `test_runtime_dependencies.cpp` — concrete yaml-cpp and FFmpeg/libav adapter behaviour.
+- `test_runtime_dependencies.cpp` — concrete yaml-cpp and FFmpeg/libav adapter behaviour;
+- `test_transcode_timeline.cpp` — A/V timeline behaviour of the real transcode pipeline,
+  measured from the fragments it actually publishes rather than through an injected engine.
 
 Shared deterministic infrastructure lives in `test_support.hpp` and `test_backend_support.hpp`. Prefer `TestService`, `TestNode`, `TestCluster`, `TestGate`, declarative case tables and exhaustive boundary loops over rebuilding keys, ports, state directories or ad-hoc sleeps in individual tests.
 
@@ -43,6 +45,37 @@ cmake --build build -j
 ```
 
 The runner accepts normal test-runner arguments after the build directory, for example `./run-tests.sh build --serial` or `./run-tests.sh build --filter catalogue`.
+
+## Sanitizer builds
+
+`MACHA_SANITIZE` builds the whole tree -- `macha_core`, the executables, every
+subsystem plugin and both test binaries -- under one sanitizer. It has to be
+whole-tree rather than per-target: core is a shared library the executables
+link and the plugins `dlopen`, so instrumenting only part of it would leave
+the interposed allocator and the shadow memory disagreeing across that
+boundary.
+
+```sh
+cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DMACHA_WARNINGS_AS_ERRORS=ON -DMACHA_SANITIZE=address,undefined
+cmake --build build-asan -j
+./run-tests.sh build-asan
+```
+
+`thread` is the other useful setting, and is deliberately run separately:
+ThreadSanitizer keeps its own shadow state and cannot share a process with
+AddressSanitizer's, so the configure step refuses the combination rather than
+letting the compiler reject it later and less legibly.
+
+Case deadlines are scaled automatically in a sanitizer build (3x under ASan,
+10x under TSan), because the declared 30/60/120 second deadlines were chosen
+against an ordinary build and a spurious timeout would hide the sanitizer
+report the run existed to produce. `--timeout-scale N` or
+`MACHA_TEST_TIMEOUT_SCALE` overrides it.
+
+Leak checking works despite the runner's `_Exit()` isolation: each case calls
+`__lsan_do_recoverable_leak_check()` after its local owners have unwound. See
+the sanitizer-proof section of `docs/ownership.md`.
 
 ## Runtime model
 

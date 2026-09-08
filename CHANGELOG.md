@@ -1,5 +1,88 @@
 # Current release
 
+## 0.36.1 — A transcode's first fragment is the short one it planned (development)
+
+The early `moov` flush was switched off whenever any stream was transcoded,
+because it was driven from the demux copy loop and a transcoded stream's
+first packet arrives from an encoder instead. So on transcode the delayed
+`moov` was written at the first real fragment boundary and consumed it: the
+pipeline produced one fewer fragment than planned, and fragment 0 carried
+twice its planned media.
+
+- Each pipeline now records its own first muxed packet, which is true for a
+  copied and a transcoded stream alike, so transcode gets the same early
+  flush remux has had. Measured on a 100 s transcode: 26 fragments for a
+  26-entry plan where it was 25, 11 for 11 where it was 10, and fragment 0
+  back to 1.96 s from 6.0 s.
+- Time to first fragment improves with it. The short startup fragment
+  (`kStartupFragmentSeconds`) exists precisely so the first response is
+  quick, and on transcode it had been silently merged away.
+- `tests/test_transcode_timeline.cpp` gains the invariant this establishes:
+  one fragment per planned entry, and a first fragment that is the short one
+  it was planned as. It is the prerequisite for serving a complete playlist
+  before anything is published — a plan that cannot predict its own output
+  makes such a playlist wrong from its first line. That work is designed but
+  not started: see
+  `TODO/2026-09-08-bounded-vod-playlist-and-segment-holds.md`.
+
+## 0.36.0 — The playlist says what the fragment holds (development)
+
+Deployed to all three cluster nodes on 2026-09-08: gbni-1, gbni-2 and es-1
+run an identical binary, verified by hash, with the torrent plugin loading on
+each and metadata generations converging. gbni-1's copy was built on gbni-2
+and shipped as a staged `/usr` tree, since compiling on gbni-1 browns it out.
+
+
+A transcoded title's playlist described the plan rather than the media, and
+nothing had ever compared the two, because no test had ever run the real
+encoder. Building the harness that compares them -- the stated Phase 0
+prerequisite of the playback resilience plan -- found both defects below on
+its first run.
+
+- **A fragment now declares the media it actually carries.** The first flush
+  of a fragmented MP4 writes the delayed `moov` and no `moof`, so that planned
+  boundary produces no fragment and its media joins the next one. The producer
+  already computed the true length for that case (`publish_duration()` carries
+  an unproduced boundary into the fragment that absorbed its media); the
+  playlist ignored it and emitted the plan instead, and `Segment::duration`
+  was written and never read by anything. Measured on a 100 s transcode:
+  fragment 0 carried 6.0 s and declared 2.0 s. A player builds its seek map by
+  accumulating `EXTINF`, so every later fragment sat four seconds early on the
+  timeline for the rest of the title -- seeks landed four seconds off, and the
+  further in, the more obviously.
+- **The transcode cut carries an unproduced boundary, like remux already did.**
+  The remux path was given this on 2026-09-07 for the identical hazard; the
+  transcode branch was not, and is the branch every compatibility playback
+  takes.
+- **A completed generation no longer finishes in an error state.**
+  `MediaSegmentStore::mark_finished()` compared fragment count against plan
+  entries, so a run that correctly carried a boundary (25 fragments for a
+  26-entry plan) recorded an error. `playlist()` withholds a playlist entirely
+  once an error is set, so a transcode that had produced all of its media
+  ended by serving an empty one, with `exit_code=1`. It now compares published
+  media against planned media, which is the invariant the producer maintains.
+- **New: `tests/test_transcode_timeline.cpp`.** Drives the real libav pipeline
+  with no injected engine, over a synthesized deterministic source longer than
+  90 seconds with a non-zero audio start, AAC priming and a seek, and measures
+  the published fragments back through libav rather than trusting the
+  pipeline's own bookkeeping. Gates stream start alignment, per-stream media
+  span, per-fragment declared-vs-actual duration, the accumulated playlist
+  timeline, and a clean finish. It does not measure pitch: a resample-ratio
+  change of the kind 0.23.8 shipped keeps the timeline honest while changing
+  how the audio sounds, and that remains a listening test.
+- **New: `MACHA_SANITIZE`.** Builds the whole tree -- core, executables,
+  plugins, both test binaries -- under `address`, `undefined`,
+  `address,undefined` or `thread`. Whole-tree rather than per-target because
+  `macha_core` is a shared library the executables link and the plugins
+  `dlopen`; partial instrumentation would leave the interposed allocator and
+  the shadow memory disagreeing across that boundary. `thread` with `address`
+  is refused at configure time rather than later by the compiler. Case
+  deadlines scale automatically under instrumentation (3x ASan, 10x TSan;
+  `--timeout-scale` / `MACHA_TEST_TIMEOUT_SCALE` to override), because the
+  declared 30/60/120 s deadlines were chosen against an ordinary build and a
+  spurious timeout would hide the report the run existed to produce. The full
+  suite is green under `address,undefined` with no sanitizer or leak report.
+
 ## 0.35.0 — Serve the web client at the root (development)
 
 A node can now serve the built web client itself, so the client and the API
