@@ -95,7 +95,8 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
                  StartupStallHandler startup_stall_handler)
     : node_(std::move(config), keys, std::move(startup_stage_hook)), cluster_status_(node_),
       subsystems_(node_.config().plugin_path.value_or(std::filesystem::path{})),
-      session_api_(node_), startup_stall_handler_(std::move(startup_stall_handler)),
+      session_api_(node_), web_(node_.config().web),
+      startup_stall_handler_(std::move(startup_stall_handler)),
       maintenance_stage_hook_(std::move(maintenance_stage_hook)) {
     cluster_status_.attach_convergence_diagnostics(
         [this] { return metadata_convergence_.diagnostics(); });
@@ -163,6 +164,14 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
     // is already online long before local storage/metadata finish recovery.
     if (request.path == "/api/v1/session")
         return session_api_.handle(request);
+
+    // The web client is static files and does not depend on local services,
+    // so it loads while they are still recovering -- the client can then show
+    // what Status says rather than failing to load at all. Everything under
+    // /api stays the server's, 404s included: WebApi refuses those itself,
+    // but the routing says so too, so the isolation is visible here.
+    if (web_.enabled() && !WebApi::api_path(request.path))
+        return web_.handle(request);
 
     if (!services_ready_.load(std::memory_order_acquire)) {
         if (startup_failed_.load(std::memory_order_acquire)) {
@@ -341,6 +350,11 @@ bool Service::capability_request(const HttpRequest& request) {
     // Session creation is the one route reachable with no bearer token at
     // all, and (like Status) must be exempt regardless of local readiness.
     if (SessionApi::capability_request(request))
+        return true;
+    // A browser asking for the client itself has no token yet, and cannot get
+    // one until the client has loaded and asked for it. Only paths outside
+    // /api reach this, and only the configured web root is ever served.
+    if (web_.enabled() && !WebApi::api_path(request.path))
         return true;
     if (!services_ready_.load(std::memory_order_acquire))
         return false;
