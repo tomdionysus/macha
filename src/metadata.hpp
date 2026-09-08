@@ -65,12 +65,11 @@ struct PersistedNodeStatus {
     uint64_t cache_used{};
     uint64_t metadata_generation{};
     uint32_t storage_backends_online{};
-    // Advertised API host/port, mirrored from NodeTelemetry for Status's
+    // Advertised API endpoint, mirrored from NodeTelemetry for Status's
     // last-known fallback. Deliberately local-only: NOT part of the metadata
     // wire codec (encode_node_status/decode_node_status in metadata.cpp), so
     // it never enters the replicated snapshot/checkpoint format.
-    std::string api_host;
-    uint16_t api_port{};
+    std::string api_endpoint;
     auto operator<=>(const PersistedNodeStatus&) const = default;
 };
 

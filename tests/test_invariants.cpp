@@ -762,8 +762,7 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
         // No telemetry has been observed for this peer yet (membership alone
         // makes it visible), so its advertised API address is genuinely
         // unknown and must be omitted rather than guessed at.
-        CHECK(value.find("api_host") == nullptr);
-        CHECK(value.find("api_port") == nullptr);
+        CHECK(value.find("api_endpoint") == nullptr);
         const auto* storage = value.find("storage");
         REQUIRE(storage != nullptr);
         CHECK(!storage->find("available")->asBool());
@@ -800,8 +799,7 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     peer_telemetry.cache_used = 0;
     peer_telemetry.metadata_generation = peer.metadata_generation;
     peer_telemetry.storage_backends_online = 1;
-    peer_telemetry.api_host = "10.44.1.51";
-    peer_telemetry.api_port = 7438;
+    peer_telemetry.api_endpoint = "http://10.44.1.51:7438";
     node.telemetry().observe(peer_telemetry, true);
 
     response = status.handle(request);
@@ -818,8 +816,7 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
         CHECK(value.find("telemetry_freshness")->asString() == "live");
         // Now that this peer has gossiped telemetry, its advertised API
         // address (distinct from host/port, its RPC bind address) is known.
-        CHECK(value.find("api_host")->asString() == "10.44.1.51");
-        CHECK(value.find("api_port")->asUInt64() == 7438);
+        CHECK(value.find("api_endpoint")->asString() == "http://10.44.1.51:7438");
         const auto* storage = value.find("storage");
         REQUIRE(storage != nullptr);
         CHECK(storage->find("available")->asBool());
@@ -882,11 +879,10 @@ MACHA_TEST("invariants", test_status_reports_self_advertised_api_endpoint) {
         REQUIRE(nodes != nullptr);
         REQUIRE(nodes->asArray().size() == 1);
         const auto& self_node = nodes->asArray().front();
-        // No advertised override configured: api_host defaults to the
+        // No advertised override configured: the endpoint defaults to the
         // resolved RPC advertise host (never the wildcard listen address
-        // above), api_port to the bound port. Always well-defined.
-        CHECK(self_node.find("api_host")->asString() == "10.44.1.60");
-        CHECK(self_node.find("api_port")->asUInt64() == 19991);
+        // above) and the bound port, over plain http. Always well-defined.
+        CHECK(self_node.find("api_endpoint")->asString() == "http://10.44.1.60:19991");
     }
     {
         TestNode fixture("status-api-endpoint-override");
@@ -898,8 +894,7 @@ MACHA_TEST("invariants", test_status_reports_self_advertised_api_endpoint) {
         config.catalogue.api.enabled = true;
         config.catalogue.api.listen = "127.0.0.1";
         config.catalogue.api.port = 19992;
-        config.catalogue.api.advertised_host = "media-node-2.example.net";
-        config.catalogue.api.advertised_port = 443;
+        config.catalogue.api.advertised_endpoint = "https://media-node-2.example.net:443";
         auto& node = fixture.start();
         REQUIRE(wait_until([&] { return node.telemetry().local().has_value(); }, 5s));
 
@@ -915,10 +910,12 @@ MACHA_TEST("invariants", test_status_reports_self_advertised_api_endpoint) {
         REQUIRE(nodes != nullptr);
         REQUIRE(nodes->asArray().size() == 1);
         const auto& self_node = nodes->asArray().front();
-        // Advertised override present: takes priority over bound listen/port
-        // (covers NAT/port-forwarding).
-        CHECK(self_node.find("api_host")->asString() == "media-node-2.example.net");
-        CHECK(self_node.find("api_port")->asUInt64() == 443);
+        // Advertised override present: takes priority over the bound
+        // listen/port, and carries a scheme the bind cannot supply. This is
+        // the TLS-offload shape -- the node serves plain http on 19992 while
+        // clients are told https on 443.
+        CHECK(self_node.find("api_endpoint")->asString() ==
+              "https://media-node-2.example.net:443");
     }
     {
         TestNode fixture("status-api-endpoint-disabled");
@@ -944,8 +941,7 @@ MACHA_TEST("invariants", test_status_reports_self_advertised_api_endpoint) {
         REQUIRE(nodes->asArray().size() == 1);
         const auto& self_node = nodes->asArray().front();
         // No catalogue API runs on this node: nothing to advertise.
-        CHECK(self_node.find("api_host") == nullptr);
-        CHECK(self_node.find("api_port") == nullptr);
+        CHECK(self_node.find("api_endpoint") == nullptr);
     }
 }
 

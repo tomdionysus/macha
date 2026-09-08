@@ -45,8 +45,7 @@ PersistedNodeStatus persisted(const NodeTelemetry& telemetry) {
     out.cache_used = telemetry.cache_used;
     out.metadata_generation = telemetry.metadata_generation;
     out.storage_backends_online = telemetry.storage_backends_online;
-    out.api_host = telemetry.api_host;
-    out.api_port = telemetry.api_port;
+    out.api_endpoint = telemetry.api_endpoint;
     return out;
 }
 
@@ -226,11 +225,11 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
     // right port (or even protocol) for a REST call. Omitted entirely rather
     // than reported as empty/0 when unknown, so older or API-less peers in a
     // mixed cluster are simply not discovered rather than guessed at.
-    const auto& api_host = live ? live->api_host : durable.api_host;
-    const auto api_port = live ? live->api_port : durable.api_port;
-    if (!api_host.empty() && api_port) {
-        node["api_host"] = api_host;
-        node["api_port"] = static_cast<uint64_t>(api_port);
+    // The API endpoint, complete with scheme, distinct from host/port above
+    // which is this node's RPC address and is never proxied.
+    const auto& api_endpoint = live ? live->api_endpoint : durable.api_endpoint;
+    if (!api_endpoint.empty()) {
+        node["api_endpoint"] = api_endpoint;
     }
 
     const auto effective = effective_telemetry(live, stale, durable, telemetry_known);

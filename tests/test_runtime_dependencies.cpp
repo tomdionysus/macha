@@ -473,6 +473,39 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
         }
         CHECK(rejected);
     }
+    // The advertised API endpoint is a URL, and a path is rejected rather
+    // than accepted and quietly mishandled: a client that treats it as an
+    // origin would drop the path and 404 against a node that looks correctly
+    // configured -- and only in the deployment that has a proxy in front.
+    for (const char* invalid_endpoint :
+         {"https://node.example/macha", "node.example:7438", "ftp://node.example",
+          "https://", "https://node.example:0", "https://node.example:99999",
+          "https://node.example?x=1"}) {
+        auto invalid = yc;
+        invalid.catalogue.api.advertised_endpoint = invalid_endpoint;
+        bool rejected = false;
+        try {
+            (void)normalize_config(std::move(invalid));
+        } catch (const std::exception&) {
+            rejected = true;
+        }
+        CHECK(rejected);
+    }
+    // Scheme and host, with or without a port, and a bracketed IPv6 literal,
+    // are all accepted. The TLS-offload shape is the second one: plain http
+    // on the bind, https on the advertised endpoint.
+    for (const char* valid_endpoint : {"http://node.example", "https://node.example:443",
+                                       "http://[2001:db8::1]:7438"}) {
+        auto valid = yc;
+        valid.catalogue.api.advertised_endpoint = valid_endpoint;
+        bool rejected = false;
+        try {
+            (void)normalize_config(std::move(valid));
+        } catch (const std::exception&) {
+            rejected = true;
+        }
+        CHECK(!rejected);
+    }
     for (const size_t invalid_arena_max : {size_t{0}, size_t{65}}) {
         auto invalid = yc;
         invalid.runtime.glibc_arena_max = invalid_arena_max;

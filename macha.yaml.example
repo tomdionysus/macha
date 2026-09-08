@@ -387,14 +387,25 @@ catalogue:
     enabled: true
     listen: 127.0.0.1
     port: 7438
-    # Optional: how this node advertises its API to cluster peers (exposed on
-    # every node in /api/v1/status's nodes[] as api_host/api_port), distinct
-    # from listen/port above. Set when NAT/port-forwarding means peers can't
-    # reach this node at its bind address. advertised_host defaults to this
-    # node's network.advertise (not listen, which is conventionally a
-    # wildcard bind); advertised_port defaults to this port.
-    # advertised_host: media-node-2.example.net
-    # advertised_port: 7438
+    # Optional: the URL clients should use to reach this node's API (exposed
+    # on every node in /api/v1/status's nodes[] as api_endpoint). listen/port
+    # above describe the INNER bind; this describes the OUTER address, and the
+    # two are independent on purpose.
+    #
+    # With a TLS-terminating proxy in front of the API, Macha serves plain
+    # http on listen:port while clients must be told https on the proxy's
+    # port -- neither the scheme nor the port of the outer address can be
+    # derived from the bind, which is why it is stated here rather than
+    # constructed by the client. Also covers NAT/port-forwarding.
+    #
+    # Scheme, host and optional port only. A PATH IS NOT SUPPORTED and is
+    # rejected at startup: fronting a node at a subpath is not a deployment
+    # this serves, and a client treating the value as an origin would drop the
+    # path and 404 silently.
+    #
+    # Defaults to http:// this node's network.advertise (not listen, which is
+    # conventionally a wildcard bind) and the port above.
+    # advertised_endpoint: https://media-node-2.example.net:443
     # token_file: /etc/macha-api.token
     max_request_bytes: 8M
 

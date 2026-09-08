@@ -223,15 +223,25 @@ struct CatalogueApiConfig {
     bool enabled{};
     std::string listen{"127.0.0.1"};
     uint16_t port{7438};
-    // Optional override for how this node's API is advertised to cluster
-    // peers (Status nodes[].api_host/api_port), distinct from listen/port
-    // above. Covers NAT/port-forwarding, where the bind address isn't what a
-    // peer should dial. Empty host defaults to this node's resolved RPC
-    // advertise address (network.advertise, or its own fallback) rather than
-    // `listen` above, since `listen` is conventionally a wildcard bind
-    // (0.0.0.0) and not itself dialable. Zero port defaults to `port` above.
-    std::string advertised_host;
-    uint16_t advertised_port{0};
+    // How this node's API is advertised to clients (Status
+    // nodes[].api_endpoint), as a complete URL: scheme, host and optional
+    // port. This describes the OUTER address and `listen`/`port` above
+    // describe the inner bind, and the two are deliberately independent --
+    // with a TLS-terminating proxy in front of the API, Macha serves plain
+    // HTTP on `listen`:`port` while clients must be told
+    // `https://host[:443]`. Neither the scheme nor the port of the outer
+    // address can be derived from the bind, which is why this is stated
+    // rather than constructed.
+    //
+    // A path is NOT supported and is rejected at configuration: a proxy
+    // fronting a node at a subpath is not a deployment this serves, and a
+    // client that assumed an origin would silently produce 404s against it.
+    //
+    // Empty defaults to http:// this node's resolved RPC advertise address
+    // (network.advertise, or its own fallback) and `port` above -- not
+    // `listen`, which is conventionally a wildcard bind (0.0.0.0) and not
+    // itself dialable by anyone else.
+    std::string advertised_endpoint;
     std::optional<std::filesystem::path> token_file;
     size_t max_request_bytes{8 * 1024 * 1024};
     size_t workers{16};
