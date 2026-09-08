@@ -1,5 +1,47 @@
 # Current release
 
+## 0.36.5 — Coverage that measures something (development)
+
+`MACHA_TEST_COVERAGE` had been in `CMakeLists.txt` for some time and had never
+produced a report. It could not: two independent faults, either of which alone
+was enough.
+
+- **It did not link.** `macha_core` was given the coverage compile flags but
+  not the link flags, in both the GCC and the Clang branch, so the shared
+  library referenced the profile runtime and never resolved it. That is why
+  the repository contains no coverage artifact of any kind — not that nobody
+  had bothered, but that nobody could.
+- **It recorded nothing.** With linking fixed, the first full run reported
+  **0.0% across every file the main suite touches, with 377 tests passing**.
+  Every case runs in a forked child, and `child_run` leaves through
+  `std::_Exit` — correctly, since that is what stops a forked child flushing
+  buffers inherited from the parent — but counters are written by an `atexit`
+  handler, so a child that never runs one records nothing at all. The children
+  now reset counters on entry and dump them before `_Exit`, compiled in only
+  under coverage. The reset matters as much as the dump: a child inherits the
+  parent's accumulated counts at `fork()`, so without it every case would
+  re-report the parent's startup as its own.
+
+`./run-coverage.sh` builds instrumented, runs the suite and reports, taking
+the same arguments as `run-tests.sh`. The two toolchains need entirely
+different machinery and it selects per compiler rather than asking the
+operator to: Clang writes a profile per process, read back with
+`llvm-profdata`/`llvm-cov`; GCC writes `.gcda` counters beside the objects,
+read back with `gcov`. Neither `lcov` nor `gcovr` is installed on the cluster
+nodes, so the GCC summary is aggregated from plain `gcov` output rather than
+depending on a tool that would have to be installed on a Pi first.
+
+The build defaults to `Debug`, because at `-O3` inlining makes a coverage
+report describe the optimiser's view rather than the code's, and case
+deadlines scale 3x for the same reason the sanitizer build scales them.
+Documented in `tests/TESTING.md`, which described `MACHA_SANITIZE` in detail
+and had never mentioned coverage at all.
+
+Verified on both toolchains. What it does not cover: the subsystem plugins,
+since instrumentation here is a per-target property rather than the
+whole-program one a sanitizer needs, so plugin-only code reads as uncovered
+whether it is tested or not.
+
 ## 0.36.4 — One API endpoint, stated rather than guessed (development)
 
 **Breaking, and not detectable by looking for a field.** `nodes[].api_host`
