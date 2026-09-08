@@ -141,7 +141,7 @@ class RetainedMemoryLedger {
         return 3 - static_cast<int>(value);
     }
     uint64_t charge(uint64_t bytes) const noexcept { return std::max<uint64_t>(1, bytes); }
-    bool available_locked(MemoryClass, uint64_t, bool reclaimable) const;
+    bool available_locked(MemoryClass, MemoryOwner, uint64_t, bool reclaimable) const;
     std::vector<std::function<void()>> request_shedding_locked(MemoryClass);
     void release(uint64_t id);
 
@@ -180,8 +180,8 @@ inline RetainedMemoryLedger::RetainedMemoryLedger(uint64_t capacity_bytes,
         throw std::invalid_argument("retained-memory reserves exceed capacity");
 }
 
-inline bool RetainedMemoryLedger::available_locked(MemoryClass memory_class, uint64_t bytes,
-                                                    bool reclaimable) const {
+inline bool RetainedMemoryLedger::available_locked(MemoryClass memory_class, MemoryOwner owner,
+                                                    uint64_t bytes, bool reclaimable) const {
     if (bytes > capacity_bytes_ || used_bytes_ > capacity_bytes_ - bytes)
         return false;
     if (memory_class == MemoryClass::control)
@@ -196,6 +196,27 @@ inline bool RetainedMemoryLedger::available_locked(MemoryClass memory_class, uin
     if (memory_class == MemoryClass::speculative && waiters_[index(MemoryClass::loader)])
         return false;
     if (reclaimable)
+        return true;
+    // RPC reassembly is exempt from the durable-lower budget, because
+    // completing a durable write is what releases that budget.
+    //
+    // Publication holds its bytes until a peer confirms the write, and the
+    // confirmation arrives as an RPC message that must first be reassembled
+    // into this ledger. Charged against the same budget the two meet:
+    // publication fills it, reassembly is refused, MessageAssembler throws,
+    // the peer channel drops, so nothing confirms and nothing is released.
+    // Seen live on es-1 on 2026-09-08 -- publication holding 508 MB of a
+    // 512 MB durable-lower budget, 49,680 reassembly refusals, a 576-byte
+    // FUSE admission waiting 35 minutes, and the node unable to drain itself
+    // across a restart, because publication resumed from the spool and
+    // re-entered the same state within minutes.
+    //
+    // This is not an unbounded exemption. Incomplete reassembly is already
+    // bounded independently by MessageAssembler's own max_partial_bytes_
+    // ("incomplete RPC reassembly budget exceeded"), and a frame is transient
+    // where a publication lease is long-lived, so the ledger does not need to
+    // bound it a second time. The class reserves above still apply.
+    if (owner == MemoryOwner::rpc_frame)
         return true;
     const auto durable_lower_capacity = non_control_capacity - viewer_reserve_bytes_;
     if (bytes > durable_lower_capacity || lower_durable_bytes_ > durable_lower_capacity - bytes)
@@ -246,7 +267,7 @@ RetainedMemoryLedger::acquire(MemoryClass memory_class, MemoryOwner owner,
             cv_.notify_all();
             return {};
         }
-        if (available_locked(memory_class, bytes, reclaimable))
+        if (available_locked(memory_class, owner, bytes, reclaimable))
             break;
         if (!counted_wait) {
             counted_wait = true;
@@ -316,7 +337,7 @@ RetainedMemoryLedger::try_acquire(MemoryClass memory_class, MemoryOwner owner, u
         throw std::invalid_argument("reclaimable retained memory requires a shed callback");
     bytes = charge(bytes);
     std::lock_guard lock(mutex_);
-    if (stopping_ || !available_locked(memory_class, bytes, reclaimable))
+    if (stopping_ || !available_locked(memory_class, owner, bytes, reclaimable))
         return {};
     const auto id = next_id_++;
     allocations_.emplace(id, Allocation{memory_class, owner, bytes, reclaimable, false,

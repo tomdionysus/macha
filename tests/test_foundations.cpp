@@ -986,6 +986,47 @@ MACHA_FAST_TEST("foundations", test_retained_memory_ledger_preserves_priority_he
     CHECK(ledger.stats().used_bytes == 0);
 }
 
+MACHA_FAST_TEST("foundations", test_retained_memory_ledger_never_starves_rpc_reassembly) {
+    // The es-1 livelock of 2026-09-08, in miniature. Publication holds its
+    // retained bytes until a peer confirms the write, and that confirmation
+    // arrives as an RPC message which must first be reassembled into this same
+    // ledger. While reassembly was charged against the durable-lower budget,
+    // publication could fill that budget and then be unable to confirm
+    // anything -- reassembly refused, MessageAssembler throwing, the peer
+    // channel dropping, so nothing was released and the node could not drain
+    // itself even across a restart.
+    RetainedMemoryLedger ledger(100, 10, 30, 10);
+
+    // Fill the durable-lower budget exactly, as a publication backlog does.
+    auto publication = ledger.try_acquire(MemoryClass::loader, MemoryOwner::publication, 60);
+    REQUIRE(publication.has_value());
+
+    // Durable lower-priority work is now correctly refused: this is the state
+    // the node was wedged in, and it must stay refused or the test proves
+    // nothing.
+    CHECK(!ledger.try_acquire(MemoryClass::loader, MemoryOwner::publication, 1).has_value());
+    CHECK(!ledger.try_acquire(MemoryClass::speculative, MemoryOwner::cache, 1).has_value());
+
+    // But reassembly still gets in, because it is the path that releases the
+    // very bytes publication is holding.
+    auto reassembly = ledger.try_acquire(MemoryClass::loader, MemoryOwner::rpc_frame, 10);
+    REQUIRE(reassembly.has_value());
+
+    // The exemption is from the durable-lower budget only, not from the
+    // ledger. Control and viewer reserves still bound it: 60 + 10 held, and
+    // non-control capacity is 90, so 30 more must not be admitted.
+    CHECK(!ledger.try_acquire(MemoryClass::loader, MemoryOwner::rpc_frame, 30).has_value());
+    // Nor may it exceed total capacity.
+    CHECK(!ledger.try_acquire(MemoryClass::control, MemoryOwner::rpc_frame, 40).has_value());
+
+    // Confirmation completes, publication releases, and the budget is usable
+    // again -- the loop closes instead of wedging.
+    reassembly.reset();
+    publication.reset();
+    CHECK(ledger.stats().used_bytes == 0);
+    CHECK(ledger.try_acquire(MemoryClass::loader, MemoryOwner::publication, 60).has_value());
+}
+
 MACHA_FAST_TEST("foundations", test_retained_memory_ledger_sheds_borrowed_cache_for_viewer) {
     RetainedMemoryLedger ledger(100, 10, 30, 10);
     std::optional<RetainedMemoryLedger::Lease> borrowed;

@@ -84,11 +84,19 @@ MACHA_FAST_TEST("rpc_cluster", test_rpc_reassembly_is_process_memory_charged_unt
     delivered = {};
     CHECK(memory.stats().owner_bytes[static_cast<size_t>(MemoryOwner::rpc_frame)] == 0);
 
+    // Reassembly is still bounded by the ledger, but at the non-control
+    // capacity rather than the durable-lower budget. It is deliberately exempt
+    // from the latter: publication holds durable bytes until a peer confirms
+    // the write, and the confirmation is itself an RPC message that has to be
+    // reassembled, so charging reassembly against the budget publication fills
+    // lets a node wedge itself with no way out (es-1, 2026-09-08). The ceiling
+    // here is capacity minus the control reserve -- 3584 of these 4096 -- so
+    // 2000 + 1800 must still be refused.
     MessageAssembler saturated(4, 4096, 4096, &memory);
-    CHECK(!saturated.push(fragment(2, true, false, 1500)).has_value());
+    CHECK(!saturated.push(fragment(2, true, false, 2000)).has_value());
     bool rejected = false;
     try {
-        (void)saturated.push(fragment(3, true, false, 1100));
+        (void)saturated.push(fragment(3, true, false, 1800));
     } catch (...) {
         rejected = true;
     }
