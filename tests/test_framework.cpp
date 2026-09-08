@@ -45,6 +45,7 @@ std::size_t current_case_index{};
 
 struct Options {
     unsigned slots{};
+    unsigned timeout_scale{};
     bool list{};
     bool verbose{};
     std::string filter;
@@ -54,6 +55,32 @@ unsigned default_slots() {
     const auto detected = std::thread::hardware_concurrency();
     if (detected <= 2) return 2;
     return std::min(12u, detected);
+}
+
+// Each case declares a wall-clock deadline (30s fast, 60s integration, 120s
+// heavy) chosen against an ordinary build. A sanitizer build is slower by a
+// large constant factor -- roughly 2-3x for AddressSanitizer, 5-15x for
+// ThreadSanitizer -- so those same deadlines would fire as timeouts on code
+// that is behaving correctly, and a spurious timeout is worse than useless
+// here: it hides the sanitizer report the run existed to produce. Scale the
+// deadlines by default when the binary is actually instrumented, so
+// MACHA_SANITIZE builds are usable without every caller remembering a flag.
+unsigned default_timeout_scale() {
+#if defined(__SANITIZE_THREAD__)
+    return 10;
+#elif defined(__SANITIZE_ADDRESS__)
+    return 3;
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+    return 10;
+#elif __has_feature(address_sanitizer)
+    return 3;
+#else
+    return 1;
+#endif
+#else
+    return 1;
+#endif
 }
 
 unsigned parse_unsigned(std::string_view value, const char* what) {
@@ -72,6 +99,9 @@ Options parse_options(int argc, char** argv) {
     options.slots = default_slots();
     if (const char* env = std::getenv("MACHA_TEST_JOBS"))
         options.slots = parse_unsigned(env, "MACHA_TEST_JOBS");
+    options.timeout_scale = default_timeout_scale();
+    if (const char* env = std::getenv("MACHA_TEST_TIMEOUT_SCALE"))
+        options.timeout_scale = parse_unsigned(env, "MACHA_TEST_TIMEOUT_SCALE");
 
     for (int i = 1; i < argc; ++i) {
         std::string_view arg(argv[i]);
@@ -91,11 +121,20 @@ Options parse_options(int argc, char** argv) {
             options.filter = argv[i];
         } else if (arg.starts_with("--filter=")) {
             options.filter = std::string(arg.substr(9));
+        } else if (arg == "--timeout-scale") {
+            if (++i >= argc) throw std::runtime_error("--timeout-scale requires a value");
+            options.timeout_scale = parse_unsigned(argv[i], "--timeout-scale");
+        } else if (arg.starts_with("--timeout-scale=")) {
+            options.timeout_scale = parse_unsigned(arg.substr(16), "--timeout-scale");
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "macha-tests [--list] [--filter TEXT] [--jobs N|--serial] [--verbose]\n"
+                         "            [--timeout-scale N]\n"
                          "Tests run in isolated child processes. MACHA_TEST_JOBS overrides the\n"
                          "default parallel slot budget. Integration tests consume two slots and\n"
-                         "heavy lifecycle tests consume three.\n";
+                         "heavy lifecycle tests consume three.\n"
+                         "MACHA_TEST_TIMEOUT_SCALE (or --timeout-scale) multiplies every case\n"
+                         "deadline; it defaults above 1 in a sanitizer build, where the same\n"
+                         "work legitimately takes several times longer.\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown test option: " + std::string(arg));
@@ -124,6 +163,9 @@ struct RunningCase {
     int log_fd{-1};
     unsigned slots{};
     Clock::time_point started{};
+    // The case's declared timeout after the scale factor, so the deadline the
+    // scheduler enforces and the one a failure reports are the same number.
+    std::chrono::seconds deadline{};
 };
 
 int create_capture_file() {
@@ -179,7 +221,8 @@ std::string read_capture(int fd) {
     std::_Exit(child_failures.load(std::memory_order_relaxed) == 0 ? 0 : 1);
 }
 
-RunningCase launch(const TestCase& test, std::size_t selection_index) {
+RunningCase launch(const TestCase& test, std::size_t selection_index,
+                   std::chrono::seconds deadline) {
     const int capture_fd = create_capture_file();
     const auto started = Clock::now();
     // fork() duplicates userspace stream buffers.  If the parent has reported
@@ -195,7 +238,8 @@ RunningCase launch(const TestCase& test, std::size_t selection_index) {
         throw std::runtime_error("fork failed: " + std::string(std::strerror(errno)));
     }
     if (pid == 0) child_run(test, selection_index, capture_fd);
-    return RunningCase{selection_index, &test, pid, capture_fd, slots_for(test.cost), started};
+    return RunningCase{selection_index, &test,           pid,     capture_fd,
+                       slots_for(test.cost), started, deadline};
 }
 
 struct Result {
@@ -205,6 +249,7 @@ struct Result {
     bool timed_out{};
     int signal{};
     int exit_code{};
+    std::chrono::seconds deadline{};
     std::chrono::milliseconds elapsed{};
     std::string output;
 };
@@ -218,12 +263,13 @@ std::optional<Result> poll_finished(RunningCase& running) {
     const auto now = Clock::now();
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - running.started);
 
-    if (waited == 0 && now - running.started < running.test->timeout)
+    if (waited == 0 && now - running.started < running.deadline)
         return std::nullopt;
 
     Result result;
     result.selection_index = running.selection_index;
     result.test = running.test;
+    result.deadline = running.deadline;
     result.elapsed = elapsed;
 
     if (waited == 0) {
@@ -256,7 +302,7 @@ void print_result(const Result& result, bool verbose) {
 
     std::cerr << "[FAIL] " << name << " " << result.elapsed.count() << "ms";
     if (result.timed_out)
-        std::cerr << " timeout=" << result.test->timeout.count() << "s";
+        std::cerr << " timeout=" << result.deadline.count() << "s";
     else if (result.signal)
         std::cerr << " signal=" << result.signal;
     else
@@ -338,7 +384,9 @@ int run_all(int argc, char** argv) {
     unsigned occupied = 0;
 
     std::cout << "Running " << selected_tests.size() << " tests with " << options.slots
-              << " parallel slots (process isolated)\n" << std::flush;
+              << " parallel slots (process isolated)";
+    if (options.timeout_scale != 1) std::cout << ", deadlines x" << options.timeout_scale;
+    std::cout << '\n' << std::flush;
 
     while (results.size() < selected_tests.size()) {
         bool launched_any = false;
@@ -352,7 +400,7 @@ int run_all(int argc, char** argv) {
             const auto selection_index = *candidate;
             const auto& test = *selected_tests[selection_index];
             const auto need = effective_slots(test);
-            auto child = launch(test, selection_index);
+            auto child = launch(test, selection_index, test.timeout * options.timeout_scale);
             child.slots = need;
             occupied += need;
             running.push_back(std::move(child));
