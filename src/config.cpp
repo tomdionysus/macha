@@ -524,6 +524,22 @@ void parse_runtime(const YAML::Node& root, Config& c) {
             yaml_size(runtime["loader_memory_reserve_bytes"]);
 }
 
+void parse_web(const YAML::Node& root, Config& c) {
+    auto web = root["web"];
+    if (!web)
+        return;
+    if (web["enabled"])
+        c.web.enabled = web["enabled"].as<bool>();
+    if (web["root"])
+        c.web.root = web["root"].as<std::string>();
+    if (web["index"])
+        c.web.index = web["index"].as<std::string>();
+    if (c.web.index.empty())
+        throw std::runtime_error("web.index must not be empty");
+    if (c.web.index.find('/') != std::string::npos)
+        throw std::runtime_error("web.index must be a file name inside web.root");
+}
+
 void parse_session(const YAML::Node& root, Config& c) {
     auto session = root["session"];
     if (!session)
@@ -665,6 +681,7 @@ Config load_yaml_config(const std::filesystem::path& path) {
     parse_hydration(root, c);
     parse_runtime(root, c);
     parse_session(root, c);
+    parse_web(root, c);
 
     if (auto bootstrap = root["bootstrap"]) {
         if (!bootstrap.IsSequence())

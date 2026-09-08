@@ -1,5 +1,40 @@
 # Current release
 
+## 0.35.0 — Serve the web client at the root (development)
+
+A node can now serve the built web client itself, so the client and the API
+it talks to are one origin and there is no second server to deploy,
+configure or keep in step.
+
+- New `web:` configuration section. `web.root` names a directory of built
+  assets; `web.index` is the document a client route resolves to
+  (`index.html` by default); `web.enabled` turns serving off without
+  unconfiguring it. Unset by default, and a node with no `web.root` answers
+  non-API paths exactly as before.
+- A path naming a file under the root is served as that file, with a
+  content type, an `ETag` and `Cache-Control: public, max-age=3600`.
+  Everything else is answered with the index document under `no-cache`, so
+  a deep link reaches the client rather than the server's 404 -- which is
+  what a single-page application needs, and the index must be revalidated
+  or a deploy stays invisible.
+- **The API namespace is never served from here.** Everything under `/api`,
+  not merely `/api/v1`, remains the server's, 404s included: an API call
+  must not come back as an HTML page that a JSON parser will choke on, and
+  reserving the whole prefix keeps a later API version from being swallowed
+  by the client's fallback.
+- Client assets are served without a bearer token, since a browser has none
+  until the client has loaded and asked for one. Only the configured root is
+  reachable: request paths are checked one segment at a time and a segment
+  that is empty, `.`, `..`, or begins with a dot is refused, so a request
+  can neither climb out nor read build leftovers such as `.env`. A refused
+  path falls through to the index rather than a 404, so probing cannot be
+  used to learn whether a file exists.
+- The client is served while local services are still recovering, because
+  it is static files and depends on none of them: it loads and shows what
+  Status reports rather than failing to load at all. A configured root that
+  does not exist answers `503 web_client_unavailable` rather than 404, and
+  starts serving as soon as the files appear.
+
 ## 0.34.0 — The playback contract says what it did
 
 Collects the night's playback work into one release. Four defects, each
