@@ -1,5 +1,62 @@
 # Current release
 
+## 0.36.2 — A complete playlist, and a wait that cannot wedge the node (development)
+
+Two changes that were made together but are independent of each other: the
+media playlist becomes a complete VOD list with bounded holds behind it, and
+the retained-memory ledger stops charging RPC reassembly against the budget
+that reassembly exists to release.
+
+**The playlist.** `media.m3u8` is now a complete `#EXT-X-PLAYLIST-TYPE:VOD`
+list — every planned fragment, closed with `#EXT-X-ENDLIST`, served on the
+first fetch with no readiness gate and byte-identical on every later fetch of
+the same generation. The duration is known because the source was probed, so
+this is the spec-correct form, and with `ENDLIST` present a player stops
+polling: one playlist fetch per generation instead of hundreds.
+
+`EXTINF` is the plan rather than the measured length, necessarily — an
+unproduced fragment has no measured length and a VOD list may not be revised.
+That is only honest because 0.36.1 made the plan predict the output exactly;
+confirmed client-side on a 1,748-fragment title whose declared durations sum
+to the film's duration, with fragment 0 declaring 2 s and delivering 1.96 s.
+
+**The wait.** Because the playlist promises fragments that do not exist yet, a
+request for one is held rather than refused — as an explicitly acquired
+resource, never an implicit blocked thread, so an async `HttpServer` would be
+an improvement rather than a rewrite. Three tests in order: beyond
+`segment_hold_window` nothing is working toward the fragment; past
+`max_session_holds` the session has had its share; past
+`max_concurrent_holds` the node has. Any of them answers immediately, and a
+refusal never advances the producer's demand watermark. `init.mp4` takes the
+same path, since a playlist served up front sends the client for it before the
+muxer has written it.
+
+A refusal is `500 segment_not_ready` with `Retry-After` and `Cache-Control:
+no-store`; a broken generation is `503 stream_failed`. That assignment is
+deliberately the opposite of what the spec suggests, and the reasoning is
+recorded in `docs/streaming.md` because it looks like a mistake otherwise: a
+client cannot read the JSON body on a fragment error, so the status is the
+discriminator, and a discriminator readable only as a status has to be one
+nothing else on the path emits. Every proxy emits `503` for a dead service, so
+`503` meaning "hold, stay here" would make a dead node look like a busy one
+and suppress failover silently. `segment_timeout_ms` is 6000, under the
+tightest client deadline actually read from a shipped artifact (media3's 8000
+ms read timeout) rather than from documentation, which was wrong twice.
+
+**The ledger.** Publication holds retained bytes until a peer confirms the
+write, and that confirmation arrives as an RPC message which must first be
+reassembled into the same ledger. Charged against the same durable-lower
+budget the two meet: publication fills it, reassembly is refused, the peer
+channel drops, so nothing confirms and nothing is released — and a restart
+re-enters it within minutes, because publication resumes from the spool.
+Observed live: 508 MB held of a 512 MB budget, 49,680 reassembly refusals, a
+576-byte FUSE admission waiting 35 minutes, telemetry 18 minutes stale in both
+directions, and a transcode on another node dying with `extent unavailable`
+two hops downstream. Reassembly is now exempt from that budget; the control
+and viewer reserves still apply and `MessageAssembler` already bounds
+incomplete reassembly independently. After the fix the affected node confirmed
+40.6 GB and drained its spool from 1.72 GB to 122 MB with no further refusals.
+
 ## 0.36.1 — A transcode's first fragment is the short one it planned (development)
 
 The early `moov` flush was switched off whenever any stream was transcoded,
