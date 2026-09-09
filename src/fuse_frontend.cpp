@@ -3431,7 +3431,9 @@ struct FuseFrontend::State {
                     config.write_through_cache && !publication->recovered,
                     WriteDurability::publication_generation,
                     config.publication_pipeline_bytes,
-                    DataWorkContext(FrameType::loader, config.publication_quantum_bytes));
+                    DataWorkContext(FrameType::loader, config.publication_quantum_bytes, {},
+                                    nullptr, &data_publication_quanta,
+                                    config.publication_no_progress_deadline));
             } catch (const FsError& e) {
                 if (e.code() == ENOENT && publication_path_may_still_appear(inode))
                     throw FsError(EAGAIN, "FUSE namespace advanced before data publication opened");

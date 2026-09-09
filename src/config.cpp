@@ -238,6 +238,10 @@ void parse_fuse(const YAML::Node& root, Config& c) {
     if (f["recovery_commit_workers"]) c.fuse.recovery_commit_workers = f["recovery_commit_workers"].as<size_t>();
     if (f["foreground_commit_workers"]) c.fuse.foreground_commit_workers = f["foreground_commit_workers"].as<size_t>();
     if (f["publication_quiet_ms"]) c.fuse.publication_quiet = milliseconds(f["publication_quiet_ms"], "fuse.publication_quiet_ms");
+    if (f["publication_no_progress_deadline_ms"])
+        c.fuse.publication_no_progress_deadline =
+            milliseconds(f["publication_no_progress_deadline_ms"],
+                         "fuse.publication_no_progress_deadline_ms");
     if (f["publication_retry_initial_backoff_ms"])
         c.fuse.publication_retry.initial_backoff =
             milliseconds(f["publication_retry_initial_backoff_ms"], "fuse.publication_retry_initial_backoff_ms");
@@ -522,6 +526,9 @@ void parse_runtime(const YAML::Node& root, Config& c) {
         c.runtime.glibc_arena_max = runtime["glibc_arena_max"].as<size_t>();
     if (runtime["retained_memory_bytes"])
         c.runtime.retained_memory_bytes = yaml_size(runtime["retained_memory_bytes"]);
+    if (runtime["reassembly_memory_reserve_bytes"])
+        c.runtime.reassembly_memory_reserve_bytes =
+            yaml_size(runtime["reassembly_memory_reserve_bytes"]);
     if (runtime["control_memory_reserve_bytes"])
         c.runtime.control_memory_reserve_bytes =
             yaml_size(runtime["control_memory_reserve_bytes"]);
