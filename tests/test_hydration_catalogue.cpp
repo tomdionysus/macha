@@ -668,6 +668,13 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
              MovieRegression{"/Movies/Rebel.Moon.Part.One.Directors.Cut.1080p.NF.WEBRip.AAC5.1.10bits.x265-Rapta.mkv", "Rebel Moon Part One", 0, "Directors Cut"},
              MovieRegression{"/Movies/2003.Kill.Bill-.Volume.1.1920x802.BDRip.x264.DTS-HD.MA.mkv", "Kill Bill Volume 1", 2003},
              MovieRegression{"/Movies/Soldier - Sci-fi 1998 Eng Rus Comm Multi Subs 720p [H264-mp4].mp4", "Soldier", 1998},
+             // A number the calendar has not reached is title text, not a
+             // release year. Found live on 2026-09-09: this file was unmatched
+             // because "2049" was read as the year, the search title was
+             // truncated to "Blade Runner", and the only candidate TMDB
+             // returned -- the 1982 film -- was then rejected on the mismatch.
+             MovieRegression{"/Movies/Blade Runner 2049.HDRip.XviD.AC3-EVO.avi", "Blade Runner 2049", 0},
+             MovieRegression{"/Movies/Death Race 2050 1080p BluRay x265.mkv", "Death Race 2050", 0},
          }) {
         auto parsed = probe_media_path(regression.path, fake);
         REQUIRE(parsed.has_value());

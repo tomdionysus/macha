@@ -1,5 +1,59 @@
 # Current release
 
+## 0.36.7 — A node stays visible while it is busy, and two title parsers stop lying (development)
+
+Three unrelated faults found the same day, all of them things the operator
+could see and the software could not explain.
+
+**Peer telemetry was blanked rather than labelled.** `node_json()` populated
+`runtime` only for a sample fresher than `max(heartbeat * 3, 5s)` — 15s here —
+so one sample crossing that line removed `uptime_ms`, `rss_bytes`, `load1`,
+`process_cpu_percent`, `cpu_cores`, `memory_total_bytes`, `peers_*` and
+`rpc_connections_*` in a single step, leaving `"runtime": {}`. On the live
+cluster every WAN pair was in exactly that state, with samples ~4.9 minutes
+old. Storage and cache figures still go unavailable when stale, because those
+are what a consumer sums into a cluster total and a stale one would be a
+fabricated number; the runtime figures are honest measurements of the sending
+process at a stated instant, and `telemetry_freshness` and `live_age_ms`
+already say how old they are.
+
+**A healthy peer could report `metadata_generation: 0`.** The emitter
+preferred the membership record unconditionally, so a membership entry
+carrying 0 beat fresh telemetry carrying the real generation. Both are
+sightings of the same monotonic counter, so it now takes the larger and falls
+back to the durable value only when neither source has one.
+
+**Telemetry gossip went quiet exactly when it mattered.** It was sent only
+after 2s free of foreground *and* read-ahead work, and then only onto an
+entirely idle writer, so a node became invisible to its peers while it was
+busy or in trouble. Both gates are gone: gossip runs every tick, and a small
+notification (at most 64 KiB, while the writer holds under 1 MiB pending) may
+queue behind existing work. It stays on the SPECULATIVE class and the writer
+still picks the most urgent frame first, so none of this can delay operational
+RPC. The cadence is now `network.telemetry_interval_ms`, default 10s, and a
+demand-driven wake still publishes sooner but never more than once a second —
+without that floor the loop had no minimum spacing at all, since its wait
+returns whenever a peer observation moves the demand counter.
+
+**"Blade Runner 2049" was catalogued as "Blade Runner", and rejected.** Any
+`19xx`/`20xx` in a filename was read as the release year, so the search title
+was truncated and the only candidate TMDB returned — the 1982 film — failed
+the year comparison. A number the calendar has not reached is title text, and
+both year scanners now say so; `strip_release_noise` also learned `hdrip`,
+`xvid`, `divx` and `brrip`, without which the title kept its release tags.
+
+**Music matched nothing when the filename decorated the title.** All 61
+unmatched music files reported "no metadata provider match after 4
+candidates": `(feat. …)`, `(Live)`, `(Spotify Bonus Tracks)` and the like went
+into the MusicBrainz query verbatim and returned no results at all, and the
+acceptance threshold of 120 needs an exact agreement on both title and artist
+— which the provider's own credit style ("Avicii feat. Sandro Cavazza" against
+a path saying "Avicii") denied. The decorated title is still tried first,
+since a remix or live cut is a genuinely distinct recording; an undecorated
+search is the fallback when the precise one finds nothing, scoring 85 against
+an exact 100, and a primary-artist agreement scores 70. A title-only
+agreement still lands at 95 and is still refused.
+
 ## 0.36.6 — Status reports how much RAM a node has (development)
 
 `runtime.memory_total_bytes` joins `cpu_cores` in the node payload. The

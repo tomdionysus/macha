@@ -26,6 +26,16 @@ constexpr size_t protocol_min_frame_size = 4 * 1024;
 constexpr size_t protocol_max_frame_size = 4 * 1024 * 1024;
 // Fast health/membership RPCs must never queue behind storage-backed control
 // handlers such as metadata checkpointing.
+// A small best-effort notification (telemetry, session gossip) may queue behind
+// work the writer already holds, provided its own payload is under
+// max_notify_payload_bytes and the writer's pending payload is under
+// max_notify_backlog_bytes. Requiring an entirely idle writer instead meant a
+// node stopped being visible to its peers exactly while it was busy. The writer
+// picks by frame priority, so such a frame never overtakes operational RPC, and
+// the bound stops a peer that has stopped draining from accumulating
+// notifications without limit.
+constexpr size_t max_notify_payload_bytes = 64 * 1024;
+constexpr size_t max_notify_backlog_bytes = 1024 * 1024;
 constexpr size_t fast_control_worker_count = 2;
 constexpr size_t control_worker_count = 2;
 constexpr size_t data_worker_count = 8;
@@ -1671,9 +1681,17 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                 return false;
         }
         std::unique_lock lock(outbound_mutex_, std::try_to_lock);
-        // Best-effort traffic is admitted only onto an otherwise idle writer.
-        // It must never add queueing delay in front of operational RPC.
-        if (!lock.owns_lock() || broken_.load() || !outbound_.empty())
+        // A small notification may queue behind existing work; anything larger
+        // still waits for an idle writer so it cannot add queueing delay in
+        // front of operational RPC. Class does not decide this: telemetry rides
+        // SPECULATIVE and is precisely the traffic that must survive a busy
+        // writer, while best_outbound_locked() still sends every more urgent
+        // frame first.
+        if (!lock.owns_lock() || broken_.load())
+            return false;
+        const bool small_notification = message.payload.size() <= max_notify_payload_bytes;
+        if (!outbound_.empty() &&
+            (!small_notification || outbound_bytes_ > max_notify_backlog_bytes))
             return false;
         if (message.payload.size() > max_peer_outbound_bytes)
             return false;
@@ -3010,9 +3028,15 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                 return false;
         }
         std::unique_lock lock(outbound_mutex, std::try_to_lock);
-        // Best-effort traffic is admitted only onto an otherwise idle writer.
-        // It must never add queueing delay in front of operational RPC.
-        if (!lock.owns_lock() || !ready.load() || done.load() || !outbound.empty())
+        // Same rule as the outbound peer connection: a small notification may
+        // queue behind existing work, so telemetry keeps flowing over an
+        // inbound route that is carrying traffic, while anything larger waits
+        // for an idle writer.
+        if (!lock.owns_lock() || !ready.load() || done.load())
+            return false;
+        const bool small_notification = message.payload.size() <= max_notify_payload_bytes;
+        if (!outbound.empty() &&
+            (!small_notification || outbound_bytes > max_notify_backlog_bytes))
             return false;
         if (message.payload.size() > max_peer_outbound_bytes)
             return false;

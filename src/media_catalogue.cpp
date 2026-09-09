@@ -15,6 +15,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <ctime>
 #include <charconv>
 #include <cerrno>
 #include <cstdlib>
@@ -325,8 +327,22 @@ std::optional<MusicMetadataReadResult> read_music_metadata_probe(FileSystem& fs,
     return result;
 }
 
+// A four-digit number is only a release year if it could actually be one.
+// "Blade Runner 2049" is the canonical counter-example: the number is part of
+// the name, and reading it as the year both truncated the search title to
+// "Blade Runner" and then rejected the only candidate TMDB returned -- the
+// 1982 film -- on the year mismatch, so the file sat unmatched (2026-09-09).
+// Nothing on disk can carry a release year past next year.
+int32_t plausible_year_ceiling() {
+    const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm parts{};
+    gmtime_r(&now, &parts);
+    return parts.tm_year + 1900 + 1;
+}
+
 std::optional<int32_t> year_from(std::string_view text) {
     static const std::regex re(R"((?:19|20)[0-9]{2})");
+    static const int32_t ceiling = plausible_year_ceiling();
     std::string owned(text);
     std::optional<int32_t> result;
     for (std::sregex_iterator it(owned.begin(), owned.end(), re), end; it != end; ++it) {
@@ -343,14 +359,17 @@ std::optional<int32_t> year_from(std::string_view text) {
             pos + len + 1 < owned.size() &&
             std::isdigit(static_cast<unsigned char>(owned[pos + len + 1])))
             continue;
-        result = std::stoi((*it).str());
+        const auto value = std::stoi((*it).str());
+        // A number the calendar has not reached is title text, not a year.
+        if (value > ceiling) continue;
+        result = value;
     }
     return result;
 }
 
 std::string strip_release_noise(std::string value) {
     static const std::regex technical(
-        R"((?:^|[ ._\-(\[]+)(?:[0-9]{3,4}x[0-9]{3,4}|2160p|1440p|1080p|720p|576p|480p|360p|uhd|bluray|blu-ray|bdrip|webrip|web-dl|webdl|hdtv|dvdrip|dvd|remux|amzn|nf|x264|x265|h264|h265|h\.264|h\.265|hevc|avc|av1|vp9|aac(?:[0-9.]*)?|eac3|ac3|ddp(?:[0-9.]*)?|dd(?:[0-9.]*)?|dts(?:-hd)?(?:[ .]ma)?|flac|opus|multi-subs|multisubs)\b.*$)",
+        R"((?:^|[ ._\-(\[]+)(?:[0-9]{3,4}x[0-9]{3,4}|2160p|1440p|1080p|720p|576p|480p|360p|uhd|bluray|blu-ray|bdrip|webrip|web-dl|webdl|hdtv|hdrip|dvdrip|dvd|brrip|xvid|divx|remux|amzn|nf|x264|x265|h264|h265|h\.264|h\.265|hevc|avc|av1|vp9|aac(?:[0-9.]*)?|eac3|ac3|ddp(?:[0-9.]*)?|dd(?:[0-9.]*)?|dts(?:-hd)?(?:[ .]ma)?|flac|opus|multi-subs|multisubs)\b.*$)",
         std::regex::icase);
     std::smatch match;
     if (std::regex_search(value, match, technical))
@@ -550,6 +569,7 @@ struct YearPosition {
 
 std::vector<YearPosition> year_positions(std::string_view text) {
     static const std::regex re(R"((?:19|20)[0-9]{2})");
+    static const int32_t ceiling = plausible_year_ceiling();
     std::string owned(text);
     std::vector<YearPosition> out;
     for (std::sregex_iterator it(owned.begin(), owned.end(), re), end; it != end; ++it) {
@@ -562,7 +582,12 @@ std::vector<YearPosition> year_positions(std::string_view text) {
             pos + len + 1 < owned.size() &&
             std::isdigit(static_cast<unsigned char>(owned[pos + len + 1])))
             continue;
-        out.push_back({std::stoi((*it).str()), pos, len});
+        const auto value = std::stoi((*it).str());
+        // Same plausibility rule as year_from(): a number the calendar has not
+        // reached is part of the title. This generator scans independently of
+        // that one, so the clamp has to be stated in both places.
+        if (value > ceiling) continue;
+        out.push_back({value, pos, len});
     }
     return out;
 }
@@ -1832,6 +1857,41 @@ std::optional<Json> MusicBrainzProvider::find_release(const MediaProbe& probe) {
     return detail;
 }
 
+// Filenames decorate a track title with things the provider's canonical title
+// does not carry: "(feat. X)", "(Live)", "(Radio Edit)", "(Spotify Bonus
+// Tracks)". Searching for the decorated string returns nothing at all, which
+// is how 61 music files -- every one of them "no metadata provider match after
+// 4 candidates" -- reached 2026-09-09 unmatched with obvious candidates. The
+// decorated form is still tried first, because a remix or live version is a
+// genuinely distinct recording and matching it exactly is better than matching
+// the studio cut.
+std::string music_title_without_decorations(const std::string& title) {
+    static const std::regex decoration(
+        R"(\s*[(\[]\s*(?:feat\.?|ft\.?|featuring|with)\b[^)\]]*[)\]]|)"
+        R"(\s*[(\[][^)\]]*\b(?:live|acoustic|instrumental|explicit|clean|remaster(?:ed)?|)"
+        R"(mono|stereo|radio edit|single version|album version|extended|bonus track[s]?|)"
+        R"(deluxe|demo|reprise|version)\b[^)\]]*[)\]])",
+        std::regex::icase);
+    auto stripped = std::regex_replace(title, decoration, "");
+    // Collapse the whitespace the removal leaves behind.
+    static const std::regex spaces(R"(\s{2,})");
+    stripped = std::regex_replace(stripped, spaces, " ");
+    while (!stripped.empty() && (stripped.back() == ' ' || stripped.back() == '-'))
+        stripped.pop_back();
+    while (!stripped.empty() && stripped.front() == ' ')
+        stripped.erase(stripped.begin());
+    return stripped;
+}
+
+// MusicBrainz credits a guest as part of the artist ("Avicii feat. Sandro
+// Cavazza") where the path carries only the primary artist ("Avicii"). Compare
+// on the primary so the credit style does not decide the match.
+std::string primary_artist_credit(const std::string& credit) {
+    static const std::regex secondary(R"(\s+(?:feat\.?|ft\.?|featuring|with|&|vs\.?|x)\s+.*$)",
+                                      std::regex::icase);
+    return std::regex_replace(credit, secondary, "");
+}
+
 std::optional<Json> MusicBrainzProvider::find_recording(const MediaProbe& probe) {
     std::string key;
     std::string recording_id;
@@ -1844,11 +1904,22 @@ std::optional<Json> MusicBrainzProvider::find_recording(const MediaProbe& probe)
     }
     if (auto it = recording_cache_.find(key); it != recording_cache_.end()) return it->second;
 
+    const auto undecorated = music_title_without_decorations(probe.title);
     if (recording_id.empty()) {
-        auto query = "recording:\"" + lucene_quote(probe.title) + "\" AND artist:\"" +
-                     lucene_quote(probe.artist) + "\"";
-        auto search = api("/recording", {{"query", query}, {"limit", "10"}});
+        auto search_for = [&](const std::string& title) {
+            auto query = "recording:\"" + lucene_quote(title) + "\" AND artist:\"" +
+                         lucene_quote(probe.artist) + "\"";
+            return api("/recording", {{"query", query}, {"limit", "10"}});
+        };
+        auto search = search_for(probe.title);
         auto recordings = search.find("recordings");
+        // The decorated title is the precise hypothesis; the undecorated one is
+        // the fallback, tried only when the precise search finds nothing at all.
+        if ((!recordings || !recordings->isArray() || recordings->asArray().empty()) &&
+            !undecorated.empty() && normalized(undecorated) != normalized(probe.title)) {
+            search = search_for(undecorated);
+            recordings = search.find("recordings");
+        }
         if (!recordings || !recordings->isArray() || recordings->asArray().empty()) {
             provider_cache_store(recording_cache_, cache_bytes_, key, std::optional<Json>{});
             return {};
@@ -1857,8 +1928,14 @@ std::optional<Json> MusicBrainzProvider::find_recording(const MediaProbe& probe)
         int best_score = -1;
         for (const auto& candidate : recordings->asArray()) {
             int score = 0;
-            if (normalized(json_string(candidate.find("title"))) == normalized(probe.title)) score += 100;
-            if (normalized(artist_credit_name(candidate.find("artist-credit"))) == normalized(probe.artist)) score += 80;
+            const auto candidate_title = normalized(json_string(candidate.find("title")));
+            if (candidate_title == normalized(probe.title)) score += 100;
+            // An undecorated agreement is real evidence but weaker than an
+            // exact one, so an exact match still wins when both are present.
+            else if (!undecorated.empty() && candidate_title == normalized(undecorated)) score += 85;
+            const auto credit = artist_credit_name(candidate.find("artist-credit"));
+            if (normalized(credit) == normalized(probe.artist)) score += 80;
+            else if (normalized(primary_artist_credit(credit)) == normalized(probe.artist)) score += 70;
             if (auto provider_score = json_i32(candidate.find("score"))) score += *provider_score / 10;
             if (score > best_score) { best_score = score; best = &candidate; }
         }

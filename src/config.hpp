@@ -566,6 +566,14 @@ struct Config {
     size_t read_ahead_extents{3};
     std::vector<Endpoint> bootstrap;
     std::chrono::milliseconds heartbeat{5000};
+    // How often a node gossips its telemetry set to peers. This is what
+    // decides how stale a peer's figures can be in another node's Status, so
+    // it is the knob to turn when node views must track a busy cluster more
+    // closely (at proportionally more control-lane traffic). A demand-driven
+    // wake -- a readiness transition or a peer observation -- publishes
+    // sooner, but never more than once per second, so a reconnect storm
+    // cannot turn this into a send loop.
+    std::chrono::milliseconds telemetry_interval{10000};
     std::chrono::milliseconds dead_after{30000};
     std::chrono::milliseconds connect_timeout{2500};
     size_t max_frame_size{256 * 1024};
