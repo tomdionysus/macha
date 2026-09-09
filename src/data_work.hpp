@@ -25,17 +25,34 @@ class DataWorkContext {
     uint64_t quantum_bytes_{};
     Clock::time_point deadline_{};
     std::atomic_bool* cancelled_{};
+    // A no-progress budget, distinct from the absolute deadline above. Work
+    // that legitimately takes a long time must not be cancelled for taking it,
+    // but work that is not moving at all must eventually fail rather than wait
+    // forever: on 2026-09-09 all eight publication workers on es-1 sat in an
+    // unbounded acquire holding 492 MB between them, so nothing failed,
+    // nothing retried and nothing parked. The counter is shared across the
+    // workers of one pipeline, so progress anywhere re-arms the window.
+    const std::atomic_uint64_t* progress_{};
+    std::chrono::milliseconds no_progress_budget_{};
 
   public:
     explicit DataWorkContext(FrameType frame_type = FrameType::loader,
                              uint64_t quantum_bytes = 0,
                              Clock::time_point deadline = {},
-                             std::atomic_bool* cancelled = nullptr)
+                             std::atomic_bool* cancelled = nullptr,
+                             const std::atomic_uint64_t* progress = nullptr,
+                             std::chrono::milliseconds no_progress_budget = {})
         : frame_type_(frame_type), quantum_bytes_(quantum_bytes), deadline_(deadline),
-          cancelled_(cancelled) {
+          cancelled_(cancelled), progress_(progress), no_progress_budget_(no_progress_budget) {
         if (frame_type == FrameType::control)
             throw std::invalid_argument("control is not a DATA work class");
     }
+
+    // Present only when the caller supplied both a counter and a budget.
+    const std::atomic_uint64_t* progress() const noexcept {
+        return no_progress_budget_.count() ? progress_ : nullptr;
+    }
+    std::chrono::milliseconds no_progress_budget() const noexcept { return no_progress_budget_; }
 
     FrameType frame_type() const noexcept { return frame_type_; }
     uint64_t quantum_bytes() const noexcept { return quantum_bytes_; }

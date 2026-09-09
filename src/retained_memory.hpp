@@ -39,6 +39,7 @@ struct RetainedMemoryStats {
     uint64_t control_reserve_bytes{};
     uint64_t viewer_reserve_bytes{};
     uint64_t loader_reserve_bytes{};
+    uint64_t reassembly_reserve_bytes{};
     uint64_t used_bytes{};
     uint64_t peak_used_bytes{};
     uint64_t reclaimable_bytes{};
@@ -110,6 +111,7 @@ class RetainedMemoryLedger {
     uint64_t control_reserve_bytes_{};
     uint64_t viewer_reserve_bytes_{};
     uint64_t loader_reserve_bytes_{};
+    uint64_t reassembly_reserve_bytes_{};
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::map<uint64_t, Allocation> allocations_;
@@ -147,7 +149,8 @@ class RetainedMemoryLedger {
 
   public:
     RetainedMemoryLedger(uint64_t capacity_bytes, uint64_t control_reserve_bytes,
-                         uint64_t viewer_reserve_bytes, uint64_t loader_reserve_bytes);
+                         uint64_t viewer_reserve_bytes, uint64_t loader_reserve_bytes,
+                         uint64_t reassembly_reserve_bytes = 32ULL * 1024 * 1024);
 
     std::optional<Lease> acquire(MemoryClass, MemoryOwner, uint64_t bytes,
                                  Clock::time_point deadline = {},
@@ -168,11 +171,13 @@ class RetainedMemoryLedger {
 inline RetainedMemoryLedger::RetainedMemoryLedger(uint64_t capacity_bytes,
                                                    uint64_t control_reserve_bytes,
                                                    uint64_t viewer_reserve_bytes,
-                                                   uint64_t loader_reserve_bytes)
+                                                   uint64_t loader_reserve_bytes,
+                                                   uint64_t reassembly_reserve_bytes)
     : capacity_bytes_(capacity_bytes), control_reserve_bytes_(control_reserve_bytes),
-      viewer_reserve_bytes_(viewer_reserve_bytes), loader_reserve_bytes_(loader_reserve_bytes) {
+      viewer_reserve_bytes_(viewer_reserve_bytes), loader_reserve_bytes_(loader_reserve_bytes),
+      reassembly_reserve_bytes_(reassembly_reserve_bytes) {
     if (!capacity_bytes_ || !control_reserve_bytes_ || !viewer_reserve_bytes_ ||
-        !loader_reserve_bytes_ ||
+        !loader_reserve_bytes_ || !reassembly_reserve_bytes_ ||
         control_reserve_bytes_ > capacity_bytes_ ||
         viewer_reserve_bytes_ > capacity_bytes_ - control_reserve_bytes_ ||
         loader_reserve_bytes_ >
@@ -193,6 +198,32 @@ inline bool RetainedMemoryLedger::available_locked(MemoryClass memory_class, Mem
         return true;
     if (waiters_[index(MemoryClass::control)] || waiters_[index(MemoryClass::viewer)])
         return false;
+    // Inbound RPC frame reassembly draws on a small dedicated reserve ahead of
+    // the gates below, because it is the path that RELEASES what those gates
+    // protect: publication holds its bytes until a peer confirms, and the
+    // confirmation is a frame that must be reassembled into this ledger first.
+    // The loader gate and the durable-lower budget therefore deadlock against
+    // it -- publication waits for memory, the frame that would let publication
+    // finish is refused because publication is waiting, and neither proceeds
+    // (es-1, 2026-09-08 and again 2026-09-09: publication pinned at ~500 MB,
+    // reclaimable 0, ~1 refusal per second, spool draining at 0 B/s).
+    //
+    // It sits BELOW the control/viewer waiter gate above, and must stay there.
+    // Governing law 1 is that the viewer never waits, and a queued viewer
+    // outranks reassembly unconditionally; a viewer cannot be the party
+    // publication is deadlocked against anyway, because the viewer reserve is
+    // headroom that loader and speculative work can never consume.
+    //
+    // Bounded deliberately. Granting reassembly priority over every gate
+    // instead -- the 2026-09-09 first attempt -- simply inverts the deadlock:
+    // on a node receiving from two peers, inbound frames then take everything
+    // below the control reserve and starve that node's own publication
+    // completely. The invariant needs a few frames in flight, so beyond the
+    // reserve reassembly queues like anything else, and MessageAssembler
+    // bounds incomplete reassembly independently.
+    if (owner == MemoryOwner::rpc_frame &&
+        owner_bytes_[index(MemoryOwner::rpc_frame)] + bytes <= reassembly_reserve_bytes_)
+        return true;
     if (memory_class == MemoryClass::speculative && waiters_[index(MemoryClass::loader)])
         return false;
     if (reclaimable)
@@ -393,7 +424,8 @@ inline void RetainedMemoryLedger::stop() {
 inline RetainedMemoryStats RetainedMemoryLedger::stats() const {
     std::lock_guard lock(mutex_);
     return {capacity_bytes_, control_reserve_bytes_, viewer_reserve_bytes_,
-            loader_reserve_bytes_, used_bytes_, peak_used_bytes_, reclaimable_bytes_,
+            loader_reserve_bytes_, reassembly_reserve_bytes_, used_bytes_, peak_used_bytes_,
+            reclaimable_bytes_,
             owner_bytes_, admissions_, waits_, shed_requests_, cancelled_waits_, restored_bytes_};
 }
 

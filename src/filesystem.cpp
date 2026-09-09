@@ -304,13 +304,61 @@ WriteHandle::WriteHandle(FileSystem& f, std::string p, FsEntry b, bool trunc, bo
 void WriteHandle::ensure_buffer_memory() {
     if (buffer_memory_)
         return;
-    auto memory = fs_.node().retained_memory().acquire(
-        filesystem_memory_class(work_context_.frame_type()), MemoryOwner::publication,
-        fs_.extent_size(), work_context_.deadline(), work_context_.cancellation());
-    if (!memory)
-        fail(EAGAIN, "write extent retained-memory admission saturated");
-    buffer_memory_.emplace(std::move(*memory));
-    buffer_.reserve(fs_.extent_size());
+    const auto memory_class = filesystem_memory_class(work_context_.frame_type());
+    auto& ledger = fs_.node().retained_memory();
+
+    // Without a no-progress budget this is the historical behaviour: wait on
+    // the caller's own deadline, which for publication was no deadline at all.
+    const auto* progress = work_context_.progress();
+    if (!progress) {
+        auto memory = ledger.acquire(memory_class, MemoryOwner::publication, fs_.extent_size(),
+                                     work_context_.deadline(), work_context_.cancellation());
+        if (!memory)
+            fail(EAGAIN, "write extent retained-memory admission saturated");
+        buffer_memory_.emplace(std::move(*memory));
+        buffer_.reserve(fs_.extent_size());
+        return;
+    }
+
+    // With one, wait in slices and watch the shared counter. Any worker in
+    // this pipeline making progress re-arms the window, so a slow-but-moving
+    // node is never punished for being slow; only a pipeline where nothing at
+    // all advances within the budget fails. That failure is an ordinary EAGAIN,
+    // which the publication retry policy already backs off and eventually
+    // parks -- turning a permanent silent deadlock into visible, bounded,
+    // self-healing failure. Before this, all eight workers held their buffers
+    // and blocked forever, so `parked_publications` stayed 0 on a node that
+    // had published nothing for hours (es-1, 2026-09-09).
+    constexpr auto slice = std::chrono::milliseconds(500);
+    const auto budget = work_context_.no_progress_budget();
+    auto seen = progress->load(std::memory_order_relaxed);
+    auto window_started = DataWorkContext::Clock::now();
+    while (true) {
+        const auto absolute = work_context_.deadline();
+        auto until = DataWorkContext::Clock::now() + slice;
+        if (absolute != DataWorkContext::Clock::time_point{} && absolute < until)
+            until = absolute;
+        auto memory = ledger.acquire(memory_class, MemoryOwner::publication, fs_.extent_size(),
+                                     until, work_context_.cancellation());
+        if (memory) {
+            buffer_memory_.emplace(std::move(*memory));
+            buffer_.reserve(fs_.extent_size());
+            return;
+        }
+        if (work_context_.cancelled() ||
+            (absolute != DataWorkContext::Clock::time_point{} &&
+             DataWorkContext::Clock::now() >= absolute))
+            fail(EAGAIN, "write extent retained-memory admission saturated");
+
+        const auto now_seen = progress->load(std::memory_order_relaxed);
+        if (now_seen != seen) {
+            seen = now_seen;
+            window_started = DataWorkContext::Clock::now();
+            continue;
+        }
+        if (DataWorkContext::Clock::now() - window_started >= budget)
+            fail(EAGAIN, "write extent retained-memory admission made no progress within budget");
+    }
 }
 WriteHandle::~WriteHandle() {
     try {

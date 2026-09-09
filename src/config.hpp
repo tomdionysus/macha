@@ -129,6 +129,15 @@ struct FuseConfig {
     // imports to remain permanently single-threaded.
     size_t foreground_commit_workers{1};
     std::chrono::milliseconds publication_quiet{5000};
+    // A publication worker blocked on retained-memory admission fails after
+    // this long with NO quantum completing anywhere in the pipeline. It is a
+    // no-progress budget, not a time limit on publishing: any worker finishing
+    // a quantum re-arms it, so a slow node is never punished for being slow.
+    // Zero disables it and restores the unbounded wait. Without this the wait
+    // had no deadline at all, so a wedged pipeline never failed, never retried
+    // and never parked -- es-1 held 492 MB across eight blocked workers with
+    // `parked_publications` reading 0 (2026-09-09).
+    std::chrono::milliseconds publication_no_progress_deadline{30000};
     // Retry discipline for one file's data publication (discipline 2 of the
     // self-healing plan). Backoff starts small so a namespace race resolves
     // in a blink, caps so a peer outage costs at most one attempt per
@@ -490,6 +499,18 @@ struct RuntimeConfig {
     uint64_t control_memory_reserve_bytes{64ULL * 1024 * 1024};
     uint64_t viewer_memory_reserve_bytes{192ULL * 1024 * 1024};
     uint64_t loader_memory_reserve_bytes{64ULL * 1024 * 1024};
+    // Headroom only inbound RPC frame reassembly may draw on, and the reason
+    // the whole ledger cannot deadlock. Publication holds its bytes until a
+    // peer confirms the write, and that confirmation arrives as a frame which
+    // must be reassembled into this same ledger: without a guaranteed slice,
+    // publication fills the budget, reassembly is refused, the channel drops,
+    // nothing confirms, and nothing is ever released (es-1, 2026-09-08 and
+    // again 2026-09-09). It is deliberately small. An earlier attempt gave
+    // reassembly absolute priority above every waiter gate instead, which
+    // inverted the deadlock -- inbound frames on a node receiving from two
+    // peers then starved that node's own publication completely. A few frames
+    // at `max_frame_size` is all the invariant needs.
+    uint64_t reassembly_memory_reserve_bytes{32ULL * 1024 * 1024};
 };
 
 struct SessionConfig {
