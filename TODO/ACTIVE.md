@@ -684,7 +684,14 @@ absorbed here rather than separate active programmes.
   *after* 0.23.3 shipped (`2026-09-03-fuse-terminal-recovery-loop.md`): node
   200 reported `state: online` while genuinely recovering at generation 0, and
   separately reported ES-1 as green at generation 0 in its own aggregate view
-  while ES-1's own endpoint reported healthy/writable at generation 4507. Audit
+  while ES-1's own endpoint reported healthy/writable at generation 4507.
+  **2026-09-09: measured on the live cluster and split into three causes in
+  [node telemetry visibility](2026-09-09-node-telemetry-visibility.md).**
+  Causes 1 (a stale sample blanked its whole `runtime` block) and 2
+  (`metadata_generation` preferring a membership record carrying 0 over a
+  live sample) are fixed there. Cause 3 is the open one: telemetry gossip is
+  idle-gated, best-effort and never retries, so a busy or backed-off peer
+  goes invisible — needs a design decision before code. Audit
   how a node folds a peer's telemetry into its own aggregate response — this
   is a different code path from the per-sample freshness fix. This is likely
   the same underlying gap as playback P0 item 2's Status-latency investigation

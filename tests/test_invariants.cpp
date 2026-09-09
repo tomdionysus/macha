@@ -1032,17 +1032,83 @@ MACHA_TEST("invariants", test_status_marks_stale_peer_telemetry_as_unavailable_n
     // Still control-plane reachable via membership -- that part isn't a lie.
     CHECK(stale_peer->find("state")->asString() == "online");
     CHECK(stale_peer->find("telemetry_freshness")->asString() == "stale");
-    // But a stale sample's resource/runtime figures must not be presented as
-    // current: this is the exact "makes up numbers" complaint being fixed.
+    // But a stale sample's resource figures must not be presented as current:
+    // this is the exact "makes up numbers" complaint being fixed. Capacity and
+    // usage are also what a consumer sums across nodes, so a stale one would
+    // leak into a cluster-wide total.
     CHECK(!stale_peer->find("storage")->find("available")->asBool());
     CHECK(stale_peer->find("storage")->find("used_bytes")->isNull());
-    CHECK(stale_peer->find("runtime")->find("rss_bytes") == nullptr);
+    // The runtime figures are the other half of that split and survive: they
+    // measure the sending process at a stated instant, nothing aggregates
+    // them, and the entry says how old they are. Withholding them left the UI
+    // with no view at all of any node whose sample had aged past 15s.
+    REQUIRE(stale_peer->find("runtime")->find("rss_bytes") != nullptr);
+    CHECK(stale_peer->find("runtime")->find("rss_bytes")->asUInt64() == peer_telemetry.rss_bytes);
+    CHECK(stale_peer->find("runtime")->find("uptime_ms")->asUInt64() == peer_telemetry.uptime_ms);
+    CHECK(stale_peer->find("live_age_ms")->asUInt64() >= 5000);
 
     // The aggregate must also stop treating this node's stale numbers as
     // authoritative, rather than silently freezing the old "available" flag.
     const auto* cluster = stale_root.find("cluster");
     REQUIRE(cluster != nullptr);
     CHECK(!cluster->find("storage_online")->find("available")->asBool());
+}
+
+MACHA_TEST("invariants", test_status_reports_peer_metadata_generation_from_fresher_source) {
+    TestNode fixture("status-generation-source");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.hydration.enabled = false;
+    config.catalogue.scanner.enabled = false;
+    auto& node = fixture.start();
+    auto& metadata = fixture.metadata();
+    metadata.snapshot();
+
+    // A membership record that predates the peer's first generation notice:
+    // control-plane reachable, carrying nothing about metadata yet.
+    NodeInfo peer;
+    peer.id = random_node_id();
+    peer.host = "10.44.1.202";
+    peer.port = 7437;
+    peer.failure_domain = "test-lab";
+    peer.capacity = 4ULL * 1024 * 1024 * 1024;
+    peer.metadata_generation = 0;
+    peer.seen_unix_ms = unix_ms();
+    node.membership().observe(peer, true);
+
+    // Fresh telemetry from the same peer that does know its generation.
+    NodeTelemetry peer_telemetry;
+    peer_telemetry.node_id = peer.id;
+    peer_telemetry.boot_id = random_node_id();
+    peer_telemetry.sequence = 1;
+    peer_telemetry.observed_unix_ms = unix_ms();
+    peer_telemetry.host = peer.host;
+    peer_telemetry.failure_domain = peer.failure_domain;
+    peer_telemetry.port = peer.port;
+    peer_telemetry.storage_capacity = peer.capacity;
+    peer_telemetry.metadata_generation = 25723;
+    peer_telemetry.storage_backends_online = 1;
+    node.telemetry().observe(peer_telemetry, true);
+
+    ClusterStatusService status(node);
+    status.attach_metadata(metadata);
+    HttpRequest request;
+    request.method = "GET";
+    request.path = "/api/v1/status";
+    const auto response = status.handle(request);
+    REQUIRE(response.status == 200);
+    const auto root = Json::parse(
+        std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
+
+    const Json* entry = nullptr;
+    for (const auto& value : root.find("nodes")->asArray())
+        if (value.find("id")->asString() == to_string(peer.id))
+            entry = &value;
+    REQUIRE(entry != nullptr);
+    // Membership winning unconditionally reported a healthy peer as
+    // generation 0 while holding a sample that said 25723.
+    CHECK(entry->find("metadata_generation")->asUInt64() == 25723);
 }
 
 MACHA_TEST("invariants", test_status_excludes_retired_identity_from_live_cluster_health) {

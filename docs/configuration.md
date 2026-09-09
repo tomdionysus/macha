@@ -132,6 +132,7 @@ network:
   port: 7437
   failure_domain: site-a
   heartbeat_ms: 5000
+  telemetry_interval_ms: 10000
   dead_after_ms: 30000
   connect_timeout_ms: 2500
   max_frame_size: 256K
@@ -140,6 +141,15 @@ network:
 ```
 
 `advertise` must be reachable by peers.
+
+`telemetry_interval_ms` is how often a node gossips its telemetry set to its
+peers, and therefore how stale another node's view of it can be in
+`/api/v1/status` (`nodes[].live_age_ms` reports the actual age). Lowering it
+makes peer figures track a busy cluster more closely at proportionally more
+control-lane traffic; a set is roughly 200 bytes per node it carries, capped
+at 64 nodes. A readiness transition or a peer observation publishes sooner
+than the configured cadence, but never more than once per second, so a
+reconnecting peer cannot turn this into a send loop.
 
 `control_no_progress_deadline_ms` bounds how long a synchronous control-lane
 call may sit with no bytes moving in either direction before it is cancelled
