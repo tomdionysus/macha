@@ -1278,28 +1278,42 @@ void NodeRuntime::signal_telemetry_refresh() {
 
 void NodeRuntime::telemetry_loop(std::stop_token stop) {
     ThreadCpuReporter cpu_reporter("macha-telemetry", std::chrono::seconds(5), true);
-    const auto interval = std::chrono::seconds(5);
-    const auto idle_before_gossip = std::chrono::seconds(2);
+    // `network.telemetry_interval_ms`, 10s by default. A floor keeps a
+    // mis-set value from turning this into a spin loop.
+    const auto interval = std::max(cfg_.telemetry_interval, std::chrono::milliseconds(250));
+    // The wait below returns early whenever telemetry demand changes, and
+    // demand is bumped on every peer observation and every readiness
+    // transition -- a reconnecting or flapping peer can raise that rate
+    // arbitrarily. Local sampling is cheap and still runs on every wake, so a
+    // phase change is published promptly, but the network broadcast keeps its
+    // own floor: however often this loop is woken, it cannot gossip more than
+    // once a second, and never faster than the configured cadence itself.
+    const auto min_gossip_interval = std::min(interval, std::chrono::milliseconds(1000));
+    auto last_gossip = Clock::time_point{};
     const auto gossip_ttl = std::max(cfg_.dead_after * 2, std::chrono::milliseconds(60000));
     uint64_t handled_demand = 0;
     while (!stop.stop_requested()) {
         const auto demand = telemetry_demand_.load(std::memory_order_acquire);
         try {
             refresh_telemetry();
-            // Sampling is always local. Network gossip is suppressed while the
-            // node has recent foreground/read-ahead work, then additionally
-            // uses no-wait/idle-writer admission in RpcClient. Telemetry is the
-            // first thing dropped when the node is doing useful work.
-            const bool operationally_idle =
-                activity_idle_for(FrameType::foreground) >= idle_before_gossip &&
-                activity_idle_for(FrameType::read_ahead) >= idle_before_gossip;
-            if (operationally_idle) {
+            // Sampling is always local. Gossip used to be suppressed whenever
+            // the node had recent foreground/read-ahead work and then admitted
+            // only onto an idle writer, which inverted what an operator needs:
+            // a node went invisible exactly while it was busy or in trouble,
+            // and on 2026-09-09 every WAN pair in the cluster reported peers
+            // with an empty runtime block and a ~5 minute old sample. Removing
+            // those two gates is what makes it timely; the frame class stays
+            // SPECULATIVE deliberately, so gossip keeps out of the control
+            // memory reserve and off the two control workers, and still cannot
+            // delay operational RPC. A telemetry set is ~200 bytes per entry,
+            // capped at 64 entries, so sending it every tick is cheap.
+            if (const auto now = Clock::now(); now - last_gossip >= min_gossip_interval) {
+                last_gossip = now;
                 auto values = telemetry_.recent(gossip_ttl, 64);
                 if (!values.empty()) {
-                    // This is a no-dial, no-wait notification. It is admitted only
-                    // if the RPC routing and per-peer outbound locks are immediately
-                    // available, and speculative priority keeps it behind all
-                    // operational control/foreground/read-ahead traffic.
+                    // Still a no-dial notification: it rides established routes
+                    // and never blocks. What it no longer does is give up the
+                    // moment the writer has anything else in flight.
                     (void)client_.broadcast_best_effort(
                         {MessageType::telemetry, encode_telemetry_set(values)},
                         FrameType::speculative);

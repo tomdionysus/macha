@@ -216,9 +216,18 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         static_cast<uint64_t>(member ? member->port : (live ? live->port : durable.port));
     node["failure_domain"] =
         member ? member->failure_domain : (live ? live->failure_domain : durable.failure_domain);
+    // Membership and telemetry are two independent sightings of the same
+    // monotonic counter, and either can be the older one: membership carries 0
+    // for a peer whose record predates its first generation notice, while a
+    // stale sample lags a peer that has since advanced. Taking the larger is
+    // therefore the fresher answer, not a guess -- reporting a healthy peer as
+    // generation 0 because membership happened to win is the bug this avoids.
+    // The durable last-known value answers only when neither source has one.
+    const uint64_t observed_generation =
+        std::max(member ? member->metadata_generation : uint64_t{0},
+                 live ? live->metadata_generation : uint64_t{0});
     node["metadata_generation"] =
-        member ? member->metadata_generation
-               : (live ? live->metadata_generation : durable.metadata_generation);
+        observed_generation ? observed_generation : durable.metadata_generation;
 
     // Where other clients should reach this node's HTTP API - distinct from
     // host/port above, which is the RPC bind address and not necessarily the
@@ -254,8 +263,17 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         roles.emplace_back("metadata-replica");
     node["roles"] = std::move(roles);
 
+    // Unlike capacity and usage above, these are measurements of the sending
+    // process itself at a stated instant: an old load average is an old
+    // measurement, not a fabricated one, and `telemetry_freshness` plus
+    // `live_age_ms` already tell the consumer exactly how old. Blanking them
+    // the moment a sample crosses the freshness line (15s at the default
+    // heartbeat) is what leaves an operator with no view of a busy or distant
+    // node at the moment they most want one, so a stale sample keeps them.
+    // Nothing aggregates these across nodes, so a stale figure cannot leak
+    // into a cluster-wide total the way a stale capacity would.
     Json::Object runtime;
-    if (effective.authoritative && online) {
+    if (live && online) {
         runtime["uptime_ms"] = live->uptime_ms;
         runtime["rss_bytes"] = live->rss_bytes;
         runtime["process_cpu_percent"] =

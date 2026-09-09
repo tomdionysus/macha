@@ -74,6 +74,8 @@ void parse_network(const YAML::Node& root, Config& c) {
         c.failure_domain = n["failure_domain"].as<std::string>();
     if (n["heartbeat_ms"])
         c.heartbeat = milliseconds(n["heartbeat_ms"], "heartbeat_ms");
+    if (n["telemetry_interval_ms"])
+        c.telemetry_interval = milliseconds(n["telemetry_interval_ms"], "telemetry_interval_ms");
     if (n["dead_after_ms"])
         c.dead_after = milliseconds(n["dead_after_ms"], "dead_after_ms");
     if (n["connect_timeout_ms"])

@@ -196,6 +196,7 @@ MACHA_TEST("rpc_cluster", test_best_effort_telemetry_notifications_reach_both_ro
     telemetry.port = remote_info.port;
     const RpcMessage notice{MessageType::telemetry, encode_telemetry_set({telemetry})};
 
+    // Production gossips telemetry as SPECULATIVE (NodeRuntime::telemetry_loop).
     // The dialler-to-acceptor direction enters RpcServer::session_loop.
     REQUIRE(wait_until(
         [&] {
@@ -211,6 +212,17 @@ MACHA_TEST("rpc_cluster", test_best_effort_telemetry_notifications_reach_both_ro
         [&] {
             (void)local_client.broadcast_best_effort(notice, FrameType::speculative);
             return remote_received.load(std::memory_order_relaxed) > 0;
+        },
+        2s));
+
+    // CONTROL remains a legal class for this message -- validate_frame_semantics()
+    // throws otherwise -- so a caller that wants telemetry on the control lane
+    // is not silently broken by the class the gossip loop happens to use.
+    const auto before = local_received.load(std::memory_order_relaxed);
+    REQUIRE(wait_until(
+        [&] {
+            (void)remote_client.broadcast_best_effort(notice, FrameType::control);
+            return local_received.load(std::memory_order_relaxed) > before;
         },
         2s));
 
