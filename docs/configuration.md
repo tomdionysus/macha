@@ -180,6 +180,7 @@ fuse:
   publication_no_progress_deadline_ms: 30000
   publication_inflight_bytes: 256M
   publication_pipeline_bytes: 8M
+  publication_max_open_writers: 0
   viewer_weight: 95
   loader_weight: 5
   max_spool_bytes: 16G
@@ -227,7 +228,27 @@ started for one file. When omitted it is two extents, capped at one quantum
 be an extent-size multiple no larger than a quantum or eight extents; lowering it reduces the
 loader I/O which may already be in flight when viewer demand arrives, while
 raising it can improve bulk-import throughput on higher-latency storage. These byte bounds work independently of
-`commit_workers`. All FUSE reads and writes are loader/convenience traffic and
+`commit_workers`.
+
+`publication_max_open_writers` bounds how many files may hold a provisional
+writer at once. A writer is retained across clean yields and retryable failures
+so a resumed publication never replays spool bytes, and it keeps its
+retained-memory extent leases -- one filling buffer plus the pipeline -- for as
+long as it is retained. Publication scheduling is otherwise breadth-first, so
+without this bound the number of writers holding partial state is simply the
+width of the backlog: on one node that reached 123 leases, the entire
+durable-lower budget, after which every writer needed one more extent and none
+could release one. No byte budget fixes that, because any budget fills the same
+way. When omitted the bound is derived so that every open writer's worst case
+fits `runtime.loader_memory_reserve_bytes` -- `loader_memory_reserve_bytes /
+(extent_size + publication_pipeline_bytes)`, never fewer than `commit_workers`.
+Past the bound the scheduler is depth-first over the already-open set, which is
+what drains a backlog anyway. Status reports `open_publications`,
+`peak_open_publications`, `publication_max_open_writers` and
+`data_publication_selections_under_writer_cap`;
+`data_publication_progress_events` counts what actually releases publication
+memory (extent retirements and commits) and is the field to read when asking
+whether a pipeline is moving at all. All FUSE reads and writes are loader/convenience traffic and
 do not manufacture viewer demand. Genuine streaming reads receive relative
 `viewer_weight` service while publication receives `loader_weight` service
 (95:5 by default). The weights are positive relative values, not a static

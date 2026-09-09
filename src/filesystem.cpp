@@ -539,6 +539,9 @@ std::chrono::milliseconds WriteHandle::drain_one_extent() {
     }
     pending_extent_bytes_ -= pending.bytes;
     pending_extents_.pop_front();
+    // The lease this extent held is now back in the ledger. That is the event
+    // a writer waiting on admission is waiting for.
+    fs_.note_write_progress();
     return result.elapsed;
 }
 
@@ -1373,6 +1376,9 @@ void WriteHandle::commit() {
         Bytes{}.swap(buffer_);
         buffer_memory_.reset();
     }
+    // A committed generation is the other way publication-owned memory comes
+    // back: this handle is now retirable and its remaining leases go with it.
+    fs_.note_write_progress();
 
     if (sparse_overlay_) {
         // The committed manifest is now the immutable authority. Discard the
