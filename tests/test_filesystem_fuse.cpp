@@ -300,6 +300,83 @@ MACHA_TEST("filesystem_fuse", test_open_write_metadata_merge) {
     CHECK(conflicted);
 }
 
+MACHA_TEST("filesystem_fuse", test_publication_buffer_admission_fails_only_without_progress) {
+    TestService fixture("publication-no-progress-budget");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    auto& service = fixture.start();
+
+    service.filesystem().create_file("/stalled.bin", 0644, getuid(), getgid());
+    const auto contents = pattern(4096);
+
+    // Hold the whole non-control budget, which is the state a wedged
+    // publication pipeline puts the ledger in: its own predecessors' buffers
+    // fill it and no admission can succeed until one of them is released.
+    auto& ledger = service.node().retained_memory();
+    const auto capacity = ledger.stats().capacity_bytes;
+    // Viewer class, because it is bounded only by the non-control capacity: a
+    // loader-class lease could not take the whole budget it is meant to fill.
+    auto hog = ledger.try_acquire(MemoryClass::viewer, MemoryOwner::playback_segment,
+                                  capacity - ledger.stats().control_reserve_bytes);
+    REQUIRE(hog.has_value());
+
+    // A pipeline where nothing completes fails within the budget rather than
+    // waiting forever. Before this the wait had no deadline at all, so eight
+    // blocked workers held their buffers indefinitely and the failure never
+    // reached the retry-and-park discipline that exists for it.
+    std::atomic_uint64_t stalled_progress{0};
+    auto stalled = service.filesystem().open_write(
+        "/stalled.bin", false, false, WriteDurability::publication_generation, 0,
+        DataWorkContext(FrameType::loader, config.extent_size, {}, nullptr, &stalled_progress,
+                        300ms));
+    const auto stalled_started = std::chrono::steady_clock::now();
+    int stalled_code = 0;
+    try {
+        (void)stalled->write(0, contents);
+    } catch (const FsError& e) {
+        stalled_code = e.code();
+    }
+    const auto stalled_elapsed = std::chrono::steady_clock::now() - stalled_started;
+    CHECK(stalled_code == EAGAIN);
+    CHECK(stalled_elapsed < 10s);
+
+    // But progress anywhere in the pipeline re-arms the window, so a node that
+    // is merely slow is never failed for being slow. This counter advances for
+    // roughly a second before stopping, and the write must outlast it.
+    service.filesystem().create_file("/moving.bin", 0644, getuid(), getgid());
+    std::atomic_uint64_t moving_progress{0};
+    std::atomic_bool advancing{true};
+    std::jthread progress_thread([&] {
+        while (advancing.load()) {
+            moving_progress.fetch_add(1, std::memory_order_relaxed);
+            std::this_thread::sleep_for(100ms);
+        }
+    });
+    auto moving = service.filesystem().open_write(
+        "/moving.bin", false, false, WriteDurability::publication_generation, 0,
+        DataWorkContext(FrameType::loader, config.extent_size, {}, nullptr, &moving_progress,
+                        300ms));
+    const auto moving_started = std::chrono::steady_clock::now();
+    std::jthread stop_after([&] {
+        std::this_thread::sleep_for(1200ms);
+        advancing.store(false);
+    });
+    int moving_code = 0;
+    try {
+        (void)moving->write(0, contents);
+    } catch (const FsError& e) {
+        moving_code = e.code();
+    }
+    const auto moving_elapsed = std::chrono::steady_clock::now() - moving_started;
+    CHECK(moving_code == EAGAIN);
+    // It must have waited past the point where a plain 300ms budget would have
+    // given up, which is what makes this a no-progress rule and not a timeout.
+    CHECK(moving_elapsed > 1s);
+}
+
 MACHA_TEST("filesystem_fuse", test_write_data_work_context_preserves_loader_provenance) {
     TestService fixture("write-data-work-context");
     auto& config = fixture.config();

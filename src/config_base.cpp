@@ -31,7 +31,12 @@ void validate(Config& config) {
             config.runtime.retained_memory_bytes - config.runtime.control_memory_reserve_bytes ||
         config.runtime.loader_memory_reserve_bytes >
             config.runtime.retained_memory_bytes - config.runtime.control_memory_reserve_bytes -
-                config.runtime.viewer_memory_reserve_bytes)
+                config.runtime.viewer_memory_reserve_bytes ||
+        !config.runtime.reassembly_memory_reserve_bytes ||
+        config.runtime.reassembly_memory_reserve_bytes >
+            config.runtime.retained_memory_bytes - config.runtime.control_memory_reserve_bytes -
+                config.runtime.viewer_memory_reserve_bytes -
+                config.runtime.loader_memory_reserve_bytes)
         throw std::runtime_error("runtime retained-memory reserves exceed total capacity");
     if (config.state_path.empty())
         throw std::runtime_error("state_path is required");

@@ -1056,6 +1056,79 @@ MACHA_FAST_TEST("foundations", test_retained_memory_ledger_never_starves_rpc_rea
     CHECK(ledger.try_acquire(MemoryClass::loader, MemoryOwner::publication, 60).has_value());
 }
 
+MACHA_FAST_TEST("foundations", test_retained_memory_reassembly_reserve_is_bounded_not_absolute) {
+    // Reserve of 5 bytes inside a 100-byte ledger, so the bound is testable.
+    RetainedMemoryLedger ledger(100, 10, 30, 10, 5);
+
+    // Publication holds the durable-lower budget, as a wedged node's does.
+    auto publication = ledger.try_acquire(MemoryClass::loader, MemoryOwner::publication, 60);
+    REQUIRE(publication.has_value());
+
+    // A permanently queued waiter is the normal state of that node, and it is
+    // the case the 2026-09-09 first attempt missed: the exemption sat below
+    // the waiter gates, so every data-lane frame was refused before it was
+    // reached and the node re-entered the identical livelock.
+    std::atomic_bool started{false};
+    std::atomic_bool finished{false};
+    std::jthread waiter([&] {
+        started.store(true);
+        std::atomic_bool cancel{false};
+        auto blocked = ledger.acquire(MemoryClass::loader, MemoryOwner::publication, 40,
+                                      RetainedMemoryLedger::Clock::now() + 2s, &cancel);
+        finished.store(true);
+        CHECK(!blocked.has_value());
+    });
+    while (!started.load()) std::this_thread::yield();
+    for (int i = 0; i < 200 && ledger.stats().waits[2] == 0; ++i)
+        std::this_thread::sleep_for(1ms);
+    CHECK(ledger.stats().waits[2] > 0);
+
+    // Governing law 1 first: a queued VIEWER outranks reassembly, always. The
+    // reserve sits below the control/viewer waiter gate precisely so that a
+    // frame can never be admitted ahead of playback, and a viewer cannot be
+    // the party publication is deadlocked against in any case -- the viewer
+    // reserve is headroom loader and speculative work can never consume.
+    std::atomic_bool viewer_cancel{false};
+    std::atomic_bool viewer_started{false};
+    std::jthread viewer([&] {
+        viewer_started.store(true);
+        (void)ledger.acquire(MemoryClass::viewer, MemoryOwner::playback_segment, 40,
+                             RetainedMemoryLedger::Clock::now() + 1s, &viewer_cancel);
+    });
+    while (!viewer_started.load()) std::this_thread::yield();
+    for (int i = 0; i < 200 && ledger.stats().waits[0] + ledger.stats().waits[3] == 0; ++i)
+        std::this_thread::sleep_for(1ms);
+    CHECK(!ledger.try_acquire(MemoryClass::speculative, MemoryOwner::rpc_frame, 1).has_value());
+    viewer_cancel.store(true);
+    viewer.join();
+
+    {
+        // Inside the reserve, reassembly is admitted despite that waiter: this
+        // is the confirmation path, and refusing it is what wedges the ledger.
+        // Scoped so the lease is released by its destructor -- an explicit
+        // reset() here trips a -Wmaybe-uninitialized false positive on GCC.
+        auto inside = ledger.try_acquire(MemoryClass::speculative, MemoryOwner::rpc_frame, 4);
+        REQUIRE(inside.has_value());
+
+        // Beyond the reserve it defers like anything else. Absolute priority
+        // here simply inverts the deadlock -- a node receiving from two peers
+        // starves its own publication -- so the guarantee must be bounded.
+        CHECK(!ledger.try_acquire(MemoryClass::speculative, MemoryOwner::rpc_frame, 4)
+                   .has_value());
+        // And an ordinary speculative admission is still deferred, so the
+        // reserve is specific to reassembly rather than a hole in the waiter
+        // discipline.
+        CHECK(!ledger.try_acquire(MemoryClass::speculative, MemoryOwner::cache, 1).has_value());
+    }
+    waiter.join();
+    CHECK(finished.load());
+
+    // Once the frame is reassembled the confirmation completes, publication
+    // releases, and the ledger is usable again.
+    publication.reset();
+    CHECK(ledger.stats().used_bytes == 0);
+}
+
 MACHA_FAST_TEST("foundations", test_retained_memory_ledger_sheds_borrowed_cache_for_viewer) {
     RetainedMemoryLedger ledger(100, 10, 30, 10);
     std::optional<RetainedMemoryLedger::Lease> borrowed;

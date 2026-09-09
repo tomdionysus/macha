@@ -177,6 +177,7 @@ fuse:
   spool_path: /var/spool/macha/fuse
   operation_journal_path: /var/lib/macha/fuse-operations.log
   publication_quantum_bytes: 32M
+  publication_no_progress_deadline_ms: 30000
   publication_inflight_bytes: 256M
   publication_pipeline_bytes: 8M
   viewer_weight: 95
@@ -209,6 +210,13 @@ never dropped.
 
 Data publication is fairly time-sliced by bytes. A generation retains its
 provisional writer and exact spool cursor after each
+`publication_no_progress_deadline_ms` bounds a publication worker blocked on
+retained-memory admission. It is a no-progress budget rather than a time limit
+on publishing: any worker in the pipeline completing a quantum re-arms it, so a
+slow node is never failed for being slow, while a pipeline where nothing at all
+advances fails with `EAGAIN` and enters the ordinary publication retry/park
+path instead of waiting forever. `0` restores the old unbounded wait.
+
 `publication_quantum_bytes` (32 MiB by default), returns to the loader queue,
 and becomes visible only after its final metadata commit. The quantum must be
 an extent-size multiple. `publication_inflight_bytes` (256 MiB by default) is

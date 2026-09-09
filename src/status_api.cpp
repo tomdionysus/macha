@@ -832,6 +832,11 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         retained_memory.viewer_reserve_bytes;
     retained_memory_diagnostics["loader_reserve_bytes"] =
         retained_memory.loader_reserve_bytes;
+    // The slice only inbound frame reassembly may draw on. Reported because
+    // its exhaustion is what turns a stuck publication into a node whose peer
+    // channels drop, and an operator needs to see the two side by side.
+    retained_memory_diagnostics["reassembly_reserve_bytes"] =
+        retained_memory.reassembly_reserve_bytes;
     retained_memory_diagnostics["used_bytes"] = retained_memory.used_bytes;
     retained_memory_diagnostics["peak_used_bytes"] = retained_memory.peak_used_bytes;
     retained_memory_diagnostics["reclaimable_bytes"] = retained_memory.reclaimable_bytes;
