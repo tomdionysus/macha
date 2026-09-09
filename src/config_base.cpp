@@ -179,6 +179,22 @@ void validate(Config& config) {
         throw std::runtime_error(
             "fuse.publication_pipeline_bytes must be an extent-size multiple from "
             "extent_size..min(publication_quantum_bytes, 8 extents)");
+    // An open writer holds at most one filling extent buffer plus its pipeline,
+    // and holds them across yields and retryable failures. Bound how many may
+    // be open so that worst case fits the loader's guaranteed share of the
+    // retained-memory ledger: then a writer waiting for admission is only ever
+    // waiting for control/viewer work, never for another publication which is
+    // itself waiting (es-1 hold-and-wait, 2026-09-09). Never below
+    // commit_workers -- a worker with no admissible inode is worse than a
+    // slightly overcommitted reserve, and the no-progress deadline still
+    // bounds the wait.
+    if (!config.fuse.publication_max_open_writers) {
+        const auto per_writer = static_cast<uint64_t>(config.extent_size) +
+                                config.fuse.publication_pipeline_bytes;
+        config.fuse.publication_max_open_writers = static_cast<size_t>(
+            std::max<uint64_t>(config.fuse.commit_workers,
+                               config.runtime.loader_memory_reserve_bytes / per_writer));
+    }
     if (!config.fuse.max_pending_requests || config.fuse.max_pending_requests > 65536 ||
         !config.fuse.max_pending_operations || config.fuse.max_pending_operations > 65536)
         throw std::runtime_error("fuse pending queue limits must be 1..65536");

@@ -933,6 +933,15 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                     values->data_closed_priority_selections;
                 filesystem_diagnostics["data_retirement_priority_selections"] =
                     values->data_retirement_priority_selections;
+                filesystem_diagnostics["open_publications"] = values->open_publications;
+                filesystem_diagnostics["peak_open_publications"] =
+                    values->peak_open_publications;
+                filesystem_diagnostics["publication_max_open_writers"] =
+                    values->publication_max_open_writers;
+                filesystem_diagnostics["data_publication_selections_under_writer_cap"] =
+                    values->data_publication_selections_under_writer_cap;
+                filesystem_diagnostics["data_publication_progress_events"] =
+                    values->data_publication_progress_events;
                 filesystem_diagnostics["data_publication_bytes_read"] =
                     values->data_publication_bytes_read;
                 filesystem_diagnostics["data_publication_bytes_committed"] =

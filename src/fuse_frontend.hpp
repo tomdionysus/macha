@@ -256,6 +256,17 @@ struct FuseFrontendStatus {
     uint64_t data_publication_peak_pipeline_extents{};
     uint64_t data_closed_priority_selections{};
     uint64_t data_retirement_priority_selections{};
+    uint64_t open_publications{};
+    uint64_t peak_open_publications{};
+    uint64_t publication_max_open_writers{};
+    uint64_t data_publication_selections_under_writer_cap{};
+    // Events that RELEASED publication-owned retained memory: a pipelined
+    // extent retiring into the manifest, and a handle committing. This is the
+    // counter a writer blocked on admission watches, and the one to read when
+    // asking "is this pipeline moving at all". Deliberately not the admitted-
+    // quantum count: quanta rise on a wedged node too, because a failure frees
+    // a slot that admits the next file.
+    uint64_t data_publication_progress_events{};
     uint64_t data_publication_bytes_read{};
     uint64_t data_publication_bytes_committed{};
     uint64_t data_publication_bytes_confirmed{};
@@ -338,6 +349,25 @@ struct FuseFrontendDiagnostics {
     uint64_t data_publication_peak_pipeline_extents{};
     uint64_t data_closed_priority_selections{};
     uint64_t data_retirement_priority_selections{};
+    // Inodes holding a provisional publication writer, its high-water mark, the
+    // bound on it, and how many queue selections happened while that bound was
+    // in effect. Each open writer holds up to one extent buffer plus the
+    // pipeline in retained memory, so peak_open_publications x (extent_size +
+    // pipeline limit) is publication's worst-case claim on the ledger.
+    // Selections under the bound rising while completions move is the bound
+    // working; rising while completions stay at zero means the open set itself
+    // is stuck.
+    uint64_t open_publications{};
+    uint64_t peak_open_publications{};
+    uint64_t publication_max_open_writers{};
+    uint64_t data_publication_selections_under_writer_cap{};
+    // Events that RELEASED publication-owned retained memory: a pipelined
+    // extent retiring into the manifest, and a handle committing. This is the
+    // counter a writer blocked on admission watches, and the one to read when
+    // asking "is this pipeline moving at all". Deliberately not the admitted-
+    // quantum count: quanta rise on a wedged node too, because a failure frees
+    // a slot that admits the next file.
+    uint64_t data_publication_progress_events{};
     uint64_t data_publication_bytes_read{};
     uint64_t data_publication_bytes_committed{};
     uint64_t data_publication_bytes_confirmed{};

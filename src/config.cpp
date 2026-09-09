@@ -272,6 +272,8 @@ void parse_fuse(const YAML::Node& root, Config& c) {
         c.fuse.publication_inflight_bytes = yaml_size(f["publication_inflight_bytes"]);
     if (f["publication_pipeline_bytes"])
         c.fuse.publication_pipeline_bytes = yaml_size(f["publication_pipeline_bytes"]);
+    if (f["publication_max_open_writers"])
+        c.fuse.publication_max_open_writers = f["publication_max_open_writers"].as<size_t>();
     if (f["max_pending_operations"]) c.fuse.max_pending_operations = f["max_pending_operations"].as<size_t>();
     if (f["max_operation_metadata_bytes"])
         c.fuse.max_operation_metadata_bytes = yaml_size(f["max_operation_metadata_bytes"]);

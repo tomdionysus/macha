@@ -177,6 +177,25 @@ struct FuseConfig {
     // Zero selects two extents, capped at one publication quantum. Validation
     // resolves this to an effective byte value before service startup.
     uint64_t publication_pipeline_bytes{};
+    // Upper bound on inodes holding a provisional writer at once.
+    //
+    // A writer is deliberately retained across clean yields and retryable
+    // failures so a resumed publication never replays spool bytes, and it keeps
+    // its retained-memory extent leases while it waits: one buffer being filled
+    // plus the pipeline above. Publication scheduling is breadth-first, so
+    // without a bound the number of writers holding partial state is simply the
+    // width of the backlog. On es-1 that reached 123 leases -- the entire
+    // durable-lower budget -- after which every writer needed one more extent
+    // and none could release one, and no budget setting could change it because
+    // any budget fills the same way (2026-09-09, classic hold-and-wait).
+    //
+    // Bounded so every open writer's worst case fits the loader reserve, the
+    // deadlock is impossible by construction: a writer waiting on the ledger is
+    // only ever waiting for control/viewer work, which releases. Past the bound
+    // the scheduler is depth-first over the already-open set, which is what
+    // drains a backlog anyway. Zero derives it from the loader reserve;
+    // validation resolves it before service startup.
+    size_t publication_max_open_writers{};
     size_t max_pending_operations{4096};
     // Conservative retained-heap budget for durable DataOp history, checksum
     // vectors and the publication snapshot which may coexist with it. This is

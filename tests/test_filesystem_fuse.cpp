@@ -2029,6 +2029,131 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_quanta_are_fair_and_byte_bou
     frontend->stop();
 }
 
+// A publication writer is retained across clean yields, and it keeps a
+// retained-memory extent lease while it waits. Publication scheduling is
+// breadth-first, so the number of writers holding partial state is the width of
+// the backlog unless something bounds it: on es-1 that reached 123 leases, the
+// entire durable-lower budget, after which every writer needed one more extent
+// and none could release one (2026-09-09). Here the backlog is deliberately
+// wider than the ledger can hold writers for. With the bound, publication goes
+// depth-first over the open set and every file completes; without it, the
+// pipeline can consume the whole budget in partial buffers.
+MACHA_TEST("filesystem_fuse", test_fuse_publication_backlog_wider_than_ledger_completes) {
+    TestService fixture("fuse-publication-backlog-width");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    // Durable-lower is capacity - control - viewer = 16M, so the ledger holds
+    // at most 16 concurrent extent leases for publication.
+    config.runtime.retained_memory_bytes = 32ULL * 1024 * 1024;
+    config.runtime.control_memory_reserve_bytes = 8ULL * 1024 * 1024;
+    config.runtime.viewer_memory_reserve_bytes = 8ULL * 1024 * 1024;
+    config.runtime.loader_memory_reserve_bytes = 8ULL * 1024 * 1024;
+    config.runtime.reassembly_memory_reserve_bytes = 4ULL * 1024 * 1024;
+    config.fuse.commit_workers = 2;
+    // Quantum == extent size makes every quantum yield mid-extent, which is
+    // what leaves a partial buffer -- and its lease -- on the retained writer.
+    config.fuse.publication_quantum_bytes = config.extent_size;
+    config.fuse.publication_inflight_bytes = 2 * config.fuse.publication_quantum_bytes;
+    config.fuse.publication_pipeline_bytes = config.extent_size;
+    config.fuse.publication_no_progress_deadline = 2s;
+    // Hold publication off while the backlog is staged, so the whole width
+    // arrives at the scheduler at once instead of draining as it is written.
+    config.fuse.publication_quiet = 500ms;
+    config.fuse.suspend_loader_for_tests = true;
+    // Worst case 4 x (1M buffer + 1M pipeline) = 8M, the loader reserve. The
+    // service normalises its own copy of the config; this frontend is
+    // constructed from the fixture's, where State's constructor derives the
+    // same value. Pin it so the test states what it is testing.
+    config.fuse.publication_max_open_writers = 4;
+
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+
+    constexpr size_t files = 20;
+    const auto contents = pattern(2 * 1024 * 1024 + 12345, 91);
+    for (size_t i = 0; i < files; ++i) {
+        service.filesystem().store().foreground_activity(1);
+        const auto path = "/backlog-" + std::to_string(i) + ".bin";
+        auto handle = frontend->create(path, 0644, getuid(), getgid(), false, true, false);
+        REQUIRE(frontend->write(handle.inode, 0, contents) == contents.size());
+        frontend->release(handle.inode, true);
+    }
+
+    // The viewer window lapses and publication becomes work-conserving with the
+    // entire backlog already queued.
+    REQUIRE(frontend->wait_for_idle(180s));
+
+    const auto status = frontend->status();
+    const auto diagnostics = frontend->diagnostics();
+    CHECK(status.data_publications_started == files);
+    CHECK(status.data_publications_completed == files);
+    CHECK(diagnostics.parked_publications == 0);
+    // The invariant itself: never more writers open than the ledger was sized
+    // for. Without the bound this reaches the width of the backlog.
+    CHECK(diagnostics.peak_open_publications <= config.fuse.publication_max_open_writers);
+    // And the bound must actually have bitten; otherwise this passes for the
+    // wrong reason and stops guarding anything.
+    CHECK(diagnostics.data_publication_selections_under_writer_cap > 0);
+    CHECK(diagnostics.open_publications == 0);
+    // Nothing failed. Unbounded, the same backlog opens 20 writers, fills the
+    // durable-lower budget with partial buffers and only escapes through the
+    // no-progress deadline: 18 retryable failures and four times the wall clock
+    // when this was measured.
+    CHECK(diagnostics.backend_failures == 0);
+    for (size_t i = 0; i < files; ++i)
+        CHECK(service.filesystem().getattr("/backlog-" + std::to_string(i) + ".bin").size ==
+              contents.size());
+    // Every lease taken for publication is back.
+    CHECK(service.node().retained_memory().stats().owner_bytes[static_cast<size_t>(
+              MemoryOwner::publication)] == 0);
+    frontend->stop();
+}
+
+// The no-progress deadline is only meaningful if it watches something that
+// actually releases retained memory. Watching admitted quanta instead re-armed
+// every blocked writer's window whenever a *new* publication was let in -- and
+// on a wedged node a failure frees a slot, which admits the next file, so the
+// window was re-armed once per failure and the deadline serialised into one
+// failure per budget instead of failing every stuck worker (es-1, 2026-09-09).
+// Quanta and progress events must therefore not be the same number: a
+// publication yields far more often than it retires an extent.
+MACHA_TEST("filesystem_fuse", test_publication_progress_counts_releases_not_admissions) {
+    TestService fixture("fuse-publication-progress-counter");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 1;
+    config.fuse.publication_quiet = 0ms;
+    // Quantum == extent size yields after one 256K spool chunk, so a 4M file
+    // takes many quanta while retiring only four extents plus one commit.
+    config.fuse.publication_quantum_bytes = config.extent_size;
+    config.fuse.publication_inflight_bytes = config.fuse.publication_quantum_bytes;
+    config.fuse.publication_pipeline_bytes = config.extent_size;
+
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto handle = frontend->create("/progress-counter.bin", 0644, getuid(), getgid(), false,
+                                   true, false);
+    const auto contents = pattern(4 * config.extent_size, 77);
+    REQUIRE(frontend->write(handle.inode, 0, contents) == contents.size());
+    frontend->release(handle.inode, true);
+    REQUIRE(frontend->wait_for_idle(60s));
+
+    const auto diagnostics = frontend->diagnostics();
+    CHECK(diagnostics.data_publications_completed == 1);
+    CHECK(diagnostics.data_publication_progress_events > 0);
+    // The distinguishing property. If the deadline watched admitted quanta
+    // these would be the same counter and this would be an equality.
+    CHECK(diagnostics.data_publication_quanta > diagnostics.data_publication_progress_events);
+    CHECK(service.filesystem().getattr("/progress-counter.bin").size == contents.size());
+    frontend->stop();
+}
+
 MACHA_TEST("filesystem_fuse", test_fuse_retryable_publication_failure_preserves_cursor) {
     TestService fixture("fuse-publication-transient-cursor");
     auto& config = fixture.config();

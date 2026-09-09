@@ -1240,6 +1240,35 @@ MACHA_TEST("foundations", test_normalize_config_defaults_plugin_path_to_the_buil
     }
 }
 
+MACHA_TEST("foundations", test_publication_open_writer_bound_fits_the_loader_reserve) {
+    // The bound exists so every writer that may be open at once can hold its
+    // worst case -- one filling extent buffer plus its pipeline -- inside the
+    // loader's guaranteed share of the retained-memory ledger. Unbounded, the
+    // number of writers holding partial state is the width of the publication
+    // backlog, and they deadlock against each other (es-1, 2026-09-09).
+    auto config = minimal_valid_config();
+    config.extent_size = 4 * 1024 * 1024;
+    config.fuse.commit_workers = 8;
+    config.runtime.loader_memory_reserve_bytes = 64ULL * 1024 * 1024;
+    auto normalized = normalize_config(config);
+    const auto per_writer =
+        static_cast<uint64_t>(normalized.extent_size) + normalized.fuse.publication_pipeline_bytes;
+    CHECK(per_writer == 12ULL * 1024 * 1024); // 4M buffer + two 4M pipeline extents
+    // 64M / 12M is 5, but never fewer than one writer per commit worker: a
+    // worker with no admissible inode is worse than a slightly overcommitted
+    // reserve, and the no-progress deadline still bounds the wait.
+    CHECK(normalized.fuse.publication_max_open_writers == 8);
+
+    // With enough reserve the ledger, not the worker count, sets the bound.
+    config.runtime.retained_memory_bytes = 2048ULL * 1024 * 1024;
+    config.runtime.loader_memory_reserve_bytes = 600ULL * 1024 * 1024;
+    CHECK(normalize_config(config).fuse.publication_max_open_writers == 50);
+
+    // An explicit operator value is never overridden.
+    config.fuse.publication_max_open_writers = 3;
+    CHECK(normalize_config(config).fuse.publication_max_open_writers == 3);
+}
+
 MACHA_TEST("foundations", test_normalize_config_preserves_an_explicit_plugin_path) {
     auto config = minimal_valid_config();
     config.plugin_path = "/opt/macha/plugins";

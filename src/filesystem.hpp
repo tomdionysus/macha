@@ -286,6 +286,15 @@ class FileSystem {
     std::atomic_uint64_t extent_tasks_peak_queued_{};
     std::atomic_uint64_t extent_tasks_peak_active_{};
     std::atomic_uint64_t extent_tasks_submitted_{};
+    // Counts events that RELEASE MemoryOwner::publication leases: a pipelined
+    // extent retiring into the manifest, and a handle committing. This is what
+    // a writer blocked on retained-memory admission must watch, because it is
+    // the only thing that can end that wait. Counting admitted quanta instead
+    // re-armed every waiter's window whenever a *new* publication was let in,
+    // which on a wedged node happens once per failure -- so the no-progress
+    // deadline could never fire and the pipeline never parked (es-1,
+    // 2026-09-09).
+    std::atomic_uint64_t write_progress_{};
     std::vector<std::jthread> extent_workers_;
     void extent_worker(std::stop_token);
     std::future<WriteHandle::StagedExtentResult> submit_extent_task(
@@ -421,6 +430,13 @@ class FileSystem {
     }
     size_t extent_size() const {
         return n_.config().extent_size;
+    }
+    // Shared across every writer in the process, so progress by any of them
+    // re-arms the no-progress window of all of them: memory that one handle
+    // releases is memory another can be admitted against.
+    const std::atomic_uint64_t& write_progress() const noexcept { return write_progress_; }
+    void note_write_progress() noexcept {
+        write_progress_.fetch_add(1, std::memory_order_relaxed);
     }
 };
 

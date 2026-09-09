@@ -701,6 +701,14 @@ struct FuseFrontend::State {
     // not a viewer signal: bulk loaders may keep writers open continuously and
     // must not thereby collapse publication to a single worker.
     std::atomic_size_t open_writers{};
+    // Inodes currently holding a provisional publication writer, and therefore
+    // holding that writer's retained-memory extent leases. Maintained under the
+    // inode mutex by set_data_publication_locked(), which is the only place
+    // Inode::data_publication changes, and bounded by
+    // config.publication_max_open_writers so the ledger cannot deadlock against
+    // itself.
+    std::atomic_size_t open_publications{};
+    std::atomic_size_t peak_open_publications{};
 
     std::array<BrokerQueue, 6> broker;
     std::atomic_size_t broker_pending{};
@@ -747,6 +755,11 @@ struct FuseFrontend::State {
     std::atomic_uint64_t data_publication_peak_pipeline_extents{};
     std::atomic_uint64_t data_closed_priority_selections{};
     std::atomic_uint64_t data_retirement_priority_selections{};
+    // Queue selections made while the open-writer bound was in effect, i.e.
+    // where an inode that already holds a writer was preferred over starting a
+    // new one. Non-zero with completions moving is the bound doing its job;
+    // non-zero with completions at zero means the open set itself is stuck.
+    std::atomic_uint64_t data_publication_selections_under_writer_cap{};
     std::atomic_uint64_t data_publication_bytes_read{};
     std::atomic_uint64_t data_publication_bytes_committed{};
     std::atomic_uint64_t data_publication_bytes_confirmed{};
@@ -813,6 +826,17 @@ struct FuseFrontend::State {
             config.publication_pipeline_bytes =
                 std::min<uint64_t>(config.publication_quantum_bytes,
                                    static_cast<uint64_t>(fs.extent_size()) * 2);
+        // Same for the open-writer bound, and for the same reason: an
+        // unbounded one can consume the whole durable-lower budget in partial
+        // extent buffers and deadlock the ledger against itself. Derive it from
+        // the node's loader reserve exactly as validation does.
+        if (!config.publication_max_open_writers) {
+            const auto per_writer =
+                static_cast<uint64_t>(fs.extent_size()) + config.publication_pipeline_bytes;
+            config.publication_max_open_writers = static_cast<size_t>(std::max<uint64_t>(
+                config.commit_workers,
+                fs.node().config().runtime.loader_memory_reserve_bytes / per_writer));
+        }
         fuse_namespace_origin = derive_fuse_namespace_origin(fs.node().node_id());
     }
 
@@ -925,6 +949,35 @@ struct FuseFrontend::State {
         else
             total.fetch_sub(accounted - current, std::memory_order_relaxed);
         accounted = current;
+    }
+
+    // The only place Inode::data_publication changes, so open_publications
+    // cannot drift from it. An open publication owns a provisional WriteHandle
+    // holding retained-memory extent leases across yields and retryable
+    // failures; the scheduler bounds how many may exist at once, and a bound is
+    // only as good as its count. Caller holds inode.mutex.
+    void set_data_publication_locked(Inode& inode, std::shared_ptr<DataPublication> publication) {
+        const bool was_open = inode.data_publication != nullptr;
+        const bool now_open = publication != nullptr;
+        inode.data_publication = std::move(publication);
+        if (was_open == now_open)
+            return;
+        if (!now_open) {
+            open_publications.fetch_sub(1, std::memory_order_relaxed);
+            return;
+        }
+        const auto open = open_publications.fetch_add(1, std::memory_order_relaxed) + 1;
+        auto peak = peak_open_publications.load(std::memory_order_relaxed);
+        while (peak < open &&
+               !peak_open_publications.compare_exchange_weak(peak, open,
+                                                             std::memory_order_relaxed)) {
+        }
+    }
+
+    bool writer_cap_reached() const {
+        return config.publication_max_open_writers &&
+               open_publications.load(std::memory_order_relaxed) >=
+                   config.publication_max_open_writers;
     }
 
     void refresh_retained_owners_locked(Inode& inode) {
@@ -3432,7 +3485,7 @@ struct FuseFrontend::State {
                     WriteDurability::publication_generation,
                     config.publication_pipeline_bytes,
                     DataWorkContext(FrameType::loader, config.publication_quantum_bytes, {},
-                                    nullptr, &data_publication_quanta,
+                                    nullptr, &fs.write_progress(),
                                     config.publication_no_progress_deadline));
             } catch (const FsError& e) {
                 if (e.code() == ENOENT && publication_path_may_still_appear(inode))
@@ -3657,15 +3710,28 @@ struct FuseFrontend::State {
         if (!data_global_slot_available())
             return data_queue.end();
 
+        // Past the open-writer bound, only inodes which already hold a writer
+        // are admissible: they can finish with the leases they have, where a
+        // new one would have to take more from a ledger that is already
+        // committed to the open set. This turns the scheduler depth-first over
+        // the open set exactly when breadth would deadlock it, and is the whole
+        // reason a publication waiting on retained memory is now guaranteed to
+        // be waiting for control/viewer work rather than for another
+        // publication (es-1, 2026-09-09).
+        const bool bounded = writer_cap_reached();
+        const auto admissible = [bounded](const Inode& inode) {
+            return !bounded || inode.data_publication != nullptr;
+        };
+
         // Closed loader files win first so a multi-gigabyte open import cannot
         // hide complete files from the authoritative namespace and catalogue.
         // Journal provenance is deliberately irrelevant: a restart does not
         // demote user-requested ingest to background recovery.
         // Inspect the current handle state rather than freezing it at enqueue:
         // release() can close an inode while it is already waiting here.
-        auto loader = std::find_if(data_queue.begin(), data_queue.end(), [](const DataQueueItem& item) {
+        auto loader = std::find_if(data_queue.begin(), data_queue.end(), [&](const DataQueueItem& item) {
             std::lock_guard inode_lock(item.inode->mutex);
-            return item.inode->writable_handles == 0;
+            return item.inode->writable_handles == 0 && admissible(*item.inode);
         });
         if (loader != data_queue.end() && spool_under_pressure()) {
             struct RetirementScore {
@@ -3726,7 +3792,8 @@ struct FuseFrontend::State {
                 RetirementScore candidate_score;
                 {
                     std::lock_guard inode_lock(candidate->inode->mutex);
-                    if (candidate->inode->writable_handles != 0)
+                    if (candidate->inode->writable_handles != 0 ||
+                        !admissible(*candidate->inode))
                         continue;
                 }
                 candidate_score = score(*candidate);
@@ -3743,7 +3810,13 @@ struct FuseFrontend::State {
 
         // Open loader files, including journal-restored files that an rsync has
         // resumed, use otherwise idle capacity behind the viewer gate.
-        return data_queue.begin();
+        if (!bounded)
+            return data_queue.begin();
+        return std::find_if(data_queue.begin(), data_queue.end(),
+                            [](const DataQueueItem& item) {
+                                std::lock_guard inode_lock(item.inode->mutex);
+                                return item.inode->data_publication != nullptr;
+                            });
     }
 
     bool runnable_data_available_locked() {
@@ -3757,37 +3830,47 @@ struct FuseFrontend::State {
             {
                 std::unique_lock lock(data_queue_mutex);
                 while (!stop.stop_requested() && !stopping.load()) {
+                    // Backed-off inodes are not in the queue at all, so their
+                    // due time is a clock deadline nothing will notify.
+                    const auto due_ns = deferred_retry_due_ns.load(std::memory_order_acquire);
+                    std::optional<Clock::time_point> due;
+                    if (due_ns)
+                        due = Clock::time_point{std::chrono::nanoseconds(due_ns)};
+                    if (due && Clock::now() >= *due) {
+                        lock.unlock();
+                        deferred_retry_due_ns.store(0, std::memory_order_release);
+                        admit_deferred();
+                        lock.lock();
+                        continue;
+                    }
                     if (data_queue.empty()) {
-                        // Backed-off inodes are not in the queue. Sleep to the
-                        // earliest due time and re-admit; otherwise wait for
-                        // new work.
-                        const auto due_ns = deferred_retry_due_ns.load(std::memory_order_acquire);
-                        if (due_ns) {
-                            const Clock::time_point due{std::chrono::nanoseconds(due_ns)};
-                            if (Clock::now() >= due) {
-                                lock.unlock();
-                                deferred_retry_due_ns.store(0, std::memory_order_release);
-                                admit_deferred();
-                                lock.lock();
-                                continue;
-                            }
-                            data_cv.wait_until(lock, stop, due, [&] {
-                                return stopping.load() || !data_queue.empty() ||
-                                       deferred_retry_due_ns.load(std::memory_order_acquire) !=
-                                           due_ns;
-                            });
-                            continue;
-                        }
-                        data_cv.wait(lock, stop,
-                                     [&] { return stopping.load() || !data_queue.empty(); });
+                        // Sleep to the earliest due time and re-admit;
+                        // otherwise wait for new work.
+                        const auto arrived = [&] {
+                            return stopping.load() || !data_queue.empty() ||
+                                   deferred_retry_due_ns.load(std::memory_order_acquire) != due_ns;
+                        };
+                        if (due)
+                            data_cv.wait_until(lock, stop, *due, arrived);
+                        else
+                            data_cv.wait(lock, stop, arrived);
                         continue;
                     }
                     if (runnable_data_available_locked())
                         break;
 
                     // Cooldown expiry and viewer-idle expiry are deadline
-                    // transitions. Sleep directly to the earlier one; active
-                    // publication completion and new queue work notify data_cv.
+                    // transitions. Sleep directly to the earliest of those and
+                    // the deferred due time; active publication completion and
+                    // new queue work notify data_cv.
+                    //
+                    // The due time matters here and not only on an empty queue:
+                    // with a bounded open-writer count the queue can be full of
+                    // inodes that are not admissible while the only inodes that
+                    // could release a writer are backed off, and then no notify
+                    // is coming. Before the bound, a non-empty queue always had
+                    // a running worker to notify it.
+                    auto wake_at = due;
                     if (viewer_active()) {
                         const auto now = Clock::now();
                         const auto cooldown = weighted_loader.wait_for(now, true);
@@ -3799,17 +3882,19 @@ struct FuseFrontend::State {
                         auto wake_after = quiet_remaining;
                         if (cooldown > std::chrono::milliseconds(0))
                             wake_after = std::min(wake_after, cooldown);
-                        if (wake_after > std::chrono::milliseconds(0)) {
-                            data_cv.wait_for(lock, stop, wake_after, [&] {
-                                return stopping.load() || data_queue.empty();
-                            });
-                            continue;
-                        }
+                        if (wake_after > std::chrono::milliseconds(0))
+                            wake_at = wake_at ? std::min(*wake_at, now + wake_after)
+                                              : now + wake_after;
                     }
-                    data_cv.wait(lock, stop, [&] {
+                    const auto changed = [&] {
                         return stopping.load() || data_queue.empty() ||
-                               runnable_data_available_locked();
-                    });
+                               runnable_data_available_locked() ||
+                               deferred_retry_due_ns.load(std::memory_order_acquire) != due_ns;
+                    };
+                    if (wake_at)
+                        data_cv.wait_until(lock, stop, *wake_at, changed);
+                    else
+                        data_cv.wait(lock, stop, changed);
                 }
                 if (stop.stop_requested() || stopping.load())
                     break;
@@ -3844,6 +3929,9 @@ struct FuseFrontend::State {
                 if (selected_retirement_ahead_of_closed)
                     data_retirement_priority_selections.fetch_add(1,
                                                                    std::memory_order_relaxed);
+                if (writer_cap_reached())
+                    data_publication_selections_under_writer_cap.fetch_add(
+                        1, std::memory_order_relaxed);
                 inode = selected->inode;
                 recovered = selected->recovered;
                 data_queue.erase(selected);
@@ -3887,7 +3975,7 @@ struct FuseFrontend::State {
                     created->recovered = recovered;
                     {
                         std::lock_guard lock(inode->mutex);
-                        inode->data_publication = created;
+                        set_data_publication_locked(*inode, created);
                         refresh_retained_owners_locked(*inode);
                     }
                     publication = std::move(created);
@@ -3944,7 +4032,7 @@ struct FuseFrontend::State {
                                   " inode=" + std::to_string(inode->id) + " error=" + e.what();
                 if (replay) {
                     std::lock_guard lock(inode->mutex);
-                    inode->data_publication.reset();
+                    set_data_publication_locked(*inode, nullptr);
                 }
                 if (abandoned) {
                     // Resolved above; nothing pending remains on this inode.
@@ -3967,7 +4055,7 @@ struct FuseFrontend::State {
                         path = inode->current_path;
                         if (!delay) {
                             inode->parked = Inode::Parked{code, e.what(), now};
-                            inode->data_publication.reset();
+                            set_data_publication_locked(*inode, nullptr);
                         }
                     }
                     if (delay) {
@@ -4017,7 +4105,7 @@ struct FuseFrontend::State {
                 if (completed)
                     inode->publication_retry.succeeded();
                 if (completed || inode->backend_error || inode->parked)
-                    inode->data_publication.reset();
+                    set_data_publication_locked(*inode, nullptr);
                 refresh_retained_owners_locked(*inode);
                 const bool still_requested =
                     inode->requested_data_sequence > inode->published_data_sequence;
@@ -5049,6 +5137,19 @@ struct FuseFrontend::State {
             data_workers.emplace_back([this](std::stop_token stop) {
                 run_supervised("fuse-data", [this, stop] { data_loop(stop); });
             });
+        // The bound and its worst-case memory cost, so an operator can compare
+        // it against runtime.loader_memory_reserve_bytes without arithmetic.
+        if (config.publication_max_open_writers) {
+            const auto per_writer =
+                static_cast<uint64_t>(fs.extent_size()) + config.publication_pipeline_bytes;
+            Log::info("FUSE publication open-writer bound=" +
+                      std::to_string(config.publication_max_open_writers) +
+                      " per_writer_bytes=" + std::to_string(per_writer) + " worst_case_bytes=" +
+                      std::to_string(per_writer * config.publication_max_open_writers));
+        } else {
+            Log::warn("FUSE publication open-writer bound is disabled; retained-memory "
+                      "admission can deadlock against itself under a wide backlog");
+        }
 
         // Recovery is reconstructed before worker startup so kernel-visible state
         // is complete before the frontend is exposed. Resume asynchronous
@@ -6283,6 +6384,12 @@ FuseFrontendStatus FuseFrontend::status() const {
     out.data_closed_priority_selections = diagnostics.data_closed_priority_selections;
     out.data_retirement_priority_selections =
         diagnostics.data_retirement_priority_selections;
+    out.open_publications = diagnostics.open_publications;
+    out.peak_open_publications = diagnostics.peak_open_publications;
+    out.publication_max_open_writers = diagnostics.publication_max_open_writers;
+    out.data_publication_selections_under_writer_cap =
+        diagnostics.data_publication_selections_under_writer_cap;
+    out.data_publication_progress_events = diagnostics.data_publication_progress_events;
     out.data_publication_bytes_read = diagnostics.data_publication_bytes_read;
     out.data_publication_bytes_committed = diagnostics.data_publication_bytes_committed;
     out.data_publication_bytes_confirmed = diagnostics.data_publication_bytes_confirmed;
@@ -6364,6 +6471,11 @@ FuseFrontendDiagnostics FuseFrontend::diagnostics() const noexcept {
         state_->data_publication_peak_pipeline_extents.load(std::memory_order_relaxed),
         state_->data_closed_priority_selections.load(std::memory_order_relaxed),
         state_->data_retirement_priority_selections.load(std::memory_order_relaxed),
+        state_->open_publications.load(std::memory_order_relaxed),
+        state_->peak_open_publications.load(std::memory_order_relaxed),
+        state_->config.publication_max_open_writers,
+        state_->data_publication_selections_under_writer_cap.load(std::memory_order_relaxed),
+        state_->fs.write_progress().load(std::memory_order_relaxed),
         state_->data_publication_bytes_read.load(std::memory_order_relaxed),
         state_->data_publication_bytes_committed.load(std::memory_order_relaxed),
         state_->data_publication_bytes_confirmed.load(std::memory_order_relaxed),
