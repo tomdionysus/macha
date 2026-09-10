@@ -9,6 +9,7 @@
 #include "ingest.hpp"
 #include "torrent.hpp"
 
+#include <atomic>
 #include <condition_variable>
 #include <filesystem>
 #include <map>
@@ -31,12 +32,20 @@ class TorrentManager final : public TorrentService {
     std::condition_variable_any cv_;
     std::map<std::string, TorrentJob, std::less<>> jobs_;
     std::unique_ptr<Impl> impl_;
+    std::atomic_bool alerts_pending_{false};
+    // Listen endpoints libtorrent reported succeeding, excluding loopback. A
+    // session with none of these can reach no peer and must say so.
+    size_t routable_listen_endpoints_{};
+    bool warned_loopback_only_{};
     std::jthread worker_;
 
     void load_state();
     void save_state_locked() const;
     void restore_jobs();
     void loop(std::stop_token);
+    // Drains libtorrent's alert queue into the journal. Also the only place
+    // that can observe whether the session actually bound a usable interface.
+    void drain_alerts();
     void update_jobs();
     bool has_active_jobs_locked() const;
     std::string add_impl(std::string uri, bool allow_fetch);
