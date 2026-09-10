@@ -239,9 +239,14 @@ without this bound the number of writers holding partial state is simply the
 width of the backlog: on one node that reached 123 leases, the entire
 durable-lower budget, after which every writer needed one more extent and none
 could release one. No byte budget fixes that, because any budget fills the same
-way. When omitted the bound is derived so that every open writer's worst case
-fits `runtime.loader_memory_reserve_bytes` -- `loader_memory_reserve_bytes /
+way. When omitted the bound is derived so that the open set's worst case fits
+`runtime.loader_memory_reserve_bytes` -- `loader_memory_reserve_bytes /
 (extent_size + publication_pipeline_bytes)`, never fewer than `commit_workers`.
+The bound is soft: the scheduler tests the count before selecting an inode and
+the worker opens the writer afterwards, so concurrent workers can overshoot it
+by up to `commit_workers - 1` (9 against a bound of 8 was observed live). Size
+the reserve with that headroom in mind, and read `peak_open_publications`
+rather than assuming the configured value was never exceeded.
 Past the bound the scheduler is depth-first over the already-open set, which is
 what drains a backlog anyway. Status reports `open_publications`,
 `peak_open_publications`, `publication_max_open_writers` and

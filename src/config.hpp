@@ -189,12 +189,20 @@ struct FuseConfig {
     // and none could release one, and no budget setting could change it because
     // any budget fills the same way (2026-09-09, classic hold-and-wait).
     //
-    // Bounded so every open writer's worst case fits the loader reserve, the
-    // deadlock is impossible by construction: a writer waiting on the ledger is
-    // only ever waiting for control/viewer work, which releases. Past the bound
-    // the scheduler is depth-first over the already-open set, which is what
-    // drains a backlog anyway. Zero derives it from the loader reserve;
+    // Bounded so the open set's worst case fits the loader reserve, a writer
+    // waiting on the ledger is waiting for control/viewer work, which releases,
+    // rather than for another publication which is itself waiting. Past the
+    // bound the scheduler is depth-first over the already-open set, which is
+    // what drains a backlog anyway. Zero derives it from the loader reserve;
     // validation resolves it before service startup.
+    //
+    // This is a SOFT bound. The scheduler tests the count before selecting an
+    // inode and the worker opens the writer later, so N workers can each pass
+    // the test at bound-1 and overshoot by up to commit_workers-1. Observed
+    // live: 9 open against a bound of 8 (es-1, 2026-09-10). The headroom
+    // absorbs it -- 9 writers is 108 MB against a 512 MB durable-lower budget
+    // -- but the reserve is a target rather than a ceiling until the slot is
+    // reserved at selection time the way transcode entitlements already are.
     size_t publication_max_open_writers{};
     size_t max_pending_operations{4096};
     // Conservative retained-heap budget for durable DataOp history, checksum

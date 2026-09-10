@@ -182,9 +182,11 @@ void validate(Config& config) {
     // An open writer holds at most one filling extent buffer plus its pipeline,
     // and holds them across yields and retryable failures. Bound how many may
     // be open so that worst case fits the loader's guaranteed share of the
-    // retained-memory ledger: then a writer waiting for admission is only ever
-    // waiting for control/viewer work, never for another publication which is
-    // itself waiting (es-1 hold-and-wait, 2026-09-09). Never below
+    // retained-memory ledger: then a writer waiting for admission is waiting
+    // for control/viewer work, not for another publication which is itself
+    // waiting (es-1 hold-and-wait, 2026-09-09). The bound is soft -- see
+    // FuseConfig::publication_max_open_writers -- so treat this as a target
+    // rather than a ceiling. Never below
     // commit_workers -- a worker with no admissible inode is worse than a
     // slightly overcommitted reserve, and the no-progress deadline still
     // bounds the wait.

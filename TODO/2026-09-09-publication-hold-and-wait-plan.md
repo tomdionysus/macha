@@ -75,8 +75,11 @@ zero. Under contention that is strictly worse than the current state.
 > one of them can hold its worst-case leases (one buffer plus the pipeline)
 > simultaneously within the loader's guaranteed share of the ledger.
 
-With that, hold-and-wait is impossible by construction: a writer waiting on
-the ledger is only ever waiting for control/viewer work, which releases.
+With that, hold-and-wait is prevented: a writer waiting on the ledger is
+waiting for control/viewer work, which releases, rather than for another
+publication which is itself waiting. (As landed the bound is soft and can
+overshoot by up to commit_workers-1; making it exact needs a reservation at
+selection time. See the 2026-09-10 status note at the end.)
 The retained-cursor design (writer kept across yields and retryable failures,
 no spool replay) stays exactly as it is.
 
@@ -266,3 +269,76 @@ New tests: `test_fuse_publication_backlog_wider_than_ledger_completes`,
   live fault; I would take it now only if the test hook is cheap.
 - **Measure the 123 split first?** Optional gdb pass on es-1 before step 0.
   The test in step 0 is the real gate either way.
+
+## Deployed, and two defects found afterwards (2026-09-10)
+
+0.36.8 and 0.36.9 were deployed to all three nodes on 2026-09-09 evening. The
+result is not in doubt: es-1's 8.59 GB spool, which had not moved in hours,
+drained completely with every byte confirmed, and over the following 15 hours
+under live ingest the cluster published ~475 GB with `parked_publications` 0,
+`waits.loader` 0 on every node, and peak ledger use of 156 MB against 768 MB.
+
+Two defects in the landed work were found afterwards. Neither has fired.
+
+### 1. The progress counter misses two extent-publishing paths, and counts the wrong thing anyway
+
+`FileSystem::write_progress_` is ticked in `drain_one_extent()` and `commit()`.
+Two other paths publish a durable extent without ticking it: `rebuild_step`
+(`filesystem.cpp:1229`), which calls `put_deferred` and pushes straight into
+the manifest, and the non-pipelined branch of `flush()` (`filesystem.cpp:489`).
+A node writing non-sequentially -- `rsync --inplace` patching partially present
+files, which is exactly what a resumed import does -- can therefore publish
+hard while the counter reads flat. Under memory pressure that fails healthy
+work with `EAGAIN` and eventually parks it: the failure this work exists to
+prevent, reintroduced at a different site.
+
+Patching the two sites is **not** the fix. The waiter is blocked on the shared
+durable-lower budget, which anyone's release can free -- a `fuse_operation`
+lease, a cache eviction, an `rpc_frame` retiring. Publication's own releases
+were never the right thing to count, so a complete set of `WriteHandle` call
+sites would still be wrong. Worse, ticking in `rebuild_step` would re-arm every
+blocked waiter's window on work that frees no memory, which can mask a genuine
+deadlock for the duration of a long rebuild.
+
+The fix is to move the no-progress budget into `RetainedMemoryLedger::acquire()`
+(`retained_memory.hpp:290`), which already owns the loop, the condition
+variable, the deadline, the cancellation check and `available_locked()` itself.
+`ensure_buffer_memory`'s hand-rolled slice loop then disappears, along with
+`DataWorkContext`'s progress pointer and `FileSystem::write_progress_`, and
+every ledger consumer gets the protection rather than only publication.
+
+Note the predicate must be **per waiter**, not a global release counter. An
+earlier sketch proposed bumping an epoch wherever the ledger already calls
+`cv_.notify_all()`; that is too permissive, because the ledger notifies on
+every release, every cancelled wait and every acquire that satisfies a waiter,
+so on a busy node the deadline would never fire and the original wedge would go
+undetected again. Re-arm only when *this* waiter's own admission condition
+could newly have become true.
+
+`publication_no_progress_deadline_ms` must be re-derived against the corrected
+counter rather than inherited: 30 s was chosen against a counter that in
+practice ticked mostly on commits, and changing what it counts silently changes
+what the constant means.
+
+Keep `data_publication_progress_events` as a publication-specific Status field
+alongside any ledger-wide figure. Its absence is what made es-1 unreadable.
+
+### 2. The open-writer bound is soft and can overshoot
+
+`runnable_data_locked` tests `writer_cap_reached()` before selecting an inode,
+and the worker opens the writer afterwards, so N workers can each pass the test
+at bound-1. Observed live on es-1: `peak_open_publications` 9 against
+`publication_max_open_writers` 8. Worst case is an overshoot of
+`commit_workers - 1`.
+
+Harmless as configured -- 9 writers is 108 MB against a 512 MB durable-lower
+budget -- but the comments and documentation claimed the bound guaranteed the
+open set fits the loader reserve, which it does not. Those claims are now
+corrected to describe a soft bound. Making it exact needs the slot reserved at
+selection time under `data_queue_mutex`, the way `reserved_video_transcodes`
+already reserves a transcode entitlement across its admission window.
+
+### Still not done
+
+Step 3 above -- the unbounded wait in `drain_one_extent` -- remains unfixed and
+still needs a `DistributedStore` fault-injection hook that does not exist.
