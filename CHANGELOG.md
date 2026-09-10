@@ -1,5 +1,97 @@
 # Current release
 
+## 0.36.9 — Bound how many files may hold a publication writer at once (development)
+
+es-1 held 515,899,392 bytes of publication-owned retained memory for hours,
+byte-identical across restarts, at 99.7% of the durable-lower budget, with 137
+publications started and none completed. No budget setting moved it: lowering
+`fuse.publication_inflight_bytes` from 256M to 96M changed the inflight figure
+and left `owners.publication` unchanged, because that setting bounds queue
+admission, not writer buffers.
+
+Every byte of `owners.publication` is a `WriteHandle` extent lease. A
+publication writer is deliberately retained across clean yields and retryable
+failures so a resumed publication never replays spool bytes, and it keeps
+those leases for as long as it is retained: one extent buffer being filled,
+plus the pipeline. A yield that does not land on an extent boundary leaves one
+behind, and publication scheduling is otherwise breadth-first, so the number of
+writers holding partial state is simply the width of the backlog. At a 4 MiB
+extent, 492 MiB is 123 such leases — against three running workers that can
+hold at most three each. Then every writer needed one more extent and none
+could release one: hold-and-wait. Any budget fills the same way, which is why
+no budget helped.
+
+- **`fuse.publication_max_open_writers`** bounds how many inodes may hold a
+  writer, derived so all of them can hold their worst case inside
+  `runtime.loader_memory_reserve_bytes` — `loader_reserve / (extent_size +
+  publication_pipeline_bytes)`, never below `commit_workers`. A writer waiting
+  on the ledger is then only ever waiting for control/viewer work, which
+  releases. Past the bound the scheduler is depth-first over the already-open
+  set, which is what drains a backlog anyway.
+- **The no-progress deadline watched the wrong counter.**
+  `data_publication_quanta` increments when a quantum is *admitted*, and on a
+  wedged node a failure frees a slot which admits the next file — so every
+  failure re-armed every other waiter's window, and the deadline serialised
+  into one failure per budget instead of failing every stuck worker. That is
+  the "different inode every 30 s, always `attempts=1`" log shape. It now
+  watches extent retirements and commits, the events that actually release
+  publication memory, reported as `data_publication_progress_events`.
+- **The deferred-retry due time now also arms the timer on the non-empty-queue
+  path.** Before the bound a non-empty queue always had a running worker to
+  notify it; with the bound the queue can be full of inodes that are not
+  admissible while the only inodes that could release a writer are backed off.
+- Status gains `open_publications`, `peak_open_publications`,
+  `publication_max_open_writers`,
+  `data_publication_selections_under_writer_cap` and
+  `data_publication_progress_events`.
+
+Measured on one backlog, unbounded against bounded at 4: 20 writers open at
+once filling 15.76M of a 16M durable-lower budget, 18 retryable failures and
+25.1 s wall clock, against 4 writers open, no failures and 6.8 s. On the live
+cluster the 8.59 GB spool that had not moved in hours drained completely, every
+byte confirmed, with no failures and nothing parked.
+
+Not fixed here and still live: `WriteHandle::drain_one_extent` waits on its
+extent future with no deadline and no cancellation check, so a stalled put
+blocks publication silently — the same shape one layer down.
+
+## 0.36.8 — A wedged publication pipeline can fail, retry and park (development)
+
+Two defects left a node publishing nothing for hours while reporting itself
+healthy, with `parked_publications` reading 0 and the spool draining at 0 B/s.
+
+**Reassembly starvation.** `MessageAssembler` could not get a retained-memory
+lease to reassemble an inbound frame, threw `process retained-memory RPC
+reassembly saturated` and killed the channel, about once a second. Every peer
+channel died 1–2 s after connecting, so requests re-dialled constantly and
+telemetry — the only consumer that never dials — appeared to vanish, which is
+why this first looked like a network fault. The loop is closed: publication
+holds its bytes until a peer confirms the write, that confirmation arrives as a
+frame which must be reassembled into the same ledger, and the reassembly is
+refused because publication is waiting.
+
+`runtime.reassembly_memory_reserve_bytes` (32 MB) gives reassembly a small
+dedicated slice. Its placement is load-bearing in both directions: below the
+control/viewer waiter gate, because a queued viewer outranks reassembly
+unconditionally; above the loader gate and the durable-lower budget, because
+those are what it deadlocks against. An earlier attempt gave reassembly
+priority over every gate and simply inverted the deadlock, starving
+publication on a node receiving from two peers.
+
+**Publication waited with no deadline at all.** The publication
+`DataWorkContext` was built without one, so the wait took the unbounded
+`cv_.wait` branch and all eight commit workers sat in `ensure_buffer_memory`
+holding 492 MB between them. Nothing ever failed, so the 0.30.0
+retry-and-park discipline could not see it.
+`fuse.publication_no_progress_deadline_ms` (30 s) is a no-progress budget, not
+a time limit on publishing: progress anywhere re-arms it, so a slow node is
+never failed for being slow, while a pipeline where nothing advances at all
+fails with `EAGAIN` and enters the ordinary retry/park path. Zero restores the
+old unbounded wait.
+
+Measured before → after: saturation events ~1/s → 0; canonical connections
+oscillating 0↔2 → stable; peer telemetry age climbing past 700 s → 1.2–4.7 s.
+
 ## 0.36.7 — A node stays visible while it is busy, and two title parsers stop lying (development)
 
 Three unrelated faults found the same day, all of them things the operator

@@ -4,55 +4,77 @@
 
 *Macha — Old Irish /ˈmˠaxə/ — approximately “MAKH-uh”*
 
-Macha is a C++20 MachaDFS (Macha Distributed File System) and media server for large, mostly immutable video and music libraries. Files are split into encrypted content-addressed extents, placed across ordinary machines, exposed through FUSE, indexed in a distributed catalogue, and served directly or through in-process FFmpeg remux/transcode pipelines.
+Macha is a C++20 distributed filesystem (MachaDFS) and media server for large,
+mostly immutable video and music libraries. Files are split into encrypted
+content-addressed extents, placed across ordinary machines, exposed through
+FUSE, indexed in a distributed catalogue, and served directly or through
+in-process FFmpeg remux/transcode pipelines.
 
-There is no permanent master, cloud service or account system. Nodes share a cluster key, discover peers through bootstrap endpoints, and converge data placement and replicas in the background.
+There is no permanent master, cloud service or account system. Nodes share a
+cluster key, discover peers through bootstrap endpoints, and converge data
+placement and replicas in the background.
 
-## 0.19 metadata availability contract
+## This repository, and what sits around it
 
-0.19 keeps the 0.18 storage layout but changes metadata coordination. Every known node is metadata-capable; there is no privileged voter subset. `dht.metadata_min_write_replicas` is the minimum number of distinct active nodes that must durably accept a namespace/control mutation before it can be published.
+This repository is **the node** — the daemon that stores, replicates and serves
+media. The `macha` binary is the whole server: DFS, FUSE mount, catalogue, HTTP
+API and playback engine, alongside `macha-metadata-dump` and
+`macha-metadata-repair` for offline forensics. A cluster is several nodes
+sharing a key.
 
-The storage model has three explicit classes:
+Players are separate projects and are not in this tree. They reach a node over
+its HTTP API, and the division of responsibility between them is deliberate and
+worth understanding before changing either side:
 
-- **DATA** — media extents, artwork, subtitles and other immutable payload objects. DATA is placed by the DHT across eligible node/backend capacity. A full preferred owner falls through to the next deterministic candidate.
-- **CONTROL/METADATA** — namespace metadata plus catalogue manifests/shards. These use dedicated priority storage and an any-node metadata write durability floor; ordinary DATA quota cannot block them.
-- **CACHE** — opportunistic non-authoritative copies. Cache contents never satisfy DATA or metadata durability.
+> **The server reports what a file is and performs what it is asked for; it
+> does not choose.** A client reads the media facts, decides what to do with
+> them against its own decoder, and instructs.
 
-`dht.min_write_replicas` is the foreground DATA publication floor. `dht.replicas` is the desired converged DATA replica count. `dht.metadata_min_write_replicas` is independent: any that many active metadata replicas may publish metadata. 0.19 retains compact commit ancestry, automatically reconciles two divergent heads, merges non-conflicting namespace changes, and preserves incompatible namespace/catalogue alternatives as durable conflicts rather than choosing a winner.
+So the node has no notion of device capability, no `capabilities` negotiation,
+and refuses only what is impossible or misdescribed — never what a client said
+it could not play. Whether a device can decode what it asked for is the
+client's business. [Streaming](docs/streaming.md) is the normative statement of
+that contract, including the error codes and the reasoning behind them; treat
+it as the interface document when working on either side.
 
-Small immutable objects are packed below `LocalStore`. Packing does not change `ObjectId`, DHT placement, catalogue references, replication, repair or GC.
+Because clients decide, they carry real logic, and a shared TypeScript core
+(`@macha/core`) implements the parts every player needs — node discovery and
+ranking, session lifecycle, playback negotiation. Phone and TV players build on
+that core. A change to the wire shape, an error code or a default is a change
+to those projects too, and is worth saying out loud rather than leaving to be
+discovered.
 
-See [Storage](docs/storage.md) and [Durability](docs/durability.md) for the precise contract.
+## Storage model
 
-## Documentation
+Three explicit storage classes, with separate durability rules:
 
-- [Linux installation](docs/install-linux.md)
-- [macOS installation](docs/install-macos.md)
-- [Quick start](docs/quickstart.md)
-- [Configuration](docs/configuration.md)
-- [Storage](docs/storage.md)
-- [Durability](docs/durability.md)
-- [Metadata replication and reconciliation](docs/metadata.md)
-- [Cluster and recovery](docs/cluster.md)
-- [Catalogue](docs/catalogue.md)
-- [Streaming](docs/streaming.md)
-- [Operations](docs/operations.md)
-- [Architecture](ARCHITECTURE.md)
-- [Security](SECURITY.md)
-- [Roadmap](ROADMAP.md)
-- [Current release notes](CHANGELOG.md)
-- [Validation](VALIDATION.md)
+- **DATA** — media extents, artwork, subtitles and other immutable payload.
+  Placed by the DHT across eligible node/backend capacity; a full preferred
+  owner falls through to the next deterministic candidate.
+- **CONTROL/METADATA** — namespace metadata and catalogue manifests/shards.
+  Dedicated priority storage and an any-node write durability floor, so
+  ordinary DATA quota can never block them.
+- **CACHE** — opportunistic, non-authoritative copies. Cache contents never
+  satisfy DATA or metadata durability.
 
-The complete configuration example is [`macha.yaml.example`](macha.yaml.example).
+Every known node is metadata-capable; there is no privileged voter subset.
+`dht.min_write_replicas` is the foreground DATA publication floor,
+`dht.replicas` the desired converged replica count, and
+`dht.metadata_min_write_replicas` the independent floor for publishing a
+namespace or control mutation. Divergent metadata heads are reconciled
+automatically, non-conflicting namespace changes are merged, and incompatible
+alternatives are preserved as durable conflicts rather than silently picking a
+winner.
 
-## Linux installation
+[Storage](docs/storage.md) and [Durability](docs/durability.md) are the precise
+contract.
 
-See the [complete Linux installation guide](docs/install-linux.md) for
-distribution-specific dependencies, supported FFmpeg versions, systemd setup,
-upgrades and removal.
+## Installing
 
-Configure a system-wide build with an explicit prefix, then use the generated
-Make targets:
+Full instructions, including distribution dependencies, supported FFmpeg
+versions, systemd setup, upgrades and removal:
+[Linux](docs/install-linux.md) · [macOS](docs/install-macos.md) ·
+[Quick start](docs/quickstart.md).
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
@@ -60,34 +82,27 @@ cmake --build build
 sudo make -C build install
 ```
 
-On Linux this installs the executable, a `macha.service` systemd unit, the
-documentation, and an initial configuration. The installer prints the exact
-paths prominently; with the `/usr` prefix above the configuration is:
+On Linux this installs the executable, a `macha.service` unit, the
+documentation and an initial `/etc/macha/macha.yaml` — copied from
+[`macha.yaml.example`](macha.yaml.example) only when no configuration exists,
+so upgrades never overwrite operator changes. Edit it, create the referenced
+storage/cache/state/spool paths and the cluster key, then start the service.
+Uninstall (`sudo make -C build uninstall`) deliberately preserves the
+configuration, keys, state, cache, spool, mounts and media data.
 
-```text
-/etc/macha/macha.yaml
-```
+## Documentation
 
-The initial file is copied from `macha.yaml.example` only when it does not
-already exist. Reinstalling or upgrading never overwrites operator changes.
-Edit it, create the referenced storage/cache/state/spool paths and cluster key,
-then enable the service:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now macha.service
-```
-
-Remove installed binaries, documentation, examples, and the unit with:
-
-```bash
-sudo systemctl disable --now macha.service
-sudo make -C build uninstall
-```
-
-Uninstall deliberately preserves `/etc/macha/macha.yaml`, keys, state, cache,
-spool, mounts, and media data. The uninstall target prints the preserved
-configuration path and reminds the operator to reload systemd.
+| | |
+|---|---|
+| [Quick start](docs/quickstart.md) | [Configuration](docs/configuration.md) |
+| [Storage](docs/storage.md) | [Durability](docs/durability.md) |
+| [Metadata replication](docs/metadata.md) | [Cluster and recovery](docs/cluster.md) |
+| [Catalogue](docs/catalogue.md) | [Streaming](docs/streaming.md) |
+| [Operations](docs/operations.md) | [Management API](docs/management.md) |
+| [High availability](docs/HA.md) | [Ownership and GC](docs/ownership.md) |
+| [Architecture](ARCHITECTURE.md) | [Security](SECURITY.md) |
+| [Release notes](CHANGELOG.md) | [Roadmap](ROADMAP.md) |
+| [Validation](VALIDATION.md) | [Contributing](CONTRIBUTING.md) |
 
 Developed with substantial use of AI-assisted implementation.
 
