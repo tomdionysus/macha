@@ -2238,11 +2238,13 @@ void FileSystem::commit_write(WriteHandle& handle, const FsEntry& expected, uint
         std::lock_guard handles(open_writes_mutex_);
         path = handle.path_;
     }
-    commit_file(path, expected, z, xs, out, mtime_override);
+    commit_file(path, expected, z, xs, out, mtime_override,
+                handle.durability_ == WriteDurability::publication_generation);
 }
 void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint64_t z,
                              const std::vector<ExtentRef>& xs, FsEntry* out,
-                             std::optional<int64_t> mtime_override) {
+                             std::optional<int64_t> mtime_override,
+                             bool stale_basis_is_replayable) {
     auto q = normalize_path(p);
     FsEntry committed;
     m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
@@ -2256,8 +2258,16 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
         // the data writer.  Reject only if the content observed when the handle
         // opened has actually changed.
         if (i->second.version != expected.version &&
-            (i->second.size != expected.size || i->second.extents != expected.extents))
+            (i->second.size != expected.size || i->second.extents != expected.extents)) {
+            // Permanently unrecoverable for this handle: `expected` was
+            // captured when it opened and the entry has moved past it, so
+            // retrying with the same basis fails identically forever. A
+            // publication says so with ESTALE, which drops the writer and
+            // replays the generation from the spool against current state.
+            if (stale_basis_is_replayable)
+                fail(ESTALE, "publication basis is stale; replay against the current entry");
             fail(EAGAIN, "concurrent file content change");
+        }
 
         // If somebody explicitly changed mtime while this handle was open, keep
         // that value.  This is required for cp -p / macOS copyfile semantics,

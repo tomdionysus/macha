@@ -431,6 +431,10 @@ struct FuseFrontendDiagnostics {
     // via FuseFrontend::parked_publications().
     uint64_t parked_publications{};
     uint64_t publication_retries_backed_off{};
+    // Failure runs that crossed the escalation threshold and were reported at
+    // WARN. Non-zero means a file is failing repeatedly but has not (yet)
+    // exhausted its budget -- the state that used to be invisible.
+    uint64_t publications_retrying_persistently{};
     // Discipline 3: what recovery resolved rather than refused. Frames the
     // journal loader skipped, bytes quarantined after mid-journal corruption,
     // operations dropped for an inode with no descriptor, and publications
