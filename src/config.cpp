@@ -418,6 +418,8 @@ void parse_ingest(const YAML::Node& root, Config& c) {
     if (ingest["checkpoint_bytes"]) c.ingest.checkpoint_bytes = yaml_size(ingest["checkpoint_bytes"]);
     if (ingest["blocked_retry_ms"])
         c.ingest.blocked_retry = milliseconds(ingest["blocked_retry_ms"], "ingest.blocked_retry_ms");
+    if (ingest["max_concurrent_jobs"])
+        c.ingest.max_concurrent_jobs = ingest["max_concurrent_jobs"].as<size_t>();
     if (auto cleanup = ingest["cleanup"]) {
         if (cleanup["delete_owned_source_on_clear"])
             c.ingest.delete_owned_source_on_clear = cleanup["delete_owned_source_on_clear"].as<bool>();

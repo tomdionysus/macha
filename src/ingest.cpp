@@ -673,20 +673,33 @@ void IngestManager::save_state_locked() const {
 }
 
 void IngestManager::start() {
-    if (!config_.enabled || worker_.joinable()) return;
-    worker_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("ingest", [this, stop] { loop(stop); });
+    if (!config_.enabled || !workers_.empty()) return;
+    const size_t count = std::max<size_t>(1, config_.max_concurrent_jobs);
+    workers_.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        workers_.emplace_back([this](std::stop_token stop) {
+            run_supervised("ingest", [this, stop] { loop(stop); });
+        });
+    }
+    catalogue_worker_ = std::jthread([this](std::stop_token stop) {
+        run_supervised("ingest-catalogue", [this, stop] { catalogue_loop(stop); });
     });
+    Log::info("ingest started workers=" + std::to_string(count));
 }
 
 void IngestManager::request_stop() {
-    if (worker_.joinable()) worker_.request_stop();
+    for (auto& worker : workers_)
+        if (worker.joinable()) worker.request_stop();
+    if (catalogue_worker_.joinable()) catalogue_worker_.request_stop();
     cv_.notify_all();
 }
 
 void IngestManager::stop() {
     request_stop();
-    if (worker_.joinable()) worker_.join();
+    for (auto& worker : workers_)
+        if (worker.joinable()) worker.join();
+    workers_.clear();
+    if (catalogue_worker_.joinable()) catalogue_worker_.join();
 }
 
 void IngestManager::reconfigure(IngestConfig config) {
@@ -694,6 +707,11 @@ void IngestManager::reconfigure(IngestConfig config) {
     // Paths define persisted/resumable job identity and cannot safely move live.
     if (config.staging_path != config_.staging_path || config.enabled != config_.enabled)
         Log::warn("ingest enabled/staging_path changes require restart");
+    // The pool is sized once at start(); resizing it live would have to stop
+    // threads that may be mid-copy, which is not worth the failure mode.
+    if (config.max_concurrent_jobs != config_.max_concurrent_jobs)
+        Log::warn("ingest.max_concurrent_jobs change requires restart (running with " +
+                  std::to_string(config_.max_concurrent_jobs) + ")");
     config_.copy_chunk_bytes = config.copy_chunk_bytes;
     config_.checkpoint_bytes = config.checkpoint_bytes;
     config_.blocked_retry = config.blocked_retry;
@@ -751,6 +769,16 @@ std::string IngestManager::submit_path(const std::filesystem::path& source,
     cv_.notify_all();
     Log::info("ingest queued id=" + job.id + " source=" + normalized.string());
     return job.id;
+}
+
+size_t IngestManager::active_jobs() const {
+    std::lock_guard lock(mutex_);
+    return active_job_ids_.size();
+}
+
+size_t IngestManager::peak_active_jobs() const {
+    std::lock_guard lock(mutex_);
+    return peak_active_jobs_;
 }
 
 std::vector<IngestJob> IngestManager::jobs() const {
@@ -898,7 +926,7 @@ bool IngestManager::cancel(std::string_view id) {
         it->second.eta_seconds.reset();
         it->second.updated_unix_ms = now_ms();
         cancelled = it->second;
-        active = active_job_id_ == it->first;
+        active = active_job_ids_.contains(it->first);
         try {
             save_state_locked();
         } catch (...) {
@@ -1036,29 +1064,29 @@ void IngestManager::enqueue_catalogue_hints(IngestJob& job) {
     }
 }
 
+std::string IngestManager::select_job_locked() const {
+    const auto now = now_ms();
+    for (const auto& [id, job] : jobs_) {
+        // Another worker already owns this one; skipping is what makes the
+        // pool concurrent rather than N threads fighting over the head job.
+        if (active_job_ids_.contains(id)) continue;
+        if (job.state == IngestJobState::queued) return id;
+        if (job.state == IngestJobState::blocked &&
+            now >= job.updated_unix_ms + static_cast<uint64_t>(config_.blocked_retry.count()))
+            return id;
+    }
+    return {};
+}
+
 void IngestManager::loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
-        refresh_catalogue_jobs();
         std::string selected;
         {
             std::unique_lock lock(mutex_);
-            const auto now = now_ms();
-            for (const auto& [id, job] : jobs_) {
-                if (job.state == IngestJobState::queued) {
-                    selected = id;
-                    break;
-                }
-                if (job.state == IngestJobState::blocked &&
-                    now >= job.updated_unix_ms + static_cast<uint64_t>(config_.blocked_retry.count())) {
-                    selected = id;
-                    break;
-                }
-            }
+            selected = select_job_locked();
             if (selected.empty()) {
-                const bool cataloguing = std::any_of(jobs_.begin(), jobs_.end(), [](const auto& pair) {
-                    return pair.second.state == IngestJobState::cataloguing;
-                });
                 std::optional<uint64_t> blocked_ready_ms;
+                const auto now = now_ms();
                 for (const auto& [_, job] : jobs_) {
                     if (job.state != IngestJobState::blocked) continue;
                     const auto ready = job.updated_unix_ms +
@@ -1066,43 +1094,40 @@ void IngestManager::loop(std::stop_token stop) {
                     if (!blocked_ready_ms || ready < *blocked_ready_ms) blocked_ready_ms = ready;
                 }
 
-                auto queued = [&] {
-                    return std::any_of(jobs_.begin(), jobs_.end(), [](const auto& pair) {
-                        return pair.second.state == IngestJobState::queued;
-                    });
-                };
+                // Wake for anything this worker could actually claim -- not
+                // merely for "a queued job exists", which with a pool would
+                // wake every idle worker for a job one of them already holds.
+                auto claimable = [&] { return !select_job_locked().empty(); };
 
-                if (cataloguing) {
-                    // Catalogue completion is currently persisted by the hint queue
-                    // rather than callback-driven into ingest. Poll only while a
-                    // copied job is genuinely awaiting that external result.
-                    cv_.wait_for(lock, stop, std::chrono::milliseconds(500), queued);
-                } else if (blocked_ready_ms) {
+                if (blocked_ready_ms) {
                     const auto remaining_ms = *blocked_ready_ms > now ? *blocked_ready_ms - now : 0;
-                    cv_.wait_for(lock, stop, std::chrono::milliseconds(remaining_ms), queued);
+                    cv_.wait_for(lock, stop, std::chrono::milliseconds(remaining_ms), claimable);
                 } else {
                     // Terminal/paused-only job sets are quiescent. New work and all
                     // relevant API state changes already notify this condition.
-                    cv_.wait(lock, stop, queued);
+                    cv_.wait(lock, stop, claimable);
                 }
                 continue;
             }
-        }
-        {
-            std::lock_guard lock(mutex_);
-            active_job_id_ = selected;
+            // Claim under the same lock that selected it, or two workers race
+            // onto one job between the select and the claim.
+            active_job_ids_.insert(selected);
+            peak_active_jobs_ = std::max(peak_active_jobs_, active_job_ids_.size());
         }
         process_job(selected, stop);
         IngestJob after;
         bool have_after = false;
         {
             std::lock_guard lock(mutex_);
-            if (active_job_id_ == selected) active_job_id_.clear();
+            active_job_ids_.erase(selected);
             if (auto it = jobs_.find(selected); it != jobs_.end()) {
                 after = it->second;
                 have_after = true;
             }
         }
+        // Releasing a claim can make a blocked/queued job selectable to a
+        // peer worker that is already parked on the condition.
+        cv_.notify_all();
         if (have_after && after.state == IngestJobState::cancelled) {
             cleanup_partials(after);
             if (after.source_owned && config_.delete_owned_source_on_cancel) {
@@ -1111,6 +1136,27 @@ void IngestManager::loop(std::stop_token stop) {
                     Log::warn("ingest cancel source cleanup failed id=" + after.id + ": " + e.what());
                 }
             }
+        }
+    }
+}
+
+void IngestManager::catalogue_loop(std::stop_token stop) {
+    while (!stop.stop_requested()) {
+        refresh_catalogue_jobs();
+        std::unique_lock lock(mutex_);
+        auto cataloguing = [&] {
+            return std::any_of(jobs_.begin(), jobs_.end(), [](const auto& pair) {
+                return pair.second.state == IngestJobState::cataloguing;
+            });
+        };
+        if (cataloguing()) {
+            // Catalogue completion is persisted by the hint queue rather than
+            // callback-driven into ingest, so it has to be polled -- but only
+            // while a copied job is genuinely awaiting that external result.
+            cv_.wait_for(lock, stop, std::chrono::milliseconds(500),
+                         [&] { return stop.stop_requested(); });
+        } else {
+            cv_.wait(lock, stop, cataloguing);
         }
     }
 }

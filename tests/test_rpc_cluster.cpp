@@ -2696,6 +2696,15 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
     c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
     c1.ingest.enabled = c2.ingest.enabled = false;
     c1.torrent.enabled = c2.torrent.enabled = false;
+    // read_record() serves from the process cache first, and read_group()'s
+    // single-head path caches whichever head it saw. A maintenance pass landing
+    // between the two make_sibling() calls below therefore cached one sibling,
+    // and every reader inside the 250 ms TTL returned it unmerged -- so this
+    // test measured a race against the maintenance loop, not reconciliation
+    // (2026-09-10: history 4->4, both heads standing, all eight readers on the
+    // same sibling, maintenance merging after the assertions). No TTL: every
+    // reader must actually read.
+    c1.metadata_cache = std::chrono::milliseconds(0);
 
     Service s1(c1, keys);
     Service s2(c2, keys);
@@ -4180,6 +4189,155 @@ MACHA_HEAVY_TEST("rpc_cluster", test_three_node_cluster) {
 // libtorrent was found; without it the node has no download engine at all
 // and there is nothing here to assert.
 #ifdef MACHA_TEST_PLUGIN_DIR
+MACHA_TEST("rpc_cluster", test_metadata_repair_stalled_on_a_silent_peer_does_not_block_local_writes) {
+    // repair_once() used to hold mutation_mutex_ across its per-peer
+    // replication fan-out. mutate_impl() takes the same mutex, so one peer
+    // that stopped answering turned a background maintenance pass into a
+    // stall of every local metadata write: on es-1 (2026-09-10) ten threads
+    // sat in mutate_impl behind one maint thread parked in AsyncRpc::get(),
+    // and six torrent ingests read "queued" while the cluster reported
+    // healthy. The fan-out now runs with the lock released. This holds the
+    // exact RPC the maint thread was stuck in (has_metadata_history_entry, the
+    // remote_has probe inside push_history_to_peer) and proves a foreground
+    // write no longer waits for it.
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    auto c1 = config_for(cluster.path() / "silent-repair-n1", cluster.keyfile(), p1,
+                         {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "silent-repair-n2", cluster.keyfile(), p2,
+                         {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 1;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }));
+    // Past the virgin generation, so repair takes the read_group()/fan-out path.
+    s1.filesystem().mkdir("/warm", 0755, getuid(), getgid());
+
+    const auto peer = s2.node().node_id();
+    s1.node().stall_peer_for_tests(peer, MessageType::has_metadata_history_entry);
+    std::atomic_bool repair_done{false};
+    std::jthread repair([&] {
+        try {
+            s1.metadata_manager().repair_once();
+        } catch (const std::exception&) {
+            // A pass abandoned on the stalled peer is fine; it retries.
+        }
+        repair_done = true;
+    });
+    // Repair is now inside the fan-out, holding the probe to the silent peer.
+    REQUIRE(wait_until([&] { return s1.node().stalled_calls_for_tests() >= 1; }, 15s));
+    CHECK(!repair_done.load());
+
+    const auto started = std::chrono::steady_clock::now();
+    s1.filesystem().mkdir("/during-stall", 0755, getuid(), getgid());
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    // Before the fix this waited for the control no-progress deadline (30 s)
+    // to cancel the probe and hand the mutex back.
+    CHECK(elapsed < 3s);
+    CHECK(!repair_done.load());
+
+    s1.node().release_peer_for_tests(peer);
+    REQUIRE(wait_until([&] { return repair_done.load(); }, 60s));
+    repair.join();
+
+    bool converged = false;
+    try {
+        s1.metadata_manager().repair_once();
+        converged = true;
+    } catch (const std::exception&) {
+    }
+    CHECK(converged);
+
+    s2.stop();
+    s1.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_extent_put_to_a_silent_peer_fails_within_the_no_progress_budget) {
+    // WriteHandle::drain_one_extent() waits on its extent future with no
+    // deadline. Underneath, put_impl() spilled a stalled replica after
+    // write_stall and looked for a replacement -- but a spilled put still
+    // counted as unfinished, so with no replacement replica the loop could
+    // never conclude and spun at 1 ms forever: the "never fails, never
+    // completes" shape one layer below the 0.36.8 fix. The put now honours
+    // the pipeline's no-progress budget and fails retryably, which the
+    // publication retry policy already backs off and parks.
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    auto c1 = config_for(cluster.path() / "silent-put-n1", cluster.keyfile(), p1,
+                         {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "silent-put-n2", cluster.keyfile(), p2,
+                         {{"127.0.0.1", p1}});
+    // Both replicas are required, so the silent one cannot be replaced.
+    c1.replication = c2.replication = 2;
+    c1.min_write_replicas = c2.min_write_replicas = 2;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.write_stall = c2.write_stall = 200ms;
+
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }));
+    s1.filesystem().create_file("/silent.bin", 0644, getuid(), getgid());
+    const auto contents = pattern(64 * 1024);
+    const auto peer = s2.node().node_id();
+
+    std::atomic_uint64_t progress{0};
+    auto open = [&] {
+        return s1.filesystem().open_write(
+            "/silent.bin", false, false, WriteDurability::publication_generation,
+            16ULL * 1024 * 1024,
+            DataWorkContext(FrameType::loader, c1.extent_size, {}, nullptr, &progress, 500ms));
+    };
+
+    s1.node().stall_peer_for_tests(peer, MessageType::put_object_deferred);
+    std::string error;
+    const auto started = std::chrono::steady_clock::now();
+    {
+        auto writer = open();
+        try {
+            (void)writer->write(0, contents);
+            writer->commit();
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        // The destructor relaunches a failed put; let the peer answer it.
+        s1.node().release_peer_for_tests(peer);
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    CHECK(!error.empty());
+    CHECK(error.find("quorum unavailable") != std::string::npos);
+    CHECK(elapsed < 15s);
+
+    // With the peer answering again the identical write goes through.
+    bool ok = false;
+    try {
+        auto writer = open();
+        (void)writer->write(0, contents);
+        writer->commit();
+        ok = true;
+    } catch (const std::exception&) {
+    }
+    CHECK(ok);
+
+    s2.stop();
+    s1.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node) {
     TestCluster cluster;
     const auto& keys = cluster.keys();

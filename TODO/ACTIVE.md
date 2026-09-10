@@ -513,6 +513,72 @@ Resume the
 after the immediate playback correctness blocker. Existing checkpoints remain
 valid evidence, but do not prove the end-to-end invariants.
 
+- [x] **`repair_once()` holds the metadata mutation mutex across per-peer
+  replication RPCs, wedging every metadata mutation on the node — found live
+  on es-1, 2026-09-10; FIXED 0.37.0 (lock released across the fan-out,
+  re-validated on re-acquire), gated by
+  `test_metadata_repair_stalled_on_a_silent_peer_does_not_block_local_writes`
+  via the new `stall_peer_for_tests` fixture.** Still under the lock, and
+  deliberately so: discovery and `publish_commit`, each bounded by the 30 s
+  control no-progress deadline rather than unbounded. `MetadataManager::repair_once()` takes
+  `std::unique_lock mutation_lock(mutation_mutex_)` (`metadata_manager.cpp:1908`)
+  and then, still holding it, calls `replicate_accepted_head()` once per
+  active peer in three separate loops (`:1936`, `:1963`, `:2008`). Each of
+  those reaches `push_history_to_peer()`, whose `remote_has` lambda issues a
+  blocking `node_.call(owner, has_metadata_history_entry, …)`
+  (`metadata_manager.cpp:496`) per history hash. `mutate_impl()` — the entry
+  point behind every `mutate_delta()`, and therefore behind every
+  `WriteHandle::commit()` — takes the *same* mutex at `:1625`. So one slow or
+  unresponsive peer converts a background maintenance pass into a total stall
+  of local metadata writes.
+  **Measured on es-1 while wedged:** the `macha-maint` thread (LWP 650116) sat
+  in `Service::loop → repair_once → replicate_accepted_head →
+  push_history_to_peer → AsyncRpc::get()`, and **ten** threads were piled up
+  behind it blocked in `MetadataManager::mutate_impl` on
+  `pthread_mutex_lock` — the ingest worker among them, inside
+  `copy_file → WriteHandle::commit → FileSystem::commit_write → commit_file`.
+  Nothing had crashed: there were no `subsystem '…' thread stopped` lines in
+  the journal, and `cluster.health` cheerfully reported **`healthy`** with all
+  three nodes `online` throughout, which is the same
+  observability gap as the "powered-off node reads as online" item in P1.
+  The lock is documented as protecting "discovery, accepted-head selection, or
+  reconfiguration" (`:1906`). Replication is none of those — the header of
+  that very loop says "Convergence is replication, not head replacement" and a
+  peer holding a different branch simply keeps it — so the peer RPCs look
+  releasable, but the baseline-commit branch (`:1977`-`2019`) does mutate and
+  must stay serialised. Fix by narrowing the lock to selection/commit rather
+  than by putting a deadline on the RPC; a deadline only bounds how long the
+  node is dead for.
+
+- [x] **Ingest is strictly serial, so one wedged job stalls the whole queue —
+  FIXED 0.37.0: `ingest.max_concurrent_jobs` (default 10), claimed-set
+  ownership, dedicated catalogue poller, `concurrency` on `ingest/status`.**
+  `IngestManager::loop()` (`ingest.cpp:1039`) selects a single job and calls
+  `process_job()` synchronously to completion before looking at the next;
+  `active_job_id_` is one `std::string` (`ingest.hpp:140`) and there is one
+  worker thread (`:141`). This is what turned the metadata stall above into
+  the visible symptom: **six torrent ingests on es-1, all reporting
+  `queued`**, staged under `/mnt/diskB/ingest/torrents/` with staging at
+  3.78 GB of a 500 GB limit — i.e. nothing resource-bound, just five jobs
+  behind one that could not finish. Wanted: concurrent jobs under a
+  configurable bound, `ingest.max_concurrent_jobs`, default 10.
+  Note the interaction with the retained-memory items below — N concurrent
+  imports means N concurrent `WriteHandle`s against the same durable-lower
+  budget, so the bound is a memory knob as much as a throughput one.
+
+- [ ] **A job being imported still reports `queued` — found 2026-09-10, not
+  root-caused.** The head job on es-1 carried `files_total: 1`,
+  `bytes_total: 739234786` and a populated `current_file` while its `state`
+  read `queued`. That combination should be unreachable: `plan_job()` persists
+  `scanning` on entry (`ingest.cpp:1338`) and returns the job to `queued` once
+  planning completes (`:1342`), then `import_job()` persists `importing`
+  *before* it ever sets `current_file` (`ingest.cpp:1590`-`1605`). So either
+  the cluster-aggregated `/api/v1/ingest/jobs` view is merging a stale peer
+  copy over the local record, or something resets the state after planning.
+  Worth settling because it is why a wedged queue reads as an idle one — the
+  operator sees six identical `queued` rows and no indication that any work
+  was ever started.
+
 - [x] **es-1 publication livelock starves RPC and takes the node out of the
   cluster — FIXED 0.36.8 + 0.36.9, deployed 2026-09-09, see `COMPLETED.md`.**
 
@@ -555,13 +621,16 @@ valid evidence, but do not prove the end-to-end invariants.
   `reserved_video_transcodes` already reserves a transcode entitlement across
   its admission window.
 
-- [ ] **`WriteHandle::drain_one_extent` waits on its extent future with no
-  deadline and no cancellation check** (`filesystem.cpp:515`), so a stalled
-  extent put blocks publication silently — the same "never fails, never
-  completes" shape one layer below the 0.36.8 fix. Deferred from that work
-  because it needs a `DistributedStore` fault-injection hook, which does not
-  exist; landing the wait change untested would add a new `EAGAIN` path to
-  publication on the strength of inspection alone.
+- [x] **`WriteHandle::drain_one_extent` waits on its extent future with no
+  deadline — FIXED 0.37.0.** The real mechanism was one layer down:
+  `put_impl` spilled a silent replica after `write_stall` and looked for a
+  replacement, but a spilled put still counted as unfinished, so with none
+  available the loop never concluded (an infinite 1 ms spin). The extent put
+  now carries the pipeline's `DataWorkContext` and fails retryably once
+  nothing has moved for the no-progress budget. The fault-injection hook this
+  was waiting on now exists (`RpcClient::stall_peer_for_tests`); gated by
+  `test_extent_put_to_a_silent_peer_fails_within_the_no_progress_budget`,
+  confirmed to hang against the pre-fix code.
 
 - [ ] Finish process-wide retained-memory ownership bounds for decoded metadata,
   catalogue/profile state, reconciliation retries, RPC/reassembly, object
@@ -753,10 +822,23 @@ absorbed here rather than separate active programmes.
   `Corvus GBNI-1`, `Corvus GBNI-2`, `Corvus ES-1`, and `Corvus MacBook Pro`.
 - [ ] Complete hard-kill stale-FUSE recovery proof and automatic clean rejoin.
 - [ ] Diagnose faulty torrent/ingest independently so it does not obscure
-  convergence and runtime measurements.
+  convergence and runtime measurements. **2026-09-10: largely answered** by
+  the `repair_once()` mutation-mutex item under P0 structural ingest — the
+  torrent/ingest subsystem was not itself faulty, it was the most visible
+  victim of a node-wide metadata stall. What remains here is the narrower
+  original ask: enough per-subsystem signal to tell those two apart without a
+  gdb backtrace.
 - [ ] Diagnose `ingest failed: metadata acceptance certificate durability
   floor unavailable` failures on torrent ingest once the torrent has
-  downloaded, which are also unaccountably slow.
+  downloaded, which are also unaccountably slow. **Probably the same root
+  cause** as the `repair_once()` item under P0 structural ingest: that exact
+  string is thrown by `ensure_accepted_head_durable()`
+  (`metadata_manager.cpp:889` and `:899`), which `mutate_impl()` calls at
+  `:1675` while holding `mutation_mutex_` — so an ingest commit reports it
+  after waiting out whatever else held that mutex, and "unaccountably slow" is
+  precisely what a caller queued behind a peer RPC under that lock looks like
+  from outside. Re-check this once that item lands rather than diagnosing it
+  separately.
 - [x] **Sanitizer build — shipped 2026-09-08. CI — declined by the operator,
   not deferred.** `MACHA_SANITIZE` builds the whole tree (core, executables,
   plugins, both test binaries) under `address`, `undefined`,

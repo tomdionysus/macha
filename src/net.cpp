@@ -2117,6 +2117,14 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
     validate_frame_semantics(type, frame_type);
     const auto lane = lane_for(type, frame_type);
 
+    if (expected) {
+        std::lock_guard lock(mutex_);
+        auto stalled = stalled_peers_for_tests_.find(*expected);
+        if (stalled != stalled_peers_for_tests_.end() &&
+            (!stalled->second || *stalled->second == type))
+            return stalled_call_for_tests_locked();
+    }
+
     auto try_existing = [&](const NodeId& peer) -> std::optional<AsyncRpc> {
         std::shared_ptr<PeerConnection> outbound;
         std::function<AsyncRpc(MessageType, std::span<const uint8_t>, FrameType)> inbound;
@@ -2200,6 +2208,53 @@ AsyncRpc RpcClient::call_async(const NodeInfo& node, MessageType type,
                                      " was reset; re-resolve the node before retrying");
     }
     return call_async_known(endpoint, &node.id, type, payload, frame_type);
+}
+
+AsyncRpc RpcClient::stalled_call_for_tests_locked() {
+    auto promise = std::make_shared<std::promise<RpcReply>>();
+    auto future = promise->get_future();
+    stalled_calls_for_tests_.push_back(promise);
+    const auto started = Clock::now();
+    std::weak_ptr<std::promise<RpcReply>> weak = promise;
+    auto fail = [weak] {
+        if (auto held = weak.lock()) {
+            try {
+                held->set_exception(std::make_exception_ptr(
+                    std::runtime_error("RPC cancelled: peer is stalled by a test fixture")));
+            } catch (const std::future_error&) {
+                // Already released or cancelled; either way it is settled.
+            }
+        }
+    };
+    return AsyncRpc(std::move(future), fail, fail, {}, [started] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
+    });
+}
+
+void RpcClient::stall_peer_for_tests(const NodeId& peer, std::optional<MessageType> message) {
+    std::lock_guard lock(mutex_);
+    stalled_peers_for_tests_[peer] = message;
+}
+
+void RpcClient::release_peer_for_tests(const NodeId& peer) {
+    std::vector<std::shared_ptr<std::promise<RpcReply>>> held;
+    {
+        std::lock_guard lock(mutex_);
+        stalled_peers_for_tests_.erase(peer);
+        held.swap(stalled_calls_for_tests_);
+    }
+    for (auto& promise : held) {
+        try {
+            promise->set_exception(std::make_exception_ptr(
+                std::runtime_error("RPC failed: stalled peer fixture released")));
+        } catch (const std::future_error&) {
+        }
+    }
+}
+
+size_t RpcClient::stalled_calls_for_tests() const {
+    std::lock_guard lock(mutex_);
+    return stalled_calls_for_tests_.size();
 }
 
 RpcReply RpcClient::call(const Endpoint& endpoint, MessageType type,

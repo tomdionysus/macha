@@ -1,5 +1,51 @@
 # Current release
 
+## 0.37.0 — Background metadata repair no longer wedges the node's writes; ingest runs concurrently (development)
+
+On 2026-09-10 es-1 had six torrent ingests all reading `queued`, nothing
+running, staging at 3.78 GB of 500 GB, and `cluster.health` saying `healthy`.
+A backtrace showed the ingest worker inside `WriteHandle::commit` blocked on
+`MetadataManager::mutation_mutex_`, together with nine other threads. The
+holder was the maintenance thread: `repair_once()` took that mutex and then,
+still holding it, replicated the accepted head to every peer — a blocking RPC
+per history hash per peer. One peer that stopped answering turned a background
+convergence pass into a stall of every local metadata mutation.
+
+- `repair_once()` releases `mutation_mutex_` across the replication fan-out.
+  Replication is idempotent and additive by the reconciliation contract
+  ("convergence is replication, not head replacement"), so it needs none of the
+  serialisation that discovery, head selection and the baseline commit do.
+  After re-taking the lock the pass re-validates that the head it selected is
+  still current and abandons itself otherwise, so the baseline commit can never
+  build generation+1 on a superseded parent. Discovery and `publish_commit`
+  still RPC under the lock — a write *is* its replication — and those calls are
+  bounded by the control no-progress deadline.
+- Ingest was strictly serial: one worker, `process_job()` to completion before
+  the next. It now runs a pool bounded by `ingest.max_concurrent_jobs`
+  (default 10, 1..64, applied at start). Jobs are claimed under the lock that
+  selects them; catalogue-completion polling has its own thread so busy
+  importers cannot starve it; show/pause/resume/cancel/clear are unchanged.
+  `GET /api/v1/ingest/status` gains `concurrency.{max_jobs,active_jobs,
+  peak_active_jobs}` — without it a queue stalled behind one wedged job is
+  indistinguishable from an idle one.
+- `WriteHandle::drain_one_extent` could wait forever: `put_impl` spilled a
+  silent replica after `write_stall` and sought a replacement, but the spilled
+  put still counted as unfinished, so with no replacement available the loop
+  spun at 1 ms indefinitely. The extent put now carries the pipeline's
+  `DataWorkContext` and fails — retryably, into the existing backoff-and-park
+  discipline — once nothing in the pipeline has moved for the no-progress
+  budget. Slow-but-moving transfers re-arm the window; only a put where nothing
+  at all advances fails.
+- A test-only silent-peer fixture, `RpcClient::stall_peer_for_tests`
+  (all messages or one type), holds outbound calls unresolved with
+  `idle_for()` advancing as it would on a dead link. This is the fault-injection
+  hook the backlog recorded as missing; both fixes above are gated by it, and
+  each regression was confirmed to fail against the pre-fix code.
+- `test_concurrent_reads_during_divergence_produce_one_reconciliation` was
+  racing the maintenance loop through the 250 ms metadata cache (a pass between
+  the two sibling commits cached one sibling; every reader returned it
+  unmerged). It now runs with no cache TTL and measures what its name says.
+
 ## 0.36.9 — Bound how many files may hold a publication writer at once (development)
 
 es-1 held 515,899,392 bytes of publication-owned retained memory for hours,

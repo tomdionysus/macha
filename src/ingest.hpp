@@ -12,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -137,12 +138,27 @@ class IngestManager {
     mutable std::mutex mutex_;
     std::condition_variable_any cv_;
     std::map<std::string, IngestJob, std::less<>> jobs_;
-    std::string active_job_id_;
-    std::jthread worker_;
+    // Jobs currently claimed by a worker. A job is inserted under mutex_ in
+    // the same critical section that selects it, so two workers can never
+    // claim the same job, and cancel() can still tell whether cleanup is its
+    // own responsibility or the owning worker's.
+    std::set<std::string, std::less<>> active_job_ids_;
+    // High-water mark of concurrently claimed jobs. Monotonic, so it answers
+    // "did this pool ever actually run jobs in parallel?" without having to
+    // catch the moment in a sample.
+    size_t peak_active_jobs_{};
+    std::vector<std::jthread> workers_;
+    // Catalogue completion is observed by polling the hint queue rather than
+    // by callback. That poll owns its own thread so it cannot be starved by
+    // busy import workers -- which is exactly what a single shared worker did.
+    std::jthread catalogue_worker_;
 
     void load_state();
     void save_state_locked() const;
     void loop(std::stop_token);
+    void catalogue_loop(std::stop_token);
+    // Picks the next job no worker holds, or empty. Caller must hold mutex_.
+    std::string select_job_locked() const;
     void process_job(const std::string&, std::stop_token);
     bool plan_job(IngestJob&, std::stop_token);
     bool import_job(IngestJob&, std::stop_token);
@@ -196,6 +212,9 @@ class IngestManager {
     bool delete_owned_source_on_cancel() const;
     StagingArea& staging() noexcept { return staging_; }
     const StagingArea& staging() const noexcept { return staging_; }
+    size_t max_concurrent_jobs() const noexcept { return config_.max_concurrent_jobs; }
+    size_t active_jobs() const;
+    size_t peak_active_jobs() const;
 
     // Cluster-wide visibility: local jobs (this node's own jobs()), plus one
     // RPC survey per active peer. An unreachable/erroring peer is logged and

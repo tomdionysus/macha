@@ -2621,6 +2621,177 @@ MACHA_TEST("hydration_catalogue", test_cleared_ingest_job_does_not_resurrect_whi
     CHECK(!ingest.job(job_id).has_value());
 }
 
+namespace {
+
+// Builds `count` single-file import roots under `base` and returns them.
+std::vector<std::filesystem::path> make_import_roots(const std::filesystem::path& base,
+                                                     size_t count, size_t file_bytes) {
+    std::vector<std::filesystem::path> roots;
+    for (size_t i = 0; i < count; ++i) {
+        auto root = base / ("concurrent-import-" + std::to_string(i));
+        std::filesystem::create_directories(root);
+        std::ofstream out(root / ("Concurrent Movie " + std::to_string(i) + " 2024.mkv"),
+                          std::ios::binary);
+        auto bytes = pattern(file_bytes);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+        roots.push_back(root);
+    }
+    return roots;
+}
+
+// True once every listed job has copied all of its planned files. Deliberately
+// checks copy progress rather than the terminal state, so the assertion does
+// not depend on how the catalogue is configured for the fixture.
+bool all_imports_copied(const IngestManager& ingest, const std::vector<std::string>& ids) {
+    for (const auto& id : ids) {
+        auto job = ingest.job(id);
+        if (!job || job->files_total == 0 || job->files_completed != job->files_total)
+            return false;
+    }
+    return true;
+}
+
+} // namespace
+
+MACHA_TEST("hydration_catalogue", test_ingest_runs_jobs_concurrently_up_to_the_configured_bound) {
+    // Ingest was strictly serial: one worker thread taking one job at a time
+    // (loop() -> process_job() synchronously), so a single job that could not
+    // finish held every other job at "queued". That is how a metadata stall on
+    // es-1 (2026-09-10) surfaced -- six torrent imports all reading "queued"
+    // with nothing visibly running. The pool is now bounded by
+    // ingest.max_concurrent_jobs.
+    //
+    // peak_active_jobs() is a monotonic high-water mark recorded by the workers
+    // at claim time, so this proves real overlap without a poller having to
+    // catch the moment -- which is what would have made it load-sensitive.
+    TestService fixture("node");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.catalogue.scanner.enabled = false;
+    config.ingest.enabled = false; // use the explicit manager below
+
+    auto& service = fixture.start();
+
+    constexpr size_t job_count = 6;
+    constexpr size_t bound = 3;
+    const auto roots = make_import_roots(fixture.path(), job_count, 4 * 1024 * 1024);
+
+    IngestConfig ingest_config;
+    ingest_config.enabled = true;
+    ingest_config.staging_path = fixture.path() / "staging";
+    ingest_config.source_roots = roots;
+    // Small chunks so each copy takes many real iterations, widening the
+    // window in which jobs genuinely overlap -- but a large checkpoint, so
+    // that costs loop iterations rather than a metadata commit per chunk.
+    ingest_config.copy_chunk_bytes = 4096;
+    ingest_config.checkpoint_bytes = 1024 * 1024;
+    ingest_config.max_concurrent_jobs = bound;
+    IngestManager ingest(service.node(), service.filesystem(), service.catalogue_hints(),
+                         ingest_config);
+
+    // Submit before start() so the pool wakes to an already-full queue: every
+    // worker finds claimable work immediately instead of racing the submits.
+    std::vector<std::string> ids;
+    for (const auto& root : roots) ids.push_back(ingest.submit_path(root));
+    CHECK(ingest.active_jobs() == 0);
+    ingest.start();
+
+    // Wait for the overlap rather than sampling for it after the fact: on a
+    // loaded machine the workers start staggered, and asserting at the end
+    // measures whether the last job happened to still be running, not whether
+    // the pool is concurrent. The high-water mark is monotonic, so waiting on
+    // it is exact -- it only ever reports overlap that genuinely happened.
+    REQUIRE(wait_until([&] { return ingest.peak_active_jobs() >= 2; }, 60s));
+
+    REQUIRE(wait_until([&] { return all_imports_copied(ingest, ids); }, 60s));
+
+    // The bound is the contract -- never more claimed at once than configured.
+    CHECK(ingest.peak_active_jobs() <= bound);
+
+    ingest.stop();
+    CHECK(ingest.active_jobs() == 0);
+}
+
+MACHA_TEST("hydration_catalogue", test_ingest_pause_resume_and_cancel_still_work_under_a_worker_pool) {
+    // The pool made job ownership a set rather than one active_job_id_, and
+    // cancel() decides whether cleanup is its own responsibility or the owning
+    // worker's by consulting exactly that. Prove the control surface the API
+    // exposes -- show/pause/resume/cancel/clear -- still behaves per job while
+    // several jobs are in flight, and that pausing one does not stall the rest.
+    TestService fixture("node");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.catalogue.scanner.enabled = false;
+    config.ingest.enabled = false;
+
+    auto& service = fixture.start();
+
+    constexpr size_t job_count = 4;
+    const auto roots = make_import_roots(fixture.path(), job_count, 2 * 1024 * 1024);
+
+    IngestConfig ingest_config;
+    ingest_config.enabled = true;
+    ingest_config.staging_path = fixture.path() / "staging";
+    ingest_config.source_roots = roots;
+    // Many copy iterations per file so there is a wide window to pause one
+    // mid-flight, without a metadata commit per chunk.
+    ingest_config.copy_chunk_bytes = 4096;
+    ingest_config.checkpoint_bytes = 1024 * 1024;
+    ingest_config.max_concurrent_jobs = job_count;
+    IngestManager ingest(service.node(), service.filesystem(), service.catalogue_hints(),
+                         ingest_config);
+
+    std::vector<std::string> ids;
+    for (const auto& root : roots) ids.push_back(ingest.submit_path(root));
+    ingest.start();
+
+    // Wait until the first job is genuinely mid-copy before touching it.
+    const auto& paused_id = ids.front();
+    REQUIRE(wait_until([&] {
+        auto job = ingest.job(paused_id);
+        return job && job->state == IngestJobState::importing;
+    }, 30s));
+
+    REQUIRE(ingest.pause(paused_id));
+    REQUIRE(wait_until([&] {
+        auto job = ingest.job(paused_id);
+        return job && job->state == IngestJobState::paused;
+    }, 10s));
+
+    // A paused job must stay paused -- no worker in the pool may pick it up.
+    std::this_thread::sleep_for(200ms);
+    auto held = ingest.job(paused_id);
+    REQUIRE(held.has_value());
+    CHECK(held->state == IngestJobState::paused);
+
+    // Cancelling a different in-flight job must not disturb the others.
+    const auto& cancelled_id = ids.back();
+    REQUIRE(ingest.cancel(cancelled_id));
+    REQUIRE(wait_until([&] {
+        auto job = ingest.job(cancelled_id);
+        return job && job->state == IngestJobState::cancelled;
+    }, 10s));
+
+    // The remaining untouched jobs still finish while one is paused and one
+    // cancelled -- i.e. neither one is holding the queue.
+    const std::vector<std::string> untouched(ids.begin() + 1, ids.end() - 1);
+    REQUIRE(wait_until([&] { return all_imports_copied(ingest, untouched); }, 60s));
+
+    // Resume puts the paused job back in the queue and it completes its copy.
+    REQUIRE(ingest.resume(paused_id));
+    REQUIRE(wait_until([&] { return all_imports_copied(ingest, {paused_id}); }, 60s));
+
+    // clear() is the API's delete: terminal jobs go, and stay gone.
+    REQUIRE(ingest.clear(cancelled_id));
+    CHECK(!ingest.job(cancelled_id).has_value());
+
+    ingest.stop();
+    CHECK(ingest.active_jobs() == 0);
+}
+
 MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh) {
     TestCluster cluster;
     const auto& keys = cluster.keys();

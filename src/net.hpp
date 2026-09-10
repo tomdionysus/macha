@@ -345,6 +345,15 @@ class RpcClient {
     std::vector<std::shared_ptr<PeerConnection>> retired_connections_;
     std::map<std::string, InboundRoute> inbound_routes_;
     std::map<std::string, NodeId> endpoint_peers_;
+    // In-process fixture for an unresponsive peer: outbound calls to a listed
+    // peer (all messages, or one message type) are handed back as an AsyncRpc
+    // that never resolves until released, with idle_for() advancing exactly as
+    // it would for a dead link. Not reachable from configuration. This is the
+    // hook the lock-across-RPC and stalled-put regressions need to reproduce a
+    // silent peer without a network.
+    std::map<NodeId, std::optional<MessageType>> stalled_peers_for_tests_;
+    std::vector<std::shared_ptr<std::promise<RpcReply>>> stalled_calls_for_tests_;
+    AsyncRpc stalled_call_for_tests_locked();
     std::map<std::string, PeerHealth> health_;
     std::map<std::string, Endpoint> endpoints_;
     std::map<std::string, IdentityAssociationReset> identity_resets_;
@@ -390,6 +399,12 @@ class RpcClient {
               size_t max_frame_size = 256 * 1024,
               RetainedMemoryLedger* retained_memory = nullptr);
     ~RpcClient();
+    // Test-only. Hold every outbound call to `peer` (or only `message`)
+    // unresolved until release_peer_for_tests(); releasing fails the held
+    // calls with a transport error, as a timed-out link would. Idempotent.
+    void stall_peer_for_tests(const NodeId& peer, std::optional<MessageType> message = {});
+    void release_peer_for_tests(const NodeId& peer);
+    size_t stalled_calls_for_tests() const;
     AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
     AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
     AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType);
