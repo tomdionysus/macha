@@ -1269,6 +1269,42 @@ MACHA_TEST("foundations", test_publication_open_writer_bound_fits_the_loader_res
     CHECK(normalize_config(config).fuse.publication_max_open_writers == 3);
 }
 
+MACHA_TEST("foundations", test_torrent_binds_the_advertised_address_not_libtorrent_enumeration) {
+    // libtorrent's default listen_interfaces is expanded by its own device
+    // enumeration. On these nodes that binds eth0 and loopback and never
+    // wlan0, so gbni-2 -- whose eth0 is NO-CARRIER and whose only live link is
+    // wireless -- ran a session bound to 127.0.0.1 and ::1 alone. Two magnets
+    // sat in `metadata` for hours with 0 peers, an empty error field, and one
+    // "plugin loaded" line in the journal. The advertised address is correct
+    // whichever device carries it.
+    TorrentConfig config;
+    config.listen_port = 6881;
+
+    CHECK(torrent_listen_interfaces(config, "10.44.1.51") == "10.44.1.51:6881");
+
+    // A literal IPv6 advertise must be bracketed or libtorrent cannot parse
+    // the port off it.
+    CHECK(torrent_listen_interfaces(config, "fd0e:9c96:30a3::bb4") ==
+          "[fd0e:9c96:30a3::bb4]:6881");
+
+    // No usable advertised address: fall back to libtorrent's own default
+    // rather than inventing a binding.
+    CHECK(torrent_listen_interfaces(config, "") == "0.0.0.0:6881,[::]:6881");
+    CHECK(torrent_listen_interfaces(config, "0.0.0.0") == "0.0.0.0:6881,[::]:6881");
+
+    // The port is honoured in every branch.
+    config.listen_port = 51413;
+    CHECK(torrent_listen_interfaces(config, "10.44.1.51") == "10.44.1.51:51413");
+    CHECK(torrent_listen_interfaces(config, "") == "0.0.0.0:51413,[::]:51413");
+
+    // An explicit operator value always wins, including a device name, which
+    // is the escape hatch when the advertised address is not what should carry
+    // peer traffic.
+    config.listen_interfaces = "wlan0:6881";
+    CHECK(torrent_listen_interfaces(config, "10.44.1.51") == "wlan0:6881");
+    CHECK(torrent_listen_interfaces(config, "") == "wlan0:6881");
+}
+
 MACHA_TEST("foundations", test_retry_budget_is_reachable_once_backoff_reaches_its_ceiling) {
     // The density rule ("more than N failures inside the window") cannot fire
     // once backoff caps: a window only ever holds failure_window/max_backoff

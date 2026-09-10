@@ -835,6 +835,24 @@ absorbed here rather than separate active programmes.
 - [ ] Add optional display-only `node_name` at `.nodes[].node_name`; configure
   `Corvus GBNI-1`, `Corvus GBNI-2`, `Corvus ES-1`, and `Corvus MacBook Pro`.
 - [ ] Complete hard-kill stale-FUSE recovery proof and automatic clean rejoin.
+- [x] **Two torrents stuck in `metadata` forever with no error — found live on
+  gbni-2 2026-09-10, FIXED 0.37.2.** libtorrent's default `listen_interfaces`
+  enumeration binds `eth0` and loopback but never `wlan0`; gbni-2's `eth0` is
+  `NO-CARRIER`, so its session held loopback sockets alone and could reach no
+  peer. Deterministic, not a startup race — a restart rebound identically. The
+  engine now binds the node's advertised address (`torrent.listen_interfaces` /
+  `torrent.listen_port` override), and the plugin consumes libtorrent alerts at
+  all for the first time, so a loopback-only session, a failed bind, a DHT
+  bootstrap or a tracker refusal is now in the journal instead of silent.
+  **Still open:** none of this reaches the HTTP API. `torrents/status` says
+  nothing about listen endpoints or DHT, and `TorrentJob` carries `peers`/
+  `seeds` as bare counts with a free-text `error` — so a client cannot tell a
+  dead session from a slow swarm. The macha-client team asked for exactly that
+  on 2026-09-10 (session health with structured warning codes; per-job
+  trackers, stall durations, connected-vs-candidate peers, structured errors).
+  It needs new `TorrentJob` fields, a persistence-shape change and the
+  cluster RPC bridge to carry them, so it is real work, not serialisation.
+
 - [ ] Diagnose faulty torrent/ingest independently so it does not obscure
   convergence and runtime measurements. **2026-09-10: largely answered** by
   the `repair_once()` mutation-mutex item under P0 structural ingest — the

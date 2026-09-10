@@ -469,6 +469,13 @@ ingest:
 # catalogue or Macha namespace.
 torrent:
   enabled: false
+  # Where the download engine binds, in libtorrent's syntax (an address or a
+  # device name, e.g. "wlan0:6881"). Unset means the node's network.advertise
+  # address: libtorrent's own default enumeration binds eth0 and loopback but
+  # not wlan0, so a node whose only live link is wireless would otherwise get
+  # a loopback-only session that reaches no peer and reports no error.
+  # listen_interfaces: 10.44.1.51:6881
+  listen_port: 6881
   max_active: 4
   max_download_rate: 0B  # 0 = unlimited
   max_upload_rate: 0B    # 0 = unlimited

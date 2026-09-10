@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace macha {
@@ -66,6 +67,13 @@ struct TorrentJob {
 // parse_torrent_job() in torrent.cpp (the on-disk jobs.json persistence
 // shape, file-local) since both live in that translation unit.
 Json torrent_job_api_json(const TorrentJob&);
+
+// The listen_interfaces string the download engine binds, in libtorrent's own
+// syntax. An explicit torrent.listen_interfaces wins; otherwise the node's
+// advertised address is used, because libtorrent's default enumeration binds
+// eth0 and loopback but never wlan0 -- which on a wireless-only node leaves
+// the session on loopback alone, reaching no peer and raising no error.
+std::string torrent_listen_interfaces(const TorrentConfig&, std::string_view advertise);
 
 struct ClusterTorrentJob {
     NodeId node_id;

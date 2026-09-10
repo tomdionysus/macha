@@ -397,6 +397,17 @@ struct TorrentConfig {
     bool dht{true};
     bool pex{true};
     bool lsd{true};
+    // libtorrent's default listen_interfaces ("0.0.0.0:port,[::]:port") is
+    // expanded by its own device enumeration, which on these nodes binds eth0
+    // and loopback but never wlan0. On a node whose only live link is
+    // wireless that leaves the session holding loopback sockets alone: no
+    // peers, no DHT, and magnets that sit in `metadata` forever with no error
+    // (gbni-2, 2026-09-10 -- eth0 NO-CARRIER, two torrents dead for hours).
+    // Empty means "bind the node's own advertised address", which is correct
+    // whichever device carries it. Set explicitly to override, in libtorrent's
+    // own syntax (an address or a device name, e.g. "wlan0:6881").
+    std::string listen_interfaces;
+    uint16_t listen_port{6881};
     std::vector<TorrentSearchProviderConfig> search_providers;
 };
 

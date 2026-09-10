@@ -1,5 +1,36 @@
 # Current release
 
+## 0.37.2 — The torrent engine binds a routable interface, and says so when it cannot (development)
+
+Two magnets sat in `metadata` on gbni-2 for hours with `peers: 0`, `seeds: 0`
+and an empty `error`. Nothing was failing; there was simply no socket that
+could reach anything. libtorrent's default `listen_interfaces`
+(`0.0.0.0:port,[::]:port`) is expanded by its own device enumeration, and on
+these nodes that binds `eth0` and loopback but never `wlan0`. gbni-2's `eth0`
+is `NO-CARRIER` — it is the wireless node — so its session held `127.0.0.1:6881`
+and `[::1]:6881` and nothing else. es-1 and gbni-1 were unaffected only because
+their `eth0` is live. A restart did not help: the binding is deterministic, not
+a startup race.
+
+- The engine now binds the node's advertised address, which is correct
+  whichever device carries it and is already per-node correct in
+  configuration. `torrent.listen_interfaces` overrides it in libtorrent's own
+  syntax (a device name such as `wlan0:6881` is accepted); `torrent.listen_port`
+  defaults to 6881 and is validated nonzero. The decision is
+  `torrent_listen_interfaces()` in `macha_core`, not the plugin, so it is
+  testable without libtorrent.
+- **The plugin never consumed libtorrent alerts at all** — no `pop_alerts`, no
+  alert mask, anywhere. A session that bound nothing usable, failed to
+  bootstrap DHT, or was refused by every tracker reported precisely nothing:
+  the journal held one "plugin loaded" line and the API's `error` field stayed
+  empty. `drain_alerts()` now logs listen success/failure, DHT bootstrap and
+  port mapping, with peer and tracker churn at debug so it cannot bury them.
+  `set_alert_notify` wakes the worker, so a settled manager still drains.
+- A session holding only loopback sockets is reported once, plainly, as a
+  configuration fault. It is a static property known at startup and it
+  invalidates every job on the node at once — the difference between "this will
+  never work" and "this is slow", which nothing previously distinguished.
+
 ## 0.37.1 — A publication with a stale basis replays instead of retrying forever (development)
 
 Two hours after 0.37.0 went out, gbni-1 had one inode that had failed **68

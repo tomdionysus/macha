@@ -416,5 +416,18 @@ std::optional<std::string> TorrentSearchManager::resolve(std::string_view acquis
     return it->second.uri;
 }
 
+std::string torrent_listen_interfaces(const TorrentConfig& config, std::string_view advertise) {
+    if (!config.listen_interfaces.empty())
+        return config.listen_interfaces;
+    const auto port = ":" + std::to_string(config.listen_port);
+    // No usable advertised address: fall back to libtorrent's own default and
+    // accept whatever its device enumeration produces.
+    if (advertise.empty() || advertise == "0.0.0.0" || advertise == "::")
+        return "0.0.0.0" + port + ",[::]" + port;
+    if (advertise.find(':') != std::string_view::npos) // literal IPv6
+        return "[" + std::string(advertise) + "]" + port;
+    return std::string(advertise) + port;
+}
+
 } // namespace macha
 
