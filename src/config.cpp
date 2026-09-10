@@ -253,6 +253,9 @@ void parse_fuse(const YAML::Node& root, Config& c) {
             milliseconds(f["publication_retry_window_ms"], "fuse.publication_retry_window_ms");
     if (f["publication_retry_max_failures"])
         c.fuse.publication_retry.max_failures_in_window = f["publication_retry_max_failures"].as<size_t>();
+    if (f["publication_retry_max_failing_ms"])
+        c.fuse.publication_retry.max_failing_duration =
+            milliseconds(f["publication_retry_max_failing_ms"], "fuse.publication_retry_max_failing_ms");
     if (f["namespace_retry_initial_backoff_ms"])
         c.fuse.namespace_retry.initial_backoff =
             milliseconds(f["namespace_retry_initial_backoff_ms"], "fuse.namespace_retry_initial_backoff_ms");
@@ -264,6 +267,9 @@ void parse_fuse(const YAML::Node& root, Config& c) {
             milliseconds(f["namespace_retry_window_ms"], "fuse.namespace_retry_window_ms");
     if (f["namespace_retry_max_failures"])
         c.fuse.namespace_retry.max_failures_in_window = f["namespace_retry_max_failures"].as<size_t>();
+    if (f["namespace_retry_max_failing_ms"])
+        c.fuse.namespace_retry.max_failing_duration =
+            milliseconds(f["namespace_retry_max_failing_ms"], "fuse.namespace_retry_max_failing_ms");
     if (f["viewer_weight"]) c.fuse.viewer_weight = f["viewer_weight"].as<size_t>();
     if (f["loader_weight"]) c.fuse.loader_weight = f["loader_weight"].as<size_t>();
     if (f["publication_quantum_bytes"])

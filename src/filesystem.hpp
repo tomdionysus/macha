@@ -382,9 +382,17 @@ class FileSystem {
                                             DataWorkContext work_context = DataWorkContext{});
     std::optional<uint64_t> active_write_size(const std::string&);
     std::vector<WriteHandleDiagnostics> active_write_diagnostics(const std::string&);
+    // `stale_basis_is_replayable`: report a basis that no longer matches the
+    // namespace as ESTALE rather than EAGAIN. A publication writer cannot
+    // recover from it -- its captured basis is permanently wrong, so every
+    // retry re-runs the identical doomed comparison -- but the spool still
+    // holds the bytes, so the generation must be replayed from the WAL against
+    // a fresh writer. Foreground handles keep EAGAIN: they stay open, the
+    // content really did change concurrently, and retrying is meaningful.
     void commit_file(const std::string&, const FsEntry&, uint64_t,
                      const std::vector<ExtentRef>&, FsEntry*,
-                     std::optional<int64_t> mtime_override = {});
+                     std::optional<int64_t> mtime_override = {},
+                     bool stale_basis_is_replayable = false);
     std::pair<uint64_t, uint64_t> logical_capacity() const;
     MetadataSnapshot local_snapshot() const;
     MetadataSnapshotView local_snapshot_view();
