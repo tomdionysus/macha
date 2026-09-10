@@ -1,6 +1,6 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-09-08
+Last updated: 2026-09-10
 
 This is the authoritative, ordered backlog. Detailed plans and UAT records in
 this directory remain evidence; completed work belongs in `COMPLETED.md` and is
@@ -65,6 +65,37 @@ The governing laws are:
    configurable share (95:5 by default), not indefinite starvation of all other work.
 
 ## P0 — Playback correctness and poor-network resilience
+
+- [ ] **An abandoned playback session holds a node's only transcode slot for
+  30 minutes — found 2026-09-10, confirmed independently by two client teams.**
+  The video/audio transcode entitlement lives on the *session*, not the
+  pipeline: `video_transcodes_locked()` (`playback.cpp:1152`) counts sessions
+  whose `logical_session->video_transcode_entitled` is set and never inspects
+  whether an engine is running. Two independent clocks in the reaper
+  (`playback.cpp:2601`): `pipeline_idle` (60 s) reclaims the **engine**, while
+  `session_idle` (**30 minutes**) is what finally erases the session and
+  releases the entitlement. So pipeline reclaim does not free the slot — it
+  makes the session cheap to hold while it goes on holding it.
+  With `max_video_transcodes: 1` on these nodes, one session created and not
+  deleted closes that node to transcoding for half an hour while the node
+  looks perfectly healthy, and `reserve_resources` refuses with
+  `429 resource_limit` (`playback.cpp:2780`) — there is no eviction path.
+  Because the count is per *logical* session, the viewer who caused it is the
+  one person who cannot observe it; the cost falls entirely on others.
+  **No client-side fix closes this.** The phone client's failover creates a
+  fresh session and drops the old one; `@macha/core` closes all five of its
+  standby paths but uses `keepalive`, which React Native ignores and Tizen 3
+  does not have, so a suspended app's closing `DELETE` may never leave; and a
+  client that crashes, is force-quit or loses power can never send one.
+  Explicit `DELETE` releases immediately (`playback.cpp:2349-2357`, which also
+  stops the pipeline and removes the session temp directory).
+  Two server-side options, neither built: a shorter idle for a session never
+  fetched from — `stream_touched` (`playback.cpp:617`) is set at construction
+  and advanced only by a real fragment fetch, and the reaper already computes
+  both that and "has no running engine" every pass, so this is a branch in an
+  existing loop needing no new state; or eviction of an entitled, engineless,
+  trafficless session at admission, which is more invasive because it converts
+  admission from a guarantee into a lease and is client-visible.
 
 - [x] **Complete VOD playlist with bounded segment holds — shipped and
   deployed to all three nodes 2026-09-08.** Verified live on a real transcode
@@ -482,41 +513,55 @@ Resume the
 after the immediate playback correctness blocker. Existing checkpoints remain
 valid evidence, but do not prove the end-to-end invariants.
 
-- [ ] **es-1 publication livelock starves RPC and takes the node out of the
-  cluster — found 2026-09-08, survives restart, not caught by the parking
-  discipline.** Measured on es-1 the same day:
-  retained-memory ledger capacity 768 MB with the `publication` owner holding
-  **508 MB** and `reclaimable_bytes` **0**; spool **1.72 GB** with
-  `spool_publish_rate_bytes_per_second` **0**;
-  `data_publication_inflight_bytes` 256 MB with `bytes_committed` and
-  `bytes_confirmed` both **0**; loader waits 6,258 against 6,249 cancelled.
-  The loop is self-sustaining: publication holds the memory and cannot confirm
-  without peer RPC, RPC reassembly cannot get memory from the same ledger
-  (`process retained-memory RPC reassembly saturated`), so peer channels drop
-  (`RPC session: peer closed`, `bootstrap: no canonical RPC route to peer`),
-  so publication still cannot confirm and the memory is never released.
-  Downstream: es-1's telemetry is ~18 minutes stale on both home nodes and
-  theirs on es-1; es-1 cannot fetch catalogue shards
-  (`catalogue shard unavailable for control repair: 254f541d…`, also failing
-  retention publication); and gbni-1 cannot read extents whose replica needs
-  es-1 (`media input read failed … error=extent unavailable` ->
-  `read media packet: Input/output error` -> a dead transcode generation).
-  **Not a network fault**: TCP to :7437 connects both ways and ping is 61 ms.
-  **Not caused by the 2026-09-08 deploy**: 49,680 saturation events on es-1
-  before 16:00 that day, first at 09:21; gbni-1 has zero ever and gbni-2 four,
-  from 2026-09-07.
-  **A restart does not clear it** — es-1 restarted at 16:01 and logged 1,653
-  more within 25 minutes, because publication resumes from the spool and
-  immediately re-consumes the ledger.
-  **`parked_publications` is 0**, so 0.30.0's retry-and-park discipline does
-  not catch this: that machinery parks work that *fails*, and this work never
-  fails, it simply never completes. That looks like a real gap in the
-  self-healing programme rather than a misconfiguration, and it is the reason
-  this is filed separately from the retained-memory bounds item below rather
-  than folded into it.
-  Not yet established: what the 1.72 GB of spool actually is, and whether that
-  content already exists elsewhere in the cluster. Establish that before
-  draining or clearing anything.
+- [x] **es-1 publication livelock starves RPC and takes the node out of the
+  cluster — FIXED 0.36.8 + 0.36.9, deployed 2026-09-09, see `COMPLETED.md`.**
+
+- [ ] **The no-progress counter added in 0.36.9 misses two extent-publishing
+  paths, and counts the wrong thing anyway — found 2026-09-10, latent.**
+  `FileSystem::write_progress_` ticks in `drain_one_extent()` and `commit()`,
+  but `rebuild_step` (`filesystem.cpp:1229`) and the non-pipelined branch of
+  `flush()` (`filesystem.cpp:489`) publish durable extents without ticking it.
+  A node writing non-sequentially — `rsync --inplace` patching partially
+  present files, which is what any resumed import does — can publish at full
+  speed while the counter reads flat, and under memory pressure that fails
+  healthy work with `EAGAIN` and eventually parks it: the exact failure 0.36.8
+  exists to prevent, reintroduced at a different site.
+  **Patching the two call sites is not the fix.** The waiter is blocked on the
+  shared durable-lower budget, which anyone's release can free, so
+  publication's own releases were never the right thing to count; and ticking
+  in `rebuild_step` would re-arm every blocked waiter on work that frees no
+  memory, masking a genuine deadlock for the length of a long rebuild.
+  Move the budget into `RetainedMemoryLedger::acquire()`
+  (`retained_memory.hpp:290`), which already owns the loop, the condition
+  variable, the deadline and `available_locked()`; the predicate must be **per
+  waiter**, not a global release counter, or the deadline becomes decorative on
+  a busy node and the original wedge goes undetected again. Re-derive
+  `publication_no_progress_deadline_ms` against the corrected counter rather
+  than inheriting 30 s. Keep a publication-specific Status field alongside any
+  ledger-wide one — its absence is what made es-1 unreadable.
+  Not fired to date: `waits.loader` is 0 on all three nodes across 15 hours of
+  heavy ingest, because 0.36.9's bound removed the memory pressure the bug
+  needs. Full write-up in
+  [`2026-09-09-publication-hold-and-wait-plan.md`](2026-09-09-publication-hold-and-wait-plan.md).
+
+- [ ] **The open-writer bound is soft and can overshoot — found 2026-09-10.**
+  `runnable_data_locked` tests `writer_cap_reached()` before selecting an
+  inode and the worker opens the writer afterwards, so N workers can each pass
+  the test at bound-1. Overshoot is up to `commit_workers - 1`; es-1 reported
+  `peak_open_publications` 9 against a bound of 8 within a day of the deploy.
+  Harmless as configured (9 writers is 108 MB against a 512 MB durable-lower
+  budget) and the misleading comments are corrected, but making it exact needs
+  the slot reserved at selection time under `data_queue_mutex`, the way
+  `reserved_video_transcodes` already reserves a transcode entitlement across
+  its admission window.
+
+- [ ] **`WriteHandle::drain_one_extent` waits on its extent future with no
+  deadline and no cancellation check** (`filesystem.cpp:515`), so a stalled
+  extent put blocks publication silently — the same "never fails, never
+  completes" shape one layer below the 0.36.8 fix. Deferred from that work
+  because it needs a `DistributedStore` fault-injection hook, which does not
+  exist; landing the wait change untested would add a new `EAGAIN` path to
+  publication on the strength of inspection alone.
 
 - [ ] Finish process-wide retained-memory ownership bounds for decoded metadata,
   catalogue/profile state, reconciliation retries, RPC/reassembly, object
@@ -600,7 +645,12 @@ valid evidence, but do not prove the end-to-end invariants.
   Keep rename a safe singleton until crash/restart proof exists.
 - [ ] Make spool backpressure smooth and visibly progressive near its configured
   limit, pacing toward measured publication/drain rate instead of alternating
-  full-speed bursts and apparent freezes.
+  full-speed bursts and apparent freezes. **Still reproducible 2026-09-10**:
+  under a sustained 6 MB/s import gbni-1's spool sat at exactly
+  `max_spool_bytes` (16.00 GB) with rsync throttled to 11 kB/s and its own ETA
+  reading `??:??:??`. The mechanism is working as designed — ingest is paced to
+  publication drain — but from outside it is indistinguishable from a stall,
+  which is precisely what this item is about.
 - [ ] Prove large-history, partition/sibling-head, cache-pressure,
   unclean-restart and stale-FUSE recovery, then run a guarded overnight
   four-node rsync UAT. Require bounded RSS/swap/history, automatic rejoin,
@@ -689,9 +739,12 @@ absorbed here rather than separate active programmes.
   [node telemetry visibility](2026-09-09-node-telemetry-visibility.md).**
   Causes 1 (a stale sample blanked its whole `runtime` block) and 2
   (`metadata_generation` preferring a membership record carrying 0 over a
-  live sample) are fixed there. Cause 3 is the open one: telemetry gossip is
-  idle-gated, best-effort and never retries, so a busy or backed-off peer
-  goes invisible — needs a design decision before code. Audit
+  live sample) are fixed there. **Cause 3 also shipped, in 0.36.7**: gossip
+  was sent only after 2 s free of foreground *and* read-ahead work and then
+  only onto an idle writer, so a node went invisible exactly while busy or in
+  trouble. Both gates are gone, gossip runs every tick on the SPECULATIVE
+  class at `network.telemetry_interval_ms` (10 s), and a demand-driven wake
+  publishes sooner but no more than once a second. **Still open:** audit
   how a node folds a peer's telemetry into its own aggregate response — this
   is a different code path from the per-sample freshness fix. This is likely
   the same underlying gap as playback P0 item 2's Status-latency investigation
@@ -798,6 +851,16 @@ that report.
 - [ ] Keep diagnostics bounded, snapshot-based and disabled by default when
   they perturb viewer behaviour; never instrument per packet or fragment on a
   critical thread merely to diagnose a P0.
+- [ ] **Status has no maintenance section at all — found 2026-09-10.** The
+  diagnostics object exposes `convergence`, `data_resources`, `data_store`,
+  `filesystem`, `metadata`, `retained_memory`, `rpc_server` and
+  `rpc_transport`, and nothing for the maintenance loop: no work remaining, no
+  queue depth, no pass progress. So "has background maintenance finished?"
+  cannot be answered from the API — only inferred from `DIAG high thread CPU
+  name=macha-maint` lines in the journal, and from GC reclaim messages. That
+  is discipline 1 of the self-healing plan (background work whose progress is
+  observable) unaddressed for the one subsystem that runs continuously. It is
+  the same shape of gap the publication counters closed in 0.36.9.
 
 ## P2 — Code health and error-handling consistency (found 2026-09-05)
 

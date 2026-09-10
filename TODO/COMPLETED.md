@@ -1,11 +1,70 @@
 # Completed and tested
 
-Last updated: 2026-09-08
+Last updated: 2026-09-10
 
 The 2026-09-08 entries below were ledgered by a pruning pass over
 `ACTIVE.md`, and cover only the items that pass removed from that file.
 0.24.1–0.35.0 is not otherwise ledgered here yet — see the documentation
 hygiene item in `ACTIVE.md`.
+
+## es-1 publication livelock — 0.36.8 + 0.36.9, deployed 2026-09-09
+
+- [x] **The whole of the "es-1 publication livelock starves RPC and takes the
+  node out of the cluster" item from `ACTIVE.md`.** Two defects, one in each
+  release, and the item's own diagnosis of *why* the parking discipline could
+  not catch it turned out to be exactly right: the work never failed, so
+  nothing could park it.
+
+  **0.36.8 — reassembly starvation and an unbounded wait.** `MessageAssembler`
+  could not get a retained-memory lease to reassemble an inbound frame, threw
+  `process retained-memory RPC reassembly saturated` and killed the channel
+  about once a second, so peer channels died 1–2 s after connecting and
+  telemetry — the only consumer that never re-dials — appeared to vanish. The
+  loop is closed exactly as the item described: publication holds its bytes
+  until a peer confirms, the confirmation is a frame that must be reassembled
+  into the same ledger, and that reassembly is refused because publication is
+  waiting. Fixed with `runtime.reassembly_memory_reserve_bytes` (32 MB),
+  placed below the control/viewer waiter gate and above the loader gate and
+  durable-lower budget — both halves load-bearing, since above every gate it
+  inverts the deadlock and above the viewer gate it breaks governing law 1.
+  Separately, the publication `DataWorkContext` carried no deadline at all, so
+  the wait took the unbounded `cv_.wait` branch and all eight commit workers
+  sat in `ensure_buffer_memory` holding 492 MB between them.
+  `fuse.publication_no_progress_deadline_ms` (30 s) makes that a bounded
+  no-progress budget that enters the ordinary retry/park path.
+
+  **0.36.9 — the hold-and-wait itself.** Every byte of `owners.publication` is
+  a `WriteHandle` extent lease. A writer is retained across clean yields and
+  retryable failures so a resumed publication never replays spool bytes, and
+  it keeps its leases while retained; publication scheduling is otherwise
+  breadth-first, so the number of writers holding partial state was simply the
+  width of the backlog — 123 leases at a 4 MiB extent, the entire durable-lower
+  budget. No byte budget could fix it, which is why lowering
+  `publication_inflight_bytes` from 256M to 96M had changed the inflight figure
+  and left `owners.publication` at 515,899,392 unchanged.
+  `fuse.publication_max_open_writers` bounds how many inodes may hold a writer,
+  derived from `runtime.loader_memory_reserve_bytes`.
+
+  **Evidence.** es-1 before: 317 publications started, **0** completed,
+  `owners.publication` 515,899,392 byte-identical across restarts at 99.7% of
+  the durable-lower budget, spool 8,589,783,970 draining at 0 B/s, 190 backend
+  failures. After the deploy the spool drained to **0** with
+  `data_publication_bytes_confirmed` reading exactly 8,589,783,970 — every
+  byte — in about 45 minutes. Over the following 15 hours under live ingest the
+  cluster published ~475 GB with `parked_publications` 0, `waits.loader` 0 on
+  every node, peak ledger use 156 MB of 768 MB, and zero warnings or errors.
+  A viewer request had been failing on this node with `viewer fragment memory
+  admission unavailable` before the fix, so governing law 1 was being violated
+  in practice, not merely at risk.
+
+  Two defects **in the fix itself** were found the next day and remain open in
+  `ACTIVE.md`: the no-progress counter misses `rebuild_step` and the
+  non-pipelined `flush()` and counts the wrong thing anyway, and the
+  open-writer bound is soft and can overshoot by up to `commit_workers - 1`.
+  Neither has fired. Plan and post-deploy audit in
+  [`2026-09-09-publication-hold-and-wait-plan.md`](2026-09-09-publication-hold-and-wait-plan.md);
+  the handover that preceded it is
+  [`2026-09-09-publication-livelock-continuation.md`](2026-09-09-publication-livelock-continuation.md).
 
 ## Self-healing disciplines — 0.29.0 → 0.32.0
 
