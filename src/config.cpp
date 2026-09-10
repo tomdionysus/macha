@@ -447,6 +447,9 @@ void parse_torrent(const YAML::Node& root, Config& c) {
     if (!torrent) return;
     if (torrent["enabled"]) c.torrent.enabled = torrent["enabled"].as<bool>();
     if (torrent["max_active"]) c.torrent.max_active = torrent["max_active"].as<size_t>();
+    if (torrent["listen_interfaces"])
+        c.torrent.listen_interfaces = torrent["listen_interfaces"].as<std::string>();
+    if (torrent["listen_port"]) c.torrent.listen_port = torrent["listen_port"].as<uint16_t>();
     if (torrent["max_download_rate"]) c.torrent.max_download_rate = yaml_size(torrent["max_download_rate"]);
     if (torrent["max_upload_rate"]) c.torrent.max_upload_rate = yaml_size(torrent["max_upload_rate"]);
     if (torrent["dht"]) c.torrent.dht = torrent["dht"].as<bool>();

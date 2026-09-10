@@ -23,6 +23,7 @@
 #include <system_error>
 
 #include <libtorrent/add_torrent_params.hpp>
+#include <libtorrent/alert_types.hpp>
 #include <libtorrent/error_code.hpp>
 #include <libtorrent/load_torrent.hpp>
 #include <libtorrent/magnet_uri.hpp>
@@ -104,9 +105,18 @@ TorrentJob parse_torrent_job(const Json& value) {
 
 namespace lt = libtorrent;
 
-lt::session_params make_session_params(const TorrentConfig& config) {
+lt::session_params make_session_params(const TorrentConfig& config, std::string_view advertise) {
     lt::session_params params;
     auto& settings = params.settings;
+    settings.set_str(lt::settings_pack::listen_interfaces,
+                     torrent_listen_interfaces(config, advertise));
+    // Nothing consumed alerts at all before this, so a session that bound
+    // nothing usable, failed to bootstrap DHT or was refused by every tracker
+    // reported exactly nothing: two torrents sat dead for hours with an empty
+    // error field and one "plugin loaded" line in the journal.
+    settings.set_int(lt::settings_pack::alert_mask,
+                     lt::alert_category::error | lt::alert_category::status |
+                         lt::alert_category::port_mapping | lt::alert_category::dht);
     settings.set_int(lt::settings_pack::active_downloads, static_cast<int>(config.max_active));
     settings.set_int(lt::settings_pack::active_limit, static_cast<int>(config.max_active + 4));
     settings.set_int(lt::settings_pack::active_seeds, 0);
@@ -143,7 +153,8 @@ struct TorrentManager::Impl {
     std::map<std::string, libtorrent::torrent_handle, std::less<>> handles;
     CurlHttpClient http;
 
-    explicit Impl(const TorrentConfig& config) : session(make_session_params(config)) {}
+    Impl(const TorrentConfig& config, std::string_view advertise)
+        : session(make_session_params(config, advertise)) {}
 };
 
 TorrentManager::TorrentManager(NodeRuntime& node, IngestManager& ingest, TorrentConfig config,
@@ -155,7 +166,14 @@ TorrentManager::TorrentManager(NodeRuntime& node, IngestManager& ingest, Torrent
         [this](std::span<const uint8_t> payload) { return handle_job_action(payload); });
     if (!config_.enabled) return;
     std::filesystem::create_directories(state_file_.parent_path());
-    impl_ = std::make_unique<Impl>(config_);
+    impl_ = std::make_unique<Impl>(config_, node_.config().advertise_host);
+    // Alerts arrive on libtorrent's own thread; this only wakes the worker,
+    // which does the draining. Without it a settled manager blocks on the
+    // condition and never reads the queue.
+    impl_->session.set_alert_notify([this] {
+        alerts_pending_.store(true, std::memory_order_release);
+        cv_.notify_all();
+    });
     load_state();
 }
 
@@ -707,19 +725,68 @@ bool TorrentManager::has_active_jobs_locked() const {
     });
 }
 
+void TorrentManager::drain_alerts() {
+    if (!impl_) return;
+    alerts_pending_.store(false, std::memory_order_release);
+    std::vector<lt::alert*> alerts;
+    impl_->session.pop_alerts(&alerts);
+    for (const auto* alert : alerts) {
+        if (const auto* failed = lt::alert_cast<lt::listen_failed_alert>(alert)) {
+            Log::warn("torrent listen failed interface=" + std::string(failed->listen_interface()) +
+                      " " + failed->message());
+            continue;
+        }
+        if (const auto* ok = lt::alert_cast<lt::listen_succeeded_alert>(alert)) {
+            const auto address = ok->address;
+            if (!address.is_loopback() && !address.is_unspecified())
+                ++routable_listen_endpoints_;
+            Log::info("torrent listening on " + address.to_string() + ":" +
+                      std::to_string(ok->port));
+            continue;
+        }
+        if (lt::alert_cast<lt::dht_bootstrap_alert>(alert)) {
+            Log::info("torrent DHT bootstrapped");
+            continue;
+        }
+        // Everything else at debug: tracker churn and peer errors are normal
+        // and must not become the noise that hides the two lines above.
+        if (Log::enabled(LogLevel::debug))
+            Log::debug(std::string("torrent alert ") + alert->what() + ": " + alert->message());
+    }
+
+    // A session holding only loopback sockets can reach no peer at all. That
+    // is a configuration fault, not a transient, so say it once and plainly
+    // rather than leaving every magnet stuck in `metadata` with no error.
+    if (!warned_loopback_only_ && !routable_listen_endpoints_ && !alerts.empty()) {
+        bool any_listen = std::any_of(alerts.begin(), alerts.end(), [](const lt::alert* a) {
+            return lt::alert_cast<lt::listen_succeeded_alert>(a) ||
+                   lt::alert_cast<lt::listen_failed_alert>(a);
+        });
+        if (any_listen) {
+            warned_loopback_only_ = true;
+            Log::warn("torrent session bound no routable interface (loopback only): no peer or "
+                      "DHT traffic is possible. Set torrent.listen_interfaces, or check that "
+                      "network.advertise names a live link on this node.");
+        }
+    }
+}
+
 void TorrentManager::loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
+        drain_alerts();
         update_jobs();
         std::unique_lock lock(mutex_);
-        if (has_active_jobs_locked()) {
+        if (has_active_jobs_locked() || alerts_pending_.load(std::memory_order_acquire)) {
             // libtorrent and linked ingest jobs are external progress sources, so
             // active jobs still receive a modest status sample cadence. A fully
             // settled/paused manager blocks until an API operation wakes it.
             cv_.wait_for(lock, stop, std::chrono::milliseconds(500), [this] {
-                return !has_active_jobs_locked();
+                return !has_active_jobs_locked() || alerts_pending_.load(std::memory_order_acquire);
             });
         } else {
-            cv_.wait(lock, stop, [this] { return has_active_jobs_locked(); });
+            cv_.wait(lock, stop, [this] {
+                return has_active_jobs_locked() || alerts_pending_.load(std::memory_order_acquire);
+            });
         }
     }
 }
