@@ -2195,6 +2195,92 @@ MACHA_TEST("filesystem_fuse", test_fuse_retryable_publication_failure_preserves_
     frontend->stop();
 }
 
+MACHA_TEST("filesystem_fuse", test_publication_with_a_stale_basis_asks_for_replay_not_retry) {
+    // A write handle captures the entry it opened against. If the entry then
+    // moves past it, commit_file's content-change guard rejects the commit --
+    // and for a publication that rejection is permanent, because the retry
+    // keeps the same writer and re-runs the identical comparison. On
+    // 2026-09-10 gbni-1 failed one inode 68 times that way (rsync
+    // --append-verify appending to a file whose publication was in flight),
+    // retrying forever because EAGAIN reads as transient.
+    //
+    // A publication now reports ESTALE, which the frontend already handles by
+    // dropping the writer and replaying the generation from the spool against
+    // current state. Foreground handles keep EAGAIN: they stay open and the
+    // content genuinely did change under them, so retrying is meaningful.
+    TestService fixture("stale-basis");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.min_write_replicas = 1;
+    config.metadata_min_write_replicas = 1;
+    auto& service = fixture.start();
+    auto& fs = service.filesystem();
+
+    const auto first = pattern(32 * 1024, 7);
+    const auto longer = pattern(96 * 1024, 9);
+
+    auto stale_commit_code = [&](WriteDurability durability) {
+        const std::string path =
+            durability == WriteDurability::publication_generation ? "/stale-pub.bin" : "/stale-fg.bin";
+        fs.create_file(path, 0644, getuid(), getgid());
+        auto writer = fs.open_write(path, false, false, durability);
+        REQUIRE(writer->write(0, first) == first.size());
+
+        // Move the entry underneath it: a separate handle commits different
+        // content, advancing version, size and extents together.
+        auto other = fs.open_write(path, false);
+        REQUIRE(other->write(0, longer) == longer.size());
+        other->commit();
+
+        try {
+            writer->commit();
+        } catch (const FsError& e) {
+            return e.code();
+        }
+        return 0;
+    };
+
+    // The publication asks to be replayed rather than retried in place.
+    CHECK(stale_commit_code(WriteDurability::publication_generation) == ESTALE);
+    // The foreground contract is unchanged.
+    CHECK(stale_commit_code(WriteDurability::immediate) == EAGAIN);
+}
+
+MACHA_TEST("filesystem_fuse", test_fuse_publication_failing_repeatedly_is_reported_before_it_parks) {
+    // A file failing tens of times used to be invisible: DEBUG-only lines, and
+    // every aggregate -- health, parked_publications, conditions -- reading
+    // clean. That is how 68 consecutive failures on gbni-1 went unnoticed
+    // until an operator went looking. A long failure run is now escalated to
+    // WARN and counted, before and independently of parking.
+    TestService fixture("fuse-publication-escalation");
+    auto& config = fixture.config();
+    config.replication = 2;
+    config.min_write_replicas = 2; // one node: the floor can never be met
+    config.metadata_min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    config.fuse.commit_workers = 1;
+    config.fuse.publication_quiet = 0ms;
+    // Room for well over the escalation threshold (10) before the budget runs
+    // out, so this measures escalation rather than parking.
+    config.fuse.publication_retry = RetryPolicy{500, 60s, 1ms, 2ms};
+    config.fuse.publication_retry.max_failing_duration = 60s;
+
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto handle = frontend->create("/noisy.bin", 0644, getuid(), getgid(), true, true, false);
+    const auto payload = pattern(64 * 1024 + 3, 51);
+    REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
+    frontend->release(handle.inode, true);
+
+    // Crossing the threshold is counted exactly once for the run.
+    REQUIRE(wait_until(
+        [&] { return frontend->diagnostics().publications_retrying_persistently == 1; }, 10s));
+    CHECK(frontend->diagnostics().parked_publications == 0);
+    std::this_thread::sleep_for(100ms);
+    CHECK(frontend->diagnostics().publications_retrying_persistently == 1);
+    CHECK(frontend->diagnostics().publication_retries_backed_off >= 10);
+}
+
 MACHA_TEST("filesystem_fuse", test_fuse_publication_backs_off_then_parks_for_operator) {
     // Discipline 2 of the self-healing plan. A publication that keeps failing
     // retryably must not retry forever at a fixed interval (a doomed inode ran

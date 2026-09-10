@@ -1014,6 +1014,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                 filesystem_diagnostics["parked_publications"] = values->parked_publications;
                 filesystem_diagnostics["publication_retries_backed_off"] =
                     values->publication_retries_backed_off;
+                filesystem_diagnostics["publications_retrying_persistently"] =
+                    values->publications_retrying_persistently;
                 // What recovery resolved instead of refusing (discipline 3).
                 filesystem_diagnostics["journal_recovery_skipped_frames"] =
                     values->journal_recovery_skipped_frames;

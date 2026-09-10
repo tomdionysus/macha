@@ -796,6 +796,11 @@ struct FuseFrontend::State {
     std::atomic_uint64_t namespace_operations_confirmed{};
     std::atomic_uint64_t parked_publications{};
     std::atomic_uint64_t publication_retries_backed_off{};
+    // Inodes whose current failure run crossed the escalation threshold. A
+    // file retrying tens of times is an operator-visible event, not a DEBUG
+    // line: on 2026-09-10 one inode failed 68 consecutive times on gbni-1
+    // with nothing above DEBUG and every aggregate reading healthy.
+    std::atomic_uint64_t publications_retrying_persistently{};
     // Write admission waited (backpressure) instead of failing; slices counted.
     std::atomic_uint64_t write_admission_waits{};
     std::atomic_uint64_t process_memory_admission_waits{};
@@ -4044,14 +4049,19 @@ struct FuseFrontend::State {
                     std::optional<std::chrono::milliseconds> delay;
                     std::string path;
                     size_t attempts = 0;
+                    size_t consecutive = 0;
                     std::chrono::milliseconds failing_for{};
+                    std::chrono::milliseconds run_for{};
                     {
                         std::lock_guard lock(inode->mutex);
                         const auto now = Clock::now();
                         delay = inode->publication_retry.failed(config.publication_retry, now);
                         attempts = inode->publication_retry.total_failures();
+                        consecutive = inode->publication_retry.consecutive_failures();
                         failing_for = std::chrono::duration_cast<std::chrono::milliseconds>(
                             now - inode->publication_retry.first_failure());
+                        run_for = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - inode->publication_retry.failing_since());
                         path = inode->current_path;
                         if (!delay) {
                             inode->parked = Inode::Parked{code, e.what(), now};
@@ -4061,8 +4071,27 @@ struct FuseFrontend::State {
                     if (delay) {
                         publication_retries_backed_off.fetch_add(1, std::memory_order_relaxed);
                         note_deferred_due(Clock::now() + *delay);
-                        Log::debug(line + " retry_in_ms=" + std::to_string(delay->count()) +
-                                   " attempts=" + std::to_string(attempts));
+                        // Escalate a long failure run out of DEBUG: once at the
+                        // threshold, then periodically, so a file stuck short of
+                        // its budget is visible without flooding the journal.
+                        constexpr size_t escalate_at = 10;
+                        constexpr size_t repeat_every = 20;
+                        const bool crossed = consecutive == escalate_at;
+                        if (crossed)
+                            publications_retrying_persistently.fetch_add(
+                                1, std::memory_order_relaxed);
+                        if (crossed || (consecutive > escalate_at &&
+                                        (consecutive - escalate_at) % repeat_every == 0)) {
+                            Log::warn("FUSE data publication failing repeatedly inode=" +
+                                      std::to_string(inode->id) + " path=" + path +
+                                      " consecutive=" + std::to_string(consecutive) +
+                                      " failing_for_ms=" + std::to_string(run_for.count()) +
+                                      " retry_in_ms=" + std::to_string(delay->count()) +
+                                      " error=" + e.what());
+                        } else {
+                            Log::debug(line + " retry_in_ms=" + std::to_string(delay->count()) +
+                                       " attempts=" + std::to_string(attempts));
+                        }
                     } else {
                         parked_publications.fetch_add(1, std::memory_order_relaxed);
                         retry = false; // not readmitted; not poisoned either.
@@ -6534,6 +6563,7 @@ FuseFrontendDiagnostics FuseFrontend::diagnostics() const noexcept {
         state_->fs.available_namespace_revision(),
         state_->parked_publications.load(std::memory_order_relaxed),
         state_->publication_retries_backed_off.load(std::memory_order_relaxed),
+        state_->publications_retrying_persistently.load(std::memory_order_relaxed),
         state_->journal_recovery_skipped_frames.load(std::memory_order_relaxed),
         state_->journal_recovery_quarantined_bytes.load(std::memory_order_relaxed),
         state_->recovery_dropped_operations.load(std::memory_order_relaxed),

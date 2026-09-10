@@ -1269,6 +1269,71 @@ MACHA_TEST("foundations", test_publication_open_writer_bound_fits_the_loader_res
     CHECK(normalize_config(config).fuse.publication_max_open_writers == 3);
 }
 
+MACHA_TEST("foundations", test_retry_budget_is_reachable_once_backoff_reaches_its_ceiling) {
+    // The density rule ("more than N failures inside the window") cannot fire
+    // once backoff caps: a window only ever holds failure_window/max_backoff
+    // attempts. The shipped publication policy was 30 min / 30 s = 60 possible
+    // attempts against a threshold of 100, so a permanently failing file
+    // retried forever. On 2026-09-10 gbni-1 did exactly that -- 68 consecutive
+    // failures of one inode, every aggregate reading healthy, parked = 0.
+    // RetryState::failed() takes `now`, so this drives simulated time and needs
+    // no sleeps.
+    using Clock = RetryState::Clock;
+    const auto start = Clock::now();
+    RetryPolicy shipped{100, 30min, 250ms, 30s};
+    shipped.max_failing_duration = {}; // the pre-fix behaviour
+
+    RetryState never_parks;
+    bool parked = false;
+    for (int i = 1; i <= 400 && !parked; ++i) // 400 x 30 s ~ 3.3 simulated hours
+        parked = !never_parks.failed(shipped, start + i * 30s).has_value();
+    CHECK(!parked);
+    CHECK(never_parks.failures_in_window() <= 61); // the arithmetic ceiling
+    CHECK(never_parks.consecutive_failures() == 400);
+
+    // With the duration backstop the same policy parks, and only once the
+    // backstop is genuinely exceeded -- not before.
+    RetryPolicy fixed = shipped;
+    fixed.max_failing_duration = 1h;
+    RetryState bounded;
+    std::optional<int> parked_at;
+    for (int i = 1; i <= 400 && !parked_at; ++i) {
+        if (!bounded.failed(fixed, start + i * 30s))
+            parked_at = i;
+    }
+    // The run is measured from the first failure, so at attempt i it has been
+    // failing for (i-1) x 30 s. It parks on the first attempt strictly past 1 h.
+    REQUIRE(parked_at.has_value());
+    CHECK(*parked_at == 122);
+    CHECK((*parked_at - 1) * 30s > 1h);
+    CHECK((*parked_at - 2) * 30s <= 1h);
+
+    // The backstop measures the current unbroken run, not the whole history:
+    // an item that keeps recovering must never park on age alone.
+    RetryState flapping;
+    for (int i = 1; i <= 400; ++i) {
+        REQUIRE(flapping.failed(fixed, start + i * 30s).has_value());
+        flapping.succeeded();
+    }
+    CHECK(flapping.consecutive_failures() == 0);
+
+    // ...but genuine flapping still parks on density, which is what that rule
+    // is for: 101 failures inside the window, sparse enough runs that the
+    // backstop never applies.
+    RetryPolicy dense{5, 10min, 1ms, 10ms};
+    dense.max_failing_duration = 1h;
+    RetryState flapping_hard;
+    std::optional<int> dense_parked_at;
+    for (int i = 1; i <= 20 && !dense_parked_at; ++i) {
+        if (!flapping_hard.failed(dense, start + i * 1s))
+            dense_parked_at = i;
+        else
+            flapping_hard.succeeded();
+    }
+    REQUIRE(dense_parked_at.has_value());
+    CHECK(*dense_parked_at == 6); // more than 5 in the window
+}
+
 MACHA_TEST("foundations", test_normalize_config_preserves_an_explicit_plugin_path) {
     auto config = minimal_valid_config();
     config.plugin_path = "/opt/macha/plugins";

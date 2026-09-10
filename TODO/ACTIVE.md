@@ -566,6 +566,20 @@ valid evidence, but do not prove the end-to-end invariants.
   imports means N concurrent `WriteHandle`s against the same durable-lower
   budget, so the bound is a memory knob as much as a throughput one.
 
+- [x] **A publication whose basis went stale retried forever, silently — found
+  live on gbni-1 2026-09-10, FIXED 0.37.1.** One inode failed 68 consecutive
+  times with `parked_publications` at 0 and health `healthy`. Three defects in
+  series: `commit_file`'s content-change guard reported a permanently stale
+  publication basis as retryable `EAGAIN` (now `ESTALE`, which replays against
+  a fresh writer); the park budget's density rule was unreachable at the
+  backoff ceiling, 30 min / 30 s = 60 attempts against a threshold of 100 (now
+  backstopped by `RetryPolicy::max_failing_duration`, default 1 h, deliberately
+  separate from `failure_window` so a long WAN/wifi outage does not park every
+  publication); and a long failure run was DEBUG-only (now WARN plus
+  `publications_retrying_persistently` on `diagnostics.filesystem`).
+  Trigger was rsync `--append-verify` appending to a file whose publication was
+  in flight — a legitimate thing to do that the system mishandled.
+
 - [ ] **A job being imported still reports `queued` — found 2026-09-10, not
   root-caused.** The head job on es-1 carried `files_total: 1`,
   `bytes_total: 739234786` and a populated `current_file` while its `state`

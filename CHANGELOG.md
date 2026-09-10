@@ -1,5 +1,46 @@
 # Current release
 
+## 0.37.1 — A publication with a stale basis replays instead of retrying forever (development)
+
+Two hours after 0.37.0 went out, gbni-1 had one inode that had failed **68
+consecutive times** and could never succeed. `parked_publications` read 0,
+`cluster.health` read `healthy`, and the only evidence was a DEBUG line every
+30 seconds. rsync `--append-verify` had appended to a file whose publication
+was still in flight; the entry advanced underneath the writer, and from then on
+every retry re-ran an identical, doomed comparison. Three separate defects had
+to line up, and all three are fixed here.
+
+- **A stale basis is now replayable, not retryable.** `commit_file` rejects a
+  commit when the entry has moved past the basis the handle captured
+  (`filesystem.cpp:2248`). For a publication that rejection is permanent — the
+  retry keeps the same writer — so it now reports `ESTALE`, which the frontend
+  already handles by dropping the writer and replaying the generation from the
+  spool against current state. Foreground handles keep `EAGAIN`: they stay
+  open, the content genuinely did change under them, and retrying is
+  meaningful. Kernel-facing semantics are unchanged.
+- **The park budget was arithmetically unreachable.** The density rule ("more
+  than N failures inside the window") cannot fire once backoff caps, because a
+  window only ever holds `failure_window / max_backoff` attempts. The shipped
+  publication policy was 30 min / 30 s = 60 possible attempts against a
+  threshold of 100, so a permanently failing file retried forever by
+  construction. `RetryPolicy` gains `max_failing_duration` (default 1 h): an
+  item that has not succeeded once within it parks, however sparsely it is
+  retried, measured over the current unbroken run rather than its whole
+  history. This is deliberately *not* `failure_window` — that answers "is this
+  flapping?", this answers "is this ever going to work?", and tying them
+  together would park every publication whenever the wireless node or the WAN
+  link is out for longer than the flap window. Settable per policy from YAML.
+- **A long failure run is now visible.** Crossing ten consecutive failures logs
+  WARN with inode, path, run length and error, repeating every twenty
+  thereafter, and increments `publications_retrying_persistently` — reported on
+  `diagnostics.filesystem`. Non-zero means a file is failing repeatedly but has
+  not yet exhausted its budget: the state that was previously invisible.
+
+The retry-budget test drives `RetryState::failed()` with simulated time and
+asserts the pre-fix policy survives 400 failures across 3.3 simulated hours
+without parking, which is the hole itself. The stale-basis test was confirmed
+to fail against the old `commit_file`.
+
 ## 0.37.0 — Background metadata repair no longer wedges the node's writes; ingest runs concurrently (development)
 
 On 2026-09-10 es-1 had six torrent ingests all reading `queued`, nothing
