@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "cluster.hpp"
+#include "data_work.hpp"
 #include "replica_selector.hpp"
 #include <atomic>
 #include <condition_variable>
@@ -101,7 +102,7 @@ class DistributedStore {
     ReplicaSelector replica_selector_;
 
     bool put_impl(const ObjectId&, std::span<const uint8_t>, FrameType, std::atomic_bool*,
-                  DurabilityBatch*);
+                  DurabilityBatch*, const DataWorkContext* work = nullptr);
     std::vector<NodeInfo> ranked(const ObjectId&) const;
     std::vector<NodeInfo> owners(const ObjectId&) const;
     bool put_on(const NodeInfo&, const ObjectId&, std::span<const uint8_t>, bool foreground);
@@ -154,12 +155,17 @@ class DistributedStore {
              std::atomic_bool* cancelled = nullptr);
     ObjectId put_deferred(std::span<const uint8_t>, DurabilityBatch&,
                           std::atomic_bool* cancelled = nullptr);
+    // `work`, when it carries a no-progress budget, bounds a put whose remote
+    // replicas have all gone silent: the put fails (retryably) once nothing in
+    // the pipeline has moved for the budget, instead of waiting forever.
     ObjectId put_deferred(std::span<const uint8_t>, DurabilityBatch&, FrameType,
-                          std::atomic_bool* cancelled = nullptr);
+                          std::atomic_bool* cancelled = nullptr,
+                          const DataWorkContext* work = nullptr);
     bool put_deferred(const ObjectId&, std::span<const uint8_t>, DurabilityBatch&,
                       std::atomic_bool* cancelled = nullptr);
     bool put_deferred(const ObjectId&, std::span<const uint8_t>, DurabilityBatch&, FrameType,
-                      std::atomic_bool* cancelled = nullptr);
+                      std::atomic_bool* cancelled = nullptr,
+                      const DataWorkContext* work = nullptr);
     // True when every requirement in `batch` has reached its durability floor.
     // A replica whose placement token died with a peer's process or backend
     // incarnation is re-derived by probing the peer with the object ids and

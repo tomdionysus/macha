@@ -446,6 +446,9 @@ ingest:
   copy_chunk_bytes: 1M
   checkpoint_bytes: 64M
   blocked_retry_ms: 5000
+  # Jobs imported at once (1..64). Each holds its own publication writer, so
+  # this bounds retained memory as much as throughput. Applied at start.
+  max_concurrent_jobs: 10
   cleanup:
     # Macha-owned sources (currently torrent staging) are retained after a
     # successful ingest until the terminal job is explicitly cleared.

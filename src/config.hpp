@@ -368,6 +368,11 @@ struct IngestConfig {
     size_t copy_chunk_bytes{1024 * 1024};
     uint64_t checkpoint_bytes{64ULL * 1024 * 1024};
     std::chrono::milliseconds blocked_retry{5000};
+    // How many jobs may import at once. Each concurrent job holds its own
+    // WriteHandle, so this bounds retained publication memory as much as it
+    // bounds throughput -- raise it against the durable-lower budget, not on
+    // its own. Applied at start(); a live change logs and waits for restart.
+    size_t max_concurrent_jobs{10};
     // Cleanup policy is applied when a terminal job is explicitly cleared.
     // "owned" means an internal producer such as the BitTorrent staging tree.
     bool delete_owned_source_on_clear{true};

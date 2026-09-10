@@ -251,6 +251,8 @@ void validate(Config& config) {
     if (config.ingest.blocked_retry < std::chrono::milliseconds(500) ||
         config.ingest.blocked_retry > std::chrono::minutes(10))
         throw std::runtime_error("ingest.blocked_retry_ms must be 500..600000");
+    if (config.ingest.max_concurrent_jobs < 1 || config.ingest.max_concurrent_jobs > 64)
+        throw std::runtime_error("ingest.max_concurrent_jobs must be 1..64");
     if (config.torrent.enabled && !config.ingest.enabled)
         throw std::runtime_error("torrent requires ingest.enabled");
     // Whether BitTorrent acquisition can actually run here is a runtime fact

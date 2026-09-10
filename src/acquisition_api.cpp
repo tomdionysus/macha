@@ -55,6 +55,14 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             cleanup["delete_owned_source_on_cancel"] = ingest_.delete_owned_source_on_cancel();
             out["cleanup"] = std::move(cleanup);
             out["staging"] = std::move(staging);
+            // Without these, a queue stalled behind a wedged job is
+            // indistinguishable from an idle one: every job reads "queued"
+            // and nothing says whether a worker is holding any of them.
+            Json::Object concurrency;
+            concurrency["max_jobs"] = static_cast<uint64_t>(ingest_.max_concurrent_jobs());
+            concurrency["active_jobs"] = static_cast<uint64_t>(ingest_.active_jobs());
+            concurrency["peak_active_jobs"] = static_cast<uint64_t>(ingest_.peak_active_jobs());
+            out["concurrency"] = std::move(concurrency);
             return http_json(200, Json(std::move(out)).dump());
         }
 
