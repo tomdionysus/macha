@@ -236,6 +236,12 @@ class NodeRuntime {
     AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
     AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType);
     AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType);
+    // Test-only pass-throughs to RpcClient's silent-peer fixture.
+    void stall_peer_for_tests(const NodeId& peer, std::optional<MessageType> message = {}) {
+        client_.stall_peer_for_tests(peer, message);
+    }
+    void release_peer_for_tests(const NodeId& peer) { client_.release_peer_for_tests(peer); }
+    size_t stalled_calls_for_tests() const { return client_.stalled_calls_for_tests(); }
     bool store_metadata_commit(const MetadataHistoryEntry&);
     bool accept_metadata_commit(const MetadataAcceptance&);
     std::vector<MetadataAcceptance> metadata_heads() const;

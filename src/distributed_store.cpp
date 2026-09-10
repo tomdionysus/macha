@@ -175,9 +175,10 @@ ObjectId DistributedStore::put_deferred(std::span<const uint8_t> data, Durabilit
 }
 
 ObjectId DistributedStore::put_deferred(std::span<const uint8_t> data, DurabilityBatch& batch,
-                                        FrameType frame_type, std::atomic_bool* cancelled) {
+                                        FrameType frame_type, std::atomic_bool* cancelled,
+                                        const DataWorkContext* work) {
     auto id = object_id(data);
-    if (!put_impl(id, data, frame_type, cancelled, &batch)) {
+    if (!put_impl(id, data, frame_type, cancelled, &batch, work)) {
         if (cancelled && cancelled->load(std::memory_order_relaxed))
             throw std::runtime_error("object replication cancelled");
         throw std::runtime_error("object replication quorum unavailable");
@@ -192,13 +193,13 @@ bool DistributedStore::put_deferred(const ObjectId& id, std::span<const uint8_t>
 
 bool DistributedStore::put_deferred(const ObjectId& id, std::span<const uint8_t> data,
                                     DurabilityBatch& batch, FrameType frame_type,
-                                    std::atomic_bool* cancelled) {
-    return put_impl(id, data, frame_type, cancelled, &batch);
+                                    std::atomic_bool* cancelled, const DataWorkContext* work) {
+    return put_impl(id, data, frame_type, cancelled, &batch, work);
 }
 
 bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
                                 FrameType frame_type, std::atomic_bool* cancelled,
-                                DurabilityBatch* batch) {
+                                DurabilityBatch* batch, const DataWorkContext* work) {
     if (object_id(data) != id)
         throw std::runtime_error("object hash mismatch");
     if (data.size() > n_.config().extent_size)
@@ -350,7 +351,44 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
     if (success >= need)
         return finish(true, need);
 
+    // No-progress budget (only when the caller's context carries one). A put
+    // is not failed for being slow: any completion, any fallback launch, any
+    // pending transfer still moving bytes, or progress anywhere else in the
+    // pipeline (the shared counter) re-arms the window. Only a put where
+    // nothing at all advances for the whole budget fails -- and it fails
+    // retryably, so publication backs off and eventually parks instead of
+    // sitting in drain_one_extent() forever. Before this, a spilled put stayed
+    // "unfinished" and kept the exit test below from ever firing, so a silent
+    // peer with no replacement replica was an infinite 1 ms spin.
+    const auto budget = work ? work->no_progress_budget() : std::chrono::milliseconds{};
+    const auto* shared_progress = work ? work->progress() : nullptr;
+    uint64_t seen = shared_progress ? shared_progress->load(std::memory_order_relaxed) : 0;
+    auto window_started = Clock::now();
+
     while (true) {
+        if (budget.count() > 0) {
+            const auto now = Clock::now();
+            if (shared_progress) {
+                const auto now_seen = shared_progress->load(std::memory_order_relaxed);
+                if (now_seen != seen) {
+                    seen = now_seen;
+                    window_started = now;
+                }
+            }
+            for (const auto& item : pending)
+                if (!item.done && item.rpc && item.rpc->idle_for() < budget)
+                    window_started = now;
+            if (work->cancelled() || work->expired() || now - window_started >= budget) {
+                for (auto& item : pending)
+                    if (!item.done && item.rpc)
+                        item.rpc->cancel();
+                Log::debug("object write made no progress within budget id=" + to_string(id) +
+                           " budget_ms=" + std::to_string(budget.count()) +
+                           " success=" + std::to_string(success) +
+                           " required=" + std::to_string(need));
+                return finish(false, need);
+            }
+        }
         if (cancelled && cancelled->load(std::memory_order_relaxed)) {
             for (auto& item : pending) {
                 if (!item.done && item.rpc)
@@ -379,6 +417,7 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
 
             item.done = true;
             progressed = true;
+            window_started = Clock::now();
             bool ok = false;
             std::optional<NodeId> durability_epoch;
             uint64_t durability_domain = 0;
@@ -421,6 +460,7 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
             --replacement_needed;
             launch(nodes[next_fallback++]);
             progressed = true;
+            window_started = Clock::now();
             if (success >= need)
                 return finish(true, need);
         }

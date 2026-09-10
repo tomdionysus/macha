@@ -1932,13 +1932,23 @@ void MetadataManager::repair_once() {
     // offered the accepted immutable head plus its proof. A node holding a
     // different accepted branch keeps that branch as another head; read_group()
     // will reconcile the maximal set rather than overwriting it.
+    const auto selected_generation = record.generation;
     size_t converged = 0;
-    for (const auto& owner : active) {
-        if (replicate_accepted_head(owner, record, *acceptance, FrameType::speculative))
-            ++converged;
+    mutation_lock.unlock();
+    try {
+        for (const auto& owner : active) {
+            if (replicate_accepted_head(owner, record, *acceptance, FrameType::speculative))
+                ++converged;
+        }
+    } catch (...) {
+        mutation_lock.lock();
+        throw;
     }
+    mutation_lock.lock();
     if (converged < active.size())
         throw MetadataNotReady("metadata accepted-head replication incomplete");
+    if (node_.metadata_replica().committed_generation() > selected_generation)
+        return;
 
     auto materialized = node_.metadata_replica().materialized(record.hash);
     if (!materialized)

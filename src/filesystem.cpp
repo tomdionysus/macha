@@ -456,7 +456,8 @@ std::chrono::milliseconds WriteHandle::flush() {
     try {
         if (durability_ == WriteDurability::publication_generation)
             id = fs_.store().put_deferred(buffer_, durability_batch_,
-                                          work_context_.frame_type(), &fs_.io_cancelled_);
+                                          work_context_.frame_type(), &fs_.io_cancelled_,
+                                          &work_context_);
         else
             id = fs_.store().put(buffer_, work_context_.frame_type(), &fs_.io_cancelled_);
     } catch (...) {
@@ -499,11 +500,15 @@ void WriteHandle::launch_pending_extent(PendingExtent& pending) {
     const auto offset = pending.offset;
     const auto bytes = pending.payload;
     const auto frame_type = work_context_.frame_type();
+    // The context carries this pipeline's shared progress counter and
+    // no-progress budget, so a put to a silent peer fails within the budget
+    // instead of holding drain_one_extent() forever.
+    const auto context = work_context_;
     pending.result = fs_.submit_extent_task(
-        [store, cancelled, cache_put, offset, frame_type, bytes] {
+        [store, cancelled, cache_put, offset, frame_type, bytes, context] {
             const auto put_started = Clock::now();
             DistributedStore::DurabilityBatch batch;
-            auto id = store->put_deferred(*bytes, batch, frame_type, cancelled);
+            auto id = store->put_deferred(*bytes, batch, frame_type, cancelled, &context);
             if (cache_put)
                 (void)store->cache_local(id, *bytes);
             return StagedExtentResult{
