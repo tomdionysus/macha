@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "config.hpp"
 
+#include "users.hpp"
+
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
@@ -151,6 +153,9 @@ void parse_dht(const YAML::Node& root, Config& c) {
         c.extent_size = yaml_size(d["extent_size"]);
     if (d["data_inflight_bytes"])
         c.data_inflight_bytes = yaml_size(d["data_inflight_bytes"]);
+    if (d["data_credit_no_progress_deadline_ms"])
+        c.data_credit_no_progress_deadline = milliseconds(d["data_credit_no_progress_deadline_ms"],
+                                                          "dht.data_credit_no_progress_deadline_ms");
     if (d["data_viewer_reserve_bytes"])
         c.data_viewer_reserve_bytes = yaml_size(d["data_viewer_reserve_bytes"]);
     if (d["read_ahead"])
@@ -319,8 +324,42 @@ void parse_catalogue(const YAML::Node& root, Config& c) {
             c.catalogue.api.listen = api["listen"].as<std::string>();
         if (api["port"])
             c.catalogue.api.port = api["port"].as<uint16_t>();
-        if (api["advertised_endpoint"])
-            c.catalogue.api.advertised_endpoint = api["advertised_endpoint"].as<std::string>();
+        if (api["advertised_endpoint"]) {
+            auto value = api["advertised_endpoint"].as<std::string>();
+            // This string is handed to clients verbatim and they build every
+            // request URL from it, so a malformed one produces requests that
+            // fail somewhere far away with no hint of where it came from.
+            // Reject it here, where the file that set it is still in hand.
+            const bool http = value.starts_with("http://");
+            const bool https = value.starts_with("https://");
+            if (!http && !https)
+                throw std::runtime_error(
+                    "catalogue.api.advertised_endpoint must begin with http:// or https:// "
+                    "(it is a complete origin, not a host)");
+            const auto authority = value.substr(http ? 7 : 8);
+            if (authority.empty())
+                throw std::runtime_error("catalogue.api.advertised_endpoint has no host");
+            // A proxy fronting a node at a subpath is not a deployment this
+            // serves: a client treats this as an origin and would append its
+            // own paths, silently 404ing against the prefix.
+            if (authority.find('/') != std::string::npos)
+                throw std::runtime_error(
+                    "catalogue.api.advertised_endpoint must not contain a path; "
+                    "it is scheme://host[:port] only");
+            if (authority.find('@') != std::string::npos ||
+                authority.find('?') != std::string::npos ||
+                authority.find('#') != std::string::npos)
+                throw std::runtime_error(
+                    "catalogue.api.advertised_endpoint must be scheme://host[:port] only");
+            // An unbracketed IPv6 literal cannot be parsed back out of a URL:
+            // its colons are indistinguishable from a port separator.
+            const auto colons = std::count(authority.begin(), authority.end(), ':');
+            if (colons > 1 && authority.front() != '[')
+                throw std::runtime_error(
+                    "catalogue.api.advertised_endpoint: bracket an IPv6 literal, e.g. "
+                    "http://[2001:db8::1]:7438");
+            c.catalogue.api.advertised_endpoint = std::move(value);
+        }
         if (api["token_file"])
             c.catalogue.api.token_file = std::filesystem::path(api["token_file"].as<std::string>());
         if (api["max_request_bytes"])
@@ -577,6 +616,18 @@ void parse_session(const YAML::Node& root, Config& c) {
         c.session.anonymous_ttl = milliseconds(session["anonymous_ttl_ms"], "session.anonymous_ttl_ms");
     if (session["max_sessions"])
         c.session.max_sessions = session["max_sessions"].as<size_t>();
+    if (session["allow_anonymous"])
+        c.session.allow_anonymous = session["allow_anonymous"].as<bool>();
+    if (session["max_users"])
+        c.session.max_users = session["max_users"].as<size_t>();
+    if (session["max_concurrent_password_checks"])
+        c.session.max_concurrent_password_checks =
+            session["max_concurrent_password_checks"].as<size_t>();
+    if (session["failed_login_attempts"])
+        c.session.failed_login_attempts = session["failed_login_attempts"].as<size_t>();
+    if (session["failed_login_lockout_ms"])
+        c.session.failed_login_lockout =
+            milliseconds(session["failed_login_lockout_ms"], "session.failed_login_lockout_ms");
 }
 
 void parse_hydration_engine(const YAML::Node& engines, const char* name,

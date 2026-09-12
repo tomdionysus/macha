@@ -24,7 +24,15 @@ struct AuthSession {
     Hash256 token_hash{};           // SHA-256(bearer token); the raw token
                                      // itself never appears here or on the
                                      // wire again once minted
-    std::vector<std::string> roles; // {"anonymous"} for v1
+    std::vector<std::string> roles; // resolved at mint time -- an admin's
+                                     // session carries every role admin
+                                     // implies, so a gate is one lookup
+    std::string user_id;            // empty for an anonymous session
+    // The user's credential_generation as of the mint. A password change or
+    // deletion bumps that counter, so every session minted before it fails
+    // this comparison on every node the user record reaches -- one replicated
+    // fact logs a person out cluster-wide without enumerating their sessions.
+    uint64_t credential_generation{};
     uint64_t created_unix_ms{};
     uint64_t expires_unix_ms{};
     uint64_t version{};             // last-write-wins counter
@@ -35,6 +43,12 @@ bool session_has_role(const AuthSession&, std::string_view role);
 bool session_live(const AuthSession&, uint64_t now_unix_ms);
 SessionIdentity session_identity(const AuthSession&);
 
+// Wire/disk format is chosen per payload, not per build: a payload whose
+// records are all anonymous encodes as MACHSES1, byte-for-byte what 0.37.x
+// emits, and anything carrying a user identity encodes as MACHSES2. Both are
+// decoded. A pre-0.38 peer therefore keeps merging anonymous sessions across
+// a rolling upgrade and only rejects payloads describing users it has no
+// concept of. Retire SES1 emission once no pre-0.38 node can rejoin.
 Bytes encode_sessions(const std::vector<AuthSession>&);
 std::vector<AuthSession> decode_sessions(std::span<const uint8_t>);
 
@@ -65,7 +79,9 @@ class SessionManager {
     // client minting in a loop (observed live: a broken proactive-refresh
     // timer re-minting on every request) must hit a hard local cap rather
     // than growing this node's replica without bound.
-    std::optional<MintedSession> create(std::vector<std::string> roles);
+    std::optional<MintedSession> create(std::vector<std::string> roles,
+                                        std::string user_id = {},
+                                        uint64_t credential_generation = 0);
     bool apply(AuthSession);                 // local merge, LWW by version
     std::optional<AuthSession> revoke(const Hash256& token_hash);
 

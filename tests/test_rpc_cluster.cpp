@@ -1823,12 +1823,85 @@ MACHA_TEST("rpc_cluster", test_rpc_foreground_not_starved_by_busy_data_workers) 
     server.stop();
 }
 
+MACHA_FAST_TEST("rpc_cluster", test_data_credit_wait_gives_up_when_nothing_is_moving) {
+    // A DATA credit wait with no caller deadline used to wait for ever. A
+    // caller that holds credit while acquiring more therefore hung silently
+    // and permanently instead of failing -- exactly what
+    // test_storage_data_credit_reserves did on any host with fewer than six
+    // cores, where it sat for 360 s with no diagnostic of any kind.
+    //
+    // Waiting is still correct under contention: any release anywhere resets
+    // the window, so a waiter behind genuine work waits as long as it takes.
+    // Only a wholly stalled arbiter gives up.
+    constexpr uint64_t capacity = 4 * 1024 * 1024;
+    constexpr uint64_t reserve = 1024 * 1024;
+    constexpr uint64_t chunk = 1024 * 1024;
+
+    // background_concurrency 2, so a third loader acquire can never be
+    // admitted while the first two are held -- the live wedge, reproduced.
+    DataResourceArbiter arbiter(capacity, reserve, 2, 200ms);
+    auto context = DataWorkContext(FrameType::loader, chunk);
+    auto first = arbiter.acquire(context, chunk);
+    auto second = arbiter.acquire(context, chunk);
+    REQUIRE(first.has_value());
+    REQUIRE(second.has_value());
+
+    const auto started = Clock::now();
+    auto third = arbiter.acquire(context, chunk);
+    const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - started);
+    // Fails visibly rather than hanging, and reports it rather than returning
+    // an indistinguishable empty optional in silence.
+    CHECK(!third.has_value());
+    CHECK(waited >= 200ms);
+    CHECK(waited < 5s);
+
+    // And releasing makes room again, so the arbiter is not left poisoned by
+    // having given up once.
+    first.reset();
+    auto fourth = arbiter.acquire(context, chunk);
+    CHECK(fourth.has_value());
+}
+
+MACHA_FAST_TEST("rpc_cluster", test_data_credit_wait_survives_genuine_contention) {
+    // The other half: a waiter must NOT give up while work is flowing. Here a
+    // holder releases inside the no-progress window, so the window resets and
+    // the waiter is admitted rather than abandoned.
+    constexpr uint64_t capacity = 4 * 1024 * 1024;
+    constexpr uint64_t reserve = 1024 * 1024;
+    constexpr uint64_t chunk = 1024 * 1024;
+
+    DataResourceArbiter arbiter(capacity, reserve, 2, 400ms);
+    auto context = DataWorkContext(FrameType::loader, chunk);
+    auto first = arbiter.acquire(context, chunk);
+    auto second = arbiter.acquire(context, chunk);
+    REQUIRE(first.has_value());
+    REQUIRE(second.has_value());
+
+    std::jthread releaser([&] {
+        std::this_thread::sleep_for(150ms);
+        first.reset();
+    });
+
+    auto third = arbiter.acquire(context, chunk);
+    CHECK(third.has_value());
+}
+
 MACHA_TEST("rpc_cluster", test_storage_data_credit_reserves_viewer_headroom_and_control) {
     TestNode fixture("data-resource-viewer-reserve", ConfigProfile::functional);
     auto& config = fixture.config();
     const auto extent = config.extent_size;
     config.data_inflight_bytes = 4 * extent;
     config.data_viewer_reserve_bytes = extent;
+    // This test is about the BYTE budget and the viewer reserve, not the
+    // background concurrency ceiling, so state the ceiling rather than
+    // inheriting it. Left unset it defaults to hardware_concurrency() / 2
+    // (NodeRuntime's constructor), and the three loader acquires below then
+    // wedge on any host with fewer than six cores -- acquire() takes no
+    // deadline, so it waits for ever rather than failing. Every node in a
+    // typical deployment is a four-core board; this deadlocked on all of them
+    // while passing on the developer's twelve-core machine.
+    config.maintenance.background_concurrency = 4;
     auto& node = fixture.start();
 
     const auto bytes = pattern(64 * 1024, 77);

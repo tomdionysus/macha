@@ -95,7 +95,7 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
                  StartupStallHandler startup_stall_handler)
     : node_(std::move(config), keys, std::move(startup_stage_hook)), cluster_status_(node_),
       subsystems_(node_.config().plugin_path.value_or(std::filesystem::path{})),
-      session_api_(node_), web_(node_.config().web),
+      session_api_(node_), users_api_(node_), web_(node_.config().web),
       startup_stall_handler_(std::move(startup_stall_handler)),
       maintenance_stage_hook_(std::move(maintenance_stage_hook)) {
     cluster_status_.attach_convergence_diagnostics(
@@ -108,7 +108,19 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
             [this](const HttpRequest& request) { return capability_request(request); },
             [this](std::string_view token) -> std::optional<SessionIdentity> {
                 auto session = node_.sessions().validate(token);
-                return session ? std::optional(session_identity(*session)) : std::nullopt;
+                if (!session)
+                    return std::nullopt;
+                // A user-bound session is only as live as the account behind
+                // it. Both lookups are O(1) against this node's own replicas,
+                // so an isolated node still answers: a deletion or password
+                // change reaches here as a replicated user record, not as an
+                // RPC we have to make.
+                if (!session->user_id.empty()) {
+                    auto user = node_.users().find(session->user_id);
+                    if (!user || user->credential_generation != session->credential_generation)
+                        return std::nullopt;
+                }
+                return std::optional(session_identity(*session));
             });
     }
 }
@@ -156,6 +168,51 @@ Service::~Service() {
     stop();
 }
 
+std::string_view Service::required_role(const HttpRequest& request) {
+    // Roles are capabilities, not a ladder, so this maps a route to the single
+    // capability it needs. Checked once here, before dispatch, rather than per
+    // handler -- a check a new route can forget to add is not a gate.
+    const bool mutating = request.method == "POST" || request.method == "PUT" ||
+                          request.method == "PATCH" || request.method == "DELETE";
+
+    // Two routes deliberately require a valid session and no role at all.
+    //
+    // A session is the caller's own to mint, read and revoke, so gating it
+    // would mean needing a role to find out which roles you have. GET here is
+    // also what a client uses to ask "is my token still live, and is this node
+    // up" -- it must answer for every account, including one that holds only
+    // manage_users, or a client's health probing silently stops working for
+    // that person and reports nothing.
+    //
+    // Cluster status is the same argument from the other direction: the person
+    // most likely to be watching an ingest is the one who most needs to see
+    // whether the cluster is healthy, and an importer-only account would
+    // otherwise be told nothing.
+    if (request.path == "/api/v1/session" || request.path == "/api/v1/status" ||
+        request.path.starts_with("/api/v1/status/"))
+        return {};
+
+    // Managing accounts. "me" is the exception: everyone may change their own
+    // password, and UsersApi refuses a role change made that way.
+    if (UsersApi::routes(request.path))
+        return request.path == "/api/v1/users/me" ? role_media_viewer : role_manage_users;
+
+    // Acquisition is importing: torrents and ingest jobs.
+    if (mutating && (request.path.starts_with("/api/v1/acquisition") ||
+                     request.path.starts_with("/api/v1/ingest") ||
+                     request.path.starts_with("/api/v1/torrent")))
+        return role_importer;
+
+    // Everything else that changes state: catalogue matches, files, namespaces,
+    // and cluster identity associations.
+    if (mutating && (request.path.starts_with("/api/v1/manage") ||
+                     request.path.starts_with("/api/v1/catalogue")))
+        return role_manager;
+
+    // Reads, playback and cluster status.
+    return role_media_viewer;
+}
+
 HttpResponse Service::handle_http(const HttpRequest& request) {
     if (request.path == "/api/v1/status" || request.path.starts_with("/api/v1/status/"))
         return cluster_status_.handle(request);
@@ -164,6 +221,18 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
     // is already online long before local storage/metadata finish recovery.
     if (request.path == "/api/v1/session")
         return session_api_.handle(request);
+
+    if (const auto role = required_role(request); !role.empty() && request.session &&
+                                                  !std::count(request.session->roles.begin(),
+                                                              request.session->roles.end(), role))
+        return http_error(403, "forbidden",
+                          "this action requires the '" + std::string(role) + "' role");
+
+    // Account management does not depend on local storage or metadata, for the
+    // same reason session creation does not: an operator must be able to fix
+    // an account on a node that is still recovering.
+    if (UsersApi::routes(request.path))
+        return users_api_.handle(request);
 
     // The web client is static files and does not depend on local services,
     // so it loads while they are still recovering -- the client can then show

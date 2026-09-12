@@ -1096,6 +1096,31 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         }
     }
     diagnostics["convergence"] = std::move(convergence_diagnostics);
+
+    // Auth state is local to each node and converges by gossip, so the only
+    // way to see whether it actually has converged is to compare these across
+    // nodes -- table_hash is stable for the same contents, the way
+    // metadata_generation is.
+    Json::Object auth_diagnostics;
+    // An empty table is the upgrade lockout described in NodeRuntime::start.
+    // Surfaced here as well as in the log, because by the time anyone looks
+    // the log line has usually scrolled and Status is what they reach for.
+    const auto user_count = node_.users().size();
+    auth_diagnostics["users"] = static_cast<uint64_t>(user_count);
+    auth_diagnostics["accounts_initialised"] = user_count > 0;
+    auth_diagnostics["user_tombstones"] = static_cast<uint64_t>(node_.users().tombstones());
+    auth_diagnostics["user_table_hash"] = to_string(node_.users().table_hash());
+    auth_diagnostics["allow_anonymous"] = node_.config().session.allow_anonymous;
+    // What an unauthenticated visitor may do lives in the anonymous account,
+    // not in config, so report the account's current roles rather than a
+    // setting that no longer decides anything.
+    Json::Array anonymous_roles;
+    if (auto anonymous = node_.users().find_by_username(anonymous_username))
+        for (const auto& role : anonymous->roles)
+            anonymous_roles.push_back(role);
+    auth_diagnostics["anonymous_roles"] = std::move(anonymous_roles);
+    diagnostics["auth"] = std::move(auth_diagnostics);
+
     root["diagnostics"] = std::move(diagnostics);
     root["generated_at_unix_ms"] = unix_ms();
     return http_json(200, Json(std::move(root)).dump());
