@@ -3,6 +3,7 @@
 #include "manage_api.hpp"
 #include "status_api.hpp"
 #include "test_backend_support.hpp"
+#include "users_api.hpp"
 
 #if defined(__linux__)
 #include <sys/syscall.h>
@@ -434,6 +435,44 @@ MACHA_TEST("invariants", test_manage_identity_reset_does_not_wait_for_metadata_a
     REQUIRE(wait_until([&] {
         return service.metadata_manager().snapshot().identity_resets.contains(key);
     }));
+}
+
+MACHA_TEST("invariants", test_no_recovery_route_is_exposed) {
+    // A recovery route would have to be reachable without a session to be
+    // useful, which makes it a standing unauthenticated path to the most
+    // privileged account in the cluster -- on a surface that includes an
+    // offsite node. It buys nothing: the only party who could present a key
+    // already has root on a node, where `macha-users passwd root` does the
+    // same job. This test exists so the decision cannot be quietly undone.
+    TestCluster cluster(ConfigProfile::isolated);
+    auto config = cluster.node_config("no-recovery-route");
+    config.catalogue.api.enabled = true;
+    config.catalogue.api.listen = "127.0.0.1";
+    config.catalogue.api.port = free_port();
+
+    Service service(config, cluster.keys());
+    service.start();
+    REQUIRE(wait_until([&] { return service.ready(); }, 10s));
+
+    const auto port = config.catalogue.api.port;
+    // Unauthenticated: must be refused like any other route, not handled.
+    const auto anonymous = raw_http_post(
+        port, "/api/v1/recover",
+        R"({"recovery_key":")" + std::string(64, '0') + R"(","password":"long-enough-pw"})");
+    CHECK(anonymous.find("HTTP/1.1 401") != std::string::npos);
+    CHECK(anonymous.find("invalid_recovery_key") == std::string::npos);
+
+    // Even holding every role, there is no such route to reach.
+    const auto privileged = raw_http_post(
+        port, "/api/v1/recover",
+        R"({"recovery_key":")" + std::string(64, '0') + R"(","password":"long-enough-pw"})",
+        bearer_header(service));
+    CHECK(privileged.find("HTTP/1.1 200") == std::string::npos);
+
+    // The one unauthenticated route is the session mint, and it still is.
+    CHECK(raw_http_post(port, "/api/v1/session", "{}").find("HTTP/1.1 201") != std::string::npos);
+
+    service.stop();
 }
 
 MACHA_TEST("invariants", test_status_api_precedes_control_plane_startup) {

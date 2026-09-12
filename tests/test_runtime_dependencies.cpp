@@ -90,6 +90,57 @@ MACHA_FAST_TEST("runtime_dependencies", test_ffmpeg_log_bridge) {
     Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
 }
 
+MACHA_FAST_TEST("runtime_dependencies", test_advertised_api_endpoint_is_validated) {
+    // This string is handed to clients verbatim and every request URL is built
+    // from it, so a malformed one fails far from the file that set it. The
+    // shipped example config has always promised these are "rejected at
+    // startup"; until 0.38.0 nothing checked.
+    TempDir t;
+    auto keyfile = (t.path() / "key").string();
+    auto write = [&](const std::string& endpoint) {
+        auto yaml = t.path() / "node.yaml";
+        std::ofstream out(yaml);
+        out << "state_path: " << (t.path() / "state").string() << "\n"
+            << "key_file: " << keyfile << "\n"
+            << "storage:\n  data:\n    backends:\n"
+            << "      - path: " << (t.path() / "d1").string() << "\n"
+            << "        limit: 10G\n"
+            << "  metadata:\n    path: " << (t.path() / "ctl").string() << "\n"
+            << "    limit: 1G\n"
+            << "catalogue:\n  api:\n    enabled: true\n"
+            << "    advertised_endpoint: " << endpoint << "\n";
+        out.close();
+        return yaml;
+    };
+    auto rejected = [&](const std::string& endpoint) {
+        try {
+            (void)load_yaml_config(write(endpoint));
+            return false;
+        } catch (const std::exception&) {
+            return true;
+        }
+    };
+
+    // A host on its own is not an origin: the client cannot know the scheme.
+    CHECK(rejected("media.example.net:7438"));
+    CHECK(rejected("//media.example.net"));
+    // A path would be dropped by a client treating this as an origin, and the
+    // 404s would appear nowhere near the cause.
+    CHECK(rejected("https://media.example.net/macha"));
+    CHECK(rejected("https://media.example.net:443/"));
+    // An unbracketed IPv6 literal cannot be parsed back out of a URL.
+    CHECK(rejected("http://2001:db8::1:7438"));
+    CHECK(rejected("http://"));
+
+    // The deployments this exists for: a TLS proxy on the implicit port, the
+    // same with it stated, and a plain port-forwarded node.
+    for (const auto* accepted : {"https://media.example.net", "https://media.example.net:443",
+                                 "http://media.example.net:7438", "http://[2001:db8::1]:7438"}) {
+        auto config = load_yaml_config(write(accepted));
+        CHECK(config.catalogue.api.advertised_endpoint == accepted);
+    }
+}
+
 MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     TempDir t;
 #ifdef MACHA_HAVE_LIBTORRENT
@@ -287,6 +338,12 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "  enabled: " << torrent_enabled << "\n"
             << "  search:\n"
             << "    providers:\n"
+            << "session:\n"
+            << "  allow_anonymous: false\n"
+            << "  max_users: 128\n"
+            << "  max_concurrent_password_checks: 3\n"
+            << "  failed_login_attempts: 7\n"
+            << "  failed_login_lockout_ms: 45000\n"
             << "streaming:\n"
             << "  enabled: true\n"
             << "  ffmpeg: /legacy/ignored/ffmpeg\n"
@@ -442,6 +499,11 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(!yc.ingest.delete_owned_source_on_cancel);
     CHECK(yc.torrent.enabled == (std::string_view(torrent_enabled) == "true"));
     CHECK(yc.torrent.search_providers.empty());
+    CHECK(!yc.session.allow_anonymous);
+    CHECK(yc.session.max_users == 128);
+    CHECK(yc.session.max_concurrent_password_checks == 3);
+    CHECK(yc.session.failed_login_attempts == 7);
+    CHECK(yc.session.failed_login_lockout == 45000ms);
     CHECK(yc.streaming.enabled);
     REQUIRE(yc.streaming.temp_path.has_value());
     CHECK(*yc.streaming.temp_path == t.path() / "streams");

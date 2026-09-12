@@ -438,12 +438,54 @@ inline std::string raw_http_get(uint16_t port, std::string_view path,
     return response;
 }
 
+inline std::string raw_http_post(uint16_t port, std::string_view path, std::string_view body,
+                                 const std::map<std::string, std::string>& headers = {}) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) throw std::runtime_error("http test socket failed");
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+        close(fd);
+        throw std::runtime_error("http test connect failed");
+    }
+    auto request = "POST " + std::string(path) + " HTTP/1.1\r\nHost: 127.0.0.1\r\n" +
+                   "Content-Type: application/json\r\nContent-Length: " +
+                   std::to_string(body.size()) + "\r\n";
+    for (const auto& [key, value] : headers)
+        request += key + ": " + value + "\r\n";
+    request += "Connection: close\r\n\r\n";
+    request += std::string(body);
+    size_t sent = 0;
+    while (sent < request.size()) {
+        auto n = send(fd, request.data() + sent, request.size() - sent, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { close(fd); throw std::runtime_error("http test send failed"); }
+        sent += static_cast<size_t>(n);
+    }
+    std::string response;
+    std::array<char, 8192> buffer{};
+    while (true) {
+        auto n = recv(fd, buffer.data(), buffer.size(), 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        response.append(buffer.data(), static_cast<size_t>(n));
+    }
+    close(fd);
+    return response;
+}
+
 // Every non-exempt API route now requires a live session bearer token (see
 // SessionApi / HttpServer's SessionAuthenticator). Mint one directly against
 // the node under test rather than through HTTP, so callers exercising an
 // unrelated route don't also need to drive session creation by hand.
 inline std::map<std::string, std::string> bearer_header(Service& service) {
-    auto minted = service.node().sessions().create({"anonymous"});
+    // Mint what a real caller gets rather than a hand-rolled role set: a token
+    // built here without the roles a route needs would be refused by the gate,
+    // and every test using it would be asserting against a 403 instead of
+    // against the handler it meant to exercise.
+    auto minted = service.node().sessions().create(all_roles());
     REQUIRE(minted.has_value());
     return {{"Authorization", "Bearer " + minted->bearer_token}};
 }

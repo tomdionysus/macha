@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "log.hpp"
 #include "net.hpp"
 
 #include <algorithm>
@@ -138,6 +139,13 @@ class DataResourceArbiter {
     // encryption and transfer, so this bounds the CPU that publication and
     // repair can take between them; viewers are never counted. 0 = no limit.
     uint64_t background_concurrency_{};
+    // A wait with no caller deadline fails after this long without a single
+    // release anywhere in the arbiter. Zero waits for ever, which is what this
+    // did unconditionally before -- and which turned a caller holding credit
+    // while acquiring more into a silent permanent hang.
+    std::chrono::milliseconds no_progress_deadline_{};
+    uint64_t releases_{};
+    uint64_t no_progress_failures_{};
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     uint64_t used_bytes_{};
@@ -169,7 +177,8 @@ class DataResourceArbiter {
 
   public:
     DataResourceArbiter(uint64_t capacity_bytes, uint64_t viewer_reserve_bytes,
-                        uint64_t background_concurrency = 0);
+                        uint64_t background_concurrency = 0,
+                        std::chrono::milliseconds no_progress_deadline = {});
     std::optional<Lease> acquire(const DataWorkContext& context, uint64_t bytes);
     std::optional<Lease> try_acquire(const DataWorkContext& context, uint64_t bytes);
     void stop();
@@ -178,9 +187,11 @@ class DataResourceArbiter {
 
 inline DataResourceArbiter::DataResourceArbiter(uint64_t capacity_bytes,
                                                 uint64_t viewer_reserve_bytes,
-                                                uint64_t background_concurrency)
+                                                uint64_t background_concurrency,
+                                                std::chrono::milliseconds no_progress_deadline)
     : capacity_bytes_(capacity_bytes), viewer_reserve_bytes_(viewer_reserve_bytes),
-      background_concurrency_(background_concurrency) {
+      background_concurrency_(background_concurrency),
+      no_progress_deadline_(no_progress_deadline) {
     if (!capacity_bytes_ || !viewer_reserve_bytes_ || viewer_reserve_bytes_ >= capacity_bytes_)
         throw std::invalid_argument("DATA resource capacity must exceed viewer reserve");
 }
@@ -237,10 +248,37 @@ DataResourceArbiter::acquire(const DataWorkContext& context, uint64_t requested_
             else
                 ++speculative_waits_;
         }
-        if (context.deadline() == Clock::time_point{})
-            cv_.wait(lock, wait_predicate);
-        else
+        if (context.deadline() != Clock::time_point{}) {
             cv_.wait_until(lock, context.deadline(), wait_predicate);
+        } else if (no_progress_deadline_ == std::chrono::milliseconds{}) {
+            cv_.wait(lock, wait_predicate);
+        } else {
+            // Wait in no-progress windows rather than for ever. Any release
+            // anywhere resets the window, so genuine contention -- where work
+            // is flowing and this waiter simply has not reached the front --
+            // waits as long as it takes. Only a wholly stalled arbiter, where
+            // nothing was released for the entire window, gives up.
+            const auto seen = releases_;
+            if (!cv_.wait_for(lock, no_progress_deadline_,
+                              [&] { return wait_predicate() || releases_ != seen; })) {
+                ++no_progress_failures_;
+                if (counted_wait)
+                    --waiters;
+                cv_.notify_all();
+                Log::warn("DATA credit wait abandoned after " +
+                          std::to_string(no_progress_deadline_.count()) +
+                          " ms with no release anywhere: class=" +
+                          std::string(frame_type_name(frame_type)) +
+                          " bytes=" + std::to_string(bytes) +
+                          " used=" + std::to_string(used_bytes_) + "/" +
+                          std::to_string(capacity_bytes_) +
+                          " lower_active=" + std::to_string(lower_active_) + "/" +
+                          std::to_string(background_concurrency_) +
+                          " waiting_viewers=" + std::to_string(waiting_viewers_) +
+                          " waiting_loaders=" + std::to_string(waiting_loaders_));
+                return {};
+            }
+        }
     }
     if (counted_wait)
         --waiters;
@@ -297,6 +335,7 @@ DataResourceArbiter::try_acquire(const DataWorkContext& context, uint64_t reques
 
 inline void DataResourceArbiter::release(FrameType frame_type, uint64_t bytes) {
     std::lock_guard lock(mutex_);
+    ++releases_;
     used_bytes_ -= std::min(used_bytes_, bytes);
     if (!viewer(frame_type)) {
         lower_used_bytes_ -= std::min(lower_used_bytes_, bytes);

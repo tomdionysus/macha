@@ -92,3 +92,51 @@ local reset. Reachable peers persist the operational tombstone during
 background propagation and subsequent identity-reset exchanges.
 
 The tombstone is a freshness boundary. Pre-reset gossip cannot recreate the invalidated mapping, and stale `NodeInfo` references are rejected rather than silently routed to a replacement node. A subsequent directly authenticated peer may establish a fresh association at the endpoint. Reset records contain an epoch, reset timestamp, initiating node, and optional reason for operational auditability; applying the same or an older epoch is idempotent.
+
+## Accounts and roles
+
+Every HTTP route requires a session bearer token from `POST /api/v1/session`, which is the only route reachable without one. A session carries the roles of the account behind it, and each route is gated on those roles in one place before dispatch. Hiding a section in a client is presentation; the gate is the enforcement.
+
+Roles are capabilities rather than a ladder — importing does not imply managing, and managing does not imply handing out accounts. Every role implies `media_viewer`, and that is the only implication.
+
+| role | grants |
+| --- | --- |
+| `media_viewer` | every read, playback, cluster status, and your own password |
+| `importer` | acquisition and ingest |
+| `manager` | files, namespaces, catalogue matches, identity-association reset |
+| `manage_users` | add, edit and remove accounts |
+
+Two accounts exist on every cluster. `root` holds every role; `anonymous` is what an unauthenticated visitor is, and holds `media_viewer` at first. Neither can be renamed or deleted, and in every other respect they are ordinary accounts. Anonymous access is controlled by editing the `anonymous` account's roles, not by configuration, so it takes effect on the next session rather than on restart — this is what decides what a television, which cannot practically type a password, is able to reach. `session.allow_anonymous: false` turns the mechanism off entirely.
+
+At least one account always holds `manage_users`. Removing the role from the last account that has it, or deleting that account, is refused with `last_user_manager` — `root` included, whose roles are otherwise ordinary. The rule is about the role, not any particular account, so it moves as the role moves.
+
+### Routes
+
+- `GET /api/v1/users` — list. No password material is ever returned; there is no route that reads a credential back.
+- `POST /api/v1/users` — `{username, password, roles}`.
+- `GET|PATCH|DELETE /api/v1/users/{id}` — `PATCH` accepts `password` and/or `roles`.
+- `GET|PATCH /api/v1/users/me` — anyone's own account. `PATCH` accepts `password` only; a `roles` change here is `403`, since otherwise it would be an escalation route for every account. Changing your own password returns a fresh token in the same response, so you are not signed out by your own change.
+
+Every user record carries a `mutable` block stating what may be changed about it — `rename`, `delete`, `set_password`, `set_roles`, and `required_roles` for roles pinned to that account. Read it rather than testing the username: a client that hardcodes `root` breaks the moment these names are configurable, and disables the wrong controls everywhere at once.
+
+A password change, a role change or a deletion retires every session that account had minted, on every node, as the record propagates. A role change does this deliberately: a session carries the roles it was minted with, so a demotion that left them alive would not take effect until they expired.
+
+### Bootstrapping and recovery
+
+A node founding a new cluster creates both accounts on first start and writes root's generated password to `<state_path>/initial-root-password`, mode 0600.
+
+An existing cluster upgrading into the accounts system does not, because it has bootstrap peers and is therefore not founding anything. Such a node starts with an empty user table, which means nothing can sign in — the node says so at startup and reports `accounts_initialised: false` in `GET /api/v1/status`. Stop one node and run:
+
+```
+macha-users <state_path> <cluster.key> init
+```
+
+This performs exactly what a founding node performs. Start the node and the accounts replicate to the rest of the cluster.
+
+If root's password is lost and no `manage_users` account can sign in, reset it the same way, with the node stopped:
+
+```
+macha-users <state_path> <cluster.key> passwd root
+```
+
+There is deliberately no recovery key and no recovery endpoint. One would have to be presentable without an account to be useful, which means a standing unauthenticated path to the most privileged account in the cluster; and anyone able to use it already has root on a node, where the command above does the same job. `macha-users` itself is not a weakness: it needs the node's state directory and the cluster key, which is root on a node — and that party already holds every byte in the cluster.

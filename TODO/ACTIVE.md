@@ -1,6 +1,6 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-09-10
+Last updated: 2026-09-12
 
 This is the authoritative, ordered backlog. Detailed plans and UAT records in
 this directory remain evidence; completed work belongs in `COMPLETED.md` and is
@@ -477,16 +477,18 @@ home network and an offsite node, this is not a hypothetical exposure.
   still not best practice — a page that somehow obtained a token (e.g. one
   leaked to a compromised client) could use it cross-origin undetected. Stop
   sending a wildcard origin on any endpoint that doesn't strictly need it.
-- [ ] **No authorization tiers yet, though the seam now exists.** 0.24.0 gave
-  every session a `roles` list and a `session_has_role()` helper, but nothing
-  is wired to check it: one bearer token still grants catalogue reads,
-  media-file deletion, namespace deletion, and cluster identity-association
-  reset (which can be wildcard: `port: 0` matches every port, an omitted
-  `node_id` matches any stale identity) — `manage_api.cpp` itself advertises
-  `"privileged": false` in its own discovery document while gating deletion
-  behind the same token as read access. Add at least a read-only vs.
-  destructive role split and gate the destructive `manage_api.cpp`/
-  `catalogue_api.cpp` routes on it.
+- [x] **Authorization tiers — shipped in 0.38.0.** Cluster-replicated users,
+  passwords and roles; see `2026-09-12-cluster-users-and-roles-plan.md` for the
+  design and `CHANGELOG.md` for what landed. Roles are capabilities rather than
+  a ladder (`media_viewer`, `importer`, `manager`, `manage_users`), resolved at
+  mint time and gated in one place before dispatch. `root` and `anonymous` are
+  created once by the founding node; anonymous access is now an ordinary
+  account's roles rather than a config key. Three latent defects were found and
+  fixed on the way: session gossip had never once run (wrong frame class on
+  send, undispatched on receive, since 0.24.0); `propagate_session` blocked
+  login for up to 30 s per unreachable-but-active peer; and periodic gossip was
+  spending bounded RPC admission on every peer every tick.
+
 - [ ] **Unbounded JSON recursion depth.** `json.cpp`'s recursive-descent parser
   has no depth limit. Combined with the 8 MiB body cap, a deeply nested body
   on any POST/PUT can exhaust the stack. Add a depth limit.

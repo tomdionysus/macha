@@ -68,6 +68,7 @@ enum class MessageType : uint16_t {
     // returns the peer's *stored* frame, which may be exactly the delta the
     // caller cannot replay). Reply: metadata_history_entry_reply.
     get_metadata_history_record = 41,
+    user_sync = 42,
     ok = 100,
     error = 101,
     members_reply = 102,
@@ -86,7 +87,8 @@ enum class MessageType : uint16_t {
     torrent_jobs_reply = 115,
     torrent_job_action_reply = 116,
     session_sync_reply = 117,
-    have_objects_reply = 118
+    have_objects_reply = 118,
+    user_sync_reply = 119
 };
 
 // Transport priority is a property of the frame type itself. There is no

@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.37.2 LANGUAGES CXX)
+project(macha VERSION 0.38.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -292,6 +292,8 @@ set(MACHA_CORE_SOURCES
     src/catalogue_api.cpp
     src/manage_api.cpp
     src/session_api.cpp
+    src/users.cpp
+    src/users_api.cpp
     src/web_api.cpp
     src/acquisition_api.cpp
     src/media_catalogue.cpp
@@ -365,15 +367,21 @@ add_executable(macha-metadata-repair tools/metadata_inspect.cpp)
 target_link_libraries(macha-metadata-repair PRIVATE macha_core)
 add_executable(macha-metadata-dump tools/metadata_history_dump.cpp)
 target_link_libraries(macha-metadata-dump PRIVATE macha_core)
+add_executable(macha-users tools/users_admin.cpp)
+target_link_libraries(macha-users PRIVATE macha_core)
+add_executable(macha-recover tools/recover.cpp)
+target_link_libraries(macha-recover PRIVATE macha_core)
 # libmacha_core installs to its own private libdir, not bindir (see
 # MACHA_PRIVATE_LIBDIR above) -- this rpath is the relative hop from an
 # installed executable's bindir to it, so it resolves regardless of prefix.
-set_target_properties(macha-metadata-repair macha-metadata-dump PROPERTIES
+set_target_properties(macha-metadata-repair macha-metadata-dump macha-users macha-recover PROPERTIES
     INSTALL_RPATH "${MACHA_RPATH_ORIGIN}/${MACHA_BINDIR_TO_PRIVATE_LIBDIR}"
     BUILD_WITH_INSTALL_RPATH FALSE)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(macha-metadata-repair PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_options(macha-metadata-dump PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(macha-users PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(macha-recover PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 if(MACHA_BUILD_SERVER)
@@ -482,6 +490,7 @@ if(MACHA_BUILD_TESTS)
         tests/test_hydration_catalogue.cpp
         tests/test_media_playback.cpp
         tests/test_session.cpp
+        tests/test_users.cpp
         tests/test_web_api.cpp
         tests/test_invariants.cpp
         tests/test_models.cpp)
@@ -623,7 +632,7 @@ set(MACHA_CONFIG_EXAMPLE "${MACHA_CONFIG_DIR}/macha.yaml.example")
 if(TARGET macha)
     install(TARGETS macha RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
-install(TARGETS macha-metadata-repair macha-metadata-dump RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS macha-metadata-repair macha-metadata-dump macha-users macha-recover RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 # macha_core is SHARED (see the add_library(macha_core SHARED ...) comment
 # above), but it is a private library, not a public system one -- it installs
 # under its own subdirectory of the standard libdir (MACHA_PRIVATE_LIBDIR),

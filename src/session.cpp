@@ -11,13 +11,22 @@
 
 namespace macha {
 namespace {
-constexpr std::array<uint8_t, 8> magic{'M', 'A', 'C', 'H', 'S', 'E', 'S', '1'};
+constexpr std::array<uint8_t, 8> magic_v1{'M', 'A', 'C', 'H', 'S', 'E', 'S', '1'};
+constexpr std::array<uint8_t, 8> magic_v2{'M', 'A', 'C', 'H', 'S', 'E', 'S', '2'};
 constexpr size_t max_roles = 64;
 constexpr size_t max_role_length = 64;
+constexpr size_t max_user_id_length = 128;
 constexpr size_t token_bytes = 32;
 constexpr size_t id_bytes = 16;
 
-void encode(Writer& writer, const AuthSession& value) {
+// An anonymous record is identical in both versions; v2 only appends the two
+// user-identity fields, so carries_identity() decides which magic a whole
+// payload needs.
+bool carries_identity(const AuthSession& value) {
+    return !value.user_id.empty() || value.credential_generation != 0;
+}
+
+void encode(Writer& writer, const AuthSession& value, bool v2) {
     writer.string(value.id);
     writer.fixed(value.token_hash.bytes);
     writer.u32(static_cast<uint32_t>(value.roles.size()));
@@ -27,9 +36,13 @@ void encode(Writer& writer, const AuthSession& value) {
     writer.u64(value.expires_unix_ms);
     writer.u64(value.version);
     writer.u8(value.revoked ? 1 : 0);
+    if (v2) {
+        writer.string(value.user_id);
+        writer.u64(value.credential_generation);
+    }
 }
 
-AuthSession decode(Reader& reader) {
+AuthSession decode(Reader& reader, bool v2) {
     AuthSession value;
     value.id = reader.string(128);
     value.token_hash.bytes = reader.fixed<32>();
@@ -43,6 +56,10 @@ AuthSession decode(Reader& reader) {
     value.expires_unix_ms = reader.u64();
     value.version = reader.u64();
     value.revoked = reader.u8() != 0;
+    if (v2) {
+        value.user_id = reader.string(max_user_id_length);
+        value.credential_generation = reader.u64();
+    }
     if (value.id.empty())
         throw DecodeError("session id must be nonempty");
     return value;
@@ -58,22 +75,25 @@ bool session_live(const AuthSession& session, uint64_t now_unix_ms) {
 }
 
 SessionIdentity session_identity(const AuthSession& session) {
-    return SessionIdentity{session.id, session.token_hash, session.roles};
+    return SessionIdentity{session.id, session.token_hash, session.roles, session.user_id};
 }
 
 Bytes encode_sessions(const std::vector<AuthSession>& values) {
+    const bool v2 = std::any_of(values.begin(), values.end(), carries_identity);
     Writer writer;
-    writer.raw(magic);
+    writer.raw(v2 ? magic_v2 : magic_v1);
     writer.u32(static_cast<uint32_t>(values.size()));
     for (const auto& value : values)
-        encode(writer, value);
+        encode(writer, value, v2);
     return writer.take();
 }
 
 std::vector<AuthSession> decode_sessions(std::span<const uint8_t> bytes) {
     Reader reader(bytes);
-    auto got = reader.raw(magic.size());
-    if (!std::equal(got.begin(), got.end(), magic.begin()))
+    auto got = reader.raw(magic_v1.size());
+    const bool v1 = std::equal(got.begin(), got.end(), magic_v1.begin());
+    const bool v2 = std::equal(got.begin(), got.end(), magic_v2.begin());
+    if (!v1 && !v2)
         throw DecodeError("bad session payload");
     const auto count = reader.u32();
     if (count > 65536)
@@ -81,7 +101,7 @@ std::vector<AuthSession> decode_sessions(std::span<const uint8_t> bytes) {
     std::vector<AuthSession> values;
     values.reserve(count);
     for (uint32_t i = 0; i < count; ++i)
-        values.push_back(decode(reader));
+        values.push_back(decode(reader, v2));
     reader.finish();
     return values;
 }
@@ -136,7 +156,9 @@ std::optional<AuthSession> SessionManager::find(const Hash256& token_hash) const
     return found->second.session;
 }
 
-std::optional<MintedSession> SessionManager::create(std::vector<std::string> roles) {
+std::optional<MintedSession> SessionManager::create(std::vector<std::string> roles,
+                                                    std::string user_id,
+                                                    uint64_t credential_generation) {
     // Hash the token in the exact form it will be presented back (the hex
     // string), not the pre-hex random bytes -- validate() only ever sees the
     // former, since that's what actually crosses the wire as the bearer token.
@@ -149,6 +171,8 @@ std::optional<MintedSession> SessionManager::create(std::vector<std::string> rol
     session.token_hash = sha256(
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(bearer_token.data()), bearer_token.size()));
     session.roles = std::move(roles);
+    session.user_id = std::move(user_id);
+    session.credential_generation = credential_generation;
     session.created_unix_ms = now;
     session.expires_unix_ms = now + static_cast<uint64_t>(anonymous_ttl_.count());
     session.version = 1;
