@@ -1,5 +1,11 @@
 # Current release
 
+## 0.38.1 — Version bump (development)
+
+No functional change since 0.38.0. The version is incremented so the build
+running on the cluster is distinguishable from the one 0.38.0 first described,
+which matters while nodes are being rolled forward at different times.
+
 ## 0.38.0 — Cluster users, passwords and roles; login works on a node that is alone (development)
 
 Macha had sessions but no people. Every session carried a `roles` list and a
