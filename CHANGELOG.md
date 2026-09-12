@@ -1,5 +1,184 @@
 # Current release
 
+## 0.38.0 — Cluster users, passwords and roles; login works on a node that is alone (development)
+
+Macha had sessions but no people. Every session carried a `roles` list and a
+`session_has_role()` helper that nothing called, so one bearer token granted
+catalogue reads, media deletion, namespace deletion and cluster
+identity-association reset alike, and `manage_api.cpp` advertised
+`"privileged": false` while gating deletion behind the same token as reads.
+This release adds the accounts, and gates the routes on what those accounts
+may do.
+
+The design constraint that shaped everything: **logging in must not depend on
+the cluster being healthy.** Users, passwords and roles are cluster-replicated
+state, but verifying a password reads only this node's memory and its own
+disk -- no RPC, no metadata, no catalogue. A node whose metadata has gone
+`read_only`, or which is temporarily alone, still authenticates every account
+it knows about. That is deliberate: the subsystem most likely to be sick when
+you need to log in must not be in the login path. Putting users in the
+metadata layer was considered and rejected for exactly this reason.
+
+**Two accounts exist from the moment a cluster is founded.** The node with no
+bootstrap peers -- the same test `MetadataReplica` already uses to decide
+whether its genesis record is authority -- creates `root` (every role) and
+`anonymous` (`media_viewer`) on first start and never again. root's generated
+password is written to `<state_path>/genesis-root-password`, mode 0600, and the
+log says where it is rather than what it is: a log line is shipped, rotated and
+read by more people than that file is. Neither account can be renamed or
+deleted; everything else about them is ordinary. The check is "the table has
+never held anything", tombstones included, so deleting root does not cause the
+next restart to mint a new one with full privileges.
+
+**No recovery key, and that is a decision.** A key would have to be
+presentable without an account to be useful, which means a standing
+unauthenticated path to the most privileged account in the cluster, on a
+surface that includes an offsite node -- bought with a capability that already
+exists behind strictly more access, since the only party who could present one
+is the operator, who has root on a node and can run `macha-users passwd root`.
+The machinery (an X25519 envelope sealing the cluster key, so a key could be
+checked without anything derived from it being stored) is implemented and
+tested but unused: the design is sound for a model where the operator cannot
+get a shell, and that model does not exist here. `macha-recover` ships, says
+so, and points at the command that does work.
+
+**At least one account always holds `manage_users`.** Removing the role from
+the last account that has it, or deleting that account, is refused with its own
+error code -- root included, whose roles are otherwise ordinary. The rule is
+about the role rather than any particular account, so it moves as the role
+moves, and it is enforced in `UserStore` rather than only at the API so no
+second caller can route around it. A client is told which roles are pinned to
+an account rather than being handed a blanket "roles are read-only": the rest
+stay editable.
+
+**Anonymous is a real account, not a special case in the auth path.** A session
+minted with no credentials is bound to that user and carries its current roles,
+so changing what an unauthenticated visitor may do is an ordinary edit of an
+ordinary account, effective on the next session rather than on restart. This
+matters for televisions, which have no practical way to type a password:
+whatever the anonymous account holds is what a TV can reach. `allow_anonymous:
+false` turns the mechanism off entirely.
+
+**Roles are capabilities, not a ladder.** Importing does not imply managing,
+and managing does not imply handing out accounts. Every role implies
+`media_viewer`, and that is the only implication:
+
+    media_viewer  read all media, playback, cluster status
+    importer      acquire content (torrents, ingest)
+    manager       files, namespaces, catalogue matches, identity-association reset
+    manage_users  add, edit and remove accounts
+
+They are resolved once when a session is minted, so a route gate is a single
+lookup on the session the caller already presented, checked in one place before
+dispatch rather than per handler -- a check a new route can forget to add is
+not a gate. `POST /api/v1/session` and `GET /api/v1/session`/`/api/v1/status`
+are the exceptions: the first needs no token at all (it is how you get one) and
+the last two need a token but no role, so that a client can ask "is my session
+live and is this node up" for any account, including one that holds only
+`manage_users`.
+
+Three things in the session subsystem turned out to be broken, and all three
+are fixed here because this work depends on them:
+
+- **Session gossip had never once run.** `session_sync` was broadcast on
+  `FrameType::speculative`, but `class_allowed()` permits a non-control frame
+  type only for bulk or priority-data messages and `session_sync` was on
+  neither list, so every gossip tick since 0.24.0 threw "message used an
+  invalid frame type" into a `catch` that logs at debug. The receiving side was
+  equally dead: both inbound readers dispatched only `telemetry` as a
+  notification and silently discarded everything else with a zero request id.
+  Session replication had been relying entirely on the synchronous push, with
+  no working backstop at all.
+- **Login blocked on unreachable peers.** `propagate_session` called every peer
+  membership still considered active, serially, each to
+  `control_no_progress_deadline` (30 s). One peer that was up but not answering
+  -- the wireless node, mid-blip -- stalled every login by that long, which is
+  precisely the situation in which you need to log in. It is now a best-effort
+  notify that queues on open connections and returns; the local merge has
+  already happened and the gossip tick is the backstop, so there was never
+  anything to wait for.
+- **Gossip competed with data work for memory, and could deadlock it.**
+  `FrameType::speculative` maps to `MemoryClass::speculative`, the same budget
+  loaders and viewers draw from, and both the send (`try_notify`) and the
+  receive (`RpcServer::admit_locked`) take a lease from it. Adding session and
+  user gossip to the one pre-existing speculative sender (telemetry) was enough
+  to starve a node with a tight data budget: on an aarch64 node a loader
+  acquire blocked in `DataResourceArbiter::acquire` and never returned. Session
+  and user gossip now ride `FrameType::control`, which has its own reserve and
+  cannot take memory data work needs. The cost, stated because it is real, is
+  that gossip is written ahead of viewer traffic -- acceptable only because
+  these payloads are a few hundred bytes and are sent solely when something
+  changed. Telemetry deliberately still rides speculative.
+
+  Relatedly, gossip no longer re-announces unchanged state on every tick: every
+  inbound notification costs a real RPC admission slot on every peer, so both
+  subsystems send when the set changed or a peer appears that has not been
+  told -- tracked by peer id, not by count, since a count changes on every
+  membership flap -- and otherwise only every 30 s. That interval is the
+  guarantee, not a fallback: `broadcast_best_effort()` reports how many frames
+  it QUEUED, not how many were delivered and applied, so a peer whose inbound
+  route is not usable yet (precisely the state a peer is in while it restarts)
+  can be marked told having received nothing. Found during this release's own
+  rollout, where an upgraded node came up with an empty user table and refused
+  every request until the sending node happened to restart.
+
+**Upgrading an existing cluster: upgrade every node promptly.** A session
+minted by a pre-0.38 node carries `roles: ["anonymous"]`, and `anonymous` is no
+longer a role -- it is an account. An upgraded node therefore refuses such a
+session with 403 on every route. The session wire format is compatible across
+the upgrade (a payload of purely anonymous sessions still encodes as
+`MACHSES1`), but the role semantics are not, so a client that obtains a session
+from an old node and presents it to a new one is refused until the whole
+cluster is on 0.38.0. There is no compatibility shim for this today.
+
+Also here: `AuthSession` gains `user_id` and `credential_generation`, so a
+password change or a deletion retires every session it minted, on every node,
+by replicating one record rather than enumerating sessions. A role change does
+the same, because a session carries the roles it was minted with and a demotion
+that left them alive would not take effect until they expired. The session wire
+format picks itself per payload -- a payload of purely anonymous sessions still
+encodes as `MACHSES1`, byte-for-byte what 0.37.x emits -- so a pre-0.38 peer
+keeps merging sessions across a rolling upgrade.
+
+Passwords are scrypt (N=2^15, r=8, p=1) with the parameters stored per record,
+so they can be raised later without invalidating anyone. The users file is
+sealed at rest under an HKDF subkey, because these hashes replicate to every
+node including one that is physically offsite. `macha-users` administers the
+table offline for bootstrap and recovery; it reads passwords from the terminal,
+never from argv.
+
+**A DATA credit wait can no longer hang for ever.** `DataResourceArbiter::acquire`
+with no caller deadline waited unconditionally, so a caller holding credit
+while acquiring more hung silently and permanently rather than failing. It now
+waits in no-progress windows: any release anywhere resets the window, so a
+waiter behind genuine work still waits as long as it takes, and only a wholly
+stalled arbiter gives up -- logging the class, the byte size, and the used /
+active / waiting counts, instead of returning an indistinguishable empty
+optional. New `dht.data_credit_no_progress_deadline_ms`, 120 s, 0 restores the
+old unbounded wait.
+
+This surfaced because `test_storage_data_credit_reserves_viewer_headroom_and_control`
+deadlocked for 360 s on every four-core node while passing on a twelve-core
+development machine: `maintenance.background_concurrency` defaults to
+`hardware_concurrency() / 2`, and the test's three loader acquires cannot all
+be admitted below six cores. The test now states the ceiling it means to test
+rather than inheriting one from the host -- a test that depends on the machine
+it runs on is not a test.
+
+Unrelated but found while checking a client's assumptions:
+`catalogue.api.advertised_endpoint` was accepted without validation, while the
+shipped example config has always said a path is "rejected at startup". It now
+is, along with a missing scheme, an unbracketed IPv6 literal, and credentials
+or a query in the authority. That string is handed to clients verbatim and
+every request URL is built from it, so a malformed one used to fail somewhere
+far away with no trace of where it came from.
+
+New: `session.allow_anonymous`, `session.max_users`,
+`session.max_concurrent_password_checks`, `session.failed_login_attempts`,
+`session.failed_login_lockout_ms`. `GET /api/v1/status` reports the user count,
+tombstones and a table hash, so cross-node convergence is visible the way
+`metadata_generation` is.
+
 ## 0.37.2 — The torrent engine binds a routable interface, and says so when it cannot (development)
 
 Two magnets sat in `metadata` on gbni-2 for hours with `peers: 0`, `seeds: 0`

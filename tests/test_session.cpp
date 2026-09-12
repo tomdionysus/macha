@@ -8,6 +8,17 @@ using namespace macha::test_support;
 
 namespace {
 
+// Anonymous access is an ordinary account, so a node that does not yet hold it
+// cannot mint an anonymous session -- which is the correct answer, not a bug.
+// A real cluster gets it at genesis; a bare NodeRuntime in a test has to be
+// given one.
+UserRecord give_anonymous_account(NodeRuntime& node) {
+    auto created = node.users().create(anonymous_username, "unused-password",
+                                       {std::string(role_media_viewer)}, node.node_id());
+    REQUIRE(created.has_value());
+    return *created;
+}
+
 HttpRequest session_request(std::string method, std::optional<SessionIdentity> identity = {}) {
     HttpRequest request;
     request.method = std::move(method);
@@ -19,6 +30,7 @@ HttpRequest session_request(std::string method, std::optional<SessionIdentity> i
 MACHA_FAST_TEST("session", test_session_create_and_validate) {
     TestCluster cluster;
     NodeRuntime node(cluster.node_config("n1"), cluster.keys());
+    const auto anonymous = give_anonymous_account(node);
     SessionApi api(node);
 
     auto created = api.handle(session_request("POST"));
@@ -30,8 +42,12 @@ MACHA_FAST_TEST("session", test_session_create_and_validate) {
     CHECK(!body.find("id")->asString().empty());
     CHECK(!body.find("token")->asString().empty());
     REQUIRE(body.find("roles")->isArray());
+    // Anonymous is read-only at genesis, and what it may do is that account's
+    // roles rather than a config key.
     REQUIRE(body.find("roles")->asArray().size() == 1);
-    CHECK(body.find("roles")->asArray().front().asString() == "anonymous");
+    CHECK(body.find("roles")->asArray().front().asString() == "media_viewer");
+    // An anonymous session is bound to the anonymous account like any other.
+    CHECK(body.find("user_id")->asString() == anonymous.id);
     CHECK(body.find("expires_unix_ms")->asUInt64() > body.find("created_unix_ms")->asUInt64());
 
     const auto token = body.find("token")->asString();
@@ -40,7 +56,10 @@ MACHA_FAST_TEST("session", test_session_create_and_validate) {
     auto validated = node.sessions().validate(token);
     REQUIRE(validated.has_value());
     CHECK(validated->id == id);
-    CHECK(session_has_role(*validated, "anonymous"));
+    CHECK(session_has_role(*validated, role_media_viewer));
+    CHECK(!session_has_role(*validated, role_manager));
+    CHECK(!session_has_role(*validated, role_manage_users));
+    CHECK(validated->user_id == anonymous.id);
 
     auto identity = session_identity(*validated);
     auto introspected = api.handle(session_request("GET", identity));
@@ -70,6 +89,7 @@ MACHA_FAST_TEST("session", test_session_rejects_non_anonymous_credentials) {
 MACHA_FAST_TEST("session", test_session_revoke_invalidates_immediately) {
     TestCluster cluster;
     NodeRuntime node(cluster.node_config("n1"), cluster.keys());
+    const auto anonymous = give_anonymous_account(node);
     SessionApi api(node);
 
     auto created = api.handle(session_request("POST"));
@@ -271,7 +291,7 @@ MACHA_TEST("session", test_http_server_gate_uses_session_authenticator) {
         [](const HttpRequest& request) { return request.path == "/exempt"; },
         [](std::string_view token) -> std::optional<SessionIdentity> {
             if (token != "good-token") return std::nullopt;
-            return SessionIdentity{"the-session-id", Hash256{}, {"anonymous"}};
+            return SessionIdentity{"the-session-id", Hash256{}, {"anonymous"}, {}};
         });
     server.start();
     REQUIRE(wait_until([&] { return server.bound_port() == config.port; }, 2s));

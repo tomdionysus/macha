@@ -561,6 +561,22 @@ struct SessionConfig {
     // creation, then the client must POST /api/v1/session again.
     std::chrono::milliseconds anonymous_ttl{std::chrono::hours(24 * 30)};
     size_t max_sessions{4096};
+    // Anonymous viewing: POST /api/v1/session with no credentials mints a
+    // session bound to the "anonymous" account, carrying whatever roles that
+    // account currently holds (media_viewer at genesis). Set false to require
+    // a login for everything, including the web client.
+    //
+    // What an anonymous visitor may *do* is not configured here: it is the
+    // anonymous account's roles, changed through the users API like anyone
+    // else's, and takes effect immediately rather than on restart.
+    bool allow_anonymous{true};
+    size_t max_users{4096};
+    // scrypt is deliberately expensive, so an unauthenticated endpoint that
+    // runs it needs a local brake. Neither of these is replicated: they are
+    // this node's own protection, not cluster state.
+    size_t max_concurrent_password_checks{2};
+    size_t failed_login_attempts{5};
+    std::chrono::milliseconds failed_login_lockout{std::chrono::seconds(30)};
 };
 
 struct Config {
@@ -627,6 +643,15 @@ struct Config {
     // non-reserved portion; viewer reads retain immediate bounded headroom.
     uint64_t data_inflight_bytes{128ULL * 1024 * 1024};
     uint64_t data_viewer_reserve_bytes{32ULL * 1024 * 1024};
+    // How long a DATA credit wait may make no progress at all before it fails
+    // instead of waiting for ever. "No progress" means not one lease was
+    // released anywhere in the arbiter for this long -- under any real load
+    // releases happen constantly and the window keeps resetting, so this only
+    // fires when the arbiter is genuinely wedged (for example a caller holding
+    // credit while acquiring more). Waiting was previously unbounded, which
+    // turned such a mistake into a silent permanent hang rather than a visible
+    // failure. Zero restores the old unbounded behaviour.
+    std::chrono::milliseconds data_credit_no_progress_deadline{std::chrono::seconds(120)};
     size_t read_ahead_extents{3};
     std::vector<Endpoint> bootstrap;
     std::chrono::milliseconds heartbeat{5000};

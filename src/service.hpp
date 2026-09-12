@@ -14,6 +14,7 @@
 #include "media_information.hpp"
 #include "playback.hpp"
 #include "session_api.hpp"
+#include "users_api.hpp"
 #include "web_api.hpp"
 #include "status_api.hpp"
 #include "torrent.hpp"
@@ -52,6 +53,7 @@ class Service {
     SubsystemRegistry registry_;
     SubsystemSupervisor subsystems_;
     SessionApi session_api_;
+    UsersApi users_api_;
     WebApi web_;
     std::unique_ptr<HttpServer> catalogue_http_;
 
@@ -106,6 +108,8 @@ class Service {
     void wait_services_ready();
     std::string describe_readiness_stall() const;
     HttpResponse handle_http(const HttpRequest&);
+    // The role a request needs, or empty when a valid session is enough.
+    static std::string_view required_role(const HttpRequest&);
     bool capability_request(const HttpRequest&);
     void loop(std::stop_token);
     void signal_maintenance(ServiceEvent);

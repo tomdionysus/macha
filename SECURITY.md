@@ -30,7 +30,39 @@ The protocol is authenticated; still restrict it with the host/network firewall.
 
 For Internet deployment use routable addressing, explicit forwarding, or a private routed overlay such as WireGuard.
 
-The catalogue/playback HTTP API is separate from the authenticated cluster protocol. It binds to loopback by default. If exposed beyond the local host, configure `catalogue.api.token_file` and restrict it with the host/network firewall.
+The catalogue/playback HTTP API is separate from the authenticated cluster protocol. It binds to loopback by default. If exposed beyond the local host, restrict it with the host/network firewall.
+
+## HTTP accounts and roles
+
+The shared cluster key authenticates *nodes*. It says nothing about *people*, and the HTTP API has its own identity model.
+
+Every HTTP route requires a session bearer token from `POST /api/v1/session`, which is the only route reachable without one. A session is minted either from a username and password, or -- when `session.allow_anonymous` is on -- with no credentials at all, in which case it is bound to the `anonymous` account. Each session carries the roles of the account behind it, and every route is gated on those roles in one place before dispatch.
+
+Roles are capabilities rather than a ladder: `media_viewer` reads, `importer` acquires, `manager` changes files/namespaces/catalogue matches and resets cluster identity associations, `manage_users` administers accounts. Every role implies `media_viewer` and nothing else implies anything.
+
+The node that founds a cluster creates `root` (every role) and `anonymous` (`media_viewer`) once, on first start, and writes root's generated password to `<state_path>/genesis-root-password` with mode 0600. Read it, sign in, change the password, delete the file. Neither account can be renamed or deleted. Anonymous access is controlled by editing the `anonymous` account's roles, not by configuration -- this is what decides what an unauthenticated television can reach.
+
+### Losing the root password
+
+There is no recovery key and no recovery endpoint, deliberately. Reset the password on any node, with that node stopped:
+
+```
+macha-users <state_path> <cluster.key> passwd root
+```
+
+It replicates to the rest of the cluster when the node starts. An account holding `manage_users` can also reset it through the API without stopping anything.
+
+The reasoning, since the absence is a decision rather than an omission: a recovery key would have to be presentable without an account to be useful, which means a standing unauthenticated path to the most privileged account in the cluster, on a surface that includes an offsite node. The only party who could present one is the operator, who already has root on a node — where the command above does the same job and needs no secret to have survived months in a drawer. Anyone able to use a recovery key could use `macha-users` instead, so the key adds exposure and no capability.
+
+`macha-users` is not itself a weakness. It needs write access to the node's state directory and the cluster key to unseal it, which is root on a node — and per the trust model above, that party already has every byte in the cluster and can join it as a node. Creating themselves an account is a lateral move inside a compromise that is already total, the same way `passwd` is on any Unix host.
+
+Passwords are scrypt-hashed with per-record parameters and never leave a node: no API route reads one back. The user table replicates to every node, including any offsite one, and is sealed at rest under a key derived from the cluster key. That is protection against a stolen disk, not against the cluster key: per the trust model above, anyone holding the key already has everything.
+
+Verifying a password reads only the local node's replica, so authentication keeps working on a node that is partitioned or whose metadata has gone read-only. The corollary is that a partition admits account writes on both sides and resolves them last-write-wins, so a simultaneous change on both sides loses one. This is deliberate: refusing account changes without quorum would mean being unable to fix an account precisely when the cluster is unhealthy.
+
+A password change, a role change or a deletion retires every session that account had minted, on every node, as the updated record propagates. That includes a recovery reset, so anyone signed in as root when it happens is signed out.
+
+At least one account always holds `manage_users`. Removing the role from the last account that has it, or deleting that account, is refused — root included, whose roles are otherwise ordinary. The invariant is about the role rather than any particular account, so it moves as the role moves.
 
 Playback control requests use the ordinary API Bearer token. A successful session returns a separate high-entropy capability in each stream URL because native media players cannot reliably attach the permanent API header to every playlist, fragment and range request. Treat the returned stream URL as a temporary bearer secret: anyone who has it can read that session's media until the session is deleted or expires. Capability URLs are scoped to one playback session and generated HLS generation; they do not authenticate cluster RPC or catalogue mutation.
 

@@ -328,6 +328,24 @@ bool is_bulk_message(MessageType type) {
            type == MessageType::object_durability_barrier || type == MessageType::object_reply;
 }
 
+// A request_id of 0 means "no reply expected". Only these types are dispatched
+// to a handler when they arrive that way; anything else is discarded, which is
+// how a gossip type that was never added here goes silently nowhere -- as
+// session_sync did from 0.24.0 until 0.38.0.
+//
+// Session and user gossip ride FrameType::control rather than speculative,
+// unlike telemetry. Speculative maps to MemoryClass::speculative, which is the
+// same budget data work draws from, so periodic control-plane gossip there can
+// take memory a loader or viewer needs -- observed as a hard deadlock in
+// DataResourceArbiter::acquire on a node with a tight data budget. Control has
+// its own reserve and cannot starve data work. The cost is that gossip is
+// written ahead of viewer traffic, which is acceptable only because these
+// payloads are a few hundred bytes and are sent solely when something changed.
+bool is_notification_message(MessageType type) {
+    return type == MessageType::telemetry || type == MessageType::session_sync ||
+           type == MessageType::user_sync;
+}
+
 bool is_priority_data_message(MessageType type) {
     switch (type) {
     case MessageType::have_object:
@@ -653,6 +671,10 @@ const char* message_type_name(MessageType type) noexcept {
         return "session_sync_reply";
     case MessageType::have_objects_reply:
         return "have_objects_reply";
+    case MessageType::user_sync:
+        return "user_sync";
+    case MessageType::user_sync_reply:
+        return "user_sync_reply";
     }
     return "unknown";
 }
@@ -1507,7 +1529,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                         cancel_inbound(target);
                         if (inbound_canceller_)
                             inbound_canceller_(peer_, target);
-                    } else if (frame->message.type == MessageType::telemetry) {
+                    } else if (is_notification_message(frame->message.type)) {
                         dispatch_notification(std::move(*frame));
                     }
                     continue;
@@ -3783,7 +3805,7 @@ void RpcServer::session_loop(Session* session) {
                     assembler.discard(target);
                     session->cancel_inbound(target);
                     cancel_queued(session->peer, target);
-                } else if (frame->message.type == MessageType::telemetry) {
+                } else if (is_notification_message(frame->message.type)) {
                     enqueue_notification(session->peer, std::move(*frame));
                 }
                 continue;

@@ -259,6 +259,14 @@ dht:
   # and executors and does not enter this budget.
   data_inflight_bytes: 128M
   data_viewer_reserve_bytes: 32M
+  # How long a DATA credit wait may make no progress before it fails instead
+  # of waiting for ever. "No progress" means not one lease was released
+  # anywhere for this long: under any real load releases happen constantly and
+  # the window keeps resetting, so a waiter queued behind genuine work is never
+  # disturbed. It fires only when the arbiter is wedged -- for example a caller
+  # holding credit while acquiring more -- and then logs the class, size and
+  # used/active/waiting counts rather than hanging silently. 0 waits for ever.
+  data_credit_no_progress_deadline_ms: 120000
   read_ahead: 3
   metadata_cache_ms: 250
   # Process-memory ceiling for decoded metadata snapshots. Durable history
@@ -574,3 +582,69 @@ streaming:
   probe_bytes: 8M
   probe_analyze_duration_ms: 5000
   probe_timeout_ms: 20000
+
+# Authentication. Every HTTP route requires a Bearer token from
+# POST /api/v1/session; what that session may do is the roles it carries.
+#
+# Users, passwords and roles are cluster state: every node holds the whole
+# table and it converges by gossip. Verifying a password is a local lookup plus
+# a KDF -- no RPC, no metadata, no catalogue -- so a node that is temporarily
+# alone, or whose metadata has gone read-only, still logs people in. Nothing in
+# the login path waits on a peer.
+#
+# The node that founds the cluster (the one with no bootstrap peers) creates
+# two accounts on first start and never again:
+#
+#   root       every role. Its generated password is written to
+#              <state_path>/genesis-root-password, mode 0600. Sign in, change
+#              it, delete that file.
+#   anonymous  media_viewer. This is what an unauthenticated visitor is.
+#
+# Neither can be renamed or deleted. Everything else about them is ordinary.
+#
+# If root's password is lost and no manage_users account can sign in, reset it
+# on any node with that node stopped:
+#
+#   macha-users <state_path> <cluster.key> passwd root
+#
+# There is no recovery key and no recovery endpoint: one would be a standing
+# unauthenticated path to the most privileged account, and anyone able to use
+# it already has root on a node, where the command above does the same job.
+#
+# At least one account always holds manage_users: removing the role from the
+# last account that has it, or deleting that account, is refused.
+#
+# Roles are capabilities, not a ladder -- importing does not imply managing:
+#   media_viewer  read all media, playback, cluster status
+#   importer      acquire content (torrents, ingest)
+#   manager       files, namespaces, catalogue matches, identity-association
+#                 reset
+#   manage_users  add, edit and remove accounts
+#
+# Add accounts over the API, or offline with the node stopped:
+#   macha-users /var/lib/macha /etc/macha/cluster.key create tom --roles manager
+session:
+  # Anonymous viewing. With this on, POST /api/v1/session with no credentials
+  # mints a session bound to the "anonymous" account. Turn it off to require a
+  # login for everything, including the web client -- note that televisions
+  # have no practical way to type a password, so this is what decides whether
+  # a TV can be used at all.
+  #
+  # What an anonymous visitor may *do* is not set here: it is the anonymous
+  # account's roles, changed like any other account's, and takes effect on the
+  # next session rather than on restart.
+  allow_anonymous: true
+
+  # A session is valid for this long from creation; there is no sliding
+  # renewal, so the client re-mints when it expires.
+  anonymous_ttl_ms: 2592000000
+  max_sessions: 4096
+  max_users: 4096
+
+  # scrypt is deliberately expensive, and POST /api/v1/session is reachable
+  # without a token, so password checks need a local brake. Neither of these is
+  # replicated: they protect this node's CPU, nothing more. On a Pi, two
+  # concurrent hashes is already most of a core each.
+  max_concurrent_password_checks: 2
+  failed_login_attempts: 5
+  failed_login_lockout_ms: 30000

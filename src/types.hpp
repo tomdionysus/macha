@@ -70,6 +70,10 @@ struct SessionIdentity {
     std::string id;
     Hash256 token_hash{};
     std::vector<std::string> roles;
+    // Default-initialised so designated-initialiser construction elsewhere
+    // (tests build these with .id/.roles only) does not trip
+    // -Wmissing-field-initializers, which GCC treats as an error here.
+    std::string user_id{}; // empty for an anonymous session
 };
 
 std::string hex(std::span<const uint8_t>);

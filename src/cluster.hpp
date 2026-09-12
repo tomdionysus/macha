@@ -12,6 +12,7 @@
 #include "retention.hpp"
 #include "retained_memory.hpp"
 #include "session.hpp"
+#include "users.hpp"
 #include "storage_pool.hpp"
 #include "telemetry.hpp"
 
@@ -87,6 +88,20 @@ class NodeRuntime {
     PublicConnectivity public_connectivity_;
     TelemetryStore telemetry_;
     SessionManager sessions_;
+    UserStore users_;
+    // What the last gossip broadcast said, and which peers have been told it.
+    // A set of ids rather than a count: a count changes whenever membership
+    // churns, which would re-broadcast on every flap, and the question being
+    // asked is "is there a peer that has not heard this", which only an
+    // identity can answer.
+    Hash256 gossiped_user_table_{};
+    std::set<NodeId> gossiped_user_peers_;
+    Clock::time_point gossip_users_retry_after_{};
+    Clock::time_point gossiped_users_at_{};
+    Hash256 gossiped_sessions_{};
+    std::set<NodeId> gossiped_session_peers_;
+    Clock::time_point gossip_sessions_retry_after_{};
+    Clock::time_point gossiped_sessions_at_{};
     RpcClient client_;
     RpcServer server_;
 
@@ -226,8 +241,24 @@ class NodeRuntime {
     const SessionManager& sessions() const {
         return sessions_;
     }
+    UserStore& users() {
+        return users_;
+    }
+    const UserStore& users() const {
+        return users_;
+    }
     bool apply_session(const AuthSession&);
+    // Both of these are notify-only: they merge locally and queue the record
+    // on whatever control-lane connections are already usable, then return.
+    // Nothing in an HTTP request path ever waits on a peer -- a node that is
+    // alone mints and answers at full speed, and a peer that was unreachable
+    // converges on the next gossip tick instead.
     void propagate_session(const AuthSession&);
+    bool apply_user(const UserRecord&);
+    void propagate_users();
+    // Periodic repair, not a heartbeat: sends only when this node's table has
+    // actually changed or a peer has appeared that may not have seen it.
+    void gossip_users_if_changed();
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
     RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType);
