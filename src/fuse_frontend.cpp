@@ -6315,11 +6315,6 @@ std::pair<uint64_t, uint64_t> FuseFrontend::logical_capacity() const {
     return state_->fs.logical_capacity();
 }
 
-void FuseFrontend::note_viewer_activity(uint64_t bytes) {
-    state_->fs.note_foreground_activity(bytes);
-    state_->data_cv.notify_all();
-}
-
 std::string FuseFrontend::path_for_inode(uint64_t id) const {
     auto inode = state_->resolve_inode(id);
     std::lock_guard lock(inode->mutex);

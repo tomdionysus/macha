@@ -615,6 +615,13 @@ struct PlaybackManager::Impl {
         std::shared_ptr<SubtitleCache> subtitle_cache{std::make_shared<SubtitleCache>()};
         Clock::time_point touched{Clock::now()};
         Clock::time_point stream_touched{Clock::now()};
+        // Has this session ever served a stream object -- playlist, fragment,
+        // subtitle or direct body? stream_touched cannot answer that: it is
+        // set at construction and reset by every start_pipeline(), so it says
+        // "not recently", never "not ever". Set once and never cleared: a
+        // session that has been used stays used across a seek or a quality
+        // change, and keeps the full session_idle.
+        bool stream_served{false};
         size_t active_stream_requests{};
         std::shared_ptr<LogicalViewerSession> logical_session;
     };
@@ -664,6 +671,7 @@ struct PlaybackManager::Impl {
     size_t reserved_video_transcodes{};
     size_t reserved_audio_transcodes{};
     uint64_t idle_pipelines_reclaimed{};
+    uint64_t unused_sessions_reclaimed{};
     bool heap_reclaim_pending{};
     uint64_t heap_reclaim_requests{};
     uint64_t heap_reclaim_runs{};
@@ -1776,6 +1784,10 @@ struct PlaybackManager::Impl {
                 if (it == sessions.end() || it->second != session)
                     return http_error(404, "not_found", "stream not found");
                 session->touched = Clock::now();
+                // Direct Play is a stream object like any other: a single
+                // ranged body can outlive several idle windows without another
+                // request, so this must count as having been used.
+                session->stream_served = true;
                 signal_cleanup_locked();
             }
             return ranged_response(request, session->source_entry.size, direct_mime(session->source.logical_path),
@@ -1802,6 +1814,7 @@ struct PlaybackManager::Impl {
             const auto now = Clock::now();
             session->touched = now;
             session->stream_touched = now;
+            session->stream_served = true;
             ++session->active_stream_requests;
             signal_cleanup_locked();
         }
@@ -2373,6 +2386,8 @@ struct PlaybackManager::Impl {
         bool heap_pending = false;
         uint64_t heap_requests = 0, heap_runs = 0, heap_successes = 0;
         std::chrono::milliseconds pipeline_idle{};
+        std::chrono::milliseconds session_unused_idle{};
+        uint64_t unused_reclaimed = 0;
         std::vector<std::shared_ptr<Session>> active_sessions;
         {
             std::lock_guard lock(mutex);
@@ -2382,11 +2397,13 @@ struct PlaybackManager::Impl {
             running_video_transcode_pipelines = running_video_transcode_pipelines_locked();
             running_audio_transcode_pipelines = running_audio_transcode_pipelines_locked();
             reclaimed = idle_pipelines_reclaimed;
+            unused_reclaimed = unused_sessions_reclaimed;
             heap_pending = heap_reclaim_pending;
             heap_requests = heap_reclaim_requests;
             heap_runs = heap_reclaim_runs;
             heap_successes = heap_reclaim_successes;
             pipeline_idle = config.pipeline_idle;
+            session_unused_idle = config.session_unused_idle;
             cached_probes = probe_cache.size();
             cached_probe_bytes = probe_cache_bytes;
             active_sessions.reserve(sessions.size());
@@ -2435,6 +2452,9 @@ struct PlaybackManager::Impl {
                           static_cast<uint64_t>(config.video_decoder_threads)},
                          {"pipeline_idle_ms", static_cast<uint64_t>(pipeline_idle.count())},
                          {"idle_pipelines_reclaimed", reclaimed},
+                         {"session_unused_idle_ms",
+                          static_cast<uint64_t>(session_unused_idle.count())},
+                         {"unused_sessions_reclaimed", unused_reclaimed},
                          {"heap_reclaim_pending", heap_pending},
                          {"heap_reclaim_requests", heap_requests},
                          {"heap_reclaim_runs", heap_runs},
@@ -2593,14 +2613,38 @@ struct PlaybackManager::Impl {
                                   std::shared_ptr<MediaEngineSession>>> idle_pipelines;
             std::optional<Clock::time_point> next_expiry;
             std::chrono::milliseconds idle_timeout{};
+            std::chrono::milliseconds unused_idle_timeout{};
             bool reclaim_heap = false;
             {
                 std::unique_lock lock(mutex);
                 const auto now = Clock::now();
                 idle_timeout = config.pipeline_idle;
+                unused_idle_timeout = config.session_unused_idle;
                 for (auto it = sessions.begin(); it != sessions.end();) {
-                    const auto expires = it->second->touched + config.session_idle;
+                    // A session that has never served a stream object expires on
+                    // the shorter clock. The transcode entitlement is held by the
+                    // session rather than by the pipeline, so reclaiming the
+                    // engine at pipeline_idle only makes an abandoned session
+                    // cheap -- it goes on holding the slot until the session
+                    // itself is erased, and with max_video_transcodes at 1 that
+                    // closes the node to transcoding for the whole session_idle.
+                    // Both clocks run from `touched`, so a client that is still
+                    // talking to us -- polling the session, PATCHing a plan --
+                    // is never evicted by this; only one that created a session
+                    // and never came back for the media is.
+                    // Clamped, not merely validated: an unused session must
+                    // never outlive a used one, whatever the two knobs say.
+                    // config_base rejects that ordering in a config file, but
+                    // reconfigure() takes a StreamingConfig from callers that
+                    // never went through it.
+                    const auto idle_budget =
+                        it->second->stream_served
+                            ? config.session_idle
+                            : std::min(config.session_unused_idle, config.session_idle);
+                    const auto expires = it->second->touched + idle_budget;
                     if (now >= expires) {
+                        if (!it->second->stream_served)
+                            ++unused_sessions_reclaimed;
                         expired.push_back(it->second);
                         erase_idempotency_for_session_locked(it->first);
                         if (!it->second->logical_session->client_key.empty())
@@ -2656,6 +2700,10 @@ struct PlaybackManager::Impl {
                 }
             }
             for (auto& session : expired) {
+                if (!session->stream_served)
+                    Log::info("playback session reclaimed without ever being streamed session=" +
+                              session->id + " idle_ms=" +
+                              std::to_string(unused_idle_timeout.count()));
                 stop_pipeline(*session);
                 std::error_code ec;
                 std::filesystem::remove_all(*config.temp_path / session->id, ec);
@@ -2755,6 +2803,7 @@ void PlaybackManager::reconfigure(StreamingConfig config) {
     impl_->config.max_video_transcodes = config.max_video_transcodes;
     impl_->config.max_audio_transcodes = config.max_audio_transcodes;
     impl_->config.session_idle = config.session_idle;
+    impl_->config.session_unused_idle = config.session_unused_idle;
     impl_->config.pipeline_idle = config.pipeline_idle;
     impl_->config.startup_timeout = config.startup_timeout;
     impl_->config.segment_duration = config.segment_duration;
