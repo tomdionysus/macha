@@ -37,6 +37,11 @@ class TorrentManager final : public TorrentService {
     // session with none of these can reach no peer and must say so.
     size_t routable_listen_endpoints_{};
     bool warned_loopback_only_{};
+    // Said once per session: a router with no UPnP must not become a
+    // recurring complaint, but "this node has no inbound port" has to be
+    // visible at least once above debug.
+    bool logged_portmap_{};
+    bool warned_portmap_failed_{};
     std::jthread worker_;
 
     void load_state();
