@@ -49,6 +49,13 @@ struct LocalStoreDiagnostics {
     uint64_t loose_reaffirmation_full_validations{};
     // Loose objects the start-up presence walk found (0 until it finishes).
     uint64_t presence_index_entries{};
+    // Pack recovery at the last open: tails discarded as torn appends, and
+    // unreadable spans skipped inside a pack (bytes and count). Non-zero
+    // skipped figures mean this backend lost objects it once held; the
+    // cluster repairs them from replicas.
+    uint64_t pack_recovery_truncated_tails{};
+    uint64_t pack_recovery_skipped_regions{};
+    uint64_t pack_recovery_skipped_bytes{};
 };
 
 class LocalStore {
@@ -130,6 +137,9 @@ class LocalStore {
     // is not a cold stat per extent (2.6-16 s per quantum commit, 2026-09-07).
     std::jthread presence_thread_;
     std::atomic_uint64_t presence_index_entries_{};
+    std::atomic_uint64_t pack_recovery_truncated_tails_{};
+    std::atomic_uint64_t pack_recovery_skipped_regions_{};
+    std::atomic_uint64_t pack_recovery_skipped_bytes_{};
     std::atomic_bool scan_complete_{};
     std::atomic_bool scan_failed_{};
     std::atomic_bool accounting_trusted_{};
@@ -252,7 +262,10 @@ class LocalStore {
     LocalStoreDiagnostics diagnostics() const noexcept {
         return {loose_reaffirmation_fast_paths_.load(std::memory_order_relaxed),
                 loose_reaffirmation_full_validations_.load(std::memory_order_relaxed),
-                presence_index_entries_.load(std::memory_order_relaxed)};
+                presence_index_entries_.load(std::memory_order_relaxed),
+                pack_recovery_truncated_tails_.load(std::memory_order_relaxed),
+                pack_recovery_skipped_regions_.load(std::memory_order_relaxed),
+                pack_recovery_skipped_bytes_.load(std::memory_order_relaxed)};
     }
 };
 NodeId load_or_create_node_id(const std::filesystem::path&);

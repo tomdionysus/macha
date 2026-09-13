@@ -687,6 +687,167 @@ MACHA_TEST("storage_v18", test_pack_recovery_discards_incomplete_tail_record) {
 }
 
 namespace {
+std::filesystem::path only_pack(const std::filesystem::path& store) {
+    std::filesystem::path pack;
+    for (const auto& entry : std::filesystem::directory_iterator(store / "packs")) {
+        if (entry.is_regular_file()) {
+            REQUIRE(pack.empty());
+            pack = entry.path();
+        }
+    }
+    REQUIRE(!pack.empty());
+    return pack;
+}
+} // namespace
+
+// A power loss between the pack write() and the durability domain's syncfs
+// can leave the file extended by a header-sized span whose block never held
+// the header (zero-filled or partial). That is exactly pack_header_size bytes
+// -- 93-byte prefix plus a 32-byte SHA-256 -- one byte too many for the
+// "fewer bytes than a header" branch, and undecodable, so until 0.38.3
+// recovery threw and the whole backend went offline (gbni-1, 2026-09-12).
+MACHA_TEST("storage_v18", test_pack_recovery_truncates_undecodable_header_at_tail) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+
+    LocalStoreOptions options;
+    options.limit = 32ULL * 1024 * 1024;
+    options.pack_threshold = 256 * 1024;
+    options.pack_target_size = 1024 * 1024;
+
+    constexpr size_t pack_header_size = 93 + 32;
+    struct Shape {
+        const char* name;
+        Bytes garbage;
+    };
+    Bytes partial = pattern(pack_header_size + 40000, 0x5a);
+    std::vector<Shape> shapes;
+    shapes.push_back({"zero-filled header", Bytes(pack_header_size, 0)});
+    shapes.push_back({"garbage header", pattern(pack_header_size, 0x5a)});
+    shapes.push_back({"garbage header and partial payload", std::move(partial)});
+
+    size_t index = 0;
+    for (auto& shape : shapes) {
+        const auto root = t.path() / ("store-" + std::to_string(index++));
+        auto first = pattern(96 * 1024, 11);
+        auto second = pattern(96 * 1024, 12);
+        const auto first_id = object_id(first);
+        const auto second_id = object_id(second);
+        {
+            LocalStore store(root, options, keys.storage);
+            REQUIRE(store.put(first_id, first));
+            REQUIRE(store.put(second_id, second));
+        }
+        const auto pack = only_pack(root);
+        const auto intact_size = std::filesystem::file_size(pack);
+        {
+            std::ofstream out(pack, std::ios::binary | std::ios::app);
+            REQUIRE(out.good());
+            out.write(reinterpret_cast<const char*>(shape.garbage.data()),
+                      static_cast<std::streamsize>(shape.garbage.size()));
+            REQUIRE(out.good());
+        }
+        REQUIRE(std::filesystem::file_size(pack) == intact_size + shape.garbage.size());
+
+        LocalStore reopened(root, options, keys.storage);
+        REQUIRE(reopened.get(first_id).has_value());
+        REQUIRE(reopened.get(second_id).has_value());
+        CHECK(*reopened.get(first_id) == first);
+        CHECK(*reopened.get(second_id) == second);
+        CHECK(std::filesystem::file_size(pack) == intact_size);
+        const auto diagnostics = reopened.diagnostics();
+        CHECK(diagnostics.pack_recovery_truncated_tails == 1);
+        CHECK(diagnostics.pack_recovery_skipped_regions == 0);
+        CHECK(diagnostics.pack_recovery_skipped_bytes == 0);
+
+        // The pack is still the active one: appends continue behind the
+        // restored boundary and survive another reopen.
+        auto third = pattern(64 * 1024, 13);
+        const auto third_id = object_id(third);
+        REQUIRE(reopened.put(third_id, third));
+        CHECK(reopened.is_packed(third_id));
+    }
+}
+
+// Damage inside a pack -- a header that fails its checksum with intact records
+// after it -- is not a torn tail. Truncating there would discard the live
+// records behind it, and refusing the pack would take the backend offline over
+// one record. Recovery skips the unreadable span, keeps everything after it,
+// reports the loss, and leaves the span as dead bytes for compaction.
+MACHA_TEST("storage_v18", test_pack_recovery_skips_unreadable_region_before_live_records) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+
+    LocalStoreOptions options;
+    options.limit = 32ULL * 1024 * 1024;
+    options.pack_threshold = 256 * 1024;
+    options.pack_target_size = 1024 * 1024;
+
+    auto first = pattern(96 * 1024, 21);
+    auto second = pattern(96 * 1024, 22);
+    auto third = pattern(96 * 1024, 23);
+    const auto first_id = object_id(first);
+    const auto second_id = object_id(second);
+    const auto third_id = object_id(third);
+    {
+        LocalStore store(t.path() / "store", options, keys.storage);
+        REQUIRE(store.put(first_id, first));
+        REQUIRE(store.put(second_id, second));
+        REQUIRE(store.put(third_id, third));
+    }
+    const auto pack = only_pack(t.path() / "store");
+    const auto intact_size = std::filesystem::file_size(pack);
+    // Records are header (125 bytes) + ciphertext of the same length as the
+    // plaintext; the second record therefore starts at 125 + 96 KiB.
+    constexpr uint64_t pack_header_size = 93 + 32;
+    const uint64_t second_offset = pack_header_size + first.size();
+    {
+        // Flip one byte inside the second record's header checksum.
+        std::fstream io(pack, std::ios::binary | std::ios::in | std::ios::out);
+        REQUIRE(io.good());
+        io.seekg(static_cast<std::streamoff>(second_offset + 100));
+        char byte = 0;
+        io.read(&byte, 1);
+        REQUIRE(io.good());
+        byte = static_cast<char>(byte ^ 0x01);
+        io.seekp(static_cast<std::streamoff>(second_offset + 100));
+        io.write(&byte, 1);
+        REQUIRE(io.good());
+    }
+
+    LocalStore reopened(t.path() / "store", options, keys.storage);
+    // Nothing was truncated: the records after the damage are live.
+    CHECK(std::filesystem::file_size(pack) == intact_size);
+    REQUIRE(reopened.get(first_id).has_value());
+    CHECK(*reopened.get(first_id) == first);
+    CHECK(!reopened.has(second_id));
+    REQUIRE(reopened.get(third_id).has_value());
+    CHECK(*reopened.get(third_id) == third);
+    const auto diagnostics = reopened.diagnostics();
+    CHECK(diagnostics.pack_recovery_truncated_tails == 0);
+    CHECK(diagnostics.pack_recovery_skipped_regions == 1);
+    CHECK(diagnostics.pack_recovery_skipped_bytes == pack_header_size + second.size());
+
+    // The lost object can be written again (this is what replica repair does),
+    // and compaction reclaims the unreadable span without touching live data.
+    REQUIRE(reopened.put(second_id, second));
+    REQUIRE(reopened.get(second_id).has_value());
+    CHECK(*reopened.get(second_id) == second);
+    const auto before_compaction = reopened.used();
+    REQUIRE(reopened.compact_packs());
+    CHECK(reopened.used() < before_compaction);
+    for (const auto* item : {&first, &second, &third}) {
+        const auto id = object_id(*item);
+        REQUIRE(reopened.get(id).has_value());
+        CHECK(*reopened.get(id) == *item);
+    }
+}
+
+namespace {
 class StorageClusterNode {
     Config config_;
     const ClusterKeys& keys_;

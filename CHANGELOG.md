@@ -1,5 +1,64 @@
 # Current release
 
+## 0.38.3 — A bad pack record no longer takes the backend offline (development)
+
+gbni-1 ran for a day advertising 0 G of storage. Its 8 TB DATA backend had
+gone offline at start-up over one record in one 29 MB pack:
+
+```
+WARN storage backend offline /mnt/diskB: corrupt pack header at
+     .../pack-00000000000000001206.pack offset=29841717
+INFO node data storage ready used=0 capacity=0
+```
+
+Exactly 125 bytes — one pack header's length — followed the last good record,
+and they did not decode. That is what a power loss leaves when it lands
+between the pack `write()` and the durability domain's `syncfs`: ext4 commits
+the file's new length while the block that was to hold the header is
+zero-filled or partial. Nothing past that point was ever acknowledged, so the
+tail holds no data the cluster was told it had. Recovery handled two torn-tail
+shapes — fewer bytes than a header, and a header whose payload runs past the
+end — and truncated both; a header that was *present but undecodable* threw
+instead, the `LocalStore` constructor failed, and the pool marked the backend
+offline. The node then reported data storage *ready* with `capacity=0`, and
+the node loop's periodic re-probe re-ran the same recovery into the same throw
+every heartbeat, logging nothing after the first time. With es-1 also down,
+replication 2 had one eligible target, which is why a client saw 42% of
+artwork on both reachable nodes or neither.
+
+Recovery now settles an undecodable header by looking for a decodable one
+after it (magic match, then the header's own SHA-256), reading the rest of
+that one pack in bounded chunks:
+
+- **Nothing decodable follows:** a torn tail. Truncated and logged like the
+  other two shapes (`truncated undecodable pack tail … zero_header=0|1`).
+- **A decodable record follows:** damage inside the pack — bit rot, an
+  external edit. Truncating would discard the live records behind it and
+  refusing the pack would take the whole backend offline over one record.
+  The unreadable span is skipped and counted as dead bytes for compaction,
+  the records after it are indexed normally, and the loss is logged at
+  `error` (`skipped unreadable pack region … bytes=N`). Objects recorded in
+  the span are absent from this backend and are repaired from replicas; a
+  tombstone lost there can resurrect an earlier record of the same object
+  until GC reaches it.
+
+Neither shape takes the backend offline any more. A real I/O error while
+reading a pack still does, and the existing re-probe brings the backend back
+once the disk answers again.
+
+- Status: `diagnostics.data_store.{pack_recovery_truncated_tails,
+  pack_recovery_skipped_regions, pack_recovery_skipped_bytes}`, summed across
+  online backends; non-zero skipped figures mean this node lost objects it
+  once held.
+- Tests: `test_pack_recovery_truncates_undecodable_header_at_tail` (a
+  zero-filled header, a garbage header, and a garbage header with a partial
+  payload — all truncate to the intact boundary and the pack stays writable),
+  `test_pack_recovery_skips_unreadable_region_before_live_records` (a flipped
+  checksum byte in the middle record: nothing truncated, neighbours live, the
+  lost object re-storable, compaction reclaims the span).
+- Nothing was done to gbni-1's pack by hand. Deploying this release and
+  restarting the node is the repair: recovery truncates the tail itself.
+
 ## 0.38.2 — libtorrent's port mapping is stated, not assumed (development)
 
 libtorrent maps its own listen port with UPnP and NAT-PMP, and both default to

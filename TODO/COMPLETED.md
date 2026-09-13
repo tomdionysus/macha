@@ -7,6 +7,43 @@ The 2026-09-08 entries below were ledgered by a pruning pass over
 0.24.1–0.35.0 is not otherwise ledgered here yet — see the documentation
 hygiene item in `ACTIVE.md`.
 
+## One bad pack record no longer takes a backend offline — 0.38.3, deployed 2026-09-13
+
+Resolves the live incident this file's sibling `ACTIVE.md` opened with on
+2026-09-13. Full diagnosis, the mechanism, and the two shapes recovery now
+handles are in `2026-09-13-torn-pack-header-recovery-plan.md`; the release
+notes are in `CHANGELOG.md` under 0.38.3.
+
+- [x] **gbni-1's 8 TB DATA backend was offline over 125 bytes.** A power loss
+  between the pack `write()` and the durability domain's `syncfs` left the file
+  extended by exactly one `pack_header_size` of zeroes. Recovery truncated two
+  torn-tail shapes but threw on a third — a header present but undecodable —
+  so the `LocalStore` constructor failed, the pool marked the backend offline,
+  and `StoragePool::limit()` reported 0 because `token_known` was never set.
+  The node then advertised `capacity=0` while reporting data storage *ready*.
+- [x] **Recovery settles an undecodable header instead of refusing the pack.**
+  It looks for a decodable header after the bad one (magic, then the header's
+  own SHA-256, one pack, 1 MiB chunks). Nothing after it → torn tail,
+  truncated. Something after it → damage inside the pack: the span is skipped
+  and counted as dead bytes for compaction, the records after it are indexed,
+  and the loss is logged at `error` for replica repair. Neither takes the
+  backend offline.
+- [x] **Verified live, not just in tests.** gbni-1 on 0.38.3 logged
+  `truncated undecodable pack tail path=…pack-00000000000000001206.pack
+  offset=29841717 bytes=125 zero_header=1`, brought the backend online in
+  97 ms, and reported `capacity=8796093022208 used=735796755266`. The node had
+  been holding **685 GiB** of authoritative data all along — the backlog's
+  "gbni-1 holds 0 of 1618 artwork objects" was a consequence of the backend
+  being offline, not of it being empty. `zero_header=1` confirmed the ext4
+  zero-fill shape that was predicted from the writer's code path.
+  Status carries `diagnostics.data_store.pack_recovery_truncated_tails: 1`.
+- [x] **No hand repair was performed.** The operator's instruction was that
+  Macha self-heals; the pack was left untouched and the deployed code fixed it
+  on start-up.
+- [x] **es-1 returned on its own** after a reboot at ~12:41 the same day and
+  now runs 0.38.3. Its cause is not recoverable — the node keeps no persistent
+  journal (see the P0 follow-up in `ACTIVE.md`).
+
 ## Cluster users, passwords and roles — 0.38.0, deployed 2026-09-12
 
 Supersedes the "No authorization tiers yet" P0 in `ACTIVE.md`. Design and the

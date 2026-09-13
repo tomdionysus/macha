@@ -176,6 +176,45 @@ std::optional<PackHeader> decode_pack_header(std::span<const uint8_t> bytes) {
     }
 }
 
+// The first offset at or after `from` holding a header that decodes, or
+// nothing if the rest of the file has none. Recovery asks this when it meets
+// an undecodable header: a torn append leaves nothing decodable behind it,
+// whereas mid-pack damage (bit rot, an external edit) leaves the records after
+// it intact. Payloads are AES-GCM ciphertext, so a magic match followed by a
+// valid SHA-256 inside one is not a realistic false positive. Reads the
+// remainder of one pack in bounded chunks; hashes only where the magic matches.
+std::optional<uint64_t> find_next_pack_header(int fd, uint64_t from, uint64_t file_size) {
+    constexpr size_t chunk = 1024 * 1024;
+    static_assert(chunk > 2 * pack_header_size);
+    uint64_t position = from;
+    while (position + pack_header_size <= file_size) {
+        const size_t want = static_cast<size_t>(std::min<uint64_t>(chunk, file_size - position));
+        auto bytes = pra_exact(fd, want, position);
+        if (!bytes)
+            throw std::runtime_error("cannot read pack during recovery");
+        const std::span<const uint8_t> view(*bytes);
+        size_t search = 0;
+        while (search + pack_header_size <= view.size()) {
+            auto hit = std::search(view.begin() + static_cast<std::ptrdiff_t>(search), view.end(),
+                                   P.begin(), P.end());
+            if (hit == view.end())
+                break;
+            const size_t index = static_cast<size_t>(hit - view.begin());
+            if (index + pack_header_size > view.size())
+                break;
+            if (decode_pack_header(view.subspan(index, pack_header_size)))
+                return position + index;
+            search = index + 1;
+        }
+        if (want < chunk)
+            break;
+        // Overlap the next chunk by a header so one straddling the boundary
+        // is still seen whole.
+        position += want - (pack_header_size - 1);
+    }
+    return {};
+}
+
 void wa(int fd, std::span<const uint8_t> bytes) {
     size_t done = 0;
     while (done < bytes.size()) {
@@ -770,9 +809,50 @@ void LocalStore::rebuild_pack_index_locked(bool truncate_incomplete_tail) {
             }
             auto header = decode_pack_header(*bytes);
             if (!header) {
-                ::close(fd);
-                throw std::runtime_error("corrupt pack header at " + file.string() +
-                                         " offset=" + std::to_string(offset));
+                // Two shapes reach here. A power loss between write() and the
+                // domain's syncfs can leave the file extended by a header whose
+                // block never held one (zero-filled or partial): nothing was
+                // acknowledged past this point and nothing decodable follows,
+                // so the tail is discarded like the other two torn shapes. If a
+                // decodable record does follow, the damage is inside the pack;
+                // the unreadable span is skipped and left as dead bytes for
+                // compaction, and the objects it held are repaired from
+                // replicas. Neither shape takes the backend offline: until
+                // 0.38.3 both threw, and one such header at a pack tail cost
+                // gbni-1 its whole 8 TB backend (2026-09-12).
+                const bool zero_header = std::all_of(bytes->begin(), bytes->end(),
+                                                     [](uint8_t b) { return b == 0; });
+                const auto next = find_next_pack_header(fd, offset + 1, file_size);
+                if (!next) {
+                    const auto discarded = file_size - offset;
+                    if (truncate_incomplete_tail) {
+                        if (::ftruncate(fd, static_cast<off_t>(offset)) != 0) {
+                            const auto saved = errno;
+                            ::close(fd);
+                            throw std::runtime_error("cannot truncate torn pack tail at " +
+                                                     file.string() + " offset=" +
+                                                     std::to_string(offset) + ": " +
+                                                     strerror(saved));
+                        }
+                        Log::warn("truncated undecodable pack tail path=" + file.string() +
+                                  " offset=" + std::to_string(offset) +
+                                  " bytes=" + std::to_string(discarded) +
+                                  " zero_header=" + std::to_string(zero_header ? 1 : 0));
+                    }
+                    pack_recovery_truncated_tails_.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                }
+                const auto skipped = *next - offset;
+                Log::error("skipped unreadable pack region path=" + file.string() +
+                           " offset=" + std::to_string(offset) +
+                           " bytes=" + std::to_string(skipped) +
+                           " zero_header=" + std::to_string(zero_header ? 1 : 0) +
+                           " (objects recorded there are absent from this backend)");
+                pack_dead_bytes_ += skipped;
+                pack_recovery_skipped_regions_.fetch_add(1, std::memory_order_relaxed);
+                pack_recovery_skipped_bytes_.fetch_add(skipped, std::memory_order_relaxed);
+                offset = *next;
+                continue;
             }
             const uint64_t total = pack_header_size + header->payload_size;
             if (total > file_size - offset) {

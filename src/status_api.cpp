@@ -877,6 +877,12 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
             data_store_diagnostics["loose_reaffirmation_full_validations"] =
                 data_store.loose_reaffirmation_full_validations;
             data_store_diagnostics["presence_index_entries"] = data_store.presence_index_entries;
+            data_store_diagnostics["pack_recovery_truncated_tails"] =
+                data_store.pack_recovery_truncated_tails;
+            data_store_diagnostics["pack_recovery_skipped_regions"] =
+                data_store.pack_recovery_skipped_regions;
+            data_store_diagnostics["pack_recovery_skipped_bytes"] =
+                data_store.pack_recovery_skipped_bytes;
         } catch (...) {
             // Readiness can transition while Status is assembled. Diagnostics
             // are observational and must never make the startup API fail.
