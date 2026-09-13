@@ -984,7 +984,25 @@ that report.
   live allocation under the global mutex** — exactly under memory pressure,
   which is the worst time to do it.
 
-## P2 — Raised by client teams, not yet decided (2026-09-13)
+## P2 — Raised by client teams and the operator, not yet decided (2026-09-13)
+
+- [x] **The anonymous account has no password, and a roles-less anonymous
+  account is no longer reported as "disabled" — raised by the operator and,
+  independently, by the web client session; both fixed in 0.38.4, not yet
+  deployed.** The reported "cannot set a password" turned out to be the right
+  behaviour arrived at for the wrong reason: the API *did* permit it, and that
+  was a live privilege hole. `/api/v1/users/me` needs only `media_viewer`,
+  which anonymous holds at genesis, so any unauthenticated visitor could
+  `PATCH` a password onto the anonymous account and then log in as it — and the
+  username/password mint path never consults `session.allow_anonymous`, so the
+  resulting bound session survived anonymous access being switched off.
+  Anonymous now has no credential at all (`kdf` 0) and `verify` refuses the
+  username outright, which also makes the random password existing clusters
+  carry inert without a migration. Separately, an anonymous account with no
+  roles now mints a session carrying `roles: []` instead of `403
+  anonymous_disabled` — that is how a registered-users-only deployment is
+  expressed, and the client needs the empty list to know to show a login.
+  Details in `CHANGELOG.md` under 0.38.4.
 
 - [ ] **`GET /api/v1/users` returns `{"users": [...]}` while every other
   collection in the API uses `items`.** Raised independently by the mobile

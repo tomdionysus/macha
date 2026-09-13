@@ -323,8 +323,8 @@ MACHA_FAST_TEST("users", test_anonymous_is_an_ordinary_account) {
     auto config = cluster.node_config("n1");
     config.session.allow_anonymous = true;
     NodeRuntime node(config, cluster.keys());
-    auto anonymous = node.users().create(anonymous_username, "unused-password",
-                                         {std::string(role_media_viewer)}, node.node_id());
+    auto anonymous = node.users().create_without_password(
+        anonymous_username, {std::string(role_media_viewer)}, node.node_id());
     REQUIRE(anonymous.has_value());
 
     PasswordCredentialValidator validator(node.users(), config.session);
@@ -358,6 +358,93 @@ MACHA_FAST_TEST("users", test_anonymous_is_an_ordinary_account) {
     CHECK(strict.validate(Json(Json::Object{})).outcome == CredentialOutcome::disabled);
 }
 
+// Anonymous access switched off and anonymous granted nothing are different
+// states, and a cluster may legitimately be in either. Reporting the second as
+// the first told a client to show a login form when the truthful answer was
+// that it already had a session and this cluster gives visitors no
+// capabilities.
+MACHA_FAST_TEST("users", test_anonymous_with_no_roles_still_mints_a_powerless_session) {
+    TestCluster cluster;
+    auto config = cluster.node_config("n1");
+    config.session.allow_anonymous = true;
+    NodeRuntime node(config, cluster.keys());
+    auto anonymous =
+        node.users().create_without_password(anonymous_username, {}, node.node_id());
+    REQUIRE(anonymous.has_value());
+    CHECK(anonymous->roles.empty());
+
+    PasswordCredentialValidator validator(node.users(), config.session);
+    auto minted = validator.validate(Json(Json::Object{}));
+    REQUIRE(minted.outcome == CredentialOutcome::ok);
+    CHECK(minted.credentials.roles.empty());
+    CHECK(minted.credentials.user_id == anonymous->id);
+
+    // Switching anonymous access off is still a different answer, and it is
+    // the only thing that produces one.
+    auto closed = config.session;
+    closed.allow_anonymous = false;
+    PasswordCredentialValidator strict(node.users(), closed);
+    CHECK(strict.validate(Json(Json::Object{})).outcome == CredentialOutcome::disabled);
+}
+
+// `session.allow_anonymous: false` guards the no-credentials path only. An
+// anonymous account that could be logged into would therefore be a second door
+// beside the switch -- and the session it handed back would be an ordinary
+// bound one that outlives the switch being turned off.
+MACHA_FAST_TEST("users", test_anonymous_has_no_password_and_cannot_be_given_one) {
+    TestCluster cluster;
+    auto config = cluster.node_config("n1");
+    config.session.allow_anonymous = false;
+    NodeRuntime node(config, cluster.keys());
+    UsersApi api(node);
+    auto anonymous = node.users().create_without_password(
+        anonymous_username, {std::string(role_media_viewer)}, node.node_id());
+    REQUIRE(anonymous.has_value());
+    CHECK(anonymous->kdf == 0);
+
+    // No password reaches this account, including the empty one.
+    PasswordCredentialValidator validator(node.users(), config.session);
+    for (const auto* attempt : {"", "unused-password", "anonymous"}) {
+        Json::Object credentials;
+        credentials["username"] = std::string(anonymous_username);
+        credentials["password"] = std::string(attempt);
+        CHECK(validator.validate(Json(credentials)).outcome == CredentialOutcome::rejected);
+    }
+    CHECK(!node.users().verify(anonymous_username, "unused-password").ok);
+
+    // The store refuses to install one, so no caller -- API, CLI or a future
+    // one -- can route around the rule.
+    CHECK(!node.users()
+               .update(anonymous->id, "a-long-enough-password", std::nullopt, node.node_id())
+               .has_value());
+    // Roles remain ordinary, which is the whole control over what a visitor
+    // may do.
+    REQUIRE(node.users()
+                .update(anonymous->id, "",
+                        std::vector<std::string>{std::string(role_media_viewer)}, node.node_id())
+                .has_value());
+
+    // Before 0.38.4 this was reachable by any holder of an anonymous session:
+    // /api/v1/users/me needs only media_viewer, and a self PATCH carrying a
+    // password set the anonymous account's credential and handed back a token.
+    SessionIdentity visitor{"s", Hash256{}, {std::string(role_media_viewer)}, anonymous->id};
+    auto refused = api.handle(
+        users_request("PATCH", "/api/v1/users/me", visitor, R"({"password":"a-long-enough-pw"})"));
+    CHECK(refused.status == 409);
+    CHECK(json_body(refused).find("no_password") != std::string::npos);
+    auto refused_by_id =
+        api.handle(users_request("PATCH", "/api/v1/users/" + anonymous->id, admin_identity(),
+                                 R"({"password":"a-long-enough-pw"})"));
+    CHECK(refused_by_id.status == 409);
+
+    // And the client is told, so it does not draw a field the server refuses.
+    auto listed = api.handle(
+        users_request("GET", "/api/v1/users/" + anonymous->id, admin_identity()));
+    REQUIRE(listed.status == 200);
+    const auto body = Json::parse(json_body(listed));
+    CHECK(!body.find("mutable")->find("set_password")->asBool());
+}
+
 MACHA_FAST_TEST("users", test_genesis_creates_root_and_anonymous_once) {
     TempDir dir;
     const auto state = dir.path() / "state";
@@ -377,6 +464,14 @@ MACHA_FAST_TEST("users", test_genesis_creates_root_and_anonymous_once) {
     CHECK(genesis->anonymous.roles.size() == 1);
     CHECK(user_has_role(genesis->anonymous, role_media_viewer));
     CHECK(store.verify(root_username, genesis->password).ok);
+    // Anonymous is created with no credential at all rather than a random
+    // password nobody is told: there is nothing to leak, nothing to guess, and
+    // nothing that could become a way past allow_anonymous.
+    const std::array<uint8_t, 32> no_hash{};
+    const std::array<uint8_t, 16> no_salt{};
+    CHECK(genesis->anonymous.kdf == 0);
+    CHECK(genesis->anonymous.password_hash.bytes == no_hash);
+    CHECK(genesis->anonymous.salt == no_salt);
 
     // The generated password has to survive being read off a screen and
     // retyped, so no vowels and none of the characters that look alike.
@@ -449,8 +544,10 @@ MACHA_FAST_TEST("users", test_root_and_anonymous_cannot_be_removed_or_recreated)
     CHECK(!may->find("rename")->asBool());
     CHECK(!may->find("delete")->asBool());
     // Anonymous's roles are the only control over what an unauthenticated
-    // television can reach, so they must stay editable.
+    // television can reach, so they must stay editable -- while its password,
+    // which does not exist, must not be offered.
     CHECK(may->find("set_roles")->asBool());
+    CHECK(!may->find("set_password")->asBool());
 
     // Neither name can be taken by a new account.
     for (const auto* name : {"root", "ROOT", "anonymous"}) {
