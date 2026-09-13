@@ -1,5 +1,32 @@
 # Current release
 
+## 0.39.0 — A line under the 0.38 series (development)
+
+No code change. 0.38.3–0.38.5 were written, deployed and verified against the
+live cluster in one sitting, and they are coherent enough to name as a series:
+**a node no longer loses a disk, an account, or its own diagnostic screen to a
+question nobody had thought to ask it.**
+
+- **0.38.3** — one torn 125-byte pack tail no longer takes an 8 TB backend
+  offline. Found live: gbni-1 had been advertising 0 G while holding 685 GiB.
+- **0.38.4** — `anonymous` has no password and cannot be given one, closing a
+  path by which any unauthenticated visitor could mint themselves a credentialed
+  session that outlived `allow_anonymous: false`. An anonymous account with no
+  roles now mints a session that grants nothing, instead of being reported as
+  anonymous access being switched off.
+- **0.38.5** — cluster health became a capability (`view_status`) rather than an
+  ungated route, and liveness got a route of its own (`/api/v1/health`).
+
+Deployed to gbni-1 and es-1. **gbni-2 is stranded on 0.38.1** — its sshd offers
+password authentication only and needs console access — so it carries none of
+the above and is the one node where `/api/v1/status` is ungated, `anonymous`
+can still be given a password, and `/api/v1/health` 404s.
+
+What this line is drawn *for*: the next piece of work is splitting the
+lightweight status view from the expensive diagnostics tree, which changes the
+shape of a response every client polls, and that is better started from a named
+boundary than from the middle of a run.
+
 ## 0.38.5 — Cluster health is a capability, and liveness is its own route (development)
 
 `/api/v1/status` carried no role. The argument for that was sound as far as it
