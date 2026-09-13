@@ -1201,12 +1201,26 @@ SSH to gbni-1 and es-1 is filtered from outside — port 22 is refused or times
 out from both a laptop and from gbni-2 — so a session with no LAN route can
 reach only whatever nodes happen to be exposed.
 
-**Versions deployed (2026-09-13, after the 0.38.4 rollout).** gbni-1 and
-es-1 run **0.38.4**, built on each node from the synced tree and verified
-byte-identical (`libmacha_core.so` sha256 f373d961…, GCC 14.2.0 on both; the
+**Versions deployed (2026-09-13, after the 0.38.5 rollout).** gbni-1 and
+es-1 run **0.38.5**, built on each node from the synced tree and verified
+byte-identical (`libmacha_core.so` sha256 966e3b2e…, GCC 14.2.0 on both; the
 `macha` binary is a thin main and is unchanged across these releases). The full
-suite passed on es-1 under GCC: 421 + 9, no failures. gbni-2 is still on
-**0.38.1** and cannot be reached — see the P0 item above. 0.38.2's torrent-bind fix is therefore live on two nodes: es-1
+suite passed on es-1 under GCC: 423 + 9, with one known load-flake
+(`test_ingest_pause_resume_and_cancel_still_work_under_a_worker_pool`, 364 ms
+in `--serial` isolation against a 60 s timeout under four-way load — add it to
+the flake list under P0 verified defects, which currently names two other
+tests). gbni-2 is still on **0.38.1** and cannot be reached — see the P0 item
+above. It is now three releases behind and is the only node where
+`/api/v1/status` is ungated, where anonymous can be given a password, and
+where `/api/v1/health` 404s.
+
+**Live account roles, for anyone reading the gating.** The stored records are
+`tom` and `root` (manage_users, manager, importer, media_viewer), `bryan`
+(manager, importer, media_viewer) and `anonymous` (**no roles**, generation 2 —
+the operator removed `media_viewer` on 2026-09-13 to make this a
+registered-users-only deployment). None of them carries `view_status` on disk
+and none needs to: 0.38.5 expands implications at mint, so the three human
+accounts receive it on their next login and anonymous correctly does not. 0.38.2's torrent-bind fix is therefore live on two nodes: es-1
 logs `torrent listen: advertised address 'ramaroja.macha.network' is not an IP
 literal, binding all interfaces instead` and then binds 6881 on every
 interface, which is the derivation working as intended.
