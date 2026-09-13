@@ -2046,6 +2046,67 @@ uint64_t DistributedStore::repair_once(uint64_t byte_budget, const std::vector<O
     return repair_step(byte_budget, 0, live, universal).bytes_transferred;
 }
 
+namespace {
+// One line a minute at most, per kind. A cluster that has genuinely lost a
+// node can be missing a great many objects at once, and a warning per object
+// would bury the journal exactly when someone needs to read it. The cumulative
+// counter in Status is the measure; the log line is the prompt to go and look.
+constexpr auto repair_warning_interval = std::chrono::minutes(1);
+constexpr size_t repair_sample_size = 32;
+} // namespace
+
+void DistributedStore::note_repair_unsourceable(const ObjectId& id) {
+    const auto total = repair_pull_unsourceable_.fetch_add(1, std::memory_order_relaxed) + 1;
+    bool warn = false;
+    {
+        std::lock_guard lock(repair_sample_mutex_);
+        if (std::find(repair_unsourceable_sample_.begin(), repair_unsourceable_sample_.end(), id) ==
+            repair_unsourceable_sample_.end()) {
+            repair_unsourceable_sample_.push_back(id);
+            while (repair_unsourceable_sample_.size() > repair_sample_size)
+                repair_unsourceable_sample_.pop_front();
+        }
+        const auto now = Clock::now();
+        if (repair_unsourceable_last_log_ == Clock::time_point{} ||
+            now - repair_unsourceable_last_log_ >= repair_warning_interval) {
+            repair_unsourceable_last_log_ = now;
+            warn = true;
+        }
+    }
+    if (warn)
+        Log::warn("repair cannot source an object this node should own object=" + to_string(id) +
+                  " unsourceable_total=" + std::to_string(total) +
+                  "; the live namespace references it and no peer would supply it");
+}
+
+void DistributedStore::note_repair_local_unreadable(const ObjectId& id) {
+    const auto total = repair_local_unreadable_.fetch_add(1, std::memory_order_relaxed) + 1;
+    bool warn = false;
+    {
+        std::lock_guard lock(repair_sample_mutex_);
+        const auto now = Clock::now();
+        if (repair_unreadable_last_log_ == Clock::time_point{} ||
+            now - repair_unreadable_last_log_ >= repair_warning_interval) {
+            repair_unreadable_last_log_ = now;
+            warn = true;
+        }
+    }
+    if (warn)
+        Log::warn("repair found a local object it cannot read back object=" + to_string(id) +
+                  " local_unreadable_total=" + std::to_string(total) +
+                  "; the store listed it but the read failed");
+}
+
+DistributedStore::RepairDiagnostics DistributedStore::repair_diagnostics() const {
+    RepairDiagnostics out;
+    out.pull_unsourceable = repair_pull_unsourceable_.load(std::memory_order_relaxed);
+    out.local_unreadable = repair_local_unreadable_.load(std::memory_order_relaxed);
+    std::lock_guard lock(repair_sample_mutex_);
+    out.unsourceable_sample.assign(repair_unsourceable_sample_.begin(),
+                                   repair_unsourceable_sample_.end());
+    return out;
+}
+
 DistributedStore::RepairResult
 DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                               const std::vector<ObjectId>* live,
@@ -2252,8 +2313,10 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                             break;
                         }
                         source = n_.local_store().get(id);
-                        if (!source)
+                        if (!source) {
+                            note_repair_local_unreadable(id);
                             break;
+                        }
                     }
                     if (byte_budget && transferred && transferred + source->size() > byte_budget) {
                         retry = true;
@@ -2359,6 +2422,15 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                     break;
                 if (n_.local_store().put(id, data->bytes))
                     transferred += data->bytes.size();
+            } else {
+                // This node should own it, does not have it, the block cache
+                // did not have it, and no peer answered with it. After a node
+                // leaves the cluster this is how a genuinely unavailable
+                // extent presents itself -- and it presented itself silently
+                // until 0.40.0. A transient peer or RPC failure lands here
+                // too, so this counts rather than concludes.
+                note_repair_unsourceable(id);
+                ++result.pull_unsourceable;
             }
 
             repair_pull_after_ = id;

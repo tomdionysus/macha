@@ -213,7 +213,7 @@ not because the design depends on it.
 
 ## Client contract change
 
-The four client sessions (UI, `@macha/core` NPM package, React Native, Site)
+The four client sessions (UI, `@machafoundation/core` NPM package, React Native, Site)
 must expect:
 
 - the media playlist arrives complete with `ENDLIST` on first fetch and does
