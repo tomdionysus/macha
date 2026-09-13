@@ -6,6 +6,10 @@
 // TODO/2026-09-05-subsystem-plugin-isolation-plan.md and torrent_manager.cpp.
 #include "torrent.hpp"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 #include "crypto.hpp"
 #include "json.hpp"
 
@@ -416,14 +420,44 @@ std::optional<std::string> TorrentSearchManager::resolve(std::string_view acquis
     return it->second.uri;
 }
 
+bool advertise_is_ip_literal(std::string_view advertise) {
+    // libtorrent's listen_interfaces takes an IP literal or a device name --
+    // never a hostname. A name reaches its device enumeration, matches no
+    // device, and binds nothing at all, silently. Only an address can be used
+    // here, so only an address is accepted.
+    if (advertise.find(':') != std::string_view::npos) {
+        in6_addr v6{};
+        return inet_pton(AF_INET6, std::string(advertise).c_str(), &v6) == 1;
+    }
+    in_addr v4{};
+    return inet_pton(AF_INET, std::string(advertise).c_str(), &v4) == 1;
+}
+
 std::string torrent_listen_interfaces(const TorrentConfig& config, std::string_view advertise) {
     if (!config.listen_interfaces.empty())
         return config.listen_interfaces;
     const auto port = ":" + std::to_string(config.listen_port);
+    const auto wildcard = "0.0.0.0" + port + ",[::]" + port;
     // No usable advertised address: fall back to libtorrent's own default and
     // accept whatever its device enumeration produces.
     if (advertise.empty() || advertise == "0.0.0.0" || advertise == "::")
-        return "0.0.0.0" + port + ",[::]" + port;
+        return wildcard;
+    // An advertised address that is not an IP literal cannot be bound. This is
+    // the ordinary case once a node advertises a DNS name -- and worse, that
+    // name usually resolves to a public address the node does not hold at all,
+    // because it is behind NAT. Binding every interface is the only honest
+    // answer: peer traffic then leaves by whichever route the kernel picks,
+    // exactly as it did before 0.37.2 tried to be more specific.
+    //
+    // Observed 2026-09-12: three nodes moved to public DNS advertise values
+    // and every one of them bound nothing on 6881, leaving torrents in
+    // dl-metadata for ever with no error anywhere.
+    if (!advertise_is_ip_literal(advertise)) {
+        Log::info("torrent listen: advertised address '" + std::string(advertise) +
+                  "' is not an IP literal, binding all interfaces instead" + port +
+                  " (set torrent.listen_interfaces to choose a device)");
+        return wildcard;
+    }
     if (advertise.find(':') != std::string_view::npos) // literal IPv6
         return "[" + std::string(advertise) + "]" + port;
     return std::string(advertise) + port;

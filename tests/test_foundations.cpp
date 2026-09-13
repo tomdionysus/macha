@@ -1303,6 +1303,37 @@ MACHA_TEST("foundations", test_torrent_binds_the_advertised_address_not_libtorre
     config.listen_interfaces = "wlan0:6881";
     CHECK(torrent_listen_interfaces(config, "10.44.1.51") == "wlan0:6881");
     CHECK(torrent_listen_interfaces(config, "") == "wlan0:6881");
+
+    // A DNS-name advertise must NOT be handed to libtorrent. listen_interfaces
+    // takes an IP literal or a device name, so a hostname matches no device
+    // and binds nothing at all -- silently. Worse, the name usually resolves
+    // to a public address the node does not hold, because it is behind NAT.
+    //
+    // Observed live on 2026-09-12: all three nodes moved to public DNS
+    // advertise values, every one of them bound nothing on 6881, and torrents
+    // sat in dl-metadata for ever with no error anywhere. Binding every
+    // interface is the only honest answer.
+    config.listen_interfaces.clear();
+    config.listen_port = 6881;
+    for (const auto* name : {"inverbeg.macha.network", "macnessa.macha.network",
+                             "localhost", "node-1", "example.com."}) {
+        CHECK(torrent_listen_interfaces(config, name) == "0.0.0.0:6881,[::]:6881");
+    }
+
+    // Addresses are still used, so a node that advertises one keeps the
+    // specific binding 0.37.2 introduced for it.
+    CHECK(torrent_listen_interfaces(config, "192.168.1.50") == "192.168.1.50:6881");
+    CHECK(torrent_listen_interfaces(config, "::1") == "[::1]:6881");
+
+    // Near-misses that must not be mistaken for addresses.
+    CHECK(torrent_listen_interfaces(config, "10.44.1") == "0.0.0.0:6881,[::]:6881");
+    CHECK(torrent_listen_interfaces(config, "10.44.1.256") == "0.0.0.0:6881,[::]:6881");
+    CHECK(torrent_listen_interfaces(config, "10.44.1.51.") == "0.0.0.0:6881,[::]:6881");
+
+    // And the operator override still wins over all of it.
+    config.listen_interfaces = "0.0.0.0:6881,[::]:6881";
+    CHECK(torrent_listen_interfaces(config, "inverbeg.macha.network") ==
+          "0.0.0.0:6881,[::]:6881");
 }
 
 MACHA_TEST("foundations", test_retry_budget_is_reachable_once_backoff_reaches_its_ceiling) {

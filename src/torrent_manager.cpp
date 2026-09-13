@@ -752,6 +752,32 @@ void TorrentManager::drain_alerts() {
             Log::info("torrent DHT bootstrapped");
             continue;
         }
+        // Having no inbound port is an operational fact, not churn: the node
+        // can still reach peers it dials, but nothing can dial it, so peer
+        // counts stay low and it can never seed. At debug that is invisible in
+        // normal running -- gbni-1 ran for hours with "no router found" and
+        // nothing above debug said so. Once per session, like the bind
+        // warnings above, so a router that simply has no UPnP does not become
+        // a recurring complaint.
+        if (const auto* mapped = lt::alert_cast<lt::portmap_alert>(alert)) {
+            if (!logged_portmap_) {
+                logged_portmap_ = true;
+                Log::info("torrent port mapped on the router: " + mapped->message());
+            }
+            continue;
+        }
+        if (const auto* map_failed = lt::alert_cast<lt::portmap_error_alert>(alert)) {
+            if (!warned_portmap_failed_) {
+                warned_portmap_failed_ = true;
+                Log::warn("torrent port mapping failed (" + map_failed->message() +
+                          "): this node has no inbound port, so it can dial peers but "
+                          "none can dial it -- expect low peer counts and no seeding. "
+                          "Forward " + std::to_string(config_.listen_port) +
+                          " TCP+UDP by hand, or set torrent.upnp/torrent.natpmp false "
+                          "to stop trying.");
+            }
+            continue;
+        }
         // Everything else at debug: tracker churn and peer errors are normal
         // and must not become the noise that hides the two lines above.
         if (Log::enabled(LogLevel::debug))
