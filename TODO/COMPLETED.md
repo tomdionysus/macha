@@ -1277,3 +1277,561 @@ Evidence: [Spool progress-bootstrap admission checkpoint](2026-08-31-spool-progr
   core plus 4/4 runtime at 12-way process isolation.
 
 Evidence: [Object-store concurrency checkpoint](2026-09-02-object-store-concurrency-checkpoint.md)
+
+## 2026-09-13 — rationalisation pass: work completed through 0.40.1
+
+Moved out of `ACTIVE.md` in full rather than summarised, because in several
+cases the reasoning is the record — a retraction, a declined option, or a
+measurement that disproved the thing it was taken to support. Open remainders
+that were buried inside these items were promoted to their own entries in
+`ACTIVE.md` before the move, not carried here.
+
+### From: P0 — Playback correctness and poor-network resilience
+
+- [x] **An abandoned playback session holds a node's only transcode slot for
+  30 minutes — found 2026-09-10, FIXED in 0.40.0 on the operator's decision of
+  2026-09-13: "shorter timeout if and only if the session has never been
+  usefully accessed."** `streaming.session_unused_idle_ms` (default 120 s)
+  expires a session that has never served a stream object; one playlist,
+  fragment, subtitle or Direct Play body earns the full `session_idle`
+  permanently, so a paused or seeking player is never evicted by it. A new
+  `stream_served` flag carries that, because `stream_touched` is reset by every
+  `start_pipeline()` and can only say "not recently". The reaper takes the
+  lesser of the two budgets, so an unused session can never outlive a used one.
+  `playback/status` reports `session_unused_idle_ms` and
+  `unused_sessions_reclaimed`; gated by
+  `test_a_session_never_streamed_from_does_not_hold_a_transcode_slot`.
+  **Not deployed** — 0.40.0 is unreleased and the cluster runs 0.39.1.
+  The second option considered and **not** taken, per the same decision:
+  eviction at admission, which converts admission from a guarantee into a
+  lease and is client-visible. Original analysis, kept because the mechanism
+  is the record:
+  The video/audio transcode entitlement lives on the *session*, not the
+  pipeline: `video_transcodes_locked()` (`playback.cpp:1152`) counts sessions
+  whose `logical_session->video_transcode_entitled` is set and never inspects
+  whether an engine is running. Two independent clocks in the reaper
+  (`playback.cpp:2601`): `pipeline_idle` (60 s) reclaims the **engine**, while
+  `session_idle` (**30 minutes**) is what finally erases the session and
+  releases the entitlement. So pipeline reclaim does not free the slot — it
+  makes the session cheap to hold while it goes on holding it.
+  With `max_video_transcodes: 1` on these nodes, one session created and not
+  deleted closes that node to transcoding for half an hour while the node
+  looks perfectly healthy, and `reserve_resources` refuses with
+  `429 resource_limit` (`playback.cpp:2780`) — there is no eviction path.
+  Because the count is per *logical* session, the viewer who caused it is the
+  one person who cannot observe it; the cost falls entirely on others.
+  **No client-side fix closes this.** The phone client's failover creates a
+  fresh session and drops the old one; `@machafoundation/core` closes all five of its
+  standby paths but uses `keepalive`, which React Native ignores and Tizen 3
+  does not have, so a suspended app's closing `DELETE` may never leave; and a
+  client that crashes, is force-quit or loses power can never send one.
+  Explicit `DELETE` releases immediately (`playback.cpp:2349-2357`, which also
+  stops the pipeline and removes the session temp directory).
+  Two server-side options, neither built: a shorter idle for a session never
+  fetched from — `stream_touched` (`playback.cpp:617`) is set at construction
+  and advanced only by a real fragment fetch, and the reaper already computes
+  both that and "has no running engine" every pass, so this is a branch in an
+  existing loop needing no new state; or eviction of an entitled, engineless,
+  trafficless session at admission, which is more invasive because it converts
+  admission from a guarantee into a lease and is client-visible.
+
+- [x] **Complete VOD playlist with bounded segment holds — shipped and
+  deployed to all three nodes 2026-09-08.** Verified live on a real transcode
+  session: `PLAYLIST-TYPE:VOD` with `ENDLIST` on first fetch, an in-plan
+  segment beyond the hold window refused in 0.35 ms with
+  `500 segment_not_ready`, and an index past the plan still a genuine 404.
+  Two numbers changed during implementation on findings from the client
+  sessions, both recorded in the plan: the refusal is **500**, not 503, because
+  the status is the only thing a player can read on a fragment error and every
+  intermediary emits 503 for a dead service; and the hold is **6000 ms**, not
+  the planned 12000, because hls.js's `fragLoadingTimeOut` is deprecated and
+  inert and the tightest real deadline is media3's 8000 ms read timeout on the
+  React Native music path.
+  **Still open. Asked of the phone session on 2026-09-13 (operator: "there is
+  [a device], talk to Macha Mobile App React Native"), and partly answered:**
+  - **iOS will not be answered by that session at all** — it has only ever run
+    on Android, and there is no iOS device there. iOS's time-to-first-byte
+    deadline remains unread by anyone. Nobody should plan around it arriving.
+  - **HTTP status never reaches that client's JavaScript**, verified against
+    the expo-video v57 source: `PlayerError` is `{message: string}` with no
+    status, no code, no cause, and segment/playlist requests go from the native
+    player straight to the stream URL without passing through the app's HTTP
+    layer. So `segment_not_ready` and a genuinely dead stream are
+    indistinguishable *on that client*. The 500-over-503 reasoning still holds
+    for players that read status; it buys nothing there. Any measurement has to
+    come from logcat at the media3/OkHttp level or a packet capture.
+  - **Statically, the hold looks right with margin.** Read from the Gradle
+    cache rather than from documentation: the video path (expo-video) uses a
+    bare `OkHttpClient` — connect 10 s, read 10 s; the music path
+    (react-native-track-player) uses `DefaultHttpDataSource.Factory()` defaults
+    — connect 8 s, read **8 s**. So the tightest deadline on that client is
+    8000 ms against a 6000 ms hold: the player should receive the 500 rather
+    than abort first, with 2 s of margin. **If the hold is ever raised above
+    8000 ms the music path starts aborting first.** That is an argument, not a
+    measurement.
+  - **Blocked on the anonymous-roles experiment**: the phone cannot create a
+    playback session while anonymous holds no roles, so questions 1 and 2 wait
+    on either that ending or credentials for an account with `media_viewer`.
+
+  Design, phases and the corrections made during implementation are in
+  [the plan](2026-09-08-bounded-vod-playlist-and-segment-holds.md), which
+  also records that the motivating bug report was retracted in full and that
+  this work does not address the DTS/TrueHD cold-start latency below — which
+  has itself since been retracted in full; see the item below.
+
+- [x] **DTS/TrueHD "40-60x slower cold transcode" — RETRACTED IN FULL
+  2026-09-08 by the session that raised it. There is no exotic-audio decode
+  problem.** Every measurement behind this item, both the original 0.36.0
+  cold-start figures and the steady-state throughput numbers added later the
+  same day, was confounded by which node served the session. The client's
+  endpoint registry had settled on gbni-2 — the wireless node, whose raw read
+  throughput is roughly 0.55 MB/s against gbni-1's 3.31 MB/s — and its
+  `EndpointBandwidth` never sampled media transfers, so the node carrying
+  essentially all the bytes was the one it measured least and had nothing to
+  deprioritise it with.
+  Re-run on gbni-1 after the client fixed endpoint selection, same build, no
+  server change: Django first frame 43.4 s -> 22.2 s -> **3.5 s**; Death Proof
+  25.6 s and 0.46x -> **2.5 s and 1.00x**; Inglourious Basterds 0.14x ->
+  **1.00x**; Full Metal Jacket 0.65x -> 0.95x. Headroom now builds on every
+  transcode (Django 9 -> 67 s, Death Proof 9 -> 62 s) instead of pinning at
+  zero. Nothing starves.
+  **The TrueHD audio anomaly is retracted with it.** Death Proof decoding
+  ~1.2 KB/s of audio against ~48 KB/s elsewhere was a symptom of a starved
+  pipeline, not a codec fault: on the re-run it decodes 502 KB in 20 s
+  (25 KB/s) with 479 video frames and zero drops. A pipeline delivering in
+  7-second bursts starves audio and video alike, and the comparison was
+  against titles that were not starving.
+  **Kept as a lesson rather than deleted.** The measurements were real; the
+  inferences on top of them kept landing on the server while the variable was
+  on the client. Every "same node, same client, within 15 minutes" control
+  cited here was assumed rather than recorded. The client now records which
+  node served each measurement, which is what would have caught it hours
+  earlier. Do not re-open this on the strength of the numbers above.
+
+- [x] **2. Split lightweight status from expensive diagnostics — shipped in
+  0.39.1, deployed 2026-09-13.** `/api/v1/status` is now `cluster`, `nodes`,
+  `startup`, `connectivity`, `subsystems` and nothing else; the tree moved to
+  `GET /api/v1/status/diagnostics` behind the same `view_status` role, and the
+  light response names that route in `diagnostics_endpoint`. Diagnostics was
+  68% of the payload live (10,091 of 14,914 bytes), but the locks were the
+  larger cost: reaching those numbers took one in nearly every subsystem,
+  several held by the busy paths that make someone open Status.
+  **The question that prompted it is still open** — see "Status took 10 s" in
+  P1 below. The split was deliberately also an experiment: a poll now takes
+  none of those locks, so if Status is still slow the cause is not in the
+  handler.
+  (The other half of this item — `PlaybackManager::status()` holding the
+  global session mutex while taking each session's subtitle-cache mutex —
+  was confirmed and fixed in 0.24.2: `status()` no longer takes any
+  per-session subtitle-cache lock while holding the global mutex, and that
+  per-session lock is now `try_lock`-only so one busy session's cache can't
+  block a `status()` call at all, only make its own count best-effort.
+  Regression test: `test_status_does_not_block_on_a_contended_subtitle_cache`
+  in `tests/test_media_playback.cpp`. Separately, the audit's claim that
+  `public_stream_response` holds the global mutex across a full libav
+  open/probe/seek/demux was re-checked against current code on 2026-09-05
+  and is **not accurate** — all such work in both `public_stream_response`
+  and `probe_source`/`resolve_session` already runs with the global mutex
+  released.)
+
+### From: P0 — Verified correctness defects (found 2026-09-05, code-audit-confirmed)
+
+- [x] **Transcoded playlists declared the plan, not the media — found and
+  fixed 2026-09-08 by the new timeline harness, on its first run.**
+  `playlist()` emitted `#EXTINF` from `vod_segment_durations` (what was
+  planned) while `Segment::duration` (what was published) was written and
+  never read anywhere. The first flush of a fragmented MP4 writes the delayed
+  `moov` and no `moof`, so that boundary produces no fragment and its media
+  joins the next one: fragment 0 measured **6.0s of media while declaring
+  2.0s**, and since a player builds its seek map by accumulating `EXTINF`,
+  every later fragment sat **four seconds early on the timeline for the whole
+  title**. The remux path had been given a `carry_boundary()` call for exactly
+  this on 2026-09-07; the transcode branch never got one, and the carried
+  value was discarded by the playlist regardless. Fixed on both sides: the
+  transcode cut now carries an unproduced boundary (`media_engine.cpp`), and
+  the playlist advertises published durations (`media_segments.cpp`). Gated
+  by `test_transcoded_audio_and_video_carry_the_same_timeline` — reverting
+  either fix fails it. Not yet confirmed against a live client on the
+  cluster; the measurement is from the published fragments, not from a player.
+
+- [x] **Every completed transcode generation finished in an error state —
+  same run, same day.** `MediaSegmentStore::mark_finished()` compared
+  fragment *count* against plan entries, so a run that legitimately carried a
+  boundary (25 fragments for a 26-entry plan) was recorded as
+  `media pipeline produced 25 fragments for a 26 fragment VOD plan`. Not
+  cosmetic: `playlist()` withholds a playlist entirely once an error is set,
+  so a transcode that had in fact produced all of its media ended by serving
+  an **empty playlist**, and the session reported `exit_code=1`. Now compares
+  published media against planned media, which is the invariant
+  `publish_duration()` actually maintains.
+
+- [x] **FUSE-mounted reads never register as viewer demand — RESOLVED in
+  0.40.0 as intended behaviour, on the operator's answer of 2026-09-13: "FUSE
+  is loader, not viewer."** The dead `note_viewer_activity()` declaration and
+  definition are gone, the policy is written down on the `FuseFrontend` class
+  itself, and the tests that used the hook to simulate viewer pressure now
+  drive `FileSystem::note_foreground_activity()` directly, which is what the
+  HTTP playback path does. Original finding:
+  `FuseFrontend::note_viewer_activity()` is declared, documented as "called by
+  the kernel adapter before viewer-critical open/read callbacks", and defined
+  — but is never called anywhere. FUSE reads open with `FrameType::loader`
+  unconditionally, so the viewer/loader duty-cycle gate that governing law 1
+  depends on is driven exclusively by the HTTP playback path today. If any
+  client reads media via the FUSE mount directly (rather than through HTTP
+  streaming), it currently gets loader priority, not viewer priority. Confirm
+  whether this is intentional (FUSE is documented elsewhere as
+  "loader/convenience traffic") or a real gap, and wire it up or remove the
+  dead declaration.
+
+### From: P0 — Security hardening for a network-exposed cluster
+
+- [x] **Authorization tiers — shipped in 0.38.0, deployed 2026-09-12.** See
+  `COMPLETED.md`. Every route now requires a session and is gated on roles.
+  Two consequences left open below.
+
+### From: P0 — Structural ingest, metadata and retained-memory safety
+
+- [x] **`repair_once()` holds the metadata mutation mutex across per-peer
+  replication RPCs, wedging every metadata mutation on the node — found live
+  on es-1, 2026-09-10; FIXED 0.37.0 (lock released across the fan-out,
+  re-validated on re-acquire), gated by
+  `test_metadata_repair_stalled_on_a_silent_peer_does_not_block_local_writes`
+  via the new `stall_peer_for_tests` fixture.** Still under the lock, and
+  deliberately so: discovery and `publish_commit`, each bounded by the 30 s
+  control no-progress deadline rather than unbounded. `MetadataManager::repair_once()` takes
+  `std::unique_lock mutation_lock(mutation_mutex_)` (`metadata_manager.cpp:1908`)
+  and then, still holding it, calls `replicate_accepted_head()` once per
+  active peer in three separate loops (`:1936`, `:1963`, `:2008`). Each of
+  those reaches `push_history_to_peer()`, whose `remote_has` lambda issues a
+  blocking `node_.call(owner, has_metadata_history_entry, …)`
+  (`metadata_manager.cpp:496`) per history hash. `mutate_impl()` — the entry
+  point behind every `mutate_delta()`, and therefore behind every
+  `WriteHandle::commit()` — takes the *same* mutex at `:1625`. So one slow or
+  unresponsive peer converts a background maintenance pass into a total stall
+  of local metadata writes.
+  **Measured on es-1 while wedged:** the `macha-maint` thread (LWP 650116) sat
+  in `Service::loop → repair_once → replicate_accepted_head →
+  push_history_to_peer → AsyncRpc::get()`, and **ten** threads were piled up
+  behind it blocked in `MetadataManager::mutate_impl` on
+  `pthread_mutex_lock` — the ingest worker among them, inside
+  `copy_file → WriteHandle::commit → FileSystem::commit_write → commit_file`.
+  Nothing had crashed: there were no `subsystem '…' thread stopped` lines in
+  the journal, and `cluster.health` cheerfully reported **`healthy`** with all
+  three nodes `online` throughout, which is the same
+  observability gap as the "powered-off node reads as online" item in P1.
+  The lock is documented as protecting "discovery, accepted-head selection, or
+  reconfiguration" (`:1906`). Replication is none of those — the header of
+  that very loop says "Convergence is replication, not head replacement" and a
+  peer holding a different branch simply keeps it — so the peer RPCs look
+  releasable, but the baseline-commit branch (`:1977`-`2019`) does mutate and
+  must stay serialised. Fix by narrowing the lock to selection/commit rather
+  than by putting a deadline on the RPC; a deadline only bounds how long the
+  node is dead for.
+
+- [x] **Ingest is strictly serial, so one wedged job stalls the whole queue —
+  FIXED 0.37.0: `ingest.max_concurrent_jobs` (default 10), claimed-set
+  ownership, dedicated catalogue poller, `concurrency` on `ingest/status`.**
+  `IngestManager::loop()` (`ingest.cpp:1039`) selects a single job and calls
+  `process_job()` synchronously to completion before looking at the next;
+  `active_job_id_` is one `std::string` (`ingest.hpp:140`) and there is one
+  worker thread (`:141`). This is what turned the metadata stall above into
+  the visible symptom: **six torrent ingests on es-1, all reporting
+  `queued`**, staged under `/mnt/diskB/ingest/torrents/` with staging at
+  3.78 GB of a 500 GB limit — i.e. nothing resource-bound, just five jobs
+  behind one that could not finish. Wanted: concurrent jobs under a
+  configurable bound, `ingest.max_concurrent_jobs`, default 10.
+  Note the interaction with the retained-memory items below — N concurrent
+  imports means N concurrent `WriteHandle`s against the same durable-lower
+  budget, so the bound is a memory knob as much as a throughput one.
+
+- [x] **A publication whose basis went stale retried forever, silently — found
+  live on gbni-1 2026-09-10, FIXED 0.37.1.** One inode failed 68 consecutive
+  times with `parked_publications` at 0 and health `healthy`. Three defects in
+  series: `commit_file`'s content-change guard reported a permanently stale
+  publication basis as retryable `EAGAIN` (now `ESTALE`, which replays against
+  a fresh writer); the park budget's density rule was unreachable at the
+  backoff ceiling, 30 min / 30 s = 60 attempts against a threshold of 100 (now
+  backstopped by `RetryPolicy::max_failing_duration`, default 1 h, deliberately
+  separate from `failure_window` so a long WAN/wifi outage does not park every
+  publication); and a long failure run was DEBUG-only (now WARN plus
+  `publications_retrying_persistently` on `diagnostics.filesystem`).
+  Trigger was rsync `--append-verify` appending to a file whose publication was
+  in flight — a legitimate thing to do that the system mishandled.
+
+- [x] **es-1 publication livelock starves RPC and takes the node out of the
+  cluster — FIXED 0.36.8 + 0.36.9, deployed 2026-09-09, see `COMPLETED.md`.**
+
+- [x] **`WriteHandle::drain_one_extent` waits on its extent future with no
+  deadline — FIXED 0.37.0.** The real mechanism was one layer down:
+  `put_impl` spilled a silent replica after `write_stall` and looked for a
+  replacement, but a spilled put still counted as unfinished, so with none
+  available the loop never concluded (an infinite 1 ms spin). The extent put
+  now carries the pipeline's `DataWorkContext` and fails retryably once
+  nothing has moved for the no-progress budget. The fault-injection hook this
+  was waiting on now exists (`RpcClient::stall_peer_for_tests`); gated by
+  `test_extent_put_to_a_silent_peer_fails_within_the_no_progress_budget`,
+  confirmed to hang against the pre-fix code.
+
+### From: P1 — Cluster connectivity, status and operations
+
+- [x] **Two torrents stuck in `metadata` forever with no error — found live on
+  gbni-2 2026-09-10, FIXED 0.37.2.** libtorrent's default `listen_interfaces`
+  enumeration binds `eth0` and loopback but never `wlan0`; gbni-2's `eth0` is
+  `NO-CARRIER`, so its session held loopback sockets alone and could reach no
+  peer. Deterministic, not a startup race — a restart rebound identically. The
+  engine now binds the node's advertised address (`torrent.listen_interfaces` /
+  `torrent.listen_port` override), and the plugin consumes libtorrent alerts at
+  all for the first time, so a loopback-only session, a failed bind, a DHT
+  bootstrap or a tracker refusal is now in the journal instead of silent.
+  **Still open:** none of this reaches the HTTP API. `torrents/status` says
+  nothing about listen endpoints or DHT, and `TorrentJob` carries `peers`/
+  `seeds` as bare counts with a free-text `error` — so a client cannot tell a
+  dead session from a slow swarm. The macha-client team asked for exactly that
+  on 2026-09-10 (session health with structured warning codes; per-job
+  trackers, stall durations, connected-vs-candidate peers, structured errors).
+  It needs new `TorrentJob` fields, a persistence-shape change and the
+  cluster RPC bridge to carry them, so it is real work, not serialisation.
+
+- [x] **Sanitizer build — shipped 2026-09-08. CI — declined by the operator,
+  not deferred.** `MACHA_SANITIZE` builds the whole tree (core, executables,
+  plugins, both test binaries) under `address`, `undefined`,
+  `address,undefined` or `thread`; whole-tree rather than per-target because
+  `macha_core` is a shared library the executables link and the plugins
+  `dlopen`, so partial instrumentation would leave the interposed allocator
+  and the shadow memory disagreeing across that boundary. `thread` combined
+  with `address` is refused at configure time. Case deadlines now scale
+  automatically under instrumentation (3x ASan, 10x TSan, `--timeout-scale` /
+  `MACHA_TEST_TIMEOUT_SCALE` to override), because the declared 30/60/120s
+  deadlines were chosen against an ordinary build and a spurious timeout would
+  hide the report the run existed to produce. Documented in
+  `tests/TESTING.md`; the LSan hook the runner already had is unchanged.
+  The CI half of this item was **declined by the operator on 2026-09-08** —
+  it is not a backlog item awaiting time. The gap it named is therefore real
+  and standing: every regression gate remains a human running
+  `./run-tests.sh` before deploying, and nothing runs TSan periodically
+  unless someone does. Do not re-file CI as an open item; the sanitizer build
+  is the part of it that was wanted.
+  - [ ] Still open, and now cheap: no TSan run has been made yet against the
+    concurrency-heavy subsystems (`net.cpp`/`metadata.cpp`/`playback.cpp`).
+    The ~47-thread hand-reasoned lock ordering that made this the audit's
+    biggest process gap is still unexercised by a sanitizer. ASan+UBSan
+    across the full suite is green as of 2026-09-08.
+
+### From: P2 — Raised by client teams and the operator, not yet decided (2026-09-13)
+
+- [x] **The anonymous account has no password, and a roles-less anonymous
+  account is no longer reported as "disabled" — raised by the operator and,
+  independently, by the web client session; both fixed in 0.38.4 and deployed
+  to gbni-1 and es-1 on 2026-09-13, verified live against the cluster's own
+  roles-less anonymous account (403 `anonymous_disabled` before, 201 with
+  `roles: []` after).** The reported "cannot set a password" turned out to be the right
+  behaviour arrived at for the wrong reason: the API *did* permit it, and that
+  was a live privilege hole. `/api/v1/users/me` needs only `media_viewer`,
+  which anonymous holds at genesis, so any unauthenticated visitor could
+  `PATCH` a password onto the anonymous account and then log in as it — and the
+  username/password mint path never consults `session.allow_anonymous`, so the
+  resulting bound session survived anonymous access being switched off.
+  Anonymous now has no credential at all (`kdf` 0) and `verify` refuses the
+  username outright, which also makes the random password existing clusters
+  carry inert without a migration. Separately, an anonymous account with no
+  roles now mints a session carrying `roles: []` instead of `403
+  anonymous_disabled` — that is how a registered-users-only deployment is
+  expressed, and the client needs the empty list to know to show a login.
+  Details in `CHANGELOG.md` under 0.38.4.
+
+- [x] **Status has no role of its own — requested by the operator via the web
+  client session, 2026-09-13; shipped in 0.38.5 as `view_status`, with
+  `/api/v1/health` added for liveness.** The operator's decision on the crux
+  below was that Status *should* be gated: an anonymous visitor sees cluster
+  health only if the anonymous account holds `view_status`, which it might not.
+  Anything using `/api/v1/status` as a health check was using the wrong route,
+  so there is now a right one — unauthenticated, role-free, and reporting only
+  whether this node is serving. The upgrade problem was solved by resolving
+  role implications at mint rather than only at write, so existing accounts
+  gain the role on their next login with no migration. Details in
+  `CHANGELOG.md` under 0.38.5.
+  **Original framing, kept because the reasoning is the record:** The client gated its Status
+  section on `manager`, which takes the diagnostic screen away from an ordinary
+  viewer at exactly the moment it earns its place; leaving it ungated shows it
+  to a session the server granted nothing. The capability being asked about is
+  neither "manage the library" nor "view media" but "see the health of this
+  cluster", and no role says that. A `view_status` role would.
+  **What has to be decided first, because it is a reversal.** `/api/v1/status`
+  is deliberately ungated today (`service.cpp:191`) and the comment there
+  argues the case: an importer-only account watching an ingest is the person
+  who most needs to see whether the cluster is healthy, so requiring a role
+  would tell them nothing. Introducing `view_status` means that route stops
+  answering for any session that lacks it — including the roles-less anonymous
+  session a registered-users-only deployment now mints, which is currently how
+  a client reaches Status to render a login wall at all. So the question is not
+  only the role's name but whether Status becomes gated, and what an
+  ungated-but-sessioned caller sees instead. Also needs: the route set
+  (`/api/v1/status`, `/api/v1/status/*`, connectivity checks), whether
+  `manager` implies it (roles are capabilities, not a ladder, so implication
+  has to be argued rather than assumed), and what existing accounts get at
+  migration. The client is unblocked — it is on `manager` today and says
+  switching is a one-line change once a name ships.
+
+- [x] **Session TTL: 30 days stands — DECIDED by the operator 2026-09-13
+  ("30 days is good for now"), asked directly and answered short. Nothing to
+  build. DO NOT RE-RAISE AS A DEFECT.** The consequence is understood and
+  accepted: a signed-in viewer is logged out 30 days after minting, counted
+  from creation rather than last use, so it expires even under daily use. What
+  made that affordable is that the client half is fixed — the phone client was
+  writing its token to disk and never reading it back, so the 30 days was being
+  cut short by the first cold start rather than by the expiry; released as
+  their 0.5.1 and verified on device.
+  **Keep this fact, whatever a future scheme looks like:** `AuthSession` is
+  gossiped to every node *and* persisted on each, so extending `expires_unix_ms`
+  on every request would be a replicated cluster-wide write on the hot path of
+  every API call. That is what forces any sliding-expiry design to use a
+  threshold (extend only when less than half the TTL remains) rather than
+  extending on use, and it is not visible from outside the server.
+  The three schemes considered, recorded against a revisit rather than deleted:
+  sliding expiry with a threshold (recommended at the time); a much longer TTL
+  plus "remember me" at mint (cheapest, but a stolen token then lives a year
+  unrotated); refresh tokens with short-lived bearers (real per-device
+  revocation and "sign out everywhere", far more machinery than a self-hosted
+  cluster needs today). Revocation already works under all three — `DELETE` is
+  replicated and `credential_generation` invalidates cluster-wide.
+  Original finding, kept because it is the evidence: Confirmed against the code rather than the report:
+  `SessionManager::create()` (`session.cpp:177`) sets
+  `expires_unix_ms = now + anonymous_ttl_` for **every** session, credentialed
+  or not — the name is misleading, and a username/password mint takes no
+  separate path — while `validate()` never extends it. So every signed-in viewer
+  is logged out 30 days after signing in, with no warning and nothing a client
+  can do about it. The client-side half (a token thrown away on every launch)
+  was theirs and is fixed.
+  Three schemes were put to the operator, with sliding expiry recommended:
+  extend `expires_unix_ms` on use when less than half the TTL remains — the
+  threshold matters because `AuthSession` is gossiped to every node, so
+  extending per request would mean a replicated write per request; or a much
+  longer TTL plus "remember me" at mint, cheapest, but a stolen token then lives
+  a year unrotated; or refresh tokens with short-lived bearers, which buys real
+  per-device revocation and "sign out everywhere" and is far more machinery than
+  a self-hosted cluster needs today. Revocation already works under all three —
+  `DELETE` is replicated and `credential_generation` invalidates cluster-wide.
+  **Still open, and deliberately not closed by the 30-day decision: the web
+  client should not hold a bearer token at all.** That is a separate question
+  from how long a session lives, and the operator answered only the TTL one.
+  Anything in JS-reachable storage is XSS-readable. The node already serves the
+  web client, so a `Secure`, `httpOnly`, `SameSite` cookie set on a successful
+  `POST /api/v1/session` and accepted alongside the `Authorization` header is
+  same-origin and natural. No client can substitute for that; it is server work,
+  and it belongs with the P0 security items rather than here.
+
+- [x] **`GET /api/v1/users` returns `{"users": [...]}` while every other
+  collection in the API uses `items` — CHANGED to `items` in 0.40.0 on the
+  operator's decision, 2026-09-13.** Core has accepted either key since its
+  0.8.0, so no client needs a release, and gbni-2 goes on emitting `users`
+  until it can be upgraded. The operator's other point: the web client should
+  not be reading that endpoint directly at all, since it is core's surface.
+  Core checked and reports the web client uses its `UsersApi` accessor
+  throughout with no envelope handling anywhere — so the accept-either shim is
+  in the phone client or one of the two TV clients, and is worth finding: a
+  client holding its own copy of a wire format will not notice the next change
+  either. Original note: Raised independently by the mobile
+  session, which read `users_api.cpp` directly; the web client had already
+  built an accept-either shim after its page silently rendered nothing (reading
+  `.items` off a payload without it yields `undefined`, which throws nowhere).
+  Single records from `POST`/`PATCH` are returned bare, which both clients
+  assumed correctly. Cheaper to settle now than after a client ships around it.
+  The inconsistency was inherited from the manage endpoints rather than chosen.
+
+- [x] **Clients cannot tell which build a node is running — DECLINED
+  2026-09-13. The answer is semver and nothing else.** No git describe, no
+  commit hash in Status. The consequence is accepted rather than unnoticed:
+  a behavioural claim pinned to a version is only as good as the discipline
+  that every behaviour change moves the version, which is what the 0.40.0 bump
+  for a removed response field already demonstrates.
+
+### From: P2 — Catalogue and media model
+
+- [x] **Make signed artwork capability URLs actually cacheable — FIXED in
+  0.40.0 on the operator's instruction, 2026-09-13.** `exp` is now quantized to
+  a bucket of the TTL (rounded up to the bucket after next, so remaining
+  validity is always between one and two TTLs), making the URL byte-identical
+  for every request inside a bucket and letting the existing 24 h `immutable`
+  header be consulted for the first time. Gated by
+  `test_catalogue_artwork_url_is_stable_so_it_can_be_cached`. **Not deployed**
+  — 0.40.0 is unreleased. Clients need no release; the two id-to-URL memos can
+  be deleted once it ships. The "cached posters go stale after a minute or two"
+  symptom that came with it is **also resolved, and was never ours**: core
+  measured it to a preferred-endpoint swap restamping a different host onto the
+  same artwork id, so identical bytes arrived under a new name and were
+  re-downloaded (same id, same `?exp&sig`, three hosts, one served in 3 ms and
+  another in 923 ms). Their sticky-artwork-host fix landed the same day, and a
+  reload then issued **zero artwork requests at all** — not cache hits, no
+  requests — which is this `immutable` directive finally being consulted.
+  Neither fix alone would have done it: stable URLs with a wandering host still
+  re-download, and a sticky host with a per-millisecond `exp` still churns the
+  key. The
+  measurement behind the fix: ("images load slowly, and when 'cached' they're just less slow").
+  What the measurement settled, against current source, so nobody re-derives it:
+  the artwork response already sends `public, max-age=86400, immutable`
+  (`catalogue_api.cpp:551`, the max-age being `artwork_capability_ttl` in
+  seconds), so the header is not the problem; `exp` is **not bucketed at any
+  granularity** — `signed_artwork_url()` uses `unix_ms() + ttl` per call
+  (`catalogue_api.cpp:99`), and `artwork_json()` runs it for every item on every
+  `/items` and `/items/{id}`, twice per item since `artwork` and
+  `effective_artwork` are both emitted; and a stable content identity for the
+  bytes **already exists on the wire** as the artwork `id` (a SHA-256 of the
+  bytes), which core already carries as `ArtworkRef.id`. Two clients
+  independently built an id→url memo beside a key they already had; that was a
+  core documentation gap, not a missing field, and core is fixing the comment.
+  A header-free URL form is also already guaranteed — the signed capability is
+  bearer-exempt (`capability_request()`, `catalogue_api.cpp:564`) — so a client
+  reporting that artwork needs a header is constructing its own URL instead of
+  using the payload's.
+  Because there is no bucket, "cached ones go stale after a minute or two" is
+  **not** a bucket expiring and has a different, unmeasured cause. Do not
+  attribute it; the web client is measuring it.
+  The fix, agreed in shape with core: round `exp` **up to a bucket boundary of
+  the TTL** rather than to a bare hour — a naive hourly bucket would give a URL
+  minted at 10:59 an hour of life instead of a day, invisibly to clients. One
+  consequence core flagged: it treats a capability whose `exp` has passed as
+  non-re-hostable onto other nodes, so that path will fire more often near a
+  boundary. Correct behaviour, and the authenticated URLs are the recovery.
+  Original filing: `exp`/`sig` are
+  recomputed fresh on every `/items`/`/items/{id}` catalogue call, so the same
+  artwork object gets a different query string (and therefore a different full
+  URL, which browsers key their cache on) every time — the existing 24h
+  `Cache-Control: public, max-age=86400, immutable` on the artwork endpoint
+  never gets consulted, and posters are re-fetched over the network on every
+  page load. Fix by quantizing `exp` to a coarser bucket (e.g. top of the next
+  hour/day) so `sig` becomes a pure function of `(artwork_id, quantized_exp)`;
+  repeated fetches within that window then return an identical URL. No
+  client-side change needed. Found 2026-09-04 via `macha-client-b8`.
+
+### From: P2 — Diagnostics and repeatable proof
+
+- [x] **"Are any extents unavailable?" could not be answered from the running
+  system — asked by the operator 2026-09-13 after gbni-2 was removed, answered
+  in 0.40.1.** `diagnostics.repair` now carries `unsourceable_objects`,
+  `unsourceable_sample` (up to 32 ids) and `local_unreadable_objects`, and
+  repair warns once a minute per kind instead of saying nothing at all.
+  **What this does not do, and the reasoning that still stands:** the count is
+  evidence, not a verdict — a pull also misses on a busy peer, a failed RPC or
+  an exhausted budget, so only a total that climbs across passes, or the same
+  ids recurring, means loss. And it only ever sees objects *this* node should
+  own: a complete cluster-wide answer still needs the join nobody has built —
+  enumerate `FileSystem::live_objects()`, ask every node `StoragePool::has()`,
+  report what no node holds, mapped back to paths. That was option 1 of the two
+  put to the operator; he chose the logging first. Note a naive `test -f` over
+  `objects/xx/yy/<id>.obj` cannot substitute for `has()`: packed objects live
+  inside pack files and would every one of them read as missing.
+  **Why it mattered here:** `replicas: 2` across three nodes means every object
+  that reached its target still has a copy after one node leaves, so the
+  expected state is under-replicated rather than unavailable. The exception is
+  `min_write_replicas: 1`, which lets a write commit with a single copy — if
+  that copy was gbni-2, the extent is gone, and nothing in the metadata records
+  which objects only ever had one replica. Stored bytes at the time of removal:
+  gbni-1 737 GB, es-1 1.82 TB.
+
+### From: P2 — Code health and error-handling consistency (found 2026-09-05)
+
+- [x] **`MANIFEST.sha256` — DELETED in 0.40.0.** 104 of its hashes failed
+  `shasum -c`, nothing in the build referenced it, and the operator's decision
+  on 2026-09-13 was that the file has no purpose. Do not reintroduce it
+  without a build step that maintains it.
+
