@@ -490,6 +490,21 @@ inline std::map<std::string, std::string> bearer_header(Service& service) {
     return {{"Authorization", "Bearer " + minted->bearer_token}};
 }
 
+// The expensive half of Status moved to its own route in 0.39.1, so polling
+// /api/v1/status no longer walks every subsystem's counters under every
+// subsystem's lock. A test asserting on a diagnostics field fetches it from
+// here; one asserting on health, nodes or startup keeps using /api/v1/status.
+// Returns the whole response rather than the `diagnostics` sub-object, so the
+// caller owns what its pointers point into -- the same shape every other Status
+// assertion here uses.
+inline Json status_diagnostics_response(uint16_t port, Service& service) {
+    const auto response = raw_http_get(port, "/api/v1/status/diagnostics", bearer_header(service));
+    REQUIRE(response.find("HTTP/1.1 200") != std::string::npos);
+    const auto body_at = response.find("\r\n\r\n");
+    REQUIRE(body_at != std::string::npos);
+    return Json::parse(response.substr(body_at + 4));
+}
+
 // Raw request/response helpers for keep-alive scenarios, where raw_http_get's
 // send-Connection-close-and-read-to-EOF shape does not apply: the caller keeps
 // the socket open and drives it request by request.

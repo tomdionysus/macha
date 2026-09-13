@@ -507,7 +507,10 @@ MACHA_TEST("invariants", test_status_api_precedes_control_plane_startup) {
     CHECK(startup->find("phase")->asString() == "starting");
     CHECK(startup->find("api")->asString() == "ready");
     CHECK(startup->find("control_plane")->asString() == "starting");
-    const auto* diagnostics = status.find("diagnostics");
+    // Both halves must answer this early, so fetch the expensive one too.
+    const auto diagnostics_root =
+        status_diagnostics_response(config.catalogue.api.port, service);
+    const auto* diagnostics = diagnostics_root.find("diagnostics");
     REQUIRE(diagnostics != nullptr);
     CHECK(!diagnostics->find("data_store")->find("available")->asBool());
     CHECK(diagnostics->find("convergence")->find("available")->asBool());
@@ -553,7 +556,12 @@ MACHA_TEST("invariants", test_control_plane_and_status_api_are_online_while_back
     CHECK(startup->find("control_plane")->asString() == "ready");
     CHECK(startup->find("data_storage")->asString() == "recovering");
     CHECK(startup->find("control_storage")->asString() == "recovering");
-    CHECK(!status.find("diagnostics")->find("data_store")->find("available")->asBool());
+    const auto recovering_diagnostics =
+        status_diagnostics_response(config.catalogue.api.port, service);
+    CHECK(!recovering_diagnostics.find("diagnostics")
+               ->find("data_store")
+               ->find("available")
+               ->asBool());
     CHECK(!service.ready());
 
     const auto ordinary = raw_http_get(config.catalogue.api.port, "/api/v1/catalogue/status",
@@ -697,6 +705,73 @@ MACHA_TEST("invariants", test_status_shows_recovering_peer_phase_without_fabrica
     recovering.stop();
 }
 
+// Status is polled; diagnostics are read when something is wrong. Serving both
+// from one route meant every poll walked most of the node's subsystems -- the
+// RPC client and server, the storage pool, the retained memory ledger, the FUSE
+// frontend -- each under its own lock, and some of those locks are held by
+// exactly the busy paths that make an operator reach for Status. The split is
+// about what a poll touches, not about bytes; the bytes are just how it shows.
+MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_own_route) {
+    TestCluster cluster;
+    NodeRuntime node(cluster.node_config("status-split"), cluster.keys());
+    ClusterStatusService status(node);
+
+    const auto body_of = [](const HttpResponse& response) {
+        return Json::parse(
+            std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
+    };
+    const auto get = [&](std::string path) {
+        HttpRequest request;
+        request.method = "GET";
+        request.path = std::move(path);
+        return status.handle(request);
+    };
+
+    auto light = get("/api/v1/status");
+    REQUIRE(light.status == 200);
+    auto root = body_of(light);
+    // Everything an operator or a client needs to render health and choose a
+    // node stays on the polled route.
+    for (const auto* key : {"cluster", "nodes", "startup", "subsystems", "connectivity"})
+        CHECK(root.find(key) != nullptr);
+    // And the expensive tree is gone from it.
+    CHECK(root.find("diagnostics") == nullptr);
+    REQUIRE(root.find("diagnostics_endpoint") != nullptr);
+    CHECK(root.find("diagnostics_endpoint")->asString() == "/api/v1/status/diagnostics");
+    auto heavy = get("/api/v1/status/diagnostics");
+    REQUIRE(heavy.status == 200);
+    auto heavy_root = body_of(heavy);
+    const auto* diagnostics = heavy_root.find("diagnostics");
+    REQUIRE(diagnostics != nullptr);
+    constexpr std::array<const char*, 9> sections{"metadata",       "rpc_server", "rpc_transport",
+                                                  "data_resources", "retained_memory",
+                                                  "data_store",     "filesystem", "convergence",
+                                                  "auth"};
+    for (const auto* section : sections)
+        CHECK(diagnostics->find(section) != nullptr);
+    CHECK(heavy_root.find("generated_at_unix_ms") != nullptr);
+
+    // The load-bearing assertion, and it is about what the polled route does
+    // rather than how big it is: not one diagnostics section is reachable
+    // through it, so not one of their locks is taken to answer a poll. A size
+    // comparison would say less and would depend on how much of this fixture
+    // had finished recovering.
+    // Named by a field each section alone owns, not by the section name: the
+    // light view legitimately says "metadata_generation" and "startup.metadata"
+    // and would match a bare "metadata".
+    const std::string light_text(reinterpret_cast<const char*>(light.body.data()),
+                                 light.body.size());
+    for (const auto* owned : {"retained_memory", "rpc_server", "rpc_transport", "data_resources",
+                              "data_store", "convergence", "peer_latency_ms",
+                              "materialization_cache_hits", "user_table_hash",
+                              "data_publication_quanta"})
+        CHECK(light_text.find(owned) == std::string::npos);
+
+    // The new route must not be swallowed by the per-node prefix beside it.
+    CHECK(get("/api/v1/status/nodes").status == 200);
+    CHECK(get("/api/v1/status/nodes/not-a-node-id").status == 400);
+}
+
 MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     TestNode fixture("status-membership");
     auto& config = fixture.config();
@@ -759,7 +834,15 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     CHECK(advertised->find("port")->asUInt64() == self.port);
     CHECK(advertised->find("source")->asString() == "configured");
 
-    const auto* diagnostics = root.find("diagnostics");
+    HttpRequest diagnostics_request;
+    diagnostics_request.method = "GET";
+    diagnostics_request.path = "/api/v1/status/diagnostics";
+    auto diagnostics_response = status.handle(diagnostics_request);
+    REQUIRE(diagnostics_response.status == 200);
+    auto diagnostics_root =
+        Json::parse(std::string(reinterpret_cast<const char*>(diagnostics_response.body.data()),
+                                diagnostics_response.body.size()));
+    const auto* diagnostics = diagnostics_root.find("diagnostics");
     REQUIRE(diagnostics != nullptr);
     const auto* metadata_diagnostics = diagnostics->find("metadata");
     REQUIRE(metadata_diagnostics != nullptr);

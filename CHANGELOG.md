@@ -1,5 +1,44 @@
 # Current release
 
+## 0.39.1 — Polling Status no longer pays for diagnostics (development)
+
+`/api/v1/status` computed and returned the whole `diagnostics` tree on every
+call. Clients poll that route. Measured against the live cluster, diagnostics
+was **10,091 of 14,914 bytes — 68% of the payload** — but the bytes are the
+small half of the problem. Reaching those numbers means touching most of the
+node's subsystems: the RPC client and the RPC server, the storage pool, the
+retained-memory ledger, the data-resource arbiter, the metadata replica, the
+FUSE frontend, the user table. Each has its own lock, and several of those
+locks are held by precisely the busy paths that make someone reach for Status
+in the first place. A poll had no business taking any of them.
+
+- **`GET /api/v1/status` is now the lightweight view**: `cluster`, `nodes`,
+  `startup`, `connectivity`, `subsystems`. Membership, telemetry and readiness
+  the node already holds decoded — a handful of short mutexes, no I/O, no
+  network, and not one diagnostics lock.
+- **`GET /api/v1/status/diagnostics` is the expensive half**, unchanged in
+  content and shape (`{"diagnostics": {...}, "generated_at_unix_ms": ...}`).
+  Same `view_status` role as the rest of the status tree.
+- The lightweight response carries **`diagnostics_endpoint`** naming that
+  route. A client that was reading `diagnostics` from `/api/v1/status` would
+  otherwise get `undefined` and no explanation — the silent-nothing failure
+  this project has been bitten by before — so the pointer travels with the
+  payload rather than living only in this file.
+
+This is also an experiment with a result either way. If Status is still
+occasionally slow now that a poll touches none of those locks, the cause is
+not inside the handler, and the next place to look is the HTTP worker pool:
+16 workers, a 15 s keep-alive idle timeout, and a backlog check that only runs
+*between* requests rather than while a worker is blocked waiting for the next
+one on an idle connection.
+
+- Tests: `test_status_is_light_and_diagnostics_have_their_own_route` asserts
+  the split by what the polled route *touches* rather than by how big it is —
+  no diagnostics-owned field is reachable through it — and that the new route
+  is not swallowed by the `/api/v1/status/nodes/` prefix beside it. Four
+  existing tests moved their diagnostics assertions to the new route via a
+  shared `status_diagnostics_response()` helper.
+
 ## 0.39.0 — A line under the 0.38 series (development)
 
 No code change. 0.38.3–0.38.5 were written, deployed and verified against the

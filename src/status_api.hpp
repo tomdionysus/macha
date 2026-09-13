@@ -30,6 +30,13 @@ class ClusterStatusService {
     void persistence_loop(std::stop_token);
     void persist_local_status();
     HttpResponse status_response(const std::optional<NodeId>& only = {});
+    // The expensive half, behind its own route. Every field in it is an
+    // in-memory counter, but reaching them means touching most of the node's
+    // subsystems -- the RPC client and server, the storage pool, the retained
+    // memory ledger, the FUSE frontend -- each under its own lock, and some of
+    // those locks are held by exactly the busy paths that make an operator
+    // reach for Status in the first place. Ordinary polling must not pay that.
+    HttpResponse diagnostics_response();
     HttpResponse connectivity_check(const std::optional<NodeId>& only);
 
   public:
