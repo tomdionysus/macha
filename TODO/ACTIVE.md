@@ -1,10 +1,19 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-09-12
+Last updated: 2026-09-13
 
 This is the authoritative, ordered backlog. Detailed plans and UAT records in
 this directory remain evidence; completed work belongs in `COMPLETED.md` and is
 not repeated here. Work top-to-bottom unless new evidence changes the order.
+
+**Start here if you are new to this work.** Read, in order: the LIVE INCIDENT
+section immediately below — the cluster is currently running on one storage
+node and has been since 2026-09-12 — then "Cluster and repository state as of
+2026-09-13" near the end of this file, which records node addresses, what is
+deployed where, what access actually works, and two unpushed commits. Neither
+is a task list; both are things that will mislead you if you assume otherwise.
+`2026-09-12-cluster-users-and-roles-plan.md` carries a "What actually shipped"
+section recording where that implementation diverged from its plan.
 
 2026-09-05: full reprioritisation pass. Two independent full-repo audits were
 run: (1) every doc under `TODO/`, `COMPLETED.md` and `CHANGELOG.md` in full,
@@ -63,6 +72,64 @@ The governing laws are:
 2. Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The Viewer Wait.
 3. Control traffic must remain promptly serviceable. Viewer priority is a large
    configurable share (95:5 by default), not indefinite starvation of all other work.
+
+## P0 — LIVE INCIDENT: gbni-1 is storing nothing, es-1 is down
+
+Both found 2026-09-13 while investigating a client report that 42% of artwork
+was unfetchable. Diagnosis is complete and evidenced; **no repair has been
+attempted** — the pack below is user data and was left untouched.
+
+- [ ] **One torn pack tail has taken gbni-1's entire 8 TB DATA backend
+  offline.** The node logs, once, at startup:
+  `WARN storage backend offline /mnt/diskB: corrupt pack header at
+  /mnt/diskB/packs/pack-00000000000000001206.pack offset=29841717`
+  followed by `INFO node data storage ready used=0 capacity=0`. It has run this
+  way since at least 2026-09-12 22:05 (the pack's mtime).
+
+  Consequence: gbni-1 advertises **0 G of storage**, so placement cannot choose
+  it for anything. `GET /api/v1/status` shows
+  `macnessa storage_cap=0.0G`, `inverbeg 8192.0G used=233.2G`,
+  `ramaroja 8192.0G used=1691.6G (offline)`. It holds **0 of 1618** artwork
+  objects. With one storage-bearing node online, replication 2 has exactly one
+  eligible target — which is why the client saw objects on both reachable nodes
+  or neither, never exactly one. This is not a placement defect; it is a
+  cluster running on one disk.
+
+  The disks themselves are healthy: `/mnt/diskA` 6.1T/9.1T exfat (media source,
+  **must not be modified**), `/mnt/diskB` 688G/9.1T ext4, no I/O errors in
+  `dmesg`, ext4 mounted clean. Only 8 packs totalling 106 MB exist.
+
+  **The specific defect** (`src/local_store.cpp:760-782`,
+  `rebuild_pack_index_locked`): recovery handles two torn-tail shapes — fewer
+  bytes left than a header, and a payload longer than the file — and truncates
+  for both when `truncate_incomplete_tail` is set. A header that is *present but
+  undecodable* throws unconditionally instead, ignoring that flag. Here the file
+  is 29,841,842 bytes and the bad header is at 29,841,717: exactly
+  `pack_header_size` (93+32 = 125) bytes remain, one byte too many to take the
+  first truncate branch. An interrupted append that wrote the header's length
+  but not its contents is the *expected* outcome of a power loss on this node,
+  and it is the one shape recovery does not handle.
+
+  Fix: when `truncate_incomplete_tail` is set and an undecodable header is at
+  the tail (nothing valid follows it), truncate rather than throw. An
+  undecodable header in the *middle* of a pack must still throw — truncating
+  there would silently discard valid records after it. Add a regression test
+  that writes exactly `pack_header_size` bytes of garbage onto a good pack.
+
+  Immediate unblock, pending that fix: truncate the pack to 29,841,717 bytes.
+  The scan proved everything before that offset decodes, and nothing follows.
+  Back the file up first.
+
+- [ ] **es-1 (ramaroja) has been offline since ~2026-09-13 morning.** SSH times
+  out on both `10.34.1.50` and `ramaroja.macha.network`; its HTTPS API returns
+  nothing where it answered `201` earlier the same day. The cluster agrees —
+  gbni-1 reports `peers_known: 3, peers_active: 2`. It holds 1691.6 G and is
+  the only replica for roughly 42% of artwork while gbni-1 stores nothing.
+  Cause unknown; not investigated.
+
+- [ ] **es-1 never received the torrent config fix** (below). It will still
+  bind nothing on 6881 when it returns, until 0.38.2 is deployed there or the
+  `torrent.listen_interfaces` line is added by hand.
 
 ## P0 — Playback correctness and poor-network resilience
 
@@ -477,18 +544,27 @@ home network and an offsite node, this is not a hypothetical exposure.
   still not best practice — a page that somehow obtained a token (e.g. one
   leaked to a compromised client) could use it cross-origin undetected. Stop
   sending a wildcard origin on any endpoint that doesn't strictly need it.
-- [x] **Authorization tiers — shipped in 0.38.0.** Cluster-replicated users,
-  passwords and roles; see `2026-09-12-cluster-users-and-roles-plan.md` for the
-  design and `CHANGELOG.md` for what landed. Roles are capabilities rather than
-  a ladder (`media_viewer`, `importer`, `manager`, `manage_users`), resolved at
-  mint time and gated in one place before dispatch. `root` and `anonymous` are
-  created once by the founding node; anonymous access is now an ordinary
-  account's roles rather than a config key. Three latent defects were found and
-  fixed on the way: session gossip had never once run (wrong frame class on
-  send, undispatched on receive, since 0.24.0); `propagate_session` blocked
-  login for up to 30 s per unreachable-but-active peer; and periodic gossip was
-  spending bounded RPC admission on every peer every tick.
-
+- [x] **Authorization tiers — shipped in 0.38.0, deployed 2026-09-12.** See
+  `COMPLETED.md`. Every route now requires a session and is gated on roles.
+  Two consequences left open below.
+- [ ] **The whole HTTP API is reachable from the public internet, and
+  anonymous can read the library.** All three nodes moved to public
+  `https://<name>.macha.network` endpoints on 2026-09-12. Verified from outside
+  the network: `POST /api/v1/session` with no credentials returns 201, and that
+  token reads `/api/v1/catalogue/items`. This is `session.allow_anonymous: true`
+  plus the `anonymous` account holding `media_viewer` — correct for a
+  television on a LAN, permissive on a public endpoint. **The operator was told
+  and chose to keep it** (2026-09-12, "single user alpha"). Revisit before this
+  is anything but alpha. To close it: `PATCH` the anonymous account's roles to
+  `[]` (no restart, effective next session), or set
+  `session.allow_anonymous: false`, or stop exposing 7438 and reach it over
+  WireGuard.
+- [ ] **Mixed-version sessions break during a rolling upgrade.** A session
+  minted by a pre-0.38 node carries `roles: ["anonymous"]`, which an upgraded
+  node refuses with 403 on every route. The session *wire format* is
+  compatible; the role vocabulary is not. No compatibility shim exists.
+  Operator's call on 2026-09-12: "don't care, we're still in single user
+  alpha." Upgrade every node promptly, or write the shim before beta.
 - [ ] **Unbounded JSON recursion depth.** `json.cpp`'s recursive-descent parser
   has no depth limit. Combined with the 8 MiB body cap, a deeply nested body
   on any POST/PUT can exhaust the stack. Add a depth limit.
@@ -937,6 +1013,26 @@ that report.
   live allocation under the global mutex** — exactly under memory pressure,
   which is the worst time to do it.
 
+## P2 — Raised by client teams, not yet decided (2026-09-13)
+
+- [ ] **`GET /api/v1/users` returns `{"users": [...]}` while every other
+  collection in the API uses `items`.** Raised independently by the mobile
+  session, which read `users_api.cpp` directly; the web client had already
+  built an accept-either shim after its page silently rendered nothing (reading
+  `.items` off a payload without it yields `undefined`, which throws nowhere).
+  Single records from `POST`/`PATCH` are returned bare, which both clients
+  assumed correctly. Cheaper to settle now than after a client ships around it.
+  The inconsistency was inherited from the manage endpoints rather than chosen.
+- [ ] **Clients cannot tell which build a node is running.** Every behavioural
+  claim exchanged between the server and client sessions is pinned to a version
+  ("0.37.2 answers the whoami with no username"), and there is no way to check
+  a live node against a tag. Status reports a version string; nothing ties it
+  to a commit. Consider reporting the git describe output.
+- [ ] **Tracker list is stale.** 111 tracker errors in five minutes on gbni-2;
+  `coppersurfer.tk` and others have been dead for years. DHT carries the
+  torrents, so this is noise rather than breakage, but it buries real tracker
+  failures.
+
 ## P2 — Catalogue and media model
 
 - [ ] Make negotiation representation-aware. One Macha work identity may
@@ -1065,6 +1161,57 @@ work needed for any of these.
   items unticked and Phase 3 shows 6 of 13 unticked, despite both phases having
   separate docs and a `COMPLETED.md` entry recording them as done). Reconcile
   the checkboxes with the ledger so this file stops contradicting itself.
+
+## Cluster and repository state as of 2026-09-13
+
+Facts a new session needs before touching anything. None of this is a task.
+
+**Nodes.** gbni-2 moved off the home LAN on 2026-09-12 and is now
+`root@inverbeg.macha.network` (public address; same machine, identical host
+key). gbni-1 is `10.44.1.50` / `macnessa.macha.network`, es-1 is `10.34.1.50` /
+`ramaroja.macha.network`. All three advertise public `https://` API endpoints.
+
+**Access is not what it was.** During 2026-09-12 the SSH key stopped working on
+gbni-2 (`Permission denied (password)`) having worked earlier the same session,
+and es-1 is unreachable at every layer. gbni-1 was reachable at the end.
+SSH to gbni-1 and es-1 is filtered from outside — port 22 is refused or times
+out from both a laptop and from gbni-2 — so a session with no LAN route can
+reach only whatever nodes happen to be exposed.
+
+**Versions deployed.** gbni-1 and es-1 run the code committed as 0.38.0
+(built before the version bump, so they report 0.38.0). gbni-2 runs the same
+code. **0.38.2 is built and committed but deployed nowhere.** es-1 has no
+0.38.x at all beyond what it had before it went down.
+
+**Torrent config applied by hand, not yet redundant.** gbni-1 and gbni-2 have
+`torrent.listen_interfaces: 0.0.0.0:6881,[::]:6881` added directly to
+`/etc/macha/macha.yaml`, with a timestamped backup beside it. That was the
+workaround for the bind bug; 0.38.2 fixes the derivation so the line becomes
+unnecessary, but it is harmless to leave. es-1 never got it.
+
+**Build once, ship the artefacts.** All three nodes are aarch64 Debian 13 with
+the same glibc. A `-j2` build on gbni-1 takes ~25 minutes; staging with
+`DESTDIR` and shipping a 3 MB tarball takes about a minute. gbni-2 has 16 GB
+RAM and builds at `-j4`. See `project-cluster-deployment` in session memory.
+
+**Run the test suite on a node, not only locally.** A clean macOS/clang build
+is not evidence: 0.38.0 shipped two defects that only GCC caught (a missing
+`<functional>` include, and `-Werror=missing-field-initializers` on designated
+initialisers). And do not run the suite concurrently with itself on a four-core
+node — it produces failures that vanish in isolation and wastes the signal.
+
+**Repository.** `main` is pushed and carries 0.38.1; 104 backfilled tags are
+pushed. Work since is on a local branch `work-0.38.2` with two unpushed commits
+(0.38.2, and the torrent bind fix) and one unpushed tag. `CLAUDE.md` in the
+repo root is the operator's and is deliberately untracked.
+
+**A branching convention was relayed on 2026-09-13** by the mobile-app session,
+attributed to the operator: work on a long-lived `develop`, releases tagged on
+`main`, bare semver, **annotated** tags, never name a branch after a version,
+and put the version bump inside the release commit. This conflicts with what
+exists — `work-0.38.2` is named after a version and all 105 tags are
+lightweight. It was relayed, not stated directly, so nothing was restructured.
+**Confirm with the operator before converting.**
 
 ## Deployment rule
 

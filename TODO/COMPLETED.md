@@ -1,11 +1,87 @@
 # Completed and tested
 
-Last updated: 2026-09-10
+Last updated: 2026-09-13
 
 The 2026-09-08 entries below were ledgered by a pruning pass over
 `ACTIVE.md`, and cover only the items that pass removed from that file.
 0.24.1–0.35.0 is not otherwise ledgered here yet — see the documentation
 hygiene item in `ACTIVE.md`.
+
+## Cluster users, passwords and roles — 0.38.0, deployed 2026-09-12
+
+Supersedes the "No authorization tiers yet" P0 in `ACTIVE.md`. Design and the
+seven places the implementation diverged from it are in
+`2026-09-12-cluster-users-and-roles-plan.md` (see its "What actually shipped"
+section — the plan itself was not edited, so it stays usable as evidence).
+
+- [x] **Cluster-replicated users, passwords and roles.** `UserStore`
+  (`src/users.hpp`), `user_sync` RPC, `/api/v1/users`, `macha-users`.
+  Passwords are scrypt with per-record parameters; the table is sealed at rest
+  under an HKDF subkey, because it replicates to an offsite node. Verifying a
+  password reads only the local replica — no RPC, no metadata, no catalogue —
+  so a node that is alone, or whose metadata has gone read-only, still
+  authenticates.
+- [x] **Roles are capabilities, not a ladder.** `media_viewer`, `importer`,
+  `manager`, `manage_users`; every role implies `media_viewer` and nothing else
+  implies anything. Resolved at mint time, gated in one place before dispatch
+  (`Service::required_role`).
+- [x] **root and anonymous are ordinary accounts** created once by the founding
+  node, neither renameable nor deletable. Anonymous access is the anonymous
+  account's roles rather than a config key. At least one account always holds
+  `manage_users`, enforced in `UserStore` rather than only the API.
+- [x] **Three latent session defects found and fixed on the way.** Session
+  gossip had never once run since 0.24.0 (wrong frame class on send,
+  undispatched on receive); `propagate_session` blocked login for up to 30 s per
+  unreachable-but-active peer; periodic gossip drew from the same memory budget
+  as data work and could wedge a loader (fixed by moving session/user gossip to
+  `FrameType::control`).
+- [x] **Gossip re-announces every 30 s.** `broadcast_best_effort()` reports
+  frames queued, not delivered, so a peer whose inbound route is not usable yet
+  can be marked told having received nothing. Found during this release's own
+  rollout: an upgraded node came up with an empty user table and refused every
+  request until the sending node happened to restart.
+- [x] **`DataResourceArbiter::acquire` no longer waits for ever.** It waits in
+  no-progress windows — any release resets the window — and logs the class,
+  size and used/active/waiting counts when it gives up. New
+  `dht.data_credit_no_progress_deadline_ms`, 120 s.
+- [x] **`test_storage_data_credit_reserves` no longer depends on the host.**
+  `maintenance.background_concurrency` defaults to `hardware_concurrency() / 2`,
+  so its three loader acquires deadlocked for 360 s on any machine with fewer
+  than six cores — every node in this cluster — while passing on a twelve-core
+  development machine. The test now states the ceiling it means to test. This is
+  the "passes in isolation" class `ACTIVE.md` had already flagged; the cheap
+  check (core count) was the one that found it.
+- [x] **`catalogue.api.advertised_endpoint` is validated at load.** The shipped
+  example had always claimed a path was "rejected at startup"; nothing checked.
+
+Deliberately not built: **no recovery key and no recovery endpoint.** One must
+be presentable without an account to be useful, which means a standing
+unauthenticated path to the most privileged account in the cluster, bought with
+a capability that already exists behind strictly more access — anyone who could
+present one has root on a node, where `macha-users passwd root` does the same
+job. The machinery (an X25519 envelope sealing the cluster key, so a key can be
+verified without anything derived from it being stored) is implemented and
+tested but uncalled; `test_no_recovery_route_is_exposed` stops the route being
+reintroduced by accident, and `macha-recover` ships saying so.
+
+## libtorrent port mapping stated, and an unbindable advertise refused — 0.38.2
+
+- [x] **`torrent.upnp` and `torrent.natpmp` exposed.** libtorrent maps its own
+  listen port and both default on inside libtorrent, so the session created
+  router mappings regardless of configuration: a node with
+  `network.upnp.enabled: false` still had 6881 mapped. Defaults unchanged
+  (true), so no node's behaviour shifted — the point is that it is now
+  refusable and visible.
+- [x] **`torrent_listen_interfaces()` refuses an address it cannot bind.**
+  0.37.2 made the session bind the node's advertised address, correct while
+  that was a LAN IP. Once nodes advertised public DNS names it bound *nothing*,
+  silently: `listen_interfaces` takes an IP literal or a device name, never a
+  hostname. It now uses the advertised address only when it parses as an IP
+  literal, and otherwise binds every interface and says so.
+- [x] **Port-mapping outcomes leave DEBUG.** Success once at info, failure once
+  at warn with what to do about it. gbni-1 ran for hours with "no router found"
+  and nothing above debug mentioned it, while its peer counts stayed low and it
+  could not seed.
 
 ## es-1 publication livelock — 0.36.8 + 0.36.9, deployed 2026-09-09
 
