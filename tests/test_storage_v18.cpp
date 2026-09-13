@@ -1113,6 +1113,64 @@ MACHA_TEST("storage_v18", test_min_write_floor_publishes_then_repair_converges_t
     CHECK(*second.node().local_store().get(id) == data);
 }
 
+MACHA_TEST("storage_v18", test_repair_counts_an_object_no_peer_can_supply) {
+    // After a node leaves the cluster, the operator's question is "is anything
+    // now unreachable?" -- and until 0.40.0 nothing could answer it.
+    // repair_step() contained no Log:: call at all, so an object the live
+    // namespace still referenced, that this node should own, and that no peer
+    // would supply, was passed over in silence on every pass forever.
+    TestCluster cluster;
+    const auto port = free_port();
+    auto config = storage_node_config(cluster, "lonely", port, 8ULL * 1024 * 1024, 2, 1);
+    StorageClusterNode node(std::move(config), cluster.keys());
+    node.start();
+
+    // One object this node holds, and one it does not and cannot obtain --
+    // the id of bytes that were never put anywhere. With no peers, the pull
+    // path exhausts every candidate and comes back empty, which is exactly
+    // the shape of an extent whose only replica left with a departed node.
+    auto present_bytes = pattern(64 * 1024, 7);
+    const auto present = object_id(present_bytes);
+    REQUIRE(node.store().put(present, present_bytes));
+    REQUIRE(node.node().local_store().has(present));
+
+    const auto missing = object_id(pattern(64 * 1024, 9));
+    REQUIRE(!node.node().local_store().has(missing));
+
+    const auto before = node.store().repair_diagnostics();
+    CHECK(before.pull_unsourceable == 0);
+
+    // Both objects are live: the namespace references them whether or not any
+    // node still holds the bytes. live must be sorted -- repair binary-searches
+    // it rather than copying it per slice.
+    std::vector<ObjectId> live{present, missing};
+    std::sort(live.begin(), live.end());
+    REQUIRE(wait_until([&] {
+        node.store().repair_once(4ULL * 1024 * 1024, &live);
+        return node.store().repair_diagnostics().pull_unsourceable > 0;
+    }, 5s));
+
+    const auto after = node.store().repair_diagnostics();
+    // Specificity matters as much as the count: an object that is present
+    // must never be reported as unsourceable, or the counter means nothing
+    // and every operator who reads it is misled at the worst moment.
+    REQUIRE(after.unsourceable_sample.size() == 1);
+    CHECK(after.unsourceable_sample.front() == missing);
+    CHECK(std::find(after.unsourceable_sample.begin(), after.unsourceable_sample.end(),
+                    present) == after.unsourceable_sample.end());
+    CHECK(node.node().local_store().has(present));
+
+    // The sample deduplicates rather than growing without bound: repeated
+    // passes over the same unobtainable object must not consume memory, and
+    // the counter keeps climbing so a persistent failure is distinguishable
+    // from a transient one.
+    const auto repeated_before = after.pull_unsourceable;
+    node.store().repair_once(4ULL * 1024 * 1024, &live);
+    const auto repeated = node.store().repair_diagnostics();
+    CHECK(repeated.unsourceable_sample.size() == 1);
+    CHECK(repeated.pull_unsourceable >= repeated_before);
+}
+
 MACHA_HEAVY_TEST("storage_v18", test_retain_data_batches_a_large_publication_within_bounded_time) {
     // Reproduces the 2026-09-06 incident at test scale: a single metadata
     // publication whose delta references thousands of DATA extents (the real

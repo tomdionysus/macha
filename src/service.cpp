@@ -627,6 +627,11 @@ void Service::initialise_services(std::stop_token stop) {
         });
 
         store_ = std::move(store);
+        // Repair is the only component that learns an object is unobtainable,
+        // and it learns it in the ordinary course of a maintenance pass. Wire
+        // its counters to Status now that the store exists.
+        cluster_status_.attach_repair_diagnostics(
+            [store = store_.get()] { return store->repair_diagnostics(); });
         metadata_ = std::move(metadata);
         catalogue_ = std::move(catalogue);
         fs_ = std::move(fs);
@@ -745,6 +750,10 @@ void Service::stop() {
         hydration_->stop();
     cluster_status_.detach_metadata();
     cluster_status_.detach_subsystem_diagnostics();
+    // The provider holds a raw pointer into store_, which is declared after
+    // cluster_status_ and therefore destroyed before it. Drop it here rather
+    // than relying on nothing calling Status during teardown.
+    cluster_status_.detach_repair_diagnostics();
     cluster_status_.stop();
     if (catalogue_http_)
         catalogue_http_->stop();

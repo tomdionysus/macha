@@ -2,6 +2,7 @@
 #pragma once
 
 #include "convergence_demand.hpp"
+#include "distributed_store.hpp"
 #include "fuse_frontend.hpp"
 #include "http.hpp"
 #include "metadata_manager.hpp"
@@ -26,6 +27,7 @@ class ClusterStatusService {
     std::function<std::optional<FuseFrontendDiagnostics>()> fuse_diagnostics_;
     std::function<ConvergenceDemandDiagnostics()> convergence_diagnostics_;
     std::function<std::vector<SubsystemStatus>()> subsystem_diagnostics_;
+    std::function<DistributedStore::RepairDiagnostics()> repair_diagnostics_;
 
     void persistence_loop(std::stop_token);
     void persist_local_status();
@@ -50,6 +52,11 @@ class ClusterStatusService {
     void attach_fuse_diagnostics(std::function<std::optional<FuseFrontendDiagnostics>()> provider);
     void detach_fuse_diagnostics();
     void attach_convergence_diagnostics(std::function<ConvergenceDemandDiagnostics()> provider);
+    // Replica repair's own view of what it could not obtain. ClusterStatusService
+    // holds a NodeRuntime, not the DistributedStore, so this arrives the same way
+    // FUSE and convergence diagnostics do.
+    void attach_repair_diagnostics(std::function<DistributedStore::RepairDiagnostics()> provider);
+    void detach_repair_diagnostics();
     // Cheap, always-present per-subsystem health (see SubsystemSupervisor):
     // unlike the expensive diagnostics block below, this belongs in the
     // lightweight part of the response -- it's exactly the kind of thing an

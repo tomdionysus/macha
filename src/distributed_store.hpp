@@ -29,8 +29,19 @@ class DistributedStore {
         size_t push_examined{};
         size_t pull_examined{};
         size_t remote_operations{};
+        // Objects this pass wanted to pull and no peer would supply.
+        size_t pull_unsourceable{};
         bool complete{true};
         bool yielded{};
+    };
+
+    // Bounded, snapshot-shaped: a cumulative count plus a small sample of the
+    // object ids involved, so Status can answer "is anything unreachable?"
+    // without an operator grepping journals on every node.
+    struct RepairDiagnostics {
+        uint64_t pull_unsourceable{};
+        uint64_t local_unreadable{};
+        std::vector<ObjectId> unsourceable_sample;
     };
 
     struct DurableReplica {
@@ -95,6 +106,26 @@ class DistributedStore {
     std::jthread prompt_thread_;
     std::atomic_uint64_t prompt_copies_{};
     std::atomic_uint64_t prompt_failures_{};
+    // Repair's two silent failures, made countable. The pull side is the one
+    // that matters after a node leaves: an object the live namespace still
+    // references, that this node should own, that is not here, not in the
+    // block cache, and that no peer would supply. That is an unavailable
+    // extent, and until 0.40.0 repair passed over it without a word -- there
+    // is no Log:: call anywhere in repair_step(). The push side counts a local
+    // object the cursor listed but the store could not read back, which is
+    // what a failing disk looks like from here.
+    // Neither is proof on its own: a pull can miss because a peer was busy,
+    // the RPC failed, or a budget ran out, and the next pass will try again.
+    // A total that keeps climbing across passes, or the same ids reappearing
+    // in the sample, is the signal.
+    std::atomic_uint64_t repair_pull_unsourceable_{};
+    std::atomic_uint64_t repair_local_unreadable_{};
+    mutable std::mutex repair_sample_mutex_;
+    std::deque<ObjectId> repair_unsourceable_sample_;
+    Clock::time_point repair_unsourceable_last_log_{};
+    Clock::time_point repair_unreadable_last_log_{};
+    void note_repair_unsourceable(const ObjectId&);
+    void note_repair_local_unreadable(const ObjectId&);
     void queue_prompt_replication(const ObjectId&);
     void prompt_replication_loop(std::stop_token);
     mutable std::mutex fetch_mutex_;
@@ -214,6 +245,7 @@ class DistributedStore {
                              const std::function<bool()>& should_yield = {},
                              uint64_t live_generation = 0);
     uint64_t scrub_once(uint64_t byte_budget = 0);
+    RepairDiagnostics repair_diagnostics() const;
 
     uint64_t take_foreground_bytes() { return n_.take_activity_bytes(FrameType::foreground); }
     uint64_t take_interactive_bytes() { return n_.take_activity_bytes(FrameType::read_ahead); }

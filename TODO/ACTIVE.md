@@ -155,7 +155,7 @@ What the incident left behind:
   Because the count is per *logical* session, the viewer who caused it is the
   one person who cannot observe it; the cost falls entirely on others.
   **No client-side fix closes this.** The phone client's failover creates a
-  fresh session and drops the old one; `@macha/core` closes all five of its
+  fresh session and drops the old one; `@machafoundation/core` closes all five of its
   standby paths but uses `keepalive`, which React Native ignores and Tizen 3
   does not have, so a suspended app's closing `DELETE` may never leave; and a
   client that crashes, is force-quit or loses power can never send one.
@@ -644,6 +644,33 @@ not inferred from docs. All are small and isolated; none require design work.
   is that a head is genuinely being dropped, which would be a real bug.
   Deciding which needs someone to instrument `accepted_heads()` over the gap;
   both answers are useful, and a 40% reproduction rate makes it cheap.
+- [ ] **`hydration_catalogue/test_ingest_pause_resume_and_cancel_still_work_under_a_worker_pool`
+  fails 40-80% of the time IN ISOLATION on both Pis — characterised 2026-09-13
+  during the 0.40.0 rollout. "Passes in isolation" is false, and has been the
+  accepted verdict five times.** This is the measurement the item below asked
+  for instead of a sixth sighting, so act on it rather than re-observing it.
+  Measured with `--serial --filter`, nothing running but the live node:
+  **gbni-1 on 0.40.0, 8 failures in 10; es-1 on 0.39.1, 4 failures in 10.**
+  It is therefore **not a 0.40.0 regression** — the unmodified 0.39.1 build on
+  es-1 reproduces it, and nothing in 0.40.0 touches ingest. Do not read the
+  80%-vs-40% difference as a version effect: the nodes differ in load, disk and
+  network, and no controlled comparison was run.
+  Every failure is the same shape: the case times out at its full 60 s having
+  logged `ingest started workers=4`, one job failing `ingest failed id=…:
+  exists`, and two of four copying successfully. An `exists` failure on a
+  concurrent import looks like a race between workers over a destination path —
+  `ingest.max_concurrent_jobs` and its claimed-set ownership shipped together in
+  0.37.0 — and that, not the harness deadline, is the first thing to read.
+  One hypothesis was tested and **refuted**: the failing runs also logged
+  `subsystem plugin 'libmacha-torrent' build identity mismatch: plugin=0.39.1
+  core=0.40.0; refusing to load`, because a freshly built test binary was
+  loading the older installed plugin. Installing 0.40.0 so the two matched
+  changed nothing — 8 in 10 before, 8 in 10 after. The mismatch is a real
+  artefact of building on a node mid-deploy, but it is not this.
+  A 40-80% reproduction rate on hardware that is sitting there makes this cheap
+  to root-cause, and it is the only one of these flakes that does not need load
+  to reproduce.
+
 - [ ] **Three load-dependent test flakes needing a real fix, not another
   isolation-pass shrug — second found 2026-09-08, third 2026-09-13.**
   The third is
@@ -1274,6 +1301,54 @@ that report.
   has to be argued rather than assumed), and what existing accounts get at
   migration. The client is unblocked — it is on `manager` today and says
   switching is a one-line change once a name ships.
+- [x] **Session TTL: 30 days stands — DECIDED by the operator 2026-09-13
+  ("30 days is good for now"), asked directly and answered short. Nothing to
+  build. DO NOT RE-RAISE AS A DEFECT.** The consequence is understood and
+  accepted: a signed-in viewer is logged out 30 days after minting, counted
+  from creation rather than last use, so it expires even under daily use. What
+  made that affordable is that the client half is fixed — the phone client was
+  writing its token to disk and never reading it back, so the 30 days was being
+  cut short by the first cold start rather than by the expiry; released as
+  their 0.5.1 and verified on device.
+  **Keep this fact, whatever a future scheme looks like:** `AuthSession` is
+  gossiped to every node *and* persisted on each, so extending `expires_unix_ms`
+  on every request would be a replicated cluster-wide write on the hot path of
+  every API call. That is what forces any sliding-expiry design to use a
+  threshold (extend only when less than half the TTL remains) rather than
+  extending on use, and it is not visible from outside the server.
+  The three schemes considered, recorded against a revisit rather than deleted:
+  sliding expiry with a threshold (recommended at the time); a much longer TTL
+  plus "remember me" at mint (cheapest, but a stolen token then lives a year
+  unrotated); refresh tokens with short-lived bearers (real per-device
+  revocation and "sign out everywhere", far more machinery than a self-hosted
+  cluster needs today). Revocation already works under all three — `DELETE` is
+  replicated and `credential_generation` invalidates cluster-wide.
+  Original finding, kept because it is the evidence: Confirmed against the code rather than the report:
+  `SessionManager::create()` (`session.cpp:177`) sets
+  `expires_unix_ms = now + anonymous_ttl_` for **every** session, credentialed
+  or not — the name is misleading, and a username/password mint takes no
+  separate path — while `validate()` never extends it. So every signed-in viewer
+  is logged out 30 days after signing in, with no warning and nothing a client
+  can do about it. The client-side half (a token thrown away on every launch)
+  was theirs and is fixed.
+  Three schemes were put to the operator, with sliding expiry recommended:
+  extend `expires_unix_ms` on use when less than half the TTL remains — the
+  threshold matters because `AuthSession` is gossiped to every node, so
+  extending per request would mean a replicated write per request; or a much
+  longer TTL plus "remember me" at mint, cheapest, but a stolen token then lives
+  a year unrotated; or refresh tokens with short-lived bearers, which buys real
+  per-device revocation and "sign out everywhere" and is far more machinery than
+  a self-hosted cluster needs today. Revocation already works under all three —
+  `DELETE` is replicated and `credential_generation` invalidates cluster-wide.
+  **Still open, and deliberately not closed by the 30-day decision: the web
+  client should not hold a bearer token at all.** That is a separate question
+  from how long a session lives, and the operator answered only the TTL one.
+  Anything in JS-reachable storage is XSS-readable. The node already serves the
+  web client, so a `Secure`, `httpOnly`, `SameSite` cookie set on a successful
+  `POST /api/v1/session` and accepted alongside the `Authorization` header is
+  same-origin and natural. No client can substitute for that; it is server work,
+  and it belongs with the P0 security items rather than here.
+
 - [x] **`GET /api/v1/users` returns `{"users": [...]}` while every other
   collection in the API uses `items` — CHANGED to `items` in 0.40.0 on the
   operator's decision, 2026-09-13.** Core has accepted either key since its
@@ -1363,6 +1438,30 @@ that report.
   client-side change needed. Found 2026-09-04 via `macha-client-b8`.
 
 ## P2 — Diagnostics and repeatable proof
+
+- [x] **"Are any extents unavailable?" could not be answered from the running
+  system — asked by the operator 2026-09-13 after gbni-2 was removed, answered
+  in 0.40.1.** `diagnostics.repair` now carries `unsourceable_objects`,
+  `unsourceable_sample` (up to 32 ids) and `local_unreadable_objects`, and
+  repair warns once a minute per kind instead of saying nothing at all.
+  **What this does not do, and the reasoning that still stands:** the count is
+  evidence, not a verdict — a pull also misses on a busy peer, a failed RPC or
+  an exhausted budget, so only a total that climbs across passes, or the same
+  ids recurring, means loss. And it only ever sees objects *this* node should
+  own: a complete cluster-wide answer still needs the join nobody has built —
+  enumerate `FileSystem::live_objects()`, ask every node `StoragePool::has()`,
+  report what no node holds, mapped back to paths. That was option 1 of the two
+  put to the operator; he chose the logging first. Note a naive `test -f` over
+  `objects/xx/yy/<id>.obj` cannot substitute for `has()`: packed objects live
+  inside pack files and would every one of them read as missing.
+  **Why it mattered here:** `replicas: 2` across three nodes means every object
+  that reached its target still has a copy after one node leaves, so the
+  expected state is under-replicated rather than unavailable. The exception is
+  `min_write_replicas: 1`, which lets a write commit with a single copy — if
+  that copy was gbni-2, the extent is gone, and nothing in the metadata records
+  which objects only ever had one replica. Stored bytes at the time of removal:
+  gbni-1 737 GB, es-1 1.82 TB.
+
 
 - [ ] Record reproducible local and four-node benchmark recipes without brittle
   default-suite wall-clock thresholds.
@@ -1533,8 +1632,26 @@ SSH to gbni-1 and es-1 is filtered from outside — port 22 is refused or times
 out from both a laptop and from gbni-2 — so a session with no LAN route can
 reach only whatever nodes happen to be exposed.
 
-**Versions deployed (2026-09-13, after the 0.39.1 rollout).** gbni-1 and es-1
-run **0.39.1** (`libmacha_core.so` sha256 72cb8162…, GCC 14.2.0, built on each
+**gbni-2 was removed from the cluster on 2026-09-13**, at the operator's
+decision, via the Status node card. Verified in both nodes' `known-nodes.bin`:
+each now lists one known node (the other) plus a third tombstone,
+`[inverbeg.macha.network]:7437 stale=68836f3e0a8b… epoch=1` at 18:47:42Z,
+propagated to both. The 7-second dial loop is gone and neither node has logged
+an ERROR since. **A reset is not a decommission** — `Membership::observe()`
+treats a tombstone as a freshness boundary, and a directly authenticated peer
+may establish the association again, so if that machine returns and completes a
+handshake it rejoins and gossips back. Permanent removal, placement exclusion
+and re-replication of what it held do not exist as a concept.
+
+**Versions deployed (2026-09-13, after the 0.40.0 rollout).** gbni-1 and es-1
+run **0.40.0** (`libmacha_core.so` sha256 255a1aeb…, GCC 14.2.0, built on
+gbni-1 at `-j2` and shipped to es-1 as a 3 MB tarball; both verified
+byte-identical). Both answer `/api/v1/health` 200 `{"status":"ok"}`, both
+loaded `libmacha-torrent`, and neither logged an ERROR in the ten minutes after
+restart. gbni-1 was restarted while idle; es-1 waited until the phone client's
+live session had finished, confirmed against that node's own journal rather
+than taken on trust. **The repository and the cluster now agree at 0.40.0.**
+The previous state, for reference: both ran 0.39.1 (`libmacha_core.so` sha256 72cb8162…, GCC 14.2.0, built on each
 node from the synced tree; the `macha` binary is a thin main and is unchanged
 across these releases). Verified live on both after the rollout:
 `/api/v1/health` 200 `{"status":"ok"}` unauthenticated, `/api/v1/status` and
