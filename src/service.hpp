@@ -110,6 +110,8 @@ class Service {
     HttpResponse handle_http(const HttpRequest&);
     // The role a request needs, or empty when a valid session is enough.
     static std::string_view required_role(const HttpRequest&);
+    // Unauthenticated liveness: whether this node is serving, and nothing more.
+    HttpResponse health_response() const;
     bool capability_request(const HttpRequest&);
     void loop(std::stop_token);
     void signal_maintenance(ServiceEvent);

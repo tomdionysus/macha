@@ -19,15 +19,27 @@ namespace macha {
 
 // Roles are flat strings and additive capabilities rather than a ladder: a
 // person who imports torrents is not thereby allowed to delete the catalogue.
-// The one implication is that every role can read, so expand_roles() is
-// resolved once at mint time and a route gate stays a single
+// The implications are that every role can read media and see cluster health,
+// so expand_roles() is resolved at mint time and a route gate stays a single
 // session_has_role() lookup on the session the caller already presented.
+// Resolving at mint rather than only at write means an implication added in a
+// later version reaches accounts created before it, with no migration.
 //
-//   media_viewer  read all media, playback, and cluster status
+//   view_status   see cluster and node health
+//   media_viewer  read all media and play it back
 //   importer      acquire content (torrents, ingest)
 //   manager       manage files, namespaces, catalogue matches, and the
 //                 cluster itself (identity-association reset)
 //   manage_users  add, edit and remove accounts
+//
+// view_status is the weakest capability: everything implies it, it implies
+// nothing, and it is grantable on its own. An operator who wants cluster
+// health visible to unauthenticated visitors gives it to the anonymous
+// account and nothing else; an account the cluster granted nothing -- which
+// is what anonymous is in a registered-users-only deployment -- cannot see
+// health at all. Until 0.38.5 the status routes carried no role, so that
+// second case was not expressible.
+inline constexpr std::string_view role_view_status = "view_status";
 inline constexpr std::string_view role_media_viewer = "media_viewer";
 inline constexpr std::string_view role_importer = "importer";
 inline constexpr std::string_view role_manager = "manager";
@@ -37,7 +49,8 @@ inline constexpr std::string_view role_manage_users = "manage_users";
 std::vector<std::string> all_roles();
 
 bool known_role(std::string_view);
-// Every role implies media_viewer; nothing else implies anything. Returns the
+// Every role implies media_viewer and view_status; nothing else implies
+// anything, and view_status implies neither. Returns the
 // closed set, deduplicated and in a stable order, preserving any marker role
 // (e.g. "anonymous") it was given.
 std::vector<std::string> expand_roles(const std::vector<std::string>&);
