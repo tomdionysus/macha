@@ -38,7 +38,7 @@ that contract, including the error codes and the reasoning behind them; treat
 it as the interface document when working on either side.
 
 Because clients decide, they carry real logic, and a shared TypeScript core
-(`@macha/core`) implements the parts every player needs — node discovery and
+(`@machafoundation/core`) implements the parts every player needs — node discovery and
 ranking, session lifecycle, playback negotiation. Phone and TV players build on
 that core. A change to the wire shape, an error code or a default is a change
 to those projects too, and is worth saying out loud rather than leaving to be

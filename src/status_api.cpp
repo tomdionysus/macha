@@ -330,6 +330,17 @@ void ClusterStatusService::detach_fuse_diagnostics() {
     fuse_diagnostics_ = {};
 }
 
+void ClusterStatusService::attach_repair_diagnostics(
+    std::function<DistributedStore::RepairDiagnostics()> provider) {
+    std::lock_guard lock(operational_diagnostics_mutex_);
+    repair_diagnostics_ = std::move(provider);
+}
+
+void ClusterStatusService::detach_repair_diagnostics() {
+    std::lock_guard lock(operational_diagnostics_mutex_);
+    repair_diagnostics_ = {};
+}
+
 void ClusterStatusService::attach_convergence_diagnostics(
     std::function<ConvergenceDemandDiagnostics()> provider) {
     std::lock_guard lock(operational_diagnostics_mutex_);
@@ -923,10 +934,12 @@ HttpResponse ClusterStatusService::diagnostics_response() {
 
     std::function<std::optional<FuseFrontendDiagnostics>()> fuse_provider;
     std::function<ConvergenceDemandDiagnostics()> convergence_provider;
+    std::function<DistributedStore::RepairDiagnostics()> repair_provider;
     {
         std::lock_guard lock(operational_diagnostics_mutex_);
         fuse_provider = fuse_diagnostics_;
         convergence_provider = convergence_diagnostics_;
+        repair_provider = repair_diagnostics_;
     }
 
     Json::Object filesystem_diagnostics;
@@ -1132,6 +1145,33 @@ HttpResponse ClusterStatusService::diagnostics_response() {
         }
     }
     diagnostics["convergence"] = std::move(convergence_diagnostics);
+
+    // What replica repair could not obtain. `unsourceable_objects` climbing
+    // across passes is the closest thing this node has to "there are extents
+    // nothing in the cluster can serve" -- after a node is removed, that is
+    // the question an operator actually has, and nothing answered it before
+    // 0.40.0. A single pass can also miss because a peer was busy or a budget
+    // ran out, so a small non-zero figure that stops growing is ordinary.
+    // `local_unreadable_objects` is the other half: objects this node's own
+    // store listed and then could not read back, which is what a failing disk
+    // looks like from up here.
+    Json::Object repair_diagnostics;
+    repair_diagnostics["available"] = false;
+    if (repair_provider) {
+        try {
+            const auto values = repair_provider();
+            repair_diagnostics["available"] = true;
+            repair_diagnostics["unsourceable_objects"] = values.pull_unsourceable;
+            repair_diagnostics["local_unreadable_objects"] = values.local_unreadable;
+            Json::Array sample;
+            for (const auto& id : values.unsourceable_sample)
+                sample.push_back(to_string(id));
+            repair_diagnostics["unsourceable_sample"] = std::move(sample);
+        } catch (const std::exception& error) {
+            Log::debug("status repair diagnostics unavailable: " + std::string(error.what()));
+        }
+    }
+    diagnostics["repair"] = std::move(repair_diagnostics);
 
     // Auth state is local to each node and converges by gossip, so the only
     // way to see whether it actually has converged is to compare these across

@@ -1,6 +1,46 @@
 # Current release
 
-## 0.40.0 — Open, unreleased (development)
+## 0.40.1 — Repair says what it cannot reach (development)
+
+**An object no node can supply is now counted and named, instead of passed
+over in silence.** `DistributedStore::repair_step()` contained no `Log::` call
+of any kind. Its pull side asks for each object this node should own and does
+not have; when no peer answers with the bytes, it moved on without a word, on
+every pass, forever. That is precisely the shape of an unavailable extent —
+the live namespace still references it and nothing in the cluster holds it —
+and it is the question an operator actually has after a node leaves, which
+until now could not be answered from the running system at all: Status carries
+`convergence`, `data_store`, `retained_memory` and the rest, and nothing about
+object availability.
+
+`diagnostics.repair` now reports `unsourceable_objects`, a cumulative count,
+alongside `unsourceable_sample`, up to 32 distinct object ids, and
+`local_unreadable_objects` — the other silent case, where this node's own store
+listed an object in its cursor and then could not read it back, which is what a
+failing disk looks like from up here. A warning names the object and the running
+total, rate-limited to one line a minute per kind: a cluster that has genuinely
+lost a node can be missing a great many objects at once, and a line per object
+would bury the journal at the exact moment someone needs to read it.
+
+**It counts rather than concludes, and says so.** A pull can also miss because
+a peer was busy, an RPC failed, or a budget ran out, and the next pass will try
+again. A small figure that stops growing is ordinary; a total climbing across
+passes, or the same ids recurring in the sample, is the signal. That distinction
+is in the code comment and in the Status block, so nobody reads a 3 as data loss.
+
+Costs nothing: both counters increment inside a loop that already exists and is
+already bounded by scan, operation and byte budgets plus a yield check, on a
+path that has just completed a failed remote fetch. The sample is a deque capped
+at 32 behind a leaf mutex that holds nothing else, and the log call happens
+outside it. Nothing new walks the namespace or the store.
+
+Gated by `test_repair_counts_an_object_no_peer_can_supply`, which also pins that
+an object that *is* present is never reported as unsourceable — a counter that
+cries wolf is worse than none — and that repeated passes over the same
+unobtainable object do not grow the sample. Neutering the call fails it at the
+wait.
+
+## 0.40.0 — Five operator decisions, and artwork that can finally be cached
 
 Five operator decisions taken on 2026-09-13, each of which had been sitting in
 `TODO/ACTIVE.md` as a question rather than as work.
@@ -888,7 +928,7 @@ indistinguishable from an old node that never reported it, which is why this
 carries a version bump: clients cannot sniff for it.
 
 The pair could not express a scheme, so a client discovering peers had to
-invent one — `@macha/core` hardcoded `http://`. That is wrong in both
+invent one — `@machafoundation/core` hardcoded `http://`. That is wrong in both
 directions on a TLS deployment: a browser on an HTTPS page blocks every
 discovered peer as mixed content, and a native client sends plaintext to a
 node the viewer deliberately put behind TLS.
