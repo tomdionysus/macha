@@ -16,6 +16,10 @@ namespace {
 // later, milder check downgrade it back.
 enum class HealthSeverity { healthy, degraded, recovering, critical };
 
+// Stated once, and carried in the lightweight response so a client learns
+// where the expensive half went from the payload itself.
+constexpr std::string_view diagnostics_path = "/api/v1/status/diagnostics";
+
 std::string_view health_name(HealthSeverity severity) {
     switch (severity) {
     case HealthSeverity::healthy: return "healthy";
@@ -706,6 +710,32 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         }
     }
     root["subsystems"] = std::move(subsystems);
+    // Named rather than assumed: a client that was reading `diagnostics` off
+    // this response and now finds it absent would otherwise get `undefined`
+    // and no explanation, which is the silent-nothing failure this project has
+    // been bitten by before. The pointer travels with the payload.
+    root["diagnostics_endpoint"] = std::string(diagnostics_path);
+    root["generated_at_unix_ms"] = unix_ms();
+    return http_json(200, Json(std::move(root)).dump());
+}
+
+// Everything above this line is membership, telemetry and readiness the node
+// already holds decoded: a handful of short mutexes, no I/O, no network. What
+// follows is the other kind, and it moved here in 0.39.1 so that polling the
+// first no longer pays for the second. See status_api.hpp for why that
+// distinction is about locks rather than about arithmetic.
+HttpResponse ClusterStatusService::diagnostics_response() {
+    auto* metadata_manager = metadata_.load(std::memory_order_acquire);
+    std::shared_ptr<const MetadataSnapshot> metadata;
+    if (metadata_manager) {
+        try {
+            if (auto available = metadata_manager->available_snapshot_view())
+                metadata = available->snapshot;
+        } catch (const std::exception& error) {
+            Log::debug("status metadata unavailable: " + std::string(error.what()));
+        }
+    }
+    const auto readiness = node_.readiness();
 
     // Process-lifetime aggregate diagnostics are read directly from local
     // atomics. They create no sampling loop, persistence work, or gossip load.
@@ -1127,6 +1157,7 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     auth_diagnostics["anonymous_roles"] = std::move(anonymous_roles);
     diagnostics["auth"] = std::move(auth_diagnostics);
 
+    Json::Object root;
     root["diagnostics"] = std::move(diagnostics);
     root["generated_at_unix_ms"] = unix_ms();
     return http_json(200, Json(std::move(root)).dump());
@@ -1172,6 +1203,8 @@ HttpResponse ClusterStatusService::handle(const HttpRequest& request) {
     if (request.method == "GET" &&
         (request.path == "/api/v1/status" || request.path == "/api/v1/status/nodes"))
         return status_response();
+    if (request.method == "GET" && request.path == diagnostics_path)
+        return diagnostics_response();
     if (request.method == "POST" && request.path == "/api/v1/status/connectivity/check")
         return connectivity_check({});
 
