@@ -1028,6 +1028,9 @@ LocalStoreDiagnostics StoragePool::diagnostics() const {
         total.loose_reaffirmation_full_validations +=
             current.loose_reaffirmation_full_validations;
         total.presence_index_entries += current.presence_index_entries;
+        total.pack_recovery_truncated_tails += current.pack_recovery_truncated_tails;
+        total.pack_recovery_skipped_regions += current.pack_recovery_skipped_regions;
+        total.pack_recovery_skipped_bytes += current.pack_recovery_skipped_bytes;
     }
     return total;
 }
