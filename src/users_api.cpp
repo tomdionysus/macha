@@ -90,12 +90,13 @@ UserMutability UsersApi::mutability(const UserRecord& user) const {
     // unauthenticated visitor is.
     out.rename = !reserved;
     out.remove = !reserved;
-    // Both still have ordinary credentials and ordinary roles. Anonymous's
-    // password is meaningless in practice (nothing logs in as it), but it is a
-    // real field and setting it is harmless; its *roles* are the only control
-    // over what an unauthenticated television can reach, so they must stay
-    // editable.
-    out.set_password = true;
+    // Roles stay editable on both: anonymous's roles are the only control over
+    // what an unauthenticated television can reach. Passwords are ordinary on
+    // root and refused on anonymous, which has none by construction -- being
+    // able to log in as it would be a way past `allow_anonymous: false`, and
+    // before 0.38.4 any visitor holding an anonymous session could set that
+    // password through /api/v1/users/me and make one.
+    out.set_password = user.username != anonymous_username;
     out.set_roles = true;
 
     if (user_has_role(user, role_manage_users) && node_.users().sole_user_manager(user.id)) {
@@ -152,6 +153,14 @@ HttpResponse UsersApi::update(const HttpRequest& request, const std::string& use
         return http_error(400, "password_rejected",
                           "password must be at least " + std::to_string(min_password_length) +
                               " characters");
+    if (!password.empty()) {
+        auto target = node_.users().find(user_id);
+        if (target && target->username == anonymous_username)
+            return http_error(409, "no_password",
+                              "the 'anonymous' account has no password and cannot be given "
+                              "one; anonymous access is controlled by its roles and by "
+                              "session.allow_anonymous");
+    }
     auto roles = read_roles(body);
     if (self && roles)
         // Otherwise changing your own password would be a privilege-escalation

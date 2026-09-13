@@ -92,8 +92,14 @@ CredentialResult PasswordCredentialValidator::validate(const Json& credentials) 
         // it is retired by the same credential_generation check as anyone
         // else's the moment those roles change.
         auto user = users_.find_by_username(anonymous_username);
-        if (!user || user->roles.empty())
+        if (!user)
             return {CredentialOutcome::disabled, {}};
+        // A roles-less anonymous account is a different state from anonymous
+        // access being switched off, and both are legitimate: the visitor gets
+        // a session that simply carries no capabilities, and every gated route
+        // refuses it. Until 0.38.4 an empty role list was reported as
+        // `disabled`, which told a client "log in" when the truthful answer
+        // was "you are in, and this cluster grants visitors nothing".
         return {CredentialOutcome::ok, {user->roles, user->id, user->credential_generation}};
     }
 

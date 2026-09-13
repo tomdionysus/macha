@@ -254,7 +254,11 @@ UserCredentialCheck UserStore::verify(std::string_view username,
                                       std::string_view password) const {
     const auto normalized = normalize_username(username);
     std::optional<UserRecord> user;
-    {
+    // `anonymous` is never reachable by password, whatever its record happens
+    // to hold. A cluster created before 0.38.4 still carries the random
+    // password genesis used to generate for it; this is what makes that
+    // credential inert rather than a standing way past allow_anonymous.
+    if (normalized != anonymous_username) {
         std::shared_lock lock(mutex_);
         for (const auto& [_, record] : by_id_)
             if (!record.tombstone && record.username == normalized) {
@@ -366,20 +370,40 @@ Hash256 UserStore::table_hash() const {
 std::optional<UserRecord> UserStore::create(std::string_view username, std::string_view password,
                                             const std::vector<std::string>& roles,
                                             const NodeId& by) {
+    if (password.empty())
+        return std::nullopt;
+    return insert(username, password, roles, by);
+}
+
+std::optional<UserRecord> UserStore::create_without_password(
+    std::string_view username, const std::vector<std::string>& roles, const NodeId& by) {
+    return insert(username, {}, roles, by);
+}
+
+std::optional<UserRecord> UserStore::insert(std::string_view username, std::string_view password,
+                                            const std::vector<std::string>& roles,
+                                            const NodeId& by) {
     const auto normalized = normalize_username(username);
-    if (normalized.empty() || normalized.size() > max_username_length || password.empty())
+    if (normalized.empty() || normalized.size() > max_username_length)
         return std::nullopt;
 
     UserRecord user;
     user.id = hex(random_bytes(id_bytes));
     user.username = normalized;
-    user.kdf = 1;
-    const auto salt = random_bytes(user.salt.size());
-    std::copy(salt.begin(), salt.end(), user.salt.begin());
-    user.kdf_n = default_kdf_n;
-    user.kdf_r = default_kdf_r;
-    user.kdf_p = default_kdf_p;
-    user.password_hash = scrypt_hash(password, user.salt, user.kdf_n, user.kdf_r, user.kdf_p);
+    if (password.empty()) {
+        // kdf 0 is "no credential": verify() refuses it before reaching a KDF,
+        // so this account cannot be logged into by any password at all --
+        // including one a later bug or a hand-edited record might install.
+        user.kdf = 0;
+    } else {
+        user.kdf = 1;
+        const auto salt = random_bytes(user.salt.size());
+        std::copy(salt.begin(), salt.end(), user.salt.begin());
+        user.kdf_n = default_kdf_n;
+        user.kdf_r = default_kdf_r;
+        user.kdf_p = default_kdf_p;
+        user.password_hash = scrypt_hash(password, user.salt, user.kdf_n, user.kdf_r, user.kdf_p);
+    }
     user.roles = expand_roles(roles);
     user.credential_generation = 1;
     user.created_unix_ms = user.updated_unix_ms = unix_ms();
@@ -428,6 +452,12 @@ std::optional<UserRecord> UserStore::update(std::string_view user_id, std::strin
     return mutate(
         user_id,
         [&](UserRecord& user) {
+            // anonymous has no password and cannot be given one; see
+            // anonymous_username. Refusing the whole update rather than
+            // applying the roles half keeps the caller's request and what
+            // happened to it the same thing.
+            if (!password.empty() && user.username == anonymous_username)
+                return false;
             if (!password.empty()) {
                 const auto salt = random_bytes(user.salt.size());
                 std::copy(salt.begin(), salt.end(), user.salt.begin());
@@ -657,11 +687,13 @@ std::optional<InitialAccounts> create_initial_accounts(UserStore& users, const C
     // not against a hypothetical.
     (void)keys;
     const std::string recovery_key;
-    // Anonymous is an ordinary account with an unguessable password nobody is
-    // ever told: it is reached by minting a session with no credentials, not by
-    // logging in as it, so there is no reason for a usable password to exist.
-    auto anonymous = users.create(anonymous_username, generate_password(),
-                                  {std::string(role_media_viewer)}, by);
+    // Anonymous has no password at all. Until 0.38.4 it was given a random one
+    // nobody was ever told, which was pointless in the good case and a way
+    // past `allow_anonymous: false` in the bad one -- that switch guards the
+    // no-credentials path, not the login path, so an anonymous account with a
+    // settable password was a second door beside it.
+    auto anonymous = users.create_without_password(anonymous_username,
+                                                   {std::string(role_media_viewer)}, by);
     if (!anonymous) {
         Log::warn("could not create the anonymous account");
         return std::nullopt;

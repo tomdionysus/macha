@@ -1,5 +1,69 @@
 # Current release
 
+## 0.38.4 — Anonymous has no password, and no roles is not the same as disabled (development)
+
+Two things about the `anonymous` account were wrong, and they were the same
+mistake seen from different sides: treating it as an ordinary account that
+happens to be reached unusually, rather than as the one account that is only
+ever reached without credentials.
+
+**Anonymous can no longer be logged into, and has no password to log in with.**
+`session.allow_anonymous: false` guards the no-credentials mint path only. The
+username/password path never consulted it, so anyone who knew the anonymous
+account's password could `POST /api/v1/session` as `anonymous` and receive a
+session carrying its roles **with anonymous access switched off** — and that
+session was an ordinary bound one, so it outlived the switch.
+
+Nobody knew that password, because genesis generated a random one and told no
+one. But the API invited an admin to set one (`set_password` was advertised
+true for anonymous, with a comment calling it harmless), and worse:
+`/api/v1/users/me` requires only `media_viewer`, which anonymous holds at
+genesis, and a self `PATCH` carrying a password set the credential and handed
+back a fresh token. **Any unauthenticated visitor could give the anonymous
+account a password of their choosing and then log in as it.** That is the hole;
+the pointless random password was the thing that made it look harmless.
+
+So anonymous now has no credential at all — `kdf` 0, no salt, no hash, via the
+new `UserStore::create_without_password` — and:
+
+- `UserStore::verify` refuses the `anonymous` username outright, through the
+  same dummy-KDF path as an unknown user so the refusal is not distinguishable
+  by timing. This is what makes the credential a cluster created before 0.38.4
+  already carries inert, with no migration and no write: the record can keep
+  its old hash, and nothing will ever reach it.
+- `UserStore::update` refuses a password change on anonymous, so the API, the
+  CLI and any future caller are all covered by one rule in one place — the
+  same discipline as the last-user-manager check beside it.
+- `UsersApi` returns `409 no_password` and reports `mutable.set_password:
+  false`, so a client does not draw a field the server will refuse.
+- `macha-users passwd anonymous` refuses with the reason rather than a bare
+  failure from two layers down.
+
+Roles stay entirely ordinary on anonymous: they are the only control over what
+an unauthenticated visitor may do.
+
+**An anonymous account with no roles now mints a session that grants nothing.**
+It previously reported `403 anonymous_disabled` — the same answer as anonymous
+access being switched off. Those are different states and a cluster may
+legitimately be in either: "visitors may connect but may do nothing" is how a
+registered-users-only deployment is expressed, and the client needs the empty
+role list to know to put a login in front of the viewer. Conflating them told
+the client "log in" when the truthful answer was "you are in, and this cluster
+grants visitors nothing" — and since the client had no session at all, every
+subsequent request 401'd and the symptom read as an unreachable cluster.
+`disabled` now means `allow_anonymous: false`, or no anonymous account on this
+node, and nothing else. Found by the web client session against gbni-1 after
+the operator removed `media_viewer` from anonymous.
+
+- Tests: `test_anonymous_has_no_password_and_cannot_be_given_one` (every
+  password refused including the empty one, the store refusing an update, the
+  `/users/me` escalation refused, the mutability flag), and
+  `test_anonymous_with_no_roles_still_mints_a_powerless_session` (roles-less
+  mint succeeds with `roles: []`, and only `allow_anonymous: false` yields
+  `disabled`).
+- Also removes a dead sealing helper in `tools/users_admin.cpp` that every
+  mutation has routed through `UserStore` since 0.38.0.
+
 ## 0.38.3 — A bad pack record no longer takes the backend offline (development)
 
 gbni-1 ran for a day advertising 0 G of storage. Its 8 TB DATA backend had

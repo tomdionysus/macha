@@ -13,8 +13,8 @@ namespace {
 // A real cluster gets it at genesis; a bare NodeRuntime in a test has to be
 // given one.
 UserRecord give_anonymous_account(NodeRuntime& node) {
-    auto created = node.users().create(anonymous_username, "unused-password",
-                                       {std::string(role_media_viewer)}, node.node_id());
+    auto created = node.users().create_without_password(
+        anonymous_username, {std::string(role_media_viewer)}, node.node_id());
     REQUIRE(created.has_value());
     return *created;
 }

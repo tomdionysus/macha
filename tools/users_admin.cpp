@@ -64,19 +64,6 @@ std::vector<UserRecord> load(const std::filesystem::path& path,
     return decode_users(aes_gcm_open(key, nonce, tag, ciphertext, magic));
 }
 
-void store(const std::filesystem::path& path, const std::array<uint8_t, 32>& key,
-           const std::vector<UserRecord>& users) {
-    std::filesystem::create_directories(path.parent_path());
-    const auto sealed = aes_gcm_seal(key, encode_users(users), magic);
-    Writer writer;
-    writer.fixed(sealed.nonce);
-    writer.fixed(sealed.tag);
-    writer.bytes(sealed.ciphertext);
-    const auto encoded = writer.take();
-    durable_replace_file(
-        path, std::string_view(reinterpret_cast<const char*>(encoded.data()), encoded.size()));
-}
-
 std::string read_password(const char* prompt) {
     std::cerr << prompt << std::flush;
     termios original{};
@@ -216,6 +203,14 @@ int main(int argc, char** argv) {
             auto* user = live(username);
             if (!user)
                 throw std::runtime_error("no such user");
+            // Same rule as the API and the store: anonymous has no password.
+            // Said here too so the operator gets the reason rather than a bare
+            // refusal from two layers down.
+            if (user->username == anonymous_username)
+                throw std::runtime_error(
+                    "the 'anonymous' account has no password and cannot be given one; "
+                    "what an unauthenticated visitor may do is its roles, and whether "
+                    "one may connect at all is session.allow_anonymous");
             UserStore store_view(4096, path, key);
             if (!store_view.update(user->id, prompt_new_password(), std::nullopt, NodeId{}))
                 throw std::runtime_error("could not change password");

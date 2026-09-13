@@ -170,8 +170,18 @@ class UserStore {
     // nullopt when the username is taken or the table is at max_users.
     std::optional<UserRecord> create(std::string_view username, std::string_view password,
                                      const std::vector<std::string>& roles, const NodeId& by);
+    // An account that cannot be authenticated by password at all: kdf 0, no
+    // salt, no hash. This is what `anonymous` is -- it is reached by minting a
+    // session with no credentials, so a password on it would be a second way
+    // in that `allow_anonymous: false` does not close.
+    std::optional<UserRecord> create_without_password(std::string_view username,
+                                                      const std::vector<std::string>& roles,
+                                                      const NodeId& by);
     // nullopt when the user is absent or tombstoned. An empty password leaves
     // the credential (and generation) alone; nullopt roles leaves roles alone.
+    // Also nullopt for a password change on `anonymous`, which has no
+    // credential by construction -- enforced here rather than only in the API
+    // so no second caller can route around it.
     std::optional<UserRecord> update(std::string_view user_id, std::string_view password,
                                      const std::optional<std::vector<std::string>>& roles,
                                      const NodeId& by);
@@ -201,6 +211,10 @@ class UserStore {
     std::optional<UserRecord> mutate(std::string_view user_id,
                                      const std::function<bool(UserRecord&)>& change,
                                      const NodeId& by);
+    // Shared body of both create paths. An empty password produces a record
+    // with kdf 0, which verify() refuses before it reaches a KDF.
+    std::optional<UserRecord> insert(std::string_view username, std::string_view password,
+                                     const std::vector<std::string>& roles, const NodeId& by);
     void persist_locked() const;
 
     mutable std::shared_mutex mutex_;
@@ -216,18 +230,23 @@ class UserStore {
 std::string generate_password();
 
 inline constexpr std::string_view root_username = "root";
-// Anonymous access is an ordinary account, not a special case in the auth
-// path: a session minted with no credentials is bound to this user and carries
-// whatever roles it currently holds. Changing what an unauthenticated visitor
-// may do is therefore an ordinary PATCH of an ordinary user, visible in the
-// same list as everyone else, rather than a config key that only takes effect
-// on restart.
+// Anonymous access is an ordinary account in every respect but one: a session
+// minted with no credentials is bound to this user and carries whatever roles
+// it currently holds, so changing what an unauthenticated visitor may do is an
+// ordinary PATCH of an ordinary user rather than a config key that takes
+// effect on restart.
+//
+// The exception is that it has no password and cannot be given one. Being able
+// to log in as `anonymous` would be a way past `session.allow_anonymous:
+// false` -- that switch guards the no-credentials path only -- and the session
+// it handed back would be a bound one that outlives the switch being turned
+// off. `allow_anonymous` is the only door, so there must not be a second.
 inline constexpr std::string_view anonymous_username = "anonymous";
 
 // root and anonymous cannot be renamed or removed -- root is the way back in
 // when every other account is locked out, and anonymous is what unauthenticated
-// visitors are. Everything else about them is ordinary: roles, password and
-// all the usual routes.
+// visitors are. Roles stay ordinary on both. Passwords stay ordinary on root
+// alone; see anonymous_username above.
 bool reserved_username(std::string_view);
 
 // What may be changed about one account. Stated by the server and carried on
