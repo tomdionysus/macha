@@ -988,8 +988,10 @@ that report.
 
 - [x] **The anonymous account has no password, and a roles-less anonymous
   account is no longer reported as "disabled" — raised by the operator and,
-  independently, by the web client session; both fixed in 0.38.4, not yet
-  deployed.** The reported "cannot set a password" turned out to be the right
+  independently, by the web client session; both fixed in 0.38.4 and deployed
+  to gbni-1 and es-1 on 2026-09-13, verified live against the cluster's own
+  roles-less anonymous account (403 `anonymous_disabled` before, 201 with
+  `roles: []` after).** The reported "cannot set a password" turned out to be the right
   behaviour arrived at for the wrong reason: the API *did* permit it, and that
   was a live privilege hole. `/api/v1/users/me` needs only `media_viewer`,
   which anonymous holds at genesis, so any unauthenticated visitor could
@@ -1004,6 +1006,28 @@ that report.
   expressed, and the client needs the empty list to know to show a login.
   Details in `CHANGELOG.md` under 0.38.4.
 
+- [ ] **Status has no role of its own — requested by the operator via the web
+  client session, 2026-09-13, not designed.** The client gated its Status
+  section on `manager`, which takes the diagnostic screen away from an ordinary
+  viewer at exactly the moment it earns its place; leaving it ungated shows it
+  to a session the server granted nothing. The capability being asked about is
+  neither "manage the library" nor "view media" but "see the health of this
+  cluster", and no role says that. A `view_status` role would.
+  **What has to be decided first, because it is a reversal.** `/api/v1/status`
+  is deliberately ungated today (`service.cpp:191`) and the comment there
+  argues the case: an importer-only account watching an ingest is the person
+  who most needs to see whether the cluster is healthy, so requiring a role
+  would tell them nothing. Introducing `view_status` means that route stops
+  answering for any session that lacks it — including the roles-less anonymous
+  session a registered-users-only deployment now mints, which is currently how
+  a client reaches Status to render a login wall at all. So the question is not
+  only the role's name but whether Status becomes gated, and what an
+  ungated-but-sessioned caller sees instead. Also needs: the route set
+  (`/api/v1/status`, `/api/v1/status/*`, connectivity checks), whether
+  `manager` implies it (roles are capabilities, not a ladder, so implication
+  has to be argued rather than assumed), and what existing accounts get at
+  migration. The client is unblocked — it is on `manager` today and says
+  switching is a one-line change once a name ships.
 - [ ] **`GET /api/v1/users` returns `{"users": [...]}` while every other
   collection in the API uses `items`.** Raised independently by the mobile
   session, which read `users_api.cpp` directly; the web client had already
@@ -1167,11 +1191,12 @@ SSH to gbni-1 and es-1 is filtered from outside — port 22 is refused or times
 out from both a laptop and from gbni-2 — so a session with no LAN route can
 reach only whatever nodes happen to be exposed.
 
-**Versions deployed (2026-09-13, after the 0.38.3 rollout).** gbni-1 and
-es-1 run **0.38.3**, built on each node from the synced tree and verified
-byte-identical (`macha` sha256 7fbe1b0e…, `libmacha_core.so` 289bc887…, GCC
-14.2.0 on both). gbni-2 is still on **0.38.1** and cannot be reached — see the
-P0 item above. 0.38.2's torrent-bind fix is therefore live on two nodes: es-1
+**Versions deployed (2026-09-13, after the 0.38.4 rollout).** gbni-1 and
+es-1 run **0.38.4**, built on each node from the synced tree and verified
+byte-identical (`libmacha_core.so` sha256 f373d961…, GCC 14.2.0 on both; the
+`macha` binary is a thin main and is unchanged across these releases). The full
+suite passed on es-1 under GCC: 421 + 9, no failures. gbni-2 is still on
+**0.38.1** and cannot be reached — see the P0 item above. 0.38.2's torrent-bind fix is therefore live on two nodes: es-1
 logs `torrent listen: advertised address 'ramaroja.macha.network' is not an IP
 literal, binding all interfaces instead` and then binds 6881 on every
 interface, which is the derivation working as intended.
@@ -1194,10 +1219,10 @@ initialisers). And do not run the suite concurrently with itself on a four-core
 node — it produces failures that vanish in isolation and wastes the signal.
 
 **Repository.** `main` is pushed and carries 0.38.1; 104 backfilled tags are
-pushed. Work since is on a local branch `work-0.38.2` with two unpushed commits
-(0.38.2, and the torrent bind fix), one unpushed tag, and **0.38.3 uncommitted
-in the working tree** — the pack-recovery fix that is already deployed and
-running on two nodes. Committing it is the next repository action.
+pushed. Work since is on a local branch `work-0.38.2` with four unpushed
+commits — 0.38.2, the torrent bind fix, 0.38.3 (pack recovery) and 0.38.4
+(anonymous account) — and one unpushed tag. Everything committed is deployed
+and running on gbni-1 and es-1. Pushing is the operator's call.
 `CLAUDE.md` in the repo root is the operator's and is deliberately untracked.
 
 **A branching convention was relayed on 2026-09-13** by the mobile-app session,
