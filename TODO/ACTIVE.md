@@ -6,12 +6,13 @@ This is the authoritative, ordered backlog. Detailed plans and UAT records in
 this directory remain evidence; completed work belongs in `COMPLETED.md` and is
 not repeated here. Work top-to-bottom unless new evidence changes the order.
 
-**Start here if you are new to this work.** Read, in order: the LIVE INCIDENT
-section immediately below — the cluster is currently running on one storage
-node and has been since 2026-09-12 — then "Cluster and repository state as of
-2026-09-13" near the end of this file, which records node addresses, what is
-deployed where, what access actually works, and two unpushed commits. Neither
-is a task list; both are things that will mislead you if you assume otherwise.
+**Start here if you are new to this work.** Read, in order: the P0 cluster
+section immediately below — the 2026-09-13 storage outage is resolved and all
+three nodes carry data again, but node-d is stranded on 0.38.1 with no SSH
+route in — then "Cluster and repository state as of 2026-09-13" near the end of
+this file, which records node addresses, what is deployed where, what access
+actually works, and the uncommitted 0.38.3 work. Neither is a task list; both
+are things that will mislead you if you assume otherwise.
 `2026-09-12-cluster-users-and-roles-plan.md` carries a "What actually shipped"
 section recording where that implementation diverged from its plan.
 
@@ -73,63 +74,33 @@ The governing laws are:
 3. Control traffic must remain promptly serviceable. Viewer priority is a large
    configurable share (95:5 by default), not indefinite starvation of all other work.
 
-## P0 — LIVE INCIDENT: node-c is storing nothing, node-e is down
+## P0 — Cluster: one node still behind, and one blind spot
 
-Both found 2026-09-13 while investigating a client report that 42% of artwork
-was unfetchable. Diagnosis is complete and evidenced; **no repair has been
-attempted** — the pack below is user data and was left untouched.
+The 2026-09-13 live incident that opened this file is resolved and ledgered in
+`COMPLETED.md`. node-c healed itself on 0.38.3 and node-e returned on its own.
+What the incident left behind:
 
-- [ ] **One torn pack tail has taken node-c's entire 8 TB DATA backend
-  offline.** The node logs, once, at startup:
-  `WARN storage backend offline /mnt/diskB: corrupt pack header at
-  /mnt/diskB/packs/pack-00000000000000001206.pack offset=29841717`
-  followed by `INFO node data storage ready used=0 capacity=0`. It has run this
-  way since at least 2026-09-12 22:05 (the pack's mtime).
-
-  Consequence: node-c advertises **0 G of storage**, so placement cannot choose
-  it for anything. `GET /api/v1/status` shows
-  `live-a storage_cap=0.0G`, `live-b 8192.0G used=233.2G`,
-  `node-e 8192.0G used=1691.6G (offline)`. It holds **0 of 1618** artwork
-  objects. With one storage-bearing node online, replication 2 has exactly one
-  eligible target — which is why the client saw objects on both reachable nodes
-  or neither, never exactly one. This is not a placement defect; it is a
-  cluster running on one disk.
-
-  The disks themselves are healthy: `/mnt/diskA` 6.1T/9.1T exfat (media source,
-  **must not be modified**), `/mnt/diskB` 688G/9.1T ext4, no I/O errors in
-  `dmesg`, ext4 mounted clean. Only 8 packs totalling 106 MB exist.
-
-  **The specific defect** (`src/local_store.cpp:760-782`,
-  `rebuild_pack_index_locked`): recovery handles two torn-tail shapes — fewer
-  bytes left than a header, and a payload longer than the file — and truncates
-  for both when `truncate_incomplete_tail` is set. A header that is *present but
-  undecodable* throws unconditionally instead, ignoring that flag. Here the file
-  is 29,841,842 bytes and the bad header is at 29,841,717: exactly
-  `pack_header_size` (93+32 = 125) bytes remain, one byte too many to take the
-  first truncate branch. An interrupted append that wrote the header's length
-  but not its contents is the *expected* outcome of a power loss on this node,
-  and it is the one shape recovery does not handle.
-
-  Fix: when `truncate_incomplete_tail` is set and an undecodable header is at
-  the tail (nothing valid follows it), truncate rather than throw. An
-  undecodable header in the *middle* of a pack must still throw — truncating
-  there would silently discard valid records after it. Add a regression test
-  that writes exactly `pack_header_size` bytes of garbage onto a good pack.
-
-  Immediate unblock, pending that fix: truncate the pack to 29,841,717 bytes.
-  The scan proved everything before that offset decodes, and nothing follows.
-  Back the file up first.
-
-- [ ] **node-e (node-e) has been offline since ~2026-09-13 morning.** SSH times
-  out on both `198.18.34.50` and `node-e.example.net`; its HTTPS API returns
-  nothing where it answered `201` earlier the same day. The cluster agrees —
-  node-c reports `peers_known: 3, peers_active: 2`. It holds 1691.6 G and is
-  the only replica for roughly 42% of artwork while node-c stores nothing.
-  Cause unknown; not investigated.
-
-- [ ] **node-e never received the torrent config fix** (below). It will still
-  bind nothing on 6881 when it returns, until 0.38.2 is deployed there or the
-  `torrent.listen_interfaces` line is added by hand.
+- [ ] **node-d (live-b) runs 0.38.1 and cannot be reached to upgrade it.**
+  Its sshd now offers **password authentication only** — `Authentications that
+  can continue: password`, so public-key auth is disabled server-side. The host
+  key still matches, so it is the same machine; this is a config change on the
+  node, not a different host. Until someone with console access restores
+  `PubkeyAuthentication` / `authorized_keys`, that node cannot be deployed to,
+  and it is the only node without the pack-recovery fix: a power loss there
+  reproduces the whole 2026-09-12 outage.
+- [ ] **node-e has no persistent journal, so reboots cannot be diagnosed.** It
+  rebooted at ~2026-09-13 12:41 (the outage this file opened with) and
+  `journalctl -b -1` answers "no persistent journal was found". The cause is
+  therefore unknowable after the fact, and will be again next time.
+  `Storage=persistent` in `journald.conf` is the whole fix. `last` is also not
+  installed there.
+- [ ] **A node with zero storage capacity reports itself healthy.** node-c ran
+  for a day as `state: "online"`, `data storage ready`, `storage_cap=0.0G`,
+  because `NodeRuntime::recover_storage` marks the plane ready whether or not
+  any backend came online (`cluster.cpp:387`). Readiness should distinguish
+  "no backend configured" from "every configured backend is offline". Belongs
+  with the "powered-off node is reported online" item under P1 and the
+  maintenance-section gap under P2 diagnostics.
 
 ## P0 — Playback correctness and poor-network resilience
 
@@ -1178,16 +1149,20 @@ SSH to node-c and node-e is filtered from outside — port 22 is refused or time
 out from both a laptop and from node-d — so a session with no LAN route can
 reach only whatever nodes happen to be exposed.
 
-**Versions deployed.** node-c and node-e run the code committed as 0.38.0
-(built before the version bump, so they report 0.38.0). node-d runs the same
-code. **0.38.2 is built and committed but deployed nowhere.** node-e has no
-0.38.x at all beyond what it had before it went down.
+**Versions deployed (2026-09-13, after the 0.38.3 rollout).** node-c and
+node-e run **0.38.3**, built on each node from the synced tree and verified
+byte-identical (`macha` sha256 7fbe1b0e…, `libmacha_core.so` 289bc887…, GCC
+14.2.0 on both). node-d is still on **0.38.1** and cannot be reached — see the
+P0 item above. 0.38.2's torrent-bind fix is therefore live on two nodes: node-e
+logs `torrent listen: advertised address 'node-e.example.net' is not an IP
+literal, binding all interfaces instead` and then binds 6881 on every
+interface, which is the derivation working as intended.
 
-**Torrent config applied by hand, not yet redundant.** node-c and node-d have
+**Torrent config applied by hand, now redundant.** node-c and node-d have
 `torrent.listen_interfaces: 0.0.0.0:6881,[::]:6881` added directly to
-`/etc/macha/macha.yaml`, with a timestamped backup beside it. That was the
-workaround for the bind bug; 0.38.2 fixes the derivation so the line becomes
-unnecessary, but it is harmless to leave. node-e never got it.
+`/etc/macha/macha.yaml`, with a timestamped backup beside it. 0.38.2 fixed the
+derivation, so on node-c the line no longer does anything; it is harmless to
+leave and harmless to remove. node-e never had it and does not need it.
 
 **Build once, ship the artefacts.** All three nodes are aarch64 Debian 13 with
 the same glibc. A `-j2` build on node-c takes ~25 minutes; staging with
@@ -1202,8 +1177,10 @@ node — it produces failures that vanish in isolation and wastes the signal.
 
 **Repository.** `main` is pushed and carries 0.38.1; 104 backfilled tags are
 pushed. Work since is on a local branch `work-0.38.2` with two unpushed commits
-(0.38.2, and the torrent bind fix) and one unpushed tag. `CLAUDE.md` in the
-repo root is the operator's and is deliberately untracked.
+(0.38.2, and the torrent bind fix), one unpushed tag, and **0.38.3 uncommitted
+in the working tree** — the pack-recovery fix that is already deployed and
+running on two nodes. Committing it is the next repository action.
+`CLAUDE.md` in the repo root is the operator's and is deliberately untracked.
 
 **A branching convention was relayed on 2026-09-13** by the mobile-app session,
 attributed to the operator: work on a long-lived `develop`, releases tagged on
