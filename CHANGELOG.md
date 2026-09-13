@@ -1,5 +1,31 @@
 # Current release
 
+## 0.40.0 — Open, unreleased (development)
+
+No code. The version is opened here because 0.39.1 removed a field from a
+response that clients poll — `diagnostics` is no longer on `/api/v1/status` —
+and that is a breaking, client-visible change which a patch number understated.
+Pre-1.0, it earns the minor. The next piece of work starts from this number.
+
+**The cluster runs 0.39.1, and that is correct rather than drift.** No code
+sits between the two versions. Redeploying purely so the nodes report the new
+string is cosmetic, and a rolling restart costs a viewer interruption, so it
+was deliberately not done.
+
+Where the 0.39 line ended up, deployed to gbni-1 and es-1 and verified live:
+
+- `/api/v1/health` — unauthenticated liveness, and the contract every client
+  now probes.
+- `/api/v1/status` — `view_status`, and lightweight: no diagnostics tree.
+- `/api/v1/status/diagnostics` — the same tree as before, on its own route.
+- `anonymous` — no password, cannot be given one, and a roles-less anonymous
+  account mints a session that grants nothing rather than being reported as
+  anonymous access switched off.
+- A torn pack tail truncates instead of taking an 8 TB backend offline.
+
+gbni-2 has none of it. It is four releases behind, its sshd offers password
+authentication only, and it needs console access.
+
 ## 0.39.1 — Polling Status no longer pays for diagnostics (development)
 
 `/api/v1/status` computed and returned the whole `diagnostics` tree on every

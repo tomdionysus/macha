@@ -7,6 +7,45 @@ The 2026-09-08 entries below were ledgered by a pruning pass over
 0.24.1–0.35.0 is not otherwise ledgered here yet — see the documentation
 hygiene item in `ACTIVE.md`.
 
+## Cluster health became a capability, and Status stopped paying for diagnostics — 0.38.5 and 0.39.1, deployed 2026-09-13
+
+Supersedes "2. Split lightweight status from expensive diagnostics" and the
+operator's request for a Status role, both in `ACTIVE.md`. The API contracts
+these created are listed under "What the four client sessions now depend on"
+there, because clients depend on them and this ledger is not where anyone
+looks first.
+
+- [x] **`view_status` (0.38.5).** `/api/v1/status` and `/api/v1/status/*`
+  carried no role, so a session the cluster had granted *nothing* — which
+  0.38.4 made a legitimate state — was still shown the node roster, every
+  node's capacity, and the whole diagnostics tree. The old argument for leaving
+  it ungated (an importer watching an ingest needs cluster health) survives as
+  an implication instead: every capability implies `view_status`, exactly as
+  every capability already implied `media_viewer`. It is the weakest
+  capability — implied by everything, implying nothing — so granting it alone
+  makes health public without handing out media.
+- [x] **Implications resolve at mint, not only at write.** `verify()` and the
+  anonymous mint path expand the stored role set, so an account written before
+  a role existed gains it at its next login with no migration. Without this,
+  upgrading would have taken Status from every existing account until each was
+  edited by hand. Verified against the live table: no stored record carries
+  `view_status` and none needs to.
+- [x] **`GET /api/v1/health` (0.38.5).** Unauthenticated, role-free, answers
+  during recovery, and reports only whether this node is serving — no version,
+  no node id, no topology, because it is reachable by anyone wherever the API
+  is. It exists because things were reaching for `/api/v1/status` to answer a
+  question it was never the right route for.
+- [x] **The status/diagnostics split (0.39.1).** Diagnostics was 68% of the
+  live payload, but the locks were the larger cost: assembling it took one in
+  nearly every subsystem on the node, several held by the busy paths that make
+  someone open Status. It now lives at `GET /api/v1/status/diagnostics`, and
+  the light response names that route in `diagnostics_endpoint` so a client
+  reading the old shape finds a pointer rather than an `undefined`.
+- [x] **A latent gating bug fixed in passing.** `Service::handle_http`
+  dispatched Status *before* the role gate ran, so a `required_role()` entry
+  for it was unreachable. The 0.38.5 gating worked only because the dispatch
+  moved with it.
+
 ## One bad pack record no longer takes a backend offline — 0.38.3, deployed 2026-09-13
 
 Resolves the live incident this file's sibling `ACTIVE.md` opened with on

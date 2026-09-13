@@ -6,13 +6,29 @@ This is the authoritative, ordered backlog. Detailed plans and UAT records in
 this directory remain evidence; completed work belongs in `COMPLETED.md` and is
 not repeated here. Work top-to-bottom unless new evidence changes the order.
 
-**Start here if you are new to this work.** Read, in order: the P0 cluster
-section immediately below — the 2026-09-13 storage outage is resolved and all
-three nodes carry data again, but gbni-2 is stranded on 0.38.1 with no SSH
-route in — then "Cluster and repository state as of 2026-09-13" near the end of
-this file, which records node addresses, what is deployed where, what access
-actually works, and the uncommitted 0.38.3 work. Neither is a task list; both
-are things that will mislead you if you assume otherwise.
+**Start here if you are new to this work.** Read, in order:
+
+1. The **P0 cluster section** immediately below. The 2026-09-13 storage outage
+   is resolved and all three nodes carry data again; what is left is that
+   gbni-2 is stranded four releases behind with no SSH route in.
+2. **"What the four client sessions now depend on"** near the end of this file.
+   Seven API contracts were settled with the client sessions on 2026-09-13 and
+   exist nowhere else in this repository. Breaking one breaks four clients.
+3. **"Cluster and repository state as of 2026-09-13"**, which records node
+   addresses, what is deployed where, what access actually works, why the repo
+   version is ahead of the cluster's on purpose, and that nothing since 0.38.2
+   is pushed or tagged.
+
+None of the three is a task list; all three will mislead you if you assume
+otherwise.
+
+**The two things most worth picking up next**, if nothing else has changed:
+`rpc_cluster/test_concurrent_reads_during_divergence_produce_one_reconciliation`
+fails 40% of the time on both Pis, in isolation, at a metadata-divergence
+assertion — a reproducible lead, not a load flake, and either a racing test or
+a real dropped head. And the 10-second `/api/v1/status` under P1, where the
+obvious causes are now eliminated and one hypothesis is left standing with a
+five-second experiment written out for it.
 `2026-09-12-cluster-users-and-roles-plan.md` carries a "What actually shipped"
 section recording where that implementation diverged from its plan.
 
@@ -232,10 +248,18 @@ What the incident left behind:
   audio sounds, so it would pass. That remains a listening test, and the
   harness says so in its own header rather than implying coverage it lacks.
   Direct and Remux equivalents are not built yet.
-- [ ] **2. Split lightweight status from expensive diagnostics.**
-  `ClusterStatusService::status_response` (`src/status_api.cpp`) still
-  unconditionally computes and includes the full `diagnostics` object on
-  every ordinary `/api/v1/status` call — no opt-in/expensive split yet.
+- [x] **2. Split lightweight status from expensive diagnostics — shipped in
+  0.39.1, deployed 2026-09-13.** `/api/v1/status` is now `cluster`, `nodes`,
+  `startup`, `connectivity`, `subsystems` and nothing else; the tree moved to
+  `GET /api/v1/status/diagnostics` behind the same `view_status` role, and the
+  light response names that route in `diagnostics_endpoint`. Diagnostics was
+  68% of the payload live (10,091 of 14,914 bytes), but the locks were the
+  larger cost: reaching those numbers took one in nearly every subsystem,
+  several held by the busy paths that make someone open Status.
+  **The question that prompted it is still open** — see "Status took 10 s" in
+  P1 below. The split was deliberately also an experiment: a poll now takes
+  none of those locks, so if Status is still slow the cause is not in the
+  handler.
   (The other half of this item — `PlaybackManager::status()` holding the
   global session mutex while taking each session's subtitle-cache mutex —
   was confirmed and fixed in 0.24.2: `status()` no longer takes any
@@ -459,8 +483,37 @@ not inferred from docs. All are small and isolated; none require design work.
   whether this is intentional (FUSE is documented elsewhere as
   "loader/convenience traffic") or a real gap, and wire it up or remove the
   dead declaration.
-- [ ] **Two load-dependent test flakes needing a real fix, not another
-  isolation-pass shrug — second one found 2026-09-08.**
+- [ ] **`rpc_cluster/test_concurrent_reads_during_divergence_produce_one_reconciliation`
+  fails 40% of the time on aarch64, reproducibly, in isolation — found
+  2026-09-13. This is the flake worth fixing first, because unlike the three
+  below it does not need load to reproduce.** Measured on both Pis at
+  `--serial` with nothing else running: **4 failures in 10 runs on gbni-1, and
+  4 in 10 on es-1**. It has never failed on macOS/clang locally across many
+  full-suite runs, so it is aarch64/GCC or simply timing on slower hardware.
+  **Not caused by the 0.39.1 status split**, which was the suspicion when it
+  surfaced: es-1 was rebuilt with `src/status_api.*` and the three touched test
+  files reverted to their 0.39.0 contents and scored *the same* 4 in 10, so the
+  behaviour predates that change.
+  It fails at `tests/test_rpc_cluster.cpp:2831`,
+  `REQUIRE(accepted_heads().size() == 2)` — the setup assertion, before the
+  test's actual subject. The test hand-builds two sibling metadata heads at the
+  same generation on one node and expects both to still be accepted when it
+  looks. Sometimes only one is. The obvious candidate is that the node
+  reconciles the divergence on its own between `make_sibling` returning and
+  that line — which is precisely what the test then goes on to measure, so a
+  race against it is plausible without any product defect. The other candidate
+  is that a head is genuinely being dropped, which would be a real bug.
+  Deciding which needs someone to instrument `accepted_heads()` over the gap;
+  both answers are useful, and a 40% reproduction rate makes it cheap.
+- [ ] **Three load-dependent test flakes needing a real fix, not another
+  isolation-pass shrug — second found 2026-09-08, third 2026-09-13.**
+  The third is
+  `hydration_catalogue/test_ingest_pause_resume_and_cancel_still_work_under_a_worker_pool`,
+  which timed out at its full 60 s under four-way parallel load on es-1 during
+  the 0.38.3 and 0.38.5 rollouts and passed in `--serial` isolation at 364 ms
+  and 470 ms. Same shape as the two below; noted because the item named two
+  tests and there are now three, which starts to look like one shared cause
+  rather than three separate races.
   - `hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`
     has now failed under parallel-suite load and passed in isolation on at
     least five separate occasions across this project's history (three plan
@@ -793,6 +846,42 @@ throughput, heap-audit and ownership documents remain detailed evidence but are
 absorbed here rather than separate active programmes.
 
 ## P1 — Cluster connectivity, status and operations
+
+- [ ] **`GET /api/v1/status` took 10 seconds once — observed by the operator
+  2026-09-13, cause not found, and the obvious suspects are eliminated.**
+  What was ruled out by reading the code and measuring the live nodes, so that
+  nobody spends the time again:
+  - **It is not the handler computing.** `status_response` does no I/O and
+    makes no network call; every field is an atomic, an in-memory snapshot or
+    a short-held mutex. Ten seconds is a *wait*.
+  - **It is not connectivity or UPnP.** Status copies a cached
+    `PublicConnectivityStatus`; only `POST /status/connectivity/check` probes.
+    Confirmed against the journal — no connectivity or UPnP activity at all in
+    the two hours around the observation.
+  - **It is not the FUSE or metadata diagnostics providers.**
+    `FuseFrontend::diagnostics()` is ~60 relaxed atomic loads and `noexcept`;
+    `MetadataManager::cluster_status()` is atomics.
+  - **It is no longer the diagnostics locks**, because 0.39.1 moved them off
+    the polled route entirely. That is the experiment: if it recurs now, the
+    cause is not inside the handler.
+  **The remaining hypothesis, untested: HTTP worker starvation.** The API has
+  16 workers and a 15 s `keep_alive_idle_timeout`. A worker that has answered a
+  request and is waiting for the next one on a kept-alive connection blocks in
+  `recv_before` for up to that long, pinned. `queue_has_backlog()` exists to
+  close a connection rather than keep it alive when others are waiting, but it
+  is only consulted *between* requests — never while a worker is already
+  blocked waiting. Ten seconds sits inside that 15 s window, and three client
+  families each holding connections would do it. There was exactly one
+  established connection per node when measured, which is consistent with an
+  intermittent fault under client load rather than a standing one.
+  **The five-second test that tells them apart**, next time it is slow: hit
+  `/api/v1/health` and `/api/v1/status` on the same node. Health touches two
+  atomics and is ungated, so *both slow* means the request never reached a
+  handler and it is the worker pool; *health fast, status slow* means it is
+  inside the handler and deserves gdb stacks.
+  Instrumentation was offered and not built: per-section `elapsed_ms` in the
+  diagnostics assembly, plus slow-request logging in the HTTP layer. For an
+  intermittent fault that is what converts "saw it once" into an answer.
 
 - [ ] **`test_storage_data_credit_reserves_viewer_headroom_and_control` hangs
   on aarch64 — pre-existing on HEAD, confirmed not from the 0.36.0 work
@@ -1185,6 +1274,51 @@ work needed for any of these.
   separate docs and a `COMPLETED.md` entry recording them as done). Reconcile
   the checkboxes with the ledger so this file stops contradicting itself.
 
+## What the four client sessions now depend on (settled 2026-09-13)
+
+Negotiated with the `@machafoundation/core` session and relayed by it to the
+web, Android TV and mobile clients. None of it exists anywhere else in this
+repository, and a server change that breaks one of these breaks four clients at
+once. Recorded here because the conversation that settled them was
+cross-session and will not be in the next session's context.
+
+- **`GET /api/v1/health` is the liveness contract.** No token, no role, works
+  during recovery. `200 {"status":"ok"}` when serving, `503` with `starting` or
+  `failed` when not, and the HTTP status carries the same answer as the body.
+  Core probes it every 10 s for latency ranking, failover and the endpoint
+  pre-save gate. It must stay unauthenticated and must keep reporting nothing
+  else: no version, no node id, no topology.
+- **An old node answers `401`, not `404`**, to that route, because
+  authentication happens before routing. Core falls back to
+  `/api/v1/catalogue/status` on *any* answer that is not a liveness answer,
+  which retires itself once no node needs it. This fact is why a 404-only
+  fallback would have fired on every node except the one that needs it.
+- **`view_status` gates the Status screen and nothing operational.** It is in
+  core's `UserRole` and `USER_ROLES` with a test pinning the order. Health,
+  ranking, failover and the connection gate are all indifferent to it.
+- **A role-less session gets `403` from `/api/v1/status`, never a reduced
+  payload.** There is no reduced-view code path; the gate is above the handler.
+  Two client reports of "200 with an empty roster" were gbni-2 (ungated 0.38.1)
+  misattributed to gbni-1 — see the endpoint-attribution note below.
+- **`/api/v1/status` no longer carries `diagnostics`** (0.39.1). Core never
+  typed that block, so it is unaffected; a client whose Status screen reads
+  diagnostics needs `/api/v1/status/diagnostics`.
+- **`GET /api/v1/session` needs a session and no role**, and re-checks
+  `credential_generation` on every request, so it catches revocation and not
+  only expiry. A `401` there can mean the account changed underneath the token;
+  a client must not tell a viewer their session merely timed out.
+- **A PATCH naming `mode` clears `video`, `audio`, `max_height` and
+  `max_bitrate`** (`playback.cpp:248`). Unchanged since 0.34.0 and confirmed
+  against 0.39.1. Android TV has been told to delete its local rule; if they
+  can produce a refusal from a body containing `mode` and nothing else, that is
+  a real regression and should be treated as one.
+- **A role-less session learning no cluster membership is correct**, per the
+  operator: such a session sees only the endpoint it was configured with.
+- **Record which host served a measurement before reporting it.** Two separate
+  client reports today were gbni-2 attributed to gbni-1, and the retracted
+  DTS/TrueHD investigation in September was the same mistake at larger scale.
+  The node is in the URL; there is no excuse for losing it.
+
 ## Cluster and repository state as of 2026-09-13
 
 Facts a new session needs before touching anything. None of this is a task.
@@ -1201,18 +1335,26 @@ SSH to gbni-1 and es-1 is filtered from outside — port 22 is refused or times
 out from both a laptop and from gbni-2 — so a session with no LAN route can
 reach only whatever nodes happen to be exposed.
 
-**Versions deployed (2026-09-13, after the 0.38.5 rollout).** gbni-1 and
-es-1 run **0.38.5**, built on each node from the synced tree and verified
-byte-identical (`libmacha_core.so` sha256 966e3b2e…, GCC 14.2.0 on both; the
-`macha` binary is a thin main and is unchanged across these releases). The full
-suite passed on es-1 under GCC: 423 + 9, with one known load-flake
-(`test_ingest_pause_resume_and_cancel_still_work_under_a_worker_pool`, 364 ms
-in `--serial` isolation against a 60 s timeout under four-way load — add it to
-the flake list under P0 verified defects, which currently names two other
-tests). gbni-2 is still on **0.38.1** and cannot be reached — see the P0 item
-above. It is now three releases behind and is the only node where
-`/api/v1/status` is ungated, where anonymous can be given a password, and
-where `/api/v1/health` 404s.
+**Versions deployed (2026-09-13, after the 0.39.1 rollout).** gbni-1 and es-1
+run **0.39.1** (`libmacha_core.so` sha256 72cb8162…, GCC 14.2.0, built on each
+node from the synced tree; the `macha` binary is a thin main and is unchanged
+across these releases). Verified live on both after the rollout:
+`/api/v1/health` 200 `{"status":"ok"}` unauthenticated, `/api/v1/status` and
+`/api/v1/status/diagnostics` both 403 to the cluster's role-less anonymous
+session.
+
+**The repository is at 0.40.0 and the cluster is at 0.39.1. That is correct,
+not drift.** 0.40.0 is open and unreleased — no code sits between the two. It
+was bumped because 0.39.1 removed a field from a response clients poll, which
+is a breaking client-visible change that a patch number understated; the next
+piece of work starts on 0.40.0. Redeploying purely so the nodes report the new
+string is cosmetic and was deliberately not done, since a rolling restart costs
+a viewer interruption.
+
+**gbni-2 is now four releases behind** and cannot be reached — see the P0 item
+above. It is the only node where `/api/v1/status` is ungated and still carries
+`diagnostics`, where `anonymous` can be given a password, and where
+`/api/v1/health` answers 401.
 
 **Live account roles, for anyone reading the gating.** The stored records are
 `tom` and `root` (manage_users, manager, importer, media_viewer), `bryan`
@@ -1242,12 +1384,23 @@ is not evidence: 0.38.0 shipped two defects that only GCC caught (a missing
 initialisers). And do not run the suite concurrently with itself on a four-core
 node — it produces failures that vanish in isolation and wastes the signal.
 
-**Repository.** `main` is pushed and carries 0.38.1; 104 backfilled tags are
-pushed. Work since is on a local branch `work-0.38.2` with four unpushed
-commits — 0.38.2, the torrent bind fix, 0.38.3 (pack recovery) and 0.38.4
-(anonymous account) — and one unpushed tag. Everything committed is deployed
-and running on gbni-1 and es-1. Pushing is the operator's call.
-`CLAUDE.md` in the repo root is the operator's and is deliberately untracked.
+**Repository.** `main` is pushed and carries 0.38.1; 105 tags are pushed, the
+newest being 0.38.2. Work since is on a local branch `work-0.38.2`, unpushed:
+0.38.2 and the torrent bind fix, then 0.38.3 (pack recovery), 0.38.4 (anonymous
+account), 0.38.5 (`view_status` and `/api/v1/health`), 0.39.0 (a line under the
+0.38 series), 0.39.1 (the status/diagnostics split) and 0.40.0. Nothing since
+0.38.2 is tagged. Everything through 0.39.1 is deployed and running on gbni-1
+and es-1. **Pushing and tagging are the operator's call and have not been
+done.** `CLAUDE.md` in the repo root is the operator's and is deliberately
+untracked.
+
+**Commit messages carry no attribution trailers**, by standing instruction. All
+256 commits on every ref were scanned on 2026-09-13 for `Co-Authored-By`,
+`Claude-Session`, `Generated with`, `anthropic` and `claude.ai` — in messages,
+in parsed trailers, in history diffs, in both branch tips and in all 105 tag
+messages. Zero found; nothing was rewritten. The only matches were a legitimate
+`.gitignore` commit for Claude Code's machine-local settings and a dated UAT
+log describing that session's own rules.
 
 **A branching convention was relayed on 2026-09-13** by the mobile-app session,
 attributed to the operator: work on a long-lived `develop`, releases tagged on
