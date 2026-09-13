@@ -123,12 +123,13 @@ bool incoming_wins(const UserRecord& existing, const UserRecord& incoming) {
 
 std::vector<std::string> all_roles() {
     return {std::string(role_manage_users), std::string(role_manager),
-            std::string(role_importer), std::string(role_media_viewer)};
+            std::string(role_importer), std::string(role_media_viewer),
+            std::string(role_view_status)};
 }
 
 bool known_role(std::string_view role) {
     return role == role_media_viewer || role == role_importer || role == role_manager ||
-           role == role_manage_users;
+           role == role_manage_users || role == role_view_status;
 }
 
 bool reserved_username(std::string_view username) {
@@ -147,6 +148,13 @@ std::vector<std::string> expand_roles(const std::vector<std::string>& roles) {
     const bool manager = holds(role_manager);
     const bool importer = holds(role_importer);
     const bool viewer = manage_users || manager || importer || holds(role_media_viewer);
+    // Seeing cluster health is implied by every capability, for the same
+    // reason reading is: an importer watching an ingest, or a manager repairing
+    // the cluster, cannot do the job blind, and the status screen earns its
+    // place exactly when things are going wrong. It is deliberately not part of
+    // the disjunction above -- granting view_status alone must not hand out
+    // media access.
+    const bool view_status = viewer || holds(role_view_status);
 
     std::vector<std::string> out;
     // An unknown role is carried through rather than dropped: nothing grants it
@@ -164,6 +172,8 @@ std::vector<std::string> expand_roles(const std::vector<std::string>& roles) {
         out.emplace_back(role_importer);
     if (viewer)
         out.emplace_back(role_media_viewer);
+    if (view_status)
+        out.emplace_back(role_view_status);
     return out;
 }
 
@@ -290,7 +300,11 @@ UserCredentialCheck UserStore::verify(std::string_view username,
     }
     if (!constant_time_equal(candidate.bytes, user->password_hash.bytes))
         return {};
-    return {true, user->id, user->roles, user->credential_generation};
+    // Expanded here, not merely as stored: implications are a derivation of the
+    // granted set, so one added in a later version applies to accounts written
+    // before it without rewriting the table. Idempotent for anything create()
+    // or update() already expanded.
+    return {true, user->id, expand_roles(user->roles), user->credential_generation};
 }
 
 std::optional<UserRecord> UserStore::find(std::string_view user_id) const {

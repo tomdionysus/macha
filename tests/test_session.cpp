@@ -43,9 +43,16 @@ MACHA_FAST_TEST("session", test_session_create_and_validate) {
     CHECK(!body.find("token")->asString().empty());
     REQUIRE(body.find("roles")->isArray());
     // Anonymous is read-only at genesis, and what it may do is that account's
-    // roles rather than a config key.
-    REQUIRE(body.find("roles")->asArray().size() == 1);
-    CHECK(body.find("roles")->asArray().front().asString() == "media_viewer");
+    // roles rather than a config key: media_viewer as granted, plus the
+    // view_status every capability implies.
+    const auto& minted_roles = body.find("roles")->asArray();
+    REQUIRE(minted_roles.size() == 2);
+    const auto holds = [&](std::string_view role) {
+        return std::any_of(minted_roles.begin(), minted_roles.end(),
+                           [&](const Json& value) { return value.asString() == role; });
+    };
+    CHECK(holds("media_viewer"));
+    CHECK(holds("view_status"));
     // An anonymous session is bound to the anonymous account like any other.
     CHECK(body.find("user_id")->asString() == anonymous.id);
     CHECK(body.find("expires_unix_ms")->asUInt64() > body.find("created_unix_ms")->asUInt64());
