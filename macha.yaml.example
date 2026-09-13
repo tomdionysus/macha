@@ -491,6 +491,18 @@ torrent:
   pex: true
   lsd: true
 
+  # libtorrent maps its own listen port on the router. Both default on inside
+  # libtorrent, and until these keys existed it did so no matter what the rest
+  # of this file said -- a node with network.upnp.enabled false still had a
+  # 6881 mapping created that nothing here mentioned and nothing could refuse.
+  #
+  # These are deliberately separate from network.upnp, which maps the cluster
+  # RPC port through Macha's own UPnP client: different ports, different
+  # reasons, and you may want one without the other. Turn both off if you
+  # forward 6881 by hand, or if the router's UPnP is not to be trusted.
+  upnp: true
+  natpmp: true
+
   # Search providers are server-side only. Torznab responses are reduced to
   # typed result fields and acquisition URLs remain opaque to the frontend.
   search:

@@ -122,6 +122,10 @@ lt::session_params make_session_params(const TorrentConfig& config, std::string_
     settings.set_int(lt::settings_pack::active_seeds, 0);
     settings.set_bool(lt::settings_pack::enable_dht, config.dht);
     settings.set_bool(lt::settings_pack::enable_lsd, config.lsd);
+    // Stated rather than inherited from libtorrent's defaults. See
+    // TorrentConfig::upnp for why these are separate from network.upnp.
+    settings.set_bool(lt::settings_pack::enable_upnp, config.upnp);
+    settings.set_bool(lt::settings_pack::enable_natpmp, config.natpmp);
     if (config.max_download_rate)
         settings.set_int(lt::settings_pack::download_rate_limit,
                          static_cast<int>(std::min<uint64_t>(config.max_download_rate, INT_MAX)));

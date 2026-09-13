@@ -494,6 +494,8 @@ void parse_torrent(const YAML::Node& root, Config& c) {
     if (torrent["dht"]) c.torrent.dht = torrent["dht"].as<bool>();
     if (torrent["pex"]) c.torrent.pex = torrent["pex"].as<bool>();
     if (torrent["lsd"]) c.torrent.lsd = torrent["lsd"].as<bool>();
+    if (torrent["upnp"]) c.torrent.upnp = torrent["upnp"].as<bool>();
+    if (torrent["natpmp"]) c.torrent.natpmp = torrent["natpmp"].as<bool>();
     if (auto search = torrent["search"]) {
         if (auto providers = search["providers"]) {
             // YAML `providers:` with only commented examples is a null node.

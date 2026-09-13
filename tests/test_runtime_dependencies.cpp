@@ -336,6 +336,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "    delete_owned_source_on_cancel: false\n"
             << "torrent:\n"
             << "  enabled: " << torrent_enabled << "\n"
+            << "  upnp: false\n"
+            << "  natpmp: false\n"
             << "  search:\n"
             << "    providers:\n"
             << "session:\n"
@@ -499,6 +501,15 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(!yc.ingest.delete_owned_source_on_cancel);
     CHECK(yc.torrent.enabled == (std::string_view(torrent_enabled) == "true"));
     CHECK(yc.torrent.search_providers.empty());
+    // libtorrent maps its own listen port and both of these default to on
+    // inside libtorrent, so before they were exposed the session did it
+    // whatever the configuration said. Assert they are actually read: an
+    // unread key is indistinguishable from one that works until a router
+    // gets an unexpected mapping.
+    CHECK(!yc.torrent.upnp);
+    CHECK(!yc.torrent.natpmp);
+    CHECK(Config{}.torrent.upnp);
+    CHECK(Config{}.torrent.natpmp);
     CHECK(!yc.session.allow_anonymous);
     CHECK(yc.session.max_users == 128);
     CHECK(yc.session.max_concurrent_password_checks == 3);

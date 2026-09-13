@@ -1,5 +1,32 @@
 # Current release
 
+## 0.38.2 — libtorrent's port mapping is stated, not assumed (development)
+
+libtorrent maps its own listen port with UPnP and NAT-PMP, and both default to
+on inside libtorrent. Macha set `enable_dht` and `enable_lsd` from
+configuration but never touched these, so the session created router mappings
+regardless of what the rest of the configuration said: a node with
+`network.upnp.enabled: false` still had libtorrent mapping 6881, which no
+setting mentioned and nothing could refuse.
+
+New `torrent.upnp` and `torrent.natpmp`, both defaulting to true — which is
+what libtorrent was doing anyway, so no node changes behaviour. The point is
+that it is now refusable, and visible to anyone reading the configuration.
+
+They are deliberately separate from `network.upnp`, which maps the cluster RPC
+port through Macha's own miniupnpc client. The two map different ports for
+different reasons and an operator may reasonably want one without the other;
+inheriting would have silently changed what a node does on upgrade.
+
+Found while diagnosing torrents that loaded and then froze. The freeze itself
+was `torrent_listen_interfaces()` handing libtorrent the node's advertised
+address after that address became a public DNS name: `listen_interfaces` takes
+an IP or a device, never a hostname, so the session bound nothing at all and
+sat in `dl metadata` for ever with no error — the same silence 0.37.2 was
+written to remove, from a new cause. Two nodes were unwedged by setting
+`torrent.listen_interfaces` explicitly; the derivation itself is not yet
+fixed.
+
 ## 0.38.1 — Version bump (development)
 
 No functional change since 0.38.0. The version is incremented so the build
