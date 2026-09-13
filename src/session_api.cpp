@@ -100,7 +100,8 @@ CredentialResult PasswordCredentialValidator::validate(const Json& credentials) 
         // refuses it. Until 0.38.4 an empty role list was reported as
         // `disabled`, which told a client "log in" when the truthful answer
         // was "you are in, and this cluster grants visitors nothing".
-        return {CredentialOutcome::ok, {user->roles, user->id, user->credential_generation}};
+        return {CredentialOutcome::ok,
+                {expand_roles(user->roles), user->id, user->credential_generation}};
     }
 
     const auto* username = credentials.find("username");

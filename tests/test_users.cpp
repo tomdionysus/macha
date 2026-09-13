@@ -49,13 +49,14 @@ std::string json_body(const HttpResponse& response) {
 } // namespace
 
 MACHA_FAST_TEST("users", test_roles_are_capabilities_not_a_ladder) {
-    // The one implication is that every role can read; nothing else implies
-    // anything. Importing torrents must not carry the right to delete the
-    // catalogue, and managing the catalogue must not carry the right to hand
-    // out accounts.
+    // Two implications, both downward: every capability can read media and see
+    // cluster health. Nothing else implies anything. Importing torrents must
+    // not carry the right to delete the catalogue, and managing the catalogue
+    // must not carry the right to hand out accounts.
     auto importer = expand_roles({std::string(role_importer)});
-    CHECK(importer.size() == 2);
+    CHECK(importer.size() == 3);
     CHECK(std::count(importer.begin(), importer.end(), role_media_viewer) == 1);
+    CHECK(std::count(importer.begin(), importer.end(), role_view_status) == 1);
     CHECK(std::count(importer.begin(), importer.end(), role_manager) == 0);
     CHECK(std::count(importer.begin(), importer.end(), role_manage_users) == 0);
 
@@ -67,14 +68,22 @@ MACHA_FAST_TEST("users", test_roles_are_capabilities_not_a_ladder) {
     CHECK(std::count(manage_users.begin(), manage_users.end(), role_manager) == 0);
 
     auto viewer = expand_roles({std::string(role_media_viewer)});
-    CHECK(viewer.size() == 1);
+    CHECK(viewer.size() == 2);
+    CHECK(std::count(viewer.begin(), viewer.end(), role_view_status) == 1);
+
+    // view_status is the weakest capability: implied by everything, implying
+    // nothing. Granting it alone must not hand out media.
+    auto status_only = expand_roles({std::string(role_view_status)});
+    CHECK(status_only.size() == 1);
+    CHECK(std::count(status_only.begin(), status_only.end(), role_view_status) == 1);
+    CHECK(std::count(status_only.begin(), status_only.end(), role_media_viewer) == 0);
 
     // root holds every capability explicitly, not by implication.
     auto root = expand_roles(all_roles());
-    CHECK(root.size() == 4);
+    CHECK(root.size() == 5);
 
     // Already-expanded input must not duplicate.
-    CHECK(expand_roles(expand_roles(all_roles())).size() == 4);
+    CHECK(expand_roles(expand_roles(all_roles())).size() == 5);
 }
 
 MACHA_FAST_TEST("users", test_user_merge_is_deterministic_and_commutative) {
@@ -460,9 +469,11 @@ MACHA_FAST_TEST("users", test_genesis_creates_root_and_anonymous_once) {
     // No recovery key is issued, and root carries no envelope.
     CHECK(genesis->recovery_key.empty());
     CHECK(!genesis->root.recovery.present());
-    CHECK(genesis->root.roles.size() == 4);
-    CHECK(genesis->anonymous.roles.size() == 1);
+    CHECK(genesis->root.roles.size() == 5);
+    // media_viewer as granted, plus the view_status it implies.
+    CHECK(genesis->anonymous.roles.size() == 2);
     CHECK(user_has_role(genesis->anonymous, role_media_viewer));
+    CHECK(user_has_role(genesis->anonymous, role_view_status));
     CHECK(store.verify(root_username, genesis->password).ok);
     // Anonymous is created with no credential at all rather than a random
     // password nobody is told: there is nothing to leak, nothing to guess, and
@@ -646,8 +657,8 @@ MACHA_FAST_TEST("users", test_users_api_requires_admin_and_hides_hashes) {
     CHECK(json_body(created).find("long-enough-pw") == std::string::npos);
     CHECK(json_body(created).find("salt") == std::string::npos);
     CHECK(json_body(created).find("password_hash") == std::string::npos);
-    // manager plus the media_viewer every role implies.
-    CHECK(body.find("roles")->asArray().size() == 2);
+    // manager plus the media_viewer and view_status every role implies.
+    CHECK(body.find("roles")->asArray().size() == 3);
     // The record carries its LWW counter for optimistic concurrency.
     CHECK(body.find("version")->asUInt64() == 1);
     // An ordinary account may be renamed and deleted; the client is told so
@@ -1006,7 +1017,7 @@ MACHA_FAST_TEST("users", test_an_upgraded_cluster_announces_that_it_has_no_accou
     REQUIRE(created.has_value());
     CHECK(created->root.username == root_username);
     CHECK(created->anonymous.username == anonymous_username);
-    CHECK(created->root.roles.size() == 4);
+    CHECK(created->root.roles.size() == 5);
 
     // And now anonymous access works again, without a restart.
     CHECK(validator.validate(Json(Json::Object{})).outcome == CredentialOutcome::ok);
@@ -1014,6 +1025,86 @@ MACHA_FAST_TEST("users", test_an_upgraded_cluster_announces_that_it_has_no_accou
     // Running it twice is refused rather than minting a second root.
     CHECK(!create_initial_accounts(node.users(), cluster.keys(), dir.path(),
                                    node.node_id()).has_value());
+}
+
+// Implications are resolved when a session is minted, not only when a record is
+// written. An account created before view_status existed holds roles that never
+// mention it, and must still see cluster health -- otherwise upgrading takes the
+// diagnostic screen away from every existing account until someone edits them
+// all, which is the worst possible moment to lose it.
+MACHA_FAST_TEST("users", test_role_implications_reach_accounts_written_before_them) {
+    TestCluster cluster;
+    NodeRuntime node(cluster.node_config("n1"), cluster.keys());
+    auto created = node.users().create("olduser", "a-long-enough-pw",
+                                       {std::string(role_manager)}, node.node_id());
+    REQUIRE(created.has_value());
+
+    // Rewrite the record the way a pre-0.38.5 node would have stored it: the
+    // granted role plus the media_viewer of the day, and no view_status.
+    auto legacy = *created;
+    legacy.roles = {std::string(role_manager), std::string(role_media_viewer)};
+    legacy.version = created->version + 1;
+    REQUIRE(node.users().apply(legacy));
+    auto stored = node.users().find(created->id);
+    REQUIRE(stored.has_value());
+    CHECK(!user_has_role(*stored, role_view_status));
+
+    auto check = node.users().verify("olduser", "a-long-enough-pw");
+    REQUIRE(check.ok);
+    CHECK(std::count(check.roles.begin(), check.roles.end(), role_view_status) == 1);
+    CHECK(std::count(check.roles.begin(), check.roles.end(), role_manager) == 1);
+    // Still no widening beyond the documented implications.
+    CHECK(std::count(check.roles.begin(), check.roles.end(), role_manage_users) == 0);
+}
+
+// Cluster health is a capability like any other. A session the cluster granted
+// nothing must not be shown the node roster, capacities and diagnostics -- and
+// an operator who wants that public says so by granting view_status, rather
+// than by the route having no gate at all.
+MACHA_TEST("users", test_status_needs_view_status_and_health_needs_nothing) {
+    TestService fixture("status-role");
+    fixture.config().catalogue.api.enabled = true;
+    fixture.config().catalogue.api.port = free_port();
+    auto& service = fixture.start();
+    const auto port = fixture.config().catalogue.api.port;
+
+    const auto token_for = [&](std::vector<std::string> roles) {
+        auto minted = service.node().sessions().create(expand_roles(roles));
+        REQUIRE(minted.has_value());
+        return std::map<std::string, std::string>{
+            {"Authorization", "Bearer " + minted->bearer_token}};
+    };
+
+    // What a roles-less anonymous session is in a registered-users-only
+    // deployment: a real session that may do nothing.
+    auto refused = raw_http_get(port, "/api/v1/status", token_for({}));
+    CHECK(refused.find("403") != std::string::npos);
+    CHECK(refused.find("view_status") != std::string::npos);
+
+    // Granting it alone is enough for health, and grants nothing else.
+    auto allowed = raw_http_get(port, "/api/v1/status",
+                                token_for({std::string(role_view_status)}));
+    CHECK(allowed.find("200") != std::string::npos);
+    auto media_refused = raw_http_get(port, "/api/v1/catalogue/items",
+                                      token_for({std::string(role_view_status)}));
+    CHECK(media_refused.find("403") != std::string::npos);
+
+    // And every other capability implies it, so nobody who could see status
+    // before loses it.
+    auto importer = raw_http_get(port, "/api/v1/status",
+                                 token_for({std::string(role_importer)}));
+    CHECK(importer.find("200") != std::string::npos);
+
+    // Liveness is a separate route with no token at all, because the things
+    // that ask it -- a load balancer, an uptime monitor, a client choosing an
+    // endpoint -- have no session and should not need one. It says whether this
+    // node is serving and nothing else: no version, no node id, no topology.
+    auto health = raw_http_get(port, "/api/v1/health");
+    CHECK(health.find("200") != std::string::npos);
+    CHECK(health.find("\"status\":\"ok\"") != std::string::npos);
+    CHECK(health.find("node") == std::string::npos);
+    CHECK(health.find("capacity") == std::string::npos);
+    CHECK(health.find("version") == std::string::npos);
 }
 
 MACHA_TEST("users", test_a_peer_that_joins_after_the_announcement_converges) {

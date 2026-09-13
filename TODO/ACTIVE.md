@@ -1006,8 +1006,18 @@ that report.
   expressed, and the client needs the empty list to know to show a login.
   Details in `CHANGELOG.md` under 0.38.4.
 
-- [ ] **Status has no role of its own — requested by the operator via the web
-  client session, 2026-09-13, not designed.** The client gated its Status
+- [x] **Status has no role of its own — requested by the operator via the web
+  client session, 2026-09-13; shipped in 0.38.5 as `view_status`, with
+  `/api/v1/health` added for liveness.** The operator's decision on the crux
+  below was that Status *should* be gated: an anonymous visitor sees cluster
+  health only if the anonymous account holds `view_status`, which it might not.
+  Anything using `/api/v1/status` as a health check was using the wrong route,
+  so there is now a right one — unauthenticated, role-free, and reporting only
+  whether this node is serving. The upgrade problem was solved by resolving
+  role implications at mint rather than only at write, so existing accounts
+  gain the role on their next login with no migration. Details in
+  `CHANGELOG.md` under 0.38.5.
+  **Original framing, kept because the reasoning is the record:** The client gated its Status
   section on `manager`, which takes the diagnostic screen away from an ordinary
   viewer at exactly the moment it earns its place; leaving it ungated shows it
   to a session the server granted nothing. The capability being asked about is

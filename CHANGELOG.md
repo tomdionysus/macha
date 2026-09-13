@@ -1,5 +1,62 @@
 # Current release
 
+## 0.38.5 — Cluster health is a capability, and liveness is its own route (development)
+
+`/api/v1/status` carried no role. The argument for that was sound as far as it
+went — an importer watching an ingest is the person who most needs to know
+whether the cluster is healthy, and gating the diagnostic screen behind
+`manager` takes it away at exactly the moment it earns its place. What it could
+not express is the other case: a session the cluster granted *nothing* — a
+roles-less `anonymous` session, which 0.38.4 made a legitimate and useful state
+— was still shown the node roster, every node's capacity and usage, the
+metadata generation, subsystem states and the whole diagnostics tree.
+
+**New role `view_status`**, and the status routes now require it. The old
+argument is kept as an implication rather than as an absent gate: every
+capability implies `view_status`, exactly as every capability already implied
+`media_viewer`, so no account that could see health before loses it. It is the
+weakest capability — implied by everything, implying nothing — so granting it
+alone is how an operator makes cluster health public without handing out media.
+An account granted nothing has it too: nothing.
+
+- `GET /api/v1/status` and `/api/v1/status/*` require `view_status`.
+  `POST .../connectivity/check` requires `manager`: it is not a read, it makes
+  this node dial every peer on the caller's say-so.
+- **Implications are now resolved at mint, not only at write.** `verify()` and
+  the anonymous mint path run `expand_roles()` over the stored set, so an
+  account written before `view_status` existed gets it on its next login with
+  no migration and no rewrite of the user table. Without this, upgrading would
+  have taken Status away from every existing account until each was edited by
+  hand.
+- Genesis `root` gains it (`all_roles()`), and it is grantable through the
+  users API like any other role.
+
+**New route `GET /api/v1/health`**, unauthenticated and role-free, for the
+things that were reaching for `/api/v1/status` to answer a question it was
+never the right route for: is this node serving. `200 {"status":"ok"}` when it
+is, `503 {"status":"starting"}` or `{"status":"failed"}` when it is not — the
+HTTP status carries the same answer as the body, so a probe that parses nothing
+still works. It deliberately reports nothing else: it is reachable wherever the
+API is reachable, by anyone, so it carries no version, no node identity and no
+topology. Anything beyond liveness is a question about the cluster and needs
+the capability that says so.
+
+One ordering bug fixed in passing: `handle_http` dispatched Status *before* the
+role gate ran, so a `required_role()` entry for it would have been unreachable
+had one existed. Status now dispatches after the gate, and still ahead of the
+services-ready check — a node that is still recovering is exactly when it is
+asked what is wrong.
+
+- Tests: `test_status_needs_view_status_and_health_needs_nothing` (roles-less
+  session refused with the role named, `view_status` alone admitted to status
+  and refused media, an importer still admitted, and health answered with no
+  token and nothing in it), `test_role_implications_reach_accounts_written_before_them`
+  (a record rewritten the way a pre-0.38.5 node stored it still gains the role
+  at mint, with no other widening), and the role-implication cases in
+  `test_roles_are_capabilities_not_a_ladder`.
+- **Clients must stop using `/api/v1/status` as a health check.** It now needs
+  a session *and* a role; `/api/v1/health` needs neither.
+
 ## 0.38.4 — Anonymous has no password, and no roles is not the same as disabled (development)
 
 Two things about the `anonymous` account were wrong, and they were the same

@@ -175,22 +175,28 @@ std::string_view Service::required_role(const HttpRequest& request) {
     const bool mutating = request.method == "POST" || request.method == "PUT" ||
                           request.method == "PATCH" || request.method == "DELETE";
 
-    // Two routes deliberately require a valid session and no role at all.
-    //
     // A session is the caller's own to mint, read and revoke, so gating it
-    // would mean needing a role to find out which roles you have. GET here is
-    // also what a client uses to ask "is my token still live, and is this node
-    // up" -- it must answer for every account, including one that holds only
-    // manage_users, or a client's health probing silently stops working for
-    // that person and reports nothing.
-    //
-    // Cluster status is the same argument from the other direction: the person
-    // most likely to be watching an ingest is the one who most needs to see
-    // whether the cluster is healthy, and an importer-only account would
-    // otherwise be told nothing.
-    if (request.path == "/api/v1/session" || request.path == "/api/v1/status" ||
-        request.path.starts_with("/api/v1/status/"))
+    // would mean needing a role to find out which roles you have. It is the one
+    // route that requires a valid session and no role at all.
+    if (request.path == "/api/v1/session")
         return {};
+
+    // Cluster and node health. Until 0.38.5 this carried no role, on the
+    // argument that an importer watching an ingest is the person who most needs
+    // it -- which is right, and is now expressed as an implication in
+    // expand_roles() instead: every capability implies view_status, so that
+    // account still sees it. What carrying no role could not express is the
+    // other case: an account the cluster granted nothing -- a roles-less
+    // anonymous session in a registered-users-only deployment -- was still
+    // shown the cluster's topology, node names, capacities and diagnostics.
+    //
+    // Liveness probing is not this route. /api/v1/health answers that with no
+    // token and no role; anything wanting more than "is this node serving" is
+    // asking about the cluster and needs the capability that says so.
+    if (request.path == "/api/v1/status" || request.path.starts_with("/api/v1/status/"))
+        // A connectivity check is not a read: it makes this node dial every
+        // peer on the caller's say-so.
+        return mutating ? role_manager : role_view_status;
 
     // Managing accounts. "me" is the exception: everyone may change their own
     // password, and UsersApi refuses a role change made that way.
@@ -214,11 +220,18 @@ std::string_view Service::required_role(const HttpRequest& request) {
 }
 
 HttpResponse Service::handle_http(const HttpRequest& request) {
-    if (request.path == "/api/v1/status" || request.path.starts_with("/api/v1/status/"))
-        return cluster_status_.handle(request);
+    // Liveness, for anything that needs to know whether this node is serving
+    // before it has a token -- a load balancer, an uptime monitor, a client
+    // choosing an endpoint. Deliberately says nothing else: it is reachable
+    // unauthenticated from wherever the API is reachable, so it carries no
+    // version, no node identity and no topology. Everything beyond "is this
+    // node serving" is a question about the cluster and lives behind
+    // /api/v1/status and the view_status role.
+    if (request.path == "/api/v1/health")
+        return health_response();
     // Session creation/introspection must work while local services are
-    // still recovering, same reasoning as Status above -- the control plane
-    // is already online long before local storage/metadata finish recovery.
+    // still recovering -- the control plane is online long before local
+    // storage and metadata finish recovery.
     if (request.path == "/api/v1/session")
         return session_api_.handle(request);
 
@@ -227,6 +240,13 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
                                                               request.session->roles.end(), role))
         return http_error(403, "forbidden",
                           "this action requires the '" + std::string(role) + "' role");
+
+    // After the gate, not before it: dispatching Status first was what made its
+    // required_role() unreachable. It stays ahead of the services_ready_ check
+    // below, because a node that is still recovering is exactly when it is
+    // asked what is wrong.
+    if (request.path == "/api/v1/status" || request.path.starts_with("/api/v1/status/"))
+        return cluster_status_.handle(request);
 
     // Account management does not depend on local storage or metadata, for the
     // same reason session creation does not: an operator must be able to fix
@@ -415,9 +435,29 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
     return catalogue_api_->handle(request);
 }
 
+HttpResponse Service::health_response() const {
+    // Three states, and the HTTP status carries the same answer as the body so
+    // a probe that reads neither JSON nor anything else still works: 200 means
+    // this node is serving, 503 means it is not yet (or will not without
+    // intervention).
+    std::string_view state = "ok";
+    int status = 200;
+    if (startup_failed_.load(std::memory_order_acquire)) {
+        state = "failed";
+        status = 503;
+    } else if (!services_ready_.load(std::memory_order_acquire)) {
+        state = "starting";
+        status = 503;
+    }
+    return http_json(status, Json(Json::Object{{"status", std::string(state)}}).dump());
+}
+
 bool Service::capability_request(const HttpRequest& request) {
-    // Session creation is the one route reachable with no bearer token at
-    // all, and (like Status) must be exempt regardless of local readiness.
+    // The two routes reachable with no bearer token at all, both of which must
+    // stay exempt regardless of local readiness: liveness, and minting the
+    // session every other route needs.
+    if (request.path == "/api/v1/health")
+        return true;
     if (SessionApi::capability_request(request))
         return true;
     // A browser asking for the client itself has no token yet, and cannot get
