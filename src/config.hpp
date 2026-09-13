@@ -397,6 +397,19 @@ struct TorrentConfig {
     bool dht{true};
     bool pex{true};
     bool lsd{true};
+    // libtorrent maps its own listen port with UPnP and NAT-PMP, and both
+    // default to on inside libtorrent. Until these existed the session did it
+    // regardless of what the rest of the configuration said: a node with
+    // network.upnp.enabled false still had libtorrent creating a 6881 mapping
+    // on the router, which no setting mentioned and nothing could stop.
+    //
+    // Deliberately separate from network.upnp, which maps the cluster RPC
+    // port through Macha's own miniupnpc: the two map different ports for
+    // different reasons, and an operator may reasonably want one without the
+    // other. Both default true, which is what libtorrent was doing anyway --
+    // the point of these is that it is now stated and refusable.
+    bool upnp{true};
+    bool natpmp{true};
     // libtorrent's default listen_interfaces ("0.0.0.0:port,[::]:port") is
     // expanded by its own device enumeration, which on these nodes binds eth0
     // and loopback but never wlan0. On a node whose only live link is
