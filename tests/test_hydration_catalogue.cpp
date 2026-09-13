@@ -3265,6 +3265,89 @@ MACHA_TEST("hydration_catalogue", test_catalogue_artwork_url_is_signed_and_capab
     CHECK(!api.capability_request(unsigned_request));
 }
 
+MACHA_TEST("hydration_catalogue", test_catalogue_artwork_url_is_stable_so_it_can_be_cached) {
+    TestService fixture("catalogue-artwork-stable-url");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.hydration.enabled = false;
+    auto& service = fixture.start();
+
+    CatalogueItem album;
+    album.id = "album:stable-url-test";
+    album.kind = CatalogueKind::album;
+    album.title = "Stable URL Album";
+    album = service.catalogue().upsert(album);
+    const Bytes cover_bytes{0x09, 0x08, 0x07};
+    service.catalogue().put_artwork(album.id, "cover", "image/png", cover_bytes, album.revision);
+
+    const std::chrono::milliseconds ttl = std::chrono::hours(24);
+    CatalogueApi api(service.catalogue(), service.catalogue_hints(), {}, {}, {}, ttl);
+    auto artwork_url = [&] {
+        const auto response = api.handle({.method = "GET",
+                                          .path = "/api/v1/catalogue/items/album%3Astable-url-test",
+                                          .query = {},
+                                          .headers = {},
+                                          .body = {}, .session = {}});
+        REQUIRE(response.status == 200);
+        const auto json = Json::parse(std::string(response.body.begin(), response.body.end()));
+        return json.find("artwork")->asArray().front().find("url")->asString();
+    };
+
+    // The whole point: a browser keys its cache on the full URL, so two reads
+    // of the same artwork must produce byte-identical URLs or the 24 hour
+    // immutable header on the artwork response can never be consulted. Before
+    // 0.40.0 the expiry was minted from the instant of signing, so these
+    // differed at millisecond granularity and every poster was re-fetched on
+    // every page load.
+    const auto first = artwork_url();
+    std::this_thread::sleep_for(5ms);
+    const auto second = artwork_url();
+    CHECK(first == second);
+
+    // Same again through the list route, which signs separately: a client that
+    // renders a grid and then an item page must not fetch the poster twice.
+    const auto listed = api.handle({.method = "GET",
+                                    .path = "/api/v1/catalogue/items",
+                                    .query = {},
+                                    .headers = {},
+                                    .body = {}, .session = {}});
+    REQUIRE(listed.status == 200);
+    const auto listed_json = Json::parse(std::string(listed.body.begin(), listed.body.end()));
+    bool found = false;
+    for (const auto& item : listed_json.find("items")->asArray()) {
+        if (item.find("id")->asString() != album.id) continue;
+        found = true;
+        CHECK(item.find("artwork")->asArray().front().find("url")->asString() == first);
+    }
+    CHECK(found);
+
+    // Stability must not be bought with a short capability. The expiry is
+    // rounded up to the bucket after next precisely so that a URL minted just
+    // before a boundary still outlives the configured TTL rather than dying
+    // in the client's hand.
+    const auto question = first.find('?');
+    REQUIRE(question != std::string::npos);
+    const auto query = parse_test_query(first.substr(question + 1));
+    REQUIRE(query.contains("exp"));
+    const auto expires = std::stoull(query.at("exp"));
+    const auto ttl_ms = static_cast<uint64_t>(ttl.count());
+    CHECK(expires % ttl_ms == 0);
+    const auto now = unix_ms();
+    CHECK(expires >= now + ttl_ms);
+    CHECK(expires <= now + 2 * ttl_ms);
+
+    // And it is still a working capability, not merely a stable string.
+    HttpRequest signed_request;
+    signed_request.method = "GET";
+    signed_request.path = first.substr(0, question);
+    signed_request.query = query;
+    CHECK(api.capability_request(signed_request));
+    const auto fetched = api.handle(signed_request);
+    REQUIRE(fetched.status == 200);
+    CHECK(fetched.body == cover_bytes);
+}
+
 MACHA_TEST("hydration_catalogue", test_catalogue_artwork_capability_rejects_tampered_or_expired) {
     TestService fixture("catalogue-artwork-tampered-url");
     auto& config = fixture.config();

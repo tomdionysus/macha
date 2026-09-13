@@ -96,8 +96,26 @@ std::array<uint8_t, 32> artwork_capability_mac(const ClusterKeys& keys, std::str
                        {reinterpret_cast<const uint8_t*>(material.data()), material.size()});
 }
 
+// The expiry is quantized to a bucket of the TTL rather than computed from the
+// instant of signing, and that is what makes artwork cacheable at all.
+//
+// A browser keys its cache on the full URL including the query, so a fresh
+// `exp` means a fresh cache key: until 0.40.0 every catalogue read minted a new
+// one, at millisecond granularity, for every item -- twice per item, since
+// `artwork` and `effective_artwork` are both emitted -- and the 24 hour
+// `immutable` header on the artwork response was therefore never once
+// consulted. Posters were re-fetched over the network on every page load, and
+// two clients independently built an id-to-URL memo to work around it.
+//
+// Rounding up to the bucket *after* next, rather than to the next one, is
+// deliberate: a naive bucket boundary would give a URL minted just before it a
+// lifetime of almost nothing, invisibly to the client holding it. This way the
+// URL is byte-identical for every request inside a bucket, and its remaining
+// validity is always at least the configured TTL and at most twice it.
 std::string signed_artwork_url(const ArtworkUrlContext& ctx, std::string_view id) {
-    const auto expires = unix_ms() + static_cast<uint64_t>(ctx.ttl.count());
+    const auto now = unix_ms();
+    const auto ttl = ctx.ttl.count() > 0 ? static_cast<uint64_t>(ctx.ttl.count()) : uint64_t{0};
+    const auto expires = ttl ? (now / ttl + 2) * ttl : now;
     const auto mac = artwork_capability_mac(ctx.keys, id, expires);
     return "/api/v1/catalogue/artwork/" + std::string(id) + "?exp=" + std::to_string(expires) +
           "&sig=" + hex(mac);
