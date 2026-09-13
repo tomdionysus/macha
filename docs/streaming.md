@@ -351,6 +351,14 @@ current-generation stream activity. Expiry cancels the in-process pipeline and
 removes any spilled generated fragments. Explicit `DELETE` performs the same
 cleanup immediately.
 
+A session that has never served a stream object expires instead after the much
+shorter `session_unused_idle_ms` (120 seconds by default), because the
+transcode entitlement is held by the session rather than by the pipeline and is
+therefore not released by idle-pipeline reclamation. One stream request of any
+kind — playlist, fragment, subtitle or Direct Play body — moves the session to
+the full `session_idle_ms` for the rest of its life, so a paused or seeking
+player is never subject to the shorter clock.
+
 Physical remux/transcode pipelines have a shorter independent
 `pipeline_idle_ms` lease (60 seconds by default). Valid current-generation
 playlist, fragment and subtitle requests renew it. Obsolete-generation and

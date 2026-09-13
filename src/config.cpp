@@ -543,6 +543,9 @@ void parse_streaming(const YAML::Node& root, Config& c) {
         c.streaming.video_encoder_threads = streaming["video_encoder_threads"].as<size_t>();
     if (streaming["session_idle_ms"])
         c.streaming.session_idle = milliseconds(streaming["session_idle_ms"], "streaming.session_idle_ms");
+    if (streaming["session_unused_idle_ms"])
+        c.streaming.session_unused_idle =
+            milliseconds(streaming["session_unused_idle_ms"], "streaming.session_unused_idle_ms");
     if (streaming["pipeline_idle_ms"])
         c.streaming.pipeline_idle = milliseconds(streaming["pipeline_idle_ms"], "streaming.pipeline_idle_ms");
     if (streaming["startup_timeout_ms"])

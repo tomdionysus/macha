@@ -2020,6 +2020,96 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
     service.stop();
 }
 
+MACHA_TEST("media_playback", test_a_session_never_streamed_from_does_not_hold_a_transcode_slot) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/never-watched.mp4", 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write("/media/never-watched.mp4", true);
+    auto bytes = pattern(65549);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    const auto media_id = file_media_id(service.filesystem().getattr("/media/never-watched.mp4"));
+
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback";
+    streaming.max_video_transcodes = 1;
+    // The clock under test. The ordinary one stays long, so a failure here is
+    // the unused clock firing and never session_idle expiring the session.
+    streaming.session_unused_idle = 150ms;
+    streaming.session_idle = 5min;
+    streaming.pipeline_idle = 5min;
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             std::make_unique<FakeMediaEngine>());
+    playback.start();
+
+    Json::Object preferences{{"mode", "transcode"}};
+    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
+    auto text = Json(std::move(root)).dump();
+    HttpRequest create;
+    create.method = "POST";
+    create.path = "/api/v1/playback/sessions";
+    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    create.body.assign(text.begin(), text.end());
+
+    auto playback_status = [&] {
+        HttpRequest request;
+        request.method = "GET";
+        request.path = "/api/v1/playback/status";
+        auto response = playback.handle(request);
+        REQUIRE(response.status == 200);
+        return Json::parse(std::string(response.body.begin(), response.body.end()));
+    };
+
+    // A viewer creates a session and is never heard from again: the phone is
+    // force-quit, the app is suspended with its DELETE unsent, the power goes.
+    // No client-side fix reaches this, which is why the server must.
+    auto abandoned = playback.handle(create);
+    REQUIRE(abandoned.status == 201);
+    auto abandoned_json = Json::parse(std::string(abandoned.body.begin(), abandoned.body.end()));
+    CHECK(playback_status().find("video_transcodes")->asUInt64() == 1);
+
+    REQUIRE(wait_until([&] {
+        auto status = playback_status();
+        return status.find("sessions")->asUInt64() == 0 &&
+               status.find("video_transcodes")->asUInt64() == 0 &&
+               status.find("unused_sessions_reclaimed")->asUInt64() == 1;
+    }, 5s));
+    CHECK(playback_status().find("session_unused_idle_ms")->asUInt64() == 150);
+
+    // The slot is genuinely released, not merely reported free.
+    auto admitted = playback.handle(create);
+    REQUIRE(admitted.status == 201);
+    auto admitted_json = Json::parse(std::string(admitted.body.begin(), admitted.body.end()));
+    CHECK(admitted_json.find("session_id")->asString() !=
+          abandoned_json.find("session_id")->asString());
+
+    // And a session that IS being streamed from keeps the long clock: one
+    // fetch is enough, forever, so a paused player is never evicted by this.
+    HttpRequest stream;
+    stream.method = "GET";
+    stream.path = admitted_json.find("stream")->find("url")->asString();
+    REQUIRE(playback.handle(stream).status == 200);
+    std::this_thread::sleep_for(400ms);
+    auto still_here = playback_status();
+    CHECK(still_here.find("sessions")->asUInt64() == 1);
+    CHECK(still_here.find("video_transcodes")->asUInt64() == 1);
+    CHECK(still_here.find("unused_sessions_reclaimed")->asUInt64() == 1);
+
+    playback.stop();
+    service.stop();
+}
+
 MACHA_TEST("media_playback", test_status_does_not_block_on_a_contended_subtitle_cache) {
     TempDir t;
     auto keyfile = t.path() / "key";

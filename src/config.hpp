@@ -440,6 +440,18 @@ struct StreamingConfig {
     // no thread count set, at about real time on the 4-core nodes.
     size_t video_encoder_threads{0};
     std::chrono::milliseconds session_idle{std::chrono::minutes(30)};
+    // A session that has never served a single stream object -- no playlist,
+    // no fragment, no subtitle -- expires on this much shorter clock instead.
+    // The transcode entitlement lives on the session, not on the pipeline, so
+    // until the session is erased the slot stays taken however cheap the
+    // session has become; with max_video_transcodes at 1 that closes the node
+    // to transcoding for the whole of session_idle. A client that crashed, was
+    // force-quit, lost power, or is suspended with an unsent DELETE cannot
+    // release it, and no client-side fix can. This is deliberately "never
+    // accessed", not "not accessed recently": a session that has served even
+    // one object has a viewer behind it and keeps the full session_idle, so a
+    // paused or seeking player is never evicted on this clock.
+    std::chrono::milliseconds session_unused_idle{std::chrono::seconds(120)};
     // Reclaim an abandoned physical encoder while retaining the logical
     // session long enough for client retry/reconciliation.
     std::chrono::milliseconds pipeline_idle{std::chrono::seconds(60)};

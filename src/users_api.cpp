@@ -247,7 +247,10 @@ HttpResponse UsersApi::handle(const HttpRequest& request) {
                 for (const auto& user : node_.users().list())
                     out.push_back(user_json(user, mutability(user)));
                 Json::Object body;
-                body["users"] = std::move(out);
+                // "items" is the envelope every other collection in this API uses;
+                // the earlier "users" key was inherited from the manage endpoints
+                // rather than chosen, and four clients had to work around it.
+                body["items"] = std::move(out);
                 return http_json(200, Json(std::move(body)).dump());
             }
             if (request.method == "POST")

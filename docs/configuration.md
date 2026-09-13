@@ -314,6 +314,7 @@ streaming:
   video_encoder_threads: 0
   pipeline_idle_ms: 60000
   session_idle_ms: 1800000
+  session_unused_idle_ms: 120000
 ```
 
 `pipeline_idle_ms` releases an abandoned physical remux/transcode encoder after
@@ -322,6 +323,23 @@ logical session remains reconcilable until `session_idle_ms`; invalid or stale
 generation retries do not renew the physical lease. This bounds leaked
 transcode capacity after a client disappears on an unreliable network without
 shortening the logical session lifetime.
+
+`session_unused_idle_ms` (120 seconds by default) is the expiry for a session
+that has **never** served a stream object — no playlist, no fragment, no
+subtitle, no Direct Play body. The transcode entitlement belongs to the
+session rather than to the pipeline, so reclaiming an idle encoder does not
+release it: until the session itself is erased the slot stays taken, and with
+`max_video_transcodes: 1` a session created and never used closes the node to
+transcoding for the whole of `session_idle_ms`. A client that crashes, is
+force-quit, loses power or is suspended with its closing `DELETE` unsent
+cannot release it, so this is bounded on the server. The condition is "never
+used", not "not used recently": a single stream request earns the full
+`session_idle_ms` permanently, so a paused or seeking player is never evicted
+by this clock, and both clocks measure from the session's last interaction of
+any kind, so a client that is still polling or PATCHing is safe as well. The
+effective value is the lesser of this and `session_idle_ms`, so lowering
+`session_idle_ms` alone is safe. `GET /api/v1/playback/status` reports
+`session_unused_idle_ms` and the cumulative `unused_sessions_reclaimed`.
 
 `video_encoder_threads` sets the x264 frame-thread count per video transcode; `0` (the default) uses every hardware thread. Until 0.32.11 the encoder ran single-file in sliced-thread mode, at about real time for 1080p on the four-core nodes, so every representation change cost 5-13 s and a mid-file seek could not catch up. The first fragment of a transcode generation is 2 s (later ones the configured segment duration) so the request is answered after 2 s of encoding.
 

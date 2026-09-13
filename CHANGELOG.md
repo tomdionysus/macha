@@ -2,7 +2,76 @@
 
 ## 0.40.0 — Open, unreleased (development)
 
-No code. The version is opened here because 0.39.1 removed a field from a
+Five operator decisions taken on 2026-09-13, each of which had been sitting in
+`TODO/ACTIVE.md` as a question rather than as work.
+
+**Artwork URLs are stable, so artwork can finally be cached.** The expiry in a
+signed artwork capability URL is now quantized to a bucket of the configured
+TTL instead of being minted from the instant of signing. A browser keys its
+cache on the full URL including the query, so a fresh `exp` meant a fresh cache
+key: every catalogue read produced a different URL for the same poster, at
+millisecond granularity, for every item — twice per item, since `artwork` and
+`effective_artwork` are both emitted — and the `public, max-age=86400,
+immutable` header the artwork response has always sent was therefore never once
+consulted. Posters were re-fetched over the network on every page load, and two
+client teams independently built the same id-to-URL memo to work around it. The
+expiry now rounds up to the bucket *after* next rather than to the next one, so
+the URL is byte-identical for every request inside a bucket while its remaining
+validity is always at least the configured TTL and at most twice it — a naive
+boundary would have given a URL minted just before one a lifetime of almost
+nothing, invisibly to the client holding it. Gated by
+`test_catalogue_artwork_url_is_stable_so_it_can_be_cached`, which also pins that
+the list and item routes, which sign separately, agree.
+A separate observation for whoever picks up the remaining complaint: because
+there was no bucket at all before this, "cached posters go stale after a minute
+or two" cannot have been a bucket expiring, and still has an unmeasured cause.
+
+**An abandoned playback session no longer holds a transcode slot for half an
+hour.** The video/audio transcode entitlement lives on the session, not on the
+pipeline, so reclaiming an idle engine at `pipeline_idle` only made an
+abandoned session cheap — it went on holding the slot until the session itself
+expired at `session_idle`, 30 minutes, and with `max_video_transcodes: 1` that
+closed the node to transcoding for the whole of it while the node looked
+perfectly healthy. No client-side fix reaches this: a suspended app's closing
+`DELETE` may never leave, and a client that crashes, is force-quit or loses
+power can never send one. A session that has **never** served a stream object
+now expires on `streaming.session_unused_idle_ms` (default 120 s) instead.
+Deliberately "never", not "not recently": one playlist, fragment, subtitle or
+Direct Play body is enough to earn the full `session_idle` permanently, so a
+paused or seeking player is never evicted by this clock, and both clocks run
+from the session's last interaction of any kind, so a client that is still
+polling or PATCHing is never evicted either. `stream_touched` could not answer
+the question on its own — it is set at construction and reset by every
+`start_pipeline()`, so it says "not recently" and never "not ever". The reaper
+takes the lesser of the two budgets, so an unused session can never outlive a
+used one whatever the configuration says. `playback/status` reports
+`session_unused_idle_ms` and `unused_sessions_reclaimed`. Gated by
+`test_a_session_never_streamed_from_does_not_hold_a_transcode_slot`.
+
+**`GET /api/v1/users` answers under `items`, like every other collection in the
+API.** It answered under `users` until now, inherited from the manage endpoints
+rather than chosen, and each client had to learn that separately. Single
+records from `POST`/`PATCH` are unchanged and still bare. `@machafoundation/core`
+has accepted either key since its 0.8.0, so no client needs a release; gbni-2
+continues to emit `users` until it can be upgraded, which the same code covers.
+The envelope is now pinned by a test.
+
+**FUSE traffic is loader traffic, and the code no longer pretends otherwise.**
+`FuseFrontend::note_viewer_activity()` was declared, documented as "called by
+the kernel adapter before viewer-critical open/read callbacks", defined — and
+called by nothing but tests. Reads through the mount open with
+`FrameType::loader` unconditionally, and the operator confirmed that is correct:
+a mount is a convenience and an import path, not a viewer, and the viewer
+priority it would claim belongs to real playback. The hook is gone, the policy
+is written down where the class is declared, and the tests that used it to
+simulate viewer pressure now drive `FileSystem::note_foreground_activity()`
+directly, which is what the HTTP playback path actually does.
+
+**`MANIFEST.sha256` is deleted.** 104 of its hashes no longer matched, nothing
+in the build referenced it, and its only remaining function was to misinform
+anyone who ran `shasum -c` against it.
+
+The version was opened because 0.39.1 removed a field from a
 response that clients poll — `diagnostics` is no longer on `/api/v1/status` —
 and that is a breaking, client-visible change which a patch number understated.
 Pre-1.0, it earns the minor. The next piece of work starts from this number.

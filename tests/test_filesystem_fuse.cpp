@@ -1424,7 +1424,10 @@ MACHA_TEST("filesystem_fuse", test_fuse_spool_stalled_publisher_blocks_without_e
     auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
     auto handle = frontend->create("/stalled-spool.bin", 0600, getuid(), getgid(), true, true,
                                    false);
-    frontend->note_viewer_activity();
+    // Viewer demand comes from the HTTP playback path, never from the mount:
+    // FUSE traffic is loader traffic by design, so hold the foreground window
+    // open on the filesystem the way playback does.
+    service.filesystem().note_foreground_activity();
     const auto first = pattern(256 * 1024, 51);
     REQUIRE(frontend->write(handle.inode, 0, first) == first.size());
 
@@ -1582,12 +1585,12 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_yields_to_playback) {
         // Inject genuine viewer activity. The already-running bounded quantum
         // yields promptly, but weighted priority must not stop loader work for
         // the complete viewer window.
-        frontend->note_viewer_activity(1);
+        service.filesystem().note_foreground_activity(1);
         REQUIRE(wait_until([&] { return frontend->status().active_data == 0; }, 2s));
         const auto paused_quanta = frontend->status().data_publication_quanta;
         REQUIRE(wait_until(
             [&] {
-                frontend->note_viewer_activity(1); // sustained genuine viewing
+                service.filesystem().note_foreground_activity(1); // sustained genuine viewing
                 return frontend->status().data_publication_quanta > paused_quanta;
             },
             3s, 25ms));
@@ -1678,7 +1681,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_pending_write_payloads_are_byte_bounded)
     // the scheduler is deliberately work-conserving when no viewer exists.
     // Hold the viewer window so spool pressure cannot publish the first write
     // and invalidate the pending-byte ownership state this test is measuring.
-    frontend->note_viewer_activity();
+    service.filesystem().note_foreground_activity();
     const auto payload = pattern(128 * 1024, 91);
     REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
     REQUIRE(wait_until([&] { return frontend->status().durability_writes == 1; }, 5s));
@@ -1735,7 +1738,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_operation_metadata_backpressures_at_heap
     auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
     auto handle = frontend->create("/metadata-bound.bin", 0600, getuid(), getgid(), true, true,
                                    false);
-    frontend->note_viewer_activity();
+    service.filesystem().note_foreground_activity();
     const auto payload = pattern(4096, 37);
     REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
     REQUIRE(frontend->write(handle.inode, payload.size(), payload) == payload.size());

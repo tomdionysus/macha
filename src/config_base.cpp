@@ -287,6 +287,13 @@ void validate(Config& config) {
         throw std::runtime_error("streaming.video_decoder_threads must be 1..16");
     if (config.streaming.session_idle < std::chrono::seconds(30))
         throw std::runtime_error("streaming.session_idle_ms must be >= 30000");
+    if (config.streaming.session_unused_idle < std::chrono::seconds(30))
+        throw std::runtime_error("streaming.session_unused_idle_ms must be >= 30000");
+    // Deliberately no check that the unused clock is shorter than the ordinary
+    // one: lowering session_idle alone is a reasonable thing for an operator to
+    // do, and refusing it by naming a knob they never set would be a poor
+    // trade. The reaper takes the lesser of the two, so the ordering invariant
+    // holds whatever the file says.
     if (config.session.anonymous_ttl < std::chrono::minutes(1))
         throw std::runtime_error("session.anonymous_ttl_ms must be >= 60000");
     if (!config.session.max_sessions || config.session.max_sessions > 1'000'000)

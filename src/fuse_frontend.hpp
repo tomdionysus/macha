@@ -484,6 +484,16 @@ struct ParkedPublication {
 // Bounded local frontend for the kernel-facing filesystem. FUSE callbacks enter
 // this object, never MetadataManager/DistributedStore directly. Distributed
 // namespace/data publication is queued behind the local inode/namespace state.
+//
+// FUSE traffic is loader traffic, deliberately. Reads through the mount open
+// with FrameType::loader and never advance the foreground clock that gates
+// loader publication under governing law 1 -- a mount is a convenience and an
+// import path, not a viewer, and the viewer priority it would claim belongs to
+// real playback. The foreground clock is driven by the HTTP playback path via
+// FileSystem::note_foreground_activity(), which is what the publication
+// scheduler here reads back through fs.foreground_idle_for(). This class had a
+// note_viewer_activity() hook for the opposite policy until 0.40.0; nothing in
+// the kernel adapter ever called it, and the operator confirmed that was right.
 class FuseFrontend final : public HydrationHintProvider {
     struct State;
     std::unique_ptr<State> state_;
@@ -628,9 +638,6 @@ class FuseFrontend final : public HydrationHintProvider {
     void release(uint64_t inode, bool writable);
 
     std::pair<uint64_t, uint64_t> logical_capacity() const;
-    // Called by the kernel adapter before viewer-critical open/read callbacks.
-    // This must drive the same foreground clock used to gate loader publication.
-    void note_viewer_activity(uint64_t bytes = 0);
     std::string path_for_inode(uint64_t inode) const;
     std::optional<uint64_t> inode_for_path(std::string_view path);
     std::vector<FuseDirtyRange> dirty_ranges(uint64_t inode) const;

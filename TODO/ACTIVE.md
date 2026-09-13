@@ -97,6 +97,8 @@ The 2026-09-13 live incident that opened this file is resolved and ledgered in
 What the incident left behind:
 
 - [ ] **gbni-2 (inverbeg) runs 0.38.1 and cannot be reached to upgrade it.**
+  **2026-09-13: the operator is working on console access and said to work
+  around it for today.** Do not plan any change that requires all three nodes.
   Its sshd now offers **password authentication only** — `Authentications that
   can continue: password`, so public-key auth is disabled server-side. The host
   key still matches, so it is the same machine; this is a config change on the
@@ -120,8 +122,24 @@ What the incident left behind:
 
 ## P0 — Playback correctness and poor-network resilience
 
-- [ ] **An abandoned playback session holds a node's only transcode slot for
-  30 minutes — found 2026-09-10, confirmed independently by two client teams.**
+- [x] **An abandoned playback session holds a node's only transcode slot for
+  30 minutes — found 2026-09-10, FIXED in 0.40.0 on the operator's decision of
+  2026-09-13: "shorter timeout if and only if the session has never been
+  usefully accessed."** `streaming.session_unused_idle_ms` (default 120 s)
+  expires a session that has never served a stream object; one playlist,
+  fragment, subtitle or Direct Play body earns the full `session_idle`
+  permanently, so a paused or seeking player is never evicted by it. A new
+  `stream_served` flag carries that, because `stream_touched` is reset by every
+  `start_pipeline()` and can only say "not recently". The reaper takes the
+  lesser of the two budgets, so an unused session can never outlive a used one.
+  `playback/status` reports `session_unused_idle_ms` and
+  `unused_sessions_reclaimed`; gated by
+  `test_a_session_never_streamed_from_does_not_hold_a_transcode_slot`.
+  **Not deployed** — 0.40.0 is unreleased and the cluster runs 0.39.1.
+  The second option considered and **not** taken, per the same decision:
+  eviction at admission, which converts admission from a guarantee into a
+  lease and is client-visible. Original analysis, kept because the mechanism
+  is the record:
   The video/audio transcode entitlement lives on the *session*, not the
   pipeline: `video_transcodes_locked()` (`playback.cpp:1152`) counts sessions
   whose `logical_session->video_transcode_entitled` is set and never inspects
@@ -163,12 +181,31 @@ What the incident left behind:
   the planned 12000, because hls.js's `fragLoadingTimeOut` is deprecated and
   inert and the tightest real deadline is media3's 8000 ms read timeout on the
   React Native music path.
-  **Still open, and unowned:** the native paths ship unmeasured. Nobody has
-  confirmed on a device that a cold session receives a 500 rather than aborting
-  first, or what a player does with a burst of refusals against a per-session
-  cap of 2 while prefetching a 20 s forward buffer. iOS's time-to-first-byte
-  deadline has never been read at all. Both the cap and the timeout are server
-  config, so acting on real numbers stays cheap when a device is available.
+  **Still open. Asked of the phone session on 2026-09-13 (operator: "there is
+  [a device], talk to Macha Mobile App React Native"), and partly answered:**
+  - **iOS will not be answered by that session at all** — it has only ever run
+    on Android, and there is no iOS device there. iOS's time-to-first-byte
+    deadline remains unread by anyone. Nobody should plan around it arriving.
+  - **HTTP status never reaches that client's JavaScript**, verified against
+    the expo-video v57 source: `PlayerError` is `{message: string}` with no
+    status, no code, no cause, and segment/playlist requests go from the native
+    player straight to the stream URL without passing through the app's HTTP
+    layer. So `segment_not_ready` and a genuinely dead stream are
+    indistinguishable *on that client*. The 500-over-503 reasoning still holds
+    for players that read status; it buys nothing there. Any measurement has to
+    come from logcat at the media3/OkHttp level or a packet capture.
+  - **Statically, the hold looks right with margin.** Read from the Gradle
+    cache rather than from documentation: the video path (expo-video) uses a
+    bare `OkHttpClient` — connect 10 s, read 10 s; the music path
+    (react-native-track-player) uses `DefaultHttpDataSource.Factory()` defaults
+    — connect 8 s, read **8 s**. So the tightest deadline on that client is
+    8000 ms against a 6000 ms hold: the player should receive the 500 rather
+    than abort first, with 2 s of margin. **If the hold is ever raised above
+    8000 ms the music path starts aborting first.** That is an argument, not a
+    measurement.
+  - **Blocked on the anonymous-roles experiment**: the phone cannot create a
+    playback session while anonymous holds no roles, so questions 1 and 2 wait
+    on either that ending or credentials for an account with `media_viewer`.
 
   Design, phases and the corrections made during implementation are in
   [the plan](2026-09-08-bounded-vod-playlist-and-segment-holds.md), which
@@ -204,6 +241,102 @@ What the incident left behind:
   cited here was assumed rather than recorded. The client now records which
   node served each measurement, which is what would have caught it hours
   earlier. Do not re-open this on the strength of the numbers above.
+
+- [ ] **A seek past the produced window is refused instantly, and on media3
+  that is fatal — measured on an Android device 2026-09-13, and it is a
+  consequence of the complete VOD playlist rather than of the hold.** Confirmed
+  against current source, not inferred from the report. `public_stream_response`
+  has two distinct refusal paths (`playback.cpp:1976-1981`): a segment inside
+  `segment_count + segment_hold_window` (8) is **held** for up to
+  `segment_timeout` (6000 ms), while one beyond that window is refused
+  **immediately** with `beyond_hold_window`, because nothing is working toward
+  it. A seek to the one-hour mark of a 2:43 title lands hundreds of segments
+  past production, so it takes the second path and is answered in well under a
+  millisecond. **Raising `segment_timeout` therefore cannot help this case at
+  all** — an important correction, because the device session proposed exactly
+  that, and the 8000 ms media3 ceiling made it look affordable.
+  What the device measured: seek at 15:57:56, `InvalidResponseCodeException:
+  500` at 15:58:00.724, surfaced as a **fatal** `ExoPlaybackException: Source
+  error` with **no retry** — media3 does not back off and re-request a 500 on
+  the HLS path. So the server's hold is the only retry budget in the system;
+  there is nothing behind it. The client then treated the 500 as node failure,
+  stopped a perfectly healthy session on gbni-1, recorded the node as failed and
+  restarted from scratch on es-1, discarding 15 s of completed transcode for a
+  6.2 s gap. That failover behaviour is the client's defect and they have filed
+  it, but the refusal that triggered it is ours.
+  Cold start, for contrast, never touches any of this: direct -> transcode
+  admitted in 1722 ms, first frame at ~2.2 s, then 2:30 of content played with
+  zero load failures, because transcode on gbni-1 runs faster than realtime for
+  that title and no segment was ever late.
+  **The design gap:** a `PLAYLIST-TYPE:VOD` playlist with `ENDLIST` tells the
+  player every segment exists, and a native player seeks by requesting the
+  segment at that offset — it does not ask the server first. Production is
+  strictly sequential from the session's seek origin, so everything outside a
+  9-segment window is a promise the server will not keep. The seek-only PATCH
+  that *does* reposition production exists and is cheap
+  (`HlsVodPlan::reusable_seek`, `video_random_access_points`,
+  `seek_segment_seconds` — no reprobe, no index rebuild), but nothing tells a
+  client it is mandatory before seeking, and on this client the seek never
+  reaches JavaScript at all.
+  **Corrected 2026-09-13, same day, by the device session against its own
+  source:** the seek that produced this measurement *did* originate in
+  JavaScript — their own scrubber, which already tracks the pending seek — and
+  the app simply never told the node about it. So the client-side fix is
+  available to them and they have taken it: on a transformed generation, PATCH
+  the session with the new position before seeking the player. That narrows,
+  but does not remove, the case for the server-side fix: a seek from the
+  lock-screen or notification media session on the music path never reaches
+  their JavaScript, and nothing else covers it. Video has no such path. Weigh
+  option 1 as covering that narrower case rather than "clients cannot tell us
+  about seeks".
+  **Both server-side candidates below are now closed, and the direction is
+  settled (operator, 2026-09-13).**
+  - **Implicit seek on an out-of-window request: REJECTED.** Inferring seek
+    intent from a read position is unsound — a reader legitimately touches
+    distant offsets for structural reasons (an AVI's index lives at the end of
+    the file and must be read before anything can play), and repositioning the
+    encoder on that would mean re-reading the tail of a multi-gigabyte file
+    across the network for a seek nobody asked for. Note this is also what
+    Jellyfin/Emby do, and their thrash under scrubbing is the prior art for
+    why not.
+  - **A growing `EXT-X-PLAYLIST-TYPE:EVENT` playlist: REJECTED, permanently,
+    and this has been round more than once.** Static media is not an event.
+    The file exists in full; a playlist that declines to say so is working
+    around the server's own limitation at the client's expense.
+  - **The direction is to pre-package.** Every rendition transcoded and
+    segmented before playback, which is what commercial VOD does and the only
+    shape with no seek problem at all: seeking is free because every segment
+    already exists. The open question is not whether but **how to do it
+    smartly** — what triggers packaging, which renditions are worth producing
+    for a given library and client mix, where the segments live and against
+    what storage budget, how it is paced against viewer and loader work under
+    the governing laws, and what a viewer sees for a title that has not been
+    packaged yet. That is a design piece, not a patch, and nothing above should
+    be built in its place.
+  Historical, for the reasoning only — **neither is to be built**:
+  - **Treat an out-of-window in-plan segment request as an implicit seek**:
+    reposition production to that segment's random-access point in the same
+    generation and then hold. Segment indices are plan-absolute, so
+    repositioning within a generation is coherent and the client's URL stays
+    valid. This makes the VOD playlist honest, and is the only option that
+    helps a player which seeks natively. Needs a debounce and a one-reposition-
+    at-a-time rule, or a deeply prefetching player will restart the encoder
+    repeatedly — `note_segment_requested` already exists to drag the authorised
+    window and is the natural place for the policy.
+  - **Document the PATCH-before-seek contract** and tell all four clients. Cheap
+    and immediate, but it cannot work where the player seeks without telling the
+    app, which is precisely the measured case.
+  **The two refusals are distinguishable at the HTTP layer without parsing a
+  body**, which decides how dumb a native transport module can be:
+  `segment_not_ready` is **500** with `Retry-After: 1` and
+  `Cache-Control: no-store`, while `stream_failed` is **503** with neither. So
+  status alone separates "retry" from "dead", and the body's `reason` is needed
+  only to tell the four not-ready sub-cases apart (`beyond_hold_window`,
+  `hold_timed_out`, `session_hold_limit`, `hold_budget_exhausted`).
+  Also recorded, because it disposes of an earlier argument: the 500-over-503
+  choice is not merely inert on that client, it is harmful. It cannot read the
+  code, so it cannot distinguish "hold, I am building it" from "this generation
+  is broken", and its failover treats both as a dead node.
 
 - [ ] **gbni-2 serves reads at roughly a sixth of gbni-1 — measured
   2026-09-08, not yet diagnosed.** Client-measured raw read rate with no
@@ -472,7 +605,13 @@ not inferred from docs. All are small and isolated; none require design work.
   cancellation, and runs from the `FuseFrontend` constructor before
   `fuse_mount`. A node whose metadata replica never becomes available hangs
   indefinitely with only a debug log line to show for it.
-- [ ] **FUSE-mounted reads never register as viewer demand.**
+- [x] **FUSE-mounted reads never register as viewer demand — RESOLVED in
+  0.40.0 as intended behaviour, on the operator's answer of 2026-09-13: "FUSE
+  is loader, not viewer."** The dead `note_viewer_activity()` declaration and
+  definition are gone, the policy is written down on the `FuseFrontend` class
+  itself, and the tests that used the hook to simulate viewer pressure now
+  drive `FileSystem::note_foreground_activity()` directly, which is what the
+  HTTP playback path does. Original finding:
   `FuseFrontend::note_viewer_activity()` is declared, documented as "called by
   the kernel adapter before viewer-critical open/read callbacks", and defined
   — but is never called anywhere. FUSE reads open with `FrameType::loader`
@@ -583,12 +722,20 @@ home network and an offsite node, this is not a hypothetical exposure.
   `[]` (no restart, effective next session), or set
   `session.allow_anonymous: false`, or stop exposing 7438 and reach it over
   WireGuard.
+  **2026-09-13, asked again and declined for now:** the operator is
+  deliberately running with anonymous holding no roles in order to exercise how
+  the system behaves in that state, and does not want `allow_anonymous` turned
+  off yet. That is a live experiment, not an oversight — do not "fix" it. It
+  has a cost: the phone client cannot start a playback session at all while it
+  stands, which is blocking the device measurements requested below.
 - [ ] **Mixed-version sessions break during a rolling upgrade.** A session
   minted by a pre-0.38 node carries `roles: ["anonymous"]`, which an upgraded
   node refuses with 403 on every route. The session *wire format* is
   compatible; the role vocabulary is not. No compatibility shim exists.
-  Operator's call on 2026-09-12: "don't care, we're still in single user
-  alpha." Upgrade every node promptly, or write the shim before beta.
+  Operator's call on 2026-09-12, reaffirmed 2026-09-13: "we'll have to deal
+  with that for the time being." Upgrade every node promptly, or write the shim
+  before beta. Note this is currently live rather than hypothetical — gbni-2 is
+  on 0.38.1 and cannot be upgraded.
 - [ ] **Unbounded JSON recursion depth.** `json.cpp`'s recursive-descent parser
   has no depth limit. Combined with the 8 MiB body cap, a deeply nested body
   on any POST/PUT can exhaust the stack. Add a depth limit.
@@ -1127,19 +1274,29 @@ that report.
   has to be argued rather than assumed), and what existing accounts get at
   migration. The client is unblocked — it is on `manager` today and says
   switching is a one-line change once a name ships.
-- [ ] **`GET /api/v1/users` returns `{"users": [...]}` while every other
-  collection in the API uses `items`.** Raised independently by the mobile
+- [x] **`GET /api/v1/users` returns `{"users": [...]}` while every other
+  collection in the API uses `items` — CHANGED to `items` in 0.40.0 on the
+  operator's decision, 2026-09-13.** Core has accepted either key since its
+  0.8.0, so no client needs a release, and gbni-2 goes on emitting `users`
+  until it can be upgraded. The operator's other point: the web client should
+  not be reading that endpoint directly at all, since it is core's surface.
+  Core checked and reports the web client uses its `UsersApi` accessor
+  throughout with no envelope handling anywhere — so the accept-either shim is
+  in the phone client or one of the two TV clients, and is worth finding: a
+  client holding its own copy of a wire format will not notice the next change
+  either. Original note: Raised independently by the mobile
   session, which read `users_api.cpp` directly; the web client had already
   built an accept-either shim after its page silently rendered nothing (reading
   `.items` off a payload without it yields `undefined`, which throws nowhere).
   Single records from `POST`/`PATCH` are returned bare, which both clients
   assumed correctly. Cheaper to settle now than after a client ships around it.
   The inconsistency was inherited from the manage endpoints rather than chosen.
-- [ ] **Clients cannot tell which build a node is running.** Every behavioural
-  claim exchanged between the server and client sessions is pinned to a version
-  ("0.37.2 answers the whoami with no username"), and there is no way to check
-  a live node against a tag. Status reports a version string; nothing ties it
-  to a commit. Consider reporting the git describe output.
+- [x] **Clients cannot tell which build a node is running — DECLINED
+  2026-09-13. The answer is semver and nothing else.** No git describe, no
+  commit hash in Status. The consequence is accepted rather than unnoticed:
+  a behavioural claim pinned to a version is only as good as the discipline
+  that every behaviour change moves the version, which is what the 0.40.0 bump
+  for a removed response field already demonstrates.
 - [ ] **Tracker list is stale.** 111 tracker errors in five minutes on gbni-2;
   `coppersurfer.tk` and others have been dead for years. DHT carries the
   torrents, so this is noise rather than breakage, but it buries real tracker
@@ -1157,7 +1314,44 @@ that report.
   identity separate from immutable content hashes.
 - [ ] Update clients to consume immutable profiles and send a useful bandwidth
   ceiling plus a persistent logical-viewer/session identity.
-- [ ] Make signed artwork capability URLs actually cacheable. `exp`/`sig` are
+- [x] **Make signed artwork capability URLs actually cacheable — FIXED in
+  0.40.0 on the operator's instruction, 2026-09-13.** `exp` is now quantized to
+  a bucket of the TTL (rounded up to the bucket after next, so remaining
+  validity is always between one and two TTLs), making the URL byte-identical
+  for every request inside a bucket and letting the existing 24 h `immutable`
+  header be consulted for the first time. Gated by
+  `test_catalogue_artwork_url_is_stable_so_it_can_be_cached`. **Not deployed**
+  — 0.40.0 is unreleased. Clients need no release; the two id-to-URL memos can
+  be deleted once it ships. Still open and unowned: "cached posters go stale
+  after a minute or two" was never the bucket expiring, because there was no
+  bucket, so that symptom has a different and still unmeasured cause. The
+  measurement behind the fix: ("images load slowly, and when 'cached' they're just less slow").
+  What the measurement settled, against current source, so nobody re-derives it:
+  the artwork response already sends `public, max-age=86400, immutable`
+  (`catalogue_api.cpp:551`, the max-age being `artwork_capability_ttl` in
+  seconds), so the header is not the problem; `exp` is **not bucketed at any
+  granularity** — `signed_artwork_url()` uses `unix_ms() + ttl` per call
+  (`catalogue_api.cpp:99`), and `artwork_json()` runs it for every item on every
+  `/items` and `/items/{id}`, twice per item since `artwork` and
+  `effective_artwork` are both emitted; and a stable content identity for the
+  bytes **already exists on the wire** as the artwork `id` (a SHA-256 of the
+  bytes), which core already carries as `ArtworkRef.id`. Two clients
+  independently built an id→url memo beside a key they already had; that was a
+  core documentation gap, not a missing field, and core is fixing the comment.
+  A header-free URL form is also already guaranteed — the signed capability is
+  bearer-exempt (`capability_request()`, `catalogue_api.cpp:564`) — so a client
+  reporting that artwork needs a header is constructing its own URL instead of
+  using the payload's.
+  Because there is no bucket, "cached ones go stale after a minute or two" is
+  **not** a bucket expiring and has a different, unmeasured cause. Do not
+  attribute it; the web client is measuring it.
+  The fix, agreed in shape with core: round `exp` **up to a bucket boundary of
+  the TTL** rather than to a bare hour — a naive hourly bucket would give a URL
+  minted at 10:59 an hour of life instead of a day, invisibly to clients. One
+  consequence core flagged: it treats a capability whose `exp` has passed as
+  non-re-hostable onto other nodes, so that path will fire more often near a
+  boundary. Correct behaviour, and the authenticated URLs are the recovery.
+  Original filing: `exp`/`sig` are
   recomputed fresh on every `/items`/`/items/{id}` catalogue call, so the same
   artwork object gets a different query string (and therefore a different full
   URL, which browsers key their cache on) every time — the existing 24h
@@ -1233,16 +1427,20 @@ work needed for any of these.
   (`config.hpp`) are real conditionals compiled into the shipped binary, not
   behind a test-only build flag. Low risk today, but worth gating out of
   release builds since they're reachable via ordinary config.
-- [ ] **`MANIFEST.sha256` is stale** — 104 hashes fail `shasum -c` as of
-  2026-09-08 (90 when this was filed on 2026-09-05).
-  Nothing in the build references it, so it currently just misinforms anyone
-  who checks it. Either regenerate it as part of the release process or
-  remove it.
+- [x] **`MANIFEST.sha256` — DELETED in 0.40.0.** 104 of its hashes failed
+  `shasum -c`, nothing in the build referenced it, and the operator's decision
+  on 2026-09-13 was that the file has no purpose. Do not reintroduce it
+  without a build step that maintains it.
 
 ## P2 — Documentation hygiene (found 2026-09-05, backlog-adjacent but not code)
 
-- [ ] **Swagger/OpenAPI description of the HTTP API (operator request
-  2026-09-07, optional).** Publish an OpenAPI 3 document for `/api/v1/*`
+- [ ] **Swagger/OpenAPI description of the HTTP API — WANTED, and soon
+  (operator, 2026-09-13, upgrading the 2026-09-07 "optional").** This is now
+  the largest piece of agreed but unstarted work in this file, and it should be
+  generated from the route table at build time rather than written by hand, so
+  that it cannot drift from `service.cpp`. Four client sessions currently learn
+  the API by reading `status_api.cpp`/`service.cpp`, which is how two of them
+  ended up holding private copies of a wire format. Publish an OpenAPI 3 document for `/api/v1/*`
   (session, status, catalogue, playback, manage routes) and serve it from the
   daemon (e.g. `/api/v1/openapi.json` plus a Swagger UI page, or generate the
   document at build time from the route table so it cannot drift). The UI and
@@ -1402,13 +1600,14 @@ messages. Zero found; nothing was rewritten. The only matches were a legitimate
 `.gitignore` commit for Claude Code's machine-local settings and a dated UAT
 log describing that session's own rules.
 
-**A branching convention was relayed on 2026-09-13** by the mobile-app session,
-attributed to the operator: work on a long-lived `develop`, releases tagged on
-`main`, bare semver, **annotated** tags, never name a branch after a version,
-and put the version bump inside the release commit. This conflicts with what
-exists — `work-0.38.2` is named after a version and all 105 tags are
-lightweight. It was relayed, not stated directly, so nothing was restructured.
-**Confirm with the operator before converting.**
+**The branching convention is confirmed (operator, 2026-09-13).** Work on a
+long-lived `develop`, releases tagged on `main`, bare semver, **annotated**
+tags, never name a branch after a version, version bump inside the release
+commit — and no branches other than those two. The commands to convert were
+written out for the operator rather than run: **pushing, tagging and branch
+deletion are his alone, without exception.** The 105 existing tags are
+lightweight; converting them would mean force-pushing all 105, so new tags are
+annotated and history is left alone unless he says otherwise.
 
 ## Deployment rule
 
