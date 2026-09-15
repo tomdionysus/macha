@@ -264,6 +264,11 @@ kernel mount handle alive across the owning code being torn down and rebuilt.
 
 ## Phase 2 — FUSE as a plugin
 
+Re-planned in detail on 2026-09-14 — see
+`2026-09-14-fuse-supervised-subsystem-plan.md`. The bullets below stay as the
+original intent; that document is what gets executed (two stages, and the
+module boundary is libfuse rather than `FuseFrontend`).
+
 - [ ] Split `fuse_adapter.cpp`/`fuse_frontend.cpp`/`fuse_journal.cpp`/
   `fuse_mountpoint.cpp` into `libmacha-fuse`; delete `fuse_stub.cpp`.
 - [ ] Simplify `main.cpp` to an unconditional signal-wait loop; move mount
@@ -276,12 +281,14 @@ kernel mount handle alive across the owning code being torn down and rebuilt.
 
 ## Phase 3 — hardening and UAT
 
-- [ ] Audit and convert the remaining unguarded thread loops
+- [x] Audit and convert the remaining unguarded thread loops
   (`cluster.cpp`, `net.cpp`, `http.cpp`, `media_catalogue.cpp`,
   `media_information.cpp`, `status_api.cpp`, `durability_domain.cpp`) to
   `run_supervised`, even though they're core, not optional — the same
   uncaught-exception-terminates-the-process hazard applies to them today and
   this plan builds the primitive that fixes it for free.
+  **Struck 2026-09-14:** already satisfied by Phase 0 — every file named
+  passes `foundations/test_every_subsystem_thread_is_run_supervised`.
 - [ ] Deployment: extend the install step to ship `libmacha_core`,
   `libmacha-fuse`, `libmacha-torrent` alongside `macha`; confirm the existing
   byte-identical-hash verification across nodes covers all shipped files, not

@@ -226,13 +226,18 @@ provenance affects replay validation and cache policy, not scheduling priority.
 ## Subsystem plugins
 
 Optional subsystems ship as `dlopen`'d modules rather than being compiled into
-the server. Today that is BitTorrent acquisition
-(`<libdir>/macha/plugins/libmacha-torrent.so`); FUSE is still linked into the
-executable. The directory scanned is `plugin_path`, which defaults to this
-build's private plugin directory, and every module is checked against the
-running core's build stamp (project version plus git commit) before it is
-called — a plugin from a different build is refused and logged rather than
-loaded.
+the server: BitTorrent acquisition
+(`<libdir>/macha/plugins/libmacha-torrent.so`) and, since 0.41.0, the FUSE
+mount (`<libdir>/macha/plugins/libmacha-fuse.so`). The directory scanned is
+`plugin_path`, which defaults to this build's private plugin directory, and
+every module is checked against the running core's build stamp (project
+version plus git commit) before it is called — a plugin from a different
+build is refused and logged rather than loaded.
+
+Only the libfuse adapter is in the FUSE plugin. The frontend that owns the
+mount's durable spool and journal is core's own code and stays in
+`libmacha_core`, so the plugin file decides whether this node can *mount*,
+not whether it has a filesystem.
 
 The practical consequences for an operator:
 
@@ -251,7 +256,7 @@ The practical consequences for an operator:
 
   | state | meaning | action |
   |---|---|---|
-  | `unavailable` | No plugin file, or the plugin declined to start because this node is configured not to run it (`torrent.enabled: false`). | None; this is the configured outcome. Install the plugin or turn the setting on if it was meant to run. |
+  | `unavailable` | No plugin file, or the plugin declined to start because this node is configured not to run it (`torrent.enabled: false`, no `fuse.mount_path`). | None; this is the configured outcome. Install the plugin or turn the setting on if it was meant to run. |
   | `running` | Loaded and started. | None. |
   | `faulted` | The last construct/start attempt threw; it is being retried with backoff. | Read `last_fault`; if it persists it becomes `disabled`. |
   | `disabled` | Too many failures in the window, or refused at load (build-stamp mismatch, unreadable file). | Needs an operator: fix the cause and restart the process. Nothing retries automatically. |
@@ -260,7 +265,21 @@ The practical consequences for an operator:
   API and playback keep running; the capability itself is withdrawn while it
   is not running, so `/api/v1/torrents/*` answers 503 rather than failing in
   an unhelpful way. `/api/v1/torrents/search` is served by core and keeps
-  working regardless.
+  working regardless. The FUSE manage endpoints
+  (`/api/v1/manage/filesystem/blocked-namespace-operation`,
+  `parked-publications`) answer "nothing to report" while the mount is
+  faulted rather than erroring.
+- **A lost mount is now a `faulted` subsystem, not a process exit.** Before
+  0.41.0, a FUSE mount that disappeared under a running node (`umount -l`, a
+  kernel module reload) called for service shutdown and the process exited
+  with code 8 for systemd to restart. It now remounts in place, with
+  `restart_count` climbing and `last_fault` naming the cause; the node never
+  stops serving. A mount that keeps failing walks into `disabled` like any
+  other subsystem rather than remounting forever, and the covered mountpoint
+  stays non-writable throughout.
+- **`SIGHUP` configuration reload works on a mounted node.** Until 0.41.0 the
+  mount ran on the main thread and libfuse owned the signals, so reload was
+  silently unavailable on exactly the nodes that mount.
 - **Enabling a capability whose plugin is missing is no longer a config
   error.** Before 0.28.0, `torrent.enabled: true` on a build without
   libtorrent refused to start the node. It now starts, reports the subsystem

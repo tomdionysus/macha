@@ -31,8 +31,11 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <mutex>
 #include <sstream>
+#include <stop_token>
 #include <string_view>
+#include <vector>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #if defined(__linux__)
@@ -489,7 +492,16 @@ class CoveredMountpointGuard {
             throw std::runtime_error("cannot stat FUSE mountpoint: " +
                                      std::string(std::strerror(error)));
         }
-        original_mode_ = st.st_mode & 07777;
+        // What the directory looked like before anything guarded it, not what
+        // it looks like now. A supervised mount can be attempted more than
+        // once in a process, and after an unexpected mount loss the directory
+        // is deliberately left non-writable -- recording that as "original"
+        // would make a later clean unmount restore the fail-closed mode
+        // permanently.
+        const auto& preparation = fuse_mountpoint_preparation();
+        original_mode_ = preparation.covered_mode_known
+                             ? static_cast<mode_t>(preparation.covered_mode)
+                             : static_cast<mode_t>(st.st_mode & 07777);
     }
 
     ~CoveredMountpointGuard() {
@@ -520,153 +532,205 @@ class CoveredMountpointGuard {
     }
 };
 
-} // namespace
+// The kernel-facing half of the FUSE subsystem: mount, serve, unmount. It
+// owns no policy -- whether to retry, what to tell an operator, and what
+// happens to the rest of the node when this fails are the supervisor's and
+// FuseSubsystem's business (fuse_subsystem.cpp).
+class LibfuseMountDriver final : public FuseMountDriver {
+    std::mutex mutex_;
+    struct fuse* instance_{};
+    struct fuse_session* session_{};
+    bool exit_requested_{};
+    bool unmounted_{};
 
-int run_fuse(FileSystem& filesystem, CacheHydrator& hydrator,
-             const std::filesystem::path& mount_path, const FuseConfig& config,
-             std::function<void()> request_shutdown,
-             std::function<void(std::weak_ptr<FuseFrontend>)> frontend_observer) {
-    auto mount = mount_path.string();
-    std::string options = config.allow_other ? "default_permissions,allow_other,fsname=macha"
-                                             : "default_permissions,fsname=macha";
-
-    std::unique_ptr<CoveredMountpointGuard> mount_guard;
-    if (config.fail_closed_mountpoint)
-        mount_guard = std::make_unique<CoveredMountpointGuard>(mount);
-
-    auto fuse_frontend = std::make_shared<FuseFrontend>(filesystem, config);
-
-    std::vector<std::string> fuse_arg_storage{"macha", "-o", options};
-    std::vector<char*> fuse_argv;
-    for (auto& arg : fuse_arg_storage)
-        fuse_argv.push_back(arg.data());
-    struct fuse_args args = FUSE_ARGS_INIT(static_cast<int>(fuse_argv.size()), fuse_argv.data());
-    auto ops = operations();
-    struct fuse* instance = fuse_new(&args, &ops, sizeof(ops), fuse_frontend.get());
-    if (!instance) {
-        fuse_opt_free_args(&args);
-        return 3;
-    }
-    if (fuse_mount(instance, mount.c_str()) != 0) {
-        fuse_destroy(instance);
-        fuse_opt_free_args(&args);
-        return 4;
-    }
-
-    if (mount_guard && !mount_guard->protect()) {
-        Log::error("FUSE fail-closed mountpoint protection could not be installed");
-        fuse_unmount(instance);
-        fuse_destroy(instance);
-        fuse_opt_free_args(&args);
-        return 5;
-    }
-
-    hydrator.add_provider(fuse_frontend);
-    auto* session = fuse_get_session(instance);
-    if (fuse_set_signal_handlers(session) != 0) {
-        hydrator.remove_provider(fuse_frontend.get());
-        fuse_unmount(instance);
-        fuse_destroy(instance);
-        fuse_opt_free_args(&args);
-        return 6;
-    }
-
-    if (frontend_observer)
-        frontend_observer(fuse_frontend);
-
-    filesystem.reset_io_cancellation();
-    std::atomic_bool unexpected_mount_loss{false};
-    // fuse_mount() has already succeeded. A mount-table probe can strengthen
-    // that observation, but failure to inspect the table must never be treated
-    // as evidence that the mount disappeared.
-    std::atomic_bool mount_seen{true};
-
-    std::jthread mount_watchdog([&](std::stop_token stop) {
-      run_supervised("fuse-mount-watchdog", [&] {
-        size_t consecutive_misses = 0;
-        size_t consecutive_probe_errors = 0;
-        constexpr size_t missing_threshold = 3;
-        while (!stop.stop_requested()) {
-            std::this_thread::sleep_for(config.watchdog_interval);
-            if (stop.stop_requested())
-                break;
-
-            const auto probe = probe_macha_mountpoint(mount);
-            if (probe.state == MountTableState::macha_fuse) {
-                mount_seen.store(true);
-                consecutive_misses = 0;
-                consecutive_probe_errors = 0;
-                continue;
-            }
-            if (probe.state == MountTableState::probe_error) {
-                // In particular, EMFILE must not convert descriptor pressure
-                // into a false fail-closed namespace shutdown. Require three
-                // successful probes which positively report the mount absent.
-                consecutive_misses = 0;
-                ++consecutive_probe_errors;
-                if (consecutive_probe_errors == 1 || consecutive_probe_errors % 30 == 0) {
-                    Log::warn("FUSE mount-table watchdog probe failed mount=" + mount +
-                              " error=" + std::string(std::strerror(probe.error)) +
-                              " consecutive_errors=" + std::to_string(consecutive_probe_errors) +
-                              "; retaining previous mount state");
-                }
-                continue;
-            }
-
-            consecutive_probe_errors = 0;
-            if (!mount_seen.load())
-                continue;
-            if (++consecutive_misses < missing_threshold) {
-                Log::debug("FUSE mount-table watchdog miss " + std::to_string(consecutive_misses) +
-                           "/" + std::to_string(missing_threshold) + " mount=" + mount);
-                continue;
-            }
-            unexpected_mount_loss.store(true);
-            Log::error("FUSE mount disappeared for three consecutive successful watchdog checks; "
-                       "namespace is fail-closed and service shutdown is requested");
-            filesystem.request_io_cancellation();
-            if (request_shutdown)
-                request_shutdown();
-            fuse_session_exit(session);
-            return;
+    // Ending a loop that is blocked reading /dev/fuse takes more than
+    // fuse_session_exit(), which only sets a flag an idle worker will not
+    // observe until the next request arrives. Unmounting makes those reads
+    // fail, which is what actually returns the loop. libfuse's own signal
+    // handlers used to do this; signals now belong to core's sigwait loop
+    // (main.cpp), so the subsystem ends its own loop.
+    void wake_locked() {
+        if (session_)
+            fuse_session_exit(session_);
+        if (instance_ && !unmounted_) {
+            fuse_unmount(instance_);
+            unmounted_ = true;
         }
-      });
-    });
-
-    Log::debug("shutdown: entering bounded FUSE main loop");
-    const int loop_rc = fuse_loop_mt(instance, 0);
-    if (fuse_loop_result_is_error(loop_rc))
-        unexpected_mount_loss.store(true);
-    else if (loop_rc > 0)
-        Log::debug("shutdown: FUSE main loop received signal=" + std::to_string(loop_rc));
-    filesystem.request_io_cancellation();
-    if (request_shutdown)
-        request_shutdown();
-
-    mount_watchdog.request_stop();
-    if (mount_watchdog.joinable())
-        mount_watchdog.join();
-
-    hydrator.remove_provider(fuse_frontend.get());
-    if (frontend_observer)
-        frontend_observer({});
-    fuse_frontend->stop();
-    fuse_remove_signal_handlers(session);
-    fuse_unmount(instance);
-
-    if (mount_guard)
-        mount_guard->restore_on_exit(!unexpected_mount_loss.load());
-
-    fuse_destroy(instance);
-    fuse_opt_free_args(&args);
-
-    if (unexpected_mount_loss.load()) {
-        Log::error(
-            "FUSE frontend terminated unexpectedly; covered mountpoint remains non-writable");
-        return 8;
     }
-    Log::debug("shutdown: FUSE main loop returned cleanly");
-    return 0;
-}
+
+  public:
+    void request_exit() override {
+        std::lock_guard lock(mutex_);
+        exit_requested_ = true;
+        wake_locked();
+    }
+
+    FuseMountOutcome run(const FuseMountContext& context, std::stop_token stop) override {
+        auto& frontend = *context.frontend;
+        auto& filesystem = *context.filesystem;
+        const auto& config = *context.config;
+        const auto mount = context.mount_path.string();
+
+        const std::string options = config.allow_other
+                                        ? "default_permissions,allow_other,fsname=macha"
+                                        : "default_permissions,fsname=macha";
+
+        std::unique_ptr<CoveredMountpointGuard> mount_guard;
+        if (config.fail_closed_mountpoint)
+            mount_guard = std::make_unique<CoveredMountpointGuard>(mount);
+
+        std::vector<std::string> fuse_arg_storage{"macha", "-o", options};
+        std::vector<char*> fuse_argv;
+        for (auto& arg : fuse_arg_storage)
+            fuse_argv.push_back(arg.data());
+        struct fuse_args args = FUSE_ARGS_INIT(static_cast<int>(fuse_argv.size()),
+                                               fuse_argv.data());
+        auto ops = operations();
+        struct fuse* instance = fuse_new(&args, &ops, sizeof(ops), &frontend);
+        if (!instance) {
+            fuse_opt_free_args(&args);
+            return {false, "fuse_new failed for " + mount};
+        }
+        if (fuse_mount(instance, mount.c_str()) != 0) {
+            fuse_destroy(instance);
+            fuse_opt_free_args(&args);
+            return {false, "fuse_mount failed for " + mount};
+        }
+
+        if (mount_guard && !mount_guard->protect()) {
+            fuse_unmount(instance);
+            fuse_destroy(instance);
+            fuse_opt_free_args(&args);
+            return {false,
+                    "fail-closed mountpoint protection could not be installed for " + mount};
+        }
+
+        auto* session = fuse_get_session(instance);
+        {
+            std::lock_guard lock(mutex_);
+            instance_ = instance;
+            session_ = session;
+            unmounted_ = false;
+            // Asked to stop between construction and the mount coming up.
+            if (exit_requested_ || stop.stop_requested())
+                wake_locked();
+        }
+        // A stop on the owning lifecycle thread ends the loop exactly as an
+        // explicit request_exit() does.
+        std::stop_callback stop_wake(stop, [this] { request_exit(); });
+
+        filesystem.reset_io_cancellation();
+        std::atomic_bool unexpected_mount_loss{false};
+        // fuse_mount() has already succeeded. A mount-table probe can strengthen
+        // that observation, but failure to inspect the table must never be treated
+        // as evidence that the mount disappeared.
+        std::atomic_bool mount_seen{true};
+
+        std::jthread mount_watchdog([&](std::stop_token watchdog_stop) {
+          run_supervised("fuse-mount-watchdog", [&] {
+            size_t consecutive_misses = 0;
+            size_t consecutive_probe_errors = 0;
+            constexpr size_t missing_threshold = 3;
+            while (!watchdog_stop.stop_requested()) {
+                std::this_thread::sleep_for(config.watchdog_interval);
+                if (watchdog_stop.stop_requested())
+                    break;
+
+                const auto probe = probe_macha_mountpoint(mount);
+                if (probe.state == MountTableState::macha_fuse) {
+                    mount_seen.store(true);
+                    consecutive_misses = 0;
+                    consecutive_probe_errors = 0;
+                    continue;
+                }
+                if (probe.state == MountTableState::probe_error) {
+                    // In particular, EMFILE must not convert descriptor pressure
+                    // into a false fail-closed namespace shutdown. Require three
+                    // successful probes which positively report the mount absent.
+                    consecutive_misses = 0;
+                    ++consecutive_probe_errors;
+                    if (consecutive_probe_errors == 1 || consecutive_probe_errors % 30 == 0) {
+                        Log::warn("FUSE mount-table watchdog probe failed mount=" + mount +
+                                  " error=" + std::string(std::strerror(probe.error)) +
+                                  " consecutive_errors=" +
+                                  std::to_string(consecutive_probe_errors) +
+                                  "; retaining previous mount state");
+                    }
+                    continue;
+                }
+
+                consecutive_probe_errors = 0;
+                if (!mount_seen.load())
+                    continue;
+                if (++consecutive_misses < missing_threshold) {
+                    Log::debug("FUSE mount-table watchdog miss " +
+                               std::to_string(consecutive_misses) + "/" +
+                               std::to_string(missing_threshold) + " mount=" + mount);
+                    continue;
+                }
+                unexpected_mount_loss.store(true);
+                Log::error("FUSE mount disappeared for three consecutive successful watchdog "
+                           "checks; the namespace is fail-closed and the mount will be rebuilt");
+                filesystem.request_io_cancellation();
+                // Deliberately only fuse_session_exit here, never fuse_unmount:
+                // the Macha mount is already gone, and whatever now occupies
+                // that path is not ours to unmount. The dead fuse fd is what
+                // returns the loop.
+                fuse_session_exit(session);
+                return;
+            }
+          });
+        });
+
+        Log::debug("FUSE mount established path=" + mount);
+        const int loop_rc = fuse_loop_mt(instance, 0);
+        if (fuse_loop_result_is_error(loop_rc))
+            unexpected_mount_loss.store(true);
+        else if (loop_rc > 0)
+            Log::debug("FUSE main loop received signal=" + std::to_string(loop_rc));
+        filesystem.request_io_cancellation();
+
+        mount_watchdog.request_stop();
+        if (mount_watchdog.joinable())
+            mount_watchdog.join();
+
+        bool requested = false;
+        {
+            std::lock_guard lock(mutex_);
+            requested = exit_requested_;
+            session_ = nullptr;
+            if (!unmounted_) {
+                fuse_unmount(instance);
+                unmounted_ = true;
+            }
+            instance_ = nullptr;
+        }
+
+        if (mount_guard)
+            mount_guard->restore_on_exit(!unexpected_mount_loss.load());
+
+        fuse_destroy(instance);
+        fuse_opt_free_args(&args);
+
+        if (unexpected_mount_loss.load())
+            return {false, "the FUSE mount at " + mount +
+                               " terminated unexpectedly; the covered mountpoint remains "
+                               "non-writable"};
+        if (requested || stop.stop_requested()) {
+            Log::debug("shutdown: FUSE main loop returned cleanly");
+            return {true, {}};
+        }
+        return {false, "the FUSE event loop at " + mount + " ended without being asked to"};
+    }
+};
+
+// Linking this translation unit is what gives a build the ability to mount.
+const bool g_libfuse_driver_registered = [] {
+    set_fuse_mount_driver_factory(
+        []() -> std::unique_ptr<FuseMountDriver> { return std::make_unique<LibfuseMountDriver>(); });
+    return true;
+}();
+
+} // namespace
 
 } // namespace macha

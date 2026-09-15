@@ -2429,8 +2429,12 @@ MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_int
     plugin_config.torrent = torrent_config;
     plugin_config.state_path = state_path;
     SubsystemRegistry registry;
-    LoadedTorrentPlugin plugin(SubsystemContext{&plugin_config, &fixture.node(), &ingest,
-                                                &registry});
+    SubsystemContext context;
+    context.config = &plugin_config;
+    context.node = &fixture.node();
+    context.ingest = &ingest;
+    context.registry = &registry;
+    LoadedTorrentPlugin plugin(context);
     auto torrents_owner = registry.torrent();
     REQUIRE(torrents_owner);
     auto& torrents = *torrents_owner;
@@ -3948,14 +3952,23 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
             return false;
         }
     }, 10s));
+    // The baseline has to be the snapshot that actually satisfied quiescence,
+    // not a second one taken afterwards: between the predicate returning true
+    // and a separate sample, another convergence run can be scheduled, and the
+    // baseline then reads runs_scheduled=5 runs_completed=4. Every delta
+    // computed from it is off by one, and the end-of-test assertion
+    // `completed_delta == scheduled_delta` fails for a run that behaved
+    // perfectly (observed 1 in 60, 2026-09-15).
+    ConvergenceDemandDiagnostics convergence_before{};
     REQUIRE(wait_until([&] {
         const auto d = s1.metadata_convergence_diagnostics();
-        return !d.scheduled && d.runs_scheduled == d.runs_completed;
+        if (d.scheduled || d.runs_scheduled != d.runs_completed)
+            return false;
+        convergence_before = d;
+        return true;
     }, 5s));
 
     const auto repairs_before = catalogue_repairs.load(std::memory_order_acquire);
-    const auto convergence_before = s1.metadata_convergence_diagnostics();
-    capture_catalogue_repair.store(true, std::memory_order_release);
     gate_metadata.store(true, std::memory_order_release);
 
     item.title = "Intermediate Catalogue Title";
@@ -3983,8 +3996,27 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     REQUIRE(wait_until([&] {
         return s1.node().known_metadata_generation() >= final_generation;
     }, 5s));
-    CHECK(catalogue_repairs.load(std::memory_order_acquire) == repairs_before);
+    // Deliberately NOT "no catalogue repair happened yet". Gating
+    // `metadata-repair-begin` stops this node's repair pass; it does not stop
+    // its committed generation from advancing, because publish_commit stores
+    // and accepts commits on replicas directly. s1 therefore legitimately
+    // moves forward under the gate and Service::loop repairs the catalogue
+    // for the generation it now has. Measured: `repairs_before=3
+    // gated_repairs=4 s1_committed=12 s1_known=13 final_generation=13`
+    // (2026-09-15) -- one repair, not a storm. The coalescing claim is
+    // asserted at the end of the test over the whole window, gate included,
+    // which is where it belongs.
+    const auto gated_repairs = catalogue_repairs.load(std::memory_order_acquire);
 
+    // Capture the convergence state at the first catalogue repair AFTER the
+    // gate opens: that is the repair which processes the accumulated burst,
+    // and the only one the run-count assertions below are about. Latching it
+    // from before the burst instead (as this did until 2026-09-15) could
+    // claim the capture on a repair for the single pre-burst upsert, giving
+    // `repair_scheduled=7 before_scheduled=6 repair_requested=10
+    // before_requested=9` -- one run and one demand event, asserted against
+    // as though it were the twenty-event burst. Observed 1 in 60.
+    capture_catalogue_repair.store(true, std::memory_order_release);
     metadata_gate.open();
     const bool final_state_ready = wait_until([&] {
         try {
@@ -4079,13 +4111,96 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
             " repairs_after=" +
             std::to_string(catalogue_repairs.load(std::memory_order_acquire)));
     }
-    CHECK(catalogue_repairs.load(std::memory_order_acquire) == repairs_before + 1);
+    // One catalogue repair per convergence run that actually advanced this
+    // node's committed metadata generation -- not one per burst event, which
+    // is the property under test, and not exactly one, which was the old
+    // assertion and is not something the product promises.
+    //
+    // `catalogue_dirty` is set by Service::loop when the local committed
+    // generation moves. The gated owner run and its coalesced follow-up are
+    // both mandatory (see above), so whether the burst's metadata arrives
+    // entirely within the first run or is split across both is a timing
+    // accident: either one or two generation changes, and therefore one or
+    // two repairs. Measured failing that way 2 times in 183 runs on the
+    // macOS laptop (2026-09-15): `before=2 after=4 scheduled_delta=2
+    // requested_delta=20` -- two convergence runs, two repairs, from twenty
+    // demand events. That is coalescing working, and the old assertion
+    // called it a failure.
+    // The subject: nine catalogue mutations, arriving as ~20 convergence
+    // demand events, must not become ~20 catalogue repairs. A quarter of the
+    // demand events is a generous ceiling on "coalesced" and still an order
+    // of magnitude below a per-event storm; observed values are 1-2.
+    //
+    // Not pinned to exactly one, which is what this assertion said until
+    // 2026-09-15 and is not a property the product has: whether the burst's
+    // metadata lands entirely within the gated owner run or is split across
+    // it and its mandatory coalesced follow-up is a timing accident, and each
+    // generation advance correctly dirties the catalogue. Measured failing
+    // that way twice in 183 runs (`before=2 after=4 scheduled_delta=2
+    // requested_delta=20`).
+    const auto repairs_after = catalogue_repairs.load(std::memory_order_acquire);
+    const auto repairs_delta = repairs_after - repairs_before;
+    if (repairs_delta < 1 || repairs_delta * 4 > requested_delta) {
+        throw std::runtime_error(
+            "unexpected catalogue repair count for one coalesced burst: repairs_before=" +
+            std::to_string(repairs_before) + " repairs_after=" + std::to_string(repairs_after) +
+            " gated_repairs=" + std::to_string(gated_repairs) +
+            " scheduled_delta=" + std::to_string(scheduled_delta) +
+            " completed_delta=" + std::to_string(completed_delta) +
+            " requested_delta=" + std::to_string(requested_delta));
+    }
 
-    REQUIRE(wait_until([&] {
+    const auto unreclaimed = [&] {
         return std::none_of(superseded.begin(), superseded.end(), [&](const ObjectId& id) {
             return s1.node().local_store().has(id) || s2.node().local_store().has(id);
         });
-    }, 12s));
+    };
+    const auto gc_started = Clock::now();
+    if (!wait_until(unreclaimed, 12s)) {
+        // Failing here has to distinguish a slow sweep from a stuck one, or
+        // the next person reads "GC did not finish in 12 s" and calls it a
+        // flake -- which is how this case survived five sightings. Give it a
+        // bounded second chance purely to classify the failure, then say
+        // which objects are left and on which node. Measured twice on
+        // 2026-09-15: all four objects left on s2 (the node that wrote them)
+        // and none on s1, with both catalogues converged at the same
+        // generation and agreeing one artwork is live -- so not a slow sweep
+        // on both nodes, but the writer reclaiming nothing while its peer
+        // reclaimed everything. Four further occurrences in 600 reps all
+        // reported `reclaimed_eventually=no` after 42 s: it is stuck, not
+        // slow. See the P0 item in TODO/ACTIVE.md.
+        const bool eventually = wait_until(unreclaimed, 15s);
+        const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - gc_started).count();
+        // Name what is left and where. Without this a failure here says only
+        // "GC did not finish in 12 s", which cannot distinguish a slow sweep
+        // from a genuine leak -- and this case has been waved past as a flake
+        // more than once on exactly that ambiguity.
+        std::string remaining;
+        for (const auto& id : superseded) {
+            const bool on1 = s1.node().local_store().has(id);
+            const bool on2 = s2.node().local_store().has(id);
+            if (!on1 && !on2)
+                continue;
+            if (!remaining.empty())
+                remaining += ' ';
+            remaining += to_string(id).substr(0, 12);
+            remaining += on1 && on2 ? "=both" : (on1 ? "=s1" : "=s2");
+        }
+        const auto status1 = s1.catalogue().status();
+        const auto status2 = s2.catalogue().status();
+        throw std::runtime_error(
+            "superseded catalogue artwork was not reclaimed within 12s: remaining=[" + remaining +
+            "] superseded_count=" + std::to_string(superseded.size()) +
+            " s1_catalogue_generation=" + std::to_string(status1.metadata_generation) +
+            " s1_known=" + std::to_string(status1.known_metadata_generation) +
+            " s1_artwork_objects=" + std::to_string(status1.artwork_objects) +
+            " s2_catalogue_generation=" + std::to_string(status2.metadata_generation) +
+            " s2_artwork_objects=" + std::to_string(status2.artwork_objects) +
+            " repairs_delta=" + std::to_string(repairs_delta) +
+            " reclaimed_eventually=" + (eventually ? "yes" : "no") +
+            " total_ms=" + std::to_string(total_ms));
+    }
 
     s2.stop();
     s1.stop();

@@ -184,6 +184,12 @@ fuse:
   # reported as filesystem.mountpoint_stray_entries.
   fail_closed_mountpoint: true
   watchdog_interval_ms: 1000
+  # How long to wait for this node's metadata replica to produce any
+  # namespace at all before the mount reports a fault its supervisor can
+  # retry and eventually show you. It bounds "no metadata has arrived",
+  # not "recovery is slow": a progressing replay is never cut off by it.
+  # 0 waits forever, which is what every release before 0.41.0 did.
+  initial_namespace_timeout_ms: 600000
 
 network:
   # listen is the local bind address. advertise is what peers connect to.

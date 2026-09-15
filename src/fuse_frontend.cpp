@@ -596,6 +596,8 @@ struct FuseFrontend::State {
 
     FileSystem& fs;
     FuseConfig config;
+    // Cancels the initial-namespace wait in start(); see the constructor.
+    std::stop_token startup_stop;
     WeightedLoaderService weighted_loader;
     std::filesystem::path spool_dir;
     std::filesystem::path journal_path;
@@ -816,8 +818,8 @@ struct FuseFrontend::State {
     std::atomic_uint64_t journal_records_appended{};
     std::atomic_uint64_t journal_durability_barriers{};
 
-    explicit State(FileSystem& filesystem, FuseConfig policy)
-        : fs(filesystem), config(std::move(policy)),
+    State(FileSystem& filesystem, FuseConfig policy, std::stop_token startup_cancel = {})
+        : fs(filesystem), config(std::move(policy)), startup_stop(std::move(startup_cancel)),
           weighted_loader(config.viewer_weight,
                           config.suspend_loader_for_tests ? 0 : config.loader_weight),
           spool_dir(config.spool_path.value_or(fs.node().config().state_path / "fuse-spool")),
@@ -4512,12 +4514,31 @@ struct FuseFrontend::State {
             sync_directory(spool_dir);
     }
 
+    // Bounded and cancellable, because this runs inside the FuseFrontend
+    // constructor and therefore inside a supervised lifecycle thread. An
+    // unbounded wait here is what let a node whose replica never became
+    // available hang indefinitely with one debug line to show for it; a wait
+    // that cannot be cancelled would hold Service::stop() for as long.
+    //
+    // Both exits are exceptions rather than a sentinel: to the supervisor a
+    // frontend that could not be constructed is an ordinary construction
+    // fault, retried with backoff and eventually surfaced as `disabled`.
     MetadataSnapshotView wait_for_initial_namespace() {
         bool announced = false;
+        const auto started = Clock::now();
         for (;;) {
             try {
                 return fs.local_snapshot_view();
             } catch (const MetadataNotReady& error) {
+                if (startup_stop.stop_requested())
+                    throw FsError(EINTR,
+                                  "FUSE startup cancelled while waiting for initial metadata");
+                if (config.initial_namespace_timeout.count() > 0 &&
+                    Clock::now() - started >= config.initial_namespace_timeout)
+                    throw FsError(ETIMEDOUT,
+                                  "FUSE saw no metadata within " +
+                                      std::to_string(config.initial_namespace_timeout.count()) +
+                                      "ms: " + std::string(error.what()));
                 if (!announced) {
                     Log::debug("FUSE waiting for initial metadata: " + std::string(error.what()));
                     announced = true;
@@ -5227,8 +5248,8 @@ struct FuseFrontend::State {
     }
 };
 
-FuseFrontend::FuseFrontend(FileSystem& filesystem, FuseConfig config)
-    : state_(std::make_unique<State>(filesystem, std::move(config))) {
+FuseFrontend::FuseFrontend(FileSystem& filesystem, FuseConfig config, std::stop_token stop)
+    : state_(std::make_unique<State>(filesystem, std::move(config), std::move(stop))) {
     state_->start();
 }
 

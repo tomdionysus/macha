@@ -6,6 +6,7 @@
 
 namespace macha {
 
+class FuseFrontend;
 class TorrentService;
 
 // Where a subsystem plugin publishes the capability it implements and where
@@ -27,9 +28,20 @@ class SubsystemRegistry {
     void withdraw_torrent(const TorrentService*);
     std::shared_ptr<TorrentService> torrent() const;
 
+    // FUSE publishes its concrete FuseFrontend rather than an abstract
+    // service, because unlike TorrentManager it is core's own class: it lives
+    // in macha_core and only the libfuse-facing adapter moves into a plugin
+    // (see TODO/2026-09-14-fuse-supervised-subsystem-plan.md, decision 2).
+    // Status and the manage endpoints therefore keep their concrete types, and
+    // tests keep constructing a FuseFrontend directly.
+    void publish_fuse(std::shared_ptr<FuseFrontend>);
+    void withdraw_fuse(const FuseFrontend*);
+    std::shared_ptr<FuseFrontend> fuse() const;
+
   private:
     mutable std::shared_mutex mutex_;
     std::shared_ptr<TorrentService> torrent_;
+    std::shared_ptr<FuseFrontend> fuse_;
 };
 
 } // namespace macha

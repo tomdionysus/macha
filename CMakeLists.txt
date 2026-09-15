@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.40.1 LANGUAGES CXX)
+project(macha VERSION 0.41.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -305,6 +305,7 @@ set(MACHA_CORE_SOURCES
     src/fuse_journal.cpp
     src/fuse_frontend.cpp
     src/fuse_mountpoint.cpp
+    src/fuse_subsystem.cpp
     src/service.cpp
 )
 
@@ -340,14 +341,14 @@ endif()
 # TODO/2026-09-05-subsystem-plugin-isolation-plan.md, Phase 1). MODULE, not
 # SHARED: it is only ever dlopen'd, never linked against.
 set(MACHA_PLUGIN_BUILD_DIR "${CMAKE_BINARY_DIR}/plugins")
+# From the installed plugin directory back to the private libdir holding
+# libmacha_core, so every plugin resolves core wherever the prefix is.
+file(RELATIVE_PATH MACHA_PLUGINDIR_TO_PRIVATE_LIBDIR
+     "${MACHA_PLUGIN_INSTALL_DIR_FULL}"
+     "${CMAKE_INSTALL_PREFIX}/${MACHA_PRIVATE_LIBDIR}")
 if(MACHA_LIBTORRENT_TARGET)
     add_library(macha-torrent MODULE src/torrent_manager.cpp src/torrent_plugin.cpp)
     target_link_libraries(macha-torrent PRIVATE macha_core ${MACHA_LIBTORRENT_TARGET})
-    # From the installed plugin directory back to the private libdir holding
-    # libmacha_core, so the plugin resolves core wherever the prefix is.
-    file(RELATIVE_PATH MACHA_PLUGINDIR_TO_PRIVATE_LIBDIR
-         "${MACHA_PLUGIN_INSTALL_DIR_FULL}"
-         "${CMAKE_INSTALL_PREFIX}/${MACHA_PRIVATE_LIBDIR}")
     set_target_properties(macha-torrent PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY "${MACHA_PLUGIN_BUILD_DIR}"
         INSTALL_RPATH "${MACHA_RPATH_ORIGIN}/${MACHA_PLUGINDIR_TO_PRIVATE_LIBDIR}"
@@ -397,28 +398,37 @@ if(MACHA_BUILD_SERVER)
         INSTALL_RPATH "${MACHA_RPATH_ORIGIN}/${MACHA_BINDIR_TO_PRIVATE_LIBDIR}"
         BUILD_WITH_INSTALL_RPATH FALSE)
 
+    # The FUSE mount adapter is a subsystem plugin, not part of the executable:
+    # libfuse3 (plus its kernel driver) is the widest native crash surface in
+    # the process, and behind a dlopen boundary a node without the plugin file
+    # simply has no mount capability at runtime. The boundary is libfuse
+    # ALONE -- FuseFrontend, the journal and the mountpoint helpers are core's
+    # own code and stay in macha_core, so core keeps its concrete types and
+    # the FUSE tests keep linking it directly. See
+    # TODO/2026-09-14-fuse-supervised-subsystem-plan.md, decision 2.
     set(MACHA_FUSE_FOUND OFF)
     if(MACHA_ENABLE_FUSE)
         pkg_check_modules(FUSE3 QUIET IMPORTED_TARGET fuse3)
-if(TARGET PkgConfig::FUSE3)
-    set(MACHA_FUSE_FOUND ON)
-    target_sources(macha PRIVATE src/fuse_adapter.cpp)
-    # On macOS, /usr/local/include is searched by Clang before -isystem
-    # directories.  If both legacy FUSE 2 headers and FUSE 3 are installed,
-    # PkgConfig::FUSE3's system include therefore lets <fuse.h> resolve to
-    # FUSE 2 while <fuse_lowlevel.h> resolves to FUSE 3.  Put the explicit
-    # FUSE 3 directory first as a normal include path so a clean configure is
-    # deterministic (an older CMake cache happened to conceal this).
-    if(APPLE)
-        target_include_directories(macha BEFORE PRIVATE ${FUSE3_INCLUDE_DIRS})
-        target_link_directories(macha PRIVATE ${FUSE3_LIBRARY_DIRS})
-        target_link_libraries(macha PRIVATE ${FUSE3_LIBRARIES})
-        target_compile_options(macha PRIVATE ${FUSE3_CFLAGS_OTHER})
-        target_link_options(macha PRIVATE ${FUSE3_LDFLAGS_OTHER})
-    else()
-        target_link_libraries(macha PRIVATE PkgConfig::FUSE3)
-    endif()
-endif()
+        if(TARGET PkgConfig::FUSE3)
+            set(MACHA_FUSE_FOUND ON)
+            add_library(macha-fuse MODULE src/fuse_adapter.cpp src/fuse_plugin.cpp)
+            target_link_libraries(macha-fuse PRIVATE macha_core)
+            # On macOS, /usr/local/include is searched by Clang before -isystem
+            # directories.  If both legacy FUSE 2 headers and FUSE 3 are installed,
+            # PkgConfig::FUSE3's system include therefore lets <fuse.h> resolve to
+            # FUSE 2 while <fuse_lowlevel.h> resolves to FUSE 3.  Put the explicit
+            # FUSE 3 directory first as a normal include path so a clean configure is
+            # deterministic (an older CMake cache happened to conceal this).
+            if(APPLE)
+                target_include_directories(macha-fuse BEFORE PRIVATE ${FUSE3_INCLUDE_DIRS})
+                target_link_directories(macha-fuse PRIVATE ${FUSE3_LIBRARY_DIRS})
+                target_link_libraries(macha-fuse PRIVATE ${FUSE3_LIBRARIES})
+                target_compile_options(macha-fuse PRIVATE ${FUSE3_CFLAGS_OTHER})
+                target_link_options(macha-fuse PRIVATE ${FUSE3_LDFLAGS_OTHER})
+            else()
+                target_link_libraries(macha-fuse PRIVATE PkgConfig::FUSE3)
+            endif()
+        endif()
 
         if(APPLE AND NOT MACHA_FUSE_FOUND)
             find_path(FUSE3_INCLUDE_DIR fuse.h
@@ -436,18 +446,32 @@ endif()
             )
             if(FUSE3_INCLUDE_DIR AND FUSE3_LIBRARY)
                 set(MACHA_FUSE_FOUND ON)
-                target_sources(macha PRIVATE src/fuse_adapter.cpp)
-                target_include_directories(macha PRIVATE ${FUSE3_INCLUDE_DIR})
-                target_link_libraries(macha PRIVATE ${FUSE3_LIBRARY})
+                add_library(macha-fuse MODULE src/fuse_adapter.cpp src/fuse_plugin.cpp)
+                target_link_libraries(macha-fuse PRIVATE macha_core ${FUSE3_LIBRARY})
+                target_include_directories(macha-fuse PRIVATE ${FUSE3_INCLUDE_DIR})
             endif()
         endif()
     endif()
 
-    if(NOT MACHA_FUSE_FOUND)
-        target_sources(macha PRIVATE src/fuse_stub.cpp)
-        if(MACHA_ENABLE_FUSE)
-            message(STATUS "FUSE3/macFUSE development files not found; building service without mount support")
+    if(MACHA_FUSE_FOUND)
+        set_target_properties(macha-fuse PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY "${MACHA_PLUGIN_BUILD_DIR}"
+            INSTALL_RPATH "${MACHA_RPATH_ORIGIN}/${MACHA_PLUGINDIR_TO_PRIVATE_LIBDIR}"
+            BUILD_WITH_INSTALL_RPATH FALSE)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(macha-fuse PRIVATE -Wall -Wextra -Wpedantic)
+            if(MACHA_WARNINGS_AS_ERRORS)
+                target_compile_options(macha-fuse PRIVATE -Werror)
+            endif()
         endif()
+        # The executable no longer links libfuse at all.
+        add_dependencies(macha macha-fuse)
+        message(STATUS "FUSE mount plugin enabled")
+    elseif(MACHA_ENABLE_FUSE)
+        # No stub translation unit: with no plugin file there is no mount
+        # driver, and the `fuse` subsystem is simply absent at runtime, the
+        # same way a node without libmacha-torrent has no torrent capability.
+        message(STATUS "FUSE3/macFUSE development files not found; building service without mount support")
     endif()
 
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
@@ -469,7 +493,8 @@ if(MACHA_BUILD_TESTS)
     # only ever dlopen'd -- and links macha_core so it shares the same
     # Subsystem/SubsystemPluginEntry types and build-identity stamp.
     foreach(plugin_name IN ITEMS test_plugin_ok test_plugin_faulting test_plugin_mismatched_abi
-                                test_plugin_no_entry_symbol test_plugin_declining)
+                                test_plugin_no_entry_symbol test_plugin_declining
+                                test_plugin_faulting_after_start)
         add_library(${plugin_name} MODULE tests/plugins/${plugin_name}.cpp)
         target_link_libraries(${plugin_name} PRIVATE macha_core)
         set_target_properties(${plugin_name} PROPERTIES PREFIX "")
@@ -483,6 +508,7 @@ if(MACHA_BUILD_TESTS)
         tests/test_framework.cpp
         tests/test_foundations.cpp
         tests/test_subsystem_supervisor.cpp
+        tests/test_fuse_subsystem.cpp
         tests/test_storage_metadata.cpp
         tests/test_storage_v18.cpp
         tests/test_rpc_cluster.cpp
@@ -501,9 +527,10 @@ if(MACHA_BUILD_TESTS)
         MACHA_TEST_PLUGIN_FAULTING="$<TARGET_FILE:test_plugin_faulting>"
         MACHA_TEST_PLUGIN_MISMATCHED_ABI="$<TARGET_FILE:test_plugin_mismatched_abi>"
         MACHA_TEST_PLUGIN_NO_ENTRY_SYMBOL="$<TARGET_FILE:test_plugin_no_entry_symbol>"
-        MACHA_TEST_PLUGIN_DECLINING="$<TARGET_FILE:test_plugin_declining>")
+        MACHA_TEST_PLUGIN_DECLINING="$<TARGET_FILE:test_plugin_declining>"
+        MACHA_TEST_PLUGIN_FAULTING_AFTER_START="$<TARGET_FILE:test_plugin_faulting_after_start>")
     add_dependencies(macha-tests test_plugin_ok test_plugin_faulting test_plugin_mismatched_abi
-        test_plugin_no_entry_symbol test_plugin_declining)
+        test_plugin_no_entry_symbol test_plugin_declining test_plugin_faulting_after_start)
     # Tests that need the real torrent subsystem dlopen it from the build
     # tree, exactly as production loads it from the install tree. Pointing a
     # Service's plugin_path here also keeps a test process from loading a
@@ -513,6 +540,11 @@ if(MACHA_BUILD_TESTS)
             MACHA_TEST_TORRENT_PLUGIN="$<TARGET_FILE:macha-torrent>"
             MACHA_TEST_PLUGIN_DIR="${MACHA_PLUGIN_BUILD_DIR}")
         add_dependencies(macha-tests macha-torrent)
+    endif()
+    if(TARGET macha-fuse)
+        target_compile_definitions(macha-tests PRIVATE
+            MACHA_TEST_FUSE_PLUGIN="$<TARGET_FILE:macha-fuse>")
+        add_dependencies(macha-tests macha-fuse)
     endif()
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(macha-tests PRIVATE -Wall -Wextra -Wpedantic)
@@ -648,6 +680,9 @@ install(TARGETS macha_core
 install(DIRECTORY DESTINATION ${MACHA_PLUGIN_INSTALL_DIR})
 if(TARGET macha-torrent)
     install(TARGETS macha-torrent LIBRARY DESTINATION ${MACHA_PLUGIN_INSTALL_DIR})
+endif()
+if(TARGET macha-fuse)
+    install(TARGETS macha-fuse LIBRARY DESTINATION ${MACHA_PLUGIN_INSTALL_DIR})
 endif()
 
 if(MACHA_INSTALL_SYSTEMD)

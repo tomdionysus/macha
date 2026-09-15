@@ -1441,3 +1441,42 @@ MACHA_TEST("foundations", test_fuse_mountpoint_preflight_refuses_unrelated_files
     CHECK(refused);
 #endif
 }
+
+MACHA_TEST("foundations", test_main_owns_signals_and_never_runs_the_mount_itself) {
+    // Until 0.41.0 main() ran FUSE on its own thread when a mount was
+    // configured, which made three things true at once: FUSE's constructor
+    // threw into main()'s outermost catch and exited the whole process, the
+    // mount loop's return value WAS the process exit status, and libfuse's
+    // signal handlers -- not this loop -- owned SIGINT/SIGTERM/SIGHUP, so
+    // SIGHUP configuration reload was silently unavailable on exactly the
+    // nodes that mount. FUSE is a supervised subsystem now
+    // (TODO/2026-09-14-fuse-supervised-subsystem-plan.md); this keeps main()
+    // from growing the branch back.
+    const std::filesystem::path main_cpp =
+        std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "src" / "main.cpp";
+    std::ifstream file(main_cpp);
+    REQUIRE(file.is_open());
+    const std::string source((std::istreambuf_iterator<char>(file)),
+                             std::istreambuf_iterator<char>());
+
+    // No mount loop on the main thread, by any route.
+    CHECK(source.find("run_fuse") == std::string::npos);
+    CHECK(source.find("fuse_loop") == std::string::npos);
+    CHECK(source.find("FuseFrontend") == std::string::npos);
+
+    // The signal mask is installed unconditionally, before Service exists, so
+    // every thread it starts inherits it -- libfuse's own workers included.
+    const auto mask = source.find("pthread_sigmask");
+    REQUIRE(mask != std::string::npos);
+    const auto service_constructed = source.find("macha::Service service");
+    REQUIRE(service_constructed != std::string::npos);
+    CHECK(mask < service_constructed);
+
+    // Nothing between the top of main() and the mask may make blocking
+    // conditional on a mount path again.
+    const auto guarded = source.find("if (!config.fuse.mount_path)");
+    CHECK(guarded == std::string::npos);
+
+    // And the sigwait loop is what the process waits in.
+    CHECK(source.find("sigwait(&service_signals") != std::string::npos);
+}
