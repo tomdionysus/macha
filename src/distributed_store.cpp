@@ -120,9 +120,20 @@ std::chrono::milliseconds DistributedStore::foreground_idle_for() const {
     return n_.activity_idle_for(FrameType::foreground);
 }
 
-std::vector<NodeInfo> DistributedStore::ranked(const ObjectId& id) const {
+std::vector<NodeInfo> DistributedStore::hosting_nodes() const {
+    // The one choke point for DATA placement (0.42.0): owners, should_own,
+    // retention candidates, repair, prompt replication and rebalance all go
+    // through ranked(), so filtering here is what keeps an edge node -- or a
+    // node that turned out to accept no inbound connections -- out of every
+    // owner set and every fallback order. Every peer gossips the same bits,
+    // so every peer computes the same answer.
     auto active = n_.membership().active();
-    return capacity_placement_nodes(id.bytes, active, n_.config().replication);
+    std::erase_if(active, [](const NodeInfo& node) { return !node_hosts_extents(node); });
+    return active;
+}
+
+std::vector<NodeInfo> DistributedStore::ranked(const ObjectId& id) const {
+    return capacity_placement_nodes(id.bytes, hosting_nodes(), n_.config().replication);
 }
 
 std::vector<NodeInfo> DistributedStore::owners(const ObjectId& id) const {
@@ -1852,7 +1863,7 @@ bool DistributedStore::has_on(const NodeInfo& target, const ObjectId& id) {
 size_t DistributedStore::replicate_all(const ObjectId& id, std::span<const uint8_t> data,
                                        bool foreground) {
     size_t success = 0;
-    for (const auto& target : n_.membership().active()) {
+    for (const auto& target : hosting_nodes()) {
         try {
             if (put_on(target, id, data, foreground))
                 ++success;
@@ -2281,7 +2292,10 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
 
             const bool everywhere = universal &&
                                     std::binary_search(universal->begin(), universal->end(), id);
-            auto nodes = everywhere ? n_.membership().active() : ranked(id);
+            // "Everywhere" means every node that hosts extents; a non-hosting
+            // node fetches a universal object on demand into its cache like
+            // anything else.
+            auto nodes = everywhere ? hosting_nodes() : ranked(id);
             if (nodes.empty()) {
                 repair_push_pending_.reset();
                 ++scanned_total;
@@ -2368,7 +2382,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 break;
 
             const ObjectId id = *it;
-            const bool everywhere = universal &&
+            const bool everywhere = universal && n_.hosts_extents() &&
                                     std::binary_search(universal->begin(), universal->end(), id);
             bool local_valid = false;
             if (everywhere || should_own(id)) {

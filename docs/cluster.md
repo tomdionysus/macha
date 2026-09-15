@@ -6,6 +6,13 @@ Each node has a persistent random node ID, advertised endpoint, configured failu
 
 Cluster protocol 20 is deliberately incompatible with 0.18/early-0.19 peers because live metadata publication now transfers immutable commits plus acceptance certificates instead of coordinating one linear successor. The 0.18 on-disk storage layout remains readable; mixed protocol operation is rejected.
 
+Protocol 21 (0.42.0) adds two self-declared bits to every node's gossiped
+record: `inbound_capable` and `hosts_extents` (see `network.inbound_capable`
+and `storage.hosts_extents`). A peer that accepts no inbound connections is
+never dialled; it is reached over the sessions it opened, and asked to open a
+lane it has not. Extents are placed only on nodes that host them. Every node
+in a cluster must run the same protocol, so this is a rolling-upgrade event.
+
 ## Metadata replicas and write floor
 
 Every node is a metadata replica. There is no configured voter subset, witness role, leader or permanent metadata authority.

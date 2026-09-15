@@ -63,6 +63,7 @@ value rather than claiming to apply a limit after worker arenas already exist.
 
 ```yaml
 storage:
+  hosts_extents: auto    # true | false | auto
   data:
     backends:
       - path: /mnt/media-a/macha-data
@@ -84,7 +85,21 @@ storage:
       target_size: 64M
 ```
 
-`storage.data.backends` is required and must be a sequence. Each backend requires `path` and non-zero `limit`.
+`hosts_extents` says whether this node is ever a DATA placement owner or
+fallback holder. `false` is the edge node: it serves the API and media to its
+own network from its block cache, publishes writes to the owners, and stores
+no extents at all, so `storage.data` may be omitted entirely. `auto` (the
+default) resolves to `false` when no data backends are configured or the node
+turns out to accept no inbound connections (see `network.inbound_capable`),
+and to `true` otherwise. The resolved value is gossiped, so every peer makes
+the same placement decision. A node that stops hosting drains its existing
+copies to the owners through ordinary repair.
+
+`storage.data.backends` must be a sequence when present, and is required when
+`hosts_extents` is `true`. Each backend requires `path` and non-zero `limit`.
+`hosts_extents: false` with backends configured is accepted with a warning:
+they will drain and stay empty. The metadata store remains required on every
+node.
 
 `reserve_free` is physical free-space protection, not part of logical DHT capacity. DATA admission stops before crossing it.
 
@@ -130,6 +145,7 @@ network:
   listen: 0.0.0.0
   advertise: media-node-2.example.net
   port: 7437
+  inbound_capable: auto    # true | false | auto
   failure_domain: site-a
   heartbeat_ms: 5000
   telemetry_interval_ms: 10000
@@ -140,7 +156,23 @@ network:
   data_no_progress_deadline_ms: 0
 ```
 
-`advertise` must be reachable by peers.
+`advertise` must be reachable by peers, unless the node accepts no inbound
+connections at all.
+
+`inbound_capable` says whether peers can connect *to* this node. `false` is
+the node behind CGNAT, a corporate NAT, or any network where exposing a port
+is not permitted: it connects out to its peers, they answer over the sessions
+it opened, and they never dial its advertised endpoint (which is then only a
+routing key; `advertise`, `upnp`, `external_ip` and `connectivity_check` are
+irrelevant and warned about). When such a peer needs a lane the node has not
+opened, it asks over the CONTROL session and the node dials it. `auto` (the
+default) is decided by asking a peer to dial back: two consecutive failures
+resolve `false`, one success resolves `true`; the answer is persisted under
+`state_path/connectivity/` so a restart is not a placement event, and it is
+re-checked every 10 minutes while `false` and every hour while `true`. A
+founding node (no `bootstrap`) with `inbound_capable: false` is refused at
+start-up: nothing could ever join it. Every transport socket also keeps TCP
+keepalive probing at 60 s, which keeps NAT mappings warm for any NAT'd node.
 
 `telemetry_interval_ms` is how often a node gossips its telemetry set to its
 peers, and therefore how stale another node's view of it can be in

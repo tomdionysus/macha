@@ -141,6 +141,51 @@ MACHA_FAST_TEST("runtime_dependencies", test_advertised_api_endpoint_is_validate
     }
 }
 
+MACHA_FAST_TEST("runtime_dependencies", test_yaml_edge_node_needs_no_data_backends) {
+    // An edge node (0.42.0): storage.hosts_extents false and no storage.data
+    // at all. The metadata store stays required and is defaulted as usual.
+    TempDir t;
+    auto keyfile = (t.path() / "key").string();
+    auto yaml = t.path() / "edge.yaml";
+    {
+        std::ofstream out(yaml);
+        out << "state_path: " << (t.path() / "state").string() << "\n"
+            << "key_file: " << keyfile << "\n"
+            << "storage:\n"
+            << "  hosts_extents: false\n"
+            << "  metadata:\n"
+            << "    limit: 1G\n"
+            << "network:\n"
+            << "  inbound_capable: auto\n"
+            << "bootstrap:\n"
+            << "  - seed1.example:7437\n";
+    }
+    const auto config = load_yaml_config(yaml);
+    CHECK(config.storage_backends.empty());
+    CHECK(config.hosts_extents == Tristate::no);
+    CHECK(config.inbound_capable == Tristate::automatic);
+    CHECK(config.metadata_store.path == t.path() / "state" / "metadata-objects");
+
+    // The same file with hosts_extents true is refused: it has nowhere to host.
+    {
+        std::ofstream out(yaml);
+        out << "state_path: " << (t.path() / "state").string() << "\n"
+            << "key_file: " << keyfile << "\n"
+            << "storage:\n"
+            << "  hosts_extents: true\n"
+            << "bootstrap:\n"
+            << "  - seed1.example:7437\n";
+    }
+    bool refused = false;
+    try {
+        (void)load_yaml_config(yaml);
+    } catch (const std::runtime_error& error) {
+        refused = std::string(error.what()).find("storage.hosts_extents is true") !=
+                  std::string::npos;
+    }
+    CHECK(refused);
+}
+
 MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     TempDir t;
 #ifdef MACHA_HAVE_LIBTORRENT
@@ -232,6 +277,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "  listen: 127.0.0.1\n"
             << "  advertise: media.example\n"
             << "  port: 7440\n"
+            << "  inbound_capable: false\n"
             << "  failure_domain: site-x\n"
             << "  max_frame_size: 192K\n"
             << "  control_stall_notice_ms: 4100\n"
@@ -443,6 +489,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(yc.external_ip.timeout == 2400ms);
     CHECK(yc.connectivity_check.enabled);
     CHECK(yc.connectivity_check.timeout == 2600ms);
+    CHECK(yc.inbound_capable == Tristate::no);
+    CHECK(yc.hosts_extents == Tristate::automatic);
     CHECK(yc.metadata_min_write_replicas == 2); // legacy metadata_replicas: 3 -> old 2-vote floor
     CHECK(yc.min_write_replicas == 2);
     CHECK(yc.write_stall == 1750ms);

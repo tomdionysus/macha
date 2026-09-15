@@ -62,6 +62,12 @@ uint64_t yaml_size(const YAML::Node& node) {
     throw std::runtime_error("size must be a scalar");
 }
 
+Tristate yaml_tristate(const YAML::Node& node, const char* what) {
+    if (!node.IsScalar())
+        throw std::runtime_error(std::string(what) + " must be true, false or auto");
+    return parse_tristate(node.as<std::string>(), what);
+}
+
 void parse_network(const YAML::Node& root, Config& c) {
     auto n = root["network"];
     if (!n)
@@ -72,6 +78,8 @@ void parse_network(const YAML::Node& root, Config& c) {
         c.advertise_host = n["advertise"].as<std::string>();
     if (n["port"])
         c.port = n["port"].as<uint16_t>();
+    if (n["inbound_capable"])
+        c.inbound_capable = yaml_tristate(n["inbound_capable"], "network.inbound_capable");
     if (n["failure_domain"])
         c.failure_domain = n["failure_domain"].as<std::string>();
     if (n["heartbeat_ms"])
@@ -708,27 +716,36 @@ Config load_yaml_config(const std::filesystem::path& path) {
     auto storage = root["storage"];
     if (!storage || !storage.IsMap())
         throw std::runtime_error("storage must be a mapping with data and metadata sections");
+    if (storage["hosts_extents"])
+        c.hosts_extents = yaml_tristate(storage["hosts_extents"], "storage.hosts_extents");
+    // storage.data is optional since 0.42.0: an edge node (hosts_extents
+    // false, or auto with nothing configured) stores no extents. A node that
+    // does host them still needs at least one backend; validate() says so.
     auto data_storage = storage["data"];
-    if (!data_storage || !data_storage.IsMap())
+    if (data_storage && !data_storage.IsMap())
         throw std::runtime_error("storage.data must be a mapping");
-    auto backends = data_storage["backends"];
-    if (!backends || !backends.IsSequence())
-        throw std::runtime_error("storage.data.backends must be a sequence");
-    for (const auto& item : backends) {
-        StorageBackendConfig backend;
-        if (!item["path"] || !item["limit"])
-            throw std::runtime_error("storage.data backend requires path and limit");
-        backend.path = item["path"].as<std::string>();
-        backend.limit = yaml_size(item["limit"]);
-        if (item["reserve_free"])
-            backend.reserve_free = yaml_size(item["reserve_free"]);
-        c.storage_backends.push_back(std::move(backend));
-    }
-    if (auto packing = data_storage["packing"]) {
-        if (packing["threshold"])
-            c.storage_packing.threshold = static_cast<size_t>(yaml_size(packing["threshold"]));
-        if (packing["target_size"])
-            c.storage_packing.target_size = static_cast<size_t>(yaml_size(packing["target_size"]));
+    if (data_storage) {
+        auto backends = data_storage["backends"];
+        if (backends && !backends.IsSequence())
+            throw std::runtime_error("storage.data.backends must be a sequence");
+        if (backends) {
+            for (const auto& item : backends) {
+                StorageBackendConfig backend;
+                if (!item["path"] || !item["limit"])
+                    throw std::runtime_error("storage.data backend requires path and limit");
+                backend.path = item["path"].as<std::string>();
+                backend.limit = yaml_size(item["limit"]);
+                if (item["reserve_free"])
+                    backend.reserve_free = yaml_size(item["reserve_free"]);
+                c.storage_backends.push_back(std::move(backend));
+            }
+        }
+        if (auto packing = data_storage["packing"]) {
+            if (packing["threshold"])
+                c.storage_packing.threshold = static_cast<size_t>(yaml_size(packing["threshold"]));
+            if (packing["target_size"])
+                c.storage_packing.target_size = static_cast<size_t>(yaml_size(packing["target_size"]));
+        }
     }
     if (auto metadata = storage["metadata"]) {
         if (!metadata.IsMap())

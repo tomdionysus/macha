@@ -29,6 +29,24 @@ enum class ServiceEvent : uint8_t {
     topology,
 };
 
+// How this node currently answers "can peers connect to me?" and "do I host
+// extents?" (0.42.0). The configured modes travel beside the resolved values
+// so Status can show both; `source` says what decided the inbound answer:
+// "configured", "persisted", "default" (auto, no evidence yet, behaving as
+// capable) or "probe:<peer>".
+struct InboundResolution {
+    Tristate inbound_capable_mode{Tristate::automatic};
+    Tristate hosts_extents_mode{Tristate::automatic};
+    bool inbound_capable{true};
+    bool hosts_extents{true};
+    std::string source{"default"};
+    uint64_t decided_unix_ms{};
+    uint64_t last_probe_unix_ms{};
+    std::string last_probe_peer;
+    std::string last_probe_error;
+    unsigned consecutive_probe_failures{};
+};
+
 struct NodeReadiness {
     bool control_plane_online{};
     bool data_storage_ready{};
@@ -80,6 +98,9 @@ class NodeRuntime {
     NodeId durability_epoch_;
     DataResourceArbiter data_resources_;
     RetainedMemoryLedger retained_memory_;
+    // Declared before members_ so the roster is built with the right flags.
+    mutable std::mutex inbound_mutex_;
+    InboundResolution inbound_;
 
     // The control plane is intentionally constructed before any storage or
     // metadata backend. A node is therefore reachable/authenticated while its
@@ -120,6 +141,13 @@ class NodeRuntime {
     std::jthread storage_recovery_;
     std::jthread state_recovery_;
     std::jthread connectivity_worker_;
+    std::mutex connectivity_wait_mutex_;
+    std::condition_variable_any connectivity_wait_cv_;
+    std::atomic_uint64_t connectivity_wake_{};
+    // One dial-back probe in flight per requesting peer, and one per 10 s: a
+    // peer cannot use the probe to make this node hammer an address.
+    std::mutex dial_back_mutex_;
+    std::map<NodeId, Clock::time_point> dial_back_last_;
 
     std::atomic_uint64_t remote_metadata_generation_{};
     std::atomic_uint64_t remote_metadata_epoch_{};
@@ -169,6 +197,13 @@ class NodeRuntime {
     RpcMessage handle(const NodeInfo&, FrameType, const RpcMessage&);
     void loop(std::stop_token);
     void local_writer_loop(std::stop_token);
+    // Public-endpoint discovery, then (for `inbound_capable: auto`) the
+    // dial-back resolution state machine, for the life of the node.
+    void connectivity_loop(std::stop_token);
+    bool resolve_hosts_extents_for(bool inbound_capable) const;
+    void apply_inbound_resolution(bool inbound_capable, std::string source);
+    void persist_inbound_resolution_locked() const;
+    void refuse_impossible_cluster() const;
     void exchange(const Endpoint&);
     void exchange(const NodeInfo&);
     void merge(std::span<const uint8_t>);
@@ -309,6 +344,19 @@ class NodeRuntime {
     }
     PublicConnectivityStatus public_connectivity_status() const;
     PublicConnectivityStatus refresh_public_connectivity(bool probe, bool force_probe = false);
+    InboundResolution inbound_resolution() const;
+    bool inbound_capable() const {
+        return inbound_resolution().inbound_capable;
+    }
+    bool hosts_extents() const {
+        return inbound_resolution().hosts_extents;
+    }
+    // Test-only: run one dial-back probe round now instead of waiting for
+    // the connectivity loop's next deadline.
+    void probe_inbound_now_for_tests() {
+        connectivity_wake_.fetch_add(1, std::memory_order_acq_rel);
+        connectivity_wait_cv_.notify_all();
+    }
     RpcStats rpc_stats() const {
         return client_.stats();
     }

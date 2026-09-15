@@ -1480,3 +1480,170 @@ MACHA_TEST("foundations", test_main_owns_signals_and_never_runs_the_mount_itself
     // And the sigwait loop is what the process waits in.
     CHECK(source.find("sigwait(&service_signals") != std::string::npos);
 }
+
+// 0.42.0: nodes that accept no inbound connections, and edge nodes.
+
+MACHA_FAST_TEST("foundations", test_node_info_flags_travel_on_the_wire_and_in_the_roster) {
+    NodeInfo node;
+    node.id = random_node_id();
+    node.host = "198.51.100.7";
+    node.port = 7437;
+    node.failure_domain = "cgnat-site";
+    node.seen_unix_ms = unix_ms();
+    CHECK(node_inbound_capable(node)); // the pre-0.42 default: dialable, hosting
+    CHECK(node_hosts_extents(node));
+
+    node.flags = node_flags_for(false, true);
+    Writer writer;
+    encode_node_info(writer, node);
+    Reader reader(writer.data());
+    const auto decoded = decode_node_info(reader);
+    reader.finish();
+    CHECK(!node_inbound_capable(decoded));
+    CHECK(node_hosts_extents(decoded));
+    CHECK(decoded.flags == node.flags);
+
+    // The roster persists the flags (v3), so a restarting node knows which
+    // peers it must not dial before it has heard from anyone.
+    TempDir t;
+    const auto roster = t.path() / "membership" / "known-nodes.bin";
+    NodeInfo self;
+    self.id = random_node_id();
+    self.host = "127.0.0.1";
+    self.port = 57411;
+    {
+        Membership membership(self, 30s, roster);
+        membership.observe(node, true);
+        CHECK(!membership.inbound_capable(node.id));
+        CHECK(membership.hosts_extents(node.id));
+        CHECK(membership.inbound_capable(self.id));
+        // Unknown ids read as the default: capable and hosting.
+        CHECK(membership.inbound_capable(random_node_id()));
+    }
+    {
+        Membership recovered(self, 30s, roster);
+        REQUIRE(recovered.all().size() == 2);
+        CHECK(!recovered.inbound_capable(node.id));
+        CHECK(recovered.hosts_extents(node.id));
+        // A flag change is an association change: it re-persists.
+        auto flipped = node;
+        flipped.flags = node_flags_for(false, false);
+        flipped.seen_unix_ms = unix_ms() + 1;
+        recovered.observe(flipped, false);
+        CHECK(!recovered.hosts_extents(node.id));
+    }
+    {
+        Membership again(self, 30s, roster);
+        CHECK(!again.hosts_extents(node.id));
+    }
+
+    // set_flags reports change and shows up in self().
+    Membership membership(self, 30s, {});
+    CHECK(membership.set_flags(false, false));
+    CHECK(!membership.set_flags(false, false));
+    CHECK(!node_inbound_capable(membership.self()));
+    CHECK(!node_hosts_extents(membership.self()));
+    CHECK(!membership.inbound_capable(self.id));
+}
+
+MACHA_FAST_TEST("foundations", test_gc_fence_excludes_pairs_that_can_never_dial_each_other) {
+    NodeInfo self;
+    self.id = random_node_id();
+    self.host = "127.0.0.1";
+    self.port = 57421;
+    self.flags = node_flags_for(false, false);
+
+    NodeInfo incapable;
+    incapable.id = random_node_id();
+    incapable.host = "192.0.2.9";
+    incapable.port = 7437;
+    incapable.flags = node_flags_for(false, true);
+    incapable.seen_unix_ms = unix_ms();
+
+    NodeInfo capable;
+    capable.id = random_node_id();
+    capable.host = "127.0.0.2";
+    capable.port = 7437;
+    capable.seen_unix_ms = unix_ms();
+
+    // Two nodes that both accept no inbound connections can never
+    // authenticate each other directly: not a fault, not a fence.
+    Membership membership(self, 40ms, {});
+    membership.observe(incapable, false);
+    CHECK(membership.all_known_reachable());
+
+    // A capable peer known only from gossip still fences, exactly as before.
+    membership.observe(capable, false);
+    CHECK(!membership.all_known_reachable());
+    membership.observe(capable, true);
+    CHECK(membership.all_known_reachable());
+
+    // From a capable node's point of view an incapable peer is an ordinary
+    // fence: it can be authenticated directly over the session it opened.
+    NodeInfo capable_self = self;
+    capable_self.flags = node_flags_for(true, true);
+    Membership from_capable(capable_self, 40ms, {});
+    from_capable.observe(incapable, false);
+    CHECK(!from_capable.all_known_reachable());
+    from_capable.observe(incapable, true);
+    CHECK(from_capable.all_known_reachable());
+}
+
+MACHA_FAST_TEST("foundations", test_configuration_tristates_and_hosting_rules) {
+    CHECK(parse_tristate("true", "x") == Tristate::yes);
+    CHECK(parse_tristate("FALSE", "x") == Tristate::no);
+    CHECK(parse_tristate("auto", "x") == Tristate::automatic);
+    CHECK(parse_tristate("yes", "x") == Tristate::yes);
+    CHECK(parse_tristate("off", "x") == Tristate::no);
+    bool rejected = false;
+    try {
+        (void)parse_tristate("maybe", "network.inbound_capable");
+    } catch (const std::runtime_error& error) {
+        rejected = std::string(error.what()).find("network.inbound_capable") != std::string::npos;
+    }
+    CHECK(rejected);
+    CHECK(tristate_name(Tristate::automatic) == "auto");
+
+    TempDir t;
+    const auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto base = config_for(t.path() / "node", keyfile, 57431);
+    CHECK(base.inbound_capable == Tristate::automatic);
+    CHECK(base.hosts_extents == Tristate::automatic);
+    CHECK(configuration_warnings(base).empty());
+
+    // storage.data is optional unless the node insists on hosting.
+    auto edge = base;
+    edge.storage_backends.clear();
+    (void)normalize_config(edge); // auto with no backends: resolves to not hosting
+    edge.hosts_extents = Tristate::no;
+    (void)normalize_config(edge);
+    auto insists = base;
+    insists.storage_backends.clear();
+    insists.hosts_extents = Tristate::yes;
+    bool refused = false;
+    try {
+        (void)normalize_config(insists);
+    } catch (const std::runtime_error& error) {
+        refused = std::string(error.what()).find("storage.hosts_extents is true") !=
+                  std::string::npos;
+    }
+    CHECK(refused);
+
+    // Legal shapes worth a warning: backends that will only drain, extents
+    // nobody can dial for, and NAT machinery a non-dialable node cannot use.
+    auto draining = base;
+    draining.hosts_extents = Tristate::no;
+    auto warnings = configuration_warnings(draining);
+    REQUIRE(warnings.size() == 1);
+    CHECK(warnings.front().find("will drain") != std::string::npos);
+
+    auto hidden_host = base;
+    hidden_host.inbound_capable = Tristate::no;
+    hidden_host.hosts_extents = Tristate::yes;
+    hidden_host.upnp.enabled = true;
+    warnings = configuration_warnings(hidden_host);
+    REQUIRE(warnings.size() == 2);
+    CHECK(warnings[0].find("inbound-capable peers only") != std::string::npos);
+    CHECK(warnings[1].find("network.advertise, network.upnp") != std::string::npos);
+}
