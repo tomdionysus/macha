@@ -1,5 +1,64 @@
 # Current release
 
+## 0.42.1 — The health route says what it is (development)
+
+**`GET /api/v1/health` now identifies the server.** The body gains a
+`service` field, the literal string `macha`, and a `version`, alongside the
+existing `status`:
+
+```json
+{"service":"macha","status":"ok","version":"0.42.1"}
+```
+
+Until now the whole body was `{"status":"ok"}`, which says nothing about what
+answered. That is fine for a liveness probe and useless for identification,
+and identification is what a client needs when a person types an address into
+an endpoint box, or when a web build probes its own origin for an API. The
+case that prompted this: macha-client's own deployment requires the web host
+to serve `index.html` for unknown application paths, so a host serving the
+client but *not* running Macha answers this route with `200 text/html` — and
+core's `checkEndpointConfiguration`, which confirms an endpoint on
+`response.ok` alone, would adopt it and then fail every call against a pile of
+HTML. Core already ships an `unconfirmed` result meaning "reached, but it did
+not identify itself as a Macha server"; there was no way to be sure of that
+distinction, so the field existed and the check behind it did not.
+
+`service` is present in every state, both `503`s included. That is deliberate
+and is the half a caller is most likely to skip: identity and readiness are
+different axes, so a node reporting `starting` is one to wait for rather than
+one to fall back from, and the body that says so is the one nobody parses.
+
+**`version` is here by an explicit operator decision, over the argument for
+leaving it out.** `test_users` has pinned since 0.38.5 that this route names
+no build, on the grounds that it needs no token and so tells an
+unauthenticated caller which known defects apply. The decision taken, and the
+reason, are recorded at `health_response()` and in that test rather than left
+to be rediscovered: `service` already names the product, and anyone reading
+that will try the known Macha exploits regardless — the version narrows which
+one they reach for, not whether they try. What it genuinely buys an attacker
+is a way to index *unpatched* hosts at scale, which is a mass-scanner's
+economics and not this project's threat model.
+
+What stays out is the cluster's shape: no node id, no topology, no
+capacities. That is what `view_status` is for. A client must gate on `service`
+alone — asserting on `version` would break it every release — and the client
+team has confirmed it does.
+
+Nothing else about the route changed: still no session and no role (it is the
+first bearer-auth exemption, checked ahead of the readiness gate), still the
+same three states with `200` for `ok` and `503` for `starting` and `failed`,
+still the cluster-wide CORS headers with `Access-Control-Allow-Origin: *`, and
+still no `Cache-Control` — clients should keep sending `no-store`.
+
+Mixed fleets need no flag day. The route itself dates from 0.38.5 (before that
+a node answers `401`, because auth runs ahead of routing, which is not
+identification and simply will not be adopted), and the client rule is "if
+`service` is present it must be `macha`", so a cluster upgrades node by node.
+
+Tested end to end against a real `Service` over HTTP with no bearer token, in
+both the starting and the serving state, using the existing control-plane
+startup gate to catch the `503` — the state that is otherwise never exercised.
+
 ## 0.42.0 — Nodes that cannot be connected to (development)
 
 **A node behind CGNAT is a full participant, and an edge node can store

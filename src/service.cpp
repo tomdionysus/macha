@@ -5,6 +5,7 @@
 #include "fuse_subsystem.hpp"
 #include "json.hpp"
 #include "log.hpp"
+#include "macha_version.hpp"
 #include "startup_progress.hpp"
 #include "supervised.hpp"
 #include <algorithm>
@@ -451,7 +452,36 @@ HttpResponse Service::health_response() const {
         state = "starting";
         status = 503;
     }
-    return http_json(status, Json(Json::Object{{"status", std::string(state)}}).dump());
+    // `service` says what answered, and is the only field a caller may gate on.
+    // "I reached something" and "I reached Macha" are different questions, and
+    // until 0.42.1 this body could not tell them apart: {"status":"ok"} is what
+    // a router admin page, a container probe, or -- the case that prompted this
+    // -- a web host serving a single-page app's index document for unknown
+    // paths would produce, and a client probing its own origin would adopt
+    // itself and then fail every call against a pile of HTML.
+    //
+    // It is present in every state, both 503s included, precisely because a
+    // client probing an address it was handed is most likely to meet a node
+    // that is still starting: identity and readiness are different axes, and a
+    // caller that can tell them apart waits instead of giving up.
+    //
+    // `version` is here by an explicit operator decision (2026-09-15), taken
+    // against the argument for leaving it out. The objection was that this
+    // route needs no token, so naming the build tells an unauthenticated
+    // caller which known defects apply. The answer taken: `service` already
+    // names the product, and anyone who reads that will try the known Macha
+    // exploits regardless -- the version narrows which one they reach for, it
+    // does not decide whether they try. What it genuinely adds is a way to
+    // index *unpatched* hosts at scale, which is a mass-scanner's economics
+    // and not this project's threat model.
+    //
+    // Still no node id and no topology: those are the cluster's shape and stay
+    // behind view_status. A client must gate on `service` alone -- asserting
+    // on `version` would break it every release.
+    return http_json(status, Json(Json::Object{{"service", std::string("macha")},
+                                               {"status", std::string(state)},
+                                               {"version", std::string(kServerVersion)}})
+                                 .dump());
 }
 
 bool Service::capability_request(const HttpRequest& request) {
