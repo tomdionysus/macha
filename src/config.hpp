@@ -12,6 +12,15 @@
 
 namespace macha {
 
+// A configuration value that may be decided by the node itself. `automatic`
+// is resolved at run time from evidence (and, for inbound_capable, re-checked
+// periodically); the resolved value is what the node gossips.
+enum class Tristate : uint8_t { yes, no, automatic };
+
+std::string_view tristate_name(Tristate) noexcept;
+// Accepts true/false/auto and the usual YAML spellings of the booleans.
+Tristate parse_tristate(std::string_view value, const char* what);
+
 struct StorageBackendConfig {
     std::filesystem::path path;
     // Maximum authoritative DATA bytes admitted to this backend. Metadata/control
@@ -620,6 +629,13 @@ struct SessionConfig {
 struct Config {
     std::filesystem::path state_path;
     std::vector<StorageBackendConfig> storage_backends;
+    // storage.hosts_extents: whether this node is ever a DATA placement owner
+    // or fallback holder. `no` is the edge node: it serves the API and media
+    // to its own network from its cache and stores no extents at all, so
+    // storage.data may be empty. `automatic` resolves to `no` when there are
+    // no data backends or the node turns out to accept no inbound
+    // connections, `yes` otherwise.
+    Tristate hosts_extents{Tristate::automatic};
     StoragePackingConfig storage_packing;
     MetadataObjectStoreConfig metadata_store;
     CacheConfig cache;
@@ -660,6 +676,21 @@ struct Config {
     std::string advertise_host;
     std::string failure_domain;
     uint16_t port{7437};
+    // network.inbound_capable: can peers connect *to* this node? `no` is the
+    // node behind CGNAT or a corporate NAT: it dials its peers, they answer
+    // over the sessions it opened, and they never dial its advertised
+    // endpoint. `automatic` is decided by asking a peer to dial back (see
+    // MessageType::dial_back_probe), persisted, and re-checked periodically.
+    Tristate inbound_capable{Tristate::automatic};
+    // Cadence of the dial-back re-check while resolved false (a port forward
+    // may have been added) and while resolved true (it may have been removed).
+    // Not read from YAML; tests shorten them.
+    std::chrono::milliseconds inbound_reprobe_while_incapable{std::chrono::minutes(10)};
+    std::chrono::milliseconds inbound_reprobe_while_capable{std::chrono::hours(1)};
+    // How often this node will answer one peer's dial_back_probe: the probe
+    // makes a real TCP connection to whatever address the asker names, so it
+    // is rate limited per asker. Not read from YAML; tests shorten it.
+    std::chrono::milliseconds dial_back_probe_min_interval{std::chrono::seconds(10)};
     UpnpConfig upnp;
     ExternalIpConfig external_ip;
     ConnectivityCheckConfig connectivity_check;
@@ -726,6 +757,10 @@ struct Config {
 
 Config parse_config(int, char**);
 Config load_yaml_config(const std::filesystem::path&);
+// Settings that are legal but worth a line in the log at start-up (a data
+// backend that will drain, a hosting node nobody can dial). validate() never
+// logs; NodeRuntime::start() prints these once.
+std::vector<std::string> configuration_warnings(const Config&);
 Config normalize_config(Config);
 uint64_t parse_size(const std::string&);
 Endpoint parse_endpoint(const std::string&, uint16_t default_port);

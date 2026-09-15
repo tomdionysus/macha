@@ -1,5 +1,99 @@
 # Current release
 
+## 0.42.0 — Nodes that cannot be connected to (development)
+
+**A node behind CGNAT is a full participant, and an edge node can store
+nothing.** Two node properties, `network.inbound_capable` and
+`storage.hosts_extents`, each `true | false | auto` (default `auto`),
+self-declared and gossiped in every node's record (protocol 21, a
+rolling-upgrade event: mixed clusters refuse each other's handshakes as they
+always have). Plan and the verified state of the transport it builds on:
+`TODO/2026-09-15-inbound-incapable-nodes-plan.md`.
+
+The transport already worked in both directions over one session: when a
+node dialled a peer, the peer registered that session as an inbound route
+and used it for everything, and liveness and the GC fence were satisfied by
+the dialling side alone. What did not exist was any way to *not* dial a peer
+that cannot be dialled, or to ask it for a lane. Now: a peer whose gossiped
+`inbound_capable` is false is never dialled. `RpcClient::connection()` sends
+a `dial_request{lane}` over the CONTROL session that peer opened and waits
+(bounded by `connect_timeout`) for the reverse dial to arrive; with no such
+session the call fails at once with the same transient error a refused dial
+would have. An inbound-incapable node keeps CONTROL and DATA dialled to every
+capable peer on its own account (it is the only side that can restore its
+reachability), so the request path only covers the window after a drop. The
+membership loop stops trying to exchange with such peers when no session
+exists -- the `bootstrap: connect: Connection refused` line every heartbeat
+is gone for them -- and `all_known_reachable()` no longer fences on a pair
+that both accept no inbound connections, since they can never authenticate
+each other directly and it is not a fault.
+
+Two transport changes benefit every NAT'd node today. Every socket now sets
+kernel keepalive at 60 s / 15 s / 4 (the OS default first probe is two hours
+out, longer than any NAT keeps an idle mapping), and the health probe covers
+the DATA lane as well as CONTROL, so an idle DATA session that died under an
+expired mapping is closed and, on the incapable side, redialled before a
+viewer's next read pays a stall.
+
+`hosts_extents: false` is the edge node: it serves the API and media to its
+own network from its block cache, publishes writes to the owners over its
+own DATA sessions, and stores no extents, so `storage.data` may be omitted
+entirely -- it runs an *empty* `StoragePool` (`capacity=0`, every call
+answers "not present"/"no space") rather than making the store optional at
+forty call sites. Placement has one choke point, `DistributedStore::ranked()`,
+and it now filters the active set to hosting nodes; that single change
+covers owners, `should_own`, retention candidates, repair, prompt
+replication and rebalance. Universal objects are pushed to hosting nodes
+only. A node that stops hosting drains through the ordinary repair push. The
+capacity aggregates, `logical_capacity` and Status count hosting nodes only.
+
+`inbound_capable: auto` resolves from evidence: once a CONTROL session to a
+capable peer exists, the node sends a `dial_back_probe` naming its advertised
+endpoint and the peer makes one throwaway TCP connection to it -- a distinct
+`probe` transport lane that handshakes (authenticating both ends) and closes,
+registering no route, so a probe can never retire a real session in
+`reconcile_locked()`. Two consecutive failures resolve `false`, one success
+resolves `true`; the answer is persisted under `state_path/connectivity/` so
+a restart is not a placement event, re-checked every 10 minutes while false
+and every hour while true, logged at INFO on change naming the deciding
+peer, and rate limited per asker on the answering side. `hosts_extents: auto`
+follows: false with no backends or when inbound resolves false.
+
+Refused at start-up rather than half-working: a founding node with
+`inbound_capable: false`, or a joining node whose every bootstrap peer is
+known to be incapable. Status: `nodes[]` gains `inbound_capable`,
+`hosts_extents`, `dialable` and, on the local node, the configured modes;
+`connectivity` gains the resolution and its dial-back evidence;
+`cluster.conditions` gains "N node(s) accept no inbound connections", "no
+inbound-capable node hosts extents" (critical) and "replication N requires N
+extent-hosting nodes; M known". The known-node roster is v3 (flags per
+entry; v1/v2 read back as capable hosting nodes).
+
+One incidental fix the flags exposed: `Membership::observe()` replaced a
+peer's record with the handshake-time copy on every direct observation, so
+the heartbeat ping rewound whatever fresher gossip had merged (capacity,
+generation -- and now flags, which would have flapped placement every
+round). The newer record wins; a direct observation only refreshes liveness.
+
+Tests: a black-hole-advertised node (192.0.2.1, TEST-NET-1) with a short
+connect timeout stands in for one behind CGNAT, no OS firewall needed. The
+transport case proves control flows both ways over the one session, a
+`get_object` from the hub triggers a dial request and completes, a dropped
+DATA lane is redialled without a request, the hub never creates a
+connection, and the probe distinguishes a dialable peer from one that is
+not. The runtime case proves `auto` resolves false after two failed
+dial-backs with `hosts_extents` following, survives a restart as
+`persisted`, flips back once the address is dialable, and that a founding
+incapable node is refused. The storage cases prove an edge node joins, is
+never an owner for any key on any observer, writes to owners and reads back
+through its cache; and that a node flipping hosting→non-hosting drains
+through repair. Codec, roster, GC-fence and configuration rules are covered
+in foundations; YAML parsing of both keys and a data-less storage section in
+runtime_dependencies. Still open from the plan: whether a draining node's
+*retention claims* release without special treatment (the drain test uses
+unretained objects; the publication path is the next thing to exercise), and
+the cluster UAT on fi-1.
+
 ## 0.41.1 — The writer's garbage collector wakes up (development)
 
 **Superseded catalogue artwork is now reclaimed on the node that wrote it.**

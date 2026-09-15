@@ -43,6 +43,14 @@ struct IdentityAssociationReset {
     auto operator<=>(const IdentityAssociationReset&) const = default;
 };
 
+// Self-declared node properties, gossiped with the node so every peer makes
+// the same dialling and placement decisions (protocol 21). Both default to
+// set: a node that predates the flags, or one built in a test with the
+// fields left alone, is the ordinary dialable storage node.
+inline constexpr uint8_t node_flag_inbound_capable = 1U << 0;
+inline constexpr uint8_t node_flag_hosts_extents = 1U << 1;
+inline constexpr uint8_t node_flags_default = node_flag_inbound_capable | node_flag_hosts_extents;
+
 struct NodeInfo {
     NodeId id{};
     std::string host;
@@ -56,7 +64,24 @@ struct NodeInfo {
     // cluster must advertise the same floor; mismatches fail closed rather than
     // allowing a weaker node to mint an acceptance certificate.
     uint32_t metadata_write_replicas_required{};
+    // node_flag_* bits. `inbound_capable` clear means peers must never dial
+    // this node's advertised endpoint: it reaches them, they answer over the
+    // session it opened, and a lane it has not opened is asked for with a
+    // dial_request. `hosts_extents` clear means the node is never a DATA
+    // placement owner or fallback holder (an edge node with no storage.data).
+    uint8_t flags{node_flags_default};
 };
+
+inline bool node_inbound_capable(const NodeInfo& node) noexcept {
+    return (node.flags & node_flag_inbound_capable) != 0;
+}
+inline bool node_hosts_extents(const NodeInfo& node) noexcept {
+    return (node.flags & node_flag_hosts_extents) != 0;
+}
+inline uint8_t node_flags_for(bool inbound_capable, bool hosts_extents) noexcept {
+    return static_cast<uint8_t>((inbound_capable ? node_flag_inbound_capable : 0U) |
+                                (hosts_extents ? node_flag_hosts_extents : 0U));
+}
 
 struct NodeIdHash {
     size_t operator()(const NodeId&) const noexcept;

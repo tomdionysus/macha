@@ -2339,6 +2339,11 @@ std::optional<MetadataSnapshotView> FileSystem::available_snapshot_view() const 
 
 std::pair<uint64_t, uint64_t> FileSystem::logical_capacity() const {
     auto ns = n_.membership().active();
+    // Only nodes that host extents hold capacity worth counting; an edge
+    // node contributes nothing and must not be an entity in the water-level
+    // calculation (its capacity is 0, but its presence changes the replica
+    // and failure-domain arithmetic).
+    std::erase_if(ns, [](const NodeInfo& node) { return !node_hosts_extents(node); });
     // In the first seconds after a start the membership view can be empty
     // or carry peers whose capacity has not been exchanged yet; statfs then
     // answered 0 blocks and `df` showed a 0-byte filesystem (gbni-2,

@@ -303,6 +303,58 @@ local copy if one exists, otherwise the generation is replayed from the FUSE
 spool (`FUSE async data publication replay …`). Restarting a node therefore
 no longer strands publications in flight on other nodes.
 
+## Nodes behind CGNAT, and edge nodes
+
+Since 0.42.0 a node can declare, or discover, that it cannot be connected to
+(`network.inbound_capable`), and that it stores no extents
+(`storage.hosts_extents`). Both are gossiped with the node, so every peer
+dials and places the same way.
+
+What works on a node that accepts no inbound connections: everything. It
+mounts the namespace, plays media, ingests, and hosts extents if configured
+to. It opens a CONTROL and a DATA session to every capable peer and keeps
+them open; peers answer over those sessions and never dial it. If a peer
+needs a lane the node has not opened, it sends a `dial_request` over the
+CONTROL session and the node dials. Every transport socket keeps TCP keepalive
+probing at 60 s (15 s apart, four probes), and the health probe now covers
+the DATA lane too, so a NAT mapping that expires underneath an idle lane is
+noticed and redialled before a viewer needs it.
+
+The shape rules:
+
+- Extents live only where they can be fetched from. A node with
+  `inbound_capable: false` and `hosts_extents: auto` hosts nothing; its
+  writes go to the owners over its own DATA sessions. Forcing
+  `hosts_extents: true` on it is allowed (a hub plus one hidden storage site
+  is a legitimate cluster) with a warning: those extents are reachable from
+  inbound-capable peers only.
+- Two nodes that both accept no inbound connections never need a path to
+  each other. Metadata reaches both through the capable replicas, and the
+  destructive-GC fence (`all_known_reachable`) excludes such pairs rather than
+  counting them as a fault.
+- There is no relay. A cluster with no inbound-capable storage node is
+  refused: a founding node with `inbound_capable: false`, or a joining node
+  whose every bootstrap peer is known to be incapable, exits at start-up.
+- `dht.replicas` must be satisfiable from extent-hosting nodes alone.
+
+How to read Status: `nodes[]` carries `inbound_capable`, `hosts_extents` and
+`dialable` for every node, plus `inbound_capable_mode` / `hosts_extents_mode`
+(the configured values) on the local node. `connectivity` carries the local
+resolution (`inbound_capable`, `inbound_capable_source` -- `configured`,
+`persisted`, `default` or `probe:<peer>` -- and the last dial-back result under
+`dial_back`). `cluster.conditions` reports `N node(s) accept no inbound
+connections` (information), `no inbound-capable node hosts extents`
+(critical) and `replication N requires N extent-hosting nodes; M known`
+(degraded). A `DEBUG` line is logged for every `dial_request` round trip and
+every dial-back probe.
+
+An `auto` resolution is sticky: it is persisted under
+`state_path/connectivity/inbound.bin`, changes only after two consecutive
+failed dial-backs (or one success), and a change logs at `INFO` naming the
+peer that decided it. The reprobe cadence is 10 minutes while incapable and
+one hour while capable, so an added or removed port forward is picked up
+without a restart.
+
 ## Cluster status and telemetry
 
 `GET /api/v1/status` merges two deliberately different telemetry planes:

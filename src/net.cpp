@@ -20,7 +20,7 @@
 
 namespace macha {
 namespace {
-constexpr uint16_t protocol_version = 20;
+constexpr uint16_t protocol_version = 21;
 constexpr uint32_t frame_magic = 0x4d433133; // "MC13"
 constexpr size_t protocol_min_frame_size = 4 * 1024;
 constexpr size_t protocol_max_frame_size = 4 * 1024 * 1024;
@@ -87,6 +87,26 @@ void socket_options(int fd) {
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
 #endif
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+    // The OS default first probe is two hours out, which is longer than any
+    // NAT keeps an idle mapping. An idle DATA lane through CGNAT died silently
+    // and the next extent read paid a stall and a redial; for a node that
+    // cannot be dialled the redial can only come from its own side. Probe at
+    // 60 s, every 15 s after that, and give up after four: a dead mapping is
+    // noticed inside two minutes at no application cost.
+    int keep_idle = 60;
+    int keep_interval = 15;
+    int keep_count = 4;
+#ifdef TCP_KEEPIDLE
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keep_idle, sizeof(keep_idle));
+#elif defined(TCP_KEEPALIVE)
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &keep_idle, sizeof(keep_idle));
+#endif
+#ifdef TCP_KEEPINTVL
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keep_interval, sizeof(keep_interval));
+#endif
+#ifdef TCP_KEEPCNT
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keep_count, sizeof(keep_count));
+#endif
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
 }
 
@@ -102,6 +122,8 @@ void socket_timeout(int fd, std::chrono::milliseconds timeout) {
 }
 
 bool allowed_on_lane(TransportLane lane, MessageType type) noexcept {
+    if (lane == TransportLane::probe)
+        return false; // A probe handshakes and closes; nothing ever flows on it.
     const bool object_message =
         type == MessageType::get_object || type == MessageType::put_object ||
         type == MessageType::put_object_deferred ||
@@ -111,10 +133,13 @@ bool allowed_on_lane(TransportLane lane, MessageType type) noexcept {
     if (object_message)
         return true;
     // These are transport/session replies or controls which can legitimately
-    // accompany object traffic on an established DATA session.
+    // accompany object traffic on an established DATA session. A ping is
+    // allowed too since 0.42.0: an idle DATA lane carried nothing, so a dead
+    // one (a NAT mapping that expired) was found by the next extent read.
     return type == MessageType::ok || type == MessageType::error ||
            type == MessageType::session_retire || type == MessageType::promote_read_ahead ||
-           type == MessageType::promote_foreground || type == MessageType::cancel_transfer;
+           type == MessageType::promote_foreground || type == MessageType::cancel_transfer ||
+           type == MessageType::ping;
 }
 
 void send_all(int fd, std::span<const uint8_t> bytes,
@@ -343,7 +368,7 @@ bool is_bulk_message(MessageType type) {
 // payloads are a few hundred bytes and are sent solely when something changed.
 bool is_notification_message(MessageType type) {
     return type == MessageType::telemetry || type == MessageType::session_sync ||
-           type == MessageType::user_sync;
+           type == MessageType::user_sync || type == MessageType::dial_request;
 }
 
 bool is_priority_data_message(MessageType type) {
@@ -529,6 +554,8 @@ const char* transport_lane_name(TransportLane lane) noexcept {
         return "control";
     case TransportLane::data:
         return "data";
+    case TransportLane::probe:
+        return "probe";
     }
     return "unknown";
 }
@@ -633,6 +660,12 @@ const char* message_type_name(MessageType type) noexcept {
         return "session_sync";
     case MessageType::have_objects:
         return "have_objects";
+    case MessageType::dial_request:
+        return "dial_request";
+    case MessageType::dial_back_probe:
+        return "dial_back_probe";
+    case MessageType::dial_back_probe_reply:
+        return "dial_back_probe_reply";
     case MessageType::ok:
         return "ok";
     case MessageType::error:
@@ -836,7 +869,8 @@ NodeInfo SecureChannel::server_handshake(const std::string& remote_host) {
     auto peer_max = static_cast<size_t>(reader.u32());
     validate_frame_limit(peer_max);
     lane_ = static_cast<TransportLane>(reader.u8());
-    if (lane_ != TransportLane::control && lane_ != TransportLane::data)
+    if (lane_ != TransportLane::control && lane_ != TransportLane::data &&
+        lane_ != TransportLane::probe)
         throw std::runtime_error("invalid transport lane");
     if (reader.fixed<16>() != keys_.cluster_id)
         throw std::runtime_error("wrong cluster/protocol");
@@ -1929,7 +1963,10 @@ void RpcClient::reconcile_locked(const NodeId& peer, TransportLane lane,
     if (!have_outbound || !have_inbound)
         return;
 
-    if (local_().id < peer) {
+    // A node that accepts no inbound connections must keep the sessions it
+    // dialled: nothing can replace them from the other side. Its inbound map
+    // should be empty anyway, but never let the id order retire its outbound.
+    if (local_().id < peer || !local_inbound_capable()) {
         auto fn = inbound->second.retire;
         inbound_routes_.erase(inbound);
         if (fn)
@@ -1950,6 +1987,7 @@ void RpcClient::register_inbound(InboundRoute route) {
     std::vector<std::function<void()>> retire;
     {
         std::lock_guard lock(mutex_);
+        note_peer_locked(route.peer);
         if (!route.peer.host.empty() && route.peer.port) {
             Endpoint advertised{route.peer.host, route.peer.port};
             endpoints_[endpoint_key(advertised)] = advertised;
@@ -1970,6 +2008,8 @@ void RpcClient::register_inbound(InboundRoute route) {
     }
     for (auto& fn : retire)
         fn();
+    // A caller may be parked in await_reverse_dial() for exactly this route.
+    connection_cv_.notify_all();
 }
 
 void RpcClient::unregister_inbound(const NodeId& peer, TransportLane lane,
@@ -2019,6 +2059,18 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
         auto health = health_.find(retry_key);
         if (health != health_.end() && Clock::now() < health->second.retry_after)
             throw std::runtime_error("peer in retry backoff");
+
+        // A peer that accepts no inbound connections is never dialled: its
+        // advertised endpoint is a routing key, not an address anyone can
+        // reach. Ask it to open the lane over the CONTROL session it holds to
+        // us and wait for that to arrive; without such a session there is
+        // nothing to ask over, and the failure is the same transient one a
+        // refused dial would be.
+        if (known && !peer_inbound_capable_locked(*known)) {
+            await_reverse_dial(lock, *known, lane, retry_key);
+            ++connections_reused_;
+            return {};
+        }
 
         flight_key = known ? route_key(*known, lane) : retry_key;
         if (connection_dials_.insert(flight_key).second)
@@ -2077,6 +2129,7 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
         bool installed = false;
         {
             std::lock_guard lock(mutex_);
+            note_peer_locked(fresh->peer());
             endpoints_[endpoint_key(endpoint)] = endpoint;
             endpoint_peers_[endpoint_key(endpoint)] = fresh->peer().id;
             if (!fresh->peer().host.empty() && fresh->peer().port) {
@@ -2147,40 +2200,8 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
             return stalled_call_for_tests_locked();
     }
 
-    auto try_existing = [&](const NodeId& peer) -> std::optional<AsyncRpc> {
-        std::shared_ptr<PeerConnection> outbound;
-        std::function<AsyncRpc(MessageType, std::span<const uint8_t>, FrameType)> inbound;
-        {
-            std::lock_guard lock(mutex_);
-            const auto k = route_key(peer, lane);
-            auto out = connections_.find(k);
-            if (out != connections_.end() && out->second && out->second->usable())
-                outbound = out->second;
-            if (!outbound) {
-                auto in = inbound_routes_.find(k);
-                if (in != inbound_routes_.end() && in->second.usable && in->second.usable())
-                    inbound = in->second.call;
-            }
-        }
-        if (outbound) {
-            ++connections_reused_;
-            try {
-                return outbound->call(type, payload, frame_type);
-            } catch (const std::exception&) {
-            }
-        }
-        if (inbound) {
-            ++connections_reused_;
-            try {
-                return inbound(type, payload, frame_type);
-            } catch (const std::exception&) {
-            }
-        }
-        return std::nullopt;
-    };
-
     if (expected)
-        if (auto existing = try_existing(*expected))
+        if (auto existing = call_existing(*expected, lane, type, payload, frame_type))
             return std::move(*existing);
 
     NodeId actual{};
@@ -2191,9 +2212,44 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
         } catch (const std::exception&) {
         }
     }
-    if (auto existing = try_existing(actual))
+    if (auto existing = call_existing(actual, lane, type, payload, frame_type))
         return std::move(*existing);
     throw std::runtime_error("no canonical RPC route to peer");
+}
+
+std::optional<AsyncRpc> RpcClient::call_existing(const NodeId& peer, TransportLane lane,
+                                                 MessageType type,
+                                                 std::span<const uint8_t> payload,
+                                                 FrameType frame_type) {
+    std::shared_ptr<PeerConnection> outbound;
+    std::function<AsyncRpc(MessageType, std::span<const uint8_t>, FrameType)> inbound;
+    {
+        std::lock_guard lock(mutex_);
+        const auto k = route_key(peer, lane);
+        auto out = connections_.find(k);
+        if (out != connections_.end() && out->second && out->second->usable())
+            outbound = out->second;
+        if (!outbound) {
+            auto in = inbound_routes_.find(k);
+            if (in != inbound_routes_.end() && in->second.usable && in->second.usable())
+                inbound = in->second.call;
+        }
+    }
+    if (outbound) {
+        ++connections_reused_;
+        try {
+            return outbound->call(type, payload, frame_type);
+        } catch (const std::exception&) {
+        }
+    }
+    if (inbound) {
+        ++connections_reused_;
+        try {
+            return inbound(type, payload, frame_type);
+        } catch (const std::exception&) {
+        }
+    }
+    return std::nullopt;
 }
 
 AsyncRpc RpcClient::call_async(const Endpoint& endpoint, MessageType type,
@@ -2400,11 +2456,212 @@ void RpcClient::close_endpoint(const Endpoint& endpoint, const std::string& reas
         connection->close();
 }
 
+bool RpcClient::local_inbound_capable() const {
+    return node_inbound_capable(local_());
+}
+
+bool RpcClient::peer_inbound_capable_locked(const NodeId& peer) const {
+    const auto found = peer_flags_.find(peer);
+    return found == peer_flags_.end() || (found->second & node_flag_inbound_capable) != 0;
+}
+
+bool RpcClient::route_usable_locked(const NodeId& peer, TransportLane lane) const {
+    const auto k = route_key(peer, lane);
+    auto out = connections_.find(k);
+    if (out != connections_.end() && out->second && out->second->usable())
+        return true;
+    auto in = inbound_routes_.find(k);
+    return in != inbound_routes_.end() && in->second.usable && in->second.usable();
+}
+
+void RpcClient::note_peer_locked(const NodeInfo& peer) {
+    if (peer.id == NodeId{})
+        return;
+    peer_flags_[peer.id] = peer.flags;
+}
+
+void RpcClient::note_peer(const NodeInfo& peer) {
+    std::lock_guard lock(mutex_);
+    note_peer_locked(peer);
+}
+
+bool RpcClient::has_route(const NodeId& peer, TransportLane lane) const {
+    std::lock_guard lock(mutex_);
+    return route_usable_locked(peer, lane);
+}
+
+void RpcClient::await_reverse_dial(std::unique_lock<std::mutex>& lock, const NodeId& peer,
+                                   TransportLane lane, const std::string& retry_key) {
+    // Find something to ask over. Only a CONTROL session the peer opened can
+    // exist (that is what "accepts no inbound connections" means), but an
+    // outbound one is honoured too should a test or a misdeclared node have one.
+    std::function<bool(const RpcMessage&, FrameType)> try_notify;
+    std::function<void(const RpcMessage&)> notify;
+    {
+        const auto k = route_key(peer, TransportLane::control);
+        auto out = connections_.find(k);
+        if (out != connections_.end() && out->second && out->second->usable()) {
+            auto connection = out->second;
+            try_notify = [connection](const RpcMessage& message, FrameType frame_type) {
+                return connection->try_notify(message, frame_type);
+            };
+            notify = [connection](const RpcMessage& message) { connection->notify(message); };
+        } else if (auto in = inbound_routes_.find(k);
+                   in != inbound_routes_.end() && in->second.usable && in->second.usable()) {
+            try_notify = in->second.try_notify;
+            notify = in->second.notify;
+        }
+    }
+    std::string failure;
+    if (!try_notify && !notify) {
+        failure = "peer " + to_string(peer).substr(0, 12) +
+                  " accepts no inbound connections and is not connected";
+    } else {
+        Writer writer;
+        writer.u8(static_cast<uint8_t>(lane));
+        const RpcMessage request{MessageType::dial_request, writer.take()};
+        lock.unlock();
+        bool sent = false;
+        try {
+            if (try_notify)
+                sent = try_notify(request, FrameType::control);
+            if (!sent && notify) {
+                notify(request);
+                sent = true;
+            }
+        } catch (const std::exception& error) {
+            failure = std::string("dial request could not be sent: ") + error.what();
+        }
+        lock.lock();
+        if (sent) {
+            ++dial_requests_sent_;
+            Log::debug("dial request sent peer=" + to_string(peer).substr(0, 12) +
+                       " lane=" + transport_lane_name(lane));
+            const bool arrived = connection_cv_.wait_for(lock, connect_timeout_, [&] {
+                return route_usable_locked(peer, lane);
+            });
+            if (arrived) {
+                Log::debug("dial request answered peer=" + to_string(peer).substr(0, 12) +
+                           " lane=" + transport_lane_name(lane));
+                return;
+            }
+            failure = "peer " + to_string(peer).substr(0, 12) +
+                      " accepts no inbound connections; its reverse dial for the " +
+                      transport_lane_name(lane) + " lane did not arrive within " +
+                      std::to_string(connect_timeout_.count()) + " ms";
+        } else if (failure.empty()) {
+            failure = "peer " + to_string(peer).substr(0, 12) +
+                      " accepts no inbound connections and the dial request was not queued";
+        }
+    }
+    // The same backoff a refused dial earns, so a caller retrying in a loop
+    // does not turn every attempt into another request over the wire.
+    lock.unlock();
+    observe_result(retry_key, false, std::chrono::milliseconds(0));
+    throw std::runtime_error(failure);
+}
+
+void RpcClient::request_lane(const NodeInfo& peer, TransportLane lane) {
+    if (peer.id == NodeId{} || peer.host.empty() || !peer.port)
+        return;
+    {
+        std::lock_guard lock(mutex_);
+        note_peer_locked(peer);
+        requested_lanes_[route_key(peer.id, lane)] = {peer, lane};
+    }
+    dial_requests_received_.fetch_add(1, std::memory_order_relaxed);
+    lane_wakeups_.fetch_add(1, std::memory_order_acq_rel);
+    health_wait_cv_.notify_all();
+}
+
+void RpcClient::set_maintained_peers(std::function<std::vector<NodeInfo>()> peers) {
+    std::lock_guard lock(mutex_);
+    maintained_peers_ = std::move(peers);
+}
+
+void RpcClient::open_requested_lanes(std::stop_token stop) {
+    std::vector<std::pair<NodeInfo, TransportLane>> wanted;
+    std::function<std::vector<NodeInfo>()> maintained;
+    {
+        std::lock_guard lock(mutex_);
+        for (auto& [_, item] : requested_lanes_)
+            wanted.push_back(item);
+        requested_lanes_.clear();
+        maintained = maintained_peers_;
+    }
+    // An inbound-incapable node keeps both lanes open to every capable peer
+    // on its own initiative; dial_request only ever covers the window between
+    // a drop and the next pass here.
+    if (maintained && !local_inbound_capable()) {
+        for (const auto& peer : maintained()) {
+            if (!node_inbound_capable(peer))
+                continue;
+            wanted.emplace_back(peer, TransportLane::control);
+            wanted.emplace_back(peer, TransportLane::data);
+        }
+    }
+    for (const auto& [peer, lane] : wanted) {
+        if (stop.stop_requested())
+            return;
+        if (!node_inbound_capable(peer))
+            continue; // Two incapable nodes have no path to each other.
+        if (has_route(peer.id, lane))
+            continue;
+        try {
+            const Endpoint endpoint{peer.host, peer.port};
+            (void)connection(endpoint, &peer.id, nullptr, lane);
+        } catch (const std::exception& error) {
+            // "peer in retry backoff" is the ordinary outcome while a peer is
+            // down; the backoff is what keeps this from being a dial loop.
+            Log::debug("lane maintenance peer=" + to_string(peer.id).substr(0, 12) + " lane=" +
+                       transport_lane_name(lane) + ": " + error.what());
+        }
+    }
+}
+
+std::string RpcClient::probe_dial(const Endpoint& endpoint, const NodeId& expected) {
+    try {
+        int fd = connect_socket(endpoint, connect_timeout_);
+        SecureChannel channel(fd, keys_, local_(), max_frame_size_);
+        channel.set_io_timeout(rpc_handshake_timeout);
+        const auto peer = channel.client_handshake(TransportLane::probe);
+        if (peer.id != expected)
+            return "endpoint " + endpoint_key(endpoint) + " authenticated as NodeId " +
+                   to_string(peer.id) + ", not the requesting node";
+        channel.shutdown();
+        return {};
+    } catch (const std::exception& error) {
+        return error.what();
+    }
+}
+
+void RpcClient::close_lane_for_tests(const NodeId& peer, TransportLane lane) {
+    std::shared_ptr<PeerConnection> outbound;
+    std::function<void()> inbound;
+    {
+        std::lock_guard lock(mutex_);
+        const auto k = route_key(peer, lane);
+        if (auto out = connections_.find(k); out != connections_.end()) {
+            outbound = std::move(out->second);
+            connections_.erase(out);
+        }
+        if (auto in = inbound_routes_.find(k); in != inbound_routes_.end()) {
+            inbound = in->second.close;
+            inbound_routes_.erase(in);
+        }
+    }
+    if (inbound)
+        inbound();
+    if (outbound)
+        outbound->close();
+}
+
 void RpcClient::health_loop(std::stop_token stop) {
     ThreadCpuReporter cpu_reporter("macha-rpc-health", std::chrono::seconds(5), true);
     struct Probe {
         NodeId peer;
         Endpoint endpoint;
+        TransportLane lane;
         std::optional<AsyncRpc> rpc;
         Clock::time_point deadline;
         Clock::time_point next_attempt;
@@ -2412,16 +2669,32 @@ void RpcClient::health_loop(std::stop_token stop) {
         bool done{};
     };
 
+    uint64_t lane_wakeups_seen = lane_wakeups_.load(std::memory_order_acquire);
+    auto last_probe_round = Clock::time_point{};
     while (!stop.stop_requested()) {
         {
             std::unique_lock wait_lock(health_wait_mutex_);
-            health_wait_cv_.wait_for(wait_lock, stop, heartbeat_, [] { return false; });
+            health_wait_cv_.wait_for(wait_lock, stop, heartbeat_, [&] {
+                return lane_wakeups_.load(std::memory_order_acquire) != lane_wakeups_seen;
+            });
+            lane_wakeups_seen = lane_wakeups_.load(std::memory_order_acquire);
         }
         if (stop.stop_requested())
             return;
 
         reap_retired();
+        // Lanes a peer asked for, or that this (inbound-incapable) node keeps
+        // open on its own account. Runs on every wake so a dial_request is
+        // answered promptly; the probes below keep their heartbeat cadence.
+        open_requested_lanes(stop);
+        if (stop.stop_requested())
+            return;
+        if (Clock::now() - last_probe_round < heartbeat_)
+            continue;
+        last_probe_round = Clock::now();
+
         std::map<NodeId, Endpoint> active_peers;
+        std::map<NodeId, Endpoint> data_peers;
         {
             std::lock_guard lock(mutex_);
             for (const auto& [base, endpoint] : endpoints_) {
@@ -2429,26 +2702,26 @@ void RpcClient::health_loop(std::stop_token stop) {
                 if (known == endpoint_peers_.end())
                     continue;
                 const auto& peer = known->second;
-                const auto k = route_key(peer, TransportLane::control);
-                bool active = false;
-                auto out = connections_.find(k);
-                if (out != connections_.end() && out->second && out->second->usable())
-                    active = true;
-                auto in = inbound_routes_.find(k);
-                if (!active && in != inbound_routes_.end() && in->second.usable &&
-                    in->second.usable())
-                    active = true;
-                if (active)
+                if (route_usable_locked(peer, TransportLane::control))
                     active_peers.try_emplace(peer, endpoint);
+                // An idle DATA lane carried nothing until 0.42.0, so a NAT
+                // mapping that expired underneath it was found by the next
+                // extent read. Probe it too -- but only when it exists; a
+                // DATA session is dialled on demand, never to be probed.
+                if (route_usable_locked(peer, TransportLane::data))
+                    data_peers.try_emplace(peer, endpoint);
             }
         }
 
         std::vector<Probe> probes;
-        probes.reserve(active_peers.size());
+        probes.reserve(active_peers.size() + data_peers.size());
         const auto started = Clock::now();
         for (const auto& [peer, endpoint] : active_peers)
-            probes.push_back(
-                {peer, endpoint, std::nullopt, started + dead_after_, started, {}, false});
+            probes.push_back({peer, endpoint, TransportLane::control, std::nullopt,
+                              started + dead_after_, started, {}, false});
+        for (const auto& [peer, endpoint] : data_peers)
+            probes.push_back({peer, endpoint, TransportLane::data, std::nullopt,
+                              started + dead_after_, started, {}, false});
 
         size_t remaining = probes.size();
         while (remaining && !stop.stop_requested()) {
@@ -2471,16 +2744,20 @@ void RpcClient::health_loop(std::stop_token stop) {
                     // route while this probe was outstanding, and closing by
                     // NodeId would tear down that new healthy route as collateral.
                     if (probe.rpc) {
-                        Log::debug("peer " + endpoint_key(probe.endpoint) +
+                        Log::debug("peer " + endpoint_key(probe.endpoint) + " lane=" +
+                                   transport_lane_name(probe.lane) +
                                    " liveness failure: " + reason);
                         probe.rpc->abort();
                         probe.rpc.reset();
-                    } else {
+                    } else if (probe.lane == TransportLane::control) {
                         // No concrete route was ever acquired, so there is no
                         // route-specific abort target. Clear any stale route/map
                         // state associated with the endpoint.
                         close_endpoint(probe.endpoint, reason);
                     }
+                    // A DATA probe that never found a route has nothing to
+                    // close: the lane is already gone, and CONTROL decides
+                    // whether the peer itself is dead.
                     probe.done = true;
                     --remaining;
                     progressed = true;
@@ -2496,7 +2773,8 @@ void RpcClient::health_loop(std::stop_token stop) {
                         auto reply = probe.rpc->get();
                         probe.rpc.reset();
                         if (reply.message.type == MessageType::ok) {
-                            peer_observer_(reply.peer);
+                            if (probe.lane == TransportLane::control)
+                                peer_observer_(reply.peer);
                             probe.done = true;
                             --remaining;
                             continue;
@@ -2506,6 +2784,14 @@ void RpcClient::health_loop(std::stop_token stop) {
                         probe.rpc.reset();
                         probe.last_error = error.what();
                     }
+                    if (probe.lane == TransportLane::data) {
+                        // The session answered with an error or broke: it is
+                        // no longer a usable DATA lane, and the next attempt
+                        // below would only find it gone. Done.
+                        probe.done = true;
+                        --remaining;
+                        continue;
+                    }
                     probe.next_attempt = now + std::chrono::milliseconds(50);
                     continue;
                 }
@@ -2513,8 +2799,22 @@ void RpcClient::health_loop(std::stop_token stop) {
                 if (now < probe.next_attempt)
                     continue;
                 try {
-                    probe.rpc.emplace(call_async_known(probe.endpoint, &probe.peer,
-                                                       MessageType::ping, {}, FrameType::control));
+                    if (probe.lane == TransportLane::data) {
+                        auto existing = call_existing(probe.peer, TransportLane::data,
+                                                      MessageType::ping, {}, FrameType::control);
+                        if (!existing) {
+                            // The lane closed between the census and now.
+                            probe.done = true;
+                            --remaining;
+                            progressed = true;
+                            continue;
+                        }
+                        probe.rpc.emplace(std::move(*existing));
+                    } else {
+                        probe.rpc.emplace(call_async_known(probe.endpoint, &probe.peer,
+                                                           MessageType::ping, {},
+                                                           FrameType::control));
+                    }
                     progressed = true;
                 } catch (const std::exception& error) {
                     probe.last_error = error.what();
@@ -3729,6 +4029,16 @@ void RpcServer::session_loop(Session* session) {
         session->peer = session->channel->server_handshake(session->remote_host);
         pre_auth_sessions_.fetch_sub(1, std::memory_order_acq_rel);
         pre_auth_slot = false;
+        if (session->channel->lane() == TransportLane::probe) {
+            // A dial-back probe (see MessageType::dial_back_probe): the peer
+            // wanted to know whether this endpoint answers, and the completed
+            // handshake is the whole answer. No route, no observer, no reader
+            // loop -- the teardown below is all that is left to do.
+            Log::debug("node connection probe accepted peer=" +
+                       to_string(session->peer.id).substr(0, 12) + " remote=" +
+                       session->remote_host);
+            throw std::runtime_error("dial-back probe complete");
+        }
         session->channel->set_io_timeout(std::chrono::milliseconds(0));
         session->ready = true;
         session->start_writer();

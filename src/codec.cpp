@@ -106,6 +106,7 @@ void encode_node_info(Writer& writer, const NodeInfo& node) {
     writer.u64(node.seen_unix_ms);
     writer.u64(node.metadata_generation);
     writer.u32(node.metadata_write_replicas_required);
+    writer.u8(node.flags);
 }
 
 NodeInfo decode_node_info(Reader& reader) {
@@ -119,6 +120,7 @@ NodeInfo decode_node_info(Reader& reader) {
     node.seen_unix_ms = reader.u64();
     node.metadata_generation = reader.u64();
     node.metadata_write_replicas_required = reader.u32();
+    node.flags = reader.u8();
     return node;
 }
 } // namespace macha

@@ -53,6 +53,12 @@ runtime:
 # artwork and other immutable payloads. CONTROL/METADATA has an independent
 # priority quota and cannot be blocked by a full DATA backend.
 storage:
+  # Whether this node is ever a DATA placement owner or fallback holder.
+  # false is the edge node: it serves the API and media to its own network
+  # from its cache, publishes writes to the owners, and stores no extents, so
+  # `data` may be omitted. auto resolves to false with no backends or when
+  # the node turns out to accept no inbound connections (network.inbound_capable).
+  hosts_extents: auto
   data:
     backends:
       - path: /mnt/media-a/macha-data
@@ -196,6 +202,14 @@ network:
   listen: 0.0.0.0
   advertise: media-node-2.example.net
   port: 7437
+
+  # Can peers connect *to* this node? false is the node behind CGNAT or a NAT
+  # nobody may forward: it dials its peers, they answer over the sessions it
+  # opened, and never dial it (advertise, upnp, external_ip and
+  # connectivity_check are then irrelevant). auto asks a peer to dial back,
+  # persists the answer under state_path/connectivity/ and re-checks it
+  # periodically. A founding node (no bootstrap) must be reachable.
+  inbound_capable: auto
 
   # Nodes sharing one physical/site failure domain should share this value.
   failure_domain: site-a

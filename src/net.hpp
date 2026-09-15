@@ -69,6 +69,14 @@ enum class MessageType : uint16_t {
     // caller cannot replay). Reply: metadata_history_entry_reply.
     get_metadata_history_record = 41,
     user_sync = 42,
+    // 0.42.0 / protocol 21: nodes that accept no inbound connections.
+    // dial_request is a notification (request_id 0) sent over an existing
+    // CONTROL route to a peer that cannot be dialled: "open this lane to me".
+    // dial_back_probe asks a peer to make one throwaway TCP connection to the
+    // sender's advertised endpoint and report whether the handshake completed;
+    // it is how `network.inbound_capable: auto` finds out the truth.
+    dial_request = 43,
+    dial_back_probe = 44,
     ok = 100,
     error = 101,
     members_reply = 102,
@@ -88,7 +96,8 @@ enum class MessageType : uint16_t {
     torrent_job_action_reply = 116,
     session_sync_reply = 117,
     have_objects_reply = 118,
-    user_sync_reply = 119
+    user_sync_reply = 119,
+    dial_back_probe_reply = 120
 };
 
 // Transport priority is a property of the frame type itself. There is no
@@ -96,6 +105,12 @@ enum class MessageType : uint16_t {
 enum class TransportLane : uint8_t {
     control = 1,
     data = 2,
+    // A dial-back probe: the handshake completes (which authenticates both
+    // ends) and the connection is closed. Nothing is ever sent on it and the
+    // accepting side registers no route for it, so a probe can never retire a
+    // real session in reconcile_locked() the way an ordinary accepted session
+    // would.
+    probe = 3,
 };
 
 const char* transport_lane_name(TransportLane) noexcept;
@@ -359,6 +374,19 @@ class RpcClient {
     std::map<std::string, PeerHealth> health_;
     std::map<std::string, Endpoint> endpoints_;
     std::map<std::string, IdentityAssociationReset> identity_resets_;
+    // What each authenticated peer said about itself (NodeInfo::flags), from
+    // the handshake and from membership gossip via note_peer(). A peer with
+    // inbound_capable clear is never dialled: connection() asks it to dial
+    // instead. Guarded by mutex_.
+    std::map<NodeId, uint8_t> peer_flags_;
+    // Lanes the health thread has been asked to open from this side: by a
+    // peer's dial_request, or by maintain_lanes_to() for every capable peer
+    // when this node is itself inbound-incapable. Keyed by route_key.
+    std::map<std::string, std::pair<NodeInfo, TransportLane>> requested_lanes_;
+    std::function<std::vector<NodeInfo>()> maintained_peers_;
+    std::atomic_uint64_t lane_wakeups_{};
+    std::atomic_uint64_t dial_requests_sent_{};
+    std::atomic_uint64_t dial_requests_received_{};
     std::atomic_uint64_t connections_created_{};
     std::atomic_uint64_t connections_reused_{};
     std::jthread health_thread_;
@@ -378,6 +406,20 @@ class RpcClient {
                                                NodeId* actual, TransportLane);
     AsyncRpc call_async_known(const Endpoint&, const NodeId*, MessageType, std::span<const uint8_t>,
                               FrameType);
+    // Send on a route that already exists (outbound first, then inbound);
+    // never dials. Empty when the peer has no usable route on `lane`.
+    std::optional<AsyncRpc> call_existing(const NodeId&, TransportLane, MessageType,
+                                          std::span<const uint8_t>, FrameType);
+    bool local_inbound_capable() const;
+    bool peer_inbound_capable_locked(const NodeId&) const;
+    bool route_usable_locked(const NodeId&, TransportLane) const;
+    void note_peer_locked(const NodeInfo&);
+    // Wait (bounded by connect_timeout) for a peer that cannot be dialled to
+    // open `lane` to us after a dial_request. Returns the inbound route's
+    // presence; throws with the reason when it never arrives.
+    void await_reverse_dial(std::unique_lock<std::mutex>& lock, const NodeId& peer,
+                            TransportLane lane, const std::string& retry_key);
+    void open_requested_lanes(std::stop_token);
     void observe_result(const std::string&, bool, std::chrono::milliseconds,
                         bool latency_sample = false);
     void health_loop(std::stop_token);
@@ -429,6 +471,37 @@ class RpcClient {
     // Smoothed CONTROL-lane round trip to a peer, if any call has completed.
     std::optional<std::chrono::milliseconds> peer_latency(const NodeId&) const;
     std::map<NodeId, std::chrono::milliseconds> peer_latencies() const;
+
+    // Nodes that accept no inbound connections (0.42.0). The transport needs
+    // to know a peer's flags before it decides whether to dial: the handshake
+    // teaches it for peers it has met, note_peer() for peers membership has
+    // only heard about.
+    void note_peer(const NodeInfo&);
+    bool has_route(const NodeId&, TransportLane) const;
+    // A peer asked (or membership decided) that this side should open `lane`
+    // to `peer`. Queued for the health thread, which dials under the ordinary
+    // retry backoff; a request never bypasses it, so a peer that keeps losing
+    // a lane cannot make this node redial in a loop.
+    void request_lane(const NodeInfo& peer, TransportLane lane);
+    // While this node is inbound-incapable, keep CONTROL and DATA dialled to
+    // every peer the callback returns (the active inbound-capable set): it is
+    // the only side that can restore its own reachability, so it never waits
+    // to be asked when it can avoid it.
+    void set_maintained_peers(std::function<std::vector<NodeInfo>()>);
+    // One-shot dial-back: a fresh TCP connection to `endpoint`, a full
+    // handshake that must authenticate as `expected`, then close. Never
+    // registered as a route; this is the evidence `inbound_capable: auto`
+    // is built on. Returns the error text, empty on success.
+    std::string probe_dial(const Endpoint& endpoint, const NodeId& expected);
+    // Tear down one lane to a peer (both directions) without touching the
+    // other. Tests use it to stand in for a NAT mapping silently expiring.
+    void close_lane_for_tests(const NodeId& peer, TransportLane lane);
+    uint64_t dial_requests_sent() const {
+        return dial_requests_sent_.load(std::memory_order_relaxed);
+    }
+    uint64_t dial_requests_received() const {
+        return dial_requests_received_.load(std::memory_order_relaxed);
+    }
     void broadcast(const RpcMessage&);
     size_t broadcast_best_effort(const RpcMessage&, FrameType);
     void invalidate_identity_association(const IdentityAssociationReset&);

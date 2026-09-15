@@ -5006,4 +5006,221 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_recovers_after_crash_
     s1.stop();
 }
 
+// 0.42.0: a node that accepts no inbound connections. Modelled with a
+// black-hole advertised address (192.0.2.1, TEST-NET-1) and a short connect
+// timeout, so no OS firewall is needed: any dial to it would hang and fail,
+// and the assertions below are that nobody ever makes one.
+MACHA_TEST("rpc_cluster", test_inbound_incapable_node_is_reached_only_over_its_own_sessions) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+
+    struct FlagNode {
+        NodeInfo info;
+        RpcClient client;
+        RpcServer server;
+
+        FlagNode(ClusterKeys keys, NodeInfo node, std::chrono::milliseconds connect_timeout)
+            : info(std::move(node)),
+              client(
+                  keys, [this] { return info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+                  connect_timeout, 100ms, 30s),
+              server(
+                  "127.0.0.1", info.port, keys, info,
+                  [this](const NodeInfo& peer, FrameType, const RpcMessage& request) {
+                      return handle(peer, request);
+                  },
+                  [](const NodeInfo&) {}) {
+            server.attach_client(client);
+            server.start();
+        }
+        ~FlagNode() {
+            server.stop();
+            client.stop();
+        }
+        // What NodeRuntime::handle does for the two new messages.
+        RpcMessage handle(const NodeInfo& peer, const RpcMessage& request) {
+            if (request.type == MessageType::dial_request) {
+                Reader reader(request.payload);
+                const auto lane = static_cast<TransportLane>(reader.u8());
+                reader.finish();
+                client.request_lane(peer, lane);
+                return {MessageType::ok, {}};
+            }
+            return {MessageType::ok, request.payload};
+        }
+    };
+
+    auto capable_info = [] {
+        NodeInfo node;
+        node.id = random_node_id();
+        node.host = "127.0.0.1";
+        node.port = free_port();
+        node.failure_domain = "hub";
+        return node;
+    };
+    auto incapable_info = [] {
+        NodeInfo node;
+        node.id = random_node_id();
+        node.host = "192.0.2.1"; // a routing key, never an address anyone reaches
+        node.port = free_port();
+        node.failure_domain = "cgnat";
+        node.flags = node_flags_for(false, true);
+        return node;
+    };
+
+    // A peer that knows the node cannot be dialled does not try, and says
+    // so at once rather than after a connect timeout.
+    {
+        FlagNode hub(keys, capable_info(), 2s);
+        FlagNode site(keys, incapable_info(), 300ms);
+        hub.client.note_peer(site.info);
+        const auto started = Clock::now();
+        bool refused = false;
+        try {
+            (void)hub.client.call(site.info, MessageType::members, Bytes{1}, 1s);
+        } catch (const std::runtime_error& error) {
+            refused = std::string(error.what()).find("accepts no inbound connections") !=
+                      std::string::npos;
+        }
+        CHECK(refused);
+        CHECK(Clock::now() - started < 1s);
+        CHECK(hub.client.stats().connections_created == 0);
+    }
+
+    FlagNode hub(keys, capable_info(), 2s);
+    FlagNode site(keys, incapable_info(), 300ms);
+
+    // Control flows both ways over the one session the site opened.
+    CHECK(site.client.call(hub.info, MessageType::members, Bytes{1}, 1s).message.payload ==
+          Bytes{1});
+    CHECK(hub.client.call(site.info, MessageType::members, Bytes{2}, 1s).message.payload ==
+          Bytes{2});
+    CHECK(hub.client.stats().connections_created == 0);
+    CHECK(site.client.stats().connections_created == 1);
+
+    // The hub needs the DATA lane the site has not opened: it asks, the site
+    // dials, the call completes -- and the hub still never dialled anything.
+    CHECK(hub.client.call(site.info, MessageType::get_object, Bytes{3}, FrameType::foreground, 5s)
+              .message.payload == Bytes{3});
+    CHECK(hub.client.dial_requests_sent() == 1);
+    CHECK(site.client.dial_requests_received() == 1);
+    CHECK(hub.client.stats().connections_created == 0);
+    CHECK(site.client.stats().connections_created == 2);
+    CHECK(hub.client.has_route(site.info.id, TransportLane::data));
+    CHECK(site.client.has_route(hub.info.id, TransportLane::data));
+
+    // A DATA lane that dies underneath (a NAT mapping expiring) is redialled
+    // by the site on its own initiative, without being asked.
+    site.client.set_maintained_peers([&] { return std::vector<NodeInfo>{hub.info}; });
+    site.client.close_lane_for_tests(hub.info.id, TransportLane::data);
+    REQUIRE(wait_until([&] { return site.client.has_route(hub.info.id, TransportLane::data); },
+                       5s));
+    CHECK(hub.client.dial_requests_sent() == 1);
+    CHECK(hub.client.stats().connections_created == 0);
+    CHECK(hub.client.call(site.info, MessageType::get_object, Bytes{4}, FrameType::foreground, 5s)
+              .message.payload == Bytes{4});
+    CHECK(hub.client.dial_requests_sent() == 1);
+
+    // The dial-back probe: a fresh connection, a handshake, nothing else.
+    // The hub can be probed; the site cannot, and the failure names why.
+    const auto hub_created = hub.client.stats().connections_created;
+    CHECK(site.client.probe_dial(Endpoint{hub.info.host, hub.info.port}, hub.info.id).empty());
+    CHECK(!hub.client.probe_dial(Endpoint{site.info.host, site.info.port}, site.info.id).empty());
+    CHECK(hub.client.stats().connections_created == hub_created);
+    CHECK(hub.client.stats().canonical_connections == 2);
+    CHECK(site.client.stats().canonical_connections == 2);
+}
+
+// `network.inbound_capable: auto` on a whole node: resolved from what a peer
+// reports after dialling back, persisted, and reversed once the address
+// becomes dialable. The site advertises a black-hole address first.
+MACHA_TEST("rpc_cluster", test_inbound_auto_resolves_from_dial_back_and_survives_restart) {
+    TestCluster cluster(ConfigProfile::isolated);
+    const auto& keys = cluster.keys();
+
+    auto hub_config = cluster.node_config("hub");
+    hub_config.dial_back_probe_min_interval = 100ms;
+
+    struct RuntimeNode {
+        Config config;
+        const ClusterKeys& keys;
+        std::unique_ptr<NodeRuntime> node;
+        RuntimeNode(Config c, const ClusterKeys& k) : config(std::move(c)), keys(k) {}
+        NodeRuntime& start() {
+            for (const auto& backend : config.storage_backends)
+                std::filesystem::create_directories(backend.path);
+            node = std::make_unique<NodeRuntime>(config, keys);
+            node->start();
+            REQUIRE(node->wait_local_state_ready(10s));
+            return *node;
+        }
+        void stop() {
+            if (node)
+                node->stop();
+            node.reset();
+        }
+        ~RuntimeNode() { stop(); }
+    };
+
+    RuntimeNode hub(hub_config, keys);
+    hub.start();
+
+    auto site_config = cluster.node_config(
+        "site", 0, {Endpoint{hub_config.advertise_host, hub_config.port}});
+    site_config.advertise_host = "192.0.2.1";
+    site_config.connect_timeout = 300ms;
+    site_config.inbound_reprobe_while_incapable = 300ms;
+    site_config.inbound_reprobe_while_capable = 300ms;
+    site_config.dial_back_probe_min_interval = 100ms;
+    RuntimeNode site(site_config, keys);
+    auto& site_node = site.start();
+    const auto site_id = site_node.node_id();
+    CHECK(site_node.inbound_resolution().source == "default");
+    CHECK(site_node.inbound_capable());
+
+    // Two dial-backs from the hub fail against the black hole: the site now
+    // says it cannot be reached, and stops hosting extents (auto follows).
+    REQUIRE(wait_until([&] { return !site_node.inbound_capable(); }, 20s));
+    {
+        const auto resolution = site_node.inbound_resolution();
+        CHECK(!resolution.hosts_extents);
+        CHECK(resolution.source == "probe:" + to_string(hub.node->node_id()));
+        CHECK(resolution.consecutive_probe_failures >= 2);
+        CHECK(!resolution.last_probe_error.empty());
+    }
+    // The hub sees the gossiped flags and stops dialling.
+    REQUIRE(wait_until([&] { return !hub.node->membership().inbound_capable(site_id); }, 10s));
+    CHECK(!hub.node->membership().hosts_extents(site_id));
+    CHECK(hub.node->membership().all_known_reachable());
+
+    // The resolution is persisted: a restart starts from it, not from "default".
+    site.stop();
+    auto& restarted = site.start();
+    CHECK(!restarted.inbound_capable());
+    CHECK(restarted.inbound_resolution().source == "persisted");
+
+    // Once the advertised address is genuinely dialable, one successful
+    // dial-back flips it back, and hosting follows.
+    site.stop();
+    site.config.advertise_host = "127.0.0.1";
+    auto& reachable = site.start();
+    CHECK(!reachable.inbound_capable()); // persisted, until evidence says otherwise
+    REQUIRE(wait_until([&] { return reachable.inbound_capable(); }, 20s));
+    CHECK(reachable.hosts_extents());
+    REQUIRE(wait_until([&] { return hub.node->membership().inbound_capable(site_id); }, 10s));
+    CHECK(hub.node->membership().hosts_extents(site_id));
+
+    // A founding node that cannot be dialled is refused outright.
+    auto founder = cluster.node_config("founder");
+    founder.inbound_capable = Tristate::no;
+    RuntimeNode refused(founder, keys);
+    bool threw = false;
+    try {
+        refused.start();
+    } catch (const std::runtime_error& error) {
+        threw = std::string(error.what()).find("founding node") != std::string::npos;
+    }
+    CHECK(threw);
+}
+
 } // namespace

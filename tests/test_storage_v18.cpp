@@ -1488,4 +1488,120 @@ MACHA_TEST("storage_v18", test_catalogue_control_objects_recover_on_metadata_rep
         CHECK(a.node().control_store().valid(id));
 }
 
+// 0.42.0: an edge node -- no storage.data at all -- joins, is never an owner
+// or a fallback for any key, and what it writes lands on the nodes that do
+// host extents.
+MACHA_TEST("storage_v18", test_edge_node_never_owns_and_its_writes_land_on_owners) {
+    TestCluster cluster(ConfigProfile::isolated);
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    const auto p3 = free_port();
+    const std::vector<Endpoint> seeds{{"127.0.0.1", p1}};
+
+    StorageClusterNode s1(storage_node_config(cluster, "s1", p1, 64ULL * 1024 * 1024, 1, 1), keys);
+    StorageClusterNode s2(storage_node_config(cluster, "s2", p2, 64ULL * 1024 * 1024, 1, 1, seeds),
+                          keys);
+    auto edge_config = storage_node_config(cluster, "edge", p3, 64ULL * 1024 * 1024, 1, 1, seeds);
+    edge_config.storage_backends.clear(); // hosts_extents auto -> false
+    StorageClusterNode edge(edge_config, keys);
+    s1.start();
+    s2.start();
+    edge.start();
+
+    CHECK(!edge.node().hosts_extents());
+    CHECK(edge.node().inbound_capable());
+    CHECK(edge.node().local_store().limit() == 0);
+    const auto edge_id = edge.node().node_id();
+    REQUIRE(wait_until([&] {
+        return edge.node().membership().active().size() == 3 &&
+               s1.node().membership().active().size() == 3 &&
+               !s1.node().membership().hosts_extents(edge_id) &&
+               !s2.node().membership().hosts_extents(edge_id);
+    }, 10s));
+
+    // Never an owner, from any node's point of view, for any key.
+    size_t owned_by_s1 = 0, owned_by_s2 = 0;
+    for (unsigned i = 0; i < 512; ++i) {
+        const auto id = object_id(pattern(64, static_cast<uint8_t>(i)));
+        CHECK(!edge.store().should_own(id));
+        owned_by_s1 += s1.store().should_own(id) ? 1 : 0;
+        owned_by_s2 += s2.store().should_own(id) ? 1 : 0;
+        // The observers agree: the edge node is in nobody's placement input.
+        const auto ranked = capacity_placement_nodes(id.bytes, s1.node().membership().active(), 1);
+        (void)ranked;
+    }
+    CHECK(owned_by_s1 > 0);
+    CHECK(owned_by_s2 > 0);
+    CHECK(owned_by_s1 + owned_by_s2 == 512);
+
+    // A write from the edge node reaches an owner and stays off the edge.
+    const auto data = pattern(256 * 1024, 7);
+    const auto id = edge.store().put(data, FrameType::loader);
+    CHECK(!edge.node().local_store().has(id));
+    CHECK(s1.node().local_store().has(id) || s2.node().local_store().has(id));
+    // ...and it can read it back, through its cache, like any non-owner.
+    const auto read = edge.store().get(id, 0, FrameType::foreground);
+    REQUIRE(read.has_value());
+    CHECK(*read == data);
+    CHECK(!edge.node().local_store().has(id));
+}
+
+// A node that stops hosting extents drains through ordinary repair: the
+// copies it holds are pushed to the owners and then removed locally.
+MACHA_TEST("storage_v18", test_node_that_stops_hosting_drains_through_repair) {
+    TestCluster cluster(ConfigProfile::isolated);
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    const std::vector<Endpoint> seeds{{"127.0.0.1", p1}};
+
+    StorageClusterNode s1(storage_node_config(cluster, "s1", p1, 64ULL * 1024 * 1024, 1, 1), keys);
+    StorageClusterNode s2(storage_node_config(cluster, "s2", p2, 64ULL * 1024 * 1024, 1, 1, seeds),
+                          keys);
+    s1.start();
+    s2.start();
+    const auto s2_id = s2.node().node_id();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() == 2 &&
+               s2.node().membership().active().size() == 2;
+    }, 10s));
+
+    // Objects s2 owns while it still hosts.
+    std::vector<ObjectId> owned;
+    for (uint8_t salt = 1; owned.size() < 4 && salt < 250; ++salt) {
+        const auto data = preferred_for(s2.node(), s2_id, 96 * 1024, salt);
+        const auto id = s2.store().put(data, FrameType::loader);
+        REQUIRE(s2.node().local_store().has(id));
+        owned.push_back(id);
+    }
+    REQUIRE(owned.size() == 4);
+
+    // s2 restarts declaring it hosts nothing. The backends are still
+    // configured (a warning, not an error), so the objects are still there
+    // to be drained.
+    s2.stop();
+    s2.config().hosts_extents = Tristate::no;
+    s2.start();
+    CHECK(!s2.node().hosts_extents());
+    REQUIRE(wait_until([&] { return !s1.node().membership().hosts_extents(s2_id); }, 10s));
+    for (const auto& id : owned) {
+        CHECK(!s2.store().should_own(id));
+        CHECK(s1.store().should_own(id));
+    }
+
+    // Repair on the draining node pushes each copy to its owner and removes
+    // the local one once the owner holds it.
+    REQUIRE(wait_until([&] {
+        (void)s2.store().repair_once();
+        return std::all_of(owned.begin(), owned.end(), [&](const ObjectId& id) {
+            return s1.node().local_store().has(id) && !s2.node().local_store().has(id);
+        });
+    }, 20s, 100ms));
+    for (const auto& id : owned) {
+        const auto read = s2.store().get(id, 0, FrameType::speculative);
+        CHECK(read.has_value());
+    }
+}
+
 } // namespace

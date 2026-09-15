@@ -109,6 +109,28 @@ The governing laws are:
 3. Control traffic must remain promptly serviceable. Viewer priority is a large
    configurable share (95:5 by default), not indefinite starvation of all other work.
 
+## P0 — Nodes that cannot accept inbound connections, and edge nodes (business, opened 2026-09-15)
+
+A node behind CGNAT or a non-forwardable NAT must be a full participant
+(mount, playback, ingest) while never being connected *to*; and a node that
+serves the API and media to its own network, caching what it plays, must be
+able to store no media at all. Plan:
+[inbound-incapable nodes](2026-09-15-inbound-incapable-nodes-plan.md) --
+`network.inbound_capable` and `storage.hosts_extents`, both self-declared,
+gossiped and `auto` by default; reverse-dialled lanes over the existing
+inbound-route machinery; no relay (extents live only where they can be
+fetched from).
+
+**Stages A, B and C shipped in 0.42.0 (2026-09-15), protocol 21.** What is
+left: (1) the cluster UAT on fi-1 described in the plan (point Macha at the
+peers' public endpoints so its RPC port is genuinely unreachable; expect
+`auto` to resolve false within two probe rounds, mount/playback/ingest to
+work, no refused dials to it on gbni-1/es-1, `all_known_reachable` to hold
+everywhere, and a 20-minute idle DATA lane not to stall); (2) the open
+retention question -- the drain test uses unretained objects, so whether a
+draining node's retention claims release without special treatment is still
+unproven; exercise a FUSE publication from a node that then stops hosting.
+
 ## P0 — The test suite must be deterministic (next, opened 2026-09-14)
 
 **"Known flake" is not a category. It is the name we have been giving the

@@ -46,8 +46,11 @@ void validate(Config& config) {
         throw std::runtime_error("network port must be nonzero");
     if (config.cache.max_blocks && config.cache.path.empty())
         throw std::runtime_error("cache.path is required when cache.max_blocks is nonzero");
-    if (config.storage_backends.empty())
-        throw std::runtime_error("at least one storage backend is required");
+    // A node that hosts extents needs somewhere to put them. One that does
+    // not (an edge node, or `auto` with nothing configured, which resolves to
+    // not hosting) runs an empty StoragePool and has nothing to validate here.
+    if (config.hosts_extents == Tristate::yes && config.storage_backends.empty())
+        throw std::runtime_error("storage.hosts_extents is true but storage.data has no backends");
     for (const auto& backend : config.storage_backends) {
         if (backend.path.empty() || !backend.limit)
             throw std::runtime_error("each storage.data backend requires path and nonzero limit");
@@ -545,6 +548,61 @@ Config normalize_config(Config c) {
         c.plugin_path = std::filesystem::path(kDefaultPluginDir);
     validate(c);
     return c;
+}
+
+std::string_view tristate_name(Tristate value) noexcept {
+    switch (value) {
+    case Tristate::yes:
+        return "true";
+    case Tristate::no:
+        return "false";
+    case Tristate::automatic:
+        return "auto";
+    }
+    return "auto";
+}
+
+Tristate parse_tristate(std::string_view value, const char* what) {
+    std::string lower(value);
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (lower == "true" || lower == "yes" || lower == "on")
+        return Tristate::yes;
+    if (lower == "false" || lower == "no" || lower == "off")
+        return Tristate::no;
+    if (lower == "auto")
+        return Tristate::automatic;
+    throw std::runtime_error(std::string(what) + " must be true, false or auto (got '" +
+                             std::string(value) + "')");
+}
+
+std::vector<std::string> configuration_warnings(const Config& config) {
+    std::vector<std::string> out;
+    if (config.hosts_extents == Tristate::no && !config.storage_backends.empty())
+        out.emplace_back("storage.data is configured but this node hosts no extents; the "
+                         "backends will drain and stay empty");
+    if (config.hosts_extents == Tristate::yes && config.inbound_capable == Tristate::no)
+        out.emplace_back("extents hosted here are reachable from inbound-capable peers only");
+    if (config.inbound_capable == Tristate::no) {
+        std::vector<std::string> irrelevant;
+        if (!config.advertise_host.empty())
+            irrelevant.emplace_back("network.advertise");
+        if (config.upnp.enabled)
+            irrelevant.emplace_back("network.upnp");
+        if (config.external_ip.enabled)
+            irrelevant.emplace_back("network.external_ip");
+        if (config.connectivity_check.enabled)
+            irrelevant.emplace_back("network.connectivity_check");
+        if (!irrelevant.empty()) {
+            std::string list;
+            for (const auto& item : irrelevant)
+                list += (list.empty() ? "" : ", ") + item;
+            out.emplace_back("network.inbound_capable is false, so " + list +
+                             (irrelevant.size() == 1 ? " is" : " are") +
+                             " irrelevant: peers never dial this node");
+        }
+    }
+    return out;
 }
 
 
