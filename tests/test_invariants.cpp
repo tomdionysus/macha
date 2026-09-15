@@ -475,6 +475,62 @@ MACHA_TEST("invariants", test_no_recovery_route_is_exposed) {
     service.stop();
 }
 
+// 0.42.1: a client probing an address must be able to tell "something
+// answered" from "Macha answered", including while the node is still starting.
+MACHA_TEST("invariants", test_health_identifies_itself_unauthenticated_in_every_state) {
+    TestCluster cluster(ConfigProfile::isolated);
+    auto config = cluster.node_config("health-identity");
+    config.catalogue.api.enabled = true;
+    config.catalogue.api.listen = "127.0.0.1";
+    config.catalogue.api.port = free_port();
+    const auto port = config.catalogue.api.port;
+
+    TestGate control_gate;
+    Service service(config, cluster.keys(), [&](std::string_view stage) {
+        if (stage == "control-plane")
+            control_gate.enter_and_wait();
+    });
+    std::jthread starter([&] { service.start(); });
+    struct ReleaseGate {
+        TestGate& gate;
+        ~ReleaseGate() { gate.open(); }
+    } release{control_gate};
+    REQUIRE(control_gate.wait_for_entries(1));
+
+    // Still starting: 503, and it still says what it is. This is the state a
+    // probe is most likely to meet and the one whose body a caller is most
+    // tempted not to parse.
+    {
+        const auto response = raw_http_get(port, "/api/v1/health");
+        CHECK(response.find("HTTP/1.1 503") != std::string::npos);
+        CHECK(response.find("Content-Type: application/json") != std::string::npos);
+        CHECK(response.find("\"service\":\"macha\"") != std::string::npos);
+        CHECK(response.find("\"status\":\"starting\"") != std::string::npos);
+    }
+
+    control_gate.open();
+    starter.join();
+    REQUIRE(wait_until([&] {
+        return raw_http_get(port, "/api/v1/health").find("HTTP/1.1 200") != std::string::npos;
+    }, 20s));
+
+    // Serving: 200, the same marker, and no bearer token anywhere above -- the
+    // probe runs before any session exists.
+    const auto response = raw_http_get(port, "/api/v1/health");
+    CHECK(response.find("\"service\":\"macha\"") != std::string::npos);
+    CHECK(response.find("\"status\":\"ok\"") != std::string::npos);
+    CHECK(response.find("\"version\":\"") != std::string::npos);
+    // The cluster's shape is still not here, and test_users pins that from the
+    // other end: what a node is may be answered without a token, what the
+    // cluster looks like may not.
+    CHECK(response.find("capacity") == std::string::npos);
+    // Same-origin is the intended case, but the probe must work cross-origin
+    // too, and a negative must be an HTTP answer rather than an opaque failure.
+    CHECK(response.find("Access-Control-Allow-Origin: *") != std::string::npos);
+
+    service.stop();
+}
+
 MACHA_TEST("invariants", test_status_api_precedes_control_plane_startup) {
     TestCluster cluster(ConfigProfile::isolated);
     auto config = cluster.node_config("status-first");

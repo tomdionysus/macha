@@ -1104,13 +1104,25 @@ MACHA_TEST("users", test_status_needs_view_status_and_health_needs_nothing) {
     // Liveness is a separate route with no token at all, because the things
     // that ask it -- a load balancer, an uptime monitor, a client choosing an
     // endpoint -- have no session and should not need one. It says whether this
-    // node is serving and nothing else: no version, no node id, no topology.
+    // node is serving, and what it is: a client that cannot tell Macha from any
+    // other thing answering {"status":"ok"} will adopt the wrong endpoint.
+    //
+    // `version` joined it in 0.42.1 by an explicit operator decision, over the
+    // objection that an unauthenticated route should not name the build. The
+    // reasoning is recorded at health_response(): `service` already names the
+    // product, so the version narrows which exploit an attacker reaches for
+    // rather than whether they try one.
+    //
+    // What stays out is the cluster's shape. No node id, no topology, no
+    // capacities -- that is what view_status is for, and it is the whole point
+    // of the gate this test exists to pin.
     auto health = raw_http_get(port, "/api/v1/health");
     CHECK(health.find("200") != std::string::npos);
     CHECK(health.find("\"status\":\"ok\"") != std::string::npos);
+    CHECK(health.find("\"service\":\"macha\"") != std::string::npos);
+    CHECK(health.find("\"version\":\"") != std::string::npos);
     CHECK(health.find("node") == std::string::npos);
     CHECK(health.find("capacity") == std::string::npos);
-    CHECK(health.find("version") == std::string::npos);
 }
 
 MACHA_TEST("users", test_a_peer_that_joins_after_the_announcement_converges) {
