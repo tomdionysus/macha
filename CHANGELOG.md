@@ -1,5 +1,59 @@
 # Current release
 
+## 0.41.1 — The writer's garbage collector wakes up (development)
+
+**Superseded catalogue artwork is now reclaimed on the node that wrote it.**
+0.41.0 shipped this as a P0 storage leak with the evidence but not the cause:
+after a burst of artwork replacements the writing node kept all four
+superseded objects indefinitely while its peer reclaimed them, both
+catalogues converged and agreeing. The backlog named two candidate
+mechanisms, and a `MACHA_TEST_LOG_LEVEL=DEBUG` repeat run reading the
+writer's maintenance decisions ruled out both: the retention claims were
+already dominated by the release clock (claim dots 4/6/9/11 against a clock
+of 13, no release ever applied), and the sweep window was not being pushed
+forward by the writer's own events. The writer's maintenance loop was
+*asleep* -- one pass in 27 s, stage `wait`, next deadline 30 days out.
+
+The mechanism: a pass that starts `busy` (foreground or interactive I/O
+inside `maintenance.foreground_quiet`) suppresses GC, repair and rebalance,
+and is supposed to hand the decision back once the foreground goes quiet.
+It armed that wake-up only while the foreground was *still* inside its quiet
+period at the end of the pass. A pass that started busy and ended after the
+quiet period had elapsed -- with the GC window already expired too, so the
+GC deadline did not apply either -- armed nothing and slept until the next
+unrelated event. On the test cluster that was the scrub deadline; on a real
+node it is whenever metadata next changes, which on a quiet library can be
+hours, and the dead bytes sit there until then. `Service::loop` now always
+bounds a busy pass's sleep by the remaining quiet period, zero included.
+Measured before: 1-2 misses in 60 reps of the coalesced-burst case at DEBUG,
+`busy=1 gc_quiet_ms=-2 wait_ms=2591999883`; after: 300/300 reps at DEBUG, then three
+full-suite runs, 441/441 each.
+
+The diagnostics that made this answerable stay in: the loop logs at DEBUG
+why the destructive sweep did not run (only when the answer changes) and
+what a sweep did; `Service::maintenance_stage()` and
+`maintenance_sleep_diagnostic()` say where the loop is and what it decided
+before sleeping; `RetentionStore::claims()` exposes an object's claim dots; a
+publication attempt that fails after placing its claims logs its sequence;
+and the coalesced-burst test prints all of it on a miss instead of "GC did
+not finish in 12 s".
+
+**`FuseFrontend::wait_for_idle` no longer reports idle with work
+outstanding.** `status()` sampled the data queue, the deferred inodes and
+`active_data` at three different times, while a publication cycles
+deferred → queued → active → deferred under `data_queue_mutex`. An inode
+could leave the place already counted and enter one not yet counted, so the
+composite read idle from a mount about to re-admit work; there was also an
+uncounted window between an enqueue being decided (`data_enqueue_pending`)
+and the queue push. Every count is now taken under `data_queue_mutex` in one
+sample (the inode list copied out first, `admit_deferred()`'s pattern, so the
+queue mutex is never held under `namespace_mutex`), and a decided enqueue
+counts as pending. Seen as
+`filesystem_fuse/test_fuse_publication_quanta_are_fair_and_byte_bounded`
+failing three assertions at once after `wait_for_idle(30s)` returned true
+(1 in 2,646 case-runs). Test-only API today, but the quiescence primitive
+most of the FUSE suite waits on.
+
 ## 0.41.0 — FUSE cannot take the node down any more (development)
 
 **The mount is a supervised subsystem, and a failure in it is now a failure of

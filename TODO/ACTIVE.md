@@ -109,65 +109,6 @@ The governing laws are:
 3. Control traffic must remain promptly serviceable. Viewer priority is a large
    configurable share (95:5 by default), not indefinite starvation of all other work.
 
-## P0 — Superseded catalogue artwork is never reclaimed on the node that wrote it (found 2026-09-15)
-
-**A storage leak, reproducible at ~0.7%, confirmed stuck rather than slow.**
-Found while classifying the coalesced-burst test's failures rather than
-re-running it until green.
-
-Shape, from six independent occurrences with identical evidence: after a
-burst of catalogue artwork replacements on node 2, the four superseded DATA
-objects remain on **s2 only** -- the node that wrote them -- while s1 has
-reclaimed every one. Both catalogues are converged at the same generation
-and both report `artwork_objects=1`, so the metadata agrees the old objects
-are dead. The instrumented assertion retries for a further 30 s and reports
-`reclaimed_eventually=no total_ms=42006` (4 of 4 occurrences): they are
-never reclaimed. A healthy run reclaims in under a second -- 0 of 360 reps
-took longer.
-
-Reproduce: `./build/macha-tests --repeat 60 --filter
-test_catalogue_uses_final_state_after_coalesced_metadata_burst`, roughly one
-failure per 150 reps; the failure prints the remaining object ids, the node
-holding them, both catalogue generations and `reclaimed_eventually`.
-
-Not yet separated: s2 is the busy writer, so its `gc_quiescent_until` is
-pushed forward by its own service events on every pass (`Service::loop`),
-and its retention claims for freshly published artwork are only released
-once a later catalogue root proves them unreferenced
-(`CatalogueManager::control_gc_*`, `retention_objects`). Either would
-explain "the writer never sweeps"; neither is confirmed. Next step is a
-`MACHA_TEST_LOG_LEVEL=DEBUG` repeat run reading s2's maintenance decisions
-across the failing window.
-
-Why it matters beyond the test: this is the ordinary path for replacing
-artwork, and on a real node the superseded bytes would simply accumulate.
-
-## P1 — `FuseFrontend::wait_for_idle` can report idle while a publication is starting (found 2026-09-15)
-
-`wait_for_idle` is the quiescence primitive most of the `filesystem_fuse`
-suite waits on, and it can return true with work outstanding.
-
-It decides from `status()`, which samples three things independently: the
-data queue under `data_queue_mutex`, the inode table under `namespace_mutex`,
-and `active_data` as a bare atomic. A publication that has been dequeued but
-whose `active_data` increment has not landed yet is counted by neither, so
-the composite reads idle. Nothing takes a consistent snapshot across the
-hand-off.
-
-Seen as `filesystem_fuse/test_fuse_publication_quanta_are_fair_and_byte_bounded`
-failing three assertions at once after `REQUIRE(wait_for_idle(30s))`
-succeeded -- `data_publications_completed != 2`,
-`data_publication_bytes_read` short, and the large file still at its old size
-(1 in 2,646 case-runs). The test is correct; the primitive lied to it.
-
-Only tests call `wait_for_idle` today, so this is not a production path --
-but it is a plausible common cause behind other `filesystem_fuse` cases that
-"pass in isolation", and every one of those is a place a real regression
-could hide. Fix by making the dequeue-to-active transition observable as one
-step (increment `active_data` before releasing `data_queue_mutex`, or have
-`status()` derive pending and active under a single lock), not by widening
-timeouts.
-
 ## P0 — The test suite must be deterministic (next, opened 2026-09-14)
 
 **"Known flake" is not a category. It is the name we have been giving the

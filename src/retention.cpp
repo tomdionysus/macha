@@ -609,6 +609,15 @@ bool RetentionStore::retained(RetentionClass type, const ObjectId& id) const {
     return found != state.end() && !found->second.adds.empty();
 }
 
+RetentionStore::Claims RetentionStore::claims(RetentionClass type, const ObjectId& id) const {
+    std::lock_guard lock(mutex_);
+    const auto& state = state_for(type);
+    const auto found = state.find(id);
+    if (found == state.end())
+        return {};
+    return {found->second.adds, found->second.removed};
+}
+
 std::vector<ObjectId> RetentionStore::retained_ids(RetentionClass type) const {
     std::lock_guard lock(mutex_);
     std::vector<ObjectId> ids;

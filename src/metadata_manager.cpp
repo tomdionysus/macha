@@ -1843,12 +1843,17 @@ MetadataRecord MetadataManager::mutate_impl(
                            " attempt=" + std::to_string(attempt + 1));
             }
             return proposed;
-        } catch (const MetadataNotReady&) {
+        } catch (const MetadataNotReady& error) {
             // If the commit crossed the store floor but certificate fan-out was
             // interrupted, the local accepted-head set may already contain this
             // exact mutation. Preserve the sequence across retries so the next
             // iteration recognises and returns it instead of generating a second
             // logical mutation.
+            if (Log::enabled(LogLevel::debug))
+                Log::debug("metadata mutation publish failed sequence=" +
+                           std::to_string(*sequence) + " attempt=" +
+                           std::to_string(attempt + 1) + "/" + std::to_string(retries) +
+                           " error=" + error.what());
             if (attempt + 1 == retries)
                 throw;
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
