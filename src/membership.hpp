@@ -35,6 +35,13 @@ class Membership {
     void storage(uint64_t used, uint64_t capacity);
     void endpoint(std::string host, uint16_t port);
     void metadata_generation(uint64_t);
+    // The resolved inbound_capable / hosts_extents bits this node gossips
+    // (NodeInfo::flags). Returns true when either changed.
+    bool set_flags(bool inbound_capable, bool hosts_extents);
+    // What the gossip says about a node (self included). Unknown ids are
+    // reported as capable hosting nodes, the pre-0.42 default.
+    bool inbound_capable(const NodeId&) const;
+    bool hosts_extents(const NodeId&) const;
     void observe(NodeInfo, bool direct = false);
     bool apply_identity_reset(const IdentityAssociationReset&);
     std::vector<IdentityAssociationReset> identity_resets() const;
@@ -45,7 +52,9 @@ class Membership {
     // Destructive GC is allowed only when every durably-known node has been
     // authenticated directly within dead_after. Gossip freshness deliberately
     // does not satisfy this predicate. A node loaded from disk after restart is
-    // therefore a GC fence until it has been contacted again.
+    // therefore a GC fence until it has been contacted again. Two nodes that
+    // both accept no inbound connections can never authenticate each other
+    // directly, so such a pair is excluded rather than counted as a fault.
     bool all_known_reachable() const;
 };
 } // namespace macha

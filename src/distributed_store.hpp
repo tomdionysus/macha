@@ -134,6 +134,8 @@ class DistributedStore {
 
     bool put_impl(const ObjectId&, std::span<const uint8_t>, FrameType, std::atomic_bool*,
                   DurabilityBatch*, const DataWorkContext* work = nullptr);
+    // Active nodes that host extents: the input to every placement decision.
+    std::vector<NodeInfo> hosting_nodes() const;
     std::vector<NodeInfo> ranked(const ObjectId&) const;
     std::vector<NodeInfo> owners(const ObjectId&) const;
     bool put_on(const NodeInfo&, const ObjectId&, std::span<const uint8_t>, bool foreground);

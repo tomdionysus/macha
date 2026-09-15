@@ -36,9 +36,10 @@ constexpr auto gossip_reannounce_interval = std::chrono::seconds(30);
 
 namespace {
 NodeInfo self_info(const Config& config, const NodeId& id, uint64_t used, uint64_t capacity,
-                   uint64_t metadata_generation) {
+                   uint64_t metadata_generation, uint8_t flags) {
     NodeInfo node;
     node.id = id;
+    node.flags = flags;
     node.host = config.advertise_host;
     if (node.host.empty()) {
         if (config.listen_host == "127.0.0.1" || config.listen_host == "::1") {
@@ -66,6 +67,73 @@ RpcMessage error_reply(const std::string& text) {
     Writer writer;
     writer.string(text);
     return {MessageType::error, writer.take()};
+}
+
+// storage.hosts_extents resolved against what the node knows about itself:
+// `auto` is "yes if I have somewhere to put them and peers can fetch them".
+bool resolve_hosts_extents(const Config& config, bool inbound_capable) {
+    switch (config.hosts_extents) {
+    case Tristate::yes:
+        return true;
+    case Tristate::no:
+        return false;
+    case Tristate::automatic:
+        break;
+    }
+    return !config.storage_backends.empty() && inbound_capable;
+}
+
+constexpr std::array<uint8_t, 8> inbound_resolution_magic{'M', 'A', 'C', 'H', 'I', 'N', 'B', '1'};
+
+std::filesystem::path inbound_resolution_path(const Config& config) {
+    return config.state_path / "connectivity" / "inbound.bin";
+}
+
+// The starting answer to "can peers connect to me?". A configured value is
+// final; `auto` starts from the persisted resolution when there is one (so a
+// restart does not look like a join/leave to placement) and otherwise
+// behaves as capable -- dial and accept -- until a dial-back says otherwise.
+InboundResolution initial_inbound_resolution(const Config& config) {
+    InboundResolution out;
+    out.inbound_capable_mode = config.inbound_capable;
+    out.hosts_extents_mode = config.hosts_extents;
+    switch (config.inbound_capable) {
+    case Tristate::yes:
+        out.inbound_capable = true;
+        out.source = "configured";
+        break;
+    case Tristate::no:
+        out.inbound_capable = false;
+        out.source = "configured";
+        break;
+    case Tristate::automatic: {
+        out.inbound_capable = true;
+        out.source = "default";
+        const auto path = inbound_resolution_path(config);
+        try {
+            if (std::filesystem::exists(path)) {
+                std::ifstream input(path, std::ios::binary);
+                Bytes bytes((std::istreambuf_iterator<char>(input)), {});
+                Reader reader(bytes);
+                if (reader.fixed<8>() != inbound_resolution_magic)
+                    throw DecodeError("bad inbound resolution magic");
+                out.inbound_capable = reader.u8() != 0;
+                out.decided_unix_ms = reader.u64();
+                (void)reader.string(4096); // the peer that decided it, informational
+                reader.finish();
+                out.source = "persisted";
+            }
+        } catch (const std::exception& error) {
+            // Persisted evidence is a convenience; the probe will decide again.
+            Log::warn("inbound resolution ignored: " + std::string(error.what()));
+            out.inbound_capable = true;
+            out.source = "default";
+        }
+        break;
+    }
+    }
+    out.hosts_extents = resolve_hosts_extents(config, out.inbound_capable);
+    return out;
 }
 
 constexpr std::array<uint8_t, 8> identity_reset_magic{'M', 'A', 'C', 'H', 'I', 'D', 'R', '1'};
@@ -170,8 +238,10 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
                        cfg_.runtime.viewer_memory_reserve_bytes,
                        cfg_.runtime.loader_memory_reserve_bytes,
                        cfg_.runtime.reassembly_memory_reserve_bytes),
-      members_(self_info(cfg_, id_, 0, 0, 0), cfg_.dead_after,
-               cfg_.state_path / "membership" / "known-nodes.bin"),
+      inbound_(initial_inbound_resolution(cfg_)),
+      members_(self_info(cfg_, id_, 0, 0, 0,
+                         node_flags_for(inbound_.inbound_capable, inbound_.hosts_extents)),
+               cfg_.dead_after, cfg_.state_path / "membership" / "known-nodes.bin"),
       public_connectivity_(cfg_, id_, Endpoint{members_.self().host, members_.self().port}),
       telemetry_(id_, cfg_.state_path / "telemetry" / "last-known.bin"),
       sessions_(cfg_.session.anonymous_ttl, cfg_.session.max_sessions,
@@ -246,6 +316,21 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
           cfg_.max_frame_size, {}, &retained_memory_),
       startup_stage_hook_(std::move(startup_stage_hook)), startup_unix_ms_(unix_ms()) {
     server_.attach_client(client_);
+    // While this node accepts no inbound connections it keeps both lanes
+    // dialled to every capable peer itself (see RpcClient::open_requested_lanes);
+    // membership is what says who those peers are.
+    client_.set_maintained_peers([this] {
+        std::vector<NodeInfo> out;
+        for (auto& node : members_.active())
+            if (node.id != id_ && node_inbound_capable(node))
+                out.push_back(std::move(node));
+        return out;
+    });
+    // The roster may already name peers that cannot be dialled; the transport
+    // must know before the first exchange, not after the first refused dial.
+    for (const auto& node : members_.all())
+        if (node.id != id_)
+            client_.note_peer(node);
     // Membership loads locally durable identity-reset tombstones before the
     // transport exists. Seed the other operational consumers now so stale
     // routes and telemetry are fenced before the control plane starts.
@@ -385,8 +470,12 @@ void NodeRuntime::recover_storage(std::stop_token stop) {
         telemetry_storage_used_.store(used, std::memory_order_relaxed);
         telemetry_storage_capacity_.store(capacity, std::memory_order_relaxed);
         mark_ready(ready_data_storage);
+        // An edge node runs an empty pool rather than no pool: every caller
+        // of local_store() sees "not present" / "no space" and needs no
+        // special case. Say so, or capacity=0 reads like a missing disk.
         Log::info("node data storage ready used=" + std::to_string(used) +
-                  " capacity=" + std::to_string(capacity));
+                  " capacity=" + std::to_string(capacity) +
+                  (cfg_.storage_backends.empty() ? " (hosts no extents)" : ""));
     } catch (const std::exception& error) {
         Log::error("node data storage recovery failed: " + std::string(error.what()));
         mark_recovery_failed("data storage: " + std::string(error.what()));
@@ -451,8 +540,25 @@ void NodeRuntime::recover_state(std::stop_token stop) {
 }
 
 void NodeRuntime::start() {
+    // The one shape that is not legal at all (a cluster nobody could ever
+    // connect to) is refused here, before anything listens or is marked
+    // started, rather than left to half-work.
+    refuse_impossible_cluster();
     if (started_.exchange(true))
         return;
+
+    // Legal but worth saying once.
+    for (const auto& warning : configuration_warnings(cfg_))
+        Log::warn("configuration: " + warning);
+    {
+        const auto resolution = inbound_resolution();
+        Log::info(std::string("node inbound_capable=") +
+                  (resolution.inbound_capable ? "true" : "false") + " (" +
+                  std::string(tristate_name(resolution.inbound_capable_mode)) + ", " +
+                  resolution.source + ") hosts_extents=" +
+                  (resolution.hosts_extents ? "true" : "false") + " (" +
+                  std::string(tristate_name(resolution.hosts_extents_mode)) + ")");
+    }
 
     if (startup_stage_hook_)
         startup_stage_hook_("control-plane");
@@ -516,14 +622,191 @@ void NodeRuntime::start() {
         run_supervised("cluster-state-recovery", [this, stop] { recover_state(stop); });
     });
     connectivity_worker_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("cluster-connectivity", [this, stop] {
-            if (stop.stop_requested())
-                return;
-            (void)refresh_public_connectivity(false);
-            if (cfg_.connectivity_check.enabled && !stop.stop_requested())
-                (void)public_connectivity_.probe(false);
-        });
+        run_supervised("cluster-connectivity", [this, stop] { connectivity_loop(stop); });
     });
+}
+
+void NodeRuntime::refuse_impossible_cluster() const {
+    if (cfg_.inbound_capable != Tristate::no)
+        return;
+    if (cfg_.bootstrap.empty())
+        throw std::runtime_error(
+            "network.inbound_capable is false and no bootstrap peers are configured: a founding "
+            "node must accept inbound connections, or nothing could ever join this cluster");
+    // Only a bootstrap peer this node has met before can be known to be
+    // incapable; an unknown one is given the benefit of the doubt.
+    const auto known = members_.all();
+    for (const auto& endpoint : cfg_.bootstrap) {
+        const auto found =
+            std::find_if(known.begin(), known.end(), [&](const NodeInfo& node) {
+                return node.id != id_ && node.host == endpoint.host && node.port == endpoint.port;
+            });
+        if (found == known.end() || node_inbound_capable(*found))
+            return;
+    }
+    throw std::runtime_error(
+        "network.inbound_capable is false and every bootstrap peer is known to accept no inbound "
+        "connections either: no node in this cluster could be reached by anyone");
+}
+
+bool NodeRuntime::resolve_hosts_extents_for(bool inbound_capable) const {
+    return resolve_hosts_extents(cfg_, inbound_capable);
+}
+
+InboundResolution NodeRuntime::inbound_resolution() const {
+    std::lock_guard lock(inbound_mutex_);
+    return inbound_;
+}
+
+void NodeRuntime::persist_inbound_resolution_locked() const {
+    const auto path = inbound_resolution_path(cfg_);
+    std::filesystem::create_directories(path.parent_path());
+    Writer writer;
+    writer.fixed(inbound_resolution_magic);
+    writer.u8(inbound_.inbound_capable ? 1 : 0);
+    writer.u64(inbound_.decided_unix_ms);
+    writer.string(inbound_.source);
+    const auto& bytes = writer.data();
+    durable_replace_file(path, std::string_view(reinterpret_cast<const char*>(bytes.data()),
+                                                bytes.size()));
+}
+
+void NodeRuntime::apply_inbound_resolution(bool inbound_capable, std::string source) {
+    bool changed = false;
+    bool hosts = false;
+    InboundResolution before;
+    {
+        std::lock_guard lock(inbound_mutex_);
+        before = inbound_;
+        hosts = resolve_hosts_extents_for(inbound_capable);
+        changed = inbound_.inbound_capable != inbound_capable || inbound_.hosts_extents != hosts ||
+                  inbound_.source != source;
+        inbound_.inbound_capable = inbound_capable;
+        inbound_.hosts_extents = hosts;
+        inbound_.source = std::move(source);
+        if (changed)
+            inbound_.decided_unix_ms = unix_ms();
+        try {
+            persist_inbound_resolution_locked();
+        } catch (const std::exception& error) {
+            Log::warn("inbound resolution not persisted: " + std::string(error.what()));
+        }
+    }
+    if (!changed)
+        return;
+    // The flags travel with every handshake and members reply from here on;
+    // placement moves exactly as it would for a join or a leave.
+    if (members_.set_flags(inbound_capable, hosts)) {
+        server_.set_local(members_.self());
+        signal_service_event(ServiceEvent::topology);
+        signal_telemetry_refresh();
+    }
+    Log::info(std::string("node inbound resolution changed inbound_capable=") +
+              (inbound_capable ? "true" : "false") + " hosts_extents=" +
+              (hosts ? "true" : "false") + " previous_inbound_capable=" +
+              (before.inbound_capable ? "true" : "false") + " source=" +
+              inbound_resolution().source);
+}
+
+void NodeRuntime::connectivity_loop(std::stop_token stop) {
+    if (stop.stop_requested())
+        return;
+    (void)refresh_public_connectivity(false);
+    if (cfg_.connectivity_check.enabled && !stop.stop_requested())
+        (void)public_connectivity_.probe(false);
+    if (cfg_.inbound_capable != Tristate::automatic)
+        return;
+
+    // `auto` resolution. Evidence is a peer that could be asked (a CONTROL
+    // session exists) reporting whether a fresh TCP connection to our
+    // advertised endpoint completed a handshake. The resolution is sticky:
+    // capable -> incapable needs two consecutive failures, incapable ->
+    // capable needs one success (someone demonstrably connected). A peer
+    // that could not be asked at all is no evidence either way.
+    auto next_probe = Clock::now();
+    uint64_t wake_seen = connectivity_wake_.load(std::memory_order_acquire);
+    while (!stop.stop_requested()) {
+        {
+            std::unique_lock lock(connectivity_wait_mutex_);
+            const auto now = Clock::now();
+            if (next_probe > now)
+                connectivity_wait_cv_.wait_for(lock, stop, next_probe - now, [&] {
+                    return connectivity_wake_.load(std::memory_order_acquire) != wake_seen;
+                });
+            wake_seen = connectivity_wake_.load(std::memory_order_acquire);
+        }
+        if (stop.stop_requested())
+            return;
+        next_probe = Clock::now() + cfg_.heartbeat;
+
+        std::optional<NodeInfo> peer;
+        for (const auto& node : members_.active()) {
+            if (node.id == id_ || !node_inbound_capable(node))
+                continue;
+            if (client_.has_route(node.id, TransportLane::control)) {
+                peer = node;
+                break;
+            }
+        }
+        if (!peer)
+            continue;
+
+        const auto self = members_.self();
+        Writer writer;
+        writer.string(self.host);
+        writer.u16(self.port);
+        bool asked = false;
+        bool reachable = false;
+        std::string error;
+        try {
+            const auto reply = call(*peer, MessageType::dial_back_probe, writer.data());
+            if (reply.message.type == MessageType::dial_back_probe_reply) {
+                Reader reader(reply.message.payload);
+                reachable = reader.u8() != 0;
+                error = reader.string(4096);
+                reader.finish();
+                asked = true;
+            } else if (reply.message.type == MessageType::error) {
+                Reader reader(reply.message.payload);
+                error = reader.remaining() ? reader.string(4096) : "dial-back probe refused";
+            }
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        if (!asked) {
+            Log::debug("dial-back probe not answered peer=" + to_string(peer->id).substr(0, 12) +
+                       " error=" + error);
+            continue; // Try again next heartbeat, ideally with another peer.
+        }
+
+        bool currently_capable = false;
+        unsigned failures = 0;
+        {
+            std::lock_guard lock(inbound_mutex_);
+            inbound_.last_probe_unix_ms = unix_ms();
+            inbound_.last_probe_peer = to_string(peer->id);
+            inbound_.last_probe_error = reachable ? std::string{} : error;
+            inbound_.consecutive_probe_failures =
+                reachable ? 0 : inbound_.consecutive_probe_failures + 1;
+            currently_capable = inbound_.inbound_capable;
+            failures = inbound_.consecutive_probe_failures;
+        }
+        Log::debug("dial-back probe peer=" + to_string(peer->id).substr(0, 12) + " endpoint=" +
+                   self.host + ":" + std::to_string(self.port) + " reachable=" +
+                   (reachable ? "true" : "false") + (error.empty() ? "" : " error=" + error) +
+                   " consecutive_failures=" + std::to_string(failures));
+
+        if (reachable) {
+            apply_inbound_resolution(true, "probe:" + to_string(peer->id));
+            next_probe = Clock::now() + cfg_.inbound_reprobe_while_capable;
+        } else if (currently_capable && failures < 2) {
+            // One failure is not a verdict; confirm it on the next round.
+            next_probe = Clock::now() + cfg_.heartbeat;
+        } else {
+            apply_inbound_resolution(false, "probe:" + to_string(peer->id));
+            next_probe = Clock::now() + cfg_.inbound_reprobe_while_incapable;
+        }
+    }
 }
 
 void NodeRuntime::request_stop() {
@@ -533,8 +816,10 @@ void NodeRuntime::request_stop() {
         storage_recovery_.request_stop();
     if (state_recovery_.joinable())
         state_recovery_.request_stop();
-    if (connectivity_worker_.joinable())
+    if (connectivity_worker_.joinable()) {
         connectivity_worker_.request_stop();
+        connectivity_wait_cv_.notify_all();
+    }
     if (telemetry_worker_.joinable()) {
         telemetry_worker_.request_stop();
         telemetry_wait_cv_.notify_all();
@@ -785,13 +1070,58 @@ bool NodeRuntime::commit_history_checkpoint(const Hash256& floor_hash, const Has
     return metadata_replica().record_checkpoint_commit(floor_hash, epoch);
 }
 
-RpcMessage NodeRuntime::handle(const NodeInfo&, FrameType frame_type, const RpcMessage& request) {
+RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
+                               const RpcMessage& request) {
     try {
         // Health/control must never depend on storage I/O. Capacity is refreshed
         // by the node maintenance loop and after successful mutations below.
         switch (request.type) {
         case MessageType::ping:
             return {MessageType::ok, {}};
+        case MessageType::dial_request: {
+            // A peer that cannot dial us wants a lane it does not have. The
+            // handshake behind `peer` is what authenticates the request; the
+            // health thread does the dialling, under its ordinary backoff.
+            Reader reader(request.payload);
+            const auto lane = static_cast<TransportLane>(reader.u8());
+            reader.finish();
+            if (lane != TransportLane::control && lane != TransportLane::data)
+                return error_reply("invalid transport lane");
+            Log::debug("dial request received peer=" + to_string(peer.id).substr(0, 12) +
+                       " lane=" + transport_lane_name(lane));
+            client_.request_lane(peer, lane);
+            return {MessageType::ok, {}};
+        }
+        case MessageType::dial_back_probe: {
+            // "Can you connect to me at this address?" Answered with one fresh
+            // TCP connection and a handshake that must authenticate as the
+            // asker, never with an existing route. Rate limited per peer so
+            // the probe cannot be used to make this node hammer an address.
+            Reader reader(request.payload);
+            Endpoint target;
+            target.host = reader.string(4096);
+            target.port = reader.u16();
+            reader.finish();
+            if (target.host.empty() || !target.port)
+                return error_reply("dial-back probe needs a host and port");
+            {
+                std::lock_guard lock(dial_back_mutex_);
+                const auto now = Clock::now();
+                auto& last = dial_back_last_[peer.id];
+                if (last != Clock::time_point{} && now - last < cfg_.dial_back_probe_min_interval)
+                    return error_reply("dial-back probe rate limited");
+                last = now;
+            }
+            const auto error = client_.probe_dial(target, peer.id);
+            Log::debug("dial-back probe for peer=" + to_string(peer.id).substr(0, 12) +
+                       " endpoint=" + target.host + ":" + std::to_string(target.port) +
+                       " reachable=" + (error.empty() ? "true" : "false") +
+                       (error.empty() ? "" : " error=" + error));
+            Writer writer;
+            writer.u8(error.empty() ? 1 : 0);
+            writer.string(error);
+            return {MessageType::dial_back_probe_reply, writer.take()};
+        }
         case MessageType::members: {
             auto nodes = members_.all();
             Writer writer;
@@ -1228,7 +1558,10 @@ void NodeRuntime::merge(std::span<const uint8_t> payload) {
         membership_changed =
             membership_changed || previous == before_all.end() || previous->host != node.host ||
             previous->port != node.port || previous->failure_domain != node.failure_domain ||
-            previous->metadata_write_replicas_required != node.metadata_write_replicas_required;
+            previous->metadata_write_replicas_required != node.metadata_write_replicas_required ||
+            previous->flags != node.flags;
+        if (node.id != id_)
+            client_.note_peer(node);
         members_.observe(std::move(node));
     }
     reader.finish();
@@ -1614,6 +1947,13 @@ void NodeRuntime::loop(std::stop_token stop) {
         telemetry_peers_known_.store(static_cast<uint32_t>(known_nodes.size()),
                                      std::memory_order_relaxed);
         uint32_t active_peers = 1;
+        // A peer that accepts no inbound connections is exchanged with only
+        // over the session it opened to us; when there is none there is
+        // nothing to dial and nothing to log about it.
+        const auto unreachable_by_design = [&](const NodeInfo& node) {
+            return !node_inbound_capable(node) &&
+                   !client_.has_route(node.id, TransportLane::control);
+        };
         for (const auto& endpoint : cfg_.bootstrap) {
             exchanged.emplace(endpoint.host, endpoint.port);
             try {
@@ -1622,6 +1962,8 @@ void NodeRuntime::loop(std::stop_token stop) {
                         return node.id != id_ && node.host == endpoint.host &&
                                node.port == endpoint.port;
                     });
+                if (known != known_nodes.end() && unreachable_by_design(*known))
+                    continue;
                 if (known != known_nodes.end())
                     exchange(*known);
                 else
@@ -1635,6 +1977,8 @@ void NodeRuntime::loop(std::stop_token stop) {
             if (node.id == id_)
                 continue;
             if (!exchanged.emplace(node.host, node.port).second)
+                continue;
+            if (unreachable_by_design(node))
                 continue;
             try {
                 exchange(node);

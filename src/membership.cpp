@@ -11,6 +11,9 @@ namespace macha {
 namespace {
 constexpr std::array<uint8_t, 8> known_magic_v1{'M', 'A', 'C', 'H', 'M', 'E', 'M', '1'};
 constexpr std::array<uint8_t, 8> known_magic_v2{'M', 'A', 'C', 'H', 'M', 'E', 'M', '2'};
+// v3 (0.42.0) appends NodeInfo::flags to every entry, so a restarting node
+// remembers which peers it must not dial before it has heard from anyone.
+constexpr std::array<uint8_t, 8> known_magic_v3{'M', 'A', 'C', 'H', 'M', 'E', 'M', '3'};
 constexpr uint32_t max_known_nodes = 65536;
 constexpr uint32_t max_identity_resets = 65536;
 constexpr uint64_t max_known_bytes = 16ULL * 1024 * 1024;
@@ -35,7 +38,8 @@ void Membership::load_known() {
         throw std::runtime_error("cannot read known-node roster " + known_path_.string());
     Reader reader(bytes);
     const auto magic = reader.fixed<8>();
-    const bool version2 = magic == known_magic_v2;
+    const bool version3 = magic == known_magic_v3;
+    const bool version2 = version3 || magic == known_magic_v2;
     if (magic != known_magic_v1 && !version2)
         throw DecodeError("bad known-node roster magic");
     const auto count = reader.u32();
@@ -50,6 +54,10 @@ void Membership::load_known() {
         node.port = reader.u16();
         if (version2)
             node.seen_unix_ms = reader.u64();
+        // v1/v2 rosters predate the flags: every node they name is a
+        // dialable storage node, which is what NodeInfo's default says.
+        if (version3)
+            node.flags = reader.u8();
         if (node.id == NodeId{} || node.id == self_.id || node.host.empty() || !node.port)
             throw DecodeError("bad known-node roster entry");
         if (!nodes_.emplace(node.id, R{std::move(node), stale, std::nullopt}).second)
@@ -102,7 +110,7 @@ void Membership::persist_known_locked() const {
         return a.id < b.id;
     });
     Writer writer;
-    writer.fixed(known_magic_v2);
+    writer.fixed(known_magic_v3);
     writer.u32(static_cast<uint32_t>(ordered.size()));
     for (const auto& node : ordered) {
         writer.fixed(node.id.bytes);
@@ -110,6 +118,7 @@ void Membership::persist_known_locked() const {
         writer.string(node.failure_domain);
         writer.u16(node.port);
         writer.u64(node.seen_unix_ms);
+        writer.u8(node.flags);
     }
     if (identity_resets_.size() > max_identity_resets)
         throw std::runtime_error("too many identity association resets");
@@ -167,6 +176,29 @@ void Membership::metadata_generation(uint64_t generation) {
     self_.metadata_generation = std::max(self_.metadata_generation, generation);
     self_.seen_unix_ms = unix_ms();
 }
+bool Membership::set_flags(bool inbound_capable, bool hosts_extents) {
+    std::lock_guard g(m_);
+    const auto flags = node_flags_for(inbound_capable, hosts_extents);
+    if (self_.flags == flags)
+        return false;
+    self_.flags = flags;
+    self_.seen_unix_ms = unix_ms();
+    return true;
+}
+bool Membership::inbound_capable(const NodeId& id) const {
+    std::lock_guard g(m_);
+    if (id == self_.id)
+        return node_inbound_capable(self_);
+    const auto found = nodes_.find(id);
+    return found == nodes_.end() || node_inbound_capable(found->second.info);
+}
+bool Membership::hosts_extents(const NodeId& id) const {
+    std::lock_guard g(m_);
+    if (id == self_.id)
+        return node_hosts_extents(self_);
+    const auto found = nodes_.find(id);
+    return found == nodes_.end() || node_hosts_extents(found->second.info);
+}
 void Membership::observe(NodeInfo n, bool direct) {
     if (n.id == self_.id || n.host.empty() || !n.port)
         return;
@@ -192,14 +224,24 @@ void Membership::observe(NodeInfo n, bool direct) {
     } else {
         const bool association_changed = i->second.info.host != n.host ||
                                          i->second.info.port != n.port ||
-                                         i->second.info.failure_domain != n.failure_domain;
-        if (direct || n.seen_unix_ms > i->second.info.seen_unix_ms) {
+                                         i->second.info.failure_domain != n.failure_domain ||
+                                         i->second.info.flags != n.flags;
+        // A direct observation proves liveness, but the NodeInfo it carries
+        // is the peer's handshake-time copy, held for the life of that
+        // session. Gossip that arrived since is newer, and until 0.42.0 the
+        // heartbeat ping replaced it with the stale copy every round; with
+        // the flags in NodeInfo that would have flapped placement on every
+        // resolution change. The newer record wins; direct only refreshes.
+        const bool newer = n.seen_unix_ms > i->second.info.seen_unix_ms;
+        if (newer) {
             i->second.info = std::move(n);
+            i->second.seen = now;
+            durable_roster_changed = association_changed;
+        } else if (direct) {
             i->second.seen = now;
         }
         if (direct)
             i->second.direct_seen = now;
-        durable_roster_changed = association_changed;
     }
     if (durable_roster_changed)
         persist_known_locked();
@@ -278,7 +320,10 @@ std::vector<NodeInfo> Membership::active() const {
 bool Membership::all_known_reachable() const {
     std::lock_guard g(m_);
     const auto now = Clock::now();
+    const bool self_capable = node_inbound_capable(self_);
     return std::all_of(nodes_.begin(), nodes_.end(), [&](const auto& item) {
+        if (!self_capable && !node_inbound_capable(item.second.info))
+            return true; // Neither side can be dialled: not a fault, no fence.
         return item.second.direct_seen && now - *item.second.direct_seen <= dead_;
     });
 }

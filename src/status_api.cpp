@@ -142,6 +142,28 @@ Json public_connectivity_json(const PublicConnectivityStatus& status) {
     return Json(std::move(out));
 }
 
+// network.inbound_capable / storage.hosts_extents as this node currently
+// resolves them, beside the modes that were configured, and the dial-back
+// evidence the answer rests on.
+void add_inbound_resolution(Json::Object& connectivity, const InboundResolution& resolution) {
+    connectivity["inbound_capable"] = resolution.inbound_capable;
+    connectivity["inbound_capable_mode"] = std::string(tristate_name(resolution.inbound_capable_mode));
+    connectivity["inbound_capable_source"] = resolution.source;
+    connectivity["inbound_capable_decided_at_unix_ms"] =
+        resolution.decided_unix_ms ? Json(resolution.decided_unix_ms) : Json(nullptr);
+    connectivity["hosts_extents"] = resolution.hosts_extents;
+    connectivity["hosts_extents_mode"] = std::string(tristate_name(resolution.hosts_extents_mode));
+    Json::Object probe;
+    probe["last_probe_unix_ms"] =
+        resolution.last_probe_unix_ms ? Json(resolution.last_probe_unix_ms) : Json(nullptr);
+    probe["last_probe_peer"] =
+        resolution.last_probe_peer.empty() ? Json(nullptr) : Json(resolution.last_probe_peer);
+    probe["last_probe_error"] =
+        resolution.last_probe_error.empty() ? Json(nullptr) : Json(resolution.last_probe_error);
+    probe["consecutive_failures"] = static_cast<uint64_t>(resolution.consecutive_probe_failures);
+    connectivity["dial_back"] = std::move(probe);
+}
+
 Json identity_reset_json(const IdentityAssociationReset& reset) {
     Json::Object out;
     out["scope"] = identity_reset_key(reset.host, reset.port);
@@ -198,10 +220,31 @@ EffectiveNodeTelemetry effective_telemetry(const NodeTelemetry* live, bool stale
 Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeInfo* member,
                const NodeTelemetry* live, uint64_t live_age_ms, bool online, bool stale,
                bool retired, bool telemetry_known, bool metadata_replica,
-               const IdentityAssociationReset* identity_reset) {
+               const IdentityAssociationReset* identity_reset,
+               const InboundResolution* local_resolution) {
     Json::Object node;
     node["id"] = to_string(id);
     node["state"] = retired ? "retired" : (online ? "online" : "offline");
+    // The gossiped self-declarations (0.42.0). Membership is the only source:
+    // a node known solely from durable telemetry predates the flags or has
+    // never been heard from, and null says so rather than guessing.
+    if (member) {
+        node["inbound_capable"] = node_inbound_capable(*member);
+        node["hosts_extents"] = node_hosts_extents(*member);
+        // The host/port above are a routing key for a node that cannot be
+        // dialled; say so where an operator would otherwise try to connect.
+        node["dialable"] = node_inbound_capable(*member);
+    } else {
+        node["inbound_capable"] = Json(nullptr);
+        node["hosts_extents"] = Json(nullptr);
+        node["dialable"] = Json(nullptr);
+    }
+    if (local_resolution) {
+        node["inbound_capable_mode"] =
+            std::string(tristate_name(local_resolution->inbound_capable_mode));
+        node["hosts_extents_mode"] =
+            std::string(tristate_name(local_resolution->hosts_extents_mode));
+    }
     node["telemetry_freshness"] =
         live ? (stale ? "stale" : "live") : (telemetry_known ? "last_known" : "unavailable");
     // The node's own reported startup phase, using the same vocabulary as
@@ -505,7 +548,10 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     bool known_storage_available = true, online_storage_available = true;
     bool known_cache_available = true, online_cache_available = true;
     size_t known_nodes = 0, online_nodes = 0;
+    size_t inbound_incapable_nodes = 0, known_hosting_nodes = 0, online_hosting_nodes = 0;
+    size_t online_capable_hosting_nodes = 0;
     bool online_node_recovering = false;
+    const auto local_resolution = node_.inbound_resolution();
     Json::Array nodes;
     for (const auto& [id, durable] : known) {
         if (only && id != *only)
@@ -541,34 +587,52 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         // the same identity remains an ordinary live/known node.
         const bool retired = !online && identity_reset &&
                              observed_unix_ms <= identity_reset->reset_unix_ms;
+        const InboundResolution* resolution_for_node =
+            id == node_.node_id() ? &local_resolution : nullptr;
         if (retired) {
             if (only)
                 nodes.push_back(node_json(id, durable, member, current, age, false, stale, true,
                                           telemetry_known.contains(id), metadata_replica,
-                                          identity_reset));
+                                          identity_reset, resolution_for_node));
             continue;
         }
         ++known_nodes;
+        // A node that hosts no extents has no durable capacity to count, and
+        // must not make the aggregate look short of something it never had.
+        const bool hosting = !member || node_hosts_extents(*member);
+        const bool inbound_capable = !member || node_inbound_capable(*member);
+        if (!inbound_capable)
+            ++inbound_incapable_nodes;
+        if (hosting)
+            ++known_hosting_nodes;
 
         const auto effective = effective_telemetry(current, stale, durable, telemetry_known.contains(id));
         const bool telemetry_available = effective.authoritative || telemetry_known.contains(id);
         const auto storage_capacity =
-            telemetry_available ? effective.storage_capacity : (member ? member->capacity : 0);
+            !hosting ? 0
+                     : (telemetry_available ? effective.storage_capacity
+                                            : (member ? member->capacity : 0));
         known_capacity += storage_capacity;
-        known_storage_available = known_storage_available && telemetry_available;
+        known_storage_available = known_storage_available && (telemetry_available || !hosting);
         known_cache_available = known_cache_available && telemetry_available;
         if (telemetry_available) {
-            known_used += effective.storage_used;
+            if (hosting)
+                known_used += effective.storage_used;
             known_cache_capacity += effective.cache_capacity;
             known_cache_used += effective.cache_used;
         }
         if (online) {
             ++online_nodes;
+            if (hosting)
+                ++online_hosting_nodes;
+            if (hosting && inbound_capable)
+                ++online_capable_hosting_nodes;
             online_capacity += storage_capacity;
-            online_storage_available = online_storage_available && telemetry_available;
+            online_storage_available = online_storage_available && (telemetry_available || !hosting);
             online_cache_available = online_cache_available && telemetry_available;
             if (telemetry_available) {
-                online_used += effective.storage_used;
+                if (hosting)
+                    online_used += effective.storage_used;
                 online_cache_capacity += effective.cache_capacity;
                 online_cache_used += effective.cache_used;
             }
@@ -582,7 +646,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                 online_node_recovering = true;
         }
         nodes.push_back(node_json(id, durable, member, current, age, online, stale, false,
-                                  telemetry_available, metadata_replica, identity_reset));
+                                  telemetry_available, metadata_replica, identity_reset,
+                                  resolution_for_node));
     }
 
     if (only) {
@@ -643,12 +708,33 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         escalate(health, HealthSeverity::degraded);
         conditions.emplace_back("some known durable capacity is unavailable");
     }
+    // Nodes that accept no inbound connections, and what that does to where
+    // extents can live (0.42.0). The first is information, not a fault; the
+    // other two are the shapes decision 3 of the plan rules out.
+    if (inbound_incapable_nodes)
+        conditions.emplace_back(std::to_string(inbound_incapable_nodes) + " node" +
+                                (inbound_incapable_nodes == 1 ? " accepts" : "s accept") +
+                                " no inbound connections");
+    if (online_nodes && !online_capable_hosting_nodes) {
+        escalate(health, HealthSeverity::critical);
+        conditions.emplace_back("no inbound-capable node hosts extents");
+    }
+    const auto replication = node_.config().replication;
+    if (replication > known_hosting_nodes) {
+        escalate(health, HealthSeverity::degraded);
+        conditions.emplace_back("replication " + std::to_string(replication) + " requires " +
+                                std::to_string(replication) + " extent-hosting nodes; " +
+                                std::to_string(known_hosting_nodes) + " known");
+    }
 
     Json::Object cluster;
     cluster["health"] = std::string(health_name(health));
     cluster["conditions"] = std::move(conditions);
     cluster["nodes_known"] = static_cast<uint64_t>(known_nodes);
     cluster["nodes_online"] = static_cast<uint64_t>(online_nodes);
+    cluster["nodes_hosting_extents"] = static_cast<uint64_t>(known_hosting_nodes);
+    cluster["nodes_hosting_extents_online"] = static_cast<uint64_t>(online_hosting_nodes);
+    cluster["nodes_inbound_incapable"] = static_cast<uint64_t>(inbound_incapable_nodes);
     cluster["metadata_generation"] =
         metadata_generation ? metadata_generation : published_metadata.generation;
     cluster["metadata_replicas"] = static_cast<uint64_t>(metadata_replicas);
@@ -702,7 +788,11 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     root["cluster"] = std::move(cluster);
     root["startup"] = std::move(startup);
     root["nodes"] = std::move(nodes);
-    root["connectivity"] = public_connectivity_json(node_.public_connectivity_status());
+    {
+        auto connectivity = public_connectivity_json(node_.public_connectivity_status());
+        add_inbound_resolution(connectivity.asObject(), local_resolution);
+        root["connectivity"] = std::move(connectivity);
+    }
 
     std::function<std::vector<SubsystemStatus>()> subsystem_provider;
     {
@@ -1234,8 +1324,11 @@ HttpResponse ClusterStatusService::connectivity_check(const std::optional<NodeId
     if (!found_requested)
         return http_error(404, "node_not_found", "unknown cluster node");
     Json::Object root{{"results", std::move(results)}, {"checked_at_unix_ms", unix_ms()}};
-    if (public_status)
-        root["connectivity"] = public_connectivity_json(*public_status);
+    if (public_status) {
+        auto connectivity = public_connectivity_json(*public_status);
+        add_inbound_resolution(connectivity.asObject(), node_.inbound_resolution());
+        root["connectivity"] = std::move(connectivity);
+    }
     return http_json(200, Json(std::move(root)).dump());
 }
 
