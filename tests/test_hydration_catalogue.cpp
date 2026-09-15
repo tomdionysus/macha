@@ -4156,6 +4156,9 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
         });
     };
     const auto gc_started = Clock::now();
+    const auto s2_wakeups_at_gc_start = s2.maintenance_wakeups();
+    const std::string s2_stage_at_gc_start =
+        std::string(s2.maintenance_stage()) + " " + s2.maintenance_sleep_diagnostic();
     if (!wait_until(unreclaimed, 12s)) {
         // Failing here has to distinguish a slow sweep from a stuck one, or
         // the next person reads "GC did not finish in 12 s" and calls it a
@@ -4189,7 +4192,54 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
         }
         const auto status1 = s1.catalogue().status();
         const auto status2 = s2.catalogue().status();
+        // The facts that decide whether s2's retention claims can ever be
+        // released: a claim is erased only by a release clock that dominates
+        // it, and release only runs when destructive GC is enabled.
+        std::string claims;
+        for (const auto& id : superseded) {
+            if (!claims.empty())
+                claims += ' ';
+            claims += to_string(id).substr(0, 12);
+            claims += ":s1=";
+            claims += s1.node().retention_store().retained(RetentionClass::data, id) ? "held" : "free";
+            claims += ",s2=";
+            claims += s2.node().retention_store().retained(RetentionClass::data, id) ? "held" : "free";
+            const auto state = s2.node().retention_store().claims(RetentionClass::data, id);
+            claims += "(adds:";
+            for (const auto& [origin, sequence] : state.adds)
+                claims += to_string(origin).substr(0, 6) + "=" + std::to_string(sequence) + ";";
+            claims += " removed:";
+            for (const auto& [origin, sequence] : state.removed)
+                claims += to_string(origin).substr(0, 6) + "=" + std::to_string(sequence) + ";";
+            claims += ")";
+        }
+        const auto view2 = s2.metadata_manager().retention_release_view();
+        std::string clock2;
+        if (view2) {
+            for (const auto& [node, sequence] : view2->snapshot->mutation_sequences) {
+                if (!clock2.empty())
+                    clock2 += ',';
+                clock2 += to_string(node).substr(0, 6) + "=" + std::to_string(sequence);
+            }
+        }
+        const auto cluster2 = s2.metadata_manager().cluster_status();
         throw std::runtime_error(
+            "GC_DIAG s2_maintenance_passes_during_wait=" +
+            std::to_string(s2.maintenance_wakeups() - s2_wakeups_at_gc_start) +
+            " s2_stage_at_gc_start=" + s2_stage_at_gc_start +
+            " s2_stage_now=" + s2.maintenance_stage() + " " + s2.maintenance_sleep_diagnostic() +
+            " claims=[" + claims + "] s2_release_view=" +
+            (view2 ? std::to_string(view2->generation) : std::string("none")) +
+            " s2_release_clock=[" + clock2 + "] s2_committed=" +
+            std::to_string(s2.node().metadata_replica().committed_generation()) +
+            " s2_known=" + std::to_string(s2.node().known_metadata_generation()) +
+            " s2_all_reachable=" + (s2.node().membership().all_known_reachable() ? "yes" : "no") +
+            " s2_stable=" + (cluster2.stable ? "yes" : "no") +
+            " s2_heads=" + std::to_string(s2.node().metadata_replica().accepted_heads().size()) +
+            " s1_heads=" + std::to_string(s1.node().metadata_replica().accepted_heads().size()) +
+            " s2_self=" + to_string(s2.node().node_id()).substr(0, 6) +
+            " s1_self=" + to_string(s1.node().node_id()).substr(0, 6) + " | " +
+            
             "superseded catalogue artwork was not reclaimed within 12s: remaining=[" + remaining +
             "] superseded_count=" + std::to_string(superseded.size()) +
             " s1_catalogue_generation=" + std::to_string(status1.metadata_generation) +

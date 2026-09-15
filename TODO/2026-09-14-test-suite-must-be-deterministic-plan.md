@@ -125,35 +125,35 @@ than re-running until green:
 
 600+ reps clean afterwards.
 
-**One product-side observation, characterised but not explained.** The same
-test's GC assertion (superseded catalogue artwork reclaimed on both nodes
-within 12 s) missed twice in ~300 reps, and the instrumentation says it is
-not a slow sweep: *all four* objects remained, *all on s2 only* -- the node
-that wrote them -- while s1 had reclaimed every one, with both catalogues
-converged at the same generation and both agreeing that one artwork is live.
-A normal pass reclaims in well under a second (0 of 360 reps exceeded 1 s).
-So the writer reclaimed nothing while its peer reclaimed everything.
-Candidate mechanisms not yet separated: s2 is the busy writer, so its
-`gc_quiescent_until` is pushed forward by its own service events, and its
-retention claims for freshly published artwork release only once a later
-catalogue root proves them unreferenced. The assertion now classifies its own
-failure -- it retries for a bounded 30 s and reports `reclaimed_eventually`
-and `total_ms` alongside the remaining object ids and their node -- so the
-next occurrence says whether this is slow or stuck without another
-investigation from scratch. **Next step:** reproduce with `--repeat` and
-`MACHA_TEST_LOG_LEVEL=DEBUG`, and read s2's maintenance/GC decisions.
+**Two product defects found by this method, both fixed in 0.41.1.**
 
-**A second product-side finding, from the same method.**
+The same test's GC assertion (superseded catalogue artwork reclaimed on both
+nodes within 12 s) missed ~1 in 150 reps, and the instrumentation said it was
+not a slow sweep: *all four* objects remained, *all on s2 only* -- the node
+that wrote them -- with both catalogues converged. Six DEBUG hunts, each
+adding the one fact the previous one could not decide, went: the claims are
+held on s2 → the claims' dots are all *below* the release clock and no
+release was ever applied to them → s2's sweep gate never opened after the
+burst → s2's maintenance loop made one pass in 27 s → it is in `wait` → it
+went to sleep `busy=1 gc_quiet_ms=-2 wait_ms=2591999883`. A busy pass
+suppresses GC and only re-armed its wake-up while the foreground was still
+inside its quiet period at the end of the pass; one that started busy and
+ended quiet, with the GC window already elapsed, slept until the scrub
+deadline. `Service::loop` now always bounds a busy pass by the remaining
+quiet period. The diagnostics stayed (see CHANGELOG 0.41.1). Verification:
+300/300 reps at `MACHA_TEST_LOG_LEVEL=DEBUG` (previously 1-2 misses per 60), then three full-suite runs, 441/441 each (2026-09-15).
+
 `filesystem_fuse/test_fuse_publication_quanta_are_fair_and_byte_bounded`
 failed three assertions at once *after* `wait_for_idle(30s)` returned true
-(1 in 2,646 case-runs). `FuseFrontend::wait_for_idle` composes its verdict
-from three independently-sampled fields, so a publication between "dequeued"
-and "active" is invisible to it. Test-only API today, but it is the
-quiescence primitive much of the FUSE suite waits on, which makes it a
-candidate common cause for other cases in that suite. P1 in `ACTIVE.md`.
+(1 in 2,646 case-runs). `FuseFrontend::status()` sampled the queue, the
+deferred inodes and `active_data` at three different times while a
+publication cycles between them under `data_queue_mutex`, and had an
+uncounted window between a decided enqueue and the push. It now takes every
+count under `data_queue_mutex` in one sample and counts
+`data_enqueue_pending`. FUSE suites 79/79 and 7/7 after the change.
 
 **Still open.** The two aarch64 cases below (no Pi reachable from here
-this session), the artwork GC leak, and the `wait_for_idle` race.
+this session).
 
 ## What "done" means
 

@@ -6378,32 +6378,49 @@ FuseFrontendStatus FuseFrontend::status() const {
         std::lock_guard lock(state_->namespace_queue_mutex);
         out.pending_namespace = state_->namespace_pending_locked();
     }
+    // The data pipeline is one cycle -- deferred -> queued -> active ->
+    // deferred -- and a publication moves between those places under
+    // data_queue_mutex (dequeue, re-admission, enqueue). Sampling the three
+    // counts at different times let an inode step out of the place already
+    // counted and into one not yet counted, so wait_for_idle() saw idle from
+    // a mount that was about to re-admit work (0.41.0, "wait_for_idle race").
+    // Every count is taken under data_queue_mutex, in one sample. The inode
+    // list is copied out first, admit_deferred()'s pattern, so the queue mutex
+    // is never taken under namespace_mutex.
+    //
+    // Deferred-but-not-admitted work is pending; active work is reported
+    // separately and deliberately not double-counted in pending_data. An
+    // enqueue that has been decided but not yet queued (data_enqueue_pending)
+    // is pending too: it is requested work that is in neither place yet.
+    std::vector<decltype(state_->inodes.begin()->second)> candidates;
+    {
+        std::lock_guard lock(state_->namespace_mutex);
+        candidates.reserve(state_->inodes.size());
+        for (const auto& [_, inode] : state_->inodes)
+            candidates.push_back(inode);
+    }
     {
         std::lock_guard lock(state_->data_queue_mutex);
         out.pending_data = state_->data_queue.size();
         out.pending_recovery_data = static_cast<size_t>(
             std::count_if(state_->data_queue.begin(), state_->data_queue.end(),
                           [](const State::DataQueueItem& item) { return item.recovered; }));
-    }
-    // Deferred-but-not-admitted work is pending; active work is reported
-    // separately and deliberately not double-counted in pending_data.
-    {
-        std::lock_guard lock(state_->namespace_mutex);
-        for (const auto& [_, inode] : state_->inodes) {
+        for (const auto& inode : candidates) {
             std::lock_guard inode_lock(inode->mutex);
             if (!inode->published_path)
                 ++out.detached_inode_count;
-            if ((inode->data_deferred || inode->unconfirmed_data_entry) && !inode->data_queued &&
-                !inode->data_running)
+            if ((inode->data_deferred || inode->unconfirmed_data_entry ||
+                 inode->data_enqueue_pending) &&
+                !inode->data_queued && !inode->data_running)
                 ++out.pending_data;
         }
+        out.active_data = state_->active_data.load();
+        out.active_recovery_data = state_->active_recovery_data.load();
     }
     out.inode_count = state_->inode_count.load(std::memory_order_relaxed);
     out.peak_inode_count = state_->peak_inode_count.load(std::memory_order_relaxed);
     out.reclaimed_inode_count =
         state_->reclaimed_inode_count.load(std::memory_order_relaxed);
-    out.active_data = state_->active_data.load();
-    out.active_recovery_data = state_->active_recovery_data.load();
     const auto diagnostics = this->diagnostics();
     out.timed_out_requests = diagnostics.timed_out_requests;
     out.merged_publications = diagnostics.merged_publications;

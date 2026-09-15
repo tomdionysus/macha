@@ -81,6 +81,13 @@ class RetentionStore {
     void retain(RetentionClass, const ObjectId&, const RetentionDot&);
     void retain_batch(RetentionClass, const std::vector<ObjectId>&, const RetentionDot&);
     bool retained(RetentionClass, const ObjectId&) const;
+    // Diagnostic: the observed-remove state of one object, `adds` and
+    // `removed` keyed by origin. Empty when the object has no state.
+    struct Claims {
+        std::map<NodeId, uint64_t> adds;
+        std::map<NodeId, uint64_t> removed;
+    };
+    Claims claims(RetentionClass, const ObjectId&) const;
     std::vector<ObjectId> retained_ids(RetentionClass) const;
     std::optional<ObjectId> next_retained(RetentionClass, std::optional<ObjectId>& cursor,
                                           bool& complete) const;

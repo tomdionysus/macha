@@ -822,8 +822,10 @@ void Service::retain_metadata_publication(const MetadataPublicationContext& cont
     };
     const auto report = [&](const char* outcome) {
         const auto total = since_ms(barrier_started);
-        if (total >= 250 && Log::enabled(LogLevel::debug))
-            Log::debug("metadata retention barrier total_ms=" + std::to_string(total) +
+        const bool failed = std::string_view(outcome) != "ok";
+        if ((total >= 250 || failed) && Log::enabled(LogLevel::debug))
+            Log::debug("metadata retention barrier dot=" + to_string(dot.origin).substr(0, 6) +
+                       ":" + std::to_string(dot.sequence) + " total_ms=" + std::to_string(total) +
                        " decode_ms=" + std::to_string(decode_ms) +
                        " collect_ms=" + std::to_string(collect_ms) +
                        " catalogue_ms=" + std::to_string(catalogue_ms) +
@@ -1029,9 +1031,18 @@ void Service::loop(std::stop_token stop) {
     double scrub_credit = 0.0;
     std::optional<ObjectId> retained_data_repair_after;
     std::optional<ObjectId> retained_control_repair_after;
+    // Why the destructive DATA sweep did not run, logged at DEBUG only when
+    // the answer changes. Without it "GC is not reclaiming" has no line to
+    // read; the 2026-09-15 artwork leak was diagnosed blind.
+    std::string last_gc_skip_reason;
+    bool release_horizon_incomplete_logged = false;
 
     while (!stop.stop_requested()) {
         maintenance_wakeups_.fetch_add(1, std::memory_order_relaxed);
+        const auto enter_stage = [this](const char* name) {
+            maintenance_stage_.store(name, std::memory_order_release);
+        };
+        enter_stage("pass-begin");
         auto now = Clock::now();
         metadata_dirty = metadata_convergence_.pending();
         const auto metadata_demand = metadata_convergence_.diagnostics().requested_epoch;
@@ -1158,6 +1169,7 @@ void Service::loop(std::stop_token stop) {
                             metadata_dirty = false;
                             metadata_ready_for_dependants = true;
                         } else {
+                            enter_stage("metadata-repair");
                             const auto stage = Clock::now();
                             try {
                                 if (maintenance_stage_hook_)
@@ -1220,6 +1232,7 @@ void Service::loop(std::stop_token stop) {
             if (metadata_ready_for_dependants &&
                 (catalogue_dirty || catalogue_->refresh_needed()) &&
                 (catalogue_retry_due == Clock::time_point{} || now >= catalogue_retry_due)) {
+                enter_stage("catalogue-repair");
                 const auto stage = Clock::now();
                 try {
                     if (maintenance_stage_hook_)
@@ -1251,6 +1264,7 @@ void Service::loop(std::stop_token stop) {
             // one immutable namespace inventory. Rebuild it only when one of
             // those consumers can make progress or metadata has advanced.
             if (network_due || garbage_due || gc_due) {
+                enter_stage("inventory");
                 const auto inventory_stage = Clock::now();
                 auto objects = fs_->maintenance_objects_cached();
                 bool rebuilt_inventory = false;
@@ -1339,6 +1353,7 @@ void Service::loop(std::stop_token stop) {
                             }
                         }
                     };
+                    enter_stage("retention-repair");
                     repair_retained(RetentionClass::data, retained_data_repair_after);
                     repair_retained(RetentionClass::control, retained_control_repair_after);
 
@@ -1349,6 +1364,7 @@ void Service::loop(std::stop_token stop) {
                     // network credit. Bound each repair slice independently.
                     const size_t operation_budget =
                         static_cast<size_t>(std::clamp<uint64_t>((byte_budget / extent), 4, 16));
+                    enter_stage("network-repair");
                     const auto repair_stage = Clock::now();
                     auto repair = store_->repair_step(
                         byte_budget, operation_budget, maintenance_live_.get(),
@@ -1474,6 +1490,7 @@ void Service::loop(std::stop_token stop) {
                             RetentionClass::control, *retention_release_control_live_,
                             retention_release_clock_, 64);
                     }
+                    enter_stage("control-gc");
                     const auto removed = catalogue_->control_gc_step(*maintenance_control_live_,
                                                                      policy.garbage_grace, 32);
                     (void)node_.retention_store().prune_unclaimed(
@@ -1491,13 +1508,52 @@ void Service::loop(std::stop_token stop) {
                 // Retention claims are checked immediately before every
                 // physical delete, so an inventory that predates a newer
                 // metadata generation remains safe for orphan cleanup.
+                std::string gc_skip_reason;
+                if (!gc_due)
+                    gc_skip_reason = busy ? "foreground busy"
+                                     : gc_quiescent_until == Clock::time_point::max()
+                                         ? "complete; waiting for an event"
+                                         : "quiet window";
+                else if (rebuilt_inventory)
+                    gc_skip_reason = "inventory rebuilt this pass";
+                else if (!cluster_gc_stable)
+                    gc_skip_reason = cluster_gc_healthy ? "metadata not stable"
+                                                        : "not every known node reachable";
+                else if (!release_metadata_view)
+                    gc_skip_reason = "no sole accepted head for retention release";
+                else if (!release_metadata_view->snapshot->retention_baseline_complete)
+                    gc_skip_reason = "retention baseline incomplete";
+                else if (!maintenance_catalogue_complete_)
+                    gc_skip_reason = "catalogue inventory incomplete";
+                else if (!maintenance_live_)
+                    gc_skip_reason = "no reachability inventory";
+                else if (maintenance_inventory_generation_ < node_.known_metadata_generation())
+                    gc_skip_reason = "inventory generation " +
+                                     std::to_string(maintenance_inventory_generation_) +
+                                     " behind known " +
+                                     std::to_string(node_.known_metadata_generation());
+                if (gc_skip_reason != last_gc_skip_reason) {
+                    last_gc_skip_reason = gc_skip_reason;
+                    if (Log::enabled(LogLevel::debug))
+                        Log::debug("garbage collection sweep node=" +
+                                   to_string(node_.node_id()).substr(0, 6) +
+                                   (gc_skip_reason.empty() ? std::string(" enabled")
+                                                           : " skipped: " + gc_skip_reason));
+                }
                 if (gc_due && !rebuilt_inventory && destructive_gc_enabled &&
                     maintenance_catalogue_complete_ && maintenance_live_ &&
                     maintenance_inventory_generation_ >= node_.known_metadata_generation()) {
                     if (retention_release_complete_ && retention_release_data_live_) {
-                        (void)node_.retention_store().release_unreferenced(
+                        const auto released = node_.retention_store().release_unreferenced(
                             RetentionClass::data, *retention_release_data_live_,
                             retention_release_clock_, 64);
+                        if (released && Log::enabled(LogLevel::debug))
+                            Log::debug("retention released DATA claims node=" +
+                                       to_string(node_.node_id()).substr(0, 6) + " count=" +
+                                       std::to_string(released));
+                    } else if (!release_horizon_incomplete_logged) {
+                        release_horizon_incomplete_logged = true;
+                        Log::debug("retention release skipped: horizon incomplete");
                     }
                     std::vector<ObjectId> protected_ids;
                     protected_ids.reserve(maintenance_garbage_.size());
@@ -1516,6 +1572,7 @@ void Service::loop(std::stop_token stop) {
                     protected_ids.erase(std::unique(protected_ids.begin(), protected_ids.end()),
                                         protected_ids.end());
 
+                    enter_stage("garbage-collect");
                     const auto gc_stage = Clock::now();
                     // Tombstones carry their own exact retirement deadline.
                     // Untombstoned bytes, however, may be the data half of an
@@ -1538,6 +1595,16 @@ void Service::loop(std::stop_token stop) {
                     log_slow_stage("garbage-collect", gc_stage,
                                    "reclaimed_bytes=" + std::to_string(gc.bytes) +
                                        " objects=" + std::to_string(gc.objects));
+                    if ((gc.deferred || gc.objects || gc.yielded) && Log::enabled(LogLevel::debug))
+                        Log::debug("garbage collection sweep node=" +
+                                   to_string(node_.node_id()).substr(0, 6) + " objects=" +
+                                   std::to_string(gc.objects) + " bytes=" +
+                                   std::to_string(gc.bytes) + " deferred=" +
+                                   std::to_string(gc.deferred ? 1 : 0) + " yielded=" +
+                                   std::to_string(gc.yielded ? 1 : 0) + " complete=" +
+                                   std::to_string(gc.complete ? 1 : 0) + " live=" +
+                                   std::to_string(maintenance_live_->size()) + " protected=" +
+                                   std::to_string(protected_ids.size()));
                     (void)node_.retention_store().prune_unclaimed(
                         RetentionClass::data,
                         [this](const ObjectId& id) { return node_.local_store().has(id); }, 64);
@@ -1566,6 +1633,7 @@ void Service::loop(std::stop_token stop) {
             // placement is already correct.
             if (!busy && now >= local_quiescent_until &&
                 local_credit >= node_.config().extent_size) {
+                enter_stage("local-rebalance");
                 const auto rebalance_stage = Clock::now();
                 auto rebalance = node_.local_store().rebalance_step(
                     static_cast<uint64_t>(local_credit), 64, [this] {
@@ -1592,8 +1660,10 @@ void Service::loop(std::stop_token stop) {
             // safety-critical durable records. Compact them only on the background
             // owner so foreground metadata latency never pays checkpoint rewrite
             // cost. Snapshot-before-truncate makes interruption idempotent.
-            if (!busy)
+            if (!busy) {
+                enter_stage("retention-compact");
                 (void)node_.retention_store().compact_if_needed(4096);
+            }
 
             // Metadata ancestry is only ever re-rooted once a durable,
             // cluster-wide proof establishes the exact same accepted-head
@@ -1612,6 +1682,7 @@ void Service::loop(std::stop_token stop) {
             // to the old restart-and-quarantine path. A no-op unless a head
             // is actually flagged.
             try {
+                enter_stage("head-repair");
                 (void)metadata_->repair_unreconstructable_heads();
             } catch (const std::exception& error) {
                 Log::debug("maintenance: metadata head repair failed: " +
@@ -1620,6 +1691,7 @@ void Service::loop(std::stop_token stop) {
 
             if (!busy) {
                 try {
+                    enter_stage("history-checkpoint");
                     metadata_->attempt_history_checkpoint();
                 } catch (const std::exception& error) {
                     Log::debug("maintenance: history checkpoint attempt failed: " +
@@ -1631,10 +1703,13 @@ void Service::loop(std::stop_token stop) {
             // victim pack per backend at a time; unlike the old whole-store
             // rewrite this has a fixed temporary-space envelope and therefore
             // remains viable on multi-terabyte backends.
-            if (!busy)
+            if (!busy) {
+                enter_stage("compact-packs");
                 (void)node_.local_store().compact_packs(stop);
+            }
 
             if (!busy && scrub_due && scrub_credit >= node_.config().extent_size) {
+                enter_stage("scrub");
                 const auto scrub_stage = Clock::now();
                 auto scrub =
                     node_.local_store().scrub_step(static_cast<uint64_t>(scrub_credit), 64, [this] {
@@ -1767,9 +1842,23 @@ void Service::loop(std::stop_token stop) {
         }
 
         if (busy) {
+            // A busy pass suppressed GC, repair and rebalance; it must hand
+            // the decision back once the foreground goes quiet. Until 0.41.1
+            // it armed that wake-up only while the foreground was still
+            // inside its quiet period at the end of the pass. A pass that
+            // started busy and ended after the quiet period had elapsed --
+            // with the GC window already expired, so the GC deadline above
+            // did not apply either -- slept for the next unrelated event
+            // (the scrub deadline: days). Measured on the writer of a
+            // catalogue burst: one maintenance pass in 27 s, `busy=1
+            // gc_quiet_ms=-2 wait_ms=2591999883`, four superseded artwork
+            // objects never reclaimed (2026-09-15, 1-2 in 60 runs). Now the
+            // pass re-evaluates as soon as the quiet period is met, and at
+            // once when it already has.
             auto idle = std::min(store_->foreground_idle_for(), store_->interactive_idle_for());
-            if (idle < policy.foreground_quiet)
-                deadline = std::min(deadline, now_after_work + (policy.foreground_quiet - idle));
+            deadline = std::min(deadline, now_after_work + (idle < policy.foreground_quiet
+                                                                ? policy.foreground_quiet - idle
+                                                                : Clock::duration{}));
         }
 
         auto credit_deadline = [&](double credit, Clock::time_point quiescent) {
@@ -1792,6 +1881,23 @@ void Service::loop(std::stop_token stop) {
         if (maintenance_event_.load(std::memory_order_acquire) != observed_event)
             continue;
 
+        enter_stage("wait");
+        {
+            const auto relative = [&](Clock::time_point at) -> int64_t {
+                if (at == Clock::time_point::max())
+                    return -1;
+                if (at == Clock::time_point{})
+                    return -3;
+                return std::chrono::duration_cast<std::chrono::milliseconds>(at - now_after_work)
+                    .count();
+            };
+            maintenance_last_wait_ms_.store(relative(deadline), std::memory_order_release);
+            maintenance_last_gc_quiet_ms_.store(relative(gc_quiescent_until),
+                                                std::memory_order_release);
+            maintenance_last_flags_.store(static_cast<uint8_t>((busy ? 1 : 0) |
+                                                               (gc_due_this_pass ? 2 : 0)),
+                                          std::memory_order_release);
+        }
         std::unique_lock wait_lock(maintenance_wait_mutex_);
         const auto waiting_event = maintenance_event_.load(std::memory_order_acquire);
         auto changed = [this, waiting_event] {

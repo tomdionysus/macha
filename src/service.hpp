@@ -87,6 +87,15 @@ class Service {
     std::condition_variable_any maintenance_wait_cv_;
     std::atomic_uint64_t maintenance_event_{1};
     std::atomic_uint64_t maintenance_wakeups_{};
+    // Which stage the maintenance loop is in, for a diagnostic that has to
+    // say where a pass is spending its time (or where it is stuck).
+    std::atomic<const char*> maintenance_stage_{"starting"};
+    // What the last pass decided before sleeping: its wait deadline and the
+    // GC quiet window, both as ms from then (-1 = unbounded, -3 = unset),
+    // plus the busy / gc-due flags. Diagnostic only.
+    std::atomic<int64_t> maintenance_last_wait_ms_{-3};
+    std::atomic<int64_t> maintenance_last_gc_quiet_ms_{-3};
+    std::atomic<uint8_t> maintenance_last_flags_{};
     ConvergenceDemand metadata_convergence_;
     MaintenanceStageHook maintenance_stage_hook_;
     uint64_t maintenance_inventory_generation_{};
@@ -172,6 +181,16 @@ class Service {
     }
     uint64_t maintenance_wakeups() const noexcept {
         return maintenance_wakeups_.load(std::memory_order_acquire);
+    }
+    const char* maintenance_stage() const noexcept {
+        return maintenance_stage_.load(std::memory_order_acquire);
+    }
+    std::string maintenance_sleep_diagnostic() const {
+        const auto flags = maintenance_last_flags_.load(std::memory_order_acquire);
+        return "wait_ms=" + std::to_string(maintenance_last_wait_ms_.load(std::memory_order_acquire)) +
+               " gc_quiet_ms=" +
+               std::to_string(maintenance_last_gc_quiet_ms_.load(std::memory_order_acquire)) +
+               " busy=" + std::to_string(flags & 1) + " gc_due=" + std::to_string((flags >> 1) & 1);
     }
     ConvergenceDemandDiagnostics metadata_convergence_diagnostics() const noexcept {
         return metadata_convergence_.diagnostics();
