@@ -2,6 +2,7 @@
 #include "service.hpp"
 #include "diagnostics.hpp"
 #include "fuse_frontend.hpp"
+#include "fuse_subsystem.hpp"
 #include "json.hpp"
 #include "log.hpp"
 #include "startup_progress.hpp"
@@ -101,6 +102,17 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
     cluster_status_.attach_convergence_diagnostics(
         [this] { return metadata_convergence_.diagnostics(); });
     cluster_status_.attach_subsystem_diagnostics([this] { return subsystems_.statuses(); });
+    // Installed once, for the life of the Service, rather than re-attached
+    // whenever a mount comes and goes: the registry already answers "is there
+    // a frontend right now", and a supervised FUSE can be rebuilt underneath
+    // this provider any number of times.
+    cluster_status_.attach_fuse_diagnostics(
+        [this]() -> std::optional<FuseFrontendDiagnostics> {
+            auto frontend = registry_.fuse();
+            if (!frontend)
+                return std::nullopt;
+            return frontend->diagnostics();
+        });
     if (node_.config().catalogue.api.enabled) {
         catalogue_http_ = std::make_unique<HttpServer>(
             node_.config().catalogue.api,
@@ -125,42 +137,32 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
     }
 }
 
-void Service::attach_fuse_frontend(std::weak_ptr<FuseFrontend> frontend) {
-    fuse_frontend_ = frontend;
-    if (!frontend.use_count()) {
-        cluster_status_.detach_fuse_diagnostics();
-        return;
-    }
-    cluster_status_.attach_fuse_diagnostics([frontend = std::move(frontend)] {
-        auto shared = frontend.lock();
-        if (!shared)
-            return std::optional<FuseFrontendDiagnostics>{};
-        return std::optional<FuseFrontendDiagnostics>{shared->diagnostics()};
-    });
-}
-
+// Each of these answers "nothing to report" when this node has no mount --
+// not configured for one, or its subsystem is faulted between restarts. The
+// shared_ptr is taken for the duration of the call so a subsystem restart
+// cannot pull the frontend out from under a handler already inside one.
 std::optional<BlockedNamespaceOperation> Service::blocked_namespace_operation() const {
-    auto frontend = fuse_frontend_.lock();
+    auto frontend = registry_.fuse();
     return frontend ? frontend->blocked_namespace_operation() : std::nullopt;
 }
 
 bool Service::skip_blocked_namespace_operation(uint64_t sequence) {
-    auto frontend = fuse_frontend_.lock();
+    auto frontend = registry_.fuse();
     return frontend && frontend->skip_blocked_namespace_operation(sequence);
 }
 
 std::vector<ParkedPublication> Service::parked_publications() const {
-    auto frontend = fuse_frontend_.lock();
+    auto frontend = registry_.fuse();
     return frontend ? frontend->parked_publications() : std::vector<ParkedPublication>{};
 }
 
 bool Service::retry_parked_publication(uint64_t inode) {
-    auto frontend = fuse_frontend_.lock();
+    auto frontend = registry_.fuse();
     return frontend && frontend->retry_parked_publication(inode);
 }
 
 bool Service::abandon_parked_publication(uint64_t inode) {
-    auto frontend = fuse_frontend_.lock();
+    auto frontend = registry_.fuse();
     return frontend && frontend->abandon_parked_publication(inode);
 }
 
@@ -654,7 +656,21 @@ void Service::initialise_services(std::stop_token stop) {
         // Only now: a subsystem plugin's context hands out references to the
         // services above (the torrent plugin needs IngestManager), and none
         // of them existed when this Service was constructed.
-        subsystems_.start(SubsystemContext{&node_.config(), &node_, ingest_.get(), &registry_});
+        //
+        // FUSE is one of them now (libmacha-fuse), discovered from
+        // plugin_path exactly as the torrent plugin is. What that buys is the
+        // whole point of the exercise: a frontend whose journal replay throws
+        // faults that subsystem and is retried, instead of unwinding to
+        // main() and taking metadata, RPC, the HTTP API and playback down
+        // with it. See TODO/2026-09-14-fuse-supervised-subsystem-plan.md.
+        SubsystemContext context;
+        context.config = &node_.config();
+        context.node = &node_;
+        context.ingest = ingest_.get();
+        context.registry = &registry_;
+        context.filesystem = fs_.get();
+        context.hydration = hydration_.get();
+        subsystems_.start(context);
         streaming_->start();
         scanner_->start();
         hydration_->start();

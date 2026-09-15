@@ -1,5 +1,146 @@
 # Current release
 
+## 0.41.0 — FUSE cannot take the node down any more (development)
+
+**The mount is a supervised subsystem, and a failure in it is now a failure of
+the mount.** `FuseFrontend`'s constructor replays the durable operation
+journal. When that threw, it threw into `main()`'s outermost `catch`, which
+logged and exited the process — metadata, RPC, the HTTP API and playback
+included, none of which had anything to do with the mount. That is not a
+hypothetical: a 0.24.3 bug in `skip_blocked_namespace_operation()`'s journal
+bookkeeping crash-looped `corvus-es-1` 49 times before anyone could read why.
+0.25.0 built the machinery to contain exactly this (`SubsystemSupervisor`,
+`run_supervised`, the plugin ABI) and 0.28.0 proved it on BitTorrent, but the
+subsystem that caused the incident was still wired the old way. It no longer
+is.
+
+A frontend that cannot be built now faults its own subsystem: logged with the
+reason, retried with backoff, and after too many failures in the window marked
+`disabled` for an operator, while the node carries on serving everything else.
+`GET /api/v1/status` reports it in the `subsystems` block it has carried since
+0.25.0, which until now was always empty for FUSE.
+
+**A mount that disappears is remounted, not escalated to a process exit.** The
+mount-table watchdog has detected external unmounts since 0.23.0, and what it
+did about it was call for service shutdown and return exit code 8 for systemd
+to restart the whole node. It now reports a subsystem fault, and the supervisor
+rebuilds the mount in place: `restart_count` climbs, `last_fault` names the
+cause, and nothing else on the node is interrupted. A mount that keeps dying
+walks into `disabled` rather than remounting forever — `RetryState::succeeded()`
+deliberately keeps its failure window, so a clean start between faults resets
+the backoff without resetting the budget. The covered mountpoint stays
+non-writable across the whole cycle.
+
+**`SIGHUP` configuration reload works on a mounted node.** `main()` ran the
+FUSE event loop on its own thread whenever a mount was configured, so libfuse's
+signal handlers — not Macha's — owned `SIGINT`/`SIGTERM`/`SIGHUP`, and reload
+was silently unavailable on precisely the nodes that mount. `main()` is now an
+unconditional `sigwait` loop in every configuration, the mask installed before
+`Service` exists so every thread it starts inherits it, libfuse's own workers
+included. FUSE no longer installs signal handlers at all, and the mount's exit
+is no longer the process's exit: the exit codes 3–8 that `run_fuse()` returned
+are gone.
+
+**The initial-namespace wait is bounded and cancellable.**
+`wait_for_initial_namespace()` polled in 100 ms sleeps forever, with no timeout
+and no cancellation, from inside the constructor. A node whose metadata replica
+never became available hung there indefinitely with one debug line to show for
+it, and on a supervised thread it would have held shutdown for just as long. It
+now takes the supervisor's stop token and a new
+`fuse.initial_namespace_timeout_ms` (default 10 minutes; 0 restores the old
+unbounded wait). It bounds "no metadata has arrived at all", not "recovery is
+slow" — the 2026-09-06 lesson, where a 120 s elapsed-time gate turned a
+progressing five-minute replay into a crash loop, is why nothing else on the
+startup path is timed against it.
+
+**`libmacha-fuse.so` is a new file you must deploy.** The libfuse adapter is a
+`dlopen`'d plugin now, alongside `libmacha-torrent.so`; a node that receives a
+new `macha` and `libmacha_core` without it silently loses the ability to mount,
+and one that receives a mismatched plugin refuses to load it on the build
+stamp. Copy `bin/macha`, `lib/macha/libmacha_core.*` and `lib/macha/plugins/`
+together and verify hashes across all of them. The boundary is libfuse alone:
+`FuseFrontend`, the journal and the mountpoint helpers are core's own code and
+stay in `libmacha_core`, so the plugin file decides whether this node can
+*mount*, not whether it has a filesystem. `fuse_stub.cpp` is deleted — plugin
+absence is capability absence, with nothing compiled in to stand for it.
+
+**`RpcServer::stop` no longer runs queued requests during shutdown.** The
+worker loops only return once their queue is empty and queued requests were
+dropped only *after* the join, so every request that arrived just before
+stop() was executed against a node whose outbound transport, retained-memory
+ledger and local writer had already been stopped -- and one that blocked
+there blocked shutdown for good. Two 120 s test timeouts on 2026-09-14 ended
+at `shutdown: RPC sessions reaped` for exactly this reason. Queued requests
+are now dropped with an error reply before the workers are joined, and the
+join is logged (`RPC workers joining/joined`). The blocking handler itself
+was not captured; if a shutdown hangs again, that log line is where to look.
+
+**The test runner can measure a flake instead of remembering it.**
+`--repeat N` runs every selected case N times across the parallel slots and
+prints a per-case failure count; `MACHA_TEST_LOG_LEVEL=DEBUG` captures the
+product's DEBUG log per case, shown only when the case fails. Two things the
+suite did to itself are fixed: concurrent runners shared the same port
+blocks and, since every test cluster shares one key, merged each other's
+clusters (a per-run `MACHA_TEST_PORT_SALT` now separates them); and
+`TempDir` kept whatever a pid-reused, runner-killed predecessor left behind,
+so a fresh node could "recover" another test's state. Six cases that failed
+under load were classified and fixed; the list and the numbers are in
+`TODO/2026-09-14-test-suite-must-be-deterministic-plan.md`.
+
+The case that had been waved past most often --
+`hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`,
+"at least five separate occasions" per the backlog -- turned out to be four
+distinct defects in one test: an exact repair count the product never
+promised, an assertion that gating metadata *repair* also freezes the
+committed generation (it does not; replication pushes accepted commits), a
+baseline sampled after its own quiescence wait rather than being the snapshot
+that satisfied it, and a capture that could latch onto a repair from before
+the burst it was measuring. Each was found by instrumenting the assertion
+that fired and reading the captured numbers, not by re-running until green;
+the numbers are in the plan. 600+ reps clean afterwards.
+
+Its remaining GC assertion is now self-classifying: on a miss it retries for
+a bounded 30 s and reports whether the objects were *ever* reclaimed, which
+ones remain and on which node. That already paid for itself -- the two misses
+seen (~2 in 300 reps) are not a slow sweep but the writing node reclaiming
+none of the four superseded artwork objects while its peer reclaimed all of
+them, both catalogues converged and agreeing. Six occurrences later the answer is
+not ambiguous: `reclaimed_eventually=no` after 42 seconds, every time. The
+writing node never reclaims them. That is a storage leak on the ordinary
+artwork-replacement path, it is **not fixed here**, and it is now a P0 in
+`TODO/ACTIVE.md` with the reproduction and the evidence rather than a test
+that fails sometimes.
+
+**Also in the supervisor, because FUSE is the first subsystem that needed it:**
+`Subsystem::attach_fault_sink()` lets a subsystem report a fault its own
+threads discovered after `start()` returned. Phase 1 left that half unbuilt on
+purpose ("better designed against a real one than guessed at now"); a lost
+kernel mount is that shape. `SubsystemSupervisor::add_builtin()` supervises a
+subsystem linked into the binary, and `restarting` is now used where every
+attempt after the first previously reported `starting`.
+
+**Two behaviours moved and are worth knowing about.** Mountpoint preparation
+(stale-mount recovery plus the fail-closed guard) still runs in `main()` before
+any service starts, so the pre-mount window stays shut, and *also* runs before
+each mount attempt, which is what a remount after an unexpected loss needs. And
+the fail-closed guard now restores the mode the covered directory had before
+anything guarded it, recorded once per process: a second mount attempt finds
+the directory deliberately non-writable, and recording *that* as the original
+would have made a later clean unmount fail it closed permanently.
+
+Gated by `fuse_subsystem/*` — construction fault, mount loss and rebuild, clean
+stop, declining without a mount path or a driver, and the real `dlopen` path —
+plus `subsystem_supervisor/*` for post-start faults, builtins, and stopping
+while a factory is still blocked. libfuse sits behind a `FuseMountDriver`
+interface so all of that runs without a kernel mount, which is why the mount
+lifecycle has test coverage at all. `foundations/test_main_owns_signals_and_never_runs_the_mount_itself`
+keeps `main()` from growing the branch back. Full suite: 441 passing.
+
+Phase 2 of `TODO/2026-09-05-subsystem-plugin-isolation-plan.md`, planned in
+detail in `TODO/2026-09-14-fuse-supervised-subsystem-plan.md`. That plan's
+Stage A and Stage B both landed here. Its Phase 3 audit item was struck as
+already satisfied by Phase 0.
+
 ## 0.40.1 — Repair says what it cannot reach (development)
 
 **An object no node can supply is now counted and named, instead of passed

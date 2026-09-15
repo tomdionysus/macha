@@ -45,11 +45,12 @@ class Service {
     NodeRuntime node_;
     ClusterStatusService cluster_status_;
     // Torrent runs as a plugin (Phase 1 of
-    // TODO/2026-09-05-subsystem-plugin-isolation-plan.md); FUSE has not
-    // migrated yet. `registry_` is where a loaded plugin publishes what it
-    // provides, and it outlives `subsystems_` deliberately: declared first,
-    // destroyed last, so a subsystem being torn down can still withdraw
-    // itself.
+    // TODO/2026-09-05-subsystem-plugin-isolation-plan.md) and FUSE as a
+    // supervised builtin (Stage A of
+    // TODO/2026-09-14-fuse-supervised-subsystem-plan.md). `registry_` is
+    // where each publishes what it provides, and it outlives `subsystems_`
+    // deliberately: declared first, destroyed last, so a subsystem being torn
+    // down can still withdraw itself.
     SubsystemRegistry registry_;
     SubsystemSupervisor subsystems_;
     SessionApi session_api_;
@@ -72,7 +73,6 @@ class Service {
     std::unique_ptr<CatalogueApi> catalogue_api_;
     std::unique_ptr<ManageApi> manage_api_;
     std::unique_ptr<PlaybackManager> streaming_;
-    std::weak_ptr<FuseFrontend> fuse_frontend_;
 
     std::jthread startup_;
     std::atomic_bool services_ready_{};
@@ -176,7 +176,18 @@ class Service {
     ConvergenceDemandDiagnostics metadata_convergence_diagnostics() const noexcept {
         return metadata_convergence_.diagnostics();
     }
-    void attach_fuse_frontend(std::weak_ptr<FuseFrontend>);
+    // Null when this node has no mount: not configured for one, or its FUSE
+    // subsystem is faulted between restarts. See SubsystemRegistry.
+    std::shared_ptr<FuseFrontend> fuse() {
+        return registry_.fuse();
+    }
+    // Where subsystems publish what they provide. Production writes to it
+    // from a Subsystem; a test that drives a FuseFrontend it constructed
+    // itself publishes here to make this Service see it, which is the same
+    // thing FuseSubsystem does.
+    SubsystemRegistry& registry() noexcept {
+        return registry_;
+    }
     std::optional<BlockedNamespaceOperation> blocked_namespace_operation() const;
     bool skip_blocked_namespace_operation(uint64_t sequence);
     std::vector<ParkedPublication> parked_publications() const;

@@ -25,9 +25,11 @@ bool has_plugin_extension(const std::filesystem::path& path) {
 
 struct SubsystemSupervisor::Entry {
     std::string name;
+    // Empty for a builtin (add_builtin): it came from this binary, not a file.
     std::filesystem::path plugin_path;
     void* handle{};
     const SubsystemPluginEntry* plugin{};
+    SubsystemFactory factory;
 
     mutable std::mutex mutex;
     std::condition_variable_any cv;
@@ -35,8 +37,16 @@ struct SubsystemSupervisor::Entry {
     size_t restart_count{};
     std::string last_fault;
     std::unique_ptr<Subsystem> instance;
+    // Set by the running instance's fault sink; consumed by run_entry, which
+    // then tears the instance down and retries it under the usual policy.
+    bool fault_requested{};
+    std::string pending_fault;
 
     std::jthread lifecycle;
+
+    std::string origin() const {
+        return plugin_path.empty() ? std::string("<builtin>") : plugin_path.string();
+    }
 
     // Deliberately no dlclose. Unmapping a plugin's code invalidates anything
     // of it that outlives the Subsystem instance -- a shared_ptr's deleter
@@ -56,14 +66,38 @@ SubsystemSupervisor::SubsystemSupervisor(std::filesystem::path plugin_dir,
                                          SubsystemRetryPolicy policy)
     : plugin_dir_(std::move(plugin_dir)), policy_(policy) {}
 
+void SubsystemSupervisor::add_builtin(std::string name, SubsystemFactory factory) {
+    if (!factory)
+        return;
+    auto entry = std::make_unique<Entry>();
+    entry->name = std::move(name);
+    entry->factory = std::move(factory);
+    entries_.push_back(std::move(entry));
+}
+
 SubsystemSupervisor::~SubsystemSupervisor() {
     stop();
 }
 
 void SubsystemSupervisor::start(SubsystemContext context) {
     context_ = context;
+    discover_plugins();
 
+    for (auto& entry : entries_) {
+        if (entry->state == SubsystemState::disabled)
+            continue; // failed to load above; nothing to run.
+        Entry* raw = entry.get();
+        raw->lifecycle = std::jthread([this, raw](std::stop_token stop) {
+            run_supervised(raw->name, [this, raw, stop] { run_entry(*raw, stop); });
+        });
+    }
+}
+
+void SubsystemSupervisor::discover_plugins() {
     std::error_code discovery_error;
+    // No plugin directory is an ordinary configuration, not an error: a node
+    // may run only builtins (and every test does). Builtins registered through
+    // add_builtin() are already in entries_ and must still be started.
     if (!std::filesystem::is_directory(plugin_dir_, discovery_error))
         return;
 
@@ -128,16 +162,10 @@ void SubsystemSupervisor::start(SubsystemContext context) {
             continue;
         }
 
+        entry->factory = [plugin = entry->plugin](const SubsystemContext& context) {
+            return plugin->create(context);
+        };
         entries_.push_back(std::move(entry));
-    }
-
-    for (auto& entry : entries_) {
-        if (entry->state == SubsystemState::disabled)
-            continue; // failed to load above; nothing to run.
-        Entry* raw = entry.get();
-        raw->lifecycle = std::jthread([this, raw](std::stop_token stop) {
-            run_supervised(raw->name, [this, raw, stop] { run_entry(*raw, stop); });
-        });
     }
 }
 
@@ -147,18 +175,42 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
     while (!stop.stop_requested()) {
         {
             std::lock_guard lock(entry.mutex);
-            entry.state = SubsystemState::starting;
+            // `restarting` is the honest word for every attempt after the
+            // first: an operator watching Status sees the difference between
+            // a node coming up and a subsystem being rebuilt under it.
+            entry.state = entry.restart_count ? SubsystemState::restarting
+                                              : SubsystemState::starting;
+            entry.fault_requested = false;
+            entry.pending_fault.clear();
         }
 
         std::unique_ptr<Subsystem> instance;
         bool declined = false;
         std::string fault;
         try {
-            instance = entry.plugin->create(context_);
-            if (instance)
+            // Each attempt gets this lifecycle thread's own stop token, so a
+            // factory that blocks (FuseFrontend waits for the initial
+            // namespace) can be cancelled by an ordinary supervisor stop.
+            SubsystemContext attempt = context_;
+            attempt.startup_stop = stop;
+            instance = entry.factory(attempt);
+            if (instance) {
+                // Installed before start(), so a subsystem whose own threads
+                // begin working inside start() can already report through it.
+                instance->attach_fault_sink([&entry](std::string reason) {
+                    std::lock_guard lock(entry.mutex);
+                    if (entry.fault_requested)
+                        return; // the first reason is the useful one.
+                    entry.fault_requested = true;
+                    entry.pending_fault =
+                        reason.empty() ? std::string("subsystem reported a fault")
+                                       : std::move(reason);
+                    entry.cv.notify_all();
+                });
                 instance->start();
-            else
+            } else {
                 declined = true;
+            }
         } catch (const std::exception& e) {
             fault = e.what();
         } catch (...) {
@@ -173,7 +225,7 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
             // rather than `disabled`.
             Log::info("subsystem plugin '" + entry.name +
                       "' loaded but its capability is not enabled on this node path=" +
-                      entry.plugin_path.string());
+                      entry.origin());
             std::lock_guard lock(entry.mutex);
             entry.state = SubsystemState::unavailable;
             return;
@@ -185,7 +237,7 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
             // a deployed plugin was actually picked up meant inspecting
             // /proc/<pid>/maps -- see docs/operations.md, "Subsystem plugins".
             Log::info("subsystem plugin '" + entry.name + "' loaded and running path=" +
-                      entry.plugin_path.string());
+                      entry.origin());
             {
                 std::lock_guard lock(entry.mutex);
                 entry.state = SubsystemState::running;
@@ -193,10 +245,21 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
             }
             retry.succeeded(); // a clean start resets backoff.
 
+            // Park until either the supervisor is stopping or the instance
+            // reports a fault of its own. RetryState::succeeded() above kept
+            // the failure window deliberately, so a subsystem that flaps --
+            // mounts, loses the mount, mounts again -- still walks into
+            // `disabled` rather than remounting forever.
             std::unique_lock lock(entry.mutex);
-            entry.cv.wait(lock, stop, [] { return false; });
+            entry.cv.wait(lock, stop, [&entry] { return entry.fault_requested; });
+            const bool post_start_fault = entry.fault_requested;
+            if (post_start_fault)
+                fault = std::move(entry.pending_fault);
+            entry.fault_requested = false;
+            entry.pending_fault.clear();
             auto owned = std::move(entry.instance);
             lock.unlock();
+
             if (owned) {
                 try {
                     owned->stop();
@@ -206,10 +269,23 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
                     Log::warn("subsystem '" + entry.name + "' stop() threw an unknown exception");
                 }
             }
-            return;
+            // Destroy the faulted instance before constructing its
+            // replacement: "restartable in place" means the old one is gone,
+            // and its fault sink still points at this entry until it is.
+            owned.reset();
+
+            if (!post_start_fault)
+                return; // ordinary shutdown.
+
+            Log::error("subsystem '" + entry.name + "' faulted while running: " + fault);
+        } else {
+            // A partially-constructed instance never reached `running`; drop
+            // it here so its destructor runs before the retry delay, not
+            // after the next attempt has already built its replacement.
+            instance.reset();
+            Log::error("subsystem '" + entry.name + "' failed to start: " + fault);
         }
 
-        Log::error("subsystem '" + entry.name + "' failed to start: " + fault);
         {
             std::lock_guard lock(entry.mutex);
             entry.last_fault = fault;
@@ -222,7 +298,7 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
             entry.state = SubsystemState::disabled;
             Log::error("subsystem '" + entry.name + "' disabled after " +
                       std::to_string(retry.failures_in_window()) +
-                      " failed start attempts; needs an operator");
+                      " failed attempts; needs an operator");
             return;
         }
 

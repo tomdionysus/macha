@@ -3594,20 +3594,15 @@ void RpcServer::stop() {
     reap_sessions(true);
     Log::debug("shutdown: RPC sessions reaped");
 
-    for (auto& worker : fast_control_workers_)
-        worker.request_stop();
-    for (auto& worker : control_workers_)
-        worker.request_stop();
-    for (auto& worker : metadata_workers_)
-        worker.request_stop();
-    for (auto& worker : data_workers_)
-        worker.request_stop();
-    request_cv_.notify_all();
-    fast_control_workers_.clear();
-    control_workers_.clear();
-    metadata_workers_.clear();
-    data_workers_.clear();
-
+    // Drop what is still queued BEFORE asking the workers to finish. The
+    // worker loops only return once their queue is empty, so with the drop
+    // after the join (as it was until 0.41.0) every request that arrived
+    // before stop() was executed *during* shutdown, against a node whose
+    // outbound transport, retained-memory ledger and local writer had
+    // already been stopped -- and a handler that then blocked blocked the
+    // join, which is what "shutdown: RPC sessions reaped" as the last line
+    // of a hung test looks like. Shutdown owes those callers an error reply,
+    // not an answer.
     std::vector<RpcClient::InboundReply> dropped;
     {
         DiagnosticLock lock(request_mutex_, "rpc.server.queue");
@@ -3634,6 +3629,23 @@ void RpcServer::stop() {
         } catch (...) {
         }
     }
+    Log::debug("shutdown: RPC queued requests dropped count=" + std::to_string(dropped.size()));
+
+    for (auto& worker : fast_control_workers_)
+        worker.request_stop();
+    for (auto& worker : control_workers_)
+        worker.request_stop();
+    for (auto& worker : metadata_workers_)
+        worker.request_stop();
+    for (auto& worker : data_workers_)
+        worker.request_stop();
+    request_cv_.notify_all();
+    Log::debug("shutdown: RPC workers joining");
+    fast_control_workers_.clear();
+    control_workers_.clear();
+    metadata_workers_.clear();
+    data_workers_.clear();
+    Log::debug("shutdown: RPC workers joined");
 
     shared_client_ = nullptr;
     Log::debug("shutdown: RpcServer::stop complete");

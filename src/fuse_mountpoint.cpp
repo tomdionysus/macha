@@ -11,6 +11,7 @@
 #include <string_view>
 #include <thread>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #if defined(__linux__)
@@ -99,6 +100,10 @@ MountpointPreparation guard_covered_mountpoint(const std::filesystem::path& moun
     MountpointPreparation out;
     std::error_code ec;
     std::filesystem::create_directories(mount_path, ec);
+    if (struct stat covered{}; ::stat(mount_path.c_str(), &covered) == 0) {
+        out.covered_mode = static_cast<uint32_t>(covered.st_mode & 07777);
+        out.covered_mode_known = true;
+    }
     for (const auto& entry : std::filesystem::directory_iterator(mount_path, ec)) {
         (void)entry;
         ++out.stray_entries;
@@ -149,7 +154,15 @@ void prepare_fuse_mountpoint(const std::filesystem::path& mount_path, const Fuse
     // mount then hides -- 52 GB on a shared host's root disk, 2026-09-07. A
     // mode change does not stop root; the immutable flag does, and it stays
     // in place across restarts so the pre-mount window is closed for good.
-    g_mountpoint_preparation = guard_covered_mountpoint(mount_path, config.fail_closed_mountpoint);
+    auto prepared = guard_covered_mountpoint(mount_path, config.fail_closed_mountpoint);
+    // Preparation runs once per mount attempt, not once per process (a
+    // supervised mount re-prepares before each retry). The original mode is
+    // whatever the first attempt saw; later attempts inherit it.
+    if (g_mountpoint_preparation.covered_mode_known) {
+        prepared.covered_mode = g_mountpoint_preparation.covered_mode;
+        prepared.covered_mode_known = true;
+    }
+    g_mountpoint_preparation = std::move(prepared);
 }
 
 namespace {

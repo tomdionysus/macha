@@ -23,4 +23,20 @@ std::shared_ptr<TorrentService> SubsystemRegistry::torrent() const {
     return torrent_;
 }
 
+void SubsystemRegistry::publish_fuse(std::shared_ptr<FuseFrontend> frontend) {
+    std::unique_lock lock(mutex_);
+    fuse_ = std::move(frontend);
+}
+
+void SubsystemRegistry::withdraw_fuse(const FuseFrontend* frontend) {
+    std::unique_lock lock(mutex_);
+    if (fuse_.get() == frontend)
+        fuse_.reset();
+}
+
+std::shared_ptr<FuseFrontend> SubsystemRegistry::fuse() const {
+    std::shared_lock lock(mutex_);
+    return fuse_;
+}
+
 } // namespace macha

@@ -32,6 +32,14 @@ struct MountpointPreparation {
     bool immutable{};
     // Why the flag could not be set, when it was requested and is not set.
     std::string immutable_error;
+    // The covered directory's own permission bits as first observed in this
+    // process, before anything protected it. The fail-closed guard restores
+    // THIS on a clean unmount rather than whatever it happened to see when it
+    // was constructed: after an unexpected mount loss the directory is left
+    // deliberately non-writable, and a later mount attempt must not record
+    // that as the original and restore it as such.
+    uint32_t covered_mode{};
+    bool covered_mode_known{};
 };
 
 MountTableProbe probe_macha_mountpoint(const std::string& mount);

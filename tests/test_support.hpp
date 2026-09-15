@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <condition_variable>
@@ -49,6 +50,16 @@ class TempDir {
         const auto base = std::filesystem::temp_directory_path();
         path_ = base / ("macha-test-" + std::to_string(getpid()) + "-" +
                         std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)));
+        // The name is pid-based and a case the runner kills on timeout never
+        // reaches the destructor below, so its directory outlives it; when
+        // the pid is reused, the next case with that pid inherited a state
+        // directory full of some other test's node. That node then
+        // "recovered" foreign state and failed with `local state recovery
+        // failed: trailing input` in a fresh single-node test
+        // (media_playback, 1 in 3,528 case-runs, 2026-09-15; 99 such
+        // leftovers in TMPDIR at the time). A fresh fixture starts empty.
+        std::error_code ec;
+        std::filesystem::remove_all(path_, ec);
         std::filesystem::create_directories(path_);
     }
 
@@ -73,7 +84,15 @@ inline uint16_t free_port() {
     constexpr uint16_t first = 20000;
     constexpr uint16_t block = 64;
     constexpr uint16_t blocks = 600; // 20000..58399
-    const auto case_block = static_cast<uint16_t>(macha::test::case_index() % blocks);
+    // The runner's per-run salt (test_framework.cpp) keeps two runners on
+    // one machine out of each other's blocks; without it they would share
+    // ports AND the deterministic cluster key, and merge clusters.
+    static const uint64_t runner_salt = [] {
+        const char* value = std::getenv("MACHA_TEST_PORT_SALT");
+        return value ? std::strtoull(value, nullptr, 10) : 0ULL;
+    }();
+    const auto case_block =
+        static_cast<uint16_t>((macha::test::case_index() + runner_salt) % blocks);
 
     int last_bind_error = 0;
     for (uint16_t attempt = 0; attempt < block; ++attempt) {

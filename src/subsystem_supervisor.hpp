@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <stop_token>
 #include <string>
@@ -26,6 +27,12 @@ struct SubsystemStatus {
 // fault-injection run fast and deterministic.
 using SubsystemRetryPolicy = RetryPolicy;
 
+// Constructs one subsystem instance, with the same contract as a plugin's
+// entry factory (subsystem_abi.hpp): returning no instance means "this node
+// is configured not to run this capability" and throwing means the attempt
+// failed and is subject to the retry/disable policy.
+using SubsystemFactory = std::function<std::unique_ptr<Subsystem>(const SubsystemContext&)>;
+
 // Owns the lifecycle of every subsystem loaded as a plugin: discovers
 // .so/.dylib files in `plugin_dir`, dlopens each, checks its build-identity
 // stamp against this process's own (see subsystem_abi.hpp) before ever
@@ -37,10 +44,13 @@ using SubsystemRetryPolicy = RetryPolicy;
 // constructor throwing during journal replay crashed the whole corvus-es-1
 // process 49 times (see TODO/2026-09-05-subsystem-plugin-isolation-plan.md).
 // A construction/start failure here degrades to a per-subsystem `faulted`/
-// `disabled` state instead. Detecting a subsystem's own background thread
-// dying *after* a successful start is intentionally not attempted yet -- no
-// subsystem has migrated onto this interface (Phase 1/2), and it is better
-// designed against a real one than guessed at now.
+// `disabled` state instead.
+//
+// A fault the subsystem discovers on its own thread *after* a successful
+// start reaches the same machinery through Subsystem::attach_fault_sink.
+// That half was deliberately left until a subsystem needed it; FUSE does
+// (a lost kernel mount is exactly this shape), so it is designed against a
+// real one rather than guessed at.
 class SubsystemSupervisor {
   public:
     explicit SubsystemSupervisor(std::filesystem::path plugin_dir,
@@ -60,6 +70,20 @@ class SubsystemSupervisor {
     // constructed.
     void start(SubsystemContext context);
 
+    // Supervise a subsystem that is linked into this binary rather than
+    // loaded from a plugin file. It gets the identical lifecycle: the same
+    // create/start attempt, the same fault sink, the same backoff/disable
+    // policy, and the same `subsystems` entry in Status.
+    //
+    // This is what lets FUSE move behind the supervisor (Stage A) before its
+    // libfuse adapter moves into libmacha-fuse (Stage B) -- the crash
+    // isolation is the valuable half and does not need the dlopen. See
+    // TODO/2026-09-14-fuse-supervised-subsystem-plan.md.
+    //
+    // Must be called before start(); builtins registered afterwards are not
+    // run. `name` is what Status reports, alongside the plugin-derived names.
+    void add_builtin(std::string name, SubsystemFactory factory);
+
     // Stops every running subsystem and joins their lifecycle threads.
     void stop();
 
@@ -67,6 +91,7 @@ class SubsystemSupervisor {
 
   private:
     struct Entry;
+    void discover_plugins();
     void run_entry(Entry&, std::stop_token);
 
     std::filesystem::path plugin_dir_;

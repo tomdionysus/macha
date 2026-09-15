@@ -243,6 +243,19 @@ struct FuseConfig {
     // Recover a stale Macha/FUSE mount left by an unclean daemon exit before startup.
     bool unmount_if_mounted{false};
     std::chrono::milliseconds watchdog_interval{1000};
+    // How long the frontend waits for this node's metadata replica to produce
+    // any namespace at all before giving up and reporting a fault its
+    // supervisor can retry and, eventually, show an operator. Before this the
+    // wait was unbounded and silent: a node whose replica never became
+    // available hung in the FuseFrontend constructor forever with one debug
+    // line to show for it.
+    //
+    // It bounds "no metadata has arrived at all", NOT "startup is slow" --
+    // the 2026-09-06 lesson about elapsed-time gates (a 120 s deadline turned
+    // a progressing 5-minute replay into a crash loop) is why this is
+    // generous by default and why nothing else on the startup path is timed
+    // against it. 0 restores the unbounded wait.
+    std::chrono::milliseconds initial_namespace_timeout{std::chrono::minutes(10)};
 };
 
 struct FilesystemConfig {

@@ -3,10 +3,7 @@
 #include "config.hpp"
 #include "filesystem.hpp"
 #include "fuse_mountpoint.hpp"
-#include "hydration.hpp"
-#include <filesystem>
-#include <functional>
-#include <memory>
+#include "fuse_subsystem.hpp"
 
 namespace macha {
 class FuseFrontend;
@@ -14,7 +11,9 @@ class FuseFrontend;
 // terminated by its installed signal handlers, and a negated errno for an
 // actual loop failure.
 constexpr bool fuse_loop_result_is_error(int result) noexcept { return result < 0; }
-int run_fuse(FileSystem& fs, CacheHydrator& hydrator, const std::filesystem::path& mount_path,
-             const FuseConfig& config, std::function<void()> request_shutdown = {},
-             std::function<void(std::weak_ptr<FuseFrontend>)> frontend_observer = {});
+
+// The libfuse mount driver registers itself with macha_core at static
+// initialisation time (see fuse_subsystem.hpp); there is no entry point to
+// call. Linking this translation unit is what gives a build the ability to
+// mount, and not linking it is what makes `fuse` report `unavailable`.
 } // namespace macha

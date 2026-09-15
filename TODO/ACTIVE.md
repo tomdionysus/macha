@@ -109,6 +109,92 @@ The governing laws are:
 3. Control traffic must remain promptly serviceable. Viewer priority is a large
    configurable share (95:5 by default), not indefinite starvation of all other work.
 
+## P0 — Superseded catalogue artwork is never reclaimed on the node that wrote it (found 2026-09-15)
+
+**A storage leak, reproducible at ~0.7%, confirmed stuck rather than slow.**
+Found while classifying the coalesced-burst test's failures rather than
+re-running it until green.
+
+Shape, from six independent occurrences with identical evidence: after a
+burst of catalogue artwork replacements on node 2, the four superseded DATA
+objects remain on **s2 only** -- the node that wrote them -- while s1 has
+reclaimed every one. Both catalogues are converged at the same generation
+and both report `artwork_objects=1`, so the metadata agrees the old objects
+are dead. The instrumented assertion retries for a further 30 s and reports
+`reclaimed_eventually=no total_ms=42006` (4 of 4 occurrences): they are
+never reclaimed. A healthy run reclaims in under a second -- 0 of 360 reps
+took longer.
+
+Reproduce: `./build/macha-tests --repeat 60 --filter
+test_catalogue_uses_final_state_after_coalesced_metadata_burst`, roughly one
+failure per 150 reps; the failure prints the remaining object ids, the node
+holding them, both catalogue generations and `reclaimed_eventually`.
+
+Not yet separated: s2 is the busy writer, so its `gc_quiescent_until` is
+pushed forward by its own service events on every pass (`Service::loop`),
+and its retention claims for freshly published artwork are only released
+once a later catalogue root proves them unreferenced
+(`CatalogueManager::control_gc_*`, `retention_objects`). Either would
+explain "the writer never sweeps"; neither is confirmed. Next step is a
+`MACHA_TEST_LOG_LEVEL=DEBUG` repeat run reading s2's maintenance decisions
+across the failing window.
+
+Why it matters beyond the test: this is the ordinary path for replacing
+artwork, and on a real node the superseded bytes would simply accumulate.
+
+## P1 — `FuseFrontend::wait_for_idle` can report idle while a publication is starting (found 2026-09-15)
+
+`wait_for_idle` is the quiescence primitive most of the `filesystem_fuse`
+suite waits on, and it can return true with work outstanding.
+
+It decides from `status()`, which samples three things independently: the
+data queue under `data_queue_mutex`, the inode table under `namespace_mutex`,
+and `active_data` as a bare atomic. A publication that has been dequeued but
+whose `active_data` increment has not landed yet is counted by neither, so
+the composite reads idle. Nothing takes a consistent snapshot across the
+hand-off.
+
+Seen as `filesystem_fuse/test_fuse_publication_quanta_are_fair_and_byte_bounded`
+failing three assertions at once after `REQUIRE(wait_for_idle(30s))`
+succeeded -- `data_publications_completed != 2`,
+`data_publication_bytes_read` short, and the large file still at its old size
+(1 in 2,646 case-runs). The test is correct; the primitive lied to it.
+
+Only tests call `wait_for_idle` today, so this is not a production path --
+but it is a plausible common cause behind other `filesystem_fuse` cases that
+"pass in isolation", and every one of those is a place a real regression
+could hide. Fix by making the dequeue-to-active transition observable as one
+step (increment `active_data` before releasing `data_queue_mutex`, or have
+`status()` derive pending and active under a single lock), not by widening
+timeouts.
+
+## P0 — The test suite must be deterministic (next, opened 2026-09-14)
+
+**"Known flake" is not a category. It is the name we have been giving the
+decision not to diagnose a failure.** Plan:
+[the test suite must be deterministic](2026-09-14-test-suite-must-be-deterministic-plan.md).
+
+Six full-suite runs on one laptop during the 0.41.0 work produced seven
+failures across six different cases, every one passing in isolation. One of
+them was not a flake at all: it was a real regression introduced that
+afternoon (0.41.0 put a second plugin in the build's shared plugin directory,
+and that test points two Services at it), and it had already been waved past
+once in the same session as "the known flakes". That is the cost, concretely.
+
+**First pass done 2026-09-15 (laptop only).** Measurement tooling landed
+(`--repeat`, `MACHA_TEST_LOG_LEVEL`, per-run port salt, `TempDir` starts
+empty), seven cases classified and fixed -- four test defects, two
+infrastructure defects, one product defect (`RpcServer::stop` executed
+queued requests during shutdown). Details, rates and what is still
+unproven are in the plan. The Pi-only cases remain.
+
+Done means: the full suite passes 20 consecutive times on gbni-1 and es-1 at
+CI's real parallelism, no case is documented anywhere as expected to fail
+sometimes, and a red run therefore blocks a deploy. The two cases with
+measured rates on real hardware are the cheapest place to start; the plan says
+which and why. The "three load-dependent test flakes" item below is folded
+into this and should be deleted, not re-worded, when its cases are classified.
+
 ## P0 — Cluster: two nodes, and what removing the third left behind
 
 The cluster is **two nodes** as of the evening of 2026-09-13: gbni-1 (macnessa)
@@ -485,6 +571,11 @@ not inferred from docs. All are small and isolated; none require design work.
   Phase 2 moves FUSE into its own plugin and off the main thread. Single
   binary, single process throughout, no separate OS processes/IPC (considered
   and rejected).
+  **Sized and re-planned 2026-09-14** as two stages in
+  [FUSE behind the subsystem supervisor, then out into a plugin](2026-09-14-fuse-supervised-subsystem-plan.md):
+  Stage A supervises FUSE in place (closes this P0), Stage B moves libfuse
+  into `libmacha-fuse`. The plugin boundary is `fuse_adapter.cpp`, not
+  `FuseFrontend`, so the FUSE tests keep linking `macha_core`.
 - [ ] **Terminal durability poisoning is never cleared.** `fuse_frontend.cpp`
   sets `durability_poisoned = true` on any exception during the durability
   batch and nothing ever resets it — one transient fsync failure disables all
@@ -821,6 +912,25 @@ throughput, heap-audit and ownership documents remain detailed evidence but are
 absorbed here rather than separate active programmes.
 
 ## P1 — Cluster connectivity, status and operations
+
+- [ ] **Spool usage is not in polled Status (requested 2026-09-14).** The
+  numbers exist — `FuseFrontendDiagnostics` carries `spool_bytes`,
+  `spool_limit_bytes`, `spool_publish_rate_bytes_per_second`,
+  `spool_throttle_waits` and `spool_throttle_wait_ms` — but 0.39.1 moved the
+  whole `diagnostics` block off `/api/v1/status` onto its own endpoint, so
+  nothing a client polls reports how full the spool is. That is the wrong
+  side of the split for this particular number: local write-back admission is
+  paced against it, a spool at its ceiling is what a wedged publication
+  pipeline looks like from outside (es-1, 2026-09-09), and it is one atomic
+  read with no locks and no namespace walk.
+  Put the small always-true summary — used, limit, and the publish rate —
+  in the cheap always-present part of the status response, next to the
+  `subsystems` block, which is there for exactly this reason (0.25.0: "it
+  costs nothing to compute and is exactly what an operator needs promptly").
+  Leave the per-counter detail in `diagnostics`. Read it through
+  `SubsystemRegistry::fuse()` like the other FUSE-facing status does since
+  0.41.0, so a node with no mount simply omits it rather than reporting
+  zeroes that look like an idle spool.
 
 - [ ] **`GET /api/v1/status` took 10 seconds once — observed by the operator
   2026-09-13, cause not found, and the obvious suspects are eliminated.**

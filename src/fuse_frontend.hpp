@@ -17,6 +17,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -600,7 +601,13 @@ class FuseFrontend final : public HydrationHintProvider {
     void note_timeout();
 
   public:
-    FuseFrontend(FileSystem&, FuseConfig);
+    // The stop token cancels the one part of construction that can wait
+    // indefinitely: the initial namespace. A supervised frontend is built
+    // on a lifecycle thread that must be joinable on shutdown, so a node
+    // whose metadata replica never arrives has to be able to give up
+    // rather than hold Service::stop() forever. Default-constructed (no
+    // associated stop state) for the in-process callers that have none.
+    FuseFrontend(FileSystem&, FuseConfig, std::stop_token = {});
     ~FuseFrontend() override;
     FuseFrontend(const FuseFrontend&) = delete;
     FuseFrontend& operator=(const FuseFrontend&) = delete;

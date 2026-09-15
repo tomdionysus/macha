@@ -30,7 +30,7 @@ MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_cou
     auto& service = fixture.start();
 
     auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
-    service.attach_fuse_frontend(frontend);
+    service.registry().publish_fuse(frontend);
     frontend->mkdir("/status-counter", 0755, getuid(), getgid());
     REQUIRE(frontend->wait_for_idle(10s));
     REQUIRE(wait_until([&] {
@@ -152,7 +152,7 @@ MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_cou
           service.node().known_metadata_generation());
     CHECK(!convergence->find("scheduled")->asBool());
 
-    service.attach_fuse_frontend({});
+    service.registry().withdraw_fuse(frontend.get());
     const auto detached = status_diagnostics_response(config.catalogue.api.port, service);
     CHECK(!detached.find("diagnostics")->find("filesystem")->find("available")->asBool());
     frontend->stop();
@@ -2872,7 +2872,7 @@ MACHA_TEST("filesystem_fuse",
     auto replay = config.fuse;
     replay.publication_quiet = 0ms;
     auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
-    service.attach_fuse_frontend(recovered);
+    service.registry().publish_fuse(recovered);
 
     REQUIRE(wait_until([&] { return recovered->blocked_namespace_operation().has_value(); }, 10s));
     auto blocked = recovered->blocked_namespace_operation();
@@ -2944,7 +2944,7 @@ MACHA_TEST("filesystem_fuse",
     uint64_t skipped_sequence = 0;
     {
         auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
-        service.attach_fuse_frontend(recovered);
+        service.registry().publish_fuse(recovered);
         REQUIRE(wait_until([&] { return recovered->blocked_namespace_operation().has_value(); }, 10s));
         auto blocked = recovered->blocked_namespace_operation();
         REQUIRE(blocked.has_value());
@@ -2965,7 +2965,7 @@ MACHA_TEST("filesystem_fuse",
     // replaying a journal that contains a namespace_done record for the
     // skipped sequence with no namespace_published ever recorded for it.
     auto restarted = std::make_shared<FuseFrontend>(service.filesystem(), replay);
-    service.attach_fuse_frontend(restarted);
+    service.registry().publish_fuse(restarted);
     REQUIRE(wait_until([&] {
         auto blocked = restarted->blocked_namespace_operation();
         return blocked && blocked->path == "/wedge2";
