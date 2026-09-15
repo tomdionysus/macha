@@ -303,6 +303,7 @@ void parse_fuse(const YAML::Node& root, Config& c) {
     if (f["fail_closed_mountpoint"]) c.fuse.fail_closed_mountpoint = f["fail_closed_mountpoint"].as<bool>();
     if (f["unmount_if_mounted"]) c.fuse.unmount_if_mounted = f["unmount_if_mounted"].as<bool>();
     if (f["watchdog_interval_ms"]) c.fuse.watchdog_interval = milliseconds(f["watchdog_interval_ms"], "fuse.watchdog_interval_ms");
+    if (f["initial_namespace_timeout_ms"]) c.fuse.initial_namespace_timeout = milliseconds(f["initial_namespace_timeout_ms"], "fuse.initial_namespace_timeout_ms");
     if (auto t = f["timeouts"]) {
         if (t["lookup_ms"]) c.fuse.timeouts.lookup = milliseconds(t["lookup_ms"], "fuse.timeouts.lookup_ms");
         if (t["namespace_ms"]) c.fuse.timeouts.namespace_mutation = milliseconds(t["namespace_ms"], "fuse.timeouts.namespace_ms");

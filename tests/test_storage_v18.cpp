@@ -930,6 +930,19 @@ Config storage_node_config(const TestCluster& cluster, std::string_view name, ui
 }
 
 Bytes preferred_for(NodeRuntime& observer, const NodeId& preferred, size_t bytes, uint8_t salt_start = 0) {
+    // Placement is computed over the observer's *active* membership, so no
+    // object can prefer a node the observer does not currently count as
+    // alive. Callers reach here right after forming a cluster, when the
+    // preferred node may not have been observed yet (or, under load, has
+    // just missed a heartbeat window): searching 4096 candidates then finds
+    // nothing and this threw "could not find object preferring requested
+    // node" 1 in 2,646 case-runs (2026-09-15). Wait for the precondition
+    // the search actually depends on instead of asserting it by accident.
+    REQUIRE(wait_until([&] {
+        const auto active = observer.membership().active();
+        return std::any_of(active.begin(), active.end(),
+                           [&](const NodeInfo& node) { return node.id == preferred; });
+    }, 10s));
     for (unsigned i = 0; i < 4096; ++i) {
         auto data = pattern(bytes, static_cast<uint8_t>(salt_start + i));
         data[0] ^= static_cast<uint8_t>(i);

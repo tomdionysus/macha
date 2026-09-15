@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_framework.hpp"
+#include "log.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -46,6 +47,11 @@ std::size_t current_case_index{};
 struct Options {
     unsigned slots{};
     unsigned timeout_scale{};
+    // Run every selected case this many times and report a per-case failure
+    // count at the end. This is the measurement the "known flake" habit never
+    // had: a rate on named hardware at real parallelism, instead of a
+    // recollection (TODO/2026-09-14-test-suite-must-be-deterministic-plan.md).
+    unsigned repeat{1};
     bool list{};
     bool verbose{};
     std::string filter;
@@ -126,15 +132,25 @@ Options parse_options(int argc, char** argv) {
             options.timeout_scale = parse_unsigned(argv[i], "--timeout-scale");
         } else if (arg.starts_with("--timeout-scale=")) {
             options.timeout_scale = parse_unsigned(arg.substr(16), "--timeout-scale");
+        } else if (arg == "--repeat") {
+            if (++i >= argc) throw std::runtime_error("--repeat requires a value");
+            options.repeat = parse_unsigned(argv[i], "--repeat");
+        } else if (arg.starts_with("--repeat=")) {
+            options.repeat = parse_unsigned(arg.substr(9), "--repeat");
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "macha-tests [--list] [--filter TEXT] [--jobs N|--serial] [--verbose]\n"
-                         "            [--timeout-scale N]\n"
+                         "            [--timeout-scale N] [--repeat N]\n"
                          "Tests run in isolated child processes. MACHA_TEST_JOBS overrides the\n"
                          "default parallel slot budget. Integration tests consume two slots and\n"
                          "heavy lifecycle tests consume three.\n"
                          "MACHA_TEST_TIMEOUT_SCALE (or --timeout-scale) multiplies every case\n"
                          "deadline; it defaults above 1 in a sanitizer build, where the same\n"
-                         "work legitimately takes several times longer.\n";
+                         "work legitimately takes several times longer.\n"
+                         "MACHA_TEST_LOG_LEVEL=DEBUG raises the product log level inside each\n"
+                         "case; the output is captured and shown only for a failing case.\n"
+                         "--repeat runs every selected case N times, interleaved across the\n"
+                         "parallel slots like an ordinary run, and reports a per-case failure\n"
+                         "count: the way to measure a suspected flake rather than recall it.\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown test option: " + std::string(arg));
@@ -231,6 +247,17 @@ void coverage_dump() {}
     coverage_reset();
     child_failures.store(0, std::memory_order_relaxed);
     set_case_index(selection_index + 1);
+    // A case's output is only ever shown when it fails, so a more verbose
+    // level costs nothing on a green run and is the difference between a
+    // diagnosable failure and "it timed out". The product's own `shutdown:`
+    // and `peer ... liveness failure:` lines are DEBUG.
+    if (const char* level = std::getenv("MACHA_TEST_LOG_LEVEL")) {
+        try {
+            Log::set_logger(std::make_shared<ConsoleLogger>(parse_log_level(level)));
+        } catch (const std::exception& e) {
+            std::cerr << "MACHA_TEST_LOG_LEVEL: " << e.what() << '\n';
+        }
+    }
     try {
         test.function();
     } catch (const std::exception& e) {
@@ -387,6 +414,13 @@ int run_all(int argc, char** argv) {
     selected_tests.reserve(tests.size());
     for (const auto& test : tests)
         if (selected(test, options)) selected_tests.push_back(&test);
+    const auto distinct_cases = selected_tests.size();
+    // Repetitions are scheduled as further selections of the same cases, so
+    // a case's repeats are spread across the run and land next to unrelated
+    // work, which is the condition a suspected flake has to be measured in.
+    for (unsigned rep = 1; rep < options.repeat; ++rep)
+        for (std::size_t i = 0; i < distinct_cases; ++i)
+            selected_tests.push_back(selected_tests[i]);
 
     if (options.list) {
         for (const auto* test : selected_tests)
@@ -405,6 +439,23 @@ int run_all(int argc, char** argv) {
         return std::min(options.slots, slots_for(test.cost));
     };
 
+    // Two runners on one machine -- a developer's filtered run beside CI, or
+    // two sweeps -- would otherwise hand the same case index, and therefore
+    // the same 64-port block, to two different tests at once. Every test
+    // cluster shares one deterministic key, so a collision is not a bind
+    // failure but a foreign node authenticating into this test's cluster
+    // ("metadata write-floor policy mismatch peer=..." from a test that
+    // started no such peer, 2026-09-14). Each runner therefore shifts the
+    // block namespace by a salt its children inherit; set it explicitly to
+    // reproduce a run's exact ports.
+    if (!std::getenv("MACHA_TEST_PORT_SALT")) {
+        const auto salt = static_cast<unsigned>(
+            (static_cast<unsigned long>(::getpid()) * 2654435761UL) ^
+            static_cast<unsigned long>(
+                std::chrono::steady_clock::now().time_since_epoch().count()));
+        ::setenv("MACHA_TEST_PORT_SALT", std::to_string(salt % 1000003u).c_str(), 1);
+    }
+
     const auto suite_started = Clock::now();
     std::vector<RunningCase> running;
     std::vector<Result> results;
@@ -414,8 +465,9 @@ int run_all(int argc, char** argv) {
     for (std::size_t i = 0; i < selected_tests.size(); ++i) pending.push_back(i);
     unsigned occupied = 0;
 
-    std::cout << "Running " << selected_tests.size() << " tests with " << options.slots
+    std::cout << "Running " << distinct_cases << " tests with " << options.slots
               << " parallel slots (process isolated)";
+    if (options.repeat != 1) std::cout << ", x" << options.repeat << " repeats";
     if (options.timeout_scale != 1) std::cout << ", deadlines x" << options.timeout_scale;
     std::cout << '\n' << std::flush;
 
@@ -469,10 +521,32 @@ int run_all(int argc, char** argv) {
     if (failed) {
         std::cerr << failed << '/' << results.size() << " tests failed; wall=" << elapsed.count()
                   << "ms case-sum=" << serial_time.count() << "ms\n";
-        std::cerr << "Failed cases:\n";
-        for (const auto& result : results)
-            if (!result.passed)
-                std::cerr << "  " << full_name(*result.test) << '\n';
+        if (options.repeat == 1) {
+            std::cerr << "Failed cases:\n";
+            for (const auto& result : results)
+                if (!result.passed)
+                    std::cerr << "  " << full_name(*result.test) << '\n';
+        } else {
+            // One line per distinct case that failed at least once, with its
+            // rate: the number this whole mode exists to produce.
+            std::cerr << "Failed cases (failures/" << options.repeat << " runs):\n";
+            std::vector<std::pair<const TestCase*, unsigned>> tally;
+            for (const auto& result : results) {
+                if (result.passed) continue;
+                auto found = std::find_if(tally.begin(), tally.end(), [&](const auto& item) {
+                    return item.first == result.test;
+                });
+                if (found == tally.end())
+                    tally.emplace_back(result.test, 1u);
+                else
+                    ++found->second;
+            }
+            std::stable_sort(tally.begin(), tally.end(),
+                             [](const auto& a, const auto& b) { return a.second > b.second; });
+            for (const auto& [test, count] : tally)
+                std::cerr << "  " << count << '/' << options.repeat << "  " << full_name(*test)
+                          << '\n';
+        }
         return 1;
     }
     std::cout << "All " << results.size() << " tests passed; wall=" << elapsed.count()

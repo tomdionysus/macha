@@ -858,6 +858,23 @@ MACHA_TEST("rpc_cluster", test_mutual_bootstrap_prunes_cross_dial) {
                a.canonical_connections == 1 && b.canonical_connections == 1;
     }));
 
+    // Simultaneous dials are the subject here: both nodes bootstrap toward
+    // each other, so one can still have a dial in flight when the other's
+    // inbound route has already become canonical, and the loser of that
+    // tie-break counts as a created connection when it lands. The predicate
+    // above cannot see a dial in flight, and sampling before that late dial
+    // landed failed this case once in 5,292 case-runs (2026-09-14). What is
+    // under test is that the churn STOPS, so wait for one quiet window --
+    // six heartbeats with nothing created on either side -- and only then
+    // assert that the next window is quiet too.
+    REQUIRE(wait_until([&] {
+        const auto a0 = n1.rpc_stats().connections_created;
+        const auto b0 = n2.rpc_stats().connections_created;
+        std::this_thread::sleep_for(120ms);
+        return n1.rpc_stats().connections_created == a0 &&
+               n2.rpc_stats().connections_created == b0;
+    }, 5s, 0ms));
+
     const auto a_before = n1.rpc_stats();
     const auto b_before = n2.rpc_stats();
     std::this_thread::sleep_for(120ms); // six configured heartbeats
@@ -1991,6 +2008,12 @@ MACHA_TEST("rpc_cluster", test_early_replication_quorum) {
     c1.heartbeat = 10s;
     Service s1(c1, keys);
     s1.start();
+    // start() returns while local storage is still recovering, and put()
+    // below refuses ("data storage is still recovering") until it is not.
+    // Nothing else in this test touches the service before that put, so
+    // there is no implicit wait; with DEBUG logging slowing startup this
+    // failed 6 of 10 runs (2026-09-14).
+    REQUIRE(s1.node().wait_local_state_ready(10s));
 
     NodeInfo fast_info;
     fast_info.id = random_node_id();
@@ -3001,7 +3024,15 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
         config->min_write_replicas = 1;
         config->metadata_min_write_replicas = 2;
         config->heartbeat = 50ms;
-        config->dead_after = 200ms;
+        // Not 200 ms: that asserted that every ping on a laptop running
+        // twelve test processes completes in 200 ms, which is not this
+        // test's subject and is false often enough (1 in 12 full-suite runs,
+        // 2026-09-14) that n1 and n2 declared each other dead, flapped in a
+        // 4 s cycle and the node could not converge. Same reasoning as
+        // test_catalogue_uses_final_state_after_coalesced_metadata_burst:
+        // liveness comfortably above scheduler jitter, with the 5 s wait
+        // below still long enough to see s3 drop out at this value.
+        config->dead_after = 2s;
         config->catalogue.scanner.enabled = false;
         config->catalogue.api.enabled = false;
         config->ingest.enabled = false;
@@ -4365,6 +4396,14 @@ MACHA_TEST("rpc_cluster", test_extent_put_to_a_silent_peer_fails_within_the_no_p
         return s1.node().membership().active().size() >= 2 &&
                s2.node().membership().active().size() >= 2;
     }));
+    // Seeing the peer is not the same as having formed the metadata replica
+    // set, and the mutation below needs the latter: under load it threw
+    // `metadata replica set forming: waiting for bootstrap checkpoint survey`
+    // (1 in 3,528 case-runs, 2026-09-15). Genesis is generation 1, so a
+    // committed generation past it is the precondition create_file depends on.
+    REQUIRE(wait_until([&] {
+        return s1.node().metadata_replica().committed_generation() > 1;
+    }, 10s));
     s1.filesystem().create_file("/silent.bin", 0644, getuid(), getgid());
     const auto contents = pattern(64 * 1024);
     const auto peer = s2.node().node_id();
@@ -4445,8 +4484,21 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
     c1.torrent.enabled = c2.torrent.enabled = true;
     // The download engine is a plugin: load the one this build produced, so
     // the test exercises the real dlopen/build-identity/factory path rather
-    // than anything linked into the test binary.
-    c1.plugin_path = c2.plugin_path = MACHA_TEST_PLUGIN_DIR;
+    // than anything linked into the test binary. It gets a directory holding
+    // only that plugin, rather than the build's shared plugin directory: two
+    // full Services start here, and every other plugin in the shared
+    // directory would be dlopen'd by both of them (libmacha-fuse pulls in
+    // libfuse/macFUSE) for no reason this test cares about.
+    TempDir plugin_dir;
+    {
+        const std::filesystem::path torrent_plugin = MACHA_TEST_TORRENT_PLUGIN;
+        std::error_code plugin_copy_error;
+        std::filesystem::copy_file(torrent_plugin, plugin_dir.path() / torrent_plugin.filename(),
+                                   std::filesystem::copy_options::overwrite_existing,
+                                   plugin_copy_error);
+        REQUIRE(!plugin_copy_error);
+    }
+    c1.plugin_path = c2.plugin_path = plugin_dir.path();
 
     Service s1(c1, keys);
     Service s2(c2, keys);
@@ -4552,11 +4604,20 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
         REQUIRE(state != nullptr);
         // This response is node 1's own synchronous answer, round-tripped
         // through the RPC survey -- it is the proof the action landed there,
-        // not the UI's local guess. A separate re-fetch immediately after
-        // would race the worker thread picking the now-queued job back up
-        // and re-failing it against the same non-media dummy file, so it is
-        // deliberately not asserted here.
-        CHECK(state->asString() == "queued");
+        // not the UI's local guess. The proof is the 200 itself: the route
+        // answers with an error unless the action reported `changed`.
+        //
+        // The `state` it carries is node 1's job as re-read AFTER resume()
+        // released its lock (IngestManager::handle_job_action), by which time
+        // a worker may already have picked the now-queued job up and
+        // re-failed it against the same non-media dummy file. Asserting
+        // "queued" asserted that no worker got there first, a window the
+        // product never promised and which closed in 1 of 5,292 case-runs on
+        // 2026-09-14. What the reply must never say is a state resume cannot
+        // lead to.
+        const auto reported = state->asString();
+        CHECK((reported == "queued" || reported == "scanning" || reported == "importing" ||
+               reported == "failed"));
     }
 
     // --- Torrent: list visibility from the non-owning node ---

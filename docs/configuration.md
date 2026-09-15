@@ -188,6 +188,7 @@ fuse:
   unmount_if_mounted: true
   fail_closed_mountpoint: true
   watchdog_interval_ms: 1000
+  initial_namespace_timeout_ms: 600000
 ```
 
 `unmount_if_mounted` controls startup recovery from an unclean daemon exit. When true, Macha inspects the mount table before starting cluster/storage services and removes a mount only if it is identified as Macha/FUSE. An unrelated filesystem at the configured mount path is a hard startup error.
