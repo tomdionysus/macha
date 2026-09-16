@@ -28,6 +28,7 @@ class ClusterStatusService {
     std::function<ConvergenceDemandDiagnostics()> convergence_diagnostics_;
     std::function<std::vector<SubsystemStatus>()> subsystem_diagnostics_;
     std::function<DistributedStore::RepairDiagnostics()> repair_diagnostics_;
+    std::function<std::optional<HttpServerDiagnostics>()> http_diagnostics_;
 
     void persistence_loop(std::stop_token);
     void persist_local_status();
@@ -63,6 +64,9 @@ class ClusterStatusService {
     // operator needs promptly, and costs nothing to compute.
     void attach_subsystem_diagnostics(std::function<std::vector<SubsystemStatus>()> provider);
     void detach_subsystem_diagnostics();
+    // The HTTP server's own counters: reactor stalls, open and idle
+    // connections, lane queues. Absent when the API is disabled.
+    void attach_http_diagnostics(std::function<std::optional<HttpServerDiagnostics>()> provider);
     ~ClusterStatusService();
     void start();
     void request_stop();
