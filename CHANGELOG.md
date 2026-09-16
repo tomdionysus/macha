@@ -1,5 +1,141 @@
 # Current release
 
+## 0.43.0 — The HTTP server without a thread per connection (development)
+
+**The API is served by one reactor thread that owns every socket and never
+waits, two bounded pools that only compute, and continuations for the
+requests that used to block.** Until now the server was sixteen worker
+threads, and a worker was spent on every kind of waiting the server did: a
+kept-alive connection idling for up to 15 s between requests, a held segment
+request waiting on the encoder, a slow viewer draining a multi-megabyte
+fragment over the WAN, a direct-play range fetched from another replica.
+Only running a handler was work. Three client families each holding one
+idle connection took most of the pool; one deeply prefetching player could
+take all of it; and when the pool was gone the node stopped answering
+`/api/v1/health` and `/api/v1/status`, which is exactly the shape of the
+unexplained 10 s Status response of 2026-09-13. Plan and reasoning:
+`TODO/2026-09-15-http-server-reactor-plan.md`.
+
+What changed, in the order a request meets it:
+
+- **Sockets are non-blocking and owned by one reactor** (`macha-http-io`),
+  a `poll()` loop with a per-connection state machine: reading, dispatched,
+  deferred, writing. An idle kept-alive connection is a descriptor and a
+  small struct. The keep-alive rules, `413`, `OPTIONS`, CORS headers and
+  `Content-Length` framing are unchanged; `catalogue.api.max_connections`
+  (default 1024) replaces `max_queued_connections`, which is still read.
+  Pipelined requests are parsed out of the bytes already received rather
+  than waited for.
+- **Handlers run on a compute pool in two lanes.** The data lane
+  (`catalogue.api.workers`, 16) runs catalogue, playback and web-asset
+  routes and every body read that can block on a disk or a replica. The
+  control lane (`catalogue.api.control_workers`, 2) runs health, status,
+  session and account routes, so a node saturated serving fragments still
+  says what is wrong with it: governing law 3 as a data structure rather
+  than a hope. A lane with `max_queued_requests` (256) waiting answers
+  `503 overloaded` with `Retry-After: 1` instead of queueing without bound;
+  the body carries `service: macha` and `status: busy` alongside the error
+  envelope, so a client confirming an endpoint by its health body can tell
+  a busy node from a host that is not Macha at all.
+  The handler contract is untouched: every route is exactly the code it was.
+- **Streaming bodies are pumped, not pushed.** A resident body -- a
+  transcoded fragment in the segment store -- is sent straight from memory
+  with no copy and no pool hop (`HttpBodySource::resident()`). Any other
+  body is read a chunk at a time on the data lane into a per-connection
+  staging window of `staging_chunks` (2) × `stream_chunk_bytes` (256 KB)
+  that the reactor drains as the client's TCP window allows. A viewer that
+  stops reading costs two chunks and an fd; a client that closes mid-body is
+  noticed on the next pass and its body source released. The number of
+  simultaneous fragment sends is bounded by bandwidth and memory, not by a
+  worker count: the sixteen-sends-in-progress limit is gone.
+- **A held segment request costs no thread.** The playback handler asks the
+  segment store for the object and, in the same locked step, subscribes to
+  the next publication if it is absent (`MediaSegmentStore::
+  object_or_subscribe`); it then returns an `HttpDeferral` -- a waker, a
+  deadline, and the admitted hold -- and the server parks the connection.
+  The store's publication fires the waker, the reactor re-runs the handler
+  with `HttpRequest::resumed` set, and the hold is released with the answer
+  or with the connection, whichever goes first. `streaming.
+  max_concurrent_holds` rises from 8 to 64: it was rationing threads, and
+  now it is the fairness and memory bound the 2026-09-08 plan said it should
+  become. The admission policy is byte-for-byte what it was.
+- **The rule that makes one thread safe is structural, and checked.** The
+  reactor's connection state cannot name a handler, a body source, a
+  `ReadHandle` or the authenticator; the only pool-filled memory it sees is
+  through a pump. It takes one mutex (the inbox's, for a push or a pop) and
+  logs only at startup and on accept failure. If anything on it ever sleeps,
+  `reactor_stalls` in `GET /api/v1/status/diagnostics` counts it within one
+  pass, with the longest pass in milliseconds beside it. A test proves the
+  counter works by doing the forbidden thing once on purpose.
+- **Diagnostics for the server itself**, under `diagnostics.http`: reactor
+  passes and stalls; open, idle-keep-alive, writing and deferred
+  connections; staged bytes; requests served, deferred, refused for overload
+  and slow; and per lane, workers, busy, queue depth, peak depth and longest
+  queue wait. A handler slower than `slow_request_threshold_ms` (1000) is
+  logged with its route from the pool -- the instrumentation the Status
+  item offered and never built.
+- **`X-Robots-Tag: noindex, nofollow` on every response.** A node can
+  advertise a public endpoint and everything it serves is a private
+  library; the web client's own robots meta tag covers HTML and nothing
+  else. Not a security control -- the session gate is that.
+
+Nine new socket-level cases in `tests/test_http_server.cpp` cover the
+promises: a body read blocked on one connection delays no other; a blocked
+data lane leaves the control lane answering and refuses beyond its queue;
+two clients that stop reading do not delay a third's 4 MB body on either
+the pool or the resident path; two hundred idle kept-alive connections cost
+nothing but descriptors; a client that closes mid-body releases its source
+within a pass; a deferred request is resumed when woken and at its
+deadline; the stall watchdog counts a sleeping pass exactly once; HEAD and
+pipelined requests share one connection. One existing case changed meaning
+rather than being deleted: `test_http_keep_alive_sheds_connection_under_
+backlog` asserted that an idle connection had to be closed to free the
+worker a second connection was waiting for; it is now
+`test_http_idle_keep_alive_connection_costs_no_worker`, and asserts the
+second connection is served while the first keeps its keep-alive.
+
+**Two suite failures that had been called "known flakes" are fixed, with
+their causes written down** (`TODO/2026-09-14-test-suite-must-be-deterministic-plan.md`,
+step 3). `IngestManager::ensure_namespace_parents` now treats `EEXIST` from
+`mkdir` as the directory existing and re-checks it: two concurrent imports
+into a scanner root, series or artist directory that did not exist yet both
+saw ENOENT and both created it, and the loser's job failed with the bare
+message "exists" -- 2 in 6 runs on es-1, and reachable in production by any
+two imports at once. And
+`test_concurrent_reads_during_divergence_produce_one_reconciliation` no
+longer runs two `Service`s, whose maintenance loops reconciled the divergence
+the test had just created before or during its readers (10 in 40 on es-1;
+0 in 40 after); it runs bare runtimes and one `MetadataManager`, which is
+the unit its claim is about. A third case surfaced by the first clean
+full run, `test_edge_node_never_owns_and_its_writes_land_on_owners`, asserted
+that two observers agree on placement before their capacity views had
+converged through gossip (2 in 30 on es-1); it now waits for the inputs it
+depends on. Neither fix retries anything.
+A fourth, `test_three_node_cluster`, hung 1 in 10 and was caught with gdb: a
+real transport deadlock, described next.
+
+**A peer going away could wedge metadata publication for good.** The RPC
+writer loops (outbound `PeerConnection` and accepted `Session`) exit when
+the reader marks a connection broken, and on that exit they left their
+queue behind: only an explicit `close()` failed the queued frames'
+promises, and a peer that simply disappeared never called it. A
+`notify()` queued in that window waited on `future.get()` forever -- and
+`accept_metadata_commit` announces under `MetadataManager`'s mutation
+mutex, so every later metadata mutation on that node queued behind a
+frame to a dead peer. Both writer loops now abandon their queue on every
+exit, releasing each waiter with an error, and `notify()` stops waiting
+the moment the connection is unusable and never waits beyond five
+seconds. Dropped opportunistic cache and promotion writes are logged at
+debug with their reason.
+
+New configuration under `catalogue.api`: `control_workers`,
+`max_connections`, `max_queued_requests`, `staging_chunks`,
+`slow_request_threshold_ms`, `reactor_stall_threshold_ms`; all documented
+in `docs/configuration.md` and `macha.yaml.example`. Not in this release,
+deliberately: `sendfile`, a second reactor, HTTP/2, in-process TLS, and the
+RPC transport, which is also thread-per-connection and could take the same
+design later.
+
 ## 0.42.1 — The health route says what it is (development)
 
 **`GET /api/v1/health` now identifies the server.** The body gains a

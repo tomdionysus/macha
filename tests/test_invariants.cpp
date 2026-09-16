@@ -2812,7 +2812,7 @@ MACHA_TEST("invariants", test_http_slow_client_cannot_pin_worker_indefinitely) {
     config.listen = "127.0.0.1";
     config.port = free_port();
     config.workers = 1;
-    config.max_queued_connections = 4;
+    config.max_connections = 4;
     config.client_io_timeout = 100ms;
 
     HttpServer server(config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
@@ -2853,7 +2853,7 @@ MACHA_TEST("invariants", test_http_keep_alive_reuses_connection_for_sequential_r
     config.listen = "127.0.0.1";
     config.port = free_port();
     config.workers = 2;
-    config.max_queued_connections = 4;
+    config.max_connections = 4;
 
     HttpServer server(config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
     server.start();
@@ -2883,7 +2883,7 @@ MACHA_TEST("invariants", test_http_keep_alive_respects_connection_close_request_
     config.listen = "127.0.0.1";
     config.port = free_port();
     config.workers = 2;
-    config.max_queued_connections = 4;
+    config.max_connections = 4;
 
     HttpServer server(config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
     server.start();
@@ -2911,7 +2911,7 @@ MACHA_TEST("invariants", test_http_keep_alive_idle_timeout_closes_connection) {
     config.listen = "127.0.0.1";
     config.port = free_port();
     config.workers = 2;
-    config.max_queued_connections = 4;
+    config.max_connections = 4;
     config.keep_alive_idle_timeout = 100ms;
 
     HttpServer server(config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
@@ -2942,7 +2942,7 @@ MACHA_TEST("invariants", test_http_keep_alive_max_requests_forces_close) {
     config.listen = "127.0.0.1";
     config.port = free_port();
     config.workers = 2;
-    config.max_queued_connections = 4;
+    config.max_connections = 4;
     config.keep_alive_max_requests = 2;
 
     HttpServer server(config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
@@ -2968,14 +2968,21 @@ MACHA_TEST("invariants", test_http_keep_alive_max_requests_forces_close) {
     server.stop();
 }
 
-MACHA_TEST("invariants", test_http_keep_alive_sheds_connection_under_backlog) {
+MACHA_TEST("invariants", test_http_idle_keep_alive_connection_costs_no_worker) {
+    // Until 0.43.0 this case asserted the opposite: with one worker, a
+    // second connection's request could only be served if the first, idle,
+    // kept-alive connection was shed ("Connection: close" under backlog),
+    // because the idle connection was pinning the worker. An idle
+    // connection is now an fd on the reactor and nothing else, so the
+    // second request is served at once and the first connection keeps its
+    // keep-alive: there is no backlog to shed for.
     CatalogueApiConfig config;
     config.enabled = true;
     config.listen = "127.0.0.1";
     config.port = free_port();
     config.workers = 1;
-    config.max_queued_connections = 4;
-    config.keep_alive_idle_timeout = 5s; // must be pre-empted by backlog, not idle expiry
+    config.max_connections = 4;
+    config.keep_alive_idle_timeout = 5s;
 
     HttpServer server(config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
     server.start();
@@ -2989,21 +2996,18 @@ MACHA_TEST("invariants", test_http_keep_alive_sheds_connection_under_backlog) {
     auto first = raw_http_exchange(first_fd, request);
     CHECK(first.headers["connection"] == "keep-alive");
 
-    // Queue a second connection's request behind the sole, now-idle-eligible
-    // worker. Give the accept thread time to enqueue it before the first
-    // connection's next request is decided.
+    // The first connection sits idle. The second is answered without the
+    // first having to give anything up.
     const int second_fd = connect_idle(config.port);
-    raw_http_send(second_fd, request);
-    std::this_thread::sleep_for(200ms);
+    REQUIRE(setsockopt(second_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+    const auto started = Clock::now();
+    auto second = raw_http_exchange(second_fd, request);
+    CHECK(second.status == 200);
+    CHECK(Clock::now() - started < 1s);
 
     auto second_on_first = raw_http_exchange(first_fd, request);
-    // Backlog must win over the client's own keep-alive preference so the
-    // worker is released for the connection already waiting.
-    CHECK(second_on_first.headers["connection"] == "close");
-
-    REQUIRE(setsockopt(second_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
-    auto queued_response = raw_http_read_response(second_fd);
-    CHECK(queued_response.status == 200);
+    CHECK(second_on_first.status == 200);
+    CHECK(second_on_first.headers["connection"] == "keep-alive");
 
     ::close(first_fd);
     ::close(second_fd);

@@ -375,13 +375,31 @@ void parse_catalogue(const YAML::Node& root, Config& c) {
             c.catalogue.api.max_request_bytes = yaml_size(api["max_request_bytes"]);
         if (api["workers"])
             c.catalogue.api.workers = api["workers"].as<size_t>();
+        if (api["control_workers"])
+            c.catalogue.api.control_workers = api["control_workers"].as<size_t>();
+        // 0.43.0 renamed this: the server no longer queues accepted
+        // connections for a worker, it holds them open. The old key is
+        // still read as the connection cap so an existing config keeps
+        // its meaning.
         if (api["max_queued_connections"])
-            c.catalogue.api.max_queued_connections = api["max_queued_connections"].as<size_t>();
+            c.catalogue.api.max_connections = api["max_queued_connections"].as<size_t>();
+        if (api["max_connections"])
+            c.catalogue.api.max_connections = api["max_connections"].as<size_t>();
+        if (api["max_queued_requests"])
+            c.catalogue.api.max_queued_requests = api["max_queued_requests"].as<size_t>();
         if (api["client_io_timeout_ms"])
             c.catalogue.api.client_io_timeout =
                 milliseconds(api["client_io_timeout_ms"], "catalogue.api.client_io_timeout_ms");
         if (api["stream_chunk_bytes"])
             c.catalogue.api.stream_chunk_bytes = yaml_size(api["stream_chunk_bytes"]);
+        if (api["staging_chunks"])
+            c.catalogue.api.staging_chunks = api["staging_chunks"].as<size_t>();
+        if (api["slow_request_threshold_ms"])
+            c.catalogue.api.slow_request_threshold = milliseconds(
+                api["slow_request_threshold_ms"], "catalogue.api.slow_request_threshold_ms");
+        if (api["reactor_stall_threshold_ms"])
+            c.catalogue.api.reactor_stall_threshold = milliseconds(
+                api["reactor_stall_threshold_ms"], "catalogue.api.reactor_stall_threshold_ms");
         if (api["keep_alive_max_requests"])
             c.catalogue.api.keep_alive_max_requests = api["keep_alive_max_requests"].as<size_t>();
         if (api["keep_alive_idle_timeout_ms"])

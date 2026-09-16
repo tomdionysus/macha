@@ -191,17 +191,79 @@ one of exactly three verdicts, with the evidence:
 with rates on real hardware, and neither needs load to reproduce, so they are
 the cheapest:
 - `rpc_cluster/test_concurrent_reads_during_divergence_produce_one_reconciliation`
-  -- 4-in-10 on both Pis in isolation. Fails at its *setup* assertion,
-  `REQUIRE(accepted_heads().size() == 2)`. Either the node reconciles the two
-  sibling heads before the test looks (a test defect: it is racing the very
-  thing it measures) or a head is being dropped (a product defect). Instrument
-  `accepted_heads()` across the gap; both answers are cheap at that rate.
+  -- **Test defect. Fixed 2026-09-15 (0.43.0).** Measured on es-1 at debug
+  level before the fix: 10 in 40 (8 at the setup `REQUIRE`, 2 at
+  `history_after - history_before == 1`); after: 0 in 40. Both failure modes
+  were one fault. The test ran two `Service`s, and accepting a sibling head
+  announces it (`accept_metadata_commit` -> `announce_metadata_generation`
+  -> `signal_service_event(metadata)` + a `metadata_notice` broadcast), so
+  both Services' maintenance loops started reconciling the divergence the
+  moment the second sibling was accepted. If that background merge finished
+  before the test looked, the setup assertion saw one head; if its history
+  frame had been appended (`store_commit`) but its certificate not yet
+  installed, the setup assertion saw two heads, `history_before` already
+  counted the merge, and the readers found nothing to reconcile -- history
+  delta 0. The merge is deterministic (same parents, same commit), so no
+  head was ever dropped: the product was working as designed and the test
+  was racing it. It now runs bare `NodeRuntime`s and one `MetadataManager`,
+  which is the unit the claim is about, and nothing else can reconcile.
 - `hydration_catalogue/test_ingest_pause_resume_and_cancel_still_work_under_a_worker_pool`
-  -- 8-in-10 on gbni-1, 4-in-10 on es-1, in isolation, and *not* a 0.40.0
-  regression. Every failure logs one job failing `ingest failed id=…: exists`,
-  which looks like two workers racing over a destination path;
-  `ingest.max_concurrent_jobs` and its claimed-set ownership shipped together
-  in 0.37.0. Read that first, not the harness deadline.
+  -- **Product defect. Fixed 2026-09-15 (0.43.0).** Measured on es-1 before
+  the fix: 2 in 6 in isolation; after: 0 in 20. `IngestManager::
+  ensure_namespace_parents` does `getattr`, and on ENOENT `mkdir`. Every
+  import under one scanner root shares that root (`choose_destination` puts
+  a movie at `<movies root>/<title (year)>/<file>`), so with four workers
+  planning into a fresh namespace two of them see ENOENT for `/Movies` and
+  both ask for it; the metadata mutation retries the loser against the
+  winner's commit, `apply_namespace_mutation` answers `EEXIST` with the bare
+  message "exists", and `ensure_namespace_parents` let that fail the job.
+  It now treats EEXIST as the directory existing and re-checks that it is
+  one. The test itself was right; the pool made the race reachable. The
+  same race exists in production for any two concurrent imports into a
+  series or artist directory that does not exist yet.
+- `storage_v18/test_edge_node_never_owns_and_its_writes_land_on_owners` --
+  **Test defect. Fixed 2026-09-15 (0.43.0).** Surfaced by the first full
+  suite run after the two above were fixed (1 in 457), then measured at 2 in
+  30 on es-1. It asserted that two observers agree on every key's owner
+  after waiting only for active-set sizes and the edge node's flags.
+  Single-replica placement (`fallback_score`) is weighted by the capacity
+  each observer holds for a node, a handshake carries the peer's NodeInfo
+  as of connect time, and a node connects before its storage has reported
+  a capacity -- so one observer can hold the other at capacity 0 (weight 1
+  against its own 64 MB) until the first gossip round and claim nearly
+  every key. The test now waits for both observers to hold the same
+  hosting set with the same, non-zero capacities, which is the precondition
+  the agreement actually depends on, and logs both counts when they still
+  disagree so the next such failure says what it saw.
+- `rpc_cluster/test_three_node_cluster` -- **Product defect (transport
+  deadlock). Fixed 2026-09-15 (0.43.0).** Surfaced by the next full run
+  (1 in 457), measured at 2 in 20 on es-1 serial and parallel alike, as a
+  120 s hang. Caught with gdb attached to the hung case: the test thread was
+  in `FileSystem::mkdir` waiting for `MetadataManager::mutation_mutex_`;
+  the maintenance thread held it inside `repair_once` -> `read_group` ->
+  `accept_metadata_commit` -> `announce_metadata_generation` ->
+  `RpcClient::broadcast` -> `PeerConnection::notify`, blocked on
+  `future.get()` for a frame queued to the node the test had just stopped.
+  The writer loop exits when the reader marks the connection broken, and
+  on that exit it left its queue behind: only `close()` drained the queue
+  and failed the promises, and a peer that simply went away never called
+  it. A notify queued in that window waited forever, under the mutation
+  mutex, and the node could never publish metadata again. Both writer
+  loops (outbound `PeerConnection` and accepted `Session`) now abandon
+  their queue -- every waiter released with an error -- on every exit, and
+  `notify()` stops waiting the moment the connection is unusable and never
+  waits more than five seconds. The same hang was reachable in production
+  whenever a peer restarted while a metadata acceptance was being
+  announced to it.
+  The case had a second, unrelated failure mode (2 in 20 on es-1, a
+  `REQUIRE` on the persistent cache filling): a **test defect**. The
+  failover read a few lines earlier queues an opportunistic promotion of
+  the object back into node 2's store; that write is asynchronous, landed
+  after the test's `remove`, and the fetch meant to populate the cache was
+  then served locally. The test now removes and fetches until the fetch has
+  to go remote. `enqueue_fetched` and the local writer also log every
+  dropped opportunistic write at debug now, so the next "cache did not
+  fill" says why.
 
 **4. Then sweep the rest** with the tool from step 1, on gbni-1 (the suite's
 slowest realistic host), and work down by measured rate.

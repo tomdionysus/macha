@@ -1,6 +1,6 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-09-13
+Last updated: 2026-09-15
 
 This is the authoritative, ordered backlog. Detailed plans and UAT records in
 this directory remain evidence; completed work belongs in `COMPLETED.md` and is
@@ -22,19 +22,20 @@ not repeated here. Work top-to-bottom unless new evidence changes the order.
 None of the three is a task list; all three will mislead you if you assume
 otherwise.
 
-**The two things most worth picking up next**, if nothing else has changed:
-
-- **`hydration_catalogue/test_ingest_pause_resume_and_cancel_still_work_under_a_worker_pool`
-  fails 40-80% of the time in isolation on both Pis**, and every failure shows
-  one concurrent import failing `exists` before the case times out. That looks
-  like a real race in concurrent ingest rather than a harness deadline, it is
-  reproducible on hardware that is sitting there, and "passes in isolation" has
-  been the accepted verdict five times without anyone measuring it. It is the
-  cheapest real bug on this list.
-- **`rpc_cluster/test_concurrent_reads_during_divergence_produce_one_reconciliation`
-  fails 40% of the time on both Pis, in isolation**, at a metadata-divergence
-  assertion — either a racing test or a genuinely dropped head, and both
-  answers are worth having.
+**Four suite failures were diagnosed and fixed on 2026-09-15 (0.43.0)**,
+each to a written verdict in the deterministic-suite plan, step 3: the
+ingest case was a product defect (two concurrent imports both creating the
+shared scanner root, the loser's `EEXIST` failing its job); the divergence
+case a test defect (two Services' maintenance loops reconciling the
+divergence the test had just created); the edge-node placement case a test
+defect (observers compared before their capacity views had converged); and
+`test_three_node_cluster` a real transport deadlock, caught with gdb -- a
+writer loop exiting on a broken connection left queued notifications
+unanswered, and a metadata announcement waiting on one held the mutation
+mutex forever -- plus a test race against asynchronous promotion. Rates
+before and after, on es-1, are in the plan. The operator's rule, stated the
+same day: a failing test on a node is P0 work, not a footnote in a deploy
+report.
 
 **OpenAPI is the largest piece of agreed but unstarted work** (P2 documentation
 hygiene): the operator asked for it on 2026-09-07 and upgraded it to "soon" on
@@ -131,7 +132,42 @@ retention question -- the drain test uses unretained objects, so whether a
 draining node's retention claims release without special treatment is still
 unproven; exercise a FUSE publication from a node that then stops hosting.
 
-## P0 — The test suite must be deterministic (next, opened 2026-09-14)
+## P0 — The HTTP server without a thread per connection (opened 2026-09-15, shipped 0.43.0, cluster UAT open)
+
+The API is served by sixteen worker threads, and a worker is spent on every
+kind of waiting the server does: a kept-alive connection idling for up to
+15 s, a held segment request waiting on the encoder, a slow viewer draining
+a multi-megabyte segment over the WAN, a direct-play read fetching from a
+remote replica. Only running a handler is work. When the pool is gone the
+node stops answering health and status, which is a governing-law-3
+violation, and `streaming.max_concurrent_holds` is 8 purely to ration that
+pool. Plan:
+[the HTTP server without a thread per connection](2026-09-15-http-server-reactor-plan.md).
+
+The shape: one reactor thread owns every socket and never waits (a
+`poll()` loop, non-blocking sends, a two-chunk staging window per
+connection, backpressure from the client's TCP window outward); a bounded
+compute pool in two lanes -- control for health/status/session/users, data
+for everything else -- runs the unchanged handler contract and every body
+read; and the two routes that wait on the media pipeline (segment holds,
+profile publication) return a deferred result and are woken by the segment
+store instead of parking a thread. The rule that makes one thread safe --
+the reactor may not call anything that sleeps -- is structural (the
+reactor's connection state cannot name a body source, handler or
+`ReadHandle`), closed by rule for mutexes and logging, and checked at
+runtime by a stall counter in diagnostics.
+
+**Both stages shipped in 0.43.0 (2026-09-15); laptop suite green (457 +
+10).** What is left is the cluster: deploy, then watch
+`diagnostics.http.reactor_stalls` stay at zero over a day of viewing, see
+`connections_idle_keep_alive` with all three client families connected, and
+retire the 10 s Status item below if it never recurs (if it does, health
+must not be slow with it). The "what shipped" section of the plan lists
+where the implementation departed from the text. Not in scope: `sendfile`,
+reactor sharding, HTTP/2, in-process TLS, and the RPC transport, which is
+also thread-per-connection and could use the same design later.
+
+## P0 — The test suite must be deterministic (opened 2026-09-14)
 
 **"Known flake" is not a category. It is the name we have been giving the
 decision not to diagnose a failure.** Plan:
@@ -930,6 +966,11 @@ absorbed here rather than separate active programmes.
   Instrumentation was offered and not built: per-section `elapsed_ms` in the
   diagnostics assembly, plus slow-request logging in the HTTP layer. For an
   intermittent fault that is what converts "saw it once" into an answer.
+  **2026-09-15:** the worker-starvation half of this is what the P0
+  [HTTP server reactor plan](2026-09-15-http-server-reactor-plan.md) removes
+  (idle keep-alive no longer costs a thread; control routes get their own
+  lane), and that plan builds the slow-request log. If it recurs after
+  Stage A ships, the cause is inside the handler and deserves gdb stacks.
 
 - [ ] **`test_storage_data_credit_reserves_viewer_headroom_and_control` hangs
   on aarch64 — pre-existing on HEAD, confirmed not from the 0.36.0 work

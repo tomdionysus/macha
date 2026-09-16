@@ -1513,11 +1513,36 @@ MACHA_TEST("storage_v18", test_edge_node_never_owns_and_its_writes_land_on_owner
     CHECK(edge.node().inbound_capable());
     CHECK(edge.node().local_store().limit() == 0);
     const auto edge_id = edge.node().node_id();
+    // Placement is computed from each observer's own membership view, and
+    // single-replica placement is weighted by the capacity that view holds
+    // for each node. A handshake carries the peer's NodeInfo as it was at
+    // connect time, and a node connects before its storage has reported a
+    // capacity, so until the first gossip round refreshes it an observer can
+    // hold a peer at capacity 0 -- weight 1 against its own 64 MB -- and
+    // claim nearly every key for itself. The agreement asserted below is
+    // therefore only meaningful once both observers hold the same hosting
+    // set with the same capacities; waiting on active-set sizes alone let
+    // this case fail 2 in 30 on es-1 (2026-09-15, owned_by_s1 + owned_by_s2
+    // != 512).
+    const auto hosting_view = [](NodeRuntime& node) {
+        std::vector<std::tuple<std::string, uint64_t, uint8_t>> out;
+        for (const auto& member : node.membership().active())
+            if (node_hosts_extents(member))
+                out.emplace_back(to_string(member.id), member.capacity, member.flags);
+        std::sort(out.begin(), out.end());
+        return out;
+    };
     REQUIRE(wait_until([&] {
+        const auto view1 = hosting_view(s1.node());
+        const auto view2 = hosting_view(s2.node());
         return edge.node().membership().active().size() == 3 &&
                s1.node().membership().active().size() == 3 &&
+               s2.node().membership().active().size() == 3 &&
                !s1.node().membership().hosts_extents(edge_id) &&
-               !s2.node().membership().hosts_extents(edge_id);
+               !s2.node().membership().hosts_extents(edge_id) &&
+               view1.size() == 2 && view1 == view2 &&
+               std::all_of(view1.begin(), view1.end(),
+                           [](const auto& member) { return std::get<1>(member) > 0; });
     }, 10s));
 
     // Never an owner, from any node's point of view, for any key.
@@ -1534,6 +1559,9 @@ MACHA_TEST("storage_v18", test_edge_node_never_owns_and_its_writes_land_on_owner
     CHECK(owned_by_s1 > 0);
     CHECK(owned_by_s2 > 0);
     CHECK(owned_by_s1 + owned_by_s2 == 512);
+    if (owned_by_s1 + owned_by_s2 != 512)
+        Log::warn("edge-node placement views disagree owned_by_s1=" +
+                  std::to_string(owned_by_s1) + " owned_by_s2=" + std::to_string(owned_by_s2));
 
     // A write from the edge node reaches an owner and stays off the edge.
     const auto data = pattern(256 * 1024, 7);

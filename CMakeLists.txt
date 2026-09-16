@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.42.1 LANGUAGES CXX)
+project(macha VERSION 0.43.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -518,6 +518,7 @@ if(MACHA_BUILD_TESTS)
         tests/test_session.cpp
         tests/test_users.cpp
         tests/test_web_api.cpp
+        tests/test_http_server.cpp
         tests/test_invariants.cpp
         tests/test_models.cpp)
     target_link_libraries(macha-tests PRIVATE macha_core)

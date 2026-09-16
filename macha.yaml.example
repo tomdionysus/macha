@@ -437,19 +437,37 @@ catalogue:
     # token_file: /etc/macha-api.token
     max_request_bytes: 8M
 
-    # HTTP workers serve catalogue requests, direct media and HLS fragments.
+    # One reactor thread owns every socket; these are the threads that
+    # compute. `workers` is the data lane (catalogue, playback, web assets,
+    # and every body read that can block on a disk or a replica);
+    # control_workers is the control lane (health, status, session, users),
+    # so a node saturated serving fragments still answers what is wrong.
     workers: 16
-    max_queued_connections: 128
+    control_workers: 2
+    # Open connections. An idle kept-alive connection is a descriptor and a
+    # small struct, not a thread. (max_queued_connections, the pre-0.43.0
+    # name, is still read as this.)
+    max_connections: 1024
+    # Requests waiting for a lane worker before the reactor answers 503.
+    max_queued_requests: 256
     client_io_timeout_ms: 30000
+    # A streaming body is sent in stream_chunk_bytes pieces, at most
+    # staging_chunks of them held ahead of a slow client, so streaming
+    # memory is bounded by connections x staging_chunks x stream_chunk_bytes.
     stream_chunk_bytes: 256K
+    staging_chunks: 2
 
     # HTTP/1.1 keep-alive. A connection is reused for up to
     # keep_alive_max_requests before the server forces "Connection: close";
-    # it is also closed early if it sits idle longer than
-    # keep_alive_idle_timeout_ms waiting for the next request, or if other
-    # connections are queued waiting for a worker.
+    # it is also closed if it sits idle longer than keep_alive_idle_timeout_ms
+    # waiting for the next request.
     keep_alive_max_requests: 100
     keep_alive_idle_timeout_ms: 15000
+    # A handler slower than this is logged with its route; a reactor pass
+    # longer than reactor_stall_threshold_ms is a diagnostics counter that
+    # must stay at zero.
+    slow_request_threshold_ms: 1000
+    reactor_stall_threshold_ms: 50
 
     # Lifetime of a signed artwork capability URL (?exp=...&sig=...) embedded
     # in catalogue responses, letting a client load artwork via a plain

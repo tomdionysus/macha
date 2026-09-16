@@ -135,6 +135,18 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
                 }
                 return std::optional(session_identity(*session));
             });
+        // What answers on the control lane: liveness, cluster status, the
+        // session and account routes. Everything else -- catalogue,
+        // playback, the web client -- is the data lane, so a node that is
+        // saturated serving fragments still says what is wrong with it.
+        catalogue_http_->set_control_prefixes(
+            {"/api/v1/health", "/api/v1/status", "/api/v1/session", "/api/v1/users"});
+        cluster_status_.attach_http_diagnostics(
+            [this]() -> std::optional<HttpServerDiagnostics> {
+                if (!catalogue_http_)
+                    return std::nullopt;
+                return catalogue_http_->diagnostics();
+            });
     }
 }
 

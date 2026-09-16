@@ -447,6 +447,31 @@ catalogue:
 
 Artwork fetched by providers is ordinary DATA. Catalogue manifest/shards are CONTROL.
 
+### API server
+
+```yaml
+catalogue:
+  api:
+    enabled: true
+    listen: 127.0.0.1
+    port: 7438
+    workers: 16
+    control_workers: 2
+    max_connections: 1024
+    max_queued_requests: 256
+    client_io_timeout_ms: 30000
+    stream_chunk_bytes: 256K
+    staging_chunks: 2
+    keep_alive_max_requests: 100
+    keep_alive_idle_timeout_ms: 15000
+    slow_request_threshold_ms: 1000
+    reactor_stall_threshold_ms: 50
+```
+
+The server is one reactor thread that owns every socket, plus two pools of threads that only compute (see `docs/streaming.md`, "Public HTTP behaviour"). `workers` is the data lane: catalogue, playback, web assets, and every body read that can block on a disk or a replica. `control_workers` is the control lane: health, status, session and account routes, so they are answered while the data lane is saturated. `max_connections` bounds open connections; an idle kept-alive connection is a descriptor and a small struct, not a thread. `max_queued_requests` bounds how many requests may wait for a lane worker before the reactor answers `503 overloaded` with `Retry-After: 1`. `staging_chunks` is how many `stream_chunk_bytes` chunks a streaming response may hold ahead of a slow client, so streaming memory is at most connections × `staging_chunks` × `stream_chunk_bytes`. A handler slower than `slow_request_threshold_ms` is logged with its route; a reactor pass longer than `reactor_stall_threshold_ms` is counted in diagnostics as a stall, which should never happen.
+
+`max_queued_connections` (pre-0.43.0) is still read, as `max_connections`.
+
 ## Streaming, ingest and acquisition
 
 Streaming, ingest and BitTorrent configuration remain independent of the storage authority model. The complete set of fields is shown in [`../macha.yaml.example`](../macha.yaml.example).

@@ -2776,6 +2776,23 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
 }
 
 MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_reconciliation) {
+    // What this measures: several foreground readers on ONE node all observe
+    // the same two-head divergence, and reconciliation_mutex_ makes exactly
+    // one of them mint the merge commit. That is a property of one
+    // MetadataManager, so that is all this runs: bare NodeRuntimes and one
+    // manager, no Service.
+    //
+    // Until 0.43.0 this ran two Services and failed 1 in 4 on the Pis, in
+    // two ways that were the same fault. Accepting a sibling head announces
+    // it (NodeRuntime::accept_metadata_commit -> announce_metadata_generation),
+    // and both Services' maintenance loops react to that notice by
+    // reconciling -- which is the product working as designed. Depending on
+    // how far that background merge had got when the test looked, either
+    // the setup assertion saw one head instead of two, or the merge frame
+    // had already been appended before history_before was read and the
+    // readers found nothing left to reconcile (history 0, not 1). Neither
+    // is what this case is about, and the earlier metadata_cache = 0 fix
+    // below closed only the cache half of the same race.
     TestCluster cluster;
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
@@ -2788,40 +2805,41 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
     c1.replication = c2.replication = 2;
     c1.min_write_replicas = c2.min_write_replicas = 1;
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
-    c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = false;
-    c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
-    c1.ingest.enabled = c2.ingest.enabled = false;
-    c1.torrent.enabled = c2.torrent.enabled = false;
     // read_record() serves from the process cache first, and read_group()'s
-    // single-head path caches whichever head it saw. A maintenance pass landing
-    // between the two make_sibling() calls below therefore cached one sibling,
-    // and every reader inside the 250 ms TTL returned it unmerged -- so this
-    // test measured a race against the maintenance loop, not reconciliation
-    // (2026-09-10: history 4->4, both heads standing, all eight readers on the
-    // same sibling, maintenance merging after the assertions). No TTL: every
-    // reader must actually read.
+    // single-head path caches whichever head it saw. No TTL: every reader
+    // must actually read.
     c1.metadata_cache = std::chrono::milliseconds(0);
 
-    Service s1(c1, keys);
-    Service s2(c2, keys);
-    s1.start();
-    s2.start();
-    (void)s1.filesystem();
-    (void)s2.filesystem();
+    NodeRuntime n1(c1, keys);
+    NodeRuntime n2(c2, keys);
+    n1.start();
+    n2.start();
+    REQUIRE(n1.wait_local_state_ready(10s));
+    REQUIRE(n2.wait_local_state_ready(10s));
     REQUIRE(wait_until(
         [&] {
-            return s1.node().membership().active().size() >= 2 &&
-                   s2.node().membership().active().size() >= 2 &&
-                   s1.node().metadata_replica().committed_generation() > 1 &&
-                   s1.node().metadata_replica().committed().hash ==
-                       s2.node().metadata_replica().committed().hash;
+            return n1.membership().active().size() >= 2 &&
+                   n2.membership().active().size() >= 2;
         },
         10s));
+
+    MetadataManager metadata1(n1);
+    // One committed mutation, so the base the siblings fork from is a real
+    // post-genesis record rather than the protocol genesis.
+    metadata1.mutate([](MetadataSnapshot& snapshot) {
+        FsEntry entry;
+        entry.type = EntryType::directory;
+        entry.mode = 0755;
+        entry.uid = getuid();
+        entry.gid = getgid();
+        snapshot.entries["/base-concurrent"] = entry;
+    });
+    REQUIRE(n1.metadata_replica().committed_generation() > 1);
 
     // Create a genuine two-head divergence on node 1 alone, bypassing RPC, via
     // the same locally-authored-sibling pattern as
     // test_service_same_generation_sibling_notice_triggers_reconciliation.
-    const auto base = s1.node().metadata_replica().committed();
+    const auto base = n1.metadata_replica().committed();
     auto make_sibling = [&](NodeRuntime& node, const std::string& path) {
         auto snapshot = decode_snapshot(base.payload);
         FsEntry entry;
@@ -2847,13 +2865,13 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
         return sibling;
     };
 
-    const auto left = make_sibling(s1.node(), "/left-concurrent");
-    const auto right = make_sibling(s1.node(), "/right-concurrent");
+    const auto left = make_sibling(n1, "/left-concurrent");
+    const auto right = make_sibling(n1, "/right-concurrent");
     REQUIRE(right.generation == left.generation);
     REQUIRE(right.hash != left.hash);
-    REQUIRE(s1.node().metadata_replica().accepted_heads().size() == 2);
+    REQUIRE(n1.metadata_replica().accepted_heads().size() == 2);
 
-    const auto history_before = s1.node().metadata_replica().diagnostics().history_records;
+    const auto history_before = n1.metadata_replica().diagnostics().history_records;
 
     // Several concurrent foreground reads all observe the same divergence.
     // Before the reconciliation_mutex_ fix, each could independently merge
@@ -2863,18 +2881,18 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
     std::vector<MetadataRecord> results(reader_count);
     readers.reserve(reader_count);
     for (int i = 0; i < reader_count; ++i)
-        readers.emplace_back([&, i] { results[i] = s1.metadata_manager().read_record(); });
+        readers.emplace_back([&, i] { results[i] = metadata1.read_record(); });
     for (auto& reader : readers)
         reader.join();
 
-    const auto history_after = s1.node().metadata_replica().diagnostics().history_records;
+    const auto history_after = n1.metadata_replica().diagnostics().history_records;
     CHECK(history_after - history_before == 1);
-    CHECK(s1.node().metadata_replica().accepted_heads().size() == 1);
+    CHECK(n1.metadata_replica().accepted_heads().size() == 1);
     for (const auto& record : results)
         CHECK(record.hash == results.front().hash);
 
-    s2.stop();
-    s1.stop();
+    n2.stop();
+    n1.stop();
 }
 
 MACHA_TEST("rpc_cluster", test_service_startup_stall_terminates_within_configured_timeout) {
@@ -4194,12 +4212,24 @@ MACHA_HEAVY_TEST("rpc_cluster", test_three_node_cluster) {
         cache_config.cache.path = cluster.path() / "n2-cache";
         cache_config.cache.max_blocks = 8;
         s2.node().reconfigure_local(cache_config);
-        s2.node().local_store().remove(damaged);
         DistributedStore playback_store(s2.node());
-        auto playback_fetch = playback_store.get(damaged, 0, true);
+        // The failover read above queued an opportunistic promotion of this
+        // object back into node 2's store, and that write is asynchronous:
+        // it can land after the remove below, in which case the fetch is
+        // served from the local store and nothing reaches the cache (2 in
+        // 20 on es-1, 2026-09-15). Remove and fetch until the fetch has to
+        // go remote; the cache write it queues is asynchronous too, so the
+        // condition is "cached", not "fetched".
+        std::optional<Bytes> playback_fetch;
+        REQUIRE(wait_until(
+            [&] {
+                s2.node().local_store().remove(damaged);
+                playback_fetch = playback_store.get(damaged, 0, true);
+                return playback_fetch.has_value() && s2.node().block_cache().has(damaged);
+            },
+            10s, 100ms));
         REQUIRE(playback_fetch.has_value());
         CHECK(object_id(*playback_fetch) == damaged);
-        REQUIRE(wait_until([&] { return s2.node().block_cache().has(damaged); }));
         REQUIRE(wait_until([&] { return s2.node().local_store().has(damaged); }));
         // Prove the cache is genuinely independent: discard the DHT copy again;
         // subsequent reads can still use the persistent cache.

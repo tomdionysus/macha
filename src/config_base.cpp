@@ -225,8 +225,14 @@ void validate(Config& config) {
         throw std::runtime_error("catalogue.api.max_request_bytes must be >= 1K");
     if (!config.catalogue.api.workers || config.catalogue.api.workers > 256)
         throw std::runtime_error("catalogue.api.workers must be 1..256");
-    if (!config.catalogue.api.max_queued_connections || config.catalogue.api.max_queued_connections > 4096)
-        throw std::runtime_error("catalogue.api.max_queued_connections must be 1..4096");
+    if (!config.catalogue.api.control_workers || config.catalogue.api.control_workers > 64)
+        throw std::runtime_error("catalogue.api.control_workers must be 1..64");
+    if (!config.catalogue.api.max_connections || config.catalogue.api.max_connections > 65536)
+        throw std::runtime_error("catalogue.api.max_connections must be 1..65536");
+    if (!config.catalogue.api.max_queued_requests || config.catalogue.api.max_queued_requests > 65536)
+        throw std::runtime_error("catalogue.api.max_queued_requests must be 1..65536");
+    if (!config.catalogue.api.staging_chunks || config.catalogue.api.staging_chunks > 64)
+        throw std::runtime_error("catalogue.api.staging_chunks must be 1..64");
     if (config.catalogue.api.client_io_timeout < std::chrono::seconds(1) ||
         config.catalogue.api.client_io_timeout > std::chrono::minutes(5))
         throw std::runtime_error("catalogue.api.client_io_timeout_ms must be 1000..300000");

@@ -457,11 +457,16 @@ MACHA_TEST("media_playback", test_a_refused_segment_request_answers_at_once_and_
     const auto url = created_json.find("stream")->find("url")->asString();
     const auto base = url.substr(0, url.rfind('/'));
 
+    // A held request no longer blocks the handler: it answers with a
+    // deferral and is re-run when the store publishes or the deadline
+    // passes. http_resolve drives that the way HttpServer does, on this
+    // thread, so the case reads as it did when the handler blocked.
     auto get = [&](const std::string& object) {
         HttpRequest request;
         request.method = "GET";
         request.path = base + "/" + object;
-        return playback.handle(request);
+        return http_resolve([&](const HttpRequest& r) { return playback.handle(r); },
+                            std::move(request));
     };
 
     auto store = engine_ptr->store();
@@ -651,7 +656,7 @@ MACHA_TEST("media_playback", test_http_server_serves_streams_concurrently) {
     config.listen = "127.0.0.1";
     config.port = 0;
     config.workers = 2;
-    config.max_queued_connections = 8;
+    config.max_connections = 8;
     config.stream_chunk_bytes = 16 * 1024;
     std::atomic_bool entered{};
     TestGate slow_body_gate;
@@ -889,7 +894,8 @@ MACHA_TEST("media_playback", test_a_deeply_prefetching_client_cannot_occupy_the_
         HttpRequest request;
         request.method = "GET";
         request.path = base + "/" + object;
-        return playback.handle(request);
+        return http_resolve([&](const HttpRequest& r) { return playback.handle(r); },
+                            std::move(request));
     };
 
     // The playlist itself no longer waits for anything: complete, closed, and
@@ -924,9 +930,9 @@ MACHA_TEST("media_playback", test_a_deeply_prefetching_client_cannot_occupy_the_
     CHECK(refused_elapsed < 200ms);
 
     // And the node is still answering control traffic while both holds are
-    // outstanding. This is the governing-law-3 gate: the reason the budget
-    // exists at all is that a held request costs a worker from a pool shared
-    // with Status and every other route.
+    // outstanding. This is the governing-law-3 gate. A hold no longer costs a
+    // worker (0.43.0: it is a parked continuation), so the budget is now a
+    // fairness bound; control traffic staying prompt is still the point.
     HttpRequest status_request;
     status_request.method = "GET";
     status_request.path = "/api/v1/playback/status";

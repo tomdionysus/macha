@@ -194,6 +194,19 @@ class MediaSegmentStore {
     // have to know which kind of object it is asking for. Any other name is
     // an immediate lookup.
     std::optional<Bytes> wait_object(std::string_view name, std::chrono::milliseconds timeout) const;
+    // The non-blocking form of wait_object, for a caller that will not park
+    // a thread on the answer. Either the object, if it is present now; or
+    // `ended`, when nothing will ever make it present (cancelled,
+    // superseded, failed, finished without it, or never planned); or
+    // neither, in which case `wake` has been registered under the store's
+    // own lock -- so a publication cannot slip between the check and the
+    // subscription -- and fires once on the next publication or ending.
+    // A spurious wake (another object was published) is ordinary: ask again.
+    struct Awaited {
+        std::optional<Bytes> object;
+        bool ended{};
+    };
+    Awaited object_or_subscribe(std::string_view name, std::function<void()> wake) const;
     void note_requested(uint64_t index);
     Snapshot snapshot() const;
     void cancel();

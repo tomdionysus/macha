@@ -1448,7 +1448,25 @@ void IngestManager::ensure_namespace_parents(std::string_view path) {
         } catch (const FsError& e) {
             if (e.code() != ENOENT) throw;
             const auto& policy = node_.config().filesystem;
-            fs_.mkdir(current, 0755, policy.root_uid, policy.root_gid);
+            try {
+                fs_.mkdir(current, 0755, policy.root_uid, policy.root_gid);
+            } catch (const FsError& created) {
+                // Another job got there first. Every import under one
+                // scanner root shares that root, and a series or artist
+                // directory is shared by every file in it, so two workers
+                // planning into a fresh namespace both see ENOENT above and
+                // both ask for the directory; the metadata mutation retries
+                // the loser against the winner's commit and answers EEXIST.
+                // That is the directory existing, which is what was wanted.
+                // Until 0.43.0 this failed the losing job outright with the
+                // bare message "exists" (1 in 3 concurrent-import runs on
+                // es-1, 2026-09-15).
+                if (created.code() != EEXIST) throw;
+                const auto existing = fs_.getattr(current);
+                if (existing.type != EntryType::directory)
+                    throw std::runtime_error("ingest destination parent is not a directory: " +
+                                             current);
+            }
         }
     }
 }

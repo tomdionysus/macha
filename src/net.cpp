@@ -325,6 +325,27 @@ std::exception_ptr rpc_error(const std::string& text) {
     return std::make_exception_ptr(std::runtime_error(text));
 }
 
+// A notification is advisory: membership gossip carries the same generation,
+// and every caller sits inside something that must not wait on a peer for
+// long (metadata acceptance holds the mutation mutex while it announces).
+// Wait for the writer to send it, but stop waiting the moment the connection
+// is no longer usable, and never beyond a hard bound. The writer abandons the
+// queue on exit, so normally this returns on the promise; the bound is for
+// the case nobody has thought of yet.
+template <class Usable>
+void wait_for_notify(std::future<void>& future, Usable&& usable) {
+    constexpr auto bound = std::chrono::seconds(5);
+    const auto deadline = Clock::now() + bound;
+    while (future.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
+        if (!usable() || Clock::now() >= deadline)
+            return;
+    }
+    try {
+        future.get();
+    } catch (...) {
+    }
+}
+
 int64_t steady_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch())
         .count();
@@ -1402,6 +1423,28 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             });
     }
 
+    // Caller holds outbound_mutex_. Every queued frame that somebody is
+    // waiting on is released with an error rather than left on a promise no
+    // thread will ever set. Until 0.43.0 only close() did this; a connection
+    // whose reader noticed the peer had gone (broken_ set, writer exiting)
+    // left its queue behind, and a notify() queued in that window waited on
+    // future.get() forever -- under MetadataManager's mutation mutex, so the
+    // node could never publish again (es-1, 2026-09-15, caught with gdb).
+    void abandon_outbound_locked(const char* reason) {
+        for (auto& item : outbound_) {
+            if (!item.sent)
+                continue;
+            try {
+                item.sent->set_exception(rpc_error(reason));
+            } catch (...) {
+            }
+        }
+        outbound_.clear();
+        outbound_bytes_ = 0;
+        outbound_classes_.clear();
+        cancelled_outgoing_.clear();
+    }
+
     void writer_loop(std::stop_token stop) {
         set_thread_name("macha-peer-wr");
         try {
@@ -1416,8 +1459,10 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                     });
                     if ((stop.stop_requested() || broken_.load()) && outbound_.empty())
                         return;
-                    if (broken_.load())
+                    if (broken_.load()) {
+                        abandon_outbound_locked("peer channel closed");
                         return;
+                    }
                     auto best = best_outbound_locked();
                     item = std::move(*best);
                     outbound_bytes_ -= item.message.payload.size();
@@ -1506,18 +1551,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             fail_all(error.what());
             {
                 DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
-                for (auto& item : outbound_) {
-                    if (!item.sent)
-                        continue;
-                    try {
-                        item.sent->set_exception(rpc_error(error.what()));
-                    } catch (...) {
-                    }
-                }
-                outbound_.clear();
-                outbound_bytes_ = 0;
-                outbound_classes_.clear();
-                cancelled_outgoing_.clear();
+                abandon_outbound_locked(error.what());
             }
             outbound_cv_.notify_all();
         }
@@ -1720,8 +1754,9 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             return;
         auto sent = std::make_shared<std::promise<void>>();
         auto future = sent->get_future();
-        if (queue_message(0, FrameType::control, message, false, sent))
-            future.get();
+        if (!queue_message(0, FrameType::control, message, false, sent))
+            return;
+        wait_for_notify(future, [this] { return usable(); });
     }
 
     bool try_notify(const RpcMessage& message, FrameType frame_type) {
@@ -3265,8 +3300,10 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                     });
                     if ((stop.stop_requested() || done.load()) && outbound.empty())
                         return;
-                    if (done.load())
+                    if (done.load()) {
+                        abandon_outbound_locked("accepted peer session closed");
                         return;
+                    }
                     auto best = best_outbound_locked();
                     item = std::move(*best);
                     outbound_bytes -= item.message.payload.size();
@@ -3360,18 +3397,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                 channel->shutdown();
             {
                 DiagnosticLock lock(outbound_mutex, "rpc.session.outbound");
-                for (auto& item : outbound) {
-                    if (!item.sent)
-                        continue;
-                    try {
-                        item.sent->set_exception(rpc_error(error.what()));
-                    } catch (...) {
-                    }
-                }
-                outbound.clear();
-                outbound_bytes = 0;
-                outbound_classes.clear();
-                cancelled_outgoing.clear();
+                abandon_outbound_locked(error.what());
             }
             outbound_cv.notify_all();
         }
@@ -3383,13 +3409,30 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
         });
     }
 
+    // Caller holds outbound_mutex. See PeerConnection::abandon_outbound_locked.
+    void abandon_outbound_locked(const char* reason) {
+        for (auto& item : outbound) {
+            if (!item.sent)
+                continue;
+            try {
+                item.sent->set_exception(rpc_error(reason));
+            } catch (...) {
+            }
+        }
+        outbound.clear();
+        outbound_bytes = 0;
+        outbound_classes.clear();
+        cancelled_outgoing.clear();
+    }
+
     void notify(const RpcMessage& message) {
         if (!usable())
             return;
         auto sent = std::make_shared<std::promise<void>>();
         auto future = sent->get_future();
-        if (queue_message(0, FrameType::control, message, false, sent))
-            future.get();
+        if (!queue_message(0, FrameType::control, message, false, sent))
+            return;
+        wait_for_notify(future, [this] { return usable(); });
     }
 
     bool try_notify(const RpcMessage& message, FrameType frame_type) {

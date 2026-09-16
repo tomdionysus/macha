@@ -298,5 +298,8 @@ default.
   deliverable parts, which is a feature rather than a refactor. The seam is
   fine — `HttpBodySource` already exists — but do not plan on partial delivery
   of a single fMP4 fragment.
-- **Async `HttpServer`.** See the note above; wanted, not now.
+- **Async `HttpServer`.** See the note above; wanted, not now. **2026-09-15:**
+  now planned as
+  [the HTTP server without a thread per connection](2026-09-15-http-server-reactor-plan.md);
+  Stage B of that plan is the continuation this note asked for.
 - **The growing EVENT playlist**, wanted eventually, per the operator.

@@ -183,6 +183,9 @@ class MemoryBody final : public HttpBodySource {
         std::copy_n(bytes_->data() + base_ + offset, wanted, destination.data());
         return wanted;
     }
+    // Already in memory for as long as this body lives: the server sends
+    // straight from it.
+    const uint8_t* resident() const noexcept override { return bytes_->data() + base_; }
 };
 
 HttpResponse ranged_response(const HttpRequest& request, uint64_t size, std::string mime,
@@ -629,9 +632,16 @@ struct PlaybackManager::Impl {
     FileSystem& fs;
     CatalogueManager& catalogue;
     StreamingConfig config;
-    // Node-global. The budget it enforces is a property of this process's
-    // worker pool, not of any one session.
+    // Node-global: a fairness and memory bound across every session, not a
+    // property of any one of them.
     SegmentHoldArbiter segment_holds{config.max_session_holds, config.max_concurrent_holds};
+    // What a held segment request parks across its deferral: the admitted
+    // hold, released when the request is finally answered or its connection
+    // goes away, whichever comes first.
+    struct HeldRequest {
+        SegmentHoldArbiter::Hold hold;
+        explicit HeldRequest(SegmentHoldArbiter::Hold admitted) : hold(std::move(admitted)) {}
+    };
     std::shared_ptr<MediaEngine> engine;
     std::jthread cleanup_thread;
     std::jthread profile_publish_thread;
@@ -1970,31 +1980,59 @@ struct PlaybackManager::Impl {
             // it is a genuine miss rather than something to wait for.
             if (index && state.planned_segments && *index >= state.planned_segments)
                 return http_error(404, "not_found", "stream object not found");
-            // Window. Beyond it nothing is working toward this fragment, so
-            // holding a worker for it would be waiting on work that has not
-            // been authorised to start.
-            if (index && *index >= state.segment_count + config.segment_hold_window)
-                return segment_not_ready(session->id, *index, "beyond_hold_window");
-            auto why = SegmentHoldArbiter::Refusal::budget_exhausted;
-            auto hold = segment_holds.try_acquire(session->id, &why);
-            if (!hold)
-                return segment_not_ready(session->id, index.value_or(0),
-                                         why == SegmentHoldArbiter::Refusal::session_limit
-                                             ? "session_hold_limit"
-                                             : "hold_budget_exhausted");
-            // Only now, admitted: noting an index we had declined to serve
-            // would drag the producer's authorised window forward on behalf of
-            // a request we refused.
-            if (index) active->note_segment_requested(*index);
-            object = store->wait_object(name, config.segment_timeout);
-            hold.reset();
-            state = store->snapshot();
-            if (object) {
+            // A request the server parked earlier, woken because something
+            // was published or because its time ran out. It still owns the
+            // hold it was admitted with; nothing is re-admitted.
+            auto held = request.resumed
+                            ? std::static_pointer_cast<HeldRequest>(request.resumed_state)
+                            : std::shared_ptr<HeldRequest>{};
+            if (!held) {
+                // Window. Beyond it nothing is working toward this fragment,
+                // so waiting for it would be waiting on work that has not
+                // been authorised to start.
+                if (index && *index >= state.segment_count + config.segment_hold_window)
+                    return segment_not_ready(session->id, *index, "beyond_hold_window");
+                auto why = SegmentHoldArbiter::Refusal::budget_exhausted;
+                auto hold = segment_holds.try_acquire(session->id, &why);
+                if (!hold)
+                    return segment_not_ready(session->id, index.value_or(0),
+                                             why == SegmentHoldArbiter::Refusal::session_limit
+                                                 ? "session_hold_limit"
+                                                 : "hold_budget_exhausted");
+                held = std::make_shared<HeldRequest>(std::move(*hold));
+                // Only now, admitted: noting an index we had declined to
+                // serve would drag the producer's authorised window forward
+                // on behalf of a request we refused.
+                if (index) active->note_segment_requested(*index);
+            }
+            // The wait itself costs no thread. The request asks the store
+            // for the object and, in the same locked step, subscribes to
+            // the next publication if it is not there; then it hands the
+            // server a deferral and returns. The server re-runs it when the
+            // store fires or the deadline passes. The hold rides along in
+            // the deferral's state and is released with it.
+            const auto deadline =
+                request.resumed ? request.resume_deadline
+                : config.segment_timeout.count() > 0
+                    ? Clock::now() + config.segment_timeout
+                    : Clock::time_point::max();
+            auto waker = std::make_shared<HttpWaker>();
+            auto awaited = store->object_or_subscribe(name, [waker] { waker->fire(); });
+            if (awaited.object) {
+                object = std::move(awaited.object);
+                held.reset();
+                state = store->snapshot();
                 Log::debug("playback stream segment session=" + session->id +
                            " generation=" + std::to_string(session->generation) +
                            " index=" + std::to_string(index.value_or(0)) +
                            " bytes=" + std::to_string(object->size()) +
                            " segments_ready=" + std::to_string(state.segment_count));
+            } else if (!awaited.ended && Clock::now() < deadline) {
+                HttpResponse deferred;
+                deferred.defer = HttpDeferral{std::move(waker), deadline, std::move(held)};
+                return deferred;
+            } else {
+                held.reset();
             }
         }
         if (!object) {
