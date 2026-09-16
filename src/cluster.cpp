@@ -2003,16 +2003,26 @@ void NodeRuntime::enqueue_fetched(const ObjectId& id, std::span<const uint8_t> d
 
     auto memory = retained_memory_.try_acquire(MemoryClass::speculative,
                                                MemoryOwner::object_payload, data.size());
-    if (!memory)
+    if (!memory) {
+        // Dropping is the design (see below), but a dropped opportunity has
+        // to be visible: a cache that "did not fill" with nothing in the log
+        // is indistinguishable from a cache that is broken.
+        Log::debug("opportunistic persistence skipped object=" + to_string(id) +
+                   " reason=retained_memory bytes=" + std::to_string(data.size()) +
+                   " cache=" + (cache ? "1" : "0") + " promote=" + (promote ? "1" : "0"));
         return;
+    }
 
     // Do not let opportunistic persistence become back-pressure on playback.
     // If the bounded memory queue is full we simply drop this opportunity; the
     // normal repair loop will converge authoritative replicas later.
     constexpr size_t max_queued_bytes = 256ULL * 1024 * 1024;
     std::lock_guard lock(local_copy_mutex_);
-    if (data.size() > max_queued_bytes || local_copy_bytes_ + data.size() > max_queued_bytes)
+    if (data.size() > max_queued_bytes || local_copy_bytes_ + data.size() > max_queued_bytes) {
+        Log::debug("opportunistic persistence skipped object=" + to_string(id) +
+                   " reason=queue_full queued_bytes=" + std::to_string(local_copy_bytes_));
         return;
+    }
     LocalCopyJob job;
     job.id = id;
     job.data.assign(data.begin(), data.end());
@@ -2043,11 +2053,17 @@ void NodeRuntime::local_writer_loop(std::stop_token stop) {
         if (!resource) {
             if (stop.stop_requested())
                 return;
+            Log::debug("opportunistic persistence skipped object=" + to_string(job.id) +
+                       " reason=data_credit");
             continue;
         }
         bool cached = false;
-        if (job.cache && ready(ready_cache) && cache_)
+        if (job.cache && ready(ready_cache) && cache_) {
             cached = cache_->put(job.id, job.data);
+            if (!cached)
+                Log::debug("opportunistic persistence skipped object=" + to_string(job.id) +
+                           " reason=cache_put_failed");
+        }
         // With a persistent cache, foreground fetches are made durable on the
         // cache device first and authoritative HDD promotion is left to idle
         // maintenance. If the cache write fails (or cache is disabled), retain

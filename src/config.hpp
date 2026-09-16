@@ -302,12 +302,37 @@ struct CatalogueApiConfig {
     std::string advertised_endpoint;
     std::optional<std::filesystem::path> token_file;
     size_t max_request_bytes{8 * 1024 * 1024};
+    // The server is one reactor thread that owns every socket and never
+    // waits, plus two bounded pools that only compute (see
+    // TODO/2026-09-15-http-server-reactor-plan.md). `workers` is the data
+    // lane -- catalogue, playback, web assets, and every body read that can
+    // block on a disk or a replica. `control_workers` is the control lane
+    // -- health, status, session, users -- so control traffic never queues
+    // behind playback (governing law 3, as a data structure).
     size_t workers{16};
-    size_t max_queued_connections{128};
+    size_t control_workers{2};
+    // Open connections, not queued ones: an idle kept-alive connection is an
+    // fd and a small struct, not a thread, so this is what bounds memory.
+    size_t max_connections{1024};
+    // Requests waiting for a lane worker before the reactor answers 503
+    // rather than letting the queue grow without bound.
+    size_t max_queued_requests{256};
+    // Deadlines the reactor checks, not socket options a thread waits under.
     std::chrono::milliseconds client_io_timeout{30000};
     size_t stream_chunk_bytes{256 * 1024};
+    // Chunks a streaming response may hold in memory ahead of the client.
+    // Memory for streaming is therefore connections x staging_chunks x
+    // stream_chunk_bytes, worst case; backpressure from the client's TCP
+    // window stops the pump asking for more.
+    size_t staging_chunks{2};
     size_t keep_alive_max_requests{100};
     std::chrono::milliseconds keep_alive_idle_timeout{15000};
+    // A handler slower than this is logged, from the pool, with its route.
+    std::chrono::milliseconds slow_request_threshold{1000};
+    // A reactor pass longer than this is counted as a stall in diagnostics.
+    // The reactor may not call anything that sleeps; if that rule is ever
+    // broken this is where it shows, on the first slow disk.
+    std::chrono::milliseconds reactor_stall_threshold{50};
     // Lifetime of a signed artwork capability URL embedded in catalogue
     // responses (GET .../artwork/{id}?exp=...&sig=...), which lets a client
     // load artwork via a plain <img src> without a bearer header. Artwork is
@@ -495,14 +520,15 @@ struct StreamingConfig {
     size_t segment_hold_window{8};
     // One in flight plus one prefetch.
     size_t max_session_holds{2};
-    // Deliberately small because it is rationing a 16-thread worker pool, not
-    // because holds are expensive in themselves. Whoever moves HttpServer to
-    // an async runtime should revisit this: the constraint becomes memory and
-    // fairness, and the natural value is much larger. Steady-state playback on
-    // a 4-core node transcoding at roughly real time sits at the frontier
-    // often, so holds are the normal case rather than the exception and this
-    // cap will bind in ordinary use.
-    size_t max_concurrent_holds{8};
+    // A fairness and memory bound, nothing more. Until 0.43.0 this was 8,
+    // because a held request occupied one of sixteen HTTP worker threads
+    // for the whole of its wait; the server now parks a held request as a
+    // continuation that costs an fd and a small struct, so what this bounds
+    // is how many requests may be waiting on encoders at once across every
+    // session -- steady-state playback on a 4-core node transcoding at
+    // roughly real time sits at the frontier often, and holds are the
+    // ordinary case rather than the exception.
+    size_t max_concurrent_holds{64};
     // Under the tightest client deadline, with margin.
     //
     // The rule: a held request sends no bytes, so the hold must be shorter

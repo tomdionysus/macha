@@ -331,7 +331,12 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "    token_file: " << (t.path() / "api.token").string() << "\n"
             << "    max_request_bytes: 2M\n"
             << "    workers: 7\n"
-            << "    max_queued_connections: 33\n"
+            << "    control_workers: 3\n"
+            << "    max_connections: 33\n"
+            << "    max_queued_requests: 44\n"
+            << "    staging_chunks: 3\n"
+            << "    slow_request_threshold_ms: 750\n"
+            << "    reactor_stall_threshold_ms: 25\n"
             << "    client_io_timeout_ms: 45000\n"
             << "    stream_chunk_bytes: 64K\n"
             << "    keep_alive_max_requests: 42\n"
@@ -515,7 +520,12 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(*yc.catalogue.api.token_file == t.path() / "api.token");
     CHECK(yc.catalogue.api.max_request_bytes == 2ULL * 1024 * 1024);
     CHECK(yc.catalogue.api.workers == 7);
-    CHECK(yc.catalogue.api.max_queued_connections == 33);
+    CHECK(yc.catalogue.api.control_workers == 3);
+    CHECK(yc.catalogue.api.max_connections == 33);
+    CHECK(yc.catalogue.api.max_queued_requests == 44);
+    CHECK(yc.catalogue.api.staging_chunks == 3);
+    CHECK(yc.catalogue.api.slow_request_threshold == 750ms);
+    CHECK(yc.catalogue.api.reactor_stall_threshold == 25ms);
     CHECK(yc.catalogue.api.client_io_timeout == 45000ms);
     CHECK(yc.catalogue.api.stream_chunk_bytes == 64ULL * 1024);
     CHECK(yc.catalogue.api.keep_alive_max_requests == 42);

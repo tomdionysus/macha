@@ -14,21 +14,15 @@ namespace macha {
 //
 // A hold is an explicitly admitted resource: acquired before waiting, released
 // after, and never an implicit consequence of a thread happening to block.
-// That distinction carries the whole design. HttpServer runs a fixed worker
-// pool shared by every route -- Status, catalogue, manage and playback alike --
-// so a held request occupies one worker for the whole of its wait. With eight
-// sessions and an eight-fragment window the unbounded worst case is sixty-four
-// held requests against sixteen workers, and one deeply prefetching player can
-// take all sixteen by itself, at which point the node stops answering control
-// traffic entirely. That is a governing-law-3 violation, and rationing it is
-// what this exists for.
-//
-// It is also what makes an async HttpServer an improvement rather than a
-// rewrite. The policy here is unchanged under async; only the waiting
-// primitive differs -- block on a condition variable becomes register a
-// continuation -- and the budget stops protecting threads and becomes a
-// fairness and memory bound. Nothing outside the configured default and this
-// comment should assume that a hold costs a thread.
+// That distinction is what let the wait change underneath it. Until 0.43.0
+// HttpServer ran a fixed worker pool shared by every route, a held request
+// occupied one worker for the whole of its wait, and this budget existed to
+// keep one deeply prefetching player from taking all sixteen and silencing
+// Status. The server now parks a held request as a continuation
+// (HttpDeferral) that costs an fd and a small struct; the policy here is
+// exactly what it was, and the budget is a fairness and memory bound across
+// sessions rather than a thread-protection one. Nothing here assumes a hold
+// costs a thread, and nothing should.
 class SegmentHoldArbiter {
   public:
     // Why a request was refused, so the refusal can say which limit it met

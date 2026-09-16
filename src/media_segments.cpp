@@ -38,6 +38,35 @@ struct MediaSegmentStore::Impl {
     std::filesystem::path spill_directory;
     std::chrono::milliseconds target_duration{4000};
     std::optional<RetainedMemoryLedger::Lease> retained_memory;
+    // Deferred requests waiting for the next publication or ending; each
+    // fires once. Registered under `mutex`, fired after it is released.
+    mutable std::vector<std::function<void()>> wakers;
+
+    // Collects the wakers a state change owes, and fires them when the
+    // caller's lock scope has ended: declared before the lock, destroyed
+    // after it, so no waker runs with the store's mutex held.
+    struct Wakeups {
+        std::vector<std::function<void()>> list;
+        Wakeups() = default;
+        Wakeups(const Wakeups&) = delete;
+        Wakeups& operator=(const Wakeups&) = delete;
+        ~Wakeups() {
+            for (auto& wake : list) {
+                try {
+                    wake();
+                } catch (...) {
+                }
+            }
+        }
+    };
+
+    void notify_locked(Wakeups& wakeups) {
+        cv.notify_all();
+        if (!wakers.empty()) {
+            for (auto& wake : wakers) wakeups.list.push_back(std::move(wake));
+            wakers.clear();
+        }
+    }
 
     void maybe_spill_locked() {
         if (!memory_limit || memory_bytes <= memory_limit || spill_directory.empty()) return;
@@ -70,21 +99,23 @@ struct MediaSegmentStore::Impl {
     }
 
     bool publish_init(Bytes bytes) {
+        Wakeups wakeups;
         std::lock_guard lock(mutex);
         if (cancelled) return false;
         init = std::make_shared<Bytes>(std::move(bytes));
         memory_bytes += init->size();
-        cv.notify_all();
+        notify_locked(wakeups);
         return true;
     }
 
     bool publish_segment(Bytes bytes, double duration) {
+        Wakeups wakeups;
         std::unique_lock lock(mutex);
         const auto index = static_cast<uint64_t>(segments.size());
         if (!vod_segment_durations.empty() && index >= vod_segment_durations.size()) {
             if (error.empty()) error = "media pipeline produced more fragments than the VOD plan";
             finished = true;
-            cv.notify_all();
+            notify_locked(wakeups);
             return false;
         }
         cv.wait(lock, [&] {
@@ -98,11 +129,12 @@ struct MediaSegmentStore::Impl {
         memory_bytes += segment.memory->size();
         segments.push_back(std::move(segment));
         maybe_spill_locked();
-        cv.notify_all();
+        notify_locked(wakeups);
         return true;
     }
 
     void mark_finished() {
+        Wakeups wakeups;
         std::lock_guard lock(mutex);
         // Fragment count is not the invariant. A planned boundary can pass
         // without producing a fragment -- the first flush of a fragmented MP4
@@ -131,14 +163,15 @@ struct MediaSegmentStore::Impl {
                         std::to_string(planned) + "s VOD plan";
         }
         finished = true;
-        cv.notify_all();
+        notify_locked(wakeups);
     }
 
     void mark_failed(std::string message) {
+        Wakeups wakeups;
         std::lock_guard lock(mutex);
         if (error.empty()) error = std::move(message);
         finished = true;
-        cv.notify_all();
+        notify_locked(wakeups);
     }
 };
 
@@ -347,15 +380,61 @@ MediaSegmentStore::Snapshot MediaSegmentStore::snapshot() const {
 }
 
 void MediaSegmentStore::cancel() {
+    Impl::Wakeups wakeups;
     std::lock_guard lock(impl_->mutex);
     impl_->cancelled = true;
-    impl_->cv.notify_all();
+    impl_->notify_locked(wakeups);
 }
 
 void MediaSegmentStore::mark_superseded(bool superseded) {
+    Impl::Wakeups wakeups;
     std::lock_guard lock(impl_->mutex);
     impl_->superseded = superseded;
-    impl_->cv.notify_all();
+    impl_->notify_locked(wakeups);
+}
+
+MediaSegmentStore::Awaited MediaSegmentStore::object_or_subscribe(
+    std::string_view name, std::function<void()> wake) const {
+    const auto parsed = segment_number(name);
+    const bool init_object =
+        !parsed && name == "init.mp4" && impl_->container != MediaContainer::mpegts;
+    // The same shape as wait_object: anything that is not a fragment or a
+    // holdable init is an immediate lookup with nothing to subscribe to.
+    if (!parsed && !init_object) return {object(name), true};
+    const uint64_t index = parsed ? *parsed : 0;
+
+    std::shared_ptr<Bytes> resident;
+    std::filesystem::path spill;
+    {
+        std::lock_guard lock(impl_->mutex);
+        if (!init_object && !impl_->vod_segment_durations.empty() &&
+            index >= impl_->vod_segment_durations.size())
+            return {std::nullopt, true};
+        const bool present =
+            init_object ? static_cast<bool>(impl_->init) : index < impl_->segments.size();
+        if (!present) {
+            const bool ended = impl_->cancelled || impl_->superseded ||
+                               !impl_->error.empty() || impl_->finished;
+            if (!ended && wake) impl_->wakers.push_back(std::move(wake));
+            return {std::nullopt, ended};
+        }
+        if (init_object) return {*impl_->init, false};
+        resident = impl_->segments[static_cast<size_t>(index)].memory;
+        spill = impl_->segments[static_cast<size_t>(index)].spill;
+    }
+    if (resident) return {*resident, false};
+    if (spill.empty()) return {std::nullopt, true};
+    std::ifstream in(spill, std::ios::binary);
+    if (!in) return {std::nullopt, true};
+    in.seekg(0, std::ios::end);
+    auto size = in.tellg();
+    if (size < 0) return {std::nullopt, true};
+    in.seekg(0, std::ios::beg);
+    Bytes bytes(static_cast<size_t>(size));
+    if (!bytes.empty())
+        in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (!in && !bytes.empty()) return {std::nullopt, true};
+    return {std::move(bytes), false};
 }
 
 bool MediaSegmentStore::publish_init(Bytes bytes) {

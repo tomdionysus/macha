@@ -401,6 +401,12 @@ void ClusterStatusService::detach_subsystem_diagnostics() {
     subsystem_diagnostics_ = {};
 }
 
+void ClusterStatusService::attach_http_diagnostics(
+    std::function<std::optional<HttpServerDiagnostics>()> provider) {
+    std::lock_guard lock(operational_diagnostics_mutex_);
+    http_diagnostics_ = std::move(provider);
+}
+
 ClusterStatusService::~ClusterStatusService() {
     stop();
 }
@@ -1025,11 +1031,13 @@ HttpResponse ClusterStatusService::diagnostics_response() {
     std::function<std::optional<FuseFrontendDiagnostics>()> fuse_provider;
     std::function<ConvergenceDemandDiagnostics()> convergence_provider;
     std::function<DistributedStore::RepairDiagnostics()> repair_provider;
+    std::function<std::optional<HttpServerDiagnostics>()> http_provider;
     {
         std::lock_guard lock(operational_diagnostics_mutex_);
         fuse_provider = fuse_diagnostics_;
         convergence_provider = convergence_diagnostics_;
         repair_provider = repair_diagnostics_;
+        http_provider = http_diagnostics_;
     }
 
     Json::Object filesystem_diagnostics;
@@ -1262,6 +1270,49 @@ HttpResponse ClusterStatusService::diagnostics_response() {
         }
     }
     diagnostics["repair"] = std::move(repair_diagnostics);
+
+    // The HTTP server that is answering this very request. `reactor_stalls`
+    // is the runtime half of the rule that the reactor may not call anything
+    // that sleeps: a non-zero count means something did, and the longest
+    // pass says for how long. Idle keep-alive connections are counted so
+    // that "a client family holding connections" is visible rather than
+    // inferred, which is what the 10 s Status question of 2026-09-13 lacked.
+    Json::Object http_diagnostics;
+    http_diagnostics["available"] = false;
+    if (http_provider) {
+        try {
+            if (const auto values = http_provider()) {
+                http_diagnostics["available"] = true;
+                http_diagnostics["reactor_passes"] = values->reactor_passes;
+                http_diagnostics["reactor_stalls"] = values->reactor_stalls;
+                http_diagnostics["reactor_longest_pass_ms"] = values->reactor_longest_pass_ms;
+                http_diagnostics["connections_open"] = values->connections_open;
+                http_diagnostics["connections_idle_keep_alive"] =
+                    values->connections_idle_keep_alive;
+                http_diagnostics["connections_writing"] = values->connections_writing;
+                http_diagnostics["connections_deferred"] = values->connections_deferred;
+                http_diagnostics["connections_refused"] = values->connections_refused;
+                http_diagnostics["staged_bytes"] = values->staged_bytes;
+                http_diagnostics["requests_served"] = values->requests_served;
+                http_diagnostics["requests_deferred"] = values->requests_deferred;
+                http_diagnostics["requests_overloaded"] = values->requests_overloaded;
+                http_diagnostics["slow_requests"] = values->slow_requests;
+                const auto lane_json = [](const HttpServerDiagnostics::Lane& lane) {
+                    return Json::Object{{"workers", lane.workers},
+                                        {"busy", lane.busy},
+                                        {"queued", lane.queued},
+                                        {"peak_queued", lane.peak_queued},
+                                        {"queue_wait_ms_max", lane.queue_wait_ms_max},
+                                        {"handled", lane.handled}};
+                };
+                http_diagnostics["control_lane"] = lane_json(values->control);
+                http_diagnostics["data_lane"] = lane_json(values->data);
+            }
+        } catch (const std::exception& error) {
+            Log::debug("status http diagnostics unavailable: " + std::string(error.what()));
+        }
+    }
+    diagnostics["http"] = std::move(http_diagnostics);
 
     // Auth state is local to each node and converges by gossip, so the only
     // way to see whether it actually has converged is to compare these across
