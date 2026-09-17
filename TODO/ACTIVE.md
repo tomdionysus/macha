@@ -1468,6 +1468,23 @@ cross-session and will not be in the next session's context.
 - **`GET /api/v1/users` answers under `items`**, like every other collection,
   from 0.40.0. Single records from `POST`/`PATCH` stay bare. Core has accepted
   either key since its 0.8.0, so no client needed a release.
+- **`stream.look_ahead_ms` on the playback session payload** (0.45.0) is how far
+  past the fragment it last requested a client may arrive and still find media
+  already produced: `max_ahead_segments` x `segment_duration_ms`, `null` for
+  direct play. Added because neither knob was on the wire or in the
+  configuration reference, so a client could only hardcode 8 and 4000 and
+  under-run against a node configured differently. Clients bound themselves
+  against this rather than against the defaults. It follows `reconfigure()`, so
+  it is read per session rather than cached across a node's lifetime.
+- **A fragment past the look-ahead is refused, not missing.** `500
+  segment_not_ready` with `Retry-After: 1` and `Cache-Control: no-store`, logged
+  as `reason=hold_timed_out`; never a `404`, because the playlist has already
+  promised the object exists and a `404` invites an intermediary to cache the
+  absence. Retrying is correct and succeeds as production advances. Production
+  is sequential, so asking for a distant index does not skip the fragments
+  before it -- where the gap exceeds the look-ahead, a new generation seeked to
+  the arrival point is cheaper than making the current one catch up (measured
+  2026-09-17 on es-1: 1.92 s cold start against ~9 s of catch-up for 28 s).
 - **A signed artwork URL is stable for up to 24 hours and valid for 24-48.**
   From 0.40.0 `exp` is quantized to a bucket of the TTL, rounded up to the
   bucket *after* next: `(now / ttl + 2) * ttl`. The invariant is "always between

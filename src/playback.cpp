@@ -1686,8 +1686,27 @@ struct PlaybackManager::Impl {
                             {"size", session.source.size},
                             {"bitrate", session.probe.bitrate},
                             {"streams", Json(std::move(streams))}};
+        // How far past the fragment it last asked for a client may arrive and
+        // still find media already produced: the producer runs to
+        // highest_requested + max_ahead_segments and then parks, and
+        // segment_hold_window is deliberately the same distance, so a request
+        // inside this window is one production is authorised to reach and a
+        // request outside it is one nothing is working toward.
+        //
+        // Reported as milliseconds rather than as the two knobs it is derived
+        // from. A count and a duration are two numbers the client has to
+        // multiply and then keep in step with ours -- a client that hardcoded
+        // 8 and 4000 silently under-runs on a node configured with 4 -- and
+        // the derived figure stays meaningful if this bound ever stops being
+        // counted in segments. Null for direct play, which has no pipeline and
+        // therefore no frontier.
+        const auto look_ahead_ms =
+            static_cast<uint64_t>(config.max_ahead_segments) *
+            static_cast<uint64_t>(std::max<int64_t>(0, config.segment_duration.count()));
         Json::Object stream{{"url", session.stream_url},
                             {"mime_type", mime_type},
+                            {"look_ahead_ms", session.plan.mode == PlaybackMode::direct
+                                                  ? Json(nullptr) : Json(look_ahead_ms)},
                             {"subtitle_url", session.subtitle_url.empty() ? Json(nullptr) : Json(session.subtitle_url)}};
         Json::Object out{{"session_id", session.id},
                          {"generation", session.generation},

@@ -118,6 +118,8 @@ For stream-copy video, the VOD planner uses the demuxer's keyframe index and cho
 
 Stream-copy timestamps are normalised only after rescaling into the MP4 stream's final muxer timebase. Missing PTS/DTS are synthesised conservatively and equal/backwards DTS values are advanced with a persistent per-stream timeline correction. Legitimate PTS-before-DTS composition offsets are preserved rather than clamped; fragmented MP4 is emitted with signed composition-time offsets enabled. Repairs that actually modify timestamps are logged with per-stream counters.
 
+`stream.look_ahead_ms` reports that bound to the client in milliseconds: how far past the fragment it last requested a viewer may arrive and still find media already produced. It is `max_ahead_segments` multiplied by `segment_duration_ms`, and it is `null` for direct play, which has no pipeline and therefore no frontier. It is reported as a derived duration rather than as the two knobs because a count and a duration are two numbers a client would have to multiply and then keep in step with the node's configuration; a client that hardcoded the defaults would silently under-run against a node configured with a shorter window. Production is sequential, so a client that arrives beyond the look-ahead does not skip the intervening fragments — the node encodes its way to the requested index at roughly real time while the viewer waits. Where the gap is larger than the look-ahead, creating a new generation seeked to the arrival point is cheaper than making the existing one catch up.
+
 The segment store remains a bounded producer/consumer queue. Once the producer is `max_ahead_segments` beyond actual client demand it blocks on a condition variable and resumes when later fragment indexes are requested. This prevents a fast remux from pulling an entire movie through the DHT while keeping VOD playlist semantics independent of producer progress. Resident generated fragments are bounded by `segment_memory_bytes`; old consumed fragments can spill below `temp_path`.
 
 Video scaling and audio resampling are initialised from actual decoded-frame properties rather than assuming the decoder knows the final pixel/sample format at open time. This matters for containers/codecs whose format details are discovered only during decoding.
@@ -281,7 +283,7 @@ The response separates requested preferences, resolved playback, original source
     "video": { "source_stream": 0, "transform": "copy", "codec": "hevc", "width": 1920, "height": 1080, "bitrate": 7500000 },
     "audio": { "source_stream": 1, "transform": "transcode", "codec": "aac", "channels": 2, "sample_rate": 48000, "bitrate": 192000 }
   },
-  "stream": { "url": "/api/v1/playback/stream/...", "mime_type": "application/vnd.apple.mpegurl", "subtitle_url": null },
+  "stream": { "url": "/api/v1/playback/stream/...", "mime_type": "application/vnd.apple.mpegurl", "look_ahead_ms": 32000, "subtitle_url": null },
   "options": {
     "modes": ["transcode"],
     "quality_heights": [720, 480, 360],

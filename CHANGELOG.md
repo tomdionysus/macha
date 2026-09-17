@@ -1,5 +1,52 @@
 # Current release
 
+## 0.45.0 — The look-ahead the node actually has (development)
+
+**The playback session now says how far ahead of the viewer it is producing.**
+`stream.look_ahead_ms` is on the session payload from `POST
+/api/v1/playback/sessions` and every `PATCH` of one: how far past the fragment
+a client last requested a viewer may arrive and still find media already
+produced. It is `null` for direct play, which has no pipeline and therefore no
+frontier.
+
+It was not knowable before. The producer runs to `highest_requested +
+max_ahead_segments` and then parks, and `segment_hold_window` is deliberately
+the same distance, so that product is the line between a request that is held
+and one that is refused at once. Neither number was on the wire, and neither
+was in `docs/configuration.md` either, so a client had nothing to bound itself
+against except the defaults. A client that hardcoded 8 and 4000 against a node
+configured with `max_ahead_segments: 4` would believe it had 32 s of
+authorised production ahead of the frontier when it had 16, and would sit
+refused at the frontier for the difference — the same two-numbers-never-
+compared shape that the bug behind this release was.
+
+The bug: a client recovering a reaped play session created a replacement, held
+it 28 s while the viewer played out its buffer, and then asked for the fragment
+at the position the viewer had reached. Measured on es-1 at 12,749 ms of frozen
+picture. Nothing was wrong with the node. Creation already starts the pipeline
+— `create` calls `start_pipeline` before it answers, and blocks on the first
+fragment, 1,924 ms in the captured trace — and the generation was still warm
+after the hold. But warming fragment 0 authorises production only as far as
+fragment 8, the viewer arrived past that, and the node encoded its way forward
+at roughly real time: 6.27 s and 7.59 s for single fragments, refused with
+`reason=hold_timed_out` in between.
+
+Reported as a derived duration rather than as the two knobs on purpose. A
+count and a duration are two numbers the client has to multiply and then keep
+in step with ours, and the derived figure stays meaningful if this bound ever
+stops being counted in segments.
+
+**`docs/configuration.md` now documents the fragment-production knobs at all**
+— `segment_duration_ms`, `max_ahead_segments`, `segment_hold_window`,
+`segment_memory_bytes`, `max_session_holds` and `max_concurrent_holds` — with
+what the look-ahead is, why the hold window matches it, and that
+`hold_timed_out` is a retryable `500` with `Retry-After: 1` rather than a
+`404`: the playlist has already promised the fragment exists, and a `404`
+invites an intermediary to cache the absence.
+
+Nothing about production timing, admission or the transcode entitlement
+changed. This release adds a field and a page of documentation.
+
 ## 0.44.0 — The bytes that never needed to be on the wire (development)
 
 **The HTTP server compresses what it sends.** It did not, at all: there was no

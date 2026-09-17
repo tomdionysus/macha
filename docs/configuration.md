@@ -348,7 +348,41 @@ streaming:
   pipeline_idle_ms: 60000
   session_idle_ms: 1800000
   session_unused_idle_ms: 120000
+  segment_duration_ms: 4000
+  max_ahead_segments: 8
+  segment_hold_window: 8
+  segment_memory_bytes: 67108864
+  max_session_holds: 2
+  max_concurrent_holds: 64
 ```
+
+`max_ahead_segments` (8) is how far beyond the highest fragment index a client
+has actually requested the producer is allowed to run before it parks on a
+condition variable, and `segment_duration_ms` (4000) is the target length of
+one fragment. Their product is the node's look-ahead: the distance past the
+last fragment a client asked for at which a viewer may arrive and still find
+media already produced. Arriving beyond it is not an error, but the fragment
+does not exist yet and production is sequential, so the node has to encode its
+way there at roughly real time while the viewer waits.
+
+`segment_hold_window` (8) is deliberately the same distance. A request inside
+it is one production is authorised to reach, so it is held; a request outside
+it is one nothing is working toward, so it is refused at once with a retryable
+`500 segment_not_ready` and `Retry-After: 1` rather than occupying a hold.
+A held request that reaches `segment_timeout` without the fragment arriving is
+refused the same way, with `reason=hold_timed_out` in the node log.
+
+**A client must not hardcode these two numbers.** `stream.look_ahead_ms` on
+the playback session payload reports their product for that session, so a
+client bounds itself against the node it is actually talking to; see
+`docs/streaming.md`. A client that assumed the defaults against a node
+configured with `max_ahead_segments: 4` would believe it had 32 seconds of
+authorised production ahead of the frontier when it had 16.
+
+`segment_memory_bytes` (64 MiB) bounds resident generated fragments; older
+consumed fragments spill below `temp_path` rather than stalling production.
+`max_session_holds` (2, one in flight plus one prefetch) and
+`max_concurrent_holds` (64) bound held requests per session and node-wide.
 
 `pipeline_idle_ms` releases an abandoned physical remux/transcode encoder after
 valid current-generation stream requests stop (60 seconds by default). The

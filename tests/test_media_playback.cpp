@@ -3451,4 +3451,73 @@ MACHA_FAST_TEST("media_playback", test_container_vocabulary_names_what_the_catal
     CHECK(!webvtt_subtitle_codec_supported("dvd_subtitle"));
 }
 
+MACHA_TEST("media_playback", test_the_session_reports_the_look_ahead_the_node_actually_has) {
+    // A client has to know how far past the fragment it last asked for a
+    // viewer may arrive and still find media produced, and before 0.45.0 it
+    // could not: neither max_ahead_segments nor segment_duration_ms was on the
+    // wire or in the configuration reference, so a client either hardcoded the
+    // defaults or guessed. A client that hardcoded 8 and 4000 against this
+    // node -- 3 and 2000 -- would believe it had 32 s of authorised production
+    // ahead of the frontier when it has 6, and would sit refused at the
+    // frontier for the difference.
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/film.mkv", 0644, getuid(), getgid());
+    auto bytes = pattern(64 * 1024);
+    auto writer = service.filesystem().open_write("/media/film.mkv", true);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto media_id = file_media_id(service.filesystem().getattr("/media/film.mkv"));
+
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback";
+    streaming.startup_timeout = 2s;
+    // Deliberately not the defaults, so the assertion cannot pass by
+    // coincidence against 8 x 4000.
+    streaming.max_ahead_segments = 3;
+    streaming.segment_duration = 2000ms;
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             std::make_unique<ObservableHlsMediaEngine>());
+    playback.start();
+
+    auto create_session = [&](const char* mode) {
+        Json::Object root{{"media_id", media_id},
+                          {"preferences", Json(Json::Object{{"mode", mode}})}};
+        auto text = Json(std::move(root)).dump();
+        HttpRequest request;
+        request.method = "POST";
+        request.path = "/api/v1/playback/sessions";
+        request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+        request.body.assign(text.begin(), text.end());
+        auto response = playback.handle(request);
+        REQUIRE(response.status == 201);
+        return Json::parse(std::string(response.body.begin(), response.body.end()));
+    };
+
+    auto transformed = create_session("remux");
+    REQUIRE(transformed.find("stream") != nullptr);
+    const auto* look_ahead = transformed.find("stream")->find("look_ahead_ms");
+    REQUIRE(look_ahead != nullptr);
+    CHECK(look_ahead->asInt64() == 6000);
+
+    // Direct play has no pipeline and therefore no frontier. Null says that;
+    // zero would read as "no look-ahead", which is a different claim and one a
+    // client could reasonably act on.
+    auto direct = create_session("direct");
+    REQUIRE(direct.find("stream") != nullptr);
+    REQUIRE(direct.find("stream")->find("look_ahead_ms") != nullptr);
+    CHECK(direct.find("stream")->find("look_ahead_ms")->isNull());
+}
+
 } // namespace
