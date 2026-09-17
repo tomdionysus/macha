@@ -14,6 +14,7 @@
 #include "filesystem.hpp"
 #include "fuse_frontend.hpp"
 #include "http.hpp"
+#include "http_compression.hpp"
 #include "local_store.hpp"
 #include "macha_version.hpp"
 #include "metadata.hpp"
@@ -55,6 +56,7 @@
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
+#include <zlib.h>
 
 using namespace macha;
 using namespace std::chrono_literals;
@@ -567,6 +569,32 @@ inline RawHttpResponse raw_http_read_response(int fd) {
         response.body.append(buffer.data(), static_cast<size_t>(n));
     }
     return response;
+}
+
+// Inflates a gzip body so a test can assert on what the client would
+// actually read, rather than on the fact that some bytes came back.
+inline std::string gunzip(std::string_view input) {
+    z_stream stream{};
+    // 15 + 16 selects the gzip wrapper, matching gzip_compress().
+    if (inflateInit2(&stream, 15 + 16) != Z_OK)
+        throw std::runtime_error("gunzip init failed");
+    std::string out;
+    std::array<char, 16384> buffer{};
+    stream.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(input.data()));
+    stream.avail_in = static_cast<uInt>(input.size());
+    int result = Z_OK;
+    do {
+        stream.next_out = reinterpret_cast<Bytef*>(buffer.data());
+        stream.avail_out = static_cast<uInt>(buffer.size());
+        result = inflate(&stream, Z_NO_FLUSH);
+        if (result != Z_OK && result != Z_STREAM_END) {
+            inflateEnd(&stream);
+            throw std::runtime_error("gunzip failed");
+        }
+        out.append(buffer.data(), buffer.size() - stream.avail_out);
+    } while (result != Z_STREAM_END);
+    inflateEnd(&stream);
+    return out;
 }
 
 inline RawHttpResponse raw_http_exchange(int fd, std::string_view request) {

@@ -397,6 +397,15 @@ void parse_catalogue(const YAML::Node& root, Config& c) {
         if (api["slow_request_threshold_ms"])
             c.catalogue.api.slow_request_threshold = milliseconds(
                 api["slow_request_threshold_ms"], "catalogue.api.slow_request_threshold_ms");
+        if (api["compression"])
+            c.catalogue.api.compression.enabled = api["compression"].as<bool>();
+        if (api["compression_min_bytes"])
+            c.catalogue.api.compression.min_bytes = yaml_size(api["compression_min_bytes"]);
+        if (api["compression_level"])
+            c.catalogue.api.compression.level = api["compression_level"].as<int>();
+        if (api["compression_max_asset_bytes"])
+            c.catalogue.api.compression.max_asset_bytes =
+                yaml_size(api["compression_max_asset_bytes"]);
         if (api["reactor_stall_threshold_ms"])
             c.catalogue.api.reactor_stall_threshold = milliseconds(
                 api["reactor_stall_threshold_ms"], "catalogue.api.reactor_stall_threshold_ms");

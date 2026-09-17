@@ -239,6 +239,12 @@ void validate(Config& config) {
     if (config.catalogue.api.stream_chunk_bytes < 16 * 1024 ||
         config.catalogue.api.stream_chunk_bytes > 4ULL * 1024 * 1024)
         throw std::runtime_error("catalogue.api.stream_chunk_bytes must be 16K..4M");
+    if (config.catalogue.api.compression.level < 1 || config.catalogue.api.compression.level > 9)
+        throw std::runtime_error("catalogue.api.compression_level must be 1..9");
+    if (config.catalogue.api.compression.min_bytes < 64)
+        throw std::runtime_error("catalogue.api.compression_min_bytes must be >= 64");
+    if (config.catalogue.api.compression.max_asset_bytes > 64ULL * 1024 * 1024)
+        throw std::runtime_error("catalogue.api.compression_max_asset_bytes must be <= 64M");
     if (config.maintenance.no_progress_backoff < std::chrono::milliseconds(500) ||
         config.maintenance.no_progress_backoff > std::chrono::hours(1))
         throw std::runtime_error("maintenance.no_progress_backoff_ms must be 500..3600000");

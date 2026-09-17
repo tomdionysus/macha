@@ -437,3 +437,96 @@ MACHA_TEST("http_server", test_head_and_pipelined_requests_on_one_connection) {
 }
 
 } // namespace
+
+MACHA_TEST("http_server", test_text_is_compressed_on_the_pool_and_streamed_bodies_are_left_alone) {
+    // Compression is a lane-worker job, never a reactor one: the reactor may
+    // not call anything that sleeps or burn CPU on a socket's behalf. And the
+    // zero-copy path for a resident body -- the thing the reactor rewrite
+    // exists for -- must come through untransformed.
+    auto config = loopback_config();
+    std::string catalogue = "{\"items\":[";
+    for (int i = 0; i < 400; ++i) {
+        if (i) catalogue += ',';
+        catalogue += "{\"id\":\"macha:" + std::to_string(i) + "\",\"title\":\"A Title\"}";
+    }
+    catalogue += "]}";
+
+    HttpServer server(config, [&](const HttpRequest& request) {
+        if (request.path == "/api/v1/catalogue")
+            return http_json(200, catalogue);
+        if (request.path == "/tiny")
+            return http_json(200, "{\"ok\":true}");
+        if (request.path == "/media") {
+            HttpResponse response;
+            response.content_type = "video/mp4";
+            response.stream = std::make_shared<ResidentBody>(256 * 1024);
+            return response;
+        }
+        return http_error(404, "not_found", "not found");
+    });
+    server.start();
+    REQUIRE(wait_until([&] { return server.bound_port() != 0; }, 1s));
+    const auto port = server.bound_port();
+    const std::map<std::string, std::string> gzip{{"Accept-Encoding", "gzip, deflate"}};
+
+    const auto compressed = raw_http_get(port, "/api/v1/catalogue", gzip);
+    CHECK(compressed.find("HTTP/1.1 200") != std::string::npos);
+    CHECK(compressed.find("Content-Encoding: gzip") != std::string::npos);
+    CHECK(compressed.find("Vary: Accept-Encoding") != std::string::npos);
+    const auto compressed_body = body_of(compressed);
+    CHECK(gunzip(compressed_body) == catalogue);
+    CHECK(compressed_body.size() < catalogue.size() / 3);
+    // Content-Length describes what was actually sent, or the client hangs
+    // waiting for bytes that are never coming.
+    CHECK(compressed.find("Content-Length: " + std::to_string(compressed_body.size())) !=
+          std::string::npos);
+
+    // The same route for a client that never mentioned encodings.
+    const auto identity = raw_http_get(port, "/api/v1/catalogue");
+    CHECK(identity.find("Content-Encoding") == std::string::npos);
+    CHECK(body_of(identity) == catalogue);
+
+    // Already compressed, and served straight from resident memory. A
+    // transform here would undo the path it is sent on.
+    const auto media = raw_http_get(port, "/media", gzip);
+    CHECK(media.find("HTTP/1.1 200") != std::string::npos);
+    CHECK(media.find("Content-Encoding") == std::string::npos);
+    CHECK(body_of(media).size() == 256 * 1024);
+
+    // Below the floor: nothing to win, but the resource still varies.
+    const auto tiny = raw_http_get(port, "/tiny", gzip);
+    CHECK(tiny.find("Content-Encoding") == std::string::npos);
+    CHECK(tiny.find("Vary: Accept-Encoding") != std::string::npos);
+    CHECK(body_of(tiny) == "{\"ok\":true}");
+
+    const auto diagnostics = server.diagnostics();
+    CHECK(diagnostics.responses_compressed == 1);
+    CHECK(diagnostics.compression_bytes_saved == catalogue.size() - compressed_body.size());
+    // The reactor did none of it.
+    CHECK(diagnostics.reactor_stalls == 0);
+    server.stop();
+}
+
+MACHA_TEST("http_server", test_compression_can_be_disabled_for_a_node_behind_a_proxy) {
+    // Some nodes sit behind a TLS terminator that already compresses and some
+    // are exposed directly, so this has to be a setting rather than a rule.
+    auto config = loopback_config();
+    config.compression.enabled = false;
+    std::string catalogue(8192, 'x');
+
+    HttpServer server(config,
+                      [&](const HttpRequest&) { return http_json(200, catalogue); });
+    server.start();
+    REQUIRE(wait_until([&] { return server.bound_port() != 0; }, 1s));
+
+    const auto response =
+        raw_http_get(server.bound_port(), "/api/v1/catalogue",
+                     {{"Accept-Encoding", "gzip, deflate"}});
+    CHECK(response.find("HTTP/1.1 200") != std::string::npos);
+    CHECK(response.find("Content-Encoding") == std::string::npos);
+    // Nothing is negotiated, so nothing varies.
+    CHECK(response.find("Vary") == std::string::npos);
+    CHECK(body_of(response) == catalogue);
+    CHECK(server.diagnostics().responses_compressed == 0);
+    server.stop();
+}

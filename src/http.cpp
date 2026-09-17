@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "http.hpp"
 #include "diagnostics.hpp"
+#include "http_compression.hpp"
 
 #include "json.hpp"
 #include "log.hpp"
@@ -515,6 +516,8 @@ struct HttpServer::Impl {
     std::atomic<uint64_t> deferrals{};
     std::atomic<uint64_t> overloaded{};
     std::atomic<uint64_t> slow{};
+    mutable std::atomic<uint64_t> compressed_responses{};
+    mutable std::atomic<uint64_t> compression_saved{};
 
     Impl(CatalogueApiConfig c, std::function<HttpResponse(const HttpRequest&)> h,
          std::function<bool(const HttpRequest&)> exempt, SessionAuthenticator auth)
@@ -581,6 +584,58 @@ struct HttpServer::Impl {
         return response;
     }
 
+    // Runs here, on a lane worker, never on the reactor: gzip is CPU work and
+    // the reactor may not do any (see the class comment on HttpServer). By the
+    // time the reactor sees this response the body is final, so the
+    // Content-Length it writes is already the compressed length.
+    //
+    // Only a complete in-memory body is eligible. A response carrying a
+    // `stream` is media or a large file being pumped chunk by chunk, and the
+    // reactor sends it from resident memory with no copy; that path is left
+    // exactly as it was.
+    void compress_response(const HttpRequest& request, HttpResponse& response) const {
+        if (!config.compression.enabled || response.stream)
+            return;
+        // 204 and 304 have no body to compress; 206 is a range, and an
+        // encoding applied to one part of a representation is not something a
+        // client can reassemble.
+        if (response.status == 204 || response.status == 206 || response.status == 304)
+            return;
+        if (!compressible_content_type(response.content_type))
+            return;
+        // A handler that already chose an encoding owns that negotiation, and
+        // its entity tag -- if it set one -- names the representation it
+        // chose. WebApi does exactly this for the client's assets.
+        if (response.headers.contains("Content-Encoding"))
+            return;
+
+        // Say the response varies even when this particular client did not ask
+        // for gzip. On a deployment where some nodes sit behind a proxy and
+        // some are exposed directly, a shared cache that stored the identity
+        // body under an unqualified key would go on to hand it to a client
+        // that did ask -- and, worse, the reverse.
+        response.headers.try_emplace("Vary", "Accept-Encoding");
+
+        if (response.body.size() < config.compression.min_bytes)
+            return;
+        if (!client_accepts_gzip(request))
+            return;
+        auto compressed = gzip_compress(response.body, config.compression.level);
+        if (!compressed)
+            return;
+
+        // Entity tags are deliberately left alone. The suffix convention other
+        // servers use would corrupt the catalogue's `rev-N` tags, which are
+        // If-Match concurrency tokens a client sends back on a write rather
+        // than cache validators. Vary above is the mechanism that keeps caches
+        // honest here.
+        compression_saved.fetch_add(response.body.size() - compressed->size(),
+                                    std::memory_order_relaxed);
+        compressed_responses.fetch_add(1, std::memory_order_relaxed);
+        response.body = std::move(*compressed);
+        response.headers["Content-Encoding"] = "gzip";
+    }
+
     void post_request(Connection& connection, HttpRequest request) {
         ++connection.generation;
         connection.state = ConnectionState::dispatched;
@@ -597,6 +652,8 @@ struct HttpServer::Impl {
                 event.connection = id;
                 event.generation = generation;
                 event.response = run_handler(request);
+                if (!event.response.defer)
+                    compress_response(request, event.response);
                 if (event.response.stream) {
                     // The one place the source is asked anything on behalf of
                     // the reactor: here, on the pool.
@@ -1368,6 +1425,8 @@ HttpServerDiagnostics HttpServer::diagnostics() const {
     out.requests_deferred = impl.deferrals.load(std::memory_order_relaxed);
     out.requests_overloaded = impl.overloaded.load(std::memory_order_relaxed);
     out.slow_requests = impl.slow.load(std::memory_order_relaxed);
+    out.responses_compressed = impl.compressed_responses.load(std::memory_order_relaxed);
+    out.compression_bytes_saved = impl.compression_saved.load(std::memory_order_relaxed);
     const auto lane = [](Lane& source) {
         HttpServerDiagnostics::Lane out_lane;
         out_lane.workers = source.threads.size();

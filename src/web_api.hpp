@@ -21,9 +21,16 @@ namespace macha {
 // rather than a fallback bolted onto the API's own dispatch.
 class WebApi {
     WebConfig config_;
+    HttpCompressionConfig compression_;
 
   public:
-    explicit WebApi(WebConfig config);
+    // Compression settings come from catalogue.api rather than from `web`:
+    // they describe the one HTTP server, and a node has no reason to answer
+    // its API and its client under different rules. The client's assets are
+    // negotiated here rather than by the server's generic compressor because
+    // this handler revalidates with entity tags, and the tag and the encoding
+    // have to be chosen together.
+    explicit WebApi(WebConfig config, HttpCompressionConfig compression = {});
 
     // Whether this node is configured to serve a web client at all. A node
     // with no `web.root` serves none, and non-API paths keep their old 404.

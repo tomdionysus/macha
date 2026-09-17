@@ -277,6 +277,28 @@ struct FilesystemConfig {
     uint32_t root_mode{0755};
 };
 
+// What the server compresses on the way out, and how hard. Only complete
+// in-memory text bodies are ever eligible -- a streamed body (media, a large
+// client asset) is sent from the reactor without a copy and is never
+// transformed. Disabling this is a supported deployment rather than a
+// degraded one: a node behind a proxy that already compresses has no reason
+// to pay for it twice.
+struct HttpCompressionConfig {
+    bool enabled{true};
+    // Bodies smaller than this are sent as they are. Below roughly a packet
+    // there is nothing to win, and gzip's own header is a real fraction of it.
+    size_t min_bytes{1024};
+    // zlib level. 6 is zlib's own default and the usual balance; 1 gives most
+    // of the ratio for a fraction of the CPU, which is the setting a
+    // Pi-class node wants.
+    int level{6};
+    // The largest web-client asset compressed on demand when the client build
+    // shipped no precompressed sibling next to it. Past this the file is
+    // streamed as it is rather than read whole into memory once per request.
+    // A build that emits .gz files never reaches this path at all.
+    size_t max_asset_bytes{4 * 1024 * 1024};
+};
+
 struct CatalogueApiConfig {
     bool enabled{};
     std::string listen{"127.0.0.1"};
@@ -333,6 +355,9 @@ struct CatalogueApiConfig {
     // The reactor may not call anything that sleeps; if that rule is ever
     // broken this is where it shows, on the first slow disk.
     std::chrono::milliseconds reactor_stall_threshold{50};
+    // Response compression. Applied on a lane worker, never on the reactor:
+    // it is CPU work, and the reactor may not do any.
+    HttpCompressionConfig compression;
     // Lifetime of a signed artwork capability URL embedded in catalogue
     // responses (GET .../artwork/{id}?exp=...&sig=...), which lets a client
     // load artwork via a plain <img src> without a bearer header. Artwork is
@@ -402,8 +427,6 @@ struct CatalogueConfig {
     CatalogueApiConfig api;
     CatalogueScannerConfig scanner;
 };
-
-
 
 struct IngestConfig {
     bool enabled{false};

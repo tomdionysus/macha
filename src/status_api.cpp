@@ -1297,6 +1297,8 @@ HttpResponse ClusterStatusService::diagnostics_response() {
                 http_diagnostics["requests_deferred"] = values->requests_deferred;
                 http_diagnostics["requests_overloaded"] = values->requests_overloaded;
                 http_diagnostics["slow_requests"] = values->slow_requests;
+                http_diagnostics["responses_compressed"] = values->responses_compressed;
+                http_diagnostics["compression_bytes_saved"] = values->compression_bytes_saved;
                 const auto lane_json = [](const HttpServerDiagnostics::Lane& lane) {
                     return Json::Object{{"workers", lane.workers},
                                         {"busy", lane.busy},
