@@ -4,7 +4,33 @@ This creates a disposable two-node cluster on one machine. It is intended to dem
 
 ## Build
 
-Install CMake, a C++20 compiler, OpenSSL, yaml-cpp, FUSE/macFUSE and the FFmpeg development libraries required by the project, then:
+Install CMake, a C++20 compiler, OpenSSL, curl, yaml-cpp, FUSE/macFUSE and the FFmpeg 6+ development libraries. Pick the line for your system:
+
+```bash
+# Debian 13+ / Ubuntu 24.04+ (on Ubuntu, enable universe first)
+sudo apt update && sudo apt install build-essential cmake pkg-config \
+  libssl-dev libcurl4-openssl-dev libyaml-cpp-dev \
+  fuse3 libfuse3-dev \
+  libavformat-dev libavcodec-dev libavutil-dev \
+  libswscale-dev libswresample-dev \
+  libtorrent-rasterbar-dev libminiupnpc-dev
+
+# Fedora
+sudo dnf install gcc-c++ cmake pkgconf-pkg-config \
+  openssl-devel libcurl-devel yaml-cpp-devel \
+  fuse3 fuse3-devel ffmpeg-free-devel \
+  rb_libtorrent-devel miniupnpc-devel
+
+# macOS (Homebrew)
+xcode-select --install
+brew update && brew install cmake pkgconf openssl@3 curl yaml-cpp \
+  ffmpeg@7 libtorrent-rasterbar miniupnpc
+brew install --cask macfuse
+```
+
+libtorrent-rasterbar and miniupnpc are optional: without them the BitTorrent acquisition plugin and UPnP port mapping are simply not built. Everything else is required. Debian 12 and Ubuntu 22.04 ship FFmpeg versions that are too old. For Arch, MacPorts, the FFmpeg version check and the full installation procedure, see [install-linux.md](install-linux.md) and [install-macos.md](install-macos.md).
+
+Then:
 
 ```bash
 cmake -S . -B build

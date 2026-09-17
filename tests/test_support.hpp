@@ -161,12 +161,24 @@ inline Config config_for(const std::filesystem::path& path, const std::filesyste
     c.dead_after = 500ms;
     c.connect_timeout = 500ms;
     c.bootstrap = std::move(bootstrap);
-    // plugin_path is deliberately left unset: an ordinary test wants no
-    // subsystem plugins at all, and loading them costs a dlopen of libtorrent
-    // and its dependencies in every one of the several hundred isolated test
-    // processes. A test that needs the real plugin points plugin_path at this
-    // build's MACHA_TEST_PLUGIN_DIR itself -- never at the installed default,
-    // which could hold a stale build.
+    // An ordinary test wants no subsystem plugins at all: loading them costs a
+    // dlopen of libtorrent and its dependencies in every one of the several
+    // hundred isolated test processes, and it would test whatever happens to be
+    // installed on the build machine rather than the build under test. A test
+    // that needs the real plugin points plugin_path at this build's
+    // MACHA_TEST_PLUGIN_DIR itself.
+    //
+    // This must be set to an *engaged but empty* path, not left unset. Leaving
+    // it unset does not mean "no plugins": NodeRuntime runs every Config through
+    // normalize_config(), which fills an absent plugin_path with the installed
+    // directory (`src/config_base.cpp:553-554`), so an unset field resolves to
+    // /usr/lib/macha/plugins. That went unnoticed for as long as the installed
+    // build matched the build under test; bumping the version to 0.43.1 on es-1
+    // (2026-09-17) made the suite log `plugin=0.43.0 core=0.43.1 ... refusing to
+    // load (partial deploy?)` and exposed it. An engaged empty path is the only
+    // way to say "builtin subsystems only" -- see Service's
+    // `plugin_path.value_or({})` at `src/service.cpp:99`.
+    c.plugin_path = std::filesystem::path{};
 
     if (profile == ConfigProfile::functional) {
         c.replication = 3;

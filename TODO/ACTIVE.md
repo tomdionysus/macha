@@ -1,6 +1,6 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-09-15
+Last updated: 2026-09-17
 
 This is the authoritative, ordered backlog. Detailed plans and UAT records in
 this directory remain evidence; completed work belongs in `COMPLETED.md` and is
@@ -8,7 +8,12 @@ not repeated here. Work top-to-bottom unless new evidence changes the order.
 
 **Start here if you are new to this work.** Read, in order:
 
-1. The **P0 cluster section** immediately below. The cluster is two nodes now,
+0. The **P-1 section** immediately below. It is new on 2026-09-17 and it sits
+   above everything else because it is not a defect in a feature: at the stated
+   scale target the namespace metadata is gigabytes per node and a single file
+   write costs several full traversals of it. Everything under P0 is worth doing
+   and none of it changes that.
+1. The **P0 cluster section**. The cluster is two nodes now,
    both on 0.40.1, and the third was removed rather than repaired — which the
    system does not really support, and that is the first item.
 2. **"What the client sessions now depend on"** near the end of this file.
@@ -109,6 +114,145 @@ The governing laws are:
 2. Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The Viewer Wait.
 3. Control traffic must remain promptly serviceable. Viewer priority is a large
    configurable share (95:5 by default), not indefinite starvation of all other work.
+
+## P-1 — The namespace does not meet its own scale target (opened 2026-09-17)
+
+Macha is designed for tens of thousands of files and 100 TB+ of media per
+cluster. It does not currently do that, and the reason is structural rather
+than a bug: `MetadataSnapshot::entries` is a `std::map<std::string, FsEntry>`
+holding the whole namespace, the record payload *is* that map serialised, and
+the record's identity *is* a SHA-256 over those bytes
+(`metadata_hash`, `src/metadata.cpp:1334`). So nothing can be demand-loaded —
+the whole structure must be materialised to produce the hash — and every commit
+re-serialises and re-hashes the library.
+
+Plan: [namespace Merkle root](2026-09-17-namespace-merkle-root-plan.md).
+
+**Stage A of the plan is done (2026-09-17) and the numbers are now measured on
+es-1 and fi-1 rather than derived.** At 1.618 TiB of library (4,808 entries,
+424,222 extents) one materialisation is **47 MB** — 26 MB decoded plus a 21 MB
+encoded payload resident alongside it — of which 97% is extent references.
+That is **15.9 MB decoded per TiB**, so 20,000 files at a realistic average size
+is 40-160 TB, i.e. **1.2-4.7 GB resident, on every node, including the Pi-class
+ones**. Struct sizes on aarch64 are as assumed (`FsEntry` 72, `ExtentRef` 56,
+map node 104+32).
+
+Two corrections Stage A forced:
+
+- **The 128 MiB `materialization_cache_limit_bytes` budget never bounded the
+  namespace.** `cur_` and `committed_` are pinned and exempt
+  (`src/metadata.cpp:3203`, `:3210-3212`, `:3230-3231`), so residency is
+  unbounded by design and the LRU only governs historical materialisations.
+  One materialisation equals the whole budget at ~4.6 TiB, not the 9 TB
+  estimated — near-term, not target-scale.
+- **28.8% of decoded residency was allocator slack, and is now gone.**
+  `entry(Reader&)` grew extent vectors by `push_back` with no `reserve`, leaving
+  610,567 slots for 424,222 extents. Reserving exactly (bounded by the input's
+  remaining bytes, so a forged count cannot size an allocation) cut the decoded
+  snapshot from 36.2 MB to 25.8 MB — ~640 MB per node at the 100 TB target, for
+  one line, with no format change and no migration. Regression test:
+  `storage_metadata/test_decoded_extent_vectors_carry_no_allocator_slack`.
+
+fi-1 is the clearest statement of the problem: it hosts no extents, uses 8.2 GB
+of disk in total, and holds a byte-identical 47 MB materialisation describing
+424,222 extents of content it does not store.
+
+And a single file write, through `mutate_impl`
+(`src/metadata_manager.cpp:1622`), costs four full traversals: a full
+`decode_snapshot` (`:1669`), a full `encode_snapshot`, a full `metadata_hash`,
+and a full element-wise `entries != entries` comparison (`:228`). The
+`before.emplace` deep copy at `:1698-1700` is already skipped, because every
+namespace write path uses `mutate_delta`.
+
+The fix is to make the record a root pointer over a content-addressed Merkle
+tree, the way `std::optional<ObjectId> catalogue_root` (`src/metadata.hpp:109`)
+already works three lines above `entries` in the same struct. That takes a
+commit from O(library) to O(log n) per changed path, and only then does moving
+extents off the heap buy anything.
+
+**This is not a new discipline for this codebase.** `repair_step`'s comment
+(`src/distributed_store.cpp:2132-2136`) diagnoses exactly this pathology in the
+object store and records the fix — cursor-based, budgeted, "they never rebuild
+complete object vectors" (`src/distributed_store.hpp:238-241`). The namespace
+never received it, and `maintenance_objects_cached`
+(`src/filesystem.cpp:2392-2455`) still builds the complete ~26-million-id live
+vector that `repair_step` is handed (~840 MB transient at 100 TB).
+
+Migration is a re-root, not a rebuild: ObjectIds address content that no
+metadata format change touches, so the library survives and only ancestry is
+discarded. It is a flag day across every node, and it needs an authority-granting
+variant of `recover_from_seed` (`src/metadata.cpp:2097-2131`) built in the shape
+of `metadata_branch_floor`/`retention_baseline_complete`
+(`src/metadata.hpp:93-103`) rather than by loosening the recovery path. That
+interlock is the most dangerous single piece of the work.
+
+- [x] Stage A: real numbers off es-1/fi-1 and `sizeof` confirmation on an ARM
+  build. Done 2026-09-17; see "Stage A results" in the plan. One item remains
+  open: the live `MetadataReplicaDiagnostics` counters
+  (`src/metadata.hpp:415-431`) are reachable only through `GET /api/v1/status`,
+  which needs an account holding `view_status`.
+- [ ] Stage B: Merkle namespace as SM14, readable alongside SM13, not yet
+  authoritative.
+- [ ] Stage C: commit path carries the change set instead of rediscovering it.
+- [ ] Stage D: demand-loaded extent nodes, on the `RetainedMemoryLedger`;
+  persist `file_media_id`.
+- [ ] Stage E: the migration and its interlock.
+- [ ] Stage F: the dependent O(N) items now listed under P1 scaling cliffs.
+
+## P0 — The catalogue materialises everything it has (opened 2026-09-17)
+
+The same failure as P-1 in a smaller organ, and — the important difference —
+**no format change is required for the core of it.** Plan:
+[catalogue demand-loaded shards](2026-09-17-catalogue-shard-demand-load-plan.md).
+
+The catalogue already has the structure the namespace is being given: a root
+pointer (`catalogue_root`, `src/metadata.hpp:109`), a manifest of
+content-addressed shards (`src/catalogue.cpp:127-129`), a hash selecting a shard
+per id (`:131-136`), and a commit that replicates only shards whose id changed
+(`:1070-1071`, `:1084-1089`). It then discards the benefit twice: `load_root`
+(`:543-571`) merges all 64 shards back into one map, and `commit` re-shards and
+re-encodes the *entire* catalogue (`:1062-1072`) purely to discover which single
+shard differs. Every read materialises everything; every write traverses
+everything, for a 17-byte change.
+
+Eight mutation sites open with `auto current = *current_snapshot();` (`:918`,
+`:937`, `:960`, `:1146`, `:1175`, `:1198`, `:1251`, `:1337`). `snapshot()`
+(`:829-831`) returns a full deep copy by value. `list()` (`:982-999`) scans and
+copies every item and returns the entire filtered set with no paging; `search()`
+(`:1001-1020`) scores every item with no index. Estimated ~150-250 MB resident
+at 100,000 titles, deep-copied per mutation — but **nothing measures it**: there
+is no catalogue equivalent of `snapshot_resident_bytes`
+(`src/metadata.cpp:55-91`), which is why that figure is derived from struct
+shapes rather than read off a node. Stage A fixes that first.
+
+Because identity is already a root `ObjectId`, a catalogue written by the new
+code is byte-identical to one written by the old. Stages B-D deploy by ordinary
+rolling restart with no migration.
+
+Two findings worth carrying forward on their own:
+
+- **The shard count is already on the wire and merely refused.**
+  `encode_catalogue_manifest` writes it (`:142`), `decode_catalogue_manifest`
+  reads it and then throws unless it equals the compile-time constant
+  (`:155-156`). Making it growable is a vector and a range check; old manifests
+  keep decoding.
+- **Profile publication is one commit at a time.**
+  `MediaInformationService::publish_one` (`src/media_information.cpp:337-350`)
+  uses the singular `put_media_profile` while the batch form
+  `put_media_profiles` (`src/catalogue.cpp:932-954`) exists and is used by
+  `reconcile_scanner`. Any future field added to `MediaProfile` means a
+  per-title backfill: 20,000 commits instead of ~200.
+
+- [ ] Stage A: `catalogue_resident_bytes` modelled on `snapshot_resident_bytes`,
+  surfaced in catalogue status. Measure before sizing.
+- [ ] Stage B: `commit` carries the changed id set; touch only those shards.
+- [ ] Stage C: demand-loaded shards on the `RetainedMemoryLedger`; `get` and
+  `media_profile` become one-shard operations.
+- [ ] Stage D: batch publication in `MediaInformationService::loop`.
+- [ ] Stage E: indexes for `list`/`search` (additive format change). **Agree the
+  paging contract with the client sessions first** — see "What the client
+  sessions now depend on" below; `list` currently returns the whole filtered set.
+- [ ] Stage F: growable shard count.
 
 ## P0 — Nodes that cannot accept inbound connections, and edge nodes (business, opened 2026-09-15)
 
@@ -1110,12 +1254,21 @@ plausible contributor to "the mount feels slow with a big library" if that's
 ever reported, and is worth fixing opportunistically rather than waiting for
 that report.
 
+**Reprioritised 2026-09-17.** Two of these are no longer "not yet urgent": the
+whole-catalogue deep copy and the live-object vector are the same failure as
+P-1 above, in two other subsystems. They now have plans of their own —
+[namespace Merkle root](2026-09-17-namespace-merkle-root-plan.md) and
+[catalogue demand-loaded shards](2026-09-17-catalogue-shard-demand-load-plan.md)
+— and are marked below. The rest stand as written.
+
 - [ ] **`readdir` is O(entire namespace).** `fuse_frontend.cpp` iterates *all*
   paths under the global namespace mutex, taking each inode's mutex, for every
   directory listing — same pattern duplicated in `rmdir` and twice in
   `rename`. `FileSystem::NamespaceIndex` already has a parent→children index
   the frontend doesn't use for this. This is the single worst scaling property
-  found in the codebase audit.
+  found in the codebase audit. *(2026-09-17: independent of storage format and
+  fixable now; listed as Stage F work in the P-1 plan but does not wait on it.
+  `FileSystem::readdir`, `src/filesystem.cpp:1633-1642`, shows the shape.)*
 - [ ] **SHA-256 plus a heap allocation inside a `std::sort` comparator.**
   `placement.cpp`'s `fallback_score()` allocates and hashes twice per
   comparison, and `StoragePool::ranked()` — hit on every put/get/has/valid/
@@ -1127,7 +1280,12 @@ that report.
   call sites**, with no id→path index — O(N²) per scan.
 - [ ] **Whole-catalogue deep copy on every single mutation.** 8 sites do
   `auto current = *current_snapshot();` (a full catalogue copy) then re-shard
-  and re-encode all 64 shards for a single-item change.
+  and re-encode all 64 shards for a single-item change. *(2026-09-17: promoted
+  and planned —
+  [catalogue demand-loaded shards](2026-09-17-catalogue-shard-demand-load-plan.md).
+  Unlike the namespace, this needs no format change: the catalogue is already a
+  root pointer over content-addressed shards, and even the shard count is
+  already on the wire.)*
 - [ ] **`StagingArea::reserve()` runs a full recursive directory-size walk
   under its own mutex**, called every 500ms per active torrent and on every
   `GET /api/v1/ingest/status`.

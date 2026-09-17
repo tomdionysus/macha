@@ -70,7 +70,7 @@ void print(const Frame& frame, const std::string& note = {}) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cerr << "usage: macha-metadata-dump <cluster.key> <history.log> [heads.meta] [--all]\n";
+        std::cerr << "usage: macha-metadata-dump <cluster.key> <history.log> [heads.meta] [--all] [--stats]\n";
         return 2;
     }
     bool all = false;
@@ -295,6 +295,34 @@ int main(int argc, char** argv) {
                   << " node_status=" << node_status_bytes << " other="
                   << (full - entry_bytes - garbage_bytes - conflict_bytes - node_status_bytes)
                   << '\n';
+        // Encoded bytes are what replication and the journal carry; resident
+        // bytes are what every node holds while it is running. They are
+        // different numbers and the second one is the larger, so report both
+        // rather than letting the file size stand in for the cost.
+        uint64_t extent_capacity = 0;
+        for (const auto& [path, value] : snapshot.entries)
+            extent_capacity += value.extents.capacity();
+        const auto resident = snapshot_resident_bytes(snapshot);
+        std::cout << "  resident: decoded_bytes=" << resident
+                  << " encoded_payload_bytes=" << full
+                  << " materialization_bytes=" << (resident + full)
+                  << " extent_slots=" << extent_capacity << " (in use " << extents << ")"
+                  << " sizeof_fs_entry=" << sizeof(FsEntry)
+                  << " sizeof_extent_ref=" << sizeof(ExtentRef)
+                  << " sizeof_map_value=" << sizeof(std::map<std::string, FsEntry>::value_type)
+                  << " sizeof_snapshot=" << sizeof(MetadataSnapshot) << '\n';
+        if (snapshot.extent_size && extents) {
+            // Extents, not files, are what scales with a media library, so the
+            // only projection worth printing is per unit of stored content.
+            const long double library_tb =
+                static_cast<long double>(extents) *
+                static_cast<long double>(snapshot.extent_size) / (1024.0L * 1024.0L * 1024.0L * 1024.0L);
+            std::cout << "  scaling: extent_size=" << snapshot.extent_size
+                      << " library_tib=" << library_tb << " decoded_bytes_per_tib="
+                      << static_cast<uint64_t>(resident / library_tb)
+                      << " materialization_bytes_per_tib="
+                      << static_cast<uint64_t>((resident + full) / library_tb) << '\n';
+        }
         if (!snapshot.conflicts.empty()) {
             size_t namespace_kind = 0, identical = 0, both_files = 0, one_side_absent = 0,
                    with_base = 0;

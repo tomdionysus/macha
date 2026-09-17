@@ -4161,4 +4161,62 @@ MACHA_TEST("storage_metadata", test_local_metadata_store_falls_back_from_invalid
     CHECK(history->body == MetadataHistoryEntry::Body::full);
 }
 
+MACHA_FAST_TEST("storage_metadata", test_decoded_extent_vectors_carry_no_allocator_slack) {
+    // Extent vectors are the whole of a media namespace's residency, and the
+    // decoded head is pinned in the materialization cache for as long as it is
+    // current -- so any capacity() beyond size() is permanent RAM on every
+    // node. Geometric push_back growth was leaving up to 2x: measured on es-1
+    // (2026-09-17, 1.6 TiB / 424,222 extents) the decoded snapshot held 610,567
+    // extent slots, 10.4 MB of slack in a 36 MB snapshot.
+    auto snapshot = decode_snapshot(genesis_metadata().payload);
+    // Sizes either side of a power of two: geometric growth is only visible
+    // when the final count is not itself the capacity the doubling lands on.
+    for (const auto count : {1u, 3u, 100u, 1000u, 1025u}) {
+        FsEntry file;
+        file.type = EntryType::file;
+        file.size = static_cast<uint64_t>(count) * 16;
+        for (uint32_t i = 0; i < count; ++i)
+            file.extents.push_back(
+                {i * 16ull, 16, object_id(pattern(32, static_cast<uint8_t>(i))), false});
+        snapshot.entries["/f" + std::to_string(count) + ".mkv"] = std::move(file);
+    }
+
+    const auto decoded = decode_snapshot(encode_snapshot(snapshot));
+    CHECK(decoded.entries == snapshot.entries);
+    for (const auto& [path, entry] : decoded.entries) {
+        if (entry.extents.empty())
+            continue;
+        CHECK(entry.extents.capacity() == entry.extents.size());
+    }
+
+    // The extent count is caller-supplied, so it must never size an allocation
+    // on its own. A payload claiming ten million extents with nothing behind it
+    // has to be refused on the truncated input, not reserved for first.
+    static constexpr std::array<uint8_t, 8> sm13{'D', 'H', 'T', 'M', 'E', 'T', 'B', '3'};
+    Writer forged;
+    forged.fixed(sm13);
+    forged.u32(0); // metadata_voters
+    forged.u32(snapshot.data_replication);
+    forged.u64(snapshot.extent_size);
+    forged.u32(0); // mutation_sequences
+    forged.u32(1); // one entry
+    forged.string("/liar.mkv");
+    forged.u8(static_cast<uint8_t>(EntryType::file));
+    forged.u32(0644);
+    forged.u32(0);
+    forged.u32(0);
+    forged.u64(0);
+    forged.i64(0);
+    forged.i64(0);
+    forged.u64(1);
+    forged.u32(10000000); // claimed extents; none follow
+    bool refused = false;
+    try {
+        (void)decode_snapshot(forged.data());
+    } catch (const DecodeError&) {
+        refused = true;
+    }
+    CHECK(refused);
+}
+
 } // namespace

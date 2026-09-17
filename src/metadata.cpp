@@ -50,6 +50,7 @@ void account_string(uint64_t& total, const std::string& value) {
 void account_entry_allocations(uint64_t& total, const FsEntry& entry) {
     saturated_add(total, static_cast<uint64_t>(entry.extents.capacity()) * sizeof(ExtentRef));
 }
+} // namespace
 
 uint64_t snapshot_resident_bytes(const MetadataSnapshot& snapshot) {
     uint64_t total = sizeof(MetadataSnapshot);
@@ -89,6 +90,7 @@ uint64_t snapshot_resident_bytes(const MetadataSnapshot& snapshot) {
     return total;
 }
 
+namespace {
 std::shared_ptr<const MetadataMaterialization>
 make_materialization(MetadataRecord record, std::shared_ptr<const MetadataSnapshot> snapshot) {
     uint64_t bytes = sizeof(MetadataMaterialization) + sizeof(Bytes) + 64;
@@ -130,6 +132,15 @@ FsEntry entry(Reader& r) {
     auto n = r.u32();
     if (n > 10000000)
         throw DecodeError("too many extents");
+    // Geometric growth leaves up to 2x slack in every extent vector, and these
+    // vectors are the whole of a media namespace's residency. Measured on es-1
+    // (2026-09-17, 1.6 TiB library): 610,567 slots for 424,222 extents, 10.4 MB
+    // of pure allocator slack in a 36 MB snapshot -- permanent, because the
+    // decoded head is pinned. `n` is caller-supplied, so bound the reservation
+    // by what the remaining input could actually contain (49 encoded bytes per
+    // extent) rather than trusting the count to size an allocation.
+    constexpr size_t encoded_extent_bytes = 8 + 8 + 1 + 32;
+    e.extents.reserve(std::min<size_t>(n, r.remaining() / encoded_extent_bytes));
     for (uint32_t i = 0; i < n; ++i) {
         ExtentRef x;
         x.offset = r.u64();

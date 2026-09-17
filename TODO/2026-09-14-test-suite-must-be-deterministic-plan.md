@@ -155,6 +155,74 @@ count under `data_queue_mutex` in one sample and counts
 **Still open.** The two aarch64 cases below (no Pi reachable from here
 this session).
 
+## Measured 2026-09-17: the suite is still not deterministic on either platform
+
+Measured while verifying an unrelated metadata change, by building pristine
+`HEAD` (69a02ee, 0.43.0) into a separate tree and running the whole suite at
+default parallelism on both platforms. Rates on **clean `develop` with no local
+changes**:
+
+| Platform | runs | runs with a failure | cases that failed |
+|---|---|---|---|
+| macOS laptop, 12 slots | 6 | **4** | `storage_v18/test_durability_barrier_reports_objects_a_restarted_peer_lost`, `storage_v18/test_durability_barrier_rederives_placement_after_peer_restart` |
+| es-1 (aarch64), ~1.8 effective | 8 | **1** | `rpc_cluster/test_rpc_v15_bidirectional_and_deduplication` |
+
+The same tree carrying a metadata `reserve()` change and a version bump gave
+4/6 on macOS (same two cases, same rate) and 3/10 on es-1
+(`rpc_cluster/test_rpc_v15_bidirectional_and_deduplication`,
+`rpc_cluster/test_metadata_history_checkpoint_concurrent_proposers_converge`,
+`media_playback/test_immutable_media_profile_survives_cold_playback_manager`).
+The change is not the cause: the macOS rate is identical either side, and
+`test_rpc_v15_bidirectional_and_deduplication` fails on the pristine baseline
+too. With n=8 and n=10 the es-1 difference is not distinguishable from noise.
+
+Two new named cases, both reproducible on clean `HEAD`:
+
+- **`storage_v18/test_durability_barrier_reports_objects_a_restarted_peer_lost`**
+  and **`storage_v18/test_durability_barrier_rederives_placement_after_peer_restart`**
+  — macOS, roughly 1-in-2 per run across the pair, often both in the same run.
+  The highest-rate cases known on any platform; they were not on the list
+  before because previous sweeps were run after the FUSE work, not on a
+  pristine tree.
+- **`rpc_cluster/test_rpc_v15_bidirectional_and_deduplication`** — es-1,
+  ~1-in-8, fails in 12 ms, which points at a connection/port race rather than a
+  timeout.
+
+Neither is a "known flake" to be waved past; both are the next piece of work
+under this plan.
+
+A pristine `HEAD` (69a02ee) tree is built and left at `/root/macha-baseline` on
+es-1 for exactly this comparison — `./build/macha-tests` there is 0.43.0 with no
+local changes, so a rate can be re-measured against it without spending 25
+minutes rebuilding first. Rebuild it from a laptop with
+`git archive HEAD | ssh root@10.34.1.50 'tar x -C /root/macha-baseline'` if it
+has gone.
+
+## Also 2026-09-17: ordinary tests load the *installed* plugin directory
+
+Not a flake, a test-isolation defect, found because the version bump made it
+audible. `config_for` (`tests/test_support.hpp`) deliberately left
+`plugin_path` unset, with a comment saying an ordinary test wants no subsystem
+plugins and must "never" use the installed default. But `NodeRuntime` runs every
+`Config` through `normalize_config`, which fills an *absent* `plugin_path` with
+the installed directory (`src/config_base.cpp:553-554`). So every `TestService`
+and `TestNode` on a machine with Macha installed was dlopening
+`/usr/lib/macha/plugins/libmacha-{torrent,fuse}.so` — testing whatever is
+deployed on the build box rather than the build under test, and paying a
+libtorrent dlopen in every isolated case, both of which the comment existed to
+prevent.
+
+It was silent for as long as installed and built versions matched. Bumping es-1's
+build to 0.43.1 against an installed 0.43.0 surfaced it as
+`plugin 'libmacha-torrent' build identity mismatch: plugin=0.43.0+unknown
+core=0.43.1+unknown; refusing to load (partial deploy?)`.
+
+Fixed by setting `c.plugin_path` to an *engaged but empty* path, which is the
+only way to say "builtin subsystems only" — `normalize_config` skips an engaged
+optional and `Service` maps an empty path to `<builtin>`
+(`src/service.cpp:99`). Note this did **not** explain the failures above: the
+es-1 run that failed most recently had zero plugin mismatches.
+
 ## What "done" means
 
 - The full suite passes 20 consecutive times on gbni-1 and on es-1 at the

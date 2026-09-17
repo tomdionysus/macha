@@ -1,5 +1,35 @@
 # Current release
 
+## 0.43.1 — The namespace stops paying for slots it never fills (development)
+
+**A decoded namespace no longer carries up to 2x allocator slack in its extent
+vectors.** `entry(Reader&)` filled each entry's extent list with `push_back` and
+no `reserve`, so every vector sat wherever geometric growth had last doubled it.
+Measured on es-1 (1.618 TiB of library, 4,808 entries): **610,567 extent slots
+holding 424,222 extents** — 10.4 MB of empty slots in a 36 MB snapshot. That
+slack is permanent rather than transient, because the current and committed
+materialisations are pinned in the replica's cache and exempt from its eviction
+budget (`src/metadata.cpp:3203`), so it is resident on every node for as long as
+the head is the head.
+
+Decoding now reserves exactly, bounded by what the remaining input could
+actually contain (49 encoded bytes per extent) so a forged or corrupt extent
+count sizes nothing. The decoded snapshot fell from 36.2 MB to 25.8 MB, a
+**28.8% cut in decoded namespace residency**, which at the 100 TB design target
+is roughly 640 MB per node. No encoding changed, no format version moved and no
+migration is involved: the same bytes decode to the same snapshot, in less
+memory.
+
+`macha-metadata-dump --stats` now also reports what a head actually costs —
+decoded bytes, encoded payload, extent slots against extents in use, the
+relevant `sizeof`s, and bytes per TiB of library — and `snapshot_resident_bytes`
+is exposed from `metadata.hpp` so the tool charges exactly what the
+materialisation cache charges. This is the measurement behind Stage A of
+`TODO/2026-09-17-namespace-merkle-root-plan.md`, which the same numbers say is
+still the load-bearing work: residency remains linear in the size of the
+library and whole-library on every node, including the ones that store no
+extents at all.
+
 ## 0.43.0 — The HTTP server without a thread per connection (development)
 
 **The API is served by one reactor thread that owns every socket and never

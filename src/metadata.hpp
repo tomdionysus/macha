@@ -406,6 +406,12 @@ std::set<ObjectId> metadata_catalogue_root_set(const MetadataSnapshot&);
 // excludes catalogue/garbage/voter state and non-content stat metadata.
 Hash256 metadata_namespace_signature(const MetadataSnapshot&);
 
+// Decoded in-memory cost of one snapshot, by the same accounting the
+// materialization cache charges against its budget. Exposed so an operator can
+// measure a real library's residency from a state directory rather than
+// inferring it from struct declarations.
+uint64_t snapshot_resident_bytes(const MetadataSnapshot&);
+
 struct MetadataReplicaDiagnostics {
     uint64_t historical_requests{};
     uint64_t historical_reconstructions{};
