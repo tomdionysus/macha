@@ -1,0 +1,138 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+
+#include "metadata.hpp"
+#include "types.hpp"
+
+#include <map>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+
+namespace macha {
+
+// A content-addressed Merkle tree over the namespace, keyed by path.
+//
+// This is the substrate for SM14 (see TODO/2026-09-17-namespace-merkle-root-plan.md).
+// It is not yet authoritative for anything: nothing here is reachable from a
+// MetadataRecord, and `encode_snapshot` is untouched. What it establishes is the
+// structure the record will eventually point at instead of inlining.
+//
+// Two properties are load-bearing and both are tested:
+//
+// 1. **History independence.** The same entry set produces the same root
+//    whatever order it was reached in -- inserted, deleted back down to, or
+//    merged into. That is not a nicety: once `metadata_namespace_signature` and
+//    `cache_record`'s `entries != entries` witness become root comparisons, two
+//    nodes that independently reconcile to the same namespace must agree on the
+//    root, or the witness reports divergence that does not exist. An
+//    incrementally built fixed-fanout B-tree does not have this property, which
+//    is why node boundaries here are chosen by hashing keys rather than by fill
+//    factor.
+//
+// 2. **Boundaries depend on keys only, never on values.** Every namespace write
+//    is a value change on an existing path -- a size, an mtime, an extent
+//    appended -- and under a conventional content-defined chunking rule (hash
+//    the whole serialised item, as Noms and Dolt do) a value change can move a
+//    boundary and rewrite its neighbours. Hashing the key alone means a value
+//    change rewrites exactly one leaf and the path to the root, and nothing
+//    else. The cost is that a pathological key set can make an oversized node,
+//    which `max_fanout` caps -- a cap on item *count* is still a pure function
+//    of the sorted key sequence, so it preserves property 1. A cap on encoded
+//    *bytes* would not, and there deliberately is none.
+//
+// Extents do not live in the leaf. A leaf holds stat data plus either a short
+// inline extent list or the root of an extent sequence, so a leaf stays bounded
+// by the key set and a 12,500-extent film does not put 600 KB inside one. That
+// is what makes Stage D (demand-loaded extents) a change of when a node is
+// fetched rather than another format change.
+struct NamespaceTreeLimits {
+    // Average entries per leaf. The boundary test fires with probability
+    // 1/target per key, so leaves average this and vary geometrically.
+    size_t entry_target_fanout{32};
+    // Hard cap on entries per leaf. Count-based, so still key-determined.
+    size_t entry_max_fanout{128};
+    size_t branch_target_fanout{32};
+    size_t branch_max_fanout{128};
+    // At or below this many extents, the list is written inside the leaf. Eight
+    // extents is 392 encoded bytes at the 49 bytes/extent the snapshot already
+    // costs, which keeps an ordinary small file to a single node.
+    size_t extent_inline_max{8};
+    size_t extent_target_fanout{256};
+    size_t extent_max_fanout{1024};
+};
+
+// Where tree nodes are read and written. The intended implementation is the
+// existing content-addressed control store -- the path catalogue shards already
+// take, via `replicate_control`/`ensure_control_local`, which inherits
+// replication, repair and GC rather than adding a second durability model. The
+// interface is here so the tree can be built and measured without a cluster.
+class NamespaceNodeStore {
+  public:
+    virtual ~NamespaceNodeStore() = default;
+    // Stores the node and returns its content address. Storing the same bytes
+    // twice must return the same id and is not an error.
+    virtual ObjectId put(std::span<const uint8_t> node) = 0;
+    virtual std::optional<Bytes> get(const ObjectId& id) const = 0;
+};
+
+// An in-memory store, for tests and for offline measurement of a real head.
+class MemoryNamespaceNodeStore final : public NamespaceNodeStore {
+  public:
+    ObjectId put(std::span<const uint8_t> node) override;
+    std::optional<Bytes> get(const ObjectId& id) const override;
+
+    size_t nodes() const {
+        return nodes_.size();
+    }
+    uint64_t bytes() const {
+        return bytes_;
+    }
+    // Ids written by the most recent build that were not already present. This
+    // is the dirty set a commit would have to replicate, and measuring it is
+    // the point of Stage B.
+    const std::vector<ObjectId>& written() const {
+        return written_;
+    }
+    void forget_written() {
+        written_.clear();
+    }
+
+  private:
+    std::map<ObjectId, Bytes> nodes_;
+    std::vector<ObjectId> written_;
+    uint64_t bytes_{};
+};
+
+struct NamespaceTreeStats {
+    uint64_t entries{};
+    uint64_t extents{};
+    uint64_t leaves{};
+    uint64_t branches{};
+    uint64_t extent_nodes{};
+    uint64_t bytes{};
+    uint64_t largest_node_bytes{};
+    size_t depth{};
+};
+
+// Builds the tree and returns the root node's id. Deterministic in the entry
+// set alone; see property 1 above.
+ObjectId build_namespace_tree(const std::map<std::string, FsEntry>& entries, NamespaceNodeStore& store,
+                              const NamespaceTreeLimits& limits = {});
+
+// Materialises the whole namespace back out. This is the inverse of the build
+// and exists to prove the round trip, not because anything on the hot path
+// should want it -- the point of the structure is that nothing has to.
+std::map<std::string, FsEntry> read_namespace_tree(const ObjectId& root, const NamespaceNodeStore& store,
+                                                   const NamespaceTreeLimits& limits = {});
+
+// One path, without materialising the namespace: O(log n) nodes fetched. This
+// is what `getattr` becomes, and what makes "nothing forces materialisation"
+// true rather than aspirational.
+std::optional<FsEntry> namespace_tree_lookup(const ObjectId& root, std::string_view path,
+                                             const NamespaceNodeStore& store);
+
+NamespaceTreeStats namespace_tree_stats(const ObjectId& root, const NamespaceNodeStore& store);
+
+} // namespace macha
