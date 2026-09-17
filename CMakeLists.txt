@@ -276,6 +276,7 @@ set(MACHA_CORE_SOURCES
     src/retention.cpp
     src/persistent_cache.cpp
     src/metadata.cpp
+    src/namespace_tree.cpp
     src/net.cpp
     src/cluster.cpp
     src/distributed_store.cpp
@@ -515,6 +516,7 @@ if(MACHA_BUILD_TESTS)
         tests/test_subsystem_supervisor.cpp
         tests/test_fuse_subsystem.cpp
         tests/test_storage_metadata.cpp
+        tests/test_namespace_tree.cpp
         tests/test_storage_v18.cpp
         tests/test_rpc_cluster.cpp
         tests/test_filesystem_fuse.cpp

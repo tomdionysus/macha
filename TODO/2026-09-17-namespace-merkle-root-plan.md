@@ -2,8 +2,10 @@
 
 Date: 2026-09-17
 
-Status: **Stage A complete (2026-09-17), measured on live nodes.** Stages B-F
-not started. The finding below is verified against current `develop` (0.43.0);
+Status: **Stage A complete (2026-09-17), measured on live nodes. Stage B
+started the same day -- the tree substrate is written and tested, and is not
+yet SM14 or reachable from a record; see "Stage B progress" below.** Stages
+C-F not started. The finding below is verified against current `develop` (0.43.0);
 the design is proposed and the migration is not yet designed in enough detail to
 execute. The estimates in "The arithmetic" have been replaced by measurements --
 see "Stage A results" below, which supersedes them. Every line reference here was
@@ -368,6 +370,58 @@ not a target-scale one.
 ## Stages
 
 **Stage A — establish the real numbers. DONE 2026-09-17. See "Stage A results".**
+
+## Stage B progress (2026-09-17)
+
+**The substrate exists and is tested; it is not yet SM14 and nothing reaches
+it.** `src/namespace_tree.{hpp,cpp}`, `tests/test_namespace_tree.cpp`, six cases
+green. `encode_snapshot`, `decode_snapshot` and `MetadataRecord` are untouched,
+so this changes no on-disk or wire format and deploys as dead code.
+
+Three design decisions were settled in building it, and the first was not in
+the plan:
+
+- **The tree must be history-independent, and an incrementally built
+  fixed-fanout B-tree is not.** The same entry set has to produce the same root
+  whatever sequence of inserts, deletes and merges reached it, because
+  `metadata_namespace_signature` and `cache_record`'s `entries != entries`
+  witness (`src/metadata_manager.cpp:228`) become root comparisons: two nodes
+  that reconcile independently to the same namespace must agree on the root or
+  they report divergence that does not exist. Node boundaries are therefore
+  chosen by hashing keys, not by fill factor -- the prolly-tree/Dolt structure.
+- **Boundaries hash the key only, never the value.** Generic content-defined
+  chunking hashes the whole serialised item, so a value change can move a
+  boundary and rewrite its neighbours. Every namespace write *is* a value change
+  on an existing path -- a size, an mtime, an extent -- so that would be the
+  common case rather than the rare one. Key-only boundaries mean a value change
+  rewrites exactly one leaf and the path to the root. The cap that stops a
+  pathological key set making an oversized node is on item *count*, which is
+  still a pure function of the sorted key sequence; a cap on encoded *bytes*
+  would break history independence and there deliberately is none.
+- **Extents are addressed from the leaf, not inlined in it**, past a small
+  threshold (8, or 392 bytes at the 49 bytes/extent the snapshot already costs).
+  A leaf therefore stays bounded by the key set, and Stage D becomes a change of
+  *when* an extent node is fetched rather than another format change. The extent
+  sequence is itself chunked, with boundaries on each extent's own content
+  address, which is what makes an append stable: adding an extent cannot move
+  the boundaries of the extents already written.
+
+**Measured, on the shapes a media library actually has:**
+
+| | |
+|---|---|
+| one file's mtime/size changed, 480-entry library | **<= 12 nodes rewritten**, against the whole library on every commit today |
+| one extent appended to a 4,000-extent file | **3 nodes rewritten of 15** -- tail chunk, extent spine, leaf |
+| largest node, with a 12,500-extent film present | **< 64 KB** (that file's extent list is 612 KB inline today) |
+| point lookup | a path from the root, never the namespace |
+
+What Stage B still owes before it can be called done: the SM14 record shape and
+`decode_snapshot` dispatch alongside SM13; a fuzz case in the shape of
+`test_fuse_journal_fuzz_every_frame_mutation_still_starts`; a stat-only read
+path that provably fetches no extent nodes (the decoder already takes the flag,
+nothing public exposes it); and the `macha-metadata-dump` mode that builds the
+tree from the live es-1 head so these figures come off a real 1.618 TiB
+namespace rather than a generated one.
 
 **Stage B — the Merkle namespace, behind a new snapshot version.** Define the
 tree, node encoding and root. `decode_snapshot` already carries SM5 through SM13

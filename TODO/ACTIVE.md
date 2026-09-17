@@ -191,8 +191,15 @@ interlock is the most dangerous single piece of the work.
   open: the live `MetadataReplicaDiagnostics` counters
   (`src/metadata.hpp:415-431`) are reachable only through `GET /api/v1/status`,
   which needs an account holding `view_status`.
-- [ ] Stage B: Merkle namespace as SM14, readable alongside SM13, not yet
-  authoritative.
+- [~] Stage B: Merkle namespace as SM14, readable alongside SM13, not yet
+  authoritative. **Started 2026-09-17**: the tree substrate is in
+  `src/namespace_tree.{hpp,cpp}` with six green cases, history-independent
+  and key-only-chunked, extents addressed from the leaf rather than inlined.
+  Measured: one file's stat change rewrites <= 12 nodes instead of the whole
+  library; an extent appended to a 4,000-extent file rewrites 3 nodes of 15.
+  Still owed: the SM14 record shape and `decode_snapshot` dispatch, a journal-
+  style fuzz case, a stat-only read path proven to fetch no extent nodes, and
+  the `macha-metadata-dump` mode that runs it over the live es-1 head.
 - [ ] Stage C: commit path carries the change set instead of rediscovering it.
 - [ ] Stage D: demand-loaded extent nodes, on the `RetainedMemoryLedger`;
   persist `file_media_id`.
