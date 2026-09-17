@@ -466,9 +466,19 @@ catalogue:
     keep_alive_idle_timeout_ms: 15000
     slow_request_threshold_ms: 1000
     reactor_stall_threshold_ms: 50
+    compression: true
+    compression_min_bytes: 1K
+    compression_level: 6
+    compression_max_asset_bytes: 4M
 ```
 
 The server is one reactor thread that owns every socket, plus two pools of threads that only compute (see `docs/streaming.md`, "Public HTTP behaviour"). `workers` is the data lane: catalogue, playback, web assets, and every body read that can block on a disk or a replica. `control_workers` is the control lane: health, status, session and account routes, so they are answered while the data lane is saturated. `max_connections` bounds open connections; an idle kept-alive connection is a descriptor and a small struct, not a thread. `max_queued_requests` bounds how many requests may wait for a lane worker before the reactor answers `503 overloaded` with `Retry-After: 1`. `staging_chunks` is how many `stream_chunk_bytes` chunks a streaming response may hold ahead of a slow client, so streaming memory is at most connections × `staging_chunks` × `stream_chunk_bytes`. A handler slower than `slow_request_threshold_ms` is logged with its route; a reactor pass longer than `reactor_stall_threshold_ms` is counted in diagnostics as a stall, which should never happen.
+
+`compression` gzips text responses on the way out: JSON from the API, and the web client's HTML, CSS and JavaScript. It applies only to complete in-memory bodies above `compression_min_bytes`, and only for a client whose `Accept-Encoding` asks for it. Media is never compressed — it is already compressed, it is streamed rather than buffered, and the reactor sends it from resident memory without a copy. Neither are images, fonts or wasm, for the same reason. `compression_level` is the zlib level, 1 to 9; 1 gives most of the ratio for a fraction of the CPU, which is what a Pi-class node wants. Every compressible response carries `Vary: Accept-Encoding` whether or not it was compressed, so a shared cache keys the two representations apart.
+
+For the web client, a precompressed file sitting next to the asset (`app.js.gz` beside `app.js`) is preferred and costs no CPU per request. When the client build did not produce one, an asset up to `compression_max_asset_bytes` is compressed on demand instead; larger ones are streamed unchanged. The compressed and uncompressed forms of an asset never share an entity tag, so revalidation cannot return the wrong one.
+
+Set `compression: false` on a node that sits behind a proxy which already compresses. That is a supported deployment, not a degraded one, and the counters `responses_compressed` and `compression_bytes_saved` in the diagnostics route say what the setting is actually doing.
 
 `max_queued_connections` (pre-0.43.0) is still read, as `max_connections`.
 

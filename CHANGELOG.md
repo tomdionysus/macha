@@ -1,5 +1,48 @@
 # Current release
 
+## 0.44.0 — The bytes that never needed to be on the wire (development)
+
+**The HTTP server compresses what it sends.** It did not, at all: there was no
+`Content-Encoding` on any response, and the `Accept-Encoding` every browser
+sends on every request was parsed into the header map and then ignored. A web
+client bundle and a catalogue listing both went out in full, on every request,
+including to clients on the other end of a WAN link.
+
+Text responses are now gzipped on a lane worker — JSON from the API, and the
+client's HTML, CSS and JavaScript. Typical listings and bundles fall to
+between a quarter and a third of their size. Compression happens on the
+compute pool and never on the reactor, which may not do CPU work on a
+socket's behalf; by the time the reactor writes the headers the body is final
+and `Content-Length` is already the compressed length.
+
+**Media is deliberately untouched, and that is the point.** An extent, a
+transcoded fragment and a direct-play range are already compressed, they are
+served through a body source rather than a byte buffer, and the reactor sends
+them straight from resident memory with no copy and no pool hop — the path
+0.43.0 exists to provide. Only a complete in-memory body of a compressible
+type is ever eligible, so that path is bit-for-bit what it was. Ranged and
+`304` responses are excluded outright, images, fonts and wasm by type.
+
+For the web client, a precompressed file beside the asset (`app.js.gz` next to
+`app.js`) is preferred and costs nothing per request; where the build produced
+none, an asset up to `compression_max_asset_bytes` is compressed on demand
+instead, so a node gets the win without waiting on a client release. The two
+representations never share an entity tag: one tag for two different bodies
+lets a cache hand a client bytes it cannot read and makes a `304` a lie. The
+API's own `rev-N` tags are left exactly alone — those are `If-Match`
+concurrency tokens a client sends back on a write, not cache validators, and
+the suffix convention other servers use would have corrupted them. Every
+compressible response carries `Vary: Accept-Encoding` whether or not it was
+compressed.
+
+All of it is configurable under `catalogue.api`: `compression`,
+`compression_min_bytes`, `compression_level` and
+`compression_max_asset_bytes`. A node behind a proxy that already compresses
+sets `compression: false`, which is a supported deployment rather than a
+degraded one — some nodes are exposed directly and some are not, so the server
+has to be correct either way. `responses_compressed` and
+`compression_bytes_saved` in the diagnostics route say what it is doing.
+
 ## 0.43.1 — The namespace stops paying for slots it never fills (development)
 
 **A decoded namespace no longer carries up to 2x allocator slack in its extent

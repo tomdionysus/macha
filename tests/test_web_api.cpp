@@ -44,6 +44,29 @@ WebConfig config_for(const std::filesystem::path& root) {
     return config;
 }
 
+HttpRequest get_accepting_gzip(std::string path) {
+    auto request = get(std::move(path));
+    request.headers["accept-encoding"] = "gzip, deflate";
+    return request;
+}
+
+// Big enough to be worth compressing and repetitive enough to compress well,
+// which is what a real client bundle looks like to gzip.
+std::string bundle(size_t repeats = 200) {
+    std::string out = "// macha client bundle\n";
+    for (size_t i = 0; i < repeats; ++i)
+        out += "export function widget" + std::to_string(i) +
+               "(state){ return render(state, 'widget', " + std::to_string(i) + "); }\n";
+    return out;
+}
+
+std::string gzip_of(std::string_view text) {
+    auto compressed = gzip_compress(
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(text.data()), text.size()), 6);
+    if (!compressed) throw std::runtime_error("test fixture would not compress");
+    return std::string(compressed->begin(), compressed->end());
+}
+
 } // namespace
 
 MACHA_FAST_TEST("web_api", test_unknown_routes_reach_the_client_and_real_files_do_not) {
@@ -158,4 +181,155 @@ MACHA_FAST_TEST("web_api", test_a_web_client_is_read_only_and_optional) {
 
     // The API namespace is refused here even if something routes it wrongly.
     CHECK(web.handle(get("/api/v1/anything")).status == 404);
+}
+
+MACHA_FAST_TEST("web_api", test_a_client_asset_is_gzipped_only_for_a_client_that_takes_one) {
+    // The reason this exists: a first page load pulls the whole bundle, and
+    // over a WAN link that is the user-visible cost of opening the client.
+    TempDir t;
+    const auto root = t.path() / "web";
+    const auto script = bundle();
+    write_file(root / "index.html", "<!doctype html><title>macha</title>");
+    write_file(root / "app.js", script);
+    write_file(root / "logo.png", std::string(4096, '\x89'));
+    WebApi web(config_for(root));
+
+    auto compressed = web.handle(get_accepting_gzip("/app.js"));
+    CHECK(compressed.status == 200);
+    CHECK(compressed.content_type == "text/javascript; charset=utf-8");
+    CHECK(compressed.headers.at("Content-Encoding") == "gzip");
+    CHECK(compressed.headers.at("Vary") == "Accept-Encoding");
+    // What the browser ends up with must be the file, byte for byte.
+    CHECK(gunzip(body_of(compressed)) == script);
+    CHECK(body_of(compressed).size() < script.size() / 2);
+
+    // The same asset, for a client that said nothing about encodings.
+    auto plain = web.handle(get("/app.js"));
+    CHECK(plain.status == 200);
+    CHECK(!plain.headers.contains("Content-Encoding"));
+    CHECK(body_of(plain) == script);
+    // Still stated, so a shared cache keys the two representations apart
+    // rather than handing this body to the next client that asks for gzip.
+    CHECK(plain.headers.at("Vary") == "Accept-Encoding");
+
+    // A PNG is already compressed; a second pass would only spend CPU.
+    auto image = web.handle(get_accepting_gzip("/logo.png"));
+    CHECK(image.status == 200);
+    CHECK(!image.headers.contains("Content-Encoding"));
+    CHECK(!image.headers.contains("Vary"));
+}
+
+MACHA_FAST_TEST("web_api", test_a_precompressed_sibling_is_served_rather_than_compressed_again) {
+    // A build that emits app.js.gz has already paid for the compression. The
+    // server must spend nothing per request to use it.
+    TempDir t;
+    const auto root = t.path() / "web";
+    const auto script = bundle();
+    // Deliberately not the gzip of app.js: if the sibling is what gets sent,
+    // this is what comes back, and nothing else could produce it.
+    const auto sibling_contents = bundle(7) + "// served from the sibling\n";
+    write_file(root / "index.html", "<!doctype html><title>macha</title>");
+    write_file(root / "app.js", script);
+    write_file(root / "app.js.gz", gzip_of(sibling_contents));
+    WebApi web(config_for(root));
+
+    auto served = web.handle(get_accepting_gzip("/app.js"));
+    CHECK(served.status == 200);
+    CHECK(served.headers.at("Content-Encoding") == "gzip");
+    // The Content-Type is the asset's, not the archive's.
+    CHECK(served.content_type == "text/javascript; charset=utf-8");
+    CHECK(gunzip(body_of(served)) == sibling_contents);
+
+    // A client that cannot take gzip is still served the real asset.
+    auto plain = web.handle(get("/app.js"));
+    CHECK(plain.status == 200);
+    CHECK(!plain.headers.contains("Content-Encoding"));
+    CHECK(body_of(plain) == script);
+
+    // The sibling is never reachable as a resource in its own right under a
+    // type that would make a browser try to execute it.
+    auto direct = web.handle(get("/app.js.gz"));
+    CHECK(direct.status == 200);
+    CHECK(direct.content_type == "application/octet-stream");
+}
+
+MACHA_FAST_TEST("web_api", test_the_gzip_and_identity_representations_never_share_an_entity_tag) {
+    // The trap this closes: one tag for two different bodies lets a cache --
+    // or the browser's own store -- answer a client with a representation it
+    // cannot read, and makes a 304 a lie.
+    TempDir t;
+    const auto root = t.path() / "web";
+    write_file(root / "index.html", "<!doctype html><title>macha</title>");
+    write_file(root / "app.js", bundle());
+    WebApi web(config_for(root));
+
+    const auto compressed = web.handle(get_accepting_gzip("/app.js"));
+    const auto plain = web.handle(get("/app.js"));
+    const auto gzip_tag = compressed.headers.at("ETag");
+    const auto identity_tag = plain.headers.at("ETag");
+    CHECK(gzip_tag != identity_tag);
+
+    // Each representation revalidates against its own tag.
+    auto revalidate_gzip = get_accepting_gzip("/app.js");
+    revalidate_gzip.headers["if-none-match"] = gzip_tag;
+    CHECK(web.handle(revalidate_gzip).status == 304);
+
+    auto revalidate_plain = get("/app.js");
+    revalidate_plain.headers["if-none-match"] = identity_tag;
+    CHECK(web.handle(revalidate_plain).status == 304);
+
+    // And never against the other's: a client holding the identity body must
+    // be sent the gzip one in full rather than told it is unchanged.
+    auto crossed = get_accepting_gzip("/app.js");
+    crossed.headers["if-none-match"] = identity_tag;
+    auto crossed_response = web.handle(crossed);
+    CHECK(crossed_response.status == 200);
+    CHECK(crossed_response.headers.at("Content-Encoding") == "gzip");
+
+    auto crossed_back = get("/app.js");
+    crossed_back.headers["if-none-match"] = gzip_tag;
+    auto crossed_back_response = web.handle(crossed_back);
+    CHECK(crossed_back_response.status == 200);
+    CHECK(!crossed_back_response.headers.contains("Content-Encoding"));
+}
+
+MACHA_FAST_TEST("web_api", test_compression_is_configurable_and_off_means_off) {
+    // A node behind a proxy that already compresses has no reason to pay for
+    // it twice, so this is a supported deployment rather than a degraded one.
+    TempDir t;
+    const auto root = t.path() / "web";
+    const auto script = bundle();
+    write_file(root / "index.html", "<!doctype html><title>macha</title>");
+    write_file(root / "app.js", script);
+    write_file(root / "app.js.gz", gzip_of(script));
+
+    HttpCompressionConfig off;
+    off.enabled = false;
+    WebApi disabled(config_for(root), off);
+    auto untouched = disabled.handle(get_accepting_gzip("/app.js"));
+    CHECK(untouched.status == 200);
+    CHECK(!untouched.headers.contains("Content-Encoding"));
+    // Nothing varies when nothing is negotiated.
+    CHECK(!untouched.headers.contains("Vary"));
+    CHECK(body_of(untouched) == script);
+
+    // The floor is honoured: below it there is nothing to win and gzip's own
+    // header is a real fraction of the body.
+    HttpCompressionConfig floored;
+    floored.min_bytes = script.size() + 1;
+    WebApi high_floor(config_for(root), floored);
+    auto small = high_floor.handle(get_accepting_gzip("/index.html"));
+    CHECK(small.status == 200);
+    CHECK(!small.headers.contains("Content-Encoding"));
+
+    // An asset past the on-demand ceiling is streamed as it is rather than
+    // read whole into memory once per request -- but a precompressed sibling
+    // is still free, so it is still preferred.
+    HttpCompressionConfig capped;
+    capped.max_asset_bytes = 16;
+    WebApi tight(config_for(root), capped);
+    auto sibling = tight.handle(get_accepting_gzip("/app.js"));
+    CHECK(sibling.status == 200);
+    CHECK(sibling.headers.at("Content-Encoding") == "gzip");
+    CHECK(gunzip(body_of(sibling)) == script);
 }
