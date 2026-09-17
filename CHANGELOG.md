@@ -17,8 +17,17 @@ was in `docs/configuration.md` either, so a client had nothing to bound itself
 against except the defaults. A client that hardcoded 8 and 4000 against a node
 configured with `max_ahead_segments: 4` would believe it had 32 s of
 authorised production ahead of the frontier when it had 16, and would sit
-refused at the frontier for the difference — the same two-numbers-never-
-compared shape that the bug behind this release was.
+refused at the frontier for the difference.
+
+**That is the general case, and it is not what the bug behind this release
+was.** On es-1, where the freeze was measured, `max_ahead_segments` is
+explicitly 8 and `segment_duration_ms` 4000, so the client's assumed constant
+was correct and the frontier really was 32 s wide. The client used the right
+number and arrived past the frontier anyway. Those call for different fixes —
+"the client had the wrong constant" is fixed by putting the value on the wire,
+"the client arrived past a correctly-read frontier" is fixed in the client's
+recovery path — and both were needed. Recorded because the first draft of this
+entry conflated them, and the distinction is the more useful half.
 
 The bug: a client recovering a reaped play session created a replacement, held
 it 28 s while the viewer played out its buffer, and then asked for the fragment
