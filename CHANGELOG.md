@@ -30,6 +30,21 @@ still the load-bearing work: residency remains linear in the size of the
 library and whole-library on every node, including the ones that store no
 extents at all.
 
+**The test suite no longer loads whatever plugins happen to be installed on the
+build machine.** An ordinary test wants no subsystem plugins at all, and
+`test_support.hpp` left `plugin_path` unset to say so. Unset does not mean "no
+plugins": `normalize_config()` fills an absent `plugin_path` with the installed
+directory, so every test process resolved it to `/usr/lib/macha/plugins` and
+loaded the deployed build rather than the build under test. It went unnoticed
+for as long as the two matched; bumping es-1 to 0.43.1 made the suite log
+`plugin=0.43.0 core=0.43.1 ... refusing to load (partial deploy?)` and exposed
+it. Test configurations now set an engaged but empty path, which is the only way
+to say "builtin subsystems only".
+
+The quickstart now names the build dependencies as a copyable command per
+distribution — Debian/Ubuntu, Fedora and macOS (Homebrew) — instead of describing
+them in prose and leaving the package names to the reader.
+
 ## 0.43.0 — The HTTP server without a thread per connection (development)
 
 **The API is served by one reactor thread that owns every socket and never
