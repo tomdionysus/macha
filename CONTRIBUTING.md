@@ -7,6 +7,17 @@ repeat-cycle lifecycle test.
 
 Macha is intentionally small. Prefer a direct fix over another layer.
 
+## Branches and releases
+
+There are exactly two long-lived branches. `main` is the last stable release;
+`develop` is where work happens. No other branch is kept, and a branch is never
+named after a version.
+
+A release is a tag on `main` named exactly `x.y.z` — a bare semantic version,
+with no `v` prefix, no suffix and no other decoration. The version bump belongs
+in the release commit itself. New tags are annotated; the older lightweight tags
+are left alone rather than rewritten.
+
 ## Build and test
 
 ```sh
