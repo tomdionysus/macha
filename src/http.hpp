@@ -134,6 +134,9 @@ struct HttpServerDiagnostics {
     uint64_t requests_deferred{};
     uint64_t requests_overloaded{};
     uint64_t slow_requests{};
+    // Bodies gzipped on the way out, and the bytes that saved on the wire.
+    uint64_t responses_compressed{};
+    uint64_t compression_bytes_saved{};
     Lane control{};
     Lane data{};
 };

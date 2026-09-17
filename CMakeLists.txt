@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.43.1 LANGUAGES CXX)
+project(macha VERSION 0.44.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -132,6 +132,10 @@ find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
 find_package(CURL REQUIRED)
+# Response compression for the API and the web client. zlib is already a
+# transitive dependency of both OpenSSL and libcurl; this names it directly
+# because src/http_compression.cpp calls deflate() itself.
+find_package(ZLIB REQUIRED)
 find_package(yaml-cpp QUIET)
 
 # Some environments expose a static CURL::libcurl without its transitive link
@@ -279,6 +283,7 @@ set(MACHA_CORE_SOURCES
     src/metadata_manager.cpp
     src/json.cpp
     src/http.cpp
+    src/http_compression.cpp
     src/media_segments.cpp
     src/media_timestamps.cpp
     src/media_vod.cpp
@@ -314,7 +319,7 @@ target_include_directories(macha_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(macha_core PUBLIC
-    OpenSSL::Crypto Threads::Threads ${MACHA_CURL_TARGET} ${CMAKE_DL_LIBS})
+    OpenSSL::Crypto Threads::Threads ${MACHA_CURL_TARGET} ZLIB::ZLIB ${CMAKE_DL_LIBS})
 if(MACHA_MINIUPNPC_TARGET)
     target_link_libraries(macha_core PUBLIC ${MACHA_MINIUPNPC_TARGET})
     target_compile_definitions(macha_core PUBLIC MACHA_HAVE_MINIUPNPC=1)
@@ -519,6 +524,7 @@ if(MACHA_BUILD_TESTS)
         tests/test_users.cpp
         tests/test_web_api.cpp
         tests/test_http_server.cpp
+        tests/test_http_compression.cpp
         tests/test_invariants.cpp
         tests/test_models.cpp)
     target_link_libraries(macha-tests PRIVATE macha_core)

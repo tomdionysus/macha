@@ -97,7 +97,8 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
                  StartupStallHandler startup_stall_handler)
     : node_(std::move(config), keys, std::move(startup_stage_hook)), cluster_status_(node_),
       subsystems_(node_.config().plugin_path.value_or(std::filesystem::path{})),
-      session_api_(node_), users_api_(node_), web_(node_.config().web),
+      session_api_(node_), users_api_(node_),
+      web_(node_.config().web, node_.config().catalogue.api.compression),
       startup_stall_handler_(std::move(startup_stall_handler)),
       maintenance_stage_hook_(std::move(maintenance_stage_hook)) {
     cluster_status_.attach_convergence_diagnostics(
