@@ -36,59 +36,48 @@ std::vector<double> fixed_vod_durations(double duration_seconds, double seek_sec
 } // namespace
 
 std::optional<HlsVodPlan> reseek_hls_vod(const HlsVodPlan& prepared,
-                                         std::chrono::milliseconds requested_seek) {
-    if (!prepared.reusable_seek || !(prepared.source_duration_seconds > 0.001) ||
-        !(prepared.seek_segment_seconds > 0.001))
+                                         std::chrono::milliseconds requested_seek,
+                                         std::string* declined_reason) {
+    const auto decline = [&](const char* reason) {
+        if (declined_reason) *declined_reason = reason;
         return std::nullopt;
+    };
+    if (!prepared.reusable_seek) return decline("plan-not-reusable");
+    if (!(prepared.source_duration_seconds > 0.001)) return decline("source-duration-unknown");
+    if (!(prepared.seek_segment_seconds > 0.001)) return decline("segment-length-unknown");
 
     HlsVodPlan result = prepared;
-    const double requested_seconds = std::clamp(
-        requested_seek.count() / 1000.0, 0.0,
-        std::max(0.0, prepared.source_duration_seconds - 0.001));
+    const int64_t requested_ms =
+        media_vod::clamp_seek_ms(requested_seek.count(), prepared.source_duration_seconds);
+    const double requested_seconds = requested_ms / 1000.0;
+    result.playback.seek_requested = std::chrono::milliseconds(requested_ms);
 
     if (prepared.playback.mode == PlaybackMode::transcode) {
-        // Transcode lays down its own GOP structure via fixed_vod_durations
-        // regardless of source keyframes, so -- unlike the remux/copy branch
-        // below -- it only needs one nearby keyframe to avoid fully decoding
-        // (not just skipping) every source frame between the landing
-        // keyframe and an exact frame-accurate target: costly on slow
-        // software decoders and unnecessary precision for a viewer rather
-        // than a nonlinear editor. indexed_plan's whole-file segment-density
-        // check doesn't apply here and can spuriously reject an otherwise
-        // perfectly usable seek point if any other part of a long file has a
-        // sparser GOP (see nearest_keyframe_at_or_after).
-        double actual_seek = requested_seconds;
-        if (!prepared.video_random_access_points.empty()) {
-            if (const double snapped = media_vod::nearest_keyframe_at_or_after(
-                    prepared.video_random_access_points, requested_seconds);
-                snapped >= 0.0)
-                actual_seek = snapped;
-        }
-        // Round UP, not to nearest: actual_seek may be a real keyframe
-        // timestamp, and llround can round a fractional-millisecond
-        // keyframe timestamp down. Reconstructing microseconds from that
-        // truncated value later (run_pipeline) then lands
-        // avformat_seek_file's AVSEEK_FLAG_BACKWARD search one keyframe
-        // *earlier* than intended -- a full GOP's worth of avoidable decode.
-        result.playback.seek = std::chrono::milliseconds(
-            static_cast<int64_t>(std::ceil(actual_seek * 1000.0)));
+        // The encoder can start on any frame, so it starts exactly where it
+        // was asked to and the offset is zero. Transcode lays down its own GOP
+        // structure via fixed_vod_durations regardless of source keyframes, so
+        // -- unlike the remux/copy branch below -- it needs no keyframe at all,
+        // and indexed_plan's whole-file segment-density check does not apply.
+        result.playback.seek = std::chrono::milliseconds(requested_ms);
+        result.playback.seek_offset = {};
         result.segment_durations = fixed_vod_durations(prepared.source_duration_seconds,
-                                                       actual_seek,
+                                                       requested_seconds,
                                                        prepared.seek_segment_seconds);
     } else if (!prepared.video_random_access_points.empty()) {
         auto indexed = media_vod::indexed_plan(prepared.video_random_access_points,
                                                prepared.source_duration_seconds,
-                                               requested_seconds,
+                                               requested_ms,
                                                prepared.seek_segment_seconds);
-        if (!indexed) return std::nullopt;
-        // Same rounding hazard as above: indexed->actual_seek_seconds is a
-        // real keyframe timestamp.
-        result.playback.seek = std::chrono::milliseconds(
-            static_cast<int64_t>(std::ceil(indexed->actual_seek_seconds * 1000.0)));
+        // The density bounds are whole-file, so a sparser GOP anywhere else can
+        // reject a seek point that would play perfectly well. That is a known
+        // wrong bound on this path rather than a silent decline: name it.
+        if (!indexed) return decline("keyframe-density-bounds");
+        result.playback.seek = std::chrono::milliseconds(indexed->seek_ms);
+        result.playback.seek_offset = std::chrono::milliseconds(indexed->seek_offset_ms);
         result.segment_durations = std::move(indexed->segment_durations);
     } else {
-        result.playback.seek = std::chrono::milliseconds(
-            static_cast<int64_t>(std::llround(requested_seconds * 1000.0)));
+        result.playback.seek = std::chrono::milliseconds(requested_ms);
+        result.playback.seek_offset = {};
         result.segment_durations = fixed_vod_durations(prepared.source_duration_seconds,
                                                        requested_seconds,
                                                        prepared.seek_segment_seconds);
