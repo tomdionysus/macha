@@ -2343,9 +2343,14 @@ MACHA_TEST("rpc_cluster", test_established_metadata_floor_ignores_misconfigured_
     }));
     // Reachability deliberately precedes local metadata recovery. This test is
     // about an already-established write floor, so make both metadata planes
-    // ready before creating that established history.
+    // ready before creating that established history. Membership alone does not
+    // say that: the replica set can still be waiting on its bootstrap
+    // checkpoint survey, and the mkdir below is then refused for a reason that
+    // has nothing to do with what this test checks.
     (void)s1.filesystem();
     (void)s2.filesystem();
+    REQUIRE(wait_metadata_writable(s1));
+    REQUIRE(wait_metadata_writable(s2));
     s1.filesystem().mkdir("/established", 0755, getuid(), getgid());
     REQUIRE(wait_until([&] {
         try {
@@ -3711,6 +3716,7 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
                    s2.node().membership().active().size() >= 2;
         }));
 
+        REQUIRE(wait_metadata_writable(s1));
         s1.filesystem().create_file("/policy.bin", 0644, getuid(), getgid());
         auto writer = s1.filesystem().open_write("/policy.bin", true);
         REQUIRE(writer->write(0, input) == input.size());
@@ -3744,6 +3750,12 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
                    s2.node().membership().active().size() >= 2;
         }));
 
+        // The write floor has to be re-established at the NEW policy before a
+        // mutation is legal. Membership says both nodes are up; it does not say
+        // the floor has caught up with a policy that changed while they were
+        // down, and until it has, the commit is refused as
+        // "metadata commit durability floor unavailable".
+        REQUIRE(wait_metadata_writable(s1));
         s1.filesystem().mkdir("/after-grow", 0755, getuid(), getgid());
         MetadataManager m1(s1.node());
         auto snapshot = m1.snapshot();
