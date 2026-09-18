@@ -97,6 +97,8 @@ void encode(Writer& writer, const NodeTelemetry& value) {
     writer.string(value.api_endpoint);
     writer.u32(value.cpu_cores);
     writer.u64(value.memory_total_bytes);
+    writer.u32(value.playback_startup_timeout_ms);
+    writer.u32(value.playback_segment_timeout_ms);
 }
 
 NodeTelemetry decode(Reader& reader) {
@@ -157,6 +159,18 @@ NodeTelemetry decode(Reader& reader) {
     // ends here and reports none, which a consumer renders as unknown.
     if (reader.remaining())
         value.memory_total_bytes = reader.u64();
+    // Optional trailing fields: a record encoded before the playback budgets
+    // existed ends here and reports none, which a consumer reads as "this node
+    // cannot say" rather than as a budget of zero. Both are needed for the
+    // pair to mean anything, so a record carrying only the first is treated as
+    // carrying neither.
+    if (reader.remaining()) {
+        const auto startup = reader.u32();
+        if (reader.remaining()) {
+            value.playback_startup_timeout_ms = startup;
+            value.playback_segment_timeout_ms = reader.u32();
+        }
+    }
     if (!value.sequence)
         throw DecodeError("telemetry sequence must be nonzero");
     return value;
@@ -249,7 +263,8 @@ NodeTelemetry TelemetryStore::refresh_local(
     const NodeInfo& info, std::string version, uint64_t cache_capacity, uint64_t cache_used,
     uint32_t storage_backends_online, uint32_t peers_known, uint32_t peers_active,
     uint64_t rpc_connections_created, uint64_t rpc_connections_reused,
-    uint64_t rpc_connections_canonical, NodePhase phase, std::string api_endpoint) {
+    uint64_t rpc_connections_canonical, NodePhase phase, std::string api_endpoint,
+    PlaybackBudgets playback) {
     const auto now = Clock::now();
     const auto cpu_now = std::clock();
     const auto wall_seconds = std::chrono::duration<double>(now - previous_cpu_wall_).count();
@@ -288,6 +303,8 @@ NodeTelemetry TelemetryStore::refresh_local(
     telemetry.api_endpoint = std::move(api_endpoint);
     telemetry.cpu_cores = std::thread::hardware_concurrency();
     telemetry.memory_total_bytes = physical_memory_bytes();
+    telemetry.playback_startup_timeout_ms = playback.startup_timeout_ms;
+    telemetry.playback_segment_timeout_ms = playback.segment_timeout_ms;
     observe(telemetry, true);
     return telemetry;
 }

@@ -1661,10 +1661,21 @@ void NodeRuntime::refresh_telemetry() {
         }
     }
 
+    // The playback budgets this node enforces, so a client can bound its own
+    // attempt against them instead of guessing. A node that serves no playback
+    // reports none rather than a figure it would not honour: zero reads as
+    // "cannot say", which is the honest answer from a node with streaming off.
+    PlaybackBudgets playback;
+    if (cfg_.streaming.enabled) {
+        playback.startup_timeout_ms =
+            static_cast<uint32_t>(std::max<int64_t>(0, cfg_.streaming.startup_timeout.count()));
+        playback.segment_timeout_ms =
+            static_cast<uint32_t>(std::max<int64_t>(0, cfg_.streaming.segment_timeout.count()));
+    }
     telemetry_.refresh_local(info, std::string(kServerVersion), cache_capacity, cache_used,
                              storage_backends_online, peers_known, peers_active, 0, 0,
                              peers_active > 0 ? peers_active - 1 : 0, phase,
-                             std::move(api_endpoint));
+                             std::move(api_endpoint), playback);
 }
 
 void NodeRuntime::signal_telemetry_refresh() {
