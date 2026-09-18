@@ -1,5 +1,69 @@
 # Current release
 
+## 0.46.2 — The budgets a node will admit to (development)
+
+**A client had to guess how long this node would take, and guessed low.** Core
+carried `GENERATION_ATTEMPT_BUDGET_MS = 12000` against a hardcoded guess at our
+`startup_timeout_ms` of 15000, so it abandoned a node three seconds inside that
+node's own entitlement -- not occasionally, structurally, on every attempt that
+ran long. Measured on 2026-09-18 on `tmdb:episode:7203311`: a seek took the
+fast path in about a millisecond, the container seek cost 39 ms, and the first
+fragment took 11,672 ms because it was 4K HEVC re-encoded to H.264 in software
+on a Pi. Comfortably inside our bound. The client failed it anyway, deleted the
+generation that landed 1.4 s later, and failover started the identical encode
+on the other node. The viewer got a failure screen instead of a wait and the
+cluster did the work twice.
+
+Two `uint32` fields on `NodeTelemetry`, surfaced on the per-node entries of
+`GET /api/v1/status` in a `playback` object beside `runtime`:
+`startup_timeout_ms` and `segment_timeout_ms`.
+
+**Why there and not on the session payload**, which is where `look_ahead_ms`
+lives and was the obvious precedent: a client needs these for every node it
+might fail over to, not only the one it is playing from, and it needs them
+*before* the request they bound. It cannot learn a startup budget from the
+response it is timing out on, and a node it has never used would never send one.
+The cluster status payload already describes every node and a client already
+reads it; these join `load1` and `cpu_cores` there as one more self-reported
+fact.
+
+**What the server does not do is compute a cluster-wide figure.** It has no
+data to: telemetry carries no peer's streaming configuration, so a node asked
+for the worst case across the cluster would be inventing one about peers it
+cannot see, and it would be stale the moment any of them reloaded. Relaying a
+node's own statement is not the same act as aggregating, and the aggregation
+belongs to the only party that knows which nodes it might use.
+
+**Absence means the node cannot say, never a default.** A node predating the
+field omits them, and so does one with `streaming.enabled` false, which will
+not honour a playback budget it does not run. A client must fall back to its
+own conservative bound rather than read a missing field as zero -- a default
+would be indistinguishable at runtime from an answer, which is the mistake the
+0.46.0 seek work exists to correct. The two are also all-or-nothing on decode:
+a record carrying only the first is treated as carrying neither, rather than
+pairing a real startup budget with a fabricated segment one.
+
+**A latent flaw this change exposed, and did not cause.** A telemetry set
+concatenates its records with no per-record length, so a decoder reading an
+optional trailing field cannot tell "this record ends here" from "the next
+record begins here". Gossip sends up to 64 records per set
+(`src/cluster.cpp:1146`), so during any rolling upgrade that adds a telemetry
+field, a multi-record set from the other version misparses and is dropped
+whole. Every telemetry field addition has had this property; adding these two
+is what made it visible, as a one-off `persisted telemetry ignored: blob too
+large` on each node's first start, after which the cache is rewritten in the
+new format and the warning does not return. Both nodes were taken to 0.46.2
+together to close the window rather than left mixed. The fix -- length-delimit
+records within a set -- is its own change with its own compatibility cost and
+is not in this release; it is recorded in `TODO/ACTIVE.md`.
+
+Also in this release: the `/api/v1/health` comment claiming the route carries
+no version was stale. It has carried one since 0.42.1, deliberately -- reading
+what a node is running without a token is how every on-box check and deploy
+verification is done -- and the recorded client contract said the same wrong
+thing. Both now describe the route as it behaves, and the rule that still holds
+is stated separately: no node identity, no topology, no configuration.
+
 ## 0.46.1 — The profiles a restart used to throw away (development)
 
 **A media profile computed but not yet published was discarded on shutdown.**
