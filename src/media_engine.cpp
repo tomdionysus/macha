@@ -448,18 +448,11 @@ std::vector<double> video_keyframe_seconds(AVFormatContext* format, int video_st
     return keyframes;
 }
 
-std::vector<double> indexed_vod_durations(AVFormatContext* format, int video_stream,
-                                          double duration_seconds, double requested_seek_seconds,
-                                          double segment_seconds, double& actual_seek_seconds,
-                                          std::vector<double>* reusable_keyframes = nullptr) {
-    auto keyframes = video_keyframe_seconds(format, video_stream);
-    if (keyframes.empty()) return {};
-    auto plan = media_vod::indexed_plan(keyframes, duration_seconds, requested_seek_seconds,
-                                        segment_seconds);
-    if (!plan) return {};
-    if (reusable_keyframes) *reusable_keyframes = keyframes;
-    actual_seek_seconds = plan->actual_seek_seconds;
-    return std::move(plan->segment_durations);
+std::string index_density_log(std::span<const double> keyframes, double duration_seconds) {
+    const auto density = media_vod::index_density(keyframes, duration_seconds);
+    return " keyframes=" + std::to_string(density.entries) +
+           " longest_gap_s=" + std::to_string(density.longest_gap_seconds) +
+           " median_gap_s=" + std::to_string(density.median_gap_seconds);
 }
 
 } // namespace
@@ -1273,10 +1266,13 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
     input.clear_deadline();
 
     // avformat timestamps are absolute on the input timeline. Keep the public
-    // playback generation relative to zero, including after a seek. Remux VOD
-    // seeks have already been aligned to an indexed video keyframe; transcode
-    // may seek backward for decoder pre-roll, but decoded frames before zero
-    // are discarded and never enter the output timeline.
+    // playback generation relative to zero, including after a seek. A remux
+    // VOD seek is the indexed keyframe at or before the request, so the
+    // backward search below lands exactly on it; a transcode seek is the
+    // request itself and may seek backward for decoder pre-roll, but decoded
+    // frames before zero are discarded and never enter the output timeline.
+    // Either way the generation begins at plan.seek, which is what the session
+    // payload publishes as seek_ms.
     const int64_t input_start_us = in->start_time == AV_NOPTS_VALUE ? 0 : in->start_time;
     const int64_t seek_target_us = input_start_us +
         av_rescale_q(plan.seek.count(), AVRational{1, 1000}, AV_TIME_BASE_Q);
@@ -1712,8 +1708,14 @@ class LibavMediaEngine final : public MediaEngine {
         result.source_duration_seconds = source_duration_seconds;
         const double target = std::max(0.001, segment_duration.count() / 1000.0);
         result.seek_segment_seconds = target;
-        double requested_seek = std::clamp(requested.seek.count() / 1000.0, 0.0,
-                                           std::max(0.0, source_duration_seconds - 0.001));
+        // The request the server honours, in integer milliseconds. Every
+        // baseline and offset below is derived from this one value, so the
+        // published invariant is exact rather than approximately reconstructed
+        // from two independent roundings of the same double.
+        const int64_t requested_ms =
+            media_vod::clamp_seek_ms(requested.seek.count(), source_duration_seconds);
+        const double requested_seek = requested_ms / 1000.0;
+        result.playback.seek_requested = std::chrono::milliseconds(requested_ms);
 
         InputContext input(source, MediaReadPurpose::probe, source.cancelled.get(), config_.probe_bytes,
                            config_.probe_analyze_duration, timeout);
@@ -1733,39 +1735,38 @@ class LibavMediaEngine final : public MediaEngine {
                 if (input.timed_out())
                     throw MediaError(MediaFailure::timed_out,
                                      "VOD planning timed out while loading video seek index");
-                double actual_seek = requested_seek;
-                result.segment_durations = indexed_vod_durations(
-                    format, result.playback.video_stream, source_duration_seconds, requested_seek,
-                    target, actual_seek, &result.video_random_access_points);
-                if (!result.segment_durations.empty()) {
-                    // actual_seek is a real keyframe's timestamp. Round UP to
-                    // milliseconds, never to nearest: llround can round a
-                    // fractional-millisecond keyframe timestamp down, and
-                    // reconstructing microseconds from that truncated value
-                    // later (run_pipeline) then lands avformat_seek_file's
-                    // AVSEEK_FLAG_BACKWARD search one keyframe *earlier* than
-                    // intended -- a full GOP's worth of avoidable decode.
-                    result.playback.seek = std::chrono::milliseconds(
-                        static_cast<int64_t>(std::ceil(actual_seek * 1000.0)));
+                const auto index_keyframes =
+                    video_keyframe_seconds(format, result.playback.video_stream);
+                std::optional<media_vod::IndexedPlan> indexed;
+                if (!index_keyframes.empty())
+                    indexed = media_vod::indexed_plan(index_keyframes, source_duration_seconds,
+                                                      requested_ms, target);
+                if (indexed) {
+                    result.video_random_access_points = index_keyframes;
+                    result.segment_durations = std::move(indexed->segment_durations);
+                    result.playback.seek = std::chrono::milliseconds(indexed->seek_ms);
+                    result.playback.seek_offset = std::chrono::milliseconds(indexed->seek_offset_ms);
+                    // The shape of the index behind a plan that worked, not
+                    // only behind one that did not. The gaps are the distance
+                    // between *indexed* entries and so an upper bound on the
+                    // true GOP; measured offsets clustering well below them
+                    // say the Cues are sparse rather than the GOP long.
+                    Log::debug("media VOD planner accepted remux keyframe index media=" +
+                               source.media_id + " entries=" +
+                               std::to_string(avformat_index_get_entries_count(stream)) +
+                               index_density_log(index_keyframes, source_duration_seconds) +
+                               " seek_ms=" + std::to_string(indexed->seek_ms) +
+                               " seek_offset_ms=" + std::to_string(indexed->seek_offset_ms) +
+                               " seek_requested_ms=" + std::to_string(indexed->seek_requested_ms));
                 } else {
-                    // Name the reason: how many entries, and the longest gap
-                    // between consecutive keyframes (the tail counts as a
-                    // gap), so an operator can tell a partial index from a
-                    // long-GOP encode without a debugger.
-                    const auto index_keyframes =
-                        video_keyframe_seconds(format, result.playback.video_stream);
-                    double longest_gap = 0.0;
-                    double previous = 0.0;
-                    for (const double seconds : index_keyframes) {
-                        longest_gap = std::max(longest_gap, seconds - previous);
-                        previous = seconds;
-                    }
-                    longest_gap = std::max(longest_gap, source_duration_seconds - previous);
+                    // Name the reason: how many entries, and the gaps between
+                    // consecutive keyframes (the tail counts as a gap), so an
+                    // operator can tell a partial index from a long-GOP encode
+                    // without a debugger.
                     Log::debug("media VOD planner rejected unusable remux keyframe index media=" +
                                source.media_id + " entries=" +
                                std::to_string(avformat_index_get_entries_count(stream)) +
-                               " keyframes=" + std::to_string(index_keyframes.size()) +
-                               " longest_gap_s=" + std::to_string(longest_gap));
+                               index_density_log(index_keyframes, source_duration_seconds));
                     if (!allow_video_transcode_fallback || !status_.h264_encoder)
                         throw std::runtime_error(
                             "remux VOD requires a usable video keyframe index; H.264 fallback is not permitted or unavailable");
@@ -1787,52 +1788,44 @@ class LibavMediaEngine final : public MediaEngine {
                     segment = gop / fps;
                 }
                 result.seek_segment_seconds = segment;
-                // A frame-accurate seek forces the decode loop to fully
-                // decode (not just skip) every source frame between the
-                // landing keyframe and the exact target before any output
-                // can be produced, purely so encoding can start at that
-                // exact frame. A viewer (not a nonlinear editor) does not
-                // need that precision, and on slow software decode (e.g.
-                // HEVC Main10 on ARM) it can add several seconds to startup.
-                // Snap to the nearest keyframe at or after the target
-                // instead (see nearest_keyframe_at_or_after for why this
-                // can't reuse indexed_plan directly) so encoding can start
-                // immediately once the seek lands; falls back to the
-                // unsnapped position if the index is missing or the target
-                // is past the last keyframe. Populating
-                // video_random_access_points here also lets
-                // reseek_hls_vod's fast PATCH-seek path reuse this same
-                // keyframe list without reopening/reprobing the source (it
-                // still goes through indexed_plan there, which is fine: a
-                // single already-known-good starting keyframe plus modest
-                // remaining runtime rarely trips the density check that
-                // burned the whole-file case here).
+                // The encoder can start on any frame, so it does: the seek is
+                // exactly what was asked for and the offset is zero. Until
+                // 2026-09-18 this snapped forward to the nearest keyframe at
+                // or after the target, to spare the decoder the pre-roll of
+                // decoding (not just skipping) every frame from the preceding
+                // keyframe. That pre-roll is still paid -- run_pipeline seeks
+                // back for it and discards decoded frames before the origin --
+                // but it is the price of asking for a non-keyframe and it is
+                // the client's to pay. Snapping put the content between the
+                // request and the keyframe in no generation at all, which no
+                // client could recover; a client that wants the cheap,
+                // exactly-aligned seek asks for a position that already is a
+                // keyframe.
+                //
+                // video_random_access_points is still populated here so
+                // reseek_hls_vod's fast PATCH-seek path reuses this keyframe
+                // list without reopening/reprobing the source, and so the
+                // density diagnostic below can say what the index looked like.
                 materialise_deferred_seek_index(format, result.playback.video_stream, requested_seek);
                 if (input.timed_out())
                     throw MediaError(MediaFailure::timed_out,
                                      "VOD planning timed out while loading video seek index");
-                auto keyframes = video_keyframe_seconds(format, result.playback.video_stream);
-                double actual_seek = requested_seek;
-                if (const double snapped =
-                        media_vod::nearest_keyframe_at_or_after(keyframes, requested_seek);
-                    snapped >= 0.0)
-                    actual_seek = snapped;
-                result.video_random_access_points = keyframes;
+                result.video_random_access_points =
+                    video_keyframe_seconds(format, result.playback.video_stream);
                 result.segment_durations =
-                    fixed_vod_durations(source_duration_seconds, actual_seek, segment);
-                // Round UP, not to nearest -- see the identical comment on
-                // the remux branch above for why: actual_seek may be a real
-                // keyframe timestamp, and rounding it down here would make
-                // run_pipeline's seek land one keyframe earlier than
-                // intended.
-                result.playback.seek = std::chrono::milliseconds(
-                    static_cast<int64_t>(std::ceil(actual_seek * 1000.0)));
+                    fixed_vod_durations(source_duration_seconds, requested_seek, segment);
+                result.playback.seek = std::chrono::milliseconds(requested_ms);
+                result.playback.seek_offset = {};
+                Log::debug("media VOD planner transcode keyframe index media=" + source.media_id +
+                           index_density_log(result.video_random_access_points,
+                                             source_duration_seconds) +
+                           " seek_ms=" + std::to_string(requested_ms) + " seek_offset_ms=0");
             }
         } else {
             result.segment_durations =
                 fixed_vod_durations(source_duration_seconds, requested_seek, target);
-            result.playback.seek = std::chrono::milliseconds(
-                static_cast<int64_t>(std::llround(requested_seek * 1000.0)));
+            result.playback.seek = std::chrono::milliseconds(requested_ms);
+            result.playback.seek_offset = {};
         }
 
         if (result.segment_durations.empty())
@@ -1841,6 +1834,8 @@ class LibavMediaEngine final : public MediaEngine {
         Log::debug("media VOD plan media=" + source.media_id +
                    " mode=" + playback_mode_name(result.playback.mode) +
                    " seek_ms=" + std::to_string(result.playback.seek.count()) +
+                   " seek_offset_ms=" + std::to_string(result.playback.seek_offset.count()) +
+                   " seek_requested_ms=" + std::to_string(result.playback.seek_requested.count()) +
                    " segments=" + std::to_string(result.segment_durations.size()));
         return result;
     }

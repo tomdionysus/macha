@@ -132,7 +132,31 @@ struct PlaybackPlan {
     std::string audio_codec{"aac"};
     std::optional<int> target_height;
     std::optional<uint64_t> target_video_bitrate;
+    // Where this generation's media actually begins: the first sample the
+    // client receives.
     std::chrono::milliseconds seek{};
+    // How far into that generation the requested position sits, and the
+    // request the server honoured after clamping. Exactly, in integer
+    // milliseconds, with no tolerance and no rounding slack:
+    //
+    //     seek + seek_offset == seek_requested
+    //
+    // seek_offset is never negative. The server does not move a requested
+    // position; where a mode cannot begin a stream exactly there it says so
+    // here rather than relocating the request and reporting the relocation as
+    // though it were what was asked for.
+    std::chrono::milliseconds seek_offset{};
+    std::chrono::milliseconds seek_requested{};
+
+    // Record a client's requested position before any planning has run. Until
+    // a planner has had a say, the baseline and the request are the same thing
+    // and the offset is zero; direct play, which has no generation, stays that
+    // way.
+    void request_seek(std::chrono::milliseconds position) {
+        seek = position;
+        seek_offset = {};
+        seek_requested = position;
+    }
 };
 
 struct HlsVodPlan {
@@ -282,9 +306,13 @@ std::unique_ptr<MediaEngine> make_libav_media_engine(const StreamingConfig&);
 
 // Derive a new transformed VOD generation from an already prepared plan.
 // Returns no plan when the original preparation did not retain sufficient
-// random-access information for a seek-only fast path.
+// random-access information for a seek-only fast path. `declined_reason`, when
+// supplied, names the precondition that failed: an unanswered question must not
+// read as an answer, and until 2026-09-18 a decline here was indistinguishable
+// from the fast path never being attempted.
 std::optional<HlsVodPlan> reseek_hls_vod(const HlsVodPlan&,
-                                         std::chrono::milliseconds requested_seek);
+                                         std::chrono::milliseconds requested_seek,
+                                         std::string* declined_reason = nullptr);
 
 std::string playback_mode_name(PlaybackMode);
 // RFC 6381 codec string for one stream of a plan ("avc1.640029",

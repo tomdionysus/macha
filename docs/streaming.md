@@ -114,7 +114,7 @@ That assignment is deliberately the opposite of what the HTTP spec suggests, bec
 
 A held request costs no thread. The handler asks the segment store for the object and, in the same locked step, subscribes to the next publication if it is absent; it then hands the server a deferral -- what it is waiting for, its deadline, and the admitted hold -- and returns. The server parks the connection and re-runs the handler when the store publishes or the deadline passes. `max_concurrent_holds` is therefore a fairness and memory bound (64 by default since 0.43.0, when it stopped rationing a sixteen-thread worker pool at 8), and the admission policy above is what it always was.
 
-For stream-copy video, the VOD planner uses the demuxer's keyframe index and chooses random-access boundaries near `segment_duration_ms`. Matroska/WebM Cues are explicitly materialised through the demuxer's seek path before that index is inspected, because probing alone may expose only a partial early-file index. The resulting plan is rejected if any advertised fragment would be grossly larger than the configured target, preventing a partial index from turning the unindexed remainder of a movie into one fragment. A transformed seek is aligned to the first indexed keyframe at or after the requested position so the first advertised segment is independently decodable. A remux whose keyframe index is unusable fails rather than silently changing mode. A fragment is as long as the source GOP makes it, up to 90 seconds; only a gap or tail beyond that rejects the plan, because scene-cut encodes routinely exceed a fixed multiple of the target. Transcoded video uses the encoder GOP cadence as its VOD boundary plan.
+For stream-copy video, the VOD planner uses the demuxer's keyframe index and chooses random-access boundaries near `segment_duration_ms`. Matroska/WebM Cues are explicitly materialised through the demuxer's seek path before that index is inspected, because probing alone may expose only a partial early-file index. The resulting plan is rejected if any advertised fragment would be grossly larger than the configured target, preventing a partial index from turning the unindexed remainder of a movie into one fragment. A transformed seek starts at the last indexed keyframe at or *before* the requested position, so the first advertised segment is independently decodable and the generation still contains the position that was asked for. The remainder is reported as `seek_offset_ms` rather than added silently to the request (see "Where a seek actually starts" below). A remux whose keyframe index is unusable fails rather than silently changing mode. A fragment is as long as the source GOP makes it, up to 90 seconds; only a gap or tail beyond that rejects the plan, because scene-cut encodes routinely exceed a fixed multiple of the target. Transcoded video uses the encoder GOP cadence as its VOD boundary plan.
 
 Stream-copy timestamps are normalised only after rescaling into the MP4 stream's final muxer timebase. Missing PTS/DTS are synthesised conservatively and equal/backwards DTS values are advanced with a persistent per-stream timeline correction. Legitimate PTS-before-DTS composition offsets are preserved rather than clamped; fragmented MP4 is emitted with signed composition-time offsets enabled. Repairs that actually modify timestamps are logged with per-stream counters.
 
@@ -255,6 +255,8 @@ The response separates requested preferences, resolved playback, original source
   "mode": "remux",
   "duration_ms": 5400000,
   "seek_ms": 0,
+  "seek_offset_ms": 0,
+  "seek_requested_ms": 0,
   "preferences": {
     "mode": "remux",
     "video": null,
@@ -298,6 +300,36 @@ The response separates requested preferences, resolved playback, original source
 ```
 
 `preferences` echoes the instruction as given; the top-level `mode` is what that instruction amounts to (a session with any stream being encoded reports `transcode`, whatever shorthand was used). `source.streams` describes the original elementary streams. `output.video`/`output.audio` describe the selected source stream, whether it is copied or transcoded, and the actual output codec/geometry/audio format. A CRF H.264 transcode has no fixed video bitrate and therefore omits `output.video.bitrate` unless an explicit target bitrate is in force. Returned stream URLs are relative to the API origin.
+
+### Where a seek actually starts
+
+The server does what it is told. It does not change the mode a client asked for, and it does not move the position a client asked for. Where a mode cannot begin a stream at the exact position requested, the response says so explicitly instead of relocating the request and reporting the relocation as though it were the answer.
+
+Three flat fields on the session payload, present on create and on every `PATCH`, all milliseconds on the title's timeline:
+
+- **`seek_ms`** — where the generation's media actually begins: the first sample the client receives. This is exactly what the field has always meant, so a client that reads only it is unaffected.
+- **`seek_offset_ms`** — how far into that generation the requested position sits.
+- **`seek_requested_ms`** — the position the server honoured, after clamping to `[0, duration - 1 ms]`.
+
+The invariant, exactly, in integer milliseconds, with no tolerance and no rounding slack:
+
+```text
+seek_ms + seek_offset_ms == seek_requested_ms
+```
+
+`seek_offset_ms` is never negative, so a generation always contains the position asked for and nothing between the request and the stream start can go missing. `seek_requested_ms` exists because an exact invariant is only useful if a client can act on it being violated, and without it a client cannot distinguish a violation from an ordinary clamp near the end of a title; those want opposite handling.
+
+Per mode:
+
+- **Transcode.** `seek_ms` is exactly the requested position and `seek_offset_ms` is always `0`. The encoder can start on any frame, so it does. The decoder still seeks back to the preceding keyframe for pre-roll and discards decoded frames before the origin; on slow software decode that can add seconds to startup. That is the price of asking for a non-keyframe and it is the client's to pay.
+- **Remux.** `seek_ms` is the last indexed keyframe at or before the request; `seek_offset_ms` is the remainder. A stream copy has no decoder and an fMP4 fragment's first sample must be a sync sample, so this is the only split the container permits. The client attaches at `seek_offset_ms` within the first fragment, so the pre-roll is fetched but never presented.
+- **Direct.** `seek_ms` is the request and `seek_offset_ms` is `0`. There is no generation; the client byte-ranges the source.
+
+The offset is therefore zero exactly when the mode can be frame-accurate. A client that wants a cheap, exactly-aligned seek asks for a position that is already a keyframe.
+
+The mode is never substituted. A remux request stays remux, including when its keyframe situation is awkward: where the index names no keyframe at or before the request, the baseline is `0` and the offset carries the whole request. A decodable stream's first sample is necessarily a sync sample, so a copy can always begin at the beginning; the index simply did not name it. (Separately, a remux whose keyframe index is unusable *as a segment plan* still fails, or falls back to transcode where `allow_video_transcode_fallback` permits it. That is remux being unplannable, not a seek being moved.)
+
+Until 0.45.x a transformed seek was aligned to the first keyframe at or *after* the request, in both modes. Measured on the live cluster on 2026-09-17, that started a remux generation up to 9.3 s past the position asked for, always forward. The content between the request and that keyframe was in no generation at all and no client could recover it: a skipped scene for a viewer seek, and deleted content mid-playback on the reaped-session recovery path, which rebuilds a generation at a position a viewer has actually reached.
 
 ## Inspect, change and stop a session
 
