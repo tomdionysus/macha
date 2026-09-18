@@ -1165,6 +1165,39 @@ struct PlaybackManager::Impl {
                                             [] { return false; });
             }
         }
+        drain_profile_publications();
+    }
+
+    // A queued profile is a container inspection that has already been paid
+    // for -- seconds of it on a large Matroska source, in the foreground, with
+    // a viewer waiting. Until 0.46.1 a stop broke out of the loop above and
+    // left whatever had not been published yet in memory, so every restart
+    // discarded the profiles probed in the moments before it and the next play
+    // of those titles paid for them again from scratch. Publish them on the
+    // way out instead.
+    //
+    // One commit for the whole queue, not one per entry: shutdown must stay
+    // prompt, and put_media_profiles() takes the catalogue mutation lock once.
+    // Failure here is not retried -- shutdown is not the place to fight a
+    // transient CAS conflict -- but it is reported, because a profile lost
+    // this way is silent work the node will repeat.
+    void drain_profile_publications() {
+        std::map<std::string, MediaProbeResult, std::less<>> pending;
+        {
+            std::lock_guard lock(profile_publish_mutex);
+            pending.swap(pending_profile_publications);
+            pending_profile_publication_bytes = 0;
+        }
+        if (pending.empty()) return;
+        const auto count = pending.size();
+        try {
+            catalogue.put_media_profiles(std::move(pending));
+            Log::debug("playback immutable profiles published at shutdown count=" +
+                       std::to_string(count));
+        } catch (const std::exception& e) {
+            Log::warn("playback immutable profiles lost at shutdown count=" +
+                      std::to_string(count) + " error=" + e.what());
+        }
     }
 
     size_t video_transcodes_locked(std::string_view excluding = {}) const {

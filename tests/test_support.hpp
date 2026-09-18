@@ -389,6 +389,22 @@ bool wait_until(Fn&& fn, std::chrono::milliseconds timeout = 5s,
     return fn();
 }
 
+// Membership convergence is NOT write readiness, and a test that treats it as
+// such is asserting something the node never promised. A node can see every
+// peer and still be forming its metadata replica set -- the bootstrap
+// checkpoint survey has to finish -- or be sitting read-only behind a
+// write-floor policy mismatch. Either way a mutation is refused, correctly and
+// with a named reason ("metadata replica set forming: waiting for bootstrap
+// checkpoint survey", "metadata commit durability floor unavailable"), and the
+// test fails somewhere unrelated to what it was written to check.
+//
+// The floor itself is what to wait for, and the node already publishes it as
+// MetadataClusterStatus::write_available.
+inline bool wait_metadata_writable(Service& service, std::chrono::milliseconds timeout = 10s) {
+    return wait_until([&] { return service.metadata_manager().cluster_status().write_available; },
+                      timeout);
+}
+
 inline Bytes pattern(size_t n, uint8_t salt = 0) {
     Bytes out(n);
     uint64_t x = 0x123456789abcdef0ULL ^ salt;
