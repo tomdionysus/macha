@@ -1,5 +1,59 @@
 # Current release
 
+## 0.46.1 — The profiles a restart used to throw away (development)
+
+**A media profile computed but not yet published was discarded on shutdown.**
+`PlaybackManager::stop()` requests the publisher thread to stop and joins it;
+the publisher's loop broke out on the stop token without draining
+`pending_profile_publications`, and nothing else drained it. Every restart
+therefore threw away the profiles probed in the seconds before it, and the next
+play of those titles paid for a full foreground container inspection again --
+the `immutable profile miss` path the profile cache exists to avoid. Both of
+the 0.46.0 deploys did exactly that.
+
+The publisher now drains what remains on the way out, through
+`put_media_profiles()` so the whole queue costs one catalogue commit rather
+than one per entry and shutdown stays prompt. A failure there is reported
+rather than retried: shutdown is not the place to fight a transient CAS
+conflict, but a profile lost this way is silent repeated work and should say so.
+
+**Known limitation, stated rather than papered over.** The drain is
+best-effort on a multi-replica node. `Service::request_stop()` calls
+`node_.cancel_outbound_calls()` before `streaming_->stop()` runs, so a commit
+needing a peer is attempted after outbound RPC has already been closed. Moving
+the drain earlier to beat it is not safe -- `request_stop()` is the only thing
+that cancels those RPCs, so blocking a commit there could hang shutdown on an
+unreachable peer. It is deterministic on a single-replica node; on the cluster
+it now logs `profiles lost at shutdown count=N` instead of losing them
+silently. Making it deterministic needs a shutdown-ordering change or a
+persisted queue, and neither is this release.
+
+**Three tests were asserting a result they had not waited for**, and were
+failing roughly one full-suite run in four on es-1 -- always a different test,
+which is what made them look like noise rather than the four distinct races
+they were. None is a product fault: in each case the node refuses correctly and
+names why.
+
+`wait_metadata_writable()` is the shared helper they were missing. Membership
+convergence is not write readiness: a node can see every peer and still be
+forming its metadata replica set, or be read-only behind a write-floor policy
+mismatch, and a mutation is then refused with `metadata replica set forming:
+waiting for bootstrap checkpoint survey` or `metadata commit durability floor
+unavailable`. The floor is what to wait for and the node already publishes it
+as `MetadataClusterStatus::write_available`. Applied to
+`test_established_metadata_floor_ignores_misconfigured_peer` and both write
+sites in `test_replication_policy_change_on_restart`.
+
+`test_catalogue_sync_search_and_artwork_gc` waited on
+`status.artwork_objects == 1`, which counts what a node's *catalogue* knows
+about; the bytes behind it are a DATA object the node may still be fetching. It
+now waits for the fetch rather than for the count that precedes it.
+
+Verified by twelve full-suite runs on es-1, where the same loop had previously
+produced failures in three runs out of twelve. Four other tests share the
+`metadata replica set forming` race and are not fixed here; the helper they
+need now exists.
+
 ## 0.46.0 — A seek goes where it was asked to go (development)
 
 **A seek no longer starts after the position it was asked for.** A remux seek

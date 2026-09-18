@@ -3719,6 +3719,13 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
     }, 10s));
     REQUIRE(s2.catalogue().get(episode.id).has_value());
     CHECK(s2.catalogue().search("test programme").front().id == show.id);
+    // status.artwork_objects counts what this node's CATALOGUE knows about.
+    // The bytes behind it are a DATA object the node may still be fetching, so
+    // the count going to 1 does not mean artwork() can answer yet. Wait for the
+    // fetch itself rather than for the count that precedes it.
+    REQUIRE(wait_until([&] {
+        try { return s2.catalogue().artwork(first_art.id).has_value(); } catch (...) { return false; }
+    }, 10s));
     auto s2_first_art = s2.catalogue().artwork(first_art.id);
     REQUIRE(s2_first_art.has_value());
     CHECK(s2_first_art->bytes == first_art_bytes);
@@ -3730,6 +3737,9 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
         return status.ready && status.items == 2 && status.artwork_objects == 1;
     }, 10s));
     CHECK(s3.catalogue().list(CatalogueKind::episode).size() == 1);
+    REQUIRE(wait_until([&] {
+        try { return s3.catalogue().artwork(first_art.id).has_value(); } catch (...) { return false; }
+    }, 10s));
     auto s3_first_art = s3.catalogue().artwork(first_art.id);
     REQUIRE(s3_first_art.has_value());
     CHECK(s3_first_art->bytes == first_art_bytes);
