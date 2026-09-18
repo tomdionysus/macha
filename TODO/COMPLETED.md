@@ -7,6 +7,56 @@ The 2026-09-08 entries below were ledgered by a pruning pass over
 0.24.1–0.35.0 is not otherwise ledgered here yet — see the documentation
 hygiene item in `ACTIVE.md`.
 
+## A seek goes where it was asked to go — 0.46.0, 2026-09-18
+
+Plan: [a seek goes where it was asked to go](2026-09-18-seek-does-what-it-is-told-plan.md).
+The open remainder — the seek fast path never being taken — stayed in
+`ACTIVE.md` as a P1 rather than being carried along here.
+
+**A remux seek starts after the position asked for, by up to 9.3 s, always
+forward, and the content in between is in no generation at all.** No client can
+recover it. Measured on es-1 and fi-1 on 2026-09-17 across four occasions, worst
+case 9,293.9 ms, confirmed independently by the browser's own media-element
+duration arithmetic. The operator watched it happen. Plan:
+[a seek goes where it was asked to go](2026-09-18-seek-does-what-it-is-told-plan.md).
+
+`media_vod::indexed_plan` (`src/media_vod.cpp:41-63`) discards every keyframe
+earlier than the request and takes the first survivor; the transcode paths do
+the same through `nearest_keyframe_at_or_after` (`:97-105`). The alignment is
+deterministic, so a client bound that rejects an over-far start cannot make
+progress: 147 `session-update` calls in 33.3 s with the seek never landing.
+
+**The governing rule, stated by the operator: the server does what it is told.**
+It does not change the mode a client asked for and it does not move the position
+a client asked for. Where a mode cannot begin a stream at the exact position,
+the response says so instead of relocating the request.
+
+The shape, agreed with both client sessions before it was written:
+`seek_ms` (the baseline, meaning unchanged), `seek_offset_ms` and
+`seek_requested_ms`, with `seek_ms + seek_offset_ms == seek_requested_ms`
+exactly and the offset never negative. Transcode is frame-accurate with a zero
+offset; remux takes the last keyframe at or before the request and carries the
+remainder as the offset; direct is the request with a zero offset. **No mode is
+ever substituted** — an earlier draft had remux fall back to transcode and the
+operator rejected it as the same second-guessing as moving the seek.
+
+- [x] Backward alignment in `indexed_plan`, and both transcode paths stop
+  snapping. `nearest_keyframe_at_or_after` is deleted.
+- [x] The three fields through `HlsVodPlan`/`PlaybackPlan` to `session_json`,
+  plus `docs/streaming.md`, `docs/configuration.md` and the client contract
+  entry in `ACTIVE.md`.
+- [x] Cue density logged on a successful plan as well as a rejected one:
+  entries, longest gap, median gap.
+- [x] The seek fast path names the precondition it declined on, and a
+  non-seek-only PATCH says which part of the request made it one.
+
+Tests: `test_a_seek_goes_where_it_was_asked_to_go` walks the invariant through
+the HTTP payload for remux, transcode and direct, on both create and `PATCH`;
+`test_media_vod_index_planning_rejects_partial_indexes` and
+`test_reseek_hls_vod_reuses_prepared_random_access_state` pin the planner,
+including the fractional-millisecond keyframe that must not attract a seek to
+itself and the empty-index case that keeps the mode rather than substituting it.
+
 ## Cluster health became a capability, and Status stopped paying for diagnostics — 0.38.5 and 0.39.1, deployed 2026-09-13
 
 Supersedes "2. Split lightweight status from expensive diagnostics" and the

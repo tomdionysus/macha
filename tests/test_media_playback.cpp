@@ -697,7 +697,7 @@ MACHA_FAST_TEST("media_playback", test_media_vod_index_planning_rejects_partial_
 
     std::vector<double> complete;
     for (double seconds = 0.0; seconds < 120.0; seconds += 2.0) complete.push_back(seconds);
-    auto full = media_vod::indexed_plan(complete, 120.0, 0.0, 4.0);
+    auto full = media_vod::indexed_plan(complete, 120.0, 0, 4.0);
     REQUIRE(full.has_value());
     CHECK(std::abs(full->actual_seek_seconds) < 0.0005);
     CHECK(full->segment_durations.size() == 30);
@@ -708,44 +708,95 @@ MACHA_FAST_TEST("media_playback", test_media_vod_index_planning_rejects_partial_
     // old planner accepted that as complete and advertised the entire
     // unindexed tail as one fragment, e.g. segments=1 for a full movie.
     const std::vector<double> partial{0.0, 2.0};
-    CHECK(!media_vod::indexed_plan(partial, 120.0, 0.0, 4.0).has_value());
+    CHECK(!media_vod::indexed_plan(partial, 120.0, 0, 4.0).has_value());
 
     // A partially populated index must also be rejected when it contains
     // enough early entries to produce several apparently sensible fragments.
     const std::vector<double> partial_with_several_starts{0.0, 4.0, 8.0, 12.0, 16.0};
-    CHECK(!media_vod::indexed_plan(partial_with_several_starts, 120.0, 0.0, 4.0).has_value());
+    CHECK(!media_vod::indexed_plan(partial_with_several_starts, 120.0, 0, 4.0).has_value());
 
     // Sparse but complete GOPs can still be remuxed: a fragment is as long as
     // the source GOP makes it.
     std::vector<double> sparse_complete;
     for (double seconds = 0.0; seconds < 60.0; seconds += 10.0)
         sparse_complete.push_back(seconds);
-    CHECK(media_vod::indexed_plan(sparse_complete, 60.0, 0.0, 4.0).has_value());
+    CHECK(media_vod::indexed_plan(sparse_complete, 60.0, 0, 4.0).has_value());
 
     // Scene-cut encodes (x264/x265 defaults) leave keyframe gaps well past
     // 3x the target fragment. Until 0.32.11 one such gap anywhere sent the
     // whole file to a software transcode; a 40 s fragment is a long fragment,
     // not an unusable index.
     std::vector<double> scene_cut{0.0, 4.0, 44.0, 48.0, 52.0, 90.0, 94.0, 118.0};
-    auto scene_cut_plan = media_vod::indexed_plan(scene_cut, 120.0, 0.0, 4.0);
+    auto scene_cut_plan = media_vod::indexed_plan(scene_cut, 120.0, 0, 4.0);
     REQUIRE(scene_cut_plan.has_value());
     CHECK(std::abs(scene_cut_plan->longest_segment_seconds - 40.0) < 0.0005);
     // ... while a gap a viewer would wait minutes to seek across still is.
     const std::vector<double> huge_gap{0.0, 4.0, 110.0, 114.0, 118.0};
-    CHECK(!media_vod::indexed_plan(huge_gap, 120.0, 0.0, 4.0).has_value());
+    CHECK(!media_vod::indexed_plan(huge_gap, 120.0, 0, 4.0).has_value());
 
     // One fragment is legitimate for genuinely short media; the regression
     // is accepting one fragment for a long presentation with an incomplete
     // index, not the segment count itself.
     const std::vector<double> short_index{0.0};
-    auto short_plan = media_vod::indexed_plan(short_index, 6.0, 0.0, 4.0);
+    auto short_plan = media_vod::indexed_plan(short_index, 6.0, 0, 4.0);
     REQUIRE(short_plan.has_value());
     CHECK(short_plan->segment_durations.size() == 1);
     CHECK(std::abs(short_plan->segment_durations.front() - 6.0) < 0.0005);
 
-    auto seeked = media_vod::indexed_plan(complete, 120.0, 61.0, 4.0);
+    // The server does what it is told. A seek starts at the LAST keyframe at
+    // or before the request, never after it, and reports the remainder as an
+    // offset rather than moving the position and calling the new position the
+    // answer. Starting after the request put the content in between in no
+    // generation at all.
+    auto seeked = media_vod::indexed_plan(complete, 120.0, 61'000, 4.0);
     REQUIRE(seeked.has_value());
-    CHECK(std::abs(seeked->actual_seek_seconds - 62.0) < 0.0005);
+    CHECK(std::abs(seeked->actual_seek_seconds - 60.0) < 0.0005);
+    CHECK(seeked->seek_ms == 60'000);
+    CHECK(seeked->seek_offset_ms == 1'000);
+    CHECK(seeked->seek_requested_ms == 61'000);
+    CHECK(seeked->seek_ms + seeked->seek_offset_ms == seeked->seek_requested_ms);
+
+    // A request that already is a keyframe costs nothing: offset zero, and the
+    // property that lets a client opt into exactly-aligned seeks.
+    auto aligned = media_vod::indexed_plan(complete, 120.0, 62'000, 4.0);
+    REQUIRE(aligned.has_value());
+    CHECK(aligned->seek_ms == 62'000);
+    CHECK(aligned->seek_offset_ms == 0);
+
+    // A keyframe a fraction of a millisecond after the request is not a
+    // candidate: it rounds UP to 61'001 ms (rounding down would land
+    // avformat_seek_file's backward search one keyframe early), and a baseline
+    // past the request would make the offset negative.
+    const std::vector<double> fractional{0.0, 30.0, 61.0004, 90.0};
+    auto fractional_plan = media_vod::indexed_plan(fractional, 120.0, 61'000, 4.0);
+    REQUIRE(fractional_plan.has_value());
+    CHECK(fractional_plan->seek_ms == 30'000);
+    CHECK(fractional_plan->seek_offset_ms == 31'000);
+
+    // Out of range clamps to [0, duration - 1 ms], and the invariant holds
+    // against the clamped request so a client can see the clamp happened
+    // instead of mistaking it for a violation.
+    CHECK(media_vod::clamp_seek_ms(500'000, 120.0) == 119'999);
+    CHECK(media_vod::clamp_seek_ms(-5, 120.0) == 0);
+
+    // No indexed keyframe at or before the request: baseline zero, the offset
+    // carries the whole request, and the mode is not substituted. A decodable
+    // stream's first sample is necessarily a sync sample, so a copy can always
+    // begin at the beginning; the index simply did not name it.
+    const std::vector<double> late_index{40.0, 44.0, 48.0};
+    auto unnamed_start = media_vod::indexed_plan(late_index, 60.0, 20'000, 4.0);
+    REQUIRE(unnamed_start.has_value());
+    CHECK(unnamed_start->seek_ms == 0);
+    CHECK(unnamed_start->seek_offset_ms == 20'000);
+    CHECK(unnamed_start->seek_requested_ms == 20'000);
+
+    // The Cues behind a plan, logged on success as well as on rejection: these
+    // gaps bound the true GOP from above, so offsets clustering well below them
+    // say the index is sparse rather than the GOP long.
+    const auto density = media_vod::index_density(complete, 120.0);
+    CHECK(density.entries == 60);
+    CHECK(std::abs(density.longest_gap_seconds - 2.0) < 0.0005);
+    CHECK(std::abs(density.median_gap_seconds - 2.0) < 0.0005);
 }
 
 namespace {
@@ -1051,9 +1102,16 @@ MACHA_TEST("media_playback", test_reseek_hls_vod_reuses_prepared_random_access_s
     for (double seconds = 0.0; seconds < 120.0; seconds += 2.0)
         remux.video_random_access_points.push_back(seconds);
 
+    // A PATCH seek and a create seek agree: the baseline is the keyframe at or
+    // before the request, and the remainder is published as an offset rather
+    // than moved silently.
     auto remux_seek = reseek_hls_vod(remux, 61s);
     REQUIRE(remux_seek.has_value());
-    CHECK(remux_seek->playback.seek == 62s);
+    CHECK(remux_seek->playback.seek == 60s);
+    CHECK(remux_seek->playback.seek_offset == 1s);
+    CHECK(remux_seek->playback.seek_requested == 61s);
+    CHECK(remux_seek->playback.seek + remux_seek->playback.seek_offset ==
+          remux_seek->playback.seek_requested);
     REQUIRE(!remux_seek->segment_durations.empty());
     CHECK(remux_seek->segment_durations.front() <= 4.001);
 
@@ -1067,27 +1125,22 @@ MACHA_TEST("media_playback", test_reseek_hls_vod_reuses_prepared_random_access_s
     auto transcode_seek = reseek_hls_vod(transcode, 61s);
     REQUIRE(transcode_seek.has_value());
     CHECK(transcode_seek->playback.seek == 61s);
+    CHECK(transcode_seek->playback.seek_offset == 0s);
+    CHECK(transcode_seek->playback.seek_requested == 61s);
     REQUIRE(transcode_seek->segment_durations.size() >= 2);
     // A seek's first fragment is the short start-up fragment (2 s), so the
     // generation answers after 2 s of encoding; the rest keep the target.
     CHECK(std::abs(transcode_seek->segment_durations.front() - 2.0) < 0.0005);
     CHECK(std::abs(transcode_seek->segment_durations[1] - 4.0) < 0.0005);
 
-    // Regression: a transcode plan whose keyframe index is known (e.g.
-    // captured during the initial VOD plan) should snap forward to the
-    // nearest keyframe instead of staying frame-accurate -- avoiding the
-    // decode-then-discard cost of landing mid-GOP -- even when a sparse gap
-    // elsewhere in the file would make indexed_plan's whole-file
-    // segment-density check reject the plan outright. That check is
-    // remux-only: transcode lays down its own GOP structure via
-    // fixed_vod_durations regardless of source keyframes.
-    // The keyframe timestamp below (62.5274s) is deliberately not a round
-    // number of milliseconds: llround(62527.4) rounds DOWN to 62527ms, which
-    // reconstructs to microseconds *before* the real keyframe's PTS and
-    // makes avformat_seek_file's AVSEEK_FLAG_BACKWARD search land one
-    // keyframe early -- a real regression caught live (see CHANGELOG). Must
-    // round up (ceil) to 62528ms instead, guaranteeing the reconstructed
-    // target is never before the keyframe it names.
+    // A transcode plan whose keyframe index is known does NOT snap: the
+    // encoder can start on any frame, so it starts exactly where it was told
+    // to. Until 2026-09-18 this snapped forward to the next keyframe to spare
+    // the decoder its pre-roll; that pre-roll is the price of asking for a
+    // non-keyframe and it is the client's to pay, whereas snapping put the
+    // content between the request and the keyframe in no generation at all.
+    // The keyframes below include one at 62.5274s, deliberately not a round
+    // number of milliseconds, which must not attract the seek to itself.
     HlsVodPlan transcode_with_keyframes;
     transcode_with_keyframes.playback.mode = PlaybackMode::transcode;
     transcode_with_keyframes.playback.video = MediaTransform::transcode;
@@ -1096,20 +1149,25 @@ MACHA_TEST("media_playback", test_reseek_hls_vod_reuses_prepared_random_access_s
     transcode_with_keyframes.reusable_seek = true;
     transcode_with_keyframes.video_random_access_points = {0.0, 30.0, 60.0, 62.5274, 6000.0};
 
-    auto snapped_seek = reseek_hls_vod(transcode_with_keyframes, 61s);
-    REQUIRE(snapped_seek.has_value());
-    CHECK(snapped_seek->playback.seek == 62528ms);
-    REQUIRE(!snapped_seek->segment_durations.empty());
-    CHECK(std::abs(snapped_seek->segment_durations.front() - 2.0) < 0.0005);
+    auto unsnapped_seek = reseek_hls_vod(transcode_with_keyframes, 61s);
+    REQUIRE(unsnapped_seek.has_value());
+    CHECK(unsnapped_seek->playback.seek == 61s);
+    CHECK(unsnapped_seek->playback.seek_offset == 0s);
+    REQUIRE(!unsnapped_seek->segment_durations.empty());
+    CHECK(std::abs(unsnapped_seek->segment_durations.front() - 2.0) < 0.0005);
 
-    // Seeking past the last known keyframe falls back to the unsnapped
-    // position rather than failing.
+    // Seeking past the last known keyframe is not a special case any more.
     auto past_last_keyframe = reseek_hls_vod(transcode_with_keyframes, 6500s);
     REQUIRE(past_last_keyframe.has_value());
     CHECK(past_last_keyframe->playback.seek == 6500s);
 
+    // A decline names the precondition that failed rather than being silent:
+    // across a day on es-1 nothing recorded whether this path was declining or
+    // never being reached.
     HlsVodPlan unavailable;
-    CHECK(!reseek_hls_vod(unavailable, 10s).has_value());
+    std::string reason;
+    CHECK(!reseek_hls_vod(unavailable, 10s, &reason).has_value());
+    CHECK(reason == "plan-not-reusable");
 }
 
 MACHA_FAST_TEST("media_playback", test_media_timestamp_repair) {
@@ -3518,6 +3576,157 @@ MACHA_TEST("media_playback", test_the_session_reports_the_look_ahead_the_node_ac
     REQUIRE(direct.find("stream") != nullptr);
     REQUIRE(direct.find("stream")->find("look_ahead_ms") != nullptr);
     CHECK(direct.find("stream")->find("look_ahead_ms")->isNull());
+}
+
+namespace {
+// A remux engine whose source index names a keyframe every 10 s, so a seek
+// that is not on one has somewhere to land *before* it. FakeMediaEngine's own
+// index is empty, which makes every offset zero and would let the invariant
+// pass by never being exercised.
+class KeyframedRemuxMediaEngine final : public FakeMediaEngine {
+  public:
+    HlsVodPlan prepare_hls_vod(const MediaSource& source, const PlaybackPlan& plan,
+                               double duration_seconds,
+                               std::chrono::milliseconds segment_duration,
+                               bool allow_video_transcode_fallback,
+                               std::chrono::milliseconds timeout = {}) override {
+        auto vod = FakeMediaEngine::prepare_hls_vod(source, plan, duration_seconds,
+                                                    segment_duration,
+                                                    allow_video_transcode_fallback, timeout);
+        for (double seconds = 0.0; seconds < duration_seconds; seconds += 10.0)
+            vod.video_random_access_points.push_back(seconds);
+        const auto requested_ms =
+            media_vod::clamp_seek_ms(plan.seek.count(), duration_seconds);
+        // Only a stream copy is bound to a sync sample. A transcode starts on
+        // the frame it was asked for, keyframe index or no keyframe index.
+        if (plan.video != MediaTransform::copy) {
+            vod.playback.seek = std::chrono::milliseconds(requested_ms);
+            vod.playback.seek_offset = {};
+            vod.playback.seek_requested = std::chrono::milliseconds(requested_ms);
+            return vod;
+        }
+        auto indexed = media_vod::indexed_plan(vod.video_random_access_points, duration_seconds,
+                                               requested_ms, vod.seek_segment_seconds);
+        REQUIRE(indexed.has_value());
+        vod.playback.seek = std::chrono::milliseconds(indexed->seek_ms);
+        vod.playback.seek_offset = std::chrono::milliseconds(indexed->seek_offset_ms);
+        vod.playback.seek_requested = std::chrono::milliseconds(indexed->seek_requested_ms);
+        vod.segment_durations = std::move(indexed->segment_durations);
+        return vod;
+    }
+};
+} // namespace
+
+MACHA_TEST("media_playback", test_a_seek_goes_where_it_was_asked_to_go) {
+    // Measured on es-1 and fi-1 on 2026-09-17: a remux seek started AFTER the
+    // position asked for, by up to 9.3 s, always forward, because the planner
+    // took the first keyframe at or after the request. The content between the
+    // request and that keyframe was in no generation at all and no client could
+    // recover it -- a skipped scene for a viewer seek, and deleted content
+    // mid-playback on the reaped-session recovery path, which rebuilds a
+    // generation at a position a viewer has actually reached.
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/film.mkv", 0644, getuid(), getgid());
+    auto bytes = pattern(64 * 1024);
+    auto writer = service.filesystem().open_write("/media/film.mkv", true);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto media_id = file_media_id(service.filesystem().getattr("/media/film.mkv"));
+
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback";
+    streaming.startup_timeout = 2s;
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             std::make_unique<KeyframedRemuxMediaEngine>());
+    playback.start();
+
+    const auto honoured = [](const Json& payload) {
+        REQUIRE(payload.find("seek_ms") != nullptr);
+        REQUIRE(payload.find("seek_offset_ms") != nullptr);
+        REQUIRE(payload.find("seek_requested_ms") != nullptr);
+        const auto seek = payload.find("seek_ms")->asInt64();
+        const auto offset = payload.find("seek_offset_ms")->asInt64();
+        const auto requested = payload.find("seek_requested_ms")->asInt64();
+        // Exactly, in integer milliseconds, no tolerance and no rounding slack.
+        CHECK(seek + offset == requested);
+        // Never negative, so the generation always contains the position asked
+        // for: this is the whole point, and an offset that could go negative
+        // would put content in no generation again.
+        CHECK(offset >= 0);
+        return requested;
+    };
+
+    auto create = [&](const char* mode, int64_t seek_ms) {
+        Json::Object root{{"media_id", media_id},
+                          {"seek_ms", seek_ms},
+                          {"preferences", Json(Json::Object{{"mode", mode}})}};
+        auto text = Json(std::move(root)).dump();
+        HttpRequest request;
+        request.method = "POST";
+        request.path = "/api/v1/playback/sessions";
+        request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+        request.body.assign(text.begin(), text.end());
+        auto response = playback.handle(request);
+        REQUIRE(response.status == 201);
+        return Json::parse(std::string(response.body.begin(), response.body.end()));
+    };
+
+    // Remux: the baseline is the last keyframe at or BEFORE 23 s, and the
+    // remainder is published rather than silently added to the request.
+    auto remux = create("remux", 23'000);
+    CHECK(remux.find("mode")->asString() == "remux");
+    CHECK(honoured(remux) == 23'000);
+    CHECK(remux.find("seek_ms")->asInt64() == 20'000);
+    CHECK(remux.find("seek_offset_ms")->asInt64() == 3'000);
+
+    // A seek-only PATCH agrees with a create seek; it is the same rule.
+    Json::Object patch_root{{"seek_ms", 35'000}};
+    auto patch_text = Json(std::move(patch_root)).dump();
+    HttpRequest patch;
+    patch.method = "PATCH";
+    patch.path = "/api/v1/playback/sessions/" + remux.find("session_id")->asString();
+    patch.body.assign(patch_text.begin(), patch_text.end());
+    auto patch_response = playback.handle(patch);
+    REQUIRE(patch_response.status == 200);
+    auto patched = Json::parse(std::string(patch_response.body.begin(), patch_response.body.end()));
+    CHECK(honoured(patched) == 35'000);
+    CHECK(patched.find("seek_ms")->asInt64() == 30'000);
+    CHECK(patched.find("seek_offset_ms")->asInt64() == 5'000);
+    // The mode is never substituted. A remux request stays remux, including
+    // when its keyframe situation is awkward.
+    CHECK(patched.find("mode")->asString() == "remux");
+
+    // A request that already is a keyframe costs nothing: this is the property
+    // that lets a client opt into exactly-aligned seeks by asking for one.
+    auto aligned = create("remux", 30'000);
+    CHECK(honoured(aligned) == 30'000);
+    CHECK(aligned.find("seek_offset_ms")->asInt64() == 0);
+
+    // Transcode is frame-accurate: the encoder can start on any frame, so it
+    // does, and the offset is always zero.
+    auto transcode = create("transcode", 23'000);
+    CHECK(transcode.find("mode")->asString() == "transcode");
+    CHECK(honoured(transcode) == 23'000);
+    CHECK(transcode.find("seek_ms")->asInt64() == 23'000);
+    CHECK(transcode.find("seek_offset_ms")->asInt64() == 0);
+
+    // Direct has no generation; the client byte-ranges the source.
+    auto direct = create("direct", 23'000);
+    CHECK(direct.find("mode")->asString() == "direct");
+    CHECK(honoured(direct) == 23'000);
+    CHECK(direct.find("seek_offset_ms")->asInt64() == 0);
 }
 
 } // namespace

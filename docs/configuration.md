@@ -410,6 +410,13 @@ effective value is the lesser of this and `session_idle_ms`, so lowering
 
 `video_encoder_threads` sets the x264 frame-thread count per video transcode; `0` (the default) uses every hardware thread. Until 0.32.11 the encoder ran single-file in sliced-thread mode, at about real time for 1080p on the four-core nodes, so every representation change cost 5-13 s and a mid-file seek could not catch up. The first fragment of a transcode generation is 2 s (later ones the configured segment duration) so the request is answered after 2 s of encoding.
 
+A seek is never moved to suit the node's configuration. A transcode generation
+begins exactly where the client asked; a remux generation begins at the last
+indexed keyframe at or before the request and publishes the remainder as
+`seek_offset_ms`, so `segment_duration_ms` and the source's GOP change how much
+pre-roll a client fetches but never which content a generation contains. See
+"Where a seek actually starts" in `docs/streaming.md` for the invariant.
+
 `video_decoder_threads` bounds decoder parallelism per transformed video in the
 range 1–16. It defaults to two so viewer work can use otherwise-idle CPU without
 allowing libav to choose an unbounded automatic value. Together with

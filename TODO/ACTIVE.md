@@ -206,6 +206,163 @@ interlock is the most dangerous single piece of the work.
 - [ ] Stage E: the migration and its interlock.
 - [ ] Stage F: the dependent O(N) items now listed under P1 scaling cliffs.
 
+## P1 — A generation can be reclaimed between its playlist and its first fragment (opened 2026-09-18)
+
+**A robustness question raised by a live observation whose own cause turned out
+to be elsewhere.** On the night of the 0.46.0 deploy a client fetched the media
+playlist at 01:00:50 (node local), requested nothing at all for the next 60 s,
+and the node reclaimed the pipeline at 01:01:50 with `idle_ms=60000`. The first
+fragment requests arrived at 01:02:43 -- 53 s after the pipeline was gone -- and
+failed until the client gave up and created a fresh session at 01:03:32.
+
+**Do not read that 113 s gap as a real client being slow.** The client session
+identified its own likely cause the same night: the run was in a programmatically
+created Chrome tab that was never brought to the foreground, and a backgrounded
+tab's timers are throttled to roughly once a minute, which is what hls.js taking
+113 s to issue its first fragment request looks like. readyState 0, nothing
+buffered and no error is that client's documented tab-visibility signature. Not
+proven -- the tab was gone before `document.hidden` could be read -- but it is a
+previously observed property of the test rig and it has to be eliminated first.
+The next run will be in a confirmed-visible tab with `document.hidden` recorded.
+
+Two client-side alternatives were proposed and both are ruled out, so they are
+not re-proposed here: the past-the-frontier stall (the node never refused a
+fragment -- no `segment_not_ready` line exists in the window, at DEBUG, with
+DEBUG on), and a seek-on-`canplay` wait in the client's handover path (that
+transition was direct play to remux, and the handover requires both sides to be
+managed HLS, so it was never eligible and the client's log shows the teardown
+path instead).
+
+The question below survives that regardless, and both sessions agree it does: a
+client on a weak link could take that long between manifest and first fragment
+for honest reasons, and what the node does then is worth knowing.
+
+**What is established.** No `playback stream refused` line exists anywhere in
+the window, at DEBUG, with DEBUG on: the node never held or refused a fragment,
+so this was not a past-the-frontier stall. The playlist itself was correct and
+complete -- `MediaSegmentStore::playlist()` writes one EXTINF per planned
+duration plus `ENDLIST`, all 482 of them. The seek fields were right
+(`984818 + 3182 == 988000`). The node restarted clean immediately before this
+and logged no WARN or ERROR.
+
+**What is not established, and it decides ownership.** Whether a fragment
+request arriving after idle reclamation revives the pipeline or simply fails.
+If it revives, that run's 01:02:43 requests should have succeeded and something
+else broke them. **If it does not, then any client that takes more than 60 s
+between its manifest and its first fragment loses its generation with no way
+back** -- and a client that is slow to start is not doing anything illegal, even
+if the client that exposed this was slow for a reason no viewer will ever hit. Read the reclamation path in `src/playback.cpp` (the log line is at
+`playback pipeline reclaimed after stream inactivity`) against the segment route
+before touching either.
+
+Also unexplained, and on the client's side of the boundary: its media element
+sat at `currentTime` 988.00 -- the absolute title position, not the 3.182 s
+offset into the generation -- with `readyState` 0 throughout. That alone does
+not explain the silence, because a client trying to load at local 988 s would
+have asked for a fragment immediately and the node would have logged the
+refusal.
+
+- [ ] Determine whether a segment request revives a reclaimed pipeline. That is
+  the fork; do not change a timeout before answering it.
+- [ ] Have the client report the gap between `hls-manifest-parsed` and the first
+  `hls-fragment-loading` **from a confirmed-visible tab**. Over 60 s there makes
+  it a real client shape rather than a throttled harness.
+
+## P1 — The seek fast path: taken for transcode, still unobserved for remux
+
+Found by the seek work completed in 0.46.0, not fixed by it. Across a whole day
+on es-1 there were **zero** `seek fast-path` lines: every seek pays a full
+probe/VOD-planning pass while the viewer waits. The client's seek `PATCH` sends
+preferences that compare equal to the stored record — `subtitle_language` is a
+plain `std::string` defaulting to `""`, so the client's `""` matches, and
+`optional_int` maps a null `subtitle_stream` to `nullopt`, which is what a
+subtitles-off session already holds — so `seek_only` should be true.
+
+The remaining branch is `reseek_hls_vod` declining. For remux it re-runs
+`indexed_plan` over the keyframes from the new position, and that rejects a plan
+whose longest fragment or tail exceeds 90 s. Those bounds are whole-file: a
+sparser GOP anywhere else in a long title rejects a seek point that would play
+perfectly well. The transcode branch of that same function already carries a
+comment warning the check "can spuriously reject an otherwise perfectly usable
+seek point if any other part of a long file has a sparser GOP"
+(`src/media_engine_common.cpp`) — that warning describes the remux branch's
+behaviour and was never applied to it.
+
+Not asserted as the cause: it is the branch that remains, not a proof. 0.46.0
+added the diagnostic that settles it — `reuse_seek_session` and
+`reseek_hls_vod` now name the failing precondition (`plan-not-reusable`,
+`source-duration-unknown`, `segment-length-unknown`, `keyframe-density-bounds`,
+`no-prepared-vod-plan`, `direct-mode`), and a non-seek-only PATCH logs
+`seek fast-path skipped` with `preferences-changed` or `media-override`. Read
+those off a node before changing a bound.
+
+Measured cost while it is broken: 147 `session-update` calls in 34.7 s, 34.68 s
+of cumulative server time, ~4.2/s on a node also serving viewers, none of them
+individually slow (235.9 ms mean, 1,407.3 ms for the first).
+
+**Superseded by measurement, 2026-09-18 afternoon. The premise of this item was
+wrong and the heading has been corrected.** Eight hours of es-1 journal on
+0.46.0:
+
+- **11 `seek fast-path` successes.** It is taken, routinely. The "zero across a
+  whole day" observation that opened this item does not hold today.
+- **2 `fast-path skipped`, both `reason=preferences-changed`.**
+- **Zero `keyframe-density-bounds` declines.** The reason I predicted would fire
+  has never fired once.
+
+Every success carried `seek_offset_ms=0`, i.e. they were transcode sessions;
+`indexed_plan`'s whole-file bounds live on the remux branch and no remux seek
+went through `reseek_hls_vod` in the window at all. So the remux half is still
+**unobserved rather than answered** — but "probably our bounds" had no evidence
+behind it and now has one piece against it. Do not change a bound on it.
+
+The likeliest explanation for the change is the traffic mix (today's sessions
+were transcode), not the 0.46.0 code: the transcode branch of `reseek_hls_vod`
+never consulted `indexed_plan` before the change either. Stated as the likelier
+of two, not as established.
+
+**And the cost this item was chasing is not here.** A 13,433 ms `session-update`
+reported by the client as a ~13 s viewer freeze, and attributed by them to a
+full re-plan materialising Cues, was none of that:
+
+```
+16:22:38  seek fast-path requested_ms=1500000 seek_ms=1500000 seek_offset_ms=0
+16:22:38  pipeline start mode=transcode
+16:22:38  pipeline seek timing stream_info_ms=2 container_seek_ms=39
+16:22:50  first fragment ready elapsed_ms=11672
+```
+
+The fast path was taken, the container seek cost 39 ms, and 11.7 s went into
+encoding the first fragment of a 4K HEVC-to-H.264 software transcode on a Pi.
+Seek latency on transcode is encoder throughput, not planning. Any further work
+on the fast path should be justified on its own terms, not on that freeze.
+
+**First live sample, es-1, 2026-09-18 right after the 0.46.0 restart — and it
+does not say what the hypothesis above predicts.** The line read
+`seek fast-path skipped ... requested_ms=988000 reason=preferences-changed`:
+the fast path was not declined by `reseek_hls_vod` at all, it was never
+attempted, because `prefs == old->preferences` was false. **Inconclusive, not a
+refutation**: that particular session was created `mode=direct` and the PATCH
+carried a seek *and* a move to `mode=remux`, so the preferences genuinely had
+changed and the log is correct. What it does establish is that
+`preferences-changed` is reachable on the live path, so the whole-file bounds
+are no longer the only remaining branch. A pure seek PATCH — same preferences,
+new position — is the sample that settles it, and core has now located its own
+casing boundary (`MachaPlaybackResolver.update()` logs the camelCase object one
+statement *above* `wirePreferences`, so the earlier empty-string evidence was
+never the wire) and confirms the real body is
+`{"preferences":{"subtitle_stream":null,"subtitle_language":""},"seek_ms":...}`,
+which compares equal here. So both branches remain open and both are now
+instrumented.
+
+- [ ] Capture a **pure** seek PATCH on es-1 or fi-1 and read its reason: either
+  `preferences-changed` again (then the comparison is wrong and core's body is
+  not what arrives) or `keyframe-density-bounds` (then the whole-file bounds
+  are the cause).
+- [ ] Decide the re-seek bound on that evidence. Changing `indexed_plan`'s 90 s
+  fragment and tail bounds is a separate decision with its own evidence and it
+  must not be made by guessing from here.
+
 ## P0 — The catalogue materialises everything it has (opened 2026-09-17)
 
 The same failure as P-1 in a smaller organ, and — the important difference —
@@ -1483,6 +1640,35 @@ cross-session and will not be in the next session's context.
   under-run against a node configured differently. Clients bound themselves
   against this rather than against the defaults. It follows `reconfigure()`, so
   it is read per session rather than cached across a node's lifetime.
+- **`seek_ms`, `seek_offset_ms` and `seek_requested_ms` on the playback session
+  payload** (0.46.0), on create and on every `PATCH`, all milliseconds on the
+  title's timeline. `seek_ms` is where the generation's media begins, which is
+  exactly what it has always meant; `seek_offset_ms` is how far into that
+  generation the requested position sits; `seek_requested_ms` is the request the
+  server honoured after clamping to `[0, duration - 1 ms]`. The invariant is
+  `seek_ms + seek_offset_ms == seek_requested_ms`, exactly, in integer
+  milliseconds, with no tolerance and no rounding slack, and the offset is never
+  negative. The server does not move a position a client asked for and does not
+  substitute a mode a client asked for: transcode and direct are frame-accurate
+  with a zero offset, remux takes the last keyframe at or before the request and
+  publishes the remainder. The offset is zero exactly when the mode can be
+  frame-accurate, so a client wanting a cheap aligned seek asks for a position
+  that already is a keyframe. Core types all three as `number | undefined`
+  because an older node omits them, and deletes its `activationPosition`
+  undefined branch — the invariant makes that state unreachable.
+- **`pipeline_idle_ms` bounds how long a client may hold a generation before
+  first requesting media.** A transformed session whose stream has been idle for
+  `streaming.pipeline_idle_ms` has its physical pipeline reclaimed; the logical
+  session and its entitlement survive, but the producing pipeline does not. The
+  default is 60,000 ms, the configured minimum is 10,000, and the live value is
+  already reported by `GET /api/v1/playback/status` as `pipeline_idle_ms` -- so
+  a client with a standby or handover window must read it rather than assume 60 s,
+  exactly as it must for `look_ahead_ms`. Core's standby windows (8 s transcode,
+  30 s otherwise) sit inside the default, but that relation was implicit until
+  2026-09-18 and nobody had written it down. **What is NOT yet settled is what
+  happens to a fragment request arriving after reclamation** -- see the P1 above;
+  until that is answered no client should treat a reclaimed generation as
+  recoverable.
 - **A fragment past the look-ahead is refused, not missing.** `500
   segment_not_ready` with `Retry-After: 1` and `Cache-Control: no-store`, logged
   as `reason=hold_timed_out`; never a `404`, because the playlist has already

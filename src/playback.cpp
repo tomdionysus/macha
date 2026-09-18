@@ -1353,7 +1353,12 @@ struct PlaybackManager::Impl {
             }
             if (cached) {
                 const auto requested_seek = session.plan.seek;
-                auto reseeked = requested_seek == cached->playback.seek
+                // Against the cached plan's honoured REQUEST, not its baseline.
+                // The two differ now that a remux generation begins at the
+                // keyframe before the request, and reusing a cached plan whose
+                // baseline happens to equal this request would publish that
+                // plan's offset for a position it was not measured from.
+                auto reseeked = requested_seek == cached->playback.seek_requested
                                     ? std::optional<HlsVodPlan>(*cached)
                                     : reseek_hls_vod(*cached, requested_seek);
                 if (reseeked) {
@@ -1362,7 +1367,9 @@ struct PlaybackManager::Impl {
                     Log::debug("playback[" + std::string(trace) +
                                "] VOD plan cache-hit media=" + session.source.media_id +
                                " requested_ms=" + std::to_string(requested_seek.count()) +
-                               " aligned_ms=" + std::to_string(session.plan.seek.count()) +
+                               " seek_ms=" + std::to_string(session.plan.seek.count()) +
+                               " seek_offset_ms=" +
+                               std::to_string(session.plan.seek_offset.count()) +
                                " segments=" +
                                std::to_string(session.vod_plan->segment_durations.size()));
                     return;
@@ -1513,9 +1520,21 @@ struct PlaybackManager::Impl {
     std::shared_ptr<Session> reuse_seek_session(const Session& old,
                                                 std::chrono::milliseconds requested_seek,
                                                 std::string_view trace) {
-        if (old.plan.mode == PlaybackMode::direct || !old.vod_plan) return {};
-        auto reseeked = reseek_hls_vod(*old.vod_plan, requested_seek);
-        if (!reseeked) return {};
+        // Every exit from here says why. Across a whole day on es-1 there were
+        // zero `seek fast-path` lines and nothing recorded which precondition
+        // was failing, so the slow path could not be told from a path that was
+        // never attempted.
+        const auto declined = [&](const std::string& reason) {
+            Log::info("playback[" + std::string(trace) + "] seek fast-path declined media=" +
+                      old.source.media_id + " requested_ms=" +
+                      std::to_string(requested_seek.count()) + " reason=" + reason);
+            return std::shared_ptr<Session>{};
+        };
+        if (old.plan.mode == PlaybackMode::direct) return declined("direct-mode");
+        if (!old.vod_plan) return declined("no-prepared-vod-plan");
+        std::string reseek_reason;
+        auto reseeked = reseek_hls_vod(*old.vod_plan, requested_seek, &reseek_reason);
+        if (!reseeked) return declined(reseek_reason);
 
         auto session = std::make_shared<Session>();
         session->id = old.id;
@@ -1532,8 +1551,9 @@ struct PlaybackManager::Impl {
         session->logical_session = old.logical_session;
         Log::info("playback[" + std::string(trace) + "] seek fast-path media=" +
                   session->source.media_id + " requested_ms=" +
-                  std::to_string(requested_seek.count()) + " aligned_ms=" +
-                  std::to_string(session->plan.seek.count()) + " segments=" +
+                  std::to_string(requested_seek.count()) + " seek_ms=" +
+                  std::to_string(session->plan.seek.count()) + " seek_offset_ms=" +
+                  std::to_string(session->plan.seek_offset.count()) + " segments=" +
                   std::to_string(session->vod_plan->segment_durations.size()));
         return session;
     }
@@ -1713,7 +1733,26 @@ struct PlaybackManager::Impl {
                          {"media_id", session.source.media_id},
                          {"mode", playback_mode_name(session.plan.mode)},
                          {"duration_ms", static_cast<uint64_t>(std::max(0.0, session.probe.duration_seconds) * 1000.0)},
+                         // The baseline, the offset into it, and the request
+                         // that was honoured. Exactly, in integer
+                         // milliseconds, with no tolerance:
+                         //
+                         //     seek_ms + seek_offset_ms == seek_requested_ms
+                         //
+                         // seek_ms means what it has always meant -- where the
+                         // generation's media begins -- so a client that reads
+                         // only it behaves as before. seek_offset_ms is how far
+                         // into the generation the requested position sits, and
+                         // is zero exactly when the mode could begin there:
+                         // always for transcode and direct, and for remux when
+                         // the request was already a keyframe. seek_requested_ms
+                         // is what lets a client tell a violated invariant from
+                         // an ordinary clamp near the end of a title; those want
+                         // opposite handling, and without it they are the same
+                         // number.
                          {"seek_ms", static_cast<uint64_t>(std::max<int64_t>(0, session.plan.seek.count()))},
+                         {"seek_offset_ms", static_cast<uint64_t>(std::max<int64_t>(0, session.plan.seek_offset.count()))},
+                         {"seek_requested_ms", static_cast<uint64_t>(std::max<int64_t>(0, session.plan.seek_requested.count()))},
                          {"preferences", preferences_json(session.preferences)},
                          {"selection", Json(std::move(selected))},
                          {"source", Json(std::move(source))},
@@ -2186,7 +2225,7 @@ struct PlaybackManager::Impl {
                                       std::move(deterministic_id), std::move(deterministic_token));
             session->logical_session = logical_session;
             if (previous) session->generation = previous->generation;
-            if (seek_ms) session->plan.seek = std::chrono::milliseconds(*seek_ms);
+            if (seek_ms) session->plan.request_seek(std::chrono::milliseconds(*seek_ms));
             prepare_transformed_vod(*session, trace);
             resource_reservation = reserve_resources(*session,
                                                      previous ? previous->id : std::string_view{});
@@ -2344,6 +2383,14 @@ struct PlaybackManager::Impl {
         std::shared_ptr<Session> replacement;
         if (seek_only)
             replacement = reuse_seek_session(*old, std::chrono::milliseconds(*seek_ms), trace);
+        else if (seek_ms)
+            // A seek that is not seek-only pays a full probe/VOD-planning pass
+            // while the viewer waits, so say which part of the request made it
+            // one rather than leaving the slow path unexplained.
+            Log::info("playback[" + trace + "] seek fast-path skipped media=" +
+                      old->source.media_id + " requested_ms=" + std::to_string(*seek_ms) +
+                      " reason=" + (media_override.empty() ? "preferences-changed"
+                                                           : "media-override"));
 
         if (!replacement) {
             auto media = media_override.empty()
@@ -2354,7 +2401,7 @@ struct PlaybackManager::Impl {
                                           trace, old->id, old->token);
             replacement->logical_session = old->logical_session;
             replacement->generation = old->generation;
-            if (seek_ms) replacement->plan.seek = std::chrono::milliseconds(*seek_ms);
+            if (seek_ms) replacement->plan.request_seek(std::chrono::milliseconds(*seek_ms));
             prepare_transformed_vod(*replacement, trace);
         }
         ResourceReservation resource_reservation;

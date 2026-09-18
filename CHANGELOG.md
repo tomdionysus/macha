@@ -1,5 +1,96 @@
 # Current release
 
+## 0.46.0 — A seek goes where it was asked to go (development)
+
+**A seek no longer starts after the position it was asked for.** A remux seek
+started *later* than the request, by up to 9.3 s, always forward: the planner
+discarded every keyframe earlier than the request and took the first survivor.
+The content between the request and that keyframe was in no generation at all.
+No client could recover it. For a viewer seek that is a skipped scene; on the
+reaped-session recovery path, which rebuilds a generation at the position a
+viewer has actually reached, it deletes content mid-playback.
+
+Measured on 2026-09-17 against es-1 and fi-1, remux, a 3,951,957 ms title:
+asked for 2,027,092 ms the node started at 2,028,903; asked for 908,791 it
+started at 918,085. The alignment is deterministic — asked for 2,926,000 the
+node returned 2,934,933 to 147 consecutive requests over 33.3 s — so a client
+bound that rejects a start more than one segment ahead cannot make progress.
+That is how this became a livelock rather than an inconvenience. It was
+confirmed independently of any server log: the browser's media element reported
+the replacement generation's duration as 3,033.9 s against a title of 3,951.957
+s, a difference of 918.057 s matching the reported start to within rounding.
+
+**The rule.** The server does what it is told. It does not change the mode a
+client asked for, and it does not move the position a client asked for. Where a
+mode cannot begin a stream at the exact position requested, the response says
+so explicitly instead of relocating the request and reporting the relocation as
+though it were what was asked for.
+
+**Three flat fields on the playback session payload**, present on create and on
+every `PATCH`, all milliseconds on the title's timeline:
+
+- `seek_ms` — where the generation's media actually begins. This is exactly
+  what the field has always meant, so no existing client changes behaviour.
+- `seek_offset_ms` — how far into that generation the requested position sits.
+- `seek_requested_ms` — the position the server honoured, after clamping to
+  `[0, duration - 1 ms]`.
+
+The invariant is `seek_ms + seek_offset_ms == seek_requested_ms`, exactly, in
+integer milliseconds, with no tolerance and no rounding slack. `seek_offset_ms`
+is never negative, so a generation always contains the position asked for.
+`seek_requested_ms` exists because an exact invariant is only useful if a client
+can act on it being violated, and without it a client cannot distinguish a
+violation from an ordinary clamp near the end of a title — those want opposite
+handling. Core's phrasing for the rule it keeps rediscovering: an unanswered
+question must not read as an answer.
+
+Per mode: transcode is exactly the request with a zero offset, because the
+encoder can start on any frame; remux is the last keyframe at or before the
+request with the remainder in the offset, because a stream copy has no decoder
+and an fMP4 fragment's first sample must be a sync sample; direct is the request
+with a zero offset, because there is no generation. The offset is zero exactly
+when the mode can be frame-accurate, and a client that wants a cheap,
+exactly-aligned seek asks for a position that already is a keyframe.
+
+**The transcode paths stop snapping entirely.** They snapped forward to spare
+the decoder its pre-roll on slow software decode. The pre-roll is still paid —
+the decoder seeks back to the preceding keyframe and discards frames before the
+origin — but it is the price of asking for a non-keyframe and it is the
+client's to pay, whereas snapping lost content. `nearest_keyframe_at_or_after`
+is gone.
+
+**The mode is never substituted.** An earlier draft of this work had remux fall
+back to transcode where no keyframe at or before the request existed. The
+operator rejected that outright, and correctly: it is the same second-guessing
+as moving the seek, and it would trade picture quality and CPU for a case the
+client did not ask about. Where the index names no keyframe at or before the
+request, the baseline is 0 and the offset carries the whole request — a
+decodable stream's first sample is necessarily a sync sample, so a copy can
+always begin at the beginning; the index simply did not name it. In practice
+unreachable, since a file's first frame is virtually always indexed; it exists
+so the invariant needs no escape hatch.
+
+**Two diagnostics this investigation needed and could not have.** The keyframe
+index's shape is now logged on a plan that succeeds, not only on one that is
+rejected: entries, longest gap, median gap. `video_keyframe_seconds` reads the
+demuxer's index, which for Matroska is the Cues, and Cues are not obliged to
+name every keyframe — so an observed spread is an upper bound on the true GOP,
+and offsets clustering well below the indexed gaps mean the Cues are sparse
+rather than the GOP long. Separately, the seek fast path declined silently:
+across a whole day on es-1 there were zero `seek fast-path` lines and nothing
+recorded whether `seek_only` was false or `reseek_hls_vod` declined. Both now
+name the failing precondition.
+
+Still open, found by this work and not fixed in it: the seek fast path is never
+taken on the live cluster, and `indexed_plan`'s 90 s fragment and tail bounds
+are whole-file, so a sparser GOP anywhere in a long title can reject a seek
+point that would play perfectly well. The transcode branch of `reseek_hls_vod`
+already carried a comment warning of exactly that; it was never applied to the
+remux branch. Named as a decline reason rather than asserted as the cause — the
+diagnostics above will settle it. Measured cost while it is broken: 147
+`session-update` calls in 34.7 s, 34.68 s of cumulative server time, ~4.2/s on
+a node also serving viewers, none of them individually slow.
+
 ## 0.45.0 — The look-ahead the node actually has (development)
 
 **The playback session now says how far ahead of the viewer it is producing.**
