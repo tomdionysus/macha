@@ -241,6 +241,8 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     telemetry.api_endpoint = "https://10.44.1.50:7438";
     telemetry.cpu_cores = 8;
     telemetry.memory_total_bytes = 64ULL * 1024 * 1024 * 1024;
+    telemetry.playback_startup_timeout_ms = 15000;
+    telemetry.playback_segment_timeout_ms = 6000;
     CHECK(decode_node_telemetry(encode_node_telemetry(telemetry)) == telemetry);
     auto telemetry_set = decode_telemetry_set(encode_telemetry_set({telemetry}));
     REQUIRE(telemetry_set.size() == 1);
@@ -253,13 +255,40 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     CHECK(recovering_set.front().phase == NodePhase::recovering);
 
     auto full = encode_node_telemetry(telemetry);
-    // memory_total_bytes is the newest trailing field: one u64. cpu_cores
-    // precedes it as a u32.
-    const size_t memory_bytes_bytes = 8;
+    // Trailing optional fields, newest last: the two playback budgets (u32
+    // each), preceded by memory_total_bytes (u64), preceded by cpu_cores
+    // (u32), preceded by the API endpoint (length prefix + content). Each
+    // constant is the distance from the END of the record back to the start of
+    // that field, so truncating to it yields a record encoded before that
+    // field existed.
+    const size_t playback_bytes = 4 + 4;
+    const size_t memory_bytes_bytes = 8 + playback_bytes;
     const size_t cpu_cores_bytes = 4 + memory_bytes_bytes;
     // The API endpoint precedes it: a string length prefix + content.
     const size_t api_fields_bytes = 4 + telemetry.api_endpoint.size();
     REQUIRE(full.size() > cpu_cores_bytes + api_fields_bytes + 1);
+
+    // A record encoded before the playback budgets existed ends right after
+    // memory_total_bytes. It must report no budgets -- which a client reads as
+    // "this node cannot say" and must never shorten its own attempt budget on
+    // -- while everything before it survives. Every node is in this position
+    // during a rolling upgrade.
+    auto pre_playback = full;
+    pre_playback.resize(pre_playback.size() - playback_bytes);
+    auto legacy_no_playback = decode_node_telemetry(pre_playback);
+    CHECK(legacy_no_playback.playback_startup_timeout_ms == 0);
+    CHECK(legacy_no_playback.playback_segment_timeout_ms == 0);
+    CHECK(legacy_no_playback.memory_total_bytes == telemetry.memory_total_bytes);
+    CHECK(legacy_no_playback.cpu_cores == telemetry.cpu_cores);
+
+    // The pair is meaningless by halves: a record carrying only the first of
+    // the two is treated as carrying neither, rather than pairing a real
+    // startup budget with a fabricated segment one.
+    auto half_playback = full;
+    half_playback.resize(half_playback.size() - 4);
+    auto decoded_half = decode_node_telemetry(half_playback);
+    CHECK(decoded_half.playback_startup_timeout_ms == 0);
+    CHECK(decoded_half.playback_segment_timeout_ms == 0);
 
     // A record encoded before physical memory existed ends right after
     // cpu_cores, and must report none rather than fail.

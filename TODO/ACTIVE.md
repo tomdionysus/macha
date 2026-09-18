@@ -206,6 +206,41 @@ interlock is the most dangerous single piece of the work.
 - [ ] Stage E: the migration and its interlock.
 - [ ] Stage F: the dependent O(N) items now listed under P1 scaling cliffs.
 
+## P1 — A telemetry set cannot carry an optional field safely (opened 2026-09-18)
+
+`encode_telemetry_set` writes a magic, a count, and then the records
+back-to-back with **no per-record length**. `decode` reads its optional
+trailing fields by asking `reader.remaining()`, which in a multi-record set is
+non-zero because the *next record* follows. So a decoder that knows about a
+field the sender did not write consumes the next record's bytes as that field,
+and the whole set fails to decode.
+
+Gossip sends up to 64 records per set (`src/cluster.cpp:1146`), so this fires
+during any rolling upgrade that adds a telemetry field, in both directions,
+until every node matches. It has been true of every telemetry field added so
+far -- `phase`, `api_endpoint`, `cpu_cores`, `memory_total_bytes` -- and the
+comments on those fields claim a rolling-upgrade safety the format does not
+provide for sets. It is only genuinely safe for a single-record set.
+
+Found on 2026-09-18 by adding the playback budgets in 0.46.2, which produced
+`persisted telemetry ignored: blob too large` on each node's first start (the
+persisted cache is the reliably multi-record case). That is self-healing -- the
+cache is rewritten in the new format -- and both nodes were upgraded together
+to close the wire window, so nothing is currently degraded.
+
+**The worry is not the dropped set, it is the set that does not drop.** A
+misparse usually throws, because a length prefix read from the wrong offset is
+absurd. It is not guaranteed to: a record could decode into plausible-looking
+garbage and be believed. Nobody has looked for that case.
+
+- [ ] Length-delimit each record inside a telemetry set, so a record's optional
+  fields are bounded by the record rather than by the payload.
+- [ ] Decide the compatibility story for the format change itself, which has
+  the same one-upgrade cost it is fixing. A version byte in the set header is
+  the obvious shape.
+- [ ] Until then, treat "add a telemetry field" as requiring both nodes to be
+  upgraded together, and say so wherever that pattern is documented.
+
 ## P1 — A generation can be reclaimed between its playlist and its first fragment (opened 2026-09-18)
 
 **A robustness question raised by a live observation whose own cause turned out
@@ -1601,8 +1636,14 @@ cross-session and will not be in the next session's context.
   during recovery. `200 {"status":"ok"}` when serving, `503` with `starting` or
   `failed` when not, and the HTTP status carries the same answer as the body.
   Core probes it every 10 s for latency ranking, failover and the endpoint
-  pre-save gate. It must stay unauthenticated and must keep reporting nothing
-  else: no version, no node id, no topology.
+  pre-save gate. It must stay unauthenticated. **Corrected 2026-09-18: it does
+  carry `version`, and that is intended** -- it has since 0.42.1, and reading a
+  node's running version without a token is how every on-box check and every
+  deploy verification is done. The rule it still keeps is the one that matters:
+  no node id, no topology, nothing about the cluster. Anything beyond "is this
+  node serving, and what is it running" needs `/api/v1/status` and
+  `view_status`. The code comment at `src/service.cpp:238-245` still claims no
+  version and is stale in the same way this entry was.
 - **An old node answers `401`, not `404`**, to that route, because
   authentication happens before routing. Core falls back to
   `/api/v1/catalogue/status` on *any* answer that is not a liveness answer,
@@ -1656,6 +1697,22 @@ cross-session and will not be in the next session's context.
   that already is a keyframe. Core types all three as `number | undefined`
   because an older node omits them, and deletes its `activationPosition`
   undefined branch — the invariant makes that state unreachable.
+- **A node reports the playback budgets it enforces** (0.46.2) on the per-node
+  entries of `GET /api/v1/status`, in a `playback` object beside `runtime`:
+  `startup_timeout_ms` and `segment_timeout_ms`. They are each node's statement
+  about itself, relayed like `load1` and `cpu_cores`; no node computes a
+  cluster-wide figure, because telemetry carries no peer's streaming
+  configuration and it would be inventing one. A client that needs a worst case
+  across candidates composes it itself, since only the client knows which nodes
+  those are. **Absent means the node cannot say** -- an older node, or one with
+  streaming disabled -- and must never shorten a client's own budget, nor be
+  filled in from another node's figure. Deliberately not on the session
+  payload, unlike `look_ahead_ms`: these bound the request that creates the
+  session, so a client cannot learn them from the response it is timing out on,
+  and a node it has never used would never report them. Agreed with the core
+  session on 2026-09-18 after it showed that a `playback/status` placement
+  could not ride its existing health probe without regressing latency ranking
+  for role-less sessions.
 - **`pipeline_idle_ms` bounds how long a client may hold a generation before
   first requesting media.** A transformed session whose stream has been idle for
   `streaming.pipeline_idle_ms` has its physical pipeline reclaimed; the logical

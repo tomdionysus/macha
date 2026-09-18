@@ -73,8 +73,35 @@ struct NodeTelemetry {
     // since total RAM would prefer a large thrashing node over a small idle
     // one.
     uint64_t memory_total_bytes{};
+    // The budgets this node itself enforces on a playback request: how long it
+    // may take to bring the first transformed fragment up
+    // (`streaming.startup_timeout_ms`), and how long it holds a request for a
+    // fragment that is not ready yet (`streaming.segment_timeout_ms`).
+    //
+    // Reported because a client has to bound its own attempt against the node
+    // it is actually talking to, including nodes it has never used -- these
+    // are self-reported facts, relayed like load1 and cpu_cores, not a
+    // cluster-wide figure any node is entitled to compute. A client that
+    // hardcodes a budget below a node's own entitlement abandons that node
+    // while it is still working: measured on 2026-09-18, a 12 s client budget
+    // against this 15 s one threw away an 11.7 s transcode that was about to
+    // succeed and started the identical encode on the other node.
+    //
+    // Zero means the sender did not report one -- an older node, or one with
+    // streaming disabled -- and a consumer must read that as "cannot say",
+    // never as licence to shorten its own budget. A default would be
+    // indistinguishable at runtime from an answer.
+    uint32_t playback_startup_timeout_ms{};
+    uint32_t playback_segment_timeout_ms{};
 
     auto operator<=>(const NodeTelemetry&) const = default;
+};
+
+// Passed as a group rather than as two more positional integers into an
+// already long refresh_local signature, where a transposition would be silent.
+struct PlaybackBudgets {
+    uint32_t startup_timeout_ms{};
+    uint32_t segment_timeout_ms{};
 };
 
 struct TelemetryView {
@@ -114,7 +141,7 @@ class TelemetryStore {
                                 uint32_t peers_known, uint32_t peers_active,
                                 uint64_t rpc_connections_created, uint64_t rpc_connections_reused,
                                 uint64_t rpc_connections_canonical, NodePhase phase,
-                                std::string api_endpoint);
+                                std::string api_endpoint, PlaybackBudgets playback = {});
     void observe(NodeTelemetry, bool direct = false);
     void apply_identity_reset(const IdentityAssociationReset&);
     std::optional<NodeTelemetry> local() const;

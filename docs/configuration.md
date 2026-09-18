@@ -410,6 +410,13 @@ effective value is the lesser of this and `session_idle_ms`, so lowering
 
 `video_encoder_threads` sets the x264 frame-thread count per video transcode; `0` (the default) uses every hardware thread. Until 0.32.11 the encoder ran single-file in sliced-thread mode, at about real time for 1080p on the four-core nodes, so every representation change cost 5-13 s and a mid-file seek could not catch up. The first fragment of a transcode generation is 2 s (later ones the configured segment duration) so the request is answered after 2 s of encoding.
 
+`startup_timeout_ms` and `segment_timeout_ms` are reported to clients on the
+per-node entries of `GET /api/v1/status`, in a `playback` object beside
+`runtime`, so a client can bound its own attempt against the node it is talking
+to instead of hardcoding a guess. A node with `streaming.enabled` false omits
+them rather than reporting zero. See "The budgets a node enforces, and where a
+client reads them" in `docs/streaming.md`.
+
 A seek is never moved to suit the node's configuration. A transcode generation
 begins exactly where the client asked; a remux generation begins at the last
 indexed keyframe at or before the request and publishes the remainder as

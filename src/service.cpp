@@ -238,11 +238,14 @@ std::string_view Service::required_role(const HttpRequest& request) {
 HttpResponse Service::handle_http(const HttpRequest& request) {
     // Liveness, for anything that needs to know whether this node is serving
     // before it has a token -- a load balancer, an uptime monitor, a client
-    // choosing an endpoint. Deliberately says nothing else: it is reachable
-    // unauthenticated from wherever the API is reachable, so it carries no
-    // version, no node identity and no topology. Everything beyond "is this
-    // node serving" is a question about the cluster and lives behind
-    // /api/v1/status and the view_status role.
+    // choosing an endpoint. It carries the running version -- deliberately,
+    // since 0.42.1: reading what a node is running without a token is how
+    // every on-box check and every deploy verification is done, and a version
+    // is a fact about this process rather than about the cluster. Nothing
+    // beyond that: no node identity, no topology, no configuration. It is
+    // reachable unauthenticated from wherever the API is reachable, so
+    // everything that describes the cluster lives behind /api/v1/status and
+    // the view_status role.
     if (request.path == "/api/v1/health")
         return health_response();
     // Session creation/introspection must work while local services are

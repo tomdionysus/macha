@@ -170,6 +170,27 @@ GET /api/v1/playback/status
 
 Reports enablement, current session/transcode counts, media-engine backend/version and encoder availability. Legacy executable-discovery status fields are reported as false/empty; the active backend/version and encoder capabilities are the authoritative status fields.
 
+### The budgets a node enforces, and where a client reads them
+
+A client must bound its own attempt on a node against the budgets that node enforces, and it needs them for every node it might fail over to, not only the one it is playing from. Those two facts decide where they are published: on the **per-node entries of `GET /api/v1/status`**, beside `runtime`, in a `playback` object.
+
+```json
+"playback": { "startup_timeout_ms": 15000, "segment_timeout_ms": 6000 }
+```
+
+- **`startup_timeout_ms`** — how long this node may take to bring a transformed generation's first fragment up (`streaming.startup_timeout_ms`).
+- **`segment_timeout_ms`** — how long it holds a request for a fragment that is not ready yet (`streaming.segment_timeout_ms`).
+
+These are each node's statement about **itself**, relayed like `load1` and `cpu_cores`. No node computes or reports a cluster-wide figure: it has no data to do so, since telemetry carries no peer's streaming configuration. A client that needs a worst case across the nodes it might use composes it from these, because only the client knows which nodes those are.
+
+They are **not** on the session payload, unlike `stream.look_ahead_ms`. That field is needed during playback, once a session exists; these bound the request that creates the session, so a client cannot learn them from the response it is timing out on — and a node it has never used would never report them at all.
+
+**Absence means the node cannot say**, never a default: an older node predating the field, or one with `streaming.enabled` false, omits them rather than reporting zero. A client must fall back to its own conservative bound and must never shorten a budget on the strength of a missing field, nor substitute another node's figure, which is a fact about that node.
+
+A client that guesses instead gets this wrong in the dangerous direction. Measured on 2026-09-18: a client budget of 12,000 ms against this server's 15,000 ms startup entitlement abandoned a node three seconds inside its own bound, discarded an 11.7 s 4K transcode that was about to succeed, and started the identical encode on the other node. Stale-high merely waits longer than necessary; stale-low manufactures viewer-visible failure out of a node that was working.
+
+Every value here applies on a live `reload_config` without a restart, so a client should refresh rather than cache once, and treat a cached figure as a floor rather than a settled fact.
+
 ## Create a session
 
 ```text

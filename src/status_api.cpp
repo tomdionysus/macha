@@ -344,6 +344,28 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         runtime["rpc_connections_canonical"] = live->rpc_connections_canonical;
     }
     node["runtime"] = std::move(runtime);
+
+    // Configuration this node enforces, not a measurement of it -- separate
+    // from `runtime` above for that reason. A client needs these about every
+    // node it might fail over to, not only the one it is playing from, which
+    // is why they ride the payload that already describes every node rather
+    // than a per-endpoint call the client would have to make N times.
+    //
+    // Omitted when the node did not report them: an older node, or one with
+    // streaming disabled. A consumer must read absence as "this node cannot
+    // say" and fall back to its own conservative bound -- never shorten a
+    // budget on the strength of a missing field, and never substitute another
+    // node's figure, which is a fact about that node and not this one.
+    Json::Object playback;
+    if (live && online) {
+        if (live->playback_startup_timeout_ms)
+            playback["startup_timeout_ms"] =
+                static_cast<uint64_t>(live->playback_startup_timeout_ms);
+        if (live->playback_segment_timeout_ms)
+            playback["segment_timeout_ms"] =
+                static_cast<uint64_t>(live->playback_segment_timeout_ms);
+    }
+    node["playback"] = std::move(playback);
     node["identity_association_reset"] =
         identity_reset ? identity_reset_json(*identity_reset) : Json(nullptr);
     return node;

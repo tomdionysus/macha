@@ -3034,6 +3034,85 @@ MACHA_TEST("invariants", test_catalogue_gc_liveness_fails_closed_when_current_ro
     CHECK(!maintenance.complete);
 }
 
+MACHA_TEST("invariants", test_a_node_reports_the_playback_budgets_it_enforces) {
+    // A client has to bound its own attempt against the node it is actually
+    // talking to, and against nodes it has never used, because those are the
+    // ones a failover will pick. Measured on 2026-09-18: a client budget of
+    // 12 s against this server's 15 s startup entitlement abandoned a node
+    // three seconds inside its own bound, threw away an 11.7 s transcode that
+    // was about to succeed, and started the identical encode on the other
+    // node. The client was guessing because nothing reported the figure.
+    //
+    // These are self-reported facts relayed like load1 and cpu_cores, not a
+    // cluster-wide value any node is entitled to compute: each node states its
+    // own, and a client composes them across the candidates it might use.
+    TestCluster cluster;
+
+    auto streaming_config = cluster.node_config("streamer");
+    streaming_config.catalogue.api.enabled = true; // streaming rides the HTTP API
+    streaming_config.streaming.enabled = true;
+    // Deliberately not the defaults, so the assertion cannot pass by
+    // coincidence against 15000 and 6000.
+    streaming_config.streaming.startup_timeout = 9000ms;
+    streaming_config.streaming.segment_timeout = 3000ms;
+    NodeRuntime streamer(streaming_config, cluster.keys());
+    streamer.start();
+    REQUIRE(streamer.wait_local_state_ready(10s));
+
+    const auto node_entry = [](ClusterStatusService& status, const NodeId& id) {
+        HttpRequest request;
+        request.method = "GET";
+        request.path = "/api/v1/status";
+        auto response = status.handle(request);
+        REQUIRE(response.status == 200);
+        auto root = Json::parse(std::string(
+            reinterpret_cast<const char*>(response.body.data()), response.body.size()));
+        const auto* nodes = root.find("nodes");
+        REQUIRE(nodes != nullptr);
+        std::optional<Json> found;
+        for (const auto& value : nodes->asArray())
+            if (value.find("id") && value.find("id")->asString() == to_string(id))
+                found = value;
+        return found;
+    };
+
+    ClusterStatusService streaming_status(streamer);
+    std::optional<Json> entry;
+    REQUIRE(wait_until([&] {
+        entry = node_entry(streaming_status, streamer.node_id());
+        return entry && entry->find("playback") &&
+               entry->find("playback")->find("startup_timeout_ms") != nullptr;
+    }, 10s));
+    const auto* playback = entry->find("playback");
+    REQUIRE(playback != nullptr);
+    CHECK(playback->find("startup_timeout_ms")->asInt64() == 9000);
+    CHECK(playback->find("segment_timeout_ms")->asInt64() == 3000);
+
+    // A node that serves no playback reports no budget rather than a figure it
+    // would not honour. Absent must read as "this node cannot say": a client
+    // that saw a zero here and took it literally would abandon every attempt
+    // immediately, which is the same class of failure as the guess above.
+    auto quiet_config = cluster.node_config("quiet");
+    REQUIRE(!quiet_config.streaming.enabled);
+    NodeRuntime quiet(quiet_config, cluster.keys());
+    quiet.start();
+    REQUIRE(quiet.wait_local_state_ready(10s));
+
+    ClusterStatusService quiet_status(quiet);
+    std::optional<Json> quiet_entry;
+    REQUIRE(wait_until([&] {
+        quiet_entry = node_entry(quiet_status, quiet.node_id());
+        return quiet_entry.has_value();
+    }, 10s));
+    const auto* quiet_playback = quiet_entry->find("playback");
+    REQUIRE(quiet_playback != nullptr);
+    CHECK(quiet_playback->find("startup_timeout_ms") == nullptr);
+    CHECK(quiet_playback->find("segment_timeout_ms") == nullptr);
+
+    quiet.stop();
+    streamer.stop();
+}
+
 } // namespace
 
 #if defined(__linux__)
