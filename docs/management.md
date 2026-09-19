@@ -97,14 +97,17 @@ The tombstone is a freshness boundary. Pre-reset gossip cannot recreate the inva
 
 Every HTTP route requires a session bearer token from `POST /api/v1/session`, which is the only route reachable without one. A session carries the roles of the account behind it, and each route is gated on those roles in one place before dispatch. Hiding a section in a client is presentation; the gate is the enforcement.
 
-Roles are capabilities rather than a ladder — importing does not imply managing, and managing does not imply handing out accounts. Every role implies `media_viewer`, and that is the only implication.
+Roles are capabilities rather than a ladder — importing does not imply managing, and managing does not imply handing out accounts. There are exactly two implications: `importer`, `manager` and `manage_users` each imply `media_viewer`, and `media_viewer` implies `view_status`.
 
 | role | grants |
 | --- | --- |
-| `media_viewer` | every read, playback, cluster status, and your own password |
+| `view_status` | cluster and node health |
+| `media_viewer` | every read, playback, and your own password |
 | `importer` | acquisition and ingest |
 | `manager` | files, namespaces, catalogue matches, identity-association reset |
 | `manage_users` | add, edit and remove accounts |
+
+`view_status` is the weakest capability: everything implies it, it implies nothing, and it is grantable on its own. That is what makes cluster health independently addressable — an operator who wants it visible to unauthenticated visitors grants the `anonymous` account `view_status` and nothing else, while an account granted nothing at all cannot see health either. Implication is resolved when a session is minted rather than when the account is written, so a change to these rules reaches accounts created before it without a migration.
 
 Two accounts exist on every cluster. `root` holds every role; `anonymous` is what an unauthenticated visitor is, and holds `media_viewer` at first. Neither can be renamed or deleted, and in every other respect they are ordinary accounts. Anonymous access is controlled by editing the `anonymous` account's roles, not by configuration, so it takes effect on the next session rather than on restart — this is what decides what a television, which cannot practically type a password, is able to reach. `session.allow_anonymous: false` turns the mechanism off entirely.
 

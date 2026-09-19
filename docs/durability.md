@@ -54,7 +54,7 @@ A full or offline preferred owner does not weaken the floor; it changes which el
 
 Every node is metadata-capable. A metadata commit is publishable after the exact immutable commit has been durably stored on at least `dht.metadata_min_write_replicas` distinct active nodes and its acceptance certificate has been durably retained. A receiver stores the commit independently of its current head; disconnected cohorts may therefore preserve different accepted successors of the same ancestor. Ordinary linear commits may use compact deterministic deltas in the history store, while full records remain valid recovery material.
 
-This is a durability floor rather than majority consensus. It deliberately allows arbitrary surviving cohorts of the configured floor size to continue. Consequently disconnected cohorts can produce divergent valid histories. Those histories are preserved and destructive convergence is refused. Automatic DAG reconciliation and first-class conflict records are implemented rather than pending: two divergent heads are reconciled automatically, non-conflicting namespace changes are merged, and incompatible alternatives are retained as durable conflict records instead of one being silently chosen. Status reports them as `metadata.conflicts`, `conflicts_resolved` and `conflicts_superseded`; see [Metadata replication and reconciliation](metadata.md).
+This is a durability floor rather than majority consensus. It deliberately allows arbitrary surviving cohorts of the configured floor size to continue, so disconnected cohorts can produce divergent valid histories. Those histories are preserved and destructive convergence is refused: two divergent heads are reconciled through a multi-parent commit, non-conflicting namespace changes are merged, and incompatible alternatives are retained as durable conflict records instead of one being silently chosen. Status reports them as `metadata.conflicts`, `conflicts_resolved` and `conflicts_superseded`; see [Metadata replication and reconciliation](metadata.md).
 
 Metadata durability is independent of DATA `dht.replicas` and `dht.min_write_replicas`.
 
@@ -159,4 +159,4 @@ accepted.
 
 Metadata mutation must not scale by retaining several complete namespace representations. `MetadataRecord` payloads share immutable backing, record hashes are streamed, compact deltas are applied in place, and ordinary mutation paths avoid building full duplicate garbage indexes.
 
-Regression coverage deliberately retains many large `MetadataRecord` copies and enforces a loose RSS ceiling on Linux so a return to payload-deep-copy behavior fails testing rather than reaching the OOM killer in production.
+This is a tested invariant, not an aspiration; see [Validation](../VALIDATION.md).

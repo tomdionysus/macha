@@ -17,7 +17,7 @@ any mutually connected pair may continue publishing metadata while the other ten
 
 ## Commit, acceptance and heads are separate concepts
 
-0.19 deliberately does not use a distributed CAS/PREPARE/COMMIT protocol for live metadata writes.
+Live metadata writes deliberately do not use a distributed CAS/PREPARE/COMMIT protocol.
 
 A `MetadataCommit` is an immutable DAG node: it contains a complete state or deterministic delta, its primary parent, and any additional merge parents. A replica may durably store a valid commit regardless of which accepted head it currently exposes. Storing a commit therefore never means "replace your current head".
 
@@ -35,16 +35,16 @@ When disconnected branches meet, replicas exchange accepted heads and ancestry, 
 
 Reconciliation itself is an ordinary immutable commit with multiple parents and must satisfy the same metadata write floor before it is accepted.
 
-## 0.19 implementation
+## Implementation
 
-0.19 implements the commit-store/acceptance model directly:
+The commit-store/acceptance model is implemented directly:
 
 - every active node is eligible to store metadata commits and acceptance evidence;
-- live publication uses `put_metadata_commit` followed by `accept_metadata_commit`; the old network CAS/PREPARE/COMMIT RPCs are rejected by protocol 20;
+- live publication uses `put_metadata_commit` followed by `accept_metadata_commit`; there are no CAS/PREPARE/COMMIT RPCs on the wire;
 - a receiver validates and stores an immutable commit without comparing it with its current head;
 - an accepted commit carries durable evidence of the distinct replicas which stored it at publication time;
 - each replica persists encrypted accepted-head certificates separately from its materialised checkpoint;
-- the 0.18 serialized `metadata_voters` field remains readable only for state compatibility and is cleared by the first policy transition;
+- a serialized `metadata_voters` field is readable for state compatibility and is cleared by the first policy transition;
 - each replica retains encrypted compact ancestry/history across checkpoint compaction;
 - accepted heads exchange ancestry, collapse stale ancestor heads and locate common ancestors;
 - divergent maximal heads are folded deterministically through two-parent reconciliation commits; this permits an arbitrary number of heads to converge without choosing one branch as authoritative;
@@ -71,10 +71,14 @@ Catalogue trees use semantic three-way item merges, with genuine collisions reta
 
 ## What a snapshot carries, and what leaves it
 
-A snapshot's size is a function of the live namespace: the production head
-on 2026-09-06 was 2.3 MB, of which 85% was the 1,744 entries (three
-quarters of that their extent tables), 1% retirement tombstones, and — until
-0.32.0 — 14% standing conflicts. Three rules keep it that way:
+A snapshot's size is a function of the live namespace. That sentence is
+[discipline 4](../ARCHITECTURE.md#the-self-healing-disciplines), and it is a
+requirement rather than an observation: read, merge, replay and transfer cost
+must scale with the library, not with how long the cluster has been running.
+
+The overwhelming majority of a snapshot is the namespace entries themselves,
+and most of that is their extent tables; everything else is meant to be a
+rounding error. Three rules keep it that way:
 
 - **Tombstones** (`garbage`) are consumed by the maintenance sweep after
   `maintenance.garbage_grace` and then erased from metadata; the vector is
@@ -92,24 +96,17 @@ quarters of that their extent tables), 1% retirement tombstones, and — until
 
 `macha-metadata-dump <key> history.log heads.meta --stats` prints the
 composition of each accepted head (entries, extents, tombstones, conflicts,
-and the encoded bytes each accounts for).
+and the encoded bytes each accounts for). Read it before concluding that a
+snapshot is large for a reason other than the library being large.
 
-The remaining metadata work is long-term history compaction policy.
+## Compatibility
 
-## Migration from 0.18
+`dht.metadata_replicas` named a fixed voter count whose effective write
+requirement was its majority. It is still accepted as an alias and translated
+to that floor, so `metadata_replicas: 3` means
+`metadata_min_write_replicas: 2`. The two keys are mutually exclusive, and new
+configurations should use only `metadata_min_write_replicas`.
 
-The old key `dht.metadata_replicas` described a fixed voter count whose effective write requirement was its majority. 0.19 accepts it only as a migration alias and translates it to that former write floor. Thus legacy:
-
-```yaml
-dht:
-  metadata_replicas: 3
-```
-
-is interpreted as:
-
-```yaml
-dht:
-  metadata_min_write_replicas: 2
-```
-
-A pre-0.19 committed checkpoint is imported once as a legacy accepted head. Subsequent 0.19 commits use explicit acceptance certificates. New configurations should use only `metadata_min_write_replicas`.
+A committed checkpoint written before acceptance certificates existed is
+imported once as a legacy accepted head; every commit after that carries an
+explicit certificate.
