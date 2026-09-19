@@ -53,13 +53,25 @@ Clients can read the validated profile without opening the media:
 GET /api/v1/catalogue/media/{url-encoded-macha-media-id}/profile
 ```
 
-The response contains `schema_version`, `media_id`, `format`, `duration_ms`,
-aggregate `bitrate`, and every stream's codec/profile, language, bitrate,
-dimensions/audio properties and default/forced/attached-picture flags. It is
-served with private immutable cache headers. A miss queues speculative profiling
-and returns `202 Accepted` with `Retry-After`; clients may retry the endpoint.
-This advisory response does not prevent them from starting normal playback
-negotiation immediately.
+The response contains `schema_version` (currently 3), `media_id`, `format`,
+`duration_ms`, aggregate `bitrate`, and every stream's codec/profile, language,
+bitrate, dimensions/audio properties and default/forced/attached-picture flags.
+It is served with private immutable cache headers.
+
+Pre-session availability is guaranteed for a `macha:` identity, so a miss is
+not normally a deferral. The order is:
+
+| condition | response |
+|---|---|
+| not a `macha:` identity | `400 bad_media_id` |
+| a stored profile exists | `200` |
+| no stored profile | probed there and then at foreground priority, persisted, `200` |
+| the probe failed | `422 profile_failed` with a `reason` |
+| the media is not resolvable on this node | `202` with `Retry-After` and `Location` if background profiling was accepted, otherwise `404 not_found` |
+
+The `202` is a residual fallback rather than the ordinary miss path. It is
+advisory in either case: it does not prevent a client from starting normal
+playback negotiation immediately.
 
 ## Commit protocol
 

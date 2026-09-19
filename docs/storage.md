@@ -39,7 +39,7 @@ storage:
 
 `limit` is the maximum physical authoritative DATA admitted to that backend. `reserve_free` is a second gate against the actual filesystem: a DATA write is refused if it would cross the configured physical free-space reserve even when `limit` has room.
 
-Backend paths are not treated as interchangeable directories. Each carries a node/backend identity marker. A non-empty unversioned backend is refused by the fresh 0.18 storage contract.
+Backend paths are not treated as interchangeable directories. Each carries a node/backend identity marker. A non-empty backend without that marker is refused rather than adopted.
 
 ## Placement across nodes
 

@@ -1,6 +1,29 @@
 # Contributing
 
-Memory-owning changes must follow the repository's
+## Read first
+
+The [governing laws and self-healing disciplines](ARCHITECTURE.md#governing-laws)
+come before everything else in this file. They are cited by number in the
+source and in review, so a comment reading "governing law 3" or "discipline 1"
+refers to that section.
+
+A change that touches scheduling, admission, priority, retry or recovery is not
+complete until it says which law it serves and which discipline it follows. In
+practice that means answering:
+
+- **Which class of work does this make wait?** If the answer is a viewer, and
+  the cause is another class of work, the change is wrong regardless of what it
+  improves.
+- **What happens when it fails repeatedly?** A new retry needs backoff, a
+  failure budget, a parked state visible in `GET /api/v1/status`, and an
+  operator action. A new RPC wait needs a deadline.
+- **What happens when it starts up against inconsistent state?** A deterministic
+  resolution is resolved, logged once, re-journalled and counted. Only key
+  mismatch or header corruption may refuse to start.
+- **Does anything here trust bookkeeping over ground truth it could re-derive?**
+  If a check can probe the content-addressed store instead, it must.
+
+Memory-owning changes must additionally follow the repository's
 [ownership and lifecycle contract](docs/ownership.md). Long-lived state is not
 complete without an explicit owner, bound, release paths, diagnostics and a
 repeat-cycle lifecycle test.

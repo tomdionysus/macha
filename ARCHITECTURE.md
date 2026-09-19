@@ -1,5 +1,81 @@
 # Macha architecture
 
+## Governing laws
+
+Three laws order every scheduling, admission and priority decision in the
+system. They are cited by number in the source and in review.
+
+1. **Thou Shalt Not Make The Viewer Wait.**
+2. **Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The
+   Viewer Wait.**
+3. **Control traffic must remain promptly serviceable.** Viewer priority is a
+   large configurable share (95:5 by default), not indefinite starvation of all
+   other work.
+
+They do not simply rank. Law 2 is explicitly subordinate to law 1 — that is
+what its second clause says, and it is why loader work yields to a viewer
+rather than negotiating with one. Law 3 is not subordinate to law 1: it is a
+floor that law 1 may not eat through. "A large configurable share, not
+indefinite starvation" is the whole point of the sentence. A node that serves
+viewers perfectly while failing to answer `ping` has broken law 3, and it will
+be recorded as dead by peers who cannot see how well it was doing.
+
+So the resolution order is: law 3's floor is reserved first, law 1 takes
+priority within what remains, and law 2 governs everything left.
+
+A viewer is someone watching or listening right now. A loader is durable work
+the user asked for — FUSE publication, ingest, acquisition — which must finish
+but need not finish first. Control is health, membership, status and session
+traffic, which must stay answerable whatever else the node is doing, because it
+is how the cluster and the operator find out anything at all.
+
+The laws are why the node has three memory reserves rather than one budget
+(`runtime.control_memory_reserve_bytes`, `viewer_memory_reserve_bytes`,
+`loader_memory_reserve_bytes`), why DATA execution priority is viewer
+foreground, viewer read-ahead, user loader, then speculative maintenance, why
+the HTTP server runs separate control and data lanes, and why the fast-control
+RPC executor has a closed allow-list. Each of those is one law expressed in a
+different resource. A change to any of them is a change to a law and should be
+argued as one.
+
+Law 1 is not absolute in the sense that a viewer never blocks on anything; it is
+absolute in the sense that no *other class of work* may be the reason a viewer
+blocks. Where a viewer genuinely waits — a request beyond the produced frontier,
+a held segment — the wait is on production that viewer itself demanded, it is
+bounded by configuration, and the bound is published to the client. Those two
+cases are documented as such in [Streaming](docs/streaming.md); they are the
+exceptions, and they are not precedent for a third.
+
+## The self-healing disciplines
+
+A separate set of rules governs how the node behaves when something is wrong.
+They exist because a system whose failures do not fail loudly produces outages
+that are only visible one at a time, each hiding the next.
+
+1. **Re-derive, don't assert.** A durability, placement or confirmation check
+   that fails against recorded evidence probes the content-addressed truth and
+   re-stamps the evidence. It never retries the stale assertion. Content
+   addressing makes ground truth one `has(id)` away, so bookkeeping that could
+   be cheaply re-derived is never trusted over it.
+2. **One work-item policy.** Every retried unit of work has backoff, a failure
+   budget, a parked state visible in Status, and an operator action. No loop
+   retries at a fixed interval, and no RPC waits without a deadline. "Not yet"
+   must never silently become "forever".
+3. **Recover by resolving.** Recovery paths do not throw on an inconsistency
+   that has a deterministic resolution: they resolve it, log one line,
+   re-journal the outcome so the next start does not see it again, and count it
+   in Status. Only a genuinely fatal condition — key mismatch, header
+   corruption — may refuse to start. A node that stays up with a counter to
+   read beats a node that exits correctly.
+4. **Compact history out of the hot path.** A snapshot's size is a function of
+   the live namespace. Retirement history and resolved conflicts belong in
+   separately compacted structures, so that read, merge, replay and transfer
+   cost scales with the library rather than with its history.
+
+Discipline 3 is also an operational rule: a node is expected to settle bad
+input and stay online. Repairing state by hand on a node is not the remedy for
+a recovery path that refuses.
+
 ## Design boundary
 
 MachaDFS (Macha Distributed File System) is a distributed media filesystem, not a general-purpose distributed POSIX filesystem. The authoritative model is immutable content-addressed objects plus replicated, branch-reconciling namespace/control metadata. Local FUSE state makes accepted filesystem mutations crash-recoverable while distributed publication proceeds asynchronously.
@@ -127,11 +203,11 @@ Logical GC authority is reachability from accepted metadata; physical deletion i
 
 ## Network model
 
-Peers use separate CONTROL and DATA transport lanes. Health/membership and metadata/control RPCs are isolated from bulk DATA scheduling. Cluster protocol 20 is intentionally incompatible with 0.18 peers because live metadata publication now transfers immutable commits and acceptance certificates instead of coordinating a linear CAS/PREPARE/COMMIT transition; the 0.18 storage layout remains readable.
+Peers use separate CONTROL and DATA transport lanes. Health/membership and metadata/control RPCs are isolated from bulk DATA scheduling. The cluster protocol version is 21; a peer offering any other version fails the handshake rather than negotiating down, so a cluster is homogeneous in protocol and a protocol change is a rolling upgrade.
 
 ## Correctness gates
 
-The storage implementation is expected to preserve these invariants under test:
+These are the invariants the storage implementation exists to preserve. Each is enforced by a regression case; [`VALIDATION.md`](VALIDATION.md) names them and how to run them.
 
 - R=1 capacity aggregates eligible heterogeneous nodes rather than collapsing to the smallest node;
 - a full preferred owner falls through deterministically;
@@ -140,5 +216,5 @@ The storage implementation is expected to preserve these invariants under test:
 - DATA exhaustion cannot block control metadata commits;
 - artwork follows DATA placement and remains remotely readable from a full node;
 - pack restart/torn-tail/compaction preserve logical objects;
-- old/unversioned non-empty storage is refused;
+- unversioned non-empty storage is refused;
 - metadata mutation memory remains bounded rather than multiplying whole namespace buffers.

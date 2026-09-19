@@ -110,9 +110,9 @@ A refusal is `500` with error code `segment_not_ready`, `Retry-After: 1` and `Ca
 
 That assignment is deliberately the opposite of what the HTTP spec suggests, because the status is the only thing a client can read. On a fragment error hls.js's `XhrLoader` surfaces just `{code: xhr.status, text: xhr.statusText}` — the JSON body is absent from the error event and a header is reachable only through the raw `XMLHttpRequest`, which is undocumented coupling that breaks under `FetchLoader`. So the discriminator must be the status, and a discriminator readable only as a status has to be one nothing else on the path can emit. `503` fails that: every proxy, tunnel and load balancer emits it when a service is down, so a client taught that `503` means "hold, stay on this node" would read a genuinely dead node as a healthy one and never fail over — a silent, permanent stall, hardest to diagnose exactly where a proxy makes it most likely. Misreading an infrastructure `500` as a hold costs a pointless retry instead. The two faults are not symmetric and this picks the recoverable one. A dead node and a broken generation both warranting "go elsewhere" is why `stream_failed` can safely share `503` with infrastructure. Both stay 5xx, because a 4xx stops hls.js retrying at all. `init.mp4` takes the same hold path as a fragment: with the playlist served up front, the client asks for it before the muxer has written it.
 
-`segment_timeout_ms` must stay under the client's time-to-first-byte deadline. A held request sends no bytes, so a client that gives up first never receives the `503` and takes its timeout path instead, which retries hard and then fails — strictly worse than not holding. The deadlines differ per client and each was read from the shipped artifact rather than from documentation, which was wrong twice: hls.js 10s (`fragLoadPolicy.default.maxTimeToFirstByteMs`, not the deprecated and inert `fragLoadingTimeOut` at 20s), expo-video 10s (bare `OkHttpClient` default read timeout), React Native track player 8s (media3 `DEFAULT_READ_TIMEOUT_MILLIS`, which reaches `HttpURLConnection.setReadTimeout` — and waiting for the status line is read time), iOS AVFoundation unknown. The default here is 6000, which clears the tightest known deadline with margin. A `503` that arrives promptly is retried sensibly instead: 6 attempts backing off 1s to 8s. `Retry-After` is sent because it is correct HTTP, but hls.js reads it only in its content-steering loader, so nothing here depends on it.
+`segment_timeout_ms` must stay under the client's time-to-first-byte deadline. A held request sends no bytes, so a client that gives up first never receives the refusal and takes its timeout path instead, which retries hard and then fails — strictly worse than not holding. The tightest deadline among the clients in use is 8 s (media3's `DEFAULT_READ_TIMEOUT_MILLIS`, reached through `HttpURLConnection.setReadTimeout`; hls.js and expo-video each allow 10 s). The default of 6000 clears that with margin. A refusal that arrives promptly is retried sensibly instead: hls.js makes 6 attempts backing off 1 s to 8 s. `Retry-After` is sent because it is correct HTTP, but hls.js reads it only in its content-steering loader, so nothing here depends on it. Read the deadline out of the client artifact before changing this value; the published documentation for these clients has been wrong about which knob governs.
 
-A held request costs no thread. The handler asks the segment store for the object and, in the same locked step, subscribes to the next publication if it is absent; it then hands the server a deferral -- what it is waiting for, its deadline, and the admitted hold -- and returns. The server parks the connection and re-runs the handler when the store publishes or the deadline passes. `max_concurrent_holds` is therefore a fairness and memory bound (64 by default since 0.43.0, when it stopped rationing a sixteen-thread worker pool at 8), and the admission policy above is what it always was.
+A held request costs no thread. The handler asks the segment store for the object and, in the same locked step, subscribes to the next publication if it is absent; it then hands the server a deferral -- what it is waiting for, its deadline, and the admitted hold -- and returns. The server parks the connection and re-runs the handler when the store publishes or the deadline passes. `max_concurrent_holds` (64) is therefore a fairness and memory bound rather than a worker-thread ration: it bounds how many requests may be waiting on encoders at once across every session. Steady-state playback on a four-core node transcoding at roughly real time sits at the frontier often, so holds are the ordinary case rather than the exception.
 
 For stream-copy video, the VOD planner uses the demuxer's keyframe index and chooses random-access boundaries near `segment_duration_ms`. Matroska/WebM Cues are explicitly materialised through the demuxer's seek path before that index is inspected, because probing alone may expose only a partial early-file index. The resulting plan is rejected if any advertised fragment would be grossly larger than the configured target, preventing a partial index from turning the unindexed remainder of a movie into one fragment. A transformed seek starts at the last indexed keyframe at or *before* the requested position, so the first advertised segment is independently decodable and the generation still contains the position that was asked for. The remainder is reported as `seek_offset_ms` rather than added silently to the request (see "Where a seek actually starts" below). A remux whose keyframe index is unusable fails rather than silently changing mode. A fragment is as long as the source GOP makes it, up to 90 seconds; only a gap or tail beyond that rejects the plan, because scene-cut encodes routinely exceed a fixed multiple of the target. Transcoded video uses the encoder GOP cadence as its VOD boundary plan.
 
@@ -146,6 +146,35 @@ traffic: under simultaneous demand the configurable default viewer/loader share
 is 95:5, so publication continues without being allowed to consume the
 execution/storage service needed to start or seek a stream. Either class borrows
 unused DATA capacity work-conservingly when the other is idle.
+
+This is [governing law 1](../ARCHITECTURE.md#governing-laws) in the playback
+path: no other class of work may be the reason a viewer waits.
+
+### The two places a viewer does wait
+
+Law 1 forbids another class of work making a viewer wait. It does not promise
+that a viewer never blocks on its own stream being produced, and there are
+exactly two places where it does. Both are bounded, both are published to the
+client, and neither is precedent for a third.
+
+**Arriving beyond the produced frontier.** Production is sequential, so a client
+that requests a fragment further ahead than the node has produced waits while
+the node encodes its way there at roughly real time. The bound is
+`stream.look_ahead_ms` on the session payload, which is why that field exists
+and why a client must read it per session rather than hardcode it. Past the
+window, creating a new generation seeked to the arrival point is cheaper than
+making the existing one catch up.
+
+**A held segment request.** A complete VOD playlist promises fragments that do
+not exist yet, so a request for one inside the hold window is held rather than
+refused. The bound is `segment_timeout_ms`, published per node on
+`GET /api/v1/status`.
+
+In both cases the wait is on production that this viewer itself demanded, which
+is the distinction that matters: the work in front of it is its own. A change
+that makes a viewer wait on anything else — a publication, a repair, a scrub, a
+catalogue scan — is a law-1 violation however favourable its throughput numbers
+are.
 
 Publication traffic has its own loader transport class below viewer foreground
 and read-ahead but above speculative maintenance. Restarting Macha does not
@@ -187,7 +216,7 @@ They are **not** on the session payload, unlike `stream.look_ahead_ms`. That fie
 
 **Absence means the node cannot say**, never a default: an older node predating the field, or one with `streaming.enabled` false, omits them rather than reporting zero. A client must fall back to its own conservative bound and must never shorten a budget on the strength of a missing field, nor substitute another node's figure, which is a fact about that node.
 
-A client that guesses instead gets this wrong in the dangerous direction. Measured on 2026-09-18: a client budget of 12,000 ms against this server's 15,000 ms startup entitlement abandoned a node three seconds inside its own bound, discarded an 11.7 s 4K transcode that was about to succeed, and started the identical encode on the other node. Stale-high merely waits longer than necessary; stale-low manufactures viewer-visible failure out of a node that was working.
+The two directions of error are not symmetric. A client budget longer than the node's merely waits longer than necessary. A budget shorter than it abandons the node inside its own entitlement, discards a transcode that was about to succeed, and starts the identical encode elsewhere — manufacturing a viewer-visible failure out of a node that was working. Read the figure rather than guessing it, and err long.
 
 Every value here applies on a live `reload_config` without a restart, so a client should refresh rather than cache once, and treat a cached figure as a floor rather than a settled fact.
 
@@ -207,8 +236,8 @@ attempt and reuse it after a timeout, disconnect or failover. The same key and
 normalized request joins or replays the same session ID, capability and
 `generation`; using that key for different request semantics returns
 `409 idempotency_conflict`. The response echoes `Idempotency-Key` and reports
-`X-Macha-Idempotency: created|replayed`. Omitting the header preserves the
-legacy non-idempotent behaviour.
+`X-Macha-Idempotency: created|replayed`. The header is optional; omitting it
+makes each POST a distinct creation, which is rarely what a client wants.
 
 `Macha-Viewer-Session` has a different, longer lifetime from
 `Idempotency-Key`: use one stable opaque value for the lifetime of a player/UI
@@ -219,8 +248,7 @@ entitlement. This makes POST-based seek/reload recovery equivalent to PATCH for
 admission purposes. The key can instead be supplied as `viewer_session_id` in
 the JSON body; if both forms are present they must agree. Clients should prefer
 the header and must not share a key among simultaneous independent viewers.
-Omitting it preserves the legacy behaviour in which each POST is a distinct
-logical session.
+Omitting it makes each POST a distinct logical session.
 
 Session admission first reads the immutable media profile from cluster metadata,
 which requires no media-object reads. A miss never produces a client-visible
@@ -350,7 +378,7 @@ The offset is therefore zero exactly when the mode can be frame-accurate. A clie
 
 The mode is never substituted. A remux request stays remux, including when its keyframe situation is awkward: where the index names no keyframe at or before the request, the baseline is `0` and the offset carries the whole request. A decodable stream's first sample is necessarily a sync sample, so a copy can always begin at the beginning; the index simply did not name it. (Separately, a remux whose keyframe index is unusable *as a segment plan* still fails, or falls back to transcode where `allow_video_transcode_fallback` permits it. That is remux being unplannable, not a seek being moved.)
 
-Until 0.45.x a transformed seek was aligned to the first keyframe at or *after* the request, in both modes. Measured on the live cluster on 2026-09-17, that started a remux generation up to 9.3 s past the position asked for, always forward. The content between the request and that keyframe was in no generation at all and no client could recover it: a skipped scene for a viewer seek, and deleted content mid-playback on the reaped-session recovery path, which rebuilds a generation at a position a viewer has actually reached.
+The baseline is never a keyframe *after* the request. Aligning forward would leave the content between the request and that keyframe in no generation at all, unrecoverable by any client: a skipped scene on a viewer seek, and deleted content on the reaped-session recovery path, which rebuilds a generation at a position a viewer has actually reached.
 
 ## Inspect, change and stop a session
 
