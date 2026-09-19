@@ -80,6 +80,8 @@ Preserve the FUSE spool/journal when diagnosing recovery errors. A missing journ
 
 ### What recovery resolves on its own
 
+This is
+[discipline 3, recover by resolving](../ARCHITECTURE.md#the-self-healing-disciplines).
 Recovery never refuses to start over the *contents* of the journal; only a
 missing or unreadable journal header is fatal. Everything else has a
 deterministic resolution, is applied once, journaled so the next start does
@@ -205,6 +207,11 @@ grouped `published` and `done` barriers.
 
 ## RPC execution isolation
 
+This is how [governing law 3](../ARCHITECTURE.md#governing-laws) is enforced on
+the RPC path: control traffic stays answerable whatever else the node is doing,
+because it is how the cluster and the operator find out anything at all. A node
+that cannot answer `ping` under load is indistinguishable from a dead one.
+
 The fast-control executor has a deliberately closed allow-list: only CONTROL-frame
 `ping` and `members` requests may run there. These handlers must remain bounded,
 in-memory operations: they may read already-published state, but must not perform
@@ -219,16 +226,18 @@ dedicated metadata executor. All other CONTROL messages use the ordinary control
 executor; object work remains on the priority-aware DATA executors.
 
 DATA execution priority is viewer foreground, viewer read-ahead, user loader,
-then speculative maintenance. Durable FUSE spool publication uses the loader
-class even when its journal records were reconstructed after restart. Recovery
-provenance affects replay validation and cache policy, not scheduling priority.
+then speculative maintenance — laws 1 and 2 as an execution order. Durable FUSE
+spool publication uses the loader class even when its journal records were
+reconstructed after restart. Recovery provenance affects replay validation and
+cache policy, not scheduling priority: work the user asked for does not become
+speculative merely because the process restarted before finishing it.
 
 ## Subsystem plugins
 
 Optional subsystems ship as `dlopen`'d modules rather than being compiled into
 the server: BitTorrent acquisition
-(`<libdir>/macha/plugins/libmacha-torrent.so`) and, since 0.41.0, the FUSE
-mount (`<libdir>/macha/plugins/libmacha-fuse.so`). The directory scanned is
+(`<libdir>/macha/plugins/libmacha-torrent.so`) and the FUSE mount
+(`<libdir>/macha/plugins/libmacha-fuse.so`). The directory scanned is
 `plugin_path`, which defaults to this build's private plugin directory, and
 every module is checked against the running core's build stamp (project
 version plus git commit) before it is called — a plugin from a different
@@ -256,7 +265,7 @@ The practical consequences for an operator:
 
   | state | meaning | action |
   |---|---|---|
-  | `unavailable` | No plugin file, or the plugin declined to start because this node is configured not to run it (`torrent.enabled: false`, no `fuse.mount_path`). | None; this is the configured outcome. Install the plugin or turn the setting on if it was meant to run. |
+  | `unavailable` | No plugin file, or the plugin declined to start because this node is configured not to run it (`torrent.enabled: false`, no `fuse.mount_path`). | None; this is the configured outcome. Install the plugin or turn the setting on if it was meant to run. Enabling a capability whose plugin is missing is not a configuration error: the node starts, reports the subsystem `unavailable`, and serves everything else. |
   | `running` | Loaded and started. | None. |
   | `faulted` | The last construct/start attempt threw; it is being retried with backoff. | Read `last_fault`; if it persists it becomes `disabled`. |
   | `disabled` | Too many failures in the window, or refused at load (build-stamp mismatch, unreadable file). | Needs an operator: fix the cause and restart the process. Nothing retries automatically. |
@@ -269,43 +278,42 @@ The practical consequences for an operator:
   (`/api/v1/manage/filesystem/blocked-namespace-operation`,
   `parked-publications`) answer "nothing to report" while the mount is
   faulted rather than erroring.
-- **A lost mount is now a `faulted` subsystem, not a process exit.** Before
-  0.41.0, a FUSE mount that disappeared under a running node (`umount -l`, a
-  kernel module reload) called for service shutdown and the process exited
-  with code 8 for systemd to restart. It now remounts in place, with
-  `restart_count` climbing and `last_fault` naming the cause; the node never
-  stops serving. A mount that keeps failing walks into `disabled` like any
-  other subsystem rather than remounting forever, and the covered mountpoint
-  stays non-writable throughout.
-- **`SIGHUP` configuration reload works on a mounted node.** Until 0.41.0 the
-  mount ran on the main thread and libfuse owned the signals, so reload was
-  silently unavailable on exactly the nodes that mount.
-- **Enabling a capability whose plugin is missing is no longer a config
-  error.** Before 0.28.0, `torrent.enabled: true` on a build without
-  libtorrent refused to start the node. It now starts, reports the subsystem
-  `unavailable`, and serves everything else.
+- **A lost mount is a `faulted` subsystem, not a process exit.** A FUSE mount
+  that disappears under a running node (`umount -l`, a kernel module reload)
+  is remounted in place, with `restart_count` climbing and `last_fault` naming
+  the cause; the node never stops serving. A mount that keeps failing walks
+  into `disabled` like any other subsystem rather than remounting forever, and
+  the covered mountpoint stays non-writable throughout.
+- **`SIGHUP` configuration reload works on a mounted node**, because the mount
+  runs on its own thread rather than owning the process's signal handling.
 
 ## Durability tokens and restarts
+
+This section is
+[discipline 1, re-derive don't assert](../ARCHITECTURE.md#the-self-healing-disciplines),
+in its most load-bearing form: the durability contract treats "present after a
+restart" as durable, justified by the store's pack validation on open plus an
+explicit flush inside the probe.
 
 A publication proves that its extents reached the write floor with placement
 tokens: `(node, durability epoch, domain, generation, backend instance)`. The
 epoch is fresh for every process and the backend instance for every reopen,
-so a token can only be *checked* by the incarnation that issued it. Since
-0.29.0 a token that outlived its incarnation is not a failure: the writer's
-barrier sends the object ids to the peer, the peer answers from its disk —
-an object present after a restart is durable, because the pack index is
-rebuilt from the packs on open and the probe flushes the current incarnation
-before replying — and hands out fresh tokens. Journal evidence on the writer:
+so a token can only be *checked* by the incarnation that issued it. A token
+that outlived its incarnation is not a failure: the writer's barrier sends the
+object ids to the peer, the peer answers from its disk — an object present
+after a restart is durable, because the pack index is rebuilt from the packs
+on open and the probe flushes the current incarnation before replying — and
+hands out fresh tokens. Journal evidence on the writer:
 `object durability re-derived after incarnation change reasserted=N absent=M
 peers=P`; on the peer: `object durability re-derived after epoch change
 present=N/M`. Only `absent` objects cost anything: they are re-put from a
 local copy if one exists, otherwise the generation is replayed from the FUSE
 spool (`FUSE async data publication replay …`). Restarting a node therefore
-no longer strands publications in flight on other nodes.
+does not strand publications in flight on other nodes.
 
 ## Nodes behind CGNAT, and edge nodes
 
-Since 0.42.0 a node can declare, or discover, that it cannot be connected to
+A node can declare, or discover, that it cannot be connected to
 (`network.inbound_capable`), and that it stores no extents
 (`storage.hosts_extents`). Both are gossiped with the node, so every peer
 dials and places the same way.
@@ -316,9 +324,9 @@ to. It opens a CONTROL and a DATA session to every capable peer and keeps
 them open; peers answer over those sessions and never dial it. If a peer
 needs a lane the node has not opened, it sends a `dial_request` over the
 CONTROL session and the node dials. Every transport socket keeps TCP keepalive
-probing at 60 s (15 s apart, four probes), and the health probe now covers
-the DATA lane too, so a NAT mapping that expires underneath an idle lane is
-noticed and redialled before a viewer needs it.
+probing at 60 s (15 s apart, four probes), and the health probe covers the
+DATA lane as well as CONTROL, so a NAT mapping that expires underneath an idle
+lane is noticed and redialled before a viewer needs it.
 
 The shape rules:
 
@@ -347,6 +355,10 @@ connections` (information), `no inbound-capable node hosts extents`
 (critical) and `replication N requires N extent-hosting nodes; M known`
 (degraded). A `DEBUG` line is logged for every `dial_request` round trip and
 every dial-back probe.
+
+Every node in a cluster must run the same protocol version, so introducing a
+node that declares either bit to a cluster that predates them is a rolling
+upgrade of the whole cluster, not a per-node change.
 
 An `auto` resolution is sticky: it is persisted under
 `state_path/connectivity/inbound.bin`, changes only after two consecutive
@@ -418,9 +430,9 @@ Metadata availability logging is transition-only and canonical, for example `met
 
 An accepted head whose record cannot be replayed from local `history.log`
 (missing ancestry, an unreadable frame, a chain that does not reproduce the
-record hash) is no longer a restart-and-quarantine event. The replica keeps
-the durable acceptance certificate, excludes that head from reads for a
-30-second cooldown at a time, and logs one line naming the exact break:
+record hash) is not a restart-and-quarantine event. The replica keeps the
+durable acceptance certificate, excludes that head from reads for a 30-second
+cooldown at a time, and logs one line naming the exact break:
 
 ```
 WARN metadata accepted head cannot be reconstructed locally; excluded from reads pending live repair hash=… generation=… during=… reason=…

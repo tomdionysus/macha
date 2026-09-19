@@ -44,6 +44,26 @@ that core. A change to the wire shape, an error code or a default is a change
 to those projects too, and is worth saying out loud rather than leaving to be
 discovered.
 
+## Governing laws
+
+Three laws order every scheduling, admission and priority decision in Macha.
+They are ranked, cited by number in the source, and the first thing to
+understand about why the node is built the way it is:
+
+1. **Thou Shalt Not Make The Viewer Wait.**
+2. **Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The
+   Viewer Wait.**
+3. **Control traffic must remain promptly serviceable** — viewer priority is a
+   large configurable share (95:5 by default), not indefinite starvation of
+   everything else.
+
+Alongside them sit four self-healing disciplines governing behaviour when
+something is wrong: re-derive rather than assert, give every retried work item
+a backoff and a parked state, recover by resolving rather than refusing, and
+keep snapshot size a function of the live namespace rather than of history.
+
+[Architecture](ARCHITECTURE.md) states all seven and what each one costs.
+
 ## Storage model
 
 Three explicit storage classes, with separate durability rules:
