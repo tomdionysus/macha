@@ -1,5 +1,85 @@
 # Current release
 
+## 0.46.3 — The laws the code already obeyed (development)
+
+**Three laws order every scheduling decision in this system and none of them
+were written down anywhere a reader could reach.** They were stated once, in
+`TODO/ACTIVE.md`, a backlog file whose own header warns it will mislead anyone
+who reads it as guidance. Meanwhile the source cites them by number as settled
+authority: `src/retained_memory.hpp:212` ("Governing law 1 is that the viewer
+never waits"), `src/config.hpp:333` ("governing law 3, as a data structure"),
+`src/fuse_frontend.hpp:491`, `tests/test_foundations.cpp:1115`. A contributor
+who hit "governing law 3" in a header had nowhere to look it up. Zero
+occurrences across `docs/` and every root document.
+
+They now open `ARCHITECTURE.md`, above the design boundary, with the numbering
+intact, alongside the four self-healing disciplines that had the same problem
+and lived only in a dated plan file.
+
+**The laws do not simply rank, and saying so is the substance of the section.**
+Law 2 is subordinate to law 1 -- that is what its second clause is for, and why
+loader work yields to a viewer rather than negotiating with one. Law 3 is not
+subordinate to law 1: it is a floor law 1 may not eat through, which is the
+entire force of "a large configurable share, not indefinite starvation of all
+other work". A node serving viewers perfectly while unable to answer `ping` has
+broken law 3, and peers who cannot see how well it was doing will record it as
+dead. So the resolution order is law 3's floor reserved first, law 1 taking
+priority within what remains, law 2 governing the rest.
+
+**Named at the point of application** rather than stated once and left to be
+spotted. The three `runtime.*_memory_reserve_bytes` settings are the laws
+expressed as memory, which reframes sizing them as a decision about which class
+of work is allowed to fail first. The fast-control allow-list is law 3 on the
+RPC path. The DATA priority ordering is laws 1 and 2 as an execution order. The
+durability-token probe is discipline 1, the recovery-resolution table
+discipline 3, the retry budgets discipline 2, snapshot composition discipline 4.
+
+**The two places a viewer genuinely waits are now labelled as the bounded
+exceptions they are**: a request past the produced frontier, bounded by
+`stream.look_ahead_ms`, and a held segment, bounded by `segment_timeout_ms`.
+What makes them lawful is that the work in front of the viewer is its own.
+Writing them down stops them being cited as precedent for a third.
+
+`CONTRIBUTING.md` leads with a review gate built from the laws: a change to
+scheduling, admission, priority, retry or recovery states which law it serves
+and which discipline it follows.
+
+**Five factual defects fixed.** `docs/configuration.md` had a corrupted
+paragraph, the sentence describing `publication_quantum_bytes` split in half by
+an unrelated paragraph spliced into its middle. `SECURITY.md` named
+`<state_path>/genesis-root-password` for the generated root password, where
+`src/users.cpp:716` writes `initial-root-password` -- anyone following it during
+a recovery would have found nothing. `SECURITY.md` also claimed a metadata
+minority refuses mutations rather than creating a second namespace history,
+which is the opposite of the write-floor model documented everywhere else. Both
+role tables omitted `view_status` and claimed every role implies `media_viewer`
+as the only implication, where `src/users.cpp:150-157` has a two-step chain
+ending at `view_status` -- the mechanism for exposing cluster health to an
+unauthenticated client, previously undocumented. `docs/catalogue.md` described a
+superseded `202`-on-miss path for the media profile, which resolves in the
+foreground and returns `200`; `docs/streaming.md` had it right, so the two files
+disagreed.
+
+Also corrected: the cluster protocol version, documented as 20 in three places
+against `src/net.cpp:23` at 21, and `SECURITY.md`'s "transport v7" naming a
+versioning scheme the handshake no longer has.
+
+**Removed.** A release-assembly log from 0.18.2 standing in for
+`VALIDATION.md`, rewritten as the invariants the suite pins down. Version
+archaeology throughout ("Before 0.41.0", "Until 0.32.11", "Since 0.29.0", a
+`0.19 implementation` heading, a migration-from-0.18 section). Dated incident
+measurements kept in place of the rules they were evidence for. Legacy config
+keys still parsed are documented as aliases without the backstory.
+
+**One gap documented rather than fixed.** `viewer_weight` and `loader_weight`
+are validated only as 1..10000 independently
+(`src/config_base.cpp:158-160`), so `viewer_weight: 5` with
+`loader_weight: 95` is accepted and inverts law 1: a bulk import outranking
+playback on the same node. `docs/configuration.md` now warns. Rejecting the
+inversion in `validate_config` is the other half and is not in this release.
+
+Documentation only. No behaviour changed and no code touched.
+
 ## 0.46.2 — The budgets a node will admit to (development)
 
 **A client had to guess how long this node would take, and guessed low.** Core
