@@ -196,6 +196,79 @@ the time:
   causes the blip, and it is separable from the transport question.
 - [ ] Stop the forever-dial loop at the offline node, or make it back off.
 
+## P0 — A replica that falls behind cannot rejoin: the materialisation cache is smaller than two snapshots (opened 2026-09-20, WORKED AROUND ON ALL THREE NODES, not fixed)
+
+**gbni-1 returned after three days away, reported `state=online phase=ready`,
+and sat 810 generations behind going nowhere** — one core pegged at 99.9% for
+42 minutes, no progress logging, no WARN, no ERROR. `health: healthy`
+throughout, while roughly 2 TB of its extents stayed invisible to the cluster.
+
+The stack, sampled three times identically:
+
+```
+repair_once() -> read_group() -> import_history_from_peer()
+              -> MetadataReplica::import_history() -> materialized()
+```
+
+**The cause is a cache that cannot hold one useful entry.** One materialisation
+of this namespace is **~51 MB**. The default
+`dht.metadata_materialization_cache_bytes` is **128 MiB**, so exactly two fit —
+and `cur_` and `committed_` are pinned and exempt from eviction
+(`src/metadata.cpp`), so they *are* those two. A replica catching up therefore
+has **zero usable cache**. Every `materialized()` misses, walks back the delta
+chain to a full snapshot because no ancestor is cached, replays it, and is
+evicted before the next call can use it.
+
+Measured on gbni-1, 30-second windows:
+
+| | default 128M | with 512M |
+|---|---|---|
+| cache hits / misses | **0 / 2** | 9 / 3 |
+| cache entries | 2 (both pinned) | 3 |
+| evictions | 3 | **0** |
+| deltas replayed | 457 for 2 reconstructions (~228 each) | — |
+| reconstruction time | ~15 s each | — |
+| history.log growth | **28 B/s** | **~16,200 B/s** |
+| 810-generation rejoin | 3.4 h+ of one core at 100% | **~2 minutes** |
+
+**577x.** Note the failure is silent: `metadata_generation` does not move
+during catch-up because the accepted head only advances at the end, so the
+only progress signal is `history.log` growing. Same shape as the 0.28.3
+quadratic tombstone replay -- a CPU-bound loop that logs nothing.
+
+**What was done, and it is a workaround, not a fix.**
+`metadata_materialization_cache_bytes: 512M` was set on gbni-1, es-1 and fi-1
+on 2026-09-20 with the operator's explicit authorisation ("development, and
+I'd rather not lose 13h or ~2TB of extents -- a manual recovery step is
+authorised this time only"). Configs backed up as
+`macha.yaml.bak-20260920-matcache` on all three, reasoning written inline.
+All three converged at generation 31655, healthy and writable.
+
+**The override hides the defect everywhere it is not yet hurting.** 128 MiB was
+sized when a snapshot was small; it is now smaller than two of them, so the
+cache is structurally useless on any real library and worse at the 100 TB
+target. This is P-1's shadow falling on a second subsystem.
+
+- [ ] **Derive the default from observed snapshot size** rather than a fixed
+  128 MiB. A cache that cannot hold two of the thing it caches is not a cache.
+- [ ] **Pin the import chain's working set for the duration of a walk**, or
+  walk forward from a checkpoint instead of backward from each target. This is
+  what `ROADMAP.md` already calls "checkpoint-rooted journal-range catch-up for
+  a replica that has fallen far behind" -- first observed live here rather than
+  predicted.
+- [ ] **Make catch-up log progress.** 42 minutes of 100% CPU with no line in
+  the journal is discipline 2 unmet: the work is neither observable nor
+  bounded.
+- [ ] **Make catch-up honour a stop token.** `systemctl restart` on gbni-1
+  timed out on SIGTERM and systemd killed it with SIGKILL
+  (`macha.service: State 'stop-sigterm' timed out. Killing.`). A node that
+  needs SIGKILL to stop is a hazard on hardware that browns out, which is
+  exactly gbni-1. es-1 and fi-1 restarted cleanly once caught up, so this is
+  specific to the spinning loop.
+- [ ] **A node 810 generations behind should not advertise `phase=ready`.**
+  Status said healthy while one replica held a three-day-old namespace. Related
+  to the aggregation-truthfulness item under P1.
+
 ## P0 — The node starves its own control plane with loader I/O (opened 2026-09-19, IN PROGRESS)
 
 **Doing this now, ahead of everything below including P-1.** Finding:
@@ -514,10 +587,14 @@ into this and should be deleted, not re-worded, when its cases are classified.
 
 ## P0 — Cluster: two nodes, and what removing the third left behind
 
-The cluster is **two live nodes** as of 2026-09-20: es-1 (ramaroja) and fi-1,
-both on 0.46.2. gbni-1 (macnessa) has been unreachable from the laptop, es-1
-and fi-1 since the 0.43.1 deploy on 2026-09-17 and is still on 0.43.0; it is
-not in either live node's peer list. (As of 2026-09-13 the pair was gbni-1 and
+The cluster is **three live nodes** as of 2026-09-20 evening. es-1 (ramaroja)
+and fi-1 are on 0.46.2; **gbni-1 (macnessa) came back at ~14:52 after three
+days away and is on 0.43.0**, three releases behind and the only node where a
+deploy would change behaviour. All three are converged at generation 31655,
+healthy and writable. gbni-1's rejoin needed the manual cache override in the
+P0 above; it would otherwise still be grinding. Its clock is now capped at
+1.5 GHz to reduce unrecoverable brown-outs, which makes any CPU-bound
+metadata work on it correspondingly slower. (As of 2026-09-13 the pair was gbni-1 and
 es-1 on 0.40.1.) gbni-2 (inverbeg) was removed by the
 operator after its sshd stopped accepting key authentication and it could not
 be deployed to. The 2026-09-13 storage incident that opened the previous
@@ -2014,6 +2091,11 @@ host key unchanged — the same machine, reconfigured — so it could not be
 deployed to and was four releases behind. **See the first P0 item: this is a
 freshness boundary, not a decommission, and the node rejoins if it ever
 completes a handshake again.**
+
+**All three nodes now carry `dht.metadata_materialization_cache_bytes: 512M`**
+(2026-09-20, operator-authorised manual step; backups
+`macha.yaml.bak-20260920-matcache`). It is a workaround for the P0 above, not
+a fix, and a fresh node will hit the 128 MiB default again.
 
 **Versions deployed.** es-1 and fi-1 run **0.46.2** (built on es-1 at `-j3`,
 shipped to fi-1 as `/tmp/macha-0.46.2.tgz`, md5 `91091ff928ab…`). Both answer
