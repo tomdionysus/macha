@@ -233,7 +233,19 @@ fuse:
 
 When false, any existing Macha mount is a hard startup error.
 
-`fail_closed_mountpoint` guards the host directory the mount covers. Before cluster and storage services start — the mount itself comes up only after them, typically 20-40 s later — Macha marks that directory immutable on Linux with the `chattr +i` flag, so nothing, root included, can create files in it while no mount is present. Without it, anything writing to the mount path during that window (an rsync started shortly after the daemon, say) walks the bare directory and fills the host's own disk with files the mount then hides from view. The flag stays set after Macha stops; run `chattr -i` on the directory if it must ever be removed. On filesystems without the flag the mode bits are cleared instead, which does not stop root. Entries already present under the directory are logged as an error at startup and counted as `filesystem.mountpoint_stray_entries` in the status API; `filesystem.mountpoint_immutable` reports whether the flag is in place. To inspect or clean stray entries while Macha is mounted, bind-mount the host root elsewhere (`mount --bind / /mnt/rootview`) and look under the mount path there.
+`fail_closed_mountpoint` guards the host directory the mount covers during the
+20-40 s between services starting and the mount coming up. On Linux Macha sets
+`chattr +i` on that directory, so nothing — root included — can write into it
+while no mount is present; otherwise anything writing to the mount path in that
+window fills the host's own disk with files the mount then hides.
+
+The flag stays set after Macha stops: run `chattr -i` if the directory must be
+removed. On filesystems without the flag the mode bits are cleared instead,
+which does not stop root. Pre-existing entries are logged as an error at
+startup and counted as `filesystem.mountpoint_stray_entries`;
+`filesystem.mountpoint_immutable` reports whether the flag is set. To inspect
+stray entries while mounted, bind-mount the host root elsewhere
+(`mount --bind / /mnt/rootview`).
 
 `spool_path` can contain the full accepted-but-not-yet-published write backlog and must be sized accordingly. `operation_journal_path` contains the ordered durable descriptors needed to interpret that spool. `max_spool_bytes` is configurable and defaults to 16 GiB. It is a bounded backlog budget rather than a logical `ENOSPC` point: writes burst at local-spool speed below 50% occupancy, pressure starts publication, and admission is progressively paced from measured completed-publication throughput until it matches that throughput by 90% occupancy. At the bound, writers sleep on publication/retirement events instead of polling or failing. A single write larger than the complete bound is rejected, and `spool_reserve_free` can still return `ENOSPC` to protect physical free space.
 
@@ -413,22 +425,22 @@ generation retries do not renew the physical lease. This bounds leaked
 transcode capacity after a client disappears on an unreliable network without
 shortening the logical session lifetime.
 
-`session_unused_idle_ms` (120 seconds by default) is the expiry for a session
-that has **never** served a stream object — no playlist, no fragment, no
-subtitle, no Direct Play body. The transcode entitlement belongs to the
-session rather than to the pipeline, so reclaiming an idle encoder does not
-release it: until the session itself is erased the slot stays taken, and with
-`max_video_transcodes: 1` a session created and never used closes the node to
-transcoding for the whole of `session_idle_ms`. A client that crashes, is
-force-quit, loses power or is suspended with its closing `DELETE` unsent
-cannot release it, so this is bounded on the server. The condition is "never
-used", not "not used recently": a single stream request earns the full
-`session_idle_ms` permanently, so a paused or seeking player is never evicted
-by this clock, and both clocks measure from the session's last interaction of
-any kind, so a client that is still polling or PATCHing is safe as well. The
-effective value is the lesser of this and `session_idle_ms`, so lowering
-`session_idle_ms` alone is safe. `GET /api/v1/playback/status` reports
-`session_unused_idle_ms` and the cumulative `unused_sessions_reclaimed`.
+`session_unused_idle_ms` (120 s) applies only to a session that has **never**
+served a stream object — no playlist, fragment, subtitle or Direct Play body.
+The condition is "never used", not "not used recently": one stream request of
+any kind earns the full `session_idle_ms` permanently, so a paused or seeking
+player is never evicted by this clock. Both clocks run from the session's last
+interaction, so a client still polling or PATCHing is safe either way.
+
+It exists because the transcode entitlement belongs to the session, not the
+pipeline: reclaiming an idle encoder does not release the slot, so with
+`max_video_transcodes: 1` a session created and abandoned would close the node
+to transcoding for the whole of `session_idle_ms`. A client that crashed or
+lost power cannot send its `DELETE`, so the bound has to be here.
+
+The effective value is the lesser of this and `session_idle_ms`.
+`GET /api/v1/playback/status` reports it alongside
+`unused_sessions_reclaimed`.
 
 `video_encoder_threads` sets the x264 frame-thread count per video transcode; `0` (the default) uses every hardware thread. The first fragment of a transcode generation is 2 s rather than the configured segment duration, so the request that creates a session is answered after 2 s of encoding instead of a full segment's worth.
 

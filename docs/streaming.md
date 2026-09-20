@@ -108,9 +108,9 @@ Because the playlist promises fragments that do not exist yet, a request for one
 
 A refusal is `500` with error code `segment_not_ready`, `Retry-After: 1` and `Cache-Control: no-store` — never `404`. The resource is not absent, since the playlist promises it exists; it is not ready, and a `404` invites an intermediary to cache the miss while some players treat it as terminal. A broken generation is `503 stream_failed`.
 
-That assignment is deliberately the opposite of what the HTTP spec suggests, because the status is the only thing a client can read. On a fragment error hls.js's `XhrLoader` surfaces just `{code: xhr.status, text: xhr.statusText}` — the JSON body is absent from the error event and a header is reachable only through the raw `XMLHttpRequest`, which is undocumented coupling that breaks under `FetchLoader`. So the discriminator must be the status, and a discriminator readable only as a status has to be one nothing else on the path can emit. `503` fails that: every proxy, tunnel and load balancer emits it when a service is down, so a client taught that `503` means "hold, stay on this node" would read a genuinely dead node as a healthy one and never fail over — a silent, permanent stall, hardest to diagnose exactly where a proxy makes it most likely. Misreading an infrastructure `500` as a hold costs a pointless retry instead. The two faults are not symmetric and this picks the recoverable one. A dead node and a broken generation both warranting "go elsewhere" is why `stream_failed` can safely share `503` with infrastructure. Both stay 5xx, because a 4xx stops hls.js retrying at all. `init.mp4` takes the same hold path as a fragment: with the playlist served up front, the client asks for it before the muxer has written it.
+The assignment is deliberately the inverse of what the HTTP spec suggests, and a client must not "correct" it. Many players expose only the status code on a fragment error — not the body, not the headers — so the status has to carry the meaning on its own. `503` cannot: every proxy and load balancer emits it when a service is down, so a client taught that `503` means "hold, stay here" would read a dead node as a healthy one and never fail over. Misreading an infrastructure `500` as a hold costs one wasted retry instead. Both stay 5xx because a 4xx stops most players retrying at all. `init.mp4` takes the same hold path as a fragment.
 
-`segment_timeout_ms` must stay under the client's time-to-first-byte deadline. A held request sends no bytes, so a client that gives up first never receives the refusal and takes its timeout path instead, which retries hard and then fails — strictly worse than not holding. The tightest deadline among the clients in use is 8 s (media3's `DEFAULT_READ_TIMEOUT_MILLIS`, reached through `HttpURLConnection.setReadTimeout`; hls.js and expo-video each allow 10 s). The default of 6000 clears that with margin. A refusal that arrives promptly is retried sensibly instead: hls.js makes 6 attempts backing off 1 s to 8 s. `Retry-After` is sent because it is correct HTTP, but hls.js reads it only in its content-steering loader, so nothing here depends on it. Read the deadline out of the client artifact before changing this value; the published documentation for these clients has been wrong about which knob governs.
+`segment_timeout_ms` must stay below the client's time-to-first-byte deadline. A held request sends no bytes, so a client that gives up first never sees the refusal and takes its timeout path, which retries hard and then fails — worse than not holding at all. The tightest deadline among the clients in use is 8 s, so the 6000 default clears it with margin and **8000 is a hard ceiling on this knob**. Read the deadline out of the client artifact before changing it: the published documentation for these clients has been wrong about which setting governs.
 
 A held request costs no thread. The handler asks the segment store for the object and, in the same locked step, subscribes to the next publication if it is absent; it then hands the server a deferral -- what it is waiting for, its deadline, and the admitted hold -- and returns. The server parks the connection and re-runs the handler when the store publishes or the deadline passes. `max_concurrent_holds` (64) is therefore a fairness and memory bound rather than a worker-thread ration: it bounds how many requests may be waiting on encoders at once across every session. Steady-state playback on a four-core node transcoding at roughly real time sits at the frontier often, so holds are the ordinary case rather than the exception.
 
@@ -118,7 +118,11 @@ For stream-copy video, the VOD planner uses the demuxer's keyframe index and cho
 
 Stream-copy timestamps are normalised only after rescaling into the MP4 stream's final muxer timebase. Missing PTS/DTS are synthesised conservatively and equal/backwards DTS values are advanced with a persistent per-stream timeline correction. Legitimate PTS-before-DTS composition offsets are preserved rather than clamped; fragmented MP4 is emitted with signed composition-time offsets enabled. Repairs that actually modify timestamps are logged with per-stream counters.
 
-`stream.look_ahead_ms` reports that bound to the client in milliseconds: how far past the fragment it last requested a viewer may arrive and still find media already produced. It is `max_ahead_segments` multiplied by `segment_duration_ms`, and it is `null` for direct play, which has no pipeline and therefore no frontier. It is reported as a derived duration rather than as the two knobs because a count and a duration are two numbers a client would have to multiply and then keep in step with the node's configuration; a client that hardcoded the defaults would silently under-run against a node configured with a shorter window. Production is sequential, so a client that arrives beyond the look-ahead does not skip the intervening fragments — the node encodes its way to the requested index at roughly real time while the viewer waits. Where the gap is larger than the look-ahead, creating a new generation seeked to the arrival point is cheaper than making the existing one catch up. The value is serialised from the live configuration rather than captured when the session was created, and `segment_duration_ms` and `max_ahead_segments` both apply on a live `reload_config` without restarting playback, so a configuration reload changes it for sessions already in flight with no `PATCH` to announce it. A client should read it per session rather than treat it as fixed for a node. A stale read is bounded rather than dangerous: arriving past a window that has narrowed is the ordinary past-the-frontier case, answered with a retryable `500` and resolved as production advances. Only an operator reload moves it; nothing changes it on the node's own initiative.
+`stream.look_ahead_ms` is how far past its last requested fragment a viewer may arrive and still find media already produced: `max_ahead_segments` x `segment_duration_ms`, and `null` for direct play, which has no pipeline and so no frontier.
+
+**Read it per session; do not hardcode it.** It is serialised from the live configuration, and both knobs apply on a `reload_config` without restarting playback, so it can change for a session already in flight with no `PATCH` to announce it. A client that assumed the defaults against a node configured with a shorter window would silently under-run.
+
+Production is sequential, so arriving beyond the look-ahead does not skip the intervening fragments: the node encodes its way there at roughly real time while the viewer waits. Where the gap exceeds the look-ahead, creating a new generation seeked to the arrival point is cheaper than making the current one catch up.
 
 The segment store remains a bounded producer/consumer queue. Once the producer is `max_ahead_segments` beyond actual client demand it blocks on a condition variable and resumes when later fragment indexes are requested. This prevents a fast remux from pulling an entire movie through the DHT while keeping VOD playlist semantics independent of producer progress. Resident generated fragments are bounded by `segment_memory_bytes`; old consumed fragments can spill below `temp_path`.
 
@@ -223,32 +227,43 @@ Every value here applies on a live `reload_config` without a restart, so a clien
 ## Create a session
 
 ```text
-POST /api/v1/playback/sessions
+POST /api/v1/playback/sessions?idempotency_key=<opaque key>
 Content-Type: application/json
-Idempotency-Key: <client-generated logical request key>
-Macha-Viewer-Session: <client-generated persistent player key>
+Authorization: Bearer <session token>
 ```
 
 Use either `item_id` or `media_id`. `item_id` allows the resolver to choose among every media representation attached to the catalogue item. `path:/logical/file` is also accepted as a media identity.
 
-Clients should generate one opaque `Idempotency-Key` for each logical creation
-attempt and reuse it after a timeout, disconnect or failover. The same key and
-normalized request joins or replays the same session ID, capability and
-`generation`; using that key for different request semantics returns
-`409 idempotency_conflict`. The response echoes `Idempotency-Key` and reports
-`X-Macha-Idempotency: created|replayed`. The header is optional; omitting it
-makes each POST a distinct creation, which is rarely what a client wants.
+**A session belongs to the bearer token that created it, and a token has at
+most one.** The server keys a playback session on the authenticated API
+session — the token from `POST /api/v1/session` — and nothing else. A second
+`POST /api/v1/playback/sessions` on the same token **supersedes whatever that
+token was already playing, across all media**: the new session keeps the old
+session's `session_id` and stream capability, increments `generation`, and the
+previous generation's pipeline is stopped.
 
-`Macha-Viewer-Session` has a different, longer lifetime from
-`Idempotency-Key`: use one stable opaque value for the lifetime of a player/UI
-session, while using a fresh idempotency key for each distinct creation
-attempt. A later POST with the same viewer-session key atomically replaces the
-player's current generation while retaining its session ID and transcode
-entitlement. This makes POST-based seek/reload recovery equivalent to PATCH for
-admission purposes. The key can instead be supplied as `viewer_session_id` in
-the JSON body; if both forms are present they must agree. Clients should prefer
-the header and must not share a key among simultaneous independent viewers.
-Omitting it makes each POST a distinct logical session.
+A client that needs two concurrent generations on one node therefore needs two
+separate API sessions. There is no request field that separates them: the
+server reads no viewer-session header and no `viewer_session_id` body field.
+
+**Idempotency is a separate mechanism** and is a **query parameter**, not a
+header:
+
+```text
+POST /api/v1/playback/sessions?idempotency_key=<opaque key>
+```
+
+Reuse one key for one logical creation attempt — after a timeout, disconnect
+or failover — and the same key with the same request replays the same session,
+capability and `generation` rather than creating another. The same key with a
+*different* request returns `409 idempotency_conflict`. The key is 1 to 256
+visible ASCII characters; anything else is `400 bad_idempotency_key`. The
+fingerprint includes the bearer token, so a key cannot replay across API
+sessions. The response reports `X-Macha-Idempotency: created|replayed`.
+
+Omitting the key makes each POST a distinct creation — which still supersedes,
+because supersession is decided by the token, not by the key. Idempotency
+prevents a *duplicate* session; it does not let you hold two.
 
 Session admission first reads the immutable media profile from cluster metadata,
 which requires no media-object reads. A miss never produces a client-visible
@@ -258,6 +273,36 @@ and a viewer takes over an already-running speculative scan instead of waiting
 behind background work. The successful result is published asynchronously for
 later sessions. Clients should still reuse the same idempotency key after a
 timeout or disconnect.
+
+### Generations, and what supersession does to a client
+
+A **generation** is one produced stream for a session. A seek, a quality or
+track change, a media switch, or a second `POST` on the same token all end the
+current generation and begin a new one. The generation number is in the stream
+path, so every URL a client holds belongs to exactly one:
+
+```text
+/api/v1/playback/stream/<session_id>/<capability>/<generation>/segment-000042.m4s
+```
+
+When a generation is superseded its producing pipeline is stopped and its
+segments stop resolving. **Every URL the client still holds for that
+generation answers `404 not_found` ("stream generation not found")**, usually
+within about a second, including requests already queued or in flight. The
+`session_id` and the stream capability survive; only the generation changes.
+
+So the effect on a client is: any read-ahead it had queued against the old
+generation fails, and it must take the new `stream.url` from the response that
+caused the supersession and resume from there. Content is not lost — the new
+generation contains the position that was asked for — but the client's own
+buffer of pending requests is invalidated and must be reissued.
+
+**A `404` here means "replaced or never existed", and the two are not
+distinguished.** That is the opposite convention to a fragment that is merely
+not ready yet, which is a retryable `500 segment_not_ready` and deliberately
+never a `404`. So on the stream path: `500` means wait and retry, `404` means
+this generation is gone — re-read the session and use the new URL. Do not
+retry a `404`.
 
 Minimal request:
 
