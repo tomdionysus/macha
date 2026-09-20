@@ -1896,6 +1896,41 @@ P-1 above, in two other subsystems. They now have plans of their own —
   observable) unaddressed for the one subsystem that runs continuously. It is
   the same shape of gap the publication counters closed in 0.36.9.
 
+## P2 — An optional plugin publishing cluster state to MQTT (operator, 2026-09-20)
+
+- [ ] **Publish cluster state to MQTT from an optional plugin.** Home
+  automation and dashboards want node and cluster state pushed rather than
+  polled, and nothing in the product offers that today: the only ways to read
+  state are `GET /api/v1/health` (unauthenticated, but three fields and
+  nothing about the cluster) and `GET /api/v1/status` (everything, but behind
+  a bearer token and the `view_status` role, which is why T.O.M.S is polling
+  health on a 15 s timer for a dashboard card).
+
+  Optional and a plugin, like FUSE and torrent, so a node that does not want a
+  broker does not link one. Off unless configured.
+
+  Constraints that are not negotiable, because this is a publisher on a node
+  that serves viewers:
+  - **Law 3.** Publishing is control-class work, not viewer-class. A broker
+    that is slow, unreachable or backed up must not delay anything, must not
+    accumulate unbounded state, and must not turn into a second way for the
+    node to make itself unreachable. Snapshot, publish, drop on backpressure.
+  - **Law 4.** A misconfigured or hostile broker must not be able to leave the
+    node in a state it cannot recover from by itself. No blocking connect on
+    startup, no retry loop without a bound.
+  - **Discipline 4.** Compose the payload from the same snapshot Status
+    already builds. Do not add a second, divergent view of cluster state, and
+    do not instrument anything new on a hot path to feed it.
+  - Publishing cluster topology to a broker is an **authorisation decision**,
+    not a convenience: `/api/v1/status` is behind `view_status` for a reason,
+    and MQTT would be a way around that gate. Decide explicitly what a topic
+    may carry, and default to the narrow set.
+
+  Open questions for whoever picks it up: retained messages and Home Assistant
+  discovery, per-node topic namespacing, whether the payload is the Status
+  document or a deliberately smaller projection, and whether it publishes on
+  change or on a timer.
+
 ## P2 — Code health and error-handling consistency (found 2026-09-05)
 
 Not urgent, but real debt worth chipping away at opportunistically. No design
