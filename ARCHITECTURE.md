@@ -11,6 +11,40 @@ system. They are cited by number in the source and in review.
 3. **Control traffic must remain promptly serviceable.** Viewer priority is a
    large configurable share (95:5 by default), not indefinite starvation of all
    other work.
+4. **Thou Shalt Not Shoot Thyself In The Foot.** No operation, code path or
+   subsystem may leave the node in a state it cannot recover from on its own.
+
+**Law 4 is different in kind from the first three and is numbered last only so
+that the existing numbering keeps working** — laws 1 to 3 are cited by number
+throughout the source. It does not take part in their contention at all. Laws
+1 to 3 decide *who goes first*; law 4 decides *what may not be done at any
+priority*. It is a veto over all three, and where it conflicts with them it
+wins: a node that has destroyed itself serves no viewer at all.
+
+"Non-recoverable" is deliberately broad, and means any of these:
+
+- it needs physical access to fix, which on a remote node means an outage
+  lasting until somebody travels;
+- it needs manual state surgery, or an operator who knows an undocumented
+  incantation;
+- it loses data the node already acknowledged;
+- it cannot be stopped or restarted cleanly, so the ordinary remedy is
+  unavailable;
+- it degrades without bound and offers no path back — a loop that will not
+  finish, a queue that will not drain, a budget that cannot admit one item.
+
+The last of those is the easiest to ship by accident and the hardest to see,
+because the node stays up and reports itself healthy the whole time. All five
+have been observed in this system, several of them on one afternoon:
+2026-09-20 produced a replica that could not rejoin (a cache smaller than its
+own unit of work), that could not be stopped without `SIGKILL` (a loop that
+never checked its stop token), on hardware that browns out unrecoverably under
+sustained load and has no remote power control. Any one of those is law 4. The
+combination is why it is a law rather than a preference.
+
+The practical test, before shipping anything: **if this goes wrong on the node
+furthest away, does it come back without me?** If the honest answer is no, it
+does not ship in that form.
 
 They do not simply rank. Law 2 is explicitly subordinate to law 1 — that is
 what its second clause says, and it is why loader work yields to a viewer
@@ -71,10 +105,29 @@ that are only visible one at a time, each hiding the next.
    the live namespace. Retirement history and resolved conflicts belong in
    separately compacted structures, so that read, merge, replay and transfer
    cost scales with the library rather than with its history.
+5. **A bound smaller than one unit of its own work is not a bound.** A cache
+   whose eviction policy can evict everything a running operation needs to
+   make progress is not a cache; it is a mechanism for converting a linear
+   operation into a quadratic one, silently. The same holds for any budget: if
+   it cannot admit one item, it does not degrade gracefully, it fails
+   superlinearly and without a log line. Prefer a bound derived from the
+   observed unit size over a byte count chosen when the unit was smaller, make
+   a budget that cannot admit one item a startup-visible error, and count
+   pinned or exempt entries against the budget rather than reporting a
+   capacity the caller cannot actually use.
 
 Discipline 3 is also an operational rule: a node is expected to settle bad
 input and stay online. Repairing state by hand on a node is not the remedy for
 a recovery path that refuses.
+
+Discipline 5 arrived on 2026-09-20 from a replica that could not rejoin the
+cluster: one materialisation of its namespace was ~51 MB against a 128 MiB
+cache whose two slots were already pinned, so catch-up ran with **zero usable
+cache**, replayed the delta chain from a snapshot on every single import, and
+made 28 bytes per second of progress while pegging a core. Raising the limit
+made it 577 times faster, but the number was never the point: nothing in the
+system detected, reported or refused a budget smaller than one unit of its own
+work, and the counters that said so unambiguously were read by nobody.
 
 ## Design boundary
 

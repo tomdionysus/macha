@@ -22,6 +22,12 @@ practice that means answering:
   mismatch or header corruption may refuse to start.
 - **Does anything here trust bookkeeping over ground truth it could re-derive?**
   If a check can probe the content-addressed store instead, it must.
+- **If this goes wrong on the node furthest away, does it come back without
+  me?** Law 4. If the honest answer is no, it does not ship in that form,
+  whatever it does for throughput.
+- **Is every bound here larger than one unit of the work it bounds?**
+  Discipline 5. A cache that cannot hold one entry, or a budget that cannot
+  admit one item, fails superlinearly and silently rather than degrading.
 
 Memory-owning changes must additionally follow the repository's
 [ownership and lifecycle contract](docs/ownership.md). Long-lived state is not
