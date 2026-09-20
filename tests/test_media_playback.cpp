@@ -1266,10 +1266,20 @@ MACHA_TEST("media_playback", test_playback_probe_failure_is_stage_specific) {
     auto response = playback.handle(request);
     REQUIRE(response.status == 503);
     auto body = Json::parse(std::string(response.body.begin(), response.body.end()));
-    CHECK(body.find("error")->asString() == "playback_probe_failed");
-    CHECK(body.find("stage")->asString() == "probe");
-    REQUIRE(body.find("trace") != nullptr);
-    CHECK(!body.find("trace")->asString().empty());
+    // One envelope for every error: error.code is the snake_case discriminator,
+    // error.message is for a human, and everything else about the failure hangs
+    // off the same object rather than being a sibling of it.
+    const auto* error = body.find("error");
+    REQUIRE(error != nullptr);
+    CHECK(error->find("code")->asString() == "playback_probe_failed");
+    REQUIRE(error->find("message") != nullptr);
+    CHECK(!error->find("message")->asString().empty());
+    CHECK(error->find("stage")->asString() == "probe");
+    REQUIRE(error->find("trace") != nullptr);
+    CHECK(!error->find("trace")->asString().empty());
+    // A probe failure is one title's problem; the node is fit for every other.
+    REQUIRE(error->find("node_healthy") != nullptr);
+    CHECK(error->find("node_healthy")->asBool());
     REQUIRE(response.headers.contains("X-Macha-Playback-Trace"));
     REQUIRE(response.headers.contains("X-Macha-Playback-Stage"));
     CHECK(response.headers.at("X-Macha-Playback-Stage") == "probe");
@@ -3576,6 +3586,69 @@ MACHA_TEST("media_playback", test_the_session_reports_the_look_ahead_the_node_ac
     REQUIRE(direct.find("stream") != nullptr);
     REQUIRE(direct.find("stream")->find("look_ahead_ms") != nullptr);
     CHECK(direct.find("stream")->find("look_ahead_ms")->isNull());
+
+    // The production figures ride beside look_ahead_ms on the same object,
+    // and are absent for direct play for the same reason the frontier is
+    // null: there is no pipeline whose rate could be reported.
+    const auto* production = transformed.find("stream")->find("production");
+    REQUIRE(production != nullptr);
+    REQUIRE(production->find("produced_ms") != nullptr);
+    REQUIRE(production->find("producing_ms") != nullptr);
+    REQUIRE(production->find("produced_age_ms") != nullptr);
+    REQUIRE(production->find("producer_parked") != nullptr);
+    CHECK(direct.find("stream")->find("production") == nullptr);
+}
+
+MACHA_TEST("media_playback", test_production_rate_excludes_time_parked_on_demand) {
+    // The rate a client divides out of this pair has to be the rate the node
+    // COULD sustain, because that is what answers "can a handover close the
+    // gap before the viewer reaches it". Wall clock cannot answer it: the
+    // producer runs to max_ahead_segments beyond demand and then blocks, so a
+    // viewer watching at normal speed keeps it parked most of its life and
+    // wall clock reports about 1.0x no matter how fast the encoder is. That
+    // is the one wrong answer with a cost -- it says "cannot outrun realtime"
+    // about a node that comfortably can, and defers a handover that would
+    // have worked.
+    //
+    // So: produce four fragments of media quickly, hold the producer parked
+    // on the gate for far longer than it spent encoding, and require that the
+    // parked interval is not in the total.
+    TempDir t;
+    MediaSegmentStore store(2, 64ULL * 1024 * 1024, t.path() / "spill", 4000ms);
+    REQUIRE(store.publish_init(Bytes{'i', 'n', 'i', 't'}));
+
+    constexpr auto park = 2000ms;
+    std::thread producer([&] {
+        for (int i = 0; i < 4; ++i) {
+            // Stand in for encode work, so the measured total is distinctly
+            // non-zero and the assertion below cannot pass by measuring
+            // nothing at all.
+            std::this_thread::sleep_for(20ms);
+            store.publish_segment(Bytes{'s', 'e', 'g'}, 4.0);
+        }
+    });
+
+    // Nothing has been requested, so the producer publishes 0, 1 and 2 and
+    // then blocks: index 3 is past highest_requested (0) + max_ahead (2).
+    std::this_thread::sleep_for(park);
+    auto parked = store.snapshot();
+    CHECK(parked.producer_parked);
+    store.note_requested(3);
+    producer.join();
+
+    const auto state = store.snapshot();
+    CHECK(state.segment_count == 4);
+    CHECK(state.produced_media_ms == 16'000);
+    // Four fragments at 20 ms of simulated encode each. The bound is loose on
+    // purpose -- this runs on nodes an order of magnitude slower than a
+    // developer box -- but it is far below the parked interval, so the only
+    // way to exceed it is to have counted the park.
+    CHECK(state.producing_ms >= 40);
+    CHECK(state.producing_ms < 1'000);
+    // ... and the park really did happen, so the bound above is a bound on
+    // something.
+    CHECK(state.produced_age_ms < 1'000);
+    CHECK(!state.producer_parked);
 }
 
 namespace {
