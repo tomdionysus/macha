@@ -1517,6 +1517,68 @@ refusal.
   `hls-fragment-loading` **from a confirmed-visible tab**. Over 60 s there makes
   it a real client shape rather than a throttled harness.
 
+## P1 — `look_ahead_ms` lies to a session that was already running when the config reloaded (opened 2026-09-20)
+
+**Found by the Web Client session asking whether a value it had measured
+could move, not by a failure.** The answer is worse than "it can move": the
+reported figure and the generation's actual behaviour move independently.
+
+`session_json` computes `look_ahead_ms` from the live configuration
+(`src/playback.cpp:1768`, `config.max_ahead_segments *
+config.segment_duration`), and `PlaybackManager::reconfigure`
+(`src/playback.cpp:2987`) updates both knobs on a `reload_config` — its own
+comment says "playback timing appl[ies] to subsequent sessions immediately".
+
+But a running generation's producer gate is not live. `MediaSegmentStore`
+takes `max_ahead_segments` as a constructor argument and stores it in
+`impl_->max_ahead` (`src/media_segments.cpp:212`); there is no setter and no
+`reconfigure`. The `cv.wait` predicate at `src/media_segments.cpp:146` uses
+that construction-time value for the life of the generation.
+
+**So after a SIGHUP that changes `max_ahead_segments`, an in-flight session
+reports a frontier its own producer will not honour, and nothing on the wire
+says so.** A client that re-reads the field per session — which is exactly
+what the 0.45.0 documentation tells it to do, and what it must do — gets a
+number that is authoritative for new generations and wrong for this one.
+
+**The harm is a viewer wait taken unknowingly.** Arriving beyond the real
+gate does not refuse; production is sequential, so the node encodes its way
+there at roughly real time while the viewer waits. That is a lawful bounded
+exception to law 1 *when the client chose it*. Here the client declined to
+choose it, on the node's own figure.
+
+**A second divergence, same root.** `segment_hold_window` is read live at
+request time (`src/playback.cpp:2136`) while the producer gate is not, and the
+comment at `src/playback.cpp:1757` states the invariant they are supposed to
+maintain: "segment_hold_window is deliberately the same distance, so a request
+inside this window is one production is authorised to reach and a request
+outside it is one nothing is working toward". After a reload of
+`max_ahead_segments` alone, that sentence stops being true, and the refusal
+boundary and the production gate are set by different generations of the
+configuration.
+
+**Note what is already correct**, because it shows the shape of the fix:
+`stream.production.producer_parked` (0.47.0) is derived from the store's own
+`impl_->max_ahead`, so it tells the truth about the running generation while
+`look_ahead_ms` beside it does not.
+
+Options, in preference order:
+- [ ] Report `look_ahead_ms` from the generation that will serve it, not from
+  the config — the store knows its own `max_ahead` and `target_duration`, and
+  `producer_parked` already reads them. Falls back to config only where there
+  is no store (direct play, pre-pipeline).
+- [ ] Make the gate live: give `MediaSegmentStore` a setter and notify the
+  condition variable. Larger change, and it silently retimes a generation
+  under a viewer, which is the thing law 1 dislikes.
+- [ ] Decide the knobs are not live for playback at all and say so in
+  `reload_config`, alongside the `streaming_restart_required` set that already
+  exists for exactly this reason.
+
+**Scope is narrow and the silence is the problem.** It needs a `reload_config`
+that changes these knobs with sessions in flight — not an everyday event. But
+there is no log line, no PATCH, and no field that reveals the disagreement, so
+a client cannot detect it and neither could we from a capture.
+
 ## P1 — The seek fast path: taken for transcode, still unobserved for remux
 
 Found by the seek work completed in 0.46.0, not fixed by it. Across a whole day
