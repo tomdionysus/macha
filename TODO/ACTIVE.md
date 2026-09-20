@@ -1,6 +1,7 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-09-20 (rationalised against 0.43.0-0.46.3 and the live cluster)
+Last updated: 2026-09-20 evening, after the 0.47.0 deploy (rationalised
+against 0.43.0-0.47.0 and the live cluster)
 
 This is the authoritative, ordered backlog. Detailed plans and UAT records in
 this directory remain evidence; completed work belongs in `COMPLETED.md` and is
@@ -26,9 +27,12 @@ everything under P0 is worth doing without changing either.
    configuration available prevents it. **Its reproduction is blocked** — read
    that item's first bullet before attempting one.
 4. The **P0 cluster section**. The live cluster is **three** nodes as of
-   2026-09-20 evening: es-1 and fi-1 on 0.46.2, and gbni-1 back after three
-   days away but still on 0.43.0. gbni-2 was removed on 2026-09-13 — which the
-   system does not really support, and that is the first item there.
+   2026-09-20 evening, **all on 0.47.0** and converged at generation 31663:
+   es-1, fi-1 and gbni-1. gbni-2 is defunct and the operator expects it to stay
+   that way for some months (2026-09-20) — do not include it in a deploy, do
+   not wait for it, and do not treat its absence as an incident. Removing a
+   node is something the system does not really support, and that is the first
+   item there.
 5. **"What the client sessions now depend on"** near the end of this file.
    These are API contracts settled in conversation with the four client
    sessions and they exist nowhere else in this repository. Breaking one breaks
@@ -398,7 +402,8 @@ on 2026-09-20 with the operator's explicit authorisation ("development, and
 I'd rather not lose 13h or ~2TB of extents -- a manual recovery step is
 authorised this time only"). Configs backed up as
 `macha.yaml.bak-20260920-matcache` on all three, reasoning written inline.
-All three converged at generation 31655, healthy and writable.
+All three converged at generation 31655 at the time, healthy and writable;
+they are at 31663 on 0.47.0 as of that evening.
 
 **The override hides the defect everywhere it is not yet hurting.** 128 MiB was
 sized when a snapshot was small; it is now smaller than two of them, so the
@@ -546,6 +551,46 @@ failure is invisible on-box; haproxy's access log is the only record. And a
 `CD--` line carries a substituted `400`, so a 4xx there is a client timeout,
 not a rejection — read the termination-state field first.
 
+## P0 — A node accepts inbound RPC before it can answer it (opened 2026-09-20)
+
+**The listening socket opens before `set_inbound_handler` has run, so a peer
+that connects inside that window gets an exception instead of a handshake.**
+Found while running the suite for the 0.47.0 deploy; not caused by it.
+
+```
+INFO node c49856e3c419 listening on 43168 state=recovering
+INFO node connection inbound peer=97f6b5a35753 lane=data
+uncaught exception: no inbound RPC handler installed
+```
+
+`src/net.cpp:1378` (`dispatch_request`) and `src/net.cpp:1898`
+(`RpcClient::dispatch_inbound`) both throw when `inbound_handler_` is unset.
+Nothing before them refuses the connection politely or defers it; the node has
+advertised itself as listening and then fails the first thing asked of it.
+
+**It is load-dependent, not random, which is why it looks like a flake.**
+`rpc_cluster/test_metadata_history_checkpoint_recovers_after_crash_between_ack_and_commit`
+failed once in a full macOS suite run and passed 5/5 in isolation. Re-running
+the whole `rpc_cluster` suite at `MACHA_TEST_JOBS=24 --repeat 6` failed a
+*different* case, and a targeted `--repeat 12` of that one reproduced the
+exception above 1 in 12. It does not reproduce on es-1's full suite (477 + 10
+green there), so a fast, contended machine is what exposes it.
+
+**Why it is a P0 rather than a test problem.** This is the startup path of
+every node, and the window is widest exactly when a cluster is recovering
+together — a power cut, a rolling upgrade, three nodes coming back at once.
+That is the moment peers are most likely to dial in early and least likely to
+have a human watching. It is also discipline 1: the node asserts readiness by
+listening instead of re-deriving whether it can serve.
+
+- [ ] Do not open the listener until the inbound handler is installed, or
+  refuse/defer cleanly until it is. Whichever is chosen, the throw must stop
+  being the mechanism, because a peer cannot distinguish it from a node that
+  is genuinely broken.
+- [ ] Check the same ordering for the other subsystems the listener fronts —
+  the promoter and canceller (`set_inbound_transfer_control`) are installed
+  separately and have the same shape of gap.
+
 ## P0 — The catalogue materialises everything it has (opened 2026-09-17)
 
 The same failure as P-1 in a smaller organ, and — the important difference —
@@ -650,14 +695,18 @@ measured rates on real hardware are the cheapest place to start; the plan says
 which and why. The "three load-dependent test flakes" item below is folded
 into this and should be deleted, not re-worded, when its cases are classified.
 
-## P0 — Cluster: two nodes, and what removing the third left behind
+## P0 — Cluster: three live nodes, and what removing a fourth left behind
 
-The cluster is **three live nodes** as of 2026-09-20 evening. es-1 (ramaroja)
-and fi-1 are on 0.46.2; **gbni-1 (macnessa) came back at ~14:52 after three
-days away and is on 0.43.0**, three releases behind and the only node where a
-deploy would change behaviour. All three are converged at generation 31655,
-healthy and writable. gbni-1's rejoin needed the manual cache override in the
-P0 above; it would otherwise still be grinding. Its clock is now capped at
+**All three live nodes run 0.47.0 as of 2026-09-20 evening**, converged at
+generation 31663, `replicas=3/3 required=2`, writable, no WARN or ERROR.
+es-1 (ramaroja), fi-1 and gbni-1 (macnessa). The 0.43.0 skew on gbni-1 is
+closed: it went 0.43.0 -> 0.47.0 in one jump and logged the expected one-off
+`persisted telemetry ignored: blob too large`, which is the documented
+self-healing discard after a NodeTelemetry field change and does not recur.
+gbni-1's earlier rejoin needed the manual cache override in the P0 above; it
+would otherwise still be grinding. It also now serves the web client from
+`/etc/macha/web`, which the install tarball does not touch (it writes only
+`/usr`). Its clock is now capped at
 1.5 GHz to reduce unrecoverable brown-outs, which makes any CPU-bound
 metadata work on it correspondingly slower. (As of 2026-09-13 the pair was gbni-1 and
 es-1 on 0.40.1.) gbni-2 (inverbeg) was removed by the
@@ -701,6 +750,32 @@ version of this file is resolved and ledgered in `COMPLETED.md`.
   maintenance-section gap under P2 diagnostics.
 
 ## P0 — Playback correctness and poor-network resilience
+
+**Measured from the live journals on 2026-09-20, seven days, all three nodes.
+This is what is actually reaching viewers, as opposed to what is reachable in
+principle.** Re-run before acting: these are measurements with a date, not
+standing facts.
+
+| Signal | es-1 | fi-1 | gbni-1 | What a viewer sees |
+| --- | --- | --- | --- | --- |
+| `hold_timed_out` | 35 | 78 | 0 | `500`, fatal on media3, no retry |
+| `beyond_hold_window` | 3 | 3 | 0 | `500` in under a millisecond |
+| `pipeline reclaimed` | 34 | 9 | 0 | generation gone after 60 s idle |
+| metadata -> read-only | 3 | 2 | 0 | writes/ingest stall, playback survives |
+
+**113 timed-out holds in a week is the headline, not the seek refusals.** The
+refusal path gets the attention because it is the dramatic one, but it fired 6
+times; the hold simply running out of time fired 113. Both surface as the same
+fatal `500` on media3, which does not retry a 500 on the HLS path, so the
+server's hold is the entire retry budget in the system. fi-1 carries more than
+twice es-1's share despite hosting no extents.
+
+gbni-1's zeroes are not evidence of health: it was away for three days of that
+window and has served little playback since.
+
+Reproduce with:
+`journalctl -u macha --no-pager --since '-7 days' | grep -c hold_timed_out`
+
 
 - [ ] **The bounded-VOD hold is unmeasured on iOS, and its ceiling is now
   known on Android — device evidence 2026-09-13, iOS still unowned.** The
@@ -920,6 +995,44 @@ tied to one persistent logical viewer/UI session, not each stream generation.
 Keep teardown active until UAT proves that seek, quality changes, disconnects,
 supersession, failure and failover cannot leak physical encoders or produce
 `transcode limit reached` for one viewer.
+
+## P0 — Seamless handover: three pieces left, in the operator's order (opened 2026-09-20)
+
+**Seamless handover is a business P0 and one of Macha's value propositions**
+(operator, 2026-09-20). The operator set the order; piece 1 shipped in 0.47.0
+and the rest are unstarted.
+
+1. ~~**Speed factor.**~~ Shipped in 0.47.0 as `stream.production`. Core has the
+   full brief, including the parked-producer trap, and has confirmed it back.
+
+2. - [ ] **The viewer key must be a route parameter.** A client-supplied
+   session key goes **in the route**, as a query parameter, consistent with
+   `idempotency_key` (`src/playback.cpp:2176`). **No non-standard HTTP
+   headers** — the operator was explicit. This is what unblocks the Web
+   Client's handover, which is impossible as currently designed because
+   sessions are keyed on the bearer token.
+
+3. - [ ] **Direct-session exemption plus per-account caps.** Direct sessions
+   are exempt from supersession but **still counted against a per-account
+   cap**. The constraint that governs the design: *"we need to make sure a
+   rogue client cannot under any circumstances launch a media DoS against the
+   server"* — an exemption must not become a way for one viewer to occupy a
+   node. This is law 1's second clause as admission control: not making the
+   viewer wait also means not letting one viewer make another wait.
+
+**HELD, not forgotten: `410 generation_superseded`.** The operator asked for
+it to be held (2026-09-20) and the code is deliberately back on `404` with a
+comment at the site explaining why. It ships only after macha-client-core
+releases tolerance — core maps an unrecognised fragment status to `unknown`
+and treats `unknown` as endpoint evidence, so shipping first would make a
+superseded generation look like a failed node. **Re-applying it is a small
+change; the interlock is the release order, not the code.** Ask Core whether
+their tolerance has shipped before assuming this is still blocked.
+
+An open question the operator raised and did not settle: whether it is useful
+for a client to know that a generation existed *anywhere* rather than on this
+node, and whether that would need cluster persistence or is overkill. He was
+taking it to core and the clients.
 
 ## P0 — Verified correctness defects (found 2026-09-05, code-audit-confirmed)
 
@@ -2271,16 +2384,38 @@ cross-session and will not be in the next session's context.
 
 Facts a new session needs before touching anything. None of this is a task.
 
-**Nodes — two are live.** es-1 is `10.34.1.50` / `ramaroja.macha.network`
-(failure domain `spain`), behind haproxy terminating TLS on 443 with no
-upstream proxy; it also hosts Plex and qbittorrent-nox, which share its disk.
-fi-1 is `root@10.35.1.50`, an edge node behind CGNAT (`inbound_capable`
-false, hosts no extents) that is nonetheless a full metadata replica — so with
-`metadata_min_write_replicas: 2` **either node going down takes metadata
-read-only**. gbni-1 (`10.44.1.50` / `macnessa.macha.network`, `test-lab`) has
-been unreachable since 2026-09-17, is on 0.43.0, and is in neither live node's
-peer list. Never build on it; it browns out under load. SSH as `root@`, not
-`tom@`.
+**Nodes — three are live, all on 0.47.0** (2026-09-20 evening), converged at
+generation 31663, `replicas=3/3 required=2`, writable.
+
+es-1 is `10.34.1.50` / `ramaroja.macha.network` (failure domain `spain`),
+behind haproxy terminating TLS on 443 with no upstream proxy; it also hosts
+Plex and qbittorrent-nox, which share its disk. **It is the build node** — it
+has `zlib1g-dev`, which fi-1 does not, so fi-1 cannot build even though it has
+more RAM.
+
+fi-1 is `root@10.35.1.50`, an edge node behind CGNAT (`inbound_capable` false,
+hosts no extents) that is nonetheless a full metadata replica. **Port 80 on
+fi-1 is not Macha** — it is the T.O.M.S web app, which answers
+`/api/v1/health` with a `200` and an HTML body. Macha is on **7438**. Anything
+probing fi-1 must check `service == "macha"` in the response, not the status
+code, or it will report Macha healthy while Macha is down.
+
+gbni-1 is `10.44.1.50` / `macnessa.macha.network` (`test-lab`), back in the
+cluster and current. It serves the web client from `/etc/macha/web`. **Never
+build on it**; it browns out under load, has no remote power control, and
+needs someone on site if it does not come back. Its clock is capped at
+1.5 GHz. SSH as `root@`, not `tom@`.
+
+With `metadata_min_write_replicas: 2` and three replicas there is now one
+node of margin: **any one node going down leaves metadata writable; any two
+takes it read-only** (reads and playback continue; FUSE writes, ingest and
+catalogue mutations stall). That margin is new — it did not exist while
+gbni-1 was away. It went read-only 5 times across es-1 and fi-1 in the seven
+days to 2026-09-20.
+
+**gbni-2 is defunct and expected to stay that way for some months** (operator,
+2026-09-20). Do not include it in a deploy, do not wait for it, do not treat
+its absence as an incident.
 
 **gbni-2 (inverbeg) was removed from the cluster**, not merely unreachable.
 Verified in both nodes' own `known-nodes.bin`: each lists one known node — the
