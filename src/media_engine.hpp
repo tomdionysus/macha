@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "http.hpp"
 #include "config.hpp"
 #include "retained_memory.hpp"
 #include "types.hpp"
@@ -90,6 +91,8 @@ enum class MediaFailure : uint8_t {
 };
 
 std::string_view media_failure_name(MediaFailure) noexcept;
+// The axes a client recovering from this failure needs; see FailureAxes.
+FailureAxes media_failure_axes(MediaFailure) noexcept;
 
 class MediaError : public std::runtime_error {
     MediaFailure failure_;
@@ -196,6 +199,31 @@ class MediaSegmentStore {
         uint64_t spill_bytes{};
         uint64_t descriptor_bytes{};
         uint64_t planned_segments{};
+        // How much media this generation has produced, and how long the
+        // encoder actually spent producing it. The pair is deliberately raw:
+        // a client divides them to get a rate from ONE response, with no
+        // polling and no second round trip on a viewer's critical path.
+        //
+        // producing_ms EXCLUDES time the producer sat parked on the
+        // max_ahead_segments gate waiting for demand. Wall clock since the
+        // generation started would read about 1.0x for any normally paced
+        // viewer, because the producer spends most of its life blocked --
+        // which is precisely the wrong answer for deciding whether the
+        // encoder can outrun realtime and close on a handover join.
+        uint64_t produced_media_ms{};
+        uint64_t producing_ms{};
+        // How long ago the last fragment was published, so a reader can see
+        // the age of the pair above rather than having to trust it. Measured
+        // on this node: an age in milliseconds, not a wall-clock instant, so
+        // it does not depend on the client's clock agreeing with ours.
+        uint64_t produced_age_ms{};
+        // Whether the producer is blocked on the max_ahead_segments gate. A
+        // large produced_age_ms means two opposite things -- a pipeline that
+        // has wedged, or one that is comfortably ahead and waiting for the
+        // viewer -- and without this the reader cannot tell which. Derived,
+        // not tracked: the producer cannot have published beyond the gate, so
+        // being past it is exactly the condition it is blocked on.
+        bool producer_parked{};
     };
 
     MediaSegmentStore(size_t max_ahead_segments, uint64_t memory_limit,

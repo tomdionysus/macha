@@ -104,6 +104,53 @@ HttpResponse http_error(int status, std::string_view code, std::string_view mess
 // server states why it could not answer and leaves the decision to the client.
 HttpResponse http_error(int status, std::string_view code, std::string_view message,
                         std::string_view reason);
+
+// What a failure is a property of. A client recovering from one has to decide
+// whether another node is worth trying, and the answer follows from this
+// without it needing a table of our error codes:
+//
+//   content  the bytes are the problem, and every node holds the same bytes.
+//            Asking a neighbour spends the viewer's time to be told the same
+//            thing. Do not walk.
+//   node     this node's view or capability. Another node may well differ --
+//            a missing extent, a slow mount, a build without an encoder.
+//            Walk.
+//   request  the request itself is wrong, and every node would refuse it
+//            identically. Walk collects N copies of the caller's own bug, so
+//            do not; fix the request.
+//
+// The third value is not decoration. Without it a malformed request has to be
+// labelled content (which says a client bug is a property of the viewer's
+// film) or node (which sends the client round the whole cluster collecting
+// its own mistake).
+enum class FailureScope { content, node, request };
+const char* failure_scope_name(FailureScope) noexcept;
+
+// The axes a client needs from a failure, stated rather than inferred.
+//
+// Every field is optional and an omitted one means "this server does not say",
+// never a default -- the same rule as the per-node playback budgets, where
+// absence means the node cannot answer and a client must keep its own
+// fallback. A `false` we did not mean is worse than a gap the client knows to
+// handle, so say nothing rather than guess.
+struct FailureAxes {
+    std::optional<FailureScope> scope;
+    // Whether this says anything about the node's fitness for other work.
+    // A per-title fault leaves the node perfectly healthy, so a 5xx with
+    // node_healthy true is honest rather than contradictory: one title failed,
+    // the node did not. Charging a node's health for a per-title fault takes a
+    // working node out of rotation for every other title.
+    std::optional<bool> node_healthy;
+    // Whether a DIFFERENT instruction could succeed on this same node. It is
+    // permission, not instruction: the client decides whether it has anything
+    // to give up. "Same instruction, just wait" is not this -- that is 429
+    // with Retry-After.
+    std::optional<bool> alternative_may_succeed;
+};
+
+// As above, with the axes attached. `reason` may be empty to omit it.
+HttpResponse http_error(int status, std::string_view code, std::string_view message,
+                        std::string_view reason, const FailureAxes& axes);
 std::string http_url_decode(std::string_view value);
 
 // Runs a handler the way HttpServer does, deferrals included: a handler that

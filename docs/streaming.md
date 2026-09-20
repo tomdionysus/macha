@@ -124,6 +124,27 @@ Stream-copy timestamps are normalised only after rescaling into the MP4 stream's
 
 Production is sequential, so arriving beyond the look-ahead does not skip the intervening fragments: the node encodes its way there at roughly real time while the viewer waits. Where the gap exceeds the look-ahead, creating a new generation seeked to the arrival point is cheaper than making the current one catch up.
 
+### How fast this generation is producing
+
+`stream.production` carries what a client needs to answer "if I join at position P, can this node reach it before the viewer does". It is absent for direct play, which has no pipeline.
+
+| Field | Meaning |
+| --- | --- |
+| `produced_ms` | Media produced by this generation so far -- the production frontier, in media time |
+| `producing_ms` | Encoder time spent producing it, with parked intervals excluded |
+| `produced_age_ms` | How long ago the last fragment was published |
+| `producer_parked` | Whether the producer is blocked on the look-ahead gate |
+
+The rate is `produced_ms / producing_ms`, and the wait for a join at `P` is `(P - produced_ms) / (rate - 1)`. The pair is raw on purpose: a rate computed on the node is a rate with the node's smoothing and the node's window baked in, and a client deciding whether to hand over needs to choose those itself. One response answers it -- there is nothing to poll, and nothing added to a viewer's critical path.
+
+**`producing_ms` is not wall clock, and must not be replaced by it.** The producer runs to `max_ahead_segments` beyond demand and then blocks, so a viewer watching at normal speed keeps it parked for most of the generation's life. Wall clock would therefore report about 1.0x however fast the encoder is -- and 1.0x is read as "cannot outrun realtime", which defers a handover that would have worked. `producing_ms` accumulates only the intervals in which the encoder was actually running.
+
+The two figures cover the same fragments, including the first, so pipeline start-up is charged to the rate. That reads low early and settles as the generation runs. The bias is deliberately in the conservative direction: understating costs a handover that is deferred, overstating costs a viewer stalled on a promise the node could not keep.
+
+`producing_ms` is `0` until the first fragment lands. **A client must read that as "no reading yet", not as an infinite rate.**
+
+`produced_age_ms` is an age measured on the node rather than a timestamp, so it does not depend on the client's clock agreeing with ours. Read it with `producer_parked`: a large age means two opposite things -- a pipeline that has wedged, or one that is comfortably ahead and waiting for this viewer -- and only the flag distinguishes them.
+
 The segment store remains a bounded producer/consumer queue. Once the producer is `max_ahead_segments` beyond actual client demand it blocks on a condition variable and resumes when later fragment indexes are requested. This prevents a fast remux from pulling an entire movie through the DHT while keeping VOD playlist semantics independent of producer progress. Resident generated fragments are bounded by `segment_memory_bytes`; old consumed fragments can spill below `temp_path`.
 
 Video scaling and audio resampling are initialised from actual decoded-frame properties rather than assuming the decoder knows the final pixel/sample format at open time. This matters for containers/codecs whose format details are discovered only during decoding.
@@ -379,7 +400,13 @@ The response separates requested preferences, resolved playback, original source
     "video": { "source_stream": 0, "transform": "copy", "codec": "hevc", "width": 1920, "height": 1080, "bitrate": 7500000 },
     "audio": { "source_stream": 1, "transform": "transcode", "codec": "aac", "channels": 2, "sample_rate": 48000, "bitrate": 192000 }
   },
-  "stream": { "url": "/api/v1/playback/stream/...", "mime_type": "application/vnd.apple.mpegurl", "look_ahead_ms": 32000, "subtitle_url": null },
+  "stream": {
+    "url": "/api/v1/playback/stream/...",
+    "mime_type": "application/vnd.apple.mpegurl",
+    "look_ahead_ms": 32000,
+    "subtitle_url": null,
+    "production": { "produced_ms": 48000, "producing_ms": 32000, "produced_age_ms": 120, "producer_parked": false }
+  },
   "options": {
     "modes": ["transcode"],
     "quality_heights": [720, 480, 360],
