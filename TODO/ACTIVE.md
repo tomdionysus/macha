@@ -8,31 +8,36 @@ not repeated here. Work top-to-bottom unless new evidence changes the order.
 
 **Start here if you are new to this work.** Read, in order:
 
-0. The **metadata-stall P0 immediately below**. It is live, it is failing real
-   ingests today, and it is not root-caused. Two agreed sessions rank it first.
-1. The **loader-I/O P0** after it. The node starves its own viewer I/O with
-   loader work: one ingest took es-1 to 91% iowait and aborted twelve client
-   requests at ~8 s. Governing law 1 is violated on the DATA backend, and no
+**Tier and position agree: the two P-1 sections come first.** They are
+invariants and structural properties rather than defects in features, and
+everything under P0 is worth doing without changing either.
+
+0. **The two P-1 sections immediately below.** The cache invariant is new on
+   2026-09-20 and generalises a failure that has now cost this project twice;
+   the namespace scale target is the long-running structural one.
+1. **The metadata-stall P0.** It is live, it is failing real ingests today, and
+   it is not root-caused. This is the thing to actually pick up first if you
+   are looking for work: two agreed sessions rank it top of the P0s.
+2. The **rejoin/cache P0** after it — worked around on all three nodes on
+   2026-09-20, not fixed, and the concrete instance of the first P-1.
+3. The **loader-I/O P0**. The node starves its own viewer I/O with loader
+   work: one ingest took es-1 to 91% iowait and aborted twelve client requests
+   at ~8 s. Governing law 1 is violated on the DATA backend, and no
    configuration available prevents it. **Its reproduction is blocked** — read
    that item's first bullet before attempting one.
-2. The **P-1 section** after that. It is new on 2026-09-17 and it outranks
-   everything below because it is not a defect in a feature: at the stated
-   scale target the namespace metadata is gigabytes per node and a single file
-   write costs several full traversals of it. Everything under P0 is worth doing
-   and none of it changes that.
-3. The **P0 cluster section**. The live cluster is two nodes, es-1 and fi-1,
-   both on 0.46.2. gbni-1 has been unreachable from every vantage since the
-   0.43.1 deploy (2026-09-17) and gbni-2 was removed on 2026-09-13 — which the
-   system does not really support, and that is the first item.
-4. **"What the client sessions now depend on"** near the end of this file.
+4. The **P0 cluster section**. The live cluster is **three** nodes as of
+   2026-09-20 evening: es-1 and fi-1 on 0.46.2, and gbni-1 back after three
+   days away but still on 0.43.0. gbni-2 was removed on 2026-09-13 — which the
+   system does not really support, and that is the first item there.
+5. **"What the client sessions now depend on"** near the end of this file.
    These are API contracts settled in conversation with the four client
    sessions and they exist nowhere else in this repository. Breaking one breaks
    clients that cannot be fixed from here.
-5. **"Cluster and repository state as of 2026-09-13"**, which records node
+6. **"Cluster and repository state as of 2026-09-13"**, which records node
    addresses, what is deployed, what access works, and where the branches and
    tags stand.
 
-None of the five is a task list; all of them will mislead you if you assume
+None of the last three is a task list; all of them will mislead you if you assume
 otherwise.
 
 **Four suite failures were diagnosed and fixed on 2026-09-15 (0.43.0)**,
@@ -123,6 +128,157 @@ The governing laws are:
 2. Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The Viewer Wait.
 3. Control traffic must remain promptly serviceable. Viewer priority is a large
    configurable share (95:5 by default), not indefinite starvation of all other work.
+
+## P-1 — A cache must never be smaller than its own working set (opened 2026-09-20)
+
+**This sits at P-1 because it is not a defect in a feature. It is an invariant
+the system currently has no way to state, enforce, or even notice being
+violated** — and when it was violated on 2026-09-20 the result was a node that
+could not rejoin the cluster, burning a core at 100% for 42 minutes, while
+Status reported `health: healthy` and `phase: ready`.
+
+**The invariant, stated plainly: a cache whose eviction policy can evict
+everything a running operation needs to make progress is not a cache. It is a
+mechanism for converting a linear operation into a quadratic one, silently.**
+
+The concrete instance is in the P0 below: one materialisation of this
+namespace is ~51 MB, `dht.metadata_materialization_cache_bytes` defaults to
+128 MiB, so two fit — and `cur_`/`committed_` are pinned and exempt, so they
+*are* those two. A replica catching up therefore ran with **zero usable
+cache**: 0 hits against 2 misses per 30 s, 3 evictions, ~228 deltas replayed
+per import, 28 B/s of progress. Raising the limit made it 577x faster. But
+**the number was never the point.** The point is that nothing anywhere
+detected, reported, or refused a cache configured smaller than one unit of the
+work it exists to serve.
+
+**Why this generalises, and why it is P-1 rather than a line in the P0.**
+Every bound in this system is declared up front as a byte count chosen when
+the thing being bounded was smaller: `metadata_materialization_cache_bytes`
+(128 MiB against 51 MB objects), and the same shape is worth auditing in
+`retained_memory_bytes` and its three reserves, the catalogue and profile
+caches, the playback probe and subtitle caches, and the provider response
+caches. A budget smaller than one unit of its own work does not degrade
+gracefully — it fails **silently and superlinearly**, which is the hardest
+failure to attribute and the one this project keeps rediscovering (0.28.3's
+quadratic tombstone replay, and now this).
+
+**It is also the shape the Merkle work must not reintroduce.** P-1 below makes
+a materialisation small by making it partial; this invariant must still hold
+afterwards, for whatever the new unit of work turns out to be. Fixing the
+namespace does not retire this.
+
+- [ ] **A cache must be able to say it is in this state.** The counters
+  already exist (`materialization_cache_hits`/`misses`/`evictions`/`entries`)
+  and they said it unambiguously — 0 hits, 100% miss, evictions exceeding
+  entries — but nothing reads them. A sustained zero-hit, high-eviction cache
+  is a defect condition and should surface in `cluster.conditions`, not only
+  in a diagnostics blob an operator has to know to go and read.
+- [ ] **A cache must refuse, or loudly warn, when its limit is below its
+  observed unit size.** At minimum one WARN naming the limit and the observed
+  object size. A bound that cannot admit one item should be a startup-visible
+  error, not a runtime mystery.
+- [ ] **Prefer derived bounds over fixed byte counts** wherever the unit scales
+  with the library. A fixed default is a guess with an expiry date, and this
+  one expired without anybody noticing.
+- [ ] **Audit the other declared bounds** listed above against their current
+  unit sizes. This is the cheap half and it is where the next instance is
+  hiding.
+- [ ] **Pinning must be counted against the budget, or excluded from it
+  honestly.** `cur_` and `committed_` consumed 103 MB of a 134 MB limit while
+  being exempt from eviction, so the *effective* cache was 31 MB against a
+  51 MB unit. A budget that reports 134 MB while offering 31 MB is lying to
+  whoever sized it.
+
+## P-1 — The namespace does not meet its own scale target (opened 2026-09-17)
+
+Macha is designed for tens of thousands of files and 100 TB+ of media per
+cluster. It does not currently do that, and the reason is structural rather
+than a bug: `MetadataSnapshot::entries` is a `std::map<std::string, FsEntry>`
+holding the whole namespace, the record payload *is* that map serialised, and
+the record's identity *is* a SHA-256 over those bytes
+(`metadata_hash`, `src/metadata.cpp:1334`). So nothing can be demand-loaded —
+the whole structure must be materialised to produce the hash — and every commit
+re-serialises and re-hashes the library.
+
+Plan: [namespace Merkle root](2026-09-17-namespace-merkle-root-plan.md).
+
+**Stage A of the plan is done (2026-09-17) and the numbers are now measured on
+es-1 and fi-1 rather than derived.** At 1.618 TiB of library (4,808 entries,
+424,222 extents) one materialisation is **47 MB** — 26 MB decoded plus a 21 MB
+encoded payload resident alongside it — of which 97% is extent references.
+That is **15.9 MB decoded per TiB**, so 20,000 files at a realistic average size
+is 40-160 TB, i.e. **1.2-4.7 GB resident, on every node, including the Pi-class
+ones**. Struct sizes on aarch64 are as assumed (`FsEntry` 72, `ExtentRef` 56,
+map node 104+32).
+
+Two corrections Stage A forced:
+
+- **The 128 MiB `materialization_cache_limit_bytes` budget never bounded the
+  namespace.** `cur_` and `committed_` are pinned and exempt
+  (`src/metadata.cpp:3203`, `:3210-3212`, `:3230-3231`), so residency is
+  unbounded by design and the LRU only governs historical materialisations.
+  One materialisation equals the whole budget at ~4.6 TiB, not the 9 TB
+  estimated — near-term, not target-scale.
+- **28.8% of decoded residency was allocator slack, and is now gone.**
+  `entry(Reader&)` grew extent vectors by `push_back` with no `reserve`, leaving
+  610,567 slots for 424,222 extents. Reserving exactly (bounded by the input's
+  remaining bytes, so a forged count cannot size an allocation) cut the decoded
+  snapshot from 36.2 MB to 25.8 MB — ~640 MB per node at the 100 TB target, for
+  one line, with no format change and no migration. Regression test:
+  `storage_metadata/test_decoded_extent_vectors_carry_no_allocator_slack`.
+
+fi-1 is the clearest statement of the problem: it hosts no extents, uses 8.2 GB
+of disk in total, and holds a byte-identical 47 MB materialisation describing
+424,222 extents of content it does not store.
+
+And a single file write, through `mutate_impl`
+(`src/metadata_manager.cpp:1622`), costs four full traversals: a full
+`decode_snapshot` (`:1669`), a full `encode_snapshot`, a full `metadata_hash`,
+and a full element-wise `entries != entries` comparison (`:228`). The
+`before.emplace` deep copy at `:1698-1700` is already skipped, because every
+namespace write path uses `mutate_delta`.
+
+The fix is to make the record a root pointer over a content-addressed Merkle
+tree, the way `std::optional<ObjectId> catalogue_root` (`src/metadata.hpp:109`)
+already works three lines above `entries` in the same struct. That takes a
+commit from O(library) to O(log n) per changed path, and only then does moving
+extents off the heap buy anything.
+
+**This is not a new discipline for this codebase.** `repair_step`'s comment
+(`src/distributed_store.cpp:2132-2136`) diagnoses exactly this pathology in the
+object store and records the fix — cursor-based, budgeted, "they never rebuild
+complete object vectors" (`src/distributed_store.hpp:238-241`). The namespace
+never received it, and `maintenance_objects_cached`
+(`src/filesystem.cpp:2392-2455`) still builds the complete ~26-million-id live
+vector that `repair_step` is handed (~840 MB transient at 100 TB).
+
+Migration is a re-root, not a rebuild: ObjectIds address content that no
+metadata format change touches, so the library survives and only ancestry is
+discarded. It is a flag day across every node, and it needs an authority-granting
+variant of `recover_from_seed` (`src/metadata.cpp:2097-2131`) built in the shape
+of `metadata_branch_floor`/`retention_baseline_complete`
+(`src/metadata.hpp:93-103`) rather than by loosening the recovery path. That
+interlock is the most dangerous single piece of the work.
+
+- [x] Stage A: real numbers off es-1/fi-1 and `sizeof` confirmation on an ARM
+  build. Done 2026-09-17; see "Stage A results" in the plan. One item remains
+  open: the live `MetadataReplicaDiagnostics` counters
+  (`src/metadata.hpp:415-431`) are reachable only through `GET /api/v1/status`,
+  which needs an account holding `view_status`.
+- [~] Stage B: Merkle namespace as SM14, readable alongside SM13, not yet
+  authoritative. **Started 2026-09-17**: the tree substrate is in
+  `src/namespace_tree.{hpp,cpp}` with six green cases, history-independent
+  and key-only-chunked, extents addressed from the leaf rather than inlined.
+  Measured: one file's stat change rewrites <= 12 nodes instead of the whole
+  library; an extent appended to a 4,000-extent file rewrites 3 nodes of 15.
+  Still owed: the SM14 record shape and `decode_snapshot` dispatch, a journal-
+  style fuzz case, a stat-only read path proven to fetch no extent nodes, and
+  the `macha-metadata-dump` mode that runs it over the live es-1 head.
+- [ ] Stage C: commit path carries the change set instead of rediscovering it.
+- [ ] Stage D: demand-loaded extent nodes, on the `RetainedMemoryLedger`;
+  persist `file_media_id`.
+- [ ] Stage E: the migration and its interlock.
+- [ ] Stage F: the dependent O(N) items now listed under P1 scaling cliffs.
 
 ## P0 — es-1 and fi-1 stall metadata RPCs at each other, and it is failing real ingests (opened 2026-09-20, NOT root-caused)
 
@@ -389,97 +545,6 @@ Also found: **the server logs nothing for a 401/403/400 refusal.** An auth
 failure is invisible on-box; haproxy's access log is the only record. And a
 `CD--` line carries a substituted `400`, so a 4xx there is a client timeout,
 not a rejection — read the termination-state field first.
-
-## P-1 — The namespace does not meet its own scale target (opened 2026-09-17)
-
-Macha is designed for tens of thousands of files and 100 TB+ of media per
-cluster. It does not currently do that, and the reason is structural rather
-than a bug: `MetadataSnapshot::entries` is a `std::map<std::string, FsEntry>`
-holding the whole namespace, the record payload *is* that map serialised, and
-the record's identity *is* a SHA-256 over those bytes
-(`metadata_hash`, `src/metadata.cpp:1334`). So nothing can be demand-loaded —
-the whole structure must be materialised to produce the hash — and every commit
-re-serialises and re-hashes the library.
-
-Plan: [namespace Merkle root](2026-09-17-namespace-merkle-root-plan.md).
-
-**Stage A of the plan is done (2026-09-17) and the numbers are now measured on
-es-1 and fi-1 rather than derived.** At 1.618 TiB of library (4,808 entries,
-424,222 extents) one materialisation is **47 MB** — 26 MB decoded plus a 21 MB
-encoded payload resident alongside it — of which 97% is extent references.
-That is **15.9 MB decoded per TiB**, so 20,000 files at a realistic average size
-is 40-160 TB, i.e. **1.2-4.7 GB resident, on every node, including the Pi-class
-ones**. Struct sizes on aarch64 are as assumed (`FsEntry` 72, `ExtentRef` 56,
-map node 104+32).
-
-Two corrections Stage A forced:
-
-- **The 128 MiB `materialization_cache_limit_bytes` budget never bounded the
-  namespace.** `cur_` and `committed_` are pinned and exempt
-  (`src/metadata.cpp:3203`, `:3210-3212`, `:3230-3231`), so residency is
-  unbounded by design and the LRU only governs historical materialisations.
-  One materialisation equals the whole budget at ~4.6 TiB, not the 9 TB
-  estimated — near-term, not target-scale.
-- **28.8% of decoded residency was allocator slack, and is now gone.**
-  `entry(Reader&)` grew extent vectors by `push_back` with no `reserve`, leaving
-  610,567 slots for 424,222 extents. Reserving exactly (bounded by the input's
-  remaining bytes, so a forged count cannot size an allocation) cut the decoded
-  snapshot from 36.2 MB to 25.8 MB — ~640 MB per node at the 100 TB target, for
-  one line, with no format change and no migration. Regression test:
-  `storage_metadata/test_decoded_extent_vectors_carry_no_allocator_slack`.
-
-fi-1 is the clearest statement of the problem: it hosts no extents, uses 8.2 GB
-of disk in total, and holds a byte-identical 47 MB materialisation describing
-424,222 extents of content it does not store.
-
-And a single file write, through `mutate_impl`
-(`src/metadata_manager.cpp:1622`), costs four full traversals: a full
-`decode_snapshot` (`:1669`), a full `encode_snapshot`, a full `metadata_hash`,
-and a full element-wise `entries != entries` comparison (`:228`). The
-`before.emplace` deep copy at `:1698-1700` is already skipped, because every
-namespace write path uses `mutate_delta`.
-
-The fix is to make the record a root pointer over a content-addressed Merkle
-tree, the way `std::optional<ObjectId> catalogue_root` (`src/metadata.hpp:109`)
-already works three lines above `entries` in the same struct. That takes a
-commit from O(library) to O(log n) per changed path, and only then does moving
-extents off the heap buy anything.
-
-**This is not a new discipline for this codebase.** `repair_step`'s comment
-(`src/distributed_store.cpp:2132-2136`) diagnoses exactly this pathology in the
-object store and records the fix — cursor-based, budgeted, "they never rebuild
-complete object vectors" (`src/distributed_store.hpp:238-241`). The namespace
-never received it, and `maintenance_objects_cached`
-(`src/filesystem.cpp:2392-2455`) still builds the complete ~26-million-id live
-vector that `repair_step` is handed (~840 MB transient at 100 TB).
-
-Migration is a re-root, not a rebuild: ObjectIds address content that no
-metadata format change touches, so the library survives and only ancestry is
-discarded. It is a flag day across every node, and it needs an authority-granting
-variant of `recover_from_seed` (`src/metadata.cpp:2097-2131`) built in the shape
-of `metadata_branch_floor`/`retention_baseline_complete`
-(`src/metadata.hpp:93-103`) rather than by loosening the recovery path. That
-interlock is the most dangerous single piece of the work.
-
-- [x] Stage A: real numbers off es-1/fi-1 and `sizeof` confirmation on an ARM
-  build. Done 2026-09-17; see "Stage A results" in the plan. One item remains
-  open: the live `MetadataReplicaDiagnostics` counters
-  (`src/metadata.hpp:415-431`) are reachable only through `GET /api/v1/status`,
-  which needs an account holding `view_status`.
-- [~] Stage B: Merkle namespace as SM14, readable alongside SM13, not yet
-  authoritative. **Started 2026-09-17**: the tree substrate is in
-  `src/namespace_tree.{hpp,cpp}` with six green cases, history-independent
-  and key-only-chunked, extents addressed from the leaf rather than inlined.
-  Measured: one file's stat change rewrites <= 12 nodes instead of the whole
-  library; an extent appended to a 4,000-extent file rewrites 3 nodes of 15.
-  Still owed: the SM14 record shape and `decode_snapshot` dispatch, a journal-
-  style fuzz case, a stat-only read path proven to fetch no extent nodes, and
-  the `macha-metadata-dump` mode that runs it over the live es-1 head.
-- [ ] Stage C: commit path carries the change set instead of rediscovering it.
-- [ ] Stage D: demand-loaded extent nodes, on the `RetainedMemoryLedger`;
-  persist `file_media_id`.
-- [ ] Stage E: the migration and its interlock.
-- [ ] Stage F: the dependent O(N) items now listed under P1 scaling cliffs.
 
 ## P0 — The catalogue materialises everything it has (opened 2026-09-17)
 
