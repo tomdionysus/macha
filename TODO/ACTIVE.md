@@ -1595,7 +1595,30 @@ This is a number that looks answered, sitting on the same object as
 of the two is current. A convention for absence does not help a client here,
 which is why the fix has to be on this side.
 
-## P1 — The seek fast path: taken for transcode, still unobserved for remux
+## P1 — The seek fast path: NOW TAKEN in the field (corrected 2026-09-20); only the remux decline is unobserved
+
+**MEASURED AGAIN 2026-09-20 AND THE HEADLINE CLAIM IS NO LONGER TRUE. The
+fast path is being taken.** Seven days of es-1's journal: **506 `seek
+fast-path` lines against 7 `seek fast-path skipped`**, concentrated on
+2026-09-17 and 2026-09-18, and still firing today. Every one of the 7 skips
+gives `reason=preferences-changed`; none give a `reseek_hls_vod` refusal. So
+"every seek pays a full probe/VOD-planning pass while the viewer waits" is
+stale and must not be quoted from this file again -- it was true when written
+and is not now.
+
+What survives is narrower and still worth doing: the 7 `preferences-changed`
+skips are unexplained, and the remux `reseek_hls_vod` bounds below have still
+never been *observed* refusing -- which now reads as "no evidence it fires"
+rather than "hidden behind a path nothing reaches". Re-measure before
+spending anything on it.
+
+**The lesson is the reason this correction is written in rather than the line
+being edited.** A backlog entry recording a measurement is only true as of its
+measurement, and this one was being read as a standing fact three releases
+later. Anything here that says "zero X in the journal" needs a date and needs
+re-running before it is acted on.
+
+Original entry follows, with its claim now disproved:
 
 Found by the seek work completed in 0.46.0, not fixed by it. Across a whole day
 on es-1 there were **zero** `seek fast-path` lines: every seek pays a full
