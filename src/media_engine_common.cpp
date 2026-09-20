@@ -210,6 +210,30 @@ std::string_view media_failure_name(MediaFailure failure) noexcept {
     return "source_unreadable";
 }
 
+FailureAxes media_failure_axes(MediaFailure failure) noexcept {
+    FailureAxes axes;
+    // None of the three is fixable by asking this node for something else:
+    // unreadable bytes, undemuxable bytes and a read that timed out defeat
+    // every instruction equally.
+    axes.alternative_may_succeed = false;
+    // Nor does any of them say the node is unfit for other work. A file this
+    // node cannot reach or parse is one title's problem; charging the node's
+    // health for it takes a working node out of rotation for everything else.
+    axes.node_healthy = true;
+    switch (failure) {
+    case MediaFailure::unsupported:
+        // The bytes are the problem and every node holds the same bytes.
+        axes.scope = FailureScope::content;
+        break;
+    case MediaFailure::unreadable:
+    case MediaFailure::timed_out:
+        // This node's view of the bytes. Another node may hold them fine.
+        axes.scope = FailureScope::node;
+        break;
+    }
+    return axes;
+}
+
 std::string media_stream_type_name(MediaStreamType type) {
     switch (type) {
     case MediaStreamType::video: return "video";

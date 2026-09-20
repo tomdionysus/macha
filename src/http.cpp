@@ -394,6 +394,33 @@ HttpResponse http_error(int status, std::string_view code, std::string_view mess
     return http_json(status, Json(std::move(root)).dump());
 }
 
+const char* failure_scope_name(FailureScope scope) noexcept {
+    switch (scope) {
+    case FailureScope::content: return "content";
+    case FailureScope::node: return "node";
+    case FailureScope::request: return "request";
+    }
+    return "node";
+}
+
+HttpResponse http_error(int status, std::string_view code, std::string_view message,
+                        std::string_view reason, const FailureAxes& axes) {
+    Json::Object error{{"code", std::string(code)}, {"message", std::string(message)}};
+    if (!reason.empty())
+        error["reason"] = std::string(reason);
+    // Omitted rather than defaulted: an axis this server cannot honestly state
+    // must read as "no answer" to the client, not as "false".
+    if (axes.scope)
+        error["scope"] = std::string(failure_scope_name(*axes.scope));
+    if (axes.node_healthy)
+        error["node_healthy"] = *axes.node_healthy;
+    if (axes.alternative_may_succeed)
+        error["alternative_may_succeed"] = *axes.alternative_may_succeed;
+    Json::Object root;
+    root["error"] = std::move(error);
+    return http_json(status, Json(std::move(root)).dump());
+}
+
 std::string http_url_decode(std::string_view value) {
     std::string out;
     for (size_t i = 0; i < value.size(); ++i) {

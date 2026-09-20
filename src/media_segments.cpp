@@ -7,7 +7,9 @@
 #include <condition_variable>
 #include <fstream>
 #include <iomanip>
+#include <chrono>
 #include <mutex>
+#include <optional>
 #include <sstream>
 
 namespace macha {
@@ -34,6 +36,22 @@ struct MediaSegmentStore::Impl {
     size_t max_ahead{8};
     uint64_t memory_limit{64ULL * 1024 * 1024};
     uint64_t memory_bytes{};
+    // Media produced by this generation, and the encoder time it actually
+    // took -- parked-on-demand intervals excluded. See Snapshot.
+    //
+    // The two must cover the same fragments or their ratio is wrong where it
+    // matters most. Measuring only the gaps BETWEEN publications would time
+    // n-1 fragments while counting the media of n, overstating the rate by
+    // n/(n-1) -- 2x after the second fragment, which is exactly when a
+    // handover decision gets made. So the clock starts at construction and
+    // the first fragment is timed like every other one, which also charges
+    // pipeline start-up to the rate rather than hiding it. That reads low
+    // early and settles as the generation runs: the conservative direction,
+    // since the cost of understating is a handover deferred, not a viewer
+    // stalled on a promise the node could not keep.
+    std::chrono::duration<double> produced_media{};
+    std::chrono::duration<double> producing{};
+    std::optional<std::chrono::steady_clock::time_point> produced_since;
     uint64_t spill_bytes{};
     std::filesystem::path spill_directory;
     std::chrono::milliseconds target_duration{4000};
@@ -110,7 +128,13 @@ struct MediaSegmentStore::Impl {
 
     bool publish_segment(Bytes bytes, double duration) {
         Wakeups wakeups;
+        // Encode time for this fragment is the gap since the previous call
+        // returned. Measuring it here rather than around the cv.wait below is
+        // what excludes the parked interval: the wait happens after this
+        // point, so a producer blocked on demand adds nothing to the total.
+        const auto entered = std::chrono::steady_clock::now();
         std::unique_lock lock(mutex);
+        if (produced_since) producing += entered - *produced_since;
         const auto index = static_cast<uint64_t>(segments.size());
         if (!vod_segment_durations.empty() && index >= vod_segment_durations.size()) {
             if (error.empty()) error = "media pipeline produced more fragments than the VOD plan";
@@ -127,9 +151,11 @@ struct MediaSegmentStore::Impl {
         segment.size = bytes.size();
         segment.memory = std::make_shared<Bytes>(std::move(bytes));
         memory_bytes += segment.memory->size();
+        produced_media += std::chrono::duration<double>(segment.duration);
         segments.push_back(std::move(segment));
         maybe_spill_locked();
         notify_locked(wakeups);
+        produced_since = std::chrono::steady_clock::now();
         return true;
     }
 
@@ -181,6 +207,7 @@ MediaSegmentStore::MediaSegmentStore(size_t max_ahead_segments, uint64_t memory_
                                      std::vector<double> vod_segment_durations,
                                      MediaContainer container)
     : impl_(std::make_unique<Impl>()) {
+    impl_->produced_since = std::chrono::steady_clock::now();
     impl_->container = container;
     impl_->max_ahead = std::max<size_t>(2, max_ahead_segments);
     impl_->memory_limit = memory_limit;
@@ -376,7 +403,18 @@ MediaSegmentStore::Snapshot MediaSegmentStore::snapshot() const {
             impl_->memory_bytes, impl_->spill_bytes,
             static_cast<uint64_t>(impl_->segments.capacity() * sizeof(Impl::Segment) +
                                   impl_->vod_segment_durations.capacity() * sizeof(double)),
-            static_cast<uint64_t>(impl_->vod_segment_durations.size())};
+            static_cast<uint64_t>(impl_->vod_segment_durations.size()),
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(impl_->produced_media)
+                    .count()),
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(impl_->producing).count()),
+            impl_->produced_since
+                ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::steady_clock::now() - *impl_->produced_since)
+                                            .count())
+                : 0,
+            impl_->segments.size() > impl_->highest_requested + impl_->max_ahead};
 }
 
 void MediaSegmentStore::cancel() {

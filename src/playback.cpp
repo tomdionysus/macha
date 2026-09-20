@@ -79,6 +79,18 @@ struct ByteRange {
     bool partial{};
 };
 
+// A well-formed, coherent instruction this node cannot carry out. The only
+// current case is a stream copy into a container that cannot hold that codec.
+// Distinct from invalid_argument because nothing is malformed: another node on
+// another build may accept the identical request, and a transcode would
+// succeed here. Reaches the client as 422 copy_not_supported with
+// scope=node and alternative_may_succeed=true, so a recovering client asks a
+// neighbour for the copy before giving the copy up.
+class PlaybackCapabilityError final : public std::invalid_argument {
+  public:
+    using std::invalid_argument::invalid_argument;
+};
+
 class ResourceLimitError final : public std::runtime_error {
   public:
     using std::runtime_error::runtime_error;
@@ -425,19 +437,19 @@ PlaybackPlan plan_for(const MediaProbeResult& probe, const PlaybackPreferences& 
     // the media and the muxer, not about the client.
     if (video && video_copy && plan.container == MediaContainer::fmp4 &&
         !fmp4_video_copy_supported(source_video_codec))
-        throw std::invalid_argument("fragmented MP4 cannot carry a copied " + source_video_codec +
+        throw PlaybackCapabilityError("fragmented MP4 cannot carry a copied " + source_video_codec +
                                     " video stream; ask for preferences.video=transcode");
     if (audio && audio_copy && plan.container == MediaContainer::fmp4 &&
         !fmp4_audio_copy_supported(source_audio_codec))
-        throw std::invalid_argument("fragmented MP4 cannot carry a copied " + source_audio_codec +
+        throw PlaybackCapabilityError("fragmented MP4 cannot carry a copied " + source_audio_codec +
                                     " audio stream; ask for preferences.audio=transcode");
     if (video && video_copy && plan.container == MediaContainer::mpegts &&
         !mpegts_video_copy_supported(source_video_codec))
-        throw std::invalid_argument("MPEG-TS cannot carry a copied " + source_video_codec +
+        throw PlaybackCapabilityError("MPEG-TS cannot carry a copied " + source_video_codec +
                                     " video stream; ask for preferences.video=transcode");
     if (audio && audio_copy && plan.container == MediaContainer::mpegts &&
         !mpegts_audio_copy_supported(source_audio_codec))
-        throw std::invalid_argument("MPEG-TS cannot carry a copied " + source_audio_codec +
+        throw PlaybackCapabilityError("MPEG-TS cannot carry a copied " + source_audio_codec +
                                     " audio stream; ask for preferences.audio=transcode");
 
     plan.video = video ? (video_copy ? MediaTransform::copy : MediaTransform::transcode) : MediaTransform::omit;
@@ -1761,6 +1773,36 @@ struct PlaybackManager::Impl {
                             {"look_ahead_ms", session.plan.mode == PlaybackMode::direct
                                                   ? Json(nullptr) : Json(look_ahead_ms)},
                             {"subtitle_url", session.subtitle_url.empty() ? Json(nullptr) : Json(session.subtitle_url)}};
+        // How fast this generation is actually producing media, as a pair a
+        // client divides itself. Raw on purpose: a rate computed here is a
+        // rate with our smoothing and our window baked in, and a client
+        // deciding whether to hand over needs to pick those itself. One
+        // response answers it -- no polling, nothing on a viewer's path.
+        //
+        // producing_ms is encoder time with the parked interval removed, so
+        // the ratio is what this node COULD sustain, not what this viewer
+        // happened to ask for. Wall clock would read about 1.0x for anyone
+        // watching at normal speed and would say "cannot outrun realtime"
+        // about a node that comfortably can -- the answer that turns a
+        // workable handover into a stall.
+        //
+        // produced_ms is also the production frontier in media time, which is
+        // the other half of a handover decision: how long a join at position
+        // P must wait is (P - produced_ms) / (rate - 1).
+        //
+        // Absent for direct play, which has no pipeline, and zeroed until the
+        // first fragment lands. A client must treat producing_ms == 0 as "no
+        // reading yet" rather than as an infinite rate.
+        if (session.plan.mode != PlaybackMode::direct) {
+            if (auto active = active_engine(session)) {
+                const auto state = active->segments()->snapshot();
+                stream["production"] =
+                    Json::Object{{"produced_ms", state.produced_media_ms},
+                                 {"producing_ms", state.producing_ms},
+                                 {"produced_age_ms", state.produced_age_ms},
+                                 {"producer_parked", state.producer_parked}};
+            }
+        }
         Json::Object out{{"session_id", session.id},
                          {"generation", session.generation},
                          {"media_id", session.source.media_id},
@@ -1909,6 +1951,16 @@ struct PlaybackManager::Impl {
         {
             std::lock_guard lock(mutex);
             auto it = sessions.find(id);
+            // NOTE: this should be 410 generation_superseded, not 404 -- the
+            // generation existed here and was replaced, which is a different
+            // fact from a segment index that never existed, and a client must
+            // not retry it. Held back deliberately (operator, 2026-09-20):
+            // macha-client-core maps an unrecognised fragment status to
+            // `unknown` and treats `unknown` as endpoint evidence, so a node
+            // emitting 410 before core ships tolerance would charge a node
+            // that is producing perfectly and build a standby that cannot
+            // help. Core ships tolerance first, then this becomes a 410.
+            // See TODO/ACTIVE.md.
             if (it == sessions.end() || it->second != session ||
                 session->generation != generation)
                 return http_error(404, "not_found", "stream generation not found");
@@ -2959,8 +3011,26 @@ HttpResponse PlaybackManager::handle(const HttpRequest& request) {
         return impl_->handle_api(request);
     } catch (const JsonError& e) {
         return http_error(400, "bad_json", e.what());
+    } catch (const PlaybackCapabilityError& e) {
+        // Well-formed, coherent, and this node cannot do it: 422 rather than
+        // 400, because nothing about the request is malformed. Another node on
+        // another build may accept the same instruction, so the client should
+        // ask one before giving up the copy -- and a different instruction
+        // (a transcode) would succeed here.
+        FailureAxes axes;
+        axes.scope = FailureScope::node;
+        axes.node_healthy = true;
+        axes.alternative_may_succeed = true;
+        return http_error(422, "copy_not_supported", e.what(), {}, axes);
     } catch (const std::invalid_argument& e) {
-        return http_error(400, "bad_playback_request", e.what());
+        // The request itself is wrong and every node would refuse it the same
+        // way, so walking the cluster collects N copies of the caller's own
+        // bug. Nothing else here could succeed either.
+        FailureAxes axes;
+        axes.scope = FailureScope::request;
+        axes.node_healthy = true;
+        axes.alternative_may_succeed = false;
+        return http_error(400, "bad_playback_request", e.what(), {}, axes);
     } catch (const std::out_of_range& e) {
         return http_error(404, "not_found", e.what());
     } catch (const ResourceLimitError& e) {
@@ -2970,18 +3040,37 @@ HttpResponse PlaybackManager::handle(const HttpRequest& request) {
         Log::warn("playback[" + e.trace() + "] request failed stage=" + e.stage() +
                   " method=" + request.method + " path=" + request.path +
                   " elapsed_ms=" + std::to_string(elapsed) + " error=" + e.what());
-        Json::Object body{{"error", "playback_" + e.stage() + "_failed"},
-                          {"message", std::string(e.what())},
-                          {"trace", e.trace()},
-                          {"stage", e.stage()}};
+        // One envelope for every error this API returns: error.code is a
+        // snake_case token a client may branch on, error.message is for a
+        // human. Everything else about the failure hangs off the same object.
+        // This path used to emit `error` as a bare string with message, trace
+        // and stage as siblings, which is why clients grew parsers for
+        // several shapes.
+        Json::Object error{{"code", "playback_" + e.stage() + "_failed"},
+                           {"message", std::string(e.what())},
+                           {"trace", e.trace()},
+                           {"stage", e.stage()}};
         // When the engine said why, say why. A source this node could not read
         // is a different situation for the client than one it could not parse,
         // and only the client can decide what to do about either.
         int status = 503;
+        // A per-title fault leaves the node fit for every other title, so the
+        // default here says so rather than letting a client charge the node's
+        // health for one bad file. Scope is left unstated when the engine did
+        // not say why: a guess is worse than a gap the client knows to handle.
+        FailureAxes axes;
+        axes.node_healthy = true;
         if (e.failure()) {
-            body["reason"] = std::string(media_failure_name(*e.failure()));
+            error["reason"] = std::string(media_failure_name(*e.failure()));
+            axes = media_failure_axes(*e.failure());
             if (*e.failure() == MediaFailure::unsupported) status = 422;
         }
+        if (axes.scope) error["scope"] = std::string(failure_scope_name(*axes.scope));
+        if (axes.node_healthy) error["node_healthy"] = *axes.node_healthy;
+        if (axes.alternative_may_succeed)
+            error["alternative_may_succeed"] = *axes.alternative_may_succeed;
+        Json::Object body;
+        body["error"] = std::move(error);
         auto response = http_json(status, Json(std::move(body)).dump());
         response.headers["X-Macha-Playback-Trace"] = e.trace();
         response.headers["X-Macha-Playback-Stage"] = e.stage();

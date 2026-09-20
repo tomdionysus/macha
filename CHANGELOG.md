@@ -1,5 +1,53 @@
 # Current release
 
+## 0.47.0 — How fast this node is actually producing (development)
+
+**A client can now tell whether a handover would close the gap before the
+viewer reaches it, from one response.** `stream.production` is on the playback
+session payload beside `stream.look_ahead_ms`, with four fields:
+`produced_ms` (media produced by this generation, which is also the production
+frontier), `producing_ms` (the encoder time it took), `produced_age_ms` (how
+long ago the last fragment landed) and `producer_parked`. Absent for direct
+play, which has no pipeline and therefore no rate.
+
+The rate is `produced_ms / producing_ms`, and the wait for a join at position
+`P` is `(P - produced_ms) / (rate - 1)`. The pair is raw rather than a computed
+rate: a rate produced here would carry this node's smoothing and this node's
+window, and the client making the handover decision needs to choose both. One
+response answers it, so there is nothing to poll and nothing added to a
+viewer's critical path.
+
+**`producing_ms` is not wall clock, and the difference is the entire point.**
+The producer runs to `max_ahead_segments` beyond demand and then blocks on the
+gate, so a viewer watching at normal speed keeps it parked for most of the
+generation's life. Elapsed time would therefore read about 1.0x however fast
+the encoder is -- and 1.0x is read as "cannot outrun realtime", which refuses
+exactly the handovers that would have succeeded. The Web Client measured 1.49x
+on this hardware by pulling fragments flat out; this field reports that same
+figure for a viewer watching normally. `producing_ms` accumulates only the
+intervals in which the encoder was running, measured as the gap between one
+publication returning and the next beginning, so the wait is structurally
+outside the total rather than subtracted from it.
+
+**The two figures cover the same fragments, including the first.** Timing only
+the gaps *between* publications would have measured n-1 fragments while
+counting the media of n, overstating the rate by n/(n-1) -- 2x at the second
+fragment, which is when a handover decision actually gets made. Including the
+first charges pipeline start-up to the rate, so it reads low early and settles
+as the generation runs. That bias is deliberate and in the safe direction:
+understating costs a handover that is deferred, overstating costs a viewer
+stalled on a promise the node could not keep.
+
+`producing_ms` is `0` until the first fragment lands, and means "no reading
+yet" rather than an infinite rate. `produced_age_ms` is an age measured on the
+node rather than an instant, so a client's confidence decay does not depend on
+its clock agreeing with ours; read with `producer_parked`, because a large age
+otherwise cannot distinguish a wedged pipeline from one comfortably ahead and
+waiting for its viewer.
+
+Documented in `docs/streaming.md` under "How fast this generation is
+producing".
+
 ## 0.46.3 — The laws the code already obeyed (development)
 
 **Three laws order every scheduling decision in this system and none of them
