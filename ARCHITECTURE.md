@@ -5,7 +5,8 @@
 Three laws order every scheduling, admission and priority decision in the
 system. They are cited by number in the source and in review.
 
-1. **Thou Shalt Not Make The Viewer Wait.**
+1. **Thou Shalt Not Make The Viewer Wait.** And no viewer may be allowed to
+   make another viewer wait.
 2. **Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The
    Viewer Wait.**
 3. **Control traffic must remain promptly serviceable.** Viewer priority is a
@@ -56,6 +57,16 @@ be recorded as dead by peers who cannot see how well it was doing.
 
 So the resolution order is: law 3's floor is reserved first, law 1 takes
 priority within what remains, and law 2 governs everything left.
+
+Law 1's second clause is not a footnote. Protecting viewers as a *class*
+against loader and speculative work is only half of it: one viewer must not be
+able to consume a shared resource to the point where another cannot start. A
+resource that is rationed against background work but unrationed *per account*
+is a law-1 violation waiting for a rogue or merely enthusiastic client, and
+the node cannot tell those apart. So every per-viewer resource needs a
+per-account bound as well as a node-wide one, and a session that is cheap
+enough to be exempt from one limit is not thereby exempt from being counted
+against the others.
 
 A viewer is someone watching or listening right now. A loader is durable work
 the user asked for — FUSE publication, ingest, acquisition — which must finish
