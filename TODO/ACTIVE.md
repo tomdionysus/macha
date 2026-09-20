@@ -1579,6 +1579,22 @@ that changes these knobs with sessions in flight — not an everyday event. But
 there is no log line, no PATCH, and no field that reveals the disagreement, so
 a client cannot detect it and neither could we from a capture.
 
+**Whichever option is taken, the fix has to be announceable, and that is a
+requirement rather than a courtesy.** Raised by the Web Client session: a
+client that learns to distrust `look_ahead_ms` will keep distrusting it after
+it becomes trustworthy. Clients are already being advised to treat it as
+advisory for a generation they did not just create, and that advice does not
+expire on its own. So landing the fix silently leaves the field correct and
+unused. Say which option landed, in the CHANGELOG and to the client sessions,
+and give them something to test against.
+
+**This is a harder case than the absence rule** (see "What the client sessions
+now depend on"). An absent field is visibly absent and one branch handles it.
+This is a number that looks answered, sitting on the same object as
+`producer_parked`, which is answered correctly. Nothing on the wire says which
+of the two is current. A convention for absence does not help a client here,
+which is why the fix has to be on this side.
+
 ## P1 — The seek fast path: taken for transcode, still unobserved for remux
 
 Found by the seek work completed in 0.46.0, not fixed by it. Across a whole day
