@@ -20,4 +20,4 @@ Finite media uses VOD semantics. A future genuinely live/event mode needs an exp
 
 ## Metadata scale
 
-If namespace mutation cost again becomes material at very large scale, prefer structural changes over more buffering: persistent indexed snapshots, finer file-manifest deltas, and checkpoint-rooted journal-range catch-up for stale voters.
+Namespace mutation cost is now the P-1 item in `TODO/ACTIVE.md` with its own plan (a content-addressed Merkle tree over the namespace). Beyond that, prefer structural changes over more buffering: persistent indexed snapshots, finer file-manifest deltas, and checkpoint-rooted journal-range catch-up for a replica that has fallen far behind. There are no voters; every node is a replica.
