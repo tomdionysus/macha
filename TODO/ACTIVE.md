@@ -1,6 +1,6 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-09-17
+Last updated: 2026-09-20 (rationalised against 0.43.0-0.46.3 and the live cluster)
 
 This is the authoritative, ordered backlog. Detailed plans and UAT records in
 this directory remain evidence; completed work belongs in `COMPLETED.md` and is
@@ -8,23 +8,31 @@ not repeated here. Work top-to-bottom unless new evidence changes the order.
 
 **Start here if you are new to this work.** Read, in order:
 
-0. The **P-1 section** immediately below. It is new on 2026-09-17 and it sits
-   above everything else because it is not a defect in a feature: at the stated
+0. The **metadata-stall P0 immediately below**. It is live, it is failing real
+   ingests today, and it is not root-caused. Two agreed sessions rank it first.
+1. The **loader-I/O P0** after it. The node starves its own viewer I/O with
+   loader work: one ingest took es-1 to 91% iowait and aborted twelve client
+   requests at ~8 s. Governing law 1 is violated on the DATA backend, and no
+   configuration available prevents it. **Its reproduction is blocked** — read
+   that item's first bullet before attempting one.
+2. The **P-1 section** after that. It is new on 2026-09-17 and it outranks
+   everything below because it is not a defect in a feature: at the stated
    scale target the namespace metadata is gigabytes per node and a single file
    write costs several full traversals of it. Everything under P0 is worth doing
    and none of it changes that.
-1. The **P0 cluster section**. The cluster is two nodes now,
-   both on 0.40.1, and the third was removed rather than repaired — which the
+3. The **P0 cluster section**. The live cluster is two nodes, es-1 and fi-1,
+   both on 0.46.2. gbni-1 has been unreachable from every vantage since the
+   0.43.1 deploy (2026-09-17) and gbni-2 was removed on 2026-09-13 — which the
    system does not really support, and that is the first item.
-2. **"What the client sessions now depend on"** near the end of this file.
+4. **"What the client sessions now depend on"** near the end of this file.
    These are API contracts settled in conversation with the four client
    sessions and they exist nowhere else in this repository. Breaking one breaks
    clients that cannot be fixed from here.
-3. **"Cluster and repository state as of 2026-09-13"**, which records node
+5. **"Cluster and repository state as of 2026-09-13"**, which records node
    addresses, what is deployed, what access works, and where the branches and
    tags stand.
 
-None of the three is a task list; all three will mislead you if you assume
+None of the five is a task list; all of them will mislead you if you assume
 otherwise.
 
 **Four suite failures were diagnosed and fixed on 2026-09-15 (0.43.0)**,
@@ -42,9 +50,10 @@ before and after, on es-1, are in the plan. The operator's rule, stated the
 same day: a failing test on a node is P0 work, not a footnote in a deploy
 report.
 
-**OpenAPI is the largest piece of agreed but unstarted work** (P2 documentation
-hygiene): the operator asked for it on 2026-09-07 and upgraded it to "soon" on
-2026-09-13. Generate it from the route table at build time so it cannot drift.
+**OpenAPI is the largest piece of agreed but unstarted work, and is now P1**
+(it sat at P2 until 2026-09-20, contradicting this very sentence): the operator
+asked for it on 2026-09-07 and upgraded it to "soon" on 2026-09-13. Generate it
+from the route table at build time so it cannot drift.
 
 2026-09-13 (evening): rationalisation pass for a new session. Twenty-three
 completed items were moved to `COMPLETED.md` in full rather than summarised —
@@ -114,6 +123,199 @@ The governing laws are:
 2. Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The Viewer Wait.
 3. Control traffic must remain promptly serviceable. Viewer priority is a large
    configurable share (95:5 by default), not indefinite starvation of all other work.
+
+## P0 — es-1 and fi-1 stall metadata RPCs at each other, and it is failing real ingests (opened 2026-09-20, NOT root-caused)
+
+**This is breaking production work right now and it outranks everything below,
+including the loader-I/O P0 above it.** Agreed with the Android TV client
+session on 2026-09-20, which confirmed the viewer-side impact is nil and the
+ingest-side impact is permanent.
+
+A 6 GB torrent ingest (`The Day After Tomorrow`) **failed permanently**:
+
+```
+ingest failed: metadata write durability floor unavailable:
+               too few policy-compatible replicas
+```
+
+The mechanism is visible in both journals. Metadata goes **read-only for
+about ten seconds at a time**, repeatedly:
+
+```
+11:33:39 WARN metadata availability changed state=read-only
+              reason="metadata write durability floor lost"  replicas=1/3 required=2
+11:33:49 INFO metadata availability changed state=writable   replicas=2/3 required=2
+```
+
+With `metadata_min_write_replicas: 2` and exactly two reachable replicas,
+**either node blinking takes the whole cluster read-only**, and a commit that
+lands in that window dies. The ingest does not retry across it. **16
+no-progress RPC cancels in one hour**, and critically they happen in **both
+directions** — es-1 stalling on fi-1 (`put_metadata_commit`,
+`accept_metadata_commit`) and fi-1 stalling on es-1 (`accept_metadata_commit`,
+`get_metadata_heads`).
+
+**Ruled out by measurement on 2026-09-20 — do not re-measure these:**
+
+- **Not fi-1 load.** fi-1 is idle: load 1.11, 97.6% idle, 15 GB of 16 GB free,
+  zero WARN or ERROR in its own journal.
+- **Not link quality.** 60 pings es-1 → fi-1: **0% loss**, RTT
+  123/137/202 ms min/avg/max.
+- **Not bandwidth.** Measured **13.8 MB/s** es-1 → fi-1. A 21 MB namespace
+  commit (the P-1 whole-library record) should cross in **~1.5 s** against a
+  30 s deadline. The bandwidth hypothesis was tested and is wrong.
+- **Not a mis-resolved edge node.** `GET /api/v1/status` shows fi-1 correctly
+  as `inbound_capable=false`, `hosts_extents=false`, `dialable=false`. es-1 is
+  not wrongly dialling it. That hypothesis was tested and is wrong too.
+
+**What is still unexplained, and where to look next.** Both ends healthy, link
+clean, 1.5 s of work taking 30 s and being cancelled. Socket state on es-1 at
+the time:
+
+- a **`SYN-SENT` to `78.149.248.154:7437`** — the offline third node, dialled
+  by bootstrap every ~8 s forever (`bootstrap: connect: No route to host` /
+  `Connection timed out`). Harmless in itself but it is a permanent retry loop
+  against a node that left the cluster;
+- a **`FIN-WAIT-1` to `10.35.1.50:7437` with unacknowledged data**, which is
+  fi-1's overlay address. A half-closed socket carrying an unacked byte will
+  not trip TCP keepalive (60 s idle, 15 s × 4) because it is not idle — it
+  retransmits with exponential backoff instead. That is the shape of a
+  30-second no-progress stall on a healthy link, and it is the first thing to
+  chase.
+- fi-1's *healthy* CONTROL and DATA lanes appear as two `ESTAB` from its CGNAT
+  public address `37.136.124.32`, which is expected for an inbound-incapable
+  node that dials out.
+
+- [ ] Establish whether the stalling RPCs are being written into a half-dead
+  socket, and why neither end tears it down inside the RPC deadline.
+- [ ] **Do not treat a 30 s no-progress cancel as the bug.** That is
+  discipline 2 working: the deadline fires instead of waiting forever. The bug
+  is whatever makes 1.5 s of work take longer than 30 s.
+- [ ] Make an ingest survive a transient read-only window. A ten-second blip
+  permanently failing a 6 GB job is the user-visible defect regardless of what
+  causes the blip, and it is separable from the transport question.
+- [ ] Stop the forever-dial loop at the offline node, or make it back off.
+
+## P0 — The node starves its own control plane with loader I/O (opened 2026-09-19, IN PROGRESS)
+
+**Doing this now, ahead of everything below including P-1.** Finding:
+[loader I/O starves control](2026-09-19-loader-io-starves-control-incident.md).
+Plan: [apply the governing laws to disk I/O](2026-09-19-governing-laws-on-disk-io-plan.md).
+
+One ordinary ingest on es-1 (0.46.2) took the node to load 11.18 and **91%
+iowait, 0% idle**, with single 4 MiB extent writes taking **17.7 s**. Attributed
+per process: **macha 34 MB/s write + 9 MB/s read**; qbittorrent-nox 3 MB/s read
+and no writes; Plex idle. The node did this to itself.
+
+haproxy recorded **12 `CD--` client aborts clustered at 7.89–8.01 s** across
+`catalogue/status`, `catalogue/artwork`, `catalogue/items`, a playback segment
+and a session `PATCH`. Requests that are normally sub-millisecond took eight
+seconds and the client gave up.
+
+**Re-aimed 2026-09-20 by measurement.** Three harness runs on es-1 (idle
+control plus two 8 GB FUSE ingests) settle which law is broken and where:
+
+| vantage | lane | disk | p99 under load |
+|---|---|---|---|
+| `/api/v1/health` on-box | control | none | **1.2–1.6 ms** |
+| `/api/v1/health` at haproxy | control | none | **1.0–2.0 ms** |
+| a `web.root` asset on-box | **data** | **NVMe** | **3.3 ms** |
+| `/api/v1/manage/unmatched` | data | **sdb1** | **7,808 ms, aborted** |
+
+The web asset is decisive: same lane, same workers, same moment, different
+disk — 3.3 ms against 7.8 s. So this is **not** worker starvation, **not** lane
+contention and **not** the reactor (0.43.0 closed those; zero `reactor stall`
+lines in five days). It is contention for one physical device between loader
+writes and interactive reads, arbitrated by nothing.
+
+**Law 3 is not violated** — control touches no disk. **Law 1 is**, on the DATA
+backend. Stage 1 is re-aimed accordingly.
+
+Six of the twelve aborts are disk-bound and belong here (artwork ×5, one
+playback segment). **`catalogue/items` does not** — it is the in-memory
+whole-catalogue copy, i.e. the next P0 down. **`catalogue/status` ×3 does not
+either**, and the first reading of it here was wrong: see the bullet below.
+
+Law 3 is enforced in memory (`control_memory_reserve_bytes`), in HTTP threads
+(the control lane) and in RPC (the fast-control allow-list). It is enforced
+nowhere on the disk, which sits underneath all three:
+
+- `maintenance.max_bandwidth` and the bandwidth fractions bound **maintenance
+  only** — repair, rebalance, GC, scrub. Ingest and FUSE publication are
+  bandwidth-unbounded by design.
+- `background_concurrency` bounds concurrent *operations* (`max(1, nproc/2)`,
+  two here). Two are enough to saturate the disk.
+- `data_inflight_bytes` bounds bytes in flight, not service time.
+- **Nothing measures disk service time.** `grep -niE
+  'service_time|io_latency|write_latency|disk_ms' src/` returns nothing.
+
+`DataResourceArbiter` says *"CONTROL does not enter this object"*
+(`src/data_work.hpp:95`). That protects control when the pool is the contended
+resource, and the disk is contended, shared and modelled nowhere — so control
+is not protected by exclusion, only invisible. Note a
+`data_control_reserve_bytes` is **the wrong fix** and must not be built:
+control never takes a lease.
+
+es-1 sets none of the relevant knobs, but **no available setting would have
+prevented this**, which is what makes it structural.
+
+- [ ] **Blocked: four reproduction attempts all failed to saturate the node,
+  and the reason is now understood.** Measured iowait fell run over run (52.8%,
+  38.1%, 21.0%, 5.4% mean) and no run exceeded load 3.8 against the incident's
+  11.18; extent writes peaked at 1.3 s against the incident's 17.7 s. **The
+  synthetic load is the wrong shape.** A real ingest reads `/mnt/diskA`
+  (`sda`) while writing `/mnt/diskB` (`sdb`), two 9.1 TB disks that on a Pi
+  very likely share one controller; my `openssl`-to-FUSE stream read from
+  memory and only wrote. **Treat the four PASS results as void** — they
+  measure a load the system was never struggling with. A faithful reproduction
+  needs a real ingest of content not already in the namespace, and nothing on
+  `diskA` qualifies (Greys Anatomy S01-S18 and From S01-S03 are all already
+  ingested, so they would dedupe). The three staged torrents are 51%, 24.6%
+  and 0% complete.
+- [x] Harness built (`run-io-pressure.py`): three vantages, `CD--` counting,
+  node vitals on one clock. It falsified two of its own designs before it was
+  trustworthy (fork-per-sample measured the TLS handshake; an absolute
+  threshold on a WAN vantage failed an idle node) and then falsified stage 1's
+  premise. Idle baseline and two loaded baselines recorded.
+- [ ] Stage 1 (law 1): `DiskServiceMonitor`, the missing primitive; pressure
+  gates **loader/speculative admission on the backend under pressure**, never
+  interactive reads. Acceptance needs a probe account with `media_viewer` —
+  `anonymous` holds no roles, so every DATA-backed route is a 403 and the
+  NVMe probe cannot stand in for one. **Account now exists** (`servertest`,
+  all five roles, created by the operator 2026-09-20) and the harness takes
+  `--probe-user`/`--probe-pass`. It also now mints its own direct-play session
+  via `--media-path` and issues 1 MiB ranged reads at random offsets, which is
+  the only probe that reaches the contended disk: artwork (~40 MB total) and
+  web assets live in page cache permanently and measured 0.8 ms under load,
+  proving nothing. Idle floor with the real probe: health 0.4 ms,
+  `catalogue/status` 13.6 ms p99, **viewer read 129.6 ms p99**.
+- [ ] Stage 2 (law 1): viewer *latency* as well as viewer *bytes*.
+  `data_viewer_reserve_bytes` reserves bytes at admission; a viewer holding
+  byte credit still queued behind a 17 s write.
+- [ ] **`/api/v1/catalogue/status` walks every artwork id per call** (~418
+  here, tens of thousands at target scale) on a route polled every 10 s,
+  building a `std::set<ObjectId>` and taking a per-object mutex plus the
+  shared `LocalStore::m_` for each. **Corrected 2026-09-20: this is not disk
+  I/O.** `LocalStore::has()` answers from in-memory sets for a present object
+  and only `stat()`s on a miss. The cost is allocation and contention on the
+  very mutex a running ingest holds continuously — which explains the three
+  longest aborts better than disk did. Own defect, own fix: cache the count on
+  artwork publication/GC, or move the walk to diagnostics.
+- [ ] Stage 3 (law 2): hard background floor so pacing can never wedge an
+  ingest; pacing must not consume publication retry budgets.
+- [ ] Stage 4: service time and paced-admission counters in
+  `diagnostics.data_resources`, transition-only logging, docs.
+
+Separate, do not conflate: `put_metadata_commit` to fi-1 takes 5.3–28.4 s and
+times out at 30–35 s (24 no-progress cancels in 6 h; metadata read-only
+02:50:12–02:53:01). Each commit ships the whole serialised namespace (P-1) off
+the same saturated disk — **whether fi-1 is slow or es-1 is too busy to send is
+not yet established.**
+
+Also found: **the server logs nothing for a 401/403/400 refusal.** An auth
+failure is invisible on-box; haproxy's access log is the only record. And a
+`CD--` line carries a substituted `400`, so a 4xx there is a client timeout,
+not a rejection — read the termination-state field first.
 
 ## P-1 — The namespace does not meet its own scale target (opened 2026-09-17)
 
@@ -206,198 +408,6 @@ interlock is the most dangerous single piece of the work.
 - [ ] Stage E: the migration and its interlock.
 - [ ] Stage F: the dependent O(N) items now listed under P1 scaling cliffs.
 
-## P1 — A telemetry set cannot carry an optional field safely (opened 2026-09-18)
-
-`encode_telemetry_set` writes a magic, a count, and then the records
-back-to-back with **no per-record length**. `decode` reads its optional
-trailing fields by asking `reader.remaining()`, which in a multi-record set is
-non-zero because the *next record* follows. So a decoder that knows about a
-field the sender did not write consumes the next record's bytes as that field,
-and the whole set fails to decode.
-
-Gossip sends up to 64 records per set (`src/cluster.cpp:1146`), so this fires
-during any rolling upgrade that adds a telemetry field, in both directions,
-until every node matches. It has been true of every telemetry field added so
-far -- `phase`, `api_endpoint`, `cpu_cores`, `memory_total_bytes` -- and the
-comments on those fields claim a rolling-upgrade safety the format does not
-provide for sets. It is only genuinely safe for a single-record set.
-
-Found on 2026-09-18 by adding the playback budgets in 0.46.2, which produced
-`persisted telemetry ignored: blob too large` on each node's first start (the
-persisted cache is the reliably multi-record case). That is self-healing -- the
-cache is rewritten in the new format -- and both nodes were upgraded together
-to close the wire window, so nothing is currently degraded.
-
-**The worry is not the dropped set, it is the set that does not drop.** A
-misparse usually throws, because a length prefix read from the wrong offset is
-absurd. It is not guaranteed to: a record could decode into plausible-looking
-garbage and be believed. Nobody has looked for that case.
-
-- [ ] Length-delimit each record inside a telemetry set, so a record's optional
-  fields are bounded by the record rather than by the payload.
-- [ ] Decide the compatibility story for the format change itself, which has
-  the same one-upgrade cost it is fixing. A version byte in the set header is
-  the obvious shape.
-- [ ] Until then, treat "add a telemetry field" as requiring both nodes to be
-  upgraded together, and say so wherever that pattern is documented.
-
-## P1 — A generation can be reclaimed between its playlist and its first fragment (opened 2026-09-18)
-
-**A robustness question raised by a live observation whose own cause turned out
-to be elsewhere.** On the night of the 0.46.0 deploy a client fetched the media
-playlist at 01:00:50 (node local), requested nothing at all for the next 60 s,
-and the node reclaimed the pipeline at 01:01:50 with `idle_ms=60000`. The first
-fragment requests arrived at 01:02:43 -- 53 s after the pipeline was gone -- and
-failed until the client gave up and created a fresh session at 01:03:32.
-
-**Do not read that 113 s gap as a real client being slow.** The client session
-identified its own likely cause the same night: the run was in a programmatically
-created Chrome tab that was never brought to the foreground, and a backgrounded
-tab's timers are throttled to roughly once a minute, which is what hls.js taking
-113 s to issue its first fragment request looks like. readyState 0, nothing
-buffered and no error is that client's documented tab-visibility signature. Not
-proven -- the tab was gone before `document.hidden` could be read -- but it is a
-previously observed property of the test rig and it has to be eliminated first.
-The next run will be in a confirmed-visible tab with `document.hidden` recorded.
-
-Two client-side alternatives were proposed and both are ruled out, so they are
-not re-proposed here: the past-the-frontier stall (the node never refused a
-fragment -- no `segment_not_ready` line exists in the window, at DEBUG, with
-DEBUG on), and a seek-on-`canplay` wait in the client's handover path (that
-transition was direct play to remux, and the handover requires both sides to be
-managed HLS, so it was never eligible and the client's log shows the teardown
-path instead).
-
-The question below survives that regardless, and both sessions agree it does: a
-client on a weak link could take that long between manifest and first fragment
-for honest reasons, and what the node does then is worth knowing.
-
-**What is established.** No `playback stream refused` line exists anywhere in
-the window, at DEBUG, with DEBUG on: the node never held or refused a fragment,
-so this was not a past-the-frontier stall. The playlist itself was correct and
-complete -- `MediaSegmentStore::playlist()` writes one EXTINF per planned
-duration plus `ENDLIST`, all 482 of them. The seek fields were right
-(`984818 + 3182 == 988000`). The node restarted clean immediately before this
-and logged no WARN or ERROR.
-
-**What is not established, and it decides ownership.** Whether a fragment
-request arriving after idle reclamation revives the pipeline or simply fails.
-If it revives, that run's 01:02:43 requests should have succeeded and something
-else broke them. **If it does not, then any client that takes more than 60 s
-between its manifest and its first fragment loses its generation with no way
-back** -- and a client that is slow to start is not doing anything illegal, even
-if the client that exposed this was slow for a reason no viewer will ever hit. Read the reclamation path in `src/playback.cpp` (the log line is at
-`playback pipeline reclaimed after stream inactivity`) against the segment route
-before touching either.
-
-Also unexplained, and on the client's side of the boundary: its media element
-sat at `currentTime` 988.00 -- the absolute title position, not the 3.182 s
-offset into the generation -- with `readyState` 0 throughout. That alone does
-not explain the silence, because a client trying to load at local 988 s would
-have asked for a fragment immediately and the node would have logged the
-refusal.
-
-- [ ] Determine whether a segment request revives a reclaimed pipeline. That is
-  the fork; do not change a timeout before answering it.
-- [ ] Have the client report the gap between `hls-manifest-parsed` and the first
-  `hls-fragment-loading` **from a confirmed-visible tab**. Over 60 s there makes
-  it a real client shape rather than a throttled harness.
-
-## P1 — The seek fast path: taken for transcode, still unobserved for remux
-
-Found by the seek work completed in 0.46.0, not fixed by it. Across a whole day
-on es-1 there were **zero** `seek fast-path` lines: every seek pays a full
-probe/VOD-planning pass while the viewer waits. The client's seek `PATCH` sends
-preferences that compare equal to the stored record — `subtitle_language` is a
-plain `std::string` defaulting to `""`, so the client's `""` matches, and
-`optional_int` maps a null `subtitle_stream` to `nullopt`, which is what a
-subtitles-off session already holds — so `seek_only` should be true.
-
-The remaining branch is `reseek_hls_vod` declining. For remux it re-runs
-`indexed_plan` over the keyframes from the new position, and that rejects a plan
-whose longest fragment or tail exceeds 90 s. Those bounds are whole-file: a
-sparser GOP anywhere else in a long title rejects a seek point that would play
-perfectly well. The transcode branch of that same function already carries a
-comment warning the check "can spuriously reject an otherwise perfectly usable
-seek point if any other part of a long file has a sparser GOP"
-(`src/media_engine_common.cpp`) — that warning describes the remux branch's
-behaviour and was never applied to it.
-
-Not asserted as the cause: it is the branch that remains, not a proof. 0.46.0
-added the diagnostic that settles it — `reuse_seek_session` and
-`reseek_hls_vod` now name the failing precondition (`plan-not-reusable`,
-`source-duration-unknown`, `segment-length-unknown`, `keyframe-density-bounds`,
-`no-prepared-vod-plan`, `direct-mode`), and a non-seek-only PATCH logs
-`seek fast-path skipped` with `preferences-changed` or `media-override`. Read
-those off a node before changing a bound.
-
-Measured cost while it is broken: 147 `session-update` calls in 34.7 s, 34.68 s
-of cumulative server time, ~4.2/s on a node also serving viewers, none of them
-individually slow (235.9 ms mean, 1,407.3 ms for the first).
-
-**Superseded by measurement, 2026-09-18 afternoon. The premise of this item was
-wrong and the heading has been corrected.** Eight hours of es-1 journal on
-0.46.0:
-
-- **11 `seek fast-path` successes.** It is taken, routinely. The "zero across a
-  whole day" observation that opened this item does not hold today.
-- **2 `fast-path skipped`, both `reason=preferences-changed`.**
-- **Zero `keyframe-density-bounds` declines.** The reason I predicted would fire
-  has never fired once.
-
-Every success carried `seek_offset_ms=0`, i.e. they were transcode sessions;
-`indexed_plan`'s whole-file bounds live on the remux branch and no remux seek
-went through `reseek_hls_vod` in the window at all. So the remux half is still
-**unobserved rather than answered** — but "probably our bounds" had no evidence
-behind it and now has one piece against it. Do not change a bound on it.
-
-The likeliest explanation for the change is the traffic mix (today's sessions
-were transcode), not the 0.46.0 code: the transcode branch of `reseek_hls_vod`
-never consulted `indexed_plan` before the change either. Stated as the likelier
-of two, not as established.
-
-**And the cost this item was chasing is not here.** A 13,433 ms `session-update`
-reported by the client as a ~13 s viewer freeze, and attributed by them to a
-full re-plan materialising Cues, was none of that:
-
-```
-16:22:38  seek fast-path requested_ms=1500000 seek_ms=1500000 seek_offset_ms=0
-16:22:38  pipeline start mode=transcode
-16:22:38  pipeline seek timing stream_info_ms=2 container_seek_ms=39
-16:22:50  first fragment ready elapsed_ms=11672
-```
-
-The fast path was taken, the container seek cost 39 ms, and 11.7 s went into
-encoding the first fragment of a 4K HEVC-to-H.264 software transcode on a Pi.
-Seek latency on transcode is encoder throughput, not planning. Any further work
-on the fast path should be justified on its own terms, not on that freeze.
-
-**First live sample, es-1, 2026-09-18 right after the 0.46.0 restart — and it
-does not say what the hypothesis above predicts.** The line read
-`seek fast-path skipped ... requested_ms=988000 reason=preferences-changed`:
-the fast path was not declined by `reseek_hls_vod` at all, it was never
-attempted, because `prefs == old->preferences` was false. **Inconclusive, not a
-refutation**: that particular session was created `mode=direct` and the PATCH
-carried a seek *and* a move to `mode=remux`, so the preferences genuinely had
-changed and the log is correct. What it does establish is that
-`preferences-changed` is reachable on the live path, so the whole-file bounds
-are no longer the only remaining branch. A pure seek PATCH — same preferences,
-new position — is the sample that settles it, and core has now located its own
-casing boundary (`MachaPlaybackResolver.update()` logs the camelCase object one
-statement *above* `wirePreferences`, so the earlier empty-string evidence was
-never the wire) and confirms the real body is
-`{"preferences":{"subtitle_stream":null,"subtitle_language":""},"seek_ms":...}`,
-which compares equal here. So both branches remain open and both are now
-instrumented.
-
-- [ ] Capture a **pure** seek PATCH on es-1 or fi-1 and read its reason: either
-  `preferences-changed` again (then the comparison is wrong and core's body is
-  not what arrives) or `keyframe-density-bounds` (then the whole-file bounds
-  are the cause).
-- [ ] Decide the re-seek bound on that evidence. Changing `indexed_plan`'s 90 s
-  fragment and tail bounds is a separate decision with its own evidence and it
-  must not be made by guessing from here.
-
 ## P0 — The catalogue materialises everything it has (opened 2026-09-17)
 
 The same failure as P-1 in a smaller organ, and — the important difference —
@@ -475,41 +485,6 @@ retention question -- the drain test uses unretained objects, so whether a
 draining node's retention claims release without special treatment is still
 unproven; exercise a FUSE publication from a node that then stops hosting.
 
-## P0 — The HTTP server without a thread per connection (opened 2026-09-15, shipped 0.43.0, cluster UAT open)
-
-The API is served by sixteen worker threads, and a worker is spent on every
-kind of waiting the server does: a kept-alive connection idling for up to
-15 s, a held segment request waiting on the encoder, a slow viewer draining
-a multi-megabyte segment over the WAN, a direct-play read fetching from a
-remote replica. Only running a handler is work. When the pool is gone the
-node stops answering health and status, which is a governing-law-3
-violation, and `streaming.max_concurrent_holds` is 8 purely to ration that
-pool. Plan:
-[the HTTP server without a thread per connection](2026-09-15-http-server-reactor-plan.md).
-
-The shape: one reactor thread owns every socket and never waits (a
-`poll()` loop, non-blocking sends, a two-chunk staging window per
-connection, backpressure from the client's TCP window outward); a bounded
-compute pool in two lanes -- control for health/status/session/users, data
-for everything else -- runs the unchanged handler contract and every body
-read; and the two routes that wait on the media pipeline (segment holds,
-profile publication) return a deferred result and are woken by the segment
-store instead of parking a thread. The rule that makes one thread safe --
-the reactor may not call anything that sleeps -- is structural (the
-reactor's connection state cannot name a body source, handler or
-`ReadHandle`), closed by rule for mutexes and logging, and checked at
-runtime by a stall counter in diagnostics.
-
-**Both stages shipped in 0.43.0 (2026-09-15); laptop suite green (457 +
-10).** What is left is the cluster: deploy, then watch
-`diagnostics.http.reactor_stalls` stay at zero over a day of viewing, see
-`connections_idle_keep_alive` with all three client families connected, and
-retire the 10 s Status item below if it never recurs (if it does, health
-must not be slow with it). The "what shipped" section of the plan lists
-where the implementation departed from the text. Not in scope: `sendfile`,
-reactor sharding, HTTP/2, in-process TLS, and the RPC transport, which is
-also thread-per-connection and could use the same design later.
-
 ## P0 — The test suite must be deterministic (opened 2026-09-14)
 
 **"Known flake" is not a category. It is the name we have been giving the
@@ -539,8 +514,11 @@ into this and should be deleted, not re-worded, when its cases are classified.
 
 ## P0 — Cluster: two nodes, and what removing the third left behind
 
-The cluster is **two nodes** as of the evening of 2026-09-13: gbni-1 (macnessa)
-and es-1 (ramaroja), both on 0.40.1. gbni-2 (inverbeg) was removed by the
+The cluster is **two live nodes** as of 2026-09-20: es-1 (ramaroja) and fi-1,
+both on 0.46.2. gbni-1 (macnessa) has been unreachable from the laptop, es-1
+and fi-1 since the 0.43.1 deploy on 2026-09-17 and is still on 0.43.0; it is
+not in either live node's peer list. (As of 2026-09-13 the pair was gbni-1 and
+es-1 on 0.40.1.) gbni-2 (inverbeg) was removed by the
 operator after its sshd stopped accepting key authentication and it could not
 be deployed to. The 2026-09-13 storage incident that opened the previous
 version of this file is resolved and ledgered in `COMPLETED.md`.
@@ -564,7 +542,9 @@ version of this file is resolved and ledgered in `COMPLETED.md`.
   what *it* cannot source, which is the first half of an answer; the other half
   is the cluster-wide join nobody has built (see P2 diagnostics). Stored bytes
   at removal: gbni-1 737 GB, es-1 1.82 TB.
-- [ ] **es-1 has no persistent journal, so reboots cannot be diagnosed.** It
+- [x] **es-1 has no persistent journal — NO LONGER TRUE, verified 2026-09-20:**
+  `/var/log/journal` exists and `journalctl --list-boots` shows two boots, so
+  the next reboot is diagnosable. (Originally: so reboots cannot be diagnosed.) It
   rebooted at ~2026-09-13 12:41 (the outage this file opened with) and
   `journalctl -b -1` answers "no persistent journal was found". The cause is
   therefore unknowable after the fact, and will be again next time.
@@ -891,9 +871,15 @@ not inferred from docs. All are small and isolated; none require design work.
     directory tree, known contents, compare `stat`/`readdir` output across
     all three nodes, then delete it) before guessing further.
 
-- [ ] **A hard failure in one subsystem takes down the entire macha process
-  (new, found 2026-09-05 live incident) — foundation shipped in 0.25.0,
-  FUSE/Torrent migration still open.** `FuseFrontend`'s durable-journal
+- [x] **A hard failure in one subsystem takes down the entire macha process
+  — CLOSED by 0.41.0 ("FUSE cannot take the node down any more"), ticked
+  2026-09-20.** The FUSE mount is a supervised subsystem in
+  `libmacha-fuse`; a lost mount is a `faulted` subsystem that remounts, not
+  a process exit; `SIGHUP` reload works on a mounted node. Kept unticked
+  for five days after shipping, which is the checkbox-maintenance failure
+  this rationalisation exists to correct. Historical record follows.
+  (Originally: found 2026-09-05 live incident — foundation shipped in
+  0.25.0, FUSE/Torrent migration still open.) `FuseFrontend`'s durable-journal
   replay throws `DecodeError` on any unexpected record, uncaught, which
   crashes the whole node — including its unrelated metadata/RPC/API roles —
   not just the local FUSE mount. Lived this directly: a 0.24.3 bug in
@@ -929,9 +915,12 @@ not inferred from docs. All are small and isolated; none require design work.
   cancellation, and runs from the `FuseFrontend` constructor before
   `fuse_mount`. A node whose metadata replica never becomes available hangs
   indefinitely with only a debug log line to show for it.
-- [ ] **`rpc_cluster/test_concurrent_reads_during_divergence_produce_one_reconciliation`
-  fails 40% of the time on aarch64, reproducibly, in isolation — found
-  2026-09-13. This is the flake worth fixing first, because unlike the three
+- [x] **`rpc_cluster/test_concurrent_reads_during_divergence_produce_one_reconciliation`
+  — FIXED 2026-09-15 (0.43.0), a test defect: two Services' maintenance
+  loops reconciled the divergence the test had just created. Verdict in the
+  deterministic-suite plan, step 3. Ticked 2026-09-20; the body below is the
+  diagnosis as it stood.** Originally: fails 40% of the time on aarch64,
+  reproducibly, in isolation — found 2026-09-13. This is the flake worth fixing first, because unlike the three
   below it does not need load to reproduce.** Measured on both Pis at
   `--serial` with nothing else running: **4 failures in 10 runs on gbni-1, and
   4 in 10 on es-1**. It has never failed on macOS/clang locally across many
@@ -951,9 +940,13 @@ not inferred from docs. All are small and isolated; none require design work.
   is that a head is genuinely being dropped, which would be a real bug.
   Deciding which needs someone to instrument `accepted_heads()` over the gap;
   both answers are useful, and a 40% reproduction rate makes it cheap.
-- [ ] **`hydration_catalogue/test_ingest_pause_resume_and_cancel_still_work_under_a_worker_pool`
-  fails 40-80% of the time IN ISOLATION on both Pis — characterised 2026-09-13
-  during the 0.40.0 rollout. "Passes in isolation" is false, and has been the
+- [x] **`hydration_catalogue/test_ingest_pause_resume_and_cancel_still_work_under_a_worker_pool`
+  — FIXED 2026-09-15 (0.43.0), a product defect: two concurrent imports both
+  created the shared scanner root and the loser's `EEXIST` failed its job.
+  Ticked 2026-09-20; the body below is the characterisation as it stood, and
+  its `exists` hypothesis was right.** Originally: fails 40-80% of the time
+  IN ISOLATION on both Pis — characterised 2026-09-13 during the 0.40.0
+  rollout. "Passes in isolation" is false, and has been the
   accepted verdict five times.** This is the measurement the item below asked
   for instead of a sixth sighting, so act on it rather than re-observing it.
   Measured with `--serial --filter`, nothing running but the live node:
@@ -1041,8 +1034,14 @@ home network and an offsite node, this is not a hypothetical exposure.
   still not best practice — a page that somehow obtained a token (e.g. one
   leaked to a compromised client) could use it cross-origin undetected. Stop
   sending a wildcard origin on any endpoint that doesn't strictly need it.
-- [ ] **The whole HTTP API is reachable from the public internet, and
-  anonymous can read the library.** All three nodes moved to public
+- [ ] **The whole HTTP API is reachable from the public internet — and
+  anonymous can NO LONGER read the library (headline corrected 2026-09-20;
+  it had said the opposite for a week after the body recorded the change).**
+  Verified 2026-09-19 on es-1: `anonymous` holds `roles=` empty, and
+  `/api/v1/status` refuses it in 0.4 ms with `requires the 'view_status'
+  role`. What remains open is narrower: whether `session.allow_anonymous`
+  itself stays on, and whether an unauthenticated 7438 should be reachable
+  at all. Original finding follows. All three nodes moved to public
   `https://<name>.macha.network` endpoints on 2026-09-12. Verified from outside
   the network: `POST /api/v1/session` with no credentials returns 201, and that
   token reads `/api/v1/catalogue/items`. This is `session.allow_anonymous: true`
@@ -1065,8 +1064,9 @@ home network and an offsite node, this is not a hypothetical exposure.
   compatible; the role vocabulary is not. No compatibility shim exists.
   Operator's call on 2026-09-12, reaffirmed 2026-09-13: "we'll have to deal
   with that for the time being." Upgrade every node promptly, or write the shim
-  before beta. Note this is currently live rather than hypothetical — gbni-2 is
-  on 0.38.1 and cannot be upgraded.
+  before beta. (gbni-2, the 0.38.1 node this originally cited, was removed on 2026-09-13;
+  no mixed-version node exists today, so this is currently hypothetical —
+  until the next node joins on an older build.)
 - [ ] **The web client holds a bearer token in JS-reachable storage, and only
   the server can fix it.** Anything in `localStorage`/`sessionStorage` is
   XSS-readable. The node already serves the web client, so a `Secure`,
@@ -1253,6 +1253,223 @@ Do not tune aggregate ingest throughput around known amplification. Older FUSE
 throughput, heap-audit and ownership documents remain detailed evidence but are
 absorbed here rather than separate active programmes.
 
+## P1 — OpenAPI description of the HTTP API (operator: wanted soon, 2026-09-13; promoted from P2 2026-09-20)
+
+Promoted because the file's own header called it the largest piece of agreed
+but unstarted work while filing it under documentation hygiene. It is not
+hygiene: two client sessions hold private copies of a wire format because
+nothing publishes one, and the route table already knows which role gates
+each route (`service.cpp:199-216`), so the document can say so instead of
+leaving clients to discover it with a 403 the server does not even log.
+
+- [ ] **Swagger/OpenAPI description of the HTTP API — WANTED, and soon
+  (operator, 2026-09-13, upgrading the 2026-09-07 "optional").** This is now
+  the largest piece of agreed but unstarted work in this file, and it should be
+  generated from the route table at build time rather than written by hand, so
+  that it cannot drift from `service.cpp`. Four client sessions currently learn
+  the API by reading `status_api.cpp`/`service.cpp`, which is how two of them
+  ended up holding private copies of a wire format. Publish an OpenAPI 3
+  document for `/api/v1/*` — session, health, status, catalogue, playback,
+  manage, users, ingest — and serve it from the daemon at
+  `/api/v1/openapi.json`, with a Swagger UI page. **Generate it from the route
+  table at build time**: a hand-written document drifts, and drift here is
+  exactly the failure it exists to prevent. Note the route table is also where
+  the role gating lives (`service.cpp:199-216`), so the document can state
+  which role each route requires rather than leaving clients to discover it
+  with a 403.
+
+## P1 — A telemetry set cannot carry an optional field safely (opened 2026-09-18)
+
+`encode_telemetry_set` writes a magic, a count, and then the records
+back-to-back with **no per-record length**. `decode` reads its optional
+trailing fields by asking `reader.remaining()`, which in a multi-record set is
+non-zero because the *next record* follows. So a decoder that knows about a
+field the sender did not write consumes the next record's bytes as that field,
+and the whole set fails to decode.
+
+Gossip sends up to 64 records per set (`src/cluster.cpp:1146`), so this fires
+during any rolling upgrade that adds a telemetry field, in both directions,
+until every node matches. It has been true of every telemetry field added so
+far -- `phase`, `api_endpoint`, `cpu_cores`, `memory_total_bytes` -- and the
+comments on those fields claim a rolling-upgrade safety the format does not
+provide for sets. It is only genuinely safe for a single-record set.
+
+Found on 2026-09-18 by adding the playback budgets in 0.46.2, which produced
+`persisted telemetry ignored: blob too large` on each node's first start (the
+persisted cache is the reliably multi-record case). That is self-healing -- the
+cache is rewritten in the new format -- and both nodes were upgraded together
+to close the wire window, so nothing is currently degraded.
+
+**The worry is not the dropped set, it is the set that does not drop.** A
+misparse usually throws, because a length prefix read from the wrong offset is
+absurd. It is not guaranteed to: a record could decode into plausible-looking
+garbage and be believed. Nobody has looked for that case.
+
+- [ ] Length-delimit each record inside a telemetry set, so a record's optional
+  fields are bounded by the record rather than by the payload.
+- [ ] Decide the compatibility story for the format change itself, which has
+  the same one-upgrade cost it is fixing. A version byte in the set header is
+  the obvious shape.
+- [ ] Until then, treat "add a telemetry field" as requiring both nodes to be
+  upgraded together, and say so wherever that pattern is documented.
+
+## P1 — A generation can be reclaimed between its playlist and its first fragment (opened 2026-09-18)
+
+**A robustness question raised by a live observation whose own cause turned out
+to be elsewhere.** On the night of the 0.46.0 deploy a client fetched the media
+playlist at 01:00:50 (node local), requested nothing at all for the next 60 s,
+and the node reclaimed the pipeline at 01:01:50 with `idle_ms=60000`. The first
+fragment requests arrived at 01:02:43 -- 53 s after the pipeline was gone -- and
+failed until the client gave up and created a fresh session at 01:03:32.
+
+**Do not read that 113 s gap as a real client being slow.** The client session
+identified its own likely cause the same night: the run was in a programmatically
+created Chrome tab that was never brought to the foreground, and a backgrounded
+tab's timers are throttled to roughly once a minute, which is what hls.js taking
+113 s to issue its first fragment request looks like. readyState 0, nothing
+buffered and no error is that client's documented tab-visibility signature. Not
+proven -- the tab was gone before `document.hidden` could be read -- but it is a
+previously observed property of the test rig and it has to be eliminated first.
+The next run will be in a confirmed-visible tab with `document.hidden` recorded.
+
+Two client-side alternatives were proposed and both are ruled out, so they are
+not re-proposed here: the past-the-frontier stall (the node never refused a
+fragment -- no `segment_not_ready` line exists in the window, at DEBUG, with
+DEBUG on), and a seek-on-`canplay` wait in the client's handover path (that
+transition was direct play to remux, and the handover requires both sides to be
+managed HLS, so it was never eligible and the client's log shows the teardown
+path instead).
+
+The question below survives that regardless, and both sessions agree it does: a
+client on a weak link could take that long between manifest and first fragment
+for honest reasons, and what the node does then is worth knowing.
+
+**What is established.** No `playback stream refused` line exists anywhere in
+the window, at DEBUG, with DEBUG on: the node never held or refused a fragment,
+so this was not a past-the-frontier stall. The playlist itself was correct and
+complete -- `MediaSegmentStore::playlist()` writes one EXTINF per planned
+duration plus `ENDLIST`, all 482 of them. The seek fields were right
+(`984818 + 3182 == 988000`). The node restarted clean immediately before this
+and logged no WARN or ERROR.
+
+**What is not established, and it decides ownership.** Whether a fragment
+request arriving after idle reclamation revives the pipeline or simply fails.
+If it revives, that run's 01:02:43 requests should have succeeded and something
+else broke them. **If it does not, then any client that takes more than 60 s
+between its manifest and its first fragment loses its generation with no way
+back** -- and a client that is slow to start is not doing anything illegal, even
+if the client that exposed this was slow for a reason no viewer will ever hit. Read the reclamation path in `src/playback.cpp` (the log line is at
+`playback pipeline reclaimed after stream inactivity`) against the segment route
+before touching either.
+
+Also unexplained, and on the client's side of the boundary: its media element
+sat at `currentTime` 988.00 -- the absolute title position, not the 3.182 s
+offset into the generation -- with `readyState` 0 throughout. That alone does
+not explain the silence, because a client trying to load at local 988 s would
+have asked for a fragment immediately and the node would have logged the
+refusal.
+
+- [ ] Determine whether a segment request revives a reclaimed pipeline. That is
+  the fork; do not change a timeout before answering it.
+- [ ] Have the client report the gap between `hls-manifest-parsed` and the first
+  `hls-fragment-loading` **from a confirmed-visible tab**. Over 60 s there makes
+  it a real client shape rather than a throttled harness.
+
+## P1 — The seek fast path: taken for transcode, still unobserved for remux
+
+Found by the seek work completed in 0.46.0, not fixed by it. Across a whole day
+on es-1 there were **zero** `seek fast-path` lines: every seek pays a full
+probe/VOD-planning pass while the viewer waits. The client's seek `PATCH` sends
+preferences that compare equal to the stored record — `subtitle_language` is a
+plain `std::string` defaulting to `""`, so the client's `""` matches, and
+`optional_int` maps a null `subtitle_stream` to `nullopt`, which is what a
+subtitles-off session already holds — so `seek_only` should be true.
+
+The remaining branch is `reseek_hls_vod` declining. For remux it re-runs
+`indexed_plan` over the keyframes from the new position, and that rejects a plan
+whose longest fragment or tail exceeds 90 s. Those bounds are whole-file: a
+sparser GOP anywhere else in a long title rejects a seek point that would play
+perfectly well. The transcode branch of that same function already carries a
+comment warning the check "can spuriously reject an otherwise perfectly usable
+seek point if any other part of a long file has a sparser GOP"
+(`src/media_engine_common.cpp`) — that warning describes the remux branch's
+behaviour and was never applied to it.
+
+Not asserted as the cause: it is the branch that remains, not a proof. 0.46.0
+added the diagnostic that settles it — `reuse_seek_session` and
+`reseek_hls_vod` now name the failing precondition (`plan-not-reusable`,
+`source-duration-unknown`, `segment-length-unknown`, `keyframe-density-bounds`,
+`no-prepared-vod-plan`, `direct-mode`), and a non-seek-only PATCH logs
+`seek fast-path skipped` with `preferences-changed` or `media-override`. Read
+those off a node before changing a bound.
+
+Measured cost while it is broken: 147 `session-update` calls in 34.7 s, 34.68 s
+of cumulative server time, ~4.2/s on a node also serving viewers, none of them
+individually slow (235.9 ms mean, 1,407.3 ms for the first).
+
+**Superseded by measurement, 2026-09-18 afternoon. The premise of this item was
+wrong and the heading has been corrected.** Eight hours of es-1 journal on
+0.46.0:
+
+- **11 `seek fast-path` successes.** It is taken, routinely. The "zero across a
+  whole day" observation that opened this item does not hold today.
+- **2 `fast-path skipped`, both `reason=preferences-changed`.**
+- **Zero `keyframe-density-bounds` declines.** The reason I predicted would fire
+  has never fired once.
+
+Every success carried `seek_offset_ms=0`, i.e. they were transcode sessions;
+`indexed_plan`'s whole-file bounds live on the remux branch and no remux seek
+went through `reseek_hls_vod` in the window at all. So the remux half is still
+**unobserved rather than answered** — but "probably our bounds" had no evidence
+behind it and now has one piece against it. Do not change a bound on it.
+
+The likeliest explanation for the change is the traffic mix (today's sessions
+were transcode), not the 0.46.0 code: the transcode branch of `reseek_hls_vod`
+never consulted `indexed_plan` before the change either. Stated as the likelier
+of two, not as established.
+
+**And the cost this item was chasing is not here.** A 13,433 ms `session-update`
+reported by the client as a ~13 s viewer freeze, and attributed by them to a
+full re-plan materialising Cues, was none of that:
+
+```
+16:22:38  seek fast-path requested_ms=1500000 seek_ms=1500000 seek_offset_ms=0
+16:22:38  pipeline start mode=transcode
+16:22:38  pipeline seek timing stream_info_ms=2 container_seek_ms=39
+16:22:50  first fragment ready elapsed_ms=11672
+```
+
+The fast path was taken, the container seek cost 39 ms, and 11.7 s went into
+encoding the first fragment of a 4K HEVC-to-H.264 software transcode on a Pi.
+Seek latency on transcode is encoder throughput, not planning. Any further work
+on the fast path should be justified on its own terms, not on that freeze.
+
+**First live sample, es-1, 2026-09-18 right after the 0.46.0 restart — and it
+does not say what the hypothesis above predicts.** The line read
+`seek fast-path skipped ... requested_ms=988000 reason=preferences-changed`:
+the fast path was not declined by `reseek_hls_vod` at all, it was never
+attempted, because `prefs == old->preferences` was false. **Inconclusive, not a
+refutation**: that particular session was created `mode=direct` and the PATCH
+carried a seek *and* a move to `mode=remux`, so the preferences genuinely had
+changed and the log is correct. What it does establish is that
+`preferences-changed` is reachable on the live path, so the whole-file bounds
+are no longer the only remaining branch. A pure seek PATCH — same preferences,
+new position — is the sample that settles it, and core has now located its own
+casing boundary (`MachaPlaybackResolver.update()` logs the camelCase object one
+statement *above* `wirePreferences`, so the earlier empty-string evidence was
+never the wire) and confirms the real body is
+`{"preferences":{"subtitle_stream":null,"subtitle_language":""},"seek_ms":...}`,
+which compares equal here. So both branches remain open and both are now
+instrumented.
+
+- [ ] Capture a **pure** seek PATCH on es-1 or fi-1 and read its reason: either
+  `preferences-changed` again (then the comparison is wrong and core's body is
+  not what arrives) or `keyframe-density-bounds` (then the whole-file bounds
+  are the cause).
+- [ ] Decide the re-seek bound on that evidence. Changing `indexed_plan`'s 90 s
+  fragment and tail bounds is a separate decision with its own evidence and it
+  must not be made by guessing from here.
+
 ## P1 — Cluster connectivity, status and operations
 
 - [ ] **Spool usage is not in polled Status (requested 2026-09-14).** The
@@ -1274,8 +1491,14 @@ absorbed here rather than separate active programmes.
   0.41.0, so a node with no mount simply omits it rather than reporting
   zeroes that look like an idle spool.
 
-- [ ] **`GET /api/v1/status` took 10 seconds once — observed by the operator
-  2026-09-13, cause not found, and the obvious suspects are eliminated.**
+- [x] **`GET /api/v1/status` took 10 seconds once — RETIRED 2026-09-20 on the
+  condition this item set itself:** the 0.43.0 reactor removed worker
+  starvation and it has not recurred in five days (zero `reactor stall`
+  lines on es-1 since 2026-09-15). The 2026-09-19 incident produced slow
+  status responses again, but with a *found* cause (loader disk I/O, the P0
+  at the top of this file), not this one. Diagnosis preserved below.
+  (Originally: observed by the operator 2026-09-13, cause not found, and the
+  obvious suspects are eliminated.)
   What was ruled out by reading the code and measuring the live nodes, so that
   nobody spends the time again:
   - **It is not the handler computing.** `status_response` does no I/O and
@@ -1315,9 +1538,12 @@ absorbed here rather than separate active programmes.
   lane), and that plan builds the slow-request log. If it recurs after
   Stage A ships, the cause is inside the handler and deserves gdb stacks.
 
-- [ ] **`test_storage_data_credit_reserves_viewer_headroom_and_control` hangs
-  on aarch64 — pre-existing on HEAD, confirmed not from the 0.36.0 work
-  (2026-09-08).** The case times out at its full 60 s deadline on both
+- [x] **`test_storage_data_credit_reserves_viewer_headroom_and_control` hangs
+  on aarch64 — NO LONGER REPRODUCES: the full suite was green on es-1 at
+  0.45.0 (468 + 10), 0.46.1 (475 + 10) and 0.46.2 (476 + 10), which includes
+  this case. Ticked 2026-09-20; nobody recorded which change fixed it, so if
+  it returns, bisect the 0.36.x-0.45.0 range. (Originally: pre-existing on
+  HEAD, confirmed not from the 0.36.0 work, 2026-09-08.)** The case times out at its full 60 s deadline on both
   gbni-2 and es-1, in the full suite and in `--serial` isolation, on a build
   of current HEAD. It passes in 372/372 on macOS (arm64, AppleClang) and
   passes in 52 ms on gbni-1's older build tree (2026-09-07 04:10), so it is
@@ -1403,7 +1629,8 @@ absorbed here rather than separate active programmes.
   the same underlying gap as playback P0 item 2's Status-latency investigation
   above; resolve together rather than tracking twice.
 - [ ] Add optional display-only `node_name` at `.nodes[].node_name`; configure
-  `Corvus GBNI-1`, `Corvus GBNI-2`, `Corvus ES-1`, and `Corvus MacBook Pro`.
+  `Corvus GBNI-1`, `Corvus ES-1`, `Corvus FI-1` and `Corvus MacBook Pro`.
+  (`Corvus GBNI-2` dropped 2026-09-20: that node left the cluster.)
 - [ ] Complete hard-kill stale-FUSE recovery proof and automatic clean rejoin.
 - [ ] **Torrent session health does not reach the HTTP API.** 0.37.2 fixed the
   bind defect and made libtorrent alerts visible in the journal, but
@@ -1582,22 +1809,6 @@ work needed for any of these.
   release builds since they're reachable via ordinary config.
 ## P2 — Documentation hygiene (found 2026-09-05, backlog-adjacent but not code)
 
-- [ ] **Swagger/OpenAPI description of the HTTP API — WANTED, and soon
-  (operator, 2026-09-13, upgrading the 2026-09-07 "optional").** This is now
-  the largest piece of agreed but unstarted work in this file, and it should be
-  generated from the route table at build time rather than written by hand, so
-  that it cannot drift from `service.cpp`. Four client sessions currently learn
-  the API by reading `status_api.cpp`/`service.cpp`, which is how two of them
-  ended up holding private copies of a wire format. Publish an OpenAPI 3
-  document for `/api/v1/*` — session, health, status, catalogue, playback,
-  manage, users, ingest — and serve it from the daemon at
-  `/api/v1/openapi.json`, with a Swagger UI page. **Generate it from the route
-  table at build time**: a hand-written document drifts, and drift here is
-  exactly the failure it exists to prevent. Note the route table is also where
-  the role gating lives (`service.cpp:199-216`), so the document can state
-  which role each route requires rather than leaving clients to discover it
-  with a 403.
-
 - [ ] `TODO/2026-09-03-playback-resilience-and-av-sync-plan.md` cites
   `TODO/2026-08-31-cluster-any-node-playback-failover.md` as tracking a
   client-side fix — that file does not exist anywhere in the repo. Either
@@ -1610,7 +1821,9 @@ work needed for any of these.
   (0.32.x–0.34.0) and SPA serving (0.35.0) are recorded in `CHANGELOG.md` but
   not in the ledger. Lower value than it looks: `CHANGELOG.md` covers that
   range properly, so this is tidiness, not lost information.
-- [ ] `docs/streaming.md`, `README.md`, `ROADMAP.md` and `VALIDATION.md` each
+- [x] **Done in 0.46.3 (2026-09-19/20).** `docs/streaming.md`, `README.md`
+  and `VALIDATION.md` were rewritten; `ROADMAP.md`'s "stale voters" was missed
+  in that pass and corrected on 2026-09-20. Originally: these four each
   contain claims contradicted by shipped code or by each other (keep-alive
   described as absent when it shipped in 0.23.3, a stale "0.19 metadata
   availability" README headline at 0.23.11, `ROADMAP.md` referring to "stale
@@ -1726,6 +1939,21 @@ cross-session and will not be in the next session's context.
   happens to a fragment request arriving after reclamation** -- see the P1 above;
   until that is answered no client should treat a reclaimed generation as
   recoverable.
+- **`session_unused_idle_ms` means "never served a stream object", not "idle".**
+  Asked by the Android TV session on 2026-09-20 after a paused **direct-play**
+  session survived 4.5 minutes against a 120,000 ms `session_unused_idle_ms`.
+  That is correct and deliberate. A session carries a `stream_served` flag set
+  the first time it serves **any** stream object -- playlist, fragment,
+  subtitle or a Direct Play ranged body -- and never cleared, across seeks and
+  quality changes. Once set, the session gets the full `session_idle_ms`
+  (30 min default); only a session that has *never* fetched media is held to
+  the short clock. Direct play sets it explicitly, with the reason in the code:
+  "a single ranged body can outlive several idle windows without another
+  request, so this must count as having been used." Both clocks measure from
+  the session's last interaction of any kind, so a client still polling or
+  PATCHing is never evicted by either. The short clock exists to stop a session
+  created and abandoned from holding a transcode entitlement, not to reap
+  paused viewers.
 - **A fragment past the look-ahead is refused, not missing.** `500
   segment_not_ready` with `Retry-After: 1` and `Cache-Control: no-store`, logged
   as `reason=hold_timed_out`; never a `404`, because the playlist has already
@@ -1761,14 +1989,20 @@ cross-session and will not be in the next session's context.
   DTS/TrueHD investigation in September was the same mistake at larger scale.
   The node is in the URL; there is no excuse for losing it.
 
-## Cluster and repository state as of 2026-09-13 (end of session)
+## Cluster and repository state as of 2026-09-20
 
 Facts a new session needs before touching anything. None of this is a task.
 
-**Nodes — there are two.** gbni-1 is `10.44.1.50` / `macnessa.macha.network`
-(failure domain `test-lab`), es-1 is `10.34.1.50` / `ramaroja.macha.network`
-(`spain`). Both advertise public `https://` API endpoints. SSH as `root@`, not
-`tom@`. SSH to both is filtered from outside the LAN/VPN.
+**Nodes — two are live.** es-1 is `10.34.1.50` / `ramaroja.macha.network`
+(failure domain `spain`), behind haproxy terminating TLS on 443 with no
+upstream proxy; it also hosts Plex and qbittorrent-nox, which share its disk.
+fi-1 is `root@10.35.1.50`, an edge node behind CGNAT (`inbound_capable`
+false, hosts no extents) that is nonetheless a full metadata replica — so with
+`metadata_min_write_replicas: 2` **either node going down takes metadata
+read-only**. gbni-1 (`10.44.1.50` / `macnessa.macha.network`, `test-lab`) has
+been unreachable since 2026-09-17, is on 0.43.0, and is in neither live node's
+peer list. Never build on it; it browns out under load. SSH as `root@`, not
+`tom@`.
 
 **gbni-2 (inverbeg) was removed from the cluster**, not merely unreachable.
 Verified in both nodes' own `known-nodes.bin`: each lists one known node — the
@@ -1781,17 +2015,16 @@ deployed to and was four releases behind. **See the first P0 item: this is a
 freshness boundary, not a decommission, and the node rejoins if it ever
 completes a handshake again.**
 
-**Versions deployed (2026-09-13, evening).** Both nodes run **0.40.1**
-(`libmacha_core.so` sha256 493f5076…, GCC 14.2.0, built on gbni-1 at `-j2` and
-shipped to es-1 as a 3 MB tarball; both verified byte-identical). Both answer
-`/api/v1/health` 200 `{"status":"ok"}` unauthenticated, both loaded
-`libmacha-torrent`, and neither logged an ERROR after restart. Neither had a
-live viewer at restart time; both journals were checked first.
+**Versions deployed.** es-1 and fi-1 run **0.46.2** (built on es-1 at `-j3`,
+shipped to fi-1 as `/tmp/macha-0.46.2.tgz`, md5 `91091ff928ab…`). Both answer
+`/api/v1/health` 200 with `"version":"0.46.2"` unauthenticated. **0.46.3 is
+tagged but not deployed** — it is documentation only, no binary change, so the
+cluster is not behind in any way that matters.
 
-**The repository and the cluster agree at 0.40.1.** `main` and `develop` are
-both at `fbe928e`, both pushed, and `0.40.0` and `0.40.1` are pushed as
-**annotated** tags. The 105 older tags are lightweight and were left alone;
-converting them would mean force-pushing all of them.
+**Repository.** `main` and `develop` are both at `cd35f22`, tagged `0.46.3`
+(annotated), both pushed. `0.46.0`, `0.46.1` and `0.46.2` are lightweight
+despite the convention; left alone rather than rewritten, like the 105 older
+ones.
 
 **Branching convention (confirmed by the operator 2026-09-13).** Work on the
 long-lived `develop`; releases are tagged on `main`; bare semver; annotated
@@ -1803,22 +2036,46 @@ and `develop` exist.
 "Yes, pushes are ok" on 2026-09-13 after an earlier "you must never push".
 Never push unprompted; never open a PR unless told.
 
-**Live account roles.** `tom` and `root` (manage_users, manager, importer,
-media_viewer), `bryan` (manager, importer, media_viewer), `anonymous` (**no
-roles**, generation 2). None carries `view_status` on disk and none needs to:
-0.38.5 expands role implications at mint, so the three human accounts receive
-it on their next login and anonymous correctly does not. **The roles-less
+**Live account roles (read off es-1 with `macha-users list`, 2026-09-19).**
+Ten accounts: `tom`, `root`, `jonny`, `rnclient` (every role); `ciaran`,
+`bryan`, `troy` (manager, importer, media_viewer, view_status); `webclient`,
+`tvtest` (media_viewer, view_status); `anonymous` (**no roles**, generation
+2). `view_status` **is** on disk for every real account now, contrary to the
+2026-09-13 note. **The roles-less
 anonymous account is a deliberate experiment**, not an oversight — the operator
 is exercising how the system behaves as a registered-users-only deployment. It
 means the manage and status APIs refuse an anonymous session, which has already
 cost one diagnosis; if something "does not work" from a client, check the role
 before reading code.
 
-**The HTTP layer logs no requests at all.** There is no access log and no
-slow-request log, so you cannot tell from a node whether a request even
-arrived, or what status it received. That has now cost two diagnoses (the
-10-second Status investigation and the identity-reset one). It is cheap to add
-and it is in P1.
+**The HTTP layer has a slow-request log (0.43.0, `slow_request_threshold_ms`)
+and nothing else.** There is still no access log, and — found 2026-09-19 —
+**no line at all for a 401, 403 or 400 refusal**, so an auth failure is
+invisible on-box and haproxy's access log is the only record. A `CD--` line
+there carries a substituted `400`: read the termination-state field before
+believing a 4xx.
+
+**Open cross-session threads as of 2026-09-20.** The Android TV RN client
+session is actively play-testing against es-1 and has agreed the priority
+order above (stalls first; it confirmed the read-only windows cost a viewer
+nothing and an ingest everything). Two things are owed in that direction: it
+is driving the reaped-session finding — a session reaped on fi-1 came back as
+a **video transcode on es-1** for a stream the television had been copying
+natively, costing the cluster a transcode slot — and it has taken an action to
+log the exact recovery request body, because the server does not log request
+preferences anywhere and that is the only way to settle whether core asked for
+the transcode. The server side is already cleared: the one documented
+substitution path (`media_engine.cpp:1770`, remux→transcode on an unusable
+keyframe index) logs at INFO and **that line is absent**, so the server did
+not downgrade the mode. A second `Macha Server` session was asked to
+deconflict and had not replied by the end of this session.
+
+**A test account exists:** `servertest` / all five roles, created by the
+operator 2026-09-20 for harness probing. `anonymous` still holds no roles, so
+every gated route 403s without a token — and note credentials nest under a
+`credentials` key in `POST /api/v1/session`; a flat `{username, password}`
+body is silently treated as an **anonymous** request and returns 201, which
+cost this session a wrong-turn diagnosis.
 
 **Build once, ship the artefacts.** Both nodes are aarch64 Debian 13 on glibc
 2.41. A `-j2` build on gbni-1 takes ~25 minutes; staging with `DESTDIR` and
@@ -1826,11 +2083,14 @@ shipping a 3 MB tarball takes about a minute. Sync with plain `rsync` and
 **never `--delete`**. See `project-cluster-deployment` in session memory.
 
 **Run the test suite on a node, not only locally.** A clean macOS/clang build
-is not evidence: 0.38.0 shipped two defects only GCC caught. Expect
-`hydration_catalogue/test_ingest_pause_resume_and_cancel_still_work_under_a_worker_pool`
-to fail there — it is a known pre-existing flake, characterised on 2026-09-13
-at 40-80% in isolation on both Pis and reproducible on 0.39.1, and it is near
-the top of this backlog.
+is not evidence: 0.38.0 shipped two defects only GCC caught. **Expect it to be
+green** — the full suite passed on es-1 at 0.45.0, 0.46.1 and 0.46.2, and a
+red run is P0 work, not a footnote (operator, 2026-09-15). The sentence that
+stood here until 2026-09-20 told the reader to *expect* a named case to fail
+as a "known pre-existing flake": that case was fixed on 2026-09-15 and the
+category was abolished the same day. One platform split is real and recorded:
+`test_durability_barrier_rederives_placement_after_peer_restart` fails on
+macOS/clang and passes on the nodes.
 
 **Commit messages carry no attribution trailers**, by standing instruction. All
 refs were scanned on 2026-09-13 and are clean. `CLAUDE.md` in the repo root is
@@ -1838,6 +2098,11 @@ the operator's and is deliberately untracked.
 
 ## Deployment rule
 
-- [ ] For every deployment, synchronise the complete source tree and all CMake
-  inputs, configure after synchronisation, build nodes in parallel, and verify
-  installed versions and byte-identical hashes on identical RPi hardware.
+Build once, ship the artefacts. Build on es-1 (or fi-1), run the full suite
+there, stage with `DESTDIR`, and ship the tarball — `bin/macha`,
+`lib/macha/libmacha_core.*` and `lib/macha/plugins/` together, never the
+executable alone. Verify `uname -m`, `ldd --version` and the tarball hash on
+each target. Never compile on gbni-1. When a release adds a `NodeTelemetry`
+field, upgrade every node together rather than rolling. (Until 2026-09-20 this
+said "build nodes in parallel", contradicting the practice recorded in every
+deploy note above it; it was also a checkbox that could never be ticked.)

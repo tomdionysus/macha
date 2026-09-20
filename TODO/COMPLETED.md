@@ -1,11 +1,50 @@
 # Completed and tested
 
-Last updated: 2026-09-13
+Last updated: 2026-09-20
 
 The 2026-09-08 entries below were ledgered by a pruning pass over
 `ACTIVE.md`, and cover only the items that pass removed from that file.
 0.24.1–0.35.0 is not otherwise ledgered here yet — see the documentation
 hygiene item in `ACTIVE.md`.
+
+## The HTTP server without a thread per connection — 0.43.0, cluster UAT passed 2026-09-20
+
+Plan: [the HTTP server without a thread per connection](2026-09-15-http-server-reactor-plan.md).
+
+**The API was served by sixteen worker threads, and a worker was spent on every
+kind of waiting the server does** — a kept-alive connection idling up to 15 s, a
+held segment request waiting on the encoder, a slow viewer draining a segment
+over the WAN, a direct-play read fetching from a remote replica. Only running a
+handler is work. When the pool was gone the node stopped answering health and
+status, which is a governing-law-3 violation, and `max_concurrent_holds` was 8
+purely to ration that pool.
+
+Shipped in 0.43.0 (2026-09-15): one reactor thread owns every socket and never
+waits; a bounded compute pool in two lanes, control for
+health/status/session/users and data for everything else; the two routes that
+wait on the media pipeline return a deferred result and are woken by the segment
+store instead of parking a thread. `max_concurrent_holds` became 64, a fairness
+bound rather than a thread ration.
+
+**Cluster UAT passed 2026-09-20 on the condition the plan set itself.** Deployed
+to es-1 and fi-1 on 2026-09-15. Over the five days since, es-1's journal carries
+**zero** `reactor stall` lines and 192 slow-request lines from the log this plan
+built. It held through the 2026-09-19 loader-I/O incident, which saturated the
+disk at 86% iowait and made handlers slow without the reactor ever sleeping. A
+deliberate 8 GB reproduction on 2026-09-20 measured control-plane service time at
+**p99 1.2 ms on-box and 2.0 ms at haproxy, with zero client aborts**, under 2,048
+durable extent puts and a 4.8 s durability barrier.
+
+The "Status took 10 s" item in `ACTIVE.md` was retired with it: the plan named
+worker starvation as the remaining hypothesis and said the reactor would settle
+it, and it has not recurred in five days.
+
+**What this did not cover, found by that same incident:** the reactor never
+waits, but the disk underneath it obeys no law at all. Control was protected
+here; the data lane was not. That is the P0 at the top of `ACTIVE.md`.
+
+Not in scope, as planned: `sendfile`, reactor sharding, HTTP/2, in-process TLS,
+and the RPC transport, which is also thread-per-connection.
 
 ## A seek goes where it was asked to go — 0.46.0, 2026-09-18
 
