@@ -92,6 +92,15 @@ class MemoryNamespaceNodeStore final : public NamespaceNodeStore {
     size_t nodes() const {
         return nodes_.size();
     }
+    // Reads served since the last `forget_reads`. This is what makes the
+    // stat-only claim provable rather than asserted: a getattr that fetches no
+    // extent node can be shown to, by counting.
+    size_t reads() const {
+        return reads_;
+    }
+    void forget_reads() {
+        reads_ = 0;
+    }
     uint64_t bytes() const {
         return bytes_;
     }
@@ -109,6 +118,7 @@ class MemoryNamespaceNodeStore final : public NamespaceNodeStore {
     std::map<ObjectId, Bytes> nodes_;
     std::vector<ObjectId> written_;
     uint64_t bytes_{};
+    mutable size_t reads_{};
 };
 
 struct NamespaceTreeStats {
@@ -136,8 +146,14 @@ std::map<std::string, FsEntry> read_namespace_tree(const ObjectId& root, const N
 // One path, without materialising the namespace: O(log n) nodes fetched. This
 // is what `getattr` becomes, and what makes "nothing forces materialisation"
 // true rather than aspirational.
+//
+// `with_extents` false is the stat-only read -- the common case, and what FUSE
+// path lookup and directory listing actually want. It fetches the path to the
+// leaf and nothing else: not the target's extent spine, and not the spine of
+// any entry it walks past inside the leaf.
 std::optional<FsEntry> namespace_tree_lookup(const ObjectId& root, std::string_view path,
-                                             const NamespaceNodeStore& store);
+                                             const NamespaceNodeStore& store,
+                                             bool with_extents = true);
 
 NamespaceTreeStats namespace_tree_stats(const ObjectId& root, const NamespaceNodeStore& store);
 

@@ -312,4 +312,54 @@ MACHA_TEST("namespace_tree", test_a_corrupt_node_is_refused_rather_than_trusted)
     CHECK(refused + survived > 0);
 }
 
+MACHA_TEST("namespace_tree", test_a_stat_only_lookup_fetches_no_extent_nodes) {
+    // The claim the whole structure rests on, made provable by counting reads
+    // rather than asserted in a comment: a getattr fetches the path from the
+    // root to one leaf and nothing else. Not the namespace, and not a single
+    // extent node -- neither the target's nor those of the entries the leaf
+    // scan walks past on the way to it.
+    //
+    // A library of films, so every entry has an external extent spine and any
+    // accidental extent fetch shows up immediately.
+    std::map<std::string, FsEntry> entries;
+    entries["/"] = make_directory(0);
+    for (int i = 0; i < 200; ++i)
+        entries["/film" + std::to_string(i) + ".mkv"] = make_file(100 + i, 400);
+
+    MemoryNamespaceNodeStore store;
+    const auto root = build_namespace_tree(entries, store);
+    const auto shape = namespace_tree_stats(root, store);
+    REQUIRE(shape.extent_nodes > 0);
+    REQUIRE(shape.depth >= 2);
+
+    // Stat only.
+    store.forget_reads();
+    const auto stat = namespace_tree_lookup(root, "/film137.mkv", store, false);
+    const auto stat_reads = store.reads();
+    REQUIRE(stat);
+    CHECK(stat->size == entries.at("/film137.mkv").size);
+    // The stat answer carries no extents, by construction.
+    CHECK(stat->extents.empty());
+    // One node per level and no more. Depth is small and bounded by log n,
+    // which is the entire point -- the library has 201 entries and thousands
+    // of extents behind them.
+    CHECK(stat_reads <= shape.depth);
+
+    // The same lookup asking for extents pays for them, which is how we know
+    // the first one was actually avoiding work rather than the tree being
+    // empty of extent nodes.
+    store.forget_reads();
+    const auto full = namespace_tree_lookup(root, "/film137.mkv", store, true);
+    const auto full_reads = store.reads();
+    REQUIRE(full);
+    CHECK(full->extents.size() == 400);
+    CHECK(full_reads > stat_reads);
+
+    // And a stat for a path that is not there is equally cheap: it settles on
+    // the leaf without descending into anything.
+    store.forget_reads();
+    CHECK(!namespace_tree_lookup(root, "/absent.mkv", store, false));
+    CHECK(store.reads() <= shape.depth);
+}
+
 } // namespace

@@ -611,13 +611,29 @@ figures came off a real 1.618 TiB namespace rather than a generated one; what
 it actually bought was a latent abort on a 1-in-65,536 condition that would
 have reached SM14 otherwise.
 
-What Stage B still owes before it can be called done: the SM14 record shape and
-`decode_snapshot` dispatch alongside SM13; a fuzz case in the shape of
-`test_fuse_journal_fuzz_every_frame_mutation_still_starts`; a stat-only read
-path that provably fetches no extent nodes (the decoder already takes the flag,
-nothing public exposes it); and the `macha-metadata-dump` mode that builds the
-tree from the live es-1 head so these figures come off a real 1.618 TiB
-namespace rather than a generated one.
+What Stage B still owes before it can be called done: **the SM14 record shape
+and `decode_snapshot` dispatch alongside SM13.** That is the whole of the
+remainder. The other three are done:
+
+- ~~a fuzz case~~ — `test_a_corrupt_node_is_refused_rather_than_trusted`, which
+  flips a bit at every seventh byte of every node and requires the reader to
+  refuse or cope rather than crash or hang.
+- ~~a stat-only read path that provably fetches no extent nodes~~ —
+  `namespace_tree_lookup(..., with_extents = false)`, proved by counting reads
+  through the store rather than asserted:
+  `test_a_stat_only_lookup_fetches_no_extent_nodes` builds 200 films with
+  external extent spines and shows a stat costs at most `depth` node reads and
+  returns no extents, while the same lookup asking for extents costs strictly
+  more.
+
+  **The flag existed and the lookup ignored it.** `namespace_tree_lookup`
+  passed `load_extents = true` unconditionally, so a stat fetched the extent
+  spine of every entry the leaf scan walked past as well as the target's. On a
+  leaf of 32 films that is dozens of node reads to answer a `getattr` that
+  needs none. The decision is now made after the key is parsed, so a scan pays
+  nothing for the entries it discards.
+- ~~the `macha-metadata-dump` mode~~ — `--tree`, and the figures above are off
+  the live head.
 
 **Stage B — the Merkle namespace, behind a new snapshot version.** Define the
 tree, node encoding and root. `decode_snapshot` already carries SM5 through SM13

@@ -258,13 +258,26 @@ void encode_leaf_entry(Writer& writer, const std::string& path, const FsEntry& e
     writer.fixed(build_extent_sequence(entry.extents, store, limits).bytes);
 }
 
-// Reads one leaf record. `load_extents` is false for a scan that only wants
-// stat data, which is every FUSE path lookup and directory listing -- the whole
-// reason the extents are addressed rather than inlined.
+// Reads one leaf record. Extents are fetched only when the caller says so, and
+// the decision is made AFTER the key is parsed so that a scan pays nothing for
+// the entries it walks past.
+//
+// `load_all` is for a full materialisation. `load_only_for` is for a lookup:
+// at most one key in the leaf is the one asked for, and the rest are compared
+// and discarded. Both false and empty is a stat-only read, which is every FUSE
+// path lookup and directory listing -- the whole reason the extents are
+// addressed rather than inlined.
+//
+// Until 2026-09-21 the lookup passed `true` unconditionally, so a stat fetched
+// the extent spine of every entry it skipped past on the way to the one it
+// wanted. On a leaf of 32 entries holding films, that is dozens of node reads
+// to answer a getattr that needs none of them.
 std::pair<std::string, FsEntry> decode_leaf_entry(Reader& reader, const NamespaceNodeStore& store,
-                                                  bool load_extents) {
+                                                  bool load_all,
+                                                  std::string_view load_only_for = {}) {
     std::pair<std::string, FsEntry> item;
     item.first = reader.string(8192);
+    const bool load_extents = load_all || (!load_only_for.empty() && item.first == load_only_for);
     auto& entry = item.second;
     const auto type = reader.u8();
     if (type < 1 || type > 2)
@@ -329,6 +342,7 @@ ObjectId MemoryNamespaceNodeStore::put(std::span<const uint8_t> node) {
 }
 
 std::optional<Bytes> MemoryNamespaceNodeStore::get(const ObjectId& id) const {
+    ++reads_;
     auto found = nodes_.find(id);
     if (found == nodes_.end())
         return {};
@@ -426,7 +440,7 @@ std::map<std::string, FsEntry> read_namespace_tree(const ObjectId& root, const N
 }
 
 std::optional<FsEntry> namespace_tree_lookup(const ObjectId& root, std::string_view path,
-                                             const NamespaceNodeStore& store) {
+                                             const NamespaceNodeStore& store, bool with_extents) {
     ObjectId current = root;
     for (;;) {
         auto encoded = store.get(current);
@@ -437,7 +451,8 @@ std::optional<FsEntry> namespace_tree_lookup(const ObjectId& root, std::string_v
         if (magic == leaf_magic) {
             const auto count = reader.u32();
             for (uint32_t i = 0; i < count; ++i) {
-                auto item = decode_leaf_entry(reader, store, true);
+                auto item = decode_leaf_entry(reader, store, false,
+                                              with_extents ? path : std::string_view{});
                 if (item.first == path)
                     return item.second;
                 // Leaf records are in path order, so a key past the one asked
