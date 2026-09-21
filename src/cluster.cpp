@@ -1671,6 +1671,12 @@ void NodeRuntime::refresh_telemetry() {
             static_cast<uint32_t>(std::max<int64_t>(0, cfg_.streaming.startup_timeout.count()));
         playback.segment_timeout_ms =
             static_cast<uint32_t>(std::max<int64_t>(0, cfg_.streaming.segment_timeout.count()));
+        playback.pipeline_idle_ms =
+            static_cast<uint32_t>(std::max<int64_t>(0, cfg_.streaming.pipeline_idle.count()));
+        playback.session_idle_ms =
+            static_cast<uint32_t>(std::max<int64_t>(0, cfg_.streaming.session_idle.count()));
+        playback.max_sessions_per_account =
+            static_cast<uint32_t>(cfg_.streaming.max_sessions_per_account);
     }
     telemetry_.refresh_local(info, std::string(kServerVersion), cache_capacity, cache_used,
                              storage_backends_online, peers_known, peers_active, 0, 0,

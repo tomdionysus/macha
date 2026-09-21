@@ -243,10 +243,14 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     telemetry.memory_total_bytes = 64ULL * 1024 * 1024 * 1024;
     telemetry.playback_startup_timeout_ms = 15000;
     telemetry.playback_segment_timeout_ms = 6000;
+    telemetry.playback_pipeline_idle_ms = 60000;
+    telemetry.playback_session_idle_ms = 1800000;
+    telemetry.playback_max_sessions_per_account = 32;
     CHECK(decode_node_telemetry(encode_node_telemetry(telemetry)) == telemetry);
     auto telemetry_set = decode_telemetry_set(encode_telemetry_set({telemetry}));
     REQUIRE(telemetry_set.size() == 1);
     CHECK(telemetry_set.front() == telemetry);
+
 
     telemetry.phase = NodePhase::recovering;
     CHECK(decode_node_telemetry(encode_node_telemetry(telemetry)) == telemetry);
@@ -254,88 +258,185 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     REQUIRE(recovering_set.size() == 1);
     CHECK(recovering_set.front().phase == NodePhase::recovering);
 
+    // The framing, which stopped being positional in 0.48.0. Every field is
+    // tagged and length-delimited inside a length-delimited record, so none of
+    // the assertions below need to know where anything sits -- which is the
+    // point. The tests they replace computed byte offsets backwards from the
+    // end of the record and had to be recomputed by hand every time a field
+    // was added.
     auto full = encode_node_telemetry(telemetry);
-    // Trailing optional fields, newest last: the two playback budgets (u32
-    // each), preceded by memory_total_bytes (u64), preceded by cpu_cores
-    // (u32), preceded by the API endpoint (length prefix + content). Each
-    // constant is the distance from the END of the record back to the start of
-    // that field, so truncating to it yields a record encoded before that
-    // field existed.
-    const size_t playback_bytes = 4 + 4;
-    const size_t memory_bytes_bytes = 8 + playback_bytes;
-    const size_t cpu_cores_bytes = 4 + memory_bytes_bytes;
-    // The API endpoint precedes it: a string length prefix + content.
-    const size_t api_fields_bytes = 4 + telemetry.api_endpoint.size();
-    REQUIRE(full.size() > cpu_cores_bytes + api_fields_bytes + 1);
 
-    // A record encoded before the playback budgets existed ends right after
-    // memory_total_bytes. It must report no budgets -- which a client reads as
-    // "this node cannot say" and must never shorten its own attempt budget on
-    // -- while everything before it survives. Every node is in this position
-    // during a rolling upgrade.
-    auto pre_playback = full;
-    pre_playback.resize(pre_playback.size() - playback_bytes);
-    auto legacy_no_playback = decode_node_telemetry(pre_playback);
-    CHECK(legacy_no_playback.playback_startup_timeout_ms == 0);
-    CHECK(legacy_no_playback.playback_segment_timeout_ms == 0);
-    CHECK(legacy_no_playback.memory_total_bytes == telemetry.memory_total_bytes);
-    CHECK(legacy_no_playback.cpu_cores == telemetry.cpu_cores);
+    // A field this build does not know is skipped by its own length, and
+    // everything around it survives. Spliced in by hand because this build
+    // cannot encode a field it has no id for.
+    const std::array<uint8_t, 8> set_magic{'M', 'A', 'C', 'H', 'T', 'E', 'L', '3'};
+    const auto put_u16 = [](Bytes& out, uint16_t value) {
+        out.push_back(static_cast<uint8_t>(value >> 8));
+        out.push_back(static_cast<uint8_t>(value));
+    };
+    const auto put_u32 = [](Bytes& out, uint32_t value) {
+        for (int shift = 24; shift >= 0; shift -= 8)
+            out.push_back(static_cast<uint8_t>(value >> shift));
+    };
+    // The record body is everything after the magic and the record length.
+    Bytes body(full.begin() + set_magic.size() + 4, full.end());
+    Bytes unknown_field;
+    put_u16(unknown_field, 4242);    // an id from a later version
+    put_u16(unknown_field, 5);       // ... carrying five bytes
+    unknown_field.insert(unknown_field.end(), 5, 0xEE);
+    Bytes with_unknown(body);
+    with_unknown.insert(with_unknown.begin(), unknown_field.begin(), unknown_field.end());
 
-    // The pair is meaningless by halves: a record carrying only the first of
-    // the two is treated as carrying neither, rather than pairing a real
-    // startup budget with a fabricated segment one.
-    auto half_playback = full;
-    half_playback.resize(half_playback.size() - 4);
-    auto decoded_half = decode_node_telemetry(half_playback);
-    CHECK(decoded_half.playback_startup_timeout_ms == 0);
-    CHECK(decoded_half.playback_segment_timeout_ms == 0);
+    Bytes record_with_unknown;
+    record_with_unknown.insert(record_with_unknown.end(), set_magic.begin(), set_magic.end());
+    put_u32(record_with_unknown, static_cast<uint32_t>(with_unknown.size()));
+    record_with_unknown.insert(record_with_unknown.end(), with_unknown.begin(),
+                               with_unknown.end());
+    CHECK(decode_node_telemetry(record_with_unknown) == telemetry);
 
-    // A record encoded before physical memory existed ends right after
-    // cpu_cores, and must report none rather than fail.
-    auto pre_memory = full;
-    pre_memory.resize(pre_memory.size() - memory_bytes_bytes);
-    auto legacy_no_memory = decode_node_telemetry(pre_memory);
-    CHECK(legacy_no_memory.memory_total_bytes == 0);
-    CHECK(legacy_no_memory.cpu_cores == telemetry.cpu_cores);
-    CHECK(legacy_no_memory.api_endpoint == telemetry.api_endpoint);
+    // THE CASE THE POSITIONAL FORMAT COULD NOT SURVIVE. A set whose first
+    // record carries a field this build has never heard of: the record after
+    // it must still decode exactly. Positionally that was impossible -- an
+    // older reader consumed the fields it knew, stopped short of the rest, and
+    // began the next record part-way through the previous one, so every record
+    // after the first was garbage. With up to 64 records on the gossip path,
+    // one added field cost a mixed-version cluster every multi-node set it
+    // exchanged.
+    NodeTelemetry second = telemetry;
+    second.node_id = random_node_id();
+    second.sequence = 11;
+    second.api_endpoint = "https://10.34.1.50:7438";
+    second.playback_startup_timeout_ms = 9000;
+    auto second_encoded = encode_node_telemetry(second);
+    Bytes second_record(second_encoded.begin() + set_magic.size(), second_encoded.end());
 
-    // A record encoded before cpu_cores existed ends right after the API
-    // endpoint. It
-    // must decode as "not reported" -- zero, meaning no opinion -- rather than
-    // fail. Every node is briefly in this position during a rolling upgrade,
-    // which is exactly when a peer's core count would otherwise be read from
-    // whatever bytes happened to follow.
-    auto pre_cores = full;
-    pre_cores.resize(pre_cores.size() - cpu_cores_bytes);
-    auto legacy_no_cores = decode_node_telemetry(pre_cores);
-    CHECK(legacy_no_cores.cpu_cores == 0);
-    CHECK(legacy_no_cores.memory_total_bytes == 0);
-    CHECK(legacy_no_cores.api_endpoint == telemetry.api_endpoint);
-    CHECK(legacy_no_cores.sequence == telemetry.sequence);
+    Bytes mixed_version;
+    mixed_version.insert(mixed_version.end(), set_magic.begin(), set_magic.end());
+    put_u32(mixed_version, 2);
+    put_u32(mixed_version, static_cast<uint32_t>(with_unknown.size()));
+    mixed_version.insert(mixed_version.end(), with_unknown.begin(), with_unknown.end());
+    mixed_version.insert(mixed_version.end(), second_record.begin(), second_record.end());
 
-    // A record encoded before the API endpoint existed simply ends earlier,
-    // right after phase. It must decode as "not reported" rather than fail or
-    // silently pick up truncated bytes as an endpoint.
-    auto pre_api = full;
-    pre_api.resize(pre_api.size() - cpu_cores_bytes - api_fields_bytes);
-    auto legacy_no_api = decode_node_telemetry(pre_api);
-    CHECK(legacy_no_api.phase == NodePhase::recovering);
-    CHECK(legacy_no_api.api_endpoint.empty());
-    CHECK(legacy_no_api.cpu_cores == 0);
-    CHECK(legacy_no_api.memory_total_bytes == 0);
-    CHECK(legacy_no_api.sequence == telemetry.sequence);
+    auto mixed = decode_telemetry_set(mixed_version);
+    REQUIRE(mixed.size() == 2);
+    CHECK(mixed.front() == telemetry);
+    CHECK(mixed.back() == second);
 
-    // A record encoded before phase (and so also before the API endpoint)
-    // existed ends one byte earlier still. It must decode as "ready"
-    // (NodeTelemetry's default) rather than fail or silently pick a
-    // different phase.
-    auto pre_phase = full;
-    pre_phase.resize(pre_phase.size() - cpu_cores_bytes - api_fields_bytes - 1);
-    auto legacy = decode_node_telemetry(pre_phase);
+    // A record missing a field keeps that field's default, which a consumer
+    // reads as "this node did not say" -- never as a figure of zero it may act
+    // on. Built by dropping every playback field from the body.
+    Bytes trimmed;
+    {
+        Reader scan(body);
+        while (scan.remaining()) {
+            const auto id = scan.u16();
+            const auto size = scan.u16();
+            auto payload = scan.raw(size);
+            if (id >= 28 && id <= 32) continue; // the playback fields
+            put_u16(trimmed, id);
+            put_u16(trimmed, size);
+            trimmed.insert(trimmed.end(), payload.begin(), payload.end());
+        }
+    }
+    Bytes without_playback;
+    without_playback.insert(without_playback.end(), set_magic.begin(), set_magic.end());
+    put_u32(without_playback, static_cast<uint32_t>(trimmed.size()));
+    without_playback.insert(without_playback.end(), trimmed.begin(), trimmed.end());
+    auto silent = decode_node_telemetry(without_playback);
+    CHECK(silent.playback_startup_timeout_ms == 0);
+    CHECK(silent.playback_segment_timeout_ms == 0);
+    CHECK(silent.playback_pipeline_idle_ms == 0);
+    CHECK(silent.playback_session_idle_ms == 0);
+    CHECK(silent.playback_max_sessions_per_account == 0);
+    // ... and everything it did say is intact.
+    CHECK(silent.api_endpoint == telemetry.api_endpoint);
+    CHECK(silent.cpu_cores == telemetry.cpu_cores);
+    CHECK(silent.memory_total_bytes == telemetry.memory_total_bytes);
+    CHECK(silent.sequence == telemetry.sequence);
+
+    // A sparse node -- streaming off, no cache, no extents -- writes a much
+    // smaller record than a busy one, because a default-valued field is simply
+    // left out. fi-1 is exactly this shape: a full metadata replica hosting no
+    // extents at all.
+    NodeTelemetry sparse;
+    sparse.node_id = telemetry.node_id;
+    sparse.boot_id = telemetry.boot_id;
+    sparse.sequence = 3;
+    sparse.observed_unix_ms = telemetry.observed_unix_ms;
+    sparse.version = telemetry.version;
+    auto sparse_encoded = encode_node_telemetry(sparse);
+    CHECK(sparse_encoded.size() * 2 < full.size());
+    CHECK(decode_node_telemetry(sparse_encoded) == sparse);
+
+    // A record that promises more bytes than it carries is damaged, and is
+    // refused rather than read as a shorter record from an older node. The
+    // positional format could not tell those two apart at all.
+    auto damaged = full;
+    damaged.resize(damaged.size() - 4);
+    bool damaged_rejected = false;
+    try {
+        (void)decode_node_telemetry(damaged);
+    } catch (const DecodeError&) {
+        damaged_rejected = true;
+    }
+    CHECK(damaged_rejected);
+
+    // A known field arriving at the wrong width is corruption, not a version
+    // difference, and must not be read as a number of some other size.
+    Bytes narrow;
+    {
+        Reader scan(body);
+        while (scan.remaining()) {
+            const auto id = scan.u16();
+            const auto size = scan.u16();
+            auto payload = scan.raw(size);
+            if (id == 26) { // cpu_cores, a u32
+                put_u16(narrow, id);
+                put_u16(narrow, 2);
+                narrow.push_back(0);
+                narrow.push_back(4);
+                continue;
+            }
+            put_u16(narrow, id);
+            put_u16(narrow, size);
+            narrow.insert(narrow.end(), payload.begin(), payload.end());
+        }
+    }
+    Bytes wrong_width;
+    wrong_width.insert(wrong_width.end(), set_magic.begin(), set_magic.end());
+    put_u32(wrong_width, static_cast<uint32_t>(narrow.size()));
+    wrong_width.insert(wrong_width.end(), narrow.begin(), narrow.end());
+    bool width_rejected = false;
+    try {
+        (void)decode_node_telemetry(wrong_width);
+    } catch (const DecodeError&) {
+        width_rejected = true;
+    }
+    CHECK(width_rejected);
+
+    // A record carrying no phase at all decodes as NodeTelemetry's default
+    // rather than failing or picking a different one -- absence is silence,
+    // and silence has a defined meaning for every field.
+    Bytes no_phase;
+    {
+        Reader scan(body);
+        while (scan.remaining()) {
+            const auto id = scan.u16();
+            const auto size = scan.u16();
+            auto payload = scan.raw(size);
+            if (id == 24) continue; // phase
+            put_u16(no_phase, id);
+            put_u16(no_phase, size);
+            no_phase.insert(no_phase.end(), payload.begin(), payload.end());
+        }
+    }
+    Bytes phaseless;
+    phaseless.insert(phaseless.end(), set_magic.begin(), set_magic.end());
+    put_u32(phaseless, static_cast<uint32_t>(no_phase.size()));
+    phaseless.insert(phaseless.end(), no_phase.begin(), no_phase.end());
+    auto legacy = decode_node_telemetry(phaseless);
     CHECK(legacy.phase == NodePhase::ready);
-    CHECK(legacy.api_endpoint.empty());
-    CHECK(legacy.cpu_cores == 0);
-    CHECK(legacy.memory_total_bytes == 0);
+    CHECK(legacy.api_endpoint == telemetry.api_endpoint);
     CHECK(legacy.sequence == telemetry.sequence);
     CHECK(legacy.rpc_connections_reused == telemetry.rpc_connections_reused);
 

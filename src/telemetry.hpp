@@ -93,6 +93,24 @@ struct NodeTelemetry {
     // indistinguishable at runtime from an answer.
     uint32_t playback_startup_timeout_ms{};
     uint32_t playback_segment_timeout_ms{};
+    // How long this node keeps a pipeline alive with nothing asking for it,
+    // and how long it keeps the session itself. A client holding a standby
+    // sizes its window against the first: held past the node's pipeline
+    // teardown, it promotes something that cannot serve, on the very path
+    // whose job is to make a failover invisible. The second bounds a deferred
+    // release -- a session abandoned on an unreachable node is worth retrying
+    // a close against until the node has expired it, and not after.
+    //
+    // Both were private copies of this node's configuration held as literals
+    // in clients until 0.48.0, which is the shape that cost a 12.7 s viewer
+    // freeze when a client's 8-segment assumption met a node configured for 4.
+    uint32_t playback_pipeline_idle_ms{};
+    uint32_t playback_session_idle_ms{};
+    // How many playback sessions one account may hold on this node. A client
+    // choosing where to put a standby needs this about the candidate, not
+    // about the node it happens to be talking to, which is why it rides here
+    // rather than only on that node's own playback status.
+    uint32_t playback_max_sessions_per_account{};
 
     auto operator<=>(const NodeTelemetry&) const = default;
 };
@@ -102,6 +120,9 @@ struct NodeTelemetry {
 struct PlaybackBudgets {
     uint32_t startup_timeout_ms{};
     uint32_t segment_timeout_ms{};
+    uint32_t pipeline_idle_ms{};
+    uint32_t session_idle_ms{};
+    uint32_t max_sessions_per_account{};
 };
 
 struct TelemetryView {
