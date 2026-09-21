@@ -1248,6 +1248,9 @@ unproven are in the plan. The Pi-only cases remain.
 **Two es-1 cases measured 2026-09-21, both load-sensitive, neither yet
 diagnosed.** Named here because the alternative is calling them known flakes:
 
+- `http_server/test_a_client_that_closes_mid_body_releases_the_body_source_promptly`
+  — **1 failure in 20 on es-1, measured 2026-09-21.** Not previously recorded.
+  Surfaced as 1/485 in a full suite and is intermittent in isolation at 5%.
 - `hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`
   — fails a full-suite run on
   `metadata replica set forming: waiting for bootstrap checkpoint survey`,

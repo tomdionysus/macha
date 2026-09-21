@@ -2,7 +2,9 @@
 
 Date: 2026-09-17
 
-Status: **Stage A complete (2026-09-17), measured on live nodes. Stage B
+Status: **Stage A complete (2026-09-17). Stage B substrate complete and now
+measured against the live es-1 namespace (2026-09-21): one ordinary write costs
+10,745 bytes against 22,525,100 today, a 2,096x reduction. Stage B
 started the same day -- the tree substrate is written and tested, and is not
 yet SM14 or reachable from a record; see "Stage B progress" below.** Stages
 C-F not started. The finding below is verified against current `develop` (0.43.0);
@@ -467,6 +469,56 @@ the plan:
 | one extent appended to a 4,000-extent file | **3 nodes rewritten of 15** -- tail chunk, extent spine, leaf |
 | largest node, with a 12,500-extent film present | **< 64 KB** (that file's extent list is 612 KB inline today) |
 | point lookup | a path from the root, never the namespace |
+
+## Stage B measured against the live namespace (2026-09-21)
+
+**The `macha-metadata-dump --tree` mode is built and the figures below are off
+es-1's real head, not a generated namespace.** It is offline and read-only: the
+tree is built in memory from the head that `--stats` already materialises, and
+nothing is written to the record, the history or the control store.
+
+| | |
+|---|---|
+| snapshot | 22,525,100 encoded bytes, 5,101 entries (2,877 files, 2,224 directories), 445,959 extents |
+| tree | 3,865 nodes, 19,924,256 bytes, 169 leaves, 10 branches, 3,963 extent nodes, depth 4 |
+| largest node | 50,184 bytes |
+| **one mtime change, median file (16 extents)** | **4 nodes rewritten, 10,745 bytes** |
+| **the same write today** | **22,525,100 bytes — the whole namespace, re-serialised and re-hashed** |
+
+**That is the number the plan turns on: 10,745 bytes against 22,525,100, a
+2,096x reduction for one ordinary write**, on a namespace of 1.6 TiB. The
+generated figures in "Stage B progress" above predicted the shape correctly —
+largest node under 64 KB (50,184 measured), a handful of nodes per change (4
+measured against "<= 12") — so nothing about the design needed revisiting.
+
+**The build threw on the real namespace first time, and the bug was real.**
+
+```
+namespace tree spine made no progress: level=1 keyed=0 children=2 parents=2 target=256
+```
+
+An **extent** spine with exactly two chunks whose two content addresses both hit
+a 1-in-256 boundary — a 1-in-65,536 event per multi-chunk file, which across
+4,808 entries is unremarkable. Six tests on generated namespaces never produced
+it. The guard treated "this level made no reduction" as "this would loop
+forever" and aborted.
+
+It would not have looped: each level hashes different bytes, so the next one
+reduces with probability 1 - (1/target)^n. But "terminates almost surely" is
+not a guarantee, so the fix makes progress unconditional instead — a level that
+fails to reduce is rebuilt ignoring the boundary test and packing by the count
+cap, which takes n children to at most ceil(n/maximum) < n parents for n >= 2.
+
+**History independence survives**, and that mattered more than the fix: the
+fallback fires on a condition computed from the level's children, which are a
+pure function of the sorted entry set, and the packing is positional over that
+same sequence. Nothing depends on insertion order or on how the namespace was
+reached.
+
+**This is why the item was on the list.** The measurement was owed so the
+figures came off a real 1.618 TiB namespace rather than a generated one; what
+it actually bought was a latent abort on a 1-in-65,536 condition that would
+have reached SM14 otherwise.
 
 What Stage B still owes before it can be called done: the SM14 record shape and
 `decode_snapshot` dispatch alongside SM13; a fuzz case in the shape of

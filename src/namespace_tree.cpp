@@ -109,22 +109,56 @@ ObjectId build_spine(std::vector<Child> children, NamespaceNodeStore& store, boo
             run.clear();
         };
 
-        for (auto& child : children) {
-            const auto hash = keyed ? boundary_hash("macha/namespace-tree/branch/v1", level,
-                                                    key_span(child.first_key))
-                                    : boundary_hash("macha/namespace-tree/extent-branch/v1", level,
-                                                    child.id.bytes);
-            run.push_back(std::move(child));
-            if (is_boundary(hash, target) || run.size() >= maximum)
-                flush();
-        }
-        flush();
+        // `packed` ignores the boundary test and groups purely by the count
+        // cap. It is the fallback for a level where every child happened to
+        // hash as a boundary, which produces one parent per child and no
+        // reduction at all.
+        //
+        // That is not a hypothetical. Measured against es-1's real namespace
+        // on 2026-09-21, the first build threw here with
+        // `level=1 keyed=0 children=2 parents=2 target=256`: an extent
+        // sequence of exactly two chunks whose two content addresses both hit
+        // a 1-in-256 boundary. That is a 1-in-65,536 event per multi-chunk
+        // file, and across 4,808 entries meeting it once is unremarkable. Six
+        // tests on generated namespaces never saw it.
+        //
+        // It would not in fact have looped forever -- each level hashes
+        // different bytes, so the next one reduces with probability
+        // 1 - (1/target)^n -- but "terminates almost surely" is not a
+        // guarantee, and the old code chose to abort rather than rely on it.
+        // Packing by the cap makes progress unconditional: at maximum >= 2,
+        // n children become at most ceil(n/maximum) < n parents for n >= 2.
+        //
+        // **History independence survives**, which is the property this must
+        // not cost. The fallback fires on a condition computed from this
+        // level's children, and those are a pure function of the sorted entry
+        // set; the packing itself is positional over that same sequence.
+        // Nothing here depends on insertion order or on how the namespace was
+        // reached.
+        const auto build_level = [&](bool packed) {
+            parents.clear();
+            run.clear();
+            for (auto& child : children) {
+                const auto hash = keyed ? boundary_hash("macha/namespace-tree/branch/v1", level,
+                                                        key_span(child.first_key))
+                                        : boundary_hash("macha/namespace-tree/extent-branch/v1",
+                                                        level, child.id.bytes);
+                run.push_back(child);
+                if ((!packed && is_boundary(hash, target)) || run.size() >= maximum)
+                    flush();
+            }
+            flush();
+        };
 
-        // A level that grouped everything into one parent still made progress;
-        // a level that could not group at all would loop forever, which the
-        // count cap makes impossible (maximum >= 2 always splits eventually).
-        if (parents.size() >= children.size() && parents.size() > 1)
-            throw std::logic_error("namespace tree spine made no progress");
+        build_level(false);
+        if (parents.size() >= children.size() && children.size() > 1)
+            build_level(true);
+        if (parents.size() >= children.size() && children.size() > 1)
+            throw std::logic_error("namespace tree spine made no progress even packed: level=" +
+                                   std::to_string(level) + " keyed=" + (keyed ? "1" : "0") +
+                                   " children=" + std::to_string(children.size()) +
+                                   " parents=" + std::to_string(parents.size()) +
+                                   " max=" + std::to_string(maximum));
         children = std::move(parents);
         if (level < std::numeric_limits<uint8_t>::max())
             ++level;
