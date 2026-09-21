@@ -212,7 +212,7 @@ void encode(Writer& writer, const NodeTelemetry& value) {
     writer.raw(encoded);
 }
 
-uint64_t field_uint(const Bytes& value, size_t width, const char* what) {
+uint64_t field_uint(std::span<const uint8_t> value, size_t width, const char* what) {
     if (value.size() != width)
         throw DecodeError(std::string("telemetry field ") + what + " has the wrong width");
     uint64_t out = 0;
@@ -222,14 +222,16 @@ uint64_t field_uint(const Bytes& value, size_t width, const char* what) {
 }
 
 NodeTelemetry decode(Reader& reader) {
+    // Borrowed, not copied: the record body is walked in place and only the
+    // values that the struct owns are copied out of it. At up to 64 records a
+    // set this is the difference between one allocation per record and none.
     const auto length = reader.u32();
-    auto body = reader.raw(length);
-    Reader fields(body);
+    Reader fields(reader.view(length));
     NodeTelemetry value;
     while (fields.remaining()) {
         const auto id = fields.u16();
         const auto size = fields.u16();
-        auto payload = fields.raw(size);
+        auto payload = fields.view(size);
         switch (id) {
         case field_node_id:
             if (payload.size() != value.node_id.bytes.size())

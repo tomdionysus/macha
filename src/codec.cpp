@@ -86,8 +86,25 @@ Bytes Reader::bytes(size_t maximum) {
     return raw(count);
 }
 
+std::span<const uint8_t> Reader::view(size_t count) {
+    need(count);
+    auto out = data_.subspan(position_, count);
+    position_ += count;
+    return out;
+}
+
+std::span<const uint8_t> Reader::view_bytes(size_t maximum) {
+    auto count = u32();
+    if (count > maximum)
+        throw DecodeError("blob too large");
+    return view(count);
+}
+
 std::string Reader::string(size_t maximum) {
-    auto value = bytes(maximum);
+    // One copy, into the string that owns it. This went through an
+    // intermediate Bytes until 0.48.0, so every decoded name -- and a metadata
+    // snapshot is thousands of them -- was copied twice.
+    auto value = view_bytes(maximum);
     return {reinterpret_cast<const char*>(value.data()), value.size()};
 }
 
