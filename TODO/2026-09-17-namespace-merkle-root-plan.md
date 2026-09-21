@@ -530,13 +530,36 @@ history-independence tested adversarially rather than assumed. Today supplied
 the argument for that — six tests over generated namespaces missed a
 1-in-65,536 condition that the real head hit on the first attempt.
 
-### The measurement that would sharpen this, and has not been taken
+### The measurement that sharpens this, now taken (2026-09-21)
 
-**What a real namespace commit costs on a node today.** If it is 200 ms, the
-ingest argument above is a present-tense problem and the work pays immediately.
-If it is 20 ms, this is purely an investment against the scale target and can
-reasonably sit behind the P0s. Nobody has measured it, and every argument about
-urgency rather than necessity rests on it.
+**56.2 ms of CPU per namespace write, on es-1, measured against the live
+head** — `encode_snapshot` 41.4 ms plus SHA-256 14.7 ms over 22,525,100 bytes,
+via `macha-metadata-dump --tree`. It is a **floor**: it excludes the
+`decode_snapshot` on the way in, the element-wise `entries != entries`
+comparison, and replicating the result to two peers.
+
+Against the thresholds set before it was taken — 200 ms would mean a
+present-tense problem, 20 ms a pure investment — **56 ms lands in between, and
+the honest reading is nearer the second.** One interactive write costing 56 ms
+of CPU is not something a viewer or an operator will notice.
+
+What it does support is the ingest argument, because the cost is per write and
+scales with the library:
+
+| library | encoded snapshot | CPU per write | a 100-file import |
+|---|---|---|---|
+| today, 1.6 TiB | 22.5 MB | **56 ms** | 5.6 s CPU, plus ~2.25 GB serialised and ~4.5 GB replicated |
+| 10x today | ~225 MB | ~560 ms | ~56 s CPU |
+| target, 100 TB | ~1.25 GB | **~3.1 s** | ~5 minutes of CPU, for 100 files |
+
+At 2.5 ms per MB, the target figure is **three seconds of CPU per file
+touched**, before replication, on Pi-class hardware. The 10x column is the one
+that decides scheduling: a bulk import taking a minute of pure re-serialisation
+is a problem someone will hit long before 100 TB.
+
+**So: not urgent today, clearly painful at 10x, inoperable at target.** That
+ordering is the argument for finishing the substrate now while it is cheap and
+inert, and for treating Stage C as scheduled work rather than an emergency.
 
 ## Stage B measured against the live namespace (2026-09-21)
 
