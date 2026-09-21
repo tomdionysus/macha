@@ -355,6 +355,37 @@ clears this.
 segment" to anything without first checking the node for a live session on the
 same media.**
 
+## HANDED OFF — No client sends DELETE (to core as a P0, 2026-09-21)
+
+**Not this repository's to fix, recorded so nobody re-measures it.** Handed to
+the `@machafoundation/core` session as a P0 on the operator's instruction,
+2026-09-21, with the evidence and the server-side contract.
+
+Measured on fi-1, not inferred: **24 session creates in three hours and zero
+expiries**; **zero `DELETE` requests to `/api/v1/playback/sessions/{id}` in the
+entire day** on the busiest node; and earlier the same day 57 creates against 0
+deletes since 13:00, with 18 in the preceding half hour — roughly 18 live
+sessions nobody wanted, continuously.
+
+Every client, by a different route. The web client's UI stops produce no
+`DELETE` and it said so itself. The television's harness leaked ten in one run,
+one holding the node's only video transcode slot. The phone reinstalled four
+times, twice mid-playback.
+
+**Why it is a P0 rather than housekeeping:** it closes a node to transcoding at
+`max_video_transcodes: 1`; it is the precondition for the unexplained
+stale-session `503` above; and it consumes the per-account cap against real
+viewers.
+
+**What the server does about its half, and its limit.** The entitlement release
+below bounds the damage from thirty minutes to five. It does not fix the leak:
+the session still occupies `max_sessions` and the per-account cap until
+`session_idle`, and an orphan remains the precondition for the `503`. Core's
+reconciliation plan — persist each id, clear on clean close, reconcile against
+each node's listing at start — is the right shape and covers force-stop, crash,
+OOM and background reaping; reinstall, cleared storage and non-our clients are
+what the node's timers are for.
+
 ## P0 — One abandoned session holds a node's only transcode slot for 30 minutes (opened 2026-09-21)
 
 fi-1, day of the cutover: **57 session creates, 0 DELETEs**, 18 creates in the
